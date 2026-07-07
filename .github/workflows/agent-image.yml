@@ -1,0 +1,67 @@
+name: build-agent-image
+
+# Build and push the headless agent image to GHCR whenever the /agent build
+# context (or this workflow) changes on main. The image currently bundles
+# Claude Code, but the name is agent-generic so it can host other agents later.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - ".github/workflows/agent-image.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: agent-image
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/agent
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Version iteration: the image's headline content is Claude Code, so the
+      # primary version tag IS the bundled Claude Code release (pinned into the
+      # build so the tag and contents can't drift). github.run_number gives a
+      # monotonic build counter that disambiguates repo-side rebuilds of the
+      # same Claude Code version (e.g. an entrypoint/Dockerfile tweak).
+      - name: Resolve Claude Code version
+        id: ver
+        run: |
+          CC_VERSION="$(npm view @anthropic-ai/claude-code version)"
+          echo "cc_version=${CC_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Pinning Claude Code ${CC_VERSION} (build #${{ github.run_number }})"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./agent
+          push: true
+          build-args: |
+            CLAUDE_CODE_VERSION=${{ steps.ver.outputs.cc_version }}
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.ver.outputs.cc_version }}
+            ${{ env.IMAGE }}:${{ steps.ver.outputs.cc_version }}-${{ github.run_number }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.cc_version }}-${{ github.run_number }}
