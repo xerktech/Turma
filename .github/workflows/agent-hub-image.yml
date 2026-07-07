@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/dockerops-agent-hub
+  IMAGE: ghcr.io/${{ github.repository_owner }}/agent-hub
 
 jobs:
   build:
