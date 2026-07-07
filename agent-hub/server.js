@@ -1,6 +1,6 @@
 // agent-hub — central dashboard + terminal gateway for the Claude Code containers.
 //
-// Agents (claude-code image) reach this server purely OUTBOUND, so hub and
+// Agents (agent image) reach this server purely OUTBOUND, so hub and
 // agents can live on any host/network (all traffic rides agents.xerktech.com):
 //   1. hub-agent.py POSTs a status heartbeat every ~20s (device/workdir/git/
 //      usage) and picks up queued restart commands on the reply.
@@ -32,7 +32,7 @@ const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 // Single-user auth: HUB_USER/HUB_PASSWORD gate the UI and browser API via
 // HTTP Basic (the browser prompt is fine for one user, and same-origin fetch
 // reuses the credentials automatically). HUB_AGENT_TOKEN is a bearer token
-// that lets the heartbeat agents in the claude-code containers report without
+// that lets the heartbeat agents in the agent containers report without
 // user credentials. Leaving a var unset disables that check (open access) —
 // logged loudly at boot since the hub is exposed through the Cloudflare
 // tunnel.

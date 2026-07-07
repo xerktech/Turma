@@ -1,21 +1,22 @@
-name: build-claude-code-image
+name: build-agent-image
 
-# Build and push the headless Claude Code image to GHCR whenever the
-# /claude-code build context (or this workflow) changes on main.
+# Build and push the headless agent image to GHCR whenever the /agent build
+# context (or this workflow) changes on main. The image currently bundles
+# Claude Code, but the name is agent-generic so it can host other agents later.
 on:
   push:
     branches: [main]
     paths:
-      - "claude-code/**"
-      - ".github/workflows/claude-code-image.yml"
+      - "agent/**"
+      - ".github/workflows/agent-image.yml"
   workflow_dispatch: {}
 
 concurrency:
-  group: claude-code-image
+  group: agent-image
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/dockerops-claude-code
+  IMAGE: ghcr.io/${{ github.repository_owner }}/agent
 
 jobs:
   build:
@@ -50,7 +51,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./claude-code
+          context: ./agent
           push: true
           build-args: |
             CLAUDE_CODE_VERSION=${{ steps.ver.outputs.cc_version }}

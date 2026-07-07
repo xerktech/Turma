@@ -1,7 +1,7 @@
 FROM node:22-alpine
 
 # Dashboard + command hub for the Claude Code containers. stdlib-only Node —
-# no npm install layer. Agents (claude-code image) heartbeat to :8300.
+# no npm install layer. Agents (agent image) heartbeat to :8300.
 
 ENV NODE_ENV=production
 WORKDIR /app

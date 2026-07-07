@@ -32,7 +32,7 @@ python3 /usr/local/bin/hub-agent.py &
 
 # Background reverse tunnel to the hub for the web terminal. Keeps a persistent
 # OUTBOUND WebSocket to HUB_URL so the hub can reach this container's ttyd from
-# any network/host (see agent-hub/server.js + claude-code/tunnel-agent.js).
+# any network/host (see agent-hub/server.js + agent/tunnel-agent.js).
 node /usr/local/bin/tunnel-agent.js &
 
 # Each boot registers a FRESH environment named "$APP_NAME-<container hex>", so

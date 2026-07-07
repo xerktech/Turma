@@ -35,7 +35,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      # Unlike the claude-code image there's no upstream package to version
+      # Unlike the agent image there's no upstream package to version
       # against, so the build counter is the version.
       - name: Build and push
         uses: docker/build-push-action@v6
