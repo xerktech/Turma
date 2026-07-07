@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Hub — Usage history</title>
+<style>
+  :root {
+    --page:      #f9f9f7;
+    --surface:   #fcfcfb;
+    --ink:       #0b0b0b;
+    --ink-2:     #52514e;
+    --muted:     #898781;
+    --hairline:  #e1e0d9;
+    --border:    rgba(11,11,11,0.10);
+    --accent:    #2a78d6;
+    /* Validated categorical slots (light) — fixed order, never cycled. */
+    --s1: #2a78d6; --s2: #1baf7a; --s3: #eda100; --s4: #008300;
+    --s5: #4a3aa7; --s6: #e34948; --s7: #e87ba4; --s8: #eb6834;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page:      #0d0d0d;
+      --surface:   #1a1a19;
+      --ink:       #ffffff;
+      --ink-2:     #c3c2b7;
+      --muted:     #898781;
+      --hairline:  #2c2c2a;
+      --border:    rgba(255,255,255,0.10);
+      --accent:    #3987e5;
+      /* Same hues, stepped for the dark surface (validated as a set). */
+      --s1: #3987e5; --s2: #199e70; --s3: #c98500; --s4: #008300;
+      --s5: #9085e9; --s6: #e66767; --s7: #d55181; --s8: #d95926;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 48px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 650; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  header .spacer { flex: 1; }
+  header a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  header a:hover { text-decoration: underline; }
+
+  .chart-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px 10px; position: relative;
+  }
+  /* Legend doubles as the series filter: grouped by device, every item a toggle. */
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 26px; margin-bottom: 12px; }
+  .lg-device { display: flex; align-items: center; gap: 4px 12px; flex-wrap: wrap; }
+  .lg-device .dev {
+    color: var(--ink); font-weight: 650; font-size: 12.5px;
+    cursor: pointer; user-select: none; padding: 3px 2px; border-radius: 5px;
+  }
+  .lg-device .dev:hover { color: var(--accent); }
+  .legend .item {
+    display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--ink-2);
+    cursor: pointer; user-select: none; padding: 3px 6px; border-radius: 6px;
+  }
+  .legend .item:hover { background: var(--page); }
+  .legend .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+  .legend .item.off { opacity: 0.4; }
+  .legend .item.off .swatch { background: transparent !important; box-shadow: inset 0 0 0 1.5px var(--muted); }
+  .legend .item.off .name { text-decoration: line-through; }
+
+  svg { display: block; width: 100%; }
+  svg text { font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--muted); font-variant-numeric: tabular-nums; }
+  .gridline { stroke: var(--hairline); stroke-width: 1; }
+  .baseline { stroke: var(--hairline); stroke-width: 1; }
+  .day-hit { fill: transparent; cursor: default; outline: none; }
+  .day-band.hover .seg { filter: brightness(1.09); }
+
+  .tooltip {
+    position: absolute; pointer-events: none; z-index: 5; display: none;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+    padding: 8px 12px; font-size: 12px; min-width: 210px;
+  }
+  .tooltip .tt-date { color: var(--muted); margin-bottom: 5px; }
+  .tooltip .tt-row { display: flex; align-items: center; gap: 8px; padding: 1.5px 0; }
+  .tooltip .tt-key { width: 10px; height: 3px; border-radius: 2px; flex: none; }
+  .tooltip .tt-val { font-weight: 650; font-variant-numeric: tabular-nums; color: var(--ink); }
+  .tooltip .tt-name { color: var(--ink-2); flex: 1; }
+  .tooltip .tt-dev { color: var(--muted); }
+  .tooltip .tt-tok { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .tooltip .tt-total { border-top: 1px solid var(--hairline); margin-top: 5px; padding-top: 5px; }
+
+  details.table-view { margin-top: 12px; }
+  details.table-view summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; }
+  details.table-view summary:hover { color: var(--ink-2); }
+  .table-scroll {
+    overflow-x: auto; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px; margin-top: 8px;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 8px 14px; text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; position: sticky; left: 0; background: var(--surface); }
+  thead th { color: var(--ink-2); font-weight: 600; font-size: 12px; border-bottom: 1px solid var(--hairline); }
+  thead th .sub { display: block; color: var(--muted); font-weight: 400; font-size: 11px; }
+  tbody td { border-bottom: 1px solid var(--hairline); font-variant-numeric: tabular-nums; }
+  tbody tr:last-child td { border-bottom: none; }
+  td .cost { font-weight: 600; }
+  td .tok { color: var(--muted); font-size: 11px; display: block; }
+  td.zero { color: var(--muted); }
+  .total-col { border-left: 1px solid var(--hairline); }
+  tfoot td { border-top: 1px solid var(--hairline); font-weight: 600; font-variant-numeric: tabular-nums; }
+  tfoot .label { color: var(--ink-2); font-weight: 600; }
+  .empty { color: var(--muted); text-align: center; padding: 64px 0; border: 1px dashed var(--hairline); border-radius: 10px; }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 28px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Usage history</h1>
+    <span class="sub">daily est. cost · all devices</span>
+    <span class="spacer"></span>
+    <a href="/">← Dashboard</a>
+  </header>
+  <div id="chart"></div>
+  <div class="footer">Daily figures are parsed from each container's Claude transcripts (UTC days) and reported by its agent — API-equivalent cost estimates. Click a container in the legend to toggle it (click a device name to toggle all of its containers); hover a day for the breakdown. The table view carries the same numbers for the visible series. Offline containers keep showing their last-reported history.</div>
+</div>
+
+<script>
+const $chart = document.getElementById("chart");
+const DAYS_SHOWN = 30;
+const SLOTS = 8; // categorical slots --s1..--s8, fixed order
+const CHART_H = 300;
+const PAD = { top: 12, right: 12, bottom: 24, left: 46 };
+const HIDDEN_KEY = "agent-hub-hidden-series";
+
+// Toggle state persists across visits. Colors are assigned to containers, not
+// to visible positions, so toggling never repaints the remaining series.
+let hidden = new Set(JSON.parse(localStorage.getItem(HIDDEN_KEY) || "[]"));
+function saveHidden() { localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hidden])); }
+
+function fmtTokens(n) {
+  if (!n) return "0";
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(n);
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[c]);
+}
+function dayTokens(d) { return d ? d.input + d.output + d.cacheWrite + d.cacheRead : 0; }
+function sumDays(list) {
+  const out = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 };
+  for (const d of list) if (d) {
+    out.input += d.input; out.output += d.output;
+    out.cacheWrite += d.cacheWrite; out.cacheRead += d.cacheRead;
+    out.cost += d.cost;
+  }
+  return out;
+}
+function dateWindow(agents) {
+  const all = agents.flatMap(a => Object.keys(a.usage?.days || {}));
+  if (!all.length) return [];
+  const end = new Date(all.sort().at(-1) + "T00:00:00Z");
+  const out = [];
+  for (let i = DAYS_SHOWN - 1; i >= 0; i--) {
+    const d = new Date(end);
+    d.setUTCDate(end.getUTCDate() - i);
+    out.push(d.toISOString().slice(0, 10));
+  }
+  return out;
+}
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const pow = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (v <= m * pow) return m * pow;
+  return 10 * pow;
+}
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function shortDate(iso) { return MONTHS[+iso.slice(5, 7) - 1] + " " + +iso.slice(8, 10); }
+
+function assignSlots(agents) {
+  const keys = agents.map(a => a.key).sort();
+  const map = new Map();
+  keys.forEach((k, i) => map.set(k, i < SLOTS ? `var(--s${i + 1})` : "var(--muted)"));
+  return map;
+}
+
+function render(data) {
+  const { agents } = data;
+  if (!agents.length) {
+    $chart.innerHTML = `<div class="empty">No usage reported yet.</div>`;
+    return;
+  }
+  const slotOf = assignSlots(agents);
+
+  // Stable order: by device, then container — this is also the stacking order.
+  const byDevice = new Map();
+  for (const a of [...agents].sort((x, y) =>
+    (x.device + "\x00" + x.key).localeCompare(y.device + "\x00" + y.key))) {
+    const d = a.device || "unknown-device";
+    if (!byDevice.has(d)) byDevice.set(d, []);
+    byDevice.get(d).push(a);
+  }
+  const ordered = [...byDevice.values()].flat();
+  const visible = ordered.filter(a => !hidden.has(a.key));
+  const dates = dateWindow(ordered);
+
+  $chart.replaceChildren();
+  if (!dates.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "No per-day usage reported yet (agents report it within ~5 minutes of starting).";
+    $chart.append(empty);
+    return;
+  }
+
+  const card = document.createElement("div");
+  card.className = "chart-card";
+  card.append(legendEl(byDevice, slotOf));
+  buildChart(card, visible, dates, slotOf);
+  $chart.append(card, tableView(visible, dates));
+}
+
+// Legend = filter. Container items toggle one series; the device name toggles
+// all of that device's containers at once.
+function legendEl(byDevice, slotOf) {
+  const legend = document.createElement("div");
+  legend.className = "legend";
+  for (const [device, list] of byDevice) {
+    const group = document.createElement("span");
+    group.className = "lg-device";
+    const dev = document.createElement("span");
+    dev.className = "dev";
+    dev.textContent = device;
+    dev.title = "Toggle all containers on " + device;
+    dev.addEventListener("click", () => {
+      const anyVisible = list.some(a => !hidden.has(a.key));
+      for (const a of list) anyVisible ? hidden.add(a.key) : hidden.delete(a.key);
+      saveHidden();
+      render(cache);
+    });
+    group.append(dev);
+    for (const a of list) {
+      const item = document.createElement("span");
+      item.className = "item" + (hidden.has(a.key) ? " off" : "");
+      const sw = document.createElement("span");
+      sw.className = "swatch";
+      sw.style.background = slotOf.get(a.key);
+      const label = document.createElement("span");
+      label.className = "name";
+      label.textContent = a.key;
+      item.append(sw, label);
+      item.addEventListener("click", () => {
+        hidden.has(a.key) ? hidden.delete(a.key) : hidden.add(a.key);
+        saveHidden();
+        render(cache);
+      });
+      group.append(item);
+    }
+    legend.append(group);
+  }
+  return legend;
+}
+
+function buildChart(card, list, dates, slotOf) {
+  const width = Math.max(520, Math.min(1146, document.body.clientWidth - 72));
+  const iw = width - PAD.left - PAD.right;
+  const ih = CHART_H - PAD.top - PAD.bottom;
+  // Scale to the visible series — the filter scopes everything below it.
+  const yMax = niceMax(Math.max(0, ...dates.map(d =>
+    sumDays(list.map(a => a.usage?.days?.[d])).cost
+  )));
+  const y = v => PAD.top + ih - (v / yMax) * ih;
+  const band = iw / dates.length;
+  const barW = Math.min(24, band * 0.7);
+  const GAP = 2; // surface gap between stacked segments
+
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${width} ${CHART_H}`);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "Daily estimated cost, stacked by container");
+
+  const TICKS = 4;
+  for (let i = 0; i <= TICKS; i++) {
+    const v = (yMax / TICKS) * i;
+    const gy = y(v);
+    const line = document.createElementNS(NS, "line");
+    line.setAttribute("class", i === 0 ? "baseline" : "gridline");
+    line.setAttribute("x1", PAD.left); line.setAttribute("x2", width - PAD.right);
+    line.setAttribute("y1", gy); line.setAttribute("y2", gy);
+    svg.append(line);
+    const t = document.createElementNS(NS, "text");
+    t.setAttribute("x", PAD.left - 8);
+    t.setAttribute("y", gy + 3.5);
+    t.setAttribute("text-anchor", "end");
+    t.textContent = "$" + (Number.isInteger(v) ? v : +v.toFixed(2));
+    svg.append(t);
+  }
+
+  const step = Math.ceil(dates.length / 8);
+  dates.forEach((d, i) => {
+    if (i % step !== 0 && i !== dates.length - 1) return;
+    const t = document.createElementNS(NS, "text");
+    t.setAttribute("x", PAD.left + band * i + band / 2);
+    t.setAttribute("y", CHART_H - 7);
+    t.setAttribute("text-anchor", "middle");
+    t.textContent = shortDate(d);
+    svg.append(t);
+  });
+
+  const tooltip = document.createElement("div");
+  tooltip.className = "tooltip";
+
+  dates.forEach((date, i) => {
+    const g = document.createElementNS(NS, "g");
+    g.setAttribute("class", "day-band");
+    const x0 = PAD.left + band * i + (band - barW) / 2;
+    const perAgent = list.map(a => ({ a, d: a.usage?.days?.[date] }));
+    const stack = perAgent.filter(p => p.d && p.d.cost > 0);
+    let cursor = y(0);
+    stack.forEach((p, idx) => {
+      const hPx = Math.max(1.5, (p.d.cost / yMax) * ih);
+      const top = cursor - hPx;
+      const isTop = idx === stack.length - 1;
+      const r = Math.min(4, barW / 2, hPx);
+      const seg = document.createElementNS(NS, "path");
+      seg.setAttribute("class", "seg");
+      seg.setAttribute("fill", slotOf.get(p.a.key));
+      seg.setAttribute("d", isTop
+        ? `M${x0},${cursor} L${x0},${top + r} Q${x0},${top} ${x0 + r},${top} L${x0 + barW - r},${top} Q${x0 + barW},${top} ${x0 + barW},${top + r} L${x0 + barW},${cursor} Z`
+        : `M${x0},${cursor} L${x0},${top} L${x0 + barW},${top} L${x0 + barW},${cursor} Z`);
+      g.append(seg);
+      cursor = top - GAP;
+    });
+
+    const hit = document.createElementNS(NS, "rect");
+    hit.setAttribute("class", "day-hit");
+    hit.setAttribute("x", PAD.left + band * i);
+    hit.setAttribute("y", PAD.top);
+    hit.setAttribute("width", band);
+    hit.setAttribute("height", ih);
+    hit.setAttribute("tabindex", "0");
+    const show = () => {
+      g.classList.add("hover");
+      fillTooltip(tooltip, date, perAgent, slotOf);
+      tooltip.style.display = "block";
+      const cardBox = card.getBoundingClientRect();
+      const svgBox = svg.getBoundingClientRect();
+      const scale = svgBox.width / width;
+      let left = svgBox.left - cardBox.left + (PAD.left + band * i + band / 2) * scale + 12;
+      if (left + tooltip.offsetWidth > cardBox.width - 8) {
+        left -= tooltip.offsetWidth + 24;
+      }
+      tooltip.style.left = left + "px";
+      tooltip.style.top = (svgBox.top - cardBox.top + 18) + "px";
+    };
+    const hide = () => { g.classList.remove("hover"); tooltip.style.display = "none"; };
+    hit.addEventListener("pointerenter", show);
+    hit.addEventListener("pointerleave", hide);
+    hit.addEventListener("focus", show);
+    hit.addEventListener("blur", hide);
+    g.append(hit);
+    svg.append(g);
+  });
+
+  card.append(svg, tooltip);
+}
+
+// Tooltip: every visible series at that X (device in muted text after the
+// name), total row last. Names inserted via textContent (untrusted data).
+function fillTooltip(tooltip, date, perAgent, slotOf) {
+  tooltip.replaceChildren();
+  const dt = document.createElement("div");
+  dt.className = "tt-date";
+  dt.textContent = shortDate(date) + " (UTC)";
+  tooltip.append(dt);
+  for (const { a, d } of perAgent) {
+    const row = document.createElement("div");
+    row.className = "tt-row";
+    const key = document.createElement("span");
+    key.className = "tt-key";
+    key.style.background = slotOf.get(a.key);
+    const val = document.createElement("span");
+    val.className = "tt-val";
+    val.textContent = d ? "$" + d.cost.toFixed(2) : "–";
+    const name = document.createElement("span");
+    name.className = "tt-name";
+    name.textContent = a.key + " ";
+    const dev = document.createElement("span");
+    dev.className = "tt-dev";
+    dev.textContent = a.device || "";
+    name.append(dev);
+    const tok = document.createElement("span");
+    tok.className = "tt-tok";
+    tok.textContent = d ? fmtTokens(dayTokens(d)) + " tok" : "";
+    row.append(key, val, name, tok);
+    tooltip.append(row);
+  }
+  const total = sumDays(perAgent.map(p => p.d));
+  const row = document.createElement("div");
+  row.className = "tt-row tt-total";
+  const key = document.createElement("span");
+  key.className = "tt-key";
+  const val = document.createElement("span");
+  val.className = "tt-val";
+  val.textContent = "$" + total.cost.toFixed(2);
+  const name = document.createElement("span");
+  name.className = "tt-name";
+  name.textContent = "Total";
+  const tok = document.createElement("span");
+  tok.className = "tt-tok";
+  tok.textContent = fmtTokens(dayTokens(total)) + " tok";
+  row.append(key, val, name, tok);
+  tooltip.append(row);
+}
+
+// Collapsible table — same slice as the chart (visible series only).
+function tableView(list, dates) {
+  const details = document.createElement("details");
+  details.className = "table-view";
+  const summary = document.createElement("summary");
+  summary.textContent = "Table view";
+  details.append(summary);
+
+  if (!list.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "All series are toggled off.";
+    details.append(empty);
+    return details;
+  }
+
+  const shown = [...dates].reverse().filter(d =>
+    list.some(a => a.usage?.days?.[d])
+  );
+  const head = list.map(a =>
+    `<th>${esc(a.key)}<span class="sub">${esc(a.device || "")} · ${esc(a.git?.repoName || "")}</span></th>`
+  ).join("");
+  const cell = d => (!d || (!d.cost && !dayTokens(d)))
+    ? `<td class="zero">–</td>`
+    : `<td><span class="cost">$${d.cost.toFixed(2)}</span><span class="tok">${fmtTokens(dayTokens(d))} tok</span></td>`;
+  const rows = shown.map(date => {
+    const total = sumDays(list.map(a => a.usage?.days?.[date]));
+    return `<tr><td>${esc(date)}</td>${list.map(a => cell(a.usage?.days?.[date])).join("")}<td class="total-col">${
+      total.cost || dayTokens(total)
+        ? `<span class="cost">$${total.cost.toFixed(2)}</span><span class="tok">${fmtTokens(dayTokens(total))} tok</span>`
+        : "–"
+    }</td></tr>`;
+  }).join("");
+  const allTime = list.map(a => {
+    const t = a.usage?.totals;
+    return `<td>${t ? `$${t.cost.toFixed(2)}<span class="tok">${fmtTokens(dayTokens(t))} tok</span>` : "–"}</td>`;
+  }).join("");
+  const allTotal = sumDays(list.map(a => a.usage?.totals));
+
+  const scroll = document.createElement("div");
+  scroll.className = "table-scroll";
+  scroll.innerHTML = `<table>
+    <thead><tr><th>Date</th>${head}<th class="total-col">Total</th></tr></thead>
+    <tbody>${rows}</tbody>
+    <tfoot><tr><td class="label">All-time</td>${allTime}<td class="total-col">$${allTotal.cost.toFixed(2)}<span class="tok">${fmtTokens(dayTokens(allTotal))} tok</span></td></tr></tfoot>
+  </table>`;
+  details.append(scroll);
+  return details;
+}
+
+let cache = null;
+async function refresh() {
+  try {
+    const r = await fetch("/api/agents");
+    cache = await r.json();
+  } catch { /* keep last render */ }
+  if (cache) render(cache);
+}
+refresh();
+setInterval(refresh, 30000);
+let resizeTimer;
+addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => cache && render(cache), 200);
+});
+</script>
+</body>
+</html>

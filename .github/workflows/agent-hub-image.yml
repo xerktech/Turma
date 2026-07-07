@@ -1,0 +1,53 @@
+name: build-agent-hub-image
+
+# Build and push the agent-hub dashboard image to GHCR whenever the
+# /agent-hub build context (or this workflow) changes on main.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agent-hub/**"
+      - ".github/workflows/agent-hub-image.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: agent-hub-image
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/dockerops-agent-hub
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Unlike the claude-code image there's no upstream package to version
+      # against, so the build counter is the version.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./agent-hub
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:build-${{ github.run_number }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=build-${{ github.run_number }}

@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Hub</title>
+<style>
+  :root {
+    --page:        #f9f9f7;
+    --surface:     #fcfcfb;
+    --ink:         #0b0b0b;
+    --ink-2:       #52514e;
+    --muted:       #898781;
+    --hairline:    #e1e0d9;
+    --border:      rgba(11,11,11,0.10);
+    --good:        #0ca30c;
+    --warning:     #fab219;
+    --critical:    #d03b3b;
+    --accent:      #2a78d6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page:      #0d0d0d;
+      --surface:   #1a1a19;
+      --ink:       #ffffff;
+      --ink-2:     #c3c2b7;
+      --muted:     #898781;
+      --hairline:  #2c2c2a;
+      --border:    rgba(255,255,255,0.10);
+      --accent:    #3987e5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 48px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 650; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  header .spacer { flex: 1; }
+  header a.nav { color: var(--accent); text-decoration: none; font-size: 13px; }
+  header a.nav:hover { text-decoration: underline; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .tile {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .tile .label { color: var(--ink-2); font-size: 12px; margin-bottom: 4px; }
+  .tile .value { font-size: 26px; font-weight: 650; letter-spacing: -0.01em; }
+  .tile .hint  { color: var(--muted); font-size: 11px; margin-top: 2px; }
+
+  .device-group { margin-bottom: 30px; }
+  .device-header {
+    display: flex; align-items: baseline; gap: 10px;
+    border-bottom: 1px solid var(--hairline);
+    padding-bottom: 8px; margin-bottom: 14px;
+  }
+  .device-header h2 { font-size: 17px; margin: 0; font-weight: 650; }
+  .device-header .count { color: var(--muted); font-size: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .card.offline { opacity: 0.62; }
+  .card-top { display: flex; align-items: center; gap: 10px; }
+  .card-top h3 { font-size: 15px; margin: 0; font-weight: 650; flex: 1; word-break: break-all; }
+  .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .dot.online { background: var(--good); }
+  .dot.offline { background: var(--critical); }
+  .dot.restarting { background: var(--warning); }
+
+  dl { display: grid; grid-template-columns: 96px 1fr; gap: 4px 10px; margin: 0; font-size: 13px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; color: var(--ink-2); overflow-wrap: anywhere; }
+  dd .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  dd b { color: var(--ink); font-weight: 600; }
+  dd a { color: var(--accent); text-decoration: none; }
+  dd a b { color: inherit; }
+  dd a:hover { text-decoration: underline; }
+
+  .usage {
+    border-top: 1px solid var(--hairline); padding-top: 10px;
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;
+  }
+  .usage .u-label { color: var(--muted); font-size: 11px; }
+  .usage .u-value { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .usage .u-sub { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+  .sess-working { color: var(--good); }
+  .sess-wait { color: var(--warning); }
+
+  details.logs { border-top: 1px solid var(--hairline); padding-top: 8px; }
+  details.logs summary { cursor: pointer; color: var(--muted); font-size: 12px; user-select: none; }
+  details.logs summary:hover { color: var(--ink-2); }
+  details.logs pre {
+    font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap; word-break: break-all;
+    max-height: 260px; overflow: auto;
+    background: var(--page); border: 1px solid var(--hairline); border-radius: 6px;
+    padding: 8px; margin: 8px 0 0;
+  }
+
+  .actions { display: flex; gap: 8px; margin-top: 2px; }
+  button {
+    font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--border); background: transparent; color: var(--ink);
+  }
+  button:hover { border-color: var(--ink-2); }
+  button.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  button.confirm { border-color: var(--critical); color: var(--critical); font-weight: 600; }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  .empty { color: var(--muted); text-align: center; padding: 64px 0; border: 1px dashed var(--hairline); border-radius: 10px; }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 28px; }
+
+  h3.link { cursor: pointer; }
+  h3.link:hover { color: var(--accent); }
+
+  .term-overlay {
+    display: none; position: fixed; inset: 0; z-index: 50;
+    background: rgba(0,0,0,0.62); flex-direction: column; padding: 20px;
+  }
+  .term-box {
+    flex: 1; display: flex; flex-direction: column; width: 100%; max-width: 1400px;
+    margin: 0 auto; background: #000; border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden;
+  }
+  .term-bar {
+    display: flex; align-items: center; gap: 12px; padding: 8px 12px;
+    background: var(--surface); border-bottom: 1px solid var(--hairline);
+  }
+  .term-bar .t-title { font-weight: 650; font-size: 14px; }
+  .term-bar .t-title .path { font-family: ui-monospace, Menlo, monospace; color: var(--muted); font-weight: 400; font-size: 12px; }
+  .term-bar .spacer { flex: 1; }
+  .term-bar a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  .term-bar a:hover { text-decoration: underline; }
+  .term-overlay iframe { flex: 1; border: 0; width: 100%; background: #000; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Agent Hub</h1>
+    <span class="sub">Claude Code containers</span>
+    <span class="spacer"></span>
+    <a class="nav" href="/history">Usage history</a>
+    <span class="sub" id="refreshed"></span>
+  </header>
+
+  <div class="tiles" id="tiles"></div>
+  <div id="groups"></div>
+  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Restart clears a container’s session context; it re-registers in claude.ai/code with a fresh name.</div>
+</div>
+
+<div class="term-overlay" id="termOverlay">
+  <div class="term-box">
+    <div class="term-bar">
+      <span class="t-title">Live session · <span class="path" id="termTitle"></span></span>
+      <span class="spacer"></span>
+      <a id="termOpen" target="_blank" rel="noopener">Open in new tab ↗</a>
+      <button class="primary" onclick="closeTerminal()">Close (Esc)</button>
+    </div>
+    <iframe id="termFrame" src="about:blank" title="Live Claude session"></iframe>
+  </div>
+</div>
+
+<script>
+const $tiles = document.getElementById("tiles");
+const $groups = document.getElementById("groups");
+const $refreshed = document.getElementById("refreshed");
+// Two-click restart confirmation state: key -> timeout id
+const confirming = new Map();
+// Cards re-render every 5s; remember which log <details> the user opened.
+const openLogs = new Set();
+function logToggle(key, open) {
+  if (open) openLogs.add(key);
+  else openLogs.delete(key);
+}
+
+function fmtTokens(n) {
+  if (n == null) return "–";
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(n);
+}
+function fmtCost(c) { return c == null ? "–" : "$" + c.toFixed(2); }
+function fmtBytes(b) {
+  if (b == null) return "–";
+  const units = ["B", "KiB", "MiB", "GiB"];
+  let i = 0;
+  while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+  return b.toFixed(i ? 1 : 0) + " " + units[i];
+}
+function ago(ms) {
+  if (!ms) return "never";
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+function uptime(startedAt, now) {
+  const t = Date.parse(startedAt);
+  if (!t) return "–";
+  const s = Math.max(0, Math.floor((now - t) / 1000));
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+  return Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h";
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[c]);
+}
+function totalTokens(u) {
+  return u ? u.input + u.output + u.cacheWrite + u.cacheRead : null;
+}
+function shortModels(models) {
+  if (!models || !models.length) return "–";
+  return models.slice(0, 2).map(m =>
+    m.replace(/^claude-/, "").replace(/-\d{8}$/, "")
+  ).join(", ");
+}
+
+// Session signals reported by the agent: transcript freshness => working/idle,
+// pending AskUserQuestion => waiting on the user, bridge pointer => attached.
+function sessionInfo(a, now) {
+  const s = a.session;
+  if (!s || s.transcriptAgeSec == null) return { label: "no transcript yet", cls: "" };
+  const age = s.transcriptAgeSec * 1000 + Math.max(0, now - a.lastSeen);
+  if (s.question)
+    return { label: "waiting for your answer", cls: "sess-wait", question: s.question, busy: true };
+  if (a.online && age < 90 * 1000)
+    return { label: "working", cls: "sess-working", detail: "last write " + ago(age), busy: true };
+  return {
+    label: s.bridgeAttached ? "idle · session attached" : "idle",
+    cls: "",
+    detail: "last write " + ago(age),
+  };
+}
+
+function agentState(a, now) {
+  // "restarting" = restart command was delivered and the container hasn't
+  // come back with a fresh startedAt yet (or hasn't re-heartbeated).
+  if (a.restartSentAt && now - a.restartSentAt < 5 * 60 * 1000) {
+    const started = Date.parse(a.startedAt);
+    if (!started || started * 1 < a.restartSentAt) return "restarting";
+  }
+  if (a.restartPending) return "restart queued";
+  return a.online ? "online" : "offline";
+}
+
+function tile(label, value, hint) {
+  return `<div class="tile"><div class="label">${esc(label)}</div>` +
+         `<div class="value">${esc(value)}</div>` +
+         (hint ? `<div class="hint">${esc(hint)}</div>` : "") + `</div>`;
+}
+
+function render(data) {
+  const { now, agents } = data;
+  $refreshed.textContent = "updated " + new Date(now).toLocaleTimeString();
+
+  const online = agents.filter(a => a.online);
+  const sum = (f) => agents.reduce((t, a) => t + (f(a) || 0), 0);
+  $tiles.innerHTML =
+    tile("Agents online", `${online.length} / ${agents.length}`,
+         [...new Set(agents.map(a => a.device))].join(", ") || "no devices yet") +
+    tile("Tokens today", fmtTokens(sum(a => totalTokens(a.usage?.today))), "all containers, incl. cache") +
+    tile("Est. cost today", fmtCost(sum(a => a.usage?.today?.cost)), "API-equivalent") +
+    tile("Est. cost all-time", fmtCost(sum(a => a.usage?.totals?.cost)), "API-equivalent");
+
+  if (!agents.length) {
+    $groups.innerHTML = `<div class="empty">No agents have reported yet.<br>
+      Containers running the claude-code image heartbeat here automatically.</div>`;
+    return;
+  }
+
+  // Group cards under a header per physical device.
+  const byDevice = new Map();
+  for (const a of agents) {
+    const d = a.device || "unknown-device";
+    if (!byDevice.has(d)) byDevice.set(d, []);
+    byDevice.get(d).push(a);
+  }
+
+  $groups.innerHTML = [...byDevice.entries()].map(([device, list]) => {
+    const onlineCount = list.filter(a => a.online).length;
+    return `<section class="device-group">
+      <div class="device-header">
+        <h2>${esc(device)}</h2>
+        <span class="count">${onlineCount} / ${list.length} online</span>
+      </div>
+      <div class="grid">${list.map(a => card(a, now)).join("")}</div>
+    </section>`;
+  }).join("");
+}
+
+function card(a, now) {
+    const state = agentState(a, now);
+    const dot = state === "online" ? "online" : (state === "offline" ? "offline" : "restarting");
+    const u = a.usage;
+    const mem = a.memory
+      ? fmtBytes(a.memory.usedBytes) + (a.memory.limitBytes ? " / " + fmtBytes(a.memory.limitBytes) : "")
+      : "–";
+    // Repo name links to its remote when it's a web URL (git@ remotes get
+    // rewritten to https for github-style hosts).
+    let repo = "not a repo";
+    if (a.git) {
+      const name = esc(a.git.repoName || "unknown");
+      let href = a.git.remote || "";
+      const sshMatch = href.match(/^git@([^:]+):(.+?)(\.git)?$/);
+      if (sshMatch) href = `https://${sshMatch[1]}/${sshMatch[2]}`;
+      repo = /^https?:\/\//.test(href)
+        ? `<a href="${esc(href.replace(/\.git$/, ""))}" target="_blank" rel="noopener"><b>${name}</b></a>`
+        : `<b>${name}</b>`;
+    }
+    const branch = a.git
+      ? `<b>${esc(a.git.branch)}</b>` + (a.git.dirtyFiles ? ` · ${a.git.dirtyFiles} dirty` : " · clean")
+      : "–";
+    const sess = sessionInfo(a, now);
+    const confirmingThis = confirming.has(a.key);
+    // Terminal button/clickable title only when this container's reverse tunnel
+    // is live right now (the hub reports terminalOnline when the tunnel-agent's
+    // control channel is connected).
+    const hasTerm = a.terminalOnline;
+    const title = hasTerm
+      ? `<h3 class="link" onclick="openTerminal('${esc(a.key)}')" title="Open the live session">${esc(a.key)}</h3>`
+      : `<h3>${esc(a.key)}</h3>`;
+    return `<div class="card ${a.online ? "" : "offline"}">
+      <div class="card-top">
+        ${title}
+        <span class="status"><span class="dot ${dot}"></span>${esc(state)}</span>
+      </div>
+      <dl>
+        <dt>Working dir</dt><dd><span class="path">${esc(a.workingDir)}</span></dd>
+        <dt>Repo</dt><dd>${repo}</dd>
+        <dt>Branch</dt><dd>${branch}</dd>
+        <dt>Session</dt><dd><b class="${sess.cls}">${esc(sess.label)}</b>${sess.detail ? " · " + esc(sess.detail) : ""}</dd>
+        ${sess.question ? `<dt>Question</dt><dd>${esc(sess.question)}</dd>` : ""}
+        <dt>Claude Code</dt><dd>${esc(a.claudeVersion || "–")}</dd>
+        <dt>Memory</dt><dd>${esc(mem)}</dd>
+        <dt>Uptime</dt><dd>${esc(uptime(a.startedAt, now))} · last seen ${esc(ago(now - a.lastSeen))}</dd>
+        <dt>Activity</dt><dd>${u?.lastActivity ? esc(ago(now - Date.parse(u.lastActivity))) : "–"}
+            · ${u ? u.sessions + " sessions" : ""} · ${esc(shortModels(u?.models))}</dd>
+      </dl>
+      <div class="usage">
+        <div><div class="u-label">Tokens today</div><div class="u-value">${fmtTokens(totalTokens(u?.today))}</div>
+             <div class="u-sub">${fmtTokens(u?.today?.output)} out</div></div>
+        <div><div class="u-label">Est. today</div><div class="u-value">${fmtCost(u?.today?.cost)}</div>
+             <div class="u-sub">API-equiv.</div></div>
+        <div><div class="u-label">All-time</div><div class="u-value">${fmtCost(u?.totals?.cost)}</div>
+             <div class="u-sub">${fmtTokens(totalTokens(u?.totals))} tokens</div></div>
+      </div>
+      ${a.logTail ? `<details class="logs" ${openLogs.has(a.key) ? "open" : ""}
+          ontoggle="logToggle('${esc(a.key)}', this.open)">
+        <summary>Container log (tail)</summary><pre>${esc(a.logTail)}</pre>
+      </details>` : ""}
+      <div class="actions">
+        ${hasTerm ? `<button class="primary" onclick="openTerminal('${esc(a.key)}')">Open session ▸</button>` : ""}
+        <button class="${confirmingThis ? "confirm" : "primary"}"
+                onclick="restart('${esc(a.key)}')"
+                ${state === "restart queued" || state === "restarting" ? "disabled" : ""}>
+          ${confirmingThis ? (sess.busy ? "Busy! Confirm restart" : "Confirm restart")
+                           : (state === "restarting" ? "Restarting…" : "Restart (clear context)")}
+        </button>
+        ${a.online ? "" : `<button onclick="removeAgent('${esc(a.key)}')">Remove</button>`}
+      </div>
+    </div>`;
+}
+
+async function restart(key) {
+  if (!confirming.has(key)) {
+    // First click arms the button; it disarms after 4s.
+    confirming.set(key, setTimeout(() => { confirming.delete(key); refresh(); }, 4000));
+    refresh();
+    return;
+  }
+  clearTimeout(confirming.get(key));
+  confirming.delete(key);
+  await fetch(`/api/agents/${encodeURIComponent(key)}/restart`, { method: "POST" });
+  refresh();
+}
+async function removeAgent(key) {
+  await fetch(`/api/agents/${encodeURIComponent(key)}`, { method: "DELETE" });
+  refresh();
+}
+
+// ---- live terminal overlay -------------------------------------------------
+// Opens /term/<key>/ in a full-screen iframe. No extra secret: the browser
+// re-sends the page's basic-auth login on the same-origin iframe requests and
+// terminal WebSocket (see agent-hub/server.js).
+const $overlay = document.getElementById("termOverlay");
+const $frame = document.getElementById("termFrame");
+function openTerminal(key) {
+  const src = `/term/${encodeURIComponent(key)}/`;
+  $overlay.dataset.key = key;
+  document.getElementById("termTitle").textContent = key;
+  document.getElementById("termOpen").href = src;
+  $frame.src = src;
+  $overlay.style.display = "flex";
+}
+function closeTerminal() {
+  $overlay.style.display = "none";
+  $frame.src = "about:blank"; // tear down the session's WebSocket
+}
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && $overlay.style.display === "flex") closeTerminal();
+});
+
+let cache = { now: Date.now(), agents: [] };
+async function refresh() {
+  try {
+    const r = await fetch("/api/agents");
+    cache = await r.json();
+  } catch { /* keep last data; the "updated" stamp goes stale visibly */ }
+  render(cache);
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

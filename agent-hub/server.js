@@ -1,0 +1,641 @@
+// agent-hub — central dashboard + terminal gateway for the Claude Code containers.
+//
+// Agents (claude-code image) reach this server purely OUTBOUND, so hub and
+// agents can live on any host/network (all traffic rides agents.xerktech.com):
+//   1. hub-agent.py POSTs a status heartbeat every ~20s (device/workdir/git/
+//      usage) and picks up queued restart commands on the reply.
+//   2. tunnel-agent.js holds a persistent WebSocket "control" channel here. To
+//      show a live terminal, the hub asks that agent (over the control channel)
+//      to dial back a "data" WebSocket; the agent bridges it to its local ttyd
+//      (the tmux/Claude TUI). The hub then proxies the browser's /term traffic
+//      through that data channel. See the reverse-tunnel section below.
+//
+// It also pushes edge-triggered alerts to the self-hosted ntfy (grafana.yaml)
+// on the `agents` topic: container offline/recovered, restart loops, daily
+// cost threshold, turn finished / question waiting for input, and PR created.
+// Set NTFY_URL (plus NTFY_USER/NTFY_PASS) to enable; unset disables alerts.
+//
+// stdlib only — no npm dependencies (the agent dials with Node's built-in
+// WebSocket; the hub hand-rolls the WebSocket *server* framing with `crypto`).
+
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const { Duplex } = require("stream");
+
+const PORT = parseInt(process.env.PORT || "8300", 10);
+const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
+const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
+const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
+
+// Single-user auth: HUB_USER/HUB_PASSWORD gate the UI and browser API via
+// HTTP Basic (the browser prompt is fine for one user, and same-origin fetch
+// reuses the credentials automatically). HUB_AGENT_TOKEN is a bearer token
+// that lets the heartbeat agents in the claude-code containers report without
+// user credentials. Leaving a var unset disables that check (open access) —
+// logged loudly at boot since the hub is exposed through the Cloudflare
+// tunnel.
+const HUB_USER = process.env.HUB_USER || "";
+const HUB_PASSWORD = process.env.HUB_PASSWORD || "";
+const HUB_AGENT_TOKEN = process.env.HUB_AGENT_TOKEN || "";
+
+// Injected on every proxied ttyd request so ttyd's own basic-auth
+// (-c term:$HUB_TOKEN, loopback-bound in the container) is satisfied without
+// the browser ever seeing the credentials. The terminal shares the agent
+// token — one credential per agent container for heartbeat, tunnel, and ttyd.
+const TTYD_AUTH = "Basic " + Buffer.from(`term:${HUB_AGENT_TOKEN || "changeme"}`).toString("base64");
+
+const NTFY_URL = (process.env.NTFY_URL || "").replace(/\/$/, "");
+const NTFY_TOPIC = process.env.NTFY_TOPIC || "agents";
+const NTFY_USER = process.env.NTFY_USER || "";
+const NTFY_PASS = process.env.NTFY_PASS || "";
+const COST_ALERT_USD = parseFloat(process.env.COST_ALERT_USD || "75");
+// A session counts as "working" while its transcript was written to within
+// this window (agents report the age at beat time; add staleness since).
+const WORKING_WINDOW_MS = 90 * 1000;
+// No offline alerts right after hub boot: agents get a chance to re-report
+// before we conclude anything from a freshly-loaded (possibly stale) state.
+const BOOT_AT = Date.now();
+const BOOT_GRACE_MS = 90 * 1000;
+
+// Keyed by containerName (stable across recreates), value = last heartbeat
+// payload + bookkeeping.
+let agents = {};
+
+// Reverse-tunnel state. controlChannels[name] = the live control connection for
+// that container's tunnel-agent; pendingChannels[ch] = resolver awaiting the
+// agent's data-WS dial-back for channel `ch`.
+const controlChannels = {};
+const pendingChannels = {};
+
+// ---- persistence (best-effort: survives hub restarts so the UI isn't blank
+// for the first heartbeat interval; losing it is harmless) -------------------
+try {
+  agents = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  console.log(`loaded ${Object.keys(agents).length} agents from ${STATE_FILE}`);
+} catch {
+  /* first boot or no volume mounted */
+}
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    fs.mkdir(path.dirname(STATE_FILE), { recursive: true }, () => {
+      fs.writeFile(STATE_FILE, JSON.stringify(agents), (err) => {
+        if (err) console.error(`state save failed: ${err.message}`);
+      });
+    });
+  }, 30 * 1000);
+}
+
+function prune() {
+  const now = Date.now();
+  for (const [key, a] of Object.entries(agents)) {
+    if (now - (a.lastSeen || 0) > PRUNE_AFTER_MS) delete agents[key];
+  }
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (c) => {
+      data += c;
+      if (data.length > 1 << 20) {
+        reject(new Error("body too large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
+
+function json(res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store",
+  });
+  res.end(body);
+}
+
+function safeEqual(a, b) {
+  const ha = crypto.createHash("sha256").update(a).digest();
+  const hb = crypto.createHash("sha256").update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+// Browser/user auth (UI + all API except the heartbeat).
+function userAuthorized(req) {
+  if (!HUB_PASSWORD) return true;
+  const header = req.headers.authorization || "";
+  if (!header.startsWith("Basic ")) return false;
+  const decoded = Buffer.from(header.slice(6), "base64").toString();
+  const sep = decoded.indexOf(":");
+  if (sep < 0) return false;
+  return (
+    safeEqual(decoded.slice(0, sep), HUB_USER) &&
+    safeEqual(decoded.slice(sep + 1), HUB_PASSWORD)
+  );
+}
+
+// Agent auth (heartbeats). The user credentials also work here, so a curl
+// with the basic-auth login can exercise the endpoint.
+function agentAuthorized(req) {
+  if (!HUB_AGENT_TOKEN) return true;
+  const header = req.headers.authorization || "";
+  if (header.startsWith("Bearer ")) return safeEqual(header.slice(7), HUB_AGENT_TOKEN);
+  return userAuthorized(req) && !!HUB_PASSWORD;
+}
+
+// Agent auth for the tunnel WebSockets. Node's browser-style WebSocket client
+// (used by tunnel-agent.js) can't set headers, so the token rides a query
+// param; a Bearer header is accepted too for tools that can send one.
+function agentWsAuthorized(url, req) {
+  if (!HUB_AGENT_TOKEN) return true;
+  const token = url.searchParams.get("token");
+  if (token) return safeEqual(token, HUB_AGENT_TOKEN);
+  return agentAuthorized(req);
+}
+
+// ---- ntfy push alerts -------------------------------------------------------
+function notify(title, message, opts = {}) {
+  if (!NTFY_URL) return;
+  const headers = {
+    Title: title,
+    Tags: opts.tags || "robot",
+    Priority: opts.priority || "default",
+  };
+  if (opts.click) headers.Click = opts.click;
+  if (NTFY_USER)
+    headers.Authorization =
+      "Basic " + Buffer.from(`${NTFY_USER}:${NTFY_PASS}`).toString("base64");
+  fetch(`${NTFY_URL}/${NTFY_TOPIC}`, { method: "POST", body: message, headers })
+    .then((r) => {
+      if (!r.ok) console.error(`ntfy ${r.status} for "${title}"`);
+    })
+    .catch((e) => console.error(`ntfy failed: ${e.message}`));
+}
+
+function fmtDur(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s}s`;
+  if (s < 5400) return `${Math.round(s / 60)}m`;
+  return `${Math.round(s / 360) / 10}h`;
+}
+
+function sessionWorking(a, now) {
+  const age = a.session?.transcriptAgeSec;
+  if (age == null) return false;
+  return age * 1000 + Math.max(0, now - (a.lastSeen || 0)) < WORKING_WINDOW_MS;
+}
+
+// Alert checks that key off a fresh heartbeat. `next.alerts` is per-agent
+// bookkeeping carried across beats (and persisted, so hub restarts don't
+// re-fire or drop edges).
+function heartbeatAlerts(key, prev, next) {
+  const now = next.lastSeen;
+  const alerts = next.alerts;
+  const where = next.device ? ` on ${next.device}` : "";
+
+  // Recovery from an alerted offline period.
+  const recovered = !!alerts.offlineAt;
+  if (recovered) {
+    notify(`${key} back online`, `Was offline ${fmtDur(now - alerts.offlineAt)}${where}`, {
+      tags: "green_circle",
+    });
+    delete alerts.offlineAt;
+  }
+
+  // Restart loop: several distinct container boots in a short window. A
+  // hub-initiated restart contributes one boot, so it can't trip this alone.
+  if (next.startedAt && next.startedAt !== prev.startedAt) {
+    const boots = (alerts.boots || []).filter((b) => now - b.at < 15 * 60 * 1000);
+    boots.push({ s: next.startedAt, at: now });
+    alerts.boots = boots.slice(-10);
+    const recent = alerts.boots.filter((b) => now - b.at < 10 * 60 * 1000);
+    if (recent.length >= 3 && now - (alerts.loopAlertedAt || 0) > 30 * 60 * 1000) {
+      alerts.loopAlertedAt = now;
+      notify(`${key} restart loop`, `${recent.length} container starts in 10 minutes${where}`, {
+        tags: "rotating_light",
+        priority: "urgent",
+      });
+    }
+  }
+
+  // Daily cost threshold (API-equivalent estimate), once per UTC day.
+  const cost = next.usage?.today?.cost;
+  const day = new Date(now).toISOString().slice(0, 10);
+  if (cost >= COST_ALERT_USD && alerts.costDay !== day) {
+    alerts.costDay = day;
+    notify(`${key} cost alert`, `Est. $${cost.toFixed(2)} today (threshold $${COST_ALERT_USD})`, {
+      tags: "moneybag",
+      priority: "high",
+    });
+  }
+
+  // Session events from the agent's transcript probe.
+  const s = next.session || {};
+  if (s.question && s.question !== alerts.lastQuestion) {
+    alerts.lastQuestion = s.question;
+    notify(`${key} has a question`, s.question, { tags: "question", priority: "high" });
+  }
+  if (!s.question) delete alerts.lastQuestion;
+
+  for (const url of s.newPrUrls || []) {
+    const seen = alerts.prSeen || [];
+    if (seen.includes(url)) continue;
+    alerts.prSeen = [...seen, url].slice(-20);
+    notify(`${key} created a PR`, url, { tags: "rocket", click: url });
+  }
+
+  // Turn finished: was working, transcript went quiet, and the newest entry
+  // is plain assistant output (a pending tool call or question means it's
+  // still mid-turn / already alerted above). A beat that just recovered from
+  // an offline period skips this — "back online" already covers it and the
+  // working->idle edge across the gap is stale.
+  const working = sessionWorking(next, now);
+  if (alerts.wasWorking && !working && !recovered && s.lastRole === "assistant" && !s.lastHasToolUse) {
+    const repo = next.git?.repoName ? ` · ${next.git.repoName}@${next.git.branch}` : "";
+    notify(`${key} finished its turn`, `Waiting for input${repo}`, { tags: "checkered_flag" });
+  }
+  alerts.wasWorking = working;
+}
+
+// Offline detection is time-driven, not heartbeat-driven, so it needs a sweep.
+setInterval(() => {
+  const now = Date.now();
+  if (now - BOOT_AT < BOOT_GRACE_MS) return;
+  for (const [key, a] of Object.entries(agents)) {
+    const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
+    if (online || a.alerts?.offlineAt) continue;
+    // Expected outage: a hub-initiated restart takes the container down for
+    // ~30-60s. Alert anyway if it still isn't back after 3 minutes.
+    if (a.restartSentAt && now - a.restartSentAt < 3 * 60 * 1000) continue;
+    a.alerts = a.alerts || {};
+    a.alerts.offlineAt = now;
+    const where = a.device ? ` on ${a.device}` : "";
+    notify(`${key} offline`, `No heartbeat for ${fmtDur(now - (a.lastSeen || 0))}${where}`, {
+      tags: "red_circle",
+      priority: "high",
+    });
+    scheduleSave();
+  }
+}, 15 * 1000);
+
+const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
+const HISTORY = fs.readFileSync(path.join(__dirname, "public", "history.html"));
+
+// ---- minimal WebSocket server framing (RFC 6455) ----------------------------
+// We only need enough to carry an opaque byte stream (the agent's ttyd TCP
+// wire) plus text control JSON, ping/pong keepalive, and close. Frames FROM the
+// agent (a WS client) are masked; frames we send are not. No fragmentation on
+// send (one frame per chunk); on receive we treat every data/continuation frame
+// as a byte run (order is preserved on the single connection).
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+function wsAccept(key) {
+  return crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
+}
+function wsHandshake(socket, req) {
+  const key = req.headers["sec-websocket-key"];
+  socket.write(
+    "HTTP/1.1 101 Switching Protocols\r\n" +
+      "Upgrade: websocket\r\n" +
+      "Connection: Upgrade\r\n" +
+      `Sec-WebSocket-Accept: ${wsAccept(key)}\r\n\r\n`
+  );
+}
+function wsEncode(opcode, payload) {
+  payload = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.from([0x80 | opcode, len]);
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  return Buffer.concat([header, payload]);
+}
+// Returns a stateful function fed raw socket chunks; invokes onFrame(op, data).
+function wsParser(onFrame) {
+  let buf = Buffer.alloc(0);
+  return (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    for (;;) {
+      if (buf.length < 2) return;
+      const opcode = buf[0] & 0x0f;
+      const masked = buf[1] & 0x80;
+      let len = buf[1] & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (buf.length < 4) return;
+        len = buf.readUInt16BE(2);
+        off = 4;
+      } else if (len === 127) {
+        if (buf.length < 10) return;
+        len = Number(buf.readBigUInt64BE(2));
+        off = 10;
+      }
+      let mask;
+      if (masked) {
+        if (buf.length < off + 4) return;
+        mask = buf.subarray(off, off + 4);
+        off += 4;
+      }
+      if (buf.length < off + len) return;
+      const payload = Buffer.from(buf.subarray(off, off + len));
+      if (masked) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+      buf = buf.subarray(off + len);
+      onFrame(opcode, payload);
+    }
+  };
+}
+
+// Wrap a handshaken data-WS socket as a raw-byte Duplex: writes become binary
+// frames to the agent; the agent's binary frames become readable bytes. Stub
+// socket-ish methods so Node's http client can drive it via createConnection.
+function channelDuplex(socket) {
+  const d = new Duplex({
+    write(chunk, _enc, cb) {
+      socket.write(wsEncode(0x2, chunk));
+      cb();
+    },
+    read() {},
+    final(cb) {
+      try { socket.write(wsEncode(0x8, Buffer.alloc(0))); } catch {}
+      cb();
+    },
+    destroy(err, cb) {
+      try { socket.destroy(); } catch {}
+      cb(err);
+    },
+  });
+  d.setNoDelay = d.setKeepAlive = d.setTimeout = () => d;
+  d.ref = d.unref = () => d;
+  const parse = wsParser((op, payload) => {
+    if (op === 0x8) { d.push(null); socket.end(); }        // close
+    else if (op === 0x9) socket.write(wsEncode(0xa, payload)); // ping -> pong
+    else if (op === 0xa) { /* pong */ }
+    else if (payload.length) d.push(payload);              // binary/text/cont
+  });
+  socket.on("data", parse);
+  socket.on("close", () => { d.push(null); d.destroy(); });
+  socket.on("error", () => d.destroy());
+  return d;
+}
+
+// Ask `name`'s tunnel-agent to dial back a data channel; resolves with its
+// Duplex once the agent connects (or rejects if the tunnel is offline / slow).
+function openChannel(name) {
+  return new Promise((resolve, reject) => {
+    const cc = controlChannels[name];
+    if (!cc) return reject(new Error("agent tunnel offline"));
+    const ch = crypto.randomBytes(9).toString("hex");
+    const timer = setTimeout(() => {
+      delete pendingChannels[ch];
+      reject(new Error("channel open timeout"));
+    }, 10000);
+    pendingChannels[ch] = (duplex) => {
+      clearTimeout(timer);
+      delete pendingChannels[ch];
+      resolve(duplex);
+    };
+    cc.sendOpen(ch);
+  });
+}
+
+// ---- terminal proxy ---------------------------------------------------------
+// Proxy an HTTP asset request (ttyd HTML/JS/token) through the agent's tunnel.
+// A fresh channel per request, closed by ttyd via Connection: close.
+async function proxyTerm(req, res, name) {
+  let channel;
+  try {
+    channel = await openChannel(name);
+  } catch (e) {
+    res.writeHead(502, { "Content-Type": "text/plain" });
+    return res.end(`terminal offline: ${e.message}`);
+  }
+  const headers = { ...req.headers, host: "ttyd", authorization: TTYD_AUTH, connection: "close" };
+  const up = http.request(
+    { createConnection: () => channel, method: req.method, path: req.url, headers },
+    (upRes) => {
+      res.writeHead(upRes.statusCode, upRes.headers);
+      upRes.pipe(res);
+    }
+  );
+  up.on("error", (e) => {
+    if (!res.headersSent) res.writeHead(502, { "Content-Type": "text/plain" });
+    res.end(`terminal error: ${e.message}`);
+  });
+  req.pipe(up);
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://x");
+  const parts = url.pathname.split("/").filter(Boolean); // e.g. api/agents/<id>/restart
+
+  try {
+    // Unauthenticated liveness probe for the Docker healthcheck (everything
+    // informative sits behind auth; this leaks nothing). Without it the
+    // healthcheck 401s and autoheal restart-loops the container.
+    if (url.pathname === "/healthz") {
+      return json(res, 200, { ok: true });
+    }
+
+    if (url.pathname === "/api/heartbeat") {
+      if (!agentAuthorized(req)) return json(res, 401, { error: "unauthorized" });
+    } else if (!userAuthorized(req)) {
+      // Everything else — UI, browser API, and the /term/ terminal proxy —
+      // rides the single basic-auth login (the browser attaches it to iframe
+      // asset requests and WebSocket upgrades automatically).
+      res.writeHead(401, {
+        "WWW-Authenticate": 'Basic realm="agent-hub", charset="UTF-8"',
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      return res.end(JSON.stringify({ error: "unauthorized" }));
+    }
+
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(INDEX);
+    }
+
+    if (req.method === "GET" && (url.pathname === "/history" || url.pathname === "/history.html")) {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(HISTORY);
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/agents") {
+      prune();
+      const now = Date.now();
+      const list = Object.entries(agents).map(([key, a]) => ({
+        key,
+        ...a,
+        online: now - (a.lastSeen || 0) < OFFLINE_AFTER_MS,
+        // Only true when this container's reverse tunnel is live right now.
+        terminalOnline: !!controlChannels[key],
+      }));
+      list.sort((x, y) => (x.device + x.key).localeCompare(y.device + y.key));
+      return json(res, 200, { now, agents: list });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/heartbeat") {
+      const payload = JSON.parse((await readBody(req)) || "{}");
+      const key = payload.containerName || payload.agentId;
+      if (!key) return json(res, 400, { error: "containerName/agentId required" });
+      const prev = agents[key] || {};
+      const restart = !!prev.restartPending;
+      const next = (agents[key] = {
+        ...payload,
+        lastSeen: Date.now(),
+        restartPending: false,
+        // Keep a marker so the UI can show "restarting…" until the container
+        // comes back with a fresh startedAt.
+        restartSentAt: restart ? Date.now() : prev.restartSentAt,
+        // Per-agent alert bookkeeping survives across beats and hub restarts.
+        alerts: prev.alerts || {},
+      });
+      heartbeatAlerts(key, prev, next);
+      scheduleSave();
+      return json(res, 200, { restart });
+    }
+
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" && parts[3] === "restart") {
+      const key = decodeURIComponent(parts[2]);
+      if (!agents[key]) return json(res, 404, { error: "unknown agent" });
+      agents[key].restartPending = true;
+      console.log(`restart queued for ${key}`);
+      scheduleSave();
+      return json(res, 200, { ok: true });
+    }
+
+    if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "agents" && parts.length === 3) {
+      const key = decodeURIComponent(parts[2]);
+      delete agents[key];
+      scheduleSave();
+      return json(res, 200, { ok: true });
+    }
+
+    // Terminal proxy: /term/<containerName>/… -> that container's ttyd,
+    // tunneled. User auth already enforced by the gate above.
+    if (parts[0] === "term" && parts.length >= 2) {
+      const name = decodeURIComponent(parts[1]);
+      if (!agents[name]) return json(res, 404, { error: "unknown agent" });
+      return proxyTerm(req, res, name);
+    }
+
+    json(res, 404, { error: "not found" });
+  } catch (err) {
+    json(res, 400, { error: err.message });
+  }
+});
+
+// ---- WebSocket upgrades -----------------------------------------------------
+// Three kinds, all on this one port:
+//   /agent/control  — an agent's tunnel-agent registering its reverse tunnel
+//   /agent/data     — an agent dialing back a data channel we requested
+//   /term/<name>/…  — a browser attaching to a live terminal (proxied via tunnel)
+server.on("upgrade", async (req, socket, head) => {
+  const url = new URL(req.url, "http://x");
+  const parts = url.pathname.split("/").filter(Boolean);
+
+  // Agent control channel: persistent, carries {open:ch} requests to the agent.
+  if (parts[0] === "agent" && parts[1] === "control") {
+    if (!agentWsAuthorized(url, req)) return socket.destroy();
+    const name = url.searchParams.get("name");
+    if (!name) return socket.destroy();
+    wsHandshake(socket, req);
+    const send = (op, payload) => {
+      try { socket.write(wsEncode(op, payload)); } catch {}
+    };
+    // Replace any stale channel for this name.
+    if (controlChannels[name]) { try { controlChannels[name].socket.destroy(); } catch {} }
+    controlChannels[name] = {
+      socket,
+      sendOpen: (ch) => send(0x1, JSON.stringify({ open: ch })),
+    };
+    console.log(`tunnel connected: ${name}`);
+    const ping = setInterval(() => send(0x9, Buffer.alloc(0)), 30000); // beat CF idle timeout
+    const parse = wsParser((op) => { if (op === 0x8) socket.end(); }); // agent sends us no data
+    socket.on("data", parse);
+    const cleanup = () => {
+      clearInterval(ping);
+      if (controlChannels[name] && controlChannels[name].socket === socket) {
+        delete controlChannels[name];
+        console.log(`tunnel gone: ${name}`);
+      }
+    };
+    socket.on("close", cleanup);
+    socket.on("error", cleanup);
+    return;
+  }
+
+  // Agent data channel: pair it with the pending openChannel() awaiting `ch`.
+  if (parts[0] === "agent" && parts[1] === "data") {
+    if (!agentWsAuthorized(url, req)) return socket.destroy();
+    const ch = url.searchParams.get("ch");
+    const resolver = pendingChannels[ch];
+    if (!resolver) return socket.destroy();
+    wsHandshake(socket, req);
+    resolver(channelDuplex(socket));
+    return;
+  }
+
+  // Browser terminal WebSocket: proxy through the agent's tunnel. The browser
+  // re-sends the cached basic-auth credentials on same-origin WS upgrades (it
+  // already authenticated to load the ttyd iframe assets).
+  if (parts[0] === "term" && parts.length >= 2) {
+    if (!userAuthorized(req)) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      return socket.destroy();
+    }
+    const name = decodeURIComponent(parts[1]);
+    let channel;
+    try {
+      channel = await openChannel(name);
+    } catch {
+      socket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      return socket.destroy();
+    }
+    // Re-issue the browser's upgrade request to ttyd over the channel; ttyd's
+    // 101 + WS frames flow straight back (its accept is keyed off the browser's
+    // Sec-WebSocket-Key, which we forward verbatim).
+    let reqLines = `${req.method} ${req.url} HTTP/1.1\r\n`;
+    const hdrs = { ...req.headers, host: "ttyd", authorization: TTYD_AUTH };
+    for (const [k, v] of Object.entries(hdrs)) reqLines += `${k}: ${v}\r\n`;
+    channel.write(Buffer.from(reqLines + "\r\n"));
+    if (head && head.length) channel.write(head);
+    channel.pipe(socket);
+    socket.pipe(channel);
+    const bail = () => { channel.destroy(); socket.destroy(); };
+    channel.on("error", bail);
+    channel.on("close", bail);
+    socket.on("error", bail);
+    socket.on("close", bail);
+    return;
+  }
+
+  socket.destroy();
+});
+
+if (!HUB_PASSWORD) console.warn("WARNING: HUB_USER/HUB_PASSWORD not set — UI is unauthenticated");
+if (!HUB_AGENT_TOKEN) console.warn("WARNING: HUB_AGENT_TOKEN not set — heartbeat and tunnel endpoints are unauthenticated");
+server.listen(PORT, () => {
+  console.log(`agent-hub listening on :${PORT}`);
+  console.log(
+    NTFY_URL
+      ? `ntfy alerts -> ${NTFY_URL}/${NTFY_TOPIC} (cost threshold $${COST_ALERT_USD}/day)`
+      : "ntfy alerts disabled (NTFY_URL not set)"
+  );
+});
