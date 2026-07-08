@@ -17,8 +17,9 @@ multiplexer:
   - Auto-resumes `running` sessions on boot.
   - POSTs a heartbeat to the hub every INTERVAL seconds carrying repos[] +
     sessions[] (per-session git / token-usage / live-session signals computed
-    per worktree, so usage PERSISTS after a session is killed — the transcript
-    under ~/.claude/projects outlives the worktree files).
+    per worktree, so usage PERSISTS in history after a session is killed — the
+    transcript under ~/.claude/projects outlives both the worktree files and
+    the registry record).
 
 Token usage is parsed from the transcript JSONLs under
 /root/.claude/projects/<slug>/ (slug = worktree path with '/'->'-'); this is the
@@ -631,19 +632,23 @@ class SessionManager:
             self._set_error(sess, e)
 
     def kill(self, sid):
-        """Stop a session but keep its branch/commits/transcript (usage lives on)."""
+        """Stop and remove a session in one step: end tmux/ttyd, delete its
+        worktree, and drop the registry record so the card disappears from the
+        hub. KEEPS the git branch (agent/<id>) and the transcript, so the work
+        stays in the repo and its usage still shows in history — it just leaves
+        the dashboard and is not resumable. (Contrast delete(), which also runs
+        `git branch -D` to erase the branch and history.)"""
         sess = self._find(sid)
         if not sess:
             log(f"kill: no such session {sid}")
             return
         self._kill_tmux(sess)
         self._kill_ttyd(sid)
-        self._worktree_remove(sess)
-        sess["status"] = "stopped"
-        sess["stoppedAt"] = now_iso()
-        sess["errorMsg"] = None
-        self.sess_state.pop(sid, None)  # keep usage_cache: still reported
-        log(f"killed session {sid}")
+        if os.path.isdir(sess["worktreePath"]):
+            self._worktree_remove(sess)
+        self.registry = [s for s in self.registry if s.get("id") != sid]
+        self._forget_session_caches(sid)
+        log(f"killed session {sid} (worktree removed, branch {sess['branch']} kept)")
 
     def start(self, sid):
         """Resume a stopped session: re-add its worktree on the EXISTING branch
