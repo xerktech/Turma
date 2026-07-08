@@ -497,6 +497,40 @@ test("http: command queue rides the reply until acked", async () => {
   assert.equal(agents.h1.ackedCommands, undefined);
 });
 
+test("http: spawn route forwards composer options; bare spawn stays minimal", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ containerName: "hc" });
+
+  // Full composer payload -> every provided field rides the queued command.
+  const full = await request("POST", "/api/agents/hc/sessions", {
+    body: {
+      repo: "AgentHub", prompt: "fix the bug", label: "Fix login",
+      baseRef: "main", branchName: "agent/fix-login", model: "opus",
+      permissionMode: "plan",
+    },
+    headers: userHeaders,
+  });
+  assert.equal(full.status, 200);
+  // Blank/omitted fields are dropped; only the ones set are forwarded, so a
+  // one-click spawn stays exactly {type,repo,cmdId}.
+  const bare = await request("POST", "/api/agents/hc/sessions", {
+    body: { repo: "AgentHub", prompt: "", label: "", model: "sonnet" },
+    headers: userHeaders,
+  });
+  assert.equal(bare.status, 200);
+
+  const res = await beat({ containerName: "hc" });
+  assert.deepEqual(res.body.commands, [
+    {
+      type: "spawn", repo: "AgentHub", prompt: "fix the bug", label: "Fix login",
+      baseRef: "main", branchName: "agent/fix-login", model: "opus",
+      permissionMode: "plan", cmdId: full.body.cmdId,
+    },
+    { type: "spawn", repo: "AgentHub", model: "sonnet", cmdId: bare.body.cmdId },
+  ]);
+});
+
 test("http: restart flag delivered once, marker kept for the UI", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });

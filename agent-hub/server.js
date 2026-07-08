@@ -648,11 +648,19 @@ const server = http.createServer(async (req, res) => {
       const key = decodeURIComponent(parts[2]);
       if (!agents[key]) return json(res, 404, { error: "unknown agent" });
 
-      // POST /api/agents/<host>/sessions  {repo}  -> spawn a new session
+      // POST /api/agents/<host>/sessions -> spawn a new session. Body: {repo}
+      // plus the optional "New session" composer fields (#11/#12/#13). Only
+      // repo is required; every other field is forwarded verbatim to the agent
+      // (which validates it), and omitted when blank so a bare one-click spawn
+      // queues exactly {type:"spawn", repo} as before.
       if (req.method === "POST" && parts.length === 4) {
         const body = JSON.parse((await readBody(req)) || "{}");
         if (!body.repo) return json(res, 400, { error: "repo required" });
-        const cmdId = queueCommand(key, { type: "spawn", repo: body.repo });
+        const cmd = { type: "spawn", repo: body.repo };
+        for (const f of ["prompt", "label", "baseRef", "branchName", "model", "permissionMode"]) {
+          if (body[f] != null && body[f] !== "") cmd[f] = body[f];
+        }
+        const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });
       }
 

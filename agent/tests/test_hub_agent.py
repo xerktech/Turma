@@ -76,6 +76,72 @@ class TestSlugify(unittest.TestCase):
         self.assertEqual(ha.slugify("!!!"), "")
 
 
+class TestSpawnOptionHelpers(unittest.TestCase):
+    """Validation for the composer's spawn options (#11/#12/#13) — everything
+    that gets interpolated into a git/tmux command line is allowlist-checked."""
+
+    def test_normalize_branch_blank_uses_agent_id(self):
+        self.assertEqual(ha.normalize_branch_name("", "abc12"), "agent/abc12")
+        self.assertEqual(ha.normalize_branch_name(None, "abc12"), "agent/abc12")
+        self.assertEqual(ha.normalize_branch_name("  ", "abc12"), "agent/abc12")
+
+    def test_normalize_branch_forces_agent_prefix(self):
+        self.assertEqual(ha.normalize_branch_name("fix-login", "abc12"), "agent/fix-login")
+        # An operator-supplied agent/ prefix is not doubled.
+        self.assertEqual(ha.normalize_branch_name("agent/fix-login", "abc12"), "agent/fix-login")
+        # agent/ with an empty core falls back to the id.
+        self.assertEqual(ha.normalize_branch_name("agent/", "abc12"), "agent/abc12")
+
+    def test_normalize_branch_rejects_bad_names(self):
+        for bad in ("../evil", "a..b", "has space", "semi;colon", "quote'x",
+                    "back`tick", "dollar$x", "tilde~x", "agent/..", "a\tb"):
+            with self.assertRaises(ValueError, msg=bad):
+                ha.normalize_branch_name(bad, "abc12")
+
+    def test_valid_ref_name(self):
+        self.assertTrue(ha.valid_ref_name("main"))
+        self.assertTrue(ha.valid_ref_name("origin/main"))
+        self.assertTrue(ha.valid_ref_name("release/v1.2.3"))
+        for bad in ("", "-x", "/x", "x/", "a..b", "a//b", "x.lock", "a@{0}", "a b", "a;b"):
+            self.assertFalse(ha.valid_ref_name(bad), bad)
+
+    def test_resolve_model(self):
+        self.assertIsNone(ha.resolve_model(""))
+        self.assertIsNone(ha.resolve_model(None))
+        self.assertIsNone(ha.resolve_model("default"))
+        self.assertEqual(ha.resolve_model("opus"), "opus")
+        self.assertEqual(ha.resolve_model("SONNET"), "sonnet")
+        self.assertEqual(ha.resolve_model("haiku"), "haiku")
+        for bad in ("gpt-4", "opus; rm", "claude-3"):
+            with self.assertRaises(ValueError):
+                ha.resolve_model(bad)
+
+    def test_resolve_permission_mode(self):
+        self.assertEqual(ha.resolve_permission_mode(""), "bypassPermissions")
+        self.assertEqual(ha.resolve_permission_mode("acceptEdits"), "acceptEdits")
+        self.assertEqual(ha.resolve_permission_mode("plan"), "plan")
+        self.assertEqual(ha.resolve_permission_mode("default"), "default")
+        for bad in ("root", "yolo", "accept edits"):
+            with self.assertRaises(ValueError):
+                ha.resolve_permission_mode(bad)
+
+    def test_resolve_base_ref(self):
+        # Blank / HEAD -> None (fork off current HEAD, today's behavior).
+        self.assertIsNone(ha.resolve_base_ref("/repo", ""))
+        self.assertIsNone(ha.resolve_base_ref("/repo", "HEAD"))
+
+        # Allowlist-clean AND resolvable -> returned; missing -> ValueError.
+        def fake_run(cmd, cwd=None):
+            return "sha" if " ".join(cmd).endswith("--verify --quiet develop") else ""
+
+        with mock.patch.object(ha, "run", fake_run):
+            self.assertEqual(ha.resolve_base_ref("/repo", "develop"), "develop")
+            with self.assertRaises(ValueError):
+                ha.resolve_base_ref("/repo", "nope")            # not found
+            with self.assertRaises(ValueError):
+                ha.resolve_base_ref("/repo", "bad;ref")         # bad chars, never hits git
+
+
 class ProjectDirMixin:
     """Temp PROJECTS_ROOT + a project dir for a fake worktree path."""
 
@@ -366,7 +432,11 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
             "not-a-dict",                                 # garbage -> ignored
         ]
         self.assertTrue(sm.handle_commands(cmds))
-        sm.spawn.assert_called_once_with("AgentHub")
+        # spawn now threads the composer options (all None for a bare command).
+        sm.spawn.assert_called_once_with(
+            "AgentHub", prompt=None, label=None, base_ref=None,
+            branch_name=None, model=None, permission_mode=None,
+        )
         sm.kill.assert_called_once_with("ab123")
         sm.save.assert_called_once()
         self.assertEqual(sm.acked, {"c1", "c2"})
@@ -377,6 +447,21 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         self.assertFalse(sm.handle_commands(cmds))
         sm.spawn.assert_not_called()
         sm.kill.assert_not_called()
+
+    def test_spawn_command_threads_composer_options(self):
+        sm = self.make_manager()
+        sm.spawn = mock.Mock()
+        sm.save = mock.Mock()
+        sm.handle_commands([{
+            "cmdId": "c9", "type": "spawn", "repo": "AgentHub",
+            "prompt": "fix the bug", "label": "Fix login", "baseRef": "main",
+            "branchName": "agent/fix-login", "model": "opus",
+            "permissionMode": "plan",
+        }])
+        sm.spawn.assert_called_once_with(
+            "AgentHub", prompt="fix the bug", label="Fix login", base_ref="main",
+            branch_name="agent/fix-login", model="opus", permission_mode="plan",
+        )
 
     def test_unknown_type_and_poison_command_still_acked(self):
         sm = self.make_manager()
@@ -551,6 +636,106 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm.start("aaaaa")  # must not raise
         self.assertEqual(sess["status"], "error")
         self.assertIn("tmux exploded", sess["errorMsg"])
+
+    # --- spawn composer options (#11/#12/#13) ------------------------------
+
+    def _worktree_add_cmd(self):
+        return next(c for c in self.run_ok_calls if "worktree" in c and "add" in c)
+
+    def _claude_cmd(self):
+        """The claude command line _launch_tmux hands to `tmux new-session`."""
+        newsess = next(c for c in self.run_ok_calls if "new-session" in c)
+        return newsess[-1]
+
+    def test_spawn_no_options_keeps_todays_command_shape(self):
+        """Regression guard: a bare spawn must produce exactly the pre-existing
+        worktree/launch commands — -b agent/<id> off HEAD (no trailing base),
+        bypassPermissions, no --model, no positional prompt."""
+        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("AgentHub")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "running")
+        wt = self._worktree_add_cmd()
+        self.assertEqual(wt[-2:], ["-b", f"agent/{sess['id']}"])  # nothing after the branch
+        self.assertEqual(
+            self._claude_cmd(),
+            f"claude --remote-control '{sess['rcName']}' --permission-mode bypassPermissions",
+        )
+
+    def test_spawn_threads_all_options(self):
+        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        sm = self.make_spawn_ready_manager([repo])
+
+        # Make the base ref resolve (branch_exists -> run rev-parse --verify).
+        def fake_run(cmd, cwd=None):
+            self.run_calls.append(cmd)
+            return "sha" if " ".join(cmd).endswith("--verify --quiet develop") else ""
+
+        p = mock.patch.object(ha, "run", fake_run)
+        p.start()
+        self.addCleanup(p.stop)
+
+        sm.spawn("AgentHub", prompt="fix the bug", label="Fix Login",
+                 base_ref="develop", branch_name="fix-login", model="opus",
+                 permission_mode="acceptEdits")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "running")
+        # Custom branch honored + agent/ prefix enforced.
+        self.assertEqual(sess["branch"], "agent/fix-login")
+        # Stored option fields.
+        self.assertEqual(sess["label"], "Fix Login")
+        self.assertEqual(sess["model"], "opus")
+        self.assertEqual(sess["permissionMode"], "acceptEdits")
+        self.assertEqual(sess["baseRef"], "develop")
+        # Label (slugged) flavors the RC display name.
+        self.assertTrue(sess["rcName"].endswith("-AgentHub-Fix-Login"), sess["rcName"])
+        # worktree add forks off the base ref.
+        wt = self._worktree_add_cmd()
+        self.assertEqual(wt[-3:], ["-b", "agent/fix-login", "develop"])
+        # Launch line carries model, permission mode, and the positional prompt.
+        cmd = self._claude_cmd()
+        self.assertIn("--model opus", cmd)
+        self.assertIn("--permission-mode acceptEdits", cmd)
+        self.assertNotIn("bypassPermissions", cmd)
+        self.assertTrue(cmd.endswith(" -- 'fix the bug'"), cmd)
+
+    def test_spawn_permission_mode_default_omits_flag(self):
+        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("AgentHub", permission_mode="default")
+        self.assertNotIn("--permission-mode", self._claude_cmd())
+
+    def test_spawn_prompt_is_shell_quoted(self):
+        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("AgentHub", prompt="rm -rf / ; echo $HOME `whoami`")
+        cmd = self._claude_cmd()
+        # The whole prompt is one shlex-quoted token after `--`; no metachar leaks.
+        self.assertIn(" -- '", cmd)
+        self.assertTrue(cmd.rstrip().endswith("'"))
+
+    def test_spawn_rejects_bad_branch_name(self):
+        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("AgentHub", branch_name="../evil")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "error")
+        # Bad option fails before any worktree add is attempted.
+        self.assertFalse(any("worktree" in c and "add" in c for c in self.run_ok_calls))
+
+    def test_spawn_rejects_missing_base_ref(self):
+        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        sm = self.make_spawn_ready_manager([repo])
+        # ManagerMixin's run() returns "" for everything, so no base ref resolves.
+        sm.spawn("AgentHub", base_ref="does-not-exist")
+        self.assertEqual(sm.registry[0]["status"], "error")
+
+    def test_spawn_rejects_unknown_model(self):
+        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("AgentHub", model="gpt-5")
+        self.assertEqual(sm.registry[0]["status"], "error")
 
 
 class TestScanRepos(unittest.TestCase):

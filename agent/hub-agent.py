@@ -42,6 +42,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 import time
@@ -186,6 +187,94 @@ def slugify(s):
     s = re.sub(r"[^A-Za-z0-9._-]", "-", s)
     s = re.sub(r"-+", "-", s).strip("-")
     return s
+
+
+# --- new-session spawn options (issues #11/#12/#13) ----------------------------
+# Every option below is interpolated into a git or tmux command line, so each is
+# validated against a fixed allowlist/enum before use — free-form text NEVER
+# reaches the shell. All default to "today's behavior" so a bare spawn (no
+# options) produces exactly the pre-existing command shape.
+
+# Model aliases the UI offers -> the value handed to `claude --model`. "default"
+# (or blank) means "don't pass --model at all" (claude's own default model).
+MODEL_ALIASES = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku"}
+# Permission modes the UI offers. "bypassPermissions" is today's behavior and
+# the default; "default" means "omit --permission-mode" (claude's own default).
+PERMISSION_MODES = {"bypassPermissions", "acceptEdits", "plan", "default"}
+# git-ref-safe token: our allowlist is a strict subset of what git accepts, so
+# anything matching is also validated below for the few remaining git rules.
+_REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
+def valid_ref_name(ref):
+    """Defensive allowlist for a git branch/ref name we interpolate into a
+    command. Stricter than git's own rules on purpose: reject anything with
+    shell-meaningful or ambiguous characters, leading dash, empty/dot segments,
+    '..', trailing '.lock', '@{', etc."""
+    if not ref or len(ref) > 200:
+        return False
+    if not _REF_TOKEN_RE.match(ref):
+        return False
+    if ref.startswith("-") or ref.startswith("/") or ref.endswith("/"):
+        return False
+    if ".." in ref or "//" in ref or "@{" in ref or ref.endswith(".lock"):
+        return False
+    return all(seg not in ("", ".", "..") for seg in ref.split("/"))
+
+
+def normalize_branch_name(name, sid):
+    """Resolve the session branch name. Blank -> agent/<id> (today's behavior).
+    A custom name is allowlist-validated and forced under the fleet's agent/
+    prefix (delete/resume/scan all key off it), de-duping an operator-supplied
+    'agent/' so we never produce agent/agent/... . Raises ValueError on junk."""
+    name = (name or "").strip()
+    if not name:
+        return f"agent/{sid}"
+    core = name[len("agent/"):] if name.startswith("agent/") else name
+    core = core.strip("/")
+    if not core:
+        return f"agent/{sid}"
+    branch = f"agent/{core}"
+    if not valid_ref_name(branch):
+        raise ValueError(f"invalid branch name {name!r}")
+    return branch
+
+
+def resolve_base_ref(repo_path, base_ref):
+    """Validate an operator-chosen base branch to fork the worktree from.
+    Blank/HEAD -> None (fork off the repo's current HEAD, today's behavior).
+    Otherwise the ref must be allowlist-clean AND actually resolve in the repo
+    (a local branch or origin/<x>) before we hand it to `worktree add`."""
+    base_ref = (base_ref or "").strip()
+    if not base_ref or base_ref == "HEAD":
+        return None
+    if not valid_ref_name(base_ref):
+        raise ValueError(f"invalid base ref {base_ref!r}")
+    if not branch_exists(repo_path, base_ref):
+        raise ValueError(f"base ref {base_ref!r} not found")
+    return base_ref
+
+
+def resolve_model(model):
+    """Map a UI model choice to a `claude --model` value, or None to omit the
+    flag. Fixed allowlist — never passes free-form text to claude."""
+    model = (model or "").strip().lower()
+    if not model or model == "default":
+        return None
+    if model in MODEL_ALIASES:
+        return MODEL_ALIASES[model]
+    raise ValueError(f"unknown model {model!r}")
+
+
+def resolve_permission_mode(mode):
+    """Validate a UI permission-mode choice against a fixed enum. Blank ->
+    bypassPermissions (today's behavior)."""
+    mode = (mode or "").strip()
+    if not mode:
+        return "bypassPermissions"
+    if mode in PERMISSION_MODES:
+        return mode
+    raise ValueError(f"unknown permission mode {mode!r}")
 
 
 def device_name():
@@ -540,6 +629,24 @@ def scan_repos():
     return repos
 
 
+def repo_branches(path):
+    """Local branches an operator might fork a new session from, newest-commit
+    first and capped — feeds the composer's base-branch dropdown. Cheap local
+    ref walk (no network). Excludes the fleet's own agent/ and agent-trash/
+    branches: you fork off real base branches, not other sessions' worktrees."""
+    out = run(["git", "-C", path, "for-each-ref", "--sort=-committerdate",
+               "--format=%(refname:short)", "refs/heads"])
+    branches = []
+    for b in out.splitlines():
+        b = b.strip()
+        if not b or b.startswith("agent/") or b.startswith(TRASH_PREFIX):
+            continue
+        branches.append(b)
+        if len(branches) >= 50:
+            break
+    return branches
+
+
 def repo_entry(repo):
     """Heartbeat repos[] entry: light git facts about the repo's own checkout."""
     path = repo["path"]
@@ -550,6 +657,8 @@ def repo_entry(repo):
         "branch": run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path),
         "remote": run(["git", "remote", "get-url", "origin"], cwd=path),
         "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
+        # Base-branch choices for the "New session" composer (#12).
+        "branches": repo_branches(path),
     }
 
 
@@ -693,25 +802,41 @@ class SessionManager:
             return None
         return newest
 
-    def _launch_tmux(self, sess, resume=False):
+    def _launch_tmux(self, sess, resume=False, prompt=None):
         """(Re)launch claude for a session inside its own tmux, detached.
 
         resume=True relaunches the worktree's most recent CONVERSATION
         (claude --resume <newest transcript id>) instead of an empty context;
-        it silently falls back to a fresh claude when no transcript exists."""
+        it silently falls back to a fresh claude when no transcript exists.
+
+        prompt (spawn only, #11) is delivered as claude's positional initial
+        prompt — the race-free path: it is submitted as the first user turn when
+        the interactive RC session comes up, with no send-keys timing to get
+        wrong. It is shell-quoted (shlex.quote) and placed after `--` so a task
+        that happens to start with '-' can't be read as a flag. The per-session
+        model (#12) and permission mode (#12) come from the validated fields on
+        the session record; both fall back to today's behavior when unset."""
         self._drop_bridge_pointer(sess["worktreePath"])
         # Claude in this worktree. IS_SANDBOX=1 (compose) lets
         # bypassPermissions run under root; --remote-control bridges the session
         # to claude.ai/code + mobile under its per-session display name.
-        resume_arg = ""
+        parts = ["claude"]
         if resume:
             claude_sid = self._latest_transcript_id(sess["worktreePath"])
             if claude_sid:
-                resume_arg = f"--resume {claude_sid} "
-        claude_cmd = (
-            f"claude {resume_arg}--remote-control '{sess['rcName']}' "
-            f"--permission-mode bypassPermissions"
-        )
+                parts.append(f"--resume {claude_sid}")
+        parts.append(f"--remote-control '{sess['rcName']}'")
+        model = sess.get("model")
+        if model:
+            parts.append(f"--model {model}")
+        # Default (unset) preserves today's --permission-mode bypassPermissions;
+        # the explicit "default" choice omits the flag (claude's own default).
+        perm = sess.get("permissionMode") or "bypassPermissions"
+        if perm != "default":
+            parts.append(f"--permission-mode {perm}")
+        claude_cmd = " ".join(parts)
+        if prompt:
+            claude_cmd += f" -- {shlex.quote(prompt)}"
         run(["tmux", "kill-session", "-t", sess["tmuxName"]])  # ensure clean slate
         rc, err = run_ok([
             "tmux", "new-session", "-d", "-s", sess["tmuxName"],
@@ -760,9 +885,11 @@ class SessionManager:
             except Exception:
                 pass
 
-    def _worktree_add(self, sess, new_branch):
-        """Add the worktree. new_branch=True creates agent/<id> off HEAD (spawn);
-        False re-checks-out the existing branch (start/resume)."""
+    def _worktree_add(self, sess, new_branch, base_ref=None):
+        """Add the worktree. new_branch=True creates the session branch (spawn);
+        off base_ref when given (a pre-validated local/remote ref, #12), else off
+        HEAD as before. new_branch=False re-checks-out the existing branch
+        (start/resume)."""
         os.makedirs(os.path.dirname(sess["worktreePath"]), exist_ok=True)
         # Clear any stale worktree registration left by a --force removal that
         # partially failed, so `worktree add` doesn't refuse.
@@ -770,6 +897,8 @@ class SessionManager:
         if new_branch:
             cmd = ["git", "-C", sess["repoPath"], "worktree", "add",
                    sess["worktreePath"], "-b", sess["branch"]]
+            if base_ref:
+                cmd.append(base_ref)
         else:
             cmd = ["git", "-C", sess["repoPath"], "worktree", "add",
                    sess["worktreePath"], sess["branch"]]
@@ -794,8 +923,17 @@ class SessionManager:
 
     # --- lifecycle (executed container-side; see CONTRACT) ----------------
 
-    def spawn(self, repo_name):
-        """Create a brand-new worktree-backed session for <repo_name>."""
+    def spawn(self, repo_name, *, prompt=None, label=None, base_ref=None,
+              branch_name=None, model=None, permission_mode=None):
+        """Create a brand-new worktree-backed session for <repo_name>.
+
+        All keyword options (#11/#12/#13) default to None so a bare spawn
+        reproduces today's behavior exactly. label (#13) is presentational: it
+        flavors the claude.ai/code display name but the agent/<id> branch and
+        agent-<id> tmux stay the canonical internal keys. The remaining options
+        (base branch, custom branch name, model, permission mode) are validated
+        below; a bad option fails the spawn cleanly as an error card rather than
+        reaching git/tmux or crashing the manager."""
         if self._running_count() >= MAX_SESSIONS:
             log(f"spawn refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
@@ -804,15 +942,22 @@ class SessionManager:
             log(f"spawn refused: unknown repo {repo_name!r}")
             return
         sid = self._new_id()
+        label = (label or "").strip() or None
+        # Prefer a slugged label in the RC display name; fall back to the id.
+        rc_slug = slugify(label) if label else ""
         sess = {
             "id": sid,
             "repo": repo["name"],
             "repoPath": repo["path"],
             "worktreePath": os.path.join(WORKTREES_ROOT, repo["name"], sid),
-            "branch": f"agent/{sid}",
-            "rcName": f"{slugify(self.device)}-{slugify(repo['name'])}-{sid}",
+            "branch": f"agent/{sid}",       # may be replaced by a custom name below
+            "label": label,
+            "rcName": f"{slugify(self.device)}-{slugify(repo['name'])}-{rc_slug or sid}",
             "tmuxName": f"agent-{sid}",
             "ttydPort": self._alloc_port(),
+            "model": None,                  # resolved --model value (None = omit)
+            "permissionMode": "bypassPermissions",
+            "baseRef": None,                # base branch the worktree forked from
             "status": "running",
             "createdAt": now_iso(),
             "stoppedAt": None,
@@ -820,10 +965,19 @@ class SessionManager:
         }
         self.registry.append(sess)
         try:
-            self._worktree_add(sess, new_branch=True)
-            self._launch_tmux(sess)
+            # Validate every interpolated option BEFORE touching git/tmux.
+            sess["branch"] = normalize_branch_name(branch_name, sid)
+            resolved_base = resolve_base_ref(repo["path"], base_ref)
+            sess["baseRef"] = resolved_base
+            sess["model"] = resolve_model(model)
+            sess["permissionMode"] = resolve_permission_mode(permission_mode)
+            self._worktree_add(sess, new_branch=True, base_ref=resolved_base)
+            self._launch_tmux(sess, prompt=(prompt or None))
             self._launch_ttyd(sess)
-            log(f"spawned session {sid} for {repo['name']} on :{sess['ttydPort']}")
+            log(f"spawned session {sid} for {repo['name']} on :{sess['ttydPort']} "
+                f"(branch {sess['branch']}"
+                + (f", base {resolved_base}" if resolved_base else "")
+                + (f", label {label!r}" if label else "") + ")")
         except Exception as e:
             self._set_error(sess, e)
 
@@ -834,7 +988,7 @@ class SessionManager:
         they just stop being offered)."""
         rec = {k: sess.get(k) for k in (
             "id", "repo", "repoPath", "worktreePath", "branch", "rcName",
-            "tmuxName", "createdAt",
+            "tmuxName", "createdAt", "label", "model", "permissionMode",
         )}
         rec["closedAt"] = now_iso()
         self.closed = [c for c in self.closed if c.get("id") != rec["id"]]
@@ -916,9 +1070,12 @@ class SessionManager:
             "repoPath": rec.get("repoPath"),
             "worktreePath": rec.get("worktreePath"),
             "branch": rec.get("branch"),
+            "label": rec.get("label"),
             "rcName": rec.get("rcName"),
             "tmuxName": rec.get("tmuxName") or f"agent-{sid}",
             "ttydPort": self._alloc_port(),  # old port may be taken by now
+            "model": rec.get("model"),
+            "permissionMode": rec.get("permissionMode") or "bypassPermissions",
             "status": "running",
             "createdAt": rec.get("createdAt") or now_iso(),
             "stoppedAt": None,
@@ -1050,7 +1207,15 @@ class SessionManager:
             ctype = cmd.get("type")
             try:
                 if ctype == "spawn":
-                    self.spawn(cmd.get("repo"))
+                    self.spawn(
+                        cmd.get("repo"),
+                        prompt=cmd.get("prompt"),
+                        label=cmd.get("label"),
+                        base_ref=cmd.get("baseRef"),
+                        branch_name=cmd.get("branchName"),
+                        model=cmd.get("model"),
+                        permission_mode=cmd.get("permissionMode"),
+                    )
                 elif ctype == "kill":
                     self.kill(cmd.get("sessionId"))
                 elif ctype == "start":
@@ -1107,6 +1272,10 @@ class SessionManager:
             "worktreePath": sess["worktreePath"],
             "branch": sess["branch"],
             "rcName": sess["rcName"],
+            "label": sess.get("label"),
+            "model": sess.get("model"),
+            "permissionMode": sess.get("permissionMode"),
+            "baseRef": sess.get("baseRef"),
             "status": sess.get("status"),
             "ttydPort": sess.get("ttydPort"),
             "createdAt": sess.get("createdAt"),
@@ -1131,6 +1300,7 @@ class SessionManager:
                 "repo": c.get("repo"),
                 "branch": c.get("branch"),
                 "rcName": c.get("rcName"),
+                "label": c.get("label"),
                 "createdAt": c.get("createdAt"),
                 "closedAt": c.get("closedAt"),
             }
