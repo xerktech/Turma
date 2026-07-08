@@ -43,8 +43,17 @@
   h1 { font-size: 20px; margin: 0; font-weight: 650; }
   header .sub { color: var(--muted); font-size: 13px; }
   header .spacer { flex: 1; }
-  header a { color: var(--accent); text-decoration: none; font-size: 13px; }
-  header a:hover { text-decoration: underline; }
+
+  /* Shared page nav: pill tabs in the header on wide screens, a fixed bottom
+     tab bar on phones (same markup on all three pages). */
+  .nav-tabs { display: flex; gap: 4px; }
+  .nav-tabs a {
+    color: var(--ink-2); text-decoration: none; font-size: 13px;
+    padding: 5px 12px; border-radius: 20px; border: 1px solid transparent;
+  }
+  .nav-tabs a:hover { color: var(--accent); }
+  .nav-tabs a.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .bottom-nav { display: none; }
 
   .chart-card {
     background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
@@ -116,6 +125,19 @@
 
   @media (max-width: 600px) {
     .wrap { padding: 16px 12px 40px; }
+    .nav-tabs { display: none; }
+    .bottom-nav {
+      display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+      background: var(--surface); border-top: 1px solid var(--hairline);
+      padding: 4px 8px calc(4px + env(safe-area-inset-bottom));
+    }
+    .bottom-nav a {
+      flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+      color: var(--muted); text-decoration: none; font-size: 11px; padding: 6px 0 4px;
+    }
+    .bottom-nav a svg { width: 21px; height: 21px; }
+    .bottom-nav a.active { color: var(--accent); }
+    body { padding-bottom: 68px; }
     .chart-card { padding: 12px 10px 8px; }
     .legend { gap: 6px 16px; margin-bottom: 10px; }
     .tooltip { min-width: 150px; font-size: 11px; padding: 7px 10px; }
@@ -133,11 +155,30 @@
     <h1>Usage history</h1>
     <span class="sub">daily est. cost · by session</span>
     <span class="spacer"></span>
-    <a href="/">← Dashboard</a>
+    <nav class="nav-tabs">
+      <a href="/">Dashboard</a>
+      <a href="/sessions">Sessions</a>
+      <a href="/history" class="active">History</a>
+    </nav>
   </header>
   <div id="chart"></div>
   <div class="footer">Daily figures are parsed from each session's Claude transcripts (UTC days) and reported by its host agent — API-equivalent cost estimates. Each series is one session (labelled <em>repo · id</em>); usage persists after a session is killed. Click a session in the legend to toggle it (click a device name to toggle all of its sessions); hover a day for the breakdown. The table view carries the same numbers for the visible series.</div>
 </div>
+
+<nav class="bottom-nav">
+  <a href="/">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    Dashboard
+  </a>
+  <a href="/sessions">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+    Sessions
+  </a>
+  <a href="/history" class="active">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/></svg>
+    History
+  </a>
+</nav>
 
 <script>
 const $chart = document.getElementById("chart");

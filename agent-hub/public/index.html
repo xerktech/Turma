@@ -40,8 +40,17 @@
   h1 { font-size: 20px; margin: 0; font-weight: 650; }
   header .sub { color: var(--muted); font-size: 13px; }
   header .spacer { flex: 1; }
-  header a.nav { color: var(--accent); text-decoration: none; font-size: 13px; }
-  header a.nav:hover { text-decoration: underline; }
+
+  /* Shared page nav: pill tabs in the header on wide screens, a fixed bottom
+     tab bar on phones (same markup on all three pages). */
+  .nav-tabs { display: flex; gap: 4px; }
+  .nav-tabs a {
+    color: var(--ink-2); text-decoration: none; font-size: 13px;
+    padding: 5px 12px; border-radius: 20px; border: 1px solid transparent;
+  }
+  .nav-tabs a:hover { color: var(--accent); }
+  .nav-tabs a.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .bottom-nav { display: none; }
 
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 24px; }
   .tile {
@@ -197,6 +206,19 @@
   @media (max-width: 600px) {
     .wrap { padding: 16px 12px 40px; }
     header { gap: 8px 12px; margin-bottom: 16px; }
+    .nav-tabs { display: none; }
+    .bottom-nav {
+      display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+      background: var(--surface); border-top: 1px solid var(--hairline);
+      padding: 4px 8px calc(4px + env(safe-area-inset-bottom));
+    }
+    .bottom-nav a {
+      flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+      color: var(--muted); text-decoration: none; font-size: 11px; padding: 6px 0 4px;
+    }
+    .bottom-nav a svg { width: 21px; height: 21px; }
+    .bottom-nav a.active { color: var(--accent); }
+    body { padding-bottom: 68px; }
     .tiles { grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 18px; }
     .tile { padding: 11px 12px; }
     .tile .value { font-size: 21px; }
@@ -222,7 +244,11 @@
     <h1>Agent Hub</h1>
     <span class="sub">Session hosts</span>
     <span class="spacer"></span>
-    <a class="nav" href="/history">Usage history</a>
+    <nav class="nav-tabs">
+      <a href="/" class="active">Dashboard</a>
+      <a href="/sessions">Sessions</a>
+      <a href="/history">History</a>
+    </nav>
     <span class="sub" id="refreshed"></span>
   </header>
 
@@ -230,6 +256,21 @@
   <div id="groups"></div>
   <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. Kill stops a session and removes it from the hub (worktree deleted, so uncommitted files are lost) in one step, but keeps its git branch and usage history — committed work stays in the repo, it just leaves the dashboard. Delete (on an already-stopped session) additionally erases the branch and history; a branch with unpushed commits is parked as <code>agent-trash/&lt;id&gt;</code> in the repo for a grace period (7 days by default) before being pruned for good. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name.</div>
 </div>
+
+<nav class="bottom-nav">
+  <a href="/" class="active">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    Dashboard
+  </a>
+  <a href="/sessions">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+    Sessions
+  </a>
+  <a href="/history">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/></svg>
+    History
+  </a>
+</nav>
 
 <div class="term-overlay" id="termOverlay">
   <div class="term-box">
