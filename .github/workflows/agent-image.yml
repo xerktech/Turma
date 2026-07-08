@@ -3,6 +3,7 @@ name: build-agent-image
 # Build and push the headless agent image to GHCR whenever the /agent build
 # context (or this workflow) changes on main. The image currently bundles
 # Claude Code, but the name is agent-generic so it can host other agents later.
+# Runs on the home-lab self-hosted runners ([self-hosted, linux]).
 on:
   push:
     branches: [main]
@@ -20,36 +21,42 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Reset workspace ownership
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
+
+      - uses: actions/checkout@v7
 
       # Version iteration: the image's headline content is Claude Code, so the
       # primary version tag IS the bundled Claude Code release (pinned into the
       # build so the tag and contents can't drift). github.run_number gives a
       # monotonic build counter that disambiguates repo-side rebuilds of the
       # same Claude Code version (e.g. an entrypoint/Dockerfile tweak).
+      # Resolved via a throwaway node container — the self-hosted runner has no
+      # npm on PATH.
       - name: Resolve Claude Code version
         id: ver
         run: |
-          CC_VERSION="$(npm view @anthropic-ai/claude-code version)"
+          set -euo pipefail
+          CC_VERSION="$(docker run --rm node:22-alpine npm view @anthropic-ai/claude-code version | tr -d '[:space:]')"
           echo "cc_version=${CC_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Pinning Claude Code ${CC_VERSION} (build #${{ github.run_number }})"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./agent
           push: true

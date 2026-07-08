@@ -45,22 +45,25 @@ NAME="${APP_NAME:-truenas-docker}-$(hostname)"
 CN=$(docker inspect --format '{{.Name}}' "$(hostname)" 2>/dev/null | sed 's#^/##')
 CN="${CN:-$NAME}"
 
-# `claude --remote-control` is an *interactive* session (a real TUI) that also
-# bridges to claude.ai/code + mobile. Run it inside tmux so it gets a PTY and
-# renders, then serve that same tmux session over the web with ttyd — attaching
-# from the Agent Hub lands you in the live session (full TUI + scrollback), not
-# a copy. Spawned child sessions need IS_SANDBOX=1 (set in compose) to use
-# skip-permissions under root.
+# `claude --remote-control` starts a normal *interactive* Claude Code session
+# (a real TUI with chat + input) that is ALSO bridged to claude.ai/code +
+# mobile. Run it inside tmux so it gets a PTY and renders, then serve that same
+# tmux session over the web with ttyd — attaching from the Agent Hub lands you
+# in the live session (full TUI + scrollback), not a copy, and you can type into
+# it. IS_SANDBOX=1 (set in compose) lets bypassPermissions run under root.
 #
-# --spawn is REQUIRED headless: newer Claude Code prompts interactively
-# ("Spawn mode: [1] same-dir [2] worktree — Choose [1/2]") on first launch, which
-# has no TTY answer here and hangs the session at boot forever. Setting it
-# explicitly skips the prompt. --spawn=worktree gives each session spawned from
-# claude.ai/code its own isolated git worktree (switch to --spawn=same-dir to
-# have sessions share this working dir instead).
-echo "Starting Claude Code Remote Control session '$NAME' in tmux..."
+# NOTE: this is deliberately the interactive `--remote-control` form, NOT
+# `claude remote-control` (server mode). Server mode is a relay/lobby: its
+# terminal only ever renders the QR/capacity/status screen and never a
+# conversation — spawned sessions stream to claude.ai/code + mobile instead — so
+# a ttyd attach has no chat to show and nowhere to type (exactly the "lobby but
+# no input" symptom). The interactive form is single-session (session ends ->
+# tmux ends -> container restarts, matching the crash / "Restart (clear
+# context)" semantics below); we trade the server's multi-session worktree
+# spawning for one session the Agent Hub can actually see and drive.
+echo "Starting interactive Claude Code Remote Control session '$NAME' in tmux..."
 tmux new-session -d -s claude -x 220 -y 50 \
-  "claude remote-control --name '$NAME' --spawn=worktree --permission-mode bypassPermissions"
+  "claude --remote-control '$NAME' --permission-mode bypassPermissions"
 
 # Web terminal for the Agent Hub. Interactive (-W), scoped to the proxy base
 # path (-b) so ttyd's own asset/WebSocket URLs resolve behind the hub prefix.

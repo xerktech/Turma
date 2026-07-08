@@ -1,0 +1,77 @@
+name: scan-agent-image
+
+# On PRs to main that touch the /agent build context, build the image locally
+# (no push) and scan it for OS/library CVEs and leaked secrets with Trivy.
+# Pre-merge counterpart to build-agent-image.yml, which pushes only on main.
+# CLAUDE_CODE_VERSION is left at its Dockerfile default (latest) — the scan
+# cares about the assembled image, not the exact pinned tag.
+#
+# Runs on the home-lab self-hosted runners. Trivy is installed from its release
+# tarball (the trivy-action pins an internal setup-trivy step to a mutable tag
+# upstream has deleted, and the no-sudo runner install is the sibling repo's
+# proven pattern anyway). No SARIF upload: the repo has no GitHub Advanced
+# Security, so there is no code-scanning API to publish to — findings print to
+# the job log and --exit-code gates the PR.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - ".trivyignore"
+      - ".github/workflows/agent-image-scan.yml"
+
+concurrency:
+  group: agent-image-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Reset workspace ownership
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
+
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Build into the local docker daemon (load, not push) so Trivy can scan
+      # the exact image this repo would ship. gha cache keeps it quick.
+      - name: Build agent image (local, no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: ./agent
+          load: true
+          push: false
+          tags: local/agent:pr-scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          VERSION=0.70.0
+          curl -fsSL -o /tmp/trivy.tgz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${VERSION}/trivy_${VERSION}_Linux-64bit.tar.gz"
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/trivy.tgz -C "$HOME/.local/bin" trivy
+          chmod +x "$HOME/.local/bin/trivy"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/trivy" --version
+
+      # ignore-unfixed keeps the gate actionable: only CVEs with an available
+      # fix fail the PR. Reviewed, non-actionable base-image CVEs are triaged in
+      # .trivyignore; anything else HIGH/CRITICAL fails the job.
+      - name: Trivy image scan
+        run: |
+          set -euo pipefail
+          trivy image local/agent:pr-scan \
+            --scanners vuln,secret \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --ignorefile .trivyignore \
+            --exit-code 1 \
+            --no-progress
