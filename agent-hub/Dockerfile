@@ -1,4 +1,4 @@
-FROM node:22-alpine
+FROM node:24-alpine
 
 # Dashboard + command hub for the Claude Code containers. stdlib-only Node —
 # no npm install layer. Agents (agent image) heartbeat to :8300.
