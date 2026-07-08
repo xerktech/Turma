@@ -53,6 +53,8 @@
   }
   .nav-tabs a:hover { color: var(--accent); }
   .nav-tabs a.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .nav-tabs a.signout { color: var(--muted); margin-left: 6px; }
+  .nav-tabs a.signout:hover { color: var(--critical); }
   .bottom-nav { display: none; }
 
   .chart-card {
@@ -159,6 +161,7 @@
       <a href="/">Dashboard</a>
       <a href="/sessions">Sessions</a>
       <a href="/history" class="active">History</a>
+      <a href="#" class="signout" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;">Sign out</a>
     </nav>
   </header>
   <div id="chart"></div>
@@ -560,6 +563,7 @@ let cache = null;
 async function refresh() {
   try {
     const r = await fetch("/api/agents");
+    if (r.status === 401) return void (location.href = "/login"); // session expired
     cache = await r.json();
   } catch { /* keep last render */ }
   if (cache) render(cache);
