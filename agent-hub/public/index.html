@@ -185,6 +185,29 @@
   .term-bar a { color: var(--accent); text-decoration: none; font-size: 13px; }
   .term-bar a:hover { text-decoration: underline; }
   .term-overlay iframe { flex: 1; border: 0; width: 100%; background: #000; }
+
+  /* Phones: single-column session cards, denser padding, two-up tiles. The
+     300px session-grid min and 170px tile min overflow a narrow viewport. */
+  @media (max-width: 600px) {
+    .wrap { padding: 16px 12px 40px; }
+    header { gap: 8px 12px; margin-bottom: 16px; }
+    .tiles { grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 18px; }
+    .tile { padding: 11px 12px; }
+    .tile .value { font-size: 21px; }
+    .host-card { padding: 13px; gap: 10px; }
+    .host-meta { gap: 3px 14px; font-size: 12.5px; }
+    details.repo { padding: 9px 10px; }
+    .sess-grid { grid-template-columns: 1fr; }
+    .term-overlay { padding: 6px; }
+    .term-bar { flex-wrap: wrap; padding: 7px 10px; gap: 6px 10px; }
+  }
+
+  /* Touch devices (any width): larger tap targets. */
+  @media (pointer: coarse) {
+    button { padding: 9px 15px; }
+    button.btn-sm { padding: 8px 12px; font-size: 12.5px; }
+    details.logs summary, details.repo > summary { padding: 2px 0; }
+  }
 </style>
 </head>
 <body>

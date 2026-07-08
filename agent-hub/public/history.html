@@ -112,6 +112,18 @@
   tfoot .label { color: var(--ink-2); font-weight: 600; }
   .empty { color: var(--muted); text-align: center; padding: 64px 0; border: 1px dashed var(--hairline); border-radius: 10px; }
   .footer { color: var(--muted); font-size: 12px; margin-top: 28px; }
+
+  @media (max-width: 600px) {
+    .wrap { padding: 16px 12px 40px; }
+    .chart-card { padding: 12px 10px 8px; }
+    .legend { gap: 6px 16px; margin-bottom: 10px; }
+    .tooltip { min-width: 150px; font-size: 11px; padding: 7px 10px; }
+  }
+  /* Touch devices: roomier legend/table hit areas. */
+  @media (pointer: coarse) {
+    .legend .item, .lg-device .dev { padding: 6px 8px; }
+    th, td { padding: 10px 14px; }
+  }
 </style>
 </head>
 <body>
@@ -285,7 +297,11 @@ function legendEl(byDevice, slotOf) {
 }
 
 function buildChart(card, list, dates, slotOf) {
-  const width = Math.max(520, Math.min(1146, document.body.clientWidth - 72));
+  // Logical SVG width. On a phone, don't floor at a wide value — the SVG scales
+  // to 100% of its container via viewBox, so a 520-wide floor would shrink all
+  // text/bars on a ~360px screen. Draw close to the real width instead.
+  const avail = document.body.clientWidth - 48;
+  const width = Math.max(320, Math.min(1146, avail));
   const iw = width - PAD.left - PAD.right;
   const ih = CHART_H - PAD.top - PAD.bottom;
   // Scale to the visible series — the filter scopes everything below it.
