@@ -1,10 +1,13 @@
 name: code-scan
 
-# Code security + quality gate on PRs to main. Runs three independent checks
+# Code security + quality gate on PRs to main. Runs four independent checks
 # over the sources that go into the two images:
 #   - Semgrep  : SAST over the JS/Python code, Dockerfiles, and secret patterns
 #   - hadolint : Dockerfile best-practice/quality lint (both Dockerfiles)
 #   - ShellCheck: shell correctness for entrypoint.sh
+#   - tests    : behavioral unit tests for agent/hub-agent.py (stdlib unittest)
+#                and agent-hub/server.js (built-in node:test) — see agent/tests/
+#                and agent-hub/tests/
 # Findings block the PR. Runs on open AND on later pushes to the PR (default
 # pull_request types) so every commit is re-checked.
 #
@@ -108,3 +111,27 @@ jobs:
       # (entrypoint.sh is #!/bin/sh). Fails the job on any finding. This action
       # runs a downloaded binary (no ghcr.io pull), so it works on the runner.
       - uses: ludeeus/action-shellcheck@2.0.0
+
+  tests:
+    name: Unit tests
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Reset workspace ownership
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
+      - uses: actions/checkout@v7
+      # Same setup-python the Semgrep job already relies on; the tests are
+      # stdlib unittest only (no pip installs — mirrors the image's no-pip
+      # stance), so this is the whole Python toolchain.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Python unit tests (agent/hub-agent.py)
+        run: python3 -m unittest discover -s agent/tests -p "test_*.py" -v
+      # node/npm aren't on the self-hosted runner, so run the Node suite in a
+      # throwaway node:24-alpine container (Docker Hub pull — the runner can't
+      # auth to ghcr.io), same pattern as the build workflow's version lookup.
+      # node:test is built in; the tests have zero npm dependencies.
+      - name: Node unit tests (agent-hub/server.js)
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/workspace -w /workspace node:24-alpine \
+            sh -c 'node --test agent-hub/tests/*.test.js'
