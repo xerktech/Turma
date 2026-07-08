@@ -50,6 +50,8 @@
   }
   .nav-tabs a:hover { color: var(--accent); }
   .nav-tabs a.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .nav-tabs a.signout { color: var(--muted); margin-left: 6px; }
+  .nav-tabs a.signout:hover { color: var(--critical); }
   .bottom-nav { display: none; }
 
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 24px; }
@@ -293,6 +295,7 @@
       <a href="/" class="active">Dashboard</a>
       <a href="/sessions">Sessions</a>
       <a href="/history">History</a>
+      <a href="#" class="signout" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;">Sign out</a>
     </nav>
     <span class="sub" id="refreshed"></span>
   </header>
@@ -1061,6 +1064,7 @@ let cache = { now: Date.now(), agents: [] };
 async function refresh() {
   try {
     const r = await fetch("/api/agents");
+    if (r.status === 401) return void (location.href = "/login"); // session expired
     cache = await r.json();
   } catch { /* keep last data; the "updated" stamp goes stale visibly */ }
   render(cache);

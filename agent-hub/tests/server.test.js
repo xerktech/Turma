@@ -42,6 +42,7 @@ const {
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, sessionWorking,
   userAuthorized, agentAuthorized, agentWsAuthorized, fmtDur,
+  credentialsMatch, issueSessionToken, sessionTokenValid,
 } = hub;
 
 const basic = (u, p) => "Basic " + Buffer.from(`${u}:${p}`).toString("base64");
@@ -209,6 +210,39 @@ test("userAuthorized: basic-auth matrix", () => {
     userAuthorized(req({ authorization: "Basic " + Buffer.from("nocolon").toString("base64") })),
     false
   );
+});
+
+test("credentialsMatch: constant-time single-user check", () => {
+  assert.equal(credentialsMatch("hubuser", "hubpass"), true);
+  assert.equal(credentialsMatch("hubuser", "nope"), false);
+  assert.equal(credentialsMatch("nope", "hubpass"), false);
+  assert.equal(credentialsMatch(undefined, undefined), false);
+});
+
+test("session tokens: issue -> valid; tampered/expired/garbage -> invalid", () => {
+  const tok = issueSessionToken();
+  assert.equal(sessionTokenValid(tok), true);
+  assert.equal(sessionTokenValid(""), false);
+  assert.equal(sessionTokenValid("nodot"), false);
+  assert.equal(sessionTokenValid("123.deadbeef"), false); // bad HMAC
+  // Forged far-future expiry keeps the original signature -> rejected.
+  const forged = `${Date.now() + 1e12}.${tok.slice(tok.indexOf(".") + 1)}`;
+  assert.equal(sessionTokenValid(forged), false);
+  // A correctly-signed but already-expired token is rejected.
+  const past = "1.".concat(
+    require("crypto").createHmac("sha256",
+      process.env.HUB_SESSION_SECRET ||
+        require("crypto").createHash("sha256").update("hubuser\nhubpass").digest("hex"))
+      .update("1").digest("base64url")
+  );
+  assert.equal(sessionTokenValid(past), false);
+});
+
+test("userAuthorized: accepts a valid session cookie", () => {
+  const tok = issueSessionToken();
+  assert.equal(userAuthorized({ headers: { cookie: `hub_session=${tok}` } }), true);
+  assert.equal(userAuthorized({ headers: { cookie: `hub_session=${tok}x` } }), false);
+  assert.equal(userAuthorized({ headers: { cookie: "other=1; hub_session=" + tok } }), true);
 });
 
 test("agentAuthorized: bearer token, with user-credential fallback", () => {
@@ -417,7 +451,7 @@ function request(method, pathName, { body, headers } = {}) {
       res.on("end", () => {
         let parsed = null;
         try { parsed = JSON.parse(data); } catch {}
-        resolve({ status: res.statusCode, body: parsed, raw: data });
+        resolve({ status: res.statusCode, body: parsed, raw: data, headers: res.headers });
       });
     });
     req.on("error", reject);
@@ -454,6 +488,46 @@ test("http: heartbeat auth (bearer or user basic, nothing else)", async () => {
     (await request("POST", "/api/heartbeat", { body: {}, headers: agentHeaders })).status,
     400 // containerName/agentId required
   );
+});
+
+test("http: login page is public; /api/login sets a working session cookie", async () => {
+  // The login form itself needs no auth.
+  const page = await request("GET", "/login");
+  assert.equal(page.status, 200);
+  assert.match(page.raw, /Sign in/);
+
+  // Wrong credentials are rejected without a cookie.
+  const bad = await request("POST", "/api/login", { body: { username: "hubuser", password: "nope" } });
+  assert.equal(bad.status, 401);
+  assert.equal(bad.headers["set-cookie"], undefined);
+
+  // Correct credentials mint an HttpOnly session cookie...
+  const ok = await request("POST", "/api/login", { body: { username: "hubuser", password: "hubpass" } });
+  assert.equal(ok.status, 200);
+  const setCookie = (ok.headers["set-cookie"] || [])[0] || "";
+  assert.match(setCookie, /^hub_session=/);
+  assert.match(setCookie, /HttpOnly/);
+  assert.match(setCookie, /SameSite=Lax/);
+
+  // ...that unlocks the browser API on its own (no Basic header).
+  const cookie = setCookie.split(";")[0];
+  assert.equal((await request("GET", "/api/agents", { headers: { cookie } })).status, 200);
+
+  // Logout clears the cookie (Max-Age=0) and revokes access.
+  const out = await request("POST", "/api/logout", { headers: { cookie } });
+  assert.equal(out.status, 200);
+  assert.match((out.headers["set-cookie"] || [])[0] || "", /Max-Age=0/);
+});
+
+test("http: unauthenticated HTML navigation redirects to /login (no Basic popup)", async () => {
+  const res = await request("GET", "/", { headers: { accept: "text/html" } });
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.location, "/login");
+  // No WWW-Authenticate header -> the browser never raises its native prompt.
+  assert.equal(res.headers["www-authenticate"], undefined);
+  // A deep link carries a next= so login can bounce back to it.
+  const deep = await request("GET", "/sessions", { headers: { accept: "text/html" } });
+  assert.equal(deep.headers.location, "/login?next=%2Fsessions");
 });
 
 test("http: command queue rides the reply until acked", async () => {

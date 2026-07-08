@@ -31,16 +31,31 @@ const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 
-// Single-user auth: HUB_USER/HUB_PASSWORD gate the UI and browser API via
-// HTTP Basic (the browser prompt is fine for one user, and same-origin fetch
-// reuses the credentials automatically). HUB_AGENT_TOKEN is a bearer token
-// that lets the heartbeat agents in the agent containers report without
-// user credentials. Leaving a var unset disables that check (open access) —
-// logged loudly at boot since the hub is exposed through the Cloudflare
-// tunnel.
+// Single-user auth: HUB_USER/HUB_PASSWORD gate the UI and browser API. The
+// browser signs in through a real login form (/login -> POST /api/login) and
+// gets a signed, HttpOnly session cookie it replays on every same-origin
+// request; Basic auth is still accepted (curl, and the agent heartbeat
+// fallback) but browsers never see the native credential popup. HUB_AGENT_TOKEN
+// is a bearer token that lets the heartbeat agents in the agent containers
+// report without user credentials. Leaving a var unset disables that check
+// (open access) — logged loudly at boot since the hub is exposed through the
+// Cloudflare tunnel.
 const HUB_USER = process.env.HUB_USER || "";
 const HUB_PASSWORD = process.env.HUB_PASSWORD || "";
 const HUB_AGENT_TOKEN = process.env.HUB_AGENT_TOKEN || "";
+
+// Browser sessions: instead of the native HTTP Basic popup, the UI POSTs to
+// /api/login and we hand back a signed, HttpOnly cookie the browser replays on
+// every same-origin request (page loads, API, ttyd iframe + WebSocket). Basic
+// auth still works for curl/agents, but browsers never see the credential
+// prompt. The signing key defaults to a hash of the configured credentials so
+// rotating the password invalidates outstanding sessions for free; set
+// HUB_SESSION_SECRET to decouple that (e.g. to survive a password rotation).
+const SESSION_COOKIE = "hub_session";
+const SESSION_TTL_MS = 30 * 24 * 3600 * 1000; // stay signed in for 30 days
+const SESSION_KEY =
+  process.env.HUB_SESSION_SECRET ||
+  crypto.createHash("sha256").update(`${HUB_USER}\n${HUB_PASSWORD}`).digest("hex");
 
 // Injected on every proxied ttyd request so ttyd's own basic-auth
 // (-c term:$HUB_TOKEN, loopback-bound in the container) is satisfied without
@@ -156,18 +171,68 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ha, hb);
 }
 
-// Browser/user auth (UI + all API except the heartbeat).
+// The single-user credentials, compared in constant time.
+function credentialsMatch(user, pass) {
+  return safeEqual(user || "", HUB_USER) && safeEqual(pass || "", HUB_PASSWORD);
+}
+
+// ---- Login sessions (signed cookie) -----------------------------------------
+// A session token is "<expiryMs>.<hmac>" — the browser can't forge it and it
+// self-expires. HttpOnly keeps it out of reach of any injected script.
+function issueSessionToken() {
+  const expiry = Date.now() + SESSION_TTL_MS;
+  const mac = crypto.createHmac("sha256", SESSION_KEY).update(String(expiry)).digest("base64url");
+  return `${expiry}.${mac}`;
+}
+
+function sessionTokenValid(token) {
+  if (!token) return false;
+  const dot = token.indexOf(".");
+  if (dot < 0) return false;
+  const expiry = token.slice(0, dot);
+  const expNum = parseInt(expiry, 10);
+  if (!Number.isFinite(expNum) || expNum < Date.now()) return false;
+  const expected = crypto.createHmac("sha256", SESSION_KEY).update(expiry).digest("base64url");
+  const got = Buffer.from(token.slice(dot + 1));
+  const want = Buffer.from(expected);
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
+}
+
+function cookies(req) {
+  const out = {};
+  for (const part of (req.headers.cookie || "").split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+
+// Mark the cookie Secure only when the request actually arrived over HTTPS
+// (Cloudflare sets x-forwarded-proto) so plain-HTTP LAN access still works.
+function sessionSetCookie(req, token) {
+  const https =
+    (req.headers["x-forwarded-proto"] || "").split(",")[0].trim() === "https" ||
+    !!(req.socket && req.socket.encrypted);
+  const maxAge = token ? Math.floor(SESSION_TTL_MS / 1000) : 0;
+  return (
+    `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}` +
+    (https ? "; Secure" : "")
+  );
+}
+
+// Browser/user auth (UI + all API except the heartbeat). A valid login cookie
+// or the equivalent Basic-auth header (kept for curl and the agent heartbeat
+// fallback) both pass.
 function userAuthorized(req) {
   if (!HUB_PASSWORD) return true;
+  if (sessionTokenValid(cookies(req)[SESSION_COOKIE])) return true;
   const header = req.headers.authorization || "";
   if (!header.startsWith("Basic ")) return false;
   const decoded = Buffer.from(header.slice(6), "base64").toString();
   const sep = decoded.indexOf(":");
   if (sep < 0) return false;
-  return (
-    safeEqual(decoded.slice(0, sep), HUB_USER) &&
-    safeEqual(decoded.slice(sep + 1), HUB_PASSWORD)
-  );
+  return credentialsMatch(decoded.slice(0, sep), decoded.slice(sep + 1));
 }
 
 // Agent auth (heartbeats). The user credentials also work here, so a curl
@@ -339,6 +404,7 @@ setInterval(() => {
 const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
 const HISTORY = fs.readFileSync(path.join(__dirname, "public", "history.html"));
 const SESSIONS = fs.readFileSync(path.join(__dirname, "public", "sessions.html"));
+const LOGIN = fs.readFileSync(path.join(__dirname, "public", "login.html"));
 // Bundled web font served to the live terminal. ttyd's page is same-origin
 // (proxied under /term/<name>/), so its xterm.js can load this from the hub;
 // proxyTerm() injects the matching @font-face. A Nerd Font gives the TUI full
@@ -549,18 +615,68 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     }
 
+    // Public routes: the login page and its API need no session, and the
+    // agent heartbeat carries its own bearer token.
+    const isLoginRoute =
+      url.pathname === "/login" ||
+      url.pathname === "/login.html" ||
+      url.pathname === "/api/login" ||
+      url.pathname === "/api/logout";
+
     if (url.pathname === "/api/heartbeat") {
       if (!agentAuthorized(req)) return json(res, 401, { error: "unauthorized" });
+    } else if (isLoginRoute) {
+      // fall through to the handlers below
     } else if (!userAuthorized(req)) {
       // Everything else — UI, browser API, and the /term/ terminal proxy —
-      // rides the single basic-auth login (the browser attaches it to iframe
-      // asset requests and WebSocket upgrades automatically).
-      res.writeHead(401, {
-        "WWW-Authenticate": 'Basic realm="agent-hub", charset="UTF-8"',
+      // rides the login cookie (the browser attaches it to iframe asset
+      // requests and WebSocket upgrades automatically). We deliberately do NOT
+      // send a WWW-Authenticate header, so browsers never raise the native
+      // Basic popup: page navigations bounce to the login form; XHR/asset
+      // requests get a plain 401 the client-side code turns into a redirect.
+      const wantsHtml = req.method === "GET" && (req.headers.accept || "").includes("text/html");
+      if (wantsHtml) {
+        const next = url.pathname + url.search;
+        const to = next && next !== "/" ? `/login?next=${encodeURIComponent(next)}` : "/login";
+        res.writeHead(302, { Location: to, "Cache-Control": "no-store" });
+        return res.end();
+      }
+      res.writeHead(401, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: "unauthorized" }));
+    }
+
+    // Login form (public). Already-authenticated visitors skip straight in.
+    if (req.method === "GET" && (url.pathname === "/login" || url.pathname === "/login.html")) {
+      if (userAuthorized(req)) {
+        res.writeHead(302, { Location: "/", "Cache-Control": "no-store" });
+        return res.end();
+      }
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+      return res.end(LOGIN);
+    }
+
+    // Validate credentials and hand back the session cookie.
+    if (req.method === "POST" && url.pathname === "/api/login") {
+      const body = JSON.parse((await readBody(req)) || "{}");
+      if (HUB_PASSWORD && !credentialsMatch(body.username, body.password)) {
+        return json(res, 401, { error: "invalid credentials" });
+      }
+      res.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
+        "Set-Cookie": sessionSetCookie(req, issueSessionToken()),
       });
-      return res.end(JSON.stringify({ error: "unauthorized" }));
+      return res.end(JSON.stringify({ ok: true }));
+    }
+
+    // Drop the session cookie.
+    if (req.method === "POST" && url.pathname === "/api/logout") {
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "Set-Cookie": sessionSetCookie(req, ""),
+      });
+      return res.end(JSON.stringify({ ok: true }));
     }
 
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
@@ -820,6 +936,9 @@ if (process.env.AGENTHUB_TEST) {
     agentAuthorized,
     agentWsAuthorized,
     safeEqual,
+    credentialsMatch,
+    issueSessionToken,
+    sessionTokenValid,
     fmtDur,
   };
 } else {
