@@ -1,5 +1,11 @@
 FROM node:24-bookworm-slim
 
+# UTF-8 locale so the TUI's box-drawing, braille spinners, and other Unicode
+# glyphs render instead of turning into tofu in the web terminal. C.UTF-8 ships
+# with the base image (no locale generation needed).
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
 # Static Docker CLI only (no daemon) — bump as needed (kept current so the
 # bundled Go stdlib stays ahead of known CVEs; the image scan gates on this).
 ARG DOCKER_CLI_VERSION=29.6.1
@@ -29,7 +35,7 @@ ARG OPENCODE_VERSION=latest
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates curl ripgrep tmux \
-      python3 python3-pip python3-venv python-is-python3 libicu72 \
+      python3 python3-pip python3-venv python-is-python3 libicu72 ncurses-term \
  && curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \
       | tar -xz --strip-components=1 -C /usr/local/bin docker/docker \
  && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
@@ -58,6 +64,7 @@ LABEL org.opencontainers.image.source="https://github.com/xerktech/DockerOps" \
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY hub-agent.py /usr/local/bin/hub-agent.py
 COPY tunnel-agent.js /usr/local/bin/tunnel-agent.js
+COPY tmux.conf /etc/tmux.conf
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/hub-agent.py /usr/local/bin/tunnel-agent.js
 
 # Start sessions in the DockerOps repo so Claude has the stacks in context.
