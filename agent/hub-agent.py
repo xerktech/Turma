@@ -100,6 +100,54 @@ def log(msg):
     print(f"[hub-agent] {msg}", flush=True)
 
 
+def load_pricing_extra():
+    """Extra pricing entries from the PRICING_JSON env var (inline JSON, per the
+    everything-inline-env convention): {"model-substring": [input, output,
+    cacheWrite, cacheRead]} per MTok. Consulted ONLY when the built-in PRICING
+    table has no match, so it can price new/unknown models but never override a
+    built-in rate. Anything malformed is logged loudly and the whole override
+    ignored — a bad env var must never take the agent down."""
+    raw = os.environ.get("PRICING_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("top level must be a JSON object")
+        extra = {}
+        for key, rates in data.items():
+            if not key or not isinstance(key, str):
+                raise ValueError(f"bad model key {key!r}")
+            if (
+                not isinstance(rates, (list, tuple))
+                or len(rates) != 4
+                or not all(
+                    isinstance(r, (int, float)) and not isinstance(r, bool) and r >= 0
+                    for r in rates
+                )
+            ):
+                raise ValueError(
+                    f"{key!r} must map to [input, output, cacheWrite, cacheRead] per MTok"
+                )
+            if key in PRICING:
+                log(f"PRICING_JSON: {key!r} duplicates a built-in entry — ignored")
+                continue
+            extra[key] = tuple(float(r) for r in rates)
+        return extra
+    except ValueError as e:
+        log(f"PRICING_JSON invalid — ignoring it entirely: {e}")
+        return {}
+
+
+PRICING_EXTRA = load_pricing_extra()
+# Logged unconditionally at boot so a bad/missing override is diagnosable from
+# the container-log tail in the hub UI.
+log(
+    "pricing extras from PRICING_JSON (consulted for unknown models only): "
+    + (", ".join(f"{k}={list(v)}" for k, v in PRICING_EXTRA.items()) or "none")
+)
+
+
 def run(cmd, cwd=None):
     """Run a command, return stripped stdout or '' on any failure."""
     try:
@@ -239,6 +287,7 @@ def usage_report(workdir):
     totals = {"input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0}
     days = {}  # "YYYY-MM-DD" (UTC) -> same shape as totals
     models = {}
+    unpriced = set()  # model ids with token usage that no pricing entry matched
     seen = set()
     last_ts = ""
     sessions = 0
@@ -281,14 +330,23 @@ def usage_report(workdir):
                         usage.get("cache_creation_input_tokens", 0) or 0,
                         usage.get("cache_read_input_tokens", 0) or 0,
                     )
+                    # Built-in table first (authoritative); PRICING_EXTRA only
+                    # covers models the built-ins don't match.
                     price = next(
                         (p for k, p in PRICING.items() if k in model), None
+                    ) or next(
+                        (p for k, p in PRICING_EXTRA.items() if k in model), None
                     )
                     cost = (
-                        sum(t * p for t, p in zip(tok, (price[0], price[1], price[2], price[3]))) / 1e6
+                        sum(t * p for t, p in zip(tok, price)) / 1e6
                         if price
                         else 0.0
                     )
+                    # An unpriced model costs $0.00 — flag every bucket it lands
+                    # in so the UI never understates cost silently.
+                    is_unpriced = price is None and any(tok)
+                    if is_unpriced:
+                        unpriced.add(model)
                     buckets = [totals]
                     # Transcript timestamps are UTC ISO; date-prefix bucketing
                     # is close enough for a dashboard.
@@ -305,6 +363,8 @@ def usage_report(workdir):
                         b["cacheWrite"] += tok[2]
                         b["cacheRead"] += tok[3]
                         b["cost"] += cost
+                        if is_unpriced:
+                            b["unpriced"] = True
         except OSError:
             continue
 
@@ -322,6 +382,9 @@ def usage_report(workdir):
         "sessions": sessions,
         "lastActivity": last_ts,
         "models": sorted(models, key=models.get, reverse=True),
+        # Models whose usage no pricing entry matched (their cost counted as
+        # $0.00) — the UI flags any figure that includes them.
+        "unpricedModels": sorted(unpriced),
     }
 
 

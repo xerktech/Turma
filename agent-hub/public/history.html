@@ -106,6 +106,7 @@
   tbody tr:last-child td { border-bottom: none; }
   td .cost { font-weight: 600; }
   td .tok { color: var(--muted); font-size: 11px; display: block; }
+  .unpriced { color: var(--s3); cursor: help; }
   td.zero { color: var(--muted); }
   .total-col { border-left: 1px solid var(--hairline); }
   tfoot td { border-top: 1px solid var(--hairline); font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -166,13 +167,20 @@ function esc(s) {
 }
 function dayTokens(d) { return d ? d.input + d.output + d.cacheWrite + d.cacheRead : 0; }
 function sumDays(list) {
-  const out = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 };
+  const out = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0, unpriced: false };
   for (const d of list) if (d) {
     out.input += d.input; out.output += d.output;
     out.cacheWrite += d.cacheWrite; out.cacheRead += d.cacheRead;
     out.cost += d.cost;
+    out.unpriced = out.unpriced || !!d.unpriced;
   }
   return out;
+}
+// Any bucket with unpriced usage means its $ figure is understated (unknown
+// models count as $0.00); ⚠ + a title naming the model(s) make that visible.
+function unpricedTitle(s) {
+  const who = ((s && s.usage?.unpricedModels) || []).join(", ");
+  return "Understated — includes unpriced model(s)" + (who ? ": " + who : "");
 }
 
 // Flatten hosts → one series per session. Usage lives on each session and
@@ -421,7 +429,8 @@ function fillTooltip(tooltip, date, perSeries, slotOf) {
     key.style.background = slotOf.get(s.skey);
     const val = document.createElement("span");
     val.className = "tt-val";
-    val.textContent = d ? "$" + d.cost.toFixed(2) : "–";
+    val.textContent = d ? "$" + d.cost.toFixed(2) + (d.unpriced ? " ⚠" : "") : "–";
+    if (d && d.unpriced) row.title = unpricedTitle(s);
     const name = document.createElement("span");
     name.className = "tt-name";
     name.textContent = s.label + " ";
@@ -442,7 +451,8 @@ function fillTooltip(tooltip, date, perSeries, slotOf) {
   key.className = "tt-key";
   const val = document.createElement("span");
   val.className = "tt-val";
-  val.textContent = "$" + total.cost.toFixed(2);
+  val.textContent = "$" + total.cost.toFixed(2) + (total.unpriced ? " ⚠" : "");
+  if (total.unpriced) row.title = "Understated — includes unpriced usage";
   const name = document.createElement("span");
   name.className = "tt-name";
   name.textContent = "Total";
@@ -475,20 +485,22 @@ function tableView(list, dates) {
   const head = list.map(s =>
     `<th>${esc(s.label)}<span class="sub">${esc(s.device || "")}</span></th>`
   ).join("");
-  const cell = d => (!d || (!d.cost && !dayTokens(d)))
+  const warn = (flag, s) =>
+    flag ? ` <span class="unpriced" title="${esc(unpricedTitle(s))}">⚠</span>` : "";
+  const cell = (d, s) => (!d || (!d.cost && !dayTokens(d)))
     ? `<td class="zero">–</td>`
-    : `<td><span class="cost">$${d.cost.toFixed(2)}</span><span class="tok">${fmtTokens(dayTokens(d))} tok</span></td>`;
+    : `<td><span class="cost">$${d.cost.toFixed(2)}${warn(d.unpriced, s)}</span><span class="tok">${fmtTokens(dayTokens(d))} tok</span></td>`;
   const rows = shown.map(date => {
     const total = sumDays(list.map(s => s.usage?.days?.[date]));
-    return `<tr><td>${esc(date)}</td>${list.map(s => cell(s.usage?.days?.[date])).join("")}<td class="total-col">${
+    return `<tr><td>${esc(date)}</td>${list.map(s => cell(s.usage?.days?.[date], s)).join("")}<td class="total-col">${
       total.cost || dayTokens(total)
-        ? `<span class="cost">$${total.cost.toFixed(2)}</span><span class="tok">${fmtTokens(dayTokens(total))} tok</span>`
+        ? `<span class="cost">$${total.cost.toFixed(2)}${warn(total.unpriced, null)}</span><span class="tok">${fmtTokens(dayTokens(total))} tok</span>`
         : "–"
     }</td></tr>`;
   }).join("");
   const allTime = list.map(s => {
     const t = s.usage?.totals;
-    return `<td>${t ? `$${t.cost.toFixed(2)}<span class="tok">${fmtTokens(dayTokens(t))} tok</span>` : "–"}</td>`;
+    return `<td>${t ? `$${t.cost.toFixed(2)}${warn(t.unpriced, s)}<span class="tok">${fmtTokens(dayTokens(t))} tok</span>` : "–"}</td>`;
   }).join("");
   const allTotal = sumDays(list.map(s => s.usage?.totals));
 
@@ -497,7 +509,7 @@ function tableView(list, dates) {
   scroll.innerHTML = `<table>
     <thead><tr><th>Date</th>${head}<th class="total-col">Total</th></tr></thead>
     <tbody>${rows}</tbody>
-    <tfoot><tr><td class="label">All-time</td>${allTime}<td class="total-col">$${allTotal.cost.toFixed(2)}<span class="tok">${fmtTokens(dayTokens(allTotal))} tok</span></td></tr></tfoot>
+    <tfoot><tr><td class="label">All-time</td>${allTime}<td class="total-col">$${allTotal.cost.toFixed(2)}${warn(allTotal.unpriced, null)}<span class="tok">${fmtTokens(dayTokens(allTotal))} tok</span></td></tr></tfoot>
   </table>`;
   details.append(scroll);
   return details;
