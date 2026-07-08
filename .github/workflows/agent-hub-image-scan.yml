@@ -36,8 +36,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Stay on >=0.33: earlier trivy-action releases pin the internal
+      # setup-trivy step to a mutable tag upstream deleted, so they fail to
+      # resolve; 0.33+ pin setup-trivy by commit SHA.
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@v0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: local/agent-hub:pr-scan
           scanners: vuln,secret

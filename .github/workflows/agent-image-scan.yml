@@ -43,8 +43,11 @@ jobs:
       # ignore-unfixed keeps the gate actionable: only CVEs with an available
       # fix (i.e. that a rebuild/bump can resolve) fail the PR; unfixable base
       # image noise is reported but not blocking.
+      # Stay on >=0.33: earlier trivy-action releases pin the internal
+      # setup-trivy step to a mutable tag upstream deleted, so they fail to
+      # resolve; 0.33+ pin setup-trivy by commit SHA.
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@v0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: local/agent:pr-scan
           scanners: vuln,secret
