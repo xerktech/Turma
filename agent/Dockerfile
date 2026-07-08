@@ -18,6 +18,14 @@ ARG NPM_VERSION=11.18.0
 # image tag reflects the bundled Claude Code version. Defaults to latest for
 # local/manual builds.
 ARG CLAUDE_CODE_VERSION=latest
+# Additional coding agents, selectable at runtime via the AGENT env var (see
+# entrypoint.sh); claude stays the default. Track latest so each rebuild pulls
+# the newest release (like CLAUDE_CODE_VERSION above); pin to a specific version
+# here if you ever need to freeze one. Auth for these is not wired up yet; only
+# claude reuses the host login today.
+ARG CODEX_VERSION=latest
+ARG COPILOT_VERSION=latest
+ARG OPENCODE_VERSION=latest
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates curl ripgrep tmux \
@@ -34,6 +42,9 @@ RUN apt-get update \
  && ln -s /opt/powershell/pwsh /usr/local/bin/pwsh \
  && npm install -g "npm@${NPM_VERSION}" \
  && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+                   "@openai/codex@${CODEX_VERSION}" \
+                   "@github/copilot@${COPILOT_VERSION}" \
+                   "opencode-ai@${OPENCODE_VERSION}" \
  && rm -rf /var/lib/apt/lists/*
 
 # Wire git to authenticate via gh, system-wide (so it applies regardless of the
