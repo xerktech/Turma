@@ -333,6 +333,7 @@ setInterval(() => {
 
 const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
 const HISTORY = fs.readFileSync(path.join(__dirname, "public", "history.html"));
+const SESSIONS = fs.readFileSync(path.join(__dirname, "public", "sessions.html"));
 // Bundled web font served to the live terminal. ttyd's page is same-origin
 // (proxied under /term/<name>/), so its xterm.js can load this from the hub;
 // proxyTerm() injects the matching @font-face. A Nerd Font gives the TUI full
@@ -565,6 +566,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && (url.pathname === "/history" || url.pathname === "/history.html")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       return res.end(HISTORY);
+    }
+
+    if (req.method === "GET" && (url.pathname === "/sessions" || url.pathname === "/sessions.html")) {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(SESSIONS);
     }
 
     // Web font for the live terminal (referenced by the @font-face proxyTerm

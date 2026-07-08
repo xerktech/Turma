@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Hub — Sessions</title>
+<style>
+  :root {
+    --page:        #f9f9f7;
+    --surface:     #fcfcfb;
+    --ink:         #0b0b0b;
+    --ink-2:       #52514e;
+    --muted:       #898781;
+    --hairline:    #e1e0d9;
+    --border:      rgba(11,11,11,0.10);
+    --good:        #0ca30c;
+    --warning:     #fab219;
+    --critical:    #d03b3b;
+    --accent:      #2a78d6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page:      #0d0d0d;
+      --surface:   #1a1a19;
+      --ink:       #ffffff;
+      --ink-2:     #c3c2b7;
+      --muted:     #898781;
+      --hairline:  #2c2c2a;
+      --border:    rgba(255,255,255,0.10);
+      --accent:    #3987e5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 24px 20px 48px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 650; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  header .spacer { flex: 1; }
+
+  /* Shared page nav: pill tabs in the header on wide screens, a fixed bottom
+     tab bar on phones (same markup on all three pages). */
+  .nav-tabs { display: flex; gap: 4px; }
+  .nav-tabs a {
+    color: var(--ink-2); text-decoration: none; font-size: 13px;
+    padding: 5px 12px; border-radius: 20px; border: 1px solid transparent;
+  }
+  .nav-tabs a:hover { color: var(--accent); }
+  .nav-tabs a.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .bottom-nav { display: none; }
+  @media (max-width: 600px) {
+    .nav-tabs { display: none; }
+    .bottom-nav {
+      display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+      background: var(--surface); border-top: 1px solid var(--hairline);
+      padding: 4px 8px calc(4px + env(safe-area-inset-bottom));
+    }
+    .bottom-nav a {
+      flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+      color: var(--muted); text-decoration: none; font-size: 11px; padding: 6px 0 4px;
+    }
+    .bottom-nav a svg { width: 21px; height: 21px; }
+    .bottom-nav a.active { color: var(--accent); }
+    body { padding-bottom: 68px; }
+  }
+
+  h2 { font-size: 13px; margin: 26px 0 10px; font-weight: 650; color: var(--ink-2);
+       text-transform: uppercase; letter-spacing: 0.04em; }
+  h2 .count { color: var(--muted); font-weight: 400; text-transform: none; letter-spacing: 0; }
+
+  /* One big tappable card per running session — the whole card attaches. */
+  .sess-list { display: flex; flex-direction: column; gap: 10px; }
+  button.scard {
+    display: flex; align-items: center; gap: 12px; width: 100%; text-align: left;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 13px 15px; cursor: pointer; font: inherit; color: var(--ink);
+  }
+  button.scard:hover:not(:disabled) { border-color: var(--accent); }
+  button.scard:disabled { cursor: default; opacity: 0.65; }
+  .scard .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .dot.working { background: var(--good); }
+  .dot.waiting { background: var(--warning); }
+  .dot.idle { background: var(--muted); }
+  .scard .body { flex: 1; min-width: 0; }
+  .scard .sid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; font-size: 14px; overflow-wrap: anywhere; }
+  .scard .meta { color: var(--muted); font-size: 12px; margin-top: 1px; overflow-wrap: anywhere; }
+  .scard .state { font-size: 12.5px; margin-top: 3px; color: var(--ink-2); }
+  .scard .state.working { color: var(--good); }
+  .scard .state.waiting { color: var(--warning); font-weight: 600; }
+  .scard .question {
+    font-size: 12.5px; color: var(--ink-2); margin-top: 3px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .scard .go { color: var(--accent); font-size: 13px; font-weight: 600; white-space: nowrap; }
+  .scard:disabled .go { color: var(--muted); font-weight: 400; }
+
+  /* Stopped sessions: compact rows with a Start button. */
+  .stopped-row {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 11px 15px;
+  }
+  .stopped-row .body { flex: 1; min-width: 0; }
+  .stopped-row .sid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; font-size: 13px; overflow-wrap: anywhere; }
+  .stopped-row .meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .stopped-row .err { color: var(--critical); font-size: 12px; }
+
+  /* New-session picker: one block per online host, its repos as spawn buttons. */
+  .host-block {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 13px 15px; margin-bottom: 10px;
+  }
+  .host-block .hname { font-weight: 650; font-size: 13.5px; margin-bottom: 8px; overflow-wrap: anywhere; }
+  .host-block .hname .dev { color: var(--muted); font-weight: 400; font-size: 12px; }
+  .repo-btns { display: flex; flex-wrap: wrap; gap: 8px; }
+
+  button {
+    font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--border); background: transparent; color: var(--ink);
+  }
+  button:hover:not(:disabled) { border-color: var(--ink-2); }
+  button.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  .spin {
+    width: 11px; height: 11px; flex: none; display: inline-block;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; vertical-align: -1px; animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .empty { color: var(--muted); text-align: center; padding: 40px 0; border: 1px dashed var(--hairline); border-radius: 10px; }
+  details.stopped-wrap summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; margin-bottom: 10px; }
+  details.stopped-wrap summary:hover { color: var(--ink-2); }
+  details.stopped-wrap .sess-list { gap: 8px; }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 28px; }
+
+  /* Full-screen terminal with a session-switcher strip, so you can hop between
+     live sessions without leaving the terminal. */
+  .term-overlay {
+    display: none; position: fixed; inset: 0; z-index: 50;
+    background: rgba(0,0,0,0.62); flex-direction: column; padding: 20px;
+  }
+  .term-box {
+    flex: 1; display: flex; flex-direction: column; width: 100%; max-width: 1400px;
+    margin: 0 auto; background: #000; border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden;
+  }
+  .term-bar {
+    display: flex; align-items: center; gap: 12px; padding: 8px 12px;
+    background: var(--surface); border-bottom: 1px solid var(--hairline);
+  }
+  .term-bar .t-title { font-weight: 650; font-size: 14px; }
+  .term-bar .t-title .path { font-family: ui-monospace, Menlo, monospace; color: var(--muted); font-weight: 400; font-size: 12px; }
+  .term-bar .spacer { flex: 1; }
+  .term-bar a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  .term-bar a:hover { text-decoration: underline; }
+  .term-switch {
+    display: flex; gap: 6px; overflow-x: auto; padding: 7px 10px;
+    background: var(--surface); border-bottom: 1px solid var(--hairline);
+    -webkit-overflow-scrolling: touch; scrollbar-width: thin;
+  }
+  .term-switch .chip {
+    display: inline-flex; align-items: center; gap: 6px; flex: none;
+    font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 5px 11px; border-radius: 20px; border: 1px solid var(--border);
+    background: transparent; color: var(--ink-2); cursor: pointer; white-space: nowrap;
+  }
+  .term-switch .chip:hover { border-color: var(--ink-2); }
+  .term-switch .chip.cur { border-color: var(--accent); color: var(--accent); }
+  .term-switch .chip .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .term-overlay iframe { flex: 1; border: 0; width: 100%; background: #000; }
+
+  @media (max-width: 600px) {
+    .wrap { padding: 16px 12px 40px; }
+    header { gap: 8px 12px; margin-bottom: 16px; }
+    .term-overlay { padding: 0; }
+    .term-box { border-radius: 0; border: 0; }
+    .term-bar { flex-wrap: wrap; padding: 7px 10px; gap: 6px 10px; }
+  }
+  @media (pointer: coarse) {
+    button { padding: 9px 15px; }
+    .term-switch .chip { padding: 8px 13px; }
+    details.stopped-wrap summary { padding: 4px 0; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Sessions</h1>
+    <span class="sub" id="counts"></span>
+    <span class="spacer"></span>
+    <nav class="nav-tabs">
+      <a href="/">Dashboard</a>
+      <a href="/sessions" class="active">Sessions</a>
+      <a href="/history">History</a>
+    </nav>
+    <span class="sub" id="refreshed"></span>
+  </header>
+
+  <div id="active"></div>
+  <div id="stopped"></div>
+  <div id="spawn"></div>
+
+  <div class="footer">Tap a session to attach to its live terminal; use the strip at the top of the terminal to hop between sessions without detaching. Managing sessions (restart, kill, delete) and host controls live on the Dashboard.</div>
+</div>
+
+<nav class="bottom-nav">
+  <a href="/">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    Dashboard
+  </a>
+  <a href="/sessions" class="active">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+    Sessions
+  </a>
+  <a href="/history">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/></svg>
+    History
+  </a>
+</nav>
+
+<div class="term-overlay" id="termOverlay">
+  <div class="term-box">
+    <div class="term-bar">
+      <span class="t-title">Live session · <span class="path" id="termTitle"></span></span>
+      <span class="spacer"></span>
+      <a id="termOpen" target="_blank" rel="noopener">Open in new tab ↗</a>
+      <button class="primary" onclick="closeTerminal()">Close (Esc)</button>
+    </div>
+    <div class="term-switch" id="termSwitch"></div>
+    <iframe id="termFrame" src="about:blank" title="Live Claude session"></iframe>
+  </div>
+</div>
+
+<script>
+const $active = document.getElementById("active");
+const $stopped = document.getElementById("stopped");
+const $spawn = document.getElementById("spawn");
+const $counts = document.getElementById("counts");
+const $refreshed = document.getElementById("refreshed");
+
+// Open/closed state of the stopped-sessions <details> survives the 5s re-render.
+let stoppedOpen = false;
+
+// Optimistic pending-action feedback, same scheme as the dashboard: spawn/start
+// commands are queued on the hub and land on the next agent heartbeat, so each
+// clicked button shows a busy state until the polled data reflects the change
+// (or a timeout clears a command that never landed).
+const pending = new Map();
+const PENDING_TTL_MS = 45000;
+function pendKey(kind, host, x) { return kind + "::" + host + "::" + x; }
+function setPending(key, val) { pending.set(key, { ...val, at: Date.now() }); }
+function reconcilePending(agents) {
+  const t = Date.now();
+  const counts = new Map(); // "host::repo" -> session count
+  const index = new Map();  // "host::id"   -> session
+  for (const a of agents) for (const s of (a.sessions || [])) {
+    const rk = a.key + "::" + s.repo;
+    counts.set(rk, (counts.get(rk) || 0) + 1);
+    index.set(a.key + "::" + s.id, s);
+  }
+  for (const [key, p] of pending) {
+    if (t - p.at > PENDING_TTL_MS) { pending.delete(key); continue; }
+    if (p.kind === "spawn") {
+      if ((counts.get(p.host + "::" + p.repo) || 0) > p.baseline) pending.delete(key);
+    } else if (p.kind === "start") {
+      const s = index.get(p.host + "::" + p.id);
+      if (s && s.status === "running") pending.delete(key);
+    }
+  }
+}
+
+function ago(ms) {
+  if (ms == null || isNaN(ms)) return "never";
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[c]);
+}
+
+// Same live-state derivation as the dashboard: pending question > fresh
+// transcript writes (working) > idle. Freshness is relative to the host's last
+// heartbeat.
+function liveState(sess, host, now) {
+  const s = sess.session;
+  if (s && s.question) return { kind: "waiting", label: "waiting for your answer", question: s.question };
+  if (!s || s.transcriptAgeSec == null) return { kind: "idle", label: "no transcript yet" };
+  const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
+  if (host.online && age < 90 * 1000)
+    return { kind: "working", label: "working", detail: "last write " + ago(age) };
+  return { kind: "idle", label: "idle", detail: "last write " + ago(age) };
+}
+
+// Running sessions sorted attention-first: waiting on you, then working, then
+// idle; freshest activity first within each group.
+const KIND_ORDER = { waiting: 0, working: 1, idle: 2 };
+function collect(agents, now) {
+  const running = [], stopped = [];
+  for (const a of agents) for (const s of (a.sessions || [])) {
+    if (s.status === "running") {
+      running.push({ a, s, live: liveState(s, a, now) });
+    } else {
+      stopped.push({ a, s });
+    }
+  }
+  running.sort((x, y) =>
+    (KIND_ORDER[x.live.kind] - KIND_ORDER[y.live.kind]) ||
+    ((y.s.session?.transcriptAgeSec == null ? -1 : -y.s.session.transcriptAgeSec) -
+     (x.s.session?.transcriptAgeSec == null ? -1 : -x.s.session.transcriptAgeSec)));
+  stopped.sort((x, y) => (x.a.key + x.s.id).localeCompare(y.a.key + y.s.id));
+  return { running, stopped };
+}
+
+function render(data) {
+  const { now, agents } = data;
+  reconcilePending(agents);
+  $refreshed.textContent = "updated " + new Date(now).toLocaleTimeString();
+
+  const { running, stopped } = collect(agents, now);
+  const waiting = running.filter(x => x.live.kind === "waiting").length;
+  $counts.textContent = running.length + " running" + (waiting ? " · " + waiting + " waiting on you" : "");
+
+  $active.innerHTML = `<h2>Active <span class="count">${running.length}</span></h2>` +
+    (running.length
+      ? `<div class="sess-list">${running.map(x => activeCard(x, now)).join("")}</div>`
+      : `<div class="empty">No running sessions.${agents.some(a => a.online) ? " Start one below." : ""}</div>`);
+
+  $stopped.innerHTML = stopped.length
+    ? `<h2>Stopped <span class="count">${stopped.length}</span></h2>
+       <details class="stopped-wrap" ${stoppedOpen ? "open" : ""} ontoggle="stoppedOpen = this.open">
+         <summary>Show / hide stopped sessions</summary>
+         <div class="sess-list">${stopped.map(x => stoppedRow(x)).join("")}</div>
+       </details>`
+    : "";
+
+  const hosts = agents.filter(a => a.online && (a.repos || []).length);
+  $spawn.innerHTML = `<h2>Start a new session</h2>` +
+    (hosts.length
+      ? hosts.map(a => hostBlock(a)).join("")
+      : `<div class="empty">No online hosts with repos to start a session on.</div>`);
+
+  if ($overlay.style.display === "flex") renderSwitcher();
+}
+
+function activeCard({ a, s, live }, now) {
+  const attachable = a.terminalOnline;
+  const meta = esc(s.repo || "?") + " · " + esc(a.device || a.key) +
+    (s.branch ? " · " + esc(s.branch) : "");
+  return `<button class="scard" ${attachable ? "" : "disabled"}
+      onclick="openTerminal('${esc(s.id)}')"
+      ${attachable ? "" : 'title="Terminal tunnel offline"'}>
+    <span class="dot ${live.kind}"></span>
+    <span class="body">
+      <div class="sid">${esc(s.id)}</div>
+      <div class="meta">${meta}</div>
+      <div class="state ${live.kind}">${esc(live.label)}${live.detail ? " · " + esc(live.detail) : ""}</div>
+      ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
+    </span>
+    <span class="go">${attachable ? "Attach ▸" : "terminal offline"}</span>
+  </button>`;
+}
+
+function stoppedRow({ a, s }) {
+  const starting = pending.has(pendKey("start", a.key, s.id));
+  return `<div class="stopped-row">
+    <span class="body">
+      <div class="sid">${esc(s.id)}</div>
+      <div class="meta">${esc(s.repo || "?")} · ${esc(a.device || a.key)}${s.branch ? " · " + esc(s.branch) : ""}</div>
+      ${s.status === "error" && s.errorMsg ? `<div class="err">${esc(s.errorMsg)}</div>` : ""}
+    </span>
+    <button class="primary" ${a.online && !starting ? "" : "disabled"}
+        onclick="sessStart('${esc(a.key)}','${esc(s.id)}')">
+      ${starting ? '<span class="spin"></span> Starting…' : "Start"}
+    </button>
+  </div>`;
+}
+
+function hostBlock(a) {
+  const repos = (a.repos || []).map(r => {
+    const spawning = pending.has(pendKey("spawn", a.key, r.name));
+    return `<button class="primary" ${spawning ? "disabled" : ""}
+        onclick="newSession('${esc(a.key)}','${esc(r.name)}')">
+      ${spawning ? '<span class="spin"></span> Starting…' : "+ " + esc(r.name)}
+    </button>`;
+  }).join("");
+  return `<div class="host-block">
+    <div class="hname">${esc(a.key)} <span class="dev">${esc(a.device || "")}</span></div>
+    <div class="repo-btns">${repos}</div>
+  </div>`;
+}
+
+// ---- actions → endpoints ----------------------------------------------------
+function enc(s) { return encodeURIComponent(s); }
+async function post(url, body) {
+  await fetch(url, body
+    ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
+    : { method: "POST" });
+  refresh();
+}
+function busy(key, val, run) {
+  if (pending.has(key)) return;
+  setPending(key, val);
+  render(cache);
+  run();
+}
+function newSession(key, repo) {
+  const host = (cache.agents || []).find(a => a.key === key);
+  const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
+  busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
+    () => post(`/api/agents/${enc(key)}/sessions`, { repo }));
+}
+function sessStart(key, id) {
+  busy(pendKey("start", key, id), { kind: "start", host: key, id },
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/start`));
+}
+
+// ---- live terminal overlay with in-place session switcher --------------------
+// Same mechanism as the dashboard (/term/<id>/ in a same-origin iframe riding
+// the page's basic-auth), plus: a chip strip listing every attachable session so
+// you can switch without closing, and a history entry so the phone back button
+// closes the overlay instead of leaving the page.
+const $overlay = document.getElementById("termOverlay");
+const $frame = document.getElementById("termFrame");
+const $switch = document.getElementById("termSwitch");
+let termOpen = false; // we pushed a history entry that popstate will consume
+let currentId = null;
+
+// Navigate the iframe with location.replace(), never src= — every src
+// assignment adds a joint session-history entry, which would make the back
+// button (and our history.back() close path) step through old terminal URLs
+// instead of closing the overlay. Same-origin, so contentWindow is reachable.
+function navFrame(src) {
+  try { $frame.contentWindow.location.replace(src); }
+  catch { $frame.src = src; }
+}
+function setFrame(id) {
+  currentId = id;
+  const src = `/term/${encodeURIComponent(id)}/`;
+  document.getElementById("termTitle").textContent = id;
+  document.getElementById("termOpen").href = src;
+  navFrame(src);
+}
+function openTerminal(id) {
+  setFrame(id);
+  $overlay.style.display = "flex";
+  renderSwitcher();
+  if (!termOpen) { history.pushState({ term: true }, ""); termOpen = true; }
+}
+function switchTerminal(id) {
+  if (id === currentId) return;
+  setFrame(id);
+  renderSwitcher();
+}
+function hideOverlay() {
+  $overlay.style.display = "none";
+  navFrame("about:blank"); // tear down the session's WebSocket
+  currentId = null;
+}
+function closeTerminal() {
+  if (termOpen) history.back(); // popstate does the actual hide
+  else hideOverlay();
+}
+window.addEventListener("popstate", () => {
+  if (termOpen) { termOpen = false; hideOverlay(); }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && $overlay.style.display === "flex") closeTerminal();
+});
+
+// Chip strip inside the terminal: every attachable running session across all
+// hosts, current one highlighted, state dots live-updated by the poll.
+function renderSwitcher() {
+  const now = cache.now || Date.now();
+  const { running } = collect(cache.agents || [], now);
+  const attachable = running.filter(x => x.a.terminalOnline);
+  $switch.replaceChildren();
+  for (const x of attachable) {
+    const chip = document.createElement("button");
+    chip.className = "chip" + (x.s.id === currentId ? " cur" : "");
+    chip.addEventListener("click", () => switchTerminal(x.s.id));
+    const dot = document.createElement("span");
+    dot.className = "dot " + x.live.kind;
+    chip.append(dot, document.createTextNode(x.s.id));
+    chip.title = (x.s.repo || "?") + " · " + (x.a.device || x.a.key) + " — " + x.live.label;
+    $switch.append(chip);
+  }
+  $switch.style.display = attachable.length > 1 ? "flex" : "none";
+}
+
+let cache = { now: Date.now(), agents: [] };
+async function refresh() {
+  try {
+    const r = await fetch("/api/agents");
+    cache = await r.json();
+  } catch { /* keep last data; the "updated" stamp goes stale visibly */ }
+  render(cache);
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
