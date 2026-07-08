@@ -19,12 +19,13 @@ ARG NPM_VERSION=11.18.0
 # local/manual builds.
 ARG CLAUDE_CODE_VERSION=latest
 # Additional coding agents, selectable at runtime via the AGENT env var (see
-# entrypoint.sh); claude stays the default. Pinned like the other tools so the
-# image scan has a concrete version to gate on — bump as needed. Auth for these
-# is not wired up yet; only claude reuses the host login today.
-ARG CODEX_VERSION=0.142.5
-ARG COPILOT_VERSION=1.0.69
-ARG OPENCODE_VERSION=1.17.15
+# entrypoint.sh); claude stays the default. Track latest so each rebuild pulls
+# the newest release (like CLAUDE_CODE_VERSION above); pin to a specific version
+# here if you ever need to freeze one. Auth for these is not wired up yet; only
+# claude reuses the host login today.
+ARG CODEX_VERSION=latest
+ARG COPILOT_VERSION=latest
+ARG OPENCODE_VERSION=latest
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates curl ripgrep tmux \
