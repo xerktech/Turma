@@ -44,7 +44,7 @@ jobs:
       # fix (i.e. that a rebuild/bump can resolve) fail the PR; unfixable base
       # image noise is reported but not blocking.
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.29.0
         with:
           image-ref: local/agent:pr-scan
           scanners: vuln,secret

@@ -40,12 +40,30 @@ jobs:
       # p/default = high-signal security+correctness rules for JS/Python; the
       # extra packs add Dockerfile and hardcoded-secret coverage. --error makes
       # any finding fail the job; SARIF is still written for the upload below.
+      #
+      # The excluded rules all flag DELIBERATE, documented design choices in this
+      # repo (see CLAUDE.md), not defects — keeping them would make the gate
+      # perpetually red for things we've chosen on purpose:
+      #   - mutable-action-tag: actions are pinned by version tag, not commit
+      #     SHA (this repo's convention across all workflows).
+      #   - using-http-server: the hub serves plain HTTP on purpose — TLS is
+      #     terminated at the Cloudflare tunnel, behind HTTP Basic auth.
+      #   - missing-user-entrypoint: the containers must run as root (full host
+      #     access for the RC listener / docker socket).
+      #   - dynamic-urllib-use-detected: the URL is HUB_URL from the trusted
+      #     compose env, not attacker-controlled input.
+      # Everything else stays blocking, so new injection/secret/unsafe-eval
+      # style issues still fail the PR.
       - name: Semgrep scan
         run: |
           semgrep scan \
             --config=p/default \
             --config=p/secrets \
             --config=p/dockerfile \
+            --exclude-rule yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag \
+            --exclude-rule problem-based-packs.insecure-transport.js-node.using-http-server.using-http-server \
+            --exclude-rule dockerfile.security.missing-user-entrypoint.missing-user-entrypoint \
+            --exclude-rule python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected \
             --error \
             --sarif --output=semgrep.sarif \
             .
