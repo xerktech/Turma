@@ -29,3 +29,10 @@ Image content lives here; **how it runs** (mounts, tokens, `REPOS_ROOT`,
 `MAX_SESSIONS`, resource limits, adding another host) lives in DockerOps'
 `compose/agents-truenas.yaml`. See `CLAUDE.md` for the full architecture, the
 session model, and the CI / PR-gate details.
+
+Cost estimates come from a built-in pricing table in `hub-agent.py`; usage from
+a model it doesn't match counts as $0.00 and is flagged ⚠ **unpriced** in the
+dashboard. The agent's optional `PRICING_JSON` env var (inline JSON,
+`{"model-substring": [input, output, cacheWrite, cacheRead]}` per MTok) adds
+rates for such unknown models only — it can never override a built-in rate. The
+loaded extras (or any parse error) are logged at boot.
