@@ -42,7 +42,7 @@ jobs:
         id: ver
         run: |
           set -euo pipefail
-          CC_VERSION="$(docker run --rm node:22-alpine npm view @anthropic-ai/claude-code version | tr -d '[:space:]')"
+          CC_VERSION="$(docker run --rm node:24-alpine npm view @anthropic-ai/claude-code version | tr -d '[:space:]')"
           echo "cc_version=${CC_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Pinning Claude Code ${CC_VERSION} (build #${{ github.run_number }})"
 

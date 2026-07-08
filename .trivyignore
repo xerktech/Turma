@@ -4,15 +4,3 @@
 # Only REVIEWED, non-actionable findings belong here, each with a reason. Any
 # HIGH/CRITICAL not listed here still fails the scan — this is a triage list,
 # not a mute button. Revisit entries when the upstream fix reaches our base image.
-
-# --- Bundled npm internals in the upstream node:22 base image ---
-# picomatch and sigstore ship inside the base image's GLOBAL npm (npm's own
-# node_modules), not our code. Neither service runs npm at runtime: agent-hub is
-# stdlib-only `node server.js`, and the agent uses npm only at build time to
-# install claude-code. So these are not reachable exposure, and no node:22 tag
-# yet bundles the patched npm. Drop these once node:22 ships the fixes.
-
-# picomatch 4.0.3 ReDoS — fixed upstream in 4.0.4
-CVE-2026-33671
-# sigstore 3.1.0 (cert OID verification) — fixed upstream in 4.1.1
-CVE-2026-48815
