@@ -84,15 +84,17 @@ jobs:
             --exit-code 1 \
             --no-progress
 
-      # The loaded image would otherwise pile up dangling in the shared
-      # runner's docker daemon run after run until the disk fills (which has
-      # taken CI down). Prune only this run's tag, dangling layers, and unused
-      # build cache — pulled base images stay for other jobs. Never fails the
-      # job.
-      - name: Clean up image and build cache
+      # The loaded image would otherwise pile up dangling in the shared runner's
+      # docker daemon run after run until the disk fills (which has taken CI
+      # down). Remove only this run's tag plus dangling layers — pulled base
+      # images stay for other jobs. Deliberately NOT `docker builder prune`:
+      # the agent + agent-hub scan jobs run concurrently on one runner, and an
+      # `-a` cache prune here aborts the other job's in-flight build with
+      # "graceful_stop". Build cache is bounded by buildkit GC + the gha cache,
+      # so it isn't the leak. Never fails the job.
+      - name: Clean up scan image
         if: always()
         run: |
           docker rmi -f "$SCAN_TAG" 2>/dev/null || true
           docker image prune -f || true
-          docker builder prune -af || true
           df -h || true

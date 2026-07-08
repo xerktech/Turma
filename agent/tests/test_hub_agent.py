@@ -277,6 +277,7 @@ class ManagerMixin:
             ("run_ok", fake_run_ok),
             ("REGISTRY_DIR", self.tmp),
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
+            ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", os.path.join(self.tmp, "worktrees")),
         ]:
@@ -454,17 +455,67 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"kill must not delete the branch: {self.run_calls}",
         )
 
-    def test_delete_also_deletes_branch(self):
+    def _stub_git_state(self, branch, *, pushed, ahead_remote="0", ahead_base="0"):
+        """Overlay the blanket fake run with the git answers the delete guard
+        asks for: the branch exists, the checkout sits on main, and the
+        pushed/ahead state is as given."""
+        local = f"refs/heads/{branch}"
+        remote = f"refs/remotes/origin/{branch}"
+
+        def fake_run(cmd, cwd=None):
+            self.run_calls.append(cmd)
+            joined = " ".join(cmd)
+            if "rev-parse --abbrev-ref HEAD" in joined:
+                return "main"
+            if joined.endswith(f"--verify --quiet {local}"):
+                return "abc123"
+            if joined.endswith(f"--verify --quiet {remote}"):
+                return "def456" if pushed else ""
+            if f"rev-list --count {remote}..{local}" in joined:
+                return ahead_remote
+            if f"rev-list --count refs/heads/main..{local}" in joined:
+                return ahead_base
+            return ""
+
+        p = mock.patch.object(ha, "run", fake_run)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_delete_hard_deletes_safe_branch(self):
         repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("AgentHub")
         sid = sm.registry[0]["id"]
         branch = sm.registry[0]["branch"]
+        self._stub_git_state(branch, pushed=True, ahead_remote="0")
         sm.delete(sid)
         self.assertEqual(sm.registry, [])
         self.assertTrue(
             any("-D" in c and branch in c for c in self.run_calls),
-            f"delete must run git branch -D: {self.run_calls}",
+            f"pushed-and-in-sync branch must be hard-deleted: {self.run_calls}",
+        )
+
+    def test_delete_parks_unpushed_branch_in_trash(self):
+        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("AgentHub")
+        sid = sm.registry[0]["id"]
+        branch = sm.registry[0]["branch"]
+        self._stub_git_state(branch, pushed=False, ahead_base="3")
+        sm.delete(sid)
+        self.assertEqual(sm.registry, [])
+        self.assertFalse(
+            any("-D" in c and branch in c for c in self.run_calls),
+            f"unpushed branch must not be hard-deleted: {self.run_calls}",
+        )
+        renames = [
+            c for c in self.run_ok_calls
+            if "-m" in c and branch in c
+            and any(a.startswith(ha.TRASH_PREFIX) for a in c)
+        ]
+        self.assertTrue(
+            renames,
+            f"unpushed branch must be parked in trash: {self.run_ok_calls}",
         )
 
     def test_start_refuses_when_already_running_or_full(self):

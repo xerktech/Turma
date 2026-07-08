@@ -4,8 +4,8 @@
 // agents can live on any host/network (all traffic rides agents.xerktech.com):
 //   1. hub-agent.py POSTs a status heartbeat every ~20s (a HOST with its repos[]
 //      and multiplexed Claude sessions[]) and picks up queued host commands
-//      (container restart + per-session spawn/kill/start/restart/delete) on the
-//      reply, acking each by cmdId so the hub stops re-sending it.
+//      (container restart + per-session spawn/kill/start/restart/resume/delete)
+//      on the reply, acking each by cmdId so the hub stops re-sending it.
 //   2. tunnel-agent.js holds a persistent WebSocket "control" channel here. To
 //      show a live terminal, the hub asks that agent (over the control channel)
 //      to dial back a "data" WebSocket; the agent bridges it to its local ttyd
@@ -616,8 +616,8 @@ const server = http.createServer(async (req, res) => {
       delete payload.ackedCommands; // don't persist the transient ack list
       const next = (agents[key] = {
         ...payload,
-        // Pending host commands (spawn/kill/start/restart/delete) queued by the
-        // UI; re-sent on every reply below until acked.
+        // Pending host commands (spawn/kill/start/restart/resume/delete)
+        // queued by the UI; re-sent on every reply below until acked.
         commands,
         lastSeen: Date.now(),
         restartPending: false,
@@ -657,9 +657,11 @@ const server = http.createServer(async (req, res) => {
       }
 
       const sessionId = decodeURIComponent(parts[4] || "");
-      // POST /api/agents/<host>/sessions/<id>/{kill|start|restart}
+      // POST /api/agents/<host>/sessions/<id>/{kill|start|restart|resume}
+      // (resume targets a KILLED session from the host's closedSessions list —
+      // the agent re-registers it and relaunches its prior conversation.)
       if (req.method === "POST" && parts.length === 6 &&
-          (parts[5] === "kill" || parts[5] === "start" || parts[5] === "restart")) {
+          (parts[5] === "kill" || parts[5] === "start" || parts[5] === "restart" || parts[5] === "resume")) {
         const cmdId = queueCommand(key, { type: parts[5], sessionId });
         return json(res, 200, { ok: true, cmdId });
       }

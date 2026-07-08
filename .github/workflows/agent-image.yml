@@ -74,11 +74,13 @@ jobs:
             org.opencontainers.image.version=${{ steps.ver.outputs.cc_version }}-${{ github.run_number }}
 
       # Keep the shared runner's disk at a steady state: sweep dangling layers
-      # and unused build cache after every run (success or failure). Pulled
-      # base images (node, busybox) stay for other jobs. Never fails the job.
-      - name: Clean up build cache
+      # after every run (success or failure). Pulled base images (node, busybox)
+      # stay for other jobs. Deliberately NOT `docker builder prune -a`: a
+      # concurrent scan job on the same runner would have its in-flight build
+      # aborted ("graceful_stop"); build cache is bounded by buildkit GC + the
+      # gha cache, so it isn't the disk leak. Never fails the job.
+      - name: Clean up dangling images
         if: always()
         run: |
           docker image prune -f || true
-          docker builder prune -af || true
           df -h || true

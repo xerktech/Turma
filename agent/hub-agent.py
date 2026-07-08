@@ -12,9 +12,14 @@ multiplexer:
     is a git *worktree* of a repo (branch agent/<id>) running its own
     `claude --remote-control` inside its own tmux (agent-<id>) served by its own
     ttyd (127.0.0.1:<ttydPort>, base path /term/<id>).
-  - Executes hub-issued commands (spawn / kill / start / restart / delete) that
-    ride back on the heartbeat reply, with at-least-once cmdId de-dup.
-  - Auto-resumes `running` sessions on boot.
+  - Executes hub-issued commands (spawn / kill / start / restart / delete /
+    resume) that ride back on the heartbeat reply, with at-least-once cmdId
+    de-dup.
+  - Auto-resumes `running` sessions on boot — WITH their conversation
+    (claude --resume against the worktree's newest transcript).
+  - Remembers killed sessions (~/.agenthub/closed.json, newest 5 per repo) so
+    the hub can offer a per-repo "Resume" picker that brings one back on its
+    kept branch with its prior conversation.
   - POSTs a heartbeat to the hub every INTERVAL seconds carrying repos[] +
     sessions[] (per-session git / token-usage / live-session signals computed
     per worktree, so usage PERSISTS in history after a session is killed — the
@@ -61,6 +66,11 @@ WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".agenthub", "worktrees")
 # Persisted session registry (survives container restart).
 REGISTRY_DIR = os.path.expanduser("~/.agenthub")
 REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
+# Killed-but-resumable session history (branch + transcript survive a kill).
+CLOSED_PATH = os.path.join(REGISTRY_DIR, "closed.json")
+# Only the newest N closed sessions per repo are kept/offered for resume —
+# bounds both the file and the heartbeat payload.
+CLOSED_PER_REPO = 5
 # Where Claude Code keeps per-project transcript JSONLs (slug = cwd with
 # '/'->'-'). Overridable so the test suite can point it at fixtures; unset in
 # production, so the default is the real path.
@@ -589,7 +599,8 @@ class SessionManager:
         self.claude_version = run(["claude", "--version"])
         self.device = device_name()
 
-        self.registry = self._load_registry()   # list[dict], the persisted state
+        self.registry = self._load_list(REGISTRY_PATH)  # persisted live sessions
+        self.closed = self._load_list(CLOSED_PATH)      # killed-but-resumable
         self.ttyd = {}                           # id -> ttyd Popen (in-memory)
         self.sess_state = {}                     # id -> session_report offsets
         self.usage_cache = {}                    # id -> usage_report result
@@ -600,9 +611,9 @@ class SessionManager:
 
     # --- registry persistence ---------------------------------------------
 
-    def _load_registry(self):
+    def _load_list(self, path):
         try:
-            with open(REGISTRY_PATH) as f:
+            with open(path) as f:
                 data = json.load(f)
             return data if isinstance(data, list) else []
         except (OSError, ValueError):
@@ -611,10 +622,11 @@ class SessionManager:
     def save(self):
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
-            tmp = REGISTRY_PATH + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(self.registry, f, indent=2)
-            os.replace(tmp, REGISTRY_PATH)
+            for path, data in ((REGISTRY_PATH, self.registry), (CLOSED_PATH, self.closed)):
+                tmp = path + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp, path)
         except OSError as e:
             log(f"registry save failed: {e}")
 
@@ -650,14 +662,54 @@ class SessionManager:
         except OSError:
             pass
 
-    def _launch_tmux(self, sess):
-        """(Re)launch claude for a session inside its own tmux, detached."""
+    def _latest_transcript_id(self, worktree):
+        """Claude session id of this worktree's newest transcript, or None.
+
+        Transcripts under ~/.claude/projects/<slug>/ are named
+        <session-id>.jsonl, so the newest file's stem is the id to hand to
+        `claude --resume`. Explicit --resume <id> is used over --continue: one
+        slug can hold several transcripts (each clear-context restart starts a
+        new one) and --continue's "most recent" pick is opaque, while
+        newest-mtime here is deterministic."""
+        slug = worktree.replace("/", "-")
+        proj = os.path.join(PROJECTS_ROOT, slug)
+        newest, newest_mtime = None, 0.0
+        try:
+            for fname in os.listdir(proj):
+                if not fname.endswith(".jsonl"):
+                    continue
+                sid = fname[:-len(".jsonl")]
+                # The id is interpolated into the tmux command line; never pass
+                # through a name that isn't a plain uuid-ish token.
+                if not re.fullmatch(r"[A-Za-z0-9-]+", sid):
+                    continue
+                try:
+                    mtime = os.stat(os.path.join(proj, fname)).st_mtime
+                except OSError:
+                    continue
+                if mtime > newest_mtime:
+                    newest, newest_mtime = sid, mtime
+        except OSError:
+            return None
+        return newest
+
+    def _launch_tmux(self, sess, resume=False):
+        """(Re)launch claude for a session inside its own tmux, detached.
+
+        resume=True relaunches the worktree's most recent CONVERSATION
+        (claude --resume <newest transcript id>) instead of an empty context;
+        it silently falls back to a fresh claude when no transcript exists."""
         self._drop_bridge_pointer(sess["worktreePath"])
-        # Fresh claude in this worktree. IS_SANDBOX=1 (compose) lets
+        # Claude in this worktree. IS_SANDBOX=1 (compose) lets
         # bypassPermissions run under root; --remote-control bridges the session
         # to claude.ai/code + mobile under its per-session display name.
+        resume_arg = ""
+        if resume:
+            claude_sid = self._latest_transcript_id(sess["worktreePath"])
+            if claude_sid:
+                resume_arg = f"--resume {claude_sid} "
         claude_cmd = (
-            f"claude --remote-control '{sess['rcName']}' "
+            f"claude {resume_arg}--remote-control '{sess['rcName']}' "
             f"--permission-mode bypassPermissions"
         )
         run(["tmux", "kill-session", "-t", sess["tmuxName"]])  # ensure clean slate
@@ -775,14 +827,36 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
+    def _remember_closed(self, sess):
+        """Record a killed session in the closed history so the hub can offer
+        to resume it. Bounded: only the newest CLOSED_PER_REPO per repo are
+        kept — older records fall off (their branch/transcript still exist,
+        they just stop being offered)."""
+        rec = {k: sess.get(k) for k in (
+            "id", "repo", "repoPath", "worktreePath", "branch", "rcName",
+            "tmuxName", "createdAt",
+        )}
+        rec["closedAt"] = now_iso()
+        self.closed = [c for c in self.closed if c.get("id") != rec["id"]]
+        self.closed.append(rec)
+        # Trim per repo, newest first (the list is in close order).
+        keep, per_repo = [], {}
+        for c in reversed(self.closed):
+            n = per_repo.get(c.get("repo"), 0)
+            if n < CLOSED_PER_REPO:
+                per_repo[c.get("repo")] = n + 1
+                keep.append(c)
+        self.closed = list(reversed(keep))
+
     def kill(self, sid):
         """Stop and remove a session in one step: end tmux/ttyd, delete its
         worktree, and drop the registry record so the card disappears from the
         hub. KEEPS the git branch (agent/<id>) and the transcript, so the work
-        stays in the repo and its usage still shows in history — it just leaves
-        the dashboard and is not resumable. (Contrast delete(), which also
-        removes the branch — immediately when fully pushed/merged, otherwise
-        parked under agent-trash/ for a grace period.)"""
+        stays in the repo and its usage still shows in history — and records it
+        in the closed history so the repo's "Resume" picker can bring it back
+        with its conversation. (Contrast delete(), which also removes the
+        branch — immediately when fully pushed/merged, otherwise parked under
+        agent-trash/ for a grace period — forfeiting resume either way.)"""
         sess = self._find(sid)
         if not sess:
             log(f"kill: no such session {sid}")
@@ -792,12 +866,14 @@ class SessionManager:
         if os.path.isdir(sess["worktreePath"]):
             self._worktree_remove(sess)
         self.registry = [s for s in self.registry if s.get("id") != sid]
+        self._remember_closed(sess)
         self._forget_session_caches(sid)
-        log(f"killed session {sid} (worktree removed, branch {sess['branch']} kept)")
+        log(f"killed session {sid} (worktree removed, branch {sess['branch']} kept, resumable)")
 
     def start(self, sid):
         """Resume a stopped session: re-add its worktree on the EXISTING branch
-        and relaunch on the SAME ttyd port."""
+        and relaunch on the SAME ttyd port, continuing its prior conversation
+        (fresh only if it never had a transcript)."""
         sess = self._find(sid)
         if not sess:
             log(f"start: no such session {sid}")
@@ -810,12 +886,52 @@ class SessionManager:
         try:
             if not os.path.isdir(sess["worktreePath"]):
                 self._worktree_add(sess, new_branch=False)
-            self._launch_tmux(sess)
+            self._launch_tmux(sess, resume=True)
             self._launch_ttyd(sess)
             sess["status"] = "running"
             sess["stoppedAt"] = None
             sess["errorMsg"] = None
             log(f"started (resumed) session {sid} on :{sess['ttydPort']}")
+        except Exception as e:
+            self._set_error(sess, e)
+
+    def resume(self, sid):
+        """Bring back a KILLED session with its conversation: re-register it,
+        re-add its worktree on the kept agent/<id> branch, and relaunch claude
+        resuming its newest transcript. The record moves out of the closed
+        history; a failure surfaces as an error card like any other session."""
+        if self._find(sid):
+            self.start(sid)  # duplicate resume / already back — treat as start
+            return
+        rec = next((c for c in self.closed if c.get("id") == sid), None)
+        if not rec:
+            log(f"resume: no closed session {sid}")
+            return
+        if self._running_count() >= MAX_SESSIONS:
+            log(f"resume refused: at MAX_SESSIONS ({MAX_SESSIONS})")
+            return
+        sess = {
+            "id": sid,
+            "repo": rec.get("repo"),
+            "repoPath": rec.get("repoPath"),
+            "worktreePath": rec.get("worktreePath"),
+            "branch": rec.get("branch"),
+            "rcName": rec.get("rcName"),
+            "tmuxName": rec.get("tmuxName") or f"agent-{sid}",
+            "ttydPort": self._alloc_port(),  # old port may be taken by now
+            "status": "running",
+            "createdAt": rec.get("createdAt") or now_iso(),
+            "stoppedAt": None,
+            "errorMsg": None,
+        }
+        self.registry.append(sess)
+        self.closed = [c for c in self.closed if c.get("id") != sid]
+        try:
+            if not os.path.isdir(sess["worktreePath"]):
+                self._worktree_add(sess, new_branch=False)
+            self._launch_tmux(sess, resume=True)
+            self._launch_ttyd(sess)
+            log(f"resumed closed session {sid} for {sess['repo']} on :{sess['ttydPort']}")
         except Exception as e:
             self._set_error(sess, e)
 
@@ -885,6 +1001,8 @@ class SessionManager:
             self._worktree_remove(sess)
         self._retire_branch(sess)
         self.registry = [s for s in self.registry if s.get("id") != sid]
+        # The branch is gone, so any stale closed record must not offer resume.
+        self.closed = [c for c in self.closed if c.get("id") != sid]
         self._forget_session_caches(sid)
         prune_trash_branches()
         log(f"deleted session {sid}")
@@ -892,7 +1010,8 @@ class SessionManager:
     # --- boot auto-resume --------------------------------------------------
 
     def resume_on_boot(self):
-        """Relaunch running sessions whose worktree survived; demote the rest."""
+        """Relaunch running sessions whose worktree survived — continuing their
+        prior conversation, not a fresh context; demote the rest."""
         for sess in self.registry:
             if sess.get("status") != "running":
                 continue  # stopped stays stopped (kept for usage; resumable)
@@ -902,7 +1021,7 @@ class SessionManager:
                 log(f"resume: worktree gone for {sess['id']}, marking stopped")
                 continue
             try:
-                self._launch_tmux(sess)
+                self._launch_tmux(sess, resume=True)
                 self._launch_ttyd(sess)
                 log(f"resumed session {sess['id']} on :{sess['ttydPort']}")
                 time.sleep(LAUNCH_STAGGER)  # stagger shared-login contention
@@ -938,6 +1057,8 @@ class SessionManager:
                     self.start(cmd.get("sessionId"))
                 elif ctype == "restart":
                     self.restart(cmd.get("sessionId"))
+                elif ctype == "resume":
+                    self.resume(cmd.get("sessionId"))
                 elif ctype == "delete":
                     self.delete(cmd.get("sessionId"))
                 else:
@@ -1000,6 +1121,22 @@ class SessionManager:
             "session": signals,                      # running only; null otherwise
         }
 
+    def _closed_payload(self):
+        """Killed-but-resumable sessions for the hub's per-repo Resume picker,
+        newest first. Already capped at CLOSED_PER_REPO per repo, so this can
+        never balloon the heartbeat."""
+        return [
+            {
+                "id": c.get("id"),
+                "repo": c.get("repo"),
+                "branch": c.get("branch"),
+                "rcName": c.get("rcName"),
+                "createdAt": c.get("createdAt"),
+                "closedAt": c.get("closedAt"),
+            }
+            for c in reversed(self.closed)
+        ]
+
     def build_payload(self, beat):
         # Usage is the expensive parse — refresh on a slow cadence, but make
         # sure any newly-seen session gets a value on first appearance.
@@ -1021,6 +1158,7 @@ class SessionManager:
             "reposRoot": REPOS_ROOT,
             "repos": [repo_entry(r) for r in scan_repos()],
             "sessions": [self._session_payload(s) for s in self.registry],
+            "closedSessions": self._closed_payload(),
             "ackedCommands": list(self.acked),
         }
 
