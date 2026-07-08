@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 // Reverse-tunnel client for the agent-hub terminal gateway (compose/claude-code.yaml).
 //
-// Runs in the background of every Claude Code container (started by
-// entrypoint.sh) alongside hub-agent.py. It keeps a persistent OUTBOUND
-// WebSocket to the hub's control endpoint. When a browser opens this
-// container's terminal in the Agent Hub, the hub sends {"open":<ch>} on that
-// control channel; we then dial back a data WebSocket for <ch> and bridge it to
-// the local ttyd (127.0.0.1:7681, serving the tmux/Claude TUI). Because every
+// Runs in the background of every AgentHub container (started by
+// entrypoint.sh) alongside hub-agent.py — ONE control channel per host, keyed
+// by container name. It keeps a persistent OUTBOUND WebSocket to the hub's
+// control endpoint. When a browser opens a session's terminal in the Agent Hub,
+// the hub sends {"open":<ch>,"port":<ttydPort>} on that control channel; we then
+// dial back a data WebSocket for <ch> and bridge it to THAT session's local ttyd
+// (127.0.0.1:<port>). The host multiplexes N per-session ttyds (one per port,
+// allocated from TTYD_PORT_BASE by the manager); data channels fan out to them
+// by port while the single control channel stays per-host. Because every
 // connection here is outbound to HUB_URL, the hub and this container can live on
 // different hosts/networks — no inbound reachability required.
 //
@@ -23,7 +26,9 @@ const HUB_URL = process.env.HUB_URL || "http://agent-hub:8300";
 // an Authorization header.
 const TOKEN = process.env.HUB_TOKEN || "";
 const TTYD_HOST = "127.0.0.1";
-const TTYD_PORT = 7681;
+// Fallback ttyd port when the hub doesn't specify one in the open message
+// (safety only — the multiplexed sessions always send their own port).
+const DEFAULT_TTYD_PORT = 7681;
 
 // ws(s):// base derived from HUB_URL's scheme.
 const WS_BASE = HUB_URL.replace(/^http/, "ws").replace(/\/+$/, "");
@@ -49,12 +54,13 @@ function containerName() {
 
 const NAME = containerName();
 
-// Bridge one data channel: hub data-WS <-> local ttyd TCP.
-function openDataChannel(ch) {
+// Bridge one data channel: hub data-WS <-> the target session's local ttyd TCP.
+// `port` selects which per-session ttyd to dial (defaults to 7681 for safety).
+function openDataChannel(ch, port) {
   const url = `${WS_BASE}/agent/data?ch=${encodeURIComponent(ch)}&token=${encodeURIComponent(TOKEN)}`;
   const ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
-  const sock = net.connect(TTYD_PORT, TTYD_HOST);
+  const sock = net.connect(port || DEFAULT_TTYD_PORT, TTYD_HOST);
   let open = false;
   const outbox = []; // ttyd bytes produced before the WS finished connecting
 
@@ -101,7 +107,10 @@ function connectControl() {
     } catch {
       return;
     }
-    if (msg && msg.open) openDataChannel(String(msg.open));
+    if (msg && msg.open) {
+      const port = Number(msg.port) || DEFAULT_TTYD_PORT;
+      openDataChannel(String(msg.open), port);
+    }
   });
   const reconnect = () => {
     const wait = backoff;

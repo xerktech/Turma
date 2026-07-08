@@ -118,12 +118,12 @@
 <div class="wrap">
   <header>
     <h1>Usage history</h1>
-    <span class="sub">daily est. cost · all devices</span>
+    <span class="sub">daily est. cost · by session</span>
     <span class="spacer"></span>
     <a href="/">← Dashboard</a>
   </header>
   <div id="chart"></div>
-  <div class="footer">Daily figures are parsed from each container's Claude transcripts (UTC days) and reported by its agent — API-equivalent cost estimates. Click a container in the legend to toggle it (click a device name to toggle all of its containers); hover a day for the breakdown. The table view carries the same numbers for the visible series. Offline containers keep showing their last-reported history.</div>
+  <div class="footer">Daily figures are parsed from each session's Claude transcripts (UTC days) and reported by its host agent — API-equivalent cost estimates. Each series is one session (labelled <em>repo · id</em>); usage persists after a session is killed. Click a session in the legend to toggle it (click a device name to toggle all of its sessions); hover a day for the breakdown. The table view carries the same numbers for the visible series.</div>
 </div>
 
 <script>
@@ -132,10 +132,11 @@ const DAYS_SHOWN = 30;
 const SLOTS = 8; // categorical slots --s1..--s8, fixed order
 const CHART_H = 300;
 const PAD = { top: 12, right: 12, bottom: 24, left: 46 };
-const HIDDEN_KEY = "agent-hub-hidden-series";
+const HIDDEN_KEY = "agent-hub-hidden-sessions";
 
-// Toggle state persists across visits. Colors are assigned to containers, not
-// to visible positions, so toggling never repaints the remaining series.
+// Toggle state persists across visits, keyed by "<host>::<sessionId>". Colors are
+// assigned to sessions, not to visible positions, so toggling never repaints the
+// remaining series.
 let hidden = new Set(JSON.parse(localStorage.getItem(HIDDEN_KEY) || "[]"));
 function saveHidden() { localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hidden])); }
 
@@ -161,8 +162,24 @@ function sumDays(list) {
   }
   return out;
 }
-function dateWindow(agents) {
-  const all = agents.flatMap(a => Object.keys(a.usage?.days || {}));
+
+// Flatten hosts → one series per session. Usage lives on each session and
+// persists even when the session is stopped, so no status filtering here.
+function toSeries(agents) {
+  return agents.flatMap(a => (a.sessions || []).map(s => ({
+    skey: a.key + "::" + s.id,
+    device: a.device || "unknown-device",
+    host: a.key,
+    repo: s.repo || "?",
+    id: s.id,
+    rcName: s.rcName,
+    label: (s.repo || "?") + " · " + s.id,
+    usage: s.usage,
+  })));
+}
+
+function dateWindow(series) {
+  const all = series.flatMap(s => Object.keys(s.usage?.days || {}));
   if (!all.length) return [];
   const end = new Date(all.sort().at(-1) + "T00:00:00Z");
   const out = [];
@@ -182,31 +199,31 @@ function niceMax(v) {
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 function shortDate(iso) { return MONTHS[+iso.slice(5, 7) - 1] + " " + +iso.slice(8, 10); }
 
-function assignSlots(agents) {
-  const keys = agents.map(a => a.key).sort();
+// Colors assigned by ordered position (stable across toggles).
+function assignSlots(ordered) {
   const map = new Map();
-  keys.forEach((k, i) => map.set(k, i < SLOTS ? `var(--s${i + 1})` : "var(--muted)"));
+  ordered.forEach((s, i) => map.set(s.skey, i < SLOTS ? `var(--s${i + 1})` : "var(--muted)"));
   return map;
 }
 
 function render(data) {
-  const { agents } = data;
-  if (!agents.length) {
-    $chart.innerHTML = `<div class="empty">No usage reported yet.</div>`;
+  const series = toSeries(data.agents || []);
+  if (!series.length) {
+    $chart.innerHTML = `<div class="empty">No sessions have reported usage yet.</div>`;
     return;
   }
-  const slotOf = assignSlots(agents);
 
-  // Stable order: by device, then container — this is also the stacking order.
+  // Stable order: by device, then repo, then id — this is also the stacking and
+  // color-assignment order.
   const byDevice = new Map();
-  for (const a of [...agents].sort((x, y) =>
-    (x.device + "\x00" + x.key).localeCompare(y.device + "\x00" + y.key))) {
-    const d = a.device || "unknown-device";
-    if (!byDevice.has(d)) byDevice.set(d, []);
-    byDevice.get(d).push(a);
+  for (const s of [...series].sort((x, y) =>
+    (x.device + "\x00" + x.repo + "\x00" + x.id).localeCompare(y.device + "\x00" + y.repo + "\x00" + y.id))) {
+    if (!byDevice.has(s.device)) byDevice.set(s.device, []);
+    byDevice.get(s.device).push(s);
   }
   const ordered = [...byDevice.values()].flat();
-  const visible = ordered.filter(a => !hidden.has(a.key));
+  const slotOf = assignSlots(ordered);
+  const visible = ordered.filter(s => !hidden.has(s.skey));
   const dates = dateWindow(ordered);
 
   $chart.replaceChildren();
@@ -225,8 +242,8 @@ function render(data) {
   $chart.append(card, tableView(visible, dates));
 }
 
-// Legend = filter. Container items toggle one series; the device name toggles
-// all of that device's containers at once.
+// Legend = filter. Session items toggle one series; the device name toggles all
+// of that device's sessions at once.
 function legendEl(byDevice, slotOf) {
   const legend = document.createElement("div");
   legend.className = "legend";
@@ -236,26 +253,27 @@ function legendEl(byDevice, slotOf) {
     const dev = document.createElement("span");
     dev.className = "dev";
     dev.textContent = device;
-    dev.title = "Toggle all containers on " + device;
+    dev.title = "Toggle all sessions on " + device;
     dev.addEventListener("click", () => {
-      const anyVisible = list.some(a => !hidden.has(a.key));
-      for (const a of list) anyVisible ? hidden.add(a.key) : hidden.delete(a.key);
+      const anyVisible = list.some(s => !hidden.has(s.skey));
+      for (const s of list) anyVisible ? hidden.add(s.skey) : hidden.delete(s.skey);
       saveHidden();
       render(cache);
     });
     group.append(dev);
-    for (const a of list) {
+    for (const s of list) {
       const item = document.createElement("span");
-      item.className = "item" + (hidden.has(a.key) ? " off" : "");
+      item.className = "item" + (hidden.has(s.skey) ? " off" : "");
       const sw = document.createElement("span");
       sw.className = "swatch";
-      sw.style.background = slotOf.get(a.key);
+      sw.style.background = slotOf.get(s.skey);
       const label = document.createElement("span");
       label.className = "name";
-      label.textContent = a.key;
+      label.textContent = s.label;
+      label.title = s.rcName || s.label;
       item.append(sw, label);
       item.addEventListener("click", () => {
-        hidden.has(a.key) ? hidden.delete(a.key) : hidden.add(a.key);
+        hidden.has(s.skey) ? hidden.delete(s.skey) : hidden.add(s.skey);
         saveHidden();
         render(cache);
       });
@@ -272,7 +290,7 @@ function buildChart(card, list, dates, slotOf) {
   const ih = CHART_H - PAD.top - PAD.bottom;
   // Scale to the visible series — the filter scopes everything below it.
   const yMax = niceMax(Math.max(0, ...dates.map(d =>
-    sumDays(list.map(a => a.usage?.days?.[d])).cost
+    sumDays(list.map(s => s.usage?.days?.[d])).cost
   )));
   const y = v => PAD.top + ih - (v / yMax) * ih;
   const band = iw / dates.length;
@@ -283,7 +301,7 @@ function buildChart(card, list, dates, slotOf) {
   const svg = document.createElementNS(NS, "svg");
   svg.setAttribute("viewBox", `0 0 ${width} ${CHART_H}`);
   svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", "Daily estimated cost, stacked by container");
+  svg.setAttribute("aria-label", "Daily estimated cost, stacked by session");
 
   const TICKS = 4;
   for (let i = 0; i <= TICKS; i++) {
@@ -320,8 +338,8 @@ function buildChart(card, list, dates, slotOf) {
     const g = document.createElementNS(NS, "g");
     g.setAttribute("class", "day-band");
     const x0 = PAD.left + band * i + (band - barW) / 2;
-    const perAgent = list.map(a => ({ a, d: a.usage?.days?.[date] }));
-    const stack = perAgent.filter(p => p.d && p.d.cost > 0);
+    const perSeries = list.map(s => ({ s, d: s.usage?.days?.[date] }));
+    const stack = perSeries.filter(p => p.d && p.d.cost > 0);
     let cursor = y(0);
     stack.forEach((p, idx) => {
       const hPx = Math.max(1.5, (p.d.cost / yMax) * ih);
@@ -330,7 +348,7 @@ function buildChart(card, list, dates, slotOf) {
       const r = Math.min(4, barW / 2, hPx);
       const seg = document.createElementNS(NS, "path");
       seg.setAttribute("class", "seg");
-      seg.setAttribute("fill", slotOf.get(p.a.key));
+      seg.setAttribute("fill", slotOf.get(p.s.skey));
       seg.setAttribute("d", isTop
         ? `M${x0},${cursor} L${x0},${top + r} Q${x0},${top} ${x0 + r},${top} L${x0 + barW - r},${top} Q${x0 + barW},${top} ${x0 + barW},${top + r} L${x0 + barW},${cursor} Z`
         : `M${x0},${cursor} L${x0},${top} L${x0 + barW},${top} L${x0 + barW},${cursor} Z`);
@@ -347,7 +365,7 @@ function buildChart(card, list, dates, slotOf) {
     hit.setAttribute("tabindex", "0");
     const show = () => {
       g.classList.add("hover");
-      fillTooltip(tooltip, date, perAgent, slotOf);
+      fillTooltip(tooltip, date, perSeries, slotOf);
       tooltip.style.display = "block";
       const cardBox = card.getBoundingClientRect();
       const svgBox = svg.getBoundingClientRect();
@@ -373,27 +391,27 @@ function buildChart(card, list, dates, slotOf) {
 
 // Tooltip: every visible series at that X (device in muted text after the
 // name), total row last. Names inserted via textContent (untrusted data).
-function fillTooltip(tooltip, date, perAgent, slotOf) {
+function fillTooltip(tooltip, date, perSeries, slotOf) {
   tooltip.replaceChildren();
   const dt = document.createElement("div");
   dt.className = "tt-date";
   dt.textContent = shortDate(date) + " (UTC)";
   tooltip.append(dt);
-  for (const { a, d } of perAgent) {
+  for (const { s, d } of perSeries) {
     const row = document.createElement("div");
     row.className = "tt-row";
     const key = document.createElement("span");
     key.className = "tt-key";
-    key.style.background = slotOf.get(a.key);
+    key.style.background = slotOf.get(s.skey);
     const val = document.createElement("span");
     val.className = "tt-val";
     val.textContent = d ? "$" + d.cost.toFixed(2) : "–";
     const name = document.createElement("span");
     name.className = "tt-name";
-    name.textContent = a.key + " ";
+    name.textContent = s.label + " ";
     const dev = document.createElement("span");
     dev.className = "tt-dev";
-    dev.textContent = a.device || "";
+    dev.textContent = s.device || "";
     name.append(dev);
     const tok = document.createElement("span");
     tok.className = "tt-tok";
@@ -401,7 +419,7 @@ function fillTooltip(tooltip, date, perAgent, slotOf) {
     row.append(key, val, name, tok);
     tooltip.append(row);
   }
-  const total = sumDays(perAgent.map(p => p.d));
+  const total = sumDays(perSeries.map(p => p.d));
   const row = document.createElement("div");
   row.className = "tt-row tt-total";
   const key = document.createElement("span");
@@ -436,27 +454,27 @@ function tableView(list, dates) {
   }
 
   const shown = [...dates].reverse().filter(d =>
-    list.some(a => a.usage?.days?.[d])
+    list.some(s => s.usage?.days?.[d])
   );
-  const head = list.map(a =>
-    `<th>${esc(a.key)}<span class="sub">${esc(a.device || "")} · ${esc(a.git?.repoName || "")}</span></th>`
+  const head = list.map(s =>
+    `<th>${esc(s.label)}<span class="sub">${esc(s.device || "")}</span></th>`
   ).join("");
   const cell = d => (!d || (!d.cost && !dayTokens(d)))
     ? `<td class="zero">–</td>`
     : `<td><span class="cost">$${d.cost.toFixed(2)}</span><span class="tok">${fmtTokens(dayTokens(d))} tok</span></td>`;
   const rows = shown.map(date => {
-    const total = sumDays(list.map(a => a.usage?.days?.[date]));
-    return `<tr><td>${esc(date)}</td>${list.map(a => cell(a.usage?.days?.[date])).join("")}<td class="total-col">${
+    const total = sumDays(list.map(s => s.usage?.days?.[date]));
+    return `<tr><td>${esc(date)}</td>${list.map(s => cell(s.usage?.days?.[date])).join("")}<td class="total-col">${
       total.cost || dayTokens(total)
         ? `<span class="cost">$${total.cost.toFixed(2)}</span><span class="tok">${fmtTokens(dayTokens(total))} tok</span>`
         : "–"
     }</td></tr>`;
   }).join("");
-  const allTime = list.map(a => {
-    const t = a.usage?.totals;
+  const allTime = list.map(s => {
+    const t = s.usage?.totals;
     return `<td>${t ? `$${t.cost.toFixed(2)}<span class="tok">${fmtTokens(dayTokens(t))} tok</span>` : "–"}</td>`;
   }).join("");
-  const allTotal = sumDays(list.map(a => a.usage?.totals));
+  const allTotal = sumDays(list.map(s => s.usage?.totals));
 
   const scroll = document.createElement("div");
   scroll.className = "table-scroll";
