@@ -46,6 +46,9 @@ jobs:
           scanners: vuln,secret
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          # Reviewed, non-actionable base-image CVEs live here; anything else
+          # HIGH/CRITICAL still fails the gate.
+          trivyignores: .trivyignore
           exit-code: "1"
           format: sarif
           output: trivy-agent-hub.sarif

@@ -1,9 +1,10 @@
 FROM node:22-bookworm-slim
 
-# Static Docker CLI only (no daemon) — bump as needed.
-ARG DOCKER_CLI_VERSION=27.5.1
+# Static Docker CLI only (no daemon) — bump as needed (kept current so the
+# bundled Go stdlib stays ahead of known CVEs; the image scan gates on this).
+ARG DOCKER_CLI_VERSION=29.6.1
 # GitHub CLI — used by Claude for PRs/issues and as git's credential helper.
-ARG GH_VERSION=2.88.1
+ARG GH_VERSION=2.96.0
 # ttyd — serves the in-container tmux session (the live Claude TUI) over the web
 # so the Agent Hub can attach to it. Static single-file binary.
 ARG TTYD_VERSION=1.7.7
