@@ -150,6 +150,19 @@
   button.btn-sm { padding: 4px 10px; font-size: 12px; }
   button:disabled { opacity: 0.5; cursor: default; }
 
+  /* Pending-action feedback: a spinner + busy label shown from the moment a
+     command is queued until the polled state reflects it, so a click never
+     looks inert (and can't be fired twice into a duplicate session). */
+  .spin {
+    width: 11px; height: 11px; flex: none; display: inline-block;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; vertical-align: -1px; animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  button:disabled .spin { border-top-color: var(--ink-2); }
+  .sess.ghost { align-items: center; justify-content: center; min-height: 118px; opacity: 0.8; }
+  .sess.ghost .busy { display: flex; align-items: center; gap: 8px; color: var(--ink-2); font-size: 13px; }
+
   .empty { color: var(--muted); text-align: center; padding: 64px 0; border: 1px dashed var(--hairline); border-radius: 10px; }
   .footer { color: var(--muted); font-size: 12px; margin-top: 28px; }
 
@@ -186,7 +199,7 @@
 
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
-  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions; killing a session keeps its branch and usage history. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name.</div>
+  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. Kill stops a session but keeps its branch and usage history so Start can resume it; Delete removes it entirely (worktree, branch, history) in one step. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name.</div>
 </div>
 
 <div class="term-overlay" id="termOverlay">
@@ -217,6 +230,57 @@ const openLogs = new Set();
 const collapsedRepos = new Set();
 function logToggle(key, open) { open ? openLogs.add(key) : openLogs.delete(key); }
 function repoToggle(rkey, open) { open ? collapsedRepos.delete(rkey) : collapsedRepos.add(rkey); }
+
+// Optimistic pending-action feedback. Session commands (spawn/kill/start/
+// restart/delete) are QUEUED on the hub and only take effect on the next agent
+// heartbeat a few seconds later, so without this a click looks like it did
+// nothing — and users re-click, spawning duplicate sessions. Each entry
+// disables its trigger and shows a busy state until the polled data reflects
+// the change (reconcilePending), with a timeout so a failed command can't wedge
+// a button forever. Keyed so it survives the 5s re-render.
+//   spawn:   "spawn::<host>::<repo>"    cleared when the repo's session count rises
+//   kill:    "kill::<host>::<id>"       cleared when the session leaves "running"
+//   start:   "start::<host>::<id>"      cleared when the session enters "running"
+//   delete:  "delete::<host>::<id>"     cleared when the session disappears
+//   restart: "restart::<host>::<id>"    no observable signal — cleared by timeout
+const pending = new Map();
+const PENDING_TTL_MS = 45000;
+const RESTART_TTL_MS = 15000;
+function pendKey(kind, host, x) { return kind + "::" + host + "::" + x; }
+function setPending(key, val) { pending.set(key, { ...val, at: Date.now() }); }
+function sessPending(host, id) {
+  for (const kind of ["kill", "delete", "start", "restart"]) {
+    if (pending.has(pendKey(kind, host, id))) return kind;
+  }
+  return null;
+}
+// Clear pending entries whose effect is now visible (or that timed out), so
+// buttons re-enable exactly when the change lands.
+function reconcilePending(agents) {
+  const t = Date.now();
+  const counts = new Map(); // "host::repo" -> live session count
+  const index = new Map();  // "host::id"   -> session
+  for (const a of agents) for (const s of (a.sessions || [])) {
+    const rk = a.key + "::" + s.repo;
+    counts.set(rk, (counts.get(rk) || 0) + 1);
+    index.set(a.key + "::" + s.id, s);
+  }
+  for (const [key, p] of pending) {
+    if (t - p.at > (p.kind === "restart" ? RESTART_TTL_MS : PENDING_TTL_MS)) { pending.delete(key); continue; }
+    if (p.kind === "spawn") {
+      if ((counts.get(p.host + "::" + p.repo) || 0) > p.baseline) pending.delete(key);
+    } else {
+      const s = index.get(p.host + "::" + p.id);
+      if (p.kind === "kill" && (!s || s.status !== "running")) pending.delete(key);
+      else if (p.kind === "delete" && !s) pending.delete(key);
+      else if (p.kind === "start" && s && s.status === "running") pending.delete(key);
+      // restart keeps the session "running" with no distinct signal → timeout.
+    }
+  }
+}
+function ghostCard() {
+  return `<div class="sess ghost"><div class="busy"><span class="spin"></span> Starting a new session…</div></div>`;
+}
 
 function fmtTokens(n) {
   if (n == null) return "–";
@@ -309,6 +373,7 @@ function tile(label, value, hint) {
 
 function render(data) {
   const { now, agents } = data;
+  reconcilePending(agents);
   $refreshed.textContent = "updated " + new Date(now).toLocaleTimeString();
 
   // Aggregate across every session on every host.
@@ -411,11 +476,13 @@ function repoBlock(a, repo, sessList, now) {
     ? `<span class="r-meta">repo not currently found · usage retained</span>`
     : `<span class="r-meta"><b>${esc(repo.branch || "–")}</b>${repo.dirtyFiles ? ` · ${repo.dirtyFiles} dirty` : " · clean"}</span>`;
   const canSpawn = a.online && !repo.missing;
+  const spawning = pending.has(pendKey("spawn", a.key, repo.name));
   const spawnBtn = canSpawn
-    ? `<button class="primary btn-sm" onclick="event.preventDefault();event.stopPropagation();newSession('${esc(a.key)}','${esc(repo.name)}')">+ New session</button>`
+    ? `<button class="primary btn-sm" ${spawning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();newSession('${esc(a.key)}','${esc(repo.name)}')">${spawning ? '<span class="spin"></span> Starting…' : "+ New session"}</button>`
     : "";
-  const body = sessList.length
-    ? `<div class="sess-grid">${sessList.map(s => sessCard(a, s, now)).join("")}</div>`
+  const ghost = spawning ? ghostCard() : "";
+  const body = (sessList.length || spawning)
+    ? `<div class="sess-grid">${ghost}${sessList.map(s => sessCard(a, s, now)).join("")}</div>`
     : `<div class="repo-empty">No sessions yet${canSpawn ? " — start one with “+ New session”." : "."}</div>`;
 
   return `<details class="repo" ${collapsed ? "" : "open"} ontoggle="repoToggle('${esc(rkey)}', this.open)">
@@ -439,14 +506,23 @@ function sessCard(a, s, now) {
   const dKey = "sd::" + a.key + "::" + s.id;
   const id = esc(s.id), key = esc(a.key);
 
+  const sp = sessPending(a.key, s.id);
   let actions = "";
-  if (st === "running") {
+  if (sp) {
+    // A command is in flight for this session — show a single busy control and
+    // disable the rest until the polled state reflects it.
+    const label = { kill: "Killing…", start: "Starting…", restart: "Restarting…", delete: "Deleting…" }[sp];
+    actions = `<button class="btn-sm" disabled><span class="spin"></span> ${label}</button>`;
+  } else if (st === "running") {
     actions =
       (canAttach
         ? `<button class="primary btn-sm" onclick="openTerminal('${id}')">Attach ▸</button>`
         : `<button class="btn-sm" disabled title="Terminal tunnel offline">Attach</button>`) +
       `<button class="btn-sm ${confirming.has(rKey) ? "confirm" : ""}" onclick="sessRestart('${key}','${id}')">${confirming.has(rKey) ? "Confirm restart" : "Restart"}</button>` +
-      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? "Confirm kill" : "Kill"}</button>`;
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? "Confirm kill" : "Kill"}</button>` +
+      // Delete straight from running: one step, fully gone (worktree + branch +
+      // history). Kill (above) is the softer "stop but keep, resumable" option.
+      `<button class="btn-sm ${confirming.has(dKey) ? "confirm" : ""}" onclick="sessDelete('${key}','${id}')">${confirming.has(dKey) ? "Confirm delete" : "Delete"}</button>`;
   } else {
     // stopped or error: offer Start (needs host online + worktree recoverable) + Delete.
     actions =
@@ -511,11 +587,40 @@ function twoClick(actionKey, doIt) {
 
 function hostRestart(key) { twoClick("hr::" + key, () => post(`/api/agents/${enc(key)}/restart`)); }
 function removeHost(key)  { del(`/api/agents/${enc(key)}`); }
-function newSession(key, repo) { post(`/api/agents/${enc(key)}/sessions`, { repo }); }
-function sessStart(key, id)   { post(`/api/agents/${enc(key)}/sessions/${enc(id)}/start`); }
-function sessRestart(key, id) { twoClick("sr::" + key + "::" + id, () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/restart`)); }
-function sessKill(key, id)    { twoClick("sk::" + key + "::" + id, () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`)); }
-function sessDelete(key, id)  { twoClick("sd::" + key + "::" + id, () => del(`/api/agents/${enc(key)}/sessions/${enc(id)}`)); }
+
+// Mark an action pending and re-render immediately (instant feedback), then fire
+// it. `busy` de-dupes so a queued command can't be double-sent from the same
+// button before the next poll clears it.
+function busy(key, val, run) {
+  if (pending.has(key)) return;
+  setPending(key, val);
+  render(cache);
+  run();
+}
+function newSession(key, repo) {
+  const host = (cache.agents || []).find(a => a.key === key);
+  const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
+  busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
+    () => post(`/api/agents/${enc(key)}/sessions`, { repo }));
+}
+function sessStart(key, id) {
+  busy(pendKey("start", key, id), { kind: "start", host: key, id },
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/start`));
+}
+// The destructive three still arm/confirm first; the pending state begins only
+// once confirmed (inside doIt), so it reflects a real in-flight command.
+function sessRestart(key, id) {
+  twoClick("sr::" + key + "::" + id, () => busy(pendKey("restart", key, id), { kind: "restart", host: key, id },
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/restart`)));
+}
+function sessKill(key, id) {
+  twoClick("sk::" + key + "::" + id, () => busy(pendKey("kill", key, id), { kind: "kill", host: key, id },
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`)));
+}
+function sessDelete(key, id) {
+  twoClick("sd::" + key + "::" + id, () => busy(pendKey("delete", key, id), { kind: "delete", host: key, id },
+    () => del(`/api/agents/${enc(key)}/sessions/${enc(id)}`)));
+}
 
 // ---- live terminal overlay (per session) -----------------------------------
 // Opens /term/<sessionId>/ in a full-screen iframe. No extra secret: the browser
