@@ -114,8 +114,19 @@ tmux new-session -d -s agent -x 220 -y 50 "$AGENT_CMD"
 # keyed off the same agent token everything else uses (the hub injects
 # "term:$HUB_AGENT_TOKEN" on proxied requests — see agent-hub/server.js).
 # Backgrounded — the crash-parity waiter below is the container's foreground.
+#
+# The -t client options tune the xterm.js frontend for the TUI: 'JBMNerd' is the
+# bundled JetBrains Mono Nerd Font the hub injects into ttyd's page (see
+# agent-hub/server.js) so glyphs/icons render on any viewer; the fallbacks cover
+# it if the font hasn't loaded. canvas renderer keeps spinner/animation redraws
+# smooth, and disableLeaveAlert stops the browser "leave site?" prompt inside the
+# hub iframe.
 echo "Serving live session via ttyd on 127.0.0.1:7681 (base /term/$CN)..."
 ttyd -p 7681 -i 127.0.0.1 -b "/term/$CN" -W -m 8 \
+  -t 'fontFamily=JBMNerd, "JetBrainsMono Nerd Font Mono", "DejaVu Sans Mono", monospace' \
+  -t fontSize=14 \
+  -t rendererType=canvas \
+  -t disableLeaveAlert=true \
   -c "term:${HUB_TOKEN:-changeme}" \
   tmux attach -t agent &
 

@@ -287,6 +287,16 @@ setInterval(() => {
 
 const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
 const HISTORY = fs.readFileSync(path.join(__dirname, "public", "history.html"));
+// Bundled web font served to the live terminal. ttyd's page is same-origin
+// (proxied under /term/<name>/), so its xterm.js can load this from the hub;
+// proxyTerm() injects the matching @font-face. A Nerd Font gives the TUI full
+// Unicode + icon coverage regardless of what fonts the viewer's machine has.
+const TERM_FONT = fs.readFileSync(path.join(__dirname, "public", "jbm-nerd-mono.woff2"));
+// <style> injected into ttyd's HTML document defining that font as 'JBMNerd' —
+// the family name the agent points ttyd's fontFamily at (see agent/entrypoint.sh).
+const TERM_FONT_STYLE =
+  "<style>@font-face{font-family:'JBMNerd';" +
+  "src:url('/term-font.woff2') format('woff2');font-display:swap;}</style>";
 
 // ---- minimal WebSocket server framing (RFC 6455) ----------------------------
 // We only need enough to carry an opaque byte stream (the agent's ttyd TCP
@@ -426,9 +436,42 @@ async function proxyTerm(req, res, name) {
     return res.end(`terminal offline: ${e.message}`);
   }
   const headers = { ...req.headers, host: "ttyd", authorization: TTYD_AUTH, connection: "close" };
+  // We rewrite ttyd's HTML document to inject the terminal web font, so ask for
+  // it uncompressed (small file; avoids having to gunzip before injecting).
+  delete headers["accept-encoding"];
   const up = http.request(
     { createConnection: () => channel, method: req.method, path: req.url, headers },
     (upRes) => {
+      // Only the top-level HTML document is buffered + rewritten; every other
+      // asset (JS, token, favicon) streams straight through as before.
+      const ctype = upRes.headers["content-type"] || "";
+      if (req.method === "GET" && ctype.includes("text/html")) {
+        const chunks = [];
+        upRes.on("data", (c) => chunks.push(c));
+        upRes.on("end", () => {
+          let html = Buffer.concat(chunks).toString("utf8");
+          // Insert the @font-face before </head> (fall back to prepending).
+          html = html.includes("</head>")
+            ? html.replace("</head>", TERM_FONT_STYLE + "</head>")
+            : TERM_FONT_STYLE + html;
+          const body = Buffer.from(html, "utf8");
+          const h = { ...upRes.headers };
+          // Content changed; drop framing headers and any CSP that would block
+          // an inline <style>/font (the hub is the single-user trust boundary).
+          delete h["content-length"];
+          delete h["transfer-encoding"];
+          delete h["content-security-policy"];
+          delete h["content-encoding"];
+          h["content-length"] = Buffer.byteLength(body);
+          res.writeHead(upRes.statusCode, h);
+          res.end(body);
+        });
+        upRes.on("error", () => {
+          if (!res.headersSent) res.writeHead(502, { "Content-Type": "text/plain" });
+          res.end("terminal error");
+        });
+        return;
+      }
       res.writeHead(upRes.statusCode, upRes.headers);
       upRes.pipe(res);
     }
@@ -474,6 +517,17 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && (url.pathname === "/history" || url.pathname === "/history.html")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       return res.end(HISTORY);
+    }
+
+    // Web font for the live terminal (referenced by the @font-face proxyTerm
+    // injects into ttyd's page). Immutable + long-lived so the browser fetches
+    // the ~1 MB file once and caches it.
+    if (req.method === "GET" && url.pathname === "/term-font.woff2") {
+      res.writeHead(200, {
+        "Content-Type": "font/woff2",
+        "Cache-Control": "public, max-age=31536000, immutable",
+      });
+      return res.end(TERM_FONT);
     }
 
     if (req.method === "GET" && url.pathname === "/api/agents") {
