@@ -625,6 +625,49 @@ test("http: session commands 404 for unknown hosts", async () => {
   assert.equal(res.status, 404);
 });
 
+test("http: voice input queues an input command; blank/oversized rejected", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ containerName: "hi" });
+
+  const ok = await request("POST", "/api/agents/hi/sessions/ab123/input", {
+    body: { text: "yes use the first option" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+
+  // Whitespace-only and over-4000-char inputs are refused before queueing.
+  const blank = await request("POST", "/api/agents/hi/sessions/ab123/input", {
+    body: { text: "   " }, headers: userHeaders,
+  });
+  assert.equal(blank.status, 400);
+  const huge = await request("POST", "/api/agents/hi/sessions/ab123/input", {
+    body: { text: "x".repeat(4001) }, headers: userHeaders,
+  });
+  assert.equal(huge.status, 400);
+
+  const res = await beat({ containerName: "hi" });
+  assert.deepEqual(res.body.commands, [
+    { type: "input", sessionId: "ab123", text: "yes use the first option", cmdId: ok.body.cmdId },
+  ]);
+});
+
+test("http: CORS preflight is answered credential-less; API echoes the origin", async () => {
+  // Preflight (no auth header) must succeed so the glasses WebView can call in.
+  const pre = await request("OPTIONS", "/api/agents", {
+    headers: { origin: "https://app.example", "access-control-request-method": "GET" },
+  });
+  assert.equal(pre.status, 204);
+  assert.equal(pre.headers["access-control-allow-origin"], "https://app.example");
+  assert.ok(/authorization/i.test(pre.headers["access-control-allow-headers"]));
+
+  // A real authorized call carries the CORS origin header on its response.
+  const res = await request("GET", "/api/agents", {
+    headers: { ...userHeaders, origin: "https://app.example" },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers["access-control-allow-origin"], "https://app.example");
+});
+
 test("findSession routes a sessionId to its host and ttyd port", async () => {
   await request("POST", "/api/heartbeat", {
     body: {

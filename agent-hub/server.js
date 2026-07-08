@@ -608,6 +608,28 @@ const server = http.createServer(async (req, res) => {
   const parts = url.pathname.split("/").filter(Boolean); // e.g. api/agents/<id>/restart
 
   try {
+    // CORS for the Even Realities G2 glasses app: it's a WebView web app served
+    // from another origin, so browser fetches to the hub API are cross-origin.
+    // Auth (Basic/bearer) is still enforced below — CORS only lets the browser
+    // READ an already-authorized response. The Authorization header makes every
+    // call a non-simple request, so we must answer the credential-less OPTIONS
+    // preflight before the auth gate. Origin is reflected (personal single-user
+    // hub) so credentialed requests are allowed too.
+    if (parts[0] === "api" || parts[0] === "term") {
+      const origin = req.headers.origin;
+      if (origin) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Vary", "Origin");
+        res.setHeader("Access-Control-Allow-Credentials", "true");
+        res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+      }
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        return res.end();
+      }
+    }
+
     // Unauthenticated liveness probe for the Docker healthcheck (everything
     // informative sits behind auth; this leaks nothing). Without it the
     // healthcheck 401s and autoheal restart-loops the container.
@@ -787,6 +809,18 @@ const server = http.createServer(async (req, res) => {
       if (req.method === "POST" && parts.length === 6 &&
           (parts[5] === "kill" || parts[5] === "start" || parts[5] === "restart" || parts[5] === "resume")) {
         const cmdId = queueCommand(key, { type: parts[5], sessionId });
+        return json(res, 200, { ok: true, cmdId });
+      }
+      // POST /api/agents/<host>/sessions/<id>/input  Body: {text}
+      // Voice-dictated (or typed) input from a small-screen client; queued as
+      // an `input` command the agent types into that session's tmux. The agent
+      // caps/flattens the text again before it reaches send-keys.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "input") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const text = typeof body.text === "string" ? body.text : "";
+        if (!text.trim()) return json(res, 400, { error: "text required" });
+        if (text.length > 4000) return json(res, 400, { error: "text too long" });
+        const cmdId = queueCommand(key, { type: "input", sessionId, text });
         return json(res, 200, { ok: true, cmdId });
       }
       // DELETE /api/agents/<host>/sessions/<id>

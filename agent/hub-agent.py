@@ -89,6 +89,18 @@ TRASH_PRUNE_EVERY = 180
 
 # Transcript parsing is the expensive part; refresh it every N heartbeats.
 USAGE_EVERY = 15
+
+# Readable transcript tail for small-screen clients. The Even Realities G2
+# glasses app (and any client that can't render the ttyd TUI) reads a compact,
+# plain-text tail of each running session's newest transcript straight off the
+# heartbeat: the last few conversation turns, ANSI-stripped and per-message
+# truncated so it never balloons the beat. Voice-dictated replies come back as
+# an `input` command that is typed into the session's tmux (capped first).
+TAIL_MSGS = int(os.environ.get("SESSION_TAIL_MSGS", "8"))
+TAIL_MSG_CHARS = int(os.environ.get("SESSION_TAIL_MSG_CHARS", "500"))
+INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "4000"))
+# Escape/control sequences that would be noise (or worse) on the glasses.
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # Small pause after launching a Claude session. The whole host shares ONE
 # ~/.claude login + .claude.json, so several RC sessions coming up at the exact
 # same instant contend on that shared state; staggering reduces the contention.
@@ -511,6 +523,64 @@ def _last_entry(path):
     return None
 
 
+def _tail_entries(path, max_bytes=131072):
+    """Parsed JSON lines from the tail of a transcript JSONL, oldest→newest.
+    Bounded to the last max_bytes so sampling a huge transcript stays cheap."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.fstat(f.fileno()).st_size - max_bytes))
+            lines = f.read().split(b"\n")
+    except OSError:
+        return []
+    out = []
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            out.append(json.loads(raw))
+        except ValueError:
+            continue  # seek-point fragment or an in-flight write
+    return out
+
+
+def _entry_text(entry):
+    """Readable one-line-per-role text for a transcript entry, or '' to skip it.
+    Assistant/user prose is kept verbatim; a tool call collapses to a short
+    [Name] marker; reasoning and raw tool results are dropped — none of that
+    reads on a five-line screen."""
+    if entry.get("type") not in ("user", "assistant"):
+        return ""
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return ANSI_RE.sub("", content).strip()
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            parts.append(str(block.get("text") or ""))
+        elif btype == "tool_use":
+            parts.append(f"[{block.get('name') or 'tool'}]")
+        # thinking / tool_result: intentionally omitted.
+    return ANSI_RE.sub("", " ".join(p for p in parts if p)).strip()
+
+
+def transcript_tail(path):
+    """Compact plain-text tail of a transcript for small-screen clients: the
+    last TAIL_MSGS non-empty messages as {role, text}, each truncated to
+    TAIL_MSG_CHARS. Empty when the transcript holds nothing readable yet."""
+    tail = []
+    for entry in _tail_entries(path):
+        text = _entry_text(entry)
+        if text:
+            tail.append({"role": entry.get("type"), "text": text[:TAIL_MSG_CHARS]})
+    return tail[-TAIL_MSGS:]
+
+
 def session_report(workdir, state):
     """Cheap per-heartbeat session signals (stat + tail reads, no full parse).
 
@@ -530,6 +600,7 @@ def session_report(workdir, state):
         "lastRole": None,          # "assistant"/"user"/... of the newest entry
         "lastHasToolUse": False,
         "question": None,          # pending AskUserQuestion text, if any
+        "tail": [],                # readable {role,text} tail for small screens
         "prUrls": [],              # PR links newly appended since last beat
     }
 
@@ -569,6 +640,10 @@ def session_report(workdir, state):
                     qs = (block.get("input") or {}).get("questions") or []
                     if qs and isinstance(qs[0], dict):
                         report["question"] = str(qs[0].get("question") or "")[:300] or None
+
+    # Plain-text conversation tail so small-screen clients (the G2 glasses) can
+    # read the session without the ttyd TUI. Bounded by TAIL_MSGS/TAIL_MSG_CHARS.
+    report["tail"] = transcript_tail(newest)
 
     # Incremental PR-URL scan over bytes appended to the active transcript.
     try:
@@ -1113,6 +1188,27 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
+    def send_input(self, sid, text):
+        """Type dictated text into a running session's Claude, then submit — the
+        input path for small-screen clients (the G2 glasses) that can't drive
+        the ttyd terminal. tmux send-keys `-l` sends the text literally, and the
+        list-form argv keeps it out of any shell; newlines are flattened so the
+        trailing Enter is the only thing that submits the prompt."""
+        sess = self._find(sid)
+        if not sess:
+            log(f"input: no such session {sid}")
+            return
+        if sess.get("status") != "running":
+            log(f"input: session {sid} not running")
+            return
+        text = str(text or "")[:INPUT_MAX_CHARS].replace("\r", " ").replace("\n", " ")
+        if not text.strip():
+            log(f"input: empty text for {sid}")
+            return
+        run(["tmux", "send-keys", "-t", sess["tmuxName"], "-l", text])
+        run(["tmux", "send-keys", "-t", sess["tmuxName"], "Enter"])
+        log(f"input delivered to {sid} ({len(text)} chars)")
+
     def _retire_branch(self, sess):
         """Lost-work guard behind delete(): `branch -D` the session branch only
         when its commits are provably safe (all on origin, or all contained in
@@ -1226,6 +1322,8 @@ class SessionManager:
                     self.resume(cmd.get("sessionId"))
                 elif ctype == "delete":
                     self.delete(cmd.get("sessionId"))
+                elif ctype == "input":
+                    self.send_input(cmd.get("sessionId"), cmd.get("text"))
                 else:
                     log(f"unknown command type {ctype!r} (cmdId {cid})")
             except Exception as e:

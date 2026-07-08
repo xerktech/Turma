@@ -320,6 +320,38 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, {})
         self.assertTrue(rep["bridgeAttached"])
 
+    def test_tail_is_readable_conversation(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [
+            {"type": "user", "message": {"content": "please fix the build"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "thinking", "text": "hidden reasoning"},
+                {"type": "text", "text": "Looking into it."},
+                {"type": "tool_use", "name": "Bash", "input": {}},
+            ]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "content": "lots of noisy output"},
+            ]}},
+        ])
+        rep = ha.session_report(self.WORKDIR, {})
+        # Reasoning and raw tool results are dropped; the tool-result-only user
+        # turn collapses to nothing and is skipped entirely.
+        self.assertEqual(rep["tail"], [
+            {"role": "user", "text": "please fix the build"},
+            {"role": "assistant", "text": "Looking into it. [Bash]"},
+        ])
+
+    def test_tail_bounds_count_and_length(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text(f"msg {i} " + "x" * 800)
+                           for i in range(ha.TAIL_MSGS + 5)])
+        rep = ha.session_report(self.WORKDIR, {})
+        self.assertEqual(len(rep["tail"]), ha.TAIL_MSGS)          # last N only
+        self.assertTrue(all(len(m["text"]) <= ha.TAIL_MSG_CHARS   # per-msg cap
+                            for m in rep["tail"]))
+        self.assertTrue(rep["tail"][-1]["text"].startswith(       # newest last
+            f"msg {ha.TAIL_MSGS + 4} "))
+
 
 class ManagerMixin:
     """SessionManager with subprocess chokepoints faked and a temp registry."""
@@ -480,6 +512,33 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         self.assertFalse(sm.handle_commands([]))
         self.assertFalse(sm.handle_commands(None))
         sm.save.assert_not_called()
+
+    def test_input_command_types_into_tmux(self):
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        sm.registry = [{"id": "ab123", "status": "running", "tmuxName": "agent-ab123"}]
+        sm.handle_commands([{
+            "cmdId": "i1", "type": "input", "sessionId": "ab123",
+            "text": "yes, use\nthe first option",
+        }])
+        # Literal text (newlines flattened) then a separate Enter to submit.
+        self.assertIn(
+            ["tmux", "send-keys", "-t", "agent-ab123", "-l", "yes, use the first option"],
+            self.run_calls)
+        self.assertIn(["tmux", "send-keys", "-t", "agent-ab123", "Enter"], self.run_calls)
+        self.assertEqual(sm.acked, {"i1"})
+
+    def test_input_ignored_for_absent_or_stopped_session(self):
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        sm.registry = [{"id": "ab123", "status": "stopped", "tmuxName": "agent-ab123"}]
+        sm.handle_commands([
+            {"cmdId": "i2", "type": "input", "sessionId": "ab123", "text": "hi"},
+            {"cmdId": "i3", "type": "input", "sessionId": "nope", "text": "hi"},
+            {"cmdId": "i4", "type": "input", "sessionId": "ab123", "text": "   "},
+        ])
+        self.assertFalse(any(c[:2] == ["tmux", "send-keys"] for c in self.run_calls))
+        self.assertEqual(sm.acked, {"i2", "i3", "i4"})  # still acked, no retries
 
 
 class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
