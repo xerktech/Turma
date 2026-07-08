@@ -95,6 +95,17 @@
   .repo-head .spacer { flex: 1; }
   .repo-empty { color: var(--muted); font-size: 12px; margin-top: 8px; }
 
+  /* Per-repo picker of recently killed sessions that can be resumed. */
+  .resume-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+  .resume-item {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    background: var(--page); border: 1px dashed var(--border); border-radius: 8px;
+    padding: 8px 12px; font-size: 12.5px; color: var(--ink-2);
+  }
+  .resume-item .sid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; font-size: 13px; color: var(--ink); }
+  .resume-item b { color: var(--ink); font-weight: 600; }
+  .resume-item .spacer { flex: 1; }
+
   .sess-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; margin-top: 10px; }
   .sess {
     background: var(--page); border: 1px solid var(--border); border-radius: 8px;
@@ -222,7 +233,7 @@
 
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
-  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. Kill stops a session and removes it from the hub (worktree deleted) in one step, but keeps its git branch and usage history — the work stays in the repo, it just leaves the dashboard. Delete (on an already-stopped session) additionally erases the branch and history. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name.</div>
+  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. Kill stops a session and removes it from the hub (worktree deleted) in one step, but keeps its git branch, conversation, and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and brings one back on the same branch with its conversation intact. Delete (on an already-stopped session) additionally erases the branch and history. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation.</div>
 </div>
 
 <div class="term-overlay" id="termOverlay">
@@ -248,11 +259,18 @@ const $refreshed = document.getElementById("refreshed");
 // - openLogs: host keys whose container-log <details> is open
 // - collapsedRepos: "host::repo" whose repo <details> the user collapsed
 //   (repos default OPEN, so we only remember the closed ones)
+// - resumeOpen: "host::repo" whose recently-killed-sessions picker is open
 const confirming = new Map();
 const openLogs = new Set();
 const collapsedRepos = new Set();
+const resumeOpen = new Set();
 function logToggle(key, open) { open ? openLogs.add(key) : openLogs.delete(key); }
 function repoToggle(rkey, open) { open ? collapsedRepos.delete(rkey) : collapsedRepos.add(rkey); }
+function toggleResume(rkey) {
+  if (resumeOpen.has(rkey)) resumeOpen.delete(rkey);
+  else { resumeOpen.add(rkey); collapsedRepos.delete(rkey); } // panel lives in the repo body
+  render(cache);
+}
 
 // Optimistic pending-action feedback. Session commands (spawn/kill/start/
 // restart/delete) are QUEUED on the hub and only take effect on the next agent
@@ -264,6 +282,7 @@ function repoToggle(rkey, open) { open ? collapsedRepos.delete(rkey) : collapsed
 //   spawn:   "spawn::<host>::<repo>"    cleared when the repo's session count rises
 //   kill:    "kill::<host>::<id>"       cleared when the session disappears
 //   start:   "start::<host>::<id>"      cleared when the session enters "running"
+//   resume:  "resume::<host>::<id>"     cleared when the session reappears
 //   delete:  "delete::<host>::<id>"     cleared when the session disappears
 //   restart: "restart::<host>::<id>"    no observable signal — cleared by timeout
 const pending = new Map();
@@ -299,6 +318,9 @@ function reconcilePending(agents) {
       if (p.kind === "kill" && !s) pending.delete(key);
       else if (p.kind === "delete" && !s) pending.delete(key);
       else if (p.kind === "start" && s && s.status === "running") pending.delete(key);
+      // resume re-registers a killed session, so it's done once the id is
+      // reported again (even as "error" — the card then shows what went wrong).
+      else if (p.kind === "resume" && s) pending.delete(key);
       // restart keeps the session "running" with no distinct signal → timeout.
     }
   }
@@ -510,13 +532,40 @@ function repoBlock(a, repo, sessList, now) {
     ? `<div class="sess-grid">${ghost}${sessList.map(s => sessCard(a, s, now)).join("")}</div>`
     : `<div class="repo-empty">No sessions yet${canSpawn ? " — start one with “+ New session”." : "."}</div>`;
 
+  // Recently killed sessions of this repo that can be brought back with their
+  // conversation (kill keeps the branch + transcript). The agent already caps
+  // the history at 5 per repo; sort newest-first and slice defensively so the
+  // picker can never grow unbounded.
+  const closed = (a.closedSessions || [])
+    .filter(c => c.repo === repo.name)
+    .sort((x, y) => String(y.closedAt || "").localeCompare(String(x.closedAt || "")))
+    .slice(0, 5);
+  const canResume = a.online && !repo.missing && closed.length > 0;
+  const resumeBtn = canResume
+    ? `<button class="btn-sm" onclick="event.preventDefault();event.stopPropagation();toggleResume('${esc(rkey)}')">${resumeOpen.has(rkey) ? "Resume ▴" : "Resume ▾"}</button>`
+    : "";
+  const resumePanel = canResume && resumeOpen.has(rkey)
+    ? `<div class="resume-list">${closed.map(c => {
+        const rp = pending.has(pendKey("resume", a.key, c.id));
+        return `<div class="resume-item">
+          <span class="sid">${esc(c.id)}</span>
+          <span><b>${esc(c.branch || "–")}</b> · killed ${c.closedAt ? esc(ago(now - Date.parse(c.closedAt))) : "–"}</span>
+          <span>${esc(c.rcName || "")}</span>
+          <span class="spacer"></span>
+          <button class="primary btn-sm" ${rp ? "disabled" : ""} onclick="resumeSession('${esc(a.key)}','${esc(c.id)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume"}</button>
+        </div>`;
+      }).join("")}</div>`
+    : "";
+
   return `<details class="repo" ${collapsed ? "" : "open"} ontoggle="repoToggle('${esc(rkey)}', this.open)">
     <summary class="repo-head">
       <span class="r-name">${repoLink(repo.remote, repo.name)}</span>
       ${meta}
       <span class="spacer"></span>
+      ${resumeBtn}
       ${spawnBtn}
     </summary>
+    ${resumePanel}
     ${body}
   </details>`;
 }
@@ -632,6 +681,12 @@ function newSession(key, repo) {
 function sessStart(key, id) {
   busy(pendKey("start", key, id), { kind: "start", host: key, id },
     () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/start`));
+}
+// Bring back a KILLED session (from the repo's Resume picker) on its kept
+// branch with its prior conversation. Not destructive, so no arm/confirm.
+function resumeSession(key, id) {
+  busy(pendKey("resume", key, id), { kind: "resume", host: key, id },
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/resume`));
 }
 // The destructive three still arm/confirm first; the pending state begins only
 // once confirmed (inside doIt), so it reflects a real in-flight command.
