@@ -59,7 +59,7 @@ RUN apt-get update \
 RUN git config --system credential.helper '!gh auth git-credential'
 
 LABEL org.opencontainers.image.source="https://github.com/xerktech/DockerOps" \
-      org.opencontainers.image.description="Headless Claude Code (Remote Control) for DockerOps"
+      org.opencontainers.image.description="Headless Claude Code host multiplexer (worktree-backed Remote Control sessions) for the Agent Hub"
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY hub-agent.py /usr/local/bin/hub-agent.py
@@ -67,7 +67,17 @@ COPY tunnel-agent.js /usr/local/bin/tunnel-agent.js
 COPY tmux.conf /etc/tmux.conf
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/hub-agent.py /usr/local/bin/tunnel-agent.js
 
-# Start sessions in the DockerOps repo so Claude has the stacks in context.
-WORKDIR /mnt/data/Docker/DockerOps
+# No baked repo WORKDIR anymore: this is ONE container per host that scans
+# REPOS_ROOT for repos and multiplexes N worktree-backed sessions. A neutral
+# home is fine — the manager cds each Claude session into its own worktree.
+#
+# Runtime env (set per-stack in DockerOps' compose; defaults live in the code):
+#   REPOS_ROOT      git-root to scan one level deep for repos (default /mnt/data/Docker/git)
+#   MAX_SESSIONS    cap on concurrently running sessions            (default 6)
+#   TTYD_PORT_BASE  first per-session ttyd port, allocated upward    (default 7700)
+#   HUB_URL / HUB_TOKEN / HUB_INTERVAL   hub endpoint + shared agent token + beat
+#   IS_SANDBOX      lets claude bypassPermissions run under root
+#   AGENT           coding agent (claude only, for now)
+WORKDIR /root
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

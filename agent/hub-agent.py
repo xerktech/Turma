@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
-"""Heartbeat agent for the agent-hub dashboard (compose/claude-code.yaml).
+"""Session manager + heartbeat agent for the agent-hub dashboard.
 
-Runs in the background of every Claude Code container (started by
-entrypoint.sh) and POSTs a heartbeat to the hub every INTERVAL seconds with:
-  - physical device name (read from the /host bind mount)
-  - container name/id, working dir, git branch/dirty state
-  - memory usage from the cgroup
-  - per-project Claude token usage parsed from the transcript JSONLs under
-    /root/.claude/projects/<slug>/ (same data ccusage reads)
-  - live session signals: bridge-pointer presence (a Remote Control session is
-    attached), transcript freshness (is Claude mid-turn right now), the role of
-    the newest transcript entry (turn finished vs. waiting on a tool), any
-    pending AskUserQuestion text, and PR URLs newly appended to the transcript
-  - the last ~50 lines of this container's own log (docker logs via the
-    mounted socket) for crash diagnosis in the hub UI
+ONE of these runs per physical host (started by entrypoint.sh, in the
+FOREGROUND — it is the container's long-lived process). It replaces the old
+"one container = one repo = one Claude session" model with a host-level
+multiplexer:
 
-The hub turns the session signals into ntfy push alerts (turn finished,
-question waiting, PR created) — see agent-hub/server.js.
+  - Scans REPOS_ROOT (default /mnt/data/Docker/git) one level deep for git
+    repos and reports them to the hub.
+  - Owns a persisted session registry (~/.agenthub/sessions.json). Each session
+    is a git *worktree* of a repo (branch agent/<id>) running its own
+    `claude --remote-control` inside its own tmux (agent-<id>) served by its own
+    ttyd (127.0.0.1:<ttydPort>, base path /term/<id>).
+  - Executes hub-issued commands (spawn / kill / start / restart / delete) that
+    ride back on the heartbeat reply, with at-least-once cmdId de-dup.
+  - Auto-resumes `running` sessions on boot.
+  - POSTs a heartbeat to the hub every INTERVAL seconds carrying repos[] +
+    sessions[] (per-session git / token-usage / live-session signals computed
+    per worktree, so usage PERSISTS after a session is killed — the transcript
+    under ~/.claude/projects outlives the worktree files).
 
-The hub's reply can carry {"restart": true}; the agent then restarts its own
-container through the bind-mounted docker socket. Doing the restart from
-inside the container (rather than from the hub) means it works even when the
-container runs on a different physical host than the hub.
+Token usage is parsed from the transcript JSONLs under
+/root/.claude/projects/<slug>/ (slug = worktree path with '/'->'-'); this is the
+same data ccusage reads. Live-session signals are bridge-pointer presence,
+transcript freshness, the newest entry's role/tool-use, any pending
+AskUserQuestion, and PR URLs newly appended to the transcript.
+
+The hub's reply can also carry {"restart": true} for a whole-container restart
+(legacy) which the agent performs through the bind-mounted docker socket.
 
 stdlib only — no pip installs in the image.
 """
@@ -29,10 +35,12 @@ stdlib only — no pip installs in the image.
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
 import urllib.request
+from collections import deque
 
 HUB_URL = os.environ.get("HUB_URL", "http://agent-hub:8300")
 # Bearer token for the hub's /api/heartbeat (the UI itself sits behind basic
@@ -40,8 +48,25 @@ HUB_URL = os.environ.get("HUB_URL", "http://agent-hub:8300")
 # the hub's HUB_AGENT_TOKEN.
 HUB_TOKEN = os.environ.get("HUB_TOKEN", "")
 INTERVAL = int(os.environ.get("HUB_INTERVAL", "20"))
+
+# Host-multiplexer configuration (see CONTRACT / entrypoint.sh comments).
+REPOS_ROOT = os.environ.get("REPOS_ROOT", "/mnt/data/Docker/git")
+MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "6"))
+TTYD_PORT_BASE = int(os.environ.get("TTYD_PORT_BASE", "7700"))
+
+# Where worktrees live: under a dot-dir so the repo scan never lists them, and
+# on the mounted tree so they survive a container restart.
+WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".agenthub", "worktrees")
+# Persisted session registry (survives container restart).
+REGISTRY_DIR = os.path.expanduser("~/.agenthub")
+REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
+
 # Transcript parsing is the expensive part; refresh it every N heartbeats.
 USAGE_EVERY = 15
+# Small pause after launching a Claude session. The whole host shares ONE
+# ~/.claude login + .claude.json, so several RC sessions coming up at the exact
+# same instant contend on that shared state; staggering reduces the contention.
+LAUNCH_STAGGER = 1.0
 
 # API-equivalent pricing per MTok (input, output, cache write, cache read).
 # Cache write = 1.25x input (5m TTL), cache read = 0.1x input. Sessions run on
@@ -69,6 +94,25 @@ def run(cmd, cwd=None):
         return out.stdout.strip() if out.returncode == 0 else ""
     except Exception:
         return ""
+
+
+def run_ok(cmd, cwd=None):
+    """Run a command, return (rc, stderr). rc is None if it couldn't launch."""
+    try:
+        out = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=30
+        )
+        return out.returncode, (out.stderr or "").strip()
+    except Exception as e:
+        return None, str(e)
+
+
+def slugify(s):
+    """URL/tmux/filesystem-safe slug: spaces->-, drop other punctuation."""
+    s = re.sub(r"\s+", "-", (s or "").strip())
+    s = re.sub(r"[^A-Za-z0-9._-]", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s
 
 
 def device_name():
@@ -346,60 +390,460 @@ def log_tail(container_id):
     return text[-LOG_TAIL_MAX_BYTES:] or None
 
 
-def main():
-    agent_id = run(["hostname"]) or "unknown"
-    workdir = os.getcwd()
-    container_name = (
-        run(["docker", "inspect", "--format", "{{.Name}}", agent_id]).lstrip("/")
-        or os.environ.get("APP_NAME", agent_id)
-    )
-    started_at = run(
-        ["docker", "inspect", "--format", "{{.State.StartedAt}}", agent_id]
-    )
-    claude_version = run(["claude", "--version"])
-    device = device_name()
-    log(f"reporting to {HUB_URL} as {container_name} ({agent_id}) on {device}")
+def scan_repos():
+    """REPOS_ROOT children that are non-dot dirs (excluding .agenthub) with a
+    .git entry. Returns [{"name","path"}] — the multiplexer's repo list."""
+    repos = []
+    try:
+        for name in sorted(os.listdir(REPOS_ROOT)):
+            if name.startswith(".") or name == ".agenthub":
+                continue
+            path = os.path.join(REPOS_ROOT, name)
+            if not os.path.isdir(path):
+                continue
+            if not os.path.exists(os.path.join(path, ".git")):
+                continue
+            repos.append({"name": name, "path": path})
+    except OSError:
+        pass
+    return repos
 
-    usage = None
-    beat = 0
-    sess_state = {}
-    pending_prs = []  # PR URLs not yet delivered (kept across failed beats)
-    while True:
-        if beat % USAGE_EVERY == 0:
-            try:
-                usage = usage_report(workdir)
-            except Exception as e:
-                log(f"usage parse failed: {e}")
-        beat += 1
 
-        session = None
+def repo_entry(repo):
+    """Heartbeat repos[] entry: light git facts about the repo's own checkout."""
+    path = repo["path"]
+    dirty = run(["git", "status", "--porcelain"], cwd=path)
+    return {
+        "name": repo["name"],
+        "path": path,
+        "branch": run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path),
+        "remote": run(["git", "remote", "get-url", "origin"], cwd=path),
+        "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
+    }
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+class SessionManager:
+    """Owns the registry, the live tmux/ttyd/claude processes, and the
+    heartbeat loop. Single-threaded: all mutations happen in the main loop, so
+    no locking is needed. Every lifecycle op is wrapped so one bad session can
+    never take down the manager or the others."""
+
+    def __init__(self):
+        self.agent_id = run(["hostname"]) or "unknown"
+        self.container_name = (
+            run(["docker", "inspect", "--format", "{{.Name}}", self.agent_id]).lstrip("/")
+            or self.agent_id
+        )
+        self.started_at = run(
+            ["docker", "inspect", "--format", "{{.State.StartedAt}}", self.agent_id]
+        )
+        self.claude_version = run(["claude", "--version"])
+        self.device = device_name()
+
+        self.registry = self._load_registry()   # list[dict], the persisted state
+        self.ttyd = {}                           # id -> ttyd Popen (in-memory)
+        self.sess_state = {}                     # id -> session_report offsets
+        self.usage_cache = {}                    # id -> usage_report result
+        self.pending_prs = {}                    # id -> undelivered PR urls
+        # at-least-once command de-dup: cmdIds we've already executed.
+        self.acked = set()
+        self.acked_order = deque(maxlen=1000)
+
+    # --- registry persistence ---------------------------------------------
+
+    def _load_registry(self):
         try:
-            session = session_report(workdir, sess_state)
-            pending_prs.extend(session.pop("prUrls"))
-            del pending_prs[:-10]
-            session["newPrUrls"] = list(pending_prs)
-        except Exception as e:
-            log(f"session probe failed: {e}")
+            with open(REGISTRY_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
 
-        payload = {
-            "agentId": agent_id,
-            "containerName": container_name,
-            "device": device,
-            "workingDir": workdir,
-            "appName": os.environ.get("APP_NAME", ""),
-            "claudeVersion": claude_version,
-            "startedAt": started_at,
-            "git": git_info(workdir),
-            "memory": memory_usage(),
-            "usage": usage,
-            "session": session,
-            "logTail": log_tail(agent_id),
+    def save(self):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = REGISTRY_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.registry, f, indent=2)
+            os.replace(tmp, REGISTRY_PATH)
+        except OSError as e:
+            log(f"registry save failed: {e}")
+
+    def _find(self, sid):
+        return next((s for s in self.registry if s.get("id") == sid), None)
+
+    def _new_id(self):
+        existing = {s.get("id") for s in self.registry}
+        while True:
+            sid = secrets.token_hex(3)[:5]
+            if sid not in existing:
+                return sid
+
+    def _alloc_port(self):
+        used = {s.get("ttydPort") for s in self.registry if s.get("ttydPort")}
+        p = TTYD_PORT_BASE
+        while p in used:
+            p += 1
+        return p
+
+    def _running_count(self):
+        return sum(1 for s in self.registry if s.get("status") == "running")
+
+    # --- low-level process control ----------------------------------------
+
+    def _drop_bridge_pointer(self, worktree):
+        # Never reattach a fresh claude to a dead RC bridge from a prior session
+        # (that silently swallows prompts). The project slug matches how Claude
+        # keys ~/.claude/projects for a given cwd.
+        slug = worktree.replace("/", "-")
+        try:
+            os.remove(f"/root/.claude/projects/{slug}/bridge-pointer.json")
+        except OSError:
+            pass
+
+    def _launch_tmux(self, sess):
+        """(Re)launch claude for a session inside its own tmux, detached."""
+        self._drop_bridge_pointer(sess["worktreePath"])
+        # Fresh claude in this worktree. IS_SANDBOX=1 (compose) lets
+        # bypassPermissions run under root; --remote-control bridges the session
+        # to claude.ai/code + mobile under its per-session display name.
+        claude_cmd = (
+            f"claude --remote-control '{sess['rcName']}' "
+            f"--permission-mode bypassPermissions"
+        )
+        run(["tmux", "kill-session", "-t", sess["tmuxName"]])  # ensure clean slate
+        rc, err = run_ok([
+            "tmux", "new-session", "-d", "-s", sess["tmuxName"],
+            "-c", sess["worktreePath"], "-x", "220", "-y", "50", claude_cmd,
+        ])
+        if rc != 0:
+            raise RuntimeError(f"tmux launch failed: {err}")
+
+    def _launch_ttyd(self, sess):
+        """Ensure a ttyd is serving this session's tmux on its stable port.
+
+        ttyd flags mirror the old single-session entrypoint, now applied
+        per-session: loopback-only (the sole reachable path is the local
+        tunnel-agent the hub drives), interactive (-W), scoped to base path
+        /term/<id> so ttyd's own asset/WS URLs resolve behind the hub prefix,
+        JBMNerd font + canvas renderer + disableLeaveAlert for the TUI, and
+        basic auth (-c) keyed off the shared agent token as defense in depth."""
+        proc = self.ttyd.get(sess["id"])
+        if proc is not None and proc.poll() is None:
+            return  # already serving (e.g. restart keeps ttyd up)
+        args = [
+            "ttyd", "-p", str(sess["ttydPort"]), "-i", "127.0.0.1",
+            "-b", f"/term/{sess['id']}", "-W", "-m", "8",
+            "-t", 'fontFamily=JBMNerd, "JetBrainsMono Nerd Font Mono", "DejaVu Sans Mono", monospace',
+            "-t", "fontSize=14",
+            "-t", "rendererType=canvas",
+            "-t", "disableLeaveAlert=true",
+            "-c", f"term:{HUB_TOKEN or 'changeme'}",
+            "tmux", "attach", "-t", sess["tmuxName"],
+        ]
+        try:
+            self.ttyd[sess["id"]] = subprocess.Popen(
+                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            raise RuntimeError(f"ttyd launch failed: {e}")
+
+    def _kill_tmux(self, sess):
+        run(["tmux", "kill-session", "-t", sess["tmuxName"]])
+
+    def _kill_ttyd(self, sid):
+        proc = self.ttyd.pop(sid, None)
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def _worktree_add(self, sess, new_branch):
+        """Add the worktree. new_branch=True creates agent/<id> off HEAD (spawn);
+        False re-checks-out the existing branch (start/resume)."""
+        os.makedirs(os.path.dirname(sess["worktreePath"]), exist_ok=True)
+        # Clear any stale worktree registration left by a --force removal that
+        # partially failed, so `worktree add` doesn't refuse.
+        run(["git", "-C", sess["repoPath"], "worktree", "prune"])
+        if new_branch:
+            cmd = ["git", "-C", sess["repoPath"], "worktree", "add",
+                   sess["worktreePath"], "-b", sess["branch"]]
+        else:
+            cmd = ["git", "-C", sess["repoPath"], "worktree", "add",
+                   sess["worktreePath"], sess["branch"]]
+        rc, err = run_ok(cmd)
+        if rc != 0:
+            raise RuntimeError(f"git worktree add failed: {err}")
+
+    def _worktree_remove(self, sess):
+        run(["git", "-C", sess["repoPath"], "worktree", "remove",
+             "--force", sess["worktreePath"]])
+        run(["git", "-C", sess["repoPath"], "worktree", "prune"])
+
+    def _forget_session_caches(self, sid):
+        self.sess_state.pop(sid, None)
+        self.usage_cache.pop(sid, None)
+        self.pending_prs.pop(sid, None)
+
+    def _set_error(self, sess, msg):
+        sess["status"] = "error"
+        sess["errorMsg"] = str(msg)[:500]
+        log(f"session {sess['id']} error: {msg}")
+
+    # --- lifecycle (executed container-side; see CONTRACT) ----------------
+
+    def spawn(self, repo_name):
+        """Create a brand-new worktree-backed session for <repo_name>."""
+        if self._running_count() >= MAX_SESSIONS:
+            log(f"spawn refused: at MAX_SESSIONS ({MAX_SESSIONS})")
+            return
+        repo = next((r for r in scan_repos() if r["name"] == repo_name), None)
+        if not repo:
+            log(f"spawn refused: unknown repo {repo_name!r}")
+            return
+        sid = self._new_id()
+        sess = {
+            "id": sid,
+            "repo": repo["name"],
+            "repoPath": repo["path"],
+            "worktreePath": os.path.join(WORKTREES_ROOT, repo["name"], sid),
+            "branch": f"agent/{sid}",
+            "rcName": f"{slugify(self.device)}-{slugify(repo['name'])}-{sid}",
+            "tmuxName": f"agent-{sid}",
+            "ttydPort": self._alloc_port(),
+            "status": "running",
+            "createdAt": now_iso(),
+            "stoppedAt": None,
+            "errorMsg": None,
         }
+        self.registry.append(sess)
+        try:
+            self._worktree_add(sess, new_branch=True)
+            self._launch_tmux(sess)
+            self._launch_ttyd(sess)
+            log(f"spawned session {sid} for {repo['name']} on :{sess['ttydPort']}")
+        except Exception as e:
+            self._set_error(sess, e)
+
+    def kill(self, sid):
+        """Stop a session but keep its branch/commits/transcript (usage lives on)."""
+        sess = self._find(sid)
+        if not sess:
+            log(f"kill: no such session {sid}")
+            return
+        self._kill_tmux(sess)
+        self._kill_ttyd(sid)
+        self._worktree_remove(sess)
+        sess["status"] = "stopped"
+        sess["stoppedAt"] = now_iso()
+        sess["errorMsg"] = None
+        self.sess_state.pop(sid, None)  # keep usage_cache: still reported
+        log(f"killed session {sid}")
+
+    def start(self, sid):
+        """Resume a stopped session: re-add its worktree on the EXISTING branch
+        and relaunch on the SAME ttyd port."""
+        sess = self._find(sid)
+        if not sess:
+            log(f"start: no such session {sid}")
+            return
+        if sess.get("status") == "running":
+            return
+        if self._running_count() >= MAX_SESSIONS:
+            log(f"start refused: at MAX_SESSIONS ({MAX_SESSIONS})")
+            return
+        try:
+            if not os.path.isdir(sess["worktreePath"]):
+                self._worktree_add(sess, new_branch=False)
+            self._launch_tmux(sess)
+            self._launch_ttyd(sess)
+            sess["status"] = "running"
+            sess["stoppedAt"] = None
+            sess["errorMsg"] = None
+            log(f"started (resumed) session {sid} on :{sess['ttydPort']}")
+        except Exception as e:
+            self._set_error(sess, e)
+
+    def restart(self, sid):
+        """Clear context: kill claude/tmux in place, drop the bridge pointer, and
+        relaunch a FRESH claude in the same worktree (new transcript/RC session).
+        Keeps id/branch/worktree/ttydPort — ttyd stays up and just re-attaches."""
+        sess = self._find(sid)
+        if not sess:
+            log(f"restart: no such session {sid}")
+            return
+        if sess.get("status") != "running":
+            log(f"restart: session {sid} not running")
+            return
+        try:
+            self._kill_tmux(sess)          # ends the current claude
+            self.sess_state.pop(sid, None)  # fresh freshness/PR tracking
+            self._launch_tmux(sess)         # drops bridge-pointer + new claude
+            self._launch_ttyd(sess)         # (re)ensure ttyd if it had died
+            sess["errorMsg"] = None
+            log(f"restarted (cleared context) session {sid}")
+        except Exception as e:
+            self._set_error(sess, e)
+
+    def delete(self, sid):
+        """Remove a session entirely: worktree + branch + registry record. It
+        disappears from the UI and its usage stops being reported."""
+        sess = self._find(sid)
+        if not sess:
+            log(f"delete: no such session {sid}")
+            return
+        self._kill_tmux(sess)
+        self._kill_ttyd(sid)
+        if os.path.isdir(sess["worktreePath"]):
+            self._worktree_remove(sess)
+        run(["git", "-C", sess["repoPath"], "branch", "-D", sess["branch"]])
+        self.registry = [s for s in self.registry if s.get("id") != sid]
+        self._forget_session_caches(sid)
+        log(f"deleted session {sid}")
+
+    # --- boot auto-resume --------------------------------------------------
+
+    def resume_on_boot(self):
+        """Relaunch running sessions whose worktree survived; demote the rest."""
+        for sess in self.registry:
+            if sess.get("status") != "running":
+                continue  # stopped stays stopped (kept for usage; resumable)
+            if not os.path.isdir(sess["worktreePath"]):
+                sess["status"] = "stopped"
+                sess["stoppedAt"] = now_iso()
+                log(f"resume: worktree gone for {sess['id']}, marking stopped")
+                continue
+            try:
+                self._launch_tmux(sess)
+                self._launch_ttyd(sess)
+                log(f"resumed session {sess['id']} on :{sess['ttydPort']}")
+                time.sleep(LAUNCH_STAGGER)  # stagger shared-login contention
+            except Exception as e:
+                self._set_error(sess, e)
+        self.save()
+
+    # --- command handling (heartbeat reply) -------------------------------
+
+    def _ack(self, cmd_id):
+        if len(self.acked_order) == self.acked_order.maxlen and self.acked_order:
+            self.acked.discard(self.acked_order[0])
+        self.acked_order.append(cmd_id)
+        self.acked.add(cmd_id)
+
+    def handle_commands(self, commands):
+        """Execute each not-yet-acked command exactly once. Returns True if any
+        ran (the caller then fires an immediate extra heartbeat)."""
+        did = False
+        for cmd in commands or []:
+            if not isinstance(cmd, dict):
+                continue
+            cid = cmd.get("cmdId")
+            if not cid or cid in self.acked:
+                continue
+            ctype = cmd.get("type")
+            try:
+                if ctype == "spawn":
+                    self.spawn(cmd.get("repo"))
+                elif ctype == "kill":
+                    self.kill(cmd.get("sessionId"))
+                elif ctype == "start":
+                    self.start(cmd.get("sessionId"))
+                elif ctype == "restart":
+                    self.restart(cmd.get("sessionId"))
+                elif ctype == "delete":
+                    self.delete(cmd.get("sessionId"))
+                else:
+                    log(f"unknown command type {ctype!r} (cmdId {cid})")
+            except Exception as e:
+                # A poison command must not be retried forever, so we still ack;
+                # any per-session failure is surfaced via that session's status.
+                log(f"command {ctype} ({cid}) failed: {e}")
+            self._ack(cid)
+            did = True
+        if did:
+            self.save()
+        return did
+
+    # --- heartbeat ---------------------------------------------------------
+
+    def _refresh_usage(self, sid, worktree):
+        try:
+            self.usage_cache[sid] = usage_report(worktree)
+        except Exception as e:
+            log(f"usage parse failed for {sid}: {e}")
+
+    def _session_payload(self, sess):
+        sid = sess["id"]
+        running = sess.get("status") == "running"
+        signals = None
+        if running:
+            try:
+                st = self.sess_state.setdefault(sid, {})
+                signals = session_report(sess["worktreePath"], st)
+                pend = self.pending_prs.setdefault(sid, [])
+                pend.extend(signals.pop("prUrls"))
+                del pend[:-10]
+                signals["newPrUrls"] = list(pend)
+            except Exception as e:
+                log(f"session probe failed for {sid}: {e}")
+                signals = None
+        return {
+            "id": sid,
+            "repo": sess["repo"],
+            "repoPath": sess["repoPath"],
+            "worktreePath": sess["worktreePath"],
+            "branch": sess["branch"],
+            "rcName": sess["rcName"],
+            "status": sess.get("status"),
+            "ttydPort": sess.get("ttydPort"),
+            "createdAt": sess.get("createdAt"),
+            "stoppedAt": sess.get("stoppedAt"),
+            "errorMsg": sess.get("errorMsg"),
+            "git": git_info(sess["worktreePath"]),  # of the worktree (None if gone)
+            "usage": self.usage_cache.get(sid),     # present for stopped too
+            "session": signals,                      # running only; null otherwise
+        }
+
+    def build_payload(self, beat):
+        # Usage is the expensive parse — refresh on a slow cadence, but make
+        # sure any newly-seen session gets a value on first appearance.
+        if beat % USAGE_EVERY == 0:
+            for s in self.registry:
+                self._refresh_usage(s["id"], s["worktreePath"])
+        for s in self.registry:
+            if s["id"] not in self.usage_cache:
+                self._refresh_usage(s["id"], s["worktreePath"])
+
+        return {
+            "agentId": self.agent_id,
+            "containerName": self.container_name,
+            "device": self.device,
+            "startedAt": self.started_at,
+            "claudeVersion": self.claude_version,
+            "memory": memory_usage(),
+            "logTail": log_tail(self.agent_id),
+            "reposRoot": REPOS_ROOT,
+            "repos": [repo_entry(r) for r in scan_repos()],
+            "sessions": [self._session_payload(s) for s in self.registry],
+            "ackedCommands": list(self.acked),
+        }
+
+    def _clear_pending_prs(self):
+        for urls in self.pending_prs.values():
+            urls.clear()
+
+    def post(self, payload):
+        """POST one heartbeat. Returns the parsed reply dict, or None on failure
+        (pending PR links are kept so they aren't lost on a failed beat)."""
         try:
             # Explicit User-Agent: HUB_URL rides the Cloudflare tunnel, and
-            # Cloudflare's Browser Integrity Check 403s (error 1010) the
-            # default "Python-urllib/3.x" signature before the request ever
-            # reaches the hub.
+            # Cloudflare's Browser Integrity Check 403s (error 1010) the default
+            # "Python-urllib/3.x" signature before it reaches the hub.
             headers = {"Content-Type": "application/json", "User-Agent": "hub-agent/1.0"}
             if HUB_TOKEN:
                 headers["Authorization"] = f"Bearer {HUB_TOKEN}"
@@ -411,18 +855,47 @@ def main():
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 reply = json.loads(resp.read().decode() or "{}")
-            pending_prs.clear()  # delivered
-            if reply.get("restart"):
-                log("restart requested by hub — restarting container")
-                # Fire-and-forget: the daemon finishes the restart even after
-                # this process (and the whole container) is killed by it.
-                subprocess.Popen(["docker", "restart", agent_id])
-                time.sleep(60)  # if docker restart failed, fall through
-                log("docker restart did not take effect, sending SIGTERM to pid 1")
-                os.kill(1, 15)
+            self._clear_pending_prs()  # delivered
+            return reply if isinstance(reply, dict) else {}
         except Exception as e:
             log(f"heartbeat failed: {e}")
-        time.sleep(INTERVAL)
+            return None
+
+    def container_restart(self):
+        log("restart requested by hub — restarting container")
+        # Fire-and-forget: the daemon finishes the restart even after this
+        # process (and the whole container) is killed by it.
+        subprocess.Popen(["docker", "restart", self.agent_id])
+        time.sleep(60)  # if docker restart failed, fall through
+        log("docker restart did not take effect, sending SIGTERM to pid 1")
+        os.kill(1, 15)
+
+    def run_forever(self):
+        log(
+            f"reporting to {HUB_URL} as {self.container_name} ({self.agent_id}) "
+            f"on {self.device}; reposRoot={REPOS_ROOT} maxSessions={MAX_SESSIONS}"
+        )
+        self.resume_on_boot()
+        beat = 0
+        while True:
+            reply = self.post(self.build_payload(beat))
+            beat += 1
+            if reply is not None:
+                if reply.get("restart"):
+                    self.container_restart()
+                if self.handle_commands(reply.get("commands")):
+                    # Fire an immediate extra heartbeat so the UI reflects the
+                    # new session state fast (don't wait a whole interval). Its
+                    # reply is processed once more; cmdId de-dup stops repeats.
+                    reply2 = self.post(self.build_payload(beat))
+                    beat += 1
+                    if reply2 is not None:
+                        self.handle_commands(reply2.get("commands"))
+            time.sleep(INTERVAL)
+
+
+def main():
+    SessionManager().run_forever()
 
 
 if __name__ == "__main__":

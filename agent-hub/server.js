@@ -2,8 +2,10 @@
 //
 // Agents (agent image) reach this server purely OUTBOUND, so hub and
 // agents can live on any host/network (all traffic rides agents.xerktech.com):
-//   1. hub-agent.py POSTs a status heartbeat every ~20s (device/workdir/git/
-//      usage) and picks up queued restart commands on the reply.
+//   1. hub-agent.py POSTs a status heartbeat every ~20s (a HOST with its repos[]
+//      and multiplexed Claude sessions[]) and picks up queued host commands
+//      (container restart + per-session spawn/kill/start/restart/delete) on the
+//      reply, acking each by cmdId so the hub stops re-sending it.
 //   2. tunnel-agent.js holds a persistent WebSocket "control" channel here. To
 //      show a live terminal, the hub asks that agent (over the control channel)
 //      to dial back a "data" WebSocket; the agent bridges it to its local ttyd
@@ -97,6 +99,30 @@ function prune() {
   }
 }
 
+// Append a command to a host's queue with a fresh, stable cmdId. The heartbeat
+// reply re-sends the queue every beat until the agent acks the cmdId (at-least-
+// once delivery; the agent dedupes). Returns the cmdId for the API response.
+function queueCommand(key, cmd) {
+  const a = agents[key];
+  const cmdId = crypto.randomBytes(6).toString("hex");
+  a.commands = a.commands || [];
+  a.commands.push({ ...cmd, cmdId });
+  scheduleSave();
+  return cmdId;
+}
+
+// Which HOST owns a given sessionId, and that session's ttyd port. Sessions are
+// per-host but sessionIds are globally unique, so /term/<sessionId> can be
+// routed by scanning every host's sessions[]. null if no host reports it.
+function findSession(sessionId) {
+  for (const [key, a] of Object.entries(agents)) {
+    for (const s of a.sessions || []) {
+      if (s.id === sessionId) return { host: key, port: s.ttydPort };
+    }
+  }
+  return null;
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -186,10 +212,13 @@ function fmtDur(ms) {
   return `${Math.round(s / 360) / 10}h`;
 }
 
-function sessionWorking(a, now) {
-  const age = a.session?.transcriptAgeSec;
+// Is this session actively working? True while its transcript was written to
+// within WORKING_WINDOW_MS (the agent reports the age at beat time; we add the
+// staleness since the host's last beat). `lastSeen` is the host's last beat.
+function sessionWorking(session, lastSeen, now) {
+  const age = session.session?.transcriptAgeSec;
   if (age == null) return false;
-  return age * 1000 + Math.max(0, now - (a.lastSeen || 0)) < WORKING_WINDOW_MS;
+  return age * 1000 + Math.max(0, now - (lastSeen || 0)) < WORKING_WINDOW_MS;
 }
 
 // Alert checks that key off a fresh heartbeat. `next.alerts` is per-agent
@@ -225,8 +254,10 @@ function heartbeatAlerts(key, prev, next) {
     }
   }
 
-  // Daily cost threshold (API-equivalent estimate), once per UTC day.
-  const cost = next.usage?.today?.cost;
+  // Daily cost threshold (API-equivalent estimate): sum across the host's
+  // sessions, once per UTC day. Usage persists for stopped sessions too, so a
+  // killed session still counts toward the day's total.
+  const cost = (next.sessions || []).reduce((sum, s) => sum + (s.usage?.today?.cost || 0), 0);
   const day = new Date(now).toISOString().slice(0, 10);
   if (cost >= COST_ALERT_USD && alerts.costDay !== day) {
     alerts.costDay = day;
@@ -236,32 +267,47 @@ function heartbeatAlerts(key, prev, next) {
     });
   }
 
-  // Session events from the agent's transcript probe.
-  const s = next.session || {};
-  if (s.question && s.question !== alerts.lastQuestion) {
-    alerts.lastQuestion = s.question;
-    notify(`${key} has a question`, s.question, { tags: "question", priority: "high" });
-  }
-  if (!s.question) delete alerts.lastQuestion;
+  // Per-session events from each session's transcript probe. Bookkeeping is
+  // nested per sessionId so questions/PRs/turns don't cross-fire between the
+  // several Claude sessions a host runs at once.
+  alerts.sessions = alerts.sessions || {};
+  const liveIds = new Set();
+  for (const session of next.sessions || []) {
+    liveIds.add(session.id);
+    const sa = (alerts.sessions[session.id] = alerts.sessions[session.id] || { prSeen: [] });
+    const label = session.rcName || `${key} · ${session.repo}@${session.branch}`;
+    const s = session.session || {}; // null for stopped sessions
 
-  for (const url of s.newPrUrls || []) {
-    const seen = alerts.prSeen || [];
-    if (seen.includes(url)) continue;
-    alerts.prSeen = [...seen, url].slice(-20);
-    notify(`${key} created a PR`, url, { tags: "rocket", click: url });
-  }
+    if (s.question && s.question !== sa.lastQuestion) {
+      sa.lastQuestion = s.question;
+      notify(`${label} has a question`, s.question, { tags: "question", priority: "high" });
+    }
+    if (!s.question) delete sa.lastQuestion;
 
-  // Turn finished: was working, transcript went quiet, and the newest entry
-  // is plain assistant output (a pending tool call or question means it's
-  // still mid-turn / already alerted above). A beat that just recovered from
-  // an offline period skips this — "back online" already covers it and the
-  // working->idle edge across the gap is stale.
-  const working = sessionWorking(next, now);
-  if (alerts.wasWorking && !working && !recovered && s.lastRole === "assistant" && !s.lastHasToolUse) {
-    const repo = next.git?.repoName ? ` · ${next.git.repoName}@${next.git.branch}` : "";
-    notify(`${key} finished its turn`, `Waiting for input${repo}`, { tags: "checkered_flag" });
+    for (const url of s.newPrUrls || []) {
+      const seen = sa.prSeen || [];
+      if (seen.includes(url)) continue;
+      sa.prSeen = [...seen, url].slice(-20);
+      notify(`${label} created a PR`, url, { tags: "rocket", click: url });
+    }
+
+    // Turn finished: was working, transcript went quiet, and the newest entry
+    // is plain assistant output (a pending tool call or question means it's
+    // still mid-turn / already alerted above). A beat that just recovered from
+    // an offline period skips this — "back online" already covers it and the
+    // working->idle edge across the gap is stale.
+    const working = sessionWorking(session, next.lastSeen, now);
+    if (sa.wasWorking && !working && !recovered && s.lastRole === "assistant" && !s.lastHasToolUse) {
+      const repo = session.git?.repoName ? ` · ${session.git.repoName}@${session.git.branch}` : "";
+      notify(`${label} finished its turn`, `Waiting for input${repo}`, { tags: "checkered_flag" });
+    }
+    sa.wasWorking = working;
   }
-  alerts.wasWorking = working;
+  // Forget bookkeeping for sessions the host no longer reports (deleted ones;
+  // stopped sessions stay in sessions[] and keep theirs).
+  for (const id of Object.keys(alerts.sessions)) {
+    if (!liveIds.has(id)) delete alerts.sessions[id];
+  }
 }
 
 // Offline detection is time-driven, not heartbeat-driven, so it needs a sweep.
@@ -404,9 +450,11 @@ function channelDuplex(socket) {
   return d;
 }
 
-// Ask `name`'s tunnel-agent to dial back a data channel; resolves with its
-// Duplex once the agent connects (or rejects if the tunnel is offline / slow).
-function openChannel(name) {
+// Ask `name`'s tunnel-agent to dial back a data channel bridged to the given
+// local ttyd `port`; resolves with its Duplex once the agent connects (or
+// rejects if the tunnel is offline / slow). One control channel per host fans
+// out to per-session ttyds by port.
+function openChannel(name, port) {
   return new Promise((resolve, reject) => {
     const cc = controlChannels[name];
     if (!cc) return reject(new Error("agent tunnel offline"));
@@ -420,17 +468,17 @@ function openChannel(name) {
       delete pendingChannels[ch];
       resolve(duplex);
     };
-    cc.sendOpen(ch);
+    cc.sendOpen(ch, port);
   });
 }
 
 // ---- terminal proxy ---------------------------------------------------------
 // Proxy an HTTP asset request (ttyd HTML/JS/token) through the agent's tunnel.
 // A fresh channel per request, closed by ttyd via Connection: close.
-async function proxyTerm(req, res, name) {
+async function proxyTerm(req, res, name, port) {
   let channel;
   try {
-    channel = await openChannel(name);
+    channel = await openChannel(name, port);
   } catch (e) {
     res.writeHead(502, { "Content-Type": "text/plain" });
     return res.end(`terminal offline: ${e.message}`);
@@ -550,8 +598,16 @@ const server = http.createServer(async (req, res) => {
       if (!key) return json(res, 400, { error: "containerName/agentId required" });
       const prev = agents[key] || {};
       const restart = !!prev.restartPending;
+      // At-least-once command delivery: drop any queued command the agent
+      // reports as executed; keep re-sending the rest until acked.
+      const acked = new Set(payload.ackedCommands || []);
+      const commands = (prev.commands || []).filter((c) => !acked.has(c.cmdId));
+      delete payload.ackedCommands; // don't persist the transient ack list
       const next = (agents[key] = {
         ...payload,
+        // Pending host commands (spawn/kill/start/restart/delete) queued by the
+        // UI; re-sent on every reply below until acked.
+        commands,
         lastSeen: Date.now(),
         restartPending: false,
         // Keep a marker so the UI can show "restarting…" until the container
@@ -562,7 +618,7 @@ const server = http.createServer(async (req, res) => {
       });
       heartbeatAlerts(key, prev, next);
       scheduleSave();
-      return json(res, 200, { restart });
+      return json(res, 200, { restart, commands });
     }
 
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" && parts[3] === "restart") {
@@ -574,6 +630,35 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     }
 
+    // Session command endpoints — each queues a cmdId onto the host's command
+    // queue for the agent to pick up on its next heartbeat reply. The host owns
+    // the actual worktree/tmux/ttyd lifecycle; the hub only relays intent.
+    if (parts[0] === "api" && parts[1] === "agents" && parts[3] === "sessions") {
+      const key = decodeURIComponent(parts[2]);
+      if (!agents[key]) return json(res, 404, { error: "unknown agent" });
+
+      // POST /api/agents/<host>/sessions  {repo}  -> spawn a new session
+      if (req.method === "POST" && parts.length === 4) {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        if (!body.repo) return json(res, 400, { error: "repo required" });
+        const cmdId = queueCommand(key, { type: "spawn", repo: body.repo });
+        return json(res, 200, { ok: true, cmdId });
+      }
+
+      const sessionId = decodeURIComponent(parts[4] || "");
+      // POST /api/agents/<host>/sessions/<id>/{kill|start|restart}
+      if (req.method === "POST" && parts.length === 6 &&
+          (parts[5] === "kill" || parts[5] === "start" || parts[5] === "restart")) {
+        const cmdId = queueCommand(key, { type: parts[5], sessionId });
+        return json(res, 200, { ok: true, cmdId });
+      }
+      // DELETE /api/agents/<host>/sessions/<id>
+      if (req.method === "DELETE" && parts.length === 5) {
+        const cmdId = queueCommand(key, { type: "delete", sessionId });
+        return json(res, 200, { ok: true, cmdId });
+      }
+    }
+
     if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "agents" && parts.length === 3) {
       const key = decodeURIComponent(parts[2]);
       delete agents[key];
@@ -581,12 +666,14 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     }
 
-    // Terminal proxy: /term/<containerName>/… -> that container's ttyd,
-    // tunneled. User auth already enforced by the gate above.
+    // Terminal proxy: /term/<sessionId>/… -> the ttyd of the host that owns
+    // that session, tunneled to its per-session ttydPort. User auth already
+    // enforced by the gate above.
     if (parts[0] === "term" && parts.length >= 2) {
-      const name = decodeURIComponent(parts[1]);
-      if (!agents[name]) return json(res, 404, { error: "unknown agent" });
-      return proxyTerm(req, res, name);
+      const sessionId = decodeURIComponent(parts[1]);
+      const loc = findSession(sessionId);
+      if (!loc) return json(res, 404, { error: "unknown session" });
+      return proxyTerm(req, res, loc.host, loc.port);
     }
 
     json(res, 404, { error: "not found" });
@@ -597,14 +684,15 @@ const server = http.createServer(async (req, res) => {
 
 // ---- WebSocket upgrades -----------------------------------------------------
 // Three kinds, all on this one port:
-//   /agent/control  — an agent's tunnel-agent registering its reverse tunnel
-//   /agent/data     — an agent dialing back a data channel we requested
-//   /term/<name>/…  — a browser attaching to a live terminal (proxied via tunnel)
+//   /agent/control      — an agent's tunnel-agent registering its reverse tunnel
+//   /agent/data         — an agent dialing back a data channel we requested
+//   /term/<sessionId>/… — a browser attaching to a live session terminal
+//                         (routed to the owning host + its ttyd port via tunnel)
 server.on("upgrade", async (req, socket, head) => {
   const url = new URL(req.url, "http://x");
   const parts = url.pathname.split("/").filter(Boolean);
 
-  // Agent control channel: persistent, carries {open:ch} requests to the agent.
+  // Agent control channel: persistent, carries {open:ch, port} requests to the agent.
   if (parts[0] === "agent" && parts[1] === "control") {
     if (!agentWsAuthorized(url, req)) return socket.destroy();
     const name = url.searchParams.get("name");
@@ -617,7 +705,9 @@ server.on("upgrade", async (req, socket, head) => {
     if (controlChannels[name]) { try { controlChannels[name].socket.destroy(); } catch {} }
     controlChannels[name] = {
       socket,
-      sendOpen: (ch) => send(0x1, JSON.stringify({ open: ch })),
+      // Tell the agent which ttyd port to bridge this data channel to (per
+      // session); it defaults to 7681 if the port is ever absent.
+      sendOpen: (ch, port) => send(0x1, JSON.stringify({ open: ch, port })),
     };
     console.log(`tunnel connected: ${name}`);
     const ping = setInterval(() => send(0x9, Buffer.alloc(0)), 30000); // beat CF idle timeout
@@ -654,10 +744,15 @@ server.on("upgrade", async (req, socket, head) => {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       return socket.destroy();
     }
-    const name = decodeURIComponent(parts[1]);
+    const sessionId = decodeURIComponent(parts[1]);
+    const loc = findSession(sessionId);
+    if (!loc) {
+      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+      return socket.destroy();
+    }
     let channel;
     try {
-      channel = await openChannel(name);
+      channel = await openChannel(loc.host, loc.port);
     } catch {
       socket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
       return socket.destroy();

@@ -43,7 +43,7 @@
   header a.nav { color: var(--accent); text-decoration: none; font-size: 13px; }
   header a.nav:hover { text-decoration: underline; }
 
-  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 24px; }
   .tile {
     background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
     padding: 14px 16px;
@@ -60,31 +60,64 @@
   }
   .device-header h2 { font-size: 17px; margin: 0; font-weight: 650; }
   .device-header .count { color: var(--muted); font-size: 12px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
-  .card {
+
+  /* Hosts stack full-width — each expands into a repo → session tree. */
+  .hosts { display: flex; flex-direction: column; gap: 16px; }
+  .host-card {
     background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-    padding: 16px; display: flex; flex-direction: column; gap: 10px;
+    padding: 16px; display: flex; flex-direction: column; gap: 12px;
   }
-  .card.offline { opacity: 0.62; }
-  .card-top { display: flex; align-items: center; gap: 10px; }
-  .card-top h3 { font-size: 15px; margin: 0; font-weight: 650; flex: 1; word-break: break-all; }
+  .host-card.offline { opacity: 0.62; }
+  .host-top { display: flex; align-items: center; gap: 10px; }
+  .host-top h3 { font-size: 15px; margin: 0; font-weight: 650; flex: 1; word-break: break-all; }
+  .host-meta { display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 13px; color: var(--ink-2); }
+  .host-meta .m-label { color: var(--muted); }
+  .host-meta b { color: var(--ink); font-weight: 600; }
+  .host-meta .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
   .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
   .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
   .dot.online { background: var(--good); }
   .dot.offline { background: var(--critical); }
   .dot.restarting { background: var(--warning); }
 
-  dl { display: grid; grid-template-columns: 96px 1fr; gap: 4px 10px; margin: 0; font-size: 13px; }
+  /* Repo blocks (collapsible) under a host. */
+  .repos { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--hairline); padding-top: 12px; }
+  details.repo { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  details.repo > summary { list-style: none; cursor: pointer; }
+  details.repo > summary::-webkit-details-marker { display: none; }
+  .repo-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .repo-head .r-name { font-weight: 650; font-size: 14px; word-break: break-all; }
+  .repo-head .r-name a { color: var(--accent); text-decoration: none; }
+  .repo-head .r-name a:hover { text-decoration: underline; }
+  .repo-head .r-meta { color: var(--ink-2); font-size: 12px; }
+  .repo-head .r-meta b { color: var(--ink); font-weight: 600; }
+  .repo-head .spacer { flex: 1; }
+  .repo-empty { color: var(--muted); font-size: 12px; margin-top: 8px; }
+
+  .sess-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; margin-top: 10px; }
+  .sess {
+    background: var(--page); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .sess.stopped, .sess.error { opacity: 0.9; }
+  .sess-hd { display: flex; align-items: center; gap: 8px; }
+  .sess-hd .sid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; font-size: 13px; flex: 1; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 20px; border: 1px solid var(--border); color: var(--ink-2); white-space: nowrap; }
+  .badge.running { color: var(--good); border-color: var(--good); }
+  .badge.stopped { color: var(--muted); }
+  .badge.error { color: var(--critical); border-color: var(--critical); }
+
+  dl { display: grid; grid-template-columns: 74px 1fr; gap: 3px 10px; margin: 0; font-size: 12.5px; }
   dt { color: var(--muted); }
   dd { margin: 0; color: var(--ink-2); overflow-wrap: anywhere; }
-  dd .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
   dd b { color: var(--ink); font-weight: 600; }
   dd a { color: var(--accent); text-decoration: none; }
-  dd a b { color: inherit; }
   dd a:hover { text-decoration: underline; }
+  dd.errmsg { color: var(--critical); }
 
   .usage {
-    border-top: 1px solid var(--hairline); padding-top: 10px;
+    border-top: 1px solid var(--hairline); padding-top: 8px;
     display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;
   }
   .usage .u-label { color: var(--muted); font-size: 11px; }
@@ -105,21 +138,20 @@
     padding: 8px; margin: 8px 0 0;
   }
 
-  .actions { display: flex; gap: 8px; margin-top: 2px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 2px; }
+  .sess-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
   button {
     font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 7px; cursor: pointer;
     border: 1px solid var(--border); background: transparent; color: var(--ink);
   }
-  button:hover { border-color: var(--ink-2); }
+  button:hover:not(:disabled) { border-color: var(--ink-2); }
   button.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
   button.confirm { border-color: var(--critical); color: var(--critical); font-weight: 600; }
+  button.btn-sm { padding: 4px 10px; font-size: 12px; }
   button:disabled { opacity: 0.5; cursor: default; }
 
   .empty { color: var(--muted); text-align: center; padding: 64px 0; border: 1px dashed var(--hairline); border-radius: 10px; }
   .footer { color: var(--muted); font-size: 12px; margin-top: 28px; }
-
-  h3.link { cursor: pointer; }
-  h3.link:hover { color: var(--accent); }
 
   .term-overlay {
     display: none; position: fixed; inset: 0; z-index: 50;
@@ -146,7 +178,7 @@
 <div class="wrap">
   <header>
     <h1>Agent Hub</h1>
-    <span class="sub">Claude Code containers</span>
+    <span class="sub">Claude Code session hosts</span>
     <span class="spacer"></span>
     <a class="nav" href="/history">Usage history</a>
     <span class="sub" id="refreshed"></span>
@@ -154,7 +186,7 @@
 
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
-  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Restart clears a container’s session context; it re-registers in claude.ai/code with a fresh name.</div>
+  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions; killing a session keeps its branch and usage history. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name.</div>
 </div>
 
 <div class="term-overlay" id="termOverlay">
@@ -173,14 +205,18 @@
 const $tiles = document.getElementById("tiles");
 const $groups = document.getElementById("groups");
 const $refreshed = document.getElementById("refreshed");
-// Two-click restart confirmation state: key -> timeout id
+
+// The tree re-renders every 5s. These module-level stores survive re-render so
+// open panels and in-progress two-click actions are not lost mid-poll.
+// - confirming: actionKey -> timeout id (armed destructive buttons)
+// - openLogs: host keys whose container-log <details> is open
+// - collapsedRepos: "host::repo" whose repo <details> the user collapsed
+//   (repos default OPEN, so we only remember the closed ones)
 const confirming = new Map();
-// Cards re-render every 5s; remember which log <details> the user opened.
 const openLogs = new Set();
-function logToggle(key, open) {
-  if (open) openLogs.add(key);
-  else openLogs.delete(key);
-}
+const collapsedRepos = new Set();
+function logToggle(key, open) { open ? openLogs.add(key) : openLogs.delete(key); }
+function repoToggle(rkey, open) { open ? collapsedRepos.delete(rkey) : collapsedRepos.add(rkey); }
 
 function fmtTokens(n) {
   if (n == null) return "–";
@@ -198,7 +234,7 @@ function fmtBytes(b) {
   return b.toFixed(i ? 1 : 0) + " " + units[i];
 }
 function ago(ms) {
-  if (!ms) return "never";
+  if (ms == null || isNaN(ms)) return "never";
   const s = Math.max(0, Math.floor(ms / 1000));
   if (s < 60) return s + "s ago";
   if (s < 3600) return Math.floor(s / 60) + "m ago";
@@ -227,16 +263,27 @@ function shortModels(models) {
     m.replace(/^claude-/, "").replace(/-\d{8}$/, "")
   ).join(", ");
 }
+// git@host:owner/repo(.git) -> https link; plain name otherwise.
+function repoLink(remote, name) {
+  const nm = esc(name || "unknown");
+  let href = remote || "";
+  const m = href.match(/^git@([^:]+):(.+?)(\.git)?$/);
+  if (m) href = `https://${m[1]}/${m[2]}`;
+  return /^https?:\/\//.test(href)
+    ? `<a href="${esc(href.replace(/\.git$/, ""))}" target="_blank" rel="noopener">${nm}</a>`
+    : nm;
+}
 
-// Session signals reported by the agent: transcript freshness => working/idle,
-// pending AskUserQuestion => waiting on the user, bridge pointer => attached.
-function sessionInfo(a, now) {
-  const s = a.session;
+// Per-session live signals: transcript freshness => working/idle, pending
+// AskUserQuestion => waiting on the user, bridge pointer => attached. Freshness
+// is relative to the host's last heartbeat (host.lastSeen).
+function liveState(sess, host, now) {
+  const s = sess.session;
   if (!s || s.transcriptAgeSec == null) return { label: "no transcript yet", cls: "" };
-  const age = s.transcriptAgeSec * 1000 + Math.max(0, now - a.lastSeen);
+  const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   if (s.question)
     return { label: "waiting for your answer", cls: "sess-wait", question: s.question, busy: true };
-  if (a.online && age < 90 * 1000)
+  if (host.online && age < 90 * 1000)
     return { label: "working", cls: "sess-working", detail: "last write " + ago(age), busy: true };
   return {
     label: s.bridgeAttached ? "idle · session attached" : "idle",
@@ -246,8 +293,6 @@ function sessionInfo(a, now) {
 }
 
 function agentState(a, now) {
-  // "restarting" = restart command was delivered and the container hasn't
-  // come back with a fresh startedAt yet (or hasn't re-heartbeated).
   if (a.restartSentAt && now - a.restartSentAt < 5 * 60 * 1000) {
     const started = Date.parse(a.startedAt);
     if (!started || started * 1 < a.restartSentAt) return "restarting";
@@ -266,22 +311,30 @@ function render(data) {
   const { now, agents } = data;
   $refreshed.textContent = "updated " + new Date(now).toLocaleTimeString();
 
+  // Aggregate across every session on every host.
+  const sess = agents.flatMap(a => (a.sessions || []).map(s => ({ s, host: a })));
   const online = agents.filter(a => a.online);
-  const sum = (f) => agents.reduce((t, a) => t + (f(a) || 0), 0);
+  const running = sess.filter(x => x.s.status === "running");
+  const waiting = sess.filter(x => x.s.status === "running" && x.s.session && x.s.session.question);
+  const tokToday = sess.reduce((t, x) => t + (totalTokens(x.s.usage?.today) || 0), 0);
+  const costToday = sess.reduce((t, x) => t + (x.s.usage?.today?.cost || 0), 0);
+  const costAll = sess.reduce((t, x) => t + (x.s.usage?.totals?.cost || 0), 0);
+
   $tiles.innerHTML =
-    tile("Agents online", `${online.length} / ${agents.length}`,
+    tile("Hosts online", `${online.length} / ${agents.length}`,
          [...new Set(agents.map(a => a.device))].join(", ") || "no devices yet") +
-    tile("Tokens today", fmtTokens(sum(a => totalTokens(a.usage?.today))), "all containers, incl. cache") +
-    tile("Est. cost today", fmtCost(sum(a => a.usage?.today?.cost)), "API-equivalent") +
-    tile("Est. cost all-time", fmtCost(sum(a => a.usage?.totals?.cost)), "API-equivalent");
+    tile("Running sessions", String(running.length), sess.length + " total") +
+    tile("Waiting on you", String(waiting.length), "sessions with a question") +
+    tile("Tokens today", fmtTokens(tokToday), "all sessions, incl. cache") +
+    tile("Est. cost today", fmtCost(costToday), "API-equivalent") +
+    tile("Est. cost all-time", fmtCost(costAll), "API-equivalent");
 
   if (!agents.length) {
-    $groups.innerHTML = `<div class="empty">No agents have reported yet.<br>
+    $groups.innerHTML = `<div class="empty">No hosts have reported yet.<br>
       Containers running the agent image heartbeat here automatically.</div>`;
     return;
   }
 
-  // Group cards under a header per physical device.
   const byDevice = new Map();
   for (const a of agents) {
     const d = a.device || "unknown-device";
@@ -296,111 +349,184 @@ function render(data) {
         <h2>${esc(device)}</h2>
         <span class="count">${onlineCount} / ${list.length} online</span>
       </div>
-      <div class="grid">${list.map(a => card(a, now)).join("")}</div>
+      <div class="hosts">${list.map(a => hostCard(a, now)).join("")}</div>
     </section>`;
   }).join("");
 }
 
-function card(a, now) {
-    const state = agentState(a, now);
-    const dot = state === "online" ? "online" : (state === "offline" ? "offline" : "restarting");
-    const u = a.usage;
-    const mem = a.memory
-      ? fmtBytes(a.memory.usedBytes) + (a.memory.limitBytes ? " / " + fmtBytes(a.memory.limitBytes) : "")
-      : "–";
-    // Repo name links to its remote when it's a web URL (git@ remotes get
-    // rewritten to https for github-style hosts).
-    let repo = "not a repo";
-    if (a.git) {
-      const name = esc(a.git.repoName || "unknown");
-      let href = a.git.remote || "";
-      const sshMatch = href.match(/^git@([^:]+):(.+?)(\.git)?$/);
-      if (sshMatch) href = `https://${sshMatch[1]}/${sshMatch[2]}`;
-      repo = /^https?:\/\//.test(href)
-        ? `<a href="${esc(href.replace(/\.git$/, ""))}" target="_blank" rel="noopener"><b>${name}</b></a>`
-        : `<b>${name}</b>`;
-    }
-    const branch = a.git
-      ? `<b>${esc(a.git.branch)}</b>` + (a.git.dirtyFiles ? ` · ${a.git.dirtyFiles} dirty` : " · clean")
-      : "–";
-    const sess = sessionInfo(a, now);
-    const confirmingThis = confirming.has(a.key);
-    // Terminal button/clickable title only when this container's reverse tunnel
-    // is live right now (the hub reports terminalOnline when the tunnel-agent's
-    // control channel is connected).
-    const hasTerm = a.terminalOnline;
-    const title = hasTerm
-      ? `<h3 class="link" onclick="openTerminal('${esc(a.key)}')" title="Open the live session">${esc(a.key)}</h3>`
-      : `<h3>${esc(a.key)}</h3>`;
-    return `<div class="card ${a.online ? "" : "offline"}">
-      <div class="card-top">
-        ${title}
-        <span class="status"><span class="dot ${dot}"></span>${esc(state)}</span>
-      </div>
-      <dl>
-        <dt>Working dir</dt><dd><span class="path">${esc(a.workingDir)}</span></dd>
-        <dt>Repo</dt><dd>${repo}</dd>
-        <dt>Branch</dt><dd>${branch}</dd>
-        <dt>Session</dt><dd><b class="${sess.cls}">${esc(sess.label)}</b>${sess.detail ? " · " + esc(sess.detail) : ""}</dd>
-        ${sess.question ? `<dt>Question</dt><dd>${esc(sess.question)}</dd>` : ""}
-        <dt>Claude Code</dt><dd>${esc(a.claudeVersion || "–")}</dd>
-        <dt>Memory</dt><dd>${esc(mem)}</dd>
-        <dt>Uptime</dt><dd>${esc(uptime(a.startedAt, now))} · last seen ${esc(ago(now - a.lastSeen))}</dd>
-        <dt>Activity</dt><dd>${u?.lastActivity ? esc(ago(now - Date.parse(u.lastActivity))) : "–"}
-            · ${u ? u.sessions + " sessions" : ""} · ${esc(shortModels(u?.models))}</dd>
-      </dl>
-      <div class="usage">
-        <div><div class="u-label">Tokens today</div><div class="u-value">${fmtTokens(totalTokens(u?.today))}</div>
-             <div class="u-sub">${fmtTokens(u?.today?.output)} out</div></div>
-        <div><div class="u-label">Est. today</div><div class="u-value">${fmtCost(u?.today?.cost)}</div>
-             <div class="u-sub">API-equiv.</div></div>
-        <div><div class="u-label">All-time</div><div class="u-value">${fmtCost(u?.totals?.cost)}</div>
-             <div class="u-sub">${fmtTokens(totalTokens(u?.totals))} tokens</div></div>
-      </div>
-      ${a.logTail ? `<details class="logs" ${openLogs.has(a.key) ? "open" : ""}
-          ontoggle="logToggle('${esc(a.key)}', this.open)">
-        <summary>Container log (tail)</summary><pre>${esc(a.logTail)}</pre>
-      </details>` : ""}
-      <div class="actions">
-        ${hasTerm ? `<button class="primary" onclick="openTerminal('${esc(a.key)}')">Open session ▸</button>` : ""}
-        <button class="${confirmingThis ? "confirm" : "primary"}"
-                onclick="restart('${esc(a.key)}')"
-                ${state === "restart queued" || state === "restarting" ? "disabled" : ""}>
-          ${confirmingThis ? (sess.busy ? "Busy! Confirm restart" : "Confirm restart")
-                           : (state === "restarting" ? "Restarting…" : "Restart (clear context)")}
-        </button>
-        ${a.online ? "" : `<button onclick="removeAgent('${esc(a.key)}')">Remove</button>`}
-      </div>
-    </div>`;
+function hostCard(a, now) {
+  const state = agentState(a, now);
+  const dot = state === "online" ? "online" : (state === "offline" ? "offline" : "restarting");
+  const mem = a.memory
+    ? fmtBytes(a.memory.usedBytes) + (a.memory.limitBytes ? " / " + fmtBytes(a.memory.limitBytes) : "")
+    : "–";
+  const repos = a.repos || [];
+  const sessions = a.sessions || [];
+  const runCount = sessions.filter(s => s.status === "running").length;
+  const cRestart = confirming.has("hr::" + a.key);
+
+  // Repos from the scan, plus synthetic entries for any session whose repo is no
+  // longer present (e.g. repo dir removed) so its usage/controls stay reachable.
+  const repoNames = repos.map(r => r.name);
+  const orphans = [...new Set(sessions.map(s => s.repo))].filter(n => !repoNames.includes(n));
+  const repoEntries = [...repos, ...orphans.map(n => ({ name: n, missing: true }))];
+
+  const reposHtml = repoEntries.length
+    ? repoEntries.map(r => repoBlock(a, r, sessions.filter(s => s.repo === r.name), now)).join("")
+    : `<div class="repo-empty">No git repos found under ${esc(a.reposRoot || "the repos root")}.</div>`;
+
+  return `<div class="host-card ${a.online ? "" : "offline"}">
+    <div class="host-top">
+      <h3>${esc(a.key)}</h3>
+      <span class="status"><span class="dot ${dot}"></span>${esc(state)}</span>
+    </div>
+    <div class="host-meta">
+      <span><span class="m-label">Device</span> <b>${esc(a.device || "–")}</b></span>
+      <span><span class="m-label">Claude Code</span> <b>${esc(a.claudeVersion || "–")}</b></span>
+      <span><span class="m-label">Memory</span> <b>${esc(mem)}</b></span>
+      <span><span class="m-label">Uptime</span> <b>${esc(uptime(a.startedAt, now))}</b> · last seen ${esc(ago(now - a.lastSeen))}</span>
+      <span><span class="m-label">Repos root</span> <span class="path">${esc(a.reposRoot || "–")}</span></span>
+      <span><span class="m-label">Sessions</span> <b>${runCount}</b> running · ${sessions.length} total</span>
+    </div>
+    <div class="repos">${reposHtml}</div>
+    ${a.logTail ? `<details class="logs" ${openLogs.has(a.key) ? "open" : ""}
+        ontoggle="logToggle('${esc(a.key)}', this.open)">
+      <summary>Container log (tail)</summary><pre>${esc(a.logTail)}</pre>
+    </details>` : ""}
+    <div class="actions">
+      <button class="${cRestart ? "confirm" : ""}"
+              onclick="hostRestart('${esc(a.key)}')"
+              ${state === "restart queued" || state === "restarting" ? "disabled" : ""}>
+        ${cRestart ? "Confirm restart" : (state === "restarting" ? "Restarting…" : "Restart container")}
+      </button>
+      ${a.online ? "" : `<button onclick="removeHost('${esc(a.key)}')">Remove host</button>`}
+    </div>
+  </div>`;
 }
 
-async function restart(key) {
-  if (!confirming.has(key)) {
-    // First click arms the button; it disarms after 4s.
-    confirming.set(key, setTimeout(() => { confirming.delete(key); refresh(); }, 4000));
+function repoBlock(a, repo, sessList, now) {
+  const rkey = a.key + "::" + repo.name;
+  const collapsed = collapsedRepos.has(rkey);
+  const meta = repo.missing
+    ? `<span class="r-meta">repo not currently found · usage retained</span>`
+    : `<span class="r-meta"><b>${esc(repo.branch || "–")}</b>${repo.dirtyFiles ? ` · ${repo.dirtyFiles} dirty` : " · clean"}</span>`;
+  const canSpawn = a.online && !repo.missing;
+  const spawnBtn = canSpawn
+    ? `<button class="primary btn-sm" onclick="event.preventDefault();event.stopPropagation();newSession('${esc(a.key)}','${esc(repo.name)}')">+ New session</button>`
+    : "";
+  const body = sessList.length
+    ? `<div class="sess-grid">${sessList.map(s => sessCard(a, s, now)).join("")}</div>`
+    : `<div class="repo-empty">No sessions yet${canSpawn ? " — start one with “+ New session”." : "."}</div>`;
+
+  return `<details class="repo" ${collapsed ? "" : "open"} ontoggle="repoToggle('${esc(rkey)}', this.open)">
+    <summary class="repo-head">
+      <span class="r-name">${repoLink(repo.remote, repo.name)}</span>
+      ${meta}
+      <span class="spacer"></span>
+      ${spawnBtn}
+    </summary>
+    ${body}
+  </details>`;
+}
+
+function sessCard(a, s, now) {
+  const st = s.status || "stopped";
+  const live = st === "running" ? liveState(s, a, now) : null;
+  const u = s.usage;
+  const canAttach = a.terminalOnline && st === "running";
+  const rKey = "sr::" + a.key + "::" + s.id;
+  const kKey = "sk::" + a.key + "::" + s.id;
+  const dKey = "sd::" + a.key + "::" + s.id;
+  const id = esc(s.id), key = esc(a.key);
+
+  let actions = "";
+  if (st === "running") {
+    actions =
+      (canAttach
+        ? `<button class="primary btn-sm" onclick="openTerminal('${id}')">Attach ▸</button>`
+        : `<button class="btn-sm" disabled title="Terminal tunnel offline">Attach</button>`) +
+      `<button class="btn-sm ${confirming.has(rKey) ? "confirm" : ""}" onclick="sessRestart('${key}','${id}')">${confirming.has(rKey) ? "Confirm restart" : "Restart"}</button>` +
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? "Confirm kill" : "Kill"}</button>`;
+  } else {
+    // stopped or error: offer Start (needs host online + worktree recoverable) + Delete.
+    actions =
+      `<button class="primary btn-sm" ${a.online ? "" : "disabled"} onclick="sessStart('${key}','${id}')">Start</button>` +
+      `<button class="btn-sm ${confirming.has(dKey) ? "confirm" : ""}" onclick="sessDelete('${key}','${id}')">${confirming.has(dKey) ? "Confirm delete" : "Delete"}</button>`;
+  }
+
+  const prs = st === "running" && s.session?.newPrUrls?.length
+    ? `<dt>PRs</dt><dd>${s.session.newPrUrls.map(p =>
+        `<a href="${esc(p)}" target="_blank" rel="noopener">${esc(p.replace(/^https?:\/\//, ""))}</a>`).join("<br>")}</dd>`
+    : "";
+
+  return `<div class="sess ${st}">
+    <div class="sess-hd">
+      <span class="sid">${id}</span>
+      <span class="badge ${st}">${esc(st)}</span>
+    </div>
+    <dl>
+      <dt>Branch</dt><dd><b>${esc(s.branch || "–")}</b></dd>
+      <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
+      ${live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>` : ""}
+      ${live && live.question ? `<dt>Question</dt><dd>${esc(live.question)}</dd>` : ""}
+      ${st === "error" && s.errorMsg ? `<dt>Error</dt><dd class="errmsg">${esc(s.errorMsg)}</dd>` : ""}
+      ${prs}
+      <dt>Created</dt><dd>${s.createdAt ? esc(ago(now - Date.parse(s.createdAt))) : "–"}${s.stoppedAt ? " · stopped " + esc(ago(now - Date.parse(s.stoppedAt))) : ""}</dd>
+      <dt>Activity</dt><dd>${u?.lastActivity ? esc(ago(now - Date.parse(u.lastActivity))) : "–"}${u ? " · " + esc(shortModels(u.models)) : ""}</dd>
+    </dl>
+    <div class="usage">
+      <div><div class="u-label">Tokens today</div><div class="u-value">${fmtTokens(totalTokens(u?.today))}</div>
+           <div class="u-sub">${fmtTokens(u?.today?.output)} out</div></div>
+      <div><div class="u-label">Est. today</div><div class="u-value">${fmtCost(u?.today?.cost)}</div>
+           <div class="u-sub">API-equiv.</div></div>
+      <div><div class="u-label">All-time</div><div class="u-value">${fmtCost(u?.totals?.cost)}</div>
+           <div class="u-sub">${fmtTokens(totalTokens(u?.totals))} tokens</div></div>
+    </div>
+    <div class="sess-actions">${actions}</div>
+  </div>`;
+}
+
+// ---- actions → endpoints ---------------------------------------------------
+function enc(s) { return encodeURIComponent(s); }
+async function post(url, body) {
+  await fetch(url, body
+    ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
+    : { method: "POST" });
+  refresh();
+}
+async function del(url) { await fetch(url, { method: "DELETE" }); refresh(); }
+
+// Two-click arm/confirm for destructive actions. The armed state lives in the
+// module-level `confirming` map so the 5s re-render keeps the button armed.
+function twoClick(actionKey, doIt) {
+  if (!confirming.has(actionKey)) {
+    confirming.set(actionKey, setTimeout(() => { confirming.delete(actionKey); refresh(); }, 4000));
     refresh();
     return;
   }
-  clearTimeout(confirming.get(key));
-  confirming.delete(key);
-  await fetch(`/api/agents/${encodeURIComponent(key)}/restart`, { method: "POST" });
-  refresh();
-}
-async function removeAgent(key) {
-  await fetch(`/api/agents/${encodeURIComponent(key)}`, { method: "DELETE" });
-  refresh();
+  clearTimeout(confirming.get(actionKey));
+  confirming.delete(actionKey);
+  doIt();
 }
 
-// ---- live terminal overlay -------------------------------------------------
-// Opens /term/<key>/ in a full-screen iframe. No extra secret: the browser
+function hostRestart(key) { twoClick("hr::" + key, () => post(`/api/agents/${enc(key)}/restart`)); }
+function removeHost(key)  { del(`/api/agents/${enc(key)}`); }
+function newSession(key, repo) { post(`/api/agents/${enc(key)}/sessions`, { repo }); }
+function sessStart(key, id)   { post(`/api/agents/${enc(key)}/sessions/${enc(id)}/start`); }
+function sessRestart(key, id) { twoClick("sr::" + key + "::" + id, () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/restart`)); }
+function sessKill(key, id)    { twoClick("sk::" + key + "::" + id, () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`)); }
+function sessDelete(key, id)  { twoClick("sd::" + key + "::" + id, () => del(`/api/agents/${enc(key)}/sessions/${enc(id)}`)); }
+
+// ---- live terminal overlay (per session) -----------------------------------
+// Opens /term/<sessionId>/ in a full-screen iframe. No extra secret: the browser
 // re-sends the page's basic-auth login on the same-origin iframe requests and
-// terminal WebSocket (see agent-hub/server.js).
+// terminal WebSocket. The hub routes <sessionId> to whichever host owns it.
 const $overlay = document.getElementById("termOverlay");
 const $frame = document.getElementById("termFrame");
-function openTerminal(key) {
-  const src = `/term/${encodeURIComponent(key)}/`;
-  $overlay.dataset.key = key;
-  document.getElementById("termTitle").textContent = key;
+function openTerminal(id) {
+  const src = `/term/${encodeURIComponent(id)}/`;
+  $overlay.dataset.id = id;
+  document.getElementById("termTitle").textContent = id;
   document.getElementById("termOpen").href = src;
   $frame.src = src;
   $overlay.style.display = "flex";
