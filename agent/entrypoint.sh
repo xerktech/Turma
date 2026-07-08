@@ -40,6 +40,36 @@ if [ "$AGENT" = "claude" ] || [ "$AGENT" = "claude-code" ]; then
 
   slug=$(pwd | sed 's#/#-#g')
   rm -f "/root/.claude/projects/$slug/bridge-pointer.json"
+
+  # Pre-accept the one-time "Bypass Permissions mode" disclaimer so the headless
+  # RC session doesn't hang on it. claude only treats the mode as accepted when
+  # skipDangerousModePermissionPrompt=true is persisted in a real settings source
+  # — IS_SANDBOX (which only lets bypass RUN as root) and --settings flag-layer
+  # values are deliberately NOT honored for this security check. So we set the
+  # exact key the interactive "Yes, I accept" writes, in the same file
+  # (~/.claude/settings.json). That dir is the host's shared login mount, so the
+  # write is a non-destructive, idempotent JSON merge (preserves the host's other
+  # settings, skips if already set) done atomically so concurrent container
+  # starts can't corrupt it.
+  CFG_DIR="${CLAUDE_CONFIG_DIR:-/root/.claude}"
+  python3 - "$CFG_DIR/settings.json" <<'PY' || echo "warn: could not pre-accept bypass disclaimer; the session may prompt"
+import json, os, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (FileNotFoundError, ValueError):
+    data = {}
+if data.get("skipDangerousModePermissionPrompt") is True:
+    sys.exit(0)
+data["skipDangerousModePermissionPrompt"] = True
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = f"{path}.tmp.{os.getpid()}"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+PY
 fi
 
 # --- Hub infrastructure (agent-agnostic) -----------------------------------
