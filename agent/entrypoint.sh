@@ -6,10 +6,12 @@ set -e
 # the original single-agent behavior is preserved when AGENT is unset.
 # Accepted: claude | codex | opencode | copilot.
 #
-# NOTE: auth is only wired up for claude today (it reuses the host's login via
-# the /root/.claude bind mount). codex/opencode/copilot are installed and
-# launchable, but you'll have to sort out their credentials separately — for now
-# they start unauthenticated and will prompt/fail until that's done.
+# All agents launch in full auto-approve mode (see the case below) so the
+# headless session runs unattended. NOTE: auth is only wired up for claude today
+# (it reuses the host's login via the /root/.claude bind mount).
+# codex/opencode/copilot are installed and launchable, but you'll have to sort
+# out their credentials separately — for now they start unauthenticated and will
+# prompt/fail at login until that's done.
 AGENT="${AGENT:-claude}"
 
 # --- Claude-only preflight -------------------------------------------------
@@ -78,15 +80,21 @@ CN="${CN:-$NAME}"
 # attach would have nothing to show and nowhere to type. The interactive form is
 # single-session (session ends -> tmux ends -> container restarts, matching the
 # crash / "Restart (clear context)" semantics below).
+# Every agent runs in full auto-approve / bypass-permissions mode: this is a
+# headless session driven remotely (claude.ai/code, mobile, or the hub's web
+# terminal), and the container itself is the sandbox (full host access), so a
+# per-action approval prompt would just hang with no one to click it. The flags
+# below are each agent's documented "run unattended in an externally sandboxed
+# environment" mode — the direct parallel to claude's bypassPermissions.
 case "$AGENT" in
   claude|claude-code)
     AGENT_CMD="claude --remote-control '$NAME' --permission-mode bypassPermissions" ;;
   codex)
-    AGENT_CMD="codex" ;;
+    AGENT_CMD="codex --dangerously-bypass-approvals-and-sandbox" ;;
   opencode)
-    AGENT_CMD="opencode" ;;
+    AGENT_CMD="opencode --auto" ;;
   copilot)
-    AGENT_CMD="copilot" ;;
+    AGENT_CMD="copilot --allow-all" ;;
   *)
     echo "Unknown AGENT '$AGENT' (want: claude | codex | opencode | copilot)" >&2
     exit 1 ;;
