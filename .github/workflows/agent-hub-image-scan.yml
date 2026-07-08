@@ -1,0 +1,56 @@
+name: scan-agent-hub-image
+
+# On PRs to main that touch the /agent-hub build context, build the image
+# locally (no push) and scan it for OS/library CVEs and leaked secrets with
+# Trivy. Pre-merge counterpart to build-agent-hub-image.yml (push only on main).
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "agent-hub/**"
+      - ".github/workflows/agent-hub-image-scan.yml"
+
+concurrency:
+  group: agent-hub-image-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build agent-hub image (local, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./agent-hub
+          load: true
+          push: false
+          tags: local/agent-hub:pr-scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: local/agent-hub:pr-scan
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: sarif
+          output: trivy-agent-hub.sarif
+
+      - name: Upload Trivy SARIF
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-agent-hub.sarif
+          category: trivy-agent-hub

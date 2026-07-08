@@ -1,0 +1,86 @@
+name: code-scan
+
+# Code security + quality gate on PRs to main. Runs three independent checks
+# over the sources that go into the two images:
+#   - Semgrep  : SAST over the JS/Python code, Dockerfiles, and secret patterns
+#   - hadolint : Dockerfile best-practice/quality lint (both Dockerfiles)
+#   - ShellCheck: shell correctness for entrypoint.sh
+# Findings block the PR. This is the pre-merge counterpart to the build
+# workflows, which only run post-merge on main. Fires on open AND on later
+# pushes to the PR (default pull_request types) so every commit is re-checked.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - "agent-hub/**"
+      - ".github/workflows/code-scan.yml"
+
+concurrency:
+  group: code-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Lets the SARIF uploads populate the Security tab on repos with GitHub
+  # Advanced Security. Harmless (soft-fails) elsewhere — see continue-on-error.
+  security-events: write
+
+jobs:
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Semgrep
+        run: pip install --quiet semgrep
+      # p/default = high-signal security+correctness rules for JS/Python; the
+      # extra packs add Dockerfile and hardcoded-secret coverage. --error makes
+      # any finding fail the job; SARIF is still written for the upload below.
+      - name: Semgrep scan
+        run: |
+          semgrep scan \
+            --config=p/default \
+            --config=p/secrets \
+            --config=p/dockerfile \
+            --error \
+            --sarif --output=semgrep.sarif \
+            .
+      - name: Upload Semgrep SARIF
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  hadolint:
+    name: Hadolint (${{ matrix.dockerfile }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile:
+          - agent/Dockerfile
+          - agent-hub/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+      # Blocks only on error-level issues; warnings (e.g. unpinned apt) are
+      # surfaced as annotations without failing. Tighten to `warning` to gate
+      # harder.
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ matrix.dockerfile }}
+          failure-threshold: error
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Finds every shell script in the repo and lints per its shebang
+      # (entrypoint.sh is #!/bin/sh). Fails the job on any finding.
+      - uses: ludeeus/action-shellcheck@master

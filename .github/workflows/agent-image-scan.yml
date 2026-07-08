@@ -1,0 +1,63 @@
+name: scan-agent-image
+
+# On PRs to main that touch the /agent build context, build the image locally
+# (no push) and scan it for OS/library CVEs and leaked secrets with Trivy.
+# Pre-merge counterpart to build-agent-image.yml, which pushes only on main.
+# CLAUDE_CODE_VERSION is left at its Dockerfile default (latest) — the scan
+# cares about the assembled image, not the exact pinned tag.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - ".github/workflows/agent-image-scan.yml"
+
+concurrency:
+  group: agent-image-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build into the local docker daemon (load, not push) so Trivy can scan
+      # the exact image this repo would ship. gha cache keeps it quick.
+      - name: Build agent image (local, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./agent
+          load: true
+          push: false
+          tags: local/agent:pr-scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ignore-unfixed keeps the gate actionable: only CVEs with an available
+      # fix (i.e. that a rebuild/bump can resolve) fail the PR; unfixable base
+      # image noise is reported but not blocking.
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: local/agent:pr-scan
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: sarif
+          output: trivy-agent.sarif
+
+      - name: Upload Trivy SARIF
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-agent.sarif
+          category: trivy-agent
