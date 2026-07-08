@@ -55,7 +55,13 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/trivy" --version
 
+      # TMPDIR/--cache-dir → runner.temp so Trivy's uncompressed-layer scratch
+      # export lands on the roomy _work volume instead of the runner's small
+      # /tmp. See agent-image-scan.yml for the full rationale (that larger image
+      # is what actually exhausted /tmp).
       - name: Trivy image scan
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
           trivy image local/agent-hub:pr-scan \
@@ -63,5 +69,6 @@ jobs:
             --severity CRITICAL,HIGH \
             --ignore-unfixed \
             --ignorefile .trivyignore \
+            --cache-dir "${RUNNER_TEMP}/trivy-cache" \
             --exit-code 1 \
             --no-progress

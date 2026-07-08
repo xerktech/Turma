@@ -65,7 +65,14 @@ jobs:
       # ignore-unfixed keeps the gate actionable: only CVEs with an available
       # fix fail the PR. Reviewed, non-actionable base-image CVEs are triaged in
       # .trivyignore; anything else HIGH/CRITICAL fails the job.
+      # TMPDIR → runner.temp: Trivy exports each uncompressed image layer to a
+      # scratch file before scanning, and the agent image (node/npm/gh/ttyd/
+      # docker CLI) is large enough to blow out the runner container's small
+      # /tmp ("no space left on device"). runner.temp lives on the roomy _work
+      # volume and is cleaned per job.
       - name: Trivy image scan
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
           trivy image local/agent:pr-scan \
@@ -73,5 +80,6 @@ jobs:
             --severity CRITICAL,HIGH \
             --ignore-unfixed \
             --ignorefile .trivyignore \
+            --cache-dir "${RUNNER_TEMP}/trivy-cache" \
             --exit-code 1 \
             --no-progress
