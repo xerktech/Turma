@@ -222,7 +222,7 @@
 
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
-  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. Kill stops a session but keeps its branch and usage history so Start can resume it; Delete removes it entirely (worktree, branch, history) in one step. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name.</div>
+  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. Kill stops a session and removes it from the hub (worktree deleted) in one step, but keeps its git branch and usage history — the work stays in the repo, it just leaves the dashboard. Delete (on an already-stopped session) additionally erases the branch and history. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name.</div>
 </div>
 
 <div class="term-overlay" id="termOverlay">
@@ -262,7 +262,7 @@ function repoToggle(rkey, open) { open ? collapsedRepos.delete(rkey) : collapsed
 // the change (reconcilePending), with a timeout so a failed command can't wedge
 // a button forever. Keyed so it survives the 5s re-render.
 //   spawn:   "spawn::<host>::<repo>"    cleared when the repo's session count rises
-//   kill:    "kill::<host>::<id>"       cleared when the session leaves "running"
+//   kill:    "kill::<host>::<id>"       cleared when the session disappears
 //   start:   "start::<host>::<id>"      cleared when the session enters "running"
 //   delete:  "delete::<host>::<id>"     cleared when the session disappears
 //   restart: "restart::<host>::<id>"    no observable signal — cleared by timeout
@@ -294,7 +294,9 @@ function reconcilePending(agents) {
       if ((counts.get(p.host + "::" + p.repo) || 0) > p.baseline) pending.delete(key);
     } else {
       const s = index.get(p.host + "::" + p.id);
-      if (p.kind === "kill" && (!s || s.status !== "running")) pending.delete(key);
+      // kill now removes the record entirely (keeping only the branch), so like
+      // delete it clears when the session disappears from the reported list.
+      if (p.kind === "kill" && !s) pending.delete(key);
       else if (p.kind === "delete" && !s) pending.delete(key);
       else if (p.kind === "start" && s && s.status === "running") pending.delete(key);
       // restart keeps the session "running" with no distinct signal → timeout.
@@ -542,10 +544,11 @@ function sessCard(a, s, now) {
         ? `<button class="primary btn-sm" onclick="openTerminal('${id}')">Attach ▸</button>`
         : `<button class="btn-sm" disabled title="Terminal tunnel offline">Attach</button>`) +
       `<button class="btn-sm ${confirming.has(rKey) ? "confirm" : ""}" onclick="sessRestart('${key}','${id}')">${confirming.has(rKey) ? "Confirm restart" : "Restart"}</button>` +
-      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? "Confirm kill" : "Kill"}</button>` +
-      // Delete straight from running: one step, fully gone (worktree + branch +
-      // history). Kill (above) is the softer "stop but keep, resumable" option.
-      `<button class="btn-sm ${confirming.has(dKey) ? "confirm" : ""}" onclick="sessDelete('${key}','${id}')">${confirming.has(dKey) ? "Confirm delete" : "Delete"}</button>`;
+      // One-step teardown: stop the session, remove its worktree, and drop it
+      // from the hub — but KEEP the git branch and usage history. (The old
+      // separate Delete button, which also nuked the branch, lived here; it now
+      // only appears on already-stopped/errored cards below.)
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? "Confirm kill" : "Kill"}</button>`;
   } else {
     // stopped or error: offer Start (needs host online + worktree recoverable) + Delete.
     actions =
