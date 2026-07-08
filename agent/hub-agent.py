@@ -61,6 +61,10 @@ WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".agenthub", "worktrees")
 # Persisted session registry (survives container restart).
 REGISTRY_DIR = os.path.expanduser("~/.agenthub")
 REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
+# Where Claude Code keeps per-project transcript JSONLs (slug = cwd with
+# '/'->'-'). Overridable so the test suite can point it at fixtures; unset in
+# production, so the default is the real path.
+PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", "/root/.claude/projects")
 
 # Transcript parsing is the expensive part; refresh it every N heartbeats.
 USAGE_EVERY = 15
@@ -178,7 +182,7 @@ HISTORY_DAYS = 60  # per-day breakdown reported to the hub (bounds payload size)
 def usage_report(workdir):
     """Aggregate token usage for this project from the transcript JSONLs."""
     slug = workdir.replace("/", "-")
-    proj = f"/root/.claude/projects/{slug}"
+    proj = os.path.join(PROJECTS_ROOT, slug)
     totals = {"input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0}
     days = {}  # "YYYY-MM-DD" (UTC) -> same shape as totals
     models = {}
@@ -301,7 +305,7 @@ def session_report(workdir, state):
     replays PR links from old sessions.
     """
     slug = workdir.replace("/", "-")
-    proj = f"/root/.claude/projects/{slug}"
+    proj = os.path.join(PROJECTS_ROOT, slug)
     primed = state.get("primed", False)
     offsets = state.setdefault("offsets", {})
     seen = state.setdefault("pr_seen", set())
@@ -502,7 +506,7 @@ class SessionManager:
         # keys ~/.claude/projects for a given cwd.
         slug = worktree.replace("/", "-")
         try:
-            os.remove(f"/root/.claude/projects/{slug}/bridge-pointer.json")
+            os.remove(os.path.join(PROJECTS_ROOT, slug, "bridge-pointer.json"))
         except OSError:
             pass
 
