@@ -25,6 +25,11 @@ permissions:
 jobs:
   scan:
     runs-on: [self-hosted, linux]
+    env:
+      # Unique per-run tag: concurrent scans of different PRs on one runner
+      # would otherwise overwrite each other's local/agent-hub:pr-scan
+      # mid-scan, and it lets cleanup remove exactly this run's image.
+      SCAN_TAG: local/agent-hub:pr-${{ github.run_id }}
     steps:
       - name: Reset workspace ownership
         run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
@@ -39,7 +44,7 @@ jobs:
           context: ./agent-hub
           load: true
           push: false
-          tags: local/agent-hub:pr-scan
+          tags: ${{ env.SCAN_TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -47,10 +52,16 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=0.70.0
-          curl -fsSL -o /tmp/trivy.tgz \
-            "https://github.com/aquasecurity/trivy/releases/download/v${VERSION}/trivy_${VERSION}_Linux-64bit.tar.gz"
           mkdir -p "$HOME/.local/bin"
-          tar -xzf /tmp/trivy.tgz -C "$HOME/.local/bin" trivy
+          # Retry the whole download+extract: the release download has been
+          # seen arriving truncated with a success status, which curl --retry
+          # alone can't catch — only the extract proves the archive is whole.
+          for attempt in 1 2 3; do
+            curl -fsSL --retry 3 -o /tmp/trivy.tgz \
+              "https://github.com/aquasecurity/trivy/releases/download/v${VERSION}/trivy_${VERSION}_Linux-64bit.tar.gz" \
+              && tar -xzf /tmp/trivy.tgz -C "$HOME/.local/bin" trivy && break
+            echo "trivy download/extract failed (attempt ${attempt})"; sleep 5
+          done
           chmod +x "$HOME/.local/bin/trivy"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/trivy" --version
@@ -64,7 +75,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          trivy image local/agent-hub:pr-scan \
+          trivy image "$SCAN_TAG" \
             --scanners vuln,secret \
             --severity CRITICAL,HIGH \
             --ignore-unfixed \
@@ -72,3 +83,16 @@ jobs:
             --cache-dir "${RUNNER_TEMP}/trivy-cache" \
             --exit-code 1 \
             --no-progress
+
+      # The loaded image would otherwise pile up dangling in the shared
+      # runner's docker daemon run after run until the disk fills (which has
+      # taken CI down). Prune only this run's tag, dangling layers, and unused
+      # build cache — pulled base images stay for other jobs. Never fails the
+      # job.
+      - name: Clean up image and build cache
+        if: always()
+        run: |
+          docker rmi -f "$SCAN_TAG" 2>/dev/null || true
+          docker image prune -f || true
+          docker builder prune -af || true
+          df -h || true

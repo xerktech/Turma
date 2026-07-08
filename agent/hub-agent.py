@@ -71,6 +71,20 @@ CLOSED_PATH = os.path.join(REGISTRY_DIR, "closed.json")
 # Only the newest N closed sessions per repo are kept/offered for resume —
 # bounds both the file and the heartbeat payload.
 CLOSED_PER_REPO = 5
+# Where Claude Code keeps per-project transcript JSONLs (slug = cwd with
+# '/'->'-'). Overridable so the test suite can point it at fixtures; unset in
+# production, so the default is the real path.
+PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", "/root/.claude/projects")
+
+# Delete guard: a session branch that still has unpushed/unmerged commits is
+# parked as agent-trash/<id>-<epoch> instead of `branch -D`'d outright, then
+# hard-deleted once it has sat in the trash longer than this many days
+# (0 = prune trash eagerly). Fully pushed/merged branches skip the trash.
+TRASH_RETENTION_DAYS = int(os.environ.get("TRASH_RETENTION_DAYS", "7"))
+TRASH_PREFIX = "agent-trash/"
+# Trash pruning rides the heartbeat loop; every N beats (~hourly at the 20s
+# default interval) is plenty of resolution for a multi-day window.
+TRASH_PRUNE_EVERY = 180
 
 # Transcript parsing is the expensive part; refresh it every N heartbeats.
 USAGE_EVERY = 15
@@ -94,6 +108,54 @@ PRICING = {
 
 def log(msg):
     print(f"[hub-agent] {msg}", flush=True)
+
+
+def load_pricing_extra():
+    """Extra pricing entries from the PRICING_JSON env var (inline JSON, per the
+    everything-inline-env convention): {"model-substring": [input, output,
+    cacheWrite, cacheRead]} per MTok. Consulted ONLY when the built-in PRICING
+    table has no match, so it can price new/unknown models but never override a
+    built-in rate. Anything malformed is logged loudly and the whole override
+    ignored — a bad env var must never take the agent down."""
+    raw = os.environ.get("PRICING_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("top level must be a JSON object")
+        extra = {}
+        for key, rates in data.items():
+            if not key or not isinstance(key, str):
+                raise ValueError(f"bad model key {key!r}")
+            if (
+                not isinstance(rates, (list, tuple))
+                or len(rates) != 4
+                or not all(
+                    isinstance(r, (int, float)) and not isinstance(r, bool) and r >= 0
+                    for r in rates
+                )
+            ):
+                raise ValueError(
+                    f"{key!r} must map to [input, output, cacheWrite, cacheRead] per MTok"
+                )
+            if key in PRICING:
+                log(f"PRICING_JSON: {key!r} duplicates a built-in entry — ignored")
+                continue
+            extra[key] = tuple(float(r) for r in rates)
+        return extra
+    except ValueError as e:
+        log(f"PRICING_JSON invalid — ignoring it entirely: {e}")
+        return {}
+
+
+PRICING_EXTRA = load_pricing_extra()
+# Logged unconditionally at boot so a bad/missing override is diagnosable from
+# the container-log tail in the hub UI.
+log(
+    "pricing extras from PRICING_JSON (consulted for unknown models only): "
+    + (", ".join(f"{k}={list(v)}" for k, v in PRICING_EXTRA.items()) or "none")
+)
 
 
 def run(cmd, cwd=None):
@@ -159,6 +221,49 @@ def git_info(cwd):
     }
 
 
+def branch_exists(repo_path, ref):
+    """True if the fully-qualified ref resolves in this repo (no network)."""
+    return bool(run(["git", "-C", repo_path, "rev-parse", "--verify",
+                     "--quiet", ref]))
+
+
+def branch_sync(repo_path, branch, base_ref):
+    """How a session branch relates to its base branch and to origin — the
+    "is this work safe yet?" facts behind the UI's work-state line and the
+    delete guard. Same cost class as `status --porcelain`: a couple of local
+    ref lookups plus rev-list --count, no network (origin/<branch> is the
+    remote-tracking ref, which a push from this host updates). Computed
+    against the shared repo, so it works even after the worktree is gone.
+    Every field degrades to None instead of raising: branch not born yet,
+    detached base, no origin, unfetchable counts, etc.
+
+      baseRef       base branch compared against (None if indeterminate)
+      aheadOfBase   commits on the branch that the base doesn't have
+      pushed        origin/<branch> exists locally (pushed from here at some
+                    point); None when the branch itself doesn't exist yet
+      aheadOfRemote commits not yet on origin/<branch> (pushed only)
+    """
+    info = {"baseRef": None, "aheadOfBase": None, "pushed": None,
+            "aheadOfRemote": None}
+    if not branch or branch == "HEAD":
+        return info
+    local = f"refs/heads/{branch}"
+    if not branch_exists(repo_path, local):
+        return info
+    info["pushed"] = branch_exists(repo_path, f"refs/remotes/origin/{branch}")
+    if info["pushed"]:
+        n = run(["git", "-C", repo_path, "rev-list", "--count",
+                 f"refs/remotes/origin/{branch}..{local}"])
+        info["aheadOfRemote"] = int(n) if n.isdigit() else None
+    if base_ref and base_ref != "HEAD" and base_ref != branch:
+        n = run(["git", "-C", repo_path, "rev-list", "--count",
+                 f"refs/heads/{base_ref}..{local}"])
+        if n.isdigit():
+            info["baseRef"] = base_ref
+            info["aheadOfBase"] = int(n)
+    return info
+
+
 def memory_usage():
     # cgroup v2, then v1.
     for cur, limit in (
@@ -188,10 +293,11 @@ HISTORY_DAYS = 60  # per-day breakdown reported to the hub (bounds payload size)
 def usage_report(workdir):
     """Aggregate token usage for this project from the transcript JSONLs."""
     slug = workdir.replace("/", "-")
-    proj = f"/root/.claude/projects/{slug}"
+    proj = os.path.join(PROJECTS_ROOT, slug)
     totals = {"input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0}
     days = {}  # "YYYY-MM-DD" (UTC) -> same shape as totals
     models = {}
+    unpriced = set()  # model ids with token usage that no pricing entry matched
     seen = set()
     last_ts = ""
     sessions = 0
@@ -234,14 +340,23 @@ def usage_report(workdir):
                         usage.get("cache_creation_input_tokens", 0) or 0,
                         usage.get("cache_read_input_tokens", 0) or 0,
                     )
+                    # Built-in table first (authoritative); PRICING_EXTRA only
+                    # covers models the built-ins don't match.
                     price = next(
                         (p for k, p in PRICING.items() if k in model), None
+                    ) or next(
+                        (p for k, p in PRICING_EXTRA.items() if k in model), None
                     )
                     cost = (
-                        sum(t * p for t, p in zip(tok, (price[0], price[1], price[2], price[3]))) / 1e6
+                        sum(t * p for t, p in zip(tok, price)) / 1e6
                         if price
                         else 0.0
                     )
+                    # An unpriced model costs $0.00 — flag every bucket it lands
+                    # in so the UI never understates cost silently.
+                    is_unpriced = price is None and any(tok)
+                    if is_unpriced:
+                        unpriced.add(model)
                     buckets = [totals]
                     # Transcript timestamps are UTC ISO; date-prefix bucketing
                     # is close enough for a dashboard.
@@ -258,6 +373,8 @@ def usage_report(workdir):
                         b["cacheWrite"] += tok[2]
                         b["cacheRead"] += tok[3]
                         b["cost"] += cost
+                        if is_unpriced:
+                            b["unpriced"] = True
         except OSError:
             continue
 
@@ -275,6 +392,9 @@ def usage_report(workdir):
         "sessions": sessions,
         "lastActivity": last_ts,
         "models": sorted(models, key=models.get, reverse=True),
+        # Models whose usage no pricing entry matched (their cost counted as
+        # $0.00) — the UI flags any figure that includes them.
+        "unpricedModels": sorted(unpriced),
     }
 
 
@@ -311,7 +431,7 @@ def session_report(workdir, state):
     replays PR links from old sessions.
     """
     slug = workdir.replace("/", "-")
-    proj = f"/root/.claude/projects/{slug}"
+    proj = os.path.join(PROJECTS_ROOT, slug)
     primed = state.get("primed", False)
     offsets = state.setdefault("offsets", {})
     seen = state.setdefault("pr_seen", set())
@@ -433,6 +553,30 @@ def repo_entry(repo):
     }
 
 
+def prune_trash_branches():
+    """Hard-delete agent-trash/* branches whose grace period has expired.
+
+    delete() embeds the trash time as a unix-epoch suffix in the branch name
+    (agent-trash/<id>-<epoch>); a trash branch without one (e.g. renamed by
+    hand) falls back to its commit date. Runs on every delete and on a slow
+    cadence in the heartbeat loop, across every scanned repo."""
+    cutoff = time.time() - TRASH_RETENTION_DAYS * 86400
+    for repo in scan_repos():
+        out = run(["git", "-C", repo["path"], "for-each-ref",
+                   "--format=%(refname:short) %(committerdate:unix)",
+                   f"refs/heads/{TRASH_PREFIX}"])
+        for line in out.splitlines():
+            name, _, cdate = line.rpartition(" ")
+            m = re.search(r"-(\d{9,})$", name)
+            trashed_at = (int(m.group(1)) if m
+                          else int(cdate) if cdate.isdigit() else None)
+            if trashed_at is None or trashed_at >= cutoff:
+                continue
+            if run_ok(["git", "-C", repo["path"], "branch", "-D", name])[0] == 0:
+                log(f"pruned trash branch {name} in {repo['name']} "
+                    f"(in trash >{TRASH_RETENTION_DAYS}d)")
+
+
 def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -514,7 +658,7 @@ class SessionManager:
         # keys ~/.claude/projects for a given cwd.
         slug = worktree.replace("/", "-")
         try:
-            os.remove(f"/root/.claude/projects/{slug}/bridge-pointer.json")
+            os.remove(os.path.join(PROJECTS_ROOT, slug, "bridge-pointer.json"))
         except OSError:
             pass
 
@@ -528,7 +672,7 @@ class SessionManager:
         new one) and --continue's "most recent" pick is opaque, while
         newest-mtime here is deterministic."""
         slug = worktree.replace("/", "-")
-        proj = f"/root/.claude/projects/{slug}"
+        proj = os.path.join(PROJECTS_ROOT, slug)
         newest, newest_mtime = None, 0.0
         try:
             for fname in os.listdir(proj):
@@ -710,8 +854,9 @@ class SessionManager:
         hub. KEEPS the git branch (agent/<id>) and the transcript, so the work
         stays in the repo and its usage still shows in history — and records it
         in the closed history so the repo's "Resume" picker can bring it back
-        with its conversation. (Contrast delete(), which also runs
-        `git branch -D` to erase the branch and history.)"""
+        with its conversation. (Contrast delete(), which also removes the
+        branch — immediately when fully pushed/merged, otherwise parked under
+        agent-trash/ for a grace period — forfeiting resume either way.)"""
         sess = self._find(sid)
         if not sess:
             log(f"kill: no such session {sid}")
@@ -811,9 +956,41 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
+    def _retire_branch(self, sess):
+        """Lost-work guard behind delete(): `branch -D` the session branch only
+        when its commits are provably safe (all on origin, or all contained in
+        the repo checkout's base branch); otherwise rename it to
+        agent-trash/<id>-<epoch> as a grace period, pruned after
+        TRASH_RETENTION_DAYS. Anything indeterminate is treated as unsafe."""
+        repo, branch = sess["repoPath"], sess["branch"]
+        if not branch_exists(repo, f"refs/heads/{branch}"):
+            return  # spawn failed before the branch was born, or already gone
+        base = run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"])
+        sync = branch_sync(repo, branch, base or None)
+        safe = ((sync["pushed"] and sync["aheadOfRemote"] == 0)
+                or sync["aheadOfBase"] == 0)
+        if safe:
+            run(["git", "-C", repo, "branch", "-D", branch])
+            return
+        trash = f"{TRASH_PREFIX}{sess['id']}-{int(time.time())}"
+        rc, err = run_ok(["git", "-C", repo, "branch", "-m", branch, trash])
+        if rc == 0:
+            unpushed = (sync["aheadOfRemote"] if sync["pushed"]
+                        else sync["aheadOfBase"])
+            log(f"branch {branch} has unpushed work "
+                f"({unpushed if unpushed is not None else 'unknown'} commits) "
+                f"— parked as {trash} for {TRASH_RETENTION_DAYS}d")
+        else:
+            log(f"could not park {branch} as {trash} ({err}); "
+                f"branch left in place")
+
     def delete(self, sid):
         """Remove a session entirely: worktree + branch + registry record. It
-        disappears from the UI and its usage stops being reported."""
+        disappears from the UI and its usage stops being reported. The branch
+        is hard-deleted only when its work is safe (pushed or merged); a branch
+        with unpushed commits is parked under agent-trash/ instead — see
+        _retire_branch(). Dirty worktree files are gone either way (the UI
+        warns before confirming)."""
         sess = self._find(sid)
         if not sess:
             log(f"delete: no such session {sid}")
@@ -822,11 +999,12 @@ class SessionManager:
         self._kill_ttyd(sid)
         if os.path.isdir(sess["worktreePath"]):
             self._worktree_remove(sess)
-        run(["git", "-C", sess["repoPath"], "branch", "-D", sess["branch"]])
+        self._retire_branch(sess)
         self.registry = [s for s in self.registry if s.get("id") != sid]
         # The branch is gone, so any stale closed record must not offer resume.
         self.closed = [c for c in self.closed if c.get("id") != sid]
         self._forget_session_caches(sid)
+        prune_trash_branches()
         log(f"deleted session {sid}")
 
     # --- boot auto-resume --------------------------------------------------
@@ -918,6 +1096,10 @@ class SessionManager:
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
+        # Base = whatever the repo's own checkout is on (the branch worktrees
+        # were forked from); '' (e.g. repo dir gone) degrades to no comparison.
+        base = run(["git", "-C", sess["repoPath"], "rev-parse",
+                    "--abbrev-ref", "HEAD"])
         return {
             "id": sid,
             "repo": sess["repo"],
@@ -931,6 +1113,10 @@ class SessionManager:
             "stoppedAt": sess.get("stoppedAt"),
             "errorMsg": sess.get("errorMsg"),
             "git": git_info(sess["worktreePath"]),  # of the worktree (None if gone)
+            # Branch↔base/origin relation from the shared repo, so it's still
+            # reported for stopped sessions whose worktree is gone — exactly
+            # when the UI's delete guard needs it.
+            "work": branch_sync(sess["repoPath"], sess["branch"], base or None),
             "usage": self.usage_cache.get(sid),     # present for stopped too
             "session": signals,                      # running only; null otherwise
         }
@@ -1021,6 +1207,8 @@ class SessionManager:
         self.resume_on_boot()
         beat = 0
         while True:
+            if beat % TRASH_PRUNE_EVERY == 0:  # incl. beat 0 = boot
+                prune_trash_branches()
             reply = self.post(self.build_payload(beat))
             beat += 1
             if reply is not None:

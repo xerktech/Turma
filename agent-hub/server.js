@@ -90,6 +90,9 @@ function scheduleSave() {
       });
     });
   }, 30 * 1000);
+  // Never the only thing keeping the process alive (the listening server is);
+  // lets the test runner exit cleanly after exercising the heartbeat handler.
+  saveTimer.unref();
 }
 
 function prune() {
@@ -311,6 +314,8 @@ function heartbeatAlerts(key, prev, next) {
 }
 
 // Offline detection is time-driven, not heartbeat-driven, so it needs a sweep.
+// unref'd for the same reason as the save timer: the server socket is what
+// keeps the process alive in production.
 setInterval(() => {
   const now = Date.now();
   if (now - BOOT_AT < BOOT_GRACE_MS) return;
@@ -329,10 +334,11 @@ setInterval(() => {
     });
     scheduleSave();
   }
-}, 15 * 1000);
+}, 15 * 1000).unref();
 
 const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
 const HISTORY = fs.readFileSync(path.join(__dirname, "public", "history.html"));
+const SESSIONS = fs.readFileSync(path.join(__dirname, "public", "sessions.html"));
 // Bundled web font served to the live terminal. ttyd's page is same-origin
 // (proxied under /term/<name>/), so its xterm.js can load this from the hub;
 // proxyTerm() injects the matching @font-face. A Nerd Font gives the TUI full
@@ -567,6 +573,11 @@ const server = http.createServer(async (req, res) => {
       return res.end(HISTORY);
     }
 
+    if (req.method === "GET" && (url.pathname === "/sessions" || url.pathname === "/sessions.html")) {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(SESSIONS);
+    }
+
     // Web font for the live terminal (referenced by the @font-face proxyTerm
     // injects into ttyd's page). Immutable + long-lived so the browser fetches
     // the ~1 MB file once and caches it.
@@ -780,13 +791,38 @@ server.on("upgrade", async (req, socket, head) => {
   socket.destroy();
 });
 
-if (!HUB_PASSWORD) console.warn("WARNING: HUB_USER/HUB_PASSWORD not set — UI is unauthenticated");
-if (!HUB_AGENT_TOKEN) console.warn("WARNING: HUB_AGENT_TOKEN not set — heartbeat and tunnel endpoints are unauthenticated");
-server.listen(PORT, () => {
-  console.log(`agent-hub listening on :${PORT}`);
-  console.log(
-    NTFY_URL
-      ? `ntfy alerts -> ${NTFY_URL}/${NTFY_TOPIC} (cost threshold $${COST_ALERT_USD}/day)`
-      : "ntfy alerts disabled (NTFY_URL not set)"
-  );
-});
+// Test hooks: when AGENTHUB_TEST is set (never in the image — the Dockerfile
+// runs `node server.js` with it unset), export the internals for the test
+// suite and skip binding the production port (tests listen on an ephemeral
+// port themselves). Production behavior is identical: the guard only decides
+// whether to listen.
+if (process.env.AGENTHUB_TEST) {
+  module.exports = {
+    server,
+    agents,
+    queueCommand,
+    findSession,
+    wsAccept,
+    wsEncode,
+    wsParser,
+    channelDuplex,
+    heartbeatAlerts,
+    sessionWorking,
+    userAuthorized,
+    agentAuthorized,
+    agentWsAuthorized,
+    safeEqual,
+    fmtDur,
+  };
+} else {
+  if (!HUB_PASSWORD) console.warn("WARNING: HUB_USER/HUB_PASSWORD not set — UI is unauthenticated");
+  if (!HUB_AGENT_TOKEN) console.warn("WARNING: HUB_AGENT_TOKEN not set — heartbeat and tunnel endpoints are unauthenticated");
+  server.listen(PORT, () => {
+    console.log(`agent-hub listening on :${PORT}`);
+    console.log(
+      NTFY_URL
+        ? `ntfy alerts -> ${NTFY_URL}/${NTFY_TOPIC} (cost threshold $${COST_ALERT_USD}/day)`
+        : "ntfy alerts disabled (NTFY_URL not set)"
+    );
+  });
+}

@@ -40,8 +40,17 @@
   h1 { font-size: 20px; margin: 0; font-weight: 650; }
   header .sub { color: var(--muted); font-size: 13px; }
   header .spacer { flex: 1; }
-  header a.nav { color: var(--accent); text-decoration: none; font-size: 13px; }
-  header a.nav:hover { text-decoration: underline; }
+
+  /* Shared page nav: pill tabs in the header on wide screens, a fixed bottom
+     tab bar on phones (same markup on all three pages). */
+  .nav-tabs { display: flex; gap: 4px; }
+  .nav-tabs a {
+    color: var(--ink-2); text-decoration: none; font-size: 13px;
+    padding: 5px 12px; border-radius: 20px; border: 1px solid transparent;
+  }
+  .nav-tabs a:hover { color: var(--accent); }
+  .nav-tabs a.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .bottom-nav { display: none; }
 
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 24px; }
   .tile {
@@ -134,9 +143,15 @@
   .usage .u-label { color: var(--muted); font-size: 11px; }
   .usage .u-value { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .usage .u-sub { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .unpriced { color: var(--warning); cursor: help; }
 
   .sess-working { color: var(--good); }
   .sess-wait { color: var(--warning); }
+
+  /* Per-session work-state line: warning when there's unpushed/uncommitted
+     work that a delete/kill would lose, muted when everything is safe. */
+  .work-risk { color: var(--warning); font-weight: 600; }
+  .work-safe { color: var(--muted); }
 
   details.logs { border-top: 1px solid var(--hairline); padding-top: 8px; }
   details.logs summary { cursor: pointer; color: var(--muted); font-size: 12px; user-select: none; }
@@ -202,6 +217,19 @@
   @media (max-width: 600px) {
     .wrap { padding: 16px 12px 40px; }
     header { gap: 8px 12px; margin-bottom: 16px; }
+    .nav-tabs { display: none; }
+    .bottom-nav {
+      display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+      background: var(--surface); border-top: 1px solid var(--hairline);
+      padding: 4px 8px calc(4px + env(safe-area-inset-bottom));
+    }
+    .bottom-nav a {
+      flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+      color: var(--muted); text-decoration: none; font-size: 11px; padding: 6px 0 4px;
+    }
+    .bottom-nav a svg { width: 21px; height: 21px; }
+    .bottom-nav a.active { color: var(--accent); }
+    body { padding-bottom: 68px; }
     .tiles { grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 18px; }
     .tile { padding: 11px 12px; }
     .tile .value { font-size: 21px; }
@@ -227,14 +255,33 @@
     <h1>Agent Hub</h1>
     <span class="sub">Session hosts</span>
     <span class="spacer"></span>
-    <a class="nav" href="/history">Usage history</a>
+    <nav class="nav-tabs">
+      <a href="/" class="active">Dashboard</a>
+      <a href="/sessions">Sessions</a>
+      <a href="/history">History</a>
+    </nav>
     <span class="sub" id="refreshed"></span>
   </header>
 
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
-  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. Kill stops a session and removes it from the hub (worktree deleted) in one step, but keeps its git branch, conversation, and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and brings one back on the same branch with its conversation intact. Delete (on an already-stopped session) additionally erases the branch and history. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation.</div>
+  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. Kill stops a session and removes it from the hub (worktree deleted, so uncommitted files are lost) in one step, but keeps its git branch, conversation, and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and brings one back on the same branch with its conversation intact. Delete (on an already-stopped session) additionally erases the branch and history; a branch with unpushed commits is parked as <code>agent-trash/&lt;id&gt;</code> in the repo for a grace period (7 days by default) before being pruned for good. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation.</div>
 </div>
+
+<nav class="bottom-nav">
+  <a href="/" class="active">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    Dashboard
+  </a>
+  <a href="/sessions">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+    Sessions
+  </a>
+  <a href="/history">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/></svg>
+    History
+  </a>
+</nav>
 
 <div class="term-overlay" id="termOverlay">
   <div class="term-box">
@@ -337,6 +384,13 @@ function fmtTokens(n) {
   return String(n);
 }
 function fmtCost(c) { return c == null ? "–" : "$" + c.toFixed(2); }
+// ⚠ next to a cost figure that includes usage from models the agent's pricing
+// table doesn't know (counted at $0.00, so the figure is understated).
+function unpricedMark(bucket, u) {
+  if (!bucket || !bucket.unpriced) return "";
+  const who = (u?.unpricedModels || []).join(", ");
+  return ` <span class="unpriced" title="Understated — includes unpriced model(s)${who ? ": " + esc(who) : ""}">⚠</span>`;
+}
 function fmtBytes(b) {
   if (b == null) return "–";
   const units = ["B", "KiB", "MiB", "GiB"];
@@ -385,6 +439,35 @@ function repoLink(remote, name) {
     : nm;
 }
 
+// Work-safety facts for a session: how many commits aren't on origin yet
+// (relative to origin/<branch> when it was ever pushed, else everything past
+// the base branch), plus the worktree's dirty-file count. null = unknown
+// (first beat, branch not born yet, repo gone).
+function unpushedCommits(s) {
+  const w = s.work || {};
+  if (w.pushed === true) return w.aheadOfRemote;   // may be null (sync unknown)
+  if (w.pushed === false) return w.aheadOfBase;    // never pushed: all of these
+  return null;
+}
+// Compact work-state line for the card, e.g. "3 commits ahead of main · not
+// pushed" (warning) or "pushed · 0 ahead" (muted). "" when nothing is known.
+function workLine(s) {
+  const w = s.work || {};
+  const dirty = s.git?.dirtyFiles ?? null;
+  if (w.pushed == null && w.aheadOfBase == null && !dirty) return "";
+  const bits = [];
+  if (w.aheadOfBase != null)
+    bits.push(`${w.aheadOfBase} commit${w.aheadOfBase === 1 ? "" : "s"} ahead` +
+              (w.baseRef ? ` of ${esc(w.baseRef)}` : ""));
+  if (w.pushed === true)
+    bits.push(w.aheadOfRemote > 0 ? `${w.aheadOfRemote} unpushed`
+            : w.aheadOfRemote === 0 ? "pushed" : "pushed · sync unknown");
+  else if (w.pushed === false) bits.push("not pushed");
+  if (dirty) bits.push(`${dirty} dirty file${dirty === 1 ? "" : "s"}`);
+  const risk = unpushedCommits(s) > 0 || dirty > 0;
+  return `<b class="${risk ? "work-risk" : "work-safe"}">${bits.join(" · ")}</b>`;
+}
+
 // Per-session live signals: transcript freshness => working/idle, pending
 // AskUserQuestion => waiting on the user, bridge pointer => attached. Freshness
 // is relative to the host's last heartbeat (host.lastSeen).
@@ -431,6 +514,10 @@ function render(data) {
   const tokToday = sess.reduce((t, x) => t + (totalTokens(x.s.usage?.today) || 0), 0);
   const costToday = sess.reduce((t, x) => t + (x.s.usage?.today?.cost || 0), 0);
   const costAll = sess.reduce((t, x) => t + (x.s.usage?.totals?.cost || 0), 0);
+  // Any unpriced usage in the mix means the $ tiles are understated — say so.
+  const unpToday = sess.some(x => x.s.usage?.today?.unpriced);
+  const unpAll = sess.some(x => x.s.usage?.totals?.unpriced);
+  const unpModels = [...new Set(sess.flatMap(x => x.s.usage?.unpricedModels || []))].join(", ");
 
   $tiles.innerHTML =
     tile("Hosts online", `${online.length} / ${agents.length}`,
@@ -438,8 +525,10 @@ function render(data) {
     tile("Running sessions", String(running.length), sess.length + " total") +
     tile("Waiting on you", String(waiting.length), "sessions with a question") +
     tile("Tokens today", fmtTokens(tokToday), "all sessions, incl. cache") +
-    tile("Est. cost today", fmtCost(costToday), "API-equivalent") +
-    tile("Est. cost all-time", fmtCost(costAll), "API-equivalent");
+    tile("Est. cost today", fmtCost(costToday) + (unpToday ? " ⚠" : ""),
+         unpToday ? "understated — unpriced: " + unpModels : "API-equivalent") +
+    tile("Est. cost all-time", fmtCost(costAll) + (unpAll ? " ⚠" : ""),
+         unpAll ? "understated — unpriced: " + unpModels : "API-equivalent");
 
   if (!agents.length) {
     $groups.innerHTML = `<div class="empty">No hosts have reported yet.<br>
@@ -580,6 +669,21 @@ function sessCard(a, s, now) {
   const dKey = "sd::" + a.key + "::" + s.id;
   const id = esc(s.id), key = esc(a.key);
 
+  // Delete/kill guard copy: say exactly what a confirm would lose. Kill keeps
+  // the branch (commits survive in the repo) but removes the worktree, so it
+  // only loses uncommitted changes; delete also retires the branch (unpushed
+  // commits are parked as agent-trash/<id> for a grace period, not kept).
+  const dirty = s.git?.dirtyFiles || 0;
+  const unpushed = unpushedCommits(s);
+  const work = workLine(s);
+  const lose = [];
+  if (unpushed > 0) lose.push(`${unpushed} unpushed commit${unpushed === 1 ? "" : "s"}`);
+  if (dirty > 0) lose.push("uncommitted changes");
+  const delConfirm = lose.length
+    ? `Confirm delete — ${lose.join(" + ")} will be lost` : "Confirm delete";
+  const killConfirm = dirty > 0
+    ? "Confirm kill — uncommitted changes will be lost" : "Confirm kill";
+
   const sp = sessPending(a.key, s.id);
   let actions = "";
   if (sp) {
@@ -597,12 +701,12 @@ function sessCard(a, s, now) {
       // from the hub — but KEEP the git branch and usage history. (The old
       // separate Delete button, which also nuked the branch, lived here; it now
       // only appears on already-stopped/errored cards below.)
-      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? "Confirm kill" : "Kill"}</button>`;
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? esc(killConfirm) : "Kill"}</button>`;
   } else {
     // stopped or error: offer Start (needs host online + worktree recoverable) + Delete.
     actions =
       `<button class="primary btn-sm" ${a.online ? "" : "disabled"} onclick="sessStart('${key}','${id}')">Start</button>` +
-      `<button class="btn-sm ${confirming.has(dKey) ? "confirm" : ""}" onclick="sessDelete('${key}','${id}')">${confirming.has(dKey) ? "Confirm delete" : "Delete"}</button>`;
+      `<button class="btn-sm ${confirming.has(dKey) ? "confirm" : ""}" onclick="sessDelete('${key}','${id}')">${confirming.has(dKey) ? esc(delConfirm) : "Delete"}</button>`;
   }
 
   const prs = st === "running" && s.session?.newPrUrls?.length
@@ -617,6 +721,7 @@ function sessCard(a, s, now) {
     </div>
     <dl>
       <dt>Branch</dt><dd><b>${esc(s.branch || "–")}</b></dd>
+      ${work ? `<dt>Work</dt><dd>${work}</dd>` : ""}
       <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
       ${live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>` : ""}
       ${live && live.question ? `<dt>Question</dt><dd>${esc(live.question)}</dd>` : ""}
@@ -628,9 +733,9 @@ function sessCard(a, s, now) {
     <div class="usage">
       <div><div class="u-label">Tokens today</div><div class="u-value">${fmtTokens(totalTokens(u?.today))}</div>
            <div class="u-sub">${fmtTokens(u?.today?.output)} out</div></div>
-      <div><div class="u-label">Est. today</div><div class="u-value">${fmtCost(u?.today?.cost)}</div>
+      <div><div class="u-label">Est. today</div><div class="u-value">${fmtCost(u?.today?.cost)}${unpricedMark(u?.today, u)}</div>
            <div class="u-sub">API-equiv.</div></div>
-      <div><div class="u-label">All-time</div><div class="u-value">${fmtCost(u?.totals?.cost)}</div>
+      <div><div class="u-label">All-time</div><div class="u-value">${fmtCost(u?.totals?.cost)}${unpricedMark(u?.totals, u)}</div>
            <div class="u-sub">${fmtTokens(totalTokens(u?.totals))} tokens</div></div>
     </div>
     <div class="sess-actions">${actions}</div>
