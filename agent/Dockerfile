@@ -11,6 +11,9 @@ ARG TTYD_VERSION=1.7.7
 # PowerShell — cross-platform shell/scripting available to Claude. Self-contained
 # linux-x64 tarball (needs libicu, installed below). Bump as needed for CVEs.
 ARG POWERSHELL_VERSION=7.6.3
+# npm — pinned ahead of the base image's bundled npm to pull in patched
+# transitive deps (e.g. undici); the image scan gates on npm's node_modules.
+ARG NPM_VERSION=11.18.0
 # Claude Code npm version. CI pins this to the latest published release so the
 # image tag reflects the bundled Claude Code version. Defaults to latest for
 # local/manual builds.
@@ -29,6 +32,7 @@ RUN apt-get update \
  && curl -fsSL "https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}/powershell-${POWERSHELL_VERSION}-linux-x64.tar.gz" \
       | tar -xz -C /opt/powershell \
  && ln -s /opt/powershell/pwsh /usr/local/bin/pwsh \
+ && npm install -g "npm@${NPM_VERSION}" \
  && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
  && rm -rf /var/lib/apt/lists/*
 
