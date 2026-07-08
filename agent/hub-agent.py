@@ -66,6 +66,16 @@ REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
 # production, so the default is the real path.
 PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", "/root/.claude/projects")
 
+# Delete guard: a session branch that still has unpushed/unmerged commits is
+# parked as agent-trash/<id>-<epoch> instead of `branch -D`'d outright, then
+# hard-deleted once it has sat in the trash longer than this many days
+# (0 = prune trash eagerly). Fully pushed/merged branches skip the trash.
+TRASH_RETENTION_DAYS = int(os.environ.get("TRASH_RETENTION_DAYS", "7"))
+TRASH_PREFIX = "agent-trash/"
+# Trash pruning rides the heartbeat loop; every N beats (~hourly at the 20s
+# default interval) is plenty of resolution for a multi-day window.
+TRASH_PRUNE_EVERY = 180
+
 # Transcript parsing is the expensive part; refresh it every N heartbeats.
 USAGE_EVERY = 15
 # Small pause after launching a Claude session. The whole host shares ONE
@@ -151,6 +161,49 @@ def git_info(cwd):
         "lastCommit": run(["git", "log", "-1", "--format=%h %s"], cwd=cwd)[:120],
         "remote": remote,
     }
+
+
+def branch_exists(repo_path, ref):
+    """True if the fully-qualified ref resolves in this repo (no network)."""
+    return bool(run(["git", "-C", repo_path, "rev-parse", "--verify",
+                     "--quiet", ref]))
+
+
+def branch_sync(repo_path, branch, base_ref):
+    """How a session branch relates to its base branch and to origin — the
+    "is this work safe yet?" facts behind the UI's work-state line and the
+    delete guard. Same cost class as `status --porcelain`: a couple of local
+    ref lookups plus rev-list --count, no network (origin/<branch> is the
+    remote-tracking ref, which a push from this host updates). Computed
+    against the shared repo, so it works even after the worktree is gone.
+    Every field degrades to None instead of raising: branch not born yet,
+    detached base, no origin, unfetchable counts, etc.
+
+      baseRef       base branch compared against (None if indeterminate)
+      aheadOfBase   commits on the branch that the base doesn't have
+      pushed        origin/<branch> exists locally (pushed from here at some
+                    point); None when the branch itself doesn't exist yet
+      aheadOfRemote commits not yet on origin/<branch> (pushed only)
+    """
+    info = {"baseRef": None, "aheadOfBase": None, "pushed": None,
+            "aheadOfRemote": None}
+    if not branch or branch == "HEAD":
+        return info
+    local = f"refs/heads/{branch}"
+    if not branch_exists(repo_path, local):
+        return info
+    info["pushed"] = branch_exists(repo_path, f"refs/remotes/origin/{branch}")
+    if info["pushed"]:
+        n = run(["git", "-C", repo_path, "rev-list", "--count",
+                 f"refs/remotes/origin/{branch}..{local}"])
+        info["aheadOfRemote"] = int(n) if n.isdigit() else None
+    if base_ref and base_ref != "HEAD" and base_ref != branch:
+        n = run(["git", "-C", repo_path, "rev-list", "--count",
+                 f"refs/heads/{base_ref}..{local}"])
+        if n.isdigit():
+            info["baseRef"] = base_ref
+            info["aheadOfBase"] = int(n)
+    return info
 
 
 def memory_usage():
@@ -427,6 +480,30 @@ def repo_entry(repo):
     }
 
 
+def prune_trash_branches():
+    """Hard-delete agent-trash/* branches whose grace period has expired.
+
+    delete() embeds the trash time as a unix-epoch suffix in the branch name
+    (agent-trash/<id>-<epoch>); a trash branch without one (e.g. renamed by
+    hand) falls back to its commit date. Runs on every delete and on a slow
+    cadence in the heartbeat loop, across every scanned repo."""
+    cutoff = time.time() - TRASH_RETENTION_DAYS * 86400
+    for repo in scan_repos():
+        out = run(["git", "-C", repo["path"], "for-each-ref",
+                   "--format=%(refname:short) %(committerdate:unix)",
+                   f"refs/heads/{TRASH_PREFIX}"])
+        for line in out.splitlines():
+            name, _, cdate = line.rpartition(" ")
+            m = re.search(r"-(\d{9,})$", name)
+            trashed_at = (int(m.group(1)) if m
+                          else int(cdate) if cdate.isdigit() else None)
+            if trashed_at is None or trashed_at >= cutoff:
+                continue
+            if run_ok(["git", "-C", repo["path"], "branch", "-D", name])[0] == 0:
+                log(f"pruned trash branch {name} in {repo['name']} "
+                    f"(in trash >{TRASH_RETENTION_DAYS}d)")
+
+
 def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -640,8 +717,9 @@ class SessionManager:
         worktree, and drop the registry record so the card disappears from the
         hub. KEEPS the git branch (agent/<id>) and the transcript, so the work
         stays in the repo and its usage still shows in history — it just leaves
-        the dashboard and is not resumable. (Contrast delete(), which also runs
-        `git branch -D` to erase the branch and history.)"""
+        the dashboard and is not resumable. (Contrast delete(), which also
+        removes the branch — immediately when fully pushed/merged, otherwise
+        parked under agent-trash/ for a grace period.)"""
         sess = self._find(sid)
         if not sess:
             log(f"kill: no such session {sid}")
@@ -699,9 +777,41 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
+    def _retire_branch(self, sess):
+        """Lost-work guard behind delete(): `branch -D` the session branch only
+        when its commits are provably safe (all on origin, or all contained in
+        the repo checkout's base branch); otherwise rename it to
+        agent-trash/<id>-<epoch> as a grace period, pruned after
+        TRASH_RETENTION_DAYS. Anything indeterminate is treated as unsafe."""
+        repo, branch = sess["repoPath"], sess["branch"]
+        if not branch_exists(repo, f"refs/heads/{branch}"):
+            return  # spawn failed before the branch was born, or already gone
+        base = run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"])
+        sync = branch_sync(repo, branch, base or None)
+        safe = ((sync["pushed"] and sync["aheadOfRemote"] == 0)
+                or sync["aheadOfBase"] == 0)
+        if safe:
+            run(["git", "-C", repo, "branch", "-D", branch])
+            return
+        trash = f"{TRASH_PREFIX}{sess['id']}-{int(time.time())}"
+        rc, err = run_ok(["git", "-C", repo, "branch", "-m", branch, trash])
+        if rc == 0:
+            unpushed = (sync["aheadOfRemote"] if sync["pushed"]
+                        else sync["aheadOfBase"])
+            log(f"branch {branch} has unpushed work "
+                f"({unpushed if unpushed is not None else 'unknown'} commits) "
+                f"— parked as {trash} for {TRASH_RETENTION_DAYS}d")
+        else:
+            log(f"could not park {branch} as {trash} ({err}); "
+                f"branch left in place")
+
     def delete(self, sid):
         """Remove a session entirely: worktree + branch + registry record. It
-        disappears from the UI and its usage stops being reported."""
+        disappears from the UI and its usage stops being reported. The branch
+        is hard-deleted only when its work is safe (pushed or merged); a branch
+        with unpushed commits is parked under agent-trash/ instead — see
+        _retire_branch(). Dirty worktree files are gone either way (the UI
+        warns before confirming)."""
         sess = self._find(sid)
         if not sess:
             log(f"delete: no such session {sid}")
@@ -710,9 +820,10 @@ class SessionManager:
         self._kill_ttyd(sid)
         if os.path.isdir(sess["worktreePath"]):
             self._worktree_remove(sess)
-        run(["git", "-C", sess["repoPath"], "branch", "-D", sess["branch"]])
+        self._retire_branch(sess)
         self.registry = [s for s in self.registry if s.get("id") != sid]
         self._forget_session_caches(sid)
+        prune_trash_branches()
         log(f"deleted session {sid}")
 
     # --- boot auto-resume --------------------------------------------------
@@ -801,6 +912,10 @@ class SessionManager:
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
+        # Base = whatever the repo's own checkout is on (the branch worktrees
+        # were forked from); '' (e.g. repo dir gone) degrades to no comparison.
+        base = run(["git", "-C", sess["repoPath"], "rev-parse",
+                    "--abbrev-ref", "HEAD"])
         return {
             "id": sid,
             "repo": sess["repo"],
@@ -814,6 +929,10 @@ class SessionManager:
             "stoppedAt": sess.get("stoppedAt"),
             "errorMsg": sess.get("errorMsg"),
             "git": git_info(sess["worktreePath"]),  # of the worktree (None if gone)
+            # Branch↔base/origin relation from the shared repo, so it's still
+            # reported for stopped sessions whose worktree is gone — exactly
+            # when the UI's delete guard needs it.
+            "work": branch_sync(sess["repoPath"], sess["branch"], base or None),
             "usage": self.usage_cache.get(sid),     # present for stopped too
             "session": signals,                      # running only; null otherwise
         }
@@ -887,6 +1006,8 @@ class SessionManager:
         self.resume_on_boot()
         beat = 0
         while True:
+            if beat % TRASH_PRUNE_EVERY == 0:  # incl. beat 0 = boot
+                prune_trash_branches()
             reply = self.post(self.build_payload(beat))
             beat += 1
             if reply is not None:

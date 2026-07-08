@@ -127,6 +127,11 @@
   .sess-working { color: var(--good); }
   .sess-wait { color: var(--warning); }
 
+  /* Per-session work-state line: warning when there's unpushed/uncommitted
+     work that a delete/kill would lose, muted when everything is safe. */
+  .work-risk { color: var(--warning); font-weight: 600; }
+  .work-safe { color: var(--muted); }
+
   details.logs { border-top: 1px solid var(--hairline); padding-top: 8px; }
   details.logs summary { cursor: pointer; color: var(--muted); font-size: 12px; user-select: none; }
   details.logs summary:hover { color: var(--ink-2); }
@@ -222,7 +227,7 @@
 
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
-  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. Kill stops a session and removes it from the hub (worktree deleted) in one step, but keeps its git branch and usage history — the work stays in the repo, it just leaves the dashboard. Delete (on an already-stopped session) additionally erases the branch and history. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name.</div>
+  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. Kill stops a session and removes it from the hub (worktree deleted, so uncommitted files are lost) in one step, but keeps its git branch and usage history — committed work stays in the repo, it just leaves the dashboard. Delete (on an already-stopped session) additionally erases the branch and history; a branch with unpushed commits is parked as <code>agent-trash/&lt;id&gt;</code> in the repo for a grace period (7 days by default) before being pruned for good. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name.</div>
 </div>
 
 <div class="term-overlay" id="termOverlay">
@@ -361,6 +366,35 @@ function repoLink(remote, name) {
   return /^https?:\/\//.test(href)
     ? `<a href="${esc(href.replace(/\.git$/, ""))}" target="_blank" rel="noopener">${nm}</a>`
     : nm;
+}
+
+// Work-safety facts for a session: how many commits aren't on origin yet
+// (relative to origin/<branch> when it was ever pushed, else everything past
+// the base branch), plus the worktree's dirty-file count. null = unknown
+// (first beat, branch not born yet, repo gone).
+function unpushedCommits(s) {
+  const w = s.work || {};
+  if (w.pushed === true) return w.aheadOfRemote;   // may be null (sync unknown)
+  if (w.pushed === false) return w.aheadOfBase;    // never pushed: all of these
+  return null;
+}
+// Compact work-state line for the card, e.g. "3 commits ahead of main · not
+// pushed" (warning) or "pushed · 0 ahead" (muted). "" when nothing is known.
+function workLine(s) {
+  const w = s.work || {};
+  const dirty = s.git?.dirtyFiles ?? null;
+  if (w.pushed == null && w.aheadOfBase == null && !dirty) return "";
+  const bits = [];
+  if (w.aheadOfBase != null)
+    bits.push(`${w.aheadOfBase} commit${w.aheadOfBase === 1 ? "" : "s"} ahead` +
+              (w.baseRef ? ` of ${esc(w.baseRef)}` : ""));
+  if (w.pushed === true)
+    bits.push(w.aheadOfRemote > 0 ? `${w.aheadOfRemote} unpushed`
+            : w.aheadOfRemote === 0 ? "pushed" : "pushed · sync unknown");
+  else if (w.pushed === false) bits.push("not pushed");
+  if (dirty) bits.push(`${dirty} dirty file${dirty === 1 ? "" : "s"}`);
+  const risk = unpushedCommits(s) > 0 || dirty > 0;
+  return `<b class="${risk ? "work-risk" : "work-safe"}">${bits.join(" · ")}</b>`;
 }
 
 // Per-session live signals: transcript freshness => working/idle, pending
@@ -531,6 +565,21 @@ function sessCard(a, s, now) {
   const dKey = "sd::" + a.key + "::" + s.id;
   const id = esc(s.id), key = esc(a.key);
 
+  // Delete/kill guard copy: say exactly what a confirm would lose. Kill keeps
+  // the branch (commits survive in the repo) but removes the worktree, so it
+  // only loses uncommitted changes; delete also retires the branch (unpushed
+  // commits are parked as agent-trash/<id> for a grace period, not kept).
+  const dirty = s.git?.dirtyFiles || 0;
+  const unpushed = unpushedCommits(s);
+  const work = workLine(s);
+  const lose = [];
+  if (unpushed > 0) lose.push(`${unpushed} unpushed commit${unpushed === 1 ? "" : "s"}`);
+  if (dirty > 0) lose.push("uncommitted changes");
+  const delConfirm = lose.length
+    ? `Confirm delete — ${lose.join(" + ")} will be lost` : "Confirm delete";
+  const killConfirm = dirty > 0
+    ? "Confirm kill — uncommitted changes will be lost" : "Confirm kill";
+
   const sp = sessPending(a.key, s.id);
   let actions = "";
   if (sp) {
@@ -548,12 +597,12 @@ function sessCard(a, s, now) {
       // from the hub — but KEEP the git branch and usage history. (The old
       // separate Delete button, which also nuked the branch, lived here; it now
       // only appears on already-stopped/errored cards below.)
-      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? "Confirm kill" : "Kill"}</button>`;
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? esc(killConfirm) : "Kill"}</button>`;
   } else {
     // stopped or error: offer Start (needs host online + worktree recoverable) + Delete.
     actions =
       `<button class="primary btn-sm" ${a.online ? "" : "disabled"} onclick="sessStart('${key}','${id}')">Start</button>` +
-      `<button class="btn-sm ${confirming.has(dKey) ? "confirm" : ""}" onclick="sessDelete('${key}','${id}')">${confirming.has(dKey) ? "Confirm delete" : "Delete"}</button>`;
+      `<button class="btn-sm ${confirming.has(dKey) ? "confirm" : ""}" onclick="sessDelete('${key}','${id}')">${confirming.has(dKey) ? esc(delConfirm) : "Delete"}</button>`;
   }
 
   const prs = st === "running" && s.session?.newPrUrls?.length
@@ -568,6 +617,7 @@ function sessCard(a, s, now) {
     </div>
     <dl>
       <dt>Branch</dt><dd><b>${esc(s.branch || "–")}</b></dd>
+      ${work ? `<dt>Work</dt><dd>${work}</dd>` : ""}
       <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
       ${live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>` : ""}
       ${live && live.question ? `<dt>Question</dt><dd>${esc(live.question)}</dd>` : ""}
