@@ -3,11 +3,16 @@ name: scan-agent-hub-image
 # On PRs to main that touch the /agent-hub build context, build the image
 # locally (no push) and scan it for OS/library CVEs and leaked secrets with
 # Trivy. Pre-merge counterpart to build-agent-hub-image.yml (push only on main).
+#
+# Runs on the home-lab self-hosted runners; Trivy installed from its release
+# tarball, no SARIF upload (no GHAS) — see agent-image-scan.yml for the full
+# rationale.
 on:
   pull_request:
     branches: [main]
     paths:
       - "agent-hub/**"
+      - ".trivyignore"
       - ".github/workflows/agent-hub-image-scan.yml"
 
 concurrency:
@@ -16,18 +21,20 @@ concurrency:
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   scan:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     steps:
-      - uses: actions/checkout@v4
+      - name: Reset workspace ownership
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build agent-hub image (local, no push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./agent-hub
           load: true
@@ -36,27 +43,25 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Stay on >=0.33: earlier trivy-action releases pin the internal
-      # setup-trivy step to a mutable tag upstream deleted, so they fail to
-      # resolve; 0.33+ pin setup-trivy by commit SHA.
-      - name: Trivy image scan
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: local/agent-hub:pr-scan
-          scanners: vuln,secret
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          # Reviewed, non-actionable base-image CVEs live here; anything else
-          # HIGH/CRITICAL still fails the gate.
-          trivyignores: .trivyignore
-          exit-code: "1"
-          format: sarif
-          output: trivy-agent-hub.sarif
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          VERSION=0.70.0
+          curl -fsSL -o /tmp/trivy.tgz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${VERSION}/trivy_${VERSION}_Linux-64bit.tar.gz"
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/trivy.tgz -C "$HOME/.local/bin" trivy
+          chmod +x "$HOME/.local/bin/trivy"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/trivy" --version
 
-      - name: Upload Trivy SARIF
-        if: always()
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-agent-hub.sarif
-          category: trivy-agent-hub
+      - name: Trivy image scan
+        run: |
+          set -euo pipefail
+          trivy image local/agent-hub:pr-scan \
+            --scanners vuln,secret \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --ignorefile .trivyignore \
+            --exit-code 1 \
+            --no-progress

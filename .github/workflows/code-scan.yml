@@ -5,9 +5,16 @@ name: code-scan
 #   - Semgrep  : SAST over the JS/Python code, Dockerfiles, and secret patterns
 #   - hadolint : Dockerfile best-practice/quality lint (both Dockerfiles)
 #   - ShellCheck: shell correctness for entrypoint.sh
-# Findings block the PR. This is the pre-merge counterpart to the build
-# workflows, which only run post-merge on main. Fires on open AND on later
-# pushes to the PR (default pull_request types) so every commit is re-checked.
+# Findings block the PR. Runs on open AND on later pushes to the PR (default
+# pull_request types) so every commit is re-checked.
+#
+# Runs on the home-lab self-hosted runners ([self-hosted, linux]). Notes that
+# shape these jobs (see the sibling SwitchBoard repo, which established the
+# pattern): the runner has no passwordless sudo (install CLIs to
+# $HOME/.local/bin), cannot auth to ghcr.io (so hadolint's Docker action is
+# swapped for the release binary), and has no GitHub Advanced Security (so
+# there is no code-scanning API to upload SARIF to — findings live in the job
+# log + exit codes). setup-python + pip and Docker actions do work here.
 on:
   pull_request:
     branches: [main]
@@ -22,24 +29,23 @@ concurrency:
 
 permissions:
   contents: read
-  # Lets the SARIF uploads populate the Security tab on repos with GitHub
-  # Advanced Security. Harmless (soft-fails) elsewhere — see continue-on-error.
-  security-events: write
 
 jobs:
   semgrep:
     name: Semgrep SAST
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Reset workspace ownership
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install Semgrep
-        run: pip install --quiet semgrep
+        run: pip install --no-cache-dir semgrep
       # p/default = high-signal security+correctness rules for JS/Python; the
       # extra packs add Dockerfile and hardcoded-secret coverage. --error makes
-      # any finding fail the job; SARIF is still written for the upload below.
+      # any finding fail the job; findings print to the job log.
       #
       # The excluded rules all flag DELIBERATE, documented design choices in this
       # repo (see CLAUDE.md), not defects — keeping them would make the gate
@@ -64,41 +70,41 @@ jobs:
             --exclude-rule problem-based-packs.insecure-transport.js-node.using-http-server.using-http-server \
             --exclude-rule dockerfile.security.missing-user-entrypoint.missing-user-entrypoint \
             --exclude-rule python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected \
-            --error \
-            --sarif --output=semgrep.sarif \
-            .
-      - name: Upload Semgrep SARIF
-        if: always()
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: semgrep.sarif
-          category: semgrep
+            --error
 
   hadolint:
-    name: Hadolint (${{ matrix.dockerfile }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        dockerfile:
-          - agent/Dockerfile
-          - agent-hub/Dockerfile
+    name: Hadolint
+    runs-on: [self-hosted, linux]
     steps:
-      - uses: actions/checkout@v4
+      - name: Reset workspace ownership
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
+      - uses: actions/checkout@v7
+      - name: Install hadolint
+        # hadolint-action pulls ghcr.io/hadolint/hadolint, which this
+        # self-hosted runner cannot authenticate to; install the release
+        # binary instead (no-sudo pattern).
+        run: |
+          set -euo pipefail
+          VERSION=2.14.0
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/hadolint" \
+            "https://github.com/hadolint/hadolint/releases/download/v${VERSION}/hadolint-linux-x86_64"
+          chmod +x "$HOME/.local/bin/hadolint"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/hadolint" --version
       # Blocks only on error-level issues; warnings (e.g. unpinned apt) are
-      # surfaced as annotations without failing. Tighten to `warning` to gate
-      # harder.
-      - uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: ${{ matrix.dockerfile }}
-          failure-threshold: error
+      # surfaced without failing. Tighten to `warning` to gate harder.
+      - name: Run hadolint
+        run: hadolint --failure-threshold error agent/Dockerfile agent-hub/Dockerfile
 
   shellcheck:
     name: ShellCheck
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     steps:
-      - uses: actions/checkout@v4
+      - name: Reset workspace ownership
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
+      - uses: actions/checkout@v7
       # Finds every shell script in the repo and lints per its shebang
-      # (entrypoint.sh is #!/bin/sh). Fails the job on any finding.
-      - uses: ludeeus/action-shellcheck@master
+      # (entrypoint.sh is #!/bin/sh). Fails the job on any finding. This action
+      # runs a downloaded binary (no ghcr.io pull), so it works on the runner.
+      - uses: ludeeus/action-shellcheck@2.0.0
