@@ -738,6 +738,104 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.registry[0]["status"], "error")
 
 
+class TestNormalizeGithubRepo(unittest.TestCase):
+    def test_plain_owner_repo(self):
+        self.assertEqual(ha.normalize_github_repo("xerktech/AgentHub"), "xerktech/AgentHub")
+        self.assertEqual(ha.normalize_github_repo("  xerktech/AgentHub  "), "xerktech/AgentHub")
+
+    def test_urls_and_git_suffix(self):
+        self.assertEqual(
+            ha.normalize_github_repo("https://github.com/xerktech/AgentHub.git"),
+            "xerktech/AgentHub")
+        self.assertEqual(
+            ha.normalize_github_repo("https://github.com/xerktech/AgentHub/"),
+            "xerktech/AgentHub")
+        self.assertEqual(
+            ha.normalize_github_repo("git@github.com:xerktech/AgentHub.git"),
+            "xerktech/AgentHub")
+
+    def test_keeps_dots_and_dashes_in_names(self):
+        self.assertEqual(ha.normalize_github_repo("my-org/re.po_name-1"), "my-org/re.po_name-1")
+
+    def test_rejects_bad(self):
+        for bad in ("", "   ", None, "noslash", "a/b/c", "../evil/x", "owner/..",
+                    "-lead/repo", "owner/re po", "owner/re;po", "owner/re`po",
+                    "owner/$x", "https://github.com/only-owner", "owner/"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                ha.normalize_github_repo(bad)
+
+
+class TestClone(ManagerMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.repos_root = os.path.join(self.tmp, "root")
+        os.makedirs(self.repos_root)
+        p = mock.patch.object(ha, "REPOS_ROOT", self.repos_root)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_invalid_spec_records_error_without_popen(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("not a repo")
+            popen.assert_not_called()
+        jobs = sm._clones_payload()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["status"], "error")
+
+    def test_existing_dest_refused_without_popen(self):
+        sm = self.make_manager()
+        os.makedirs(os.path.join(self.repos_root, "AgentHub"))
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("xerktech/AgentHub")
+            popen.assert_not_called()
+        job = sm.clones["AgentHub"]
+        self.assertEqual(job["status"], "error")
+        self.assertIn("already exists", job["error"])
+
+    def test_clone_launches_git_and_finishes_on_poll(self):
+        sm = self.make_manager()
+        dest = os.path.join(self.repos_root, "AgentHub")
+
+        class FakeProc:
+            def poll(self_inner):
+                # Simulate git materializing the checkout, then exiting 0.
+                os.makedirs(os.path.join(dest, ".git"), exist_ok=True)
+                return 0
+
+            def kill(self_inner):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()) as popen:
+            sm.clone("xerktech/AgentHub")
+            # git clone <url> <dest> was launched (not a session run_ok call).
+            args = popen.call_args[0][0]
+            self.assertEqual(args[:2], ["git", "clone"])
+            self.assertIn("https://github.com/xerktech/AgentHub.git", args)
+            self.assertIn(dest, args)
+        self.assertEqual(sm.clones["AgentHub"]["status"], "cloning")
+        sm._poll_clones()
+        self.assertEqual(sm.clones["AgentHub"]["status"], "done")
+        # The serializable view never leaks the Popen/file handles.
+        payload = sm._clones_payload()[0]
+        self.assertEqual(set(payload), {"name", "repo", "status", "error", "startedAt"})
+
+    def test_failed_clone_captures_error(self):
+        sm = self.make_manager()
+
+        class FailProc:
+            def poll(self_inner):
+                return 1  # no .git created -> failure
+
+            def kill(self_inner):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FailProc()):
+            sm.clone("xerktech/AgentHub")
+        sm._poll_clones()
+        self.assertEqual(sm.clones["AgentHub"]["status"], "error")
+
+
 class TestScanRepos(unittest.TestCase):
     def test_scan_filters_dotdirs_and_non_git(self):
         tmp = tempfile.mkdtemp(prefix="hub-agent-scan-")
