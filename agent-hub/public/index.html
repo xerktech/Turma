@@ -1151,7 +1151,15 @@ async function refresh() {
   render(cache);
 }
 refresh();
-setInterval(refresh, 5000);
+// The periodic poll re-renders the whole tree via innerHTML, which closes any
+// native <select> popup the user has open (the clone repo picker, the composer
+// dropdowns) mid-selection. Skip the poll while a <select> is focused; it
+// resumes on the next tick once they pick an option or click away. User-driven
+// renders (actions, toggles) are unaffected — only this timer is gated.
+setInterval(() => {
+  if (document.activeElement && document.activeElement.tagName === "SELECT") return;
+  refresh();
+}, 5000);
 </script>
 </body>
 </html>
