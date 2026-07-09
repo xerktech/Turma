@@ -30,6 +30,9 @@ const PORT = parseInt(process.env.PORT || "8300", 10);
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
+const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
+const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
+const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted first
 
 // Single-user auth: HUB_USER/HUB_PASSWORD gate the UI and browser API. The
 // browser signs in through a real login form (/login -> POST /api/login) and
@@ -127,6 +130,29 @@ function queueCommand(key, cmd) {
   a.commands.push({ ...cmd, cmdId });
   scheduleSave();
   return cmdId;
+}
+
+// Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
+// into the host's per-session cache, then bound its memory: drop entries older
+// than HISTORY_MAX_AGE_MS and cap the cache at HISTORY_MAX_SESSIONS, evicting
+// the oldest `fetchedAt` first. Runs on every heartbeat ingest, even absent new
+// results, so the sweep still bounds memory on quiet hosts.
+function ingestHistory(agent, historyResults) {
+  const now = Date.now();
+  for (const r of historyResults || []) {
+    if (!r || !r.sessionId) continue;
+    agent.history[r.sessionId] = { entries: r.entries, truncated: r.truncated, fetchedAt: now };
+  }
+  for (const [sessionId, h] of Object.entries(agent.history)) {
+    if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.history[sessionId];
+  }
+  const over = Object.keys(agent.history).length - HISTORY_MAX_SESSIONS;
+  if (over > 0) {
+    Object.entries(agent.history)
+      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
+      .slice(0, over)
+      .forEach(([sessionId]) => delete agent.history[sessionId]);
+  }
 }
 
 // Which HOST owns a given sessionId, and that session's ttyd port. Sessions are
@@ -605,6 +631,24 @@ const server = http.createServer(async (req, res) => {
   const parts = url.pathname.split("/").filter(Boolean); // e.g. api/agents/<id>/sessions
 
   try {
+    // CORS for the cross-origin glasses WebView client: only /api/* and
+    // /term/* opt in, and only when the request actually carries an Origin
+    // (same-origin requests — the dashboard UI itself — never send one, so
+    // this never fires for them). OPTIONS preflights are answered here,
+    // before any auth gate — they're credential-less by spec and must not 401.
+    const origin = req.headers.origin;
+    if ((parts[0] === "api" || parts[0] === "term") && origin) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        return res.end();
+      }
+    }
+
     // Unauthenticated liveness probe for the Docker healthcheck (everything
     // informative sits behind auth; this leaks nothing). Without it the
     // healthcheck 401s and autoheal restart-loops the container.
@@ -705,7 +749,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/agents") {
       prune();
       const now = Date.now();
-      const list = Object.entries(agents).map(([key, a]) => ({
+      // The history cache can be big (up to 8 sessions' transcripts per host)
+      // and this list is polled every few seconds by every dashboard client,
+      // so it's excluded here; GET .../sessions/<id>/history is the only
+      // place history is served.
+      const list = Object.entries(agents).map(([key, { history, ...a }]) => ({
         key,
         ...a,
         online: now - (a.lastSeen || 0) < OFFLINE_AFTER_MS,
@@ -729,6 +777,11 @@ const server = http.createServer(async (req, res) => {
       const acked = new Set(payload.ackedCommands || []);
       const commands = (prev.commands || []).filter((c) => !acked.has(c.cmdId));
       delete payload.ackedCommands; // don't persist the transient ack list
+      // On-demand session history the agent fetched since the last beat (see
+      // the {type:"history"} command); ingested into the cache below, not
+      // stored on the record verbatim.
+      const historyResults = payload.historyResults;
+      delete payload.historyResults;
       const next = (agents[key] = {
         ...payload,
         // Pending host commands (spawn/kill/start/restart/resume/delete)
@@ -737,7 +790,11 @@ const server = http.createServer(async (req, res) => {
         lastSeen: Date.now(),
         // Per-agent alert bookkeeping survives across beats and hub restarts.
         alerts: prev.alerts || {},
+        // Per-session history cache (see the /history route); survives across
+        // beats like the rest of agent state.
+        history: prev.history || {},
       });
+      ingestHistory(next, historyResults);
       heartbeatAlerts(key, prev, next);
       scheduleSave();
       return json(res, 200, { commands });
@@ -774,6 +831,35 @@ const server = http.createServer(async (req, res) => {
           (parts[5] === "kill" || parts[5] === "start" || parts[5] === "restart" || parts[5] === "resume")) {
         const cmdId = queueCommand(key, { type: parts[5], sessionId });
         return json(res, 200, { ok: true, cmdId });
+      }
+      // POST /api/agents/<host>/sessions/<id>/input -> forward free-text input
+      // to a running session (e.g. answering a pending question). Body: {text}.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "input") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const text = typeof body.text === "string" ? body.text : "";
+        if (!text.trim()) return json(res, 400, { error: "text required" });
+        if (text.length > 4000) return json(res, 400, { error: "text too long" });
+        const cmdId = queueCommand(key, { type: "input", sessionId, text });
+        return json(res, 200, { ok: true, cmdId });
+      }
+      // GET /api/agents/<host>/sessions/<id>/history -> that session's recent
+      // transcript. Serves a fresh cached result (see ingestHistory) or, on a
+      // cache miss/stale entry, queues a fetch and reports it pending; a
+      // history command already outstanding for this session is reused
+      // (single-flight) instead of piling up duplicates.
+      if (req.method === "GET" && parts.length === 6 && parts[5] === "history") {
+        const cached = (agents[key].history || {})[sessionId];
+        if (cached && Date.now() - cached.fetchedAt < HISTORY_FRESH_MS) {
+          return json(res, 200, {
+            entries: cached.entries,
+            truncated: cached.truncated,
+            fetchedAt: cached.fetchedAt,
+          });
+        }
+        const pending = (agents[key].commands || [])
+          .find((c) => c.type === "history" && c.sessionId === sessionId);
+        const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "history", sessionId });
+        return json(res, 202, { pending: true, cmdId });
       }
       // DELETE /api/agents/<host>/sessions/<id>
       if (req.method === "DELETE" && parts.length === 5) {

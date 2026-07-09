@@ -623,3 +623,209 @@ test("findSession routes a sessionId to its host and ttyd port", async () => {
   assert.deepEqual(findSession("zz222"), { host: "h3", port: 7706 });
   assert.equal(findSession("nope"), null);
 });
+
+// ---- CORS on /api and /term (glasses WebView client) --------------------------
+
+test("CORS: OPTIONS preflight on /api/* answers 204 with the CORS headers, no auth required", async () => {
+  const res = await request("OPTIONS", "/api/agents", { headers: { origin: "http://glasses.local" } });
+  assert.equal(res.status, 204);
+  assert.equal(res.raw, "");
+  assert.equal(res.headers["access-control-allow-origin"], "http://glasses.local");
+  assert.equal(res.headers["vary"], "Origin");
+  assert.equal(res.headers["access-control-allow-credentials"], "true");
+  assert.equal(res.headers["access-control-allow-headers"], "Authorization, Content-Type");
+  assert.equal(res.headers["access-control-allow-methods"], "GET, POST, DELETE, OPTIONS");
+});
+
+test("CORS: OPTIONS preflight on /term/* also answers 204 without auth", async () => {
+  const res = await request("OPTIONS", "/term/whatever", { headers: { origin: "http://glasses.local" } });
+  assert.equal(res.status, 204);
+  assert.equal(res.headers["access-control-allow-origin"], "http://glasses.local");
+});
+
+test("CORS: authenticated GET on /api reflects Origin + Vary", async () => {
+  const res = await request("GET", "/api/agents", {
+    headers: { ...userHeaders, origin: "http://glasses.local" },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers["access-control-allow-origin"], "http://glasses.local");
+  assert.equal(res.headers["vary"], "Origin");
+});
+
+test("CORS: request without Origin gets no CORS headers", async () => {
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers["access-control-allow-origin"], undefined);
+  assert.equal(res.headers["vary"], undefined);
+});
+
+test("CORS: non-/api /term path gets no CORS headers even with Origin", async () => {
+  const res = await request("GET", "/login", { headers: { origin: "http://glasses.local" } });
+  assert.equal(res.headers["access-control-allow-origin"], undefined);
+});
+
+// ---- session input endpoint -----------------------------------------------------
+
+test("http: input endpoint queues an input command that rides the next heartbeat", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hi1" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/hi1/sessions/sess1/input", {
+    body: { text: "hello agent" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.ok(res.body.cmdId);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "hi1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "input", sessionId: "sess1", text: "hello agent", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: input endpoint rejects missing/empty/whitespace-only and over-long text", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hi2" }, headers: agentHeaders });
+
+  const missing = await request("POST", "/api/agents/hi2/sessions/sess1/input", {
+    body: {}, headers: userHeaders,
+  });
+  assert.equal(missing.status, 400);
+  assert.deepEqual(missing.body, { error: "text required" });
+
+  const whitespace = await request("POST", "/api/agents/hi2/sessions/sess1/input", {
+    body: { text: "   " }, headers: userHeaders,
+  });
+  assert.equal(whitespace.status, 400);
+  assert.deepEqual(whitespace.body, { error: "text required" });
+
+  const long = await request("POST", "/api/agents/hi2/sessions/sess1/input", {
+    body: { text: "a".repeat(4001) }, headers: userHeaders,
+  });
+  assert.equal(long.status, 400);
+  assert.deepEqual(long.body, { error: "text too long" });
+});
+
+test("http: input endpoint 404s unknown host and requires user auth", async () => {
+  const unknownHost = await request("POST", "/api/agents/ghost/sessions/sess1/input", {
+    body: { text: "hi" }, headers: userHeaders,
+  });
+  assert.equal(unknownHost.status, 404);
+
+  const noAuth = await request("POST", "/api/agents/hi2/sessions/sess1/input", {
+    body: { text: "hi" },
+  });
+  assert.equal(noAuth.status, 401);
+});
+
+// ---- session history endpoint ----------------------------------------------------
+
+test("http: history endpoint returns 202 pending on cache miss, single-flight on repeat GET", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hh1" }, headers: agentHeaders });
+
+  const first = await request("GET", "/api/agents/hh1/sessions/s1/history", { headers: userHeaders });
+  assert.equal(first.status, 202);
+  assert.equal(first.body.pending, true);
+  assert.ok(first.body.cmdId);
+
+  // A second GET while the first is still outstanding must not queue a
+  // duplicate command; it returns the same cmdId.
+  const second = await request("GET", "/api/agents/hh1/sessions/s1/history", { headers: userHeaders });
+  assert.equal(second.status, 202);
+  assert.equal(second.body.cmdId, first.body.cmdId);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "hh1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "history", sessionId: "s1", cmdId: first.body.cmdId },
+  ]);
+});
+
+test("http: history endpoint 404s unknown host", async () => {
+  const res = await request("GET", "/api/agents/ghost/sessions/s1/history", { headers: userHeaders });
+  assert.equal(res.status, 404);
+});
+
+test("http: heartbeat historyResults populate the cache; GET returns 200 while fresh", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hh2" }, headers: agentHeaders });
+  await request("GET", "/api/agents/hh2/sessions/s1/history", { headers: userHeaders }); // queue it
+
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "hh2",
+      historyResults: [
+        { sessionId: "s1", entries: [{ id: "1", role: "user", text: "hi" }], truncated: false },
+      ],
+    },
+    headers: agentHeaders,
+  });
+
+  const res = await request("GET", "/api/agents/hh2/sessions/s1/history", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.entries, [{ id: "1", role: "user", text: "hi" }]);
+  assert.equal(res.body.truncated, false);
+  assert.ok(res.body.fetchedAt);
+});
+
+test("http: stale cached history (>5 minutes) is re-queued instead of served", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hh3" }, headers: agentHeaders });
+  await request("POST", "/api/heartbeat", {
+    body: { device: "hh3", historyResults: [{ sessionId: "s1", entries: [], truncated: false }] },
+    headers: agentHeaders,
+  });
+  assert.ok(agents.hh3.history.s1);
+  agents.hh3.history.s1.fetchedAt = Date.now() - 6 * 60 * 1000; // fudge stale
+
+  const res = await request("GET", "/api/agents/hh3/sessions/s1/history", { headers: userHeaders });
+  assert.equal(res.status, 202);
+  assert.equal(res.body.pending, true);
+});
+
+test("http: history cache eviction — entries older than 10 minutes dropped on ingest", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hh4" }, headers: agentHeaders });
+  await request("POST", "/api/heartbeat", {
+    body: { device: "hh4", historyResults: [{ sessionId: "old", entries: [], truncated: false }] },
+    headers: agentHeaders,
+  });
+  assert.ok(agents.hh4.history.old);
+  agents.hh4.history.old.fetchedAt = Date.now() - 11 * 60 * 1000;
+
+  // Any subsequent heartbeat ingest re-sweeps the cache, even with no new results.
+  await request("POST", "/api/heartbeat", { body: { device: "hh4" }, headers: agentHeaders });
+  assert.equal(agents.hh4.history.old, undefined);
+});
+
+test("http: /api/agents does not serialize the history cache (served only by .../history)", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hh6" }, headers: agentHeaders });
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "hh6",
+      historyResults: [
+        { sessionId: "s1", entries: [{ id: "1", role: "user", text: "hi" }], truncated: false },
+      ],
+    },
+    headers: agentHeaders,
+  });
+
+  // The dashboard poll must not carry the (potentially large) history cache...
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.status, 200);
+  for (const a of list.body.agents) {
+    assert.ok(!("history" in a), `agent ${a.key} leaked its history cache into /api/agents`);
+  }
+
+  // ...while the dedicated endpoint still serves the cached entries.
+  const hist = await request("GET", "/api/agents/hh6/sessions/s1/history", { headers: userHeaders });
+  assert.equal(hist.status, 200);
+  assert.deepEqual(hist.body.entries, [{ id: "1", role: "user", text: "hi" }]);
+});
+
+test("http: history cache eviction — capped at 8 sessions, oldest fetchedAt evicted first", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hh5" }, headers: agentHeaders });
+  for (let i = 1; i <= 9; i++) {
+    await request("POST", "/api/heartbeat", {
+      body: { device: "hh5", historyResults: [{ sessionId: `s${i}`, entries: [], truncated: false }] },
+      headers: agentHeaders,
+    });
+  }
+  const keys = Object.keys(agents.hh5.history);
+  assert.equal(keys.length, 8, "cache should be capped at 8 sessions");
+  assert.ok(!keys.includes("s1"), "oldest session (s1) should have been evicted");
+  assert.ok(keys.includes("s9"), "newest session (s9) should remain");
+});
