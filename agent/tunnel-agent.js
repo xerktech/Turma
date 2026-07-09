@@ -19,6 +19,7 @@
 const net = require("net");
 const fs = require("fs");
 const os = require("os");
+const { execFileSync } = require("child_process");
 
 const HUB_URL = process.env.HUB_URL || "http://agent-hub:8300";
 // Same agent token hub-agent.py heartbeats with (the hub's HUB_AGENT_TOKEN).
@@ -38,14 +39,13 @@ function log(msg) {
 }
 
 // The physical host name the hub keys agents by — mirrors hub-agent.py's
-// device_name() EXACTLY (same order, same rejects) so the control channel
-// registers under the same key the heartbeat uses and /term/<name> lines up.
-// With one container per host the container name is no longer the identity
-// (they're all just "agent"); the host name is. A container is isolated from its
-// host's name, so on Docker Desktop / WSL2 this can't be auto-discovered — set
-// DEVICE_NAME in compose (e.g. DEVICE_NAME=${COMPUTERNAME}). Crucially we never
-// report the kernel-assigned container id (os.hostname() inside a container) as
-// the device — that was the "fe0e38df73b4" bug.
+// device_name() EXACTLY (same order, same sources, same rejects) so the control
+// channel registers under the same key the heartbeat uses and /term/<name> lines
+// up. With one container per host the container name is no longer the identity
+// (they're all just "agent"); the host name is, and it's auto-discovered with no
+// env/compose config. Crucially we never report the kernel-assigned container id
+// (os.hostname() inside a container) as the device — that was the
+// "fe0e38df73b4" bug.
 const HOSTNAME_PLACEHOLDERS = new Set([
   "",
   "localhost",
@@ -61,9 +61,32 @@ function usableHostname(name) {
   return n;
 }
 
+// The Docker daemon's own hostname via the bind-mounted socket — the automated
+// cross-OS source (bare Linux -> host hostname; Docker-in-WSL -> the Windows
+// machine name). See hub-agent.py docker_host_name().
+function dockerHostName() {
+  try {
+    return execFileSync("docker", ["info", "--format", "{{.Name}}"], {
+      encoding: "utf8",
+      timeout: 15000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    return "";
+  }
+}
+
 function deviceName() {
   try {
     const n = usableHostname(fs.readFileSync("/host/etc/hostname", "utf8"));
+    if (n) return n;
+  } catch {
+    /* fall through */
+  }
+  const dockerName = usableHostname(dockerHostName());
+  if (dockerName) return dockerName;
+  try {
+    const n = usableHostname(os.hostname());
     if (n) return n;
   } catch {
     /* fall through */
@@ -72,16 +95,10 @@ function deviceName() {
     const v = (process.env[env] || "").trim();
     if (v) return v;
   }
-  try {
-    const n = usableHostname(os.hostname());
-    if (n) return n;
-  } catch {
-    /* fall through */
-  }
   log(
-    "device name unresolved (container is isolated from the host name) — set " +
-      "DEVICE_NAME in the compose env, e.g. DEVICE_NAME=${COMPUTERNAME} on " +
-      "Windows/WSL; falling back to 'unknown-device'",
+    "device name unresolved: /host/etc/hostname absent, `docker info` gave no " +
+      "usable name, and the OS hostname is a container id — falling back to " +
+      "'unknown-device' (set DEVICE_NAME to override)",
   );
   return "unknown-device";
 }

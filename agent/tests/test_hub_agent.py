@@ -78,20 +78,34 @@ class TestSlugify(unittest.TestCase):
 
 
 class TestDeviceName(unittest.TestCase):
-    """Host-identity resolution — /host/etc/hostname, then DEVICE_NAME /
-    COMPUTERNAME, then the OS hostname, never the kernel-assigned container id
-    (the "fe0e38df73b4" bug) and never a shared placeholder."""
+    """Host-identity resolution — auto-detected with no env/compose config:
+    /host/etc/hostname, then `docker info` .Name via the mounted socket, then the
+    OS hostname; DEVICE_NAME/COMPUTERNAME are an optional last-resort override.
+    Never reports the kernel-assigned container id (the "fe0e38df73b4" bug) or a
+    shared placeholder."""
 
-    def _run(self, *, host_file=None, env=None, gethostname="host-os"):
-        """Resolve device_name() with the three sources stubbed.
-        host_file=None means /host/etc/hostname is absent (open raises)."""
+    # A container-id gethostname() is the real in-container default; use it so a
+    # test only reaches a later source when the earlier ones are genuinely empty.
+    CONTAINER_ID = "fe0e38df73b4"
+
+    def _run(self, *, host_file=None, docker_name="", env=None,
+             gethostname=CONTAINER_ID):
+        """Resolve device_name() with every source stubbed.
+        host_file=None means /host/etc/hostname is absent (open raises);
+        docker_name is what `docker info` returns ('' = daemon unreachable)."""
         def fake_open(path, *a, **k):
             if path == "/host/etc/hostname" and host_file is not None:
                 return io.StringIO(host_file)
             raise OSError("no such file")
 
+        def fake_run(cmd, cwd=None):
+            if cmd[:2] == ["docker", "info"]:
+                return docker_name
+            return ""
+
         with mock.patch.dict(os.environ, env or {}, clear=True), \
                 mock.patch("builtins.open", fake_open), \
+                mock.patch.object(ha, "run", fake_run), \
                 mock.patch.object(ha.socket, "gethostname", lambda: gethostname):
             return ha.device_name()
 
@@ -104,38 +118,38 @@ class TestDeviceName(unittest.TestCase):
             self.assertEqual(ha._usable_hostname(good), good, good)
 
     def test_host_file_wins_when_real(self):
-        self.assertEqual(self._run(host_file="truenas\n"), "truenas")
-
-    def test_host_file_ignored_when_docker_desktop(self):
-        # Docker Desktop's LinuxKit VM name collides across hosts -> skip it,
-        # fall through to the explicit override.
         self.assertEqual(
-            self._run(host_file="docker-desktop\n",
-                      env={"DEVICE_NAME": "WIN-DESK01"}),
-            "WIN-DESK01",
-        )
+            self._run(host_file="truenas\n", docker_name="other"), "truenas")
 
-    def test_device_name_env_used_when_no_host_file(self):
-        self.assertEqual(self._run(env={"DEVICE_NAME": "WIN-DESK01"}),
-                         "WIN-DESK01")
+    def test_docker_info_name_used_when_no_host_file(self):
+        # The automated cross-OS path: no mount, but the mounted socket lets us
+        # ask the daemon its name (WSL distro name == Windows machine name).
+        self.assertEqual(self._run(docker_name="DESKTOP-AB12\n"), "DESKTOP-AB12")
 
-    def test_computername_env_used(self):
-        self.assertEqual(self._run(env={"COMPUTERNAME": "WIN-DESK01"}),
-                         "WIN-DESK01")
-
-    def test_device_name_beats_computername(self):
+    def test_docker_desktop_name_rejected(self):
+        # Docker Desktop's daemon reports the shared VM name -> not a per-host id.
         self.assertEqual(
-            self._run(env={"DEVICE_NAME": "explicit", "COMPUTERNAME": "winname"}),
-            "explicit",
+            self._run(docker_name="docker-desktop", gethostname="realbox"),
+            "realbox",
         )
 
     def test_os_hostname_used_when_real(self):
         self.assertEqual(self._run(gethostname="bare-linux"), "bare-linux")
 
+    def test_env_override_only_when_autodetect_fails(self):
+        # Everything auto fails (no mount, no docker, container-id hostname);
+        # the optional env override is the last resort.
+        self.assertEqual(self._run(env={"DEVICE_NAME": "WIN-DESK01"}), "WIN-DESK01")
+        self.assertEqual(self._run(env={"COMPUTERNAME": "WIN-DESK01"}), "WIN-DESK01")
+        self.assertEqual(
+            self._run(env={"DEVICE_NAME": "explicit", "COMPUTERNAME": "win"}),
+            "explicit",
+        )
+
     def test_container_id_hostname_falls_back_to_placeholder(self):
         # The reported bug: inside a container gethostname() is the container id;
         # we must NOT report it, and with no other source we say unknown-device.
-        self.assertEqual(self._run(gethostname="fe0e38df73b4"), "unknown-device")
+        self.assertEqual(self._run(), "unknown-device")
 
 
 class TestSpawnOptionHelpers(unittest.TestCase):

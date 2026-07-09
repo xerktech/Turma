@@ -295,22 +295,34 @@ def _usable_hostname(name):
     return name
 
 
+def docker_host_name():
+    """The Docker daemon's own hostname, read through the bind-mounted docker
+    socket (`docker info`). This is the automated, zero-config way to learn the
+    host's name from inside an isolated container:
+      - bare Linux: the physical host's hostname;
+      - Docker Engine inside a WSL2 distro ("Docker on Windows via WSL"): the
+        distro hostname, which WSL sets to the Windows machine name by default.
+    Docker Desktop reports the shared LinuxKit VM name "docker-desktop", which
+    _usable_hostname() rejects (it collides across every Desktop host)."""
+    return run(["docker", "info", "--format", "{{.Name}}"])
+
+
 def device_name():
-    # The physical host name the hub keys this agent by. A container is isolated
-    # from its host's identity, so this can't always be discovered automatically.
-    # Resolution order, most-authoritative first:
-    #   1. /host/etc/hostname — the host's hostname, bind-mounted by the compose
-    #      file. Works on bare Linux and on Docker-Engine-in-WSL (there the WSL
-    #      distro's hostname is the Windows machine name). Rejected if it's the
-    #      Docker Desktop VM ("docker-desktop") or otherwise not a real name.
-    #   2. DEVICE_NAME — explicit override, and the ONLY reliable source on Docker
-    #      Desktop / WSL2, where the container cannot see the Windows host name.
-    #      Set it in compose, e.g. DEVICE_NAME=${COMPUTERNAME} (Windows) or
-    #      DEVICE_NAME=${HOSTNAME} (Linux).
-    #   3. COMPUTERNAME — Windows' own env var, honored if passed straight through.
-    #   4. socket.gethostname() — the OS hostname, used ONLY when it isn't a
-    #      container id. Inside a container it usually IS the meaningless 12-hex
-    #      container id, which we reject rather than report as the device.
+    # The physical host name the hub keys this agent by. A container doesn't know
+    # its host's name on its own, so we discover it — no env var / compose config
+    # required. Resolution order, most-authoritative first:
+    #   1. /host/etc/hostname — the host's hostname if the compose file happens to
+    #      bind-mount it (kept first so the existing Linux/TrueNAS deployment is
+    #      byte-for-byte unchanged).
+    #   2. `docker info` .Name via the bind-mounted docker socket — the automated
+    #      cross-OS source. On bare Linux it's the host hostname; with Docker in a
+    #      WSL2 distro it's the Windows machine name. This is what makes Windows
+    #      hosts resolve automatically. (See docker_host_name().)
+    #   3. socket.gethostname() — the OS hostname, used ONLY when it isn't a
+    #      container id. Inside a container it's usually the meaningless 12-hex
+    #      container id (the "fe0e38df73b4" bug), which we reject.
+    #   4. DEVICE_NAME / COMPUTERNAME env — optional manual override, only used
+    #      when auto-detection can't find a real name (e.g. bare Docker Desktop).
     try:
         with open("/host/etc/hostname") as f:
             name = _usable_hostname(f.read())
@@ -318,20 +330,23 @@ def device_name():
                 return name
     except OSError:
         pass
-    for env in ("DEVICE_NAME", "COMPUTERNAME"):
-        name = os.environ.get(env, "").strip()
-        if name:
-            return name
+    name = _usable_hostname(docker_host_name())
+    if name:
+        return name
     try:
         name = _usable_hostname(socket.gethostname())
         if name:
             return name
     except OSError:
         pass
+    for env in ("DEVICE_NAME", "COMPUTERNAME"):
+        name = os.environ.get(env, "").strip()
+        if name:
+            return name
     log(
-        "device name unresolved (container is isolated from the host name) — "
-        "set DEVICE_NAME in the compose env, e.g. DEVICE_NAME=${COMPUTERNAME} "
-        "on Windows/WSL; falling back to 'unknown-device'"
+        "device name unresolved: /host/etc/hostname absent, `docker info` gave "
+        "no usable name, and the OS hostname is a container id — falling back to "
+        "'unknown-device' (set DEVICE_NAME to override)"
     )
     return "unknown-device"
 
