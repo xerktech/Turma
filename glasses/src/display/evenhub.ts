@@ -64,6 +64,7 @@ export class EvenHubDisplay implements GlassesDisplay {
   private readonly bridge: EvenHubBridge;
   private inputCb: ((e: InputEvent) => void) | null = null;
   private lifecycleCb: ((e: LifecycleEvent) => void) | null = null;
+  private readonly audioFrameCbs = new Set<(pcm: Uint8Array) => void>();
   private unsubscribeRouter: (() => void) | null = null;
   private readonly scheduleUpdate: (content: string) => void;
 
@@ -100,6 +101,9 @@ export class EvenHubDisplay implements GlassesDisplay {
     this.unsubscribeRouter = createInputRouter(this.bridge, {
       onInput: (e) => this.inputCb?.(e),
       onLifecycle: (e) => this.lifecycleCb?.(e),
+      onAudioFrame: (pcm) => {
+        for (const cb of this.audioFrameCbs) cb(pcm);
+      },
     });
   }
 
@@ -131,6 +135,19 @@ export class EvenHubDisplay implements GlassesDisplay {
   // normalizes alongside taps and scrolls.
   onLifecycle(cb: (e: LifecycleEvent) => void): void {
     this.lifecycleCb = cb;
+  }
+
+  // Not part of `GlassesDisplay` — Task 7's `AudioRecorder` (main.ts) is the
+  // one consumer, subscribing here instead of opening a second
+  // `bridge.onEvenHubEvent` listener (see router.ts's `RouterHandlers.onAudioFrame`
+  // doc comment for why). Multiple subscribers are supported for symmetry
+  // with the real bridge's `onEvenHubEvent`, though in practice only one
+  // recorder runs at a time. Returns an unsubscribe function.
+  onAudioFrame(cb: (pcm: Uint8Array) => void): () => void {
+    this.audioFrameCbs.add(cb);
+    return () => {
+      this.audioFrameCbs.delete(cb);
+    };
   }
 
   requestExit(): void {

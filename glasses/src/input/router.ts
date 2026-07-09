@@ -54,13 +54,19 @@ export interface RawListEvent {
   currentSelectItemIndex?: number;
 }
 
+// device-features skill: `event.audioEvent.audioPcm` is a Uint8Array of raw
+// 16kHz s16le mono PCM. Structural stand-in for the SDK's `AudioEventPayload`.
+export interface RawAudioEvent {
+  audioPcm?: Uint8Array;
+}
+
 // Structural stand-in for the SDK's `EvenHubEvent` — every field optional,
 // same field names, so a real bridge event is assignable here with no cast.
 export interface RawEvenHubEvent {
   sysEvent?: RawSysEvent;
   textEvent?: RawTextEvent;
   listEvent?: RawListEvent;
-  audioEvent?: unknown;
+  audioEvent?: RawAudioEvent;
 }
 
 export type LifecyclePhase = "foreground-enter" | "foreground-exit" | "abnormal-exit" | "system-exit";
@@ -121,6 +127,15 @@ export interface RouterBridge {
 export interface RouterHandlers {
   onInput: (e: InputEvent) => void;
   onLifecycle?: (e: LifecycleEvent) => void;
+  // Task 7: raw mic PCM frames ride the same `onEvenHubEvent` stream as taps
+  // and lifecycle events (see device-features skill — `audioEvent.audioPcm`).
+  // Rather than a second `bridge.onEvenHubEvent` subscription (there must be
+  // exactly one, owned by `EvenHubDisplay`/this router), we fan audio frames
+  // out here alongside the existing normalized dispatch. `normalizeEvent`
+  // deliberately keeps returning null for `audioEvent` (see its tests) —
+  // frames aren't part of the InputEvent/LifecycleEvent vocabulary, so they
+  // never go through tap dedup and are dispatched here instead, ungated.
+  onAudioFrame?: (pcm: Uint8Array) => void;
   // Overrides the tap-dedup gate; defaults to `tryConsumeTap` from
   // even-toolkit/gestures (matches ClaudeHUD's choice). Tests can inject a
   // pass-through so every synthetic tap gets through deterministically.
@@ -134,6 +149,10 @@ export interface RouterHandlers {
 export function createInputRouter(bridge: RouterBridge, handlers: RouterHandlers): () => void {
   const dedup = handlers.tapDedup ?? tryConsumeTap;
   return bridge.onEvenHubEvent((raw) => {
+    const pcm = raw.audioEvent?.audioPcm;
+    if (pcm && pcm.length > 0) {
+      handlers.onAudioFrame?.(pcm);
+    }
     const normalized = normalizeEvent(raw);
     if (!normalized) return;
     if (normalized.type === "lifecycle") {

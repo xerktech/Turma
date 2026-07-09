@@ -209,6 +209,52 @@ describe("EvenHubDisplay", () => {
     });
   });
 
+  describe("onAudioFrame (Task 7)", () => {
+    it("fans mic PCM frames out to a subscriber without a second onEvenHubEvent subscription", async () => {
+      const { bridge, emit } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      const frames: Uint8Array[] = [];
+      display.onAudioFrame((pcm) => frames.push(pcm));
+
+      const pcm = new Uint8Array([4, 5, 6]);
+      emit({ audioEvent: { audioPcm: pcm } });
+      expect(frames).toEqual([pcm]);
+    });
+
+    it("supports multiple subscribers and independent unsubscribe", async () => {
+      const { bridge, emit } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      const a: Uint8Array[] = [];
+      const b: Uint8Array[] = [];
+      const unsubA = display.onAudioFrame((pcm) => a.push(pcm));
+      display.onAudioFrame((pcm) => b.push(pcm));
+
+      emit({ audioEvent: { audioPcm: new Uint8Array([1]) } });
+      expect(a).toHaveLength(1);
+      expect(b).toHaveLength(1);
+
+      unsubA();
+      emit({ audioEvent: { audioPcm: new Uint8Array([2]) } });
+      expect(a).toHaveLength(1); // unsubscribed — no second frame
+      expect(b).toHaveLength(2);
+    });
+
+    it("never delivers audio frames to onInput", async () => {
+      const { bridge, emit } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      const received: InputEvent[] = [];
+      display.onInput((e) => received.push(e));
+      await display.start();
+
+      emit({ audioEvent: { audioPcm: new Uint8Array([1]) } });
+      expect(received).toEqual([]);
+    });
+  });
+
   describe("teardown", () => {
     it("unsubscribes the router", async () => {
       const helper = fakeBridge();

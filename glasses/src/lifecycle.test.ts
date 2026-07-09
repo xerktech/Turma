@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App, createInitialState, type AppState } from "./app.ts";
 import type { HubClient } from "./hub-client.ts";
 import type { GlassesDisplay } from "./display/index.ts";
-import type { Dictation } from "./dictation.ts";
-import type { InputEvent } from "./types.ts";
+import type { Dictation, DictationResult } from "./dictation.ts";
+import type { AgentInfo, InputEvent } from "./types.ts";
 import {
   installLifecycle,
   onAbnormalOrSystemExit,
@@ -47,12 +47,58 @@ class FakeDisplay implements GlassesDisplay {
 }
 
 class FakeDictation implements Dictation {
-  start(): void {}
-  stop(): void {}
-  cancel(): void {}
+  started = 0;
+  stopped = 0;
+  cancelled = 0;
+  private cb: ((r: DictationResult) => void) | null = null;
+
+  start(onResult: (r: DictationResult) => void): void {
+    this.started++;
+    this.cb = onResult;
+  }
+  stop(): void {
+    this.stopped++;
+  }
+  cancel(): void {
+    this.cancelled++;
+  }
+  resolve(r: DictationResult): void {
+    this.cb?.(r);
+  }
 }
 
-function fakeClient() {
+// A single online host with one running session — enough to drive the app
+// into the reply/listening screen the same way a real user would (home ->
+// session -> actions -> reply), for the mic-cancel-on-lifecycle tests below.
+function agentWithSession(): AgentInfo {
+  return {
+    key: "host-a",
+    device: "host-a",
+    online: true,
+    repos: [{ name: "myrepo", path: "/repos/myrepo" }],
+    sessions: [
+      {
+        id: "s1",
+        repo: "myrepo",
+        status: "running",
+        createdAt: "2026-01-01T00:00:00Z",
+        session: {
+          bridgeAttached: true,
+          transcriptAgeSec: 1,
+          lastRole: null,
+          lastHasToolUse: false,
+          question: null,
+          questionOptions: [],
+          tail: [],
+          newPrUrls: [],
+        },
+      },
+    ],
+    closedSessions: [],
+  };
+}
+
+function fakeClient(overrides: Record<string, ReturnType<typeof vi.fn>> = {}) {
   return {
     listAgents: vi.fn(async () => ({ now: Date.now(), agents: [] })),
     spawnSession: vi.fn(async () => ({ ok: true, cmdId: "spawn-1" })),
@@ -64,6 +110,7 @@ function fakeClient() {
       body: { entries: [], truncated: false, fetchedAt: Date.now() },
     })),
     wsToken: vi.fn(async () => ({ token: "t", expiresInSec: 300 })),
+    ...overrides,
   };
 }
 
@@ -388,5 +435,71 @@ describe("lifecycle phase handlers", () => {
     const { app } = makeApp();
     await app.start();
     expect(() => onAbnormalOrSystemExit(app, {})).not.toThrow();
+  });
+});
+
+// Task 7: recording + foreground-exit / abnormal-exit / system-exit MUST
+// cancel the active dictation (mic off). Ownership lives in App.pause()
+// (app.ts) — onForegroundExit and onAbnormalOrSystemExit both funnel through
+// it, never touching `dictation` directly — so driving these through the
+// same fake-driven lifecycle handlers Task 6 established also proves the
+// mic gets cancelled.
+describe("lifecycle cancels an active dictation (mic off)", () => {
+  function makeAppWithSession(): { app: App; display: FakeDisplay; dictation: FakeDictation } {
+    const display = new FakeDisplay();
+    const dictation = new FakeDictation();
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agentWithSession()] })),
+    });
+    const app = new App({
+      client: client as unknown as HubClient,
+      display,
+      dictation,
+      now: () => Date.now(),
+      pollMs: 6000,
+    });
+    return { app, display, dictation };
+  }
+
+  async function driveIntoListeningReply(app: App, display: FakeDisplay): Promise<void> {
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0); // let the first poll land the session
+    display.emit({ type: "scrollDown" }); // cursor 0 (hostHeader, unselectable) -> 1 (session row)
+    display.emit({ type: "tap" }); // home -> session
+    display.emit({ type: "tap" }); // session -> actions (cursor 0 = Reply)
+    display.emit({ type: "tap" }); // actions -> reply, listening
+  }
+
+  it("onForegroundExit cancels a recording dictation via App.pause()", async () => {
+    const { app, display, dictation } = makeAppWithSession();
+    await driveIntoListeningReply(app, display);
+    expect(app.getState().reply?.phase).toBe("listening");
+    expect(dictation.started).toBe(1);
+
+    onForegroundExit(app);
+
+    expect(dictation.cancelled).toBe(1);
+    expect(app.getState().screen).toBe("session");
+  });
+
+  it("onAbnormalOrSystemExit cancels a recording dictation via App.pause()", async () => {
+    const { app, display, dictation } = makeAppWithSession();
+    await driveIntoListeningReply(app, display);
+    expect(app.getState().reply?.phase).toBe("listening");
+
+    onAbnormalOrSystemExit(app, display);
+
+    expect(dictation.cancelled).toBe(1);
+    expect(app.getState().screen).toBe("session");
+    expect(display.teardownCalled).toBe(1); // display teardown still happens too
+  });
+
+  it("does not cancel dictation when no dictation is active", async () => {
+    const { app, display, dictation } = makeAppWithSession();
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    onForegroundExit(app);
+    expect(dictation.cancelled).toBe(0);
   });
 });

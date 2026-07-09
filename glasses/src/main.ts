@@ -15,10 +15,12 @@
 // importing it, so the browser/dev build never needs to load or evaluate
 // `@evenrealities/even_hub_sdk` at all unless this import actually runs.
 import { App } from "./app.ts";
+import type { Config } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { DomDisplay } from "./display/dom.ts";
 import type { GlassesDisplay } from "./display/index.ts";
-import { PromptDictation } from "./dictation.ts";
+import { HubAudioDictation, PromptDictation } from "./dictation.ts";
+import type { Dictation } from "./dictation.ts";
 import { HubClient } from "./hub-client.ts";
 import { BridgeStorage, BrowserStorage, type KeyValueStorage } from "./storage.ts";
 import { initPhoneSettings } from "./phone-settings.ts";
@@ -63,11 +65,16 @@ async function main(): Promise<void> {
 
 async function mainDom(): Promise<void> {
   const storage = new BrowserStorage();
-  await boot(storage, new DomDisplay());
+  await boot(storage, new DomDisplay(), () => new PromptDictation());
 }
 
 async function mainBridge(bridge: ResolvedBridge): Promise<void> {
   const { EvenHubDisplay } = await import("./display/evenhub.ts");
+  // Task 7: real G2-mic dictation. audio.ts touches no SDK types (structural
+  // only, like display/evenhub.ts and input/router.ts) — dynamically
+  // imported here anyway, matching this file's "bridge-path-only modules
+  // load lazily" convention.
+  const { AudioRecorder } = await import("./audio.ts");
   const storage: KeyValueStorage = new BridgeStorage(bridge);
   const measure = await pretextMeasure();
   setDefaultMeasure(measure);
@@ -79,40 +86,63 @@ async function mainBridge(bridge: ResolvedBridge): Promise<void> {
   // soon as events go live. Registering afterwards would silently drop
   // anything that fires during the boot window (ClaudeHUD's "register
   // before onEvenHubEvent" rule) — hence the beforeStart hook.
-  await boot(storage, display, (app) => {
-    installLifecycle(app);
-    display.onLifecycle((e) => {
-      switch (e.phase) {
-        case "foreground-exit":
-          onForegroundExit(app);
-          return;
-        case "foreground-enter":
-          onForegroundEnter(app);
-          return;
-        case "abnormal-exit":
-        case "system-exit":
-          onAbnormalOrSystemExit(app, display);
-          return;
-      }
-    });
-  });
+  await boot(
+    storage,
+    display,
+    (client, config) =>
+      new HubAudioDictation({
+        hubClient: client,
+        hubUrl: config.hubUrl,
+        // Mic PCM frames ride the display's single `onEvenHubEvent`
+        // subscription (see display/evenhub.ts's `onAudioFrame` / input/
+        // router.ts's `onAudioFrame` fan-out) rather than a second one;
+        // `audioControl` itself is a plain hardware call straight from the
+        // real bridge.
+        recorder: new AudioRecorder({
+          bridge: {
+            audioControl: (on) => bridge.audioControl(on),
+            onAudioFrame: (cb) => display.onAudioFrame(cb),
+          },
+        }),
+      }),
+    (app) => {
+      installLifecycle(app);
+      display.onLifecycle((e) => {
+        switch (e.phase) {
+          case "foreground-exit":
+            onForegroundExit(app);
+            return;
+          case "foreground-enter":
+            onForegroundEnter(app);
+            return;
+          case "abnormal-exit":
+          case "system-exit":
+            onAbnormalOrSystemExit(app, display);
+            return;
+        }
+      });
+    }
+  );
 }
 
 // Shared wiring for both backends: load config, start the phone-side
 // settings panel, build the HubClient + App, and start the app.
-// `beforeStart` runs after the App exists but before app.start() subscribes
-// the display's event stream — the bridge path hangs its lifecycle
-// registration there (see mainBridge).
+// `makeDictation` picks the backend-appropriate `Dictation` (PromptDictation
+// for the DOM dev path, HubAudioDictation for the bridge path) once the
+// HubClient + Config it may need both exist. `beforeStart` runs after the
+// App exists but before app.start() subscribes the display's event stream —
+// the bridge path hangs its lifecycle registration there (see mainBridge).
 async function boot(
   storage: KeyValueStorage,
   display: GlassesDisplay,
+  makeDictation: (client: HubClient, config: Config) => Dictation,
   beforeStart?: (app: App) => void
 ): Promise<App> {
   const config = await loadConfig(storage);
   void initPhoneSettings(storage);
 
   const client = new HubClient({ config });
-  const dictation = new PromptDictation();
+  const dictation = makeDictation(client, config);
   const app = new App({ client, display, dictation, pollMs: config.pollMs });
 
   beforeStart?.(app);

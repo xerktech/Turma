@@ -261,6 +261,63 @@ describe("App", () => {
     expect(display.lines[0]).toBe(FLASH_QUEUED);
   });
 
+  it("pause() cancels an in-progress dictation (reply screen, listening phase) and navigates back", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    display.emit({ type: "scrollDown" });
+    display.emit({ type: "tap" }); // session
+    display.emit({ type: "tap" }); // actions (cursor 0 = Reply)
+    display.emit({ type: "tap" }); // -> reply, listening
+    expect(app.getState().reply?.phase).toBe("listening");
+    expect(dictation.started).toBe(1);
+
+    app.pause();
+
+    expect(dictation.cancelled).toBe(1);
+    // Same navigation a user-initiated cancel (double-tap while listening)
+    // performs — back to the session screen, not stranded on "listening".
+    expect(app.getState().screen).toBe("session");
+    expect(app.getState().session).toEqual({ hostKey: "host-a", sessionId: "s1", offset: 0 });
+  });
+
+  it("pause() is a no-op for dictation when not on the reply/listening screen", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    app.pause();
+    expect(dictation.cancelled).toBe(0);
+    expect(app.getState().screen).toBe("home");
+  });
+
+  it("pause() does not cancel dictation once the reply screen has moved past listening (preview phase)", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    display.emit({ type: "scrollDown" });
+    display.emit({ type: "tap" }); // session
+    display.emit({ type: "tap" }); // actions
+    display.emit({ type: "tap" }); // -> reply, listening
+    dictation.resolve({ text: "deploy the fix" });
+    expect(app.getState().reply?.phase).toBe("preview");
+
+    app.pause();
+    expect(dictation.cancelled).toBe(0);
+    expect(app.getState().screen).toBe("reply"); // untouched — not a listening dictation
+  });
+
   it("scrolling above the top triggers getHistory and shows the loading line until it resolves", async () => {
     const s = session({ session: signals({ transcriptAgeSec: 1 }) });
     const client = fakeClient({

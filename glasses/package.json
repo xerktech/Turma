@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "mock-hub": "node tests/mock-hub.mjs",
+    "audio-client": "node tests/audio-client.mjs",
     "pack": "evenhub pack app.json dist -o ../agenthub-hud.ehpk",
     "simulate": "evenhub-simulator http://localhost:5173 --automation-port 9898"
   },

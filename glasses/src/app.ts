@@ -222,7 +222,19 @@ export class App {
     this.schedulePoll(0);
   }
 
+  // Lifecycle glue (Task 7) funnels foreground-exit / abnormal-exit /
+  // system-exit through here via lifecycle.ts's onForegroundExit and
+  // onAbnormalOrSystemExit — both call app.pause(), never dictation.cancel()
+  // directly. That keeps dictation-cancel ownership in exactly one place:
+  // App is the only thing that knows whether a dictation is actually active
+  // (the reply screen's "listening" phase) and is already the sole caller of
+  // dictation.start/stop/cancel for user-driven flows (see onReply below).
   pause(): void {
+    if (this.state.screen === "reply" && this.state.reply?.phase === "listening") {
+      const r = this.state.reply;
+      this.dictation.cancel();
+      this.leaveReply(r);
+    }
     this.paused = true;
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);

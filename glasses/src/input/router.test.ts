@@ -162,6 +162,59 @@ describe("createInputRouter", () => {
     expect(helper.unsubscribed).toBe(true);
   });
 
+  describe("onAudioFrame fan-out (Task 7)", () => {
+    // Mic PCM rides the same `onEvenHubEvent` stream as taps/lifecycle
+    // events — the router fans it out to a dedicated handler instead of a
+    // second `bridge.onEvenHubEvent` subscription. Frames are ungated: they
+    // never touch tapDedup and are dispatched even on ticks that also carry
+    // a normalized input/lifecycle event.
+    it("dispatches audioEvent.audioPcm frames to onAudioFrame, not onInput/onLifecycle", () => {
+      const { bridge, emit } = fakeBridge();
+      const frames: Uint8Array[] = [];
+      const input: InputEvent[] = [];
+      createInputRouter(bridge, {
+        onInput: (e) => input.push(e),
+        onAudioFrame: (pcm) => frames.push(pcm),
+        tapDedup: () => true,
+      });
+      const pcm = new Uint8Array([1, 2, 3]);
+      emit({ audioEvent: { audioPcm: pcm } });
+      expect(frames).toEqual([pcm]);
+      expect(input).toEqual([]);
+    });
+
+    it("ignores an audioEvent with no audioPcm or an empty frame", () => {
+      const { bridge, emit } = fakeBridge();
+      const frames: Uint8Array[] = [];
+      createInputRouter(bridge, { onInput: () => {}, onAudioFrame: (pcm) => frames.push(pcm) });
+      emit({ audioEvent: {} });
+      emit({ audioEvent: { audioPcm: new Uint8Array([]) } });
+      expect(frames).toEqual([]);
+    });
+
+    it("does nothing (no throw) when onAudioFrame isn't provided", () => {
+      const { bridge, emit } = fakeBridge();
+      createInputRouter(bridge, { onInput: () => {} });
+      expect(() => emit({ audioEvent: { audioPcm: new Uint8Array([1]) } })).not.toThrow();
+    });
+
+    it("still normalizes a tap/lifecycle event delivered on the same tick as an audio frame", () => {
+      const { bridge, emit } = fakeBridge();
+      const frames: Uint8Array[] = [];
+      const input: InputEvent[] = [];
+      createInputRouter(bridge, {
+        onInput: (e) => input.push(e),
+        onAudioFrame: (pcm) => frames.push(pcm),
+        tapDedup: () => true,
+      });
+      // Not a realistic combined payload from the SDK, but proves the two
+      // fan-outs are independent regardless of what else rides the event.
+      emit({ audioEvent: { audioPcm: new Uint8Array([9]) }, sysEvent: { eventType: 0 } });
+      expect(frames).toHaveLength(1);
+      expect(input).toEqual([{ type: "tap" }]);
+    });
+  });
+
   describe("default tap dedup (real tryConsumeTap, no injection)", () => {
     beforeEach(() => {
       vi.useFakeTimers();
