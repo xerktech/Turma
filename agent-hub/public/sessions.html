@@ -398,7 +398,7 @@ function hostBlock(a) {
     </button>`;
   }).join("");
   return `<div class="host-block">
-    <div class="hname">${esc(a.key)} <span class="dev">${esc(a.device || "")}</span></div>
+    <div class="hname">${esc(a.key)}</div>
     <div class="repo-btns">${repos}</div>
   </div>`;
 }

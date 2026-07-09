@@ -476,7 +476,7 @@ test("http: /healthz is unauthenticated; everything else is gated", async () => 
 });
 
 test("http: heartbeat auth (bearer or user basic, nothing else)", async () => {
-  const beat = { containerName: "auth-host" };
+  const beat = { device: "auth-host" };
   assert.equal((await request("POST", "/api/heartbeat", { body: beat })).status, 401);
   assert.equal(
     (await request("POST", "/api/heartbeat", { body: beat, headers: { authorization: "Bearer bad" } })).status,
@@ -486,7 +486,7 @@ test("http: heartbeat auth (bearer or user basic, nothing else)", async () => {
   assert.equal((await request("POST", "/api/heartbeat", { body: beat, headers: userHeaders })).status, 200);
   assert.equal(
     (await request("POST", "/api/heartbeat", { body: {}, headers: agentHeaders })).status,
-    400 // containerName/agentId required
+    400 // device/agentId required
   );
 });
 
@@ -535,7 +535,7 @@ test("http: command queue rides the reply until acked", async () => {
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
 
   // Register the host; queue is empty at first.
-  let res = await beat({ containerName: "h1" });
+  let res = await beat({ device: "h1" });
   assert.equal(res.status, 200);
   assert.deepEqual(res.body, { restart: false, commands: [] });
 
@@ -551,7 +551,7 @@ test("http: command queue rides the reply until acked", async () => {
   const [spawnId, killId] = [spawnRes.body.cmdId, killRes.body.cmdId];
 
   // Both ride the next reply...
-  res = await beat({ containerName: "h1" });
+  res = await beat({ device: "h1" });
   assert.deepEqual(
     res.body.commands,
     [
@@ -562,9 +562,9 @@ test("http: command queue rides the reply until acked", async () => {
 
   // ...and keep riding it (at-least-once) until the agent acks. Acking one
   // drops only that one.
-  res = await beat({ containerName: "h1", ackedCommands: [spawnId] });
+  res = await beat({ device: "h1", ackedCommands: [spawnId] });
   assert.deepEqual(res.body.commands, [{ type: "kill", sessionId: "ab123", cmdId: killId }]);
-  res = await beat({ containerName: "h1", ackedCommands: [killId] });
+  res = await beat({ device: "h1", ackedCommands: [killId] });
   assert.deepEqual(res.body.commands, []);
   assert.deepEqual(agents.h1.commands, []);
   // The transient ack list is not persisted onto the agent record.
@@ -574,7 +574,7 @@ test("http: command queue rides the reply until acked", async () => {
 test("http: spawn route forwards composer options; bare spawn stays minimal", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
-  await beat({ containerName: "hc" });
+  await beat({ device: "hc" });
 
   // Full composer payload -> every provided field rides the queued command.
   const full = await request("POST", "/api/agents/hc/sessions", {
@@ -594,7 +594,7 @@ test("http: spawn route forwards composer options; bare spawn stays minimal", as
   });
   assert.equal(bare.status, 200);
 
-  const res = await beat({ containerName: "hc" });
+  const res = await beat({ device: "hc" });
   assert.deepEqual(res.body.commands, [
     {
       type: "spawn", repo: "AgentHub", prompt: "fix the bug", label: "Fix login",
@@ -608,13 +608,13 @@ test("http: spawn route forwards composer options; bare spawn stays minimal", as
 test("http: restart flag delivered once, marker kept for the UI", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
-  await beat({ containerName: "h2" });
+  await beat({ device: "h2" });
   const r = await request("POST", "/api/agents/h2/restart", { headers: userHeaders });
   assert.equal(r.status, 200);
-  let res = await beat({ containerName: "h2" });
+  let res = await beat({ device: "h2" });
   assert.equal(res.body.restart, true);
   assert.ok(agents.h2.restartSentAt, "restartSentAt marker missing");
-  res = await beat({ containerName: "h2" });
+  res = await beat({ device: "h2" });
   assert.equal(res.body.restart, false);
 });
 
@@ -628,7 +628,7 @@ test("http: session commands 404 for unknown hosts", async () => {
 test("findSession routes a sessionId to its host and ttyd port", async () => {
   await request("POST", "/api/heartbeat", {
     body: {
-      containerName: "h3",
+      device: "h3",
       sessions: [{ id: "zz111", ttydPort: 7705 }, { id: "zz222", ttydPort: 7706 }],
     },
     headers: agentHeaders,
