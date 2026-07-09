@@ -3,7 +3,7 @@
 //
 // Runs in the background of every AgentHub container (started by
 // entrypoint.sh) alongside hub-agent.py — ONE control channel per host, keyed
-// by container name. It keeps a persistent OUTBOUND WebSocket to the hub's
+// by the host name. It keeps a persistent OUTBOUND WebSocket to the hub's
 // control endpoint. When a browser opens a session's terminal in the Agent Hub,
 // the hub sends {"open":<ch>,"port":<ttydPort>} on that control channel; we then
 // dial back a data WebSocket for <ch> and bridge it to THAT session's local ttyd
@@ -17,8 +17,7 @@
 // framing/masking; we only shovel bytes between it and a net.Socket.
 
 const net = require("net");
-const os = require("os");
-const { execFileSync } = require("child_process");
+const fs = require("fs");
 
 const HUB_URL = process.env.HUB_URL || "http://agent-hub:8300";
 // Same agent token hub-agent.py heartbeats with (the hub's HUB_AGENT_TOKEN).
@@ -37,22 +36,22 @@ function log(msg) {
   console.log(`[tunnel-agent] ${msg}`);
 }
 
-// Same container name the hub keys agents by (docker inspect via the mounted
-// socket), matching hub-agent.py so /term/<name> lines up.
-function containerName() {
+// The physical host name the hub keys agents by — mirrors hub-agent.py's
+// device_name() exactly (read /host/etc/hostname, then DEVICE_NAME env) so the
+// control channel registers under the same key the heartbeat uses and
+// /term/<name> lines up. With one container per host the container name is no
+// longer the identity (they're all just "agent"); the host name is.
+function deviceName() {
   try {
-    const out = execFileSync("docker", ["inspect", "--format", "{{.Name}}", os.hostname()], {
-      timeout: 15000,
-    });
-    const n = out.toString().trim().replace(/^\//, "");
+    const n = fs.readFileSync("/host/etc/hostname", "utf8").trim();
     if (n) return n;
   } catch {
     /* fall through */
   }
-  return process.env.APP_NAME || os.hostname();
+  return process.env.DEVICE_NAME || "unknown-device";
 }
 
-const NAME = containerName();
+const NAME = deviceName();
 
 // Bridge one data channel: hub data-WS <-> the target session's local ttyd TCP.
 // `port` selects which per-session ttyd to dial (defaults to 7681 for safety).

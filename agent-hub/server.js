@@ -76,8 +76,8 @@ const WORKING_WINDOW_MS = 90 * 1000;
 const BOOT_AT = Date.now();
 const BOOT_GRACE_MS = 90 * 1000;
 
-// Keyed by containerName (stable across recreates), value = last heartbeat
-// payload + bookkeeping.
+// Keyed by the host name (`device`), value = last heartbeat payload +
+// bookkeeping. One container per host, so the host name is the stable identity.
 let agents = {};
 
 // Reverse-tunnel state. controlChannels[name] = the live control connection for
@@ -721,8 +721,11 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/heartbeat") {
       const payload = JSON.parse((await readBody(req)) || "{}");
-      const key = payload.containerName || payload.agentId;
-      if (!key) return json(res, 400, { error: "containerName/agentId required" });
+      // Identity is the physical host name (`device`); with one container per
+      // host the container name is no longer meaningful. agentId is a last-resort
+      // fallback if the host name couldn't be read.
+      const key = payload.device || payload.agentId;
+      if (!key) return json(res, 400, { error: "device/agentId required" });
       const prev = agents[key] || {};
       const restart = !!prev.restartPending;
       // At-least-once command delivery: drop any queued command the agent

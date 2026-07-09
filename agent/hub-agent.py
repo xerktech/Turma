@@ -697,11 +697,12 @@ class SessionManager:
     never take down the manager or the others."""
 
     def __init__(self):
+        # agent_id is the container's own hostname/ID — used only for LOCAL docker
+        # self-operations (inspect StartedAt, log tail, self-restart), never as the
+        # hub identity. With one container per host, the container name is no longer
+        # meaningful (they're all just "agent"); the physical host name (device) is
+        # what the hub keys on and displays.
         self.agent_id = run(["hostname"]) or "unknown"
-        self.container_name = (
-            run(["docker", "inspect", "--format", "{{.Name}}", self.agent_id]).lstrip("/")
-            or self.agent_id
-        )
         self.started_at = run(
             ["docker", "inspect", "--format", "{{.State.StartedAt}}", self.agent_id]
         )
@@ -1318,8 +1319,9 @@ class SessionManager:
                 self._refresh_usage(s["id"], s["worktreePath"])
 
         return {
+            # `device` (the physical host name) is the hub's identity key; agentId
+            # is only a last-resort fallback if the host name can't be read.
             "agentId": self.agent_id,
-            "containerName": self.container_name,
             "device": self.device,
             "startedAt": self.started_at,
             "claudeVersion": self.claude_version,
@@ -1371,8 +1373,8 @@ class SessionManager:
 
     def run_forever(self):
         log(
-            f"reporting to {HUB_URL} as {self.container_name} ({self.agent_id}) "
-            f"on {self.device}; reposRoot={REPOS_ROOT} maxSessions={MAX_SESSIONS}"
+            f"reporting to {HUB_URL} as {self.device} (container {self.agent_id}); "
+            f"reposRoot={REPOS_ROOT} maxSessions={MAX_SESSIONS}"
         )
         self.resume_on_boot()
         beat = 0
