@@ -42,6 +42,20 @@ if [ "$AGENT" = "claude" ] || [ "$AGENT" = "claude-code" ]; then
   fi
 fi
 
+# --- Host identity (agent-agnostic) ----------------------------------------
+# The hub keys each agent by its physical host name (device). A container can't
+# see that on its own, so hub-agent.py --print-device auto-detects it (host
+# mount -> docker socket -> SMB to the Windows host on Docker Desktop / WSL2).
+# Resolve it ONCE here and export, so the reverse tunnel and the session manager
+# both register under the same identity (no per-process re-resolution, and the
+# SMB probe runs at most once). An explicit DEVICE_NAME from the compose still
+# wins. The sed pulls the DEVICE_NAME= line out of the manager's boot logs.
+if [ -z "${DEVICE_NAME:-}" ]; then
+  DEVICE_NAME="$(python3 /usr/local/bin/hub-agent.py --print-device 2>/dev/null | sed -n 's/^DEVICE_NAME=//p' | tail -n1)"
+  export DEVICE_NAME
+  echo "[entrypoint] resolved device name: ${DEVICE_NAME:-<unresolved>}"
+fi
+
 # --- Hub infrastructure (agent-agnostic) -----------------------------------
 # Background reverse tunnel to the hub for the web terminals. Keeps a persistent
 # OUTBOUND WebSocket to HUB_URL so the hub can reach this container's per-session

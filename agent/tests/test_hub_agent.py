@@ -10,9 +10,11 @@ docker/tmux/git needed.
 """
 
 import importlib.util
+import io
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import time
@@ -74,6 +76,134 @@ class TestSlugify(unittest.TestCase):
         self.assertEqual(ha.slugify(""), "")
         self.assertEqual(ha.slugify(None), "")
         self.assertEqual(ha.slugify("!!!"), "")
+
+
+class TestDeviceName(unittest.TestCase):
+    """Host-identity resolution — auto-detected with no env/compose config.
+    Order: DEVICE_NAME/COMPUTERNAME env (entrypoint-resolved or operator
+    override) -> /host/etc/hostname -> `docker info` .Name -> SMB to the Windows
+    host (Docker Desktop / WSL2) -> OS hostname. Never reports the
+    kernel-assigned container id (the "fe0e38df73b4" bug) or a shared
+    placeholder."""
+
+    # A container-id gethostname() is the real in-container default; use it so a
+    # test only reaches a later source when the earlier ones are genuinely empty.
+    CONTAINER_ID = "fe0e38df73b4"
+
+    def _run(self, *, host_file=None, docker_name="", smb_name="", env=None,
+             gethostname=CONTAINER_ID):
+        """Resolve device_name() with every source stubbed.
+        host_file=None means /host/etc/hostname is absent (open raises);
+        docker_name is what `docker info` returns, smb_name what the SMB probe
+        of the Windows host returns ('' = unreachable/blocked)."""
+        def fake_open(path, *a, **k):
+            if path == "/host/etc/hostname" and host_file is not None:
+                return io.StringIO(host_file)
+            raise OSError("no such file")
+
+        def fake_run(cmd, cwd=None):
+            if cmd[:2] == ["docker", "info"]:
+                return docker_name
+            return ""
+
+        with mock.patch.dict(os.environ, env or {}, clear=True), \
+                mock.patch("builtins.open", fake_open), \
+                mock.patch.object(ha, "run", fake_run), \
+                mock.patch.object(ha, "smb_host_name", lambda: smb_name), \
+                mock.patch.object(ha.socket, "gethostname", lambda: gethostname):
+            return ha.device_name()
+
+    def test_usable_hostname_rejects_container_ids_and_placeholders(self):
+        for bad in ("", "  ", "localhost", "LOCALHOST", "docker-desktop",
+                    "unknown-device", "fe0e38df73b4",
+                    "a" * 64):  # short + full container id forms
+            self.assertEqual(ha._usable_hostname(bad), "", bad)
+        for good in ("truenas", "WIN-DESK01", "host.lab", "server-1"):
+            self.assertEqual(ha._usable_hostname(good), good, good)
+
+    def test_env_wins_first(self):
+        # entrypoint.sh exports DEVICE_NAME after resolving once; it (or an
+        # explicit operator override) is checked before any auto-detection.
+        self.assertEqual(
+            self._run(env={"DEVICE_NAME": "MAXAI"}, host_file="truenas\n",
+                      docker_name="other", smb_name="smbname"),
+            "MAXAI",
+        )
+        self.assertEqual(self._run(env={"COMPUTERNAME": "WIN-DESK01"}), "WIN-DESK01")
+        self.assertEqual(
+            self._run(env={"DEVICE_NAME": "explicit", "COMPUTERNAME": "win"}),
+            "explicit",
+        )
+
+    def test_host_file_wins_over_docker_and_smb(self):
+        self.assertEqual(
+            self._run(host_file="truenas\n", docker_name="other", smb_name="x"),
+            "truenas",
+        )
+
+    def test_docker_info_name_used_when_no_host_file(self):
+        # bare Linux / Docker-in-WSL: the mounted socket's daemon name.
+        self.assertEqual(self._run(docker_name="DESKTOP-AB12\n"), "DESKTOP-AB12")
+
+    def test_smb_used_when_docker_desktop(self):
+        # The Docker Desktop path: docker info is the shared VM name, so we fall
+        # through to the SMB probe of the Windows host for the real name.
+        self.assertEqual(
+            self._run(docker_name="docker-desktop", smb_name="MAXAI"), "MAXAI")
+
+    def test_smb_used_when_no_mount_no_docker(self):
+        self.assertEqual(self._run(smb_name="MAXAI"), "MAXAI")
+
+    def test_os_hostname_used_when_real(self):
+        self.assertEqual(self._run(gethostname="bare-linux"), "bare-linux")
+
+    def test_container_id_hostname_falls_back_to_placeholder(self):
+        # The reported bug: no env, no mount, docker=docker-desktop, SMB blocked,
+        # and gethostname() is the container id -> unknown-device, never the id.
+        self.assertEqual(
+            self._run(docker_name="docker-desktop", smb_name=""), "unknown-device")
+
+
+class TestSmbHostName(unittest.TestCase):
+    """The SMB2/NTLM computer-name extraction (Docker Desktop / WSL2 path)."""
+
+    @staticmethod
+    def _challenge(names):
+        """Build a minimal NTLM CHALLENGE (type 2) with the given Target Info AV
+        pairs {av_id: str}, wrapped in some leading bytes like a real SMB blob."""
+        ti = b""
+        for av_id, val in names.items():
+            v = val.encode("utf-16-le")
+            ti += struct.pack("<HH", av_id, len(v)) + v
+        ti += struct.pack("<HH", 0, 0)  # MsvAvEOL
+        ntlm = (
+            b"NTLMSSP\x00" + struct.pack("<I", 2)
+            + struct.pack("<HHI", 0, 0, 0)   # TargetName fields
+            + struct.pack("<I", 0)           # NegotiateFlags
+            + b"\x11" * 8                     # ServerChallenge
+            + b"\x00" * 8                     # Reserved
+            + struct.pack("<HHI", len(ti), len(ti), 48)  # TargetInfo @ offset 48
+            + ti
+        )
+        return b"\x00" * 137 + ntlm  # arbitrary SMB2 header/prefix before NTLMSSP
+
+    def test_extracts_netbios_computer_name(self):
+        blob = self._challenge({1: "MAXAI", 2: "XERKTECH",
+                                3: "MaxAI.xerktech.com"})
+        self.assertEqual(ha._smb_parse_computer_name(blob), "MAXAI")
+
+    def test_no_ntlmssp_returns_empty(self):
+        self.assertEqual(ha._smb_parse_computer_name(b"not an ntlm response"), "")
+
+    def test_no_computer_name_av_returns_empty(self):
+        # Only a domain AV pair, no MsvAvNbComputerName(0x1).
+        self.assertEqual(
+            ha._smb_parse_computer_name(self._challenge({2: "XERKTECH"})), "")
+
+    def test_request_packets_are_well_formed(self):
+        # SMB2 header is exactly 64 bytes; the SESSION_SETUP security buffer
+        # offset (88) must equal header + fixed body, or Windows rejects it.
+        self.assertEqual(len(ha._smb2_header(0, 0)), 64)
 
 
 class TestSpawnOptionHelpers(unittest.TestCase):
@@ -1111,6 +1241,164 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(
             [r["sessionId"] for r in payload["historyResults"]], ["s1", "s2"],
         )
+
+
+class TestNormalizeGithubRepo(unittest.TestCase):
+    def test_plain_owner_repo(self):
+        self.assertEqual(ha.normalize_github_repo("xerktech/AgentHub"), "xerktech/AgentHub")
+        self.assertEqual(ha.normalize_github_repo("  xerktech/AgentHub  "), "xerktech/AgentHub")
+
+    def test_urls_and_git_suffix(self):
+        self.assertEqual(
+            ha.normalize_github_repo("https://github.com/xerktech/AgentHub.git"),
+            "xerktech/AgentHub")
+        self.assertEqual(
+            ha.normalize_github_repo("https://github.com/xerktech/AgentHub/"),
+            "xerktech/AgentHub")
+        self.assertEqual(
+            ha.normalize_github_repo("git@github.com:xerktech/AgentHub.git"),
+            "xerktech/AgentHub")
+
+    def test_keeps_dots_and_dashes_in_names(self):
+        self.assertEqual(ha.normalize_github_repo("my-org/re.po_name-1"), "my-org/re.po_name-1")
+
+    def test_rejects_bad(self):
+        for bad in ("", "   ", None, "noslash", "a/b/c", "../evil/x", "owner/..",
+                    "-lead/repo", "owner/re po", "owner/re;po", "owner/re`po",
+                    "owner/$x", "https://github.com/only-owner", "owner/"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                ha.normalize_github_repo(bad)
+
+
+class TestListGithubRepos(unittest.TestCase):
+    """The clone dropdown's repo discovery. `gh repo list` with no owner returns
+    only the user's OWN repos, so org repos must come from an explicit org sweep
+    — otherwise an org member sees an empty dropdown (the reported bug)."""
+
+    def _fake_run(self, *, orgs, by_owner):
+        def fake_run(cmd, cwd=None):
+            joined = " ".join(cmd)
+            if "user/orgs" in joined:
+                return "\n".join(orgs)
+            if cmd[:3] == ["gh", "repo", "list"]:
+                owner = cmd[3] if len(cmd) > 3 and not cmd[3].startswith("-") else None
+                return json.dumps(by_owner.get(owner, []))
+            return ""
+        return fake_run
+
+    def test_sweeps_user_orgs_so_org_repos_appear(self):
+        fake = self._fake_run(
+            orgs=["xerktech"],
+            by_owner={
+                None: [],  # the login owns no personal repos (the org case)
+                "xerktech": [
+                    {"nameWithOwner": "xerktech/AgentHub", "updatedAt": "2026-07-02", "isPrivate": True},
+                    {"nameWithOwner": "xerktech/DockerOps", "updatedAt": "2026-07-01"},
+                ],
+            },
+        )
+        with mock.patch.object(ha, "run", fake), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            repos = ha.list_github_repos()
+        names = [r["nameWithOwner"] for r in repos]
+        self.assertEqual(names, ["xerktech/AgentHub", "xerktech/DockerOps"])  # newest first
+        self.assertTrue(repos[0]["isPrivate"])
+        self.assertEqual(repos[0]["name"], "AgentHub")
+
+    def test_own_orgs_and_env_owners_merged_and_deduped(self):
+        fake = self._fake_run(
+            orgs=["orgA"],
+            by_owner={
+                None: [{"nameWithOwner": "me/dotfiles", "updatedAt": "2026-05-01"}],
+                "orgA": [{"nameWithOwner": "orgA/app", "updatedAt": "2026-06-01"}],
+                "orgB": [
+                    {"nameWithOwner": "orgB/lib", "updatedAt": "2026-06-15"},
+                    {"nameWithOwner": "orgA/app", "updatedAt": "2026-06-01"},  # dup across owners
+                ],
+            },
+        )
+        with mock.patch.object(ha, "run", fake), \
+                mock.patch.dict(os.environ, {"GH_CLONE_OWNERS": "orgB"}, clear=True):
+            repos = ha.list_github_repos()
+        names = [r["nameWithOwner"] for r in repos]
+        self.assertEqual(names, ["orgB/lib", "orgA/app", "me/dotfiles"])  # deduped, newest-first
+
+    def test_no_creds_paths_return_empty(self):
+        # run() returns "" for everything (no orgs, no repos) -> empty list, no raise.
+        with mock.patch.object(ha, "run", lambda *a, **k: ""), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(ha.list_github_repos(), [])
+
+
+class TestClone(ManagerMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.repos_root = os.path.join(self.tmp, "root")
+        os.makedirs(self.repos_root)
+        p = mock.patch.object(ha, "REPOS_ROOT", self.repos_root)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_invalid_spec_records_error_without_popen(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("not a repo")
+            popen.assert_not_called()
+        jobs = sm._clones_payload()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["status"], "error")
+
+    def test_existing_dest_refused_without_popen(self):
+        sm = self.make_manager()
+        os.makedirs(os.path.join(self.repos_root, "AgentHub"))
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("xerktech/AgentHub")
+            popen.assert_not_called()
+        job = sm.clones["AgentHub"]
+        self.assertEqual(job["status"], "error")
+        self.assertIn("already exists", job["error"])
+
+    def test_clone_launches_git_and_finishes_on_poll(self):
+        sm = self.make_manager()
+        dest = os.path.join(self.repos_root, "AgentHub")
+
+        class FakeProc:
+            def poll(self_inner):
+                # Simulate git materializing the checkout, then exiting 0.
+                os.makedirs(os.path.join(dest, ".git"), exist_ok=True)
+                return 0
+
+            def kill(self_inner):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()) as popen:
+            sm.clone("xerktech/AgentHub")
+            # git clone <url> <dest> was launched (not a session run_ok call).
+            args = popen.call_args[0][0]
+            self.assertEqual(args[:2], ["git", "clone"])
+            self.assertIn("https://github.com/xerktech/AgentHub.git", args)
+            self.assertIn(dest, args)
+        self.assertEqual(sm.clones["AgentHub"]["status"], "cloning")
+        sm._poll_clones()
+        self.assertEqual(sm.clones["AgentHub"]["status"], "done")
+        # The serializable view never leaks the Popen/file handles.
+        payload = sm._clones_payload()[0]
+        self.assertEqual(set(payload), {"name", "repo", "status", "error", "startedAt"})
+
+    def test_failed_clone_captures_error(self):
+        sm = self.make_manager()
+
+        class FailProc:
+            def poll(self_inner):
+                return 1  # no .git created -> failure
+
+            def kill(self_inner):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FailProc()):
+            sm.clone("xerktech/AgentHub")
+        sm._poll_clones()
+        self.assertEqual(sm.clones["AgentHub"]["status"], "error")
 
 
 class TestScanRepos(unittest.TestCase):

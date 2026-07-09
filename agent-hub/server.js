@@ -906,6 +906,21 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { commands });
     }
 
+    // POST /api/agents/<host>/clone — queue a GitHub clone into the host's
+    // repos root. Body: {repo} (owner/repo or a GitHub URL); the agent validates
+    // and clones it (gated on the host actually having GitHub creds — the UI
+    // greys the control out otherwise). The new repo joins the scan and becomes
+    // spawnable once the clone lands.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "clone" && parts.length === 4) {
+      const key = decodeURIComponent(parts[2]);
+      if (!agents[key]) return json(res, 404, { error: "unknown agent" });
+      const body = JSON.parse((await readBody(req)) || "{}");
+      if (!body.repo) return json(res, 400, { error: "repo required" });
+      const cmdId = queueCommand(key, { type: "clone", repo: String(body.repo) });
+      return json(res, 200, { ok: true, cmdId });
+    }
+
     // Session command endpoints — each queues a cmdId onto the host's command
     // queue for the agent to pick up on its next heartbeat reply. The host owns
     // the actual worktree/tmux/ttyd lifecycle; the hub only relays intent.

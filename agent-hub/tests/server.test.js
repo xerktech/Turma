@@ -638,6 +638,47 @@ test("http: spawn route forwards composer options; bare spawn stays minimal", as
   ]);
 });
 
+test("http: clone route queues a clone command; validates repo and host", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ device: "hcl" });
+
+  // Missing repo -> 400, nothing queued.
+  const bad = await request("POST", "/api/agents/hcl/clone", { body: {}, headers: userHeaders });
+  assert.equal(bad.status, 400);
+
+  // A valid clone rides the next reply as a {type:"clone", repo} command.
+  const ok = await request("POST", "/api/agents/hcl/clone", {
+    body: { repo: "xerktech/AgentHub" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+  const res = await beat({ device: "hcl" });
+  assert.deepEqual(res.body.commands, [
+    { type: "clone", repo: "xerktech/AgentHub", cmdId: ok.body.cmdId },
+  ]);
+
+  // Unknown host -> 404.
+  const ghost = await request("POST", "/api/agents/ghost/clone", {
+    body: { repo: "x/y" }, headers: userHeaders,
+  });
+  assert.equal(ghost.status, 404);
+});
+
+test("http: heartbeat passes github + clones through to /api/agents", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({
+    device: "hgh",
+    github: { available: true, login: "octocat", repos: [{ nameWithOwner: "octocat/hello", name: "hello" }] },
+    clones: [{ name: "hello", repo: "octocat/hello", status: "cloning" }],
+  });
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  const host = list.body.agents.find((a) => a.key === "hgh");
+  assert.equal(host.github.available, true);
+  assert.equal(host.github.login, "octocat");
+  assert.deepEqual(host.clones, [{ name: "hello", repo: "octocat/hello", status: "cloning" }]);
+});
+
 test("http: session commands 404 for unknown hosts", async () => {
   const res = await request("POST", "/api/agents/ghost/sessions", {
     body: { repo: "X" }, headers: userHeaders,

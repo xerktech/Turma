@@ -141,6 +141,33 @@
   .composer .cmp-actions .spacer { flex: 1; }
   .sess-label { font-size: 12px; }
 
+  /* "Clone from GitHub" bar at the top of a host's repo tree: a dropdown of the
+     gh login's repos + a free-text owner/repo box that clone into REPOS_ROOT.
+     Greyed out (with a note) when the host has no usable GitHub credentials. */
+  .clone-bar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding-bottom: 12px; border-bottom: 1px solid var(--hairline);
+  }
+  .clone-bar.disabled { opacity: 0.75; }
+  .clone-bar .clone-label { font-weight: 600; font-size: 13px; }
+  .clone-bar .clone-note { color: var(--muted); font-weight: 400; font-size: 12px; }
+  .clone-bar select, .clone-bar input {
+    font: inherit; font-size: 13px; padding: 6px 9px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--ink);
+    max-width: 100%;
+  }
+  .clone-bar select { max-width: 320px; flex: 1 1 200px; min-width: 150px; }
+  .clone-bar input { flex: 0 1 180px; min-width: 120px; }
+  .clone-bar select:focus, .clone-bar input:focus { outline: none; border-color: var(--accent); }
+  .clone-bar .spacer { flex: 1; }
+  .clone-job {
+    display: flex; align-items: center; gap: 8px; margin-top: 8px;
+    font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere;
+  }
+  .clone-job b { color: var(--ink); font-weight: 600; }
+  .clone-job.done { color: var(--good); }
+  .clone-job.err { color: var(--critical); }
+
   .sess-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; margin-top: 10px; }
   .sess {
     background: var(--page); border: 1px solid var(--border); border-radius: 8px;
@@ -292,7 +319,7 @@
 
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
-  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, custom branch name, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub (worktree deleted, so uncommitted files are lost) in one step, but keeps its git branch, conversation, and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and brings one back on the same branch with its conversation intact. Delete (on an already-stopped session) additionally erases the branch and history; a branch with unpushed commits is parked as <code>agent-trash/&lt;id&gt;</code> in the repo for a grace period (7 days by default) before being pruned for good. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation.</div>
+  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. "Clone from GitHub" pulls a repo (from the host's GitHub login) into the repos root so it joins the list and can host sessions — greyed out on hosts without GitHub credentials. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, custom branch name, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub (worktree deleted, so uncommitted files are lost) in one step, but keeps its git branch, conversation, and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and brings one back on the same branch with its conversation intact. Delete (on an already-stopped session) additionally erases the branch and history; a branch with unpushed commits is parked as <code>agent-trash/&lt;id&gt;</code> in the repo for a grace period (7 days by default) before being pruned for good. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation.</div>
 </div>
 
 <nav class="bottom-nav">
@@ -356,6 +383,13 @@ const composerOpen = new Set();
 const optionsOpen = new Set();
 const composerDraft = new Map();
 
+// - cloneDraft: host key -> {sel, text} in-progress selection/free-text for the
+//   "Clone from GitHub" bar, kept in memory so the 5s re-render doesn't wipe a
+//   half-typed owner/repo.
+const cloneDraft = new Map();
+function cloneSel(key, v) { const d = cloneDraft.get(key) || {}; d.sel = v; cloneDraft.set(key, d); }
+function cloneText(key, v) { const d = cloneDraft.get(key) || {}; d.text = v; cloneDraft.set(key, d); }
+
 // DOM id for a composer field, derived from the (host::repo) key + field name.
 function cid(rk, field) { return "cmp-" + field + "-" + rk.replace(/[^A-Za-z0-9]/g, "_"); }
 // Client-side slug for the branch-name suggestion hint (branch is validated
@@ -409,7 +443,7 @@ function onLabelInput(rkey, el) {
 // in an open composer survives the 5s poll re-render.
 function captureComposerFocus() {
   const el = document.activeElement;
-  if (!el || !el.id || !el.id.startsWith("cmp-")) return null;
+  if (!el || !el.id || !(el.id.startsWith("cmp-") || el.id.startsWith("clone-"))) return null;
   const f = { id: el.id };
   try { f.start = el.selectionStart; f.end = el.selectionEnd; } catch { /* selects have none */ }
   return f;
@@ -452,6 +486,7 @@ function reconcilePending(agents) {
   const t = Date.now();
   const counts = new Map(); // "host::repo" -> live session count
   const index = new Map();  // "host::id"   -> session
+  const byHost = new Map(agents.map(a => [a.key, a]));
   for (const a of agents) for (const s of (a.sessions || [])) {
     const rk = a.key + "::" + s.repo;
     counts.set(rk, (counts.get(rk) || 0) + 1);
@@ -461,6 +496,13 @@ function reconcilePending(agents) {
     if (t - p.at > (p.kind === "restart" ? RESTART_TTL_MS : PENDING_TTL_MS)) { pending.delete(key); continue; }
     if (p.kind === "spawn") {
       if ((counts.get(p.host + "::" + p.repo) || 0) > p.baseline) pending.delete(key);
+    } else if (p.kind === "clone") {
+      // Done once the agent echoes a clone job for it (any status) or the repo
+      // shows up in the scan — the agent's clones[] then drives the display.
+      const a = byHost.get(p.host);
+      const seen = a && ((a.clones || []).some(c => c.name === p.name) ||
+                         (a.repos || []).some(r => r.name === p.name));
+      if (seen) pending.delete(key);
     } else {
       const s = index.get(p.host + "::" + p.id);
       // kill now removes the record entirely (keeping only the branch), so like
@@ -674,7 +716,7 @@ function hostCard(a, now) {
       <span><span class="m-label">Repos root</span> <span class="path">${esc(a.reposRoot || "–")}</span></span>
       <span><span class="m-label">Sessions</span> <b>${runCount}</b> running · ${sessions.length} total</span>
     </div>
-    <div class="repos">${reposHtml}</div>
+    <div class="repos">${cloneBar(a)}${reposHtml}</div>
     ${a.logTail ? `<details class="logs" ${openLogs.has(a.key) ? "open" : ""}
         ontoggle="logToggle('${esc(a.key)}', this.open)">
       <summary>Container log (tail)</summary><pre>${esc(a.logTail)}</pre>
@@ -683,6 +725,68 @@ function hostCard(a, now) {
       <button onclick="removeHost('${esc(a.key)}')">Remove host</button>
     </div>`}
   </div>`;
+}
+
+// DOM-safe host id for the clone control's field ids.
+function hostId(key) { return key.replace(/[^A-Za-z0-9]/g, "_"); }
+
+// "Clone from GitHub" control for a host. When the host has usable GitHub creds
+// it offers a dropdown of the login's repos (already-present ones disabled) plus
+// a free-text owner/repo box, and queues a clone into REPOS_ROOT; the repo then
+// joins the scan and becomes spawnable. With no creds it renders greyed out with
+// a note. In-flight / recent clone jobs (reported by the agent) show below, with
+// an optimistic row for one just fired but not yet echoed back.
+function cloneBar(a) {
+  const gh = a.github || {};
+  const hid = hostId(a.key);
+  const clones = a.clones || [];
+  const jobRows = clones.map(c => {
+    if (c.status === "cloning")
+      return `<div class="clone-job"><span class="spin"></span> Cloning <b>${esc(c.repo)}</b>…</div>`;
+    if (c.status === "done")
+      return `<div class="clone-job done">✓ Cloned <b>${esc(c.name)}</b> — it should appear below shortly.</div>`;
+    return `<div class="clone-job err">⚠ Clone of <b>${esc(c.repo)}</b> failed: ${esc(c.error || "unknown error")}</div>`;
+  }).join("");
+  // Optimistic row(s) for a clone queued this session the agent hasn't echoed yet.
+  const echoed = new Set(clones.map(c => c.name));
+  const optimistic = [...pending.values()]
+    .filter(p => p.kind === "clone" && p.host === a.key && !echoed.has(p.name))
+    .map(p => `<div class="clone-job"><span class="spin"></span> Cloning <b>${esc(p.repo)}</b>…</div>`)
+    .join("");
+
+  if (!gh.available) {
+    return `<div class="clone-bar disabled">
+      <span class="clone-label">Clone from GitHub</span>
+      <span class="clone-note">No GitHub credentials on this host — cloning unavailable.</span>
+    </div>${jobRows}${optimistic}`;
+  }
+
+  const existing = new Set((a.repos || []).map(r => r.name));
+  const d = cloneDraft.get(a.key) || {};
+  const options = (gh.repos || []).map(r => {
+    const here = existing.has(r.name);
+    const sel = r.nameWithOwner === d.sel ? " selected" : "";
+    return `<option value="${esc(r.nameWithOwner)}"${here ? " disabled" : ""}${sel}>` +
+      `${esc(r.nameWithOwner)}${r.isPrivate ? " 🔒" : ""}${here ? " · already here" : ""}</option>`;
+  }).join("");
+  const dis = a.online ? "" : "disabled";
+  // Creds are present but the discovery sweep found nothing — say so, and point
+  // at the free-text box (which always works) so an empty dropdown isn't a dead end.
+  const emptyNote = (gh.repos || []).length === 0
+    ? `<span class="clone-note">No repos found${gh.login ? ` for ${esc(gh.login)}` : ""} — type an <code>owner/repo</code> to clone.</span>`
+    : "";
+  return `<div class="clone-bar">
+    <span class="clone-label">Clone from GitHub${gh.login ? ` <span class="clone-note">as ${esc(gh.login)}</span>` : ""}</span>
+    <select id="clone-select-${hid}" ${dis} onchange="cloneSel('${esc(a.key)}',this.value)">
+      <option value="">Choose a repo…</option>
+      ${options}
+    </select>
+    <input id="clone-input-${hid}" type="text" placeholder="or owner/repo" value="${esc(d.text || "")}"
+      ${dis} oninput="cloneText('${esc(a.key)}',this.value)"
+      onkeydown="if(event.key==='Enter'){event.preventDefault();cloneRepo('${esc(a.key)}');}">
+    <button class="primary btn-sm" ${dis} onclick="cloneRepo('${esc(a.key)}')">Clone</button>
+    ${emptyNote}
+  </div>${jobRows}${optimistic}`;
 }
 
 function repoBlock(a, repo, sessList, now) {
@@ -943,6 +1047,20 @@ function newSession(key, repo) {
   busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
     () => post(`/api/agents/${enc(key)}/sessions`, { repo }));
 }
+// Clone a GitHub repo into a host's REPOS_ROOT. Free-text takes precedence over
+// the dropdown selection. The dest name (last path segment, sans .git) keys the
+// optimistic pending row so it clears when the agent reports the clone or the
+// repo appears in the scan.
+function cloneRepo(key) {
+  const d = cloneDraft.get(key) || {};
+  const spec = ((d.text || "").trim()) || (d.sel || "");
+  if (!spec) return;
+  const name = spec.replace(/\.git$/, "").replace(/\/+$/, "").split("/").pop();
+  if (!name) return;
+  busy(pendKey("clone", key, name), { kind: "clone", host: key, name, repo: spec },
+    () => post(`/api/agents/${enc(key)}/clone`, { repo: spec }));
+  cloneDraft.set(key, {}); // clear the box; progress shows as a clone-job row
+}
 // Persist the composer's option selects as this repo's last-used prefs.
 function onOptChange(rk, repo) {
   const v = id => { const el = document.getElementById(cid(rk, id)); return el ? el.value : ""; };
@@ -1033,7 +1151,15 @@ async function refresh() {
   render(cache);
 }
 refresh();
-setInterval(refresh, 5000);
+// The periodic poll re-renders the whole tree via innerHTML, which closes any
+// native <select> popup the user has open (the clone repo picker, the composer
+// dropdowns) mid-selection. Skip the poll while a <select> is focused; it
+// resumes on the next tick once they pick an option or click away. User-driven
+// renders (actions, toggles) are unaffected — only this timer is gated.
+setInterval(() => {
+  if (document.activeElement && document.activeElement.tagName === "SELECT") return;
+  refresh();
+}, 5000);
 </script>
 </body>
 </html>

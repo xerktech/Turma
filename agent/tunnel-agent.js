@@ -19,6 +19,7 @@
 const net = require("net");
 const fs = require("fs");
 const os = require("os");
+const { execFileSync } = require("child_process");
 
 const HUB_URL = process.env.HUB_URL || "http://agent-hub:8300";
 // Same agent token hub-agent.py heartbeats with (the hub's HUB_AGENT_TOKEN).
@@ -37,28 +38,68 @@ function log(msg) {
   console.log(`[tunnel-agent] ${msg}`);
 }
 
-// The physical host name the hub keys agents by — mirrors hub-agent.py's
-// device_name() exactly (read /host/etc/hostname, then DEVICE_NAME env, then the
-// OS hostname) so the control channel registers under the same key the heartbeat
-// uses and /term/<name> lines up. With one container per host the container name
-// is no longer the identity (they're all just "agent"); the host name is.
-// On Windows there is no /host/etc/hostname to mount, so DEVICE_NAME (or the
-// os.hostname() fallback) is what supplies the name instead of "unknown-device".
+// The physical host name the hub keys agents by. entrypoint.sh resolves it once
+// (via `hub-agent.py --print-device`, which includes the SMB probe of the
+// Windows host on Docker Desktop) and exports DEVICE_NAME, so here we read that
+// env FIRST — that's how the tunnel and the heartbeat register under one
+// identity and /term/<name> lines up. The remaining sources mirror
+// hub-agent.py's device_name() (same rejects) purely as a fallback if the env
+// wasn't set. Crucially we never report the kernel-assigned container id
+// (os.hostname() inside a container) as the device — the "fe0e38df73b4" bug.
+const HOSTNAME_PLACEHOLDERS = new Set([
+  "",
+  "localhost",
+  "unknown-device",
+  "docker-desktop",
+]);
+const CONTAINER_ID_RE = /^[0-9a-f]{12}$|^[0-9a-f]{64}$/;
+
+function usableHostname(name) {
+  const n = (name || "").trim();
+  if (HOSTNAME_PLACEHOLDERS.has(n.toLowerCase())) return "";
+  if (CONTAINER_ID_RE.test(n)) return "";
+  return n;
+}
+
+// The Docker daemon's own hostname via the bind-mounted socket — the automated
+// cross-OS source (bare Linux -> host hostname; Docker-in-WSL -> the Windows
+// machine name). See hub-agent.py docker_host_name().
+function dockerHostName() {
+  try {
+    return execFileSync("docker", ["info", "--format", "{{.Name}}"], {
+      encoding: "utf8",
+      timeout: 15000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    return "";
+  }
+}
+
 function deviceName() {
+  for (const env of ["DEVICE_NAME", "COMPUTERNAME"]) {
+    const v = (process.env[env] || "").trim();
+    if (v) return v;
+  }
   try {
-    const n = fs.readFileSync("/host/etc/hostname", "utf8").trim();
+    const n = usableHostname(fs.readFileSync("/host/etc/hostname", "utf8"));
     if (n) return n;
   } catch {
     /* fall through */
   }
-  const env = (process.env.DEVICE_NAME || "").trim();
-  if (env) return env;
+  const dockerName = usableHostname(dockerHostName());
+  if (dockerName) return dockerName;
   try {
-    const n = (os.hostname() || "").trim();
+    const n = usableHostname(os.hostname());
     if (n) return n;
   } catch {
     /* fall through */
   }
+  log(
+    "device name unresolved: DEVICE_NAME unset, no /host/etc/hostname, no usable " +
+      "`docker info` name, and the OS hostname is a container id — falling back " +
+      "to 'unknown-device'",
+  );
   return "unknown-device";
 }
 

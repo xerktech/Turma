@@ -41,6 +41,7 @@ import re
 import secrets
 import shlex
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -287,32 +288,176 @@ def resolve_permission_mode(mode):
     raise ValueError(f"unknown permission mode {mode!r}")
 
 
+# Names that are NOT a usable per-host identity: blank, localhost, our own
+# placeholder, the Docker Desktop LinuxKit VM name (shared by every Windows/Mac
+# host, so it collides), and the 12-/64-char hex id the kernel hands an unnamed
+# container (socket.gethostname() inside a container — the "fe0e38df73b4" bug).
+_HOSTNAME_PLACEHOLDERS = {"", "localhost", "unknown-device", "docker-desktop"}
+_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12}$|^[0-9a-f]{64}$")
+
+
+def _usable_hostname(name):
+    name = (name or "").strip()
+    if name.lower() in _HOSTNAME_PLACEHOLDERS:
+        return ""
+    if _CONTAINER_ID_RE.match(name):
+        return ""
+    return name
+
+
+def docker_host_name():
+    """The Docker daemon's own hostname, read through the bind-mounted docker
+    socket (`docker info`). This is the automated, zero-config way to learn the
+    host's name from inside an isolated container:
+      - bare Linux: the physical host's hostname;
+      - Docker Engine inside a WSL2 distro ("Docker on Windows via WSL"): the
+        distro hostname, which WSL sets to the Windows machine name by default.
+    Docker Desktop reports the shared LinuxKit VM name "docker-desktop", which
+    _usable_hostname() rejects (it collides across every Desktop host)."""
+    return run(["docker", "info", "--format", "{{.Name}}"])
+
+
+# --- SMB host-name discovery (Docker Desktop / WSL2) -----------------------
+# Docker Desktop runs the container in an isolated Linux VM, so none of the
+# sources above can see the *Windows* host name (docker info reports the shared
+# "docker-desktop"). But the container can still reach the host over the network
+# (host.docker.internal), and Windows answers an UNAUTHENTICATED SMB2 NEGOTIATE
+# + SESSION_SETUP with an NTLM challenge (type 2) whose Target Info carries the
+# machine's NetBIOS computer name. Reading it needs no credentials — it's the
+# same trick as nmap's smb-os-discovery — and no host/compose config.
+SMB_HOST = os.environ.get("SMB_DISCOVERY_HOST", "host.docker.internal")
+SMB_PORT = 445
+SMB_TIMEOUT = 4
+
+
+def _smb_recvn(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("SMB connection closed")
+        buf += chunk
+    return buf
+
+
+def _smb_recv_msg(sock):
+    # Direct-TCP transport: 4-byte length prefix (top byte 0), then the message.
+    length = struct.unpack(">I", _smb_recvn(sock, 4))[0] & 0xFFFFFF
+    return _smb_recvn(sock, length)
+
+
+def _smb2_header(command, message_id):
+    return struct.pack(
+        "<4sHHIHHIIQIIQ16s",
+        b"\xfeSMB", 64, 0, 0, command, 1, 0, 0, message_id, 0, 0, 0, b"\x00" * 16,
+    )
+
+
+def _smb_parse_computer_name(data):
+    """Pull the NetBIOS computer name out of the NTLM challenge embedded in an
+    SMB2 SESSION_SETUP response (Target Info AV pair MsvAvNbComputerName=0x1)."""
+    i = data.find(b"NTLMSSP\x00")
+    if i < 0 or len(data) - i < 48:
+        return ""
+    ntlm = data[i:]
+    ti_len, _, ti_off = struct.unpack("<HHI", ntlm[40:48])
+    ti = ntlm[ti_off:ti_off + ti_len]
+    o = 0
+    while o + 4 <= len(ti):
+        av_id, av_len = struct.unpack("<HH", ti[o:o + 4])
+        o += 4
+        val = ti[o:o + av_len]
+        o += av_len
+        if av_id == 0:  # MsvAvEOL
+            break
+        if av_id == 1:  # MsvAvNbComputerName — the short machine name
+            return val.decode("utf-16-le", "replace").strip()
+    return ""
+
+
+def smb_host_name():
+    """The Windows host's NetBIOS computer name, read from its SMB service
+    (SMB_HOST:445) via an unauthenticated SMB2/NTLM handshake — the automated
+    path for Docker Desktop / WSL2. Returns '' on any failure (unreachable,
+    firewall-blocked, non-Windows host, or an unexpected response)."""
+    negotiate = (
+        _smb2_header(0x0000, 0)
+        + struct.pack("<HHHHI16sQ", 36, 2, 0x01, 0, 0, b"\x00" * 16, 0)
+        + struct.pack("<HH", 0x0202, 0x0210)  # dialects 2.0.2, 2.1
+    )
+    ntlm_negotiate = (
+        b"NTLMSSP\x00"
+        + struct.pack("<I", 1)             # message type 1 (NEGOTIATE)
+        + struct.pack("<I", 0x00088207)    # UNICODE|OEM|REQ_TARGET|NTLM|SIGN|EXT
+        + struct.pack("<HHI", 0, 0, 0)     # DomainName fields (empty)
+        + struct.pack("<HHI", 0, 0, 0)     # Workstation fields (empty)
+    )
+    session = (
+        _smb2_header(0x0001, 1)
+        + struct.pack("<HBBIIHHQ", 25, 0, 0x01, 0, 0, 88, len(ntlm_negotiate), 0)
+        + ntlm_negotiate
+    )
+    sock = None
+    try:
+        sock = socket.create_connection((SMB_HOST, SMB_PORT), timeout=SMB_TIMEOUT)
+        sock.settimeout(SMB_TIMEOUT)
+        sock.sendall(struct.pack(">I", len(negotiate)) + negotiate)
+        _smb_recv_msg(sock)
+        sock.sendall(struct.pack(">I", len(session)) + session)
+        return _smb_parse_computer_name(_smb_recv_msg(sock))
+    except Exception:
+        return ""
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
 def device_name():
-    # The physical host name the hub keys this agent by. Resolution order:
-    #   1. /host/etc/hostname — the Linux host's hostname, bind-mounted in by the
-    #      compose file (the container's own hostname is meaningless, all "agent").
-    #   2. DEVICE_NAME — explicit override, and the way a Windows host supplies its
-    #      name since there is no /host/etc/hostname to mount there.
-    #   3. socket.gethostname() — the container/OS hostname. On Windows this is the
-    #      container name (COMPUTERNAME); still a real, stable id and far better
-    #      than the "unknown-device" placeholder we used to fall through to.
-    for path in ("/host/etc/hostname",):
-        try:
-            with open(path) as f:
-                name = f.read().strip()
-                if name:
-                    return name
-        except OSError:
-            pass
-    name = os.environ.get("DEVICE_NAME", "").strip()
+    # The physical host name the hub keys this agent by. A container doesn't know
+    # its host's name on its own, so we discover it — no env var / compose config
+    # required. entrypoint.sh resolves this once and exports DEVICE_NAME so the
+    # manager and the reverse tunnel share one identity. Resolution order:
+    #   1. DEVICE_NAME / COMPUTERNAME env — the entrypoint-resolved value (or an
+    #      explicit operator override); checked first so the one-time resolution
+    #      short-circuits both processes and auto-detection isn't re-run.
+    #   2. /host/etc/hostname — the host's hostname if the compose file bind-mounts
+    #      it (kept ahead of the socket so Linux/TrueNAS behavior is unchanged).
+    #   3. `docker info` .Name via the docker socket — bare Linux / Docker-in-WSL.
+    #   4. SMB to the Windows host (host.docker.internal:445) — the Docker Desktop
+    #      / WSL2 path, where the container is isolated from the host name.
+    #   5. socket.gethostname() — only when it isn't a container id (the
+    #      "fe0e38df73b4" bug); inside a container it usually is, so it's rejected.
+    for env in ("DEVICE_NAME", "COMPUTERNAME"):
+        name = os.environ.get(env, "").strip()
+        if name:
+            return name
+    try:
+        with open("/host/etc/hostname") as f:
+            name = _usable_hostname(f.read())
+            if name:
+                return name
+    except OSError:
+        pass
+    name = _usable_hostname(docker_host_name())
+    if name:
+        return name
+    name = _usable_hostname(smb_host_name())
     if name:
         return name
     try:
-        name = socket.gethostname().strip()
+        name = _usable_hostname(socket.gethostname())
         if name:
             return name
     except OSError:
         pass
+    log(
+        "device name unresolved: no /host/etc/hostname, no usable `docker info` "
+        "name, no SMB reply from the host, and the OS hostname is a container id "
+        "— falling back to 'unknown-device' (set DEVICE_NAME to override)"
+    )
     return "unknown-device"
 
 
@@ -846,6 +991,126 @@ def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+# --- GitHub clone-into-root ----------------------------------------------------
+# The hub can ask the agent to `git clone` a GitHub repo into REPOS_ROOT so it
+# joins the scanned repo list and becomes spawnable. The whole feature is gated
+# on GitHub creds: with no usable `gh` login the hub greys the control out. The
+# repo spec (from a dropdown of the login's repos, or free-typed owner/repo) is
+# validated down to a bare owner/repo before it is interpolated into a clone URL
+# and a filesystem dest, so nothing free-form reaches git or the shell.
+GITHUB_REFRESH_EVERY = 15   # beats between gh availability/repo-list refreshes
+GH_REPO_LIMIT = 100         # per owner, passed to `gh repo list --limit`
+GH_REPO_MAX = 300           # total repos reported (bounds the heartbeat payload)
+GH_ORG_MAX = 20             # orgs to auto-sweep for repos (bounds the gh calls)
+CLONE_TIMEOUT_SEC = 600     # reap a `git clone` subprocess stuck this long
+CLONE_DONE_LINGER_SEC = 30  # keep a finished clone job visible this long...
+CLONE_ERROR_LINGER_SEC = 300  # ...longer for a failed one (operator reads it)
+# A GitHub owner or repo-name segment: alnum start, then GitHub's own limited
+# set. Deliberately strict — the result becomes part of a URL and a path.
+_GH_SEG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def normalize_github_repo(spec):
+    """Parse an 'owner/repo' out of a slug or GitHub URL and return it validated,
+    or raise ValueError. Accepts 'owner/repo',
+    'https://github.com/owner/repo(.git)', and 'git@github.com:owner/repo(.git)'.
+    Both segments are allowlist-checked (no '..', no leading dash, bounded
+    length) so nothing shell- or path-dangerous reaches git."""
+    spec = (spec or "").strip()
+    if not spec:
+        raise ValueError("empty repo spec")
+    m = re.match(r"^(?:https?://[^/]+/|git@[^:]+:)(.+)$", spec)
+    if m:
+        spec = m.group(1)
+    spec = spec.strip("/")
+    if spec.endswith(".git"):
+        spec = spec[:-len(".git")]
+    parts = spec.split("/")
+    if len(parts) != 2:
+        raise ValueError(f"expected owner/repo, got {spec!r}")
+    owner, repo = parts
+    for seg in (owner, repo):
+        if len(seg) > 100 or ".." in seg or not _GH_SEG_RE.match(seg):
+            raise ValueError(f"invalid owner/repo segment {seg!r}")
+    return f"{owner}/{repo}"
+
+
+def gh_token_present():
+    """True if `gh` has a usable auth token (from the mounted /root/.config/gh
+    or a GH_TOKEN/GITHUB_TOKEN env). Local and cheap — `gh auth token` just
+    prints the stored token; no network round-trip."""
+    return bool(run(["gh", "auth", "token"]))
+
+
+def _gh_repo_list(owner):
+    """`gh repo list [owner] --json ...` -> parsed list ([] on any failure).
+    owner=None lists the authenticated user's own repos."""
+    cmd = ["gh", "repo", "list"]
+    if owner:
+        cmd.append(owner)
+    cmd += ["--limit", str(GH_REPO_LIMIT), "--json",
+            "nameWithOwner,description,isPrivate,updatedAt"]
+    raw = run(cmd)
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _gh_user_orgs():
+    """Logins of the orgs the authenticated user belongs to (capped, best
+    effort). This is what makes org-owned repos show up in the dropdown without
+    any config: `gh repo list` with no owner only returns the user's OWN repos,
+    so an org member would otherwise see an empty list."""
+    raw = run(["gh", "api", "user/orgs", "--jq", ".[].login"])
+    return [o.strip() for o in raw.splitlines() if o.strip()][:GH_ORG_MAX]
+
+
+def list_github_repos():
+    """Repos the gh login can clone, for the hub's clone dropdown. Sweeps, in
+    order: the authenticated user's own repos, the orgs they belong to (so
+    org-owned repos appear with no config — the common case), and any extra
+    owners named in GH_CLONE_OWNERS (space/comma separated). Deduped by
+    nameWithOwner, newest-updated first, capped at GH_REPO_MAX."""
+    extra = [o for o in re.split(r"[\s,]+", os.environ.get("GH_CLONE_OWNERS", "").strip()) if o]
+    # None = the authenticated user's own repos; then their orgs; then overrides.
+    targets, seen_targets = [], set()
+    for owner in [None] + _gh_user_orgs() + extra:
+        key = owner or ""
+        if key not in seen_targets:
+            seen_targets.add(key)
+            targets.append(owner)
+    found = {}
+    for owner in targets:
+        for r in _gh_repo_list(owner):
+            nwo = r.get("nameWithOwner")
+            if not nwo or nwo in found:
+                continue
+            found[nwo] = {
+                "nameWithOwner": nwo,
+                "name": nwo.split("/")[-1],
+                "description": (r.get("description") or "")[:120],
+                "isPrivate": bool(r.get("isPrivate")),
+                "updatedAt": r.get("updatedAt") or "",
+            }
+    repos = sorted(found.values(), key=lambda r: r["updatedAt"], reverse=True)
+    return repos[:GH_REPO_MAX]
+
+
+def collect_github():
+    """The heartbeat's `github` block: whether cloning is available (a gh token
+    is present) and, if so, the login + clonable repo list. Any failure degrades
+    to available=False rather than raising, so a creds hiccup never breaks the
+    heartbeat."""
+    if not gh_token_present():
+        return {"available": False, "login": None, "repos": []}
+    login = run(["gh", "api", "user", "--jq", ".login"]) or None
+    return {"available": True, "login": login, "repos": list_github_repos()}
+
+
 class SessionManager:
     """Owns the registry, the live tmux/ttyd/claude processes, and the
     heartbeat loop. Single-threaded: all mutations happen in the main loop, so
@@ -875,6 +1140,12 @@ class SessionManager:
         # (historyResults) — held across a failed POST, cleared only once
         # delivery succeeds, same lifecycle as pending_prs above.
         self.history_results = []
+        # GitHub clone-into-root state: the cached availability/repo-list block
+        # (refreshed on a slow cadence, reported every beat) and in-flight/recent
+        # clone jobs keyed by dest name (the Popen lives here; only a serializable
+        # view is heartbeated).
+        self.github = {"available": False, "login": None, "repos": []}
+        self.clones = {}
         # at-least-once command de-dup: cmdIds we've already executed.
         self.acked = set()
         self.acked_order = deque(maxlen=1000)
@@ -1371,6 +1642,135 @@ class SessionManager:
             "truncated": truncated,
         })
 
+    # --- GitHub clone-into-root -------------------------------------------
+
+    def refresh_github(self):
+        """Refresh the cached GitHub availability/repo-list block. Called on a
+        slow cadence from build_payload; degrades to unavailable on any error."""
+        try:
+            self.github = collect_github()
+        except Exception as e:
+            log(f"github refresh failed: {e}")
+            self.github = {"available": False, "login": None, "repos": []}
+
+    def clone(self, repo_spec):
+        """Clone a GitHub repo into REPOS_ROOT so it joins the scanned repo list.
+
+        Launched as a DETACHED subprocess and reaped by _poll_clones on later
+        beats — `git clone` can take minutes and must never block the heartbeat
+        loop (a blocked loop would make the hub mark the host offline). The spec
+        is validated to a bare owner/repo first; the dest is that repo name
+        directly under REPOS_ROOT and must not already exist. Auth (private
+        repos) rides the system git credential helper (`gh auth git-credential`,
+        configured in the image)."""
+        raw = (repo_spec or "").strip()
+        try:
+            owner_repo = normalize_github_repo(raw)
+        except ValueError as e:
+            key = slugify(raw) or "clone"
+            self.clones[key] = {
+                "name": key, "repo": raw, "status": "error", "error": str(e),
+                "startedAt": now_iso(), "startedMono": time.time(),
+                "proc": None, "logf": None, "logPath": None,
+            }
+            log(f"clone refused: {e}")
+            return
+        name = owner_repo.split("/")[1]
+        dest = os.path.join(REPOS_ROOT, name)
+        job = {
+            "name": name, "repo": owner_repo, "status": "cloning", "error": None,
+            "startedAt": now_iso(), "startedMono": time.time(),
+            "proc": None, "logf": None,
+            "logPath": os.path.join(REGISTRY_DIR, f"clone-{slugify(name)}.log"),
+        }
+        self.clones[name] = job
+        if os.path.exists(dest):
+            job["status"] = "error"
+            job["error"] = f"'{name}' already exists under the repos root"
+            job["startedMono"] = time.time()
+            log(f"clone refused: {job['error']}")
+            return
+        url = f"https://github.com/{owner_repo}.git"
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            logf = open(job["logPath"], "w")
+            proc = subprocess.Popen(
+                ["git", "clone", "--", url, dest],
+                stdout=logf, stderr=subprocess.STDOUT,
+            )
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
+            job["startedMono"] = time.time()
+            log(f"clone launch failed for {owner_repo}: {e}")
+            return
+        job["proc"] = proc
+        job["logf"] = logf
+        log(f"cloning {owner_repo} into {dest}")
+
+    def _clone_log_tail(self, job):
+        try:
+            with open(job.get("logPath") or "", errors="replace") as f:
+                return f.read()[-400:].strip() or None
+        except OSError:
+            return None
+
+    def _finish_clone(self, job, status, error):
+        try:
+            if job.get("logf"):
+                job["logf"].close()
+        except Exception:
+            pass
+        job["logf"] = None
+        job["proc"] = None
+        job["status"] = status
+        if error:
+            job["error"] = error
+        job["finishedMono"] = time.time()
+        if status == "done":
+            log(f"cloned {job['repo']} -> {job['name']}")
+        else:
+            log(f"clone failed for {job['repo']}: {job.get('error')}")
+
+    def _poll_clones(self):
+        """Reap finished `git clone` subprocesses and drop stale terminal jobs.
+        Runs every heartbeat (one poll() per active clone). A done job lingers
+        briefly (the repo then appears in the scan); a failed one lingers longer
+        so the operator can read the error in the UI."""
+        now = time.time()
+        for name, job in list(self.clones.items()):
+            proc = job.get("proc")
+            if proc is not None:
+                rc = proc.poll()
+                if rc is None:
+                    if now - job.get("startedMono", now) > CLONE_TIMEOUT_SEC:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        self._finish_clone(job, "error", "clone timed out")
+                    continue
+                if rc == 0 and os.path.isdir(os.path.join(REPOS_ROOT, name, ".git")):
+                    self._finish_clone(job, "done", None)
+                else:
+                    self._finish_clone(
+                        job, "error",
+                        self._clone_log_tail(job) or f"git clone exited {rc}")
+                continue
+            # Already terminal — prune once it has lingered long enough.
+            linger = CLONE_DONE_LINGER_SEC if job.get("status") == "done" else CLONE_ERROR_LINGER_SEC
+            if now - job.get("finishedMono", job.get("startedMono", now)) > linger:
+                self.clones.pop(name, None)
+
+    def _clones_payload(self):
+        """Serializable view of clone jobs for the heartbeat (no Popen/file)."""
+        return [
+            {"name": j.get("name"), "repo": j.get("repo"),
+             "status": j.get("status"), "error": j.get("error"),
+             "startedAt": j.get("startedAt")}
+            for j in self.clones.values()
+        ]
+
     # --- boot auto-resume --------------------------------------------------
 
     def resume_on_boot(self):
@@ -1437,6 +1837,8 @@ class SessionManager:
                     self.send_input(cmd.get("sessionId"), cmd.get("text") or "")
                 elif ctype == "history":
                     self._stage_history(cmd.get("sessionId"))
+                elif ctype == "clone":
+                    self.clone(cmd.get("repo"))
                 else:
                     log(f"unknown command type {ctype!r} (cmdId {cid})")
             except Exception as e:
@@ -1528,6 +1930,12 @@ class SessionManager:
             if s["id"] not in self.usage_cache:
                 self._refresh_usage(s["id"], s["worktreePath"])
 
+        # GitHub availability/repo list refreshes on its own slow cadence (a few
+        # gh calls); clone jobs are reaped every beat (cheap poll()s).
+        if beat % GITHUB_REFRESH_EVERY == 0:
+            self.refresh_github()
+        self._poll_clones()
+
         payload = {
             # `device` (the physical host name) is the hub's identity key; agentId
             # is only a last-resort fallback if the host name can't be read.
@@ -1541,6 +1949,10 @@ class SessionManager:
             "repos": [repo_entry(r) for r in scan_repos()],
             "sessions": [self._session_payload(s) for s in self.registry],
             "closedSessions": self._closed_payload(),
+            # GitHub clone-into-root: availability + clonable repos for the hub's
+            # clone control, and any in-flight/recent clone jobs.
+            "github": self.github,
+            "clones": self._clones_payload(),
             "ackedCommands": list(self.acked),
         }
         # Purely additive, and only present when something is staged — mirrors
@@ -1608,6 +2020,12 @@ def main():
 
 
 if __name__ == "__main__":
+    # entrypoint.sh calls this to resolve the host name once and export it. The
+    # "DEVICE_NAME=" prefix lets the caller sed it out cleanly, ignoring the
+    # module-level boot logs that also land on stdout.
+    if "--print-device" in sys.argv:
+        print("DEVICE_NAME=" + device_name())
+        sys.exit(0)
     try:
         main()
     except KeyboardInterrupt:
