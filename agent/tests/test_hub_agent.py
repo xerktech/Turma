@@ -841,6 +841,66 @@ class TestNormalizeGithubRepo(unittest.TestCase):
                 ha.normalize_github_repo(bad)
 
 
+class TestListGithubRepos(unittest.TestCase):
+    """The clone dropdown's repo discovery. `gh repo list` with no owner returns
+    only the user's OWN repos, so org repos must come from an explicit org sweep
+    — otherwise an org member sees an empty dropdown (the reported bug)."""
+
+    def _fake_run(self, *, orgs, by_owner):
+        def fake_run(cmd, cwd=None):
+            joined = " ".join(cmd)
+            if "user/orgs" in joined:
+                return "\n".join(orgs)
+            if cmd[:3] == ["gh", "repo", "list"]:
+                owner = cmd[3] if len(cmd) > 3 and not cmd[3].startswith("-") else None
+                return json.dumps(by_owner.get(owner, []))
+            return ""
+        return fake_run
+
+    def test_sweeps_user_orgs_so_org_repos_appear(self):
+        fake = self._fake_run(
+            orgs=["xerktech"],
+            by_owner={
+                None: [],  # the login owns no personal repos (the org case)
+                "xerktech": [
+                    {"nameWithOwner": "xerktech/AgentHub", "updatedAt": "2026-07-02", "isPrivate": True},
+                    {"nameWithOwner": "xerktech/DockerOps", "updatedAt": "2026-07-01"},
+                ],
+            },
+        )
+        with mock.patch.object(ha, "run", fake), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            repos = ha.list_github_repos()
+        names = [r["nameWithOwner"] for r in repos]
+        self.assertEqual(names, ["xerktech/AgentHub", "xerktech/DockerOps"])  # newest first
+        self.assertTrue(repos[0]["isPrivate"])
+        self.assertEqual(repos[0]["name"], "AgentHub")
+
+    def test_own_orgs_and_env_owners_merged_and_deduped(self):
+        fake = self._fake_run(
+            orgs=["orgA"],
+            by_owner={
+                None: [{"nameWithOwner": "me/dotfiles", "updatedAt": "2026-05-01"}],
+                "orgA": [{"nameWithOwner": "orgA/app", "updatedAt": "2026-06-01"}],
+                "orgB": [
+                    {"nameWithOwner": "orgB/lib", "updatedAt": "2026-06-15"},
+                    {"nameWithOwner": "orgA/app", "updatedAt": "2026-06-01"},  # dup across owners
+                ],
+            },
+        )
+        with mock.patch.object(ha, "run", fake), \
+                mock.patch.dict(os.environ, {"GH_CLONE_OWNERS": "orgB"}, clear=True):
+            repos = ha.list_github_repos()
+        names = [r["nameWithOwner"] for r in repos]
+        self.assertEqual(names, ["orgB/lib", "orgA/app", "me/dotfiles"])  # deduped, newest-first
+
+    def test_no_creds_paths_return_empty(self):
+        # run() returns "" for everything (no orgs, no repos) -> empty list, no raise.
+        with mock.patch.object(ha, "run", lambda *a, **k: ""), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(ha.list_github_repos(), [])
+
+
 class TestClone(ManagerMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
