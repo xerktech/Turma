@@ -38,27 +38,51 @@ function log(msg) {
 }
 
 // The physical host name the hub keys agents by — mirrors hub-agent.py's
-// device_name() exactly (read /host/etc/hostname, then DEVICE_NAME env, then the
-// OS hostname) so the control channel registers under the same key the heartbeat
-// uses and /term/<name> lines up. With one container per host the container name
-// is no longer the identity (they're all just "agent"); the host name is.
-// On Windows there is no /host/etc/hostname to mount, so DEVICE_NAME (or the
-// os.hostname() fallback) is what supplies the name instead of "unknown-device".
+// device_name() EXACTLY (same order, same rejects) so the control channel
+// registers under the same key the heartbeat uses and /term/<name> lines up.
+// With one container per host the container name is no longer the identity
+// (they're all just "agent"); the host name is. A container is isolated from its
+// host's name, so on Docker Desktop / WSL2 this can't be auto-discovered — set
+// DEVICE_NAME in compose (e.g. DEVICE_NAME=${COMPUTERNAME}). Crucially we never
+// report the kernel-assigned container id (os.hostname() inside a container) as
+// the device — that was the "fe0e38df73b4" bug.
+const HOSTNAME_PLACEHOLDERS = new Set([
+  "",
+  "localhost",
+  "unknown-device",
+  "docker-desktop",
+]);
+const CONTAINER_ID_RE = /^[0-9a-f]{12}$|^[0-9a-f]{64}$/;
+
+function usableHostname(name) {
+  const n = (name || "").trim();
+  if (HOSTNAME_PLACEHOLDERS.has(n.toLowerCase())) return "";
+  if (CONTAINER_ID_RE.test(n)) return "";
+  return n;
+}
+
 function deviceName() {
   try {
-    const n = fs.readFileSync("/host/etc/hostname", "utf8").trim();
+    const n = usableHostname(fs.readFileSync("/host/etc/hostname", "utf8"));
     if (n) return n;
   } catch {
     /* fall through */
   }
-  const env = (process.env.DEVICE_NAME || "").trim();
-  if (env) return env;
+  for (const env of ["DEVICE_NAME", "COMPUTERNAME"]) {
+    const v = (process.env[env] || "").trim();
+    if (v) return v;
+  }
   try {
-    const n = (os.hostname() || "").trim();
+    const n = usableHostname(os.hostname());
     if (n) return n;
   } catch {
     /* fall through */
   }
+  log(
+    "device name unresolved (container is isolated from the host name) — set " +
+      "DEVICE_NAME in the compose env, e.g. DEVICE_NAME=${COMPUTERNAME} on " +
+      "Windows/WSL; falling back to 'unknown-device'",
+  );
   return "unknown-device";
 }
 

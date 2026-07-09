@@ -10,6 +10,7 @@ docker/tmux/git needed.
 """
 
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -74,6 +75,67 @@ class TestSlugify(unittest.TestCase):
         self.assertEqual(ha.slugify(""), "")
         self.assertEqual(ha.slugify(None), "")
         self.assertEqual(ha.slugify("!!!"), "")
+
+
+class TestDeviceName(unittest.TestCase):
+    """Host-identity resolution — /host/etc/hostname, then DEVICE_NAME /
+    COMPUTERNAME, then the OS hostname, never the kernel-assigned container id
+    (the "fe0e38df73b4" bug) and never a shared placeholder."""
+
+    def _run(self, *, host_file=None, env=None, gethostname="host-os"):
+        """Resolve device_name() with the three sources stubbed.
+        host_file=None means /host/etc/hostname is absent (open raises)."""
+        def fake_open(path, *a, **k):
+            if path == "/host/etc/hostname" and host_file is not None:
+                return io.StringIO(host_file)
+            raise OSError("no such file")
+
+        with mock.patch.dict(os.environ, env or {}, clear=True), \
+                mock.patch("builtins.open", fake_open), \
+                mock.patch.object(ha.socket, "gethostname", lambda: gethostname):
+            return ha.device_name()
+
+    def test_usable_hostname_rejects_container_ids_and_placeholders(self):
+        for bad in ("", "  ", "localhost", "LOCALHOST", "docker-desktop",
+                    "unknown-device", "fe0e38df73b4",
+                    "a" * 64):  # short + full container id forms
+            self.assertEqual(ha._usable_hostname(bad), "", bad)
+        for good in ("truenas", "WIN-DESK01", "host.lab", "server-1"):
+            self.assertEqual(ha._usable_hostname(good), good, good)
+
+    def test_host_file_wins_when_real(self):
+        self.assertEqual(self._run(host_file="truenas\n"), "truenas")
+
+    def test_host_file_ignored_when_docker_desktop(self):
+        # Docker Desktop's LinuxKit VM name collides across hosts -> skip it,
+        # fall through to the explicit override.
+        self.assertEqual(
+            self._run(host_file="docker-desktop\n",
+                      env={"DEVICE_NAME": "WIN-DESK01"}),
+            "WIN-DESK01",
+        )
+
+    def test_device_name_env_used_when_no_host_file(self):
+        self.assertEqual(self._run(env={"DEVICE_NAME": "WIN-DESK01"}),
+                         "WIN-DESK01")
+
+    def test_computername_env_used(self):
+        self.assertEqual(self._run(env={"COMPUTERNAME": "WIN-DESK01"}),
+                         "WIN-DESK01")
+
+    def test_device_name_beats_computername(self):
+        self.assertEqual(
+            self._run(env={"DEVICE_NAME": "explicit", "COMPUTERNAME": "winname"}),
+            "explicit",
+        )
+
+    def test_os_hostname_used_when_real(self):
+        self.assertEqual(self._run(gethostname="bare-linux"), "bare-linux")
+
+    def test_container_id_hostname_falls_back_to_placeholder(self):
+        # The reported bug: inside a container gethostname() is the container id;
+        # we must NOT report it, and with no other source we say unknown-device.
+        self.assertEqual(self._run(gethostname="fe0e38df73b4"), "unknown-device")
 
 
 class TestSpawnOptionHelpers(unittest.TestCase):

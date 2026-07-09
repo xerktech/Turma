@@ -278,32 +278,61 @@ def resolve_permission_mode(mode):
     raise ValueError(f"unknown permission mode {mode!r}")
 
 
+# Names that are NOT a usable per-host identity: blank, localhost, our own
+# placeholder, the Docker Desktop LinuxKit VM name (shared by every Windows/Mac
+# host, so it collides), and the 12-/64-char hex id the kernel hands an unnamed
+# container (socket.gethostname() inside a container — the "fe0e38df73b4" bug).
+_HOSTNAME_PLACEHOLDERS = {"", "localhost", "unknown-device", "docker-desktop"}
+_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12}$|^[0-9a-f]{64}$")
+
+
+def _usable_hostname(name):
+    name = (name or "").strip()
+    if name.lower() in _HOSTNAME_PLACEHOLDERS:
+        return ""
+    if _CONTAINER_ID_RE.match(name):
+        return ""
+    return name
+
+
 def device_name():
-    # The physical host name the hub keys this agent by. Resolution order:
-    #   1. /host/etc/hostname — the Linux host's hostname, bind-mounted in by the
-    #      compose file (the container's own hostname is meaningless, all "agent").
-    #   2. DEVICE_NAME — explicit override, and the way a Windows host supplies its
-    #      name since there is no /host/etc/hostname to mount there.
-    #   3. socket.gethostname() — the container/OS hostname. On Windows this is the
-    #      container name (COMPUTERNAME); still a real, stable id and far better
-    #      than the "unknown-device" placeholder we used to fall through to.
-    for path in ("/host/etc/hostname",):
-        try:
-            with open(path) as f:
-                name = f.read().strip()
-                if name:
-                    return name
-        except OSError:
-            pass
-    name = os.environ.get("DEVICE_NAME", "").strip()
-    if name:
-        return name
+    # The physical host name the hub keys this agent by. A container is isolated
+    # from its host's identity, so this can't always be discovered automatically.
+    # Resolution order, most-authoritative first:
+    #   1. /host/etc/hostname — the host's hostname, bind-mounted by the compose
+    #      file. Works on bare Linux and on Docker-Engine-in-WSL (there the WSL
+    #      distro's hostname is the Windows machine name). Rejected if it's the
+    #      Docker Desktop VM ("docker-desktop") or otherwise not a real name.
+    #   2. DEVICE_NAME — explicit override, and the ONLY reliable source on Docker
+    #      Desktop / WSL2, where the container cannot see the Windows host name.
+    #      Set it in compose, e.g. DEVICE_NAME=${COMPUTERNAME} (Windows) or
+    #      DEVICE_NAME=${HOSTNAME} (Linux).
+    #   3. COMPUTERNAME — Windows' own env var, honored if passed straight through.
+    #   4. socket.gethostname() — the OS hostname, used ONLY when it isn't a
+    #      container id. Inside a container it usually IS the meaningless 12-hex
+    #      container id, which we reject rather than report as the device.
     try:
-        name = socket.gethostname().strip()
+        with open("/host/etc/hostname") as f:
+            name = _usable_hostname(f.read())
+            if name:
+                return name
+    except OSError:
+        pass
+    for env in ("DEVICE_NAME", "COMPUTERNAME"):
+        name = os.environ.get(env, "").strip()
+        if name:
+            return name
+    try:
+        name = _usable_hostname(socket.gethostname())
         if name:
             return name
     except OSError:
         pass
+    log(
+        "device name unresolved (container is isolated from the host name) — "
+        "set DEVICE_NAME in the compose env, e.g. DEVICE_NAME=${COMPUTERNAME} "
+        "on Windows/WSL; falling back to 'unknown-device'"
+    )
     return "unknown-device"
 
 
