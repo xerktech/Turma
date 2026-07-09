@@ -38,14 +38,14 @@ function log(msg) {
   console.log(`[tunnel-agent] ${msg}`);
 }
 
-// The physical host name the hub keys agents by — mirrors hub-agent.py's
-// device_name() EXACTLY (same order, same sources, same rejects) so the control
-// channel registers under the same key the heartbeat uses and /term/<name> lines
-// up. With one container per host the container name is no longer the identity
-// (they're all just "agent"); the host name is, and it's auto-discovered with no
-// env/compose config. Crucially we never report the kernel-assigned container id
-// (os.hostname() inside a container) as the device — that was the
-// "fe0e38df73b4" bug.
+// The physical host name the hub keys agents by. entrypoint.sh resolves it once
+// (via `hub-agent.py --print-device`, which includes the SMB probe of the
+// Windows host on Docker Desktop) and exports DEVICE_NAME, so here we read that
+// env FIRST — that's how the tunnel and the heartbeat register under one
+// identity and /term/<name> lines up. The remaining sources mirror
+// hub-agent.py's device_name() (same rejects) purely as a fallback if the env
+// wasn't set. Crucially we never report the kernel-assigned container id
+// (os.hostname() inside a container) as the device — the "fe0e38df73b4" bug.
 const HOSTNAME_PLACEHOLDERS = new Set([
   "",
   "localhost",
@@ -77,6 +77,10 @@ function dockerHostName() {
 }
 
 function deviceName() {
+  for (const env of ["DEVICE_NAME", "COMPUTERNAME"]) {
+    const v = (process.env[env] || "").trim();
+    if (v) return v;
+  }
   try {
     const n = usableHostname(fs.readFileSync("/host/etc/hostname", "utf8"));
     if (n) return n;
@@ -91,14 +95,10 @@ function deviceName() {
   } catch {
     /* fall through */
   }
-  for (const env of ["DEVICE_NAME", "COMPUTERNAME"]) {
-    const v = (process.env[env] || "").trim();
-    if (v) return v;
-  }
   log(
-    "device name unresolved: /host/etc/hostname absent, `docker info` gave no " +
-      "usable name, and the OS hostname is a container id — falling back to " +
-      "'unknown-device' (set DEVICE_NAME to override)",
+    "device name unresolved: DEVICE_NAME unset, no /host/etc/hostname, no usable " +
+      "`docker info` name, and the OS hostname is a container id — falling back " +
+      "to 'unknown-device'",
   );
   return "unknown-device";
 }
