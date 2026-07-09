@@ -275,7 +275,7 @@ class TestSpawnOptionHelpers(unittest.TestCase):
 class ProjectDirMixin:
     """Temp PROJECTS_ROOT + a project dir for a fake worktree path."""
 
-    WORKDIR = "/w/repo"
+    WORKDIR = "/w/.agenthub/worktrees/repo"
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="hub-agent-test-")
@@ -283,7 +283,7 @@ class ProjectDirMixin:
         patcher = mock.patch.object(ha, "PROJECTS_ROOT", self.tmp)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.proj = os.path.join(self.tmp, self.WORKDIR.replace("/", "-"))
+        self.proj = os.path.join(self.tmp, ha._project_slug(self.WORKDIR))
         os.makedirs(self.proj)
 
 
@@ -1048,7 +1048,7 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
 
 
 class TestHistoryCommand(ManagerMixin, unittest.TestCase):
-    WORKDIR = "/w/repo"
+    WORKDIR = "/w/.agenthub/worktrees/repo"
 
     def _running_session(self, sm, sid="abcde", workdir=None):
         workdir = workdir or self.WORKDIR
@@ -1059,7 +1059,7 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
 
     def _proj_dir(self, workdir=None):
         workdir = workdir or self.WORKDIR
-        proj = os.path.join(ha.PROJECTS_ROOT, workdir.replace("/", "-"))
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(workdir))
         os.makedirs(proj, exist_ok=True)
         return proj
 
@@ -1399,6 +1399,26 @@ class TestClone(ManagerMixin, unittest.TestCase):
             sm.clone("xerktech/AgentHub")
         sm._poll_clones()
         self.assertEqual(sm.clones["AgentHub"]["status"], "error")
+
+
+class TestProjectSlug(unittest.TestCase):
+    def test_every_non_alphanumeric_becomes_dash(self):
+        # Claude Code slugs dots too: /repos/.agenthub/... -> -repos--agenthub-...
+        # (observed on disk; the old '/'-only mapping missed every worktree
+        # transcript because of the '.agenthub' path segment).
+        self.assertEqual(
+            ha._project_slug("/repos/.agenthub/worktrees/CoinBox-46578"),
+            "-repos--agenthub-worktrees-CoinBox-46578",
+        )
+
+    def test_plain_path_matches_old_rule(self):
+        self.assertEqual(ha._project_slug("/w/repo"), "-w-repo")
+
+    def test_windows_style_path(self):
+        self.assertEqual(
+            ha._project_slug(r"C:\Users\me/.switchboard"),
+            "C--Users-me--switchboard",
+        )
 
 
 class TestScanRepos(unittest.TestCase):

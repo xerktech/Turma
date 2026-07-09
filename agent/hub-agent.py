@@ -27,7 +27,7 @@ multiplexer:
     the registry record).
 
 Token usage is parsed from the transcript JSONLs under
-/root/.claude/projects/<slug>/ (slug = worktree path with '/'->'-'); this is the
+/root/.claude/projects/<slug>/ (slug = worktree path via _project_slug); this is the
 same data ccusage reads. Live-session signals are bridge-pointer presence,
 transcript freshness, the newest entry's role/tool-use, any pending
 AskUserQuestion, and PR URLs newly appended to the transcript.
@@ -71,10 +71,20 @@ CLOSED_PATH = os.path.join(REGISTRY_DIR, "closed.json")
 # Only the newest N closed sessions per repo are kept/offered for resume —
 # bounds both the file and the heartbeat payload.
 CLOSED_PER_REPO = 5
-# Where Claude Code keeps per-project transcript JSONLs (slug = cwd with
-# '/'->'-'). Overridable so the test suite can point it at fixtures; unset in
-# production, so the default is the real path.
+# Where Claude Code keeps per-project transcript JSONLs (slug = cwd via
+# _project_slug below). Overridable so the test suite can point it at
+# fixtures; unset in production, so the default is the real path.
 PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", "/root/.claude/projects")
+
+
+def _project_slug(path):
+    """Claude Code's project-dir slug for a cwd: EVERY non-alphanumeric
+    character becomes '-', not just '/'. The worktree paths this agent
+    manages always contain a dot (REPOS_ROOT/.agenthub/worktrees/<id>), so
+    the old '/'->'-' mapping produced '-.agenthub-' where Claude writes
+    '--agenthub-' — every transcript lookup missed, silently blanking
+    session signals, tails, history, and usage for worktree sessions."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
 # Glasses-client transcript tail: how many surviving messages to report per
 # beat, and how many chars of each to keep (payload-size bounds).
 TAIL_MSGS = int(os.environ.get("SESSION_TAIL_MSGS", "30"))
@@ -552,7 +562,7 @@ HISTORY_DAYS = 60  # per-day breakdown reported to the hub (bounds payload size)
 
 def usage_report(workdir):
     """Aggregate token usage for this project from the transcript JSONLs."""
-    slug = workdir.replace("/", "-")
+    slug = _project_slug(workdir)
     proj = os.path.join(PROJECTS_ROOT, slug)
     totals = {"input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0}
     days = {}  # "YYYY-MM-DD" (UTC) -> same shape as totals
@@ -754,7 +764,7 @@ def _newest_transcript_path(workdir):
     """Newest transcript JSONL for a worktree: same lookup session_report uses
     (worktree path -> project slug dir -> newest *.jsonl). None when the
     project dir is missing or has no transcripts."""
-    slug = workdir.replace("/", "-")
+    slug = _project_slug(workdir)
     proj = os.path.join(PROJECTS_ROOT, slug)
     newest, newest_mtime = None, 0.0
     try:
@@ -812,7 +822,7 @@ def session_report(workdir, state):
     offsets to EOF for every existing transcript, so a restarted agent never
     replays PR links from old sessions.
     """
-    slug = workdir.replace("/", "-")
+    slug = _project_slug(workdir)
     proj = os.path.join(PROJECTS_ROOT, slug)
     primed = state.get("primed", False)
     offsets = state.setdefault("offsets", {})
@@ -1197,7 +1207,7 @@ class SessionManager:
         # Never reattach a fresh claude to a dead RC bridge from a prior session
         # (that silently swallows prompts). The project slug matches how Claude
         # keys ~/.claude/projects for a given cwd.
-        slug = worktree.replace("/", "-")
+        slug = _project_slug(worktree)
         try:
             os.remove(os.path.join(PROJECTS_ROOT, slug, "bridge-pointer.json"))
         except OSError:
@@ -1212,7 +1222,7 @@ class SessionManager:
         slug can hold several transcripts (each clear-context restart starts a
         new one) and --continue's "most recent" pick is opaque, while
         newest-mtime here is deterministic."""
-        slug = worktree.replace("/", "-")
+        slug = _project_slug(worktree)
         proj = os.path.join(PROJECTS_ROOT, slug)
         newest, newest_mtime = None, 0.0
         try:
