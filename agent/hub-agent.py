@@ -32,9 +32,6 @@ same data ccusage reads. Live-session signals are bridge-pointer presence,
 transcript freshness, the newest entry's role/tool-use, any pending
 AskUserQuestion, and PR URLs newly appended to the transcript.
 
-The hub's reply can also carry {"restart": true} for a whole-container restart
-(legacy) which the agent performs through the bind-mounted docker socket.
-
 stdlib only — no pip installs in the image.
 """
 
@@ -1362,15 +1359,6 @@ class SessionManager:
             log(f"heartbeat failed: {e}")
             return None
 
-    def container_restart(self):
-        log("restart requested by hub — restarting container")
-        # Fire-and-forget: the daemon finishes the restart even after this
-        # process (and the whole container) is killed by it.
-        subprocess.Popen(["docker", "restart", self.agent_id])
-        time.sleep(60)  # if docker restart failed, fall through
-        log("docker restart did not take effect, sending SIGTERM to pid 1")
-        os.kill(1, 15)
-
     def run_forever(self):
         log(
             f"reporting to {HUB_URL} as {self.device} (container {self.agent_id}); "
@@ -1384,8 +1372,6 @@ class SessionManager:
             reply = self.post(self.build_payload(beat))
             beat += 1
             if reply is not None:
-                if reply.get("restart"):
-                    self.container_restart()
                 if self.handle_commands(reply.get("commands")):
                     # Fire an immediate extra heartbeat so the UI reflects the
                     # new session state fast (don't wait a whole interval). Its
