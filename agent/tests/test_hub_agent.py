@@ -841,6 +841,259 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.registry[0]["status"], "error")
 
 
+class TestSendInput(ManagerMixin, unittest.TestCase):
+    def make_manager(self):
+        # __init__ itself issues run() calls (hostname, docker inspect, claude
+        # --version); clear those so run_calls only reflects send_input.
+        sm = super().make_manager()
+        self.run_calls.clear()
+        return sm
+
+    def _running_session(self, sm, sid="abcde", status="running"):
+        sess = {"id": sid, "status": status, "tmuxName": f"agent-{sid}"}
+        sm.registry = [sess]
+        return sess
+
+    def test_exact_argvs_literal_send_then_enter(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sm.send_input(sess["id"], "hello")
+        self.assertEqual(self.run_calls, [
+            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "hello"],
+            ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
+        ])
+
+    def test_newlines_flattened_to_spaces(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sm.send_input(sess["id"], "line1\r\nline2\rline3\nline4")
+        self.assertEqual(self.run_calls[0], [
+            "tmux", "send-keys", "-t", "agent-abcde", "-l",
+            "line1 line2 line3 line4",
+        ])
+
+    def test_text_capped_at_input_max_chars(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        with mock.patch.object(ha, "INPUT_MAX_CHARS", 5):
+            sm.send_input(sess["id"], "abcdefghij")
+        self.assertEqual(self.run_calls[0][-1], "abcde")
+
+    def test_noop_for_unknown_session(self):
+        sm = self.make_manager()
+        sm.registry = []
+        sm.send_input("nope", "hello")
+        self.assertEqual(self.run_calls, [])
+
+    def test_noop_for_non_running_session(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm, status="stopped")
+        sm.send_input(sess["id"], "hello")
+        self.assertEqual(self.run_calls, [])
+
+    def test_noop_for_whitespace_only_text(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sm.send_input(sess["id"], "   \t\n  ")
+        self.assertEqual(self.run_calls, [])
+
+
+class TestHistoryCommand(ManagerMixin, unittest.TestCase):
+    WORKDIR = "/w/repo"
+
+    def _running_session(self, sm, sid="abcde", workdir=None):
+        workdir = workdir or self.WORKDIR
+        sess = {"id": sid, "status": "running", "worktreePath": workdir,
+                "tmuxName": f"agent-{sid}"}
+        sm.registry = [sess]
+        return sess
+
+    def _proj_dir(self, workdir=None):
+        workdir = workdir or self.WORKDIR
+        proj = os.path.join(ha.PROJECTS_ROOT, workdir.replace("/", "-"))
+        os.makedirs(proj, exist_ok=True)
+        return proj
+
+    def test_unknown_session_stages_empty_result(self):
+        sm = self.make_manager()
+        sm.registry = []
+        sm._stage_history("nope")
+        self.assertEqual(sm.history_results, [
+            {"sessionId": "nope", "entries": [], "truncated": False},
+        ])
+
+    def test_fixture_transcript_entries_ids_roles_order(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        write_jsonl(os.path.join(proj, "t.jsonl"), [
+            {"uuid": "u1", "type": "user", "message": {"content": "hi"}},
+            {"uuid": "u2", "type": "assistant",
+             "message": {"content": [{"type": "text", "text": "hello back"}]}},
+        ])
+        sm._stage_history(sess["id"])
+        self.assertEqual(sm.history_results, [{
+            "sessionId": sess["id"],
+            "entries": [
+                {"id": "u1", "role": "user", "text": "hi"},
+                {"id": "u2", "role": "assistant", "text": "hello back"},
+            ],
+            "truncated": False,
+        }])
+
+    def test_truncated_false_when_everything_fits(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        write_jsonl(os.path.join(proj, "t.jsonl"), [
+            {"uuid": f"u{i}", "type": "user", "message": {"content": f"msg {i}"}}
+            for i in range(5)
+        ])
+        with mock.patch.object(ha, "HISTORY_MAX_MSGS", 10):
+            sm._stage_history(sess["id"])
+        self.assertEqual(len(sm.history_results[0]["entries"]), 5)
+        self.assertFalse(sm.history_results[0]["truncated"])
+
+    def test_truncated_true_when_exceeding_history_max_msgs(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        write_jsonl(os.path.join(proj, "t.jsonl"), [
+            {"uuid": f"u{i}", "type": "user", "message": {"content": f"msg {i}"}}
+            for i in range(10)
+        ])
+        with mock.patch.object(ha, "HISTORY_MAX_MSGS", 3):
+            sm._stage_history(sess["id"])
+        result = sm.history_results[0]
+        self.assertEqual([e["id"] for e in result["entries"]], ["u7", "u8", "u9"])
+        self.assertTrue(result["truncated"])
+
+    def test_empty_transcript_file(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        open(os.path.join(proj, "t.jsonl"), "w").close()
+        sm._stage_history(sess["id"])
+        self.assertEqual(sm.history_results, [
+            {"sessionId": sess["id"], "entries": [], "truncated": False},
+        ])
+
+    def test_missing_project_dir_stages_empty(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm, workdir="/absent/worktree")
+        sm._stage_history(sess["id"])
+        self.assertEqual(sm.history_results, [
+            {"sessionId": sess["id"], "entries": [], "truncated": False},
+        ])
+
+    def test_byte_cap_marks_truncated(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        path = os.path.join(proj, "t.jsonl")
+        with mock.patch.object(ha, "_read_tail_lines",
+                                lambda p, n: [json.dumps(
+                                    {"uuid": "u1", "type": "user",
+                                     "message": {"content": "hi"}}
+                                ).encode()]):
+            with mock.patch("os.path.getsize", return_value=(1 << 22) + 1):
+                open(path, "w").close()
+                sm._stage_history(sess["id"])
+        self.assertTrue(sm.history_results[0]["truncated"])
+
+
+class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
+    def test_dispatches_input_and_history_and_acks_both(self):
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        sm.send_input = mock.Mock()
+        sm._stage_history = mock.Mock()
+        cmds = [
+            {"cmdId": "i1", "type": "input", "sessionId": "s1", "text": "hi"},
+            {"cmdId": "h1", "type": "history", "sessionId": "s1"},
+        ]
+        self.assertTrue(sm.handle_commands(cmds))
+        sm.send_input.assert_called_once_with("s1", "hi")
+        sm._stage_history.assert_called_once_with("s1")
+        self.assertEqual(sm.acked, {"i1", "h1"})
+
+
+class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
+    """historyResults staging must mirror ackedCommands/pending_prs: appear in
+    the next built payload, survive a failed heartbeat POST, and clear only
+    after a successful one."""
+
+    def test_immediate_extra_heartbeat_carries_staged_result(self):
+        # Mirrors run_forever's "immediate extra heartbeat after executing
+        # commands": handle_commands() runs (staging a history result), THEN
+        # build_payload() is called for the follow-up beat — no extra wiring
+        # needed for the staged result to ride along automatically.
+        sm = self.make_manager()
+        sm.registry = []  # unknown sessionId -> empty staged result
+        sm.save = mock.Mock()
+        did_work = sm.handle_commands(
+            [{"cmdId": "h1", "type": "history", "sessionId": "s1"}]
+        )
+        self.assertTrue(did_work)
+        extra_beat_payload = sm.build_payload(1)
+        self.assertEqual(extra_beat_payload["historyResults"],
+                          [{"sessionId": "s1", "entries": [], "truncated": False}])
+
+    def test_absent_when_nothing_staged(self):
+        sm = self.make_manager()
+        payload = sm.build_payload(0)
+        self.assertNotIn("historyResults", payload)
+
+    def test_staged_result_appears_in_next_payload(self):
+        sm = self.make_manager()
+        sm.history_results.append({"sessionId": "s1", "entries": [], "truncated": False})
+        payload = sm.build_payload(0)
+        self.assertEqual(payload["historyResults"],
+                          [{"sessionId": "s1", "entries": [], "truncated": False}])
+
+    def test_cleared_only_after_successful_post(self):
+        sm = self.make_manager()
+        sm.history_results.append({"sessionId": "s1", "entries": [], "truncated": False})
+        payload = sm.build_payload(0)
+
+        # Failed POST: staged result must survive.
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                                side_effect=OSError("network down")):
+            reply = sm.post(payload)
+        self.assertIsNone(reply)
+        self.assertEqual(len(sm.history_results), 1)
+        payload2 = sm.build_payload(1)
+        self.assertEqual(payload2["historyResults"], payload["historyResults"])
+
+        # Successful POST: staged result is cleared.
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                                return_value=FakeResp()):
+            reply = sm.post(payload2)
+        self.assertEqual(reply, {})
+        self.assertEqual(sm.history_results, [])
+        self.assertNotIn("historyResults", sm.build_payload(2))
+
+    def test_multiple_pending_requests_batch(self):
+        sm = self.make_manager()
+        sm.registry = []
+        sm._stage_history("s1")
+        sm._stage_history("s2")
+        payload = sm.build_payload(0)
+        self.assertEqual(
+            [r["sessionId"] for r in payload["historyResults"]], ["s1", "s2"],
+        )
+
+
 class TestScanRepos(unittest.TestCase):
     def test_scan_filters_dotdirs_and_non_git(self):
         tmp = tempfile.mkdtemp(prefix="hub-agent-scan-")

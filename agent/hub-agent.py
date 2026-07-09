@@ -81,6 +81,11 @@ TAIL_MSG_CHARS = int(os.environ.get("SESSION_TAIL_MSG_CHARS", "500"))
 # Terminal color/cursor codes sometimes make it into pasted transcript text;
 # strip them so the glasses client only ever sees plain text.
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+# Glasses-client on-demand commands: how much typed text `input` accepts per
+# call, and how many surviving messages an on-demand `history` request returns
+# (independent of the per-heartbeat TAIL_MSGS above).
+INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "4000"))
+HISTORY_MAX_MSGS = int(os.environ.get("SESSION_HISTORY_MSGS", "200"))
 
 # Delete guard: a session branch that still has unpushed/unmerged commits is
 # parked as agent-trash/<id>-<epoch> instead of `branch -D`'d outright, then
@@ -600,6 +605,60 @@ def transcript_tail(path):
     return tail[-TAIL_MSGS:]
 
 
+def _newest_transcript_path(workdir):
+    """Newest transcript JSONL for a worktree: same lookup session_report uses
+    (worktree path -> project slug dir -> newest *.jsonl). None when the
+    project dir is missing or has no transcripts."""
+    slug = workdir.replace("/", "-")
+    proj = os.path.join(PROJECTS_ROOT, slug)
+    newest, newest_mtime = None, 0.0
+    try:
+        for fname in os.listdir(proj):
+            if not fname.endswith(".jsonl"):
+                continue
+            path = os.path.join(proj, fname)
+            try:
+                mtime = os.stat(path).st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest, newest_mtime = path, mtime
+    except OSError:
+        return None
+    return newest
+
+
+def _history_entries(path):
+    """On-demand `history` read of a transcript: bounded to the last 4 MiB
+    (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
+    ~128 KB, tolerant JSONL parse, entries mapped through _entry_text (no
+    duplicated entry->text logic). Returns (entries, byte_capped) — oldest
+    first; byte_capped is True when the file is bigger than the 4 MiB window,
+    i.e. older content was cut off before parsing even started."""
+    read_cap = 1 << 22
+    try:
+        byte_capped = os.path.getsize(path) > read_cap
+    except OSError:
+        byte_capped = False
+    entries = []
+    for raw in _read_tail_lines(path, read_cap):
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        text = _entry_text(entry)
+        if text is None:
+            continue
+        entries.append({
+            "id": entry.get("uuid"),
+            "role": entry.get("type"),
+            "text": text[:TAIL_MSG_CHARS],
+        })
+    return entries, byte_capped
+
+
 def session_report(workdir, state):
     """Cheap per-heartbeat session signals (stat + tail reads, no full parse).
 
@@ -812,6 +871,10 @@ class SessionManager:
         self.sess_state = {}                     # id -> session_report offsets
         self.usage_cache = {}                    # id -> usage_report result
         self.pending_prs = {}                    # id -> undelivered PR urls
+        # Staged `history` command results awaiting the next heartbeat payload
+        # (historyResults) — held across a failed POST, cleared only once
+        # delivery succeeds, same lifecycle as pending_prs above.
+        self.history_results = []
         # at-least-once command de-dup: cmdIds we've already executed.
         self.acked = set()
         self.acked_order = deque(maxlen=1000)
@@ -1262,6 +1325,49 @@ class SessionManager:
         prune_trash_branches()
         log(f"deleted session {sid}")
 
+    # --- on-demand input/history (glasses client) --------------------------
+
+    def send_input(self, sid, text):
+        """Type text into a running session's Claude TUI via tmux send-keys:
+        one literal keystroke send (-l — no key-name interpretation, no
+        shell) followed by a separate Enter. This is also the path an
+        AskUserQuestion answer rides: the glasses client sends the digit
+        "1".."4" through this same method (it moves the TUI's selection) and
+        the Enter this method sends confirms it in the Remote Control TUI;
+        free-text answers go through the same path but are best-effort and
+        need on-hardware verification."""
+        sess = self._find(sid)
+        if not sess or sess.get("status") != "running":
+            return
+        text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        if not text.strip():
+            return
+        text = text[:INPUT_MAX_CHARS]
+        tmux_name = sess["tmuxName"]
+        run(["tmux", "send-keys", "-t", tmux_name, "-l", text])
+        run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+
+    def _stage_history(self, sid):
+        """Handle a {type:"history"} command: locate sid's newest transcript
+        the same way session_report does and stage a bounded read of it for
+        the next heartbeat payload (historyResults). Unknown/killed sessionId
+        stages an empty result instead of raising — a poison sessionId must
+        not take down the heartbeat loop."""
+        sess = self._find(sid)
+        path = _newest_transcript_path(sess["worktreePath"]) if sess else None
+        if not path:
+            self.history_results.append(
+                {"sessionId": sid, "entries": [], "truncated": False}
+            )
+            return
+        entries, byte_capped = _history_entries(path)
+        truncated = byte_capped or len(entries) > HISTORY_MAX_MSGS
+        self.history_results.append({
+            "sessionId": sid,
+            "entries": entries[-HISTORY_MAX_MSGS:],
+            "truncated": truncated,
+        })
+
     # --- boot auto-resume --------------------------------------------------
 
     def resume_on_boot(self):
@@ -1324,6 +1430,10 @@ class SessionManager:
                     self.resume(cmd.get("sessionId"))
                 elif ctype == "delete":
                     self.delete(cmd.get("sessionId"))
+                elif ctype == "input":
+                    self.send_input(cmd.get("sessionId"), cmd.get("text") or "")
+                elif ctype == "history":
+                    self._stage_history(cmd.get("sessionId"))
                 else:
                     log(f"unknown command type {ctype!r} (cmdId {cid})")
             except Exception as e:
@@ -1415,7 +1525,7 @@ class SessionManager:
             if s["id"] not in self.usage_cache:
                 self._refresh_usage(s["id"], s["worktreePath"])
 
-        return {
+        payload = {
             # `device` (the physical host name) is the hub's identity key; agentId
             # is only a last-resort fallback if the host name can't be read.
             "agentId": self.agent_id,
@@ -1430,6 +1540,12 @@ class SessionManager:
             "closedSessions": self._closed_payload(),
             "ackedCommands": list(self.acked),
         }
+        # Purely additive, and only present when something is staged — mirrors
+        # how pending_prs stays out of a session's payload until there's
+        # something to report.
+        if self.history_results:
+            payload["historyResults"] = list(self.history_results)
+        return payload
 
     def _clear_pending_prs(self):
         for urls in self.pending_prs.values():
@@ -1454,6 +1570,7 @@ class SessionManager:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 reply = json.loads(resp.read().decode() or "{}")
             self._clear_pending_prs()  # delivered
+            self.history_results.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
         except Exception as e:
             log(f"heartbeat failed: {e}")
