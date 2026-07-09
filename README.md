@@ -23,6 +23,12 @@ repo (`compose/agents-truenas.yaml`).
   Killing a session frees its worktree but keeps its usage history. Behind
   single-user HTTP Basic auth; agents authenticate with one shared token.
 
+- **`glasses/`** — an Even Realities G2 smart-glasses client (Vite + TypeScript):
+  sessions list, scrollable transcript, question answering, spawn/kill/resume,
+  and G2-mic dictation transcribed via the hub's Whisper-backed `/audio`
+  endpoint. See `glasses/README.md` for dev, simulator, and packaging/sideload
+  instructions.
+
 ## Deploy
 
 Image content lives here; **how it runs** (mounts, tokens, `REPOS_ROOT`,
