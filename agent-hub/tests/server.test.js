@@ -12,6 +12,7 @@
 const os = require("os");
 const path = require("path");
 const http = require("http");
+const net = require("net");
 const { EventEmitter } = require("events");
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -27,13 +28,28 @@ process.env.STATE_FILE = path.join(
   os.tmpdir(),
   `agenthub-test-state-${process.pid}.json`
 );
+// Whisper STT: configured so the "enabled" code paths (transcribePcm request
+// building, the /audio WS end-to-end tests) are exercised against the real
+// module instance. The "WHISPER_URL unset" case is tested via a separately
+// required module instance (see freshServerModule below).
+process.env.WHISPER_URL = "http://whisper.test/v1/audio/transcriptions";
+process.env.WHISPER_MODEL = "whisper-1";
+process.env.WHISPER_API_KEY = "whisperkey";
+process.env.WHISPER_LANGUAGE = "en";
+process.env.WHISPER_TIMEOUT_MS = "30000";
 
-// Capture ntfy pushes synchronously (notify() calls global fetch).
+// Capture ntfy pushes synchronously (notify() calls global fetch). Individual
+// tests below stub globalThis.fetch to exercise transcribePcm/the audio WS,
+// then must call restoreFetch() to put this capturing stub back.
 const notifications = [];
-globalThis.fetch = (url, opts) => {
+function ntfyFetchStub(url, opts) {
   notifications.push({ url, title: opts.headers.Title, body: opts.body, headers: opts.headers });
   return Promise.resolve({ ok: true });
-};
+}
+globalThis.fetch = ntfyFetchStub;
+function restoreFetch() {
+  globalThis.fetch = ntfyFetchStub;
+}
 const titles = () => notifications.map((n) => n.title);
 
 const hub = require("../server.js");
@@ -43,7 +59,24 @@ const {
   heartbeatAlerts, sessionWorking,
   userAuthorized, agentAuthorized, agentWsAuthorized, fmtDur,
   credentialsMatch, issueSessionToken, sessionTokenValid,
+  pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
 } = hub;
+
+// Requires a fresh instance of server.js with mutated env vars (e.g. to test
+// the WHISPER_URL-unset code path while the primary suite keeps it
+// configured). Module-level consts are frozen at require time, so this is
+// the only way to exercise both branches from one test file.
+function freshServerModule(mutateEnv) {
+  const modPath = require.resolve("../server.js");
+  const saved = { ...process.env };
+  mutateEnv(process.env);
+  delete require.cache[modPath];
+  try {
+    return require(modPath);
+  } finally {
+    process.env = { ...saved };
+  }
+}
 
 const basic = (u, p) => "Basic " + Buffer.from(`${u}:${p}`).toString("base64");
 
@@ -828,4 +861,396 @@ test("http: history cache eviction — capped at 8 sessions, oldest fetchedAt ev
   assert.equal(keys.length, 8, "cache should be capped at 8 sessions");
   assert.ok(!keys.includes("s1"), "oldest session (s1) should have been evicted");
   assert.ok(keys.includes("s9"), "newest session (s9) should remain");
+});
+
+// ---- pcmToWav ------------------------------------------------------------------
+
+test("pcmToWav: RIFF/WAVE header fields for 16kHz s16le mono", () => {
+  const pcm = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]);
+  const wav = pcmToWav(pcm);
+  assert.equal(wav.length, 44 + pcm.length);
+  assert.equal(wav.toString("ascii", 0, 4), "RIFF");
+  assert.equal(wav.readUInt32LE(4), 36 + pcm.length); // RIFF size
+  assert.equal(wav.toString("ascii", 8, 12), "WAVE");
+  assert.equal(wav.toString("ascii", 12, 16), "fmt ");
+  assert.equal(wav.readUInt32LE(16), 16); // fmt chunk size
+  assert.equal(wav.readUInt16LE(20), 1); // PCM format
+  assert.equal(wav.readUInt16LE(22), 1); // mono
+  assert.equal(wav.readUInt32LE(24), 16000); // sample rate
+  assert.equal(wav.readUInt32LE(28), 32000); // byte rate
+  assert.equal(wav.readUInt16LE(32), 2); // block align
+  assert.equal(wav.readUInt16LE(34), 16); // bits per sample
+  assert.equal(wav.toString("ascii", 36, 40), "data");
+  assert.equal(wav.readUInt32LE(40), pcm.length); // data chunk size
+  assert.ok(wav.subarray(44).equals(pcm));
+});
+
+test("pcmToWav: header math holds for an empty and an odd-length payload", () => {
+  const empty = pcmToWav(Buffer.alloc(0));
+  assert.equal(empty.length, 44);
+  assert.equal(empty.readUInt32LE(4), 36);
+  assert.equal(empty.readUInt32LE(40), 0);
+
+  const odd = pcmToWav(Buffer.alloc(7, 9));
+  assert.equal(odd.readUInt32LE(4), 43);
+  assert.equal(odd.readUInt32LE(40), 7);
+});
+
+// ---- transcribePcm ---------------------------------------------------------------
+
+test("transcribePcm: WHISPER_URL unset -> unavailable, fetch never called", async () => {
+  let called = false;
+  globalThis.fetch = () => { called = true; return Promise.resolve({ ok: true, json: async () => ({}) }); };
+  const disabled = freshServerModule((env) => { delete env.WHISPER_URL; });
+  const result = await disabled.transcribePcm(Buffer.from([1, 2, 3, 4]));
+  assert.deepEqual(result, { text: "", unavailable: true, reason: "whisper not configured" });
+  assert.equal(called, false);
+  restoreFetch();
+});
+
+test("transcribePcm: {text} body, trimmed", async () => {
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: "  hello world  " }) });
+  const result = await transcribePcm(Buffer.from([1, 2, 3, 4]));
+  assert.deepEqual(result, { text: "hello world" });
+  restoreFetch();
+});
+
+test("transcribePcm: {transcription} string fallback", async () => {
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ transcription: "  raw text  " }) });
+  const result = await transcribePcm(Buffer.from([1]));
+  assert.deepEqual(result, { text: "raw text" });
+  restoreFetch();
+});
+
+test("transcribePcm: {transcription} array-of-segments fallback joins .text", async () => {
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({ transcription: [{ text: "Hello " }, { text: "world" }] }),
+  });
+  const result = await transcribePcm(Buffer.from([1]));
+  assert.deepEqual(result, { text: "Hello world" });
+  restoreFetch();
+});
+
+test("transcribePcm: language is passed through when present", async () => {
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: "hi", language: "en" }) });
+  const result = await transcribePcm(Buffer.from([1]));
+  assert.deepEqual(result, { text: "hi", language: "en" });
+  restoreFetch();
+});
+
+test("transcribePcm: non-OK response -> unavailable, status in reason", async () => {
+  globalThis.fetch = async () => ({ ok: false, status: 503 });
+  const result = await transcribePcm(Buffer.from([1]));
+  assert.deepEqual(result, { text: "", unavailable: true, reason: "whisper returned 503" });
+  restoreFetch();
+});
+
+test("transcribePcm: fetch rejection -> unavailable with the error message", async () => {
+  globalThis.fetch = async () => { throw new Error("network down"); };
+  const result = await transcribePcm(Buffer.from([1]));
+  assert.deepEqual(result, { text: "", unavailable: true, reason: "network down" });
+  restoreFetch();
+});
+
+test("transcribePcm: request assertions — URL, Bearer header, FormData fields", async () => {
+  let captured;
+  globalThis.fetch = async (url, opts) => {
+    captured = { url, opts };
+    return { ok: true, json: async () => ({ text: "hi" }) };
+  };
+  await transcribePcm(Buffer.from([9, 9, 9, 9]));
+  assert.equal(captured.url, process.env.WHISPER_URL);
+  assert.equal(captured.opts.method, "POST");
+  assert.equal(captured.opts.headers.Authorization, `Bearer ${process.env.WHISPER_API_KEY}`);
+  const form = captured.opts.body;
+  assert.ok(form instanceof FormData);
+  assert.equal(form.get("model"), process.env.WHISPER_MODEL);
+  assert.equal(form.get("language"), process.env.WHISPER_LANGUAGE);
+  assert.equal(form.get("response_format"), "json");
+  const file = form.get("file");
+  assert.equal(file.name, "audio.wav");
+  restoreFetch();
+});
+
+test("transcribePcm: no Authorization header when WHISPER_API_KEY unset", async () => {
+  let captured;
+  globalThis.fetch = async (url, opts) => {
+    captured = opts;
+    return { ok: true, json: async () => ({ text: "hi" }) };
+  };
+  const noKey = freshServerModule((env) => { delete env.WHISPER_API_KEY; });
+  await noKey.transcribePcm(Buffer.from([1]));
+  assert.equal(captured.headers.Authorization, undefined);
+  restoreFetch();
+});
+
+// ---- ws-token --------------------------------------------------------------------
+
+test("ws-token: issued token validates; garbage/expired/tampered are rejected", () => {
+  const tok = issueWsToken();
+  assert.match(tok, /^ws\./);
+  assert.equal(wsTokenValid(tok), true);
+  assert.equal(wsTokenValid(""), false);
+  assert.equal(wsTokenValid("nodot"), false);
+  assert.equal(wsTokenValid("ws.notanumber.abc"), false);
+  assert.equal(wsTokenValid(tok + "x"), false); // tampered MAC
+
+  // Correctly-signed but already-expired token (forged expiry, real HMAC key).
+  const pastExpiry = Date.now() - 1000;
+  const key =
+    process.env.HUB_SESSION_SECRET ||
+    require("crypto").createHash("sha256").update("hubuser\nhubpass").digest("hex");
+  const mac = require("crypto")
+    .createHmac("sha256", key)
+    .update(`ws.${pastExpiry}`)
+    .digest("base64url");
+  assert.equal(wsTokenValid(`ws.${pastExpiry}.${mac}`), false);
+});
+
+test("ws-token: scope isolation — a session cookie fails wsTokenValid and vice versa", () => {
+  const sessionTok = issueSessionToken();
+  const wsTok = issueWsToken();
+  assert.equal(wsTokenValid(sessionTok), false);
+  assert.equal(sessionTokenValid(wsTok), false);
+});
+
+test("http: GET /api/ws-token is user-auth gated; returns {token, expiresInSec}", async () => {
+  const noAuth = await request("GET", "/api/ws-token");
+  assert.equal(noAuth.status, 401);
+
+  const res = await request("GET", "/api/ws-token", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.match(res.body.token, /^ws\./);
+  assert.equal(res.body.expiresInSec, 300);
+  assert.equal(wsTokenValid(res.body.token), true);
+});
+
+// ---- audio WebSocket (raw net socket, per the RFC 6455 helpers above) --------------
+
+// Performs a raw HTTP Upgrade handshake against the live test server and
+// resolves once the status line + headers are in; `leftover` is any bytes
+// already read past the header terminator (the server may coalesce the 101
+// response with the first WS frames it emits).
+function wsConnect(pathAndQuery, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const port = server.address().port;
+    const socket = net.connect(port, "127.0.0.1", () => {
+      const key = Buffer.from("test-key-0123456789").toString("base64");
+      socket.write(
+        `GET ${pathAndQuery} HTTP/1.1\r\n` +
+          "Host: x\r\n" +
+          "Upgrade: websocket\r\n" +
+          "Connection: Upgrade\r\n" +
+          `Sec-WebSocket-Key: ${key}\r\n` +
+          "Sec-WebSocket-Version: 13\r\n\r\n"
+      );
+    });
+    let buf = Buffer.alloc(0);
+    let settled = false;
+    const finish = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeListener("data", onData);
+      socket.removeListener("close", onClose);
+      socket.removeListener("error", onError);
+      fn(val);
+    };
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      const headerEnd = buf.indexOf("\r\n\r\n");
+      if (headerEnd < 0) return;
+      finish(resolve, {
+        socket,
+        statusLine: buf.subarray(0, headerEnd).toString("utf8").split("\r\n")[0],
+        leftover: buf.subarray(headerEnd + 4),
+      });
+    };
+    // A rejected upgrade may just write bytes and destroy the socket (no
+    // "error"), so a close without ever seeing the header terminator, or a
+    // flat timeout, must also settle the promise instead of hanging forever.
+    const onClose = () => finish(reject, new Error(`socket closed before headers arrived (${buf.length}B)`));
+    const onError = (e) => finish(reject, e);
+    const timer = setTimeout(() => finish(reject, new Error("wsConnect timed out")), timeoutMs);
+    socket.on("data", onData);
+    socket.on("close", onClose);
+    socket.on("error", onError);
+  });
+}
+
+// Collects parsed server->client frames (never masked) off a socket, seeded
+// with any handshake leftover bytes.
+function collectFrames(socket, leftover) {
+  const frames = [];
+  const parse = wsParser((op, payload) => frames.push({ op, payload }));
+  if (leftover && leftover.length) parse(leftover);
+  socket.on("data", parse);
+  return frames;
+}
+
+function waitFor(predicate, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const iv = setInterval(() => {
+      if (predicate()) {
+        clearInterval(iv);
+        resolve();
+      } else if (Date.now() - start > timeoutMs) {
+        clearInterval(iv);
+        reject(new Error("timed out waiting for condition"));
+      }
+    }, 10);
+  });
+}
+
+async function issueToken() {
+  const res = await request("GET", "/api/ws-token", { headers: userHeaders });
+  return res.body.token;
+}
+
+test("audio WS: bad/missing token -> 401, no 101 upgrade", async () => {
+  const bad = await wsConnect("/audio?auth=not-a-token");
+  assert.match(bad.statusLine, /^HTTP\/1\.1 401/);
+  bad.socket.destroy();
+
+  const missing = await wsConnect("/audio");
+  assert.match(missing.statusLine, /^HTTP\/1\.1 401/);
+  missing.socket.destroy();
+});
+
+test("audio WS: stream PCM, finalize -> audio_result with correct bytes; WAV data length matches", async () => {
+  let captured;
+  globalThis.fetch = async (url, opts) => {
+    captured = { url, opts };
+    return { ok: true, json: async () => ({ text: "hello from whisper", language: "en" }) };
+  };
+
+  const token = await issueToken();
+  const { socket, statusLine, leftover } = await wsConnect(`/audio?auth=${token}`);
+  assert.match(statusLine, /^HTTP\/1\.1 101/);
+  const frames = collectFrames(socket, leftover);
+
+  const pcm1 = Buffer.alloc(3200, 0x11);
+  const pcm2 = Buffer.alloc(1600, 0x22);
+  socket.write(maskedFrame(0x2, pcm1));
+  socket.write(maskedFrame(0x2, pcm2));
+  socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({ type: "finalize" }))));
+
+  await waitFor(() => frames.some((f) => f.op === 0x1));
+  const msg = JSON.parse(frames.find((f) => f.op === 0x1).payload.toString("utf8"));
+  assert.equal(msg.type, "audio_result");
+  assert.equal(msg.bytes, pcm1.length + pcm2.length);
+  assert.equal(msg.capped, undefined);
+  assert.deepEqual(msg.transcript, { text: "hello from whisper", language: "en" });
+  assert.equal(typeof msg.durationMs, "number");
+
+  await waitFor(() => frames.some((f) => f.op === 0x8));
+
+  const file = captured.opts.body.get("file");
+  const wavBuf = Buffer.from(await file.arrayBuffer());
+  assert.equal(wavBuf.readUInt32LE(40), pcm1.length + pcm2.length); // data chunk size
+  assert.equal(wavBuf.length - 44, pcm1.length + pcm2.length);
+
+  socket.destroy();
+  restoreFetch();
+});
+
+test("audio WS: close before finalize discards buffered audio, never calls Whisper", async () => {
+  let called = false;
+  globalThis.fetch = async () => { called = true; return { ok: true, json: async () => ({ text: "" }) }; };
+
+  const token = await issueToken();
+  const { socket, statusLine, leftover } = await wsConnect(`/audio?auth=${token}`);
+  assert.match(statusLine, /^HTTP\/1\.1 101/);
+  const frames = collectFrames(socket, leftover);
+
+  socket.write(maskedFrame(0x2, Buffer.alloc(100, 0x33)));
+  socket.write(maskedFrame(0x8, Buffer.alloc(0)));
+
+  await waitFor(() => frames.some((f) => f.op === 0x8));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(called, false);
+
+  socket.destroy();
+  restoreFetch();
+});
+
+test("audio WS: bytes past the 1920000-byte cap are dropped; capped:true reported", async () => {
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: "" }) });
+
+  const token = await issueToken();
+  const { socket, statusLine, leftover } = await wsConnect(`/audio?auth=${token}`);
+  assert.match(statusLine, /^HTTP\/1\.1 101/);
+  const frames = collectFrames(socket, leftover);
+
+  const CAP = 1920000;
+  const chunk = Buffer.alloc(640000, 0x44); // 3 * 640000 == cap exactly
+  for (let i = 0; i < 3; i++) socket.write(maskedFrame(0x2, chunk));
+  socket.write(maskedFrame(0x2, Buffer.alloc(640000, 0x55))); // entirely beyond the cap
+  socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({ type: "finalize" }))));
+
+  await waitFor(() => frames.some((f) => f.op === 0x1), 10000);
+  const msg = JSON.parse(frames.find((f) => f.op === 0x1).payload.toString("utf8"));
+  assert.equal(msg.bytes, CAP);
+  assert.equal(msg.capped, true);
+
+  socket.destroy();
+  restoreFetch();
+});
+
+test("audio WS: double finalize is ignored (second is a no-op)", async () => {
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; return { ok: true, json: async () => ({ text: "ok" }) }; };
+
+  const token = await issueToken();
+  const { socket, statusLine, leftover } = await wsConnect(`/audio?auth=${token}`);
+  assert.match(statusLine, /^HTTP\/1\.1 101/);
+  const frames = collectFrames(socket, leftover);
+
+  socket.write(maskedFrame(0x2, Buffer.alloc(10)));
+  const finalizeFrame = maskedFrame(0x1, Buffer.from(JSON.stringify({ type: "finalize" })));
+  socket.write(finalizeFrame);
+  socket.write(finalizeFrame);
+
+  await waitFor(() => frames.some((f) => f.op === 0x8));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(calls, 1);
+  assert.equal(frames.filter((f) => f.op === 0x1).length, 1);
+
+  socket.destroy();
+  restoreFetch();
+});
+
+test("audio WS: ping is answered with a pong carrying the same payload", async () => {
+  const token = await issueToken();
+  const { socket, statusLine, leftover } = await wsConnect(`/audio?auth=${token}`);
+  assert.match(statusLine, /^HTTP\/1\.1 101/);
+  const frames = collectFrames(socket, leftover);
+
+  socket.write(maskedFrame(0x9, Buffer.from("beat")));
+  await waitFor(() => frames.some((f) => f.op === 0xa));
+  const pong = frames.find((f) => f.op === 0xa);
+  assert.equal(pong.payload.toString(), "beat");
+
+  socket.destroy();
+});
+
+test("audio WS: unparseable/other text frames before finalize are ignored", async () => {
+  let called = false;
+  globalThis.fetch = async () => { called = true; return { ok: true, json: async () => ({ text: "" }) }; };
+
+  const token = await issueToken();
+  const { socket, statusLine, leftover } = await wsConnect(`/audio?auth=${token}`);
+  assert.match(statusLine, /^HTTP\/1\.1 101/);
+  const frames = collectFrames(socket, leftover);
+
+  socket.write(maskedFrame(0x1, Buffer.from("not json")));
+  socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({ type: "ping" }))));
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(called, false);
+  assert.equal(frames.filter((f) => f.op === 0x1).length, 0);
+
+  socket.destroy();
+  restoreFetch();
 });

@@ -71,6 +71,16 @@ const NTFY_TOPIC = process.env.NTFY_TOPIC || "agents";
 const NTFY_USER = process.env.NTFY_USER || "";
 const NTFY_PASS = process.env.NTFY_PASS || "";
 const COST_ALERT_USD = parseFloat(process.env.COST_ALERT_USD || "75");
+
+// Whisper STT: the glasses client streams mic PCM to us over /audio and we
+// wrap+POST it to an external OpenAI-compatible Whisper server on finalize.
+// Unset WHISPER_URL disables STT (the WS endpoint still works; it just
+// returns an `unavailable` transcript instead of erroring).
+const WHISPER_URL = process.env.WHISPER_URL || "";
+const WHISPER_MODEL = process.env.WHISPER_MODEL || "";
+const WHISPER_API_KEY = process.env.WHISPER_API_KEY || "";
+const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || "en";
+const WHISPER_TIMEOUT_MS = parseInt(process.env.WHISPER_TIMEOUT_MS || "30000", 10);
 // A session counts as "working" while its transcript was written to within
 // this window (agents report the age at beat time; add staleness since).
 const WORKING_WINDOW_MS = 90 * 1000;
@@ -220,6 +230,33 @@ function sessionTokenValid(token) {
   if (!Number.isFinite(expNum) || expNum < Date.now()) return false;
   const expected = crypto.createHmac("sha256", SESSION_KEY).update(expiry).digest("base64url");
   const got = Buffer.from(token.slice(dot + 1));
+  const want = Buffer.from(expected);
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
+}
+
+// ---- ws-token (short-lived, query-string auth for the /audio WebSocket) ----
+// Browser `WebSocket` can't send an Authorization header, so the glasses
+// client fetches one of these over authenticated HTTP (GET /api/ws-token)
+// and passes it as ?auth=. Same "<payload>.<hmac>" shape as the session
+// cookie, but scoped with a "ws." prefix in both the token and the MAC input
+// so session cookies and ws-tokens can never be used in place of each other.
+const WS_TOKEN_TTL_MS = 5 * 60 * 1000;
+function issueWsToken() {
+  const expiry = Date.now() + WS_TOKEN_TTL_MS;
+  const mac = crypto.createHmac("sha256", SESSION_KEY).update(`ws.${expiry}`).digest("base64url");
+  return `ws.${expiry}.${mac}`;
+}
+
+function wsTokenValid(token) {
+  if (!token || !token.startsWith("ws.")) return false;
+  const rest = token.slice(3);
+  const dot = rest.indexOf(".");
+  if (dot < 0) return false;
+  const expiry = rest.slice(0, dot);
+  const expNum = parseInt(expiry, 10);
+  if (!Number.isFinite(expNum) || expNum < Date.now()) return false;
+  const expected = crypto.createHmac("sha256", SESSION_KEY).update(`ws.${expiry}`).digest("base64url");
+  const got = Buffer.from(rest.slice(dot + 1));
   const want = Buffer.from(expected);
   return got.length === want.length && crypto.timingSafeEqual(got, want);
 }
@@ -512,6 +549,69 @@ function wsParser(onFrame) {
   };
 }
 
+// ---- Whisper STT -------------------------------------------------------------
+// The glasses client streams raw 16 kHz signed 16-bit little-endian mono PCM
+// over the /audio WebSocket; on finalize we wrap it in a WAV container and
+// POST it to an external OpenAI-compatible Whisper server.
+
+// Pure function: raw PCM -> a Buffer with a 44-byte RIFF/WAVE header in front
+// of it, describing 16 kHz s16le mono audio.
+function pcmToWav(pcm) {
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(16, 16); // fmt chunk size
+  header.writeUInt16LE(1, 20); // PCM format
+  header.writeUInt16LE(1, 22); // channels
+  header.writeUInt32LE(16000, 24); // sample rate
+  header.writeUInt32LE(32000, 28); // byte rate (sampleRate * blockAlign)
+  header.writeUInt16LE(2, 32); // block align (channels * bitsPerSample/8)
+  header.writeUInt16LE(16, 34); // bits per sample
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+// Never throws — every failure mode (disabled, non-OK response, network
+// error/timeout, bad JSON) resolves to {text:"", unavailable:true, reason}.
+async function transcribePcm(pcm) {
+  if (!WHISPER_URL) return { text: "", unavailable: true, reason: "whisper not configured" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WHISPER_TIMEOUT_MS);
+  try {
+    const form = new FormData();
+    form.append("file", new Blob([pcmToWav(pcm)]), "audio.wav");
+    form.append("response_format", "json");
+    if (WHISPER_MODEL) form.append("model", WHISPER_MODEL);
+    if (WHISPER_LANGUAGE) form.append("language", WHISPER_LANGUAGE);
+    const headers = {};
+    if (WHISPER_API_KEY) headers.Authorization = `Bearer ${WHISPER_API_KEY}`;
+    const res = await fetch(WHISPER_URL, {
+      method: "POST",
+      body: form,
+      headers,
+      signal: controller.signal,
+    });
+    if (!res.ok) return { text: "", unavailable: true, reason: `whisper returned ${res.status}` };
+    const body = await res.json();
+    let text = body.text;
+    if (text == null && body.transcription != null) {
+      text = Array.isArray(body.transcription)
+        ? body.transcription.map((seg) => (seg && seg.text) || "").join("")
+        : body.transcription;
+    }
+    const result = { text: String(text == null ? "" : text).trim() };
+    if (body.language != null) result.language = body.language;
+    return result;
+  } catch (e) {
+    return { text: "", unavailable: true, reason: e.message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Wrap a handshaken data-WS socket as a raw-byte Duplex: writes become binary
 // frames to the agent; the agent's binary frames become readable bytes. Stub
 // socket-ish methods so Node's http client can drive it via createConnection.
@@ -746,6 +846,12 @@ const server = http.createServer(async (req, res) => {
       return res.end(TERM_FONT);
     }
 
+    // Short-lived token for the /audio WebSocket (browser WebSocket can't set
+    // an Authorization header, so the token rides the query string instead).
+    if (req.method === "GET" && url.pathname === "/api/ws-token") {
+      return json(res, 200, { token: issueWsToken(), expiresInSec: WS_TOKEN_TTL_MS / 1000 });
+    }
+
     if (req.method === "GET" && url.pathname === "/api/agents") {
       prune();
       const now = Date.now();
@@ -945,6 +1051,85 @@ server.on("upgrade", async (req, socket, head) => {
     return;
   }
 
+  // Glasses mic-audio WebSocket: /audio?auth=<ws-token>. The client streams
+  // raw 16kHz s16le mono PCM as binary frames; a {"type":"finalize"} text
+  // frame triggers a Whisper transcription of everything buffered so far,
+  // replied as one audio_result text frame, then we close the socket.
+  if (parts[0] === "audio") {
+    if (!wsTokenValid(url.searchParams.get("auth"))) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      return socket.destroy();
+    }
+    wsHandshake(socket, req);
+    const send = (op, payload) => {
+      try { socket.write(wsEncode(op, payload)); } catch {}
+    };
+
+    const AUDIO_CAP_BYTES = 1920000; // 60s of 16kHz s16le mono
+    const AUDIO_IDLE_TIMEOUT_MS = 90 * 1000;
+    let chunks = [];
+    let bytes = 0;
+    let capped = false;
+    let firstByteAt = null;
+    let finalized = false;
+    let idleTimer;
+
+    const cleanup = () => {
+      clearTimeout(idleTimer);
+    };
+    const resetIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => { try { socket.destroy(); } catch {} }, AUDIO_IDLE_TIMEOUT_MS);
+      idleTimer.unref();
+    };
+    resetIdle();
+
+    const finalize = async () => {
+      if (finalized) return;
+      finalized = true;
+      clearTimeout(idleTimer);
+      const pcm = Buffer.concat(chunks);
+      chunks = [];
+      const transcript = await transcribePcm(pcm);
+      const durationMs = firstByteAt ? Date.now() - firstByteAt : 0;
+      const reply = { type: "audio_result", transcript, durationMs, bytes };
+      if (capped) reply.capped = true;
+      send(0x1, JSON.stringify(reply));
+      send(0x8, Buffer.alloc(0));
+      try { socket.end(); } catch {}
+    };
+
+    const parse = wsParser((op, payload) => {
+      resetIdle();
+      if (finalized) return;
+      if (op === 0x2) {
+        if (firstByteAt == null) firstByteAt = Date.now();
+        if (bytes + payload.length > AUDIO_CAP_BYTES) {
+          capped = true; // frame beyond the cap: dropped entirely
+          return;
+        }
+        chunks.push(payload);
+        bytes += payload.length;
+      } else if (op === 0x9) {
+        send(0xa, payload);
+      } else if (op === 0x1) {
+        let msg;
+        try { msg = JSON.parse(payload.toString("utf8")); } catch { return; }
+        if (msg && msg.type === "finalize") finalize();
+      } else if (op === 0x8) {
+        finalized = true; // discard buffered audio, no STT call
+        chunks = [];
+        clearTimeout(idleTimer);
+        send(0x8, Buffer.alloc(0));
+        try { socket.end(); } catch {}
+      }
+    });
+    socket.on("data", parse);
+    socket.on("close", cleanup);
+    socket.on("error", cleanup);
+    return;
+  }
+
   // Browser terminal WebSocket: proxy through the agent's tunnel. The browser
   // re-sends the cached basic-auth credentials on same-origin WS upgrades (it
   // already authenticated to load the ttyd iframe assets).
@@ -1012,6 +1197,10 @@ if (process.env.AGENTHUB_TEST) {
     issueSessionToken,
     sessionTokenValid,
     fmtDur,
+    pcmToWav,
+    transcribePcm,
+    issueWsToken,
+    wsTokenValid,
   };
 } else {
   if (!HUB_PASSWORD) console.warn("WARNING: HUB_USER/HUB_PASSWORD not set — UI is unauthenticated");
@@ -1022,6 +1211,9 @@ if (process.env.AGENTHUB_TEST) {
       NTFY_URL
         ? `ntfy alerts -> ${NTFY_URL}/${NTFY_TOPIC} (cost threshold $${COST_ALERT_USD}/day)`
         : "ntfy alerts disabled (NTFY_URL not set)"
+    );
+    console.log(
+      WHISPER_URL ? `whisper STT -> ${WHISPER_URL}` : "whisper STT disabled (WHISPER_URL not set)"
     );
   });
 }
