@@ -738,6 +738,9 @@ const server = http.createServer(async (req, res) => {
     // before any auth gate — they're credential-less by spec and must not 401.
     const origin = req.headers.origin;
     if ((parts[0] === "api" || parts[0] === "term") && origin) {
+      // Reflection (not "*") is required for credentialed CORS, and the
+      // glasses WebView's origin isn't fixed; auth still gates every route.
+      // nosemgrep: javascript.express.security.cors-misconfiguration.cors-misconfiguration
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Vary", "Origin");
       res.setHeader("Access-Control-Allow-Credentials", "true");

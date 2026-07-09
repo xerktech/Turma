@@ -43,7 +43,7 @@ function ensureInstalled(): void {
       try {
         out[key] = exporter();
       } catch (err) {
-        console.warn(`[lifecycle] exporter for "${key}" threw:`, err);
+        console.warn("[lifecycle] exporter threw for key:", key, err);
       }
     }
     return JSON.stringify(out);
@@ -63,7 +63,7 @@ function ensureInstalled(): void {
         try {
           restorer(value);
         } catch (err) {
-          console.warn(`[lifecycle] restorer for "${key}" threw:`, err);
+          console.warn("[lifecycle] restorer threw for key:", key, err);
         }
       } else {
         // Restorer not registered yet — replay when it lands.
@@ -93,7 +93,7 @@ export function onBackgroundRestore(key: string, restorer: Restorer): void {
     try {
       restorer(value);
     } catch (err) {
-      console.warn(`[lifecycle] restorer for "${key}" threw:`, err);
+      console.warn("[lifecycle] restorer threw for key:", key, err);
     }
   }
 }

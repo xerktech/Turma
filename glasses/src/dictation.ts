@@ -46,6 +46,9 @@ export class PromptDictation implements Dictation {
 // Exported directly so URL derivation is unit-testable without a fake
 // recorder/WebSocket in the loop.
 export function buildAudioWsUrl(hubUrl: string, token: string): string {
+  // ws:// is the deliberate dev/LAN fallback for an http:// hub (sideload
+  // testing); the production hub is https so this derives wss://.
+  // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
   const wsBase = hubUrl.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://").replace(/\/$/, "");
   return `${wsBase}/audio?auth=${encodeURIComponent(token)}`;
 }

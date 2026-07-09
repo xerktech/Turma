@@ -87,6 +87,7 @@ describe("HubAudioDictation", () => {
     expect(recorder.startCalls).toEqual(["wss://hub.example.com/audio?auth=my-token"]);
   });
 
+  // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
   it("derives ws:// for an http hubUrl", async () => {
     const hubClient = fakeHubClient();
     const recorder = fakeRecorder();
