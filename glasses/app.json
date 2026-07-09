@@ -1,0 +1,21 @@
+{
+  "package_id": "com.xerktech.agenthub",
+  "edition": "202601",
+  "name": "AgentHub HUD",
+  "version": "0.1.0",
+  "min_app_version": "2.0.0",
+  "min_sdk_version": "0.0.10",
+  "entrypoint": "index.html",
+  "supported_languages": ["en"],
+  "permissions": [
+    {
+      "name": "g2-microphone",
+      "desc": "Capture voice to dictate prompts to your AgentHub Claude Code sessions."
+    },
+    {
+      "name": "network",
+      "desc": "Connect to your self-hosted AgentHub hub to list and control Claude Code sessions.",
+      "whitelist": ["https://agents.xerktech.com", "wss://agents.xerktech.com"]
+    }
+  ]
+}

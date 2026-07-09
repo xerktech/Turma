@@ -75,6 +75,18 @@ CLOSED_PER_REPO = 5
 # '/'->'-'). Overridable so the test suite can point it at fixtures; unset in
 # production, so the default is the real path.
 PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", "/root/.claude/projects")
+# Glasses-client transcript tail: how many surviving messages to report per
+# beat, and how many chars of each to keep (payload-size bounds).
+TAIL_MSGS = int(os.environ.get("SESSION_TAIL_MSGS", "30"))
+TAIL_MSG_CHARS = int(os.environ.get("SESSION_TAIL_MSG_CHARS", "500"))
+# Terminal color/cursor codes sometimes make it into pasted transcript text;
+# strip them so the glasses client only ever sees plain text.
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+# Glasses-client on-demand commands: how much typed text `input` accepts per
+# call, and how many surviving messages an on-demand `history` request returns
+# (independent of the per-heartbeat TAIL_MSGS above).
+INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "4000"))
+HISTORY_MAX_MSGS = int(os.environ.get("SESSION_HISTORY_MSGS", "200"))
 
 # Delete guard: a session branch that still has unpushed/unmerged commits is
 # parked as agent-trash/<id>-<epoch> instead of `branch -D`'d outright, then
@@ -651,23 +663,145 @@ LOG_TAIL_LINES = 50
 LOG_TAIL_MAX_BYTES = 12_000
 
 
-def _last_entry(path):
-    """Newest complete JSON line from the tail of a transcript JSONL."""
+def _read_tail_lines(path, max_bytes):
+    """Non-empty raw lines from roughly the last max_bytes of a file, in file
+    order. The leading line may be a fragment (seek landed mid-line) — callers
+    that json.loads() it get a ValueError and skip it like any other garbage."""
     try:
         with open(path, "rb") as f:
-            f.seek(max(0, os.fstat(f.fileno()).st_size - 65536))
-            lines = f.read().split(b"\n")
+            f.seek(max(0, os.fstat(f.fileno()).st_size - max_bytes))
+            raw = f.read()
     except OSError:
-        return None
-    for raw in reversed(lines):
-        raw = raw.strip()
-        if not raw:
-            continue
+        return []
+    return [line.strip() for line in raw.split(b"\n") if line.strip()]
+
+
+def _last_entry(path):
+    """Newest complete JSON line from the tail of a transcript JSONL."""
+    for raw in reversed(_read_tail_lines(path, 65536)):
         try:
             return json.loads(raw)
         except ValueError:
             continue  # partial write at the tail, or the seek-point fragment
     return None
+
+
+def _tail_entries(path):
+    """Parsed dict entries from roughly the last 128 KB of a transcript JSONL,
+    in file order. Tolerant JSONL parse: lines that fail json.loads or don't
+    decode to a dict (a truncated seek-point fragment, a partial write) are
+    silently skipped rather than aborting the read."""
+    entries = []
+    for raw in _read_tail_lines(path, 1 << 17):  # ~128 KB
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def _entry_text(entry):
+    """Map one transcript entry to display text for the glasses tail feed, or
+    None to drop it (wrong type, no message, tool_result-only turn, or empty
+    after stripping ANSI)."""
+    if entry.get("type") not in ("user", "assistant"):
+        return None
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                parts.append(str(block.get("text") or ""))
+            elif btype == "tool_use" and block.get("name"):
+                parts.append(f"[{block['name']}]")
+            # "thinking" and "tool_result" blocks are dropped.
+        text = "".join(parts)
+    else:
+        return None
+    text = ANSI_RE.sub("", text).strip()
+    return text or None
+
+
+def transcript_tail(path):
+    """Last TAIL_MSGS surviving messages of a transcript for the glasses
+    client's tail feed, oldest first: [{"id": entry uuid, "role": "user"/
+    "assistant", "text": text}, ...]. Missing/empty transcript -> []. id is
+    the transcript entry's own uuid so clients can merge/dedup on it."""
+    tail = []
+    for entry in _tail_entries(path):
+        text = _entry_text(entry)
+        if text is None:
+            continue
+        tail.append({
+            "id": entry.get("uuid"),
+            "role": entry.get("type"),
+            "text": text[:TAIL_MSG_CHARS],
+        })
+    return tail[-TAIL_MSGS:]
+
+
+def _newest_transcript_path(workdir):
+    """Newest transcript JSONL for a worktree: same lookup session_report uses
+    (worktree path -> project slug dir -> newest *.jsonl). None when the
+    project dir is missing or has no transcripts."""
+    slug = workdir.replace("/", "-")
+    proj = os.path.join(PROJECTS_ROOT, slug)
+    newest, newest_mtime = None, 0.0
+    try:
+        for fname in os.listdir(proj):
+            if not fname.endswith(".jsonl"):
+                continue
+            path = os.path.join(proj, fname)
+            try:
+                mtime = os.stat(path).st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest, newest_mtime = path, mtime
+    except OSError:
+        return None
+    return newest
+
+
+def _history_entries(path):
+    """On-demand `history` read of a transcript: bounded to the last 4 MiB
+    (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
+    ~128 KB, tolerant JSONL parse, entries mapped through _entry_text (no
+    duplicated entry->text logic). Returns (entries, byte_capped) — oldest
+    first; byte_capped is True when the file is bigger than the 4 MiB window,
+    i.e. older content was cut off before parsing even started."""
+    read_cap = 1 << 22
+    try:
+        byte_capped = os.path.getsize(path) > read_cap
+    except OSError:
+        byte_capped = False
+    entries = []
+    for raw in _read_tail_lines(path, read_cap):
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        text = _entry_text(entry)
+        if text is None:
+            continue
+        entries.append({
+            "id": entry.get("uuid"),
+            "role": entry.get("type"),
+            "text": text[:TAIL_MSG_CHARS],
+        })
+    return entries, byte_capped
 
 
 def session_report(workdir, state):
@@ -689,7 +823,9 @@ def session_report(workdir, state):
         "lastRole": None,          # "assistant"/"user"/... of the newest entry
         "lastHasToolUse": False,
         "question": None,          # pending AskUserQuestion text, if any
+        "questionOptions": [],     # pending AskUserQuestion option labels, if any
         "prUrls": [],              # PR links newly appended since last beat
+        "tail": [],                # recent transcript messages, for the glasses client
     }
 
     newest, newest_mtime = None, 0.0
@@ -713,6 +849,7 @@ def session_report(workdir, state):
     if not newest:
         return report
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
+    report["tail"] = transcript_tail(newest)
 
     entry = _last_entry(newest)
     if entry:
@@ -728,6 +865,11 @@ def session_report(workdir, state):
                     qs = (block.get("input") or {}).get("questions") or []
                     if qs and isinstance(qs[0], dict):
                         report["question"] = str(qs[0].get("question") or "")[:300] or None
+                        opts = qs[0].get("options") or []
+                        report["questionOptions"] = [
+                            opt["label"][:80] for opt in opts[:4]
+                            if isinstance(opt, dict) and isinstance(opt.get("label"), str)
+                        ]
 
     # Incremental PR-URL scan over bytes appended to the active transcript.
     try:
@@ -994,6 +1136,10 @@ class SessionManager:
         self.sess_state = {}                     # id -> session_report offsets
         self.usage_cache = {}                    # id -> usage_report result
         self.pending_prs = {}                    # id -> undelivered PR urls
+        # Staged `history` command results awaiting the next heartbeat payload
+        # (historyResults) — held across a failed POST, cleared only once
+        # delivery succeeds, same lifecycle as pending_prs above.
+        self.history_results = []
         # GitHub clone-into-root state: the cached availability/repo-list block
         # (refreshed on a slow cadence, reported every beat) and in-flight/recent
         # clone jobs keyed by dest name (the Popen lives here; only a serializable
@@ -1450,6 +1596,52 @@ class SessionManager:
         prune_trash_branches()
         log(f"deleted session {sid}")
 
+    # --- on-demand input/history (glasses client) --------------------------
+
+    def send_input(self, sid, text):
+        """Type text into a running session's Claude TUI via tmux send-keys:
+        one literal keystroke send (-l — no key-name interpretation, no
+        shell) followed by a separate Enter. This is also the path an
+        AskUserQuestion answer rides: the glasses client sends the digit
+        "1".."4" through this same method (it moves the TUI's selection) and
+        the Enter this method sends confirms it in the Remote Control TUI;
+        free-text answers go through the same path but are best-effort and
+        need on-hardware verification. `--` ends tmux's own option parsing
+        before the literal text so a dictated/typed string that happens to
+        start with '-' (e.g. "-1 on that idea") isn't misread as more
+        send-keys flags; -l still applies to everything after it."""
+        sess = self._find(sid)
+        if not sess or sess.get("status") != "running":
+            return
+        text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        if not text.strip():
+            return
+        text = text[:INPUT_MAX_CHARS]
+        tmux_name = sess["tmuxName"]
+        run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
+        run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+
+    def _stage_history(self, sid):
+        """Handle a {type:"history"} command: locate sid's newest transcript
+        the same way session_report does and stage a bounded read of it for
+        the next heartbeat payload (historyResults). Unknown/killed sessionId
+        stages an empty result instead of raising — a poison sessionId must
+        not take down the heartbeat loop."""
+        sess = self._find(sid)
+        path = _newest_transcript_path(sess["worktreePath"]) if sess else None
+        if not path:
+            self.history_results.append(
+                {"sessionId": sid, "entries": [], "truncated": False}
+            )
+            return
+        entries, byte_capped = _history_entries(path)
+        truncated = byte_capped or len(entries) > HISTORY_MAX_MSGS
+        self.history_results.append({
+            "sessionId": sid,
+            "entries": entries[-HISTORY_MAX_MSGS:],
+            "truncated": truncated,
+        })
+
     # --- GitHub clone-into-root -------------------------------------------
 
     def refresh_github(self):
@@ -1641,6 +1833,10 @@ class SessionManager:
                     self.resume(cmd.get("sessionId"))
                 elif ctype == "delete":
                     self.delete(cmd.get("sessionId"))
+                elif ctype == "input":
+                    self.send_input(cmd.get("sessionId"), cmd.get("text") or "")
+                elif ctype == "history":
+                    self._stage_history(cmd.get("sessionId"))
                 elif ctype == "clone":
                     self.clone(cmd.get("repo"))
                 else:
@@ -1740,7 +1936,7 @@ class SessionManager:
             self.refresh_github()
         self._poll_clones()
 
-        return {
+        payload = {
             # `device` (the physical host name) is the hub's identity key; agentId
             # is only a last-resort fallback if the host name can't be read.
             "agentId": self.agent_id,
@@ -1759,6 +1955,12 @@ class SessionManager:
             "clones": self._clones_payload(),
             "ackedCommands": list(self.acked),
         }
+        # Purely additive, and only present when something is staged — mirrors
+        # how pending_prs stays out of a session's payload until there's
+        # something to report.
+        if self.history_results:
+            payload["historyResults"] = list(self.history_results)
+        return payload
 
     def _clear_pending_prs(self):
         for urls in self.pending_prs.values():
@@ -1783,6 +1985,7 @@ class SessionManager:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 reply = json.loads(resp.read().decode() or "{}")
             self._clear_pending_prs()  # delivered
+            self.history_results.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
         except Exception as e:
             log(f"heartbeat failed: {e}")

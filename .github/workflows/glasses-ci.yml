@@ -1,0 +1,35 @@
+name: glasses-ci
+
+# Typecheck + test + build gate for the glasses client on PRs to main.
+# Path-filtered to glasses/** so it only runs when that package changes.
+# Runs on the home-lab self-hosted runners ([self-hosted, linux]); npm isn't
+# on the runner, so the whole npm workflow (install/typecheck/test/build)
+# runs inside a throwaway node:24-alpine container (Docker Hub pull — the
+# runner can't auth to ghcr.io), same pattern as code-scan.yml's Node test
+# job and agent-image.yml's version-lookup step.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "glasses/**"
+      - ".github/workflows/glasses-ci.yml"
+
+concurrency:
+  group: glasses-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Typecheck, test, build
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Reset workspace ownership
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
+      - uses: actions/checkout@v7
+      - name: Install, typecheck, test, build (glasses/)
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/workspace -w /workspace/glasses node:24-alpine \
+            sh -c 'npm ci --no-audit --no-fund && npm run typecheck && npm test && npm run build'
