@@ -770,6 +770,11 @@ function cloneBar(a) {
       `${esc(r.nameWithOwner)}${r.isPrivate ? " 🔒" : ""}${here ? " · already here" : ""}</option>`;
   }).join("");
   const dis = a.online ? "" : "disabled";
+  // Creds are present but the discovery sweep found nothing — say so, and point
+  // at the free-text box (which always works) so an empty dropdown isn't a dead end.
+  const emptyNote = (gh.repos || []).length === 0
+    ? `<span class="clone-note">No repos found${gh.login ? ` for ${esc(gh.login)}` : ""} — type an <code>owner/repo</code> to clone.</span>`
+    : "";
   return `<div class="clone-bar">
     <span class="clone-label">Clone from GitHub${gh.login ? ` <span class="clone-note">as ${esc(gh.login)}</span>` : ""}</span>
     <select id="clone-select-${hid}" ${dis} onchange="cloneSel('${esc(a.key)}',this.value)">
@@ -780,6 +785,7 @@ function cloneBar(a) {
       ${dis} oninput="cloneText('${esc(a.key)}',this.value)"
       onkeydown="if(event.key==='Enter'){event.preventDefault();cloneRepo('${esc(a.key)}');}">
     <button class="primary btn-sm" ${dis} onclick="cloneRepo('${esc(a.key)}')">Clone</button>
+    ${emptyNote}
   </div>${jobRows}${optimistic}`;
 }
 

@@ -758,6 +758,7 @@ def now_iso():
 GITHUB_REFRESH_EVERY = 15   # beats between gh availability/repo-list refreshes
 GH_REPO_LIMIT = 100         # per owner, passed to `gh repo list --limit`
 GH_REPO_MAX = 300           # total repos reported (bounds the heartbeat payload)
+GH_ORG_MAX = 20             # orgs to auto-sweep for repos (bounds the gh calls)
 CLONE_TIMEOUT_SEC = 600     # reap a `git clone` subprocess stuck this long
 CLONE_DONE_LINGER_SEC = 30  # keep a finished clone job visible this long...
 CLONE_ERROR_LINGER_SEC = 300  # ...longer for a failed one (operator reads it)
@@ -798,29 +799,50 @@ def gh_token_present():
     return bool(run(["gh", "auth", "token"]))
 
 
+def _gh_repo_list(owner):
+    """`gh repo list [owner] --json ...` -> parsed list ([] on any failure).
+    owner=None lists the authenticated user's own repos."""
+    cmd = ["gh", "repo", "list"]
+    if owner:
+        cmd.append(owner)
+    cmd += ["--limit", str(GH_REPO_LIMIT), "--json",
+            "nameWithOwner,description,isPrivate,updatedAt"]
+    raw = run(cmd)
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _gh_user_orgs():
+    """Logins of the orgs the authenticated user belongs to (capped, best
+    effort). This is what makes org-owned repos show up in the dropdown without
+    any config: `gh repo list` with no owner only returns the user's OWN repos,
+    so an org member would otherwise see an empty list."""
+    raw = run(["gh", "api", "user/orgs", "--jq", ".[].login"])
+    return [o.strip() for o in raw.splitlines() if o.strip()][:GH_ORG_MAX]
+
+
 def list_github_repos():
-    """Repos the gh login can clone, for the hub's clone dropdown. Lists the
-    authenticated user's repos plus any owners named in GH_CLONE_OWNERS
-    (space/comma separated — e.g. an org). One `gh repo list --json` call per
-    owner; deduped by nameWithOwner, newest-updated first, capped at
-    GH_REPO_MAX."""
-    owners = [o for o in re.split(r"[\s,]+", os.environ.get("GH_CLONE_OWNERS", "").strip()) if o]
-    targets = owners or [None]  # None = the authenticated user's own repos
+    """Repos the gh login can clone, for the hub's clone dropdown. Sweeps, in
+    order: the authenticated user's own repos, the orgs they belong to (so
+    org-owned repos appear with no config — the common case), and any extra
+    owners named in GH_CLONE_OWNERS (space/comma separated). Deduped by
+    nameWithOwner, newest-updated first, capped at GH_REPO_MAX."""
+    extra = [o for o in re.split(r"[\s,]+", os.environ.get("GH_CLONE_OWNERS", "").strip()) if o]
+    # None = the authenticated user's own repos; then their orgs; then overrides.
+    targets, seen_targets = [], set()
+    for owner in [None] + _gh_user_orgs() + extra:
+        key = owner or ""
+        if key not in seen_targets:
+            seen_targets.add(key)
+            targets.append(owner)
     found = {}
     for owner in targets:
-        cmd = ["gh", "repo", "list"]
-        if owner:
-            cmd.append(owner)
-        cmd += ["--limit", str(GH_REPO_LIMIT), "--json",
-                "nameWithOwner,description,isPrivate,updatedAt"]
-        raw = run(cmd)
-        if not raw:
-            continue
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            continue
-        for r in data if isinstance(data, list) else []:
+        for r in _gh_repo_list(owner):
             nwo = r.get("nameWithOwner")
             if not nwo or nwo in found:
                 continue
