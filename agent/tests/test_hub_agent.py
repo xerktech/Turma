@@ -320,6 +320,109 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, {})
         self.assertTrue(rep["bridgeAttached"])
 
+    def test_missing_project_dir_has_empty_tail_and_options(self):
+        rep = ha.session_report("/absent/worktree", {})
+        self.assertEqual(rep["tail"], [])
+        self.assertEqual(rep["questionOptions"], [])
+
+    def test_tail_reported_for_live_transcript(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [
+            {"uuid": "u1", "type": "user", "message": {"content": "hi"}},
+            {"uuid": "u2", "type": "assistant",
+             "message": {"content": [{"type": "text", "text": "hello back"}]}},
+        ])
+        rep = ha.session_report(self.WORKDIR, {})
+        self.assertEqual(rep["tail"], [
+            {"id": "u1", "role": "user", "text": "hi"},
+            {"id": "u2", "role": "assistant", "text": "hello back"},
+        ])
+
+    def test_question_options_from_ask_user_question(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        long_label = "L" * 100
+        options = [{"label": long_label}, {"label": "b"}, {"label": "c"},
+                   {"label": "d"}, {"label": "e"}]  # 5 options -> capped at 4
+        write_jsonl(path, [{
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "AskUserQuestion",
+                 "input": {"questions": [{"question": "pick one", "options": options}]}},
+            ]},
+        }])
+        rep = ha.session_report(self.WORKDIR, {})
+        self.assertEqual(rep["questionOptions"], [long_label[:80], "b", "c", "d"])
+
+    def test_question_options_empty_when_no_question(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("just chatting")])
+        rep = ha.session_report(self.WORKDIR, {})
+        self.assertEqual(rep["questionOptions"], [])
+
+    def test_question_options_skips_non_string_labels(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        options = [{"label": "ok"}, {"label": 42}, "not-a-dict"]
+        write_jsonl(path, [{
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "AskUserQuestion",
+                 "input": {"questions": [{"question": "pick", "options": options}]}},
+            ]},
+        }])
+        rep = ha.session_report(self.WORKDIR, {})
+        self.assertEqual(rep["questionOptions"], ["ok"])
+
+
+class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
+    def test_missing_file(self):
+        self.assertEqual(ha.transcript_tail(os.path.join(self.proj, "nope.jsonl")), [])
+
+    def test_empty_file(self):
+        path = os.path.join(self.proj, "empty.jsonl")
+        open(path, "w").close()
+        self.assertEqual(ha.transcript_tail(path), [])
+
+    def test_mixed_entries_ansi_stripped_and_garbage_skipped(self):
+        path = os.path.join(self.proj, "t.jsonl")
+        ansi_text = "\x1b[31mred\x1b[0m alert"
+        write_jsonl(path, [
+            {"uuid": "u1", "type": "user", "message": {"content": "hello there"}},
+            "not json {{{",  # garbage line, skipped
+            {"uuid": "u2", "type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "hmm, let me see"},
+                {"type": "text", "text": ansi_text},
+                {"type": "tool_use", "name": "Bash", "input": {}},
+            ]}},
+            {"uuid": "u3", "type": "user", "message": {"content": [
+                {"type": "tool_result", "content": "some tool output"},
+            ]}},  # tool_result-only -> dropped
+            {"uuid": "u4", "type": "summary", "message": {"content": "not a turn"}},  # wrong type -> dropped
+        ])
+        tail = ha.transcript_tail(path)
+        self.assertEqual([e["id"] for e in tail], ["u1", "u2"])
+        self.assertEqual(tail[0], {"id": "u1", "role": "user", "text": "hello there"})
+        self.assertEqual(tail[1]["role"], "assistant")
+        self.assertEqual(tail[1]["text"], "red alert[Bash]")
+
+    def test_oversize_message_truncated(self):
+        path = os.path.join(self.proj, "big.jsonl")
+        long_text = "x" * (ha.TAIL_MSG_CHARS + 50)
+        write_jsonl(path, [{"uuid": "u1", "type": "user", "message": {"content": long_text}}])
+        tail = ha.transcript_tail(path)
+        self.assertEqual(len(tail[0]["text"]), ha.TAIL_MSG_CHARS)
+        self.assertEqual(tail[0]["text"], long_text[:ha.TAIL_MSG_CHARS])
+
+    def test_window_limited_to_tail_msgs(self):
+        path = os.path.join(self.proj, "many.jsonl")
+        entries = [
+            {"uuid": f"u{i}", "type": "user", "message": {"content": f"msg {i}"}}
+            for i in range(10)
+        ]
+        write_jsonl(path, entries)
+        with mock.patch.object(ha, "TAIL_MSGS", 3):
+            tail = ha.transcript_tail(path)
+        self.assertEqual([e["id"] for e in tail], ["u7", "u8", "u9"])
+
 
 class ManagerMixin:
     """SessionManager with subprocess chokepoints faked and a temp registry."""

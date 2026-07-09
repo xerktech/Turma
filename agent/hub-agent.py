@@ -74,6 +74,13 @@ CLOSED_PER_REPO = 5
 # '/'->'-'). Overridable so the test suite can point it at fixtures; unset in
 # production, so the default is the real path.
 PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", "/root/.claude/projects")
+# Glasses-client transcript tail: how many surviving messages to report per
+# beat, and how many chars of each to keep (payload-size bounds).
+TAIL_MSGS = int(os.environ.get("SESSION_TAIL_MSGS", "30"))
+TAIL_MSG_CHARS = int(os.environ.get("SESSION_TAIL_MSG_CHARS", "500"))
+# Terminal color/cursor codes sometimes make it into pasted transcript text;
+# strip them so the glasses client only ever sees plain text.
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 # Delete guard: a session branch that still has unpushed/unmerged commits is
 # parked as agent-trash/<id>-<epoch> instead of `branch -D`'d outright, then
@@ -506,23 +513,91 @@ LOG_TAIL_LINES = 50
 LOG_TAIL_MAX_BYTES = 12_000
 
 
-def _last_entry(path):
-    """Newest complete JSON line from the tail of a transcript JSONL."""
+def _read_tail_lines(path, max_bytes):
+    """Non-empty raw lines from roughly the last max_bytes of a file, in file
+    order. The leading line may be a fragment (seek landed mid-line) — callers
+    that json.loads() it get a ValueError and skip it like any other garbage."""
     try:
         with open(path, "rb") as f:
-            f.seek(max(0, os.fstat(f.fileno()).st_size - 65536))
-            lines = f.read().split(b"\n")
+            f.seek(max(0, os.fstat(f.fileno()).st_size - max_bytes))
+            raw = f.read()
     except OSError:
-        return None
-    for raw in reversed(lines):
-        raw = raw.strip()
-        if not raw:
-            continue
+        return []
+    return [line.strip() for line in raw.split(b"\n") if line.strip()]
+
+
+def _last_entry(path):
+    """Newest complete JSON line from the tail of a transcript JSONL."""
+    for raw in reversed(_read_tail_lines(path, 65536)):
         try:
             return json.loads(raw)
         except ValueError:
             continue  # partial write at the tail, or the seek-point fragment
     return None
+
+
+def _tail_entries(path):
+    """Parsed dict entries from roughly the last 128 KB of a transcript JSONL,
+    in file order. Tolerant JSONL parse: lines that fail json.loads or don't
+    decode to a dict (a truncated seek-point fragment, a partial write) are
+    silently skipped rather than aborting the read."""
+    entries = []
+    for raw in _read_tail_lines(path, 1 << 17):  # ~128 KB
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def _entry_text(entry):
+    """Map one transcript entry to display text for the glasses tail feed, or
+    None to drop it (wrong type, no message, tool_result-only turn, or empty
+    after stripping ANSI)."""
+    if entry.get("type") not in ("user", "assistant"):
+        return None
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                parts.append(str(block.get("text") or ""))
+            elif btype == "tool_use" and block.get("name"):
+                parts.append(f"[{block['name']}]")
+            # "thinking" and "tool_result" blocks are dropped.
+        text = "".join(parts)
+    else:
+        return None
+    text = ANSI_RE.sub("", text).strip()
+    return text or None
+
+
+def transcript_tail(path):
+    """Last TAIL_MSGS surviving messages of a transcript for the glasses
+    client's tail feed, oldest first: [{"id": entry uuid, "role": "user"/
+    "assistant", "text": text}, ...]. Missing/empty transcript -> []. id is
+    the transcript entry's own uuid so clients can merge/dedup on it."""
+    tail = []
+    for entry in _tail_entries(path):
+        text = _entry_text(entry)
+        if text is None:
+            continue
+        tail.append({
+            "id": entry.get("uuid"),
+            "role": entry.get("type"),
+            "text": text[:TAIL_MSG_CHARS],
+        })
+    return tail[-TAIL_MSGS:]
 
 
 def session_report(workdir, state):
@@ -544,7 +619,9 @@ def session_report(workdir, state):
         "lastRole": None,          # "assistant"/"user"/... of the newest entry
         "lastHasToolUse": False,
         "question": None,          # pending AskUserQuestion text, if any
+        "questionOptions": [],     # pending AskUserQuestion option labels, if any
         "prUrls": [],              # PR links newly appended since last beat
+        "tail": [],                # recent transcript messages, for the glasses client
     }
 
     newest, newest_mtime = None, 0.0
@@ -568,6 +645,7 @@ def session_report(workdir, state):
     if not newest:
         return report
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
+    report["tail"] = transcript_tail(newest)
 
     entry = _last_entry(newest)
     if entry:
@@ -583,6 +661,11 @@ def session_report(workdir, state):
                     qs = (block.get("input") or {}).get("questions") or []
                     if qs and isinstance(qs[0], dict):
                         report["question"] = str(qs[0].get("question") or "")[:300] or None
+                        opts = qs[0].get("options") or []
+                        report["questionOptions"] = [
+                            opt["label"][:80] for opt in opts[:4]
+                            if isinstance(opt, dict) and isinstance(opt.get("label"), str)
+                        ]
 
     # Incremental PR-URL scan over bytes appended to the active transcript.
     try:
