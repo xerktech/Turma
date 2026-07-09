@@ -81,7 +81,6 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
   .dot.online { background: var(--good); }
   .dot.offline { background: var(--critical); }
-  .dot.restarting { background: var(--warning); }
 
   /* Repo blocks (collapsible) under a host. */
   .repos { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--hairline); padding-top: 12px; }
@@ -591,11 +590,6 @@ function liveState(sess, host, now) {
 }
 
 function agentState(a, now) {
-  if (a.restartSentAt && now - a.restartSentAt < 5 * 60 * 1000) {
-    const started = Date.parse(a.startedAt);
-    if (!started || started * 1 < a.restartSentAt) return "restarting";
-  }
-  if (a.restartPending) return "restart queued";
   return a.online ? "online" : "offline";
 }
 
@@ -650,14 +644,13 @@ function render(data) {
 
 function hostCard(a, now) {
   const state = agentState(a, now);
-  const dot = state === "online" ? "online" : (state === "offline" ? "offline" : "restarting");
+  const dot = state; // "online" | "offline"
   const mem = a.memory
     ? fmtBytes(a.memory.usedBytes) + (a.memory.limitBytes ? " / " + fmtBytes(a.memory.limitBytes) : "")
     : "–";
   const repos = a.repos || [];
   const sessions = a.sessions || [];
   const runCount = sessions.filter(s => s.status === "running").length;
-  const cRestart = confirming.has("hr::" + a.key);
 
   // Repos from the scan, plus synthetic entries for any session whose repo is no
   // longer present (e.g. repo dir removed) so its usage/controls stay reachable.
@@ -686,14 +679,9 @@ function hostCard(a, now) {
         ontoggle="logToggle('${esc(a.key)}', this.open)">
       <summary>Container log (tail)</summary><pre>${esc(a.logTail)}</pre>
     </details>` : ""}
-    <div class="actions">
-      <button class="${cRestart ? "confirm" : ""}"
-              onclick="hostRestart('${esc(a.key)}')"
-              ${state === "restart queued" || state === "restarting" ? "disabled" : ""}>
-        ${cRestart ? "Confirm restart" : (state === "restarting" ? "Restarting…" : "Restart container")}
-      </button>
-      ${a.online ? "" : `<button onclick="removeHost('${esc(a.key)}')">Remove host</button>`}
-    </div>
+    ${a.online ? "" : `<div class="actions">
+      <button onclick="removeHost('${esc(a.key)}')">Remove host</button>
+    </div>`}
   </div>`;
 }
 
@@ -938,7 +926,6 @@ function twoClick(actionKey, doIt) {
   doIt();
 }
 
-function hostRestart(key) { twoClick("hr::" + key, () => post(`/api/agents/${enc(key)}/restart`)); }
 function removeHost(key)  { del(`/api/agents/${enc(key)}`); }
 
 // Mark an action pending and re-render immediately (instant feedback), then fire

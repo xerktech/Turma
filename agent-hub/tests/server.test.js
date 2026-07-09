@@ -537,7 +537,7 @@ test("http: command queue rides the reply until acked", async () => {
   // Register the host; queue is empty at first.
   let res = await beat({ device: "h1" });
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body, { restart: false, commands: [] });
+  assert.deepEqual(res.body, { commands: [] });
 
   // The UI queues two session commands (as the /api/agents/... routes do).
   const spawnRes = await request("POST", "/api/agents/h1/sessions", {
@@ -603,19 +603,6 @@ test("http: spawn route forwards composer options; bare spawn stays minimal", as
     },
     { type: "spawn", repo: "AgentHub", model: "sonnet", cmdId: bare.body.cmdId },
   ]);
-});
-
-test("http: restart flag delivered once, marker kept for the UI", async () => {
-  const beat = (payload) =>
-    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
-  await beat({ device: "h2" });
-  const r = await request("POST", "/api/agents/h2/restart", { headers: userHeaders });
-  assert.equal(r.status, 200);
-  let res = await beat({ device: "h2" });
-  assert.equal(res.body.restart, true);
-  assert.ok(agents.h2.restartSentAt, "restartSentAt marker missing");
-  res = await beat({ device: "h2" });
-  assert.equal(res.body.restart, false);
 });
 
 test("http: session commands 404 for unknown hosts", async () => {

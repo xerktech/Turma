@@ -4,8 +4,8 @@
 // agents can live on any host/network (all traffic rides agents.xerktech.com):
 //   1. hub-agent.py POSTs a status heartbeat every ~20s (a HOST with its repos[]
 //      and multiplexed Claude sessions[]) and picks up queued host commands
-//      (container restart + per-session spawn/kill/start/restart/resume/delete)
-//      on the reply, acking each by cmdId so the hub stops re-sending it.
+//      (per-session spawn/kill/start/restart/resume/delete) on the reply, acking
+//      each by cmdId so the hub stops re-sending it.
 //   2. tunnel-agent.js holds a persistent WebSocket "control" channel here. To
 //      show a live terminal, the hub asks that agent (over the control channel)
 //      to dial back a "data" WebSocket; the agent bridges it to its local ttyd
@@ -13,7 +13,7 @@
 //      through that data channel. See the reverse-tunnel section below.
 //
 // It also pushes edge-triggered alerts to the self-hosted ntfy (grafana.yaml)
-// on the `agents` topic: container offline/recovered, restart loops, daily
+// on the `agents` topic: container offline/recovered, crash loops, daily
 // cost threshold, turn finished / question waiting for input, and PR created.
 // Set NTFY_URL (plus NTFY_USER/NTFY_PASS) to enable; unset disables alerts.
 //
@@ -306,8 +306,8 @@ function heartbeatAlerts(key, prev, next) {
     delete alerts.offlineAt;
   }
 
-  // Restart loop: several distinct container boots in a short window. A
-  // hub-initiated restart contributes one boot, so it can't trip this alone.
+  // Crash loop: several distinct container boots in a short window (the
+  // container restarting itself, e.g. on repeated crashes).
   if (next.startedAt && next.startedAt !== prev.startedAt) {
     const boots = (alerts.boots || []).filter((b) => now - b.at < 15 * 60 * 1000);
     boots.push({ s: next.startedAt, at: now });
@@ -387,9 +387,6 @@ setInterval(() => {
   for (const [key, a] of Object.entries(agents)) {
     const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
     if (online || a.alerts?.offlineAt) continue;
-    // Expected outage: a hub-initiated restart takes the container down for
-    // ~30-60s. Alert anyway if it still isn't back after 3 minutes.
-    if (a.restartSentAt && now - a.restartSentAt < 3 * 60 * 1000) continue;
     a.alerts = a.alerts || {};
     a.alerts.offlineAt = now;
     const where = a.device ? ` on ${a.device}` : "";
@@ -605,7 +602,7 @@ async function proxyTerm(req, res, name, port) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
-  const parts = url.pathname.split("/").filter(Boolean); // e.g. api/agents/<id>/restart
+  const parts = url.pathname.split("/").filter(Boolean); // e.g. api/agents/<id>/sessions
 
   try {
     // Unauthenticated liveness probe for the Docker healthcheck (everything
@@ -727,7 +724,6 @@ const server = http.createServer(async (req, res) => {
       const key = payload.device || payload.agentId;
       if (!key) return json(res, 400, { error: "device/agentId required" });
       const prev = agents[key] || {};
-      const restart = !!prev.restartPending;
       // At-least-once command delivery: drop any queued command the agent
       // reports as executed; keep re-sending the rest until acked.
       const acked = new Set(payload.ackedCommands || []);
@@ -739,25 +735,12 @@ const server = http.createServer(async (req, res) => {
         // queued by the UI; re-sent on every reply below until acked.
         commands,
         lastSeen: Date.now(),
-        restartPending: false,
-        // Keep a marker so the UI can show "restarting…" until the container
-        // comes back with a fresh startedAt.
-        restartSentAt: restart ? Date.now() : prev.restartSentAt,
         // Per-agent alert bookkeeping survives across beats and hub restarts.
         alerts: prev.alerts || {},
       });
       heartbeatAlerts(key, prev, next);
       scheduleSave();
-      return json(res, 200, { restart, commands });
-    }
-
-    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" && parts[3] === "restart") {
-      const key = decodeURIComponent(parts[2]);
-      if (!agents[key]) return json(res, 404, { error: "unknown agent" });
-      agents[key].restartPending = true;
-      console.log(`restart queued for ${key}`);
-      scheduleSave();
-      return json(res, 200, { ok: true });
+      return json(res, 200, { commands });
     }
 
     // Session command endpoints — each queues a cmdId onto the host's command
