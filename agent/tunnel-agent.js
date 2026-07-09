@@ -18,6 +18,7 @@
 
 const net = require("net");
 const fs = require("fs");
+const os = require("os");
 
 const HUB_URL = process.env.HUB_URL || "http://agent-hub:8300";
 // Same agent token hub-agent.py heartbeats with (the hub's HUB_AGENT_TOKEN).
@@ -37,10 +38,12 @@ function log(msg) {
 }
 
 // The physical host name the hub keys agents by — mirrors hub-agent.py's
-// device_name() exactly (read /host/etc/hostname, then DEVICE_NAME env) so the
-// control channel registers under the same key the heartbeat uses and
-// /term/<name> lines up. With one container per host the container name is no
-// longer the identity (they're all just "agent"); the host name is.
+// device_name() exactly (read /host/etc/hostname, then DEVICE_NAME env, then the
+// OS hostname) so the control channel registers under the same key the heartbeat
+// uses and /term/<name> lines up. With one container per host the container name
+// is no longer the identity (they're all just "agent"); the host name is.
+// On Windows there is no /host/etc/hostname to mount, so DEVICE_NAME (or the
+// os.hostname() fallback) is what supplies the name instead of "unknown-device".
 function deviceName() {
   try {
     const n = fs.readFileSync("/host/etc/hostname", "utf8").trim();
@@ -48,7 +51,15 @@ function deviceName() {
   } catch {
     /* fall through */
   }
-  return process.env.DEVICE_NAME || "unknown-device";
+  const env = (process.env.DEVICE_NAME || "").trim();
+  if (env) return env;
+  try {
+    const n = (os.hostname() || "").trim();
+    if (n) return n;
+  } catch {
+    /* fall through */
+  }
+  return "unknown-device";
 }
 
 const NAME = deviceName();

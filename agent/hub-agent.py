@@ -43,6 +43,7 @@ import os
 import re
 import secrets
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -278,7 +279,14 @@ def resolve_permission_mode(mode):
 
 
 def device_name():
-    # The compose file mounts the host root at /host.
+    # The physical host name the hub keys this agent by. Resolution order:
+    #   1. /host/etc/hostname — the Linux host's hostname, bind-mounted in by the
+    #      compose file (the container's own hostname is meaningless, all "agent").
+    #   2. DEVICE_NAME — explicit override, and the way a Windows host supplies its
+    #      name since there is no /host/etc/hostname to mount there.
+    #   3. socket.gethostname() — the container/OS hostname. On Windows this is the
+    #      container name (COMPUTERNAME); still a real, stable id and far better
+    #      than the "unknown-device" placeholder we used to fall through to.
     for path in ("/host/etc/hostname",):
         try:
             with open(path) as f:
@@ -287,7 +295,16 @@ def device_name():
                     return name
         except OSError:
             pass
-    return os.environ.get("DEVICE_NAME", "unknown-device")
+    name = os.environ.get("DEVICE_NAME", "").strip()
+    if name:
+        return name
+    try:
+        name = socket.gethostname().strip()
+        if name:
+            return name
+    except OSError:
+        pass
+    return "unknown-device"
 
 
 def git_info(cwd):
