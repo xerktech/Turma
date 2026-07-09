@@ -167,6 +167,38 @@ describe("AudioRecorder", () => {
       await expect(startPromise).rejects.toThrow(/handshake failed/);
       expect(audioControlCalls).toEqual([]); // mic never touched
     });
+
+    // Stuck-mic race (final-review finding #2b): if the WS closes/errors
+    // while we're still awaiting audioControl(true), `handleUnexpectedEnd`
+    // (the permanent close/error listener) used to fire while `micOn` was
+    // still false, so its teardownMic() no-op'd — then audioControl(true)
+    // resolving would flip `micOn` true anyway, stranding a live mic on a
+    // dead socket. start() must notice the socket died mid-await and tear
+    // the mic back down instead of "succeeding".
+    it("tears the mic back down and fails start() if the WS closes during the audioControl(true) await", async () => {
+      let ws!: FakeWebSocket;
+      const { bridge, audioControlCalls } = fakeBridge({
+        audioControl: async (on) => {
+          audioControlCalls.push(on);
+          if (on) {
+            // The socket dies while the native mic-on call is still in flight.
+            ws.readyState = CLOSED;
+            ws.emit("close", {});
+          }
+          return true;
+        },
+      });
+      const recorder = makeRecorder(bridge);
+      const startPromise = recorder.start("wss://hub.example.com/audio?auth=t");
+      ws = FakeWebSocket.instances[0]!;
+      ws.open();
+
+      await expect(startPromise).rejects.toThrow(/WS closed/);
+      // audioControl(true) actually turned the mic on (hardware-wise), so
+      // the teardown must compensate with a matching audioControl(false).
+      expect(audioControlCalls).toEqual([true, false]);
+      expect(recorder.isRecording()).toBe(false);
+    });
   });
 
   describe("PCM frame forwarding", () => {

@@ -1335,7 +1335,10 @@ class SessionManager:
         "1".."4" through this same method (it moves the TUI's selection) and
         the Enter this method sends confirms it in the Remote Control TUI;
         free-text answers go through the same path but are best-effort and
-        need on-hardware verification."""
+        need on-hardware verification. `--` ends tmux's own option parsing
+        before the literal text so a dictated/typed string that happens to
+        start with '-' (e.g. "-1 on that idea") isn't misread as more
+        send-keys flags; -l still applies to everything after it."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
@@ -1344,7 +1347,7 @@ class SessionManager:
             return
         text = text[:INPUT_MAX_CHARS]
         tmux_name = sess["tmuxName"]
-        run(["tmux", "send-keys", "-t", tmux_name, "-l", text])
+        run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
         run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
 
     def _stage_history(self, sid):

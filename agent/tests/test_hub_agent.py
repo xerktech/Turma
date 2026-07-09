@@ -859,7 +859,7 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "hello")
         self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "hello"],
+            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--", "hello"],
             ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
         ])
 
@@ -868,8 +868,27 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "line1\r\nline2\rline3\nline4")
         self.assertEqual(self.run_calls[0], [
-            "tmux", "send-keys", "-t", "agent-abcde", "-l",
+            "tmux", "send-keys", "-t", "agent-abcde", "-l", "--",
             "line1 line2 line3 line4",
+        ])
+
+    def test_dash_prefixed_text_sent_literally_after_option_terminator(self):
+        # A dictated/typed reply that starts with '-' (or '--') must not be
+        # parsed as a tmux send-keys option — the `--` terminator forces it
+        # through as the literal key-list argument.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sm.send_input(sess["id"], "-1 on that idea")
+        self.assertEqual(self.run_calls, [
+            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--", "-1 on that idea"],
+            ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
+        ])
+
+        self.run_calls.clear()
+        sm.send_input(sess["id"], "--force the deploy")
+        self.assertEqual(self.run_calls, [
+            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--", "--force the deploy"],
+            ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
         ])
 
     def test_text_capped_at_input_max_chars(self):

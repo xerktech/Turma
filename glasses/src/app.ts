@@ -240,6 +240,14 @@ export class App {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
+    // Backgrounding stops the poll loop above, but history-fetch retry
+    // timers are independent `setTimeout`s keyed by sessionId — without
+    // this they keep firing every HISTORY_RETRY_MS while backgrounded.
+    this.clearHistoryTimers();
+    if (Object.keys(this.state.loadingHistory).length > 0) {
+      this.state = { ...this.state, now: this.now(), loadingHistory: {} };
+      this.repaint();
+    }
   }
 
   resume(): void {
@@ -266,7 +274,22 @@ export class App {
   }
 
   private setState(patch: Partial<AppState>): void {
+    const prevScreen = this.state.screen;
+    const prevSession = this.state.session;
     this.state = { ...this.state, ...patch, now: this.now() };
+    // Leaving the session screen: that session's history-fetch retry timer
+    // (if any) and its loading-line flag are no longer relevant to what's on
+    // screen — stop the background 202-retry loop from continuing to poll
+    // for a transcript nobody's looking at.
+    if (prevScreen === "session" && prevSession && this.state.screen !== "session") {
+      this.clearHistoryTimer(prevSession.sessionId);
+      if (this.state.loadingHistory[prevSession.sessionId]) {
+        this.state = {
+          ...this.state,
+          loadingHistory: { ...this.state.loadingHistory, [prevSession.sessionId]: false },
+        };
+      }
+    }
     this.repaint();
   }
 
@@ -306,6 +329,11 @@ export class App {
         flash: wasErroring ? null : this.state.flash,
         flashUntil: wasErroring ? 0 : this.state.flashUntil,
       };
+      // The row list a fresh home.cursor indexes into just changed (hosts
+      // going offline, sessions converging/disappearing) — keep the cursor
+      // in range and off non-selectable rows rather than leaving it stranded
+      // on a row that no longer exists or never was tappable.
+      this.state = { ...this.state, home: { cursor: clampHomeCursor(this.homeRows(), this.state.home.cursor) } };
       this.repaint();
     } catch {
       if (!this.state.pollErrorActive) {
@@ -415,18 +443,26 @@ export class App {
 
   private onHome(e: InputEvent): void {
     const rows = this.homeRows();
+    // Rows can shrink or reorder between a poll and the next input (a
+    // session dies, a host drops offline) — reclamp before acting so a tap
+    // never indexes a row that's gone and never lands on a non-selectable
+    // row (host headers/offline lines).
+    const cursor = clampHomeCursor(rows, this.state.home.cursor);
+    if (cursor !== this.state.home.cursor) {
+      this.state = { ...this.state, home: { cursor } };
+    }
     if (e.type === "doubleTap") {
       this.display.requestExit();
       return;
     }
     if (e.type === "scrollDown" || e.type === "scrollUp") {
       const dir = e.type === "scrollDown" ? 1 : -1;
-      const cursor = nextSelectableIndex(rows, this.state.home.cursor, dir);
-      this.setState({ home: { cursor } });
+      const next = nextSelectableIndex(rows, cursor, dir);
+      this.setState({ home: { cursor: next } });
       return;
     }
     if (e.type === "tap") {
-      const row = rows[this.state.home.cursor];
+      const row = rows[cursor];
       if (!row || !row.selectable) return;
       if (row.kind === "session" && row.hostKey && row.sessionId) {
         this.setState({
@@ -466,28 +502,67 @@ export class App {
     if (e.type === "scrollUp") {
       if (s.offset >= maxOffset) {
         const buffer = this.state.transcripts[s.sessionId];
-        if (buffer?.hasMore !== false) {
+        // undefined: history has never been fetched — worth a round trip.
+        // true: already fetched and the server told us it's truncated at
+        // HISTORY_MAX_MSGS (see render.ts's "truncated" marker) — that can't
+        // grow, so re-fetching is pointless. false: genuinely at the top.
+        if (buffer?.hasMore === undefined) {
           this.triggerHistoryLoad(s.hostKey, s.sessionId);
           return;
         }
-        return; // truly at the top, nothing more to load
+        return; // nothing more to load
       }
       this.setState({ session: { ...s, offset: Math.min(maxOffset, s.offset + contentArea) } });
     }
   }
 
-  private triggerHistoryLoad(hostKey: string, sessionId: string): void {
-    if (this.state.loadingHistory[sessionId]) return;
-    this.setState({ loadingHistory: { ...this.state.loadingHistory, [sessionId]: true } });
-    void this.pollHistory(hostKey, sessionId);
+  private clearHistoryTimer(sessionId: string): void {
+    const timer = this.historyTimers[sessionId];
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    delete this.historyTimers[sessionId];
   }
 
-  private async pollHistory(hostKey: string, sessionId: string): Promise<void> {
+  private clearHistoryTimers(): void {
+    for (const timer of Object.values(this.historyTimers)) clearTimeout(timer);
+    this.historyTimers = {};
+  }
+
+  private triggerHistoryLoad(hostKey: string, sessionId: string): void {
+    if (this.state.loadingHistory[sessionId]) return;
+    // The "· loading earlier ·" line (render.ts's sessionContentLines) is
+    // about to become the new topmost content line. The caller only ever
+    // reaches here already scrolled to the (pre-insert) top, so bump the
+    // offset by the one line being inserted to keep that top line in view —
+    // otherwise it renders one line above the visible window (clipped).
+    const bumpedSession =
+      this.state.session && this.state.session.sessionId === sessionId
+        ? { ...this.state.session, offset: this.state.session.offset + 1 }
+        : this.state.session;
+    this.setState({ loadingHistory: { ...this.state.loadingHistory, [sessionId]: true }, session: bumpedSession });
+    void this.pollHistory(hostKey, sessionId, this.now());
+  }
+
+  // `startedAt` bounds the 202-retry loop to PENDING_TIMEOUT_MS total (an
+  // offline/wedged host would otherwise retry forever) — reusing the same
+  // budget the pending-overlay reconciliation uses elsewhere in this file.
+  private async pollHistory(hostKey: string, sessionId: string, startedAt: number): Promise<void> {
     try {
       const res = await this.client.getHistory(hostKey, sessionId);
       if (res.status === 202) {
+        delete this.historyTimers[sessionId];
+        if (this.now() - startedAt >= PENDING_TIMEOUT_MS) {
+          this.state = {
+            ...this.state,
+            now: this.now(),
+            loadingHistory: { ...this.state.loadingHistory, [sessionId]: false },
+          };
+          this.repaint();
+          return;
+        }
         this.historyTimers[sessionId] = setTimeout(() => {
-          void this.pollHistory(hostKey, sessionId);
+          delete this.historyTimers[sessionId];
+          void this.pollHistory(hostKey, sessionId, startedAt);
         }, HISTORY_RETRY_MS);
         return;
       }
@@ -905,4 +980,24 @@ function nextSelectableIndex(rows: { selectable: boolean }[], from: number, dir:
     if (rows[i]?.selectable) return i;
   }
   return from;
+}
+
+// Keeps the home cursor in range as the row list shrinks/grows (host
+// offline, sessions converging away) and off non-selectable rows (host
+// headers, offline lines) — including the very first render, where the
+// cursor starts at 0 and row 0 is always a non-selectable host header once
+// any host is known. Searches outward (nearest first, forward on ties) for
+// the closest selectable row; "+ New session"/"Settings" are always present
+// and selectable, so a selectable row always exists once rows is non-empty.
+function clampHomeCursor(rows: { selectable: boolean }[], cursor: number): number {
+  if (rows.length === 0) return 0;
+  const c = clamp(cursor, 0, rows.length - 1);
+  if (rows[c]?.selectable) return c;
+  for (let d = 1; d < rows.length; d++) {
+    const forward = c + d;
+    if (forward < rows.length && rows[forward]?.selectable) return forward;
+    const backward = c - d;
+    if (backward >= 0 && rows[backward]?.selectable) return backward;
+  }
+  return c;
 }

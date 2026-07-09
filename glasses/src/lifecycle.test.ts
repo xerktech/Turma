@@ -463,8 +463,7 @@ describe("lifecycle cancels an active dictation (mic off)", () => {
 
   async function driveIntoListeningReply(app: App, display: FakeDisplay): Promise<void> {
     await app.start();
-    await vi.advanceTimersByTimeAsync(0); // let the first poll land the session
-    display.emit({ type: "scrollDown" }); // cursor 0 (hostHeader, unselectable) -> 1 (session row)
+    await vi.advanceTimersByTimeAsync(0); // let the first poll land the session; cursor auto-snaps to it
     display.emit({ type: "tap" }); // home -> session
     display.emit({ type: "tap" }); // session -> actions (cursor 0 = Reply)
     display.emit({ type: "tap" }); // actions -> reply, listening

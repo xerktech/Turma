@@ -182,7 +182,28 @@ export class AudioRecorder implements AudioRecorderLike {
       throw new Error(`audioControl(true) failed: ${errorMessage(err)}`);
     }
 
+    // The mic is now actually on, hardware-wise — set the guard immediately
+    // so the teardown below (and any concurrent cancel()/handleUnexpectedEnd)
+    // can't race past it and skip the compensating audioControl(false).
     this.micOn = true;
+
+    // The WS can die (or this call can be superseded by a fresh start()/
+    // cancel()) during the await above: if it fires, `handleUnexpectedEnd`
+    // runs while `micOn` was still false and its `teardownMic()` no-ops —
+    // then this line would otherwise flip the mic on for a dead/foreign
+    // socket. Catch that here instead of leaving a stuck-on mic.
+    if (this.ws !== ws || ws.readyState !== WS_OPEN) {
+      this.detachPermanentListeners(ws);
+      await this.teardownMic();
+      try {
+        ws.close();
+      } catch {
+        // ignore — already closed
+      }
+      if (this.ws === ws) this.ws = null;
+      throw new Error("WS closed while turning the mic on");
+    }
+
     this.recording = true;
     this.startedAt = this.now();
     this.unsubscribeFramesFn = this.bridge.onAudioFrame((pcm) => this.sendFrame(pcm));

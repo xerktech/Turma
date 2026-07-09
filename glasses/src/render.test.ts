@@ -182,6 +182,51 @@ describe("render: session", () => {
     const lines = render(state);
     expect(lines).toContain("· loading earlier ·");
   });
+
+  it("shows a truncated-history marker at the very top when the buffer's hasMore is true", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      transcripts: {
+        s1: {
+          entries: [
+            { id: "1", role: "user", text: "hello" },
+            { id: "2", role: "assistant", text: "hi there" },
+          ],
+          hasMore: true,
+        },
+      },
+    });
+
+    const lines = render(state);
+    // Content lines start right after the header (index 0); the marker must
+    // be the topmost content line, ahead of the transcript entries.
+    expect(lines[1]).toBe("· earlier history truncated ·");
+    expect(lines.indexOf("· earlier history truncated ·")).toBeLessThan(lines.findIndex((l) => l.includes("hello")));
+  });
+
+  it("does not show the truncated marker when hasMore is false (real top) or undefined (never fetched)", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const falseState = base({
+      screen: "session",
+      agents,
+      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }], hasMore: false } },
+    });
+    const undefinedState = base({
+      screen: "session",
+      agents,
+      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+    });
+
+    expect(render(falseState).some((l) => l.includes("truncated"))).toBe(false);
+    expect(render(undefinedState).some((l) => l.includes("truncated"))).toBe(false);
+  });
 });
 
 describe("render: actions", () => {

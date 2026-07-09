@@ -36,7 +36,12 @@ export function queryPhoneSettingsElements(doc: Document = document): PhoneSetti
 export async function initPhoneSettings(
   storage: KeyValueStorage,
   els: PhoneSettingsElements = queryPhoneSettingsElements(),
-  fetchFn: typeof fetch = globalThis.fetch.bind(globalThis)
+  fetchFn: typeof fetch = globalThis.fetch.bind(globalThis),
+  // Config is otherwise read once at boot (main.ts) — without reloading
+  // after a save, first-run onboarding keeps polling with the empty config
+  // it started with until the user fully restarts the app. Injectable so
+  // tests can assert the wiring without a real WebView navigation.
+  reload: () => void = () => location.reload()
 ): Promise<void> {
   const config = await loadConfig(storage);
   els.hubUrl.value = config.hubUrl;
@@ -53,7 +58,8 @@ export async function initPhoneSettings(
   els.save.addEventListener("click", () => {
     void (async () => {
       await saveConfig(storage, readForm());
-      els.status.textContent = "Saved.";
+      els.status.textContent = "Saved — reloading…";
+      reload();
     })();
   });
 

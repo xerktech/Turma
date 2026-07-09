@@ -188,4 +188,87 @@ describe("HubAudioDictation", () => {
 
     expect(results).toEqual([]);
   });
+
+  // Stuck-mic race (final-review finding #2a): stop()/cancel() firing while
+  // connect() is still awaiting wsToken()/recorder.start() used to no-op
+  // (ws === null on the recorder), letting connect() resume afterwards and
+  // turn the mic on for a user who's already gone. A generation counter
+  // checked after every await in connect() closes that window.
+
+  it("cancel() before the token fetch resolves prevents recorder.start() from ever being called (mic never turns on)", async () => {
+    let resolveToken!: (v: { token: string; expiresInSec: number }) => void;
+    const hubClient = fakeHubClient({
+      wsToken: () =>
+        new Promise((resolve) => {
+          resolveToken = resolve;
+        }),
+    });
+    const recorder = fakeRecorder();
+    const dictation = new HubAudioDictation({ hubClient, recorder, hubUrl: "https://hub.example.com" });
+
+    const results: DictationResult[] = [];
+    dictation.start((r) => results.push(r));
+    dictation.cancel(); // lands while still awaiting wsToken()
+
+    resolveToken({ token: "tok-123", expiresInSec: 300 });
+    await flushMicrotasks();
+
+    expect(recorder.startCalls).toEqual([]); // mic never turns on
+    expect(results).toEqual([]); // no result delivered, ever
+  });
+
+  it("stop() before the token fetch resolves behaves like cancel(): mic never turns on, no result delivered", async () => {
+    let resolveToken!: (v: { token: string; expiresInSec: number }) => void;
+    const hubClient = fakeHubClient({
+      wsToken: () =>
+        new Promise((resolve) => {
+          resolveToken = resolve;
+        }),
+    });
+    const recorder = fakeRecorder();
+    const dictation = new HubAudioDictation({ hubClient, recorder, hubUrl: "https://hub.example.com" });
+
+    const results: DictationResult[] = [];
+    dictation.start((r) => results.push(r));
+    dictation.stop(); // tap "done" before a token has even been fetched
+
+    resolveToken({ token: "tok-123", expiresInSec: 300 });
+    await flushMicrotasks();
+
+    expect(recorder.startCalls).toEqual([]);
+    expect(results).toEqual([]);
+  });
+
+  it("cancel() while recorder.start() is in flight tears the mic back down via recorder.cancel() and delivers no result", async () => {
+    let resolveStart!: () => void;
+    const recorder = fakeRecorder({
+      start: (url: string) => {
+        recorder.startCalls.push(url);
+        return new Promise<void>((resolve) => {
+          resolveStart = resolve;
+        });
+      },
+    });
+    const hubClient = fakeHubClient();
+    const dictation = new HubAudioDictation({ hubClient, recorder, hubUrl: "https://hub.example.com" });
+
+    const results: DictationResult[] = [];
+    dictation.start((r) => results.push(r));
+    await flushMicrotasks(); // token fetch resolves; recorder.start() is now in flight
+    expect(recorder.startCalls).toHaveLength(1);
+
+    dictation.cancel(); // lands while recorder.start() is still pending
+
+    resolveStart(); // the mic/WS came up successfully after all
+    await flushMicrotasks();
+
+    // cancel() calls recorder.cancel() immediately, and connect()'s own
+    // post-await staleness check calls it again once recorder.start()
+    // settles — recorder.cancel() is contractually idempotent/safe (see
+    // audio.ts's teardownMic micOn guard), so what matters is that it was
+    // invoked at least once, not the exact count.
+    expect(recorder.cancelCalls).toBeGreaterThanOrEqual(1);
+    expect(recorder.startCalls).toHaveLength(1); // start() itself was not re-invoked
+    expect(results).toEqual([]); // no result delivered
+  });
 });

@@ -146,8 +146,16 @@ function roleLine(role: string, text: string): string {
 // end.
 export function sessionContentLines(state: AppState, hostKey: string, sessionId: string): string[] {
   const lines: string[] = [];
-  if (state.loadingHistory[sessionId]) lines.push("· loading earlier ·");
   const buffer = state.transcripts[sessionId];
+  if (state.loadingHistory[sessionId]) {
+    lines.push("· loading earlier ·");
+  } else if (buffer?.hasMore === true) {
+    // History has been fetched and the server told us it's truncated at
+    // HISTORY_MAX_MSGS — that can't grow (app.ts's onSession only re-fetches
+    // when hasMore is undefined), so mark it instead of implying more is a
+    // scroll away.
+    lines.push("· earlier history truncated ·");
+  }
   for (const entry of buffer?.entries ?? []) {
     lines.push(...wrap(roleLine(entry.role, entry.text)));
   }
