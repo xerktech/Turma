@@ -14,6 +14,20 @@ export function charMeasure(s: string): number {
 
 export type Measure = (s: string) => number;
 
+// Module-level default measure, swappable at boot. `render.ts`'s `wrap()`
+// helper calls `wrapText(text, width)` with no explicit measure — leaving it
+// on `charMeasure` in dev/tests, and letting main.ts's Even Hub bridge path
+// upgrade every wrap call to real font metrics (via `pretextMeasure()`
+// below) without changing render.ts's signature or touching the
+// hardware-agnostic core. Default-parameter expressions are evaluated at
+// call time, so re-pointing `defaultMeasure` here takes effect immediately
+// for every future `wrapText(text, width)` call.
+let defaultMeasure: Measure = charMeasure;
+
+export function setDefaultMeasure(measure: Measure): void {
+  defaultMeasure = measure;
+}
+
 // Tolerance for float rounding in measure functions (px-per-char
 // multiplication isn't exact) — never lets a hair-thin overflow force an
 // extra wrap point.
@@ -47,7 +61,7 @@ function splitLongWord(word: string, maxWidthPx: number, measure: Measure): stri
 // input forces a line break (each paragraph is wrapped independently);
 // runs of other whitespace collapse to single spaces, matching how the
 // glasses render plain text lines.
-export function wrapText(text: string, maxWidthPx: number, measure: Measure = charMeasure): string[] {
+export function wrapText(text: string, maxWidthPx: number, measure: Measure = defaultMeasure): string[] {
   if (!text.trim()) return [];
 
   const lines: string[] = [];

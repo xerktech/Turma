@@ -368,4 +368,21 @@ describe("App", () => {
     expect(app.getState().pollErrorActive).toBe(false);
     expect(app.getState().flash).toBeNull();
   });
+
+  it("restoreScreen jumps directly to a screen/session snapshot and repaints (Task 6 lifecycle glue)", async () => {
+    const app = makeApp(fakeClient());
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.getState().screen).toBe("home");
+
+    app.restoreScreen("session", { hostKey: "host-a", sessionId: "s1", offset: 0 });
+
+    expect(app.getState().screen).toBe("session");
+    expect(app.getState().session).toEqual({ hostKey: "host-a", sessionId: "s1", offset: 0 });
+    expect(display.lines.length).toBeGreaterThan(0); // repainted
+
+    app.restoreScreen("settings", null);
+    expect(app.getState().screen).toBe("settings");
+    expect(app.getState().session).toBeNull();
+  });
 });

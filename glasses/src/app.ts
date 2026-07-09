@@ -236,6 +236,15 @@ export class App {
     this.schedulePoll(0);
   }
 
+  // Lifecycle glue (Task 6): jumps straight to a screen/session snapshot
+  // restored from a background→foreground migration (the host may recreate
+  // a fresh WebView on restore, so in-memory AppState alone isn't enough —
+  // see glasses/src/lifecycle.ts). Hardware-agnostic: no SDK dependency,
+  // just the same public setState path every other mutation uses.
+  restoreScreen(screen: Screen, session: SessionScreenState | null): void {
+    this.setState({ screen, session });
+  }
+
   private schedulePoll(delayMs: number): void {
     if (this.paused) return;
     if (this.pollTimer) clearTimeout(this.pollTimer);
