@@ -273,15 +273,24 @@ function cookies(req) {
 
 // Mark the cookie Secure only when the request actually arrived over HTTPS
 // (Cloudflare sets x-forwarded-proto) so plain-HTTP LAN access still works.
+//
+// Over HTTPS the cookie is SameSite=None; Secure; Partitioned so the dashboard
+// works when it's embedded as a cross-site iframe (the glasses client's phone
+// view loads the real dashboard in an iframe). SameSite=Lax would be dropped
+// in that third-party context. Partitioned (CHIPS) keys the cookie to the
+// embedding top-level site, so it still works where third-party cookies are
+// blocked AND is never shared with any other embedder — it doesn't broaden
+// the hub's cross-site exposure the way a bare SameSite=None would. Plain
+// HTTP (LAN/dev) can't use SameSite=None (it requires Secure), so it stays Lax.
 function sessionSetCookie(req, token) {
   const https =
     (req.headers["x-forwarded-proto"] || "").split(",")[0].trim() === "https" ||
     !!(req.socket && req.socket.encrypted);
   const maxAge = token ? Math.floor(SESSION_TTL_MS / 1000) : 0;
-  return (
-    `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}` +
-    (https ? "; Secure" : "")
-  );
+  const base = `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Max-Age=${maxAge}`;
+  return https
+    ? `${base}; SameSite=None; Secure; Partitioned`
+    : `${base}; SameSite=Lax`;
 }
 
 // Browser/user auth (UI + all API except the heartbeat). A valid login cookie

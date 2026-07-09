@@ -64,11 +64,17 @@ async function main(): Promise<void> {
 }
 
 async function mainDom(): Promise<void> {
+  // Dev/browser path: the signed-in view shows the green-text glasses mirror
+  // (#glasses-display) rather than the embedded dashboard iframe.
+  document.body.classList.add("backend-dom");
   const storage = new BrowserStorage();
   await boot(storage, new DomDisplay(), () => new PromptDictation());
 }
 
 async function mainBridge(bridge: ResolvedBridge): Promise<void> {
+  // Device path: the glasses render via the SDK, and the phone's signed-in
+  // view embeds the real hub dashboard (#dashboard iframe).
+  document.body.classList.add("backend-bridge");
   const { EvenHubDisplay } = await import("./display/evenhub.ts");
   // Task 7: real G2-mic dictation. audio.ts touches no SDK types (structural
   // only, like display/evenhub.ts and input/router.ts) — dynamically

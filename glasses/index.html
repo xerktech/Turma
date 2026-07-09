@@ -79,25 +79,41 @@
 
   .foot { margin-top: 20px; color: var(--muted); font-size: 11.5px; text-align: center; }
 
-  /* Signed-in view: a compact status line plus the live mirror of what the
-     glasses are showing. Hidden until the user authenticates. */
+  /* Signed-in view: a slim bar plus the real hub dashboard embedded as a
+     full-bleed iframe (bridge/device path), or the green-text glasses mirror
+     (DOM dev path). Hidden until the user authenticates. */
   #app[hidden] { display: none; }
-  #app { width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 14px; }
-  .bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  #app {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    background: var(--page);
+  }
+  .bar {
+    flex: none; display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
   .bar .who { color: var(--ink-2); font-size: 12.5px; }
   .bar .who b { color: var(--ink); font-weight: 650; }
   .bar button {
     margin: 0; width: auto; color: var(--accent); background: none;
     border: 1px solid var(--border); border-radius: 8px;
-    padding: 7px 12px; font-size: 12.5px; font-weight: 600;
+    padding: 6px 12px; font-size: 12.5px; font-weight: 600;
   }
   .bar button:hover { filter: none; background: rgba(42,120,214,0.08); }
+
+  /* The embedded dashboard — shown on the device (bridge) path. */
+  #dashboard { flex: 1; width: 100%; border: 0; display: none; }
+  body.backend-bridge #dashboard { display: block; }
+
+  /* The glasses text mirror — shown on the DOM dev path (npm run dev). */
   #glasses-display {
+    display: none; margin: 12px;
     background: #000; color: #7fffb0;
     font-family: "Courier New", monospace; font-size: 14px; line-height: 1.3;
     padding: 12px; white-space: pre; outline: none;
     border-radius: 10px; border: 1px solid var(--border);
   }
+  body.backend-dom #glasses-display { display: block; }
 </style>
 
 <!-- Login card — matches the web dashboard's login page. The hub URL is
@@ -126,12 +142,16 @@
   <div class="foot">Even Realities G2 · Single-user access</div>
 </div>
 
-<!-- Signed-in mirror of the glasses display, shown after a successful login. -->
+<!-- Signed-in view, shown after a successful login: the real hub dashboard
+     embedded as a full-bleed iframe (device path), or the glasses text mirror
+     (DOM dev path). The iframe relies on the hub's SameSite=None; Partitioned
+     session cookie set during sign-in. -->
 <section id="app" hidden>
   <div class="bar">
     <span class="who">Signed in as <b id="app-user"></b></span>
     <button id="sign-out" type="button">Sign out</button>
   </div>
+  <iframe id="dashboard" title="Agent Hub dashboard"></iframe>
   <div id="glasses-display" tabindex="0"></div>
 </section>
 
