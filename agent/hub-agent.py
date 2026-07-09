@@ -704,6 +704,104 @@ def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+# --- GitHub clone-into-root ----------------------------------------------------
+# The hub can ask the agent to `git clone` a GitHub repo into REPOS_ROOT so it
+# joins the scanned repo list and becomes spawnable. The whole feature is gated
+# on GitHub creds: with no usable `gh` login the hub greys the control out. The
+# repo spec (from a dropdown of the login's repos, or free-typed owner/repo) is
+# validated down to a bare owner/repo before it is interpolated into a clone URL
+# and a filesystem dest, so nothing free-form reaches git or the shell.
+GITHUB_REFRESH_EVERY = 15   # beats between gh availability/repo-list refreshes
+GH_REPO_LIMIT = 100         # per owner, passed to `gh repo list --limit`
+GH_REPO_MAX = 300           # total repos reported (bounds the heartbeat payload)
+CLONE_TIMEOUT_SEC = 600     # reap a `git clone` subprocess stuck this long
+CLONE_DONE_LINGER_SEC = 30  # keep a finished clone job visible this long...
+CLONE_ERROR_LINGER_SEC = 300  # ...longer for a failed one (operator reads it)
+# A GitHub owner or repo-name segment: alnum start, then GitHub's own limited
+# set. Deliberately strict — the result becomes part of a URL and a path.
+_GH_SEG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def normalize_github_repo(spec):
+    """Parse an 'owner/repo' out of a slug or GitHub URL and return it validated,
+    or raise ValueError. Accepts 'owner/repo',
+    'https://github.com/owner/repo(.git)', and 'git@github.com:owner/repo(.git)'.
+    Both segments are allowlist-checked (no '..', no leading dash, bounded
+    length) so nothing shell- or path-dangerous reaches git."""
+    spec = (spec or "").strip()
+    if not spec:
+        raise ValueError("empty repo spec")
+    m = re.match(r"^(?:https?://[^/]+/|git@[^:]+:)(.+)$", spec)
+    if m:
+        spec = m.group(1)
+    spec = spec.strip("/")
+    if spec.endswith(".git"):
+        spec = spec[:-len(".git")]
+    parts = spec.split("/")
+    if len(parts) != 2:
+        raise ValueError(f"expected owner/repo, got {spec!r}")
+    owner, repo = parts
+    for seg in (owner, repo):
+        if len(seg) > 100 or ".." in seg or not _GH_SEG_RE.match(seg):
+            raise ValueError(f"invalid owner/repo segment {seg!r}")
+    return f"{owner}/{repo}"
+
+
+def gh_token_present():
+    """True if `gh` has a usable auth token (from the mounted /root/.config/gh
+    or a GH_TOKEN/GITHUB_TOKEN env). Local and cheap — `gh auth token` just
+    prints the stored token; no network round-trip."""
+    return bool(run(["gh", "auth", "token"]))
+
+
+def list_github_repos():
+    """Repos the gh login can clone, for the hub's clone dropdown. Lists the
+    authenticated user's repos plus any owners named in GH_CLONE_OWNERS
+    (space/comma separated — e.g. an org). One `gh repo list --json` call per
+    owner; deduped by nameWithOwner, newest-updated first, capped at
+    GH_REPO_MAX."""
+    owners = [o for o in re.split(r"[\s,]+", os.environ.get("GH_CLONE_OWNERS", "").strip()) if o]
+    targets = owners or [None]  # None = the authenticated user's own repos
+    found = {}
+    for owner in targets:
+        cmd = ["gh", "repo", "list"]
+        if owner:
+            cmd.append(owner)
+        cmd += ["--limit", str(GH_REPO_LIMIT), "--json",
+                "nameWithOwner,description,isPrivate,updatedAt"]
+        raw = run(cmd)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            continue
+        for r in data if isinstance(data, list) else []:
+            nwo = r.get("nameWithOwner")
+            if not nwo or nwo in found:
+                continue
+            found[nwo] = {
+                "nameWithOwner": nwo,
+                "name": nwo.split("/")[-1],
+                "description": (r.get("description") or "")[:120],
+                "isPrivate": bool(r.get("isPrivate")),
+                "updatedAt": r.get("updatedAt") or "",
+            }
+    repos = sorted(found.values(), key=lambda r: r["updatedAt"], reverse=True)
+    return repos[:GH_REPO_MAX]
+
+
+def collect_github():
+    """The heartbeat's `github` block: whether cloning is available (a gh token
+    is present) and, if so, the login + clonable repo list. Any failure degrades
+    to available=False rather than raising, so a creds hiccup never breaks the
+    heartbeat."""
+    if not gh_token_present():
+        return {"available": False, "login": None, "repos": []}
+    login = run(["gh", "api", "user", "--jq", ".login"]) or None
+    return {"available": True, "login": login, "repos": list_github_repos()}
+
+
 class SessionManager:
     """Owns the registry, the live tmux/ttyd/claude processes, and the
     heartbeat loop. Single-threaded: all mutations happen in the main loop, so
@@ -729,6 +827,12 @@ class SessionManager:
         self.sess_state = {}                     # id -> session_report offsets
         self.usage_cache = {}                    # id -> usage_report result
         self.pending_prs = {}                    # id -> undelivered PR urls
+        # GitHub clone-into-root state: the cached availability/repo-list block
+        # (refreshed on a slow cadence, reported every beat) and in-flight/recent
+        # clone jobs keyed by dest name (the Popen lives here; only a serializable
+        # view is heartbeated).
+        self.github = {"available": False, "login": None, "repos": []}
+        self.clones = {}
         # at-least-once command de-dup: cmdIds we've already executed.
         self.acked = set()
         self.acked_order = deque(maxlen=1000)
@@ -1179,6 +1283,135 @@ class SessionManager:
         prune_trash_branches()
         log(f"deleted session {sid}")
 
+    # --- GitHub clone-into-root -------------------------------------------
+
+    def refresh_github(self):
+        """Refresh the cached GitHub availability/repo-list block. Called on a
+        slow cadence from build_payload; degrades to unavailable on any error."""
+        try:
+            self.github = collect_github()
+        except Exception as e:
+            log(f"github refresh failed: {e}")
+            self.github = {"available": False, "login": None, "repos": []}
+
+    def clone(self, repo_spec):
+        """Clone a GitHub repo into REPOS_ROOT so it joins the scanned repo list.
+
+        Launched as a DETACHED subprocess and reaped by _poll_clones on later
+        beats — `git clone` can take minutes and must never block the heartbeat
+        loop (a blocked loop would make the hub mark the host offline). The spec
+        is validated to a bare owner/repo first; the dest is that repo name
+        directly under REPOS_ROOT and must not already exist. Auth (private
+        repos) rides the system git credential helper (`gh auth git-credential`,
+        configured in the image)."""
+        raw = (repo_spec or "").strip()
+        try:
+            owner_repo = normalize_github_repo(raw)
+        except ValueError as e:
+            key = slugify(raw) or "clone"
+            self.clones[key] = {
+                "name": key, "repo": raw, "status": "error", "error": str(e),
+                "startedAt": now_iso(), "startedMono": time.time(),
+                "proc": None, "logf": None, "logPath": None,
+            }
+            log(f"clone refused: {e}")
+            return
+        name = owner_repo.split("/")[1]
+        dest = os.path.join(REPOS_ROOT, name)
+        job = {
+            "name": name, "repo": owner_repo, "status": "cloning", "error": None,
+            "startedAt": now_iso(), "startedMono": time.time(),
+            "proc": None, "logf": None,
+            "logPath": os.path.join(REGISTRY_DIR, f"clone-{slugify(name)}.log"),
+        }
+        self.clones[name] = job
+        if os.path.exists(dest):
+            job["status"] = "error"
+            job["error"] = f"'{name}' already exists under the repos root"
+            job["startedMono"] = time.time()
+            log(f"clone refused: {job['error']}")
+            return
+        url = f"https://github.com/{owner_repo}.git"
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            logf = open(job["logPath"], "w")
+            proc = subprocess.Popen(
+                ["git", "clone", "--", url, dest],
+                stdout=logf, stderr=subprocess.STDOUT,
+            )
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
+            job["startedMono"] = time.time()
+            log(f"clone launch failed for {owner_repo}: {e}")
+            return
+        job["proc"] = proc
+        job["logf"] = logf
+        log(f"cloning {owner_repo} into {dest}")
+
+    def _clone_log_tail(self, job):
+        try:
+            with open(job.get("logPath") or "", errors="replace") as f:
+                return f.read()[-400:].strip() or None
+        except OSError:
+            return None
+
+    def _finish_clone(self, job, status, error):
+        try:
+            if job.get("logf"):
+                job["logf"].close()
+        except Exception:
+            pass
+        job["logf"] = None
+        job["proc"] = None
+        job["status"] = status
+        if error:
+            job["error"] = error
+        job["finishedMono"] = time.time()
+        if status == "done":
+            log(f"cloned {job['repo']} -> {job['name']}")
+        else:
+            log(f"clone failed for {job['repo']}: {job.get('error')}")
+
+    def _poll_clones(self):
+        """Reap finished `git clone` subprocesses and drop stale terminal jobs.
+        Runs every heartbeat (one poll() per active clone). A done job lingers
+        briefly (the repo then appears in the scan); a failed one lingers longer
+        so the operator can read the error in the UI."""
+        now = time.time()
+        for name, job in list(self.clones.items()):
+            proc = job.get("proc")
+            if proc is not None:
+                rc = proc.poll()
+                if rc is None:
+                    if now - job.get("startedMono", now) > CLONE_TIMEOUT_SEC:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        self._finish_clone(job, "error", "clone timed out")
+                    continue
+                if rc == 0 and os.path.isdir(os.path.join(REPOS_ROOT, name, ".git")):
+                    self._finish_clone(job, "done", None)
+                else:
+                    self._finish_clone(
+                        job, "error",
+                        self._clone_log_tail(job) or f"git clone exited {rc}")
+                continue
+            # Already terminal — prune once it has lingered long enough.
+            linger = CLONE_DONE_LINGER_SEC if job.get("status") == "done" else CLONE_ERROR_LINGER_SEC
+            if now - job.get("finishedMono", job.get("startedMono", now)) > linger:
+                self.clones.pop(name, None)
+
+    def _clones_payload(self):
+        """Serializable view of clone jobs for the heartbeat (no Popen/file)."""
+        return [
+            {"name": j.get("name"), "repo": j.get("repo"),
+             "status": j.get("status"), "error": j.get("error"),
+             "startedAt": j.get("startedAt")}
+            for j in self.clones.values()
+        ]
+
     # --- boot auto-resume --------------------------------------------------
 
     def resume_on_boot(self):
@@ -1241,6 +1474,8 @@ class SessionManager:
                     self.resume(cmd.get("sessionId"))
                 elif ctype == "delete":
                     self.delete(cmd.get("sessionId"))
+                elif ctype == "clone":
+                    self.clone(cmd.get("repo"))
                 else:
                     log(f"unknown command type {ctype!r} (cmdId {cid})")
             except Exception as e:
@@ -1332,6 +1567,12 @@ class SessionManager:
             if s["id"] not in self.usage_cache:
                 self._refresh_usage(s["id"], s["worktreePath"])
 
+        # GitHub availability/repo list refreshes on its own slow cadence (a few
+        # gh calls); clone jobs are reaped every beat (cheap poll()s).
+        if beat % GITHUB_REFRESH_EVERY == 0:
+            self.refresh_github()
+        self._poll_clones()
+
         return {
             # `device` (the physical host name) is the hub's identity key; agentId
             # is only a last-resort fallback if the host name can't be read.
@@ -1345,6 +1586,10 @@ class SessionManager:
             "repos": [repo_entry(r) for r in scan_repos()],
             "sessions": [self._session_payload(s) for s in self.registry],
             "closedSessions": self._closed_payload(),
+            # GitHub clone-into-root: availability + clonable repos for the hub's
+            # clone control, and any in-flight/recent clone jobs.
+            "github": self.github,
+            "clones": self._clones_payload(),
             "ackedCommands": list(self.acked),
         }
 
