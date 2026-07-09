@@ -41,6 +41,7 @@ import re
 import secrets
 import shlex
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -304,22 +305,123 @@ def docker_host_name():
     return run(["docker", "info", "--format", "{{.Name}}"])
 
 
+# --- SMB host-name discovery (Docker Desktop / WSL2) -----------------------
+# Docker Desktop runs the container in an isolated Linux VM, so none of the
+# sources above can see the *Windows* host name (docker info reports the shared
+# "docker-desktop"). But the container can still reach the host over the network
+# (host.docker.internal), and Windows answers an UNAUTHENTICATED SMB2 NEGOTIATE
+# + SESSION_SETUP with an NTLM challenge (type 2) whose Target Info carries the
+# machine's NetBIOS computer name. Reading it needs no credentials — it's the
+# same trick as nmap's smb-os-discovery — and no host/compose config.
+SMB_HOST = os.environ.get("SMB_DISCOVERY_HOST", "host.docker.internal")
+SMB_PORT = 445
+SMB_TIMEOUT = 4
+
+
+def _smb_recvn(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("SMB connection closed")
+        buf += chunk
+    return buf
+
+
+def _smb_recv_msg(sock):
+    # Direct-TCP transport: 4-byte length prefix (top byte 0), then the message.
+    length = struct.unpack(">I", _smb_recvn(sock, 4))[0] & 0xFFFFFF
+    return _smb_recvn(sock, length)
+
+
+def _smb2_header(command, message_id):
+    return struct.pack(
+        "<4sHHIHHIIQIIQ16s",
+        b"\xfeSMB", 64, 0, 0, command, 1, 0, 0, message_id, 0, 0, 0, b"\x00" * 16,
+    )
+
+
+def _smb_parse_computer_name(data):
+    """Pull the NetBIOS computer name out of the NTLM challenge embedded in an
+    SMB2 SESSION_SETUP response (Target Info AV pair MsvAvNbComputerName=0x1)."""
+    i = data.find(b"NTLMSSP\x00")
+    if i < 0 or len(data) - i < 48:
+        return ""
+    ntlm = data[i:]
+    ti_len, _, ti_off = struct.unpack("<HHI", ntlm[40:48])
+    ti = ntlm[ti_off:ti_off + ti_len]
+    o = 0
+    while o + 4 <= len(ti):
+        av_id, av_len = struct.unpack("<HH", ti[o:o + 4])
+        o += 4
+        val = ti[o:o + av_len]
+        o += av_len
+        if av_id == 0:  # MsvAvEOL
+            break
+        if av_id == 1:  # MsvAvNbComputerName — the short machine name
+            return val.decode("utf-16-le", "replace").strip()
+    return ""
+
+
+def smb_host_name():
+    """The Windows host's NetBIOS computer name, read from its SMB service
+    (SMB_HOST:445) via an unauthenticated SMB2/NTLM handshake — the automated
+    path for Docker Desktop / WSL2. Returns '' on any failure (unreachable,
+    firewall-blocked, non-Windows host, or an unexpected response)."""
+    negotiate = (
+        _smb2_header(0x0000, 0)
+        + struct.pack("<HHHHI16sQ", 36, 2, 0x01, 0, 0, b"\x00" * 16, 0)
+        + struct.pack("<HH", 0x0202, 0x0210)  # dialects 2.0.2, 2.1
+    )
+    ntlm_negotiate = (
+        b"NTLMSSP\x00"
+        + struct.pack("<I", 1)             # message type 1 (NEGOTIATE)
+        + struct.pack("<I", 0x00088207)    # UNICODE|OEM|REQ_TARGET|NTLM|SIGN|EXT
+        + struct.pack("<HHI", 0, 0, 0)     # DomainName fields (empty)
+        + struct.pack("<HHI", 0, 0, 0)     # Workstation fields (empty)
+    )
+    session = (
+        _smb2_header(0x0001, 1)
+        + struct.pack("<HBBIIHHQ", 25, 0, 0x01, 0, 0, 88, len(ntlm_negotiate), 0)
+        + ntlm_negotiate
+    )
+    sock = None
+    try:
+        sock = socket.create_connection((SMB_HOST, SMB_PORT), timeout=SMB_TIMEOUT)
+        sock.settimeout(SMB_TIMEOUT)
+        sock.sendall(struct.pack(">I", len(negotiate)) + negotiate)
+        _smb_recv_msg(sock)
+        sock.sendall(struct.pack(">I", len(session)) + session)
+        return _smb_parse_computer_name(_smb_recv_msg(sock))
+    except Exception:
+        return ""
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
 def device_name():
     # The physical host name the hub keys this agent by. A container doesn't know
     # its host's name on its own, so we discover it — no env var / compose config
-    # required. Resolution order, most-authoritative first:
-    #   1. /host/etc/hostname — the host's hostname if the compose file happens to
-    #      bind-mount it (kept first so the existing Linux/TrueNAS deployment is
-    #      byte-for-byte unchanged).
-    #   2. `docker info` .Name via the bind-mounted docker socket — the automated
-    #      cross-OS source. On bare Linux it's the host hostname; with Docker in a
-    #      WSL2 distro it's the Windows machine name. This is what makes Windows
-    #      hosts resolve automatically. (See docker_host_name().)
-    #   3. socket.gethostname() — the OS hostname, used ONLY when it isn't a
-    #      container id. Inside a container it's usually the meaningless 12-hex
-    #      container id (the "fe0e38df73b4" bug), which we reject.
-    #   4. DEVICE_NAME / COMPUTERNAME env — optional manual override, only used
-    #      when auto-detection can't find a real name (e.g. bare Docker Desktop).
+    # required. entrypoint.sh resolves this once and exports DEVICE_NAME so the
+    # manager and the reverse tunnel share one identity. Resolution order:
+    #   1. DEVICE_NAME / COMPUTERNAME env — the entrypoint-resolved value (or an
+    #      explicit operator override); checked first so the one-time resolution
+    #      short-circuits both processes and auto-detection isn't re-run.
+    #   2. /host/etc/hostname — the host's hostname if the compose file bind-mounts
+    #      it (kept ahead of the socket so Linux/TrueNAS behavior is unchanged).
+    #   3. `docker info` .Name via the docker socket — bare Linux / Docker-in-WSL.
+    #   4. SMB to the Windows host (host.docker.internal:445) — the Docker Desktop
+    #      / WSL2 path, where the container is isolated from the host name.
+    #   5. socket.gethostname() — only when it isn't a container id (the
+    #      "fe0e38df73b4" bug); inside a container it usually is, so it's rejected.
+    for env in ("DEVICE_NAME", "COMPUTERNAME"):
+        name = os.environ.get(env, "").strip()
+        if name:
+            return name
     try:
         with open("/host/etc/hostname") as f:
             name = _usable_hostname(f.read())
@@ -330,20 +432,19 @@ def device_name():
     name = _usable_hostname(docker_host_name())
     if name:
         return name
+    name = _usable_hostname(smb_host_name())
+    if name:
+        return name
     try:
         name = _usable_hostname(socket.gethostname())
         if name:
             return name
     except OSError:
         pass
-    for env in ("DEVICE_NAME", "COMPUTERNAME"):
-        name = os.environ.get(env, "").strip()
-        if name:
-            return name
     log(
-        "device name unresolved: /host/etc/hostname absent, `docker info` gave "
-        "no usable name, and the OS hostname is a container id — falling back to "
-        "'unknown-device' (set DEVICE_NAME to override)"
+        "device name unresolved: no /host/etc/hostname, no usable `docker info` "
+        "name, no SMB reply from the host, and the OS hostname is a container id "
+        "— falling back to 'unknown-device' (set DEVICE_NAME to override)"
     )
     return "unknown-device"
 
@@ -1716,6 +1817,12 @@ def main():
 
 
 if __name__ == "__main__":
+    # entrypoint.sh calls this to resolve the host name once and export it. The
+    # "DEVICE_NAME=" prefix lets the caller sed it out cleanly, ignoring the
+    # module-level boot logs that also land on stdout.
+    if "--print-device" in sys.argv:
+        print("DEVICE_NAME=" + device_name())
+        sys.exit(0)
     try:
         main()
     except KeyboardInterrupt:

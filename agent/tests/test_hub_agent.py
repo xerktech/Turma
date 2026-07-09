@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import time
@@ -78,21 +79,23 @@ class TestSlugify(unittest.TestCase):
 
 
 class TestDeviceName(unittest.TestCase):
-    """Host-identity resolution — auto-detected with no env/compose config:
-    /host/etc/hostname, then `docker info` .Name via the mounted socket, then the
-    OS hostname; DEVICE_NAME/COMPUTERNAME are an optional last-resort override.
-    Never reports the kernel-assigned container id (the "fe0e38df73b4" bug) or a
-    shared placeholder."""
+    """Host-identity resolution — auto-detected with no env/compose config.
+    Order: DEVICE_NAME/COMPUTERNAME env (entrypoint-resolved or operator
+    override) -> /host/etc/hostname -> `docker info` .Name -> SMB to the Windows
+    host (Docker Desktop / WSL2) -> OS hostname. Never reports the
+    kernel-assigned container id (the "fe0e38df73b4" bug) or a shared
+    placeholder."""
 
     # A container-id gethostname() is the real in-container default; use it so a
     # test only reaches a later source when the earlier ones are genuinely empty.
     CONTAINER_ID = "fe0e38df73b4"
 
-    def _run(self, *, host_file=None, docker_name="", env=None,
+    def _run(self, *, host_file=None, docker_name="", smb_name="", env=None,
              gethostname=CONTAINER_ID):
         """Resolve device_name() with every source stubbed.
         host_file=None means /host/etc/hostname is absent (open raises);
-        docker_name is what `docker info` returns ('' = daemon unreachable)."""
+        docker_name is what `docker info` returns, smb_name what the SMB probe
+        of the Windows host returns ('' = unreachable/blocked)."""
         def fake_open(path, *a, **k):
             if path == "/host/etc/hostname" and host_file is not None:
                 return io.StringIO(host_file)
@@ -106,6 +109,7 @@ class TestDeviceName(unittest.TestCase):
         with mock.patch.dict(os.environ, env or {}, clear=True), \
                 mock.patch("builtins.open", fake_open), \
                 mock.patch.object(ha, "run", fake_run), \
+                mock.patch.object(ha, "smb_host_name", lambda: smb_name), \
                 mock.patch.object(ha.socket, "gethostname", lambda: gethostname):
             return ha.device_name()
 
@@ -117,39 +121,89 @@ class TestDeviceName(unittest.TestCase):
         for good in ("truenas", "WIN-DESK01", "host.lab", "server-1"):
             self.assertEqual(ha._usable_hostname(good), good, good)
 
-    def test_host_file_wins_when_real(self):
+    def test_env_wins_first(self):
+        # entrypoint.sh exports DEVICE_NAME after resolving once; it (or an
+        # explicit operator override) is checked before any auto-detection.
         self.assertEqual(
-            self._run(host_file="truenas\n", docker_name="other"), "truenas")
-
-    def test_docker_info_name_used_when_no_host_file(self):
-        # The automated cross-OS path: no mount, but the mounted socket lets us
-        # ask the daemon its name (WSL distro name == Windows machine name).
-        self.assertEqual(self._run(docker_name="DESKTOP-AB12\n"), "DESKTOP-AB12")
-
-    def test_docker_desktop_name_rejected(self):
-        # Docker Desktop's daemon reports the shared VM name -> not a per-host id.
-        self.assertEqual(
-            self._run(docker_name="docker-desktop", gethostname="realbox"),
-            "realbox",
+            self._run(env={"DEVICE_NAME": "MAXAI"}, host_file="truenas\n",
+                      docker_name="other", smb_name="smbname"),
+            "MAXAI",
         )
-
-    def test_os_hostname_used_when_real(self):
-        self.assertEqual(self._run(gethostname="bare-linux"), "bare-linux")
-
-    def test_env_override_only_when_autodetect_fails(self):
-        # Everything auto fails (no mount, no docker, container-id hostname);
-        # the optional env override is the last resort.
-        self.assertEqual(self._run(env={"DEVICE_NAME": "WIN-DESK01"}), "WIN-DESK01")
         self.assertEqual(self._run(env={"COMPUTERNAME": "WIN-DESK01"}), "WIN-DESK01")
         self.assertEqual(
             self._run(env={"DEVICE_NAME": "explicit", "COMPUTERNAME": "win"}),
             "explicit",
         )
 
+    def test_host_file_wins_over_docker_and_smb(self):
+        self.assertEqual(
+            self._run(host_file="truenas\n", docker_name="other", smb_name="x"),
+            "truenas",
+        )
+
+    def test_docker_info_name_used_when_no_host_file(self):
+        # bare Linux / Docker-in-WSL: the mounted socket's daemon name.
+        self.assertEqual(self._run(docker_name="DESKTOP-AB12\n"), "DESKTOP-AB12")
+
+    def test_smb_used_when_docker_desktop(self):
+        # The Docker Desktop path: docker info is the shared VM name, so we fall
+        # through to the SMB probe of the Windows host for the real name.
+        self.assertEqual(
+            self._run(docker_name="docker-desktop", smb_name="MAXAI"), "MAXAI")
+
+    def test_smb_used_when_no_mount_no_docker(self):
+        self.assertEqual(self._run(smb_name="MAXAI"), "MAXAI")
+
+    def test_os_hostname_used_when_real(self):
+        self.assertEqual(self._run(gethostname="bare-linux"), "bare-linux")
+
     def test_container_id_hostname_falls_back_to_placeholder(self):
-        # The reported bug: inside a container gethostname() is the container id;
-        # we must NOT report it, and with no other source we say unknown-device.
-        self.assertEqual(self._run(), "unknown-device")
+        # The reported bug: no env, no mount, docker=docker-desktop, SMB blocked,
+        # and gethostname() is the container id -> unknown-device, never the id.
+        self.assertEqual(
+            self._run(docker_name="docker-desktop", smb_name=""), "unknown-device")
+
+
+class TestSmbHostName(unittest.TestCase):
+    """The SMB2/NTLM computer-name extraction (Docker Desktop / WSL2 path)."""
+
+    @staticmethod
+    def _challenge(names):
+        """Build a minimal NTLM CHALLENGE (type 2) with the given Target Info AV
+        pairs {av_id: str}, wrapped in some leading bytes like a real SMB blob."""
+        ti = b""
+        for av_id, val in names.items():
+            v = val.encode("utf-16-le")
+            ti += struct.pack("<HH", av_id, len(v)) + v
+        ti += struct.pack("<HH", 0, 0)  # MsvAvEOL
+        ntlm = (
+            b"NTLMSSP\x00" + struct.pack("<I", 2)
+            + struct.pack("<HHI", 0, 0, 0)   # TargetName fields
+            + struct.pack("<I", 0)           # NegotiateFlags
+            + b"\x11" * 8                     # ServerChallenge
+            + b"\x00" * 8                     # Reserved
+            + struct.pack("<HHI", len(ti), len(ti), 48)  # TargetInfo @ offset 48
+            + ti
+        )
+        return b"\x00" * 137 + ntlm  # arbitrary SMB2 header/prefix before NTLMSSP
+
+    def test_extracts_netbios_computer_name(self):
+        blob = self._challenge({1: "MAXAI", 2: "XERKTECH",
+                                3: "MaxAI.xerktech.com"})
+        self.assertEqual(ha._smb_parse_computer_name(blob), "MAXAI")
+
+    def test_no_ntlmssp_returns_empty(self):
+        self.assertEqual(ha._smb_parse_computer_name(b"not an ntlm response"), "")
+
+    def test_no_computer_name_av_returns_empty(self):
+        # Only a domain AV pair, no MsvAvNbComputerName(0x1).
+        self.assertEqual(
+            ha._smb_parse_computer_name(self._challenge({2: "XERKTECH"})), "")
+
+    def test_request_packets_are_well_formed(self):
+        # SMB2 header is exactly 64 bytes; the SESSION_SETUP security buffer
+        # offset (88) must equal header + fixed body, or Windows rejects it.
+        self.assertEqual(len(ha._smb2_header(0, 0)), 64)
 
 
 class TestSpawnOptionHelpers(unittest.TestCase):
