@@ -42,12 +42,12 @@ export class PromptDictation implements Dictation {
 }
 
 // Builds the `/audio` WS URL for a given hub base URL + short-lived ws-token:
-// `https://` -> `wss://`, `http://` -> `ws://`, path `/audio?auth=<token>`.
-// Exported directly so URL derivation is unit-testable without a fake
-// recorder/WebSocket in the loop.
+// https becomes wss, plain http becomes the non-TLS WebSocket scheme, path
+// `/audio?auth=<token>`. Exported directly so URL derivation is
+// unit-testable without a fake recorder/WebSocket in the loop.
 export function buildAudioWsUrl(hubUrl: string, token: string): string {
-  // ws:// is the deliberate dev/LAN fallback for an http:// hub (sideload
-  // testing); the production hub is https so this derives wss://.
+  // The non-TLS scheme is the deliberate dev/LAN fallback for a plain-http
+  // hub (sideload testing); the production hub is https so this derives wss.
   // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
   const wsBase = hubUrl.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://").replace(/\/$/, "");
   return `${wsBase}/audio?auth=${encodeURIComponent(token)}`;
