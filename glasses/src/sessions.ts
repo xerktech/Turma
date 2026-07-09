@@ -1,0 +1,52 @@
+import type { AgentInfo, SessionInfo, SessionRef } from "./types.ts";
+
+export type LiveState = "working" | "waiting" | "idle" | "stopped" | "error";
+
+// "pending" is not a live-server state — it's an app-layer overlay app.ts
+// paints over a session's glyph right after queuing a mutation, until the
+// next poll shows convergence or a 60s timeout. See app.ts's pending map.
+export type DisplayState = LiveState | "pending";
+
+const WORKING_WINDOW_MS = 90 * 1000;
+
+// Precedence: error > stopped > waiting > working > idle.
+export function liveState(s: SessionInfo): LiveState {
+  if (s.status === "error") return "error";
+  if (s.status === "stopped") return "stopped";
+  const live = s.session;
+  if (live?.question) return "waiting";
+  if (live?.transcriptAgeSec != null && live.transcriptAgeSec * 1000 < WORKING_WINDOW_MS) {
+    return "working";
+  }
+  return "idle";
+}
+
+const GLYPHS: Record<DisplayState, string> = {
+  working: "*",
+  waiting: "?",
+  idle: "-",
+  stopped: "o",
+  error: "!",
+  pending: "…",
+};
+
+export function glyph(state: DisplayState): string {
+  return GLYPHS[state];
+}
+
+// Flattens every host's sessions into one list, hosts sorted by device name
+// (falling back to the host key), sessions within a host sorted by
+// createdAt (missing createdAt sorts first).
+export function flattenSessions(agents: AgentInfo[]): SessionRef[] {
+  const hosts = [...agents].sort((a, b) => (a.device ?? a.key).localeCompare(b.device ?? b.key));
+  const out: SessionRef[] = [];
+  for (const agent of hosts) {
+    const sessions = [...(agent.sessions ?? [])].sort((a, b) =>
+      (a.createdAt ?? "").localeCompare(b.createdAt ?? "")
+    );
+    for (const session of sessions) {
+      out.push({ hostKey: agent.key, device: agent.device ?? agent.key, online: agent.online, session });
+    }
+  }
+  return out;
+}
