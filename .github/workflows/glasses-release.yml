@@ -12,9 +12,9 @@ name: glasses-release
 # pack) inside a throwaway node:24-alpine container (Docker Hub pull — the
 # runner can't auth to ghcr.io, and npm isn't on the runner itself).
 #
-# There's no upstream package to version against, so — like the image
-# workflows — the build counter disambiguates: the tag is
-# glasses-v<package.json version>-<run_number>.
+# Versioning matches the rest of the repo: the MAJOR.MINOR lives in the root
+# VERSION file and this pipeline appends its Actions run number as the patch,
+# so the release tag is glasses-v<VERSION>.<run_number> (e.g. glasses-v0.1.42).
 on:
   push:
     branches: [main]
@@ -46,16 +46,17 @@ jobs:
       - name: Install, build, pack (glasses/)
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE":/workspace -w /workspace/glasses node:24-alpine \
-            sh -c 'npm ci --no-audit --no-fund && npm run build && npm run pack && node -p "require(\"./package.json\").version" > /workspace/.glasses-version'
+            sh -c 'npm ci --no-audit --no-fund && npm run build && npm run pack'
 
-      # Compose the release tag / versioned asset name on the runner side
-      # (the .glasses-version file was written from inside the container).
+      # Compose the release tag / versioned asset name from the repo VERSION
+      # file (MAJOR.MINOR) plus this run number as the patch.
       - name: Compute version
         id: ver
         run: |
-          VERSION="$(cat "$GITHUB_WORKSPACE/.glasses-version" | tr -d '[:space:]')"
-          TAG="glasses-v${VERSION}-${{ github.run_number }}"
-          ASSET="agenthub-hud-v${VERSION}-${{ github.run_number }}.ehpk"
+          BASE="$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/VERSION")"
+          VERSION="${BASE}.${{ github.run_number }}"
+          TAG="glasses-v${VERSION}"
+          ASSET="agenthub-hud-v${VERSION}.ehpk"
           cp "$GITHUB_WORKSPACE/agenthub-hud.ehpk" "$GITHUB_WORKSPACE/$ASSET"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -69,7 +70,7 @@ jobs:
           body: |
             Even Hub (G2 glasses) app package for AgentHub.
 
-            - Version: `${{ steps.ver.outputs.version }}` (build ${{ github.run_number }})
+            - Version: `${{ steps.ver.outputs.version }}`
             - Commit: ${{ github.sha }}
 
             Download `${{ steps.ver.outputs.asset }}` below and sideload it via the Even Hub app.
