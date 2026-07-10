@@ -214,6 +214,31 @@ describe("EvenHubDisplay", () => {
       expect(statusContainer).not.toBe(boxContainer);
     });
 
+    it("pads the transcript so a full transcript's newest line clears the box border with a gap (no line dropped)", async () => {
+      const { bridge, rebuildCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      display.render(sessionModel({ transcriptLines: ["line a"], lines: ["> draft"], status: "Working" }));
+
+      const containers = rebuildCalls[0]!.textObject!;
+      const box = containers.find((c) => c.borderWidth === 1)!;
+      const transcript = containers.find((c) => c.containerName === "transcript")!;
+
+      // Device constants (pretext README / render.ts): 27px line height, a
+      // 10-line canvas. A 1-line input box leaves render.ts a full transcript
+      // budget of DISPLAY_LINES - 1 = 9 lines — none dropped for the gap.
+      const LINE_HEIGHT = 27;
+      const fullTranscriptLines = 10 - 1;
+      const textBottom = transcript.yPosition! + transcript.paddingLength! + fullTranscriptLines * LINE_HEIGHT;
+      // Even at a full transcript, the newest line ends strictly above the box's
+      // top border — a real gap, never flush against or under it.
+      expect(box.yPosition! - textBottom).toBeGreaterThanOrEqual(4);
+      // Inner content width still covers the wrap width (LINE_WIDTH_PX 560), so
+      // wrapped lines don't clip horizontally either.
+      expect(576 - 2 * transcript.paddingLength!).toBeGreaterThanOrEqual(560);
+    });
+
     it("a second render with the same shape (same mode + box line count) uses textContainerUpgrade, not another rebuild", async () => {
       const { bridge, rebuildCalls, upgradeCalls } = fakeBridge();
       const display = new EvenHubDisplay(bridge);

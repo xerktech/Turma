@@ -66,6 +66,18 @@ const BOX_BORDER_RADIUS = 12;
 const BOX_BORDER_COLOR = 15;
 const BOX_PADDING = 2;
 const BOX_INSET = 2 * (BOX_PADDING + BOX_BORDER_WIDTH);
+// Transcript container padding. The transcript sits flush above the bordered
+// input box (its height IS boxY), so its own bottom padding is the only thing
+// separating the newest line from the box's top border. At the G2's fixed
+// 27px line height (pretext README), the full DISPLAY_LINES-minus-box budget
+// of transcript lines needs `lines * 27` px; a 16px pad left only boxY - 32 of
+// content height, one line short of that, so the newest line spilled onto — and
+// a few px under — the box border. 4px fits every line with room to spare AND
+// leaves an ~8px gap above the border. It also keeps the container's inner
+// width (576 - 2*4 = 568) at least the 560px wrap width, which the old 16px
+// pad (544px inner) violated, and lines the transcript up with the box's own
+// 2px-padded text instead of indenting it 14px further in.
+const TRANSCRIPT_PADDING = 4;
 // Status corner: sized to fit the widest label ("Working"/"[REC]" etc.)
 // without crowding the box's right/top border.
 const STATUS_WIDTH = 120;
@@ -169,7 +181,9 @@ function buildSessionContainers(boxLines: number, content: SessionContent): Text
       yPosition: 0,
       width: CANVAS_WIDTH,
       height: boxY,
-      paddingLength: 16,
+      // Small padding (see TRANSCRIPT_PADDING): its bottom half is the gap that
+      // keeps the newest transcript line clear of the box's top border.
+      paddingLength: TRANSCRIPT_PADDING,
       containerID: SESSION_TRANSCRIPT_ID,
       containerName: SESSION_TRANSCRIPT_NAME,
       content: content.transcript,
