@@ -21,9 +21,12 @@ npm run dev         # in another — Vite dev server, DOM backend
 `npm run dev` opens a keyboard-driven DOM stand-in for the glasses display:
 arrow keys scroll, Enter taps, Escape double-taps (back).
 
-To point the dev server at a real hub instead of the mock, set
-`VITE_HUB_URL` / `VITE_HUB_USER` / `VITE_HUB_PASSWORD` (e.g. in a `.env.local`
-Vite picks up) before running `npm run dev`.
+The hub URL is hardcoded (`DEFAULT_HUB_URL` in `src/config.ts`) so the phone
+login page only asks for a username and password, exactly like the web
+dashboard's login. For local dev, `VITE_HUB_URL` overrides that target (e.g.
+to point at the mock-hub or a LAN hub), and `VITE_HUB_USER` /
+`VITE_HUB_PASSWORD` prefill the credentials — set them in a `.env.local` Vite
+picks up before running `npm run dev`.
 
 ## Simulator
 
@@ -97,8 +100,9 @@ to exercise the whole STT path without hardware.
 ## On-hardware QA checklist
 
 - Whitelist edited to your hub host and the app sideloads/opens OK.
-- Credentials entered via the phone settings panel and "Test connection"
-  shows green.
+- Signed in via the phone login page (matches the web dashboard's login —
+  username + password; the hub URL is hardcoded in `src/config.ts`) and the
+  glasses-display mirror appears.
 - Session list matches the web dashboard.
 - Each lifecycle action (spawn/kill/start/restart/resume) shows queued (…)
   then converges within ~40s.

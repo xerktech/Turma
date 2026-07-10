@@ -552,6 +552,24 @@ test("http: login page is public; /api/login sets a working session cookie", asy
   assert.match((out.headers["set-cookie"] || [])[0] || "", /Max-Age=0/);
 });
 
+test("http: over HTTPS the session cookie is SameSite=None; Secure; Partitioned (cross-site iframe embed)", async () => {
+  // Simulate the Cloudflare-tunnel HTTPS hop so the cookie takes its
+  // production form, which the embedded-dashboard iframe on the phone needs.
+  const ok = await request("POST", "/api/login", {
+    body: { username: "hubuser", password: "hubpass" },
+    headers: { "x-forwarded-proto": "https" },
+  });
+  assert.equal(ok.status, 200);
+  const setCookie = (ok.headers["set-cookie"] || [])[0] || "";
+  assert.match(setCookie, /^hub_session=/);
+  assert.match(setCookie, /HttpOnly/);
+  assert.match(setCookie, /SameSite=None/);
+  assert.match(setCookie, /Secure/);
+  assert.match(setCookie, /Partitioned/);
+  // Lax must NOT appear — it would shadow None and break the iframe embed.
+  assert.doesNotMatch(setCookie, /SameSite=Lax/);
+});
+
 test("http: unauthenticated HTML navigation redirects to /login (no Basic popup)", async () => {
   const res = await request("GET", "/", { headers: { accept: "text/html" } });
   assert.equal(res.status, 302);

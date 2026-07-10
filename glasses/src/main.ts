@@ -23,7 +23,7 @@ import { HubAudioDictation, PromptDictation } from "./dictation.ts";
 import type { Dictation } from "./dictation.ts";
 import { HubClient } from "./hub-client.ts";
 import { BridgeStorage, BrowserStorage, type KeyValueStorage } from "./storage.ts";
-import { initPhoneSettings } from "./phone-settings.ts";
+import { initPhoneLogin } from "./phone-login.ts";
 import { pretextMeasure, setDefaultMeasure } from "./text-wrap.ts";
 import { installLifecycle, onAbnormalOrSystemExit, onForegroundEnter, onForegroundExit } from "./lifecycle.ts";
 
@@ -64,11 +64,17 @@ async function main(): Promise<void> {
 }
 
 async function mainDom(): Promise<void> {
+  // Dev/browser path: the signed-in view shows the green-text glasses mirror
+  // (#glasses-display) rather than the embedded dashboard iframe.
+  document.body.classList.add("backend-dom");
   const storage = new BrowserStorage();
   await boot(storage, new DomDisplay(), () => new PromptDictation());
 }
 
 async function mainBridge(bridge: ResolvedBridge): Promise<void> {
+  // Device path: the glasses render via the SDK, and the phone's signed-in
+  // view embeds the real hub dashboard (#dashboard iframe).
+  document.body.classList.add("backend-bridge");
   const { EvenHubDisplay } = await import("./display/evenhub.ts");
   // Task 7: real G2-mic dictation. audio.ts touches no SDK types (structural
   // only, like display/evenhub.ts and input/router.ts) — dynamically
@@ -126,7 +132,7 @@ async function mainBridge(bridge: ResolvedBridge): Promise<void> {
 }
 
 // Shared wiring for both backends: load config, start the phone-side
-// settings panel, build the HubClient + App, and start the app.
+// login page, build the HubClient + App, and start the app.
 // `makeDictation` picks the backend-appropriate `Dictation` (PromptDictation
 // for the DOM dev path, HubAudioDictation for the bridge path) once the
 // HubClient + Config it may need both exist. `beforeStart` runs after the
@@ -139,7 +145,7 @@ async function boot(
   beforeStart?: (app: App) => void
 ): Promise<App> {
   const config = await loadConfig(storage);
-  void initPhoneSettings(storage);
+  void initPhoneLogin(storage);
 
   const client = new HubClient({ config });
   const dictation = makeDictation(client, config);
