@@ -356,10 +356,20 @@ function render(data) {
   if ($overlay.style.display === "flex") renderSwitcher();
 }
 
+// Worktree dir name + the live branch the agent named for its work ("detached"
+// until it branches). The app itself creates no branch, so s.branch is unused.
+function sessMeta(s) {
+  if (s.root) return "repos root";
+  const wt = String(s.worktreePath || "").split("/").filter(Boolean).pop();
+  const b = s.git && s.git.branch;
+  const branch = (b && b !== "HEAD") ? b : "detached";
+  return [wt, branch].filter(Boolean).join(" · ");
+}
+
 function activeCard({ a, s, live }, now) {
   const attachable = a.terminalOnline;
   const meta = esc(s.repo || "?") + " · " + esc(a.device || a.key) +
-    (s.branch ? " · " + esc(s.branch) : "");
+    " · " + esc(sessMeta(s));
   return `<button class="scard" ${attachable ? "" : "disabled"}
       onclick="openTerminal('${esc(s.id)}')"
       ${attachable ? "" : 'title="Terminal tunnel offline"'}>
@@ -379,7 +389,7 @@ function stoppedRow({ a, s }) {
   return `<div class="stopped-row">
     <span class="body">
       <div class="sid">${esc(s.id)}</div>
-      <div class="meta">${esc(s.repo || "?")} · ${esc(a.device || a.key)}${s.branch ? " · " + esc(s.branch) : ""}</div>
+      <div class="meta">${esc(s.repo || "?")} · ${esc(a.device || a.key)} · ${esc(sessMeta(s))}</div>
       ${s.status === "error" && s.errorMsg ? `<div class="err">${esc(s.errorMsg)}</div>` : ""}
     </span>
     <button class="primary" ${a.online && !starting ? "" : "disabled"}

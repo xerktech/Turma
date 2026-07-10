@@ -11,7 +11,6 @@ export interface SpawnOptions {
   prompt?: string;
   label?: string;
   baseRef?: string;
-  branchName?: string;
   model?: string;
   permissionMode?: string;
 }

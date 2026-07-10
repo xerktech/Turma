@@ -101,7 +101,6 @@ export type ReplyTarget =
       repo: string;
       label?: string;
       baseRef?: string;
-      branchName?: string;
       model?: string;
       permissionMode?: string;
     };
@@ -1229,10 +1228,10 @@ export class App {
       this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
       return;
     }
-    const { hostKey, repo, label, baseRef, branchName, model, permissionMode } = r.target;
+    const { hostKey, repo, label, baseRef, model, permissionMode } = r.target;
     this.markSpawnPending(hostKey, repo);
     void this.client
-      .spawnSession(hostKey, { repo, prompt: r.text, label, baseRef, branchName, model, permissionMode })
+      .spawnSession(hostKey, { repo, prompt: r.text, label, baseRef, model, permissionMode })
       .then(() => {
         this.flash(FLASH_QUEUED);
         this.repaint();

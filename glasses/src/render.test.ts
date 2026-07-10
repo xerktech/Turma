@@ -490,7 +490,7 @@ describe("render: confirm", () => {
       confirm: { action: { kind: "delete", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 1 },
     });
     const model = asSession(render(state));
-    expect(model.bottom.lines[0]).toContain("Also removes branch");
+    expect(model.bottom.lines[0]).toContain("Removes worktree");
     expect(model.bottom.lines).toContain("  Cancel");
     expect(model.bottom.lines).toContain("> Confirm");
   });

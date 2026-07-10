@@ -983,6 +983,20 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, cmdId });
     }
 
+    // POST /api/agents/<host>/repos/<repo>/prune — sweep a repo's finished work
+    // on that host: the agent removes session worktrees whose commits are merged
+    // into the latest default branch (leaving anything unmerged or dirty) and
+    // deletes local branches merged into it. The result rides the heartbeat.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "repos" && parts[5] === "prune" && parts.length === 6) {
+      const key = decodeURIComponent(parts[2]);
+      if (!agents[key]) return json(res, 404, { error: "unknown agent" });
+      const repo = decodeURIComponent(parts[4]);
+      if (!repo) return json(res, 400, { error: "repo required" });
+      const cmdId = queueCommand(key, { type: "prune", repo });
+      return json(res, 200, { ok: true, cmdId });
+    }
+
     // Session command endpoints — each queues a cmdId onto the host's command
     // queue for the agent to pick up on its next heartbeat reply. The host owns
     // the actual worktree/tmux/ttyd lifecycle; the hub only relays intent.
@@ -999,7 +1013,7 @@ const server = http.createServer(async (req, res) => {
         const body = JSON.parse((await readBody(req)) || "{}");
         if (!body.repo) return json(res, 400, { error: "repo required" });
         const cmd = { type: "spawn", repo: body.repo };
-        for (const f of ["prompt", "label", "baseRef", "branchName", "model", "permissionMode"]) {
+        for (const f of ["prompt", "label", "baseRef", "model", "permissionMode"]) {
           if (body[f] != null && body[f] !== "") cmd[f] = body[f];
         }
         const cmdId = queueCommand(key, cmd);

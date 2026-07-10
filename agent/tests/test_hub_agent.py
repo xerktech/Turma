@@ -211,23 +211,33 @@ class TestSpawnOptionHelpers(unittest.TestCase):
     """Validation for the composer's spawn options (#11/#12/#13) — everything
     that gets interpolated into a git/tmux command line is allowlist-checked."""
 
-    def test_normalize_branch_blank_uses_agent_id(self):
-        self.assertEqual(ha.normalize_branch_name("", "abc12"), "agent/abc12")
-        self.assertEqual(ha.normalize_branch_name(None, "abc12"), "agent/abc12")
-        self.assertEqual(ha.normalize_branch_name("  ", "abc12"), "agent/abc12")
+    def test_default_branch_name_prefers_origin_head(self):
+        # origin/HEAD -> origin/main means the default branch is "main".
+        with mock.patch.object(
+                ha, "run",
+                lambda cmd, cwd=None: "origin/main" if "symbolic-ref" in cmd else ""):
+            self.assertEqual(ha.default_branch_name("/repo"), "main")
 
-    def test_normalize_branch_forces_agent_prefix(self):
-        self.assertEqual(ha.normalize_branch_name("fix-login", "abc12"), "agent/fix-login")
-        # An operator-supplied agent/ prefix is not doubled.
-        self.assertEqual(ha.normalize_branch_name("agent/fix-login", "abc12"), "agent/fix-login")
-        # agent/ with an empty core falls back to the id.
-        self.assertEqual(ha.normalize_branch_name("agent/", "abc12"), "agent/abc12")
+    def test_default_branch_name_falls_back_to_local_main(self):
+        # No origin/HEAD; a local "main" exists -> use it.
+        with mock.patch.object(ha, "run", lambda cmd, cwd=None: ""), \
+             mock.patch.object(ha, "branch_exists",
+                               lambda repo, ref: ref == "refs/heads/main"):
+            self.assertEqual(ha.default_branch_name("/repo"), "main")
 
-    def test_normalize_branch_rejects_bad_names(self):
-        for bad in ("../evil", "a..b", "has space", "semi;colon", "quote'x",
-                    "back`tick", "dollar$x", "tilde~x", "agent/..", "a\tb"):
-            with self.assertRaises(ValueError, msg=bad):
-                ha.normalize_branch_name(bad, "abc12")
+    def test_default_base_ref_fetches_latest_and_prefers_origin(self):
+        # New sessions fork off the LATEST default branch: fetch, then origin/<d>.
+        calls = []
+        with mock.patch.object(
+                ha, "run",
+                lambda cmd, cwd=None: "origin/main" if "symbolic-ref" in cmd else ""), \
+             mock.patch.object(ha, "run_ok",
+                               lambda cmd, cwd=None: calls.append(cmd) or (0, "")), \
+             mock.patch.object(ha, "branch_exists",
+                               lambda repo, ref: ref == "refs/remotes/origin/main"):
+            self.assertEqual(ha.default_base_ref("/repo"), "origin/main")
+        self.assertTrue(any("fetch" in c for c in calls),
+                        f"expected a git fetch for latest main, got {calls}")
 
     def test_valid_ref_name(self):
         self.assertTrue(ha.valid_ref_name("main"))
@@ -257,9 +267,10 @@ class TestSpawnOptionHelpers(unittest.TestCase):
                 ha.resolve_permission_mode(bad)
 
     def test_resolve_base_ref(self):
-        # Blank / HEAD -> None (fork off current HEAD, today's behavior).
-        self.assertIsNone(ha.resolve_base_ref("/repo", ""))
-        self.assertIsNone(ha.resolve_base_ref("/repo", "HEAD"))
+        # Blank / HEAD -> the latest default branch (delegates to default_base_ref).
+        with mock.patch.object(ha, "default_base_ref", lambda p: "origin/main"):
+            self.assertEqual(ha.resolve_base_ref("/repo", ""), "origin/main")
+            self.assertEqual(ha.resolve_base_ref("/repo", "HEAD"), "origin/main")
 
         # Allowlist-clean AND resolvable -> returned; missing -> ValueError.
         def fake_run(cmd, cwd=None):
@@ -669,7 +680,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         # spawn now threads the composer options (all None for a bare command).
         sm.spawn.assert_called_once_with(
             "AgentHub", prompt=None, label=None, base_ref=None,
-            branch_name=None, model=None, permission_mode=None,
+            model=None, permission_mode=None,
         )
         sm.kill.assert_called_once_with("ab123")
         sm.save.assert_called_once()
@@ -689,13 +700,20 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.handle_commands([{
             "cmdId": "c9", "type": "spawn", "repo": "AgentHub",
             "prompt": "fix the bug", "label": "Fix login", "baseRef": "main",
-            "branchName": "agent/fix-login", "model": "opus",
-            "permissionMode": "plan",
+            "model": "opus", "permissionMode": "plan",
         }])
         sm.spawn.assert_called_once_with(
             "AgentHub", prompt="fix the bug", label="Fix login", base_ref="main",
-            branch_name="agent/fix-login", model="opus", permission_mode="plan",
+            model="opus", permission_mode="plan",
         )
+
+    def test_prune_command_dispatches_to_prune_repo(self):
+        sm = self.make_manager()
+        sm.prune_repo = mock.Mock()
+        sm.save = mock.Mock()
+        sm.handle_commands([{"cmdId": "cp", "type": "prune", "repo": "AgentHub"}])
+        sm.prune_repo.assert_called_once_with("AgentHub")
+        self.assertIn("cp", sm.acked)
 
     def test_unknown_type_and_poison_command_still_acked(self):
         sm = self.make_manager()
@@ -733,7 +751,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sess = sm.registry[0]
         self.assertEqual(sess["status"], "running")
         self.assertEqual(sess["repo"], "AgentHub")
-        self.assertEqual(sess["branch"], f"agent/{sess['id']}")
+        # The app creates no branch — the worktree is detached, the agent branches.
+        self.assertIsNone(sess["branch"])
         self.assertEqual(sess["ttydPort"], ha.TTYD_PORT_BASE)
         self.assertEqual(sess["tmuxName"], f"agent-{sess['id']}")
         self.assertTrue(sess["rcName"].endswith(f"-AgentHub-{sess['id']}"))
@@ -741,8 +760,10 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             sess["worktreePath"],
             os.path.join(ha.WORKTREES_ROOT, "AgentHub", sess["id"]),
         )
-        # git worktree add -b agent/<id> went through run_ok
-        self.assertTrue(any("worktree" in c and "-b" in c for c in self.run_ok_calls))
+        # git worktree add --detach (no -b) went through run_ok
+        wt = next(c for c in self.run_ok_calls if "worktree" in c and "add" in c)
+        self.assertIn("--detach", wt)
+        self.assertNotIn("-b", wt)
 
     def test_spawn_refused_at_max_sessions(self):
         repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
@@ -759,83 +780,56 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm.spawn("NoSuchRepo")
         self.assertEqual(sm.registry, [])
 
-    def test_kill_drops_record_but_keeps_no_branch_delete(self):
+    def test_kill_drops_record_but_keeps_worktree(self):
         repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("AgentHub")
         sid = sm.registry[0]["id"]
         sm.usage_cache[sid] = {"totals": {}}
+        self.run_ok_calls.clear()
+        self.run_calls.clear()
         sm.kill(sid)
         self.assertEqual(sm.registry, [])
         self.assertNotIn(sid, sm.usage_cache)
-        # kill keeps the branch: no `git branch -D` may be issued
+        # kill must KEEP the worktree (uncommitted work survives): no worktree
+        # remove and no `git branch -D`.
+        self.assertFalse(
+            any("worktree" in c and "remove" in c
+                for c in self.run_calls + self.run_ok_calls),
+            f"kill must not remove the worktree: {self.run_calls}",
+        )
         self.assertFalse(
             any("branch" in c and "-D" in c for c in self.run_calls),
-            f"kill must not delete the branch: {self.run_calls}",
+            f"kill must not delete a branch: {self.run_calls}",
         )
+        # It is offered for resume (closed history records it).
+        self.assertTrue(any(c.get("id") == sid for c in sm.closed))
 
-    def _stub_git_state(self, branch, *, pushed, ahead_remote="0", ahead_base="0"):
-        """Overlay the blanket fake run with the git answers the delete guard
-        asks for: the branch exists, the checkout sits on main, and the
-        pushed/ahead state is as given."""
-        local = f"refs/heads/{branch}"
-        remote = f"refs/remotes/origin/{branch}"
-
-        def fake_run(cmd, cwd=None):
-            self.run_calls.append(cmd)
-            joined = " ".join(cmd)
-            if "rev-parse --abbrev-ref HEAD" in joined:
-                return "main"
-            if joined.endswith(f"--verify --quiet {local}"):
-                return "abc123"
-            if joined.endswith(f"--verify --quiet {remote}"):
-                return "def456" if pushed else ""
-            if f"rev-list --count {remote}..{local}" in joined:
-                return ahead_remote
-            if f"rev-list --count refs/heads/main..{local}" in joined:
-                return ahead_base
-            return ""
-
-        p = mock.patch.object(ha, "run", fake_run)
-        p.start()
-        self.addCleanup(p.stop)
-
-    def test_delete_hard_deletes_safe_branch(self):
+    def test_delete_removes_worktree_but_touches_no_branch(self):
         repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("AgentHub")
         sid = sm.registry[0]["id"]
-        branch = sm.registry[0]["branch"]
-        self._stub_git_state(branch, pushed=True, ahead_remote="0")
+        os.makedirs(sm.registry[0]["worktreePath"], exist_ok=True)  # so it's removed
+        self.run_calls.clear()
+        self.run_ok_calls.clear()
         sm.delete(sid)
         self.assertEqual(sm.registry, [])
+        # The worktree is removed...
         self.assertTrue(
-            any("-D" in c and branch in c for c in self.run_calls),
-            f"pushed-and-in-sync branch must be hard-deleted: {self.run_calls}",
+            any("worktree" in c and "remove" in c
+                for c in self.run_calls + self.run_ok_calls),
+            f"delete must remove the worktree: {self.run_calls}",
         )
-
-    def test_delete_parks_unpushed_branch_in_trash(self):
-        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
-        sm = self.make_spawn_ready_manager([repo])
-        sm.spawn("AgentHub")
-        sid = sm.registry[0]["id"]
-        branch = sm.registry[0]["branch"]
-        self._stub_git_state(branch, pushed=False, ahead_base="3")
-        sm.delete(sid)
-        self.assertEqual(sm.registry, [])
+        # ...but the app owns no branch, so no branch is ever deleted or renamed
+        # (the agent's own branch, and its committed work, survive untouched).
+        allcalls = self.run_calls + self.run_ok_calls
         self.assertFalse(
-            any("-D" in c and branch in c for c in self.run_calls),
-            f"unpushed branch must not be hard-deleted: {self.run_calls}",
+            any("branch" in c and ("-D" in c or "-m" in c) for c in allcalls),
+            f"delete must not touch any branch: {allcalls}",
         )
-        renames = [
-            c for c in self.run_ok_calls
-            if "-m" in c and branch in c
-            and any(a.startswith(ha.TRASH_PREFIX) for a in c)
-        ]
-        self.assertTrue(
-            renames,
-            f"unpushed branch must be parked in trash: {self.run_ok_calls}",
-        )
+        # No stale resume offer is left behind.
+        self.assertFalse(any(c.get("id") == sid for c in sm.closed))
 
     def test_start_refuses_when_already_running_or_full(self):
         sm = self.make_manager()
@@ -882,16 +876,19 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         return newsess[-1]
 
     def test_spawn_no_options_keeps_todays_command_shape(self):
-        """Regression guard: a bare spawn must produce exactly the pre-existing
-        worktree/launch commands — -b agent/<id> off HEAD (no trailing base),
-        bypassPermissions, no --model, no positional prompt."""
+        """Regression guard: a bare spawn adds a DETACHED worktree (no -b, no
+        app branch) and launches with bypassPermissions, no --model, no
+        positional prompt. (No default base resolves under the fake git, so the
+        detach point is HEAD — nothing trails the worktree path.)"""
         repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("AgentHub")
         sess = sm.registry[0]
         self.assertEqual(sess["status"], "running")
         wt = self._worktree_add_cmd()
-        self.assertEqual(wt[-2:], ["-b", f"agent/{sess['id']}"])  # nothing after the branch
+        self.assertIn("--detach", wt)
+        self.assertNotIn("-b", wt)
+        self.assertEqual(wt[-1], sess["worktreePath"])  # nothing after the path
         self.assertEqual(
             self._claude_cmd(),
             f"claude --remote-control '{sess['rcName']}' --permission-mode bypassPermissions",
@@ -911,12 +908,12 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.addCleanup(p.stop)
 
         sm.spawn("AgentHub", prompt="fix the bug", label="Fix Login",
-                 base_ref="develop", branch_name="fix-login", model="opus",
+                 base_ref="develop", model="opus",
                  permission_mode="acceptEdits")
         sess = sm.registry[0]
         self.assertEqual(sess["status"], "running")
-        # Custom branch honored + agent/ prefix enforced.
-        self.assertEqual(sess["branch"], "agent/fix-login")
+        # The app creates no branch — detached worktree, agent branches its work.
+        self.assertIsNone(sess["branch"])
         # Stored option fields.
         self.assertEqual(sess["label"], "Fix Login")
         self.assertEqual(sess["model"], "opus")
@@ -924,9 +921,11 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["baseRef"], "develop")
         # Label (slugged) flavors the RC display name.
         self.assertTrue(sess["rcName"].endswith("-AgentHub-Fix-Login"), sess["rcName"])
-        # worktree add forks off the base ref.
+        # worktree add is detached and forks off the chosen base ref.
         wt = self._worktree_add_cmd()
-        self.assertEqual(wt[-3:], ["-b", "agent/fix-login", "develop"])
+        self.assertIn("--detach", wt)
+        self.assertNotIn("-b", wt)
+        self.assertEqual(wt[-1], "develop")
         # Launch line carries model, permission mode, and the positional prompt.
         cmd = self._claude_cmd()
         self.assertIn("--model opus", cmd)
@@ -948,15 +947,6 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         # The whole prompt is one shlex-quoted token after `--`; no metachar leaks.
         self.assertIn(" -- '", cmd)
         self.assertTrue(cmd.rstrip().endswith("'"))
-
-    def test_spawn_rejects_bad_branch_name(self):
-        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
-        sm = self.make_spawn_ready_manager([repo])
-        sm.spawn("AgentHub", branch_name="../evil")
-        sess = sm.registry[0]
-        self.assertEqual(sess["status"], "error")
-        # Bad option fails before any worktree add is attempted.
-        self.assertFalse(any("worktree" in c and "add" in c for c in self.run_ok_calls))
 
     def test_spawn_rejects_missing_base_ref(self):
         repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
@@ -1010,12 +1000,12 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         newsess = next(c for c in self.run_ok_calls if "new-session" in c)
         self.assertIn(self.tmp, newsess)
 
-    def test_spawn_root_ignores_branch_and_base_but_keeps_model(self):
+    def test_spawn_root_ignores_base_but_keeps_model(self):
         sm = self._root_ready_manager()
         # base_ref would normally have to resolve in the repo; for root it does
         # not apply, so an unresolvable one must NOT fail the spawn.
         sm.spawn(ha.ROOT_REPO_NAME, base_ref="does-not-exist",
-                 branch_name="custom", model="opus", permission_mode="acceptEdits")
+                 model="opus", permission_mode="acceptEdits")
         sess = sm.registry[0]
         self.assertEqual(sess["status"], "running")
         self.assertIsNone(sess["branch"])
@@ -1047,10 +1037,10 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sid = sm.registry[0]["id"]
         sm.delete(sid)
         self.assertEqual(sm.registry, [])
-        self.assertFalse(any("worktree" in c and "remove" in c for c in self.run_calls))
-        self.assertFalse(any("-D" in c for c in self.run_calls))
-        self.assertFalse(any("-m" in c and ha.TRASH_PREFIX in " ".join(c)
-                             for c in self.run_ok_calls))
+        self.assertFalse(any("worktree" in c and "remove" in c
+                             for c in self.run_calls + self.run_ok_calls))
+        self.assertFalse(any("branch" in c and ("-D" in c or "-m" in c)
+                             for c in self.run_calls + self.run_ok_calls))
 
     def test_session_payload_flags_root(self):
         sm = self._root_ready_manager()
@@ -1554,6 +1544,95 @@ class TestPokeHeartbeat(unittest.TestCase):
         start = time.monotonic()
         self.assertTrue(ha._poke.wait(5))
         self.assertLess(time.monotonic() - start, 1.0)
+
+
+class TestPruneRepo(unittest.TestCase):
+    """prune_repo() over a REAL git repo + worktrees (the logic is git-heavy, so
+    faking run() would prove little). Verifies only merged/clean worktrees and
+    branches are swept and in-progress work is preserved."""
+
+    def _git(self, *args, cwd=None):
+        import subprocess
+        return subprocess.run(["git", *args], cwd=cwd or self.repo,
+                              capture_output=True, text=True, check=True)
+
+    def setUp(self):
+        import subprocess
+        if not shutil.which("git"):
+            self.skipTest("git not available")
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-prune-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.join(self.tmp, "demo")
+        os.makedirs(self.repo)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        run = lambda *a, cwd=None: subprocess.run(
+            ["git", *a], cwd=cwd or self.repo, env=env, capture_output=True,
+            text=True, check=True)
+        self._run = run
+        run("init", "-q", "-b", "main")
+        run("commit", "-q", "--allow-empty", "-m", "c1")
+
+        self.wt_root = os.path.join(self.tmp, "worktrees")
+        patches = [
+            ("REGISTRY_DIR", self.tmp),
+            ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
+            ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
+            ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
+            ("WORKTREES_ROOT", self.wt_root),
+            ("REPOS_ROOT", self.tmp),
+            ("device_name", lambda: "test-host"),
+            ("scan_repos", lambda: [{"name": "demo", "path": self.repo}]),
+        ]
+        for name, value in patches:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _add_worktree(self, sid, base="main"):
+        path = os.path.join(self.wt_root, "demo", sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self._run("worktree", "add", "--detach", path, base)
+        return path
+
+    def test_prune_sweeps_merged_keeps_in_progress(self):
+        sm = ha.SessionManager()
+
+        merged_wt = self._add_worktree("merged")          # detached at main -> merged
+        unmerged_wt = self._add_worktree("unmerged")
+        self._run("commit", "-q", "--allow-empty", "-m", "wip", cwd=unmerged_wt)
+        dirty_wt = self._add_worktree("dirty")
+        with open(os.path.join(dirty_wt, "scratch.txt"), "w") as f:
+            f.write("uncommitted")
+
+        # feature-merged points at main's tip (merged -> deleted); feature-wip at
+        # the unmerged worktree's commit, so it's ahead of main (kept).
+        self._run("branch", "feature-merged", "main")
+        wip_sha = self._run("rev-parse", "HEAD", cwd=unmerged_wt).stdout.strip()
+        self._run("branch", "feature-wip", wip_sha)
+
+        sm.prune_repo("demo")
+
+        # Merged/clean worktree gone; unmerged + dirty kept.
+        self.assertFalse(os.path.isdir(merged_wt))
+        self.assertTrue(os.path.isdir(unmerged_wt))
+        self.assertTrue(os.path.isdir(dirty_wt))
+
+        branches = self._run("branch", "--format", "%(refname:short)").stdout.split()
+        self.assertNotIn("feature-merged", branches)   # merged -> deleted
+        self.assertIn("feature-wip", branches)         # unmerged -> kept
+        self.assertIn("main", branches)                # default -> kept
+
+        res = sm.prunes["demo"]
+        self.assertEqual(res["status"], "done")
+        self.assertEqual(res["removedWorktrees"], 1)
+        self.assertEqual(res["deletedBranches"], 1)
+        self.assertGreaterEqual(res["skippedWorktrees"], 2)
+
+    def test_prune_unknown_repo_reports_error(self):
+        sm = ha.SessionManager()
+        sm.prune_repo("nope")
+        self.assertEqual(sm.prunes["nope"]["status"], "error")
 
 
 if __name__ == "__main__":
