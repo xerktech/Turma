@@ -5,7 +5,7 @@
 // data in, strings out. Ported from ClaudeHUD's plugin/src/screens/
 // input-strip.ts (box body + status label) and prompt-sheet.ts (sheet
 // windowing idea), adapted to this codebase's units.
-import { DISPLAY_LINES, LINE_WIDTH_PX } from "./render.ts";
+import { DISPLAY_LINES, LINE_WIDTH_PX } from "./layout.ts";
 import { wrapText } from "./text-wrap.ts";
 
 export type MicState = "idle" | "recording" | "finalising" | "error";

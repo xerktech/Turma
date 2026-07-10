@@ -1,17 +1,52 @@
-// PURE rendering: (state) -> display lines. No I/O, no Date.now — every
+// PURE rendering: (state) -> a ScreenModel. No I/O, no Date.now — every
 // timestamp render needs travels in AppState.now. Target: 10 lines x ~560px
 // usable width (the G2's 576x288 canvas, ~10 text lines).
-import type { AppState, ReplyScreenState } from "./app.ts";
+import type { AppState, ReplyScreenState, SessionScreenState } from "./app.ts";
+import { bottomBoxLines, inputBoxBody, sheetBody, statusLabel, type MicState } from "./input-box.ts";
+import { DISPLAY_LINES, LINE_WIDTH_PX } from "./layout.ts";
 import { glyph, liveState } from "./sessions.ts";
 import { wrapText } from "./text-wrap.ts";
 import type { AgentInfo, SessionInfo } from "./types.ts";
 
-export const DISPLAY_LINES = 10;
-export const LINE_WIDTH_PX = 560;
-// Session transcript view: 1 header line, rest is scrollable content. No
-// footer page indicator here (paging is continuous scroll, not discrete
-// pages, so "p/N" doesn't apply the way it does to the menu screens).
+export { DISPLAY_LINES, LINE_WIDTH_PX };
+// Legacy fixed transcript-area height (1 header line + 9 content), kept only
+// because app.ts's scroll-amount math still references it pending Task 4's
+// rewrite. renderSession no longer uses it: the session screen has no header
+// line anymore, and the transcript area now varies with the bottom box's
+// height (see bottomBoxLines).
 export const SESSION_CONTENT_AREA = DISPLAY_LINES - 1;
+
+// How many lines the transcript scrolls per scroll-gesture step on the
+// session screen (distinct from the menu screens' page-at-a-time paging).
+export const SESSION_SCROLL_STEP = 2;
+
+// Focus target on the session screen: the scrollable transcript, or the
+// bottom input/sheet box.
+export type SessionFocus = "transcript" | "bottom";
+
+// The session screen's live-interaction fields, added to AppState.session in
+// Task 4. Declared here (rather than widening AppState.session itself, which
+// is Task 4's job) so render() can read them — with defaults below — while
+// staying pure and testable from plain fixtures today.
+export interface SessionScreenStateExt extends SessionScreenState {
+  focus?: SessionFocus;
+  draft?: string;
+  mic?: MicState;
+  viewOffset?: number;
+  selected?: number;
+}
+
+export type BottomModel =
+  | { mode: "input"; lines: string[]; status: string; focused: boolean }
+  | { mode: "sheet"; lines: string[]; status: string; focused: boolean; options: string[]; selected: number };
+
+export type ScreenModel =
+  | { type: "lines"; lines: string[] }
+  | { type: "session"; transcriptLines: string[]; bottom: BottomModel };
+
+function linesModel(lines: string[]): ScreenModel {
+  return { type: "lines", lines };
+}
 
 function wrap(text: string): string[] {
   return wrapText(text, LINE_WIDTH_PX);
@@ -169,23 +204,58 @@ export function sessionContentLines(state: AppState, hostKey: string, sessionId:
   return lines;
 }
 
-function renderSession(state: AppState): string[] {
-  const sess = state.session;
-  if (!sess) return [headerLine(state, "Session")];
+// Builds the session screen's bottom bar — an AskUserQuestion sheet when the
+// session has a pending question, otherwise the free-text dictation input —
+// from the session's live signals plus the (Task 4-supplied, defaulted here)
+// focus/draft/mic/selected fields.
+function renderSessionBottom(state: AppState, sess: SessionScreenStateExt): BottomModel {
   const s = findSessionLocal(state, sess.hostKey, sess.sessionId);
-  const device = findAgentLocal(state, sess.hostKey)?.device ?? sess.hostKey;
-  const labelOrRepo = s ? s.label || s.repo : sess.sessionId;
-  const header = headerLine(state, `${device}·${labelOrRepo}`);
+  const focus = sess.focus ?? "transcript";
+  const mic: MicState = sess.mic ?? "idle";
+  const live = s ? liveState(s) : "idle";
+  const status = statusLabel({ mic, live });
+  const focused = focus === "bottom";
 
+  const question = s?.session?.question;
+  if (question) {
+    const options = s?.session?.questionOptions ?? [];
+    const selected = sess.selected ?? 0;
+    return { mode: "sheet", lines: sheetBody({ question, options, selected }), options, selected, status, focused };
+  }
+
+  const draft = sess.draft ?? "";
+  const viewOffset = sess.viewOffset ?? 0;
+  return { mode: "input", lines: inputBoxBody({ text: draft, focused, mic, viewOffset }), status, focused };
+}
+
+function renderSession(state: AppState): ScreenModel {
+  const sess = state.session as SessionScreenStateExt | null;
+  if (!sess) {
+    // Defensive fallback: screen is "session" but no session target is set.
+    // Shouldn't happen in practice (every transition to "session" sets both
+    // together), but keeps render() total over AppState.
+    return {
+      type: "session",
+      transcriptLines: [],
+      bottom: {
+        mode: "input",
+        lines: inputBoxBody({ text: "", focused: false, mic: "idle", viewOffset: 0 }),
+        status: statusLabel({ mic: "idle", live: "idle" }),
+        focused: false,
+      },
+    };
+  }
+
+  const bottom = renderSessionBottom(state, sess);
   const content = sessionContentLines(state, sess.hostKey, sess.sessionId);
-  const area = SESSION_CONTENT_AREA;
+  const area = DISPLAY_LINES - bottomBoxLines(bottom.lines);
   const maxOffset = Math.max(0, content.length - area);
   const offset = Math.min(sess.offset, maxOffset);
   const end = content.length - offset;
   const start = Math.max(0, end - area);
-  const visible = content.slice(start, end);
+  const transcriptLines = content.slice(start, end);
 
-  return [header, ...visible];
+  return { type: "session", transcriptLines, bottom };
 }
 
 // ---- actions --------------------------------------------------------
@@ -383,27 +453,27 @@ function renderSettings(state: AppState): string[] {
 
 // ---- dispatcher -----------------------------------------------------
 
-export function render(state: AppState): string[] {
+export function render(state: AppState): ScreenModel {
   switch (state.screen) {
     case "home":
-      return renderHome(state);
+      return linesModel(renderHome(state));
     case "session":
       return renderSession(state);
     case "actions":
-      return renderActions(state);
+      return linesModel(renderActions(state));
     case "question":
-      return renderQuestion(state);
+      return linesModel(renderQuestion(state));
     case "reply":
-      return renderReply(state);
+      return linesModel(renderReply(state));
     case "confirm":
-      return renderConfirm(state);
+      return linesModel(renderConfirm(state));
     case "newHost":
-      return renderNewHost(state);
+      return linesModel(renderNewHost(state));
     case "newRepo":
-      return renderNewRepo(state);
+      return linesModel(renderNewRepo(state));
     case "newPrompt":
-      return renderNewPrompt(state);
+      return linesModel(renderNewPrompt(state));
     case "settings":
-      return renderSettings(state);
+      return linesModel(renderSettings(state));
   }
 }
