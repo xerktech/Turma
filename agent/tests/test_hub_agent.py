@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import struct
 import sys
 import tempfile
@@ -1440,6 +1441,31 @@ class TestScanRepos(unittest.TestCase):
         self.assertEqual(
             [r["name"] for r in repos], ["RepoA", "RepoB"]  # sorted, filtered
         )
+
+
+@unittest.skipUnless(
+    hasattr(signal, "SIGUSR1"), "SIGUSR1 is POSIX-only; the agent runs on Linux"
+)
+class TestPokeHeartbeat(unittest.TestCase):
+    """SIGUSR1 (sent by tunnel-agent.js on a control-channel poke) must cut the
+    heartbeat loop's interval wait short so a just-queued command is picked up
+    right away instead of up to a whole INTERVAL later."""
+
+    def test_sigusr1_sets_the_poke_event_and_cuts_the_wait_short(self):
+        prev = signal.getsignal(signal.SIGUSR1)
+        signal.signal(signal.SIGUSR1, lambda *_: ha._poke.set())
+        self.addCleanup(signal.signal, signal.SIGUSR1, prev)
+
+        ha._poke.clear()
+        # Without a poke, wait() blocks up to the timeout and returns False.
+        self.assertFalse(ha._poke.wait(0.05))
+
+        # A poke makes the same wait return True effectively immediately — the
+        # heartbeat loop would beat now rather than after INTERVAL.
+        os.kill(os.getpid(), signal.SIGUSR1)
+        start = time.monotonic()
+        self.assertTrue(ha._poke.wait(5))
+        self.assertLess(time.monotonic() - start, 1.0)
 
 
 if __name__ == "__main__":

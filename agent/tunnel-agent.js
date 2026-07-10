@@ -199,6 +199,21 @@ function stopAllWatches() {
   watchers.clear();
 }
 
+// Nudge the session-manager process (hub-agent.py) to heartbeat immediately so
+// a just-queued hub command is delivered in that beat's reply rather than up
+// to a whole HUB_INTERVAL later. entrypoint.sh `exec`s hub-agent.py as PID 1
+// and starts this tunnel as a child, so PID 1 is the manager; it installs a
+// SIGUSR1 handler that cuts its interval sleep short. Best-effort — a failed
+// signal (e.g. running outside that entrypoint) just falls back to the
+// scheduled beat.
+function pokeHeartbeat() {
+  try {
+    process.kill(1, "SIGUSR1");
+  } catch (err) {
+    log(`poke failed: ${(err && err.message) || err}`);
+  }
+}
+
 // ws(s):// base derived from HUB_URL's scheme.
 const WS_BASE = HUB_URL.replace(/^http/, "ws").replace(/\/+$/, "");
 
@@ -337,6 +352,8 @@ function connectControl() {
       startWatch(String(msg.watch), msg.worktreePath ? String(msg.worktreePath) : "");
     } else if (msg.unwatch) {
       stopWatch(String(msg.unwatch));
+    } else if (msg.poke) {
+      pokeHeartbeat();
     }
   });
   const reconnect = () => {
@@ -364,5 +381,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, entryText, transcriptTail };
+  module.exports = { projectSlug, newestTranscript, entryText, transcriptTail, pokeHeartbeat };
 }
