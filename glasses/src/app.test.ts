@@ -454,6 +454,65 @@ describe("App", () => {
     expect(app.getState().session?.draft).toBe("deploy the fix"); // untouched
   });
 
+  it("input mode: doubleTap while recording cancels the mic before opening actions (no hot mic left behind)", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await toSessionBottom(app);
+
+    display.emit({ type: "tap" }); // idle -> recording (no stop-tap yet)
+    expect(app.getState().session?.mic).toBe("recording");
+
+    display.emit({ type: "doubleTap" }); // leave input focus -> actions
+    expect(dictation.cancelled).toBe(1); // mic torn down, not left capturing
+    expect(app.getState().session?.mic).toBe("idle");
+    expect(app.getState().screen).toBe("actions");
+  });
+
+  it("input mode: scroll handing focus back to the transcript while recording also cancels the mic", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await toSessionBottom(app);
+
+    display.emit({ type: "tap" }); // idle -> recording; draft still empty
+    expect(app.getState().session?.mic).toBe("recording");
+
+    display.emit({ type: "scrollUp" }); // empty draft -> exits to transcript
+    expect(dictation.cancelled).toBe(1);
+    expect(app.getState().session?.mic).toBe("idle");
+    expect(app.getState().session?.focus).toBe("transcript");
+  });
+
+  it("input mode: a result delivered after navigating to a different session is NOT appended to the new session's draft", async () => {
+    const s1 = session({ id: "s1", createdAt: "2026-01-01T00:00:00Z" });
+    const s2 = session({ id: "s2", createdAt: "2026-01-01T00:00:01Z" });
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [s1, s2] })] })),
+    });
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Home cursor auto-snaps to the first session (s1); tap in, focus the box,
+    // start recording — the callback captures s1 as the originating session.
+    display.emit({ type: "tap" }); // home -> session s1
+    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom"
+    display.emit({ type: "tap" }); // idle -> recording (captures host-a/s1)
+    expect(app.getState().session?.sessionId).toBe("s1");
+
+    // User navigates to a *different* session before the transcript lands.
+    app.restoreScreen("session", newSessionState("host-a", "s2"));
+    expect(app.getState().session?.sessionId).toBe("s2");
+
+    // The late s1 result must be dropped, not appended to s2's draft.
+    dictation.resolve({ text: "deploy the fix" });
+    expect(app.getState().session?.draft).toBe("");
+    expect(app.getState().session?.sessionId).toBe("s2");
+  });
+
   it("scrolling above the top triggers getHistory and shows the loading line until it resolves", async () => {
     const s = session({ session: signals({ transcriptAgeSec: 1 }) });
     const client = fakeClient({

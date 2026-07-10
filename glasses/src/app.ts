@@ -571,7 +571,16 @@ export class App {
     }
 
     if (e.type === "doubleTap") {
-      this.setState({ screen: "actions", actions: { hostKey: s.hostKey, sessionId: s.sessionId, cursor: 0 } });
+      // Leaving input focus with the mic still hot (tap-to-record, then
+      // doubleTap before the stop-tap) would strand a live HubAudioDictation
+      // recorder capturing until the app happens to background. Cancel it and
+      // clear the mic at the transition, mirroring onReply's doubleTap guard.
+      this.cancelBoxDictation(s);
+      this.setState({
+        screen: "actions",
+        session: { ...s, mic: "idle" },
+        actions: { hostKey: s.hostKey, sessionId: s.sessionId, cursor: 0 },
+      });
       return;
     }
     if (e.type === "tap") {
@@ -583,13 +592,24 @@ export class App {
     }
   }
 
+  // Cancels a live box recording if one is active (recording/finalising) —
+  // shared by every path that leaves the bottom input focus, so a hot mic
+  // never outlives the screen it was started on. No-op for idle/error.
+  private cancelBoxDictation(s: SessionScreenState): void {
+    if (s.mic === "recording" || s.mic === "finalising") this.dictation.cancel();
+  }
+
   // idle -> recording (dictation.start) -> finalising (dictation.stop);
   // ignored while finalising/error so a stray extra tap can't double-fire
-  // start/stop against an in-flight result.
+  // start/stop against an in-flight result. The originating session's
+  // hostKey+sessionId are captured into the result callback so a late
+  // transcript delivered after the user navigated to a *different* session
+  // can be dropped rather than misattributed (see onBoxDictationResult).
   private toggleBoxDictation(s: SessionScreenState): void {
     if (s.mic === "idle") {
+      const { hostKey, sessionId } = s;
       this.setState({ session: { ...s, mic: "recording" } });
-      this.dictation.start((r) => this.onBoxDictationResult(r));
+      this.dictation.start((r) => this.onBoxDictationResult(r, hostKey, sessionId));
       return;
     }
     if (s.mic === "recording") {
@@ -604,9 +624,13 @@ export class App {
   // the reason and settle back to idle rather than stranding the box in a
   // permanent error state the input-mode tap dispatch would otherwise never
   // let the user out of (tap is a no-op while mic==="error").
-  private onBoxDictationResult(result: DictationResult): void {
+  //
+  // Guarded on the originating session: if the current session isn't the one
+  // the dictation started on (user navigated away mid-capture), the result
+  // is dropped — never appended to, and thus never Sent to, the wrong agent.
+  private onBoxDictationResult(result: DictationResult, hostKey: string, sessionId: string): void {
     const s = this.state.session;
-    if (!s) return;
+    if (!s || s.hostKey !== hostKey || s.sessionId !== sessionId) return;
     if (result.unavailable) {
       this.setState({ session: { ...s, mic: "error" } });
       this.flash(result.reason ?? "dictation unavailable");
@@ -620,26 +644,26 @@ export class App {
   // Moves the box's view one line at a time (mirrors the transcript's
   // step-scroll); running off either end hands focus back to the
   // transcript rather than clamping in place — an empty draft has nothing
-  // to scroll through, so any scroll there exits immediately.
+  // to scroll through, so any scroll there exits immediately. Any exit to
+  // the transcript also cancels a live box recording (same hot-mic guard as
+  // the doubleTap path above).
   private scrollInputBox(type: "scrollUp" | "scrollDown", s: SessionScreenState): void {
-    if (s.draft === "") {
-      this.setState({ session: { ...s, focus: "transcript" } });
-      return;
-    }
+    if (s.draft === "") return this.handBackToTranscript(s);
     if (type === "scrollDown") {
-      if (s.viewOffset <= 0) {
-        this.setState({ session: { ...s, focus: "transcript" } });
-        return;
-      }
+      if (s.viewOffset <= 0) return this.handBackToTranscript(s);
       this.setState({ session: { ...s, viewOffset: s.viewOffset - 1 } });
       return;
     }
     const maxOffset = draftMaxViewOffset(s.draft);
-    if (s.viewOffset >= maxOffset) {
-      this.setState({ session: { ...s, focus: "transcript" } });
-      return;
-    }
+    if (s.viewOffset >= maxOffset) return this.handBackToTranscript(s);
     this.setState({ session: { ...s, viewOffset: s.viewOffset + 1 } });
+  }
+
+  // Hands focus back to the transcript, cancelling any live box recording
+  // and resetting the mic first so the mic never outlives the input focus.
+  private handBackToTranscript(s: SessionScreenState): void {
+    this.cancelBoxDictation(s);
+    this.setState({ session: { ...s, focus: "transcript", mic: "idle" } });
   }
 
   private clearHistoryTimer(sessionId: string): void {
