@@ -42,6 +42,30 @@ if [ "$AGENT" = "claude" ] || [ "$AGENT" = "claude-code" ]; then
   fi
 fi
 
+# --- GitHub auth preflight (agent-agnostic) --------------------------------
+# git authenticates through the image's system credential helper
+# (`gh auth git-credential`, set in /etc/gitconfig), so private clone/fetch/push
+# and `gh pr create` all need a usable gh login in the mounted /root/.config/gh.
+# This is a Linux container with NO OS keyring, so the token must be present as
+# PLAINTEXT there (hosts.yml: oauth_token):
+#   * Linux hosts store it that way already, so mounting the host's ~/.config/gh
+#     works out of the box.
+#   * Windows hosts keep it in Credential Manager, which this container can't
+#     read; the mounted dir must be seeded FROM WITHIN THIS CONTAINER (never a
+#     host script) — see the seed command printed below.
+# Non-fatal: we log the state (and the fix) but still start the manager, so
+# sessions that don't touch private git keep working.
+if command -v gh >/dev/null 2>&1; then
+  if gh auth status >/dev/null 2>&1; then
+    echo "[entrypoint] gh: authenticated as $(gh api user -q .login 2>/dev/null || echo '?')"
+  else
+    echo "[entrypoint] gh: NOT authenticated — private git ops and 'gh pr create' will fail."
+    echo "[entrypoint]   Seed/refresh the token from WITHIN this container (the host keyring"
+    echo "[entrypoint]   is not readable here); it persists to the mounted /root/.config/gh:"
+    echo "[entrypoint]     docker exec -it $(hostname) gh auth login --hostname github.com"
+  fi
+fi
+
 # --- Host identity (agent-agnostic) ----------------------------------------
 # The hub keys each agent by its physical host name (device). A container can't
 # see that on its own, so hub-agent.py --print-device auto-detects it (host
