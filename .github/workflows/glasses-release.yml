@@ -40,16 +40,9 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      # Build dist/ and package it + app.json into agenthub-hud.ehpk. The pack
-      # script writes to ../agenthub-hud.ehpk relative to glasses/, so the
-      # artifact lands at the workspace root.
-      - name: Install, build, pack (glasses/)
-        run: |
-          docker run --rm -v "$GITHUB_WORKSPACE":/workspace -w /workspace/glasses node:24-alpine \
-            sh -c 'npm ci --no-audit --no-fund && npm run build && npm run pack'
-
-      # Compose the release tag / versioned asset name from the repo VERSION
-      # file (MAJOR.MINOR) plus this run number as the patch.
+      # Compose the full build version from the repo VERSION file (MAJOR.MINOR)
+      # plus this run number as the patch, and the release tag / asset name from
+      # it. Computed before the build so it can be stamped into app.json below.
       - name: Compute version
         id: ver
         run: |
@@ -57,10 +50,27 @@ jobs:
           VERSION="${BASE}.${{ github.run_number }}"
           TAG="glasses-v${VERSION}"
           ASSET="agenthub-hud-v${VERSION}.ehpk"
-          cp "$GITHUB_WORKSPACE/agenthub-hud.ehpk" "$GITHUB_WORKSPACE/$ASSET"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+
+      # Stamp the build version into app.json so the packed .ehpk carries it.
+      # Even Hub keys sideloaded installs on app.json's "version" field — without
+      # this it stays 0.1.0 forever and every new build silently replaces the
+      # previous one instead of registering as a new build. (Only app.json is
+      # touched: `evenhub pack app.json dist` reads the version from there, and
+      # rewriting package.json would desync it from package-lock.json and break
+      # `npm ci`.) The pack script writes ../agenthub-hud.ehpk relative to
+      # glasses/, so the artifact lands at the workspace root.
+      - name: Stamp version, install, build, pack (glasses/)
+        run: |
+          docker run --rm -e VERSION="${{ steps.ver.outputs.version }}" \
+            -v "$GITHUB_WORKSPACE":/workspace -w /workspace/glasses node:24-alpine \
+            sh -c 'node -e "const fs=require(\"fs\");const j=JSON.parse(fs.readFileSync(\"app.json\"));j.version=process.env.VERSION;fs.writeFileSync(\"app.json\",JSON.stringify(j,null,2)+\"\n\")" &&
+                   npm ci --no-audit --no-fund && npm run build && npm run pack'
+
+      - name: Name the release asset
+        run: cp "$GITHUB_WORKSPACE/agenthub-hud.ehpk" "$GITHUB_WORKSPACE/${{ steps.ver.outputs.asset }}"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
