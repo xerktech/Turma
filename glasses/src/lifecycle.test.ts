@@ -200,11 +200,6 @@ describe("snapshotFromState", () => {
     expect(snapshotFromState(s)).toEqual({ screen: "session", hostKey: "h", sessionId: "s1" });
   });
 
-  it("maps the transient question screen to its parent session", () => {
-    const s = state({ screen: "question", question: { hostKey: "h", sessionId: "s1", cursor: 1 } });
-    expect(snapshotFromState(s)).toEqual({ screen: "session", hostKey: "h", sessionId: "s1" });
-  });
-
   it("maps the transient confirm screen to its parent session", () => {
     const s = state({
       screen: "confirm",

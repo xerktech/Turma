@@ -113,7 +113,7 @@ export function resetLifecycleForTests(): void {
 // ---- App-facing glue ------------------------------------------------------
 
 // Only these three screens are worth resurrecting after a background →
-// foreground WebView migration. Transient screens (actions/question/confirm/
+// foreground WebView migration. Transient screens (actions/confirm/
 // reply/newHost/newRepo/newPrompt) carry sub-state (cursors, dictation
 // phases, half-built spawn targets) that would restore as null and render a
 // degraded header-only fallback — so the snapshot records their *parent*
@@ -145,8 +145,6 @@ export function snapshotFromState(state: AppState): AppSnapshot {
     // Transient session-scoped screens → their parent session view.
     case "actions":
       return sessionSnap(state.actions?.hostKey, state.actions?.sessionId);
-    case "question":
-      return sessionSnap(state.question?.hostKey, state.question?.sessionId);
     case "confirm":
       return sessionSnap(state.confirm?.action.hostKey, state.confirm?.action.sessionId);
     case "reply": {

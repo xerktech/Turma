@@ -176,14 +176,32 @@ export function sessionContentLines(state: AppState, hostKey: string, sessionId:
   for (const entry of buffer?.entries ?? []) {
     lines.push(...wrap(roleLine(entry.role, entry.text)));
   }
+  // A pending question no longer duplicates here — the session bottom's
+  // sheet mode (Task 6) is the one place it renders. PR links aren't part
+  // of the question, so they still surface at the newest end of the
+  // transcript.
   const s = findSessionLocal(state, hostKey, sessionId);
-  if (s?.session?.question) {
-    lines.push(...wrap(`? ${s.session.question}`));
-  }
   for (const url of s?.session?.newPrUrls ?? []) {
     lines.push(...wrap(`PR ${url}`));
   }
   return lines;
+}
+
+// Whether the session bottom box should render/dispatch as the
+// AskUserQuestion sheet: a question is pending AND the user hasn't already
+// committed to a free-text answer instead. Task 6's "Dictate answer…" row
+// hands off to input mode by starting box dictation — once the mic goes hot,
+// or once a dictated draft is sitting there ready to send, the box stays in
+// input mode (so a mid-dictation tap/scroll isn't reinterpreted as an option
+// pick) even though the live session still reports the question as pending.
+// A type guard so callers narrow `question` to `string` in the sheet branch.
+// Exported so app.ts's bottom-box input dispatch routes through the exact
+// same predicate render.ts uses to choose a rendering mode.
+export function questionSheetActive(
+  question: string | null | undefined,
+  sess: SessionScreenState
+): question is string {
+  return !!question && sess.mic === "idle" && sess.draft === "";
 }
 
 // Builds the session screen's bottom bar — an AskUserQuestion sheet when the
@@ -199,7 +217,7 @@ function renderSessionBottom(state: AppState, sess: SessionScreenState): BottomM
   const focused = focus === "bottom";
 
   const question = s?.session?.question;
-  if (question) {
+  if (questionSheetActive(question, sess)) {
     const options = s?.session?.questionOptions ?? [];
     const selected = sess.selected;
     return { mode: "sheet", lines: sheetBody({ question, options, selected }), options, selected, status, focused };
@@ -258,7 +276,7 @@ function renderSession(state: AppState): ScreenModel {
 // ---- actions --------------------------------------------------------
 
 export interface ActionRow {
-  action: "send" | "clear" | "answer" | "restart" | "start" | "kill" | "delete" | "back";
+  action: "send" | "clear" | "restart" | "start" | "kill" | "delete" | "back";
   text: string;
 }
 
@@ -267,7 +285,9 @@ export interface ActionRow {
 // itself no longer routes through this menu — it happens directly in the
 // box — so this reads `state.session` (the same session's draft) rather
 // than the transient `ActionsScreenState`, which carries no draft of its
-// own.
+// own. There's no "Answer question" row (dropped in Task 6): the sheet is
+// always visible in the session bottom whenever a question is pending, so a
+// redundant menu path would just be another way to reach the same place.
 export function buildActionsRows(state: AppState, hostKey: string, sessionId: string): ActionRow[] {
   const s = findSessionLocal(state, hostKey, sessionId);
   if (!s || s.status === "stopped") {
@@ -286,7 +306,6 @@ export function buildActionsRows(state: AppState, hostKey: string, sessionId: st
     rows.push({ action: "send", text: "Send" });
     rows.push({ action: "clear", text: "Clear" });
   }
-  if (s.session?.question) rows.push({ action: "answer", text: "Answer question" });
   rows.push({ action: "restart", text: "Restart" });
   rows.push({ action: "kill", text: "Kill" });
   rows.push({ action: "delete", text: "Delete" });
@@ -309,29 +328,6 @@ function renderActions(state: AppState): string[] {
   );
   const lines = [header];
   visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === a.cursor)));
-  if (showFooter) lines.push(`p${page}/${totalPages}`);
-  return lines;
-}
-
-// ---- question -------------------------------------------------------
-
-function questionOptionRows(options: string[]): string[] {
-  return [...options.map((opt, i) => `${i + 1}) ${opt}`), "Dictate answer…", "Back"];
-}
-
-function renderQuestion(state: AppState): string[] {
-  const q = state.question;
-  if (!q) return [headerLine(state, "Question")];
-  const s = findSessionLocal(state, q.hostKey, q.sessionId);
-  const question = s?.session?.question ?? "";
-  const options = s?.session?.questionOptions ?? [];
-  const header = headerLine(state, "Question");
-  const questionLines = wrap(question);
-  const rows = questionOptionRows(options);
-  const area = Math.max(1, DISPLAY_LINES - 1 - questionLines.length);
-  const { visible, start, page, totalPages, showFooter } = paginate(rows, q.cursor, area, Math.max(1, area - 1));
-  const lines = [header, ...questionLines];
-  visible.forEach((text, i) => lines.push(markerLine(text, start + i === q.cursor)));
   if (showFooter) lines.push(`p${page}/${totalPages}`);
   return lines;
 }
@@ -472,8 +468,6 @@ export function render(state: AppState): ScreenModel {
       return renderSession(state);
     case "actions":
       return linesModel(renderActions(state));
-    case "question":
-      return linesModel(renderQuestion(state));
     case "reply":
       return linesModel(renderReply(state));
     case "confirm":

@@ -170,7 +170,7 @@ describe("render: session", () => {
     expect(model.bottom.lines.some((l) => l.includes("Dictate answer…"))).toBe(true);
   });
 
-  it("shows the merged transcript, a pending question, and PR urls at the newest end", () => {
+  it("shows the merged transcript and PR urls at the newest end, without duplicating the pending question (Task 6: the sheet owns it)", () => {
     const s = session({
       id: "s1",
       repo: "myrepo",
@@ -195,9 +195,11 @@ describe("render: session", () => {
 
     expect(model.transcriptLines.some((l) => l.includes("> hello"))).toBe(true);
     expect(model.transcriptLines.some((l) => l.includes("hi there"))).toBe(true);
-    expect(model.transcriptLines.some((l) => l.includes("? Deploy now?"))).toBe(true);
+    // The question renders once — in the sheet, not the transcript.
+    expect(model.transcriptLines.some((l) => l.includes("Deploy now?"))).toBe(false);
     expect(model.transcriptLines.some((l) => l.includes("https://github.com/x/y/pull/1"))).toBe(true);
     expect(model.bottom.mode).toBe("sheet");
+    expect(model.bottom.lines.some((l) => l.includes("Deploy now?"))).toBe(true);
   });
 
   it("pages a long transcript, showing only the bottom-anchored window at offset 0", () => {
@@ -329,7 +331,7 @@ describe("SESSION_SCROLL_STEP", () => {
 });
 
 describe("render: actions", () => {
-  it("shows the running-session menu with Answer question when a question is pending (no draft, so no Send/Clear)", () => {
+  it("shows the running-session menu with no Answer question row when a question is pending (Task 6: the sheet is always visible, so that row was dropped)", () => {
     const s = session({ id: "s1", session: signals({ question: "pick" }) });
     const agents = [agent({ sessions: [s] })];
     const state = base({
@@ -340,10 +342,11 @@ describe("render: actions", () => {
     });
 
     const lines = asLines(render(state));
-    expect(lines).toContain("> Answer question");
+    expect(lines).toContain("> Restart");
     expect(lines).toContain("  Kill");
     expect(lines).toContain("  Delete");
     expect(lines).toContain("  Back");
+    expect(lines.some((l) => l.includes("Answer question"))).toBe(false);
     expect(lines.some((l) => l.includes("Reply"))).toBe(false);
     expect(lines.some((l) => l.includes("Send"))).toBe(false);
     expect(lines.some((l) => l.includes("Clear"))).toBe(false);
@@ -396,29 +399,6 @@ describe("render: actions", () => {
     expect(lines).toContain("  Back");
     expect(lines.some((l) => l.includes("Reply"))).toBe(false);
     expect(lines.some((l) => l.includes("Kill"))).toBe(false);
-  });
-});
-
-describe("render: question", () => {
-  it("shows the wrapped question, numbered options, dictate, and back, with the cursor marker", () => {
-    const s = session({
-      id: "s1",
-      session: signals({ question: "Which approach?", questionOptions: ["Fast", "Safe", "Cheap"] }),
-    });
-    const agents = [agent({ sessions: [s] })];
-    const state = base({
-      screen: "question",
-      agents,
-      question: { hostKey: "host-a", sessionId: "s1", cursor: 1 },
-    });
-
-    const lines = asLines(render(state));
-    expect(lines.some((l) => l.includes("Which approach?"))).toBe(true);
-    expect(lines).toContain("  1) Fast");
-    expect(lines).toContain("> 2) Safe");
-    expect(lines).toContain("  3) Cheap");
-    expect(lines).toContain("  Dictate answer…");
-    expect(lines).toContain("  Back");
   });
 });
 

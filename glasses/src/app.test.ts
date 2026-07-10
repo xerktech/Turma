@@ -226,38 +226,160 @@ describe("App", () => {
     expect(app.getState().pending["spawn:host-a:myrepo"]).toBeDefined();
   });
 
-  it("question screen: tapping option N sends the digit as input and marks the session pending", async () => {
-    const s = session({ session: signals({ transcriptAgeSec: 1, question: "pick", questionOptions: ["A", "B"] }) });
-    const client = fakeClient({
-      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [s] })] })),
+  // ---- session bottom: AskUserQuestion sheet mode (Task 6) --------------
+  // Replaces the old separate "question" screen: a pending question renders
+  // inline in the session bottom bar (render.ts's sheet mode) whenever
+  // focus==="bottom", dispatched by onSessionBottom's sheet branch.
+
+  function questionAgent(): AgentInfo {
+    return agent({
+      sessions: [
+        session({ session: signals({ transcriptAgeSec: 1, question: "pick", questionOptions: ["A", "B"] }) }),
+      ],
     });
-    const app = makeApp(client);
+  }
+
+  async function toSheet(app: App): Promise<void> {
     await app.start();
     await vi.advanceTimersByTimeAsync(0);
+    display.emit({ type: "tap" }); // home -> session
+    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (sheet mode: question pending)
+  }
 
-    // home.cursor already sits on the (only) session row post-poll.
-    display.emit({ type: "tap" }); // -> session screen
-    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
-    // A pending question puts the box in sheet mode — still a Task-6 stub,
-    // so tap still opens the actions menu; with no draft and a pending
-    // question, cursor 0 is "Answer question" (the removed "Reply" row
-    // used to sit ahead of it).
-    display.emit({ type: "tap" }); // bottom-focus stub -> actions screen (cursor 0 = Answer question)
-    display.emit({ type: "tap" }); // -> question screen
-    expect(app.getState().screen).toBe("question");
+  function bottomMode(): string {
+    const model = display.model;
+    if (!model || model.type !== "session") throw new Error("expected a session ScreenModel");
+    return model.bottom.mode;
+  }
 
-    // cursor 0 = option "1) A"
+  it("sheet mode: entering the session with a pending question renders bottom.mode as 'sheet'", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+    expect(bottomMode()).toBe("sheet");
+    expect(app.getState().session?.selected).toBe(0);
+  });
+
+  it("sheet mode: scroll moves `selected` through the options plus the trailing Dictate-answer row, clamped", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+
+    display.emit({ type: "scrollDown" }); // A -> B
+    expect(app.getState().session?.selected).toBe(1);
+    display.emit({ type: "scrollDown" }); // B -> "Dictate answer…" (index === options.length)
+    expect(app.getState().session?.selected).toBe(2);
+    display.emit({ type: "scrollDown" }); // clamped at the end
+    expect(app.getState().session?.selected).toBe(2);
+
+    display.emit({ type: "scrollUp" });
+    display.emit({ type: "scrollUp" });
+    display.emit({ type: "scrollUp" }); // clamped at 0
+    expect(app.getState().session?.selected).toBe(0);
+  });
+
+  it("sheet mode: tap on option index 1 sends the 1-based digit, flashes, marks pending, and hands focus back to the transcript", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+
+    display.emit({ type: "scrollDown" }); // selected -> 1 ("B")
     display.emit({ type: "tap" });
 
-    expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "1");
+    expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "2");
     expect(app.getState().screen).toBe("session");
+    expect(app.getState().session?.focus).toBe("transcript");
     expect(app.getState().pending["s1"]).toBeDefined();
 
     await vi.advanceTimersByTimeAsync(0); // flush the sendInput promise
     expect(app.getState().flash).toBe(FLASH_QUEUED);
-    // Task 5 surfaces the flash as a transient top transcript line on the
-    // session screen (it has no header of its own since Task 2).
     expect(display.lines.some((l) => l.includes("queued"))).toBe(true);
+  });
+
+  it("sheet mode: tap on option index 0 sends digit '1'", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+
+    display.emit({ type: "tap" }); // selected 0 = "A"
+    expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "1");
+  });
+
+  it("sheet mode: doubleTap opens the actions menu (session actions stay reachable while a question is pending)", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+
+    display.emit({ type: "doubleTap" });
+    expect(app.getState().screen).toBe("actions");
+  });
+
+  it("sheet mode: tap on the trailing 'Dictate answer…' row starts box dictation and hands the box to input mode; the dictated draft then sends via the ordinary actions-menu Send path", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+
+    display.emit({ type: "scrollDown" });
+    display.emit({ type: "scrollDown" }); // selected -> options.length ("Dictate answer…")
+    display.emit({ type: "tap" });
+
+    expect(dictation.started).toBe(1);
+    expect(app.getState().session?.mic).toBe("recording");
+    expect(app.getState().screen).toBe("session"); // stays put — no separate reply screen
+    expect(app.getState().session?.focus).toBe("bottom");
+    // Bottom now renders as input (dictation active) even though the live
+    // session still reports the question as pending.
+    expect(bottomMode()).toBe("input");
+
+    dictation.resolve({ text: "yes deploy" });
+    expect(app.getState().session?.draft).toBe("yes deploy");
+    expect(app.getState().session?.mic).toBe("idle");
+    // Still input mode: a non-empty draft keeps the box out of the sheet
+    // until it's sent or cleared.
+    expect(bottomMode()).toBe("input");
+
+    display.emit({ type: "doubleTap" }); // -> actions, cursor 0 = Send (draft present)
+    display.emit({ type: "tap" }); // select Send
+
+    expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "yes deploy");
+    expect(app.getState().screen).toBe("session");
+  });
+
+  it("a question arriving via poll while the box mic is recording (plain input mode) cancels the mic and drops focus to the transcript", async () => {
+    const noQuestion = agent({ sessions: [session({ session: signals({ transcriptAgeSec: 1 }) })] });
+    const withQuestion = questionAgent();
+    const client = fakeClient({
+      listAgents: vi
+        .fn()
+        .mockResolvedValueOnce({ now: Date.now(), agents: [noQuestion] })
+        .mockResolvedValue({ now: Date.now(), agents: [withQuestion] }),
+    });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0); // 1st poll: no question yet
+
+    display.emit({ type: "tap" }); // -> session
+    display.emit({ type: "tap" }); // focus:"bottom", input mode (no question)
+    display.emit({ type: "tap" }); // idle -> recording
+    expect(app.getState().session?.mic).toBe("recording");
+
+    await vi.advanceTimersByTimeAsync(1000); // 2nd poll: question now pending
+    expect(dictation.cancelled).toBe(1);
+    expect(app.getState().session?.mic).toBe("idle");
+    expect(app.getState().session?.focus).toBe("transcript");
+  });
+
+  it("does not yank focus away from an already-pending question's sheet on subsequent polls", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client, 1000);
+    await toSheet(app);
+
+    display.emit({ type: "scrollDown" }); // selected -> 1, focus stays "bottom"
+    expect(app.getState().session?.focus).toBe("bottom");
+
+    await vi.advanceTimersByTimeAsync(1000); // poll again: same question still pending
+    expect(app.getState().session?.focus).toBe("bottom");
+    expect(app.getState().session?.selected).toBe(1); // untouched
   });
 
   // ---- bottom-box input mode: dictate / send / clear (Task 5) -----------
