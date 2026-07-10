@@ -1214,6 +1214,22 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
             {"sessionId": sess["id"], "entries": [], "truncated": False},
         ])
 
+    def test_keeps_full_message_beyond_tail_preview_cap(self):
+        # History is a reading path: a message longer than the heartbeat's
+        # per-message preview (TAIL_MSG_CHARS) is kept in full up to the larger
+        # TAIL_MSG_CHARS_FULL, so a long response isn't cut off mid-sentence.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        long_text = "x" * (ha.TAIL_MSG_CHARS + 50)
+        write_jsonl(os.path.join(proj, "t.jsonl"), [
+            {"uuid": "u1", "type": "user", "message": {"content": long_text}},
+        ])
+        sm._stage_history(sess["id"])
+        text = sm.history_results[0]["entries"][0]["text"]
+        self.assertEqual(text, long_text)
+        self.assertGreater(len(text), ha.TAIL_MSG_CHARS)
+
     def test_byte_cap_marks_truncated(self):
         sm = self.make_manager()
         sess = self._running_session(sm)

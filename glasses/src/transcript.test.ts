@@ -28,6 +28,16 @@ describe("mergeTail", () => {
     expect(buf.entries.find((e) => e.id === "2")?.text).toBe("finished sentence");
   });
 
+  it("keeps the longer copy when a shorter one arrives for the same id", () => {
+    // The live tail / history deliver a full message; a later heartbeat poll
+    // ships the bounded per-message preview (a truncated prefix). The preview
+    // must not clobber the full text back to truncated.
+    let buf = emptyBuffer();
+    buf = mergeTail(buf, [entry("1", "a full assistant response, all of it")]);
+    buf = mergeTail(buf, [entry("1", "a full assistant respon")]); // preview prefix
+    expect(buf.entries.find((e) => e.id === "1")?.text).toBe("a full assistant response, all of it");
+  });
+
   it("treats an empty tail as a no-op", () => {
     let buf = emptyBuffer();
     buf = mergeTail(buf, [entry("1", "a")]);

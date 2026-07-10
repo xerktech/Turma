@@ -4,3 +4,13 @@
 # Only REVIEWED, non-actionable findings belong here, each with a reason. Any
 # HIGH/CRITICAL not listed here still fails the scan — this is a triage list,
 # not a mute button. Revisit entries when the upstream fix reaches our base image.
+
+# CVE-2026-39822 — Go stdlib os.Root symlink-following / directory-traversal.
+# Present only in bundled third-party Go binaries (docker CLI 29.6.1 and gh
+# 2.96.0), both compiled with Go 1.26.4; the fix is Go 1.25.12 / 1.26.5. Both
+# are already the newest upstream releases (docker 29.6.1 2026-06-26, gh 2.96.0
+# 2026-07-02), so DOCKER_CLI_VERSION / GH_VERSION can't be bumped yet — they'll
+# pick up the patched toolchain on their next rebuild. Not first-party code and
+# not reachable via attacker-controlled symlinks in this container. The expiry
+# forces a revisit: bump the pins once upstream ships Go-1.26.5+ rebuilds.
+CVE-2026-39822 exp:2026-10-10

@@ -109,6 +109,13 @@ def _project_slug(path):
 # beat, and how many chars of each to keep (payload-size bounds).
 TAIL_MSGS = int(os.environ.get("SESSION_TAIL_MSGS", "30"))
 TAIL_MSG_CHARS = int(os.environ.get("SESSION_TAIL_MSG_CHARS", "500"))
+# The per-beat tail above is a bounded *preview* shipped for every session on
+# every heartbeat, so a long message is clipped to keep the payload small. The
+# single-session reading paths — the live tail (tunnel-agent.js) and on-demand
+# `history` — instead keep this many chars per message, so a full assistant
+# response never shows up cut off mid-sentence on the glasses. The client keeps
+# whichever copy of a message is longer, so the preview never clobbers it.
+TAIL_MSG_CHARS_FULL = int(os.environ.get("SESSION_TAIL_MSG_CHARS_FULL", "16000"))
 # Terminal color/cursor codes sometimes make it into pasted transcript text;
 # strip them so the glasses client only ever sees plain text.
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -832,7 +839,7 @@ def _history_entries(path):
         entries.append({
             "id": entry.get("uuid"),
             "role": entry.get("type"),
-            "text": text[:TAIL_MSG_CHARS],
+            "text": text[:TAIL_MSG_CHARS_FULL],
         })
     return entries, byte_capped
 
