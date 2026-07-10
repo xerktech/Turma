@@ -1449,5 +1449,46 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       await vi.advanceTimersByTimeAsync(80);
       expect(app.getState().reveal.shown).toBeGreaterThan(frozen);
     });
+
+    it("pins the visible window when scrolled up and new text lands, but auto-scrolls at the tail", async () => {
+      const app = await enterSession();
+      // Enough one-line entries to overflow the display so scrolling up moves
+      // the offset above 0 and leaves a stable window of older lines.
+      const entries = Array.from({ length: 30 }, (_, i) => ({
+        id: `m${i}`,
+        role: "assistant",
+        text: `line ${i}`,
+      }));
+      liveTail.deliver(entries);
+      await vi.advanceTimersByTimeAsync(200); // let the tail fully reveal
+
+      // Scroll up to read history and snapshot the top visible transcript line.
+      display.emit({ type: "scrollUp" });
+      const offsetUp = app.getState().session!.offset;
+      expect(offsetUp).toBeGreaterThan(0);
+      const model = () => display.model as { type: "session"; transcriptLines: string[] };
+      const topBefore = model().transcriptLines[0];
+
+      // A committed block lands underneath the scrolled-up view (>200 chars, so
+      // it snaps in at full length rather than typewriting): the visible window
+      // stays pinned to the same lines (offset absorbs the added lines) and the
+      // fresh text is NOT yanked on screen.
+      const block = "brand new block ".repeat(20); // ~320 chars -> several wrapped lines
+      liveTail.deliver([...entries, { id: "mNew", role: "assistant", text: block }]);
+      expect(model().transcriptLines[0]).toBe(topBefore);
+      expect(app.getState().session!.offset).toBeGreaterThan(offsetUp);
+      expect(display.lines.some((l) => l.includes("brand new block"))).toBe(false);
+
+      // Back at the tail (offset 0), new text auto-scrolls in as before.
+      for (let i = 0; i < 40; i++) display.emit({ type: "scrollDown" });
+      expect(app.getState().session!.offset).toBe(0);
+      liveTail.deliver([
+        ...entries,
+        { id: "mNew", role: "assistant", text: block },
+        { id: "mNew2", role: "assistant", text: "newest line here" },
+      ]);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(display.lines.some((l) => l.includes("newest line here"))).toBe(true);
+    });
   });
 });
