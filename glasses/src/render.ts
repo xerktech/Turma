@@ -238,12 +238,19 @@ function renderSession(state: AppState): ScreenModel {
 
   const bottom = renderSessionBottom(state, sess);
   const content = sessionContentLines(state, sess.hostKey, sess.sessionId);
-  const area = DISPLAY_LINES - bottomBoxLines(bottom.lines);
+  // An active flash (e.g. "✓ queued" after Send/restart/kill) has nowhere
+  // else to render on this screen — Task 2 dropped the session header this
+  // and every other screen's headerLine used to carry it. Surface it as a
+  // transient top line of the transcript instead (only while it's live),
+  // borrowing from the content window the same way a header line would.
+  const flash = activeFlash(state);
+  const flashLines = flash ? wrap(flash) : [];
+  const area = Math.max(1, DISPLAY_LINES - bottomBoxLines(bottom.lines) - flashLines.length);
   const maxOffset = Math.max(0, content.length - area);
   const offset = Math.min(sess.offset, maxOffset);
   const end = content.length - offset;
   const start = Math.max(0, end - area);
-  const transcriptLines = content.slice(start, end);
+  const transcriptLines = [...flashLines, ...content.slice(start, end)];
 
   return { type: "session", transcriptLines, bottom };
 }
@@ -251,10 +258,16 @@ function renderSession(state: AppState): ScreenModel {
 // ---- actions --------------------------------------------------------
 
 export interface ActionRow {
-  action: "reply" | "answer" | "restart" | "start" | "kill" | "delete" | "back";
+  action: "send" | "clear" | "answer" | "restart" | "start" | "kill" | "delete" | "back";
   text: string;
 }
 
+// Context-sensitive: Send/Clear only show up when the session's bottom-box
+// draft (dictated in-box, Task 5) actually has text to act on. Dictation
+// itself no longer routes through this menu — it happens directly in the
+// box — so this reads `state.session` (the same session's draft) rather
+// than the transient `ActionsScreenState`, which carries no draft of its
+// own.
 export function buildActionsRows(state: AppState, hostKey: string, sessionId: string): ActionRow[] {
   const s = findSessionLocal(state, hostKey, sessionId);
   if (!s || s.status === "stopped") {
@@ -264,7 +277,15 @@ export function buildActionsRows(state: AppState, hostKey: string, sessionId: st
       { action: "back", text: "Back" },
     ];
   }
-  const rows: ActionRow[] = [{ action: "reply", text: "Reply (dictate)" }];
+  const draft =
+    state.session && state.session.hostKey === hostKey && state.session.sessionId === sessionId
+      ? state.session.draft
+      : "";
+  const rows: ActionRow[] = [];
+  if (draft) {
+    rows.push({ action: "send", text: "Send" });
+    rows.push({ action: "clear", text: "Clear" });
+  }
   if (s.session?.question) rows.push({ action: "answer", text: "Answer question" });
   rows.push({ action: "restart", text: "Restart" });
   rows.push({ action: "kill", text: "Kill" });

@@ -283,6 +283,43 @@ describe("render: session", () => {
     expect(asSession(render(falseState)).transcriptLines.some((l) => l.includes("truncated"))).toBe(false);
     expect(asSession(render(undefinedState)).transcriptLines.some((l) => l.includes("truncated"))).toBe(false);
   });
+
+  // ---- flash surfacing (Task 5 carry-forward: the session screen has no
+  // header of its own to show it, unlike every other screen) -------------
+
+  it("surfaces an active flash as a transient top line of the transcript", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+      flash: "✓ queued — agent picks up in ~20s",
+      flashUntil: NOW + 1000,
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines[0]).toContain("✓ queued");
+    expect(model.transcriptLines.some((l) => l.includes("hi"))).toBe(true);
+  });
+
+  it("does not show an expired flash on the session screen", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+      flash: "✓ queued — agent picks up in ~20s",
+      flashUntil: NOW - 1,
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines.some((l) => l.includes("queued"))).toBe(false);
+    expect(model.transcriptLines[0]).toBe("> hi");
+  });
 });
 
 describe("SESSION_SCROLL_STEP", () => {
@@ -292,21 +329,56 @@ describe("SESSION_SCROLL_STEP", () => {
 });
 
 describe("render: actions", () => {
-  it("shows the running-session menu with Answer question when a question is pending", () => {
+  it("shows the running-session menu with Answer question when a question is pending (no draft, so no Send/Clear)", () => {
     const s = session({ id: "s1", session: signals({ question: "pick" }) });
     const agents = [agent({ sessions: [s] })];
     const state = base({
       screen: "actions",
       agents,
-      actions: { hostKey: "host-a", sessionId: "s1", cursor: 1 },
+      session: newSessionState("host-a", "s1"),
+      actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
     });
 
     const lines = asLines(render(state));
-    expect(lines).toContain("  Reply (dictate)");
     expect(lines).toContain("> Answer question");
     expect(lines).toContain("  Kill");
     expect(lines).toContain("  Delete");
     expect(lines).toContain("  Back");
+    expect(lines.some((l) => l.includes("Reply"))).toBe(false);
+    expect(lines.some((l) => l.includes("Send"))).toBe(false);
+    expect(lines.some((l) => l.includes("Clear"))).toBe(false);
+  });
+
+  it("prepends Send/Clear ahead of the other rows once the session's bottom-box draft has text", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "actions",
+      agents,
+      session: { ...newSessionState("host-a", "s1"), draft: "deploy the fix" },
+      actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
+    });
+
+    const lines = asLines(render(state));
+    expect(lines).toContain("> Send");
+    expect(lines).toContain("  Clear");
+    expect(lines).toContain("  Restart");
+    expect(lines).toContain("  Kill");
+  });
+
+  it("ignores another session's draft (Send/Clear only reflect the actions target's own session)", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "actions",
+      agents,
+      session: { ...newSessionState("host-a", "other-session"), draft: "unrelated draft" },
+      actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
+    });
+
+    const lines = asLines(render(state));
+    expect(lines.some((l) => l.includes("Send"))).toBe(false);
+    expect(lines.some((l) => l.includes("Clear"))).toBe(false);
   });
 
   it("omits Answer question and dictate/restart when the session is stopped", () => {

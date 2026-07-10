@@ -34,6 +34,15 @@ function windowTail(lines: string[], viewOffset: number): string[] {
   return lines.slice(start, end);
 }
 
+// How far the box can scroll back from the tail for a given draft — the
+// same bound `windowTail` clamps `viewOffset` against, exposed so app.ts's
+// bottom-box scroll dispatch (Task 5) can tell "already at the top" apart
+// from "more to scroll" without duplicating the wrap/width math here.
+export function draftMaxViewOffset(text: string): number {
+  const wrapped = wrapText(text, LINE_WIDTH_PX);
+  return Math.max(0, wrapped.length - BOTTOM_MAX_LINES);
+}
+
 // Input-mode body: the visible (windowed) text for the box, given the draft
 // text, focus, mic state, and a scroll offset within a tall box. Mic state
 // takes priority over the text itself — a user actively dictating should

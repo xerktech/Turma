@@ -364,7 +364,7 @@ describe("installLifecycle", () => {
     // backgrounds the app: snapshot must record the parent session view.
     app.restoreScreen("session", newSessionState("host-a", "s1"));
     app.handleInput({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
-    app.handleInput({ type: "tap" }); // bottom-focus stub -> actions
+    app.handleInput({ type: "doubleTap" }); // input-mode doubleTap -> actions
     expect(app.getState().screen).toBe("actions");
 
     const snapshot = host().__getStateSnapshot!();
@@ -447,12 +447,14 @@ describe("lifecycle phase handlers", () => {
   });
 });
 
-// Task 7: recording + foreground-exit / abnormal-exit / system-exit MUST
-// cancel the active dictation (mic off). Ownership lives in App.pause()
-// (app.ts) — onForegroundExit and onAbnormalOrSystemExit both funnel through
-// it, never touching `dictation` directly — so driving these through the
-// same fake-driven lifecycle handlers Task 6 established also proves the
-// mic gets cancelled.
+// Recording + foreground-exit / abnormal-exit / system-exit MUST cancel the
+// active dictation (mic off). Ownership lives in App.pause() (app.ts) —
+// onForegroundExit and onAbnormalOrSystemExit both funnel through it, never
+// touching `dictation` directly. Task 5 moved dictation off the standalone
+// reply screen and into the session's bottom box directly (mic:"recording"
+// on SessionScreenState) — pause() cancels that the same way it used to
+// cancel a reply/listening dictation, so driving these through the same
+// fake-driven lifecycle handlers still proves the mic gets cancelled.
 describe("lifecycle cancels an active dictation (mic off)", () => {
   function makeAppWithSession(): { app: App; display: FakeDisplay; dictation: FakeDictation } {
     const display = new FakeDisplay();
@@ -470,35 +472,36 @@ describe("lifecycle cancels an active dictation (mic off)", () => {
     return { app, display, dictation };
   }
 
-  async function driveIntoListeningReply(app: App, display: FakeDisplay): Promise<void> {
+  async function driveIntoBoxRecording(app: App, display: FakeDisplay): Promise<void> {
     await app.start();
     await vi.advanceTimersByTimeAsync(0); // let the first poll land the session; cursor auto-snaps to it
     display.emit({ type: "tap" }); // home -> session
     display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
-    display.emit({ type: "tap" }); // bottom-focus stub -> actions (cursor 0 = Reply)
-    display.emit({ type: "tap" }); // actions -> reply, listening
+    display.emit({ type: "tap" }); // input mode: idle -> recording (Task 5)
   }
 
   it("onForegroundExit cancels a recording dictation via App.pause()", async () => {
     const { app, display, dictation } = makeAppWithSession();
-    await driveIntoListeningReply(app, display);
-    expect(app.getState().reply?.phase).toBe("listening");
+    await driveIntoBoxRecording(app, display);
+    expect(app.getState().session?.mic).toBe("recording");
     expect(dictation.started).toBe(1);
 
     onForegroundExit(app);
 
     expect(dictation.cancelled).toBe(1);
+    expect(app.getState().session?.mic).toBe("idle");
     expect(app.getState().screen).toBe("session");
   });
 
   it("onAbnormalOrSystemExit cancels a recording dictation via App.pause()", async () => {
     const { app, display, dictation } = makeAppWithSession();
-    await driveIntoListeningReply(app, display);
-    expect(app.getState().reply?.phase).toBe("listening");
+    await driveIntoBoxRecording(app, display);
+    expect(app.getState().session?.mic).toBe("recording");
 
     onAbnormalOrSystemExit(app, display);
 
     expect(dictation.cancelled).toBe(1);
+    expect(app.getState().session?.mic).toBe("idle");
     expect(app.getState().screen).toBe("session");
     expect(display.teardownCalled).toBe(1); // display teardown still happens too
   });

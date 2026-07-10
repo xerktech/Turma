@@ -176,14 +176,12 @@ describe("App", () => {
     expect(app.getState().session).toEqual(newSessionState("host-a", "s1"));
 
     // Fresh session screen: transcript focus, offset 0 ("at the tail") — tap
-    // hands focus to the bottom box rather than jumping straight to actions
-    // (Task 4). The bottom-focus tap is a Task-4 stub standing in for Task
-    // 5's real dictation toggle; for now it opens the actions menu so the
-    // reply/kill/question/confirm flows this task doesn't touch stay
-    // reachable in tests.
+    // hands focus to the bottom box. Once focused there (input mode, no
+    // pending question), tap toggles dictation and doubleTap opens the
+    // context actions menu (Task 5).
     display.emit({ type: "tap" }); // -> focus:"bottom"
     expect(app.getState().session?.focus).toBe("bottom");
-    display.emit({ type: "tap" }); // bottom-focus stub -> actions
+    display.emit({ type: "doubleTap" }); // input-mode doubleTap -> actions
     expect(app.getState().screen).toBe("actions");
 
     display.emit({ type: "doubleTap" });
@@ -240,8 +238,11 @@ describe("App", () => {
     // home.cursor already sits on the (only) session row post-poll.
     display.emit({ type: "tap" }); // -> session screen
     display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
-    display.emit({ type: "tap" }); // bottom-focus stub -> actions screen (cursor 0 = Reply)
-    display.emit({ type: "scrollDown" }); // -> Answer question
+    // A pending question puts the box in sheet mode — still a Task-6 stub,
+    // so tap still opens the actions menu; with no draft and a pending
+    // question, cursor 0 is "Answer question" (the removed "Reply" row
+    // used to sit ahead of it).
+    display.emit({ type: "tap" }); // bottom-focus stub -> actions screen (cursor 0 = Answer question)
     display.emit({ type: "tap" }); // -> question screen
     expect(app.getState().screen).toBe("question");
 
@@ -253,66 +254,177 @@ describe("App", () => {
     expect(app.getState().pending["s1"]).toBeDefined();
 
     await vi.advanceTimersByTimeAsync(0); // flush the sendInput promise
-    // Task 2 dropped the session screen's header line, so a flash no longer
-    // renders anywhere while on "session" — assert the flash state directly
-    // rather than the (now header-less) rendered lines.
     expect(app.getState().flash).toBe(FLASH_QUEUED);
+    // Task 5 surfaces the flash as a transient top transcript line on the
+    // session screen (it has no header of its own since Task 2).
+    expect(display.lines.some((l) => l.includes("queued"))).toBe(true);
   });
 
-  it("reply screen: dictation result -> preview -> Send calls sendInput with the dictated text", async () => {
+  // ---- bottom-box input mode: dictate / send / clear (Task 5) -----------
+
+  async function toSessionBottom(app: App): Promise<void> {
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    display.emit({ type: "tap" }); // home -> session
+    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom"
+  }
+
+  it("input mode: tap toggles dictation start/stop; a delivered result appends to the draft", async () => {
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
     });
     const app = makeApp(client);
-    await app.start();
-    await vi.advanceTimersByTimeAsync(0);
+    await toSessionBottom(app);
+    expect(app.getState().session?.focus).toBe("bottom");
 
-    display.emit({ type: "tap" }); // session
-    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
-    display.emit({ type: "tap" }); // bottom-focus stub -> actions (cursor 0 = Reply)
-    display.emit({ type: "tap" }); // -> reply, listening
-    expect(app.getState().screen).toBe("reply");
-    expect(app.getState().reply?.phase).toBe("listening");
+    display.emit({ type: "tap" }); // idle -> recording
+    expect(app.getState().session?.mic).toBe("recording");
     expect(dictation.started).toBe(1);
 
+    display.emit({ type: "tap" }); // recording -> finalising
+    expect(app.getState().session?.mic).toBe("finalising");
+    expect(dictation.stopped).toBe(1);
+
     dictation.resolve({ text: "deploy the fix" });
-    expect(app.getState().reply?.phase).toBe("preview");
+    expect(app.getState().session?.draft).toBe("deploy the fix");
+    expect(app.getState().session?.mic).toBe("idle");
+    expect(app.getState().session?.viewOffset).toBe(0);
 
-    display.emit({ type: "tap" }); // cursor 0 = Send
-    expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "deploy the fix");
-    expect(app.getState().screen).toBe("session");
-
-    await vi.advanceTimersByTimeAsync(0);
-    // Task 2 dropped the session screen's header line — assert the flash
-    // state directly (see the equivalent note in the question-screen test).
-    expect(app.getState().flash).toBe(FLASH_QUEUED);
+    // A second dictation round appends, space-joined, to the existing draft.
+    display.emit({ type: "tap" }); // idle -> recording again
+    display.emit({ type: "tap" }); // recording -> finalising
+    dictation.resolve({ text: "and redeploy" });
+    expect(app.getState().session?.draft).toBe("deploy the fix and redeploy");
   });
 
-  it("pause() cancels an in-progress dictation (reply screen, listening phase) and navigates back", async () => {
+  it("input mode: tap is ignored while finalising or in error", async () => {
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
     });
     const app = makeApp(client);
-    await app.start();
-    await vi.advanceTimersByTimeAsync(0);
+    await toSessionBottom(app);
 
-    display.emit({ type: "tap" }); // session
-    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
-    display.emit({ type: "tap" }); // bottom-focus stub -> actions (cursor 0 = Reply)
-    display.emit({ type: "tap" }); // -> reply, listening
-    expect(app.getState().reply?.phase).toBe("listening");
+    display.emit({ type: "tap" }); // idle -> recording
+    display.emit({ type: "tap" }); // recording -> finalising
+    display.emit({ type: "tap" }); // finalising: ignored
+    expect(dictation.started).toBe(1); // not re-started
+    expect(app.getState().session?.mic).toBe("finalising");
+  });
+
+  it("input mode: an unavailable dictation result flashes the reason and settles back to idle", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await toSessionBottom(app);
+
+    display.emit({ type: "tap" }); // idle -> recording
+    dictation.resolve({ text: "", unavailable: true, reason: "mic permission denied" });
+
+    expect(app.getState().session?.mic).toBe("idle");
+    expect(app.getState().flash).toBe("mic permission denied");
+    expect(app.getState().session?.draft).toBe(""); // nothing appended
+  });
+
+  it("input mode: doubleTap opens the actions menu; Send/Clear only appear once there's a draft", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await toSessionBottom(app);
+
+    display.emit({ type: "doubleTap" }); // no draft yet -> actions, no Send/Clear
+    expect(app.getState().screen).toBe("actions");
+    expect(display.lines.some((l) => l.includes("Send"))).toBe(false);
+    expect(display.lines.some((l) => l.includes("Clear"))).toBe(false);
+
+    display.emit({ type: "doubleTap" }); // back to session
+    display.emit({ type: "tap" }); // idle -> recording
+    display.emit({ type: "tap" }); // recording -> finalising
+    dictation.resolve({ text: "deploy the fix" });
+
+    display.emit({ type: "doubleTap" }); // draft present -> actions with Send/Clear prepended
+    expect(app.getState().screen).toBe("actions");
+    expect(display.lines.some((l) => l.includes("Send"))).toBe(true);
+    expect(display.lines.some((l) => l.includes("Clear"))).toBe(true);
+  });
+
+  it("input mode: Send calls sendInput with the draft, clears it, flashes, marks pending, and the flash is visible on the session screen", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await toSessionBottom(app);
+
+    display.emit({ type: "tap" }); // idle -> recording
+    display.emit({ type: "tap" }); // recording -> finalising
+    dictation.resolve({ text: "deploy the fix" });
+
+    display.emit({ type: "doubleTap" }); // -> actions, cursor 0 = Send
+    display.emit({ type: "tap" }); // select Send
+
+    expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "deploy the fix");
+    expect(app.getState().screen).toBe("session");
+    expect(app.getState().session?.draft).toBe("");
+    expect(app.getState().pending["s1"]).toBeDefined();
+
+    await vi.advanceTimersByTimeAsync(0); // flush the sendInput promise
+    expect(app.getState().flash).toBe(FLASH_QUEUED);
+    // Task 5 surfaces the flash as a transient top transcript line — the
+    // session screen otherwise has no header of its own since Task 2.
+    expect(display.lines.some((l) => l.includes("queued"))).toBe(true);
+  });
+
+  it("input mode: Clear empties the draft and returns to session without sending anything", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await toSessionBottom(app);
+
+    display.emit({ type: "tap" }); // idle -> recording
+    display.emit({ type: "tap" }); // recording -> finalising
+    dictation.resolve({ text: "deploy the fix" });
+
+    display.emit({ type: "doubleTap" }); // -> actions, cursor 0 = Send
+    display.emit({ type: "scrollDown" }); // cursor 1 = Clear
+    display.emit({ type: "tap" }); // select Clear
+
+    expect(client.sendInput).not.toHaveBeenCalled();
+    expect(app.getState().screen).toBe("session");
+    expect(app.getState().session?.draft).toBe("");
+  });
+
+  it("input mode: scrolling an empty box returns focus to the transcript immediately", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await toSessionBottom(app);
+    expect(app.getState().session?.draft).toBe("");
+
+    display.emit({ type: "scrollDown" });
+    expect(app.getState().session?.focus).toBe("transcript");
+  });
+
+  it("pause() cancels an in-progress box dictation (mic recording) and resets mic to idle", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await toSessionBottom(app);
+
+    display.emit({ type: "tap" }); // idle -> recording
     expect(dictation.started).toBe(1);
 
     app.pause();
 
     expect(dictation.cancelled).toBe(1);
-    // Same navigation a user-initiated cancel (double-tap while listening)
-    // performs — back to the session screen, not stranded on "listening".
-    expect(app.getState().screen).toBe("session");
-    expect(app.getState().session).toEqual(newSessionState("host-a", "s1"));
+    expect(app.getState().session?.mic).toBe("idle");
+    expect(app.getState().screen).toBe("session"); // stays put, unlike the reply-screen cancel
   });
 
-  it("pause() is a no-op for dictation when not on the reply/listening screen", async () => {
+  it("pause() is a no-op for dictation when nothing is recording", async () => {
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
     });
@@ -325,24 +437,21 @@ describe("App", () => {
     expect(app.getState().screen).toBe("home");
   });
 
-  it("pause() does not cancel dictation once the reply screen has moved past listening (preview phase)", async () => {
+  it("pause() does not re-cancel once a box dictation has already settled back to idle", async () => {
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
     });
     const app = makeApp(client);
-    await app.start();
-    await vi.advanceTimersByTimeAsync(0);
+    await toSessionBottom(app);
 
-    display.emit({ type: "tap" }); // session
-    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
-    display.emit({ type: "tap" }); // bottom-focus stub -> actions
-    display.emit({ type: "tap" }); // -> reply, listening
-    dictation.resolve({ text: "deploy the fix" });
-    expect(app.getState().reply?.phase).toBe("preview");
+    display.emit({ type: "tap" }); // idle -> recording
+    display.emit({ type: "tap" }); // recording -> finalising
+    dictation.resolve({ text: "deploy the fix" }); // -> mic idle, draft set
+    expect(app.getState().session?.mic).toBe("idle");
 
     app.pause();
-    expect(dictation.cancelled).toBe(0);
-    expect(app.getState().screen).toBe("reply"); // untouched — not a listening dictation
+    expect(dictation.cancelled).toBe(0); // nothing active to cancel
+    expect(app.getState().session?.draft).toBe("deploy the fix"); // untouched
   });
 
   it("scrolling above the top triggers getHistory and shows the loading line until it resolves", async () => {
@@ -391,8 +500,7 @@ describe("App", () => {
 
     display.emit({ type: "tap" }); // session
     display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
-    display.emit({ type: "tap" }); // bottom-focus stub -> actions (cursor 0 = Reply)
-    display.emit({ type: "scrollDown" }); // Restart
+    display.emit({ type: "doubleTap" }); // input-mode doubleTap -> actions (cursor 0 = Restart, no draft)
     display.emit({ type: "scrollDown" }); // Kill
     display.emit({ type: "tap" }); // -> confirm
     display.emit({ type: "scrollDown" }); // cursor -> Confirm
@@ -419,8 +527,7 @@ describe("App", () => {
 
     display.emit({ type: "tap" }); // session
     display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
-    display.emit({ type: "tap" }); // bottom-focus stub -> actions
-    display.emit({ type: "scrollDown" }); // Restart
+    display.emit({ type: "doubleTap" }); // input-mode doubleTap -> actions (cursor 0 = Restart, no draft)
     display.emit({ type: "tap" }); // queue restart
     await vi.advanceTimersByTimeAsync(0);
     expect(app.getState().pending["s1"]).toBeDefined();
@@ -622,11 +729,11 @@ describe("App", () => {
 
     // triggerHistoryLoad bumped offset to 1 (to keep the new loading line in
     // view) — so reaching the bottom box now takes one extra tap: first
-    // snaps offset back to 0, then hands focus to the bottom, then the
-    // bottom-focus stub opens actions (leaves the session screen).
+    // snaps offset back to 0, then hands focus to the bottom; doubleTap
+    // there (input mode) opens actions (leaves the session screen).
     display.emit({ type: "tap" }); // offset>0 -> snap to 0
     display.emit({ type: "tap" }); // offset===0 -> focus:"bottom"
-    display.emit({ type: "tap" }); // bottom-focus stub -> actions
+    display.emit({ type: "doubleTap" }); // input-mode doubleTap -> actions
     expect(app.getState().screen).toBe("actions");
     expect(app.getState().loadingHistory["s1"]).toBeFalsy();
 
@@ -825,9 +932,9 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
     expect(display.lines).toContain("· loading earlier ·");
   });
 
-  // ---- bottom-focus stub (Task 4 only stubs it; Tasks 5–6 implement it) --
+  // ---- bottom-focus input mode (Task 5; sheet mode is still Task 6) -----
 
-  it("bottom-focus stub: doubleTap hands focus back to the transcript", async () => {
+  it("input mode: doubleTap opens the actions menu (not a return to the transcript)", async () => {
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
     });
@@ -837,18 +944,30 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
     expect(app.getState().session?.focus).toBe("bottom");
 
     display.emit({ type: "doubleTap" });
-    expect(app.getState().session?.focus).toBe("transcript");
-    expect(app.getState().screen).toBe("session");
+    expect(app.getState().screen).toBe("actions");
   });
 
-  it("bottom-focus stub: tap opens the actions menu (Task 5 replaces this with the dictation toggle)", async () => {
+  it("input mode: tap toggles dictation instead of opening the actions menu", async () => {
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
     });
     const app = await enterSession(client);
 
     display.emit({ type: "tap" }); // -> focus:"bottom"
-    display.emit({ type: "tap" }); // stub -> actions
-    expect(app.getState().screen).toBe("actions");
+    display.emit({ type: "tap" }); // idle -> recording
+    expect(app.getState().screen).toBe("session"); // stays put — no longer jumps to actions
+    expect(app.getState().session?.mic).toBe("recording");
+    expect(dictation.started).toBe(1);
+  });
+
+  it("input mode: scrolling an empty box (no draft) returns focus to the transcript", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
+    });
+    const app = await enterSession(client);
+
+    display.emit({ type: "tap" }); // -> focus:"bottom"
+    display.emit({ type: "scrollUp" });
+    expect(app.getState().session?.focus).toBe("transcript");
   });
 });
