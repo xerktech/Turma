@@ -1313,3 +1313,109 @@ test("audio WS: unparseable/other text frames before finalize are ignored", asyn
   socket.destroy();
   restoreFetch();
 });
+
+// ---- live transcript relay (/live) ------------------------------------------
+
+// Reads one text frame's JSON off a live socket's frame list, waiting for it.
+async function nextTextJson(frames, fromIndex = 0) {
+  await waitFor(() => frames.filter((f) => f.op === 0x1).length > fromIndex);
+  const text = frames.filter((f) => f.op === 0x1)[fromIndex];
+  return JSON.parse(text.payload.toString("utf8"));
+}
+
+test("live WS: bad/missing token -> 401, no upgrade", async () => {
+  const bad = await wsConnect("/live/h/s?auth=not-a-token");
+  assert.match(bad.statusLine, /^HTTP\/1\.1 401/);
+  bad.socket.destroy();
+  const missing = await wsConnect("/live/h/s");
+  assert.match(missing.statusLine, /^HTTP\/1\.1 401/);
+  missing.socket.destroy();
+});
+
+test("live WS: unknown host -> 404, no upgrade", async () => {
+  const token = await issueToken();
+  const res = await wsConnect(`/live/nosuchhost/s1?auth=${token}`);
+  assert.match(res.statusLine, /^HTTP\/1\.1 404/);
+  res.socket.destroy();
+});
+
+test("live WS: seeds cached tail, watches via the control channel, fans out deltas, unwatches on close", async () => {
+  // A host with one running session, its worktree path + a cached tail.
+  agents.livehost = {
+    device: "livehost",
+    lastSeen: Date.now(),
+    commands: [],
+    history: {},
+    sessions: [
+      {
+        id: "ls1",
+        worktreePath: "/wt/ls1",
+        session: { tail: [{ id: "c1", role: "assistant", text: "cached" }] },
+      },
+    ],
+  };
+
+  // Stand in for the host's tunnel-agent: a control channel the hub can send
+  // watch/unwatch on and that we push tail deltas back over.
+  const ctrl = await wsConnect(`/agent/control?name=livehost&token=agenttok`);
+  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+  const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
+
+  // The glasses live socket.
+  const token = await issueToken();
+  const live = await wsConnect(`/live/livehost/ls1?auth=${token}`);
+  assert.match(live.statusLine, /^HTTP\/1\.1 101/);
+  const liveFrames = collectFrames(live.socket, live.leftover);
+
+  // 1. Immediately seeded with the cached tail.
+  const seed = await nextTextJson(liveFrames, 0);
+  assert.equal(seed.type, "tail");
+  assert.deepEqual(seed.entries, [{ id: "c1", role: "assistant", text: "cached" }]);
+
+  // 2. The agent was told to start tailing, with the worktree path.
+  const watch = await nextTextJson(ctrlFrames, 0);
+  assert.equal(watch.watch, "ls1");
+  assert.equal(watch.worktreePath, "/wt/ls1");
+
+  // 3. A delta the agent pushes on the control channel reaches the live client.
+  const delta = { tail: "ls1", entries: [{ id: "c1", role: "assistant", text: "cached and more" }] };
+  ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(delta))));
+  const relayed = await nextTextJson(liveFrames, 1);
+  assert.equal(relayed.type, "tail");
+  assert.deepEqual(relayed.entries, delta.entries);
+
+  // 4. Closing the last watcher unwatches on the control channel.
+  live.socket.destroy();
+  await waitFor(() => ctrlFrames.filter((f) => f.op === 0x1).some((f) => {
+    try { return JSON.parse(f.payload.toString("utf8")).unwatch === "ls1"; } catch { return false; }
+  }));
+
+  ctrl.socket.destroy();
+  delete agents.livehost;
+});
+
+test("live WS: a control channel connecting after watchers exist re-arms their watches", async () => {
+  agents.rehost = {
+    device: "rehost",
+    lastSeen: Date.now(),
+    commands: [],
+    history: {},
+    sessions: [{ id: "rs1", worktreePath: "/wt/rs1", session: { tail: [] } }],
+  };
+
+  // Watcher attaches while the tunnel is offline (no control channel yet).
+  const token = await issueToken();
+  const live = await wsConnect(`/live/rehost/rs1?auth=${token}`);
+  assert.match(live.statusLine, /^HTTP\/1\.1 101/);
+
+  // Now the tunnel connects — it must be told to watch the already-attached session.
+  const ctrl = await wsConnect(`/agent/control?name=rehost&token=agenttok`);
+  const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
+  const watch = await nextTextJson(ctrlFrames, 0);
+  assert.equal(watch.watch, "rs1");
+  assert.equal(watch.worktreePath, "/wt/rs1");
+
+  live.socket.destroy();
+  ctrl.socket.destroy();
+  delete agents.rehost;
+});

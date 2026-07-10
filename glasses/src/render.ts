@@ -156,9 +156,19 @@ export function sessionContentLines(state: AppState, hostKey: string, sessionId:
     // scroll away.
     lines.push("· earlier history truncated ·");
   }
-  for (const entry of buffer?.entries ?? []) {
-    lines.push(...wrap(roleLine(entry.role, entry.text)));
-  }
+  // The newest entry of the focused session may be mid-typewriter (reveal.ts):
+  // show only its revealed prefix so still-streaming text types in rather than
+  // block-jumping. Older entries, and any other session, always render in full.
+  const entries = buffer?.entries ?? [];
+  const reveal = state.session?.sessionId === sessionId ? state.reveal : null;
+  const lastIdx = entries.length - 1;
+  entries.forEach((entry, i) => {
+    let text = entry.text;
+    if (reveal && i === lastIdx && reveal.entryId === entry.id && reveal.shown < text.length) {
+      text = text.slice(0, Math.max(0, reveal.shown));
+    }
+    lines.push(...wrap(roleLine(entry.role, text)));
+  });
   const s = findSessionLocal(state, hostKey, sessionId);
   if (s?.session?.question) {
     lines.push(...wrap(`? ${s.session.question}`));

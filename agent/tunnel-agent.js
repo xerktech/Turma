@@ -19,6 +19,7 @@
 const net = require("net");
 const fs = require("fs");
 const os = require("os");
+const path = require("path");
 const { execFileSync } = require("child_process");
 
 const HUB_URL = process.env.HUB_URL || "http://agent-hub:8300";
@@ -30,6 +31,165 @@ const TTYD_HOST = "127.0.0.1";
 // Fallback ttyd port when the hub doesn't specify one in the open message
 // (safety only — the multiplexed sessions always send their own port).
 const DEFAULT_TTYD_PORT = 7681;
+
+// ---- live transcript tail ---------------------------------------------------
+// The near-real-time path for the glasses' session screen. When a glasses
+// client is watching a session, the hub sends {"watch":<sessionId>,
+// "worktreePath":<path>} on the control channel; we then tail that ONE
+// transcript every LIVE_TAIL_MS and push {"tail":<sessionId>,"entries":[...]}
+// deltas straight back on the same control channel (the hub fans them out to
+// the watching glasses). {"unwatch":<sessionId>} stops it. Tailing runs only
+// while a session is actively watched, so idle sessions cost nothing.
+//
+// The transcript read here is a deliberate re-implementation of hub-agent.py's
+// transcript_tail / _entry_text / _project_slug (kept byte-for-byte compatible
+// so the glasses get the same entries whether they arrive via this fast path
+// or the 20s heartbeat). If that Python changes shape, change this too.
+const PROJECTS_ROOT = process.env.CLAUDE_PROJECTS_ROOT || "/root/.claude/projects";
+const LIVE_TAIL_MS = Number(process.env.LIVE_TAIL_MS) || 1000;
+const TAIL_MSGS = Number(process.env.SESSION_TAIL_MSGS) || 30;
+const TAIL_MSG_CHARS = Number(process.env.SESSION_TAIL_MSG_CHARS) || 500;
+const TAIL_READ_BYTES = 1 << 17; // ~128 KB, matches _tail_entries
+const MAX_WATCHERS = 16; // safety cap on concurrent live tails
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
+
+// Claude Code's project-dir slug for a worktree cwd: every non-alphanumeric
+// char -> '-' (mirrors hub-agent.py _project_slug — a plain '/'->'-' map is
+// wrong for the dotted worktree paths this agent uses).
+function projectSlug(p) {
+  return p.replace(/[^A-Za-z0-9]/g, "-");
+}
+
+// Newest *.jsonl transcript for a worktree (its project-slug dir), or null.
+function newestTranscript(worktreePath) {
+  const dir = path.join(PROJECTS_ROOT, projectSlug(worktreePath));
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return null; }
+  let newest = null;
+  let newestMtime = 0;
+  for (const name of names) {
+    if (!name.endsWith(".jsonl")) continue;
+    const full = path.join(dir, name);
+    let mtime;
+    try { mtime = fs.statSync(full).mtimeMs; } catch { continue; }
+    if (mtime > newestMtime) { newest = full; newestMtime = mtime; }
+  }
+  return newest;
+}
+
+// Non-empty trimmed lines from roughly the last maxBytes of a file. The
+// leading line may be a mid-line fragment; JSON.parse rejects it and the
+// caller skips it, exactly like hub-agent.py _read_tail_lines.
+function readTailLines(p, maxBytes) {
+  let fd;
+  try { fd = fs.openSync(p, "r"); } catch { return []; }
+  try {
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - maxBytes);
+    const len = size - start;
+    if (len <= 0) return [];
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, start);
+    return buf.toString("utf8").split("\n").map((l) => l.trim()).filter((l) => l.length);
+  } catch {
+    return [];
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+  }
+}
+
+// One transcript entry -> glasses display text, or null to drop it (wrong
+// type, no message, tool_result-only turn, empty after ANSI strip). Mirrors
+// hub-agent.py _entry_text.
+function entryText(entry) {
+  const type = entry.type;
+  if (type !== "user" && type !== "assistant") return null;
+  const msg = entry.message;
+  if (!msg || typeof msg !== "object") return null;
+  const content = msg.content;
+  let text;
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    const parts = [];
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "text") parts.push(String(block.text || ""));
+      else if (block.type === "tool_use" && block.name) parts.push(`[${block.name}]`);
+      // "thinking" and "tool_result" blocks are dropped.
+    }
+    text = parts.join("");
+  } else {
+    return null;
+  }
+  text = text.replace(ANSI_RE, "").trim();
+  return text || null;
+}
+
+// Last TAIL_MSGS surviving messages of a worktree's newest transcript, oldest
+// first: [{id: uuid, role, text}]. [] when there's no transcript yet.
+function transcriptTail(worktreePath) {
+  const p = newestTranscript(worktreePath);
+  if (!p) return [];
+  const tail = [];
+  for (const raw of readTailLines(p, TAIL_READ_BYTES)) {
+    let entry;
+    try { entry = JSON.parse(raw); } catch { continue; }
+    if (!entry || typeof entry !== "object") continue;
+    const text = entryText(entry);
+    if (text === null) continue;
+    tail.push({ id: entry.uuid, role: entry.type, text: text.slice(0, TAIL_MSG_CHARS) });
+  }
+  return tail.slice(-TAIL_MSGS);
+}
+
+// The live control WebSocket the tail deltas ride back on, and the set of
+// sessions currently being tailed. Both owned by connectControl below.
+let controlWs = null;
+const watchers = new Map(); // sessionId -> { worktreePath, lastJson, timer }
+
+function pollWatcher(sessionId) {
+  const w = watchers.get(sessionId);
+  if (!w) return;
+  let entries;
+  try { entries = transcriptTail(w.worktreePath); } catch { return; }
+  if (!entries.length) return; // no transcript yet, or nothing displayable
+  const json = JSON.stringify(entries);
+  if (json === w.lastJson) return; // unchanged since the last beat — don't spam
+  w.lastJson = json;
+  if (controlWs && controlWs.readyState === WebSocket.OPEN) {
+    try { controlWs.send(JSON.stringify({ tail: sessionId, entries })); } catch {}
+  }
+}
+
+function startWatch(sessionId, worktreePath) {
+  if (!sessionId || !worktreePath) return;
+  const existing = watchers.get(sessionId);
+  if (existing) { existing.worktreePath = worktreePath; return; } // already tailing
+  if (watchers.size >= MAX_WATCHERS) {
+    log(`live tail: at MAX_WATCHERS (${MAX_WATCHERS}); ignoring watch for ${sessionId}`);
+    return;
+  }
+  const w = { worktreePath, lastJson: null, timer: null };
+  watchers.set(sessionId, w);
+  w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
+  pollWatcher(sessionId); // emit an immediate snapshot, don't wait a full interval
+  log(`live tail: watching ${sessionId}`);
+}
+
+function stopWatch(sessionId) {
+  const w = watchers.get(sessionId);
+  if (!w) return;
+  clearInterval(w.timer);
+  watchers.delete(sessionId);
+  log(`live tail: stopped ${sessionId}`);
+}
+
+function stopAllWatches() {
+  for (const w of watchers.values()) clearInterval(w.timer);
+  watchers.clear();
+}
 
 // ws(s):// base derived from HUB_URL's scheme.
 const WS_BASE = HUB_URL.replace(/^http/, "ws").replace(/\/+$/, "");
@@ -146,6 +306,7 @@ let backoff = 1000;
 function connectControl() {
   const url = `${WS_BASE}/agent/control?name=${encodeURIComponent(NAME)}&token=${encodeURIComponent(TOKEN)}`;
   const ws = new WebSocket(url);
+  controlWs = ws;
 
   ws.addEventListener("open", () => {
     backoff = 1000;
@@ -158,9 +319,16 @@ function connectControl() {
     } catch {
       return;
     }
-    if (msg && msg.open) {
+    if (!msg) return;
+    if (msg.open) {
       const port = Number(msg.port) || DEFAULT_TTYD_PORT;
       openDataChannel(String(msg.open), port);
+    } else if (msg.watch) {
+      // The hub re-sends a watch for every still-attached glasses client on
+      // reconnect, so startWatch is idempotent (it just refreshes the path).
+      startWatch(String(msg.watch), msg.worktreePath ? String(msg.worktreePath) : "");
+    } else if (msg.unwatch) {
+      stopWatch(String(msg.unwatch));
     }
   });
   const reconnect = () => {
@@ -169,6 +337,10 @@ function connectControl() {
     setTimeout(connectControl, wait);
   };
   ws.addEventListener("close", () => {
+    // The channel the deltas ride is gone; stop every tail loop. The hub
+    // re-arms the watches once we reconnect, so no state is lost.
+    if (controlWs === ws) controlWs = null;
+    stopAllWatches();
     log(`control channel closed; reconnecting in ${Math.round(backoff / 1000)}s`);
     reconnect();
   });
@@ -178,5 +350,11 @@ function connectControl() {
   });
 }
 
-log(`starting; hub=${WS_BASE} name=${NAME}`);
-connectControl();
+// Run-as-script starts the tunnel; being require()d (the parity test in
+// agent/tests) just exposes the pure transcript-tail helpers.
+if (require.main === module) {
+  log(`starting; hub=${WS_BASE} name=${NAME}`);
+  connectControl();
+} else {
+  module.exports = { projectSlug, newestTranscript, entryText, transcriptTail };
+}
