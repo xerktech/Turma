@@ -63,6 +63,11 @@ function projectSlug(p) {
 
 // Newest *.jsonl transcript for a worktree (its project-slug dir), or null.
 function newestTranscript(worktreePath) {
+  // Not path-traversable: projectSlug() rewrites EVERY non-alphanumeric char
+  // (including '/' and '.') to '-', so the slug is a single flat path
+  // component with no separators or '..' — it can only ever name a child of
+  // PROJECTS_ROOT.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
   const dir = path.join(PROJECTS_ROOT, projectSlug(worktreePath));
   let names;
   try { names = fs.readdirSync(dir); } catch { return null; }
@@ -70,6 +75,9 @@ function newestTranscript(worktreePath) {
   let newestMtime = 0;
   for (const name of names) {
     if (!name.endsWith(".jsonl")) continue;
+    // `name` is a single directory entry from readdirSync (never contains a
+    // path separator), so this stays inside `dir`.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const full = path.join(dir, name);
     let mtime;
     try { mtime = fs.statSync(full).mtimeMs; } catch { continue; }

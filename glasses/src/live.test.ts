@@ -87,9 +87,10 @@ describe("buildLiveWsUrl", () => {
     );
   });
   it("derives ws for a plain-http hub", () => {
-    expect(buildLiveWsUrl("http://192.168.1.9:8300", "h", "s", "t")).toBe(
-      "ws://192.168.1.9:8300/live/h/s?auth=t"
-    );
+    // Plain-ws is the intended dev/LAN fallback (see live.ts); URL-derivation
+    // assertion, not a real connection.
+    // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+    expect(buildLiveWsUrl("http://localhost:8300", "h", "s", "t")).toBe("ws://localhost:8300/live/h/s?auth=t");
   });
 });
 
