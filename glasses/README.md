@@ -114,6 +114,62 @@ Use a dedicated hub password for this app rather than reusing your normal
 one: HTTP Basic credentials are stored on-device via the bridge's key/value
 storage, not just held in memory.
 
+## Publishing to Even Hub
+
+The `npm run pack` / `evenhub qr` flow above is **sideload only** — it installs
+the `.ehpk` onto your own paired glasses for development. Getting the app into
+the Even Hub store (so it shows up in the Even phone app for install) is a
+separate flow that runs through Even Realities' **developer portal**, not the
+CLI: `evenhub` has only `init`, `qr`, and `pack` — there is no `publish`/`submit`
+command, so the built `.ehpk` is uploaded through the web portal.
+
+1. **Get developer access (one-time gate).** Even Hub is curated — you can't
+   upload without being accepted. Apply to the developer program at
+   [evenhub.evenrealities.com/application](https://evenhub.evenrealities.com/application)
+   and wait for approval (first batch reviewed within ~10 business days,
+   response by email). Until you're in, you can only sideload.
+2. **Make `app.json` submission-ready.** Bump `version`; confirm
+   `min_app_version` / `min_sdk_version`; and — most important — make sure the
+   `network` permission `whitelist` lists your real hub host for **both**
+   `https://` and `wss://` (currently `https://agents.xerktech.com` and
+   `wss://agents.xerktech.com`). Reviewers enforce this whitelist at the WebView
+   network layer, so a stale entry means the app can't reach the hub during
+   review.
+3. **Build + pack** exactly as for sideload:
+
+   ```sh
+   npm run build   # tsc + vite → dist/
+   npm run pack    # evenhub pack app.json dist -o ../agenthub-hud.ehpk
+   ```
+
+4. **Upload the `.ehpk` in the developer portal** and create/update the app
+   entry. This is the step the CLI does not cover.
+5. **Manual review.** Every submission goes through a manual review against Even
+   Hub's [App Submission & QA checklist](https://hub.evenrealities.com/docs/reference/app-submission);
+   anything that fails is returned with a rejection note. The recommended
+   pre-flight is the **Beta build** [testing tier](https://hub.evenrealities.com/docs/test)
+   (the `.ehpk` distributed to invited testers), because it gives full
+   *reviewer parity* — the exact conditions the reviewer sees.
+
+### Private/Beta vs Public
+
+These are two distribution states of the *same* uploaded build, chosen in the
+portal:
+
+- **Private / Beta** — distributed only to testers you invite via **email invite
+  links**; testers see these under "Beta" plugins. This is the invite-only lane
+  and the QA gate before any public listing.
+- **Public** — after passing review, listed in the Even Hub store for anyone to
+  install (shown under "Public" plugins).
+
+**For AgentHub HUD specifically, the private/beta lane is the realistic one.**
+The app is single-user and self-hosted: the hub URL is hardcoded
+(`DEFAULT_HUB_URL` in `src/config.ts`), it sits behind HTTP Basic auth, and the
+`app.json` `network` whitelist is pinned to one host. A public installer has no
+reachable hub and no credentials, so a public store listing wouldn't be usable.
+Going genuinely public would first require making the hub URL user-configurable
+at login and loosening/parameterizing the `network` whitelist accordingly.
+
 ## Testing the hub audio path without glasses
 
 ```sh
