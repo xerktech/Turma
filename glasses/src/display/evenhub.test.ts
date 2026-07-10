@@ -284,6 +284,38 @@ describe("EvenHubDisplay", () => {
       expect(() => display.render(sessionModel({}))).not.toThrow();
       await Promise.resolve();
     });
+
+    it("guards currentPageShape against a rebuild rejection: a same-shape render after a rejected rebuild retries the rebuild instead of no-op upgrading", async () => {
+      let rebuildCallCount = 0;
+      let shouldReject = true;
+      const { bridge } = fakeBridge({
+        rebuildPageContainer: async () => {
+          rebuildCallCount++;
+          if (shouldReject) {
+            shouldReject = false;
+            throw new Error("boom");
+          }
+          return true;
+        },
+      });
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      display.render(sessionModel({ lines: ["> draft"], status: "Working" }));
+      expect(rebuildCallCount).toBe(1);
+
+      // Let the rejected rebuild's catch handler run and roll the shape
+      // tracker back — without this, the tracker would be stuck advanced to
+      // a shape whose containers were never actually built.
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Same shape as before. If the tracker had been left advanced despite
+      // the rejection, this would wrongly be treated as "already current"
+      // and routed through textContainerUpgrade against containers that
+      // don't exist on the glasses — a silent no-op (frozen screen).
+      display.render(sessionModel({ lines: ["> draft"], status: "Working" }));
+      expect(rebuildCallCount).toBe(2);
+    });
   });
 
   describe("render — session <-> lines transitions", () => {

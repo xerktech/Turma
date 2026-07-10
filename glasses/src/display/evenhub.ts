@@ -284,7 +284,7 @@ export class EvenHubDisplay implements GlassesDisplay {
       // single full-canvas container with this content directly.
       this.cancelPendingUpdates();
       this.currentPageShape = LINES_SHAPE;
-      void this.rebuild([buildLinesContainer(capContent(content, REBUILD_MAX_CONTENT_CHARS))]);
+      void this.rebuild([buildLinesContainer(capContent(content, REBUILD_MAX_CONTENT_CHARS))], LINES_SHAPE);
       return;
     }
     // Single container already current — debounced in-place update (unchanged).
@@ -320,7 +320,7 @@ export class EvenHubDisplay implements GlassesDisplay {
       const boxLines = bottomBoxLines(model.bottom.lines);
       const content = sessionContentFrom(model, REBUILD_MAX_CONTENT_CHARS);
       const containers = buildSessionContainers(boxLines, content);
-      void this.rebuild(containers);
+      void this.rebuild(containers, signature);
       return;
     }
     // Same shape: just new text in the same three containers. Debounced
@@ -335,7 +335,19 @@ export class EvenHubDisplay implements GlassesDisplay {
     this.scheduleSessionUpdate.cancel();
   }
 
-  private async rebuild(containers: TextContainerConfig[]): Promise<void> {
+  // `committedShape`, when given, is the shape value the caller already
+  // advanced `currentPageShape` to *before* this call (optimistically, so a
+  // synchronous run of renders targeting the same new shape correctly dedupes
+  // against the in-flight rebuild rather than firing another one — see the
+  // "same shape" tests). If the rebuild actually rejects, the containers it
+  // would have built never landed on the glasses, so leaving the tracker
+  // advanced would make the *next* same-shape render silently no-op via
+  // `textContainerUpgrade` against containers that were never built (frozen
+  // screen) until some unrelated structural change forces a rebuild. Roll the
+  // tracker back on rejection — but only if nothing else has since moved it
+  // on (a later render already succeeded, or is itself in flight) — so the
+  // next render, whatever shape it targets, retries a rebuild.
+  private async rebuild(containers: TextContainerConfig[], committedShape?: string): Promise<void> {
     try {
       await this.bridge.rebuildPageContainer({
         containerTotalNum: containers.length,
@@ -343,6 +355,9 @@ export class EvenHubDisplay implements GlassesDisplay {
       });
     } catch (err) {
       console.error("[glasses] rebuildPageContainer failed:", err);
+      if (committedShape !== undefined && this.currentPageShape === committedShape) {
+        this.currentPageShape = null;
+      }
     }
   }
 

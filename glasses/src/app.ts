@@ -371,6 +371,17 @@ export class App {
         if (nowQuestion && !prevQuestion) {
           if (sess.mic === "recording" || sess.mic === "finalising") this.dictation.cancel();
           this.state = { ...this.state, session: { ...sess, mic: "idle", focus: "transcript" } };
+        } else if (nowQuestion && prevQuestion && nowQuestion !== prevQuestion) {
+          // A *different* question replaced the one already pending on this
+          // session while the user was still sitting in its sheet (not a
+          // fresh arrival, so the branch above doesn't fire) — the sheet's
+          // highlighted row must not carry over onto the new question's own
+          // options list. Dispatch already clamps `selected` against the
+          // new options length so a stale index can't send a wrong digit,
+          // but the highlight itself would still land on the wrong row
+          // until the user scrolls. Reset it, edge-triggered the same way
+          // as the arrival guard above.
+          this.state = { ...this.state, session: { ...sess, selected: 0 } };
         }
       }
       this.repaint();
@@ -802,7 +813,7 @@ export class App {
     const a = this.state.actions;
     if (!a) return this.goHome();
     if (e.type === "doubleTap") {
-      this.setState({ screen: "session", session: newSessionState(a.hostKey, a.sessionId) });
+      this.setState({ screen: "session", session: this.returnToSession(a.hostKey, a.sessionId) });
       return;
     }
     const rows = buildActionsRows(this.state, a.hostKey, a.sessionId);
@@ -855,9 +866,29 @@ export class App {
         this.setState({ screen: "confirm", confirm: { action: { kind: "delete", hostKey, sessionId }, cursor: 0 } });
         return;
       case "back":
-        this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
+        // Non-destructive exit: unlike Send/Clear (which must zero the
+        // draft), Back must not discard a dictated draft the user hasn't
+        // acted on yet — input mode has no tap-to-send, so the actions menu
+        // is the only route to Send, and bouncing through it must be a safe
+        // no-op. Preserve the existing session state (draft/focus/mic/
+        // viewOffset/selected) rather than minting a fresh one.
+        this.setState({ screen: "session", session: this.returnToSession(hostKey, sessionId) });
         return;
     }
+  }
+
+  // Returns to the session screen after a non-destructive actions-menu exit
+  // (doubleTap out, or the "Back" row) preserving whatever session state was
+  // already there — draft, focus, mic, viewOffset, selected — rather than
+  // resetting via newSessionState (which Send/Clear still use deliberately,
+  // since those *should* zero the draft). Falls back to a fresh state only
+  // if state.session doesn't already match this hostKey/sessionId, which
+  // shouldn't happen in practice (actions is only ever entered from this
+  // exact session) but keeps this defensive rather than silently wrong.
+  private returnToSession(hostKey: string, sessionId: string): SessionScreenState {
+    const s = this.state.session;
+    if (s && s.hostKey === hostKey && s.sessionId === sessionId) return s;
+    return newSessionState(hostKey, sessionId);
   }
 
   private queueAction(hostKey: string, sessionId: string, action: "kill" | "start" | "restart" | "resume"): void {

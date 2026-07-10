@@ -239,6 +239,16 @@ describe("App", () => {
     });
   }
 
+  // Same shape as questionAgent, but with a caller-chosen question/options —
+  // used to simulate one pending question on a session being *replaced* by a
+  // different one mid-sheet (as opposed to a question newly arriving where
+  // none was pending before, which questionAgent()/toSheet() already cover).
+  function questionAgentWith(question: string, options: string[]): AgentInfo {
+    return agent({
+      sessions: [session({ session: signals({ transcriptAgeSec: 1, question, questionOptions: options }) })],
+    });
+  }
+
   async function toSheet(app: App): Promise<void> {
     await app.start();
     await vi.advanceTimersByTimeAsync(0);
@@ -382,6 +392,32 @@ describe("App", () => {
     expect(app.getState().session?.selected).toBe(1); // untouched
   });
 
+  it("a different question replacing the pending one mid-sheet resets `selected` back to 0", async () => {
+    const first = questionAgentWith("pick one", ["A", "B"]);
+    const second = questionAgentWith("pick two", ["X", "Y", "Z"]);
+    const client = fakeClient({
+      listAgents: vi
+        .fn()
+        .mockResolvedValueOnce({ now: Date.now(), agents: [first] })
+        .mockResolvedValue({ now: Date.now(), agents: [second] }),
+    });
+    const app = makeApp(client, 1000);
+    await toSheet(app);
+
+    display.emit({ type: "scrollDown" }); // A -> B
+    display.emit({ type: "scrollDown" }); // B -> "Dictate answer…" (selected === options.length === 2)
+    expect(app.getState().session?.selected).toBe(2);
+
+    await vi.advanceTimersByTimeAsync(1000); // poll: a *different* question replaces this one
+    // Dispatch already clamps against the new options list, so this stale
+    // index couldn't have sent a wrong digit — but the highlighted row must
+    // still reset rather than silently point at the wrong option.
+    expect(app.getState().session?.selected).toBe(0);
+    // Still sitting in the sheet (this isn't the "question newly arrived
+    // while unfocused" case) — only the highlight resets, not the focus.
+    expect(app.getState().session?.focus).toBe("bottom");
+  });
+
   // ---- bottom-box input mode: dictate / send / clear (Task 5) -----------
 
   async function toSessionBottom(app: App): Promise<void> {
@@ -515,6 +551,55 @@ describe("App", () => {
     expect(client.sendInput).not.toHaveBeenCalled();
     expect(app.getState().screen).toBe("session");
     expect(app.getState().session?.draft).toBe("");
+  });
+
+  it("input mode: Back preserves the dictated draft instead of discarding it (only Send/Clear should reset it)", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await toSessionBottom(app);
+
+    display.emit({ type: "tap" }); // idle -> recording
+    display.emit({ type: "tap" }); // recording -> finalising
+    dictation.resolve({ text: "deploy the fix" });
+    expect(app.getState().session?.draft).toBe("deploy the fix");
+
+    // Draft present: rows are [Send, Clear, Restart, Kill, Delete, Back].
+    display.emit({ type: "doubleTap" }); // -> actions, cursor 0 = Send
+    display.emit({ type: "scrollDown" }); // 1 = Clear
+    display.emit({ type: "scrollDown" }); // 2 = Restart
+    display.emit({ type: "scrollDown" }); // 3 = Kill
+    display.emit({ type: "scrollDown" }); // 4 = Delete
+    display.emit({ type: "scrollDown" }); // 5 = Back
+    display.emit({ type: "tap" }); // select Back
+
+    expect(client.sendInput).not.toHaveBeenCalled();
+    expect(app.getState().screen).toBe("session");
+    // The only way to Send a dictated draft is via this same actions menu
+    // (input mode has no tap-to-send) — Back must not silently discard it.
+    expect(app.getState().session?.draft).toBe("deploy the fix");
+    // Focus returns to right where the user left it (the bottom box).
+    expect(app.getState().session?.focus).toBe("bottom");
+  });
+
+  it("input mode: double-tapping out of the actions menu (without picking a row) also preserves the draft", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await toSessionBottom(app);
+
+    display.emit({ type: "tap" }); // idle -> recording
+    display.emit({ type: "tap" }); // recording -> finalising
+    dictation.resolve({ text: "deploy the fix" });
+
+    display.emit({ type: "doubleTap" }); // -> actions
+    display.emit({ type: "doubleTap" }); // double-tap out, no row picked
+
+    expect(app.getState().screen).toBe("session");
+    expect(app.getState().session?.draft).toBe("deploy the fix");
+    expect(app.getState().session?.focus).toBe("bottom");
   });
 
   it("input mode: scrolling an empty box returns focus to the transcript immediately", async () => {
