@@ -305,7 +305,7 @@ function renderSession(state: AppState): ScreenModel {
 // ---- actions --------------------------------------------------------
 
 export interface ActionRow {
-  action: "send" | "clear" | "restart" | "start" | "kill" | "delete" | "back";
+  action: "send" | "clear" | "dictate" | "restart" | "start" | "kill" | "delete" | "back";
   text: string;
 }
 
@@ -332,8 +332,13 @@ export function buildActionsRows(state: AppState, hostKey: string, sessionId: st
       : "";
   const rows: ActionRow[] = [];
   if (draft) {
+    // Reached by a tap on the in-box draft (or a double-tap): Send is the
+    // default (cursor 0), Clear discards, "Dictate more" appends another
+    // dictation to the existing draft (the append that a bare tap used to do
+    // in place — now an explicit choice so a tap doesn't record over text).
     rows.push({ action: "send", text: "Send" });
     rows.push({ action: "clear", text: "Clear" });
+    rows.push({ action: "dictate", text: "Dictate more" });
   }
   rows.push({ action: "restart", text: "Restart" });
   rows.push({ action: "kill", text: "Kill" });
