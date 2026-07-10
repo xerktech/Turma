@@ -115,3 +115,74 @@ test("pokeHeartbeat swallows a failing signal (best-effort)", () => {
     process.kill = realKill;
   }
 });
+
+// --- live TUI pane parsing (real-time assistant streaming) ------------------
+// parsePaneLiveTurn extracts the in-progress assistant turn from a `tmux
+// capture-pane` snapshot. Fixtures mirror real Claude Code v2.1.x TUI output.
+const RULE = "─".repeat(100); // the input box's ─ border
+
+test("parsePaneLiveTurn: extracts the streaming assistant text while generating", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const pane = [
+    "╭─ Claude ─╮",
+    "│ Welcome │",
+    "╰────────╯",
+    "",
+    "❯ Write a short haiku about the ocean",
+    "● Haiku",
+    "  Salt breath meets the shore,",
+    "  gulls trace the tide's silver seam,",
+    "  blue swallowing sky.",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ bypass permissions on · esc to interrupt · ← for agents",
+  ].join("\n");
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.generating, true);
+  assert.equal(r.text, "Haiku Salt breath meets the shore, gulls trace the tide's silver seam, blue swallowing sky.");
+});
+
+test("parsePaneLiveTurn: thinking (no assistant text yet) -> generating, empty text", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const pane = [
+    "❯ Write a haiku",
+    "· Honking…",
+    "  tmux detected",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ bypass permissions on · esc to interrupt · ← for agents",
+  ].join("\n");
+  assert.deepEqual(parsePaneLiveTurn(pane), { generating: true, text: "" });
+});
+
+test("parsePaneLiveTurn: completed turn (no 'esc to interrupt') -> not generating", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const pane = [
+    "❯ Write a haiku",
+    "● Haiku",
+    "  Salt breath meets the shore,",
+    "✻ Worked for 4s",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ bypass permissions on · ← for agents",
+  ].join("\n");
+  assert.deepEqual(parsePaneLiveTurn(pane), { generating: false, text: "" });
+});
+
+test("parsePaneLiveTurn: ignores the right-aligned effort indicator, empty pane", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  assert.deepEqual(parsePaneLiveTurn(""), { generating: false, text: "" });
+  // The "● high · /effort" indicator is right-aligned (leading spaces), so a
+  // pane that only has it — and no real turn — yields no assistant text.
+  const pane = [
+    "                                          ● high · /effort",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ bypass permissions on · esc to interrupt · ← for agents",
+  ].join("\n");
+  assert.deepEqual(parsePaneLiveTurn(pane), { generating: true, text: "" });
+});

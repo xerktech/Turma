@@ -101,12 +101,12 @@ class FakeDictation implements Dictation {
 class FakeLiveTail {
   started: { hostKey: string; sessionId: string }[] = [];
   stops = 0;
-  private cb: ((entries: import("./types.ts").TailEntry[]) => void) | null = null;
+  private cb: ((ev: import("./live.ts").LiveEvent) => void) | null = null;
   private current: string | null = null;
 
-  start(hostKey: string, sessionId: string, onTail: (entries: import("./types.ts").TailEntry[]) => void): void {
+  start(hostKey: string, sessionId: string, onEvent: (ev: import("./live.ts").LiveEvent) => void): void {
     this.started.push({ hostKey, sessionId });
-    this.cb = onTail;
+    this.cb = onEvent;
     this.current = sessionId;
   }
   stop(): void {
@@ -117,8 +117,13 @@ class FakeLiveTail {
   isWatching(sessionId: string): boolean {
     return this.current === sessionId;
   }
+  // Committed transcript delta.
   deliver(entries: import("./types.ts").TailEntry[]): void {
-    this.cb?.(entries);
+    this.cb?.({ type: "tail", entries });
+  }
+  // In-progress assistant turn scraped from the TUI ("" clears it).
+  deliverTurn(text: string): void {
+    this.cb?.({ type: "turn", text });
   }
 }
 
@@ -1350,6 +1355,40 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       const shownAtPause = app.getState().reveal.shown;
       await vi.advanceTimersByTimeAsync(500); // no ticks should fire while paused
       expect(app.getState().reveal.shown).toBe(shownAtPause);
+    });
+
+    it("streams the in-progress assistant turn from the TUI, then hands off to the committed transcript", async () => {
+      const app = await enterSession();
+      // A live delta: Claude is generating (transcript has only the user turn).
+      liveTail.deliver([{ id: "u1", role: "user", text: "haiku please" }]);
+      // The TUI stream delivers the in-progress assistant text (grows over ticks).
+      liveTail.deliverTurn("Salt breath meets the shore");
+      expect(app.getState().liveTurn).toEqual({ sessionId: "s1", text: "Salt breath meets the shore" });
+      // The reveal anchors to the live turn and types it in.
+      expect(app.getState().reveal.entryId).toBe("__live");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(app.getState().reveal.shown).toBeGreaterThan(0);
+      expect(display.lines.some((l) => l.includes("Salt breath"))).toBe(true);
+
+      // Turn completes: the committed transcript delivers the real entry and the
+      // agent clears the live turn.
+      liveTail.deliver([
+        { id: "u1", role: "user", text: "haiku please" },
+        { id: "a1", role: "assistant", text: "Salt breath meets the shore, gulls trace the tide." },
+      ]);
+      liveTail.deliverTurn("");
+      expect(app.getState().liveTurn).toBe(null);
+      await vi.advanceTimersByTimeAsync(300);
+      // No duplicate: the committed entry is shown, the synthetic __live is gone.
+      expect(display.lines.filter((l) => l.includes("Salt breath")).length).toBe(1);
+    });
+
+    it("drops the live turn when leaving the session", async () => {
+      const app = await enterSession();
+      liveTail.deliverTurn("streaming…");
+      expect(app.getState().liveTurn).not.toBe(null);
+      display.emit({ type: "doubleTap" }); // session -> home
+      expect(app.getState().liveTurn).toBe(null);
     });
 
     it("freezes the reveal while scrolled up and resumes at the tail", async () => {

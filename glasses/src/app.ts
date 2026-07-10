@@ -21,6 +21,7 @@ import {
   sessionContentLines,
   sessionTranscriptArea,
   SESSION_SCROLL_STEP,
+  LIVE_TURN_ID,
   type HomeRow,
   type SessionFocus,
 } from "./render.ts";
@@ -156,6 +157,11 @@ export interface AppState {
   // reveal.ts). Only ever describes state.session's newest entry; reset to
   // empty whenever the session screen isn't the one in view.
   reveal: RevealState;
+  // The in-progress assistant turn scraped live from the session's TUI pane
+  // (real-time streaming — the transcript JSONL only lands on completion).
+  // Only for the focused session; cleared on completion, session change, and
+  // background. Rendered as the newest transcript entry (LIVE_TURN_ID).
+  liveTurn: { sessionId: string; text: string } | null;
   pending: Record<string, PendingEntry>;
   loadingHistory: Record<string, boolean>;
 
@@ -181,6 +187,7 @@ export function createInitialState(now: number): AppState {
     sessionRefs: [],
     transcripts: {},
     reveal: emptyReveal(),
+    liveTurn: null,
     pending: {},
     loadingHistory: {},
     home: { cursor: 0 },
@@ -283,6 +290,7 @@ export class App {
     // the agent tailing a transcript nobody's watching.
     this.liveTail.stop();
     this.clearRevealTimer();
+    if (this.state.liveTurn) this.state = { ...this.state, liveTurn: null };
     // Backgrounding stops the poll loop above, but history-fetch retry
     // timers are independent `setTimeout`s keyed by sessionId — without
     // this they keep firing every HISTORY_RETRY_MS while backgrounded.
@@ -364,25 +372,35 @@ export class App {
     if (inSession) {
       this.startLiveTail(cur!.hostKey, cur!.sessionId);
       // The existing buffer is history, not a live stream — show it in full,
-      // and let only subsequent growth type in.
+      // and let only subsequent growth type in. Any live turn from a previous
+      // session is dropped (a fresh session has no in-progress turn until the
+      // stream delivers one).
       const entries = this.state.transcripts[cur!.sessionId]?.entries ?? [];
       const last = entries[entries.length - 1];
-      this.state = { ...this.state, reveal: fullReveal(last?.id ?? null, last?.text.length ?? 0) };
+      this.state = {
+        ...this.state,
+        liveTurn: null,
+        reveal: fullReveal(last?.id ?? null, last?.text.length ?? 0),
+      };
       this.lastRevealAt = this.now();
     } else if (wasSession) {
       this.liveTail.stop();
       this.clearRevealTimer();
-      this.state = { ...this.state, reveal: emptyReveal() };
+      this.state = { ...this.state, liveTurn: null, reveal: emptyReveal() };
     }
   }
 
   private startLiveTail(hostKey: string, sessionId: string): void {
-    this.liveTail.start(hostKey, sessionId, (entries) => this.onLiveTail(hostKey, sessionId, entries));
+    this.liveTail.start(hostKey, sessionId, (ev) => {
+      if (ev.type === "tail") this.onLiveTail(hostKey, sessionId, ev.entries);
+      else this.onLiveTurn(hostKey, sessionId, ev.text);
+    });
   }
 
-  // A live delta for the focused session: merge it into the buffer (same
-  // dedup/append as a poll's tail), re-anchor the reveal, and repaint. Frames
-  // for a session no longer in view are dropped (a stale close race).
+  // A committed transcript delta for the focused session: merge it into the
+  // buffer (same dedup/append as a poll's tail), re-anchor the reveal, and
+  // repaint. Frames for a session no longer in view are dropped (a stale close
+  // race).
   private onLiveTail(_hostKey: string, sessionId: string, entries: TailEntry[]): void {
     if (this.state.screen !== "session" || this.state.session?.sessionId !== sessionId) return;
     const existing = this.state.transcripts[sessionId] ?? emptyBuffer();
@@ -395,6 +413,41 @@ export class App {
     this.reanchorReveal(sessionId);
     this.repaint();
     this.scheduleRevealTick();
+  }
+
+  // The in-progress assistant turn scraped from the TUI (real-time streaming).
+  private onLiveTurn(_hostKey: string, sessionId: string, text: string): void {
+    if (this.state.screen !== "session" || this.state.session?.sessionId !== sessionId) return;
+    if (text) {
+      // Still generating — update the live turn and let the reveal type it in.
+      this.state = { ...this.state, now: this.now(), liveTurn: { sessionId, text } };
+      this.reanchorReveal(sessionId);
+    } else {
+      // Turn completed: drop the live turn (the committed tail owns the message
+      // now) and show the now-committed newest entry in FULL — it was already
+      // streamed live via the turn, so don't re-type it from scratch.
+      const entries = this.state.transcripts[sessionId]?.entries ?? [];
+      const last = entries[entries.length - 1];
+      this.state = {
+        ...this.state,
+        now: this.now(),
+        liveTurn: null,
+        reveal: fullReveal(last?.id ?? null, last?.text.length ?? 0),
+      };
+      this.lastRevealAt = this.now();
+    }
+    this.repaint();
+    this.scheduleRevealTick();
+  }
+
+  // The newest entry the reveal should type: the live in-progress turn if one
+  // is streaming for this session, else the newest committed transcript entry.
+  private newestRevealTarget(sessionId: string): { id: string | null; len: number } {
+    const lt = this.state.liveTurn;
+    if (lt && lt.sessionId === sessionId && lt.text) return { id: LIVE_TURN_ID, len: lt.text.length };
+    const entries = this.state.transcripts[sessionId]?.entries ?? [];
+    const last = entries[entries.length - 1];
+    return { id: last?.id ?? null, len: last?.text.length ?? 0 };
   }
 
   private repaint(): void {
@@ -421,9 +474,8 @@ export class App {
   // transcript change (live delta or poll) so the reveal tracks the newest id.
   private reanchorReveal(sessionId: string): void {
     if (this.state.session?.sessionId !== sessionId) return;
-    const entries = this.state.transcripts[sessionId]?.entries ?? [];
-    const last = entries[entries.length - 1];
-    const reveal = advanceReveal(this.state.reveal, last?.id ?? null, last?.text.length ?? 0, 0);
+    const target = this.newestRevealTarget(sessionId);
+    const reveal = advanceReveal(this.state.reveal, target.id, target.len, 0);
     this.state = { ...this.state, reveal };
     this.lastRevealAt = this.now();
   }
@@ -448,13 +500,12 @@ export class App {
     // Scrolled up since this tick was scheduled — pause without advancing or
     // repainting; onSession re-arms on the return to the tail.
     if (s.offset > 0) return;
-    const entries = this.state.transcripts[s.sessionId]?.entries ?? [];
-    const last = entries[entries.length - 1];
-    const targetLen = last?.text.length ?? 0;
+    const target = this.newestRevealTarget(s.sessionId);
+    const targetLen = target.len;
     const now = this.now();
     const dt = now - this.lastRevealAt;
     this.lastRevealAt = now;
-    const reveal = advanceReveal(this.state.reveal, last?.id ?? null, targetLen, dt);
+    const reveal = advanceReveal(this.state.reveal, target.id, targetLen, dt);
     this.state = { ...this.state, now, reveal };
     this.repaint();
     if (!revealComplete(reveal, targetLen)) this.scheduleRevealTick();

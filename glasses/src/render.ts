@@ -14,6 +14,13 @@ export { DISPLAY_LINES, LINE_WIDTH_PX };
 // session screen (distinct from the menu screens' page-at-a-time paging).
 export const SESSION_SCROLL_STEP = 2;
 
+// Synthetic id for the in-progress assistant turn scraped live from the TUI
+// (app.ts `liveTurn`). It's rendered as the newest transcript entry while
+// generating and the reveal types it; the committed transcript supersedes it
+// on completion. A stable non-uuid string so it never collides with a real
+// entry id.
+export const LIVE_TURN_ID = "__live";
+
 // Focus target on the session screen: the scrollable transcript, or the
 // bottom input/sheet box.
 export type SessionFocus = "transcript" | "bottom";
@@ -192,6 +199,19 @@ export function sessionContentLines(state: AppState, hostKey: string, sessionId:
   const s = findSessionLocal(state, hostKey, sessionId);
   for (const url of s?.session?.newPrUrls ?? []) {
     lines.push(...wrap(`PR ${url}`));
+  }
+  // The in-progress assistant turn scraped live from the TUI (real-time),
+  // rendered as the newest entry and typed in by the reveal. It supersedes
+  // nothing in the committed transcript — the agent clears it (empty text)
+  // the instant the turn completes and the committed tail owns that message.
+  const lt = state.liveTurn;
+  if (lt && lt.sessionId === sessionId && lt.text) {
+    const reveal = state.session?.sessionId === sessionId ? state.reveal : null;
+    let text = lt.text;
+    if (reveal && reveal.entryId === LIVE_TURN_ID && reveal.shown < text.length) {
+      text = text.slice(0, Math.max(0, reveal.shown));
+    }
+    lines.push(...wrap(roleLine("assistant", text)));
   }
   return lines;
 }
