@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import signal
 import struct
@@ -889,10 +890,15 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertIn("--detach", wt)
         self.assertNotIn("-b", wt)
         self.assertEqual(wt[-1], sess["worktreePath"])  # nothing after the path
+        settings = os.path.join(ha.REGISTRY_DIR, "guard-settings.json")
         self.assertEqual(
             self._claude_cmd(),
-            f"claude --remote-control '{sess['rcName']}' --permission-mode bypassPermissions",
+            f"claude --remote-control '{sess['rcName']}' "
+            f"--permission-mode bypassPermissions --settings {shlex.quote(settings)}",
         )
+        # The guard settings file was written and wires the Bash PreToolUse hook.
+        loaded = json.loads(open(settings).read())
+        self.assertEqual(loaded["hooks"]["PreToolUse"][0]["matcher"], "Bash")
 
     def test_spawn_threads_all_options(self):
         repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
