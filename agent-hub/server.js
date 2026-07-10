@@ -999,7 +999,7 @@ const server = http.createServer(async (req, res) => {
         const body = JSON.parse((await readBody(req)) || "{}");
         if (!body.repo) return json(res, 400, { error: "repo required" });
         const cmd = { type: "spawn", repo: body.repo };
-        for (const f of ["prompt", "label", "baseRef", "branchName", "model", "permissionMode"]) {
+        for (const f of ["prompt", "label", "baseRef", "model", "permissionMode"]) {
           if (body[f] != null && body[f] !== "") cmd[f] = body[f];
         }
         const cmdId = queueCommand(key, cmd);

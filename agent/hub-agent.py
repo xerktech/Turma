@@ -9,17 +9,19 @@ multiplexer:
   - Scans REPOS_ROOT (default /mnt/data/Docker/git) one level deep for git
     repos and reports them to the hub.
   - Owns a persisted session registry (~/.agenthub/sessions.json). Each session
-    is a git *worktree* of a repo (branch agent/<id>) running its own
-    `claude --remote-control` inside its own tmux (agent-<id>) served by its own
-    ttyd (127.0.0.1:<ttydPort>, base path /term/<id>).
+    is a git *worktree* of a repo in DETACHED HEAD (the app creates no branch;
+    the running agent branches its own work when ready) forked off the latest
+    default branch, running its own `claude --remote-control` inside its own tmux
+    (agent-<id>) served by its own ttyd (127.0.0.1:<ttydPort>, base /term/<id>).
   - Executes hub-issued commands (spawn / kill / start / restart / delete /
     resume) that ride back on the heartbeat reply, with at-least-once cmdId
     de-dup.
   - Auto-resumes `running` sessions on boot — WITH their conversation
     (claude --resume against the worktree's newest transcript).
   - Remembers killed sessions (~/.agenthub/closed.json, newest 5 per repo) so
-    the hub can offer a per-repo "Resume" picker that brings one back on its
-    kept branch with its prior conversation.
+    the hub can offer a per-repo "Resume" picker. Killing a session stops its
+    processes but KEEPS its worktree on disk (uncommitted work survives), so a
+    resume re-attaches to the same worktree with its prior conversation.
   - POSTs a heartbeat to the hub every INTERVAL seconds carrying repos[] +
     sessions[] (per-session git / token-usage / live-session signals computed
     per worktree, so usage PERSISTS in history after a session is killed — the
@@ -115,16 +117,6 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # (independent of the per-heartbeat TAIL_MSGS above).
 INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "4000"))
 HISTORY_MAX_MSGS = int(os.environ.get("SESSION_HISTORY_MSGS", "200"))
-
-# Delete guard: a session branch that still has unpushed/unmerged commits is
-# parked as agent-trash/<id>-<epoch> instead of `branch -D`'d outright, then
-# hard-deleted once it has sat in the trash longer than this many days
-# (0 = prune trash eagerly). Fully pushed/merged branches skip the trash.
-TRASH_RETENTION_DAYS = int(os.environ.get("TRASH_RETENTION_DAYS", "7"))
-TRASH_PREFIX = "agent-trash/"
-# Trash pruning rides the heartbeat loop; every N beats (~hourly at the 20s
-# default interval) is plenty of resolution for a multi-day window.
-TRASH_PRUNE_EVERY = 180
 
 # Transcript parsing is the expensive part; refresh it every N heartbeats.
 USAGE_EVERY = 15
@@ -261,32 +253,45 @@ def valid_ref_name(ref):
     return all(seg not in ("", ".", "..") for seg in ref.split("/"))
 
 
-def normalize_branch_name(name, sid):
-    """Resolve the session branch name. Blank -> agent/<id> (today's behavior).
-    A custom name is allowlist-validated and forced under the fleet's agent/
-    prefix (delete/resume/scan all key off it), de-duping an operator-supplied
-    'agent/' so we never produce agent/agent/... . Raises ValueError on junk."""
-    name = (name or "").strip()
-    if not name:
-        return f"agent/{sid}"
-    core = name[len("agent/"):] if name.startswith("agent/") else name
-    core = core.strip("/")
-    if not core:
-        return f"agent/{sid}"
-    branch = f"agent/{core}"
-    if not valid_ref_name(branch):
-        raise ValueError(f"invalid branch name {name!r}")
-    return branch
+def default_branch_name(repo_path):
+    """The repo's default branch short name (no network): origin/HEAD's target
+    if set, else 'main'/'master' if either exists locally, else the current
+    checkout's branch. Feeds the composer's base default; the fetch-and-detach
+    happens in default_base_ref() at spawn time."""
+    head = run(["git", "-C", repo_path, "symbolic-ref", "--short", "-q",
+                "refs/remotes/origin/HEAD"])
+    if head.startswith("origin/"):
+        return head[len("origin/"):]
+    for cand in ("main", "master"):
+        if branch_exists(repo_path, f"refs/heads/{cand}"):
+            return cand
+    return run(["git", "-C", repo_path, "rev-parse", "--abbrev-ref", "HEAD"])
+
+
+def default_base_ref(repo_path):
+    """The commit-ish a *new* session's detached worktree forks from: the LATEST
+    default branch. Best-effort `git fetch` of that branch (offline/no-remote is
+    fine — we just fall back), then prefer origin/<default> so new work starts
+    from current upstream, else the local branch, else None (detach at HEAD)."""
+    name = default_branch_name(repo_path)
+    if not name or not valid_ref_name(name):
+        return None
+    run_ok(["git", "-C", repo_path, "fetch", "origin", name])  # best-effort
+    if branch_exists(repo_path, f"refs/remotes/origin/{name}"):
+        return f"origin/{name}"
+    if branch_exists(repo_path, f"refs/heads/{name}"):
+        return name
+    return None
 
 
 def resolve_base_ref(repo_path, base_ref):
-    """Validate an operator-chosen base branch to fork the worktree from.
-    Blank/HEAD -> None (fork off the repo's current HEAD, today's behavior).
-    Otherwise the ref must be allowlist-clean AND actually resolve in the repo
-    (a local branch or origin/<x>) before we hand it to `worktree add`."""
+    """Resolve the commit-ish a session's detached worktree forks from. Blank/HEAD
+    -> the latest default branch (default_base_ref: fetch + origin/<default>).
+    An explicit operator choice must be allowlist-clean AND actually resolve in
+    the repo (a local branch or origin/<x>) before we hand it to `worktree add`."""
     base_ref = (base_ref or "").strip()
     if not base_ref or base_ref == "HEAD":
-        return None
+        return default_base_ref(repo_path)
     if not valid_ref_name(base_ref):
         raise ValueError(f"invalid base ref {base_ref!r}")
     if not branch_exists(repo_path, base_ref):
@@ -963,14 +968,16 @@ def scan_repos():
 def repo_branches(path):
     """Local branches an operator might fork a new session from, newest-commit
     first and capped — feeds the composer's base-branch dropdown. Cheap local
-    ref walk (no network). Excludes the fleet's own agent/ and agent-trash/
-    branches: you fork off real base branches, not other sessions' worktrees."""
+    ref walk (no network). The app no longer creates its own branches, so every
+    local branch (incl. ones a running session named for its work) is a valid
+    detach point; a detached worktree can even fork off a branch checked out
+    elsewhere."""
     out = run(["git", "-C", path, "for-each-ref", "--sort=-committerdate",
                "--format=%(refname:short)", "refs/heads"])
     branches = []
     for b in out.splitlines():
         b = b.strip()
-        if not b or b.startswith("agent/") or b.startswith(TRASH_PREFIX):
+        if not b:
             continue
         branches.append(b)
         if len(branches) >= 50:
@@ -988,8 +995,10 @@ def repo_entry(repo):
         "branch": run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path),
         "remote": run(["git", "remote", "get-url", "origin"], cwd=path),
         "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
-        # Base-branch choices for the "New session" composer (#12).
+        # Base-branch choices for the "New session" composer (#12), plus the
+        # default the composer pre-selects (new sessions fork off latest main).
         "branches": repo_branches(path),
+        "defaultBranch": default_branch_name(path),
     }
 
 
@@ -1009,31 +1018,8 @@ def root_repo_entry():
         "remote": info.get("remote", ""),
         "dirtyFiles": info.get("dirtyFiles", 0),
         "branches": [],
+        "defaultBranch": "",
     }
-
-
-def prune_trash_branches():
-    """Hard-delete agent-trash/* branches whose grace period has expired.
-
-    delete() embeds the trash time as a unix-epoch suffix in the branch name
-    (agent-trash/<id>-<epoch>); a trash branch without one (e.g. renamed by
-    hand) falls back to its commit date. Runs on every delete and on a slow
-    cadence in the heartbeat loop, across every scanned repo."""
-    cutoff = time.time() - TRASH_RETENTION_DAYS * 86400
-    for repo in scan_repos():
-        out = run(["git", "-C", repo["path"], "for-each-ref",
-                   "--format=%(refname:short) %(committerdate:unix)",
-                   f"refs/heads/{TRASH_PREFIX}"])
-        for line in out.splitlines():
-            name, _, cdate = line.rpartition(" ")
-            m = re.search(r"-(\d{9,})$", name)
-            trashed_at = (int(m.group(1)) if m
-                          else int(cdate) if cdate.isdigit() else None)
-            if trashed_at is None or trashed_at >= cutoff:
-                continue
-            if run_ok(["git", "-C", repo["path"], "branch", "-D", name])[0] == 0:
-                log(f"pruned trash branch {name} in {repo['name']} "
-                    f"(in trash >{TRASH_RETENTION_DAYS}d)")
 
 
 def now_iso():
@@ -1373,23 +1359,20 @@ class SessionManager:
             except Exception:
                 pass
 
-    def _worktree_add(self, sess, new_branch, base_ref=None):
-        """Add the worktree. new_branch=True creates the session branch (spawn);
-        off base_ref when given (a pre-validated local/remote ref, #12), else off
-        HEAD as before. new_branch=False re-checks-out the existing branch
-        (start/resume)."""
+    def _worktree_add(self, sess, base_ref=None):
+        """Add the worktree in DETACHED HEAD — the app never creates a branch;
+        the running agent branches its own work. base_ref (a pre-validated
+        commit-ish, typically origin/<default> for latest main) is the detach
+        point; None detaches at the repo's current HEAD. Used by spawn and, as a
+        cold-path recovery, by start/resume when the worktree dir has vanished."""
         os.makedirs(os.path.dirname(sess["worktreePath"]), exist_ok=True)
         # Clear any stale worktree registration left by a --force removal that
         # partially failed, so `worktree add` doesn't refuse.
         run(["git", "-C", sess["repoPath"], "worktree", "prune"])
-        if new_branch:
-            cmd = ["git", "-C", sess["repoPath"], "worktree", "add",
-                   sess["worktreePath"], "-b", sess["branch"]]
-            if base_ref:
-                cmd.append(base_ref)
-        else:
-            cmd = ["git", "-C", sess["repoPath"], "worktree", "add",
-                   sess["worktreePath"], sess["branch"]]
+        cmd = ["git", "-C", sess["repoPath"], "worktree", "add", "--detach",
+               sess["worktreePath"]]
+        if base_ref:
+            cmd.append(base_ref)
         rc, err = run_ok(cmd)
         if rc != 0:
             raise RuntimeError(f"git worktree add failed: {err}")
@@ -1412,21 +1395,21 @@ class SessionManager:
     # --- lifecycle (executed container-side; see CONTRACT) ----------------
 
     def spawn(self, repo_name, *, prompt=None, label=None, base_ref=None,
-              branch_name=None, model=None, permission_mode=None):
+              model=None, permission_mode=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
-        All keyword options (#11/#12/#13) default to None so a bare spawn
-        reproduces today's behavior exactly. label (#13) is presentational: it
-        flavors the claude.ai/code display name but the agent/<id> branch and
-        agent-<id> tmux stay the canonical internal keys. The remaining options
-        (base branch, custom branch name, model, permission mode) are validated
-        below; a bad option fails the spawn cleanly as an error card rather than
-        reaching git/tmux or crashing the manager."""
+        The worktree is added in DETACHED HEAD forked off the latest default
+        branch (or an operator-chosen base) — the app creates NO branch; the
+        running agent branches its own work when ready. label is presentational:
+        it flavors the claude.ai/code display name but agent-<id> tmux stays the
+        canonical internal key. The options (base branch, model, permission mode)
+        are validated below; a bad option fails the spawn cleanly as an error
+        card rather than reaching git/tmux or crashing the manager."""
         if self._running_count() >= MAX_SESSIONS:
             log(f"spawn refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
         # A root session runs directly at REPOS_ROOT (no worktree/branch). The
-        # base/branch-name options don't apply; only one may run at a time.
+        # base option doesn't apply; only one may run at a time.
         is_root = (repo_name == ROOT_REPO_NAME)
         if is_root:
             if self._root_running():
@@ -1449,7 +1432,7 @@ class SessionManager:
             # Root runs in REPOS_ROOT itself; a repo session gets a fresh worktree.
             "worktreePath": (REPOS_ROOT if is_root
                              else os.path.join(WORKTREES_ROOT, repo["name"], sid)),
-            "branch": None if is_root else f"agent/{sid}",  # custom name applied below
+            "branch": None,        # app owns no branch; the agent names its own
             "root": is_root,
             "label": label,
             "rcName": f"{slugify(self.device)}-{slugify(repo['name'])}-{rc_slug or sid}",
@@ -1466,20 +1449,20 @@ class SessionManager:
         self.registry.append(sess)
         try:
             # Validate every interpolated option BEFORE touching git/tmux. Model
-            # and permission mode apply to root too; branch/base/worktree don't.
+            # and permission mode apply to root too; base/worktree don't.
             sess["model"] = resolve_model(model)
             sess["permissionMode"] = resolve_permission_mode(permission_mode)
             resolved_base = None
             if not is_root:
-                sess["branch"] = normalize_branch_name(branch_name, sid)
                 resolved_base = resolve_base_ref(repo["path"], base_ref)
                 sess["baseRef"] = resolved_base
-                self._worktree_add(sess, new_branch=True, base_ref=resolved_base)
+                self._worktree_add(sess, base_ref=resolved_base)
             self._launch_tmux(sess, prompt=(prompt or None))
             self._launch_ttyd(sess)
+            wt = os.path.basename(sess["worktreePath"])
             log(f"spawned session {sid} for {repo['name']} on :{sess['ttydPort']} "
                 + ("(root)" if is_root else
-                   f"(branch {sess['branch']}"
+                   f"(detached worktree {wt}"
                    + (f", base {resolved_base}" if resolved_base else "")
                    + ")")
                 + (f" label {label!r}" if label else ""))
@@ -1492,8 +1475,9 @@ class SessionManager:
         kept — older records fall off (their branch/transcript still exist,
         they just stop being offered)."""
         rec = {k: sess.get(k) for k in (
-            "id", "repo", "repoPath", "worktreePath", "branch", "rcName",
-            "tmuxName", "createdAt", "label", "model", "permissionMode", "root",
+            "id", "repo", "repoPath", "worktreePath", "branch", "baseRef",
+            "rcName", "tmuxName", "createdAt", "label", "model",
+            "permissionMode", "root",
         )}
         rec["closedAt"] = now_iso()
         self.closed = [c for c in self.closed if c.get("id") != rec["id"]]
@@ -1508,36 +1492,32 @@ class SessionManager:
         self.closed = list(reversed(keep))
 
     def kill(self, sid):
-        """Stop and remove a session in one step: end tmux/ttyd, delete its
-        worktree, and drop the registry record so the card disappears from the
-        hub. KEEPS the git branch (agent/<id>) and the transcript, so the work
-        stays in the repo and its usage still shows in history — and records it
-        in the closed history so the repo's "Resume" picker can bring it back
-        with its conversation. (Contrast delete(), which also removes the
-        branch — immediately when fully pushed/merged, otherwise parked under
-        agent-trash/ for a grace period — forfeiting resume either way.)"""
+        """Stop a session and drop its registry record so the card disappears
+        from the hub — but KEEP its worktree on disk (any uncommitted work
+        survives) and its transcript. Recorded in the closed history so the
+        repo's "Resume" picker can re-attach to the same worktree with its
+        conversation. (Contrast delete(), which removes the worktree too.)"""
         sess = self._find(sid)
         if not sess:
             log(f"kill: no such session {sid}")
             return
         self._kill_tmux(sess)
         self._kill_ttyd(sid)
-        # A root session's "worktree" IS REPOS_ROOT — never remove it; there's no
-        # worktree/branch to clean up, just the running processes.
-        if not sess.get("root") and os.path.isdir(sess["worktreePath"]):
-            self._worktree_remove(sess)
+        # The worktree is deliberately left in place — killing must never lose
+        # uncommitted work. (Root has no worktree; nothing to leave either way.)
         self.registry = [s for s in self.registry if s.get("id") != sid]
         self._remember_closed(sess)
         self._forget_session_caches(sid)
         log(f"killed session {sid} ("
-            + ("root, no worktree/branch" if sess.get("root")
-               else f"worktree removed, branch {sess['branch']} kept")
+            + ("root, no worktree" if sess.get("root")
+               else "worktree kept on disk")
             + ", resumable)")
 
     def start(self, sid):
-        """Resume a stopped session: re-add its worktree on the EXISTING branch
-        and relaunch on the SAME ttyd port, continuing its prior conversation
-        (fresh only if it never had a transcript)."""
+        """Resume a stopped session: relaunch on the SAME ttyd port in its still-
+        present worktree, continuing its prior conversation (fresh only if it
+        never had a transcript). If the worktree dir has somehow vanished, re-add
+        a detached one off the recorded base as a best-effort recovery."""
         sess = self._find(sid)
         if not sess:
             log(f"start: no such session {sid}")
@@ -1552,8 +1532,9 @@ class SessionManager:
             return
         try:
             # Root runs in REPOS_ROOT (always present) — no worktree to re-add.
+            # Normally the worktree persists (kill keeps it), so this is skipped.
             if not sess.get("root") and not os.path.isdir(sess["worktreePath"]):
-                self._worktree_add(sess, new_branch=False)
+                self._worktree_add(sess, base_ref=sess.get("baseRef"))
             self._launch_tmux(sess, resume=True)
             self._launch_ttyd(sess)
             sess["status"] = "running"
@@ -1564,10 +1545,11 @@ class SessionManager:
             self._set_error(sess, e)
 
     def resume(self, sid):
-        """Bring back a KILLED session with its conversation: re-register it,
-        re-add its worktree on the kept agent/<id> branch, and relaunch claude
-        resuming its newest transcript. The record moves out of the closed
-        history; a failure surfaces as an error card like any other session."""
+        """Bring back a KILLED session with its conversation: re-register it and
+        relaunch claude in its kept worktree, resuming its newest transcript
+        (re-adding a detached worktree off the recorded base only if the dir has
+        vanished). The record moves out of the closed history; a failure surfaces
+        as an error card like any other session."""
         if self._find(sid):
             self.start(sid)  # duplicate resume / already back — treat as start
             return
@@ -1587,6 +1569,7 @@ class SessionManager:
             "repoPath": rec.get("repoPath"),
             "worktreePath": rec.get("worktreePath"),
             "branch": rec.get("branch"),
+            "baseRef": rec.get("baseRef"),
             "root": rec.get("root"),
             "label": rec.get("label"),
             "rcName": rec.get("rcName"),
@@ -1603,8 +1586,9 @@ class SessionManager:
         self.closed = [c for c in self.closed if c.get("id") != sid]
         try:
             # Root has no worktree to re-add; it resumes in place at REPOS_ROOT.
+            # The kept worktree normally still exists, so this is skipped.
             if not sess.get("root") and not os.path.isdir(sess["worktreePath"]):
-                self._worktree_add(sess, new_branch=False)
+                self._worktree_add(sess, base_ref=sess.get("baseRef"))
             self._launch_tmux(sess, resume=True)
             self._launch_ttyd(sess)
             log(f"resumed closed session {sid} for {sess['repo']} on :{sess['ttydPort']}")
@@ -1632,58 +1616,30 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
-    def _retire_branch(self, sess):
-        """Lost-work guard behind delete(): `branch -D` the session branch only
-        when its commits are provably safe (all on origin, or all contained in
-        the repo checkout's base branch); otherwise rename it to
-        agent-trash/<id>-<epoch> as a grace period, pruned after
-        TRASH_RETENTION_DAYS. Anything indeterminate is treated as unsafe."""
-        repo, branch = sess["repoPath"], sess["branch"]
-        if not branch_exists(repo, f"refs/heads/{branch}"):
-            return  # spawn failed before the branch was born, or already gone
-        base = run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"])
-        sync = branch_sync(repo, branch, base or None)
-        safe = ((sync["pushed"] and sync["aheadOfRemote"] == 0)
-                or sync["aheadOfBase"] == 0)
-        if safe:
-            run(["git", "-C", repo, "branch", "-D", branch])
-            return
-        trash = f"{TRASH_PREFIX}{sess['id']}-{int(time.time())}"
-        rc, err = run_ok(["git", "-C", repo, "branch", "-m", branch, trash])
-        if rc == 0:
-            unpushed = (sync["aheadOfRemote"] if sync["pushed"]
-                        else sync["aheadOfBase"])
-            log(f"branch {branch} has unpushed work "
-                f"({unpushed if unpushed is not None else 'unknown'} commits) "
-                f"— parked as {trash} for {TRASH_RETENTION_DAYS}d")
-        else:
-            log(f"could not park {branch} as {trash} ({err}); "
-                f"branch left in place")
-
     def delete(self, sid):
-        """Remove a session entirely: worktree + branch + registry record. It
-        disappears from the UI and its usage stops being reported. The branch
-        is hard-deleted only when its work is safe (pushed or merged); a branch
-        with unpushed commits is parked under agent-trash/ instead — see
-        _retire_branch(). Dirty worktree files are gone either way (the UI
-        warns before confirming)."""
+        """Remove a session entirely: its worktree + registry record. It
+        disappears from the UI and its usage stops being reported. The app owns
+        no branch, so any branch the running agent named for its work — and thus
+        every committed change on it — survives in the repo untouched; only
+        uncommitted worktree files are lost (the UI warns before confirming)."""
         sess = self._find(sid)
         if not sess:
             log(f"delete: no such session {sid}")
             return
         self._kill_tmux(sess)
         self._kill_ttyd(sid)
-        # Root has no worktree/branch to remove — REPOS_ROOT and its repos stay
-        # put; delete just tears down the processes and drops the record.
-        if not sess.get("root"):
-            if os.path.isdir(sess["worktreePath"]):
-                self._worktree_remove(sess)
-            self._retire_branch(sess)
+        # Root has no worktree to remove — REPOS_ROOT and its repos stay put;
+        # delete just tears down the processes and drops the record.
+        if not sess.get("root") and os.path.isdir(sess["worktreePath"]):
+            gi = git_info(sess["worktreePath"])
+            if gi and gi.get("dirtyFiles"):
+                log(f"delete {sid}: discarding {gi['dirtyFiles']} "
+                    f"uncommitted worktree file(s)")
+            self._worktree_remove(sess)
         self.registry = [s for s in self.registry if s.get("id") != sid]
-        # The branch is gone, so any stale closed record must not offer resume.
+        # The worktree is gone, so any stale closed record must not offer resume.
         self.closed = [c for c in self.closed if c.get("id") != sid]
         self._forget_session_caches(sid)
-        prune_trash_branches()
         log(f"deleted session {sid}")
 
     # --- on-demand input/history (glasses client) --------------------------
@@ -1909,7 +1865,6 @@ class SessionManager:
                         prompt=cmd.get("prompt"),
                         label=cmd.get("label"),
                         base_ref=cmd.get("baseRef"),
-                        branch_name=cmd.get("branchName"),
                         model=cmd.get("model"),
                         permission_mode=cmd.get("permissionMode"),
                     )
@@ -1964,16 +1919,23 @@ class SessionManager:
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
-        # Base = whatever the repo's own checkout is on (the branch worktrees
-        # were forked from); '' (e.g. repo dir gone) degrades to no comparison.
-        base = run(["git", "-C", sess["repoPath"], "rev-parse",
-                    "--abbrev-ref", "HEAD"])
+        gi = git_info(sess["worktreePath"])  # of the worktree (None if gone)
+        # The app owns no branch, so the branch to report is the LIVE one the
+        # running agent named for its work ("HEAD" = still detached, not yet
+        # branched -> no branch to sync). Compare it against what the session
+        # forked from (baseRef, e.g. origin/main), falling back to the repo's
+        # current checkout when we didn't record a base.
+        live_branch = gi.get("branch") if gi else None
+        if live_branch == "HEAD":
+            live_branch = None
+        base = sess.get("baseRef") or run(
+            ["git", "-C", sess["repoPath"], "rev-parse", "--abbrev-ref", "HEAD"])
         return {
             "id": sid,
             "repo": sess["repo"],
             "repoPath": sess["repoPath"],
             "worktreePath": sess["worktreePath"],
-            "branch": sess["branch"],
+            "branch": sess["branch"],           # app branch: always None now
             "root": sess.get("root", False),
             "rcName": sess["rcName"],
             "label": sess.get("label"),
@@ -1985,11 +1947,11 @@ class SessionManager:
             "createdAt": sess.get("createdAt"),
             "stoppedAt": sess.get("stoppedAt"),
             "errorMsg": sess.get("errorMsg"),
-            "git": git_info(sess["worktreePath"]),  # of the worktree (None if gone)
-            # Branch↔base/origin relation from the shared repo, so it's still
-            # reported for stopped sessions whose worktree is gone — exactly
-            # when the UI's delete guard needs it.
-            "work": branch_sync(sess["repoPath"], sess["branch"], base or None),
+            "git": gi,
+            # The live branch's relation to its base/origin, computed from the
+            # shared repo so it's reported even for a stopped session. Empty
+            # while the agent is still on detached HEAD (no branch to sync).
+            "work": branch_sync(sess["repoPath"], live_branch, base or None),
             "usage": self.usage_cache.get(sid),     # present for stopped too
             "session": signals,                      # running only; null otherwise
         }
@@ -2003,6 +1965,7 @@ class SessionManager:
                 "id": c.get("id"),
                 "repo": c.get("repo"),
                 "branch": c.get("branch"),
+                "worktreePath": c.get("worktreePath"),
                 "root": c.get("root", False),
                 "rcName": c.get("rcName"),
                 "label": c.get("label"),
@@ -2101,8 +2064,6 @@ class SessionManager:
             # queued while we're mid-cycle) still shortens the next wait rather
             # than being swallowed.
             _poke.clear()
-            if beat % TRASH_PRUNE_EVERY == 0:  # incl. beat 0 = boot
-                prune_trash_branches()
             reply = self.post(self.build_payload(beat))
             beat += 1
             if reply is not None:

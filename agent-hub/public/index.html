@@ -319,7 +319,7 @@
 
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
-  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no branch, so the base-branch and branch-name options don't apply, and only one may run per host at a time. "Clone from GitHub" pulls a repo (from the host's GitHub login) into the repos root so it joins the list and can host sessions — greyed out on hosts without GitHub credentials. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, custom branch name, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub (worktree deleted, so uncommitted files are lost) in one step, but keeps its git branch, conversation, and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and brings one back on the same branch with its conversation intact. Delete (on an already-stopped session) additionally erases the branch and history; a branch with unpushed commits is parked as <code>agent-trash/&lt;id&gt;</code> in the repo for a grace period (7 days by default) before being pruned for good. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation.</div>
+  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. "Clone from GitHub" pulls a repo (from the host's GitHub login) into the repos root so it joins the list and can host sessions — greyed out on hosts without GitHub credentials. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation.</div>
 </div>
 
 <nav class="bottom-nav">
@@ -375,7 +375,7 @@ function toggleResume(rkey) {
 
 // - composerOpen: "host::repo" whose "New session" composer panel is open
 // - optionsOpen:  "host::repo" whose nested ▸ Options disclosure is expanded
-// - composerDraft: "host::repo" -> {task,label,branch} in-progress text, kept in
+// - composerDraft: "host::repo" -> {task,label} in-progress text, kept in
 //   memory ONLY (never localStorage) so the 5s re-render can't wipe what the
 //   operator is typing. Options (base/model/perm) persist per-repo in
 //   localStorage instead (loadOpts/saveOpts) so a repeat spawn keeps them.
@@ -392,13 +392,6 @@ function cloneText(key, v) { const d = cloneDraft.get(key) || {}; d.text = v; cl
 
 // DOM id for a composer field, derived from the (host::repo) key + field name.
 function cid(rk, field) { return "cmp-" + field + "-" + rk.replace(/[^A-Za-z0-9]/g, "_"); }
-// Client-side slug for the branch-name suggestion hint (branch is validated
-// agent-side; this is presentational only).
-function slug(s) {
-  return String(s || "").trim().toLowerCase()
-    .replace(/\s+/g, "-").replace(/[^a-z0-9._-]/g, "-")
-    .replace(/-+/g, "-").replace(/^-|-$/g, "");
-}
 // Per-repo last-used spawn options (base branch, model, permission mode, and
 // whether Options was expanded). Defensive: any storage error → plain defaults.
 function optStoreKey(repo) { return "agenthub.composer." + repo; }
@@ -432,12 +425,10 @@ function onOptionsToggle(rkey, repo, open) {
   if (open) optionsOpen.add(rkey); else optionsOpen.delete(rkey);
   const o = loadOpts(repo); o.optionsExpanded = open; saveOpts(repo, o);
 }
-// Live-update the branch-name placeholder as the label is typed (blank branch
-// is fine — the agent then generates agent/<id>).
+// The label is presentational (it flavors the claude.ai/code display name); the
+// app names no branch, so there's nothing to live-preview as it's typed.
 function onLabelInput(rkey, el) {
   draftSet(rkey, "label", el.value);
-  const b = document.getElementById(cid(rkey, "branch"));
-  if (b) b.placeholder = el.value.trim() ? "agent/" + (slug(el.value) || "…") + "-<id>" : "agent/<id>";
 }
 // Capture/restore focus + caret across the full-tree innerHTML swap so typing
 // in an open composer survives the 5s poll re-render.
@@ -611,6 +602,17 @@ function workLine(s) {
   if (dirty) bits.push(`${dirty} dirty file${dirty === 1 ? "" : "s"}`);
   const risk = unpushedCommits(s) > 0 || dirty > 0;
   return `<b class="${risk ? "work-risk" : "work-safe"}">${bits.join(" · ")}</b>`;
+}
+// The session's worktree directory name (the randomly-assigned id under the
+// worktrees root) — shown on the card alongside the branch.
+function worktreeName(s) {
+  return String(s.worktreePath || "").split("/").filter(Boolean).pop() || "–";
+}
+// The branch to show: the LIVE branch the running agent named for its work (the
+// app itself creates none). "detached" while it's still on detached HEAD.
+function sessBranch(s) {
+  const b = s.git?.branch;
+  return (b && b !== "HEAD") ? b : "detached";
 }
 
 // Per-session live signals: transcript freshness => working/idle, pending
@@ -833,7 +835,7 @@ function repoBlock(a, repo, sessList, now) {
         return `<div class="resume-item">
           <span class="sid">${esc(c.id)}</span>
           ${c.label ? `<span class="lbl">${esc(c.label)}</span>` : ""}
-          <span><b>${c.root ? "repos root" : esc(c.branch || "–")}</b> · killed ${c.closedAt ? esc(ago(now - Date.parse(c.closedAt))) : "–"}</span>
+          <span><b>${c.root ? "repos root" : esc(worktreeName(c))}</b> · killed ${c.closedAt ? esc(ago(now - Date.parse(c.closedAt))) : "–"}</span>
           <span>${esc(c.rcName || "")}</span>
           <span class="spacer"></span>
           <button class="primary btn-sm" ${rp ? "disabled" : ""} onclick="resumeSession('${esc(a.key)}','${esc(c.id)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume"}</button>
@@ -867,18 +869,19 @@ function composer(a, repo, rk, spawning) {
   const d = composerDraft.get(rk) || {};
   const o = loadOpts(repo.name);
   const key = esc(a.key), rn = esc(repo.name);
-  // Base-branch choices: current HEAD first, then the repo's other branches and
-  // any remembered choice, de-duped. Falls back to the repo's current branch.
+  // Base-branch choices: the default branch (latest main — the fork point for a
+  // new session) first, then the repo's current HEAD and other branches and any
+  // remembered choice, de-duped. Falls back to the repo's current branch.
   const bases = [];
-  for (const b of [repo.branch, ...(repo.branches || []), o.baseRef]) {
+  for (const b of [repo.defaultBranch, repo.branch, ...(repo.branches || []), o.baseRef]) {
     if (b && !bases.includes(b)) bases.push(b);
   }
-  const selBase = (o.baseRef && bases.includes(o.baseRef)) ? o.baseRef : (repo.branch || "");
+  const selBase = (o.baseRef && bases.includes(o.baseRef))
+    ? o.baseRef : (repo.defaultBranch || repo.branch || "");
   const selModel = o.model || "default";
   const selPerm = o.permissionMode || "bypassPermissions";
   const optsExpanded = optionsOpen.has(rk);
   const opt = (v, label, sel) => `<option value="${esc(v)}"${v === sel ? " selected" : ""}>${esc(label)}</option>`;
-  const branchPh = (d.label || "").trim() ? "agent/" + (slug(d.label) || "…") + "-<id>" : "agent/<id>";
   const submit = `startSession('${key}','${rn}')`;
   return `<div class="composer">
     <div>
@@ -896,15 +899,10 @@ function composer(a, repo, rk, spawning) {
       <summary>${optsExpanded ? "▾" : "▸"} Options</summary>
       <div class="opts-grid">
         ${repo.isRoot ? "" : `<div class="full">
-          <label>Base branch</label>
+          <label>Base branch <span class="hint">(fork point; latest is fetched)</span></label>
           <select id="${cid(rk, "base")}" onchange="onOptChange('${esc(rk)}','${rn}')">
             ${bases.map(b => opt(b, b, selBase)).join("")}
           </select>
-        </div>
-        <div class="full">
-          <label>Branch name</label>
-          <input id="${cid(rk, "branch")}" type="text" placeholder="${esc(branchPh)}" value="${esc(d.branch || "")}"
-            oninput="draftSet('${esc(rk)}','branch',this.value)">
         </div>`}
         <div>
           <label>Model</label>
@@ -938,20 +936,15 @@ function sessCard(a, s, now) {
   const dKey = "sd::" + a.key + "::" + s.id;
   const id = esc(s.id), key = esc(a.key);
 
-  // Delete/kill guard copy: say exactly what a confirm would lose. Kill keeps
-  // the branch (commits survive in the repo) but removes the worktree, so it
-  // only loses uncommitted changes; delete also retires the branch (unpushed
-  // commits are parked as agent-trash/<id> for a grace period, not kept).
+  // Delete/kill guard copy. Kill keeps the worktree on disk (nothing is lost —
+  // it's resumable). Delete removes the worktree, but the app owns no branch, so
+  // any branch the agent named for its work — and its commits — survive in the
+  // repo; only uncommitted worktree files are lost.
   const dirty = s.git?.dirtyFiles || 0;
-  const unpushed = unpushedCommits(s);
   const work = workLine(s);
-  const lose = [];
-  if (unpushed > 0) lose.push(`${unpushed} unpushed commit${unpushed === 1 ? "" : "s"}`);
-  if (dirty > 0) lose.push("uncommitted changes");
-  const delConfirm = lose.length
-    ? `Confirm delete — ${lose.join(" + ")} will be lost` : "Confirm delete";
-  const killConfirm = dirty > 0
-    ? "Confirm kill — uncommitted changes will be lost" : "Confirm kill";
+  const delConfirm = dirty > 0
+    ? "Confirm delete — uncommitted changes will be lost" : "Confirm delete";
+  const killConfirm = "Confirm kill";
 
   const sp = sessPending(a.key, s.id);
   let actions = "";
@@ -966,10 +959,10 @@ function sessCard(a, s, now) {
         ? `<button class="primary btn-sm" onclick="openTerminal('${id}')">Attach ▸</button>`
         : `<button class="btn-sm" disabled title="Terminal tunnel offline">Attach</button>`) +
       `<button class="btn-sm ${confirming.has(rKey) ? "confirm" : ""}" onclick="sessRestart('${key}','${id}')">${confirming.has(rKey) ? "Confirm restart" : "Restart"}</button>` +
-      // One-step teardown: stop the session, remove its worktree, and drop it
-      // from the hub — but KEEP the git branch and usage history. (The old
-      // separate Delete button, which also nuked the branch, lived here; it now
-      // only appears on already-stopped/errored cards below.)
+      // Stop the session and drop it from the hub — but KEEP its worktree on
+      // disk (uncommitted work survives) and its usage history, so it stays
+      // resumable. Delete (which removes the worktree) only appears on already-
+      // stopped/errored cards below.
       `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? esc(killConfirm) : "Kill"}</button>`;
   } else {
     // stopped or error: offer Start (needs host online + worktree recoverable) + Delete.
@@ -990,7 +983,10 @@ function sessCard(a, s, now) {
       <span class="badge ${st}">${esc(st)}</span>
     </div>
     <dl>
-      <dt>${s.root ? "Location" : "Branch"}</dt><dd><b>${s.root ? "repos root (no worktree)" : esc(s.branch || "–")}</b></dd>
+      ${s.root
+        ? `<dt>Location</dt><dd><b>repos root (no worktree)</b></dd>`
+        : `<dt>Worktree</dt><dd><b>${esc(worktreeName(s))}</b></dd>
+      <dt>Branch</dt><dd><b>${esc(sessBranch(s))}</b></dd>`}
       ${work ? `<dt>Work</dt><dd>${work}</dd>` : ""}
       <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
       ${live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>` : ""}
@@ -1081,15 +1077,16 @@ function startSession(key, repo) {
   const v = id => { const el = document.getElementById(cid(rk, id)); return el ? el.value : ""; };
   const host = (cache.agents || []).find(a => a.key === key);
   const repoInfo = host ? (host.repos || []).find(r => r.name === repo) : null;
-  const curBranch = repoInfo ? repoInfo.branch : "";
+  const defBranch = repoInfo ? (repoInfo.defaultBranch || repoInfo.branch) : "";
   const prompt = v("task").trim(), label = v("label").trim();
-  const baseRef = v("base"), branchName = v("branch").trim();
+  const baseRef = v("base");
   const model = v("model"), perm = v("perm");
   const body = { repo };
   if (prompt) body.prompt = prompt;
   if (label) body.label = label;
-  if (baseRef && baseRef !== curBranch) body.baseRef = baseRef; // blank/HEAD = today's fork point
-  if (branchName) body.branchName = branchName;
+  // Omitted base = the agent forks the latest default branch (main). Only send
+  // an explicit base when the operator picked something other than that.
+  if (baseRef && baseRef !== defBranch) body.baseRef = baseRef;
   if (model && model !== "default") body.model = model;
   if (perm && perm !== "bypassPermissions") body.permissionMode = perm;
   saveOpts(repo, { baseRef, model, permissionMode: perm, optionsExpanded: optionsOpen.has(rk) });

@@ -471,7 +471,7 @@ describe("render: confirm", () => {
       confirm: { action: { kind: "delete", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 1 },
     });
     const lines = asLines(render(state));
-    expect(lines[0]).toContain("Also removes branch");
+    expect(lines[0]).toContain("Removes worktree");
     expect(lines).toContain("  Cancel");
     expect(lines).toContain("> Confirm");
   });

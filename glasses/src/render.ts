@@ -392,7 +392,7 @@ function confirmHeader(state: AppState): string {
   const c = state.confirm;
   if (!c) return "Confirm";
   const id = c.action.sessionId.slice(0, 6);
-  return c.action.kind === "kill" ? `Kill ${id}?` : `Delete ${id}? Also removes branch`;
+  return c.action.kind === "kill" ? `Kill ${id}?` : `Delete ${id}? Removes worktree`;
 }
 
 function renderConfirm(state: AppState): string[] {

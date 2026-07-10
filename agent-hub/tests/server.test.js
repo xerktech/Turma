@@ -628,10 +628,11 @@ test("http: spawn route forwards composer options; bare spawn stays minimal", as
   await beat({ device: "hc" });
 
   // Full composer payload -> every provided field rides the queued command.
+  // (The app no longer names branches, so there is no branchName field.)
   const full = await request("POST", "/api/agents/hc/sessions", {
     body: {
       repo: "AgentHub", prompt: "fix the bug", label: "Fix login",
-      baseRef: "main", branchName: "agent/fix-login", model: "opus",
+      baseRef: "main", model: "opus",
       permissionMode: "plan",
     },
     headers: userHeaders,
@@ -649,7 +650,7 @@ test("http: spawn route forwards composer options; bare spawn stays minimal", as
   assert.deepEqual(res.body.commands, [
     {
       type: "spawn", repo: "AgentHub", prompt: "fix the bug", label: "Fix login",
-      baseRef: "main", branchName: "agent/fix-login", model: "opus",
+      baseRef: "main", model: "opus",
       permissionMode: "plan", cmdId: full.body.cmdId,
     },
     { type: "spawn", repo: "AgentHub", model: "sonnet", cmdId: bare.body.cmdId },
