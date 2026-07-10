@@ -16,10 +16,14 @@ export function emptyBuffer(): TranscriptBuffer {
   return { entries: [] };
 }
 
-// Merges a freshly-polled tail into the buffer: entries already present (by
-// id) are updated in place (their text may have grown since the last poll,
-// e.g. a still-streaming assistant turn); new ids are appended in the order
-// they appear in `tail`, which the agent guarantees is oldest-to-newest.
+// Merges a freshly-polled tail into the buffer: an entry already present (by
+// id) is updated in place only when the incoming copy is at least as long as
+// the stored one — transcript entries only grow (a streaming assistant turn
+// appends; a finished message is fixed), so a SHORTER incoming copy is the
+// heartbeat's bounded per-message preview (TAIL_MSG_CHARS) landing after the
+// live tail / history already delivered the full message, and must not clobber
+// it back to truncated. New ids are appended in the order they appear in
+// `tail`, which the agent guarantees is oldest-to-newest.
 export function mergeTail(buffer: TranscriptBuffer, tail: TailEntry[]): TranscriptBuffer {
   if (tail.length === 0) return buffer;
   const entries = buffer.entries.slice();
@@ -27,7 +31,10 @@ export function mergeTail(buffer: TranscriptBuffer, tail: TailEntry[]): Transcri
   for (const incoming of tail) {
     const existingIndex = indexById.get(incoming.id);
     if (existingIndex !== undefined) {
-      entries[existingIndex] = incoming;
+      const existing = entries[existingIndex];
+      if (existing && incoming.text.length >= existing.text.length) {
+        entries[existingIndex] = incoming;
+      }
     } else {
       indexById.set(incoming.id, entries.length);
       entries.push(incoming);

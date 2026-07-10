@@ -42,13 +42,20 @@ const DEFAULT_TTYD_PORT = 7681;
 // while a session is actively watched, so idle sessions cost nothing.
 //
 // The transcript read here is a deliberate re-implementation of hub-agent.py's
-// transcript_tail / _entry_text / _project_slug (kept byte-for-byte compatible
-// so the glasses get the same entries whether they arrive via this fast path
-// or the 20s heartbeat). If that Python changes shape, change this too.
+// transcript_tail / _entry_text / _project_slug (same entry->text mapping,
+// ordering and dedup so the glasses get the same entries whether they arrive
+// via this fast path or the 20s heartbeat). The one intentional difference:
+// this live path keeps the FULL per-message text (TAIL_MSG_CHARS below mirrors
+// the Python reading paths' TAIL_MSG_CHARS_FULL, not the heartbeat's smaller
+// per-message preview). If that Python changes shape, change this too.
 const PROJECTS_ROOT = process.env.CLAUDE_PROJECTS_ROOT || "/root/.claude/projects";
 const LIVE_TAIL_MS = Number(process.env.LIVE_TAIL_MS) || 1000;
 const TAIL_MSGS = Number(process.env.SESSION_TAIL_MSGS) || 30;
-const TAIL_MSG_CHARS = Number(process.env.SESSION_TAIL_MSG_CHARS) || 500;
+// The live tail only runs while a glasses client is watching one session, so it
+// carries the full message text — a long assistant response must not arrive cut
+// off mid-sentence. The heartbeat's transcript_tail ships a smaller per-message
+// preview (SESSION_TAIL_MSG_CHARS); the glasses keep whichever copy is longer.
+const TAIL_MSG_CHARS = Number(process.env.SESSION_TAIL_MSG_CHARS_FULL) || 16000;
 const TAIL_READ_BYTES = 1 << 17; // ~128 KB, matches _tail_entries
 const MAX_WATCHERS = 16; // safety cap on concurrent live tails
 // eslint-disable-next-line no-control-regex
