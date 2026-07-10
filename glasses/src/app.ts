@@ -1092,9 +1092,6 @@ export class App {
         this.toggleBoxDictation(s);
         return;
       }
-      case "restart":
-        this.queueAction(hostKey, sessionId, "restart");
-        return;
       case "start":
         this.queueAction(hostKey, sessionId, "start");
         return;

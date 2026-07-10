@@ -2,7 +2,7 @@
 // timestamp render needs travels in AppState.now. Target: 10 lines x ~560px
 // usable width (the G2's 576x288 canvas, ~10 text lines).
 import type { AppState, ReplyScreenState, SessionScreenState } from "./app.ts";
-import { bottomBoxLines, inputBoxBody, sheetBody, statusLabel, type MicState } from "./input-box.ts";
+import { bottomBoxLines, inputBoxBody, menuBox, sheetBody, statusLabel, type MicState } from "./input-box.ts";
 import { DISPLAY_LINES, LINE_WIDTH_PX } from "./layout.ts";
 import { glyph, liveState } from "./sessions.ts";
 import { wrapText } from "./text-wrap.ts";
@@ -27,7 +27,8 @@ export type SessionFocus = "transcript" | "bottom";
 
 export type BottomModel =
   | { mode: "input"; lines: string[]; status: string; focused: boolean }
-  | { mode: "sheet"; lines: string[]; status: string; focused: boolean; options: string[]; selected: number };
+  | { mode: "sheet"; lines: string[]; status: string; focused: boolean; options: string[]; selected: number }
+  | { mode: "menu"; lines: string[]; status: string };
 
 export type ScreenModel =
   | { type: "lines"; lines: string[] }
@@ -257,6 +258,15 @@ function renderSessionBottom(state: AppState, sess: SessionScreenState): BottomM
   return { mode: "input", lines: inputBoxBody({ text: draft, focused, mic, viewOffset }), status, focused };
 }
 
+// The bottom box's on-screen height in text lines. Input/sheet boxes cap at
+// BOTTOM_MAX_LINES via bottomBoxLines; the menu box is already capped at
+// MENU_MAX_LINES by menuBox, so it sizes to its own content (up to 8 lines).
+// Shared by the evenhub backend (which sizes the box container) and
+// sessionOverlay (which sizes the transcript above it) so the two never drift.
+export function boxLineCount(bottom: BottomModel): number {
+  return bottom.mode === "menu" ? Math.max(1, bottom.lines.length) : bottomBoxLines(bottom.lines);
+}
+
 // The transcript's visible line-count for a given session — the bottom box
 // (input or sheet) grows/shrinks with its content, so app.ts's scroll-offset
 // math needs this exact figure to stay in sync with what renderSession
@@ -305,65 +315,66 @@ function renderSession(state: AppState): ScreenModel {
 // ---- actions --------------------------------------------------------
 
 export interface ActionRow {
-  action: "send" | "clear" | "dictate" | "restart" | "start" | "kill" | "delete" | "back";
+  action: "send" | "clear" | "dictate" | "start" | "kill" | "delete" | "back";
   text: string;
 }
 
-// Context-sensitive: Send/Clear only show up when the session's bottom-box
-// draft (dictated in-box, Task 5) actually has text to act on. Dictation
-// itself no longer routes through this menu — it happens directly in the
-// box — so this reads `state.session` (the same session's draft) rather
-// than the transient `ActionsScreenState`, which carries no draft of its
-// own. There's no "Answer question" row (dropped in Task 6): the sheet is
-// always visible in the session bottom whenever a question is pending, so a
-// redundant menu path would just be another way to reach the same place.
+// Context-sensitive rows. Back is always cursor 0 so the default selection is
+// a safe no-op (a stray tap backs out rather than acting). Restart is
+// intentionally not offered on the glasses. Send/Clear/Dictate more appear only
+// when the session's bottom-box draft (dictated in-box) actually has text to
+// act on — read from `state.session` (the same session's draft), since the
+// transient ActionsScreenState carries no draft of its own. There's no "Answer
+// question" row: the sheet is always visible in the session bottom whenever a
+// question is pending, so a menu path would be redundant.
 export function buildActionsRows(state: AppState, hostKey: string, sessionId: string): ActionRow[] {
   const s = findSessionLocal(state, hostKey, sessionId);
   if (!s || s.status === "stopped") {
     return [
+      { action: "back", text: "Back" },
       { action: "start", text: "Start" },
       { action: "delete", text: "Delete" },
-      { action: "back", text: "Back" },
     ];
   }
   const draft =
     state.session && state.session.hostKey === hostKey && state.session.sessionId === sessionId
       ? state.session.draft
       : "";
-  const rows: ActionRow[] = [];
+  const rows: ActionRow[] = [{ action: "back", text: "Back" }];
   if (draft) {
-    // Reached by a tap on the in-box draft (or a double-tap): Send is the
-    // default (cursor 0), Clear discards, "Dictate more" appends another
-    // dictation to the existing draft (the append that a bare tap used to do
-    // in place — now an explicit choice so a tap doesn't record over text).
+    // Send acts on the dictated draft, Clear discards it, "Dictate more"
+    // appends another dictation (the append a bare tap used to do in place —
+    // now an explicit choice so a tap doesn't record over text).
     rows.push({ action: "send", text: "Send" });
     rows.push({ action: "clear", text: "Clear" });
     rows.push({ action: "dictate", text: "Dictate more" });
   }
-  rows.push({ action: "restart", text: "Restart" });
   rows.push({ action: "kill", text: "Kill" });
   rows.push({ action: "delete", text: "Delete" });
-  rows.push({ action: "back", text: "Back" });
   return rows;
 }
 
-function renderActions(state: AppState): string[] {
+// Builds the session-screen overlay used by the actions/confirm menus: the
+// underlying session's transcript, bottom-anchored to whatever room the menu
+// box leaves, with `bottom` (a menu-mode box) drawn over it. The transcript is
+// static while a menu is open (the reveal only ticks on the session screen).
+function sessionOverlay(state: AppState, hostKey: string, sessionId: string, bottom: BottomModel): ScreenModel {
+  const content = sessionContentLines(state, hostKey, sessionId);
+  const area = Math.max(1, DISPLAY_LINES - boxLineCount(bottom));
+  const start = Math.max(0, content.length - area);
+  return { type: "session", transcriptLines: content.slice(start), bottom };
+}
+
+function renderActions(state: AppState): ScreenModel {
   const a = state.actions;
-  if (!a) return [headerLine(state, "Actions")];
-  const s = findSessionLocal(state, a.hostKey, a.sessionId);
-  const labelOrRepo = s ? s.label || s.repo : a.sessionId;
-  const header = headerLine(state, `Actions · ${labelOrRepo}`);
+  if (!a) return linesModel([headerLine(state, "Actions")]);
   const rows = buildActionsRows(state, a.hostKey, a.sessionId);
-  const { visible, start, page, totalPages, showFooter } = paginate(
-    rows,
-    a.cursor,
-    DISPLAY_LINES - 1,
-    DISPLAY_LINES - 2
-  );
-  const lines = [header];
-  visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === a.cursor)));
-  if (showFooter) lines.push(`p${page}/${totalPages}`);
-  return lines;
+  const bottom: BottomModel = {
+    mode: "menu",
+    lines: menuBox({ title: "Options", rows: rows.map((r) => r.text), selected: a.cursor }),
+    status: "",
+  };
+  return sessionOverlay(state, a.hostKey, a.sessionId, bottom);
 }
 
 // ---- reply ------------------------------------------------------------
@@ -400,14 +411,15 @@ function confirmHeader(state: AppState): string {
   return c.action.kind === "kill" ? `Kill ${id}?` : `Delete ${id}? Also removes branch`;
 }
 
-function renderConfirm(state: AppState): string[] {
+function renderConfirm(state: AppState): ScreenModel {
   const c = state.confirm;
-  if (!c) return [headerLine(state, "Confirm")];
-  const header = headerLine(state, confirmHeader(state));
-  const rows = ["Cancel", "Confirm"];
-  const lines = [header];
-  rows.forEach((text, i) => lines.push(markerLine(text, i === c.cursor)));
-  return lines;
+  if (!c) return linesModel([headerLine(state, "Confirm")]);
+  const bottom: BottomModel = {
+    mode: "menu",
+    lines: menuBox({ title: confirmHeader(state), rows: ["Cancel", "Confirm"], selected: c.cursor }),
+    status: "",
+  };
+  return sessionOverlay(state, c.action.hostKey, c.action.sessionId, bottom);
 }
 
 // ---- newHost ------------------------------------------------------------
@@ -503,11 +515,11 @@ export function render(state: AppState): ScreenModel {
     case "session":
       return renderSession(state);
     case "actions":
-      return linesModel(renderActions(state));
+      return renderActions(state);
     case "reply":
       return linesModel(renderReply(state));
     case "confirm":
-      return linesModel(renderConfirm(state));
+      return renderConfirm(state);
     case "newHost":
       return linesModel(renderNewHost(state));
     case "newRepo":

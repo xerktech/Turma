@@ -380,7 +380,8 @@ describe("App", () => {
     // until it's sent or cleared.
     expect(bottomMode()).toBe("input");
 
-    display.emit({ type: "doubleTap" }); // -> actions, cursor 0 = Send (draft present)
+    display.emit({ type: "doubleTap" }); // -> actions (cursor 0 = Back, draft present)
+    display.emit({ type: "scrollDown" }); // 1 = Send
     display.emit({ type: "tap" }); // select Send
 
     expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "yes deploy");
@@ -484,8 +485,9 @@ describe("App", () => {
     // over the text). "Dictate more" appends another round, space-joined.
     display.emit({ type: "tap" }); // draft present -> actions menu
     expect(app.getState().screen).toBe("actions");
-    display.emit({ type: "scrollDown" }); // Send(0) -> Clear(1)
-    display.emit({ type: "scrollDown" }); // -> Dictate more(2)
+    display.emit({ type: "scrollDown" }); // Back(0) -> Send(1)
+    display.emit({ type: "scrollDown" }); // -> Clear(2)
+    display.emit({ type: "scrollDown" }); // -> Dictate more(3)
     display.emit({ type: "tap" }); // Dictate more -> back to box, recording
     expect(app.getState().screen).toBe("session");
     expect(app.getState().session?.mic).toBe("recording");
@@ -557,7 +559,8 @@ describe("App", () => {
     display.emit({ type: "tap" }); // recording -> finalising
     dictation.resolve({ text: "deploy the fix" });
 
-    display.emit({ type: "doubleTap" }); // -> actions, cursor 0 = Send
+    display.emit({ type: "doubleTap" }); // -> actions (cursor 0 = Back)
+    display.emit({ type: "scrollDown" }); // 1 = Send
     display.emit({ type: "tap" }); // select Send
 
     expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "deploy the fix");
@@ -583,8 +586,9 @@ describe("App", () => {
     display.emit({ type: "tap" }); // recording -> finalising
     dictation.resolve({ text: "deploy the fix" });
 
-    display.emit({ type: "doubleTap" }); // -> actions, cursor 0 = Send
-    display.emit({ type: "scrollDown" }); // cursor 1 = Clear
+    display.emit({ type: "doubleTap" }); // -> actions (cursor 0 = Back)
+    display.emit({ type: "scrollDown" }); // 1 = Send
+    display.emit({ type: "scrollDown" }); // 2 = Clear
     display.emit({ type: "tap" }); // select Clear
 
     expect(client.sendInput).not.toHaveBeenCalled();
@@ -604,14 +608,8 @@ describe("App", () => {
     dictation.resolve({ text: "deploy the fix" });
     expect(app.getState().session?.draft).toBe("deploy the fix");
 
-    // Draft present: rows are [Send, Clear, Dictate more, Restart, Kill, Delete, Back].
-    display.emit({ type: "doubleTap" }); // -> actions, cursor 0 = Send
-    display.emit({ type: "scrollDown" }); // 1 = Clear
-    display.emit({ type: "scrollDown" }); // 2 = Dictate more
-    display.emit({ type: "scrollDown" }); // 3 = Restart
-    display.emit({ type: "scrollDown" }); // 4 = Kill
-    display.emit({ type: "scrollDown" }); // 5 = Delete
-    display.emit({ type: "scrollDown" }); // 6 = Back
+    // Draft present: rows are [Back, Send, Clear, Dictate more, Kill, Delete].
+    display.emit({ type: "doubleTap" }); // -> actions, cursor 0 = Back
     display.emit({ type: "tap" }); // select Back
 
     expect(client.sendInput).not.toHaveBeenCalled();
@@ -806,7 +804,7 @@ describe("App", () => {
 
     display.emit({ type: "tap" }); // session
     display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
-    display.emit({ type: "doubleTap" }); // input-mode doubleTap -> actions (cursor 0 = Restart, no draft)
+    display.emit({ type: "doubleTap" }); // input-mode doubleTap -> actions (cursor 0 = Back, no draft)
     display.emit({ type: "scrollDown" }); // Kill
     display.emit({ type: "tap" }); // -> confirm
     display.emit({ type: "scrollDown" }); // cursor -> Confirm
@@ -833,8 +831,11 @@ describe("App", () => {
 
     display.emit({ type: "tap" }); // session
     display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
-    display.emit({ type: "doubleTap" }); // input-mode doubleTap -> actions (cursor 0 = Restart, no draft)
-    display.emit({ type: "tap" }); // queue restart
+    display.emit({ type: "doubleTap" }); // -> actions (cursor 0 = Back, no draft)
+    display.emit({ type: "scrollDown" }); // 1 = Kill
+    display.emit({ type: "tap" }); // -> confirm
+    display.emit({ type: "scrollDown" }); // cursor -> Confirm
+    display.emit({ type: "tap" }); // queue kill (session stays running, never converges)
     await vi.advanceTimersByTimeAsync(0);
     expect(app.getState().pending["s1"]).toBeDefined();
 

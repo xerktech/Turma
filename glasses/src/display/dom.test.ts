@@ -74,4 +74,23 @@ describe("DomDisplay.render", () => {
     expect(text).toContain("> 1. yes");
     expect(text.endsWith("2. no")).toBe(true);
   });
+
+  it("renders a menu-mode session model (transcript, divider, then the menu box lines)", async () => {
+    const el = makeEl();
+    const display = new DomDisplay(el);
+    await display.start();
+
+    const model: ScreenModel = {
+      type: "session",
+      transcriptLines: ["assistant said hi"],
+      bottom: { mode: "menu", lines: ["Options", "> Back", "  Kill", "  Delete"], status: "" },
+    };
+    display.render(model);
+
+    const text = el.textContent ?? "";
+    expect(text).toContain("assistant said hi");
+    expect(text).toContain("Options");
+    expect(text).toContain("> Back");
+    expect(text.endsWith("Delete")).toBe(true);
+  });
 });
