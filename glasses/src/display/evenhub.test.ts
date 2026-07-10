@@ -72,21 +72,18 @@ function linesModel(lines: string[]): ScreenModel {
 
 function sessionModel(opts: {
   transcriptLines?: string[];
-  mode?: "input" | "sheet";
+  mode?: "input" | "sheet" | "menu";
   lines?: string[];
   status?: string;
 }): ScreenModel {
   const mode = opts.mode ?? "input";
   const lines = opts.lines ?? ["> draft"];
   const status = opts.status ?? "Working";
-  return {
-    type: "session",
-    transcriptLines: opts.transcriptLines ?? ["hello"],
-    bottom:
-      mode === "input"
-        ? { mode: "input", lines, status, focused: true }
-        : { mode: "sheet", lines, status, focused: true, options: ["yes", "no"], selected: 0 },
-  };
+  let bottom: Extract<ScreenModel, { type: "session" }>["bottom"];
+  if (mode === "input") bottom = { mode: "input", lines, status, focused: true };
+  else if (mode === "sheet") bottom = { mode: "sheet", lines, status, focused: true, options: ["yes", "no"], selected: 0 };
+  else bottom = { mode: "menu", lines, status };
+  return { type: "session", transcriptLines: opts.transcriptLines ?? ["hello"], bottom };
 }
 
 describe("EvenHubDisplay", () => {
@@ -214,6 +211,31 @@ describe("EvenHubDisplay", () => {
       expect(statusContainer).not.toBe(boxContainer);
     });
 
+    it("pads the transcript so a full transcript's newest line clears the box border with a gap (no line dropped)", async () => {
+      const { bridge, rebuildCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      display.render(sessionModel({ transcriptLines: ["line a"], lines: ["> draft"], status: "Working" }));
+
+      const containers = rebuildCalls[0]!.textObject!;
+      const box = containers.find((c) => c.borderWidth === 1)!;
+      const transcript = containers.find((c) => c.containerName === "transcript")!;
+
+      // Device constants (pretext README / render.ts): 27px line height, a
+      // 10-line canvas. A 1-line input box leaves render.ts a full transcript
+      // budget of DISPLAY_LINES - 1 = 9 lines — none dropped for the gap.
+      const LINE_HEIGHT = 27;
+      const fullTranscriptLines = 10 - 1;
+      const textBottom = transcript.yPosition! + transcript.paddingLength! + fullTranscriptLines * LINE_HEIGHT;
+      // Even at a full transcript, the newest line ends strictly above the box's
+      // top border — a real gap, never flush against or under it.
+      expect(box.yPosition! - textBottom).toBeGreaterThanOrEqual(4);
+      // Inner content width still covers the wrap width (LINE_WIDTH_PX 560), so
+      // wrapped lines don't clip horizontally either.
+      expect(576 - 2 * transcript.paddingLength!).toBeGreaterThanOrEqual(560);
+    });
+
     it("a second render with the same shape (same mode + box line count) uses textContainerUpgrade, not another rebuild", async () => {
       const { bridge, rebuildCalls, upgradeCalls } = fakeBridge();
       const display = new EvenHubDisplay(bridge);
@@ -251,6 +273,28 @@ describe("EvenHubDisplay", () => {
 
       display.render(sessionModel({ mode: "input", lines: ["line one", "line two", "line three"] }));
       expect(rebuildCalls).toHaveLength(2);
+    });
+
+    it("sizes a menu-mode box container by its full line count (past the 5-line input/sheet cap)", async () => {
+      const { bridge, rebuildCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      // Both menus are TALLER than the 5-line input/sheet cap, so under the
+      // old bottomBoxLines() sizing both would clamp to 5 lines — identical
+      // height and identical shape signature (the second wouldn't even
+      // rebuild). Only boxLineCount()'s per-mode sizing tells them apart, so
+      // this genuinely regression-guards the clipping bug.
+      const eightLineMenu = ["Options", "  Back", "  Send", "  Clear", "  Dictate more", "  Kill", "  Delete", "  X"];
+      display.render(sessionModel({ mode: "menu", lines: eightLineMenu, status: "" }));
+      const tallBox = rebuildCalls[0]!.textObject!.find((c) => c.borderWidth === 1)!;
+
+      const sixLineMenu = ["Options", "  Back", "  Send", "  Clear", "  Kill", "  Delete"];
+      display.render(sessionModel({ mode: "menu", lines: sixLineMenu, status: "" }));
+      const shortBox = rebuildCalls[1]!.textObject!.find((c) => c.borderWidth === 1)!;
+
+      expect(tallBox.content).toContain("Delete"); // all eight lines present, not truncated to 5
+      expect(tallBox.height!).toBeGreaterThan(shortBox.height!); // 8-line box taller than 6-line box
     });
 
     it("debounces rapid same-shape session renders to a single trailing textContainerUpgrade batch", async () => {

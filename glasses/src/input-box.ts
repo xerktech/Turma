@@ -15,6 +15,11 @@ export type MicState = "idle" | "recording" | "finalising" | "error";
 // the screen.
 export const BOTTOM_MAX_LINES = Math.floor(DISPLAY_LINES / 2);
 
+// The menu-overlay box (actions menu / confirm dialog) is taller than the
+// input/sheet box: it may show a title plus several option rows. Cap it so at
+// least two transcript lines stay visible behind it.
+export const MENU_MAX_LINES = DISPLAY_LINES - 2;
+
 // How many text lines the bottom box should occupy for the given wrapped
 // content — at least 1 (never fully collapse), capped at BOTTOM_MAX_LINES.
 export function bottomBoxLines(contentLines: string[]): number {
@@ -124,4 +129,32 @@ export function statusLabel(opts: {
     case "error":
       return "Error";
   }
+}
+
+// Menu-mode body for the actions/confirm overlay: a wrapped title line (or
+// lines) followed by option rows, each prefixed "> " when selected / "  "
+// otherwise, windowed around `selected` so it stays visible when the list
+// overflows MENU_MAX_LINES. Mirrors sheetBody's windowing, minus the numbering.
+export function menuBox(opts: { title: string; rows: string[]; selected: number }): string[] {
+  const { title, rows } = opts;
+  const total = rows.length;
+  // Clamp `selected` once so the window math and the row marking agree even
+  // if a caller passes an out-of-range index.
+  const selected = Math.max(0, Math.min(opts.selected, total - 1));
+
+  // Reserve at least one option row: cap the title portion, the option area is
+  // whatever's left, keeping the combined output within MENU_MAX_LINES.
+  const titleLines = wrapText(title, LINE_WIDTH_PX).slice(0, MENU_MAX_LINES - 1);
+  const area = MENU_MAX_LINES - titleLines.length;
+
+  let start = 0;
+  if (total > area) {
+    start = Math.max(0, selected - Math.floor(area / 2));
+    start = Math.min(start, total - area);
+  }
+  const visibleRows = rows
+    .slice(start, start + area)
+    .map((row, i) => (start + i === selected ? `> ${row}` : `  ${row}`));
+
+  return [...titleLines, ...visibleRows];
 }

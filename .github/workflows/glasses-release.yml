@@ -1,0 +1,84 @@
+name: glasses-release
+
+# Build + package the Even Hub (G2 glasses) app and publish it as a GitHub
+# Release so the .ehpk is a one-click download.
+#
+# Runs post-merge on push to main, path-filtered to glasses/** (the CI gate
+# in glasses-ci.yml runs pre-merge on PRs; this is the release counterpart,
+# mirroring how agent-image.yml / agent-hub-image.yml build on push to main).
+#
+# Same self-hosted-runner constraints as the rest of the repo: reset the
+# root-owned workspace first, and run the whole npm workflow (install/build/
+# pack) inside a throwaway node:24-alpine container (Docker Hub pull — the
+# runner can't auth to ghcr.io, and npm isn't on the runner itself).
+#
+# There's no upstream package to version against, so — like the image
+# workflows — the build counter disambiguates: the tag is
+# glasses-v<package.json version>-<run_number>.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "glasses/**"
+      - ".github/workflows/glasses-release.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: glasses-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # create releases + upload assets
+
+jobs:
+  release:
+    name: Build, pack, release
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Reset workspace ownership
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
+
+      - uses: actions/checkout@v7
+
+      # Build dist/ and package it + app.json into agenthub-hud.ehpk. The pack
+      # script writes to ../agenthub-hud.ehpk relative to glasses/, so the
+      # artifact lands at the workspace root.
+      - name: Install, build, pack (glasses/)
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/workspace -w /workspace/glasses node:24-alpine \
+            sh -c 'npm ci --no-audit --no-fund && npm run build && npm run pack && node -p "require(\"./package.json\").version" > /workspace/.glasses-version'
+
+      # Compose the release tag / versioned asset name on the runner side
+      # (the .glasses-version file was written from inside the container).
+      - name: Compute version
+        id: ver
+        run: |
+          VERSION="$(cat "$GITHUB_WORKSPACE/.glasses-version" | tr -d '[:space:]')"
+          TAG="glasses-v${VERSION}-${{ github.run_number }}"
+          ASSET="agenthub-hud-v${VERSION}-${{ github.run_number }}.ehpk"
+          cp "$GITHUB_WORKSPACE/agenthub-hud.ehpk" "$GITHUB_WORKSPACE/$ASSET"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Glasses ${{ steps.ver.outputs.tag }}
+          body: |
+            Even Hub (G2 glasses) app package for AgentHub.
+
+            - Version: `${{ steps.ver.outputs.version }}` (build ${{ github.run_number }})
+            - Commit: ${{ github.sha }}
+
+            Download `${{ steps.ver.outputs.asset }}` below and sideload it via the Even Hub app.
+          files: ${{ github.workspace }}/${{ steps.ver.outputs.asset }}
+          fail_on_unmatched_files: true
+
+      # Keep the shared runner's disk at a steady state; never fail the job.
+      - name: Clean up dangling images
+        if: always()
+        run: |
+          docker image prune -f || true
+          df -h || true
