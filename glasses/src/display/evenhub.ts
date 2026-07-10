@@ -10,10 +10,10 @@
 // instance `main.ts` resolves via `waitForEvenAppBridge()` satisfies
 // `EvenHubBridge` structurally with no cast needed.
 import type { BottomModel, ScreenModel } from "../render.ts";
+import { boxLineCount } from "../render.ts";
 import type { InputEvent } from "../types.ts";
 import type { GlassesDisplay } from "./index.ts";
 import { createInputRouter, type LifecycleEvent, type RawEvenHubEvent } from "../input/router.ts";
-import { bottomBoxLines } from "../input-box.ts";
 import { capContent, createTrailingDebounce, type Debounced } from "./debounce.ts";
 
 // G2 canvas: 576x288, one full-canvas text container, the sole
@@ -119,7 +119,7 @@ export interface EvenHubBridge {
 // transcript/status containers' geometry too) all change this signature —
 // exactly the cases the brief calls out as needing a full rebuild.
 function sessionSignature(bottom: BottomModel): string {
-  return `${bottom.mode}:${bottomBoxLines(bottom.lines)}`;
+  return `${bottom.mode}:${boxLineCount(bottom)}`;
 }
 
 interface SessionContent {
@@ -317,7 +317,7 @@ export class EvenHubDisplay implements GlassesDisplay {
       // ~120ms after — and overwrite — these fresh containers.
       this.cancelPendingUpdates();
       this.currentPageShape = signature;
-      const boxLines = bottomBoxLines(model.bottom.lines);
+      const boxLines = boxLineCount(model.bottom);
       const content = sessionContentFrom(model, REBUILD_MAX_CONTENT_CHARS);
       const containers = buildSessionContainers(boxLines, content);
       void this.rebuild(containers, signature);
