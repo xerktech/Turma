@@ -40,13 +40,23 @@ import os
 import re
 import secrets
 import shlex
+import signal
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from collections import deque
+
+# Set by a SIGUSR1 handler (installed in run_forever). tunnel-agent.js sends
+# SIGUSR1 when the hub pokes it over the control channel because a command was
+# just queued, so the heartbeat loop cuts its interval sleep short and delivers
+# that command in the next beat's reply instead of up to a whole INTERVAL
+# later. A threading.Event lets the loop wait interruptibly (plain time.sleep
+# wouldn't wake on the signal).
+_poke = threading.Event()
 
 HUB_URL = os.environ.get("HUB_URL", "http://agent-hub:8300")
 # Bearer token for the hub's /api/heartbeat (the UI itself sits behind basic
@@ -2006,9 +2016,19 @@ class SessionManager:
             f"reporting to {HUB_URL} as {self.device} (container {self.agent_id}); "
             f"reposRoot={REPOS_ROOT} maxSessions={MAX_SESSIONS}"
         )
+        # SIGUSR1 = "the hub queued a command for you — beat now" (sent by
+        # tunnel-agent.js on a control-channel poke). Default disposition of
+        # SIGUSR1 is to terminate, so this must be installed before the tunnel
+        # can poke; run_forever is the main thread, where signal handlers must
+        # be set.
+        signal.signal(signal.SIGUSR1, lambda *_: _poke.set())
         self.resume_on_boot()
         beat = 0
         while True:
+            # Clear before the beat so a poke that lands *during* it (a command
+            # queued while we're mid-cycle) still shortens the next wait rather
+            # than being swallowed.
+            _poke.clear()
             if beat % TRASH_PRUNE_EVERY == 0:  # incl. beat 0 = boot
                 prune_trash_branches()
             reply = self.post(self.build_payload(beat))
@@ -2022,7 +2042,9 @@ class SessionManager:
                     beat += 1
                     if reply2 is not None:
                         self.handle_commands(reply2.get("commands"))
-            time.sleep(INTERVAL)
+            # Interruptible sleep: returns immediately if a poke arrived, else
+            # after the normal interval.
+            _poke.wait(INTERVAL)
 
 
 def main():

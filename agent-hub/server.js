@@ -145,6 +145,19 @@ function queueCommand(key, cmd) {
   a.commands = a.commands || [];
   a.commands.push({ ...cmd, cmdId });
   scheduleSave();
+  // Poke the agent (if its control tunnel is up) to heartbeat immediately, so
+  // the command it just enqueued is delivered in the next beat's reply within
+  // ~a round-trip rather than up to a whole HUB_INTERVAL later. A missed poke
+  // (tunnel down) just falls back to the normal interval — the command still
+  // rides the next scheduled beat.
+  const cc = controlChannels[key];
+  if (cc) {
+    try {
+      cc.sendPoke();
+    } catch {
+      /* best-effort; the interval beat is the fallback */
+    }
+  }
   return cmdId;
 }
 
@@ -1091,6 +1104,9 @@ server.on("upgrade", async (req, socket, head) => {
       // is where the agent looks up the transcript (see tunnel-agent.js).
       sendWatch: (sessionId, worktreePath) => send(0x1, JSON.stringify({ watch: sessionId, worktreePath })),
       sendUnwatch: (sessionId) => send(0x1, JSON.stringify({ unwatch: sessionId })),
+      // Nudge the agent to heartbeat NOW so a just-queued command is delivered
+      // in that beat's reply instead of waiting up to a whole HUB_INTERVAL.
+      sendPoke: () => send(0x1, JSON.stringify({ poke: true })),
     };
     console.log(`tunnel connected: ${name}`);
     // A fresh (or reconnected) tunnel doesn't know which sessions the hub still

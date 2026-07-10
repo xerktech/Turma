@@ -1361,6 +1361,30 @@ test("live WS: unknown session on a known host -> 404; a real session still upgr
   ok.socket.destroy();
 });
 
+test("queueCommand pokes a connected control channel so the agent beats immediately", async () => {
+  agents.pokehost = { device: "pokehost", lastSeen: Date.now(), commands: [], history: {}, sessions: [] };
+  const ctrl = await wsConnect(`/agent/control?name=pokehost&token=agenttok`);
+  assert.match(ctrl.statusLine, /^HTTP\/1\.1 101/);
+  const frames = collectFrames(ctrl.socket, ctrl.leftover);
+
+  const cmdId = queueCommand("pokehost", { type: "kill", sessionId: "s1" });
+
+  // The hub nudges the agent to heartbeat now...
+  const poke = await nextTextJson(frames, 0);
+  assert.deepEqual(poke, { poke: true });
+  // ...and the command is still queued for delivery in that (imminent) beat.
+  assert.equal(agents.pokehost.commands.length, 1);
+  assert.equal(agents.pokehost.commands[0].cmdId, cmdId);
+  ctrl.socket.destroy();
+});
+
+test("queueCommand without a control channel still queues (no poke, no throw)", () => {
+  agents.nolink = { device: "nolink", lastSeen: Date.now(), commands: [], history: {}, sessions: [] };
+  const cmdId = queueCommand("nolink", { type: "kill", sessionId: "s1" });
+  assert.ok(cmdId);
+  assert.equal(agents.nolink.commands.length, 1);
+});
+
 test("live WS: seeds cached tail, watches via the control channel, fans out deltas, unwatches on close", async () => {
   // A host with one running session, its worktree path + a cached tail.
   agents.livehost = {

@@ -21,7 +21,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.HUB_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, newestTranscript } = require("../tunnel-agent.js");
+const { projectSlug, transcriptTail, entryText, newestTranscript, pokeHeartbeat } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -88,4 +88,30 @@ test("transcriptTail: picks the newest transcript, caps at 30 messages", () => {
 test("transcriptTail: no transcript -> []", () => {
   assert.deepEqual(transcriptTail("/wt/does-not-exist"), []);
   assert.equal(newestTranscript("/wt/does-not-exist"), null);
+});
+
+test("pokeHeartbeat signals the session-manager process (PID 1) with SIGUSR1", () => {
+  // Stub process.kill so the test never actually signals anything — just
+  // capture what pokeHeartbeat would send.
+  const calls = [];
+  const realKill = process.kill;
+  process.kill = (pid, sig) => calls.push([pid, sig]);
+  try {
+    pokeHeartbeat();
+  } finally {
+    process.kill = realKill;
+  }
+  assert.deepEqual(calls, [[1, "SIGUSR1"]]);
+});
+
+test("pokeHeartbeat swallows a failing signal (best-effort)", () => {
+  const realKill = process.kill;
+  process.kill = () => {
+    throw new Error("no such process");
+  };
+  try {
+    assert.doesNotThrow(() => pokeHeartbeat());
+  } finally {
+    process.kill = realKill;
+  }
 });
