@@ -112,7 +112,7 @@ describe("LiveTail", () => {
   it("connects with a fresh ws-token and the right URL, then delivers tail deltas", async () => {
     const { lt, wsToken } = makeLiveTail();
     const got: TailEntry[][] = [];
-    lt.start("host-a", "s1", (e) => got.push(e));
+    lt.start("host-a", "s1", (ev) => { if (ev.type === "tail") got.push(ev.entries); });
     await flush();
     expect(wsToken).toHaveBeenCalledTimes(1);
     const ws = FakeSocket.instances[0]!;
@@ -125,7 +125,7 @@ describe("LiveTail", () => {
   it("ignores non-tail frames and empty deltas", async () => {
     const { lt } = makeLiveTail();
     const got: TailEntry[][] = [];
-    lt.start("h", "s", (e) => got.push(e));
+    lt.start("h", "s", (ev) => { if (ev.type === "tail") got.push(ev.entries); });
     await flush();
     const ws = FakeSocket.instances[0]!;
     ws.open();
@@ -133,6 +133,19 @@ describe("LiveTail", () => {
     ws.message(tail([]));
     ws.emit("message", { data: "not json" });
     expect(got).toEqual([]);
+  });
+
+  it("delivers live 'turn' frames (in-progress assistant text, incl. the empty clear)", async () => {
+    const { lt } = makeLiveTail();
+    const turns: string[] = [];
+    lt.start("h", "s", (ev) => { if (ev.type === "turn") turns.push(ev.text); });
+    await flush();
+    const ws = FakeSocket.instances[0]!;
+    ws.open();
+    ws.message({ type: "turn", text: "Haiku Salt breath" });
+    ws.message({ type: "turn", text: "Haiku Salt breath meets the shore" });
+    ws.message({ type: "turn", text: "" }); // turn completed -> clear
+    expect(turns).toEqual(["Haiku Salt breath", "Haiku Salt breath meets the shore", ""]);
   });
 
   it("reconnects with backoff after an unexpected close", async () => {
@@ -151,7 +164,7 @@ describe("LiveTail", () => {
   it("stop() closes the socket and silences further deltas", async () => {
     const { lt } = makeLiveTail();
     const got: TailEntry[][] = [];
-    lt.start("h", "s", (e) => got.push(e));
+    lt.start("h", "s", (ev) => { if (ev.type === "tail") got.push(ev.entries); });
     await flush();
     const ws = FakeSocket.instances[0]!;
     ws.open();
@@ -164,7 +177,7 @@ describe("LiveTail", () => {
   it("stop() before the socket opens cancels the pending reconnect and delivers nothing", async () => {
     const { lt, sched } = makeLiveTail();
     const got: TailEntry[][] = [];
-    lt.start("h", "s", (e) => got.push(e));
+    lt.start("h", "s", (ev) => { if (ev.type === "tail") got.push(ev.entries); });
     await flush();
     FakeSocket.instances[0]!.emit("error");
     expect(sched.count()).toBe(1);

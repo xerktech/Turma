@@ -1423,12 +1423,23 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
   assert.equal(watch.watch, "ls1");
   assert.equal(watch.worktreePath, "/wt/ls1");
 
-  // 3. A delta the agent pushes on the control channel reaches the live client.
+  // 3. A tail delta the agent pushes on the control channel reaches the live client.
   const delta = { tail: "ls1", entries: [{ id: "c1", role: "assistant", text: "cached and more" }] };
   ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(delta))));
   const relayed = await nextTextJson(liveFrames, 1);
   assert.equal(relayed.type, "tail");
   assert.deepEqual(relayed.entries, delta.entries);
+
+  // 3b. A live `turn` delta (in-progress assistant text from the TUI) is fanned
+  //     out too, including the empty-string clear on completion.
+  ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({ turn: "ls1", text: "streaming…" }))));
+  const turn = await nextTextJson(liveFrames, 2);
+  assert.equal(turn.type, "turn");
+  assert.equal(turn.text, "streaming…");
+  ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({ turn: "ls1", text: "" }))));
+  const cleared = await nextTextJson(liveFrames, 3);
+  assert.equal(cleared.type, "turn");
+  assert.equal(cleared.text, "");
 
   // 4. Closing the last watcher unwatches on the control channel.
   live.socket.destroy();

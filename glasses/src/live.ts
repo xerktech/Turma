@@ -19,17 +19,23 @@ import type { HubClient } from "./hub-client.ts";
 import type { WebSocketCtor, WebSocketEvent, WebSocketLike } from "./audio.ts";
 import type { TailEntry } from "./types.ts";
 
-export type TailListener = (entries: TailEntry[]) => void;
+// A live delta: either committed transcript entries (`tail`) or the current
+// in-progress assistant turn scraped from the TUI (`turn`; real-time
+// streaming, empty text = the turn completed and the committed tail owns it).
+export type LiveEvent =
+  | { type: "tail"; entries: TailEntry[] }
+  | { type: "turn"; text: string };
+export type LiveListener = (ev: LiveEvent) => void;
 
 export interface LiveTailLike {
-  start(hostKey: string, sessionId: string, onTail: TailListener): void;
+  start(hostKey: string, sessionId: string, onEvent: LiveListener): void;
   stop(): void;
 }
 
 // A no-op used wherever a live tail isn't wired (existing tests, the poll-only
 // fallback). Keeps App's dependency non-optional at the call sites.
 export class NoopLiveTail implements LiveTailLike {
-  start(_hostKey: string, _sessionId: string, _onTail: TailListener): void {}
+  start(_hostKey: string, _sessionId: string, _onEvent: LiveListener): void {}
   stop(): void {}
 }
 
@@ -61,9 +67,10 @@ export interface LiveTailOptions {
   clearTimer?: (t: ReturnType<typeof setTimeout>) => void;
 }
 
-interface TailFrame {
-  type: "tail";
+interface LiveFrame {
+  type: "tail" | "turn";
   entries?: TailEntry[];
+  text?: string;
 }
 
 const DEFAULT_BACKOFF_MS = [1000, 2000, 4000, 8000, 15000];
@@ -86,7 +93,7 @@ export class LiveTail implements LiveTailLike {
 
   private hostKey = "";
   private sessionId = "";
-  private onTail: TailListener | null = null;
+  private onEvent: LiveListener | null = null;
 
   constructor(opts: LiveTailOptions) {
     this.hubClient = opts.hubClient;
@@ -98,17 +105,17 @@ export class LiveTail implements LiveTailLike {
     this.clearTimer = opts.clearTimer ?? ((t) => clearTimeout(t));
   }
 
-  start(hostKey: string, sessionId: string, onTail: TailListener): void {
+  start(hostKey: string, sessionId: string, onEvent: LiveListener): void {
     // A start() for the session we're already streaming is a no-op — don't
     // tear down a healthy socket just because the screen re-entered.
-    if (this.onTail && this.hostKey === hostKey && this.sessionId === sessionId) {
-      this.onTail = onTail;
+    if (this.onEvent && this.hostKey === hostKey && this.sessionId === sessionId) {
+      this.onEvent = onEvent;
       return;
     }
     this.teardown();
     this.hostKey = hostKey;
     this.sessionId = sessionId;
-    this.onTail = onTail;
+    this.onEvent = onEvent;
     this.attempt = 0;
     const gen = ++this.generation;
     void this.connect(gen);
@@ -116,7 +123,7 @@ export class LiveTail implements LiveTailLike {
 
   stop(): void {
     this.generation++;
-    this.onTail = null;
+    this.onEvent = null;
     this.teardown();
   }
 
@@ -164,14 +171,16 @@ export class LiveTail implements LiveTailLike {
     ws.addEventListener("message", (ev: WebSocketEvent) => {
       if (gen !== this.generation) return;
       if (typeof ev.data !== "string") return;
-      let frame: TailFrame;
+      let frame: LiveFrame;
       try {
-        frame = JSON.parse(ev.data) as TailFrame;
+        frame = JSON.parse(ev.data) as LiveFrame;
       } catch {
         return;
       }
       if (frame?.type === "tail" && Array.isArray(frame.entries) && frame.entries.length) {
-        this.onTail?.(frame.entries);
+        this.onEvent?.({ type: "tail", entries: frame.entries });
+      } else if (frame?.type === "turn" && typeof frame.text === "string") {
+        this.onEvent?.({ type: "turn", text: frame.text });
       }
     });
     const onEnd = (): void => {

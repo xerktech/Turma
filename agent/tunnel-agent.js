@@ -20,7 +20,7 @@ const net = require("net");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { execFileSync } = require("child_process");
+const { execFileSync, execFile } = require("child_process");
 
 const HUB_URL = process.env.HUB_URL || "http://agent-hub:8300";
 // Same agent token hub-agent.py heartbeats with (the hub's HUB_AGENT_TOKEN).
@@ -157,18 +157,105 @@ function transcriptTail(worktreePath) {
 let controlWs = null;
 const watchers = new Map(); // sessionId -> { worktreePath, lastJson, timer }
 
+function sendControl(obj) {
+  if (controlWs && controlWs.readyState === WebSocket.OPEN) {
+    try { controlWs.send(JSON.stringify(obj)); } catch {}
+  }
+}
+
+// Claude Code writes each assistant message to the transcript JSONL only when
+// the turn COMPLETES — there is no partial/streaming entry (confirmed: no
+// isPartial field, and there is no supported streaming tap for an interactive
+// `claude --remote-control` session). So the transcript tail can't show a
+// response until it finishes generating. The live TUI does stream tokens,
+// though, so we ALSO scrape the tmux pane for the in-progress assistant turn
+// and push it as a `turn` delta — real-time streaming — while the transcript
+// tail stays the authoritative record that supersedes it on completion.
+//
+// Pure so it's unit-testable against captured pane fixtures. Returns the
+// current in-progress assistant text (empty when not generating / still
+// thinking). Anchored to the stable TUI markers: "esc to interrupt" (shown
+// only while generating), a column-0 ● bullet (assistant text; the right-
+// aligned "● high · /effort" indicator has leading spaces and is excluded),
+// 2-space-indented continuation lines, and the input box's long ─ rule.
+function parsePaneLiveTurn(pane) {
+  const raw = String(pane || "").replace(/\r/g, "");
+  if (!/esc to interrupt/i.test(raw)) return { generating: false, text: "" };
+  const lines = raw.split("\n");
+  const isRule = (l) => /^─{20,}$/.test(l.trim());
+  // Drop the whole bottom input box (its top border ─, the ❯ prompt line(s),
+  // its bottom border ─, and the status line). Find the bottom border (the
+  // last ─ rule), then the top border just above it, and cut from the top
+  // border — otherwise the box's own empty ❯ prompt would end the scan before
+  // we reach the assistant block.
+  let bottom = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (isRule(lines[i])) { bottom = i; break; }
+  }
+  let end = lines.length;
+  if (bottom >= 0) {
+    end = bottom;
+    for (let i = bottom - 1; i >= 0 && bottom - i <= 6; i--) {
+      if (isRule(lines[i])) { end = i; break; }
+    }
+  }
+  const convo = lines.slice(0, end);
+  // The in-progress assistant block starts at the last column-0 ● bullet.
+  let start = -1;
+  for (let i = convo.length - 1; i >= 0; i--) {
+    if (/^●\s/.test(convo[i])) { start = i; break; }
+    if (/^❯/.test(convo[i])) break; // hit the user prompt -> no text yet
+  }
+  if (start < 0) return { generating: true, text: "" }; // thinking; no text yet
+  const block = [];
+  for (let i = start; i < convo.length; i++) {
+    const l = convo[i];
+    // Stop at the next turn marker / spinner / status glyph.
+    if (i > start && /^[●❯✻✽·*]/.test(l)) break;
+    block.push(i === start ? l.replace(/^●\s?/, "") : l.replace(/^ {1,3}/, ""));
+  }
+  // Reflow the TUI's hard-wrapped lines into flowing text; the glasses re-wrap,
+  // and the transcript delivers the authoritative structure on completion.
+  const text = block.join(" ").replace(/\s+/g, " ").trim();
+  return { generating: true, text };
+}
+
+// Capture the session's tmux pane (agent-<id>) and extract the in-progress
+// assistant turn. Async (execFile, not execFileSync) so a slow/hung capture
+// can't block the control-WS event loop.
+function captureLiveTurn(sessionId, cb) {
+  execFile(
+    "tmux",
+    ["capture-pane", "-p", "-t", `agent-${sessionId}`],
+    { timeout: 2000, maxBuffer: 1 << 20 },
+    (err, stdout) => cb(err ? { generating: false, text: "" } : parsePaneLiveTurn(stdout))
+  );
+}
+
 function pollWatcher(sessionId) {
   const w = watchers.get(sessionId);
   if (!w) return;
-  let entries;
-  try { entries = transcriptTail(w.worktreePath); } catch { return; }
-  if (!entries.length) return; // no transcript yet, or nothing displayable
-  const json = JSON.stringify(entries);
-  if (json === w.lastJson) return; // unchanged since the last beat — don't spam
-  w.lastJson = json;
-  if (controlWs && controlWs.readyState === WebSocket.OPEN) {
-    try { controlWs.send(JSON.stringify({ tail: sessionId, entries })); } catch {}
+  // 1. Committed transcript tail (authoritative history) — unchanged.
+  let entries = null;
+  try { entries = transcriptTail(w.worktreePath); } catch { entries = null; }
+  if (entries && entries.length) {
+    const json = JSON.stringify(entries);
+    if (json !== w.lastJson) {
+      w.lastJson = json;
+      sendControl({ tail: sessionId, entries });
+    }
   }
+  // 2. Live in-progress assistant turn scraped from the TUI (real-time). Sent
+  //    as its own `turn` delta; an empty text clears it (generation ended, so
+  //    the committed tail now owns that message).
+  captureLiveTurn(sessionId, (live) => {
+    if (!watchers.has(sessionId)) return; // stopped mid-capture
+    const text = live.generating ? live.text : "";
+    if (text !== w.lastTurn) {
+      w.lastTurn = text;
+      sendControl({ turn: sessionId, text });
+    }
+  });
 }
 
 function startWatch(sessionId, worktreePath) {
@@ -179,7 +266,7 @@ function startWatch(sessionId, worktreePath) {
     log(`live tail: at MAX_WATCHERS (${MAX_WATCHERS}); ignoring watch for ${sessionId}`);
     return;
   }
-  const w = { worktreePath, lastJson: null, timer: null };
+  const w = { worktreePath, lastJson: null, lastTurn: "", timer: null };
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
   pollWatcher(sessionId); // emit an immediate snapshot, don't wait a full interval
@@ -381,5 +468,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, entryText, transcriptTail, pokeHeartbeat };
+  module.exports = { projectSlug, newestTranscript, entryText, transcriptTail, pokeHeartbeat, parsePaneLiveTurn };
 }

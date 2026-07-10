@@ -1117,9 +1117,11 @@ server.on("upgrade", async (req, socket, head) => {
       if (wp) controlChannels[name].sendWatch(sessionId, wp);
     }
     const ping = setInterval(() => send(0x9, Buffer.alloc(0)), 30000); // beat CF idle timeout
-    // The agent pushes live transcript deltas back on this same channel as
-    // `{tail: sessionId, entries}` text frames; everything else it sends we
-    // ignore (it never sent us data before the live tail existed).
+    // The agent pushes live deltas back on this same channel: committed
+    // transcript entries as `{tail: sessionId, entries}`, and the in-progress
+    // assistant turn scraped from the TUI as `{turn: sessionId, text}` (real-
+    // time streaming — empty text clears it once the turn completes and the
+    // committed tail owns it). Everything else it sends we ignore.
     const parse = wsParser((op, payload) => {
       if (op === 0x8) return socket.end();
       if (op !== 0x1) return;
@@ -1127,6 +1129,8 @@ server.on("upgrade", async (req, socket, head) => {
       try { msg = JSON.parse(payload.toString("utf8")); } catch { return; }
       if (msg && msg.tail && Array.isArray(msg.entries)) {
         liveFanout(name, msg.tail, { type: "tail", entries: msg.entries });
+      } else if (msg && msg.turn && typeof msg.text === "string") {
+        liveFanout(name, msg.turn, { type: "turn", text: msg.text });
       }
     });
     socket.on("data", parse);
