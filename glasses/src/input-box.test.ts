@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BOTTOM_MAX_LINES, bottomBoxLines, inputBoxBody, sheetBody, statusLabel } from "./input-box.ts";
+import { BOTTOM_MAX_LINES, bottomBoxLines, inputBoxBody, MENU_MAX_LINES, menuBox, sheetBody, statusLabel } from "./input-box.ts";
 
 describe("bottomBoxLines", () => {
   it("clamps to a minimum of 1 line when content is empty", () => {
@@ -136,5 +136,33 @@ describe("statusLabel", () => {
     expect(statusLabel({ mic: "idle", live: "idle" })).toBe("Idle");
     expect(statusLabel({ mic: "idle", live: "stopped" })).toBe("Stopped");
     expect(statusLabel({ mic: "idle", live: "error" })).toBe("Error");
+  });
+});
+
+describe("menuBox", () => {
+  it("renders a title line followed by option rows, marking the selected one", () => {
+    expect(menuBox({ title: "Options", rows: ["Back", "Kill", "Delete"], selected: 1 })).toEqual([
+      "Options",
+      "  Back",
+      "> Kill",
+      "  Delete",
+    ]);
+  });
+
+  it("clamps an out-of-range selected index so a row is always marked", () => {
+    const out = menuBox({ title: "Options", rows: ["Back", "Kill"], selected: 9 });
+    expect(out).toEqual(["Options", "  Back", "> Kill"]);
+  });
+
+  it("caps total output at MENU_MAX_LINES, windowing rows around the selection", () => {
+    const rows = Array.from({ length: 12 }, (_, i) => `row${i}`);
+    const out = menuBox({ title: "Options", rows, selected: 8 });
+    expect(out.length).toBe(MENU_MAX_LINES);
+    expect(out[0]).toBe("Options");
+    expect(out).toContain("> row8"); // selection stays visible
+  });
+
+  it("MENU_MAX_LINES leaves at least two transcript lines", () => {
+    expect(MENU_MAX_LINES).toBe(8);
   });
 });
