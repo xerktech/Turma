@@ -1153,6 +1153,15 @@ server.on("upgrade", async (req, socket, head) => {
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
       return socket.destroy();
     }
+    // Reject a bogus/stale sessionId up front rather than accepting a socket
+    // that can never tail anything (no worktree to watch, empty seed) and
+    // just sits idle until the client backs off. A known-but-stopped session
+    // still connects — it seeds from cache and simply never arms a watch.
+    const known = (agents[host].sessions || []).some((s) => s.id === sessionId);
+    if (!known) {
+      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+      return socket.destroy();
+    }
     wsHandshake(socket, req);
 
     const byHost = (liveClients[host] = liveClients[host] || {});

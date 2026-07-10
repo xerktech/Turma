@@ -431,6 +431,11 @@ export class App {
   private scheduleRevealTick(): void {
     if (this.paused || this.revealTimer) return;
     if (this.state.screen !== "session") return;
+    // While the user has scrolled up to read history (offset > 0) the newest
+    // entry is off-screen, so typing it in is invisible work that also creeps
+    // the visible window; freeze the tick loop. It re-arms when they scroll
+    // back to the tail (offset 0) — see onSession.
+    if (this.state.session && this.state.session.offset > 0) return;
     this.revealTimer = setTimeout(() => {
       this.revealTimer = null;
       this.revealTick();
@@ -440,6 +445,9 @@ export class App {
   private revealTick(): void {
     const s = this.state.session;
     if (this.state.screen !== "session" || !s) return;
+    // Scrolled up since this tick was scheduled — pause without advancing or
+    // repainting; onSession re-arms on the return to the tail.
+    if (s.offset > 0) return;
     const entries = this.state.transcripts[s.sessionId]?.entries ?? [];
     const last = entries[entries.length - 1];
     const targetLen = last?.text.length ?? 0;
@@ -693,7 +701,11 @@ export class App {
     const total = this.sessionContentLength(s.hostKey, s.sessionId);
     const maxOffset = Math.max(0, total - area);
     if (e.type === "scrollDown") {
-      this.setState({ session: { ...s, offset: Math.max(0, s.offset - SESSION_SCROLL_STEP) } });
+      const offset = Math.max(0, s.offset - SESSION_SCROLL_STEP);
+      this.setState({ session: { ...s, offset } });
+      // Back at the tail — resume the typewriter (frozen while scrolled up),
+      // catching up to whatever streamed in meanwhile.
+      if (offset === 0) this.resumeRevealAtTail(s.sessionId);
       return;
     }
     if (e.type === "scrollUp") {
@@ -715,10 +727,20 @@ export class App {
     if (e.type === "tap") {
       if (s.offset > 0) {
         this.setState({ session: { ...s, offset: 0 } }); // snap to newest
+        this.resumeRevealAtTail(s.sessionId); // resume the frozen typewriter
       } else {
         this.setState({ session: { ...s, focus: "bottom" } });
       }
     }
+  }
+
+  // Re-anchor and restart the reveal tick after the user scrolls back to the
+  // tail. reanchorReveal snaps a large backlog (a block that streamed in while
+  // scrolled up) or leaves a small one to type; scheduleRevealTick (now
+  // unblocked, offset === 0) resumes the animation.
+  private resumeRevealAtTail(sessionId: string): void {
+    this.reanchorReveal(sessionId);
+    this.scheduleRevealTick();
   }
 
   // Bottom-box focus gestures. A pending AskUserQuestion turns the box into
