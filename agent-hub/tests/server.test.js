@@ -683,19 +683,44 @@ test("http: clone route queues a clone command; validates repo and host", async 
   assert.equal(ghost.status, 404);
 });
 
-test("http: heartbeat passes github + clones through to /api/agents", async () => {
+test("http: prune route queues a prune command per repo; validates host", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ device: "hpr" });
+
+  // A valid prune rides the next reply as a {type:"prune", repo} command.
+  const ok = await request("POST", "/api/agents/hpr/repos/AgentHub/prune", {
+    body: {}, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+  const res = await beat({ device: "hpr" });
+  assert.deepEqual(res.body.commands, [
+    { type: "prune", repo: "AgentHub", cmdId: ok.body.cmdId },
+  ]);
+
+  // Unknown host -> 404.
+  const ghost = await request("POST", "/api/agents/ghost/repos/AgentHub/prune", {
+    body: {}, headers: userHeaders,
+  });
+  assert.equal(ghost.status, 404);
+});
+
+test("http: heartbeat passes github + clones + prunes through to /api/agents", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
   await beat({
     device: "hgh",
     github: { available: true, login: "octocat", repos: [{ nameWithOwner: "octocat/hello", name: "hello" }] },
     clones: [{ name: "hello", repo: "octocat/hello", status: "cloning" }],
+    prunes: [{ repo: "hello", status: "done", summary: "removed 1 worktree · 0 merged branches", at: "2026-07-10T00:00:00Z" }],
   });
   const list = await request("GET", "/api/agents", { headers: userHeaders });
   const host = list.body.agents.find((a) => a.key === "hgh");
   assert.equal(host.github.available, true);
   assert.equal(host.github.login, "octocat");
   assert.deepEqual(host.clones, [{ name: "hello", repo: "octocat/hello", status: "cloning" }]);
+  assert.equal(host.prunes[0].repo, "hello");
+  assert.equal(host.prunes[0].status, "done");
 });
 
 test("http: session commands 404 for unknown hosts", async () => {

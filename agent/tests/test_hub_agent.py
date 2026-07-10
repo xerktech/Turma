@@ -707,6 +707,14 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
             model="opus", permission_mode="plan",
         )
 
+    def test_prune_command_dispatches_to_prune_repo(self):
+        sm = self.make_manager()
+        sm.prune_repo = mock.Mock()
+        sm.save = mock.Mock()
+        sm.handle_commands([{"cmdId": "cp", "type": "prune", "repo": "AgentHub"}])
+        sm.prune_repo.assert_called_once_with("AgentHub")
+        self.assertIn("cp", sm.acked)
+
     def test_unknown_type_and_poison_command_still_acked(self):
         sm = self.make_manager()
         sm.save = mock.Mock()
@@ -1536,6 +1544,95 @@ class TestPokeHeartbeat(unittest.TestCase):
         start = time.monotonic()
         self.assertTrue(ha._poke.wait(5))
         self.assertLess(time.monotonic() - start, 1.0)
+
+
+class TestPruneRepo(unittest.TestCase):
+    """prune_repo() over a REAL git repo + worktrees (the logic is git-heavy, so
+    faking run() would prove little). Verifies only merged/clean worktrees and
+    branches are swept and in-progress work is preserved."""
+
+    def _git(self, *args, cwd=None):
+        import subprocess
+        return subprocess.run(["git", *args], cwd=cwd or self.repo,
+                              capture_output=True, text=True, check=True)
+
+    def setUp(self):
+        import subprocess
+        if not shutil.which("git"):
+            self.skipTest("git not available")
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-prune-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.join(self.tmp, "demo")
+        os.makedirs(self.repo)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        run = lambda *a, cwd=None: subprocess.run(
+            ["git", *a], cwd=cwd or self.repo, env=env, capture_output=True,
+            text=True, check=True)
+        self._run = run
+        run("init", "-q", "-b", "main")
+        run("commit", "-q", "--allow-empty", "-m", "c1")
+
+        self.wt_root = os.path.join(self.tmp, "worktrees")
+        patches = [
+            ("REGISTRY_DIR", self.tmp),
+            ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
+            ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
+            ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
+            ("WORKTREES_ROOT", self.wt_root),
+            ("REPOS_ROOT", self.tmp),
+            ("device_name", lambda: "test-host"),
+            ("scan_repos", lambda: [{"name": "demo", "path": self.repo}]),
+        ]
+        for name, value in patches:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _add_worktree(self, sid, base="main"):
+        path = os.path.join(self.wt_root, "demo", sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self._run("worktree", "add", "--detach", path, base)
+        return path
+
+    def test_prune_sweeps_merged_keeps_in_progress(self):
+        sm = ha.SessionManager()
+
+        merged_wt = self._add_worktree("merged")          # detached at main -> merged
+        unmerged_wt = self._add_worktree("unmerged")
+        self._run("commit", "-q", "--allow-empty", "-m", "wip", cwd=unmerged_wt)
+        dirty_wt = self._add_worktree("dirty")
+        with open(os.path.join(dirty_wt, "scratch.txt"), "w") as f:
+            f.write("uncommitted")
+
+        # feature-merged points at main's tip (merged -> deleted); feature-wip at
+        # the unmerged worktree's commit, so it's ahead of main (kept).
+        self._run("branch", "feature-merged", "main")
+        wip_sha = self._run("rev-parse", "HEAD", cwd=unmerged_wt).stdout.strip()
+        self._run("branch", "feature-wip", wip_sha)
+
+        sm.prune_repo("demo")
+
+        # Merged/clean worktree gone; unmerged + dirty kept.
+        self.assertFalse(os.path.isdir(merged_wt))
+        self.assertTrue(os.path.isdir(unmerged_wt))
+        self.assertTrue(os.path.isdir(dirty_wt))
+
+        branches = self._run("branch", "--format", "%(refname:short)").stdout.split()
+        self.assertNotIn("feature-merged", branches)   # merged -> deleted
+        self.assertIn("feature-wip", branches)         # unmerged -> kept
+        self.assertIn("main", branches)                # default -> kept
+
+        res = sm.prunes["demo"]
+        self.assertEqual(res["status"], "done")
+        self.assertEqual(res["removedWorktrees"], 1)
+        self.assertEqual(res["deletedBranches"], 1)
+        self.assertGreaterEqual(res["skippedWorktrees"], 2)
+
+    def test_prune_unknown_repo_reports_error(self):
+        sm = ha.SessionManager()
+        sm.prune_repo("nope")
+        self.assertEqual(sm.prunes["nope"]["status"], "error")
 
 
 if __name__ == "__main__":

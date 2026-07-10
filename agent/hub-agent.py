@@ -1040,6 +1040,7 @@ GH_ORG_MAX = 20             # orgs to auto-sweep for repos (bounds the gh calls)
 CLONE_TIMEOUT_SEC = 600     # reap a `git clone` subprocess stuck this long
 CLONE_DONE_LINGER_SEC = 30  # keep a finished clone job visible this long...
 CLONE_ERROR_LINGER_SEC = 300  # ...longer for a failed one (operator reads it)
+PRUNE_RESULT_LINGER_SEC = 60  # keep a repo's prune summary in the heartbeat
 # A GitHub owner or repo-name segment: alnum start, then GitHub's own limited
 # set. Deliberately strict — the result becomes part of a URL and a path.
 _GH_SEG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -1181,6 +1182,9 @@ class SessionManager:
         # view is heartbeated).
         self.github = {"available": False, "login": None, "repos": []}
         self.clones = {}
+        # Recent per-repo prune results (merged branches + safe worktrees swept),
+        # keyed by repo name, lingered briefly so the UI can show the summary.
+        self.prunes = {}
         # at-least-once command de-dup: cmdIds we've already executed.
         self.acked = set()
         self.acked_order = deque(maxlen=1000)
@@ -1817,6 +1821,131 @@ class SessionManager:
             for j in self.clones.values()
         ]
 
+    # --- prune merged branches + safe worktrees ----------------------------
+
+    def _repo_worktrees(self, repo_path):
+        """Parse `git worktree list --porcelain` into [{path, head, branch}].
+        branch is the short name or None when detached; the main checkout is
+        included (callers filter it out by path)."""
+        out = run(["git", "-C", repo_path, "worktree", "list", "--porcelain"])
+        trees, cur = [], None
+        for line in out.splitlines():
+            if line.startswith("worktree "):
+                cur = {"path": line[len("worktree "):], "head": None, "branch": None}
+                trees.append(cur)
+            elif cur is None:
+                continue
+            elif line.startswith("HEAD "):
+                cur["head"] = line[len("HEAD "):]
+            elif line.startswith("branch "):
+                ref = line[len("branch "):]
+                cur["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+        return trees
+
+    def prune_repo(self, repo_name):
+        """Sweep a repo's finished work: remove session worktrees whose commits
+        are fully merged into the latest default branch (skipping any still
+        backing a hub session or holding uncommitted changes), then delete local
+        branches merged into that default (this also clears branches whose PR was
+        merged and remote deleted). Nothing unmerged or dirty is ever touched, so
+        no in-progress work is lost. The summary rides the heartbeat briefly."""
+        repo = next((r for r in scan_repos() if r["name"] == repo_name), None)
+        if not repo:
+            self.prunes[repo_name] = {
+                "repo": repo_name, "status": "error", "at": now_iso(),
+                "error": f"unknown repo {repo_name!r}", "summary": "unknown repo",
+                "finishedMono": time.time()}
+            log(f"prune refused: unknown repo {repo_name!r}")
+            return
+        path = repo["path"]
+        default = default_branch_name(path)
+        # Refresh remote-tracking refs so "merged into main" reflects upstream.
+        if default and valid_ref_name(default):
+            run_ok(["git", "-C", path, "fetch", "--prune", "origin"])
+        tip = None
+        for cand in (f"origin/{default}", default):
+            if default and branch_exists(path, cand):
+                tip = cand
+                break
+        if not tip:
+            self.prunes[repo_name] = {
+                "repo": repo_name, "status": "error", "at": now_iso(),
+                "error": "no default branch to compare against",
+                "summary": "no default branch — nothing pruned",
+                "finishedMono": time.time()}
+            log(f"prune {repo_name}: no default branch resolved")
+            return
+
+        wt_prefix = os.path.join(WORKTREES_ROOT, repo_name) + os.sep
+        live = {s.get("worktreePath") for s in self.registry}
+        removed_wt, skipped_wt = 0, 0
+        for wt in self._repo_worktrees(path):
+            p = wt["path"]
+            if not p.startswith(wt_prefix):
+                continue                      # main checkout / other repo — leave
+            if p in live:
+                continue                      # backs a hub session — never touch
+            if run(["git", "-C", p, "status", "--porcelain"]):
+                skipped_wt += 1               # uncommitted work — keep it
+                continue
+            head = wt["head"]
+            merged = head and run_ok(
+                ["git", "-C", path, "merge-base", "--is-ancestor", head, tip])[0] == 0
+            if not merged:
+                skipped_wt += 1               # unmerged commits — keep it
+                continue
+            if run_ok(["git", "-C", path, "worktree", "remove", p])[0] == 0:
+                removed_wt += 1
+                self.closed = [c for c in self.closed
+                               if c.get("worktreePath") != p]
+            else:
+                skipped_wt += 1
+        run(["git", "-C", path, "worktree", "prune"])
+
+        # Branches merged into the default tip are safe to delete; exclude the
+        # default itself and any branch still checked out in a remaining worktree
+        # (git would refuse those anyway). -D is safe here: we verified merged.
+        checked_out = {wt["branch"] for wt in self._repo_worktrees(path)
+                       if wt.get("branch")}
+        merged_out = run(["git", "-C", path, "branch", "--merged", tip,
+                          "--format", "%(refname:short)"])
+        deleted_br, kept_br = 0, 0
+        for b in merged_out.splitlines():
+            b = b.strip()
+            if not b or b == default or b == tip or b in checked_out:
+                continue
+            if run_ok(["git", "-C", path, "branch", "-D", b])[0] == 0:
+                deleted_br += 1
+            else:
+                kept_br += 1
+
+        bits = [f"{removed_wt} worktree{'' if removed_wt == 1 else 's'}",
+                f"{deleted_br} merged branch{'' if deleted_br == 1 else 'es'}"]
+        summary = "removed " + " · ".join(bits)
+        if skipped_wt:
+            summary += f" · kept {skipped_wt} in-progress worktree" + ("" if skipped_wt == 1 else "s")
+        self.prunes[repo_name] = {
+            "repo": repo_name, "status": "done", "at": now_iso(),
+            "error": None, "summary": summary,
+            "removedWorktrees": removed_wt, "deletedBranches": deleted_br,
+            "skippedWorktrees": skipped_wt, "finishedMono": time.time()}
+        log(f"pruned {repo_name}: {summary}")
+
+    def _poll_prunes(self):
+        """Drop prune summaries once they've lingered past their window."""
+        now = time.time()
+        for repo in list(self.prunes):
+            if now - self.prunes[repo].get("finishedMono", now) > PRUNE_RESULT_LINGER_SEC:
+                self.prunes.pop(repo, None)
+
+    def _prunes_payload(self):
+        return [
+            {"repo": j.get("repo"), "status": j.get("status"),
+             "error": j.get("error"), "summary": j.get("summary"),
+             "at": j.get("at")}
+            for j in self.prunes.values()
+        ]
+
     # --- boot auto-resume --------------------------------------------------
 
     def resume_on_boot(self):
@@ -1884,6 +2013,8 @@ class SessionManager:
                     self._stage_history(cmd.get("sessionId"))
                 elif ctype == "clone":
                     self.clone(cmd.get("repo"))
+                elif ctype == "prune":
+                    self.prune_repo(cmd.get("repo"))
                 else:
                     log(f"unknown command type {ctype!r} (cmdId {cid})")
             except Exception as e:
@@ -1990,6 +2121,7 @@ class SessionManager:
         if beat % GITHUB_REFRESH_EVERY == 0:
             self.refresh_github()
         self._poll_clones()
+        self._poll_prunes()
 
         payload = {
             # `device` (the physical host name) is the hub's identity key; agentId
@@ -2008,6 +2140,7 @@ class SessionManager:
             # clone control, and any in-flight/recent clone jobs.
             "github": self.github,
             "clones": self._clones_payload(),
+            "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),
         }
         # Purely additive, and only present when something is staged — mirrors

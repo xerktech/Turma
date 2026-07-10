@@ -96,6 +96,10 @@
   .repo-head .spacer { flex: 1; }
   .repo-empty { color: var(--muted); font-size: 12px; margin-top: 8px; }
 
+  /* Transient summary line after a repo prune (merged worktrees/branches swept). */
+  .prune-note { color: var(--ink-2); font-size: 12px; margin-top: 8px; }
+  .prune-note.err { color: var(--bad, #d66); }
+
   /* Per-repo picker of recently killed sessions that can be resumed. */
   .resume-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
   .resume-item {
@@ -319,7 +323,7 @@
 
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
-  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. "Clone from GitHub" pulls a repo (from the host's GitHub login) into the repos root so it joins the list and can host sessions — greyed out on hosts without GitHub credentials. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation.</div>
+  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. "Clone from GitHub" pulls a repo (from the host's GitHub login) into the repos root so it joins the list and can host sessions — greyed out on hosts without GitHub credentials. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
 </div>
 
 <nav class="bottom-nav">
@@ -494,6 +498,12 @@ function reconcilePending(agents) {
       const seen = a && ((a.clones || []).some(c => c.name === p.name) ||
                          (a.repos || []).some(r => r.name === p.name));
       if (seen) pending.delete(key);
+    } else if (p.kind === "prune") {
+      // Done once the agent reports a NEW prune result for this repo (its `at`
+      // differs from whatever was showing when we queued it).
+      const a = byHost.get(p.host);
+      const r = a && (a.prunes || []).find(x => x.repo === p.repo);
+      if (r && r.at !== p.prevAt) pending.delete(key);
     } else {
       const s = index.get(p.host + "::" + p.id);
       // kill now removes the record entirely (keeping only the branch), so like
@@ -829,6 +839,18 @@ function repoBlock(a, repo, sessList, now) {
   const resumeBtn = canResume
     ? `<button class="btn-sm" onclick="event.preventDefault();event.stopPropagation();toggleResume('${esc(rkey)}')">${resumeOpen.has(rkey) ? "Resume ▴" : "Resume ▾"}</button>`
     : "";
+  // Prune: sweep this repo's merged worktrees + branches (non-root only). Arms
+  // on first click, confirms on the second; a busy spinner until the result lands.
+  const pruning = pending.has(pendKey("prune", a.key, repo.name));
+  const pruneArmed = confirming.has("prune::" + a.key + "::" + repo.name);
+  const canPrune = a.online && !repo.missing && !repo.isRoot;
+  const pruneBtn = canPrune
+    ? `<button class="btn-sm ${pruneArmed ? "confirm" : ""}" title="Remove merged branches and worktrees" ${pruning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();pruneRepo('${esc(a.key)}','${esc(repo.name)}')">${pruning ? '<span class="spin"></span> Pruning…' : pruneArmed ? "Confirm prune" : "Prune"}</button>`
+    : "";
+  const pruneRes = (a.prunes || []).find(p => p.repo === repo.name);
+  const pruneNote = pruneRes
+    ? `<div class="prune-note ${pruneRes.status === "error" ? "err" : ""}">${esc(pruneRes.status === "error" ? (pruneRes.error || "prune failed") : pruneRes.summary || "pruned")}</div>`
+    : "";
   const resumePanel = canResume && resumeOpen.has(rkey)
     ? `<div class="resume-list">${closed.map(c => {
         const rp = pending.has(pendKey("resume", a.key, c.id));
@@ -850,10 +872,12 @@ function repoBlock(a, repo, sessList, now) {
       <span class="r-name">${repo.isRoot ? "⌂ Repos root" : repoLink(repo.remote, repo.name)}</span>
       ${meta}
       <span class="spacer"></span>
+      ${pruneBtn}
       ${resumeBtn}
       ${composerBtn}
       ${spawnBtn}
     </summary>
+    ${pruneNote}
     ${resumePanel}
     ${composerPanel}
     ${body}
@@ -1119,6 +1143,19 @@ function sessKill(key, id) {
 function sessDelete(key, id) {
   twoClick("sd::" + key + "::" + id, () => busy(pendKey("delete", key, id), { kind: "delete", host: key, id },
     () => del(`/api/agents/${enc(key)}/sessions/${enc(id)}`)));
+}
+// Prune a repo's finished work on a host: the agent removes worktrees whose
+// commits are merged into the latest default branch and deletes merged branches
+// (nothing unmerged or dirty is touched). Destructive-ish, so arm/confirm first;
+// prevAt lets reconcilePending clear the spinner when a NEW result lands.
+function pruneRepo(key, repo) {
+  twoClick("prune::" + key + "::" + repo, () => {
+    const host = (cache.agents || []).find(a => a.key === key);
+    const prev = host && (host.prunes || []).find(p => p.repo === repo);
+    busy(pendKey("prune", key, repo),
+      { kind: "prune", host: key, repo, prevAt: prev ? prev.at : null },
+      () => post(`/api/agents/${enc(key)}/repos/${enc(repo)}/prune`));
+  });
 }
 
 // ---- live terminal overlay (per session) -----------------------------------
