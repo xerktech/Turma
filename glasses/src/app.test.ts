@@ -608,7 +608,7 @@ describe("App", () => {
     dictation.resolve({ text: "deploy the fix" });
     expect(app.getState().session?.draft).toBe("deploy the fix");
 
-    // Draft present: rows are [Back, Send, Clear, Dictate more, Kill, Delete].
+    // Draft present: rows are [Back, Send, Clear, Dictate more, End this session].
     display.emit({ type: "doubleTap" }); // -> actions, cursor 0 = Back
     display.emit({ type: "tap" }); // select Back
 

@@ -140,11 +140,22 @@ interface SessionContent {
   status: string;
 }
 
+// The hardware's textContainerUpgrade treats empty content as a no-op: it
+// leaves whatever the container last drew on screen (the same reason start()
+// seeds a single space instead of ""). So a container whose content becomes
+// empty — e.g. the input box after focus leaves it, "> Tap to dictate…" -> ""
+// when the user scrolls up into the transcript — would otherwise keep its
+// stale text forever. Coerce empty content to a single space so the upgrade
+// actually clears the container.
+function orSpace(content: string): string {
+  return content.length === 0 ? " " : content;
+}
+
 function sessionContentFrom(model: Extract<ScreenModel, { type: "session" }>, cap: number): SessionContent {
   return {
-    transcript: capContent(model.transcriptLines.join("\n"), cap),
-    box: capContent(model.bottom.lines.join("\n"), cap),
-    status: capContent(model.bottom.status, cap),
+    transcript: orSpace(capContent(model.transcriptLines.join("\n"), cap)),
+    box: orSpace(capContent(model.bottom.lines.join("\n"), cap)),
+    status: orSpace(capContent(model.bottom.status, cap)),
   };
 }
 
