@@ -31,20 +31,23 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      # Version iteration: the image's headline content is Claude Code, so the
-      # primary version tag IS the bundled Claude Code release (pinned into the
-      # build so the tag and contents can't drift). github.run_number gives a
-      # monotonic build counter that disambiguates repo-side rebuilds of the
-      # same Claude Code version (e.g. an entrypoint/Dockerfile tweak).
-      # Resolved via a throwaway node container — the self-hosted runner has no
-      # npm on PATH.
-      - name: Resolve Claude Code version
+      # Versioning: the repo-wide MAJOR.MINOR lives in the root VERSION file and
+      # every pipeline appends its Actions run number as the patch, giving one
+      # full version per build (VERSION.run_number, e.g. 0.1.42). Separately —
+      # NOT part of the version — the bundled Claude Code release is pinned into
+      # the build so its contents can't drift; it's resolved here only to feed
+      # the CLAUDE_CODE_VERSION build-arg (via a throwaway node container, since
+      # the self-hosted runner has no npm on PATH).
+      - name: Resolve versions
         id: ver
         run: |
           set -euo pipefail
+          BASE="$(tr -d '[:space:]' < VERSION)"
+          VERSION="${BASE}.${{ github.run_number }}"
           CC_VERSION="$(docker run --rm node:24-alpine npm view @anthropic-ai/claude-code version | tr -d '[:space:]')"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "cc_version=${CC_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Pinning Claude Code ${CC_VERSION} (build #${{ github.run_number }})"
+          echo "Building agent ${VERSION} (bundling Claude Code ${CC_VERSION})"
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
@@ -64,14 +67,13 @@ jobs:
             CLAUDE_CODE_VERSION=${{ steps.ver.outputs.cc_version }}
           tags: |
             ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ steps.ver.outputs.cc_version }}
-            ${{ env.IMAGE }}:${{ steps.ver.outputs.cc_version }}-${{ github.run_number }}
+            ${{ env.IMAGE }}:${{ steps.ver.outputs.version }}
             ${{ env.IMAGE }}:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.ver.outputs.cc_version }}-${{ github.run_number }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
 
       # Keep the shared runner's disk at a steady state: sweep dangling layers
       # after every run (success or failure). Pulled base images (node, busybox)
