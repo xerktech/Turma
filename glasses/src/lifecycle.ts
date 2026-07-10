@@ -14,7 +14,7 @@
 //     `App`: foreground-exit pauses + snapshots UI state (screen + selected
 //     session id); foreground-enter/restore resumes (which polls
 //     immediately); abnormal/system exit pauses and tears the display down.
-import type { App, AppState, SessionScreenState } from "./app.ts";
+import { newSessionState, type App, type AppState } from "./app.ts";
 
 type Exporter = () => unknown;
 type Restorer = (saved: unknown) => void;
@@ -113,7 +113,7 @@ export function resetLifecycleForTests(): void {
 // ---- App-facing glue ------------------------------------------------------
 
 // Only these three screens are worth resurrecting after a background →
-// foreground WebView migration. Transient screens (actions/question/confirm/
+// foreground WebView migration. Transient screens (actions/confirm/
 // reply/newHost/newRepo/newPrompt) carry sub-state (cursors, dictation
 // phases, half-built spawn targets) that would restore as null and render a
 // degraded header-only fallback — so the snapshot records their *parent*
@@ -145,8 +145,6 @@ export function snapshotFromState(state: AppState): AppSnapshot {
     // Transient session-scoped screens → their parent session view.
     case "actions":
       return sessionSnap(state.actions?.hostKey, state.actions?.sessionId);
-    case "question":
-      return sessionSnap(state.question?.hostKey, state.question?.sessionId);
     case "confirm":
       return sessionSnap(state.confirm?.action.hostKey, state.confirm?.action.sessionId);
     case "reply": {
@@ -174,8 +172,7 @@ export function installLifecycle(app: App): void {
   onBackgroundRestore(BACKGROUND_STATE_KEY, (saved) => {
     const s = (saved ?? {}) as Partial<AppSnapshot>;
     if (typeof s.hostKey === "string" && typeof s.sessionId === "string") {
-      const session: SessionScreenState = { hostKey: s.hostKey, sessionId: s.sessionId, offset: 0 };
-      app.restoreScreen("session", session);
+      app.restoreScreen("session", newSessionState(s.hostKey, s.sessionId));
       return;
     }
     // Only home/settings are restorable without session context; anything
