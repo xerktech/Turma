@@ -345,8 +345,8 @@ describe("render: actions", () => {
     expect(model.bottom.mode).toBe("menu");
     const box = model.bottom.lines;
     expect(box).toContain("> Back");
-    expect(box).toContain("  Kill");
-    expect(box).toContain("  Delete");
+    expect(box).toContain("  End this session");
+    expect(box.some((l) => l.includes("Delete"))).toBe(false);
     expect(box.some((l) => l.includes("Restart"))).toBe(false);
     expect(box.some((l) => l.includes("Answer question"))).toBe(false);
     expect(box.some((l) => l.includes("Send"))).toBe(false);
@@ -384,7 +384,7 @@ describe("render: actions", () => {
     expect(box).toContain("  Send");
     expect(box).toContain("  Clear");
     expect(box).toContain("  Dictate more");
-    expect(box).toContain("  Kill");
+    expect(box).toContain("  End this session");
   });
 
   it("ignores another session's draft (Send/Clear only reflect the actions target's own session)", () => {
@@ -402,7 +402,7 @@ describe("render: actions", () => {
     expect(box.some((l) => l.includes("Clear"))).toBe(false);
   });
 
-  it("shows Back/Start/Delete (no Kill, no Restart) when the session is stopped", () => {
+  it("shows Back/Start (no Delete, no Kill, no Restart) when the session is stopped", () => {
     const s = session({ id: "s1", status: "stopped", session: null });
     const agents = [agent({ sessions: [s] })];
     const state = base({
@@ -414,8 +414,9 @@ describe("render: actions", () => {
     const box = asSession(render(state)).bottom.lines;
     expect(box).toContain("> Back");
     expect(box).toContain("  Start");
-    expect(box).toContain("  Delete");
+    expect(box.some((l) => l.includes("Delete"))).toBe(false);
     expect(box.some((l) => l.includes("Kill"))).toBe(false);
+    expect(box.some((l) => l.includes("End this session"))).toBe(false);
     expect(box.some((l) => l.includes("Restart"))).toBe(false);
   });
 });
@@ -472,25 +473,25 @@ describe("render: reply", () => {
 });
 
 describe("render: confirm", () => {
-  it("renders the kill confirmation as a menu overlay with Cancel preselected", () => {
+  it("renders the end-session confirmation as a menu overlay with Cancel preselected", () => {
     const state = base({
       screen: "confirm",
       confirm: { action: { kind: "kill", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 0 },
     });
     const model = asSession(render(state));
     expect(model.bottom.mode).toBe("menu");
-    expect(model.bottom.lines[0]).toBe("Kill sess-0?");
+    expect(model.bottom.lines[0]).toBe("End session sess-0?");
     expect(model.bottom.lines).toContain("> Cancel");
     expect(model.bottom.lines).toContain("  Confirm");
   });
 
-  it("shows the delete confirmation wording with Confirm selected", () => {
+  it("honors the cursor selection on the confirmation menu", () => {
     const state = base({
       screen: "confirm",
-      confirm: { action: { kind: "delete", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 1 },
+      confirm: { action: { kind: "kill", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 1 },
     });
     const model = asSession(render(state));
-    expect(model.bottom.lines[0]).toContain("Removes worktree");
+    expect(model.bottom.lines[0]).toBe("End session sess-0?");
     expect(model.bottom.lines).toContain("  Cancel");
     expect(model.bottom.lines).toContain("> Confirm");
   });

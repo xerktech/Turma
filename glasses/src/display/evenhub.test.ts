@@ -251,6 +251,22 @@ describe("EvenHubDisplay", () => {
       expect(upgradeCalls.some((u) => u.content === "Waiting")).toBe(true);
     });
 
+    it("coerces an empty box to a single space so the upgrade clears stale text (hardware no-ops on empty content)", async () => {
+      const { bridge, upgradeCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      // Focused empty input box shows the "Tap to dictate…" hint...
+      display.render(sessionModel({ lines: ["> Tap to dictate…"], status: "Idle" }));
+      // ...then focus leaves it (same 1-line shape) and render.ts emits [""].
+      display.render(sessionModel({ lines: [""], status: "Idle" }));
+
+      // The box container is upgraded with " ", not "" (an empty upgrade is a
+      // no-op on the glasses and would leave the hint on screen).
+      expect(upgradeCalls.some((u) => u.content === " ")).toBe(true);
+      expect(upgradeCalls.some((u) => u.content === "")).toBe(false);
+    });
+
     it("switching from input mode to sheet mode triggers a rebuild even with an unchanged box line count", async () => {
       const { bridge, rebuildCalls } = fakeBridge();
       const display = new EvenHubDisplay(bridge);

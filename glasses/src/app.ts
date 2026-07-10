@@ -113,9 +113,7 @@ export interface ReplyScreenState {
   cursor: number; // preview/unavailable button selection
 }
 
-export type ConfirmAction =
-  | { kind: "kill"; hostKey: string; sessionId: string }
-  | { kind: "delete"; hostKey: string; sessionId: string };
+export type ConfirmAction = { kind: "kill"; hostKey: string; sessionId: string };
 
 export interface ConfirmScreenState {
   action: ConfirmAction;
@@ -1097,9 +1095,6 @@ export class App {
       case "kill":
         this.setState({ screen: "confirm", confirm: { action: { kind: "kill", hostKey, sessionId }, cursor: 0 } });
         return;
-      case "delete":
-        this.setState({ screen: "confirm", confirm: { action: { kind: "delete", hostKey, sessionId }, cursor: 0 } });
-        return;
       case "back":
         // Non-destructive exit: unlike Send/Clear (which must zero the
         // draft), Back must not discard a dictated draft the user hasn't
@@ -1269,22 +1264,10 @@ export class App {
         return;
       }
       const { hostKey, sessionId } = c.action;
-      if (c.action.kind === "kill") {
-        this.queueAction(hostKey, sessionId, "kill");
-      } else {
-        this.markPending(sessionId, findSession(this.state, hostKey, sessionId));
-        void this.client
-          .deleteSession(hostKey, sessionId)
-          .then(() => {
-            this.flash(FLASH_QUEUED);
-            this.repaint();
-          })
-          .catch(() => {
-            this.flash(FLASH_HUB_UNREACHABLE);
-            this.repaint();
-          });
-        this.goHome();
-      }
+      // "End this session" is a non-destructive kill: the session leaves the
+      // hub but its worktree, conversation, and token history stay on disk.
+      // The glasses never delete a worktree, so there's no destructive branch.
+      this.queueAction(hostKey, sessionId, "kill");
     }
   }
 

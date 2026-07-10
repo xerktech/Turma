@@ -315,7 +315,7 @@ function renderSession(state: AppState): ScreenModel {
 // ---- actions --------------------------------------------------------
 
 export interface ActionRow {
-  action: "send" | "clear" | "dictate" | "start" | "kill" | "delete" | "back";
+  action: "send" | "clear" | "dictate" | "start" | "kill" | "back";
   text: string;
 }
 
@@ -333,7 +333,6 @@ export function buildActionsRows(state: AppState, hostKey: string, sessionId: st
     return [
       { action: "back", text: "Back" },
       { action: "start", text: "Start" },
-      { action: "delete", text: "Delete" },
     ];
   }
   const draft =
@@ -349,8 +348,11 @@ export function buildActionsRows(state: AppState, hostKey: string, sessionId: st
     rows.push({ action: "clear", text: "Clear" });
     rows.push({ action: "dictate", text: "Dictate more" });
   }
-  rows.push({ action: "kill", text: "Kill" });
-  rows.push({ action: "delete", text: "Delete" });
+  // "End this session" issues the same non-destructive kill the hub does:
+  // the session drops off the hub but its worktree (any uncommitted work),
+  // conversation, and token history all survive on disk. There is
+  // deliberately no "Delete" row — the glasses never remove a worktree.
+  rows.push({ action: "kill", text: "End this session" });
   return rows;
 }
 
@@ -408,7 +410,7 @@ function confirmHeader(state: AppState): string {
   const c = state.confirm;
   if (!c) return "Confirm";
   const id = c.action.sessionId.slice(0, 6);
-  return c.action.kind === "kill" ? `Kill ${id}?` : `Delete ${id}? Removes worktree`;
+  return `End session ${id}?`;
 }
 
 function renderConfirm(state: AppState): ScreenModel {
