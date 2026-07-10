@@ -321,6 +321,52 @@ def resolve_permission_mode(mode):
     raise ValueError(f"unknown permission mode {mode!r}")
 
 
+# --- agent safety guard (--settings wiring) ------------------------------
+
+# Host credential / agent-config stores the agent must never write or delete.
+# Path rules use Claude Code's gitignore-style matching and win even under
+# `--permission-mode bypassPermissions`, unlike fragile Bash arg patterns.
+_GUARD_DENY_PATH_RULES = [
+    "Edit(~/.ssh/**)",
+    "Write(~/.ssh/**)",
+    "Edit(~/.aws/**)",
+    "Write(~/.aws/**)",
+    "Edit(~/.claude/**)",
+    "Write(~/.claude/**)",
+    "Edit(~/.config/gcloud/**)",
+    "Write(~/.config/gcloud/**)",
+]
+
+
+def guard_script_path():
+    """Absolute path to the bundled PreToolUse guard hook. Resolves correctly
+    both in the repo (``agent/hooks/guard.py``) and in the image
+    (``/usr/local/bin/hooks/guard.py``), since guard.py sits in a ``hooks/``
+    dir next to this file in both layouts."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "guard.py")
+
+
+def build_guard_settings(python_exe=None, guard_path=None):
+    """Build the dict passed to ``claude --settings``: a ``PreToolUse`` guard
+    hook over Bash plus deny rules protecting the host credential stores. The
+    bypass-mode session runs freely except for what the guard blocks (see
+    ``hooks/guard.py``)."""
+    python_exe = python_exe or sys.executable or "python3"
+    guard_path = guard_path or guard_script_path()
+    hook_command = f'"{python_exe}" "{guard_path}"'
+    return {
+        "permissions": {"deny": list(_GUARD_DENY_PATH_RULES)},
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": hook_command}],
+                }
+            ]
+        },
+    }
+
+
 # Names that are NOT a usable per-host identity: blank, localhost, our own
 # placeholder, the Docker Desktop LinuxKit VM name (shared by every Windows/Mac
 # host, so it collides), and the 12-/64-char hex id the kernel hands an unnamed
@@ -1280,6 +1326,27 @@ class SessionManager:
             return None
         return newest
 
+    def _ensure_guard_settings(self):
+        """Write (once per manager) the Claude ``--settings`` file that wires
+        the PreToolUse safety guard, returning its path — or None if it couldn't
+        be written, in which case the session launches without the guard layer
+        rather than failing to start. The content is identical for every session
+        on the host (guard path + interpreter are fixed), so it's written once
+        to ``REGISTRY_DIR/guard-settings.json`` and reused."""
+        cached = getattr(self, "_guard_settings_path", None)
+        if cached and os.path.exists(cached):
+            return cached
+        path = os.path.join(REGISTRY_DIR, "guard-settings.json")
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(build_guard_settings(), fh, indent=2)
+        except OSError as e:
+            log(f"guard settings write failed ({e}); launching without --settings")
+            return None
+        self._guard_settings_path = path
+        return path
+
     def _launch_tmux(self, sess, resume=False, prompt=None):
         """(Re)launch claude for a session inside its own tmux, detached.
 
@@ -1312,6 +1379,12 @@ class SessionManager:
         perm = sess.get("permissionMode") or "bypassPermissions"
         if perm != "default":
             parts.append(f"--permission-mode {perm}")
+        # Wire the PreToolUse safety guard that makes bypassPermissions safe
+        # (blocks catastrophic / policy / attribution Bash). Best-effort: if the
+        # settings file can't be written the session still launches (bare).
+        settings = self._ensure_guard_settings()
+        if settings:
+            parts.append(f"--settings {shlex.quote(settings)}")
         claude_cmd = " ".join(parts)
         if prompt:
             claude_cmd += f" -- {shlex.quote(prompt)}"
