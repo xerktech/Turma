@@ -400,6 +400,7 @@ export class App {
   // race).
   private onLiveTail(_hostKey: string, sessionId: string, entries: TailEntry[]): void {
     if (this.state.screen !== "session" || this.state.session?.sessionId !== sessionId) return;
+    const beforeLen = this.sessionContentLength(_hostKey, sessionId);
     const existing = this.state.transcripts[sessionId] ?? emptyBuffer();
     const merged = mergeTail(existing, entries);
     this.state = {
@@ -408,17 +409,39 @@ export class App {
       transcripts: { ...this.state.transcripts, [sessionId]: merged },
     };
     this.reanchorReveal(sessionId);
+    this.preserveScrollOffset(beforeLen);
     this.repaint();
     this.scheduleRevealTick();
+  }
+
+  // Keep the visible transcript window pinned to the same lines when content
+  // grows underneath a user who has scrolled up to read history (offset > 0).
+  // Because render.ts windows the transcript from the bottom (end =
+  // content.length - offset), new text landing below would otherwise slide the
+  // whole window down and creep what they're reading off-screen. Bump the
+  // from-bottom offset by however many lines were added so the same slice stays
+  // put. At the tail (offset === 0) this is a deliberate no-op, so new text
+  // still auto-scrolls in. `beforeLen` is the content length captured *before*
+  // the transcript/reveal mutation that may have grown it.
+  private preserveScrollOffset(beforeLen: number): void {
+    const s = this.state.session;
+    if (!s || s.offset <= 0) return;
+    const afterLen = this.sessionContentLength(s.hostKey, s.sessionId);
+    const growth = afterLen - beforeLen;
+    if (growth > 0) {
+      this.state = { ...this.state, session: { ...s, offset: s.offset + growth } };
+    }
   }
 
   // The in-progress assistant turn scraped from the TUI (real-time streaming).
   private onLiveTurn(_hostKey: string, sessionId: string, text: string): void {
     if (this.state.screen !== "session" || this.state.session?.sessionId !== sessionId) return;
+    const beforeLen = this.sessionContentLength(_hostKey, sessionId);
     if (text) {
       // Still generating — update the live turn and let the reveal type it in.
       this.state = { ...this.state, now: this.now(), liveTurn: { sessionId, text } };
       this.reanchorReveal(sessionId);
+      this.preserveScrollOffset(beforeLen);
     } else {
       // Turn completed: drop the live turn (the committed tail owns the message
       // now) and show the now-committed newest entry in FULL — it was already
@@ -432,6 +455,7 @@ export class App {
         reveal: fullReveal(last?.id ?? null, last?.text.length ?? 0),
       };
       this.lastRevealAt = this.now();
+      this.preserveScrollOffset(beforeLen);
     }
     this.repaint();
     this.scheduleRevealTick();
@@ -515,6 +539,11 @@ export class App {
     try {
       const res = await this.client.listAgents();
       const sessionRefs = flattenSessions(res.agents);
+      // Content length of the focused session *before* this poll's tail merge,
+      // so a scrolled-up view can be pinned to the same lines (see
+      // preserveScrollOffset) if the poll grows the transcript underneath it.
+      const focused = this.state.screen === "session" ? this.state.session : null;
+      const beforeLen = focused ? this.sessionContentLength(focused.hostKey, focused.sessionId) : 0;
       const transcripts = { ...this.state.transcripts };
       for (const ref of sessionRefs) {
         const tail = ref.session.session?.tail ?? [];
@@ -554,6 +583,7 @@ export class App {
       // delta would, rather than flashing in at full length.
       if (this.state.screen === "session" && this.state.session) {
         this.reanchorReveal(this.state.session.sessionId);
+        this.preserveScrollOffset(beforeLen);
         this.scheduleRevealTick();
       }
       // A question that newly appeared while the bottom box was focused in
