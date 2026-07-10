@@ -1351,5 +1351,35 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       await vi.advanceTimersByTimeAsync(500); // no ticks should fire while paused
       expect(app.getState().reveal.shown).toBe(shownAtPause);
     });
+
+    it("freezes the reveal while scrolled up and resumes at the tail", async () => {
+      const app = await enterSession();
+      // Enough short entries that scrolling up moves the offset above 0.
+      const older = Array.from({ length: 20 }, (_, i) => ({
+        id: `m${i}`,
+        role: "assistant",
+        text: `line ${i}`,
+      }));
+      liveTail.deliver(older);
+      await vi.advanceTimersByTimeAsync(80);
+      // A new long entry begins typing (78 chars — more than one 80ms tick,
+      // under the 200-char snap threshold).
+      const longText = "abcdefghijklmnopqrstuvwxyz".repeat(3);
+      liveTail.deliver([...older, { id: "mLast", role: "assistant", text: longText }]);
+      expect(app.getState().reveal.entryId).toBe("mLast");
+
+      // Scroll up to read history — the reveal must freeze.
+      display.emit({ type: "scrollUp" });
+      expect(app.getState().session?.offset ?? 0).toBeGreaterThan(0);
+      const frozen = app.getState().reveal.shown;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(app.getState().reveal.shown).toBe(frozen); // no ticks while scrolled up
+
+      // Scroll back to the tail — the typewriter resumes and advances.
+      for (let i = 0; i < 12; i++) display.emit({ type: "scrollDown" });
+      expect(app.getState().session?.offset).toBe(0);
+      await vi.advanceTimersByTimeAsync(80);
+      expect(app.getState().reveal.shown).toBeGreaterThan(frozen);
+    });
   });
 });

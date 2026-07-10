@@ -1339,6 +1339,28 @@ test("live WS: unknown host -> 404, no upgrade", async () => {
   res.socket.destroy();
 });
 
+test("live WS: unknown session on a known host -> 404; a real session still upgrades", async () => {
+  agents.knownhost = {
+    device: "knownhost",
+    lastSeen: Date.now(),
+    commands: [],
+    history: {},
+    sessions: [{ id: "real1", worktreePath: "/wt/real1", session: { tail: [] } }],
+  };
+  const token = await issueToken();
+
+  // A bogus/stale sessionId is rejected up front rather than left as an idle
+  // do-nothing socket.
+  const bogus = await wsConnect(`/live/knownhost/nosuchsession?auth=${token}`);
+  assert.match(bogus.statusLine, /^HTTP\/1\.1 404/);
+  bogus.socket.destroy();
+
+  // The real session on the same host still upgrades (no over-rejection).
+  const ok = await wsConnect(`/live/knownhost/real1?auth=${token}`);
+  assert.match(ok.statusLine, /^HTTP\/1\.1 101/);
+  ok.socket.destroy();
+});
+
 test("live WS: seeds cached tail, watches via the control channel, fans out deltas, unwatches on close", async () => {
   // A host with one running session, its worktree path + a cached tail.
   agents.livehost = {
