@@ -9,12 +9,6 @@ import { wrapText } from "./text-wrap.ts";
 import type { AgentInfo, SessionInfo } from "./types.ts";
 
 export { DISPLAY_LINES, LINE_WIDTH_PX };
-// Legacy fixed transcript-area height (1 header line + 9 content), kept only
-// because app.ts's scroll-amount math still references it pending Task 4's
-// rewrite. renderSession no longer uses it: the session screen has no header
-// line anymore, and the transcript area now varies with the bottom box's
-// height (see bottomBoxLines).
-export const SESSION_CONTENT_AREA = DISPLAY_LINES - 1;
 
 // How many lines the transcript scrolls per scroll-gesture step on the
 // session screen (distinct from the menu screens' page-at-a-time paging).
@@ -23,18 +17,6 @@ export const SESSION_SCROLL_STEP = 2;
 // Focus target on the session screen: the scrollable transcript, or the
 // bottom input/sheet box.
 export type SessionFocus = "transcript" | "bottom";
-
-// The session screen's live-interaction fields, added to AppState.session in
-// Task 4. Declared here (rather than widening AppState.session itself, which
-// is Task 4's job) so render() can read them — with defaults below — while
-// staying pure and testable from plain fixtures today.
-export interface SessionScreenStateExt extends SessionScreenState {
-  focus?: SessionFocus;
-  draft?: string;
-  mic?: MicState;
-  viewOffset?: number;
-  selected?: number;
-}
 
 export type BottomModel =
   | { mode: "input"; lines: string[]; status: string; focused: boolean }
@@ -206,12 +188,12 @@ export function sessionContentLines(state: AppState, hostKey: string, sessionId:
 
 // Builds the session screen's bottom bar — an AskUserQuestion sheet when the
 // session has a pending question, otherwise the free-text dictation input —
-// from the session's live signals plus the (Task 4-supplied, defaulted here)
-// focus/draft/mic/selected fields.
-function renderSessionBottom(state: AppState, sess: SessionScreenStateExt): BottomModel {
+// from the session's live signals plus its focus/draft/mic/selected fields
+// (added to AppState.session in Task 4).
+function renderSessionBottom(state: AppState, sess: SessionScreenState): BottomModel {
   const s = findSessionLocal(state, sess.hostKey, sess.sessionId);
-  const focus = sess.focus ?? "transcript";
-  const mic: MicState = sess.mic ?? "idle";
+  const focus = sess.focus;
+  const mic: MicState = sess.mic;
   const live = s ? liveState(s) : "idle";
   const status = statusLabel({ mic, live });
   const focused = focus === "bottom";
@@ -219,17 +201,25 @@ function renderSessionBottom(state: AppState, sess: SessionScreenStateExt): Bott
   const question = s?.session?.question;
   if (question) {
     const options = s?.session?.questionOptions ?? [];
-    const selected = sess.selected ?? 0;
+    const selected = sess.selected;
     return { mode: "sheet", lines: sheetBody({ question, options, selected }), options, selected, status, focused };
   }
 
-  const draft = sess.draft ?? "";
-  const viewOffset = sess.viewOffset ?? 0;
+  const draft = sess.draft;
+  const viewOffset = sess.viewOffset;
   return { mode: "input", lines: inputBoxBody({ text: draft, focused, mic, viewOffset }), status, focused };
 }
 
+// The transcript's visible line-count for a given session — the bottom box
+// (input or sheet) grows/shrinks with its content, so app.ts's scroll-offset
+// math needs this exact figure to stay in sync with what renderSession
+// actually windows. Shared rather than duplicated so the two never drift.
+export function sessionTranscriptArea(state: AppState, sess: SessionScreenState): number {
+  return DISPLAY_LINES - bottomBoxLines(renderSessionBottom(state, sess).lines);
+}
+
 function renderSession(state: AppState): ScreenModel {
-  const sess = state.session as SessionScreenStateExt | null;
+  const sess = state.session;
   if (!sess) {
     // Defensive fallback: screen is "session" but no session target is set.
     // Shouldn't happen in practice (every transition to "session" sets both

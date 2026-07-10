@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createInitialState, type AppState } from "./app.ts";
+import { createInitialState, newSessionState, type AppState } from "./app.ts";
 import { render, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
@@ -137,7 +137,7 @@ describe("render: session", () => {
     const state = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      session: newSessionState("host-a", "s1"),
       transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
     });
 
@@ -156,7 +156,7 @@ describe("render: session", () => {
     const state = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      session: newSessionState("host-a", "s1"),
       transcripts: { s1: { entries: [] } },
     });
 
@@ -180,7 +180,7 @@ describe("render: session", () => {
     const state = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      session: newSessionState("host-a", "s1"),
       transcripts: {
         s1: {
           entries: [
@@ -211,7 +211,7 @@ describe("render: session", () => {
     const state = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      session: newSessionState("host-a", "s1"),
       transcripts: { s1: { entries } },
     });
 
@@ -229,7 +229,7 @@ describe("render: session", () => {
     const state = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 999 },
+      session: { ...newSessionState("host-a", "s1"), offset: 999 },
       transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
       loadingHistory: { s1: true },
     });
@@ -244,7 +244,7 @@ describe("render: session", () => {
     const state = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      session: newSessionState("host-a", "s1"),
       transcripts: {
         s1: {
           entries: [
@@ -270,13 +270,13 @@ describe("render: session", () => {
     const falseState = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      session: newSessionState("host-a", "s1"),
       transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }], hasMore: false } },
     });
     const undefinedState = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      session: newSessionState("host-a", "s1"),
       transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
     });
 

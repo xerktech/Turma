@@ -3,14 +3,17 @@ import type { GlassesDisplay } from "./display/index.ts";
 import type { Dictation, DictationResult } from "./dictation.ts";
 import { emptyBuffer, mergeTail, prependHistory, type TranscriptBuffer } from "./transcript.ts";
 import { flattenSessions } from "./sessions.ts";
+import type { MicState } from "./input-box.ts";
 import {
   buildActionsRows,
   buildHomeRows,
   buildNewRepoRows,
   render,
-  SESSION_CONTENT_AREA,
   sessionContentLines,
+  sessionTranscriptArea,
+  SESSION_SCROLL_STEP,
   type HomeRow,
+  type SessionFocus,
 } from "./render.ts";
 import type { AgentInfo, InputEvent, SessionInfo, SessionRef, SessionStatus } from "./types.ts";
 
@@ -57,6 +60,18 @@ export interface SessionScreenState {
   hostKey: string;
   sessionId: string;
   offset: number; // lines scrolled up from the bottom (0 = anchored at bottom)
+  focus: SessionFocus; // transcript scroll vs. the bottom input/sheet box
+  draft: string; // dictation buffer for the bottom input box
+  mic: MicState;
+  viewOffset: number; // scroll within a tall bottom box
+  selected: number; // highlighted sheet option (AskUserQuestion)
+}
+
+// Every transition into the session screen builds its SessionScreenState
+// through here so the new focus/draft/mic/viewOffset/selected fields never
+// drift out of sync between call sites.
+export function newSessionState(hostKey: string, sessionId: string): SessionScreenState {
+  return { hostKey, sessionId, offset: 0, focus: "transcript", draft: "", mic: "idle", viewOffset: 0, selected: 0 };
 }
 
 export interface ActionsScreenState {
@@ -467,7 +482,7 @@ export class App {
       if (row.kind === "session" && row.hostKey && row.sessionId) {
         this.setState({
           screen: "session",
-          session: { hostKey: row.hostKey, sessionId: row.sessionId, offset: 0 },
+          session: newSessionState(row.hostKey, row.sessionId),
         });
       } else if (row.kind === "newSession") {
         this.setState({ screen: "newHost", newHost: { cursor: 0 } });
@@ -484,19 +499,23 @@ export class App {
     return lines.length;
   }
 
+  // Transcript-focus gestures (the default focus on entering the session
+  // screen). scrollUp/scrollDown creep the transcript SESSION_SCROLL_STEP
+  // lines at a time (not a full-page jump) against the same area render.ts
+  // windows against (sessionTranscriptArea — the bottom box's height varies
+  // with its content, so this can't be a fixed constant). tap snaps back to
+  // the newest content if scrolled, otherwise hands focus to the bottom
+  // box; doubleTap always leaves the session screen.
   private onSession(e: InputEvent): void {
     const s = this.state.session;
     if (!s) return this.goHome();
+    if (s.focus === "bottom") return this.onSessionBottom(e, s);
     if (e.type === "doubleTap") return this.goHome();
-    if (e.type === "tap") {
-      this.setState({ screen: "actions", actions: { hostKey: s.hostKey, sessionId: s.sessionId, cursor: 0 } });
-      return;
-    }
-    const contentArea = SESSION_CONTENT_AREA;
+    const area = sessionTranscriptArea(this.state, s);
     const total = this.sessionContentLength(s.hostKey, s.sessionId);
-    const maxOffset = Math.max(0, total - contentArea);
+    const maxOffset = Math.max(0, total - area);
     if (e.type === "scrollDown") {
-      this.setState({ session: { ...s, offset: Math.max(0, s.offset - contentArea) } });
+      this.setState({ session: { ...s, offset: Math.max(0, s.offset - SESSION_SCROLL_STEP) } });
       return;
     }
     if (e.type === "scrollUp") {
@@ -512,8 +531,33 @@ export class App {
         }
         return; // nothing more to load
       }
-      this.setState({ session: { ...s, offset: Math.min(maxOffset, s.offset + contentArea) } });
+      this.setState({ session: { ...s, offset: Math.min(maxOffset, s.offset + SESSION_SCROLL_STEP) } });
+      return;
     }
+    if (e.type === "tap") {
+      if (s.offset > 0) {
+        this.setState({ session: { ...s, offset: 0 } }); // snap to newest
+      } else {
+        this.setState({ session: { ...s, focus: "bottom" } });
+      }
+    }
+  }
+
+  // Bottom-box focus gestures — STUBBED in this task (Task 4 only owns the
+  // transcript side of the session screen). Tasks 5–6 replace this with
+  // real dictation-toggle / send-clear / AskUserQuestion-sheet dispatch;
+  // for now: doubleTap hands focus back to the transcript, and tap reaches
+  // the existing actions menu (the pre-refactor session behavior) so the
+  // reply/question/confirm flows this task doesn't touch stay exercisable.
+  private onSessionBottom(e: InputEvent, s: SessionScreenState): void {
+    if (e.type === "doubleTap") {
+      this.setState({ session: { ...s, focus: "transcript" } });
+      return;
+    }
+    if (e.type === "tap") {
+      this.setState({ screen: "actions", actions: { hostKey: s.hostKey, sessionId: s.sessionId, cursor: 0 } });
+    }
+    // scrollUp/scrollDown: no-op stub until Task 5.
   }
 
   private clearHistoryTimer(sessionId: string): void {
@@ -591,7 +635,7 @@ export class App {
     const a = this.state.actions;
     if (!a) return this.goHome();
     if (e.type === "doubleTap") {
-      this.setState({ screen: "session", session: { hostKey: a.hostKey, sessionId: a.sessionId, offset: 0 } });
+      this.setState({ screen: "session", session: newSessionState(a.hostKey, a.sessionId) });
       return;
     }
     const rows = buildActionsRows(this.state, a.hostKey, a.sessionId);
@@ -634,7 +678,7 @@ export class App {
         this.setState({ screen: "confirm", confirm: { action: { kind: "delete", hostKey, sessionId }, cursor: 0 } });
         return;
       case "back":
-        this.setState({ screen: "session", session: { hostKey, sessionId, offset: 0 } });
+        this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
         return;
     }
   }
@@ -652,7 +696,7 @@ export class App {
         this.flash(FLASH_HUB_UNREACHABLE);
         this.repaint();
       });
-    this.setState({ screen: "session", session: { hostKey, sessionId, offset: 0 } });
+    this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
   }
 
   // ---- question -------------------------------------------------------
@@ -661,7 +705,7 @@ export class App {
     const q = this.state.question;
     if (!q) return this.goHome();
     if (e.type === "doubleTap") {
-      this.setState({ screen: "session", session: { hostKey: q.hostKey, sessionId: q.sessionId, offset: 0 } });
+      this.setState({ screen: "session", session: newSessionState(q.hostKey, q.sessionId) });
       return;
     }
     const s = findSession(this.state, q.hostKey, q.sessionId);
@@ -686,7 +730,7 @@ export class App {
             this.flash(FLASH_HUB_UNREACHABLE);
             this.repaint();
           });
-        this.setState({ screen: "session", session: { hostKey: q.hostKey, sessionId: q.sessionId, offset: 0 } });
+        this.setState({ screen: "session", session: newSessionState(q.hostKey, q.sessionId) });
         return;
       }
       if (q.cursor === options.length) {
@@ -704,7 +748,7 @@ export class App {
         return;
       }
       // Back
-      this.setState({ screen: "session", session: { hostKey: q.hostKey, sessionId: q.sessionId, offset: 0 } });
+      this.setState({ screen: "session", session: newSessionState(q.hostKey, q.sessionId) });
     }
   }
 
@@ -766,7 +810,7 @@ export class App {
     if (r.target.kind === "session") {
       this.setState({
         screen: r.target.back,
-        session: { hostKey: r.target.hostKey, sessionId: r.target.sessionId, offset: 0 },
+        session: newSessionState(r.target.hostKey, r.target.sessionId),
       });
     } else {
       this.setState({
@@ -791,7 +835,7 @@ export class App {
           this.flash(FLASH_HUB_UNREACHABLE);
           this.repaint();
         });
-      this.setState({ screen: "session", session: { hostKey, sessionId, offset: 0 } });
+      this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
       return;
     }
     const { hostKey, repo, label, baseRef, branchName, model, permissionMode } = r.target;

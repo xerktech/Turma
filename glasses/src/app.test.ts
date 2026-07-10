@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { App, FLASH_HUB_UNREACHABLE, FLASH_QUEUED } from "./app.ts";
+import { App, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, newSessionState } from "./app.ts";
 import type { HubClient } from "./hub-client.ts";
 import type { GlassesDisplay } from "./display/index.ts";
 import type { Dictation, DictationResult } from "./dictation.ts";
+import type { ScreenModel } from "./render.ts";
 import type { AgentInfo, InputEvent, LiveSignals, SessionInfo } from "./types.ts";
 
 function signals(overrides: Partial<LiveSignals> = {}): LiveSignals {
@@ -43,16 +44,27 @@ function agent(overrides: Partial<AgentInfo> = {}): AgentInfo {
 }
 
 class FakeDisplay implements GlassesDisplay {
-  lines: string[] = [];
+  model: ScreenModel | null = null;
   started = false;
   exitRequested = false;
   private cb: ((e: InputEvent) => void) | null = null;
 
+  // Flattened convenience view of whatever render() last produced. Most
+  // assertions below just want "the text on screen" regardless of screen
+  // type: for {type:"lines"} that's `lines`; for {type:"session"} it's the
+  // transcript followed by the bottom box's lines (no header either way).
+  get lines(): string[] {
+    if (!this.model) return [];
+    return this.model.type === "lines"
+      ? this.model.lines
+      : [...this.model.transcriptLines, ...this.model.bottom.lines];
+  }
+
   async start(): Promise<void> {
     this.started = true;
   }
-  render(lines: string[]): void {
-    this.lines = lines;
+  render(model: ScreenModel): void {
+    this.model = model;
   }
   onInput(cb: (e: InputEvent) => void): void {
     this.cb = cb;
@@ -161,9 +173,17 @@ describe("App", () => {
     expect(app.getState().home.cursor).toBe(1);
     display.emit({ type: "tap" });
     expect(app.getState().screen).toBe("session");
-    expect(app.getState().session).toEqual({ hostKey: "host-a", sessionId: "s1", offset: 0 });
+    expect(app.getState().session).toEqual(newSessionState("host-a", "s1"));
 
-    display.emit({ type: "tap" });
+    // Fresh session screen: transcript focus, offset 0 ("at the tail") — tap
+    // hands focus to the bottom box rather than jumping straight to actions
+    // (Task 4). The bottom-focus tap is a Task-4 stub standing in for Task
+    // 5's real dictation toggle; for now it opens the actions menu so the
+    // reply/kill/question/confirm flows this task doesn't touch stay
+    // reachable in tests.
+    display.emit({ type: "tap" }); // -> focus:"bottom"
+    expect(app.getState().session?.focus).toBe("bottom");
+    display.emit({ type: "tap" }); // bottom-focus stub -> actions
     expect(app.getState().screen).toBe("actions");
 
     display.emit({ type: "doubleTap" });
@@ -219,7 +239,8 @@ describe("App", () => {
 
     // home.cursor already sits on the (only) session row post-poll.
     display.emit({ type: "tap" }); // -> session screen
-    display.emit({ type: "tap" }); // -> actions screen (cursor 0 = Reply)
+    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
+    display.emit({ type: "tap" }); // bottom-focus stub -> actions screen (cursor 0 = Reply)
     display.emit({ type: "scrollDown" }); // -> Answer question
     display.emit({ type: "tap" }); // -> question screen
     expect(app.getState().screen).toBe("question");
@@ -232,7 +253,10 @@ describe("App", () => {
     expect(app.getState().pending["s1"]).toBeDefined();
 
     await vi.advanceTimersByTimeAsync(0); // flush the sendInput promise
-    expect(display.lines[0]).toBe(FLASH_QUEUED);
+    // Task 2 dropped the session screen's header line, so a flash no longer
+    // renders anywhere while on "session" — assert the flash state directly
+    // rather than the (now header-less) rendered lines.
+    expect(app.getState().flash).toBe(FLASH_QUEUED);
   });
 
   it("reply screen: dictation result -> preview -> Send calls sendInput with the dictated text", async () => {
@@ -244,7 +268,8 @@ describe("App", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     display.emit({ type: "tap" }); // session
-    display.emit({ type: "tap" }); // actions (cursor 0 = Reply)
+    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
+    display.emit({ type: "tap" }); // bottom-focus stub -> actions (cursor 0 = Reply)
     display.emit({ type: "tap" }); // -> reply, listening
     expect(app.getState().screen).toBe("reply");
     expect(app.getState().reply?.phase).toBe("listening");
@@ -258,7 +283,9 @@ describe("App", () => {
     expect(app.getState().screen).toBe("session");
 
     await vi.advanceTimersByTimeAsync(0);
-    expect(display.lines[0]).toBe(FLASH_QUEUED);
+    // Task 2 dropped the session screen's header line — assert the flash
+    // state directly (see the equivalent note in the question-screen test).
+    expect(app.getState().flash).toBe(FLASH_QUEUED);
   });
 
   it("pause() cancels an in-progress dictation (reply screen, listening phase) and navigates back", async () => {
@@ -270,7 +297,8 @@ describe("App", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     display.emit({ type: "tap" }); // session
-    display.emit({ type: "tap" }); // actions (cursor 0 = Reply)
+    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
+    display.emit({ type: "tap" }); // bottom-focus stub -> actions (cursor 0 = Reply)
     display.emit({ type: "tap" }); // -> reply, listening
     expect(app.getState().reply?.phase).toBe("listening");
     expect(dictation.started).toBe(1);
@@ -281,7 +309,7 @@ describe("App", () => {
     // Same navigation a user-initiated cancel (double-tap while listening)
     // performs — back to the session screen, not stranded on "listening".
     expect(app.getState().screen).toBe("session");
-    expect(app.getState().session).toEqual({ hostKey: "host-a", sessionId: "s1", offset: 0 });
+    expect(app.getState().session).toEqual(newSessionState("host-a", "s1"));
   });
 
   it("pause() is a no-op for dictation when not on the reply/listening screen", async () => {
@@ -306,7 +334,8 @@ describe("App", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     display.emit({ type: "tap" }); // session
-    display.emit({ type: "tap" }); // actions
+    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
+    display.emit({ type: "tap" }); // bottom-focus stub -> actions
     display.emit({ type: "tap" }); // -> reply, listening
     dictation.resolve({ text: "deploy the fix" });
     expect(app.getState().reply?.phase).toBe("preview");
@@ -361,7 +390,8 @@ describe("App", () => {
     await vi.advanceTimersByTimeAsync(0); // 1st poll
 
     display.emit({ type: "tap" }); // session
-    display.emit({ type: "tap" }); // actions (cursor 0 = Reply)
+    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
+    display.emit({ type: "tap" }); // bottom-focus stub -> actions (cursor 0 = Reply)
     display.emit({ type: "scrollDown" }); // Restart
     display.emit({ type: "scrollDown" }); // Kill
     display.emit({ type: "tap" }); // -> confirm
@@ -388,7 +418,8 @@ describe("App", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     display.emit({ type: "tap" }); // session
-    display.emit({ type: "tap" }); // actions
+    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
+    display.emit({ type: "tap" }); // bottom-focus stub -> actions
     display.emit({ type: "scrollDown" }); // Restart
     display.emit({ type: "tap" }); // queue restart
     await vi.advanceTimersByTimeAsync(0);
@@ -427,10 +458,10 @@ describe("App", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(app.getState().screen).toBe("home");
 
-    app.restoreScreen("session", { hostKey: "host-a", sessionId: "s1", offset: 0 });
+    app.restoreScreen("session", newSessionState("host-a", "s1"));
 
     expect(app.getState().screen).toBe("session");
-    expect(app.getState().session).toEqual({ hostKey: "host-a", sessionId: "s1", offset: 0 });
+    expect(app.getState().session).toEqual(newSessionState("host-a", "s1"));
     expect(display.lines.length).toBeGreaterThan(0); // repainted
 
     app.restoreScreen("settings", null);
@@ -453,7 +484,7 @@ describe("App", () => {
     expect(app.getState().home.cursor).toBe(1);
     display.emit({ type: "tap" });
     expect(app.getState().screen).toBe("session");
-    expect(app.getState().session).toEqual({ hostKey: "host-a", sessionId: "s1", offset: 0 });
+    expect(app.getState().session).toEqual(newSessionState("host-a", "s1"));
   });
 
   it("rows shrinking below the cursor after a poll clamp it to a selectable row — tap works and scroll recovers", async () => {
@@ -589,7 +620,13 @@ describe("App", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(getHistory).toHaveBeenCalledTimes(1);
 
-    display.emit({ type: "tap" }); // -> actions (leaves the session screen)
+    // triggerHistoryLoad bumped offset to 1 (to keep the new loading line in
+    // view) — so reaching the bottom box now takes one extra tap: first
+    // snaps offset back to 0, then hands focus to the bottom, then the
+    // bottom-focus stub opens actions (leaves the session screen).
+    display.emit({ type: "tap" }); // offset>0 -> snap to 0
+    display.emit({ type: "tap" }); // offset===0 -> focus:"bottom"
+    display.emit({ type: "tap" }); // bottom-focus stub -> actions
     expect(app.getState().screen).toBe("actions");
     expect(app.getState().loadingHistory["s1"]).toBeFalsy();
 
@@ -625,7 +662,10 @@ describe("App", () => {
   });
 
   it("the loading-earlier line stays visible at the top of a long, already-scrolled transcript while history is being fetched", async () => {
-    const tail = Array.from({ length: 15 }, (_, i) => ({ id: `t${i}`, role: "assistant", text: `msg ${i}` }));
+    // 11 lines so maxOffset (11 - area(9) = 2) is reachable in exactly one
+    // SESSION_SCROLL_STEP (2-line) hop — preserves the "one hop to the top"
+    // shape of this test under Task 4's stepped (not full-page) scrolling.
+    const tail = Array.from({ length: 11 }, (_, i) => ({ id: `t${i}`, role: "assistant", text: `msg ${i}` }));
     const s = session({ session: signals({ transcriptAgeSec: 1, tail }) });
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [s] })] })),
@@ -641,8 +681,174 @@ describe("App", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(app.getState().loadingHistory["s1"]).toBe(true);
-    // Header is lines[0]; the loading line must be the very next line, not
-    // pushed out of view by a scroll offset that didn't account for it.
-    expect(display.lines[1]).toBe("· loading earlier ·");
+    // No header line (Task 2 dropped it): the loading line must be the very
+    // first transcript line, not pushed out of view by a scroll offset that
+    // didn't account for it.
+    expect(display.lines[0]).toBe("· loading earlier ·");
+  });
+});
+
+// ---- Task 4: session screen focus/scroll state --------------------------
+
+describe("session screen: transcript-focus gestures (Task 4)", () => {
+  let display: FakeDisplay;
+  let dictation: FakeDictation;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    display = new FakeDisplay();
+    dictation = new FakeDictation();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function makeApp(client: ReturnType<typeof fakeClient>) {
+    return new App({
+      client: client as unknown as HubClient,
+      display,
+      dictation,
+      now: () => Date.now(),
+      pollMs: 6000,
+    });
+  }
+
+  // 20 short (unwrapped) tail lines is comfortably more than the transcript
+  // area (9, given the default 1-line empty/unfocused input box) so offset
+  // has room to move by SESSION_SCROLL_STEP without immediately hitting
+  // maxOffset / triggering a history fetch.
+  function longSession(): SessionInfo {
+    const tail = Array.from({ length: 20 }, (_, i) => ({ id: `t${i}`, role: "assistant", text: `msg ${i}` }));
+    return session({ session: signals({ transcriptAgeSec: 1, tail }) });
+  }
+
+  async function enterSession(client: ReturnType<typeof fakeClient>): Promise<App> {
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    display.emit({ type: "tap" }); // home -> session (fresh: focus:"transcript", offset:0)
+    return app;
+  }
+
+  it("a fresh session starts at offset 0 with transcript focus", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
+    });
+    const app = await enterSession(client);
+    expect(app.getState().session).toEqual(newSessionState("host-a", "s1"));
+  });
+
+  it("two scrollUps move the offset by exactly 2 each — not a full-page jump", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
+    });
+    const app = await enterSession(client);
+
+    display.emit({ type: "scrollUp" });
+    expect(app.getState().session?.offset).toBe(2);
+
+    display.emit({ type: "scrollUp" });
+    expect(app.getState().session?.offset).toBe(4);
+  });
+
+  it("scrollDown moves the offset back by 2, clamped at 0", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
+    });
+    const app = await enterSession(client);
+
+    display.emit({ type: "scrollUp" });
+    display.emit({ type: "scrollUp" });
+    expect(app.getState().session?.offset).toBe(4);
+
+    display.emit({ type: "scrollDown" });
+    expect(app.getState().session?.offset).toBe(2);
+
+    display.emit({ type: "scrollDown" });
+    expect(app.getState().session?.offset).toBe(0);
+
+    display.emit({ type: "scrollDown" }); // already at 0 -> stays clamped
+    expect(app.getState().session?.offset).toBe(0);
+  });
+
+  it("tap while scrolled snaps back to the newest (offset 0) and keeps transcript focus", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
+    });
+    const app = await enterSession(client);
+
+    display.emit({ type: "scrollUp" });
+    expect(app.getState().session?.offset).toBe(2);
+
+    display.emit({ type: "tap" });
+    expect(app.getState().session?.offset).toBe(0);
+    expect(app.getState().session?.focus).toBe("transcript");
+    expect(app.getState().screen).toBe("session");
+  });
+
+  it("tap at the tail (offset 0) hands focus to the bottom box, staying on the session screen", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
+    });
+    const app = await enterSession(client);
+    expect(app.getState().session?.offset).toBe(0);
+
+    display.emit({ type: "tap" });
+    expect(app.getState().session?.focus).toBe("bottom");
+    expect(app.getState().screen).toBe("session");
+  });
+
+  it("doubleTap from transcript focus returns to home", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
+    });
+    const app = await enterSession(client);
+
+    display.emit({ type: "doubleTap" });
+    expect(app.getState().screen).toBe("home");
+  });
+
+  it("scrolling past the top still triggers a history fetch and shows the loading line (snap-to-tail behavior unaffected)", async () => {
+    const s = session({ session: signals({ transcriptAgeSec: 1 }) }); // empty transcript
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [s] })] })),
+      getHistory: vi.fn(() => new Promise(() => {})), // never resolves — stays "loading"
+    });
+    const app = await enterSession(client);
+
+    display.emit({ type: "scrollUp" }); // empty transcript: already at "the top"
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(app.getState().loadingHistory["s1"]).toBe(true);
+    expect(display.lines).toContain("· loading earlier ·");
+  });
+
+  // ---- bottom-focus stub (Task 4 only stubs it; Tasks 5–6 implement it) --
+
+  it("bottom-focus stub: doubleTap hands focus back to the transcript", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
+    });
+    const app = await enterSession(client);
+
+    display.emit({ type: "tap" }); // -> focus:"bottom"
+    expect(app.getState().session?.focus).toBe("bottom");
+
+    display.emit({ type: "doubleTap" });
+    expect(app.getState().session?.focus).toBe("transcript");
+    expect(app.getState().screen).toBe("session");
+  });
+
+  it("bottom-focus stub: tap opens the actions menu (Task 5 replaces this with the dictation toggle)", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
+    });
+    const app = await enterSession(client);
+
+    display.emit({ type: "tap" }); // -> focus:"bottom"
+    display.emit({ type: "tap" }); // stub -> actions
+    expect(app.getState().screen).toBe("actions");
   });
 });

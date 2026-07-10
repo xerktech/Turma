@@ -14,7 +14,7 @@
 //     `App`: foreground-exit pauses + snapshots UI state (screen + selected
 //     session id); foreground-enter/restore resumes (which polls
 //     immediately); abnormal/system exit pauses and tears the display down.
-import type { App, AppState, SessionScreenState } from "./app.ts";
+import { newSessionState, type App, type AppState } from "./app.ts";
 
 type Exporter = () => unknown;
 type Restorer = (saved: unknown) => void;
@@ -174,8 +174,7 @@ export function installLifecycle(app: App): void {
   onBackgroundRestore(BACKGROUND_STATE_KEY, (saved) => {
     const s = (saved ?? {}) as Partial<AppSnapshot>;
     if (typeof s.hostKey === "string" && typeof s.sessionId === "string") {
-      const session: SessionScreenState = { hostKey: s.hostKey, sessionId: s.sessionId, offset: 0 };
-      app.restoreScreen("session", session);
+      app.restoreScreen("session", newSessionState(s.hostKey, s.sessionId));
       return;
     }
     // Only home/settings are restorable without session context; anything
