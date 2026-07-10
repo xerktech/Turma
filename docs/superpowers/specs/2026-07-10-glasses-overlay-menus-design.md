@@ -2,8 +2,8 @@
 
 ## Context
 
-On the glasses session screen, the **actions menu** (Send / Clear / Dictate more
-/ Restart / Kill / Delete / Back) and the **confirm dialog** (Kill/Delete →
+On the glasses session screen, the **actions menu** (Back / Send / Clear /
+Dictate more / Kill / Delete) and the **confirm dialog** (Kill/Delete →
 Cancel / Confirm) currently render as full-screen pages (`{type:"lines"}`) that
 replace the whole screen. The user wants them to **pop up on top of the current
 session** — a bordered box over the still-visible transcript — instead of
@@ -58,6 +58,16 @@ each prefixed `> ` when selected / `  ` otherwise. Grows to fit; capped at
 math as `sheetBody`) so the highlighted row is always visible. Pure + unit
 tested.
 
+### Actions-menu row changes (`buildActionsRows`, `render.ts`)
+Two content changes to the actions rows, applied while we're here:
+- **Drop `Restart`** — remove the `restart` row entirely (the `runAction`
+  `"restart"` case and its tests go too; the row is no longer reachable).
+- **`Back` moves to the top** of every variant, so cursor 0 (the default
+  selection) is the safe no-op:
+  - stopped: `Back / Start / Delete`
+  - running, no draft: `Back / Kill / Delete`
+  - running, with draft: `Back / Send / Clear / Dictate more / Kill / Delete`
+
 ### Overlay renderers (`render.ts`)
 A shared helper builds the session-overlay layout given the underlying session
 and a bottom model:
@@ -84,7 +94,8 @@ which is ≤ 5 lines, and drive app.ts's transcript scroll math which the menus
 don't touch).
 
 ### No change
-- `app.ts` dispatch (`onActions`, `onConfirm`) and the `screen` state machine.
+- `app.ts` dispatch (`onActions`, `onConfirm`) and the `screen` state machine
+  (aside from removing the now-dead `runAction` `"restart"` case).
 - Display backends (they render `{type:"session"}` already), pending a
   one-line check that they don't switch on `bottom.mode`.
 - Spawn flow, Settings, reply, question sheet.
@@ -92,15 +103,17 @@ don't touch).
 ## Behavior notes
 - The transcript behind an open menu is **static** (the reveal only ticks while
   `screen === "session"`), which reads cleanly — no motion behind the menu.
-- The default cursor (0) sits on the first row (`Send` for the actions menu with
-  a draft; `Cancel` for confirm — preserving the existing safe default).
+- The default cursor (0) sits on the first row — now `Back` for the actions
+  menu (a safe no-op), `Cancel` for the confirm dialog.
 - The `✓ queued` flash still surfaces on the plain session screen after an
   action runs and the menu closes (unchanged).
 
 ## Files
 - `glasses/src/input-box.ts` — `MENU_MAX_LINES`, `menuBox` (+ tests).
 - `glasses/src/render.ts` — `menu` BottomModel variant, `sessionOverlay`,
-  `renderActions`/`renderConfirm` return the overlay (+ render tests updated).
+  `renderActions`/`renderConfirm` return the overlay, `buildActionsRows` drops
+  `Restart` and puts `Back` first (+ render tests updated).
+- `glasses/src/app.ts` — remove the `runAction` `"restart"` case (+ tests).
 - Display backends — verify `{type:"session"}` renders the menu box; adjust only
   if they mode-switch. DOM backend test if it asserts screen shape.
 
