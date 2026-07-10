@@ -319,7 +319,7 @@
 
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
-  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. "Clone from GitHub" pulls a repo (from the host's GitHub login) into the repos root so it joins the list and can host sessions — greyed out on hosts without GitHub credentials. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, custom branch name, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub (worktree deleted, so uncommitted files are lost) in one step, but keeps its git branch, conversation, and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and brings one back on the same branch with its conversation intact. Delete (on an already-stopped session) additionally erases the branch and history; a branch with unpushed commits is parked as <code>agent-trash/&lt;id&gt;</code> in the repo for a grace period (7 days by default) before being pruned for good. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation.</div>
+  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no branch, so the base-branch and branch-name options don't apply, and only one may run per host at a time. "Clone from GitHub" pulls a repo (from the host's GitHub login) into the repos root so it joins the list and can host sessions — greyed out on hosts without GitHub credentials. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, custom branch name, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub (worktree deleted, so uncommitted files are lost) in one step, but keeps its git branch, conversation, and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and brings one back on the same branch with its conversation intact. Delete (on an already-stopped session) additionally erases the branch and history; a branch with unpushed commits is parked as <code>agent-trash/&lt;id&gt;</code> in the repo for a grace period (7 days by default) before being pruned for good. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation.</div>
 </div>
 
 <nav class="bottom-nav">
@@ -792,10 +792,15 @@ function cloneBar(a) {
 function repoBlock(a, repo, sessList, now) {
   const rkey = a.key + "::" + repo.name;
   const collapsed = collapsedRepos.has(rkey);
-  const meta = repo.missing
+  const meta = repo.isRoot
+    ? `<span class="r-meta">runs at the repos root · spans every repo · one at a time</span>`
+    : repo.missing
     ? `<span class="r-meta">repo not currently found · usage retained</span>`
     : `<span class="r-meta"><b>${esc(repo.branch || "–")}</b>${repo.dirtyFiles ? ` · ${repo.dirtyFiles} dirty` : " · clean"}</span>`;
-  const canSpawn = a.online && !repo.missing;
+  // Only one root session may run at a time (they share REPOS_ROOT), so once one
+  // is live the root block stops offering "+ New session".
+  const rootBusy = repo.isRoot && sessList.some(s => s.status === "running");
+  const canSpawn = a.online && !repo.missing && !rootBusy;
   const spawning = pending.has(pendKey("spawn", a.key, repo.name));
   const spawnBtn = canSpawn
     ? `<button class="primary btn-sm" ${spawning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();newSession('${esc(a.key)}','${esc(repo.name)}')">${spawning ? '<span class="spin"></span> Starting…' : "+ New session"}</button>`
@@ -828,7 +833,7 @@ function repoBlock(a, repo, sessList, now) {
         return `<div class="resume-item">
           <span class="sid">${esc(c.id)}</span>
           ${c.label ? `<span class="lbl">${esc(c.label)}</span>` : ""}
-          <span><b>${esc(c.branch || "–")}</b> · killed ${c.closedAt ? esc(ago(now - Date.parse(c.closedAt))) : "–"}</span>
+          <span><b>${c.root ? "repos root" : esc(c.branch || "–")}</b> · killed ${c.closedAt ? esc(ago(now - Date.parse(c.closedAt))) : "–"}</span>
           <span>${esc(c.rcName || "")}</span>
           <span class="spacer"></span>
           <button class="primary btn-sm" ${rp ? "disabled" : ""} onclick="resumeSession('${esc(a.key)}','${esc(c.id)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume"}</button>
@@ -840,7 +845,7 @@ function repoBlock(a, repo, sessList, now) {
 
   return `<details class="repo" ${collapsed ? "" : "open"} ontoggle="repoToggle('${esc(rkey)}', this.open)">
     <summary class="repo-head">
-      <span class="r-name">${repoLink(repo.remote, repo.name)}</span>
+      <span class="r-name">${repo.isRoot ? "⌂ Repos root" : repoLink(repo.remote, repo.name)}</span>
       ${meta}
       <span class="spacer"></span>
       ${resumeBtn}
@@ -890,7 +895,7 @@ function composer(a, repo, rk, spawning) {
     <details class="opts" ${optsExpanded ? "open" : ""} ontoggle="onOptionsToggle('${esc(rk)}','${rn}',this.open)">
       <summary>${optsExpanded ? "▾" : "▸"} Options</summary>
       <div class="opts-grid">
-        <div class="full">
+        ${repo.isRoot ? "" : `<div class="full">
           <label>Base branch</label>
           <select id="${cid(rk, "base")}" onchange="onOptChange('${esc(rk)}','${rn}')">
             ${bases.map(b => opt(b, b, selBase)).join("")}
@@ -900,7 +905,7 @@ function composer(a, repo, rk, spawning) {
           <label>Branch name</label>
           <input id="${cid(rk, "branch")}" type="text" placeholder="${esc(branchPh)}" value="${esc(d.branch || "")}"
             oninput="draftSet('${esc(rk)}','branch',this.value)">
-        </div>
+        </div>`}
         <div>
           <label>Model</label>
           <select id="${cid(rk, "model")}" onchange="onOptChange('${esc(rk)}','${rn}')">
@@ -985,7 +990,7 @@ function sessCard(a, s, now) {
       <span class="badge ${st}">${esc(st)}</span>
     </div>
     <dl>
-      <dt>Branch</dt><dd><b>${esc(s.branch || "–")}</b></dd>
+      <dt>${s.root ? "Location" : "Branch"}</dt><dd><b>${s.root ? "repos root (no worktree)" : esc(s.branch || "–")}</b></dd>
       ${work ? `<dt>Work</dt><dd>${work}</dd>` : ""}
       <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
       ${live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>` : ""}

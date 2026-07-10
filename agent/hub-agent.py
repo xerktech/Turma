@@ -70,6 +70,14 @@ REPOS_ROOT = os.environ.get("REPOS_ROOT", "/mnt/data/Docker/git")
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "6"))
 TTYD_PORT_BASE = int(os.environ.get("TTYD_PORT_BASE", "7700"))
 
+# Reserved pseudo-repo name for a session that runs directly at REPOS_ROOT
+# (spanning every repo) instead of inside one repo's worktree. It is NOT a git
+# worktree: no branch, no base/branch-name option, no worktree add/remove —
+# claude just runs in REPOS_ROOT. Because all root sessions share that cwd (and
+# thus one claude project slug + Remote Control bridge pointer), at most one may
+# run at a time. Parens keep it clear of any real (dir-name) repo in the scan.
+ROOT_REPO_NAME = "(root)"
+
 # Where worktrees live: under a dot-dir so the repo scan never lists them, and
 # on the mounted tree so they survive a container restart.
 WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".agenthub", "worktrees")
@@ -937,7 +945,9 @@ def scan_repos():
     repos = []
     try:
         for name in sorted(os.listdir(REPOS_ROOT)):
-            if name.startswith(".") or name == ".agenthub":
+            # Skip dot-dirs, our own worktree store, and the reserved root
+            # pseudo-repo name so a real dir can never shadow the root entry.
+            if name.startswith(".") or name in (".agenthub", ROOT_REPO_NAME):
                 continue
             path = os.path.join(REPOS_ROOT, name)
             if not os.path.isdir(path):
@@ -980,6 +990,25 @@ def repo_entry(repo):
         "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
         # Base-branch choices for the "New session" composer (#12).
         "branches": repo_branches(path),
+    }
+
+
+def root_repo_entry():
+    """Heartbeat repos[] entry for the REPOS_ROOT pseudo-repo, so the hub can
+    offer a "New session" affordance that runs directly at the root. Unlike
+    repo_entry() it runs no per-branch ref walk (the root isn't a fork source,
+    so there's no base-branch list); git facts are best-effort and empty unless
+    REPOS_ROOT itself happens to be a git checkout. isRoot flags it for the UI,
+    which hides the base-branch/custom-branch/resume/clone bits that don't apply."""
+    info = git_info(REPOS_ROOT) or {}
+    return {
+        "name": ROOT_REPO_NAME,
+        "path": REPOS_ROOT,
+        "isRoot": True,
+        "branch": info.get("branch", ""),
+        "remote": info.get("remote", ""),
+        "dirtyFiles": info.get("dirtyFiles", 0),
+        "branches": [],
     }
 
 
@@ -1211,6 +1240,13 @@ class SessionManager:
     def _running_count(self):
         return sum(1 for s in self.registry if s.get("status") == "running")
 
+    def _root_running(self):
+        """True if a root session (cwd = REPOS_ROOT) is already live. Root
+        sessions share one claude project slug + RC bridge pointer, so only one
+        may run at a time; spawn/start/resume all gate on this."""
+        return any(s.get("root") and s.get("status") == "running"
+                   for s in self.registry)
+
     # --- low-level process control ----------------------------------------
 
     def _drop_bridge_pointer(self, worktree):
@@ -1389,10 +1425,19 @@ class SessionManager:
         if self._running_count() >= MAX_SESSIONS:
             log(f"spawn refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
-        repo = next((r for r in scan_repos() if r["name"] == repo_name), None)
-        if not repo:
-            log(f"spawn refused: unknown repo {repo_name!r}")
-            return
+        # A root session runs directly at REPOS_ROOT (no worktree/branch). The
+        # base/branch-name options don't apply; only one may run at a time.
+        is_root = (repo_name == ROOT_REPO_NAME)
+        if is_root:
+            if self._root_running():
+                log("spawn refused: a root session is already running")
+                return
+            repo = {"name": ROOT_REPO_NAME, "path": REPOS_ROOT}
+        else:
+            repo = next((r for r in scan_repos() if r["name"] == repo_name), None)
+            if not repo:
+                log(f"spawn refused: unknown repo {repo_name!r}")
+                return
         sid = self._new_id()
         label = (label or "").strip() or None
         # Prefer a slugged label in the RC display name; fall back to the id.
@@ -1401,8 +1446,11 @@ class SessionManager:
             "id": sid,
             "repo": repo["name"],
             "repoPath": repo["path"],
-            "worktreePath": os.path.join(WORKTREES_ROOT, repo["name"], sid),
-            "branch": f"agent/{sid}",       # may be replaced by a custom name below
+            # Root runs in REPOS_ROOT itself; a repo session gets a fresh worktree.
+            "worktreePath": (REPOS_ROOT if is_root
+                             else os.path.join(WORKTREES_ROOT, repo["name"], sid)),
+            "branch": None if is_root else f"agent/{sid}",  # custom name applied below
+            "root": is_root,
             "label": label,
             "rcName": f"{slugify(self.device)}-{slugify(repo['name'])}-{rc_slug or sid}",
             "tmuxName": f"agent-{sid}",
@@ -1417,19 +1465,24 @@ class SessionManager:
         }
         self.registry.append(sess)
         try:
-            # Validate every interpolated option BEFORE touching git/tmux.
-            sess["branch"] = normalize_branch_name(branch_name, sid)
-            resolved_base = resolve_base_ref(repo["path"], base_ref)
-            sess["baseRef"] = resolved_base
+            # Validate every interpolated option BEFORE touching git/tmux. Model
+            # and permission mode apply to root too; branch/base/worktree don't.
             sess["model"] = resolve_model(model)
             sess["permissionMode"] = resolve_permission_mode(permission_mode)
-            self._worktree_add(sess, new_branch=True, base_ref=resolved_base)
+            resolved_base = None
+            if not is_root:
+                sess["branch"] = normalize_branch_name(branch_name, sid)
+                resolved_base = resolve_base_ref(repo["path"], base_ref)
+                sess["baseRef"] = resolved_base
+                self._worktree_add(sess, new_branch=True, base_ref=resolved_base)
             self._launch_tmux(sess, prompt=(prompt or None))
             self._launch_ttyd(sess)
             log(f"spawned session {sid} for {repo['name']} on :{sess['ttydPort']} "
-                f"(branch {sess['branch']}"
-                + (f", base {resolved_base}" if resolved_base else "")
-                + (f", label {label!r}" if label else "") + ")")
+                + ("(root)" if is_root else
+                   f"(branch {sess['branch']}"
+                   + (f", base {resolved_base}" if resolved_base else "")
+                   + ")")
+                + (f" label {label!r}" if label else ""))
         except Exception as e:
             self._set_error(sess, e)
 
@@ -1440,7 +1493,7 @@ class SessionManager:
         they just stop being offered)."""
         rec = {k: sess.get(k) for k in (
             "id", "repo", "repoPath", "worktreePath", "branch", "rcName",
-            "tmuxName", "createdAt", "label", "model", "permissionMode",
+            "tmuxName", "createdAt", "label", "model", "permissionMode", "root",
         )}
         rec["closedAt"] = now_iso()
         self.closed = [c for c in self.closed if c.get("id") != rec["id"]]
@@ -1469,12 +1522,17 @@ class SessionManager:
             return
         self._kill_tmux(sess)
         self._kill_ttyd(sid)
-        if os.path.isdir(sess["worktreePath"]):
+        # A root session's "worktree" IS REPOS_ROOT — never remove it; there's no
+        # worktree/branch to clean up, just the running processes.
+        if not sess.get("root") and os.path.isdir(sess["worktreePath"]):
             self._worktree_remove(sess)
         self.registry = [s for s in self.registry if s.get("id") != sid]
         self._remember_closed(sess)
         self._forget_session_caches(sid)
-        log(f"killed session {sid} (worktree removed, branch {sess['branch']} kept, resumable)")
+        log(f"killed session {sid} ("
+            + ("root, no worktree/branch" if sess.get("root")
+               else f"worktree removed, branch {sess['branch']} kept")
+            + ", resumable)")
 
     def start(self, sid):
         """Resume a stopped session: re-add its worktree on the EXISTING branch
@@ -1489,8 +1547,12 @@ class SessionManager:
         if self._running_count() >= MAX_SESSIONS:
             log(f"start refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
+        if sess.get("root") and self._root_running():
+            log("start refused: a root session is already running")
+            return
         try:
-            if not os.path.isdir(sess["worktreePath"]):
+            # Root runs in REPOS_ROOT (always present) — no worktree to re-add.
+            if not sess.get("root") and not os.path.isdir(sess["worktreePath"]):
                 self._worktree_add(sess, new_branch=False)
             self._launch_tmux(sess, resume=True)
             self._launch_ttyd(sess)
@@ -1516,12 +1578,16 @@ class SessionManager:
         if self._running_count() >= MAX_SESSIONS:
             log(f"resume refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
+        if rec.get("root") and self._root_running():
+            log("resume refused: a root session is already running")
+            return
         sess = {
             "id": sid,
             "repo": rec.get("repo"),
             "repoPath": rec.get("repoPath"),
             "worktreePath": rec.get("worktreePath"),
             "branch": rec.get("branch"),
+            "root": rec.get("root"),
             "label": rec.get("label"),
             "rcName": rec.get("rcName"),
             "tmuxName": rec.get("tmuxName") or f"agent-{sid}",
@@ -1536,7 +1602,8 @@ class SessionManager:
         self.registry.append(sess)
         self.closed = [c for c in self.closed if c.get("id") != sid]
         try:
-            if not os.path.isdir(sess["worktreePath"]):
+            # Root has no worktree to re-add; it resumes in place at REPOS_ROOT.
+            if not sess.get("root") and not os.path.isdir(sess["worktreePath"]):
                 self._worktree_add(sess, new_branch=False)
             self._launch_tmux(sess, resume=True)
             self._launch_ttyd(sess)
@@ -1606,9 +1673,12 @@ class SessionManager:
             return
         self._kill_tmux(sess)
         self._kill_ttyd(sid)
-        if os.path.isdir(sess["worktreePath"]):
-            self._worktree_remove(sess)
-        self._retire_branch(sess)
+        # Root has no worktree/branch to remove — REPOS_ROOT and its repos stay
+        # put; delete just tears down the processes and drops the record.
+        if not sess.get("root"):
+            if os.path.isdir(sess["worktreePath"]):
+                self._worktree_remove(sess)
+            self._retire_branch(sess)
         self.registry = [s for s in self.registry if s.get("id") != sid]
         # The branch is gone, so any stale closed record must not offer resume.
         self.closed = [c for c in self.closed if c.get("id") != sid]
@@ -1904,6 +1974,7 @@ class SessionManager:
             "repoPath": sess["repoPath"],
             "worktreePath": sess["worktreePath"],
             "branch": sess["branch"],
+            "root": sess.get("root", False),
             "rcName": sess["rcName"],
             "label": sess.get("label"),
             "model": sess.get("model"),
@@ -1932,6 +2003,7 @@ class SessionManager:
                 "id": c.get("id"),
                 "repo": c.get("repo"),
                 "branch": c.get("branch"),
+                "root": c.get("root", False),
                 "rcName": c.get("rcName"),
                 "label": c.get("label"),
                 "createdAt": c.get("createdAt"),
@@ -1966,7 +2038,7 @@ class SessionManager:
             "memory": memory_usage(),
             "logTail": log_tail(self.agent_id),
             "reposRoot": REPOS_ROOT,
-            "repos": [repo_entry(r) for r in scan_repos()],
+            "repos": [root_repo_entry()] + [repo_entry(r) for r in scan_repos()],
             "sessions": [self._session_payload(s) for s in self.registry],
             "closedSessions": self._closed_payload(),
             # GitHub clone-into-root: availability + clonable repos for the hub's
