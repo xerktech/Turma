@@ -1,18 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { EvenHubDisplay, type EvenHubBridge, type StartUpContainerConfig, type TextUpgradeConfig } from "./evenhub.ts";
+import {
+  EvenHubDisplay,
+  type EvenHubBridge,
+  type RebuildContainerConfig,
+  type StartUpContainerConfig,
+  type TextUpgradeConfig,
+} from "./evenhub.ts";
 import type { RawEvenHubEvent } from "../input/router.ts";
 import type { InputEvent } from "../types.ts";
 import type { LifecycleEvent } from "../input/router.ts";
+import type { ScreenModel } from "../render.ts";
 
 function fakeBridge(overrides: Partial<EvenHubBridge> = {}): {
   bridge: EvenHubBridge;
   startCalls: StartUpContainerConfig[];
+  rebuildCalls: RebuildContainerConfig[];
   upgradeCalls: TextUpgradeConfig[];
   shutDownCalls: (number | undefined)[];
   emit: (e: RawEvenHubEvent) => void;
   unsubscribed: boolean;
 } {
   const startCalls: StartUpContainerConfig[] = [];
+  const rebuildCalls: RebuildContainerConfig[] = [];
   const upgradeCalls: TextUpgradeConfig[] = [];
   const shutDownCalls: (number | undefined)[] = [];
   let handler: ((e: RawEvenHubEvent) => void) | null = null;
@@ -22,6 +31,10 @@ function fakeBridge(overrides: Partial<EvenHubBridge> = {}): {
     async createStartUpPageContainer(container) {
       startCalls.push(container);
       return 0;
+    },
+    async rebuildPageContainer(container) {
+      rebuildCalls.push(container);
+      return true;
     },
     async textContainerUpgrade(container) {
       upgradeCalls.push(container);
@@ -43,12 +56,36 @@ function fakeBridge(overrides: Partial<EvenHubBridge> = {}): {
   return {
     bridge,
     startCalls,
+    rebuildCalls,
     upgradeCalls,
     shutDownCalls,
     emit: (e) => handler?.(e),
     get unsubscribed() {
       return state.unsubscribed;
     },
+  };
+}
+
+function linesModel(lines: string[]): ScreenModel {
+  return { type: "lines", lines };
+}
+
+function sessionModel(opts: {
+  transcriptLines?: string[];
+  mode?: "input" | "sheet";
+  lines?: string[];
+  status?: string;
+}): ScreenModel {
+  const mode = opts.mode ?? "input";
+  const lines = opts.lines ?? ["> draft"];
+  const status = opts.status ?? "Working";
+  return {
+    type: "session",
+    transcriptLines: opts.transcriptLines ?? ["hello"],
+    bottom:
+      mode === "input"
+        ? { mode: "input", lines, status, focused: true }
+        : { mode: "sheet", lines, status, focused: true, options: ["yes", "no"], selected: 0 },
   };
 }
 
@@ -96,7 +133,7 @@ describe("EvenHubDisplay", () => {
       const display = new EvenHubDisplay(bridge);
       await display.start();
 
-      display.render(["line1", "line2", "line3"]);
+      display.render(linesModel(["line1", "line2", "line3"]));
       expect(upgradeCalls).toHaveLength(1); // leading-edge fire
       expect(upgradeCalls[0]!.content).toBe("line1\nline2\nline3");
       expect(upgradeCalls[0]!.containerID).toBe(0);
@@ -108,10 +145,10 @@ describe("EvenHubDisplay", () => {
       const display = new EvenHubDisplay(bridge);
       await display.start();
 
-      display.render(["a"]); // leading fire
+      display.render(linesModel(["a"])); // leading fire
       expect(upgradeCalls).toHaveLength(1);
-      display.render(["b"]);
-      display.render(["c"]);
+      display.render(linesModel(["b"]));
+      display.render(linesModel(["c"]));
       expect(upgradeCalls).toHaveLength(1); // still coalescing
 
       await vi.advanceTimersByTimeAsync(120);
@@ -125,7 +162,7 @@ describe("EvenHubDisplay", () => {
       await display.start();
 
       const longLine = "b".repeat(2500);
-      display.render([longLine]);
+      display.render(linesModel([longLine]));
       expect(upgradeCalls[0]!.content).toHaveLength(2000);
       expect(upgradeCalls[0]!.content).toBe("b".repeat(2000));
     });
@@ -138,8 +175,184 @@ describe("EvenHubDisplay", () => {
       });
       const display = new EvenHubDisplay(bridge);
       await display.start();
-      expect(() => display.render(["x"])).not.toThrow();
+      expect(() => display.render(linesModel(["x"]))).not.toThrow();
       await vi.advanceTimersByTimeAsync(0);
+    });
+  });
+
+  describe("render — session model (multi-container bottom bar)", () => {
+    it("first session render issues a rebuildPageContainer with a transcript container, a bordered box container (borderWidth:1), a status container, and exactly one isEventCapture:1 overlay", async () => {
+      const { bridge, rebuildCalls, upgradeCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      display.render(
+        sessionModel({ transcriptLines: ["line a", "line b"], lines: ["> draft text"], status: "Working" })
+      );
+
+      expect(rebuildCalls).toHaveLength(1);
+      expect(upgradeCalls).toHaveLength(0); // no textContainerUpgrade on a shape change
+
+      const containers = rebuildCalls[0]!.textObject!;
+      expect(containers.length).toBe(4);
+
+      const captureContainers = containers.filter((c) => c.isEventCapture === 1);
+      expect(captureContainers).toHaveLength(1);
+      expect(captureContainers[0]!.width).toBe(576);
+      expect(captureContainers[0]!.height).toBe(288);
+
+      const boxContainer = containers.find((c) => c.borderWidth === 1);
+      expect(boxContainer).toBeDefined();
+      expect(boxContainer!.content).toBe("> draft text");
+
+      const transcriptContainer = containers.find((c) => c.content === "line a\nline b");
+      expect(transcriptContainer).toBeDefined();
+      expect(transcriptContainer!.isEventCapture).not.toBe(1);
+
+      const statusContainer = containers.find((c) => c.content === "Working");
+      expect(statusContainer).toBeDefined();
+      expect(statusContainer).not.toBe(boxContainer);
+    });
+
+    it("a second render with the same shape (same mode + box line count) uses textContainerUpgrade, not another rebuild", async () => {
+      const { bridge, rebuildCalls, upgradeCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      display.render(sessionModel({ lines: ["> draft"], status: "Working" }));
+      expect(rebuildCalls).toHaveLength(1);
+
+      display.render(sessionModel({ lines: ["> draft two"], status: "Waiting" }));
+      expect(rebuildCalls).toHaveLength(1); // still just the one rebuild
+      expect(upgradeCalls.length).toBeGreaterThan(0); // leading-edge fire of the upgrade debounce
+      expect(upgradeCalls.some((u) => u.content === "> draft two")).toBe(true);
+      expect(upgradeCalls.some((u) => u.content === "Waiting")).toBe(true);
+    });
+
+    it("switching from input mode to sheet mode triggers a rebuild even with an unchanged box line count", async () => {
+      const { bridge, rebuildCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      display.render(sessionModel({ mode: "input", lines: ["> draft"] }));
+      expect(rebuildCalls).toHaveLength(1);
+
+      display.render(sessionModel({ mode: "sheet", lines: ["> draft"] }));
+      expect(rebuildCalls).toHaveLength(2);
+    });
+
+    it("a bottomBoxLines change (same mode) also triggers a rebuild", async () => {
+      const { bridge, rebuildCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      display.render(sessionModel({ mode: "input", lines: ["one line only"] }));
+      expect(rebuildCalls).toHaveLength(1);
+
+      display.render(sessionModel({ mode: "input", lines: ["line one", "line two", "line three"] }));
+      expect(rebuildCalls).toHaveLength(2);
+    });
+
+    it("debounces rapid same-shape session renders to a single trailing textContainerUpgrade batch", async () => {
+      const { bridge, upgradeCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      display.render(sessionModel({ lines: ["> a"], status: "Working" }));
+      const afterRebuild = upgradeCalls.length; // 0 — the first render was a rebuild
+
+      display.render(sessionModel({ lines: ["> b"], status: "Working" })); // leading fire
+      expect(upgradeCalls.length).toBe(afterRebuild + 3); // transcript + box + status
+
+      display.render(sessionModel({ lines: ["> c"], status: "Working" }));
+      display.render(sessionModel({ lines: ["> d"], status: "Working" }));
+      expect(upgradeCalls.length).toBe(afterRebuild + 3); // still coalescing
+
+      await vi.advanceTimersByTimeAsync(120);
+      expect(upgradeCalls.length).toBe(afterRebuild + 6); // one trailing batch with "> d"
+      expect(upgradeCalls.some((u) => u.content === "> d")).toBe(true);
+    });
+
+    it("does not throw when rebuildPageContainer rejects", async () => {
+      const { bridge } = fakeBridge({
+        rebuildPageContainer: async () => {
+          throw new Error("boom");
+        },
+      });
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+      expect(() => display.render(sessionModel({}))).not.toThrow();
+      await Promise.resolve();
+    });
+  });
+
+  describe("render — session <-> lines transitions", () => {
+    it("a lines render after a session render rebuilds the page back to the single full-canvas container", async () => {
+      const { bridge, rebuildCalls, upgradeCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      display.render(sessionModel({ lines: ["> draft"], status: "Working" }));
+      expect(rebuildCalls).toHaveLength(1); // session rebuild
+      const upgradesBeforeBack = upgradeCalls.length;
+
+      // Going "back home" — a lines screen. The session layout (containers
+      // 1-4) is on screen, so a bare textContainerUpgrade to container 0
+      // would no-op; this must rebuild back to one container.
+      display.render(linesModel(["AGENTHUB 0 run", "  + New session"]));
+
+      expect(rebuildCalls).toHaveLength(2);
+      const backContainers = rebuildCalls[1]!.textObject!;
+      expect(backContainers).toHaveLength(1);
+      const single = backContainers[0]!;
+      expect(single.containerID).toBe(0);
+      expect(single.containerName).toBe("main");
+      expect(single.isEventCapture).toBe(1);
+      expect(single.width).toBe(576);
+      expect(single.height).toBe(288);
+      expect(single.content).toBe("AGENTHUB 0 run\n  + New session");
+      // The transition rebuilds — it does not route through the in-place
+      // upgrade path.
+      expect(upgradeCalls.length).toBe(upgradesBeforeBack);
+    });
+
+    it("a second lines render after the single container is current uses textContainerUpgrade, not another rebuild", async () => {
+      const { bridge, rebuildCalls, upgradeCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      display.render(sessionModel({ lines: ["> draft"] }));
+      display.render(linesModel(["home one"])); // session -> lines rebuild
+      expect(rebuildCalls).toHaveLength(2);
+      const upgradesBeforeSecond = upgradeCalls.length;
+
+      display.render(linesModel(["home two"])); // lines -> lines, single container current
+      expect(rebuildCalls).toHaveLength(2); // no new rebuild
+      expect(upgradeCalls.length).toBe(upgradesBeforeSecond + 1); // leading-edge upgrade
+      expect(upgradeCalls[upgradeCalls.length - 1]!.content).toBe("home two");
+    });
+
+    it("a shape-change rebuild cancels a pending same-shape update so a late upgrade cannot clobber the fresh containers", async () => {
+      const { bridge, rebuildCalls, upgradeCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      // Establish the session layout, then queue a trailing (debounced)
+      // same-shape update that has NOT yet flushed.
+      display.render(sessionModel({ lines: ["> a"], status: "Working" })); // rebuild
+      display.render(sessionModel({ lines: ["> b"], status: "Working" })); // leading upgrade
+      display.render(sessionModel({ lines: ["> stale"], status: "Working" })); // trailing pending
+      const upgradesBeforeSwitch = upgradeCalls.length;
+
+      // Now change shape (input -> sheet) — an immediate rebuild. The pending
+      // "> stale" trailing upgrade must be cancelled, not fire 120ms later.
+      display.render(sessionModel({ mode: "sheet", lines: ["> a"], status: "Working" }));
+      expect(rebuildCalls).toHaveLength(2);
+
+      await vi.advanceTimersByTimeAsync(200); // well past the debounce window
+      // No upgrade fired after the switch — the stale trailing flush was cancelled.
+      expect(upgradeCalls.length).toBe(upgradesBeforeSwitch);
+      expect(upgradeCalls.some((u) => u.content === "> stale")).toBe(false);
     });
   });
 
