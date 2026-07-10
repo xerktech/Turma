@@ -80,6 +80,10 @@ export interface ClosedSessionInfo {
 export interface RepoInfo {
   name: string;
   path: string;
+  // The REPOS_ROOT pseudo-repo (name ROOT_REPO_NAME): a session spawned against
+  // it runs directly at the repos root, no worktree/branch. See hub-agent.py's
+  // root_repo_entry / spawn.
+  isRoot?: boolean;
   [key: string]: unknown;
 }
 

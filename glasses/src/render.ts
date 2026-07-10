@@ -419,7 +419,9 @@ export function buildNewRepoRows(state: AppState, hostKey: string): NewRepoRow[]
   if (!agent) return [];
   const rows: NewRepoRow[] = [];
   for (const repo of agent.repos ?? []) {
-    rows.push({ kind: "repo", repo: repo.name, text: repo.name });
+    // The repos-root pseudo-repo spawns a session at the root (no worktree);
+    // give it a legible label instead of the bare "(root)" sentinel name.
+    rows.push({ kind: "repo", repo: repo.name, text: repo.isRoot ? "Repos root (all repos)" : repo.name });
     for (const c of agent.closedSessions ?? []) {
       if (c.repo !== repo.name) continue;
       rows.push({ kind: "resume", closedSessionId: c.id, text: `Resume ${c.label || c.repo}` });

@@ -971,6 +971,94 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm.spawn("AgentHub", model="gpt-5")
         self.assertEqual(sm.registry[0]["status"], "error")
 
+    # --- root (repos-root) sessions ---------------------------------------
+    # A session spawned against ROOT_REPO_NAME runs directly at REPOS_ROOT with
+    # no worktree and no branch; the worktree/branch machinery must be skipped
+    # everywhere (spawn/kill/delete) so REPOS_ROOT and its repos are never
+    # touched, and only one may run at a time.
+
+    def _root_ready_manager(self):
+        sm = self.make_spawn_ready_manager([])  # scan_repos irrelevant for root
+        p = mock.patch.object(ha, "REPOS_ROOT", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+        return sm
+
+    def test_root_repo_entry_advertises_root(self):
+        p = mock.patch.object(ha, "REPOS_ROOT", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+        entry = ha.root_repo_entry()
+        self.assertEqual(entry["name"], ha.ROOT_REPO_NAME)
+        self.assertTrue(entry["isRoot"])
+        self.assertEqual(entry["path"], self.tmp)
+        self.assertEqual(entry["branches"], [])  # no base-branch walk for root
+
+    def test_spawn_root_runs_in_repos_root_without_worktree(self):
+        sm = self._root_ready_manager()
+        sm.spawn(ha.ROOT_REPO_NAME)
+        self.assertEqual(len(sm.registry), 1)
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "running")
+        self.assertTrue(sess["root"])
+        self.assertIsNone(sess["branch"])
+        self.assertEqual(sess["repo"], ha.ROOT_REPO_NAME)
+        self.assertEqual(sess["worktreePath"], self.tmp)  # REPOS_ROOT itself
+        # No worktree is ever added for a root session.
+        self.assertFalse(any("worktree" in c and "add" in c for c in self.run_ok_calls))
+        # claude still launches, and does so with cwd = REPOS_ROOT (tmux -c).
+        newsess = next(c for c in self.run_ok_calls if "new-session" in c)
+        self.assertIn(self.tmp, newsess)
+
+    def test_spawn_root_ignores_branch_and_base_but_keeps_model(self):
+        sm = self._root_ready_manager()
+        # base_ref would normally have to resolve in the repo; for root it does
+        # not apply, so an unresolvable one must NOT fail the spawn.
+        sm.spawn(ha.ROOT_REPO_NAME, base_ref="does-not-exist",
+                 branch_name="custom", model="opus", permission_mode="acceptEdits")
+        sess = sm.registry[0]
+        self.assertEqual(sess["status"], "running")
+        self.assertIsNone(sess["branch"])
+        self.assertIsNone(sess["baseRef"])
+        self.assertEqual(sess["model"], "opus")            # model still applies
+        self.assertEqual(sess["permissionMode"], "acceptEdits")
+
+    def test_spawn_root_refused_when_root_already_running(self):
+        sm = self._root_ready_manager()
+        sm.spawn(ha.ROOT_REPO_NAME)
+        self.assertEqual(len(sm.registry), 1)
+        sm.spawn(ha.ROOT_REPO_NAME)  # a second concurrent root is refused
+        self.assertEqual(len(sm.registry), 1)
+
+    def test_kill_root_keeps_repos_root_and_records_root(self):
+        sm = self._root_ready_manager()
+        sm.spawn(ha.ROOT_REPO_NAME)
+        sid = sm.registry[0]["id"]
+        sm.kill(sid)
+        self.assertEqual(sm.registry, [])
+        # REPOS_ROOT is not a worktree: never remove it, never delete a branch.
+        self.assertFalse(any("worktree" in c and "remove" in c for c in self.run_calls))
+        self.assertFalse(any("branch" in c and "-D" in c for c in self.run_calls))
+        self.assertTrue(sm.closed[-1]["root"])  # resumable, flagged as root
+
+    def test_delete_root_skips_worktree_and_branch(self):
+        sm = self._root_ready_manager()
+        sm.spawn(ha.ROOT_REPO_NAME)
+        sid = sm.registry[0]["id"]
+        sm.delete(sid)
+        self.assertEqual(sm.registry, [])
+        self.assertFalse(any("worktree" in c and "remove" in c for c in self.run_calls))
+        self.assertFalse(any("-D" in c for c in self.run_calls))
+        self.assertFalse(any("-m" in c and ha.TRASH_PREFIX in " ".join(c)
+                             for c in self.run_ok_calls))
+
+    def test_session_payload_flags_root(self):
+        sm = self._root_ready_manager()
+        sm.spawn(ha.ROOT_REPO_NAME)
+        payload = sm._session_payload(sm.registry[0])
+        self.assertTrue(payload["root"])
+        self.assertIsNone(payload["branch"])
+
 
 class TestSendInput(ManagerMixin, unittest.TestCase):
     def make_manager(self):
