@@ -22,6 +22,7 @@ import type { GlassesDisplay } from "./display/index.ts";
 import { HubAudioDictation, PromptDictation } from "./dictation.ts";
 import type { Dictation } from "./dictation.ts";
 import { HubClient } from "./hub-client.ts";
+import { LiveTail } from "./live.ts";
 import { BridgeStorage, BrowserStorage, type KeyValueStorage } from "./storage.ts";
 import { initPhoneLogin } from "./phone-login.ts";
 import { pretextMeasure, setDefaultMeasure } from "./text-wrap.ts";
@@ -149,7 +150,13 @@ async function boot(
 
   const client = new HubClient({ config });
   const dictation = makeDictation(client, config);
-  const app = new App({ client, display, dictation, pollMs: config.pollMs });
+  // Near-real-time transcript stream for the session screen. Uses the same
+  // short-lived ws-token + wss/ws derivation as dictation's /audio socket, and
+  // the browser's built-in WebSocket on both backends; if it can't connect
+  // (agent tunnel offline, dev mock hub with no /live route) the app falls back
+  // to the poll unchanged.
+  const liveTail = new LiveTail({ hubClient: client, hubUrl: config.hubUrl });
+  const app = new App({ client, display, dictation, liveTail, pollMs: config.pollMs });
 
   beforeStart?.(app);
   await app.start();

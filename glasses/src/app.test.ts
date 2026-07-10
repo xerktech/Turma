@@ -98,6 +98,30 @@ class FakeDictation implements Dictation {
   }
 }
 
+class FakeLiveTail {
+  started: { hostKey: string; sessionId: string }[] = [];
+  stops = 0;
+  private cb: ((entries: import("./types.ts").TailEntry[]) => void) | null = null;
+  private current: string | null = null;
+
+  start(hostKey: string, sessionId: string, onTail: (entries: import("./types.ts").TailEntry[]) => void): void {
+    this.started.push({ hostKey, sessionId });
+    this.cb = onTail;
+    this.current = sessionId;
+  }
+  stop(): void {
+    this.stops++;
+    this.cb = null;
+    this.current = null;
+  }
+  isWatching(sessionId: string): boolean {
+    return this.current === sessionId;
+  }
+  deliver(entries: import("./types.ts").TailEntry[]): void {
+    this.cb?.(entries);
+  }
+}
+
 function fakeClient(overrides: Record<string, ReturnType<typeof vi.fn>> = {}) {
   return {
     listAgents: vi.fn(async () => ({ now: Date.now(), agents: [] })),
@@ -119,12 +143,14 @@ const START = 1_700_000_000_000;
 describe("App", () => {
   let display: FakeDisplay;
   let dictation: FakeDictation;
+  let liveTail: FakeLiveTail;
 
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(START);
     display = new FakeDisplay();
     dictation = new FakeDictation();
+    liveTail = new FakeLiveTail();
   });
 
   afterEach(() => {
@@ -136,6 +162,7 @@ describe("App", () => {
       client: client as unknown as HubClient,
       display,
       dictation,
+      liveTail,
       now: () => Date.now(),
       pollMs,
     });
@@ -1235,5 +1262,94 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
     display.emit({ type: "tap" }); // -> focus:"bottom"
     display.emit({ type: "scrollUp" });
     expect(app.getState().session?.focus).toBe("transcript");
+  });
+
+  describe("live tail + streaming reveal", () => {
+    // This block needs a FakeLiveTail wired into the App (the enclosing
+    // Task-4 describe's makeApp doesn't pass one), so it builds the App
+    // itself rather than reusing the outer makeApp.
+    let liveTail: FakeLiveTail;
+    beforeEach(() => {
+      liveTail = new FakeLiveTail();
+    });
+
+    async function enterSession() {
+      const client = fakeClient({
+        listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+      });
+      const app = new App({
+        client: client as unknown as HubClient,
+        display,
+        dictation,
+        liveTail,
+        now: () => Date.now(),
+        pollMs: 6000,
+      });
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      display.emit({ type: "tap" }); // home -> session
+      expect(app.getState().screen).toBe("session");
+      return app;
+    }
+
+    it("starts the live tail on entering a session and stops it on leaving", async () => {
+      const app = await enterSession();
+      expect(liveTail.started).toEqual([{ hostKey: "host-a", sessionId: "s1" }]);
+      expect(liveTail.isWatching("s1")).toBe(true);
+
+      display.emit({ type: "doubleTap" }); // session -> home
+      expect(app.getState().screen).toBe("home");
+      expect(liveTail.stops).toBe(1);
+      expect(liveTail.isWatching("s1")).toBe(false);
+    });
+
+    it("types a small live delta in over successive reveal ticks", async () => {
+      const app = await enterSession();
+      // A brand-new short assistant entry: re-anchors hidden, then types in.
+      liveTail.deliver([{ id: "m1", role: "assistant", text: "hello world" }]); // 11 chars
+      expect(app.getState().reveal).toEqual({ entryId: "m1", shown: 0 });
+      // 80ms tick @ 150cps -> 12 chars, clamps to the 11 available.
+      await vi.advanceTimersByTimeAsync(80);
+      expect(app.getState().reveal.shown).toBe(11);
+      // The rendered assistant line shows the (now full) text.
+      expect(display.lines.some((l) => l.includes("hello world"))).toBe(true);
+    });
+
+    it("snaps a big live block instead of typewriting it", async () => {
+      const app = await enterSession();
+      const big = "x".repeat(400); // > REVEAL_SNAP_CHARS
+      liveTail.deliver([{ id: "m1", role: "assistant", text: big }]);
+      // No tick needed — a block appears at once.
+      expect(app.getState().reveal).toEqual({ entryId: "m1", shown: 400 });
+    });
+
+    it("reveals only the typed prefix of the newest entry while typing", async () => {
+      const app = await enterSession();
+      // Seed a first (older) entry via the live tail, let it finish.
+      liveTail.deliver([{ id: "m1", role: "assistant", text: "done" }]);
+      await vi.advanceTimersByTimeAsync(80);
+      // A new long-ish entry that will take more than one tick to type.
+      liveTail.deliver([
+        { id: "m1", role: "assistant", text: "done" },
+        { id: "m2", role: "assistant", text: "abcdefghijklmnopqrstuvwxyz0123456789" }, // 36 chars
+      ]);
+      expect(app.getState().reveal.entryId).toBe("m2");
+      await vi.advanceTimersByTimeAsync(80); // 12 chars revealed
+      const state = app.getState();
+      expect(state.reveal.shown).toBe(12);
+      // Older entry stays full; newest shows only its 12-char prefix.
+      expect(display.lines.some((l) => l.includes("done"))).toBe(true);
+      expect(display.lines.some((l) => l.includes("abcdefghijkl") && !l.includes("mnop"))).toBe(true);
+    });
+
+    it("stops the live tail and reveal timer on pause()", async () => {
+      const app = await enterSession();
+      liveTail.deliver([{ id: "m1", role: "assistant", text: "streaming text here" }]);
+      app.pause();
+      expect(liveTail.stops).toBe(1);
+      const shownAtPause = app.getState().reveal.shown;
+      await vi.advanceTimersByTimeAsync(500); // no ticks should fire while paused
+      expect(app.getState().reveal.shown).toBe(shownAtPause);
+    });
   });
 });

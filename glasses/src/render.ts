@@ -173,13 +173,22 @@ export function sessionContentLines(state: AppState, hostKey: string, sessionId:
     // scroll away.
     lines.push("· earlier history truncated ·");
   }
-  for (const entry of buffer?.entries ?? []) {
-    lines.push(...wrap(roleLine(entry.role, entry.text)));
-  }
-  // A pending question no longer duplicates here — the session bottom's
-  // sheet mode (Task 6) is the one place it renders. PR links aren't part
-  // of the question, so they still surface at the newest end of the
-  // transcript.
+  // The newest entry of the focused session may be mid-typewriter (reveal.ts):
+  // show only its revealed prefix so still-streaming text types in rather than
+  // block-jumping. Older entries, and any other session, always render in full.
+  const entries = buffer?.entries ?? [];
+  const reveal = state.session?.sessionId === sessionId ? state.reveal : null;
+  const lastIdx = entries.length - 1;
+  entries.forEach((entry, i) => {
+    let text = entry.text;
+    if (reveal && i === lastIdx && reveal.entryId === entry.id && reveal.shown < text.length) {
+      text = text.slice(0, Math.max(0, reveal.shown));
+    }
+    lines.push(...wrap(roleLine(entry.role, text)));
+  });
+  // A pending question no longer duplicates here — the session bottom's sheet
+  // mode (Task 6) is the one place it renders. PR links aren't part of the
+  // question, so they still surface at the newest end of the transcript.
   const s = findSessionLocal(state, hostKey, sessionId);
   for (const url of s?.session?.newPrUrls ?? []) {
     lines.push(...wrap(`PR ${url}`));

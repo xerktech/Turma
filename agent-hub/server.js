@@ -98,6 +98,12 @@ let agents = {};
 // agent's data-WS dial-back for channel `ch`.
 const controlChannels = {};
 const pendingChannels = {};
+// Live transcript subscribers: liveClients[host][sessionId] = Set of glasses
+// WebSocket sockets watching that session's transcript in near-real-time (see
+// the /live upgrade handler). The hub asks the host's tunnel-agent to tail a
+// session only while at least one socket here is watching it, and fans the
+// agent's `{tail, entries}` deltas back out to that set.
+const liveClients = {};
 
 // ---- persistence (best-effort: survives hub restarts so the UI isn't blank
 // for the first heartbeat interval; losing it is harmless) -------------------
@@ -676,6 +682,37 @@ function openChannel(name, port) {
   });
 }
 
+// ---- live transcript relay --------------------------------------------------
+// The near-real-time tail path. The glasses open /live/<host>/<session>; the
+// hub tells that host's tunnel-agent (over the persistent control channel) to
+// start tailing the one transcript, and fans the agent's `{tail, entries}`
+// deltas back to every socket watching that session. Everything here is
+// best-effort: if the control channel is offline the glasses simply keep
+// getting the (slower) heartbeat tail via the poll.
+
+// The session's worktree path as last reported on a heartbeat — what the agent
+// needs to locate the transcript. null if the session isn't known.
+function worktreePathFor(host, sessionId) {
+  const sess = (agents[host]?.sessions || []).find((s) => s.id === sessionId);
+  return sess?.worktreePath || null;
+}
+
+// Send one JSON text frame to a single live subscriber socket (best-effort).
+function sendLive(socket, obj) {
+  try {
+    socket.write(wsEncode(0x1, JSON.stringify(obj)));
+  } catch {
+    /* socket already gone; cleanup runs on its close/error */
+  }
+}
+
+// Fan a delta out to every socket watching (host, sessionId).
+function liveFanout(host, sessionId, obj) {
+  const set = liveClients[host]?.[sessionId];
+  if (!set) return;
+  for (const socket of set) sendLive(socket, obj);
+}
+
 // ---- terminal proxy ---------------------------------------------------------
 // Proxy an HTTP asset request (ttyd HTML/JS/token) through the agent's tunnel.
 // A fresh channel per request, closed by ttyd via Connection: close.
@@ -1050,10 +1087,32 @@ server.on("upgrade", async (req, socket, head) => {
       // Tell the agent which ttyd port to bridge this data channel to (per
       // session); it defaults to 7681 if the port is ever absent.
       sendOpen: (ch, port) => send(0x1, JSON.stringify({ open: ch, port })),
+      // Start/stop the agent's live tail of one session's transcript. worktreePath
+      // is where the agent looks up the transcript (see tunnel-agent.js).
+      sendWatch: (sessionId, worktreePath) => send(0x1, JSON.stringify({ watch: sessionId, worktreePath })),
+      sendUnwatch: (sessionId) => send(0x1, JSON.stringify({ unwatch: sessionId })),
     };
     console.log(`tunnel connected: ${name}`);
+    // A fresh (or reconnected) tunnel doesn't know which sessions the hub still
+    // has live watchers for — re-arm each so an agent restart / control-channel
+    // flap doesn't silently stop the live stream to already-attached glasses.
+    for (const sessionId of Object.keys(liveClients[name] || {})) {
+      const wp = worktreePathFor(name, sessionId);
+      if (wp) controlChannels[name].sendWatch(sessionId, wp);
+    }
     const ping = setInterval(() => send(0x9, Buffer.alloc(0)), 30000); // beat CF idle timeout
-    const parse = wsParser((op) => { if (op === 0x8) socket.end(); }); // agent sends us no data
+    // The agent pushes live transcript deltas back on this same channel as
+    // `{tail: sessionId, entries}` text frames; everything else it sends we
+    // ignore (it never sent us data before the live tail existed).
+    const parse = wsParser((op, payload) => {
+      if (op === 0x8) return socket.end();
+      if (op !== 0x1) return;
+      let msg;
+      try { msg = JSON.parse(payload.toString("utf8")); } catch { return; }
+      if (msg && msg.tail && Array.isArray(msg.entries)) {
+        liveFanout(name, msg.tail, { type: "tail", entries: msg.entries });
+      }
+    });
     socket.on("data", parse);
     const cleanup = () => {
       clearInterval(ping);
@@ -1075,6 +1134,76 @@ server.on("upgrade", async (req, socket, head) => {
     if (!resolver) return socket.destroy();
     wsHandshake(socket, req);
     resolver(channelDuplex(socket));
+    return;
+  }
+
+  // Glasses live-transcript WebSocket: /live/<host>/<sessionId>?auth=<ws-token>.
+  // The hub asks the host's tunnel-agent to tail that one session (over the
+  // control channel) and streams back the agent's `{type:"tail", entries}`
+  // deltas. Same short-lived ws-token auth as /audio (browser WebSocket can't
+  // set an Authorization header).
+  if (parts[0] === "live" && parts.length >= 3) {
+    if (!wsTokenValid(url.searchParams.get("auth"))) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      return socket.destroy();
+    }
+    const host = decodeURIComponent(parts[1]);
+    const sessionId = decodeURIComponent(parts[2]);
+    if (!agents[host]) {
+      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+      return socket.destroy();
+    }
+    wsHandshake(socket, req);
+
+    const byHost = (liveClients[host] = liveClients[host] || {});
+    const set = (byHost[sessionId] = byHost[sessionId] || new Set());
+    const first = set.size === 0;
+    set.add(socket);
+
+    // Immediately seed the client with the most recent tail we already have
+    // (from the last heartbeat) so it isn't blank until the first live delta.
+    const cachedTail = (agents[host].sessions || []).find((s) => s.id === sessionId)?.session?.tail;
+    if (Array.isArray(cachedTail) && cachedTail.length) {
+      sendLive(socket, { type: "tail", entries: cachedTail });
+    }
+
+    // First watcher for this session -> ask the agent to start tailing it.
+    if (first) {
+      const wp = worktreePathFor(host, sessionId);
+      if (wp && controlChannels[host]) controlChannels[host].sendWatch(sessionId, wp);
+    }
+
+    const ping = setInterval(() => {
+      try { socket.write(wsEncode(0x9, Buffer.alloc(0))); } catch {}
+    }, 30000);
+    const parse = wsParser((op, payload) => {
+      if (op === 0x8) return socket.end();
+      if (op === 0x9) { try { socket.write(wsEncode(0xa, payload)); } catch {} } // ping -> pong
+    });
+    socket.on("data", parse);
+
+    // Safe to run more than once: after the first pass the subscriber is gone,
+    // so the guard below returns early (no double unwatch).
+    const cleanup = () => {
+      clearInterval(ping);
+      const s = liveClients[host]?.[sessionId];
+      if (!s) return;
+      s.delete(socket);
+      if (s.size > 0) return;
+      delete liveClients[host][sessionId];
+      // Last watcher gone -> tell the agent to stop tailing (frees the ~1s
+      // file-tail loop when nobody's looking).
+      if (controlChannels[host]) controlChannels[host].sendUnwatch(sessionId);
+      if (Object.keys(liveClients[host]).length === 0) delete liveClients[host];
+    };
+    // A graceful WS close arrives as a 0x8 frame (handled above -> socket.end
+    // -> "close"), but a client that half-closes the TCP side (or the SDK
+    // WebView being torn down) only ever emits "end". Handle both, and end our
+    // own writable side so the ping interval's handle doesn't keep the socket
+    // (and the process) alive.
+    socket.on("end", () => { cleanup(); try { socket.end(); } catch {} });
+    socket.on("close", cleanup);
+    socket.on("error", cleanup);
     return;
   }
 
