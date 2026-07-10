@@ -480,8 +480,15 @@ describe("App", () => {
     expect(app.getState().session?.mic).toBe("idle");
     expect(app.getState().session?.viewOffset).toBe(0);
 
-    // A second dictation round appends, space-joined, to the existing draft.
-    display.emit({ type: "tap" }); // idle -> recording again
+    // With a draft present, a tap opens the options menu (not a new recording
+    // over the text). "Dictate more" appends another round, space-joined.
+    display.emit({ type: "tap" }); // draft present -> actions menu
+    expect(app.getState().screen).toBe("actions");
+    display.emit({ type: "scrollDown" }); // Send(0) -> Clear(1)
+    display.emit({ type: "scrollDown" }); // -> Dictate more(2)
+    display.emit({ type: "tap" }); // Dictate more -> back to box, recording
+    expect(app.getState().screen).toBe("session");
+    expect(app.getState().session?.mic).toBe("recording");
     display.emit({ type: "tap" }); // recording -> finalising
     dictation.resolve({ text: "and redeploy" });
     expect(app.getState().session?.draft).toBe("deploy the fix and redeploy");
@@ -597,13 +604,14 @@ describe("App", () => {
     dictation.resolve({ text: "deploy the fix" });
     expect(app.getState().session?.draft).toBe("deploy the fix");
 
-    // Draft present: rows are [Send, Clear, Restart, Kill, Delete, Back].
+    // Draft present: rows are [Send, Clear, Dictate more, Restart, Kill, Delete, Back].
     display.emit({ type: "doubleTap" }); // -> actions, cursor 0 = Send
     display.emit({ type: "scrollDown" }); // 1 = Clear
-    display.emit({ type: "scrollDown" }); // 2 = Restart
-    display.emit({ type: "scrollDown" }); // 3 = Kill
-    display.emit({ type: "scrollDown" }); // 4 = Delete
-    display.emit({ type: "scrollDown" }); // 5 = Back
+    display.emit({ type: "scrollDown" }); // 2 = Dictate more
+    display.emit({ type: "scrollDown" }); // 3 = Restart
+    display.emit({ type: "scrollDown" }); // 4 = Kill
+    display.emit({ type: "scrollDown" }); // 5 = Delete
+    display.emit({ type: "scrollDown" }); // 6 = Back
     display.emit({ type: "tap" }); // select Back
 
     expect(client.sendInput).not.toHaveBeenCalled();
@@ -1245,7 +1253,7 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
     expect(app.getState().screen).toBe("actions");
   });
 
-  it("input mode: tap toggles dictation instead of opening the actions menu", async () => {
+  it("input mode: an empty-box tap starts dictation (not the actions menu)", async () => {
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
     });
@@ -1253,8 +1261,28 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
 
     display.emit({ type: "tap" }); // -> focus:"bottom"
     display.emit({ type: "tap" }); // idle -> recording
-    expect(app.getState().screen).toBe("session"); // stays put — no longer jumps to actions
+    expect(app.getState().screen).toBe("session"); // stays put — no jump to actions
     expect(app.getState().session?.mic).toBe("recording");
+    expect(dictation.started).toBe(1);
+  });
+
+  it("input mode: with a draft present, a tap opens the options menu instead of recording over the text", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [longSession()] })] })),
+    });
+    const app = await enterSession(client);
+
+    display.emit({ type: "tap" }); // focus bottom
+    display.emit({ type: "tap" }); // idle -> recording
+    display.emit({ type: "tap" }); // recording -> finalising
+    dictation.resolve({ text: "ship it" });
+    expect(app.getState().session?.draft).toBe("ship it");
+    expect(dictation.started).toBe(1);
+
+    // The next tap opens Send/Clear/Dictate-more, and does NOT start a new
+    // recording over the existing text.
+    display.emit({ type: "tap" });
+    expect(app.getState().screen).toBe("actions");
     expect(dictation.started).toBe(1);
   });
 

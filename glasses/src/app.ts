@@ -822,6 +822,17 @@ export class App {
       return;
     }
     if (e.type === "tap") {
+      // Once the box holds a dictated draft (and the mic is idle), a tap opens
+      // the options menu — Send / Clear / Dictate more — instead of starting a
+      // recording over the existing text. An empty box still taps to record,
+      // and a tap while recording still stops it (toggleBoxDictation).
+      if (s.mic === "idle" && s.draft) {
+        this.setState({
+          screen: "actions",
+          actions: { hostKey: s.hostKey, sessionId: s.sessionId, cursor: 0 },
+        });
+        return;
+      }
       this.toggleBoxDictation(s);
       return;
     }
@@ -1071,6 +1082,16 @@ export class App {
       case "clear":
         this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
         return;
+      case "dictate": {
+        // Append another dictation to the existing draft: return to the box
+        // (preserving the draft) in bottom focus and start recording. The
+        // result appends to the draft (onBoxDictationResult), same as before —
+        // it's just now an explicit choice rather than what a bare tap does.
+        const s = { ...this.returnToSession(hostKey, sessionId), focus: "bottom" as SessionFocus };
+        this.setState({ screen: "session", session: s });
+        this.toggleBoxDictation(s);
+        return;
+      }
       case "restart":
         this.queueAction(hostKey, sessionId, "restart");
         return;
