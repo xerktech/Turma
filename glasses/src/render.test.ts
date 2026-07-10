@@ -331,7 +331,7 @@ describe("SESSION_SCROLL_STEP", () => {
 });
 
 describe("render: actions", () => {
-  it("shows the running-session menu with no Answer question row when a question is pending (Task 6: the sheet is always visible, so that row was dropped)", () => {
+  it("renders the running-session menu as an overlay: Back first (cursor 0), no Send/Clear/Answer/Restart when there's no draft", () => {
     const s = session({ id: "s1", session: signals({ question: "pick" }) });
     const agents = [agent({ sessions: [s] })];
     const state = base({
@@ -341,18 +341,35 @@ describe("render: actions", () => {
       actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
     });
 
-    const lines = asLines(render(state));
-    expect(lines).toContain("> Restart");
-    expect(lines).toContain("  Kill");
-    expect(lines).toContain("  Delete");
-    expect(lines).toContain("  Back");
-    expect(lines.some((l) => l.includes("Answer question"))).toBe(false);
-    expect(lines.some((l) => l.includes("Reply"))).toBe(false);
-    expect(lines.some((l) => l.includes("Send"))).toBe(false);
-    expect(lines.some((l) => l.includes("Clear"))).toBe(false);
+    const model = asSession(render(state));
+    expect(model.bottom.mode).toBe("menu");
+    const box = model.bottom.lines;
+    expect(box).toContain("> Back");
+    expect(box).toContain("  Kill");
+    expect(box).toContain("  Delete");
+    expect(box.some((l) => l.includes("Restart"))).toBe(false);
+    expect(box.some((l) => l.includes("Answer question"))).toBe(false);
+    expect(box.some((l) => l.includes("Send"))).toBe(false);
+    expect(box.some((l) => l.includes("Clear"))).toBe(false);
   });
 
-  it("prepends Send/Clear ahead of the other rows once the session's bottom-box draft has text", () => {
+  it("keeps the session transcript visible behind the menu", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "actions",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
+      transcripts: { s1: { entries: [{ id: "e1", role: "assistant", text: "behind the menu" }] } },
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines.some((l) => l.includes("behind the menu"))).toBe(true);
+    expect(model.bottom.mode).toBe("menu");
+  });
+
+  it("prepends Send/Clear/Dictate more after Back once the session's bottom-box draft has text", () => {
     const s = session({ id: "s1" });
     const agents = [agent({ sessions: [s] })];
     const state = base({
@@ -362,11 +379,12 @@ describe("render: actions", () => {
       actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
     });
 
-    const lines = asLines(render(state));
-    expect(lines).toContain("> Send");
-    expect(lines).toContain("  Clear");
-    expect(lines).toContain("  Restart");
-    expect(lines).toContain("  Kill");
+    const box = asSession(render(state)).bottom.lines;
+    expect(box).toContain("> Back");
+    expect(box).toContain("  Send");
+    expect(box).toContain("  Clear");
+    expect(box).toContain("  Dictate more");
+    expect(box).toContain("  Kill");
   });
 
   it("ignores another session's draft (Send/Clear only reflect the actions target's own session)", () => {
@@ -379,12 +397,12 @@ describe("render: actions", () => {
       actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
     });
 
-    const lines = asLines(render(state));
-    expect(lines.some((l) => l.includes("Send"))).toBe(false);
-    expect(lines.some((l) => l.includes("Clear"))).toBe(false);
+    const box = asSession(render(state)).bottom.lines;
+    expect(box.some((l) => l.includes("Send"))).toBe(false);
+    expect(box.some((l) => l.includes("Clear"))).toBe(false);
   });
 
-  it("omits Answer question and dictate/restart when the session is stopped", () => {
+  it("shows Back/Start/Delete (no Kill, no Restart) when the session is stopped", () => {
     const s = session({ id: "s1", status: "stopped", session: null });
     const agents = [agent({ sessions: [s] })];
     const state = base({
@@ -393,12 +411,12 @@ describe("render: actions", () => {
       actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
     });
 
-    const lines = asLines(render(state));
-    expect(lines).toContain("> Start");
-    expect(lines).toContain("  Delete");
-    expect(lines).toContain("  Back");
-    expect(lines.some((l) => l.includes("Reply"))).toBe(false);
-    expect(lines.some((l) => l.includes("Kill"))).toBe(false);
+    const box = asSession(render(state)).bottom.lines;
+    expect(box).toContain("> Back");
+    expect(box).toContain("  Start");
+    expect(box).toContain("  Delete");
+    expect(box.some((l) => l.includes("Kill"))).toBe(false);
+    expect(box.some((l) => l.includes("Restart"))).toBe(false);
   });
 });
 
@@ -454,26 +472,27 @@ describe("render: reply", () => {
 });
 
 describe("render: confirm", () => {
-  it("shows the kill confirmation with Cancel preselected", () => {
+  it("renders the kill confirmation as a menu overlay with Cancel preselected", () => {
     const state = base({
       screen: "confirm",
       confirm: { action: { kind: "kill", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 0 },
     });
-    const lines = asLines(render(state));
-    expect(lines[0]).toBe("Kill sess-0?");
-    expect(lines).toContain("> Cancel");
-    expect(lines).toContain("  Confirm");
+    const model = asSession(render(state));
+    expect(model.bottom.mode).toBe("menu");
+    expect(model.bottom.lines[0]).toBe("Kill sess-0?");
+    expect(model.bottom.lines).toContain("> Cancel");
+    expect(model.bottom.lines).toContain("  Confirm");
   });
 
-  it("shows the delete confirmation wording", () => {
+  it("shows the delete confirmation wording with Confirm selected", () => {
     const state = base({
       screen: "confirm",
       confirm: { action: { kind: "delete", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 1 },
     });
-    const lines = asLines(render(state));
-    expect(lines[0]).toContain("Also removes branch");
-    expect(lines).toContain("  Cancel");
-    expect(lines).toContain("> Confirm");
+    const model = asSession(render(state));
+    expect(model.bottom.lines[0]).toContain("Also removes branch");
+    expect(model.bottom.lines).toContain("  Cancel");
+    expect(model.bottom.lines).toContain("> Confirm");
   });
 });
 
