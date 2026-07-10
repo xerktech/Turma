@@ -1,8 +1,23 @@
+import type { ScreenModel } from "../render.ts";
 import type { InputEvent } from "../types.ts";
 import type { GlassesDisplay } from "./index.ts";
 
-// Dev backend: renders the glasses' text lines into a styled <pre>, and maps
-// a keyboard to the four-gesture input vocabulary (ArrowUp/ArrowDown =
+// Width of the divider line dev-rendered between the session screen's
+// transcript and its bottom box — arbitrary but wide enough to look like a
+// rule under the ~560px-wide transcript text.
+const DIVIDER_WIDTH = 40;
+
+// Renders a "─"-filled divider of DIVIDER_WIDTH chars with `status`
+// overlaid flush against its right edge (a plain-text stand-in for the real
+// backend's separate status-corner container — see evenhub.ts).
+function sessionDivider(status: string): string {
+  const bar = "─".repeat(DIVIDER_WIDTH);
+  if (status.length === 0) return bar;
+  return bar.slice(0, Math.max(0, bar.length - status.length)) + status;
+}
+
+// Dev backend: renders the glasses' screen into a styled <pre>, and maps a
+// keyboard to the four-gesture input vocabulary (ArrowUp/ArrowDown =
 // scroll, Enter = tap, Escape = double-tap). No debouncing — the real
 // hardware backend (Task 6) owns pacing the BLE write path; this dev
 // backend just needs to be visually usable.
@@ -20,8 +35,17 @@ export class DomDisplay implements GlassesDisplay {
     this.el.focus();
   }
 
-  render(lines: string[]): void {
-    this.el.textContent = lines.join("\n");
+  render(model: ScreenModel): void {
+    if (model.type === "lines") {
+      this.el.textContent = model.lines.join("\n");
+      return;
+    }
+    // Session screen: no real bordered-box container in the dev DOM
+    // backend, so stack the transcript, a status divider, and the bottom
+    // box's own lines into one string — visually distinct enough to be
+    // usable, per the brief.
+    const divider = sessionDivider(model.bottom.status);
+    this.el.textContent = [...model.transcriptLines, divider, ...model.bottom.lines].join("\n");
   }
 
   onInput(cb: (e: InputEvent) => void): void {

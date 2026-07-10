@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { createInitialState, type AppState } from "./app.ts";
-import { render } from "./render.ts";
+import { createInitialState, newSessionState, type AppState } from "./app.ts";
+import { render, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
 const NOW = 1_700_000_000_000;
@@ -46,6 +46,18 @@ function base(overrides: Partial<AppState> = {}): AppState {
   return { ...createInitialState(NOW), ...overrides };
 }
 
+// Every non-session screen renders {type:"lines"}; this unwraps it (and
+// fails loudly if a test accidentally points it at the session screen).
+function asLines(model: ScreenModel): string[] {
+  if (model.type !== "lines") throw new Error(`expected a "lines" ScreenModel, got "${model.type}"`);
+  return model.lines;
+}
+
+function asSession(model: ScreenModel) {
+  if (model.type !== "session") throw new Error(`expected a "session" ScreenModel, got "${model.type}"`);
+  return model;
+}
+
 describe("render: home", () => {
   it("shows the run/ask header, grouped hosts (incl. an offline one), and the trailing menu rows", () => {
     const agents: AgentInfo[] = [
@@ -62,7 +74,9 @@ describe("render: home", () => {
     ];
     const state = base({ agents, home: { cursor: 0 } });
 
-    const lines = render(state);
+    const model = render(state);
+    expect(model.type).toBe("lines");
+    const lines = asLines(model);
 
     expect(lines[0]).toBe("AGENTHUB 1 run · 1 ask");
     expect(lines).toContain("> alpha");
@@ -81,7 +95,7 @@ describe("render: home", () => {
     // Row 0 = host header (non-selectable), row 1 = the session.
     const state = base({ agents, home: { cursor: 1 }, pending: { s1: { at: NOW } } });
 
-    const lines = render(state);
+    const lines = asLines(render(state));
     expect(lines.some((l) => l.startsWith("> … host-a·myrepo"))).toBe(true);
   });
 
@@ -94,30 +108,69 @@ describe("render: home", () => {
     // Page area with a footer is DISPLAY_LINES-2 = 8; cursor 0 -> page 1.
     const state = base({ agents, home: { cursor: 0 } });
 
-    const lines = render(state);
+    const lines = asLines(render(state));
     expect(lines[0]).toBe("AGENTHUB 0 run · 0 ask");
     expect(lines[lines.length - 1]).toBe("p1/2");
     expect(lines.length).toBe(10); // header + 8 content + footer
 
     const state2 = base({ agents, home: { cursor: 14 } }); // settings row, on page 2
-    const lines2 = render(state2);
+    const lines2 = asLines(render(state2));
     expect(lines2[lines2.length - 1]).toBe("p2/2");
     expect(lines2.some((l) => l === "> Settings")).toBe(true);
   });
 
   it("shows a flash message in place of the header", () => {
     const state = base({ flash: "hub unreachable", flashUntil: NOW + 1000 });
-    expect(render(state)[0]).toBe("hub unreachable");
+    expect(asLines(render(state))[0]).toBe("hub unreachable");
   });
 
   it("does not show an expired flash", () => {
     const state = base({ flash: "hub unreachable", flashUntil: NOW - 1000 });
-    expect(render(state)[0]).toBe("AGENTHUB 0 run · 0 ask");
+    expect(asLines(render(state))[0]).toBe("AGENTHUB 0 run · 0 ask");
   });
 });
 
 describe("render: session", () => {
-  it("shows the merged transcript, a pending question, and PR urls at the newest end", () => {
+  it("returns a session ScreenModel with no header line and an input-mode bottom bar when no question is pending", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+    });
+
+    const model = asSession(render(state));
+
+    // No header: the first (and only) transcript line is the content itself,
+    // not "host-a·myrepo" or similar.
+    expect(model.transcriptLines[0]).toBe("> hi");
+    expect(model.transcriptLines.some((l) => l.includes("host-a"))).toBe(false);
+    expect(model.bottom.mode).toBe("input");
+  });
+
+  it("shows a sheet-mode bottom bar with numbered options and a Dictate answer row when a question is pending", () => {
+    const s = session({ id: "s1", session: signals({ question: "Deploy now?", questionOptions: ["Yes", "No"] }) });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [] } },
+    });
+
+    const model = asSession(render(state));
+
+    expect(model.bottom.mode).toBe("sheet");
+    if (model.bottom.mode !== "sheet") throw new Error("unreachable");
+    expect(model.bottom.options).toEqual(["Yes", "No"]);
+    expect(model.bottom.lines.some((l) => l.includes("1. Yes"))).toBe(true);
+    expect(model.bottom.lines.some((l) => l.includes("2. No"))).toBe(true);
+    expect(model.bottom.lines.some((l) => l.includes("Dictate answer…"))).toBe(true);
+  });
+
+  it("shows the merged transcript and PR urls at the newest end, without duplicating the pending question (Task 6: the sheet owns it)", () => {
     const s = session({
       id: "s1",
       repo: "myrepo",
@@ -127,7 +180,7 @@ describe("render: session", () => {
     const state = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      session: newSessionState("host-a", "s1"),
       transcripts: {
         s1: {
           entries: [
@@ -138,12 +191,15 @@ describe("render: session", () => {
       },
     });
 
-    const lines = render(state);
+    const model = asSession(render(state));
 
-    expect(lines.some((l) => l.includes("> hello"))).toBe(true);
-    expect(lines.some((l) => l.includes("hi there"))).toBe(true);
-    expect(lines.some((l) => l.includes("? Deploy now?"))).toBe(true);
-    expect(lines.some((l) => l.includes("https://github.com/x/y/pull/1"))).toBe(true);
+    expect(model.transcriptLines.some((l) => l.includes("> hello"))).toBe(true);
+    expect(model.transcriptLines.some((l) => l.includes("hi there"))).toBe(true);
+    // The question renders once — in the sheet, not the transcript.
+    expect(model.transcriptLines.some((l) => l.includes("Deploy now?"))).toBe(false);
+    expect(model.transcriptLines.some((l) => l.includes("https://github.com/x/y/pull/1"))).toBe(true);
+    expect(model.bottom.mode).toBe("sheet");
+    expect(model.bottom.lines.some((l) => l.includes("Deploy now?"))).toBe(true);
   });
 
   it("pages a long transcript, showing only the bottom-anchored window at offset 0", () => {
@@ -157,15 +213,16 @@ describe("render: session", () => {
     const state = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      session: newSessionState("host-a", "s1"),
       transcripts: { s1: { entries } },
     });
 
-    const lines = render(state);
-    // Header + 9 content lines.
-    expect(lines.length).toBe(10);
-    expect(lines[lines.length - 1]).toContain("line 19");
-    expect(lines.join("\n")).not.toContain("line 0\n");
+    const model = asSession(render(state));
+    // No header line now; the input bottom bar (empty draft, unfocused) is 1
+    // line, so the transcript area is DISPLAY_LINES - 1 = 9.
+    expect(model.transcriptLines.length).toBe(9);
+    expect(model.transcriptLines[model.transcriptLines.length - 1]).toContain("line 19");
+    expect(model.transcriptLines.join("\n")).not.toContain("line 0\n");
   });
 
   it("shows the loading-earlier indicator while history is being fetched", () => {
@@ -174,13 +231,13 @@ describe("render: session", () => {
     const state = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 999 },
+      session: { ...newSessionState("host-a", "s1"), offset: 999 },
       transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
       loadingHistory: { s1: true },
     });
 
-    const lines = render(state);
-    expect(lines).toContain("· loading earlier ·");
+    const model = asSession(render(state));
+    expect(model.transcriptLines).toContain("· loading earlier ·");
   });
 
   it("shows a truncated-history marker at the very top when the buffer's hasMore is true", () => {
@@ -189,7 +246,7 @@ describe("render: session", () => {
     const state = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      session: newSessionState("host-a", "s1"),
       transcripts: {
         s1: {
           entries: [
@@ -201,11 +258,12 @@ describe("render: session", () => {
       },
     });
 
-    const lines = render(state);
-    // Content lines start right after the header (index 0); the marker must
-    // be the topmost content line, ahead of the transcript entries.
-    expect(lines[1]).toBe("· earlier history truncated ·");
-    expect(lines.indexOf("· earlier history truncated ·")).toBeLessThan(lines.findIndex((l) => l.includes("hello")));
+    const model = asSession(render(state));
+    // No header now: the marker must be the very first transcript line.
+    expect(model.transcriptLines[0]).toBe("· earlier history truncated ·");
+    expect(model.transcriptLines.indexOf("· earlier history truncated ·")).toBeLessThan(
+      model.transcriptLines.findIndex((l) => l.includes("hello"))
+    );
   });
 
   it("does not show the truncated marker when hasMore is false (real top) or undefined (never fetched)", () => {
@@ -214,37 +272,116 @@ describe("render: session", () => {
     const falseState = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      session: newSessionState("host-a", "s1"),
       transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }], hasMore: false } },
     });
     const undefinedState = base({
       screen: "session",
       agents,
-      session: { hostKey: "host-a", sessionId: "s1", offset: 0 },
+      session: newSessionState("host-a", "s1"),
       transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
     });
 
-    expect(render(falseState).some((l) => l.includes("truncated"))).toBe(false);
-    expect(render(undefinedState).some((l) => l.includes("truncated"))).toBe(false);
+    expect(asSession(render(falseState)).transcriptLines.some((l) => l.includes("truncated"))).toBe(false);
+    expect(asSession(render(undefinedState)).transcriptLines.some((l) => l.includes("truncated"))).toBe(false);
+  });
+
+  // ---- flash surfacing (Task 5 carry-forward: the session screen has no
+  // header of its own to show it, unlike every other screen) -------------
+
+  it("surfaces an active flash as a transient top line of the transcript", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+      flash: "✓ queued — agent picks up in ~20s",
+      flashUntil: NOW + 1000,
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines[0]).toContain("✓ queued");
+    expect(model.transcriptLines.some((l) => l.includes("hi"))).toBe(true);
+  });
+
+  it("does not show an expired flash on the session screen", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+      flash: "✓ queued — agent picks up in ~20s",
+      flashUntil: NOW - 1,
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines.some((l) => l.includes("queued"))).toBe(false);
+    expect(model.transcriptLines[0]).toBe("> hi");
+  });
+});
+
+describe("SESSION_SCROLL_STEP", () => {
+  it("is 2", () => {
+    expect(SESSION_SCROLL_STEP).toBe(2);
   });
 });
 
 describe("render: actions", () => {
-  it("shows the running-session menu with Answer question when a question is pending", () => {
+  it("shows the running-session menu with no Answer question row when a question is pending (Task 6: the sheet is always visible, so that row was dropped)", () => {
     const s = session({ id: "s1", session: signals({ question: "pick" }) });
     const agents = [agent({ sessions: [s] })];
     const state = base({
       screen: "actions",
       agents,
-      actions: { hostKey: "host-a", sessionId: "s1", cursor: 1 },
+      session: newSessionState("host-a", "s1"),
+      actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
     });
 
-    const lines = render(state);
-    expect(lines).toContain("  Reply (dictate)");
-    expect(lines).toContain("> Answer question");
+    const lines = asLines(render(state));
+    expect(lines).toContain("> Restart");
     expect(lines).toContain("  Kill");
     expect(lines).toContain("  Delete");
     expect(lines).toContain("  Back");
+    expect(lines.some((l) => l.includes("Answer question"))).toBe(false);
+    expect(lines.some((l) => l.includes("Reply"))).toBe(false);
+    expect(lines.some((l) => l.includes("Send"))).toBe(false);
+    expect(lines.some((l) => l.includes("Clear"))).toBe(false);
+  });
+
+  it("prepends Send/Clear ahead of the other rows once the session's bottom-box draft has text", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "actions",
+      agents,
+      session: { ...newSessionState("host-a", "s1"), draft: "deploy the fix" },
+      actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
+    });
+
+    const lines = asLines(render(state));
+    expect(lines).toContain("> Send");
+    expect(lines).toContain("  Clear");
+    expect(lines).toContain("  Restart");
+    expect(lines).toContain("  Kill");
+  });
+
+  it("ignores another session's draft (Send/Clear only reflect the actions target's own session)", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "actions",
+      agents,
+      session: { ...newSessionState("host-a", "other-session"), draft: "unrelated draft" },
+      actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
+    });
+
+    const lines = asLines(render(state));
+    expect(lines.some((l) => l.includes("Send"))).toBe(false);
+    expect(lines.some((l) => l.includes("Clear"))).toBe(false);
   });
 
   it("omits Answer question and dictate/restart when the session is stopped", () => {
@@ -256,35 +393,12 @@ describe("render: actions", () => {
       actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
     });
 
-    const lines = render(state);
+    const lines = asLines(render(state));
     expect(lines).toContain("> Start");
     expect(lines).toContain("  Delete");
     expect(lines).toContain("  Back");
     expect(lines.some((l) => l.includes("Reply"))).toBe(false);
     expect(lines.some((l) => l.includes("Kill"))).toBe(false);
-  });
-});
-
-describe("render: question", () => {
-  it("shows the wrapped question, numbered options, dictate, and back, with the cursor marker", () => {
-    const s = session({
-      id: "s1",
-      session: signals({ question: "Which approach?", questionOptions: ["Fast", "Safe", "Cheap"] }),
-    });
-    const agents = [agent({ sessions: [s] })];
-    const state = base({
-      screen: "question",
-      agents,
-      question: { hostKey: "host-a", sessionId: "s1", cursor: 1 },
-    });
-
-    const lines = render(state);
-    expect(lines.some((l) => l.includes("Which approach?"))).toBe(true);
-    expect(lines).toContain("  1) Fast");
-    expect(lines).toContain("> 2) Safe");
-    expect(lines).toContain("  3) Cheap");
-    expect(lines).toContain("  Dictate answer…");
-    expect(lines).toContain("  Back");
   });
 });
 
@@ -299,7 +413,7 @@ describe("render: reply", () => {
         cursor: 0,
       },
     });
-    expect(render(state)).toContain("● listening… (tap=done)");
+    expect(asLines(render(state))).toContain("● listening… (tap=done)");
   });
 
   it("shows the preview text, char count, and Send/Redo/Cancel buttons", () => {
@@ -312,7 +426,7 @@ describe("render: reply", () => {
         cursor: 0,
       },
     });
-    const lines = render(state);
+    const lines = asLines(render(state));
     expect(lines.some((l) => l.includes("deploy it"))).toBe(true);
     expect(lines).toContain("9 chars");
     expect(lines).toContain("> Send");
@@ -331,7 +445,7 @@ describe("render: reply", () => {
         cursor: 0,
       },
     });
-    const lines = render(state);
+    const lines = asLines(render(state));
     expect(lines.some((l) => l.includes("whisper not configured"))).toBe(true);
     expect(lines).toContain("> Redo");
     expect(lines).toContain("  Cancel");
@@ -345,7 +459,7 @@ describe("render: confirm", () => {
       screen: "confirm",
       confirm: { action: { kind: "kill", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 0 },
     });
-    const lines = render(state);
+    const lines = asLines(render(state));
     expect(lines[0]).toBe("Kill sess-0?");
     expect(lines).toContain("> Cancel");
     expect(lines).toContain("  Confirm");
@@ -356,7 +470,7 @@ describe("render: confirm", () => {
       screen: "confirm",
       confirm: { action: { kind: "delete", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 1 },
     });
-    const lines = render(state);
+    const lines = asLines(render(state));
     expect(lines[0]).toContain("Also removes branch");
     expect(lines).toContain("  Cancel");
     expect(lines).toContain("> Confirm");
@@ -380,7 +494,7 @@ describe("render: newRepo", () => {
       newRepo: { hostKey: "host-a", cursor: 1 },
     });
 
-    const lines = render(state);
+    const lines = asLines(render(state));
     expect(lines).toContain("  repoA");
     expect(lines).toContain("> Resume old-fix");
     expect(lines).toContain("  repoB");
@@ -391,7 +505,7 @@ describe("render: settings", () => {
   it("shows host online/offline counts", () => {
     const agents = [agent({ key: "a", online: true }), agent({ key: "b", online: false })];
     const state = base({ screen: "settings", agents, settings: { cursor: 0 } });
-    const lines = render(state);
+    const lines = asLines(render(state));
     expect(lines).toContain("1/2 hosts online");
   });
 });

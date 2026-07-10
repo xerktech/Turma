@@ -12,7 +12,16 @@
 //     limit, truncating from the top (dropping the oldest/least-relevant
 //     content) so the newest, bottom-anchored content always survives.
 
-export function createTrailingDebounce<T>(fn: (value: T) => void, waitMs: number): (value: T) => void {
+// A debounced callable that also exposes `cancel()` — dropping any pending
+// trailing invocation. Used when an out-of-band, immediate action (a
+// `rebuildPageContainer`) supersedes whatever stale value the debounce was
+// about to flush, so the late flush can't clobber the fresh state.
+export interface Debounced<T> {
+  (value: T): void;
+  cancel(): void;
+}
+
+export function createTrailingDebounce<T>(fn: (value: T) => void, waitMs: number): Debounced<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let lastInvokeAt = -Infinity;
   let pending: T | undefined;
@@ -23,7 +32,7 @@ export function createTrailingDebounce<T>(fn: (value: T) => void, waitMs: number
     fn(value);
   };
 
-  return (value: T): void => {
+  const debounced = (value: T): void => {
     pending = value;
     const sinceLastInvoke = Date.now() - lastInvokeAt;
     if (timer === null && sinceLastInvoke >= waitMs) {
@@ -41,6 +50,19 @@ export function createTrailingDebounce<T>(fn: (value: T) => void, waitMs: number
       invoke(v);
     }, waitMs);
   };
+
+  // Drop the pending trailing invocation (if any) without firing it. Leaves
+  // `lastInvokeAt` untouched so a subsequent isolated call still fires on the
+  // leading edge as usual.
+  debounced.cancel = (): void => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    pending = undefined;
+  };
+
+  return debounced;
 }
 
 export function capContent(content: string, maxChars: number): string {

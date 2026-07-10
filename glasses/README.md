@@ -10,6 +10,33 @@ purely by the `GlassesDisplay` / `Dictation` / `KeyValueStorage` interfaces;
 (`src/display/dom.ts`, `npm run dev`), chosen automatically by racing
 `waitForEvenAppBridge()` against a short timeout.
 
+### Session screen: bottom bar + focus model
+
+The session screen has no header line — the whole canvas is the transcript
+plus a persistent bordered box pinned to the bottom (drawn as a real
+bordered container only on hardware; the DOM dev backend stands it in with a
+plain-text divider, see `src/display/dom.ts`). The box has two modes: an
+**input box** (a dictation target and free-text draft, with a right-corner
+status label showing REC/…/Working/Waiting/etc.) and, whenever the session
+has a pending `AskUserQuestion` the user hasn't already started dictating an
+answer to, a **question sheet** — the question text and numbered options
+fill/grow/scroll the same box, plus a trailing "Dictate answer…" row.
+
+Two focus states drive input dispatch (`SessionFocus` in `src/render.ts`):
+**transcript focus** (the default on entering the screen) scrolls the
+transcript ~2 lines per gesture (`SESSION_SCROLL_STEP`) and a tap either
+snaps back to the newest content (if scrolled up) or hands focus to the
+bottom box; a double-tap always leaves the session screen. **Bottom focus**
+dispatches to whichever mode is active: in the input box, tap starts/stops
+in-box dictation and a double-tap opens the context actions menu (Send —
+only shown once there's a draft —/Clear/Restart/Kill/Delete/Back); in the
+question sheet, scroll moves the highlighted option (including the trailing
+"Dictate answer…" row) and tap either sends the highlighted option's 1-based
+digit as the answer or, on the trailing row, starts box dictation instead.
+The separate full-screen reply and question-answering screens are gone; the
+reply screen still exists but only for the spawn/`newPrompt` initial-prompt
+flow.
+
 ## Dev quickstart
 
 ```sh
@@ -106,10 +133,20 @@ to exercise the whole STT path without hardware.
 - Session list matches the web dashboard.
 - Each lifecycle action (spawn/kill/start/restart/resume) shows queued (…)
   then converges within ~40s.
-- A dictated reply appears in the session's terminal and Claude answers it.
-- `AskUserQuestion` shows the option labels; tapping one answers it (digit +
-  Enter lands in the RC TUI — verify); a dictated free-text answer is also
-  verified.
+- No header line on the session screen — the transcript runs to the top of
+  the canvas, with the bordered bottom box the only other thing on screen.
+- Scrolling the transcript feels smooth in ~2-line steps per gesture (not a
+  full-page jump); tapping (when not scrolled up) focuses the bottom box.
+- A pending `AskUserQuestion` turns the bottom box into a sheet: the
+  question text and options fill/grow/scroll the box as needed; scrolling
+  highlights an option (including a trailing "Dictate answer…" row) and
+  tapping a highlighted option sends its digit — verify it lands correctly
+  in the RC TUI (the agent appends Enter).
+- Dictating into the bottom input box appends to its draft, and Send (from
+  the box's double-tap context menu) delivers it to the session.
+- The drawn border around the bottom box and real G2-mic dictation are
+  hardware-only — the DOM dev backend stands in a plain-text divider and
+  can't exercise the mic, so both need on-hardware verification.
 - Scrolling a long session to the top loads/prepends history with a
   truncated marker.
 - Resuming a closed session from the Resume picker works.

@@ -11,14 +11,18 @@ import {
   type RevealState,
 } from "./reveal.ts";
 import { flattenSessions } from "./sessions.ts";
+import { draftMaxViewOffset, type MicState } from "./input-box.ts";
 import {
   buildActionsRows,
   buildHomeRows,
   buildNewRepoRows,
+  questionSheetActive,
   render,
-  SESSION_CONTENT_AREA,
   sessionContentLines,
+  sessionTranscriptArea,
+  SESSION_SCROLL_STEP,
   type HomeRow,
+  type SessionFocus,
 } from "./render.ts";
 import type { AgentInfo, InputEvent, SessionInfo, SessionRef, SessionStatus, TailEntry } from "./types.ts";
 
@@ -26,7 +30,6 @@ export type Screen =
   | "home"
   | "session"
   | "actions"
-  | "question"
   | "reply"
   | "confirm"
   | "newHost"
@@ -69,6 +72,18 @@ export interface SessionScreenState {
   hostKey: string;
   sessionId: string;
   offset: number; // lines scrolled up from the bottom (0 = anchored at bottom)
+  focus: SessionFocus; // transcript scroll vs. the bottom input/sheet box
+  draft: string; // dictation buffer for the bottom input box
+  mic: MicState;
+  viewOffset: number; // scroll within a tall bottom box
+  selected: number; // highlighted sheet option (AskUserQuestion)
+}
+
+// Every transition into the session screen builds its SessionScreenState
+// through here so the new focus/draft/mic/viewOffset/selected fields never
+// drift out of sync between call sites.
+export function newSessionState(hostKey: string, sessionId: string): SessionScreenState {
+  return { hostKey, sessionId, offset: 0, focus: "transcript", draft: "", mic: "idle", viewOffset: 0, selected: 0 };
 }
 
 export interface ActionsScreenState {
@@ -77,14 +92,8 @@ export interface ActionsScreenState {
   cursor: number;
 }
 
-export interface QuestionScreenState {
-  hostKey: string;
-  sessionId: string;
-  cursor: number;
-}
-
 export type ReplyTarget =
-  | { kind: "session"; hostKey: string; sessionId: string; back: "session" | "question" }
+  | { kind: "session"; hostKey: string; sessionId: string; back: "session" }
   | {
       kind: "spawn";
       hostKey: string;
@@ -153,7 +162,6 @@ export interface AppState {
   home: HomeScreenState;
   session: SessionScreenState | null;
   actions: ActionsScreenState | null;
-  question: QuestionScreenState | null;
   reply: ReplyScreenState | null;
   confirm: ConfirmScreenState | null;
   newHost: NewHostScreenState | null;
@@ -178,7 +186,6 @@ export function createInitialState(now: number): AppState {
     home: { cursor: 0 },
     session: null,
     actions: null,
-    question: null,
     reply: null,
     confirm: null,
     newHost: null,
@@ -258,6 +265,12 @@ export class App {
       const r = this.state.reply;
       this.dictation.cancel();
       this.leaveReply(r);
+    } else if (this.state.session && (this.state.session.mic === "recording" || this.state.session.mic === "finalising")) {
+      // Task 5: dictation can now also be live directly in the session's
+      // bottom box (no reply screen involved) — cancel that mic the same
+      // way, so backgrounding never leaves it hot.
+      this.dictation.cancel();
+      this.setState({ session: { ...this.state.session, mic: "idle" } });
     }
     this.paused = true;
     if (this.pollTimer) {
@@ -455,6 +468,14 @@ export class App {
       }
       const pending = this.reconcilePending(this.state.pending, res.agents, sessionRefs, now);
       const wasErroring = this.state.pollErrorActive;
+      // Snapshot the current session's pending-question view *before* the
+      // new agents array lands — used below to detect a question that just
+      // arrived this poll (vs. one the user is already comfortably sitting
+      // in the sheet with).
+      const prevSession = this.state.session;
+      const prevQuestion = prevSession
+        ? findSession(this.state, prevSession.hostKey, prevSession.sessionId)?.session?.question ?? null
+        : null;
       this.state = {
         ...this.state,
         now,
@@ -478,6 +499,35 @@ export class App {
       if (this.state.screen === "session" && this.state.session) {
         this.reanchorReveal(this.state.session.sessionId);
         this.scheduleRevealTick();
+      }
+      // A question that newly appeared while the bottom box was focused in
+      // plain input mode must not let the user's next gesture land on the
+      // freshly-arrived sheet by accident (and, if they were mid-dictation,
+      // must not leave that mic stranded hot) — cancel any live box
+      // recording and drop focus back to the transcript. Mirrors
+      // ClaudeHUD's setPendingSheet, which drops input focus the instant a
+      // sheet appears. Only fires on the *arrival* transition (prevQuestion
+      // was falsy) — an already-pending question the user is actively
+      // working the sheet for must not get its focus yanked on every poll.
+      if (this.state.session && this.state.session.focus === "bottom") {
+        const sess = this.state.session;
+        const live = findSession(this.state, sess.hostKey, sess.sessionId);
+        const nowQuestion = live?.session?.question ?? null;
+        if (nowQuestion && !prevQuestion) {
+          if (sess.mic === "recording" || sess.mic === "finalising") this.dictation.cancel();
+          this.state = { ...this.state, session: { ...sess, mic: "idle", focus: "transcript" } };
+        } else if (nowQuestion && prevQuestion && nowQuestion !== prevQuestion) {
+          // A *different* question replaced the one already pending on this
+          // session while the user was still sitting in its sheet (not a
+          // fresh arrival, so the branch above doesn't fire) — the sheet's
+          // highlighted row must not carry over onto the new question's own
+          // options list. Dispatch already clamps `selected` against the
+          // new options length so a stale index can't send a wrong digit,
+          // but the highlight itself would still land on the wrong row
+          // until the user scrolls. Reset it, edge-triggered the same way
+          // as the arrival guard above.
+          this.state = { ...this.state, session: { ...sess, selected: 0 } };
+        }
       }
       this.repaint();
     } catch {
@@ -559,8 +609,6 @@ export class App {
         return this.onSession(e);
       case "actions":
         return this.onActions(e);
-      case "question":
-        return this.onQuestion(e);
       case "reply":
         return this.onReply(e);
       case "confirm":
@@ -612,7 +660,7 @@ export class App {
       if (row.kind === "session" && row.hostKey && row.sessionId) {
         this.setState({
           screen: "session",
-          session: { hostKey: row.hostKey, sessionId: row.sessionId, offset: 0 },
+          session: newSessionState(row.hostKey, row.sessionId),
         });
       } else if (row.kind === "newSession") {
         this.setState({ screen: "newHost", newHost: { cursor: 0 } });
@@ -629,19 +677,23 @@ export class App {
     return lines.length;
   }
 
+  // Transcript-focus gestures (the default focus on entering the session
+  // screen). scrollUp/scrollDown creep the transcript SESSION_SCROLL_STEP
+  // lines at a time (not a full-page jump) against the same area render.ts
+  // windows against (sessionTranscriptArea — the bottom box's height varies
+  // with its content, so this can't be a fixed constant). tap snaps back to
+  // the newest content if scrolled, otherwise hands focus to the bottom
+  // box; doubleTap always leaves the session screen.
   private onSession(e: InputEvent): void {
     const s = this.state.session;
     if (!s) return this.goHome();
+    if (s.focus === "bottom") return this.onSessionBottom(e, s);
     if (e.type === "doubleTap") return this.goHome();
-    if (e.type === "tap") {
-      this.setState({ screen: "actions", actions: { hostKey: s.hostKey, sessionId: s.sessionId, cursor: 0 } });
-      return;
-    }
-    const contentArea = SESSION_CONTENT_AREA;
+    const area = sessionTranscriptArea(this.state, s);
     const total = this.sessionContentLength(s.hostKey, s.sessionId);
-    const maxOffset = Math.max(0, total - contentArea);
+    const maxOffset = Math.max(0, total - area);
     if (e.type === "scrollDown") {
-      this.setState({ session: { ...s, offset: Math.max(0, s.offset - contentArea) } });
+      this.setState({ session: { ...s, offset: Math.max(0, s.offset - SESSION_SCROLL_STEP) } });
       return;
     }
     if (e.type === "scrollUp") {
@@ -657,8 +709,178 @@ export class App {
         }
         return; // nothing more to load
       }
-      this.setState({ session: { ...s, offset: Math.min(maxOffset, s.offset + contentArea) } });
+      this.setState({ session: { ...s, offset: Math.min(maxOffset, s.offset + SESSION_SCROLL_STEP) } });
+      return;
     }
+    if (e.type === "tap") {
+      if (s.offset > 0) {
+        this.setState({ session: { ...s, offset: 0 } }); // snap to newest
+      } else {
+        this.setState({ session: { ...s, focus: "bottom" } });
+      }
+    }
+  }
+
+  // Bottom-box focus gestures. A pending AskUserQuestion turns the box into
+  // a sheet (Task 6) — dispatched by onSheetBottom below, per
+  // questionSheetActive (shared with render.ts's mode choice so the two
+  // never disagree about what's on screen). Otherwise (plain input mode, or
+  // a pending question the user has already handed off to dictation/a draft)
+  // this is Task 5's real dispatch: tap toggles in-box dictation, scroll
+  // moves the box's view (or exits to the transcript at either end),
+  // doubleTap opens the context actions menu.
+  private onSessionBottom(e: InputEvent, s: SessionScreenState): void {
+    const live = findSession(this.state, s.hostKey, s.sessionId);
+    if (questionSheetActive(live?.session?.question, s)) {
+      return this.onSheetBottom(e, s, live);
+    }
+
+    if (e.type === "doubleTap") {
+      // Leaving input focus with the mic still hot (tap-to-record, then
+      // doubleTap before the stop-tap) would strand a live HubAudioDictation
+      // recorder capturing until the app happens to background. Cancel it and
+      // clear the mic at the transition, mirroring onReply's doubleTap guard.
+      this.cancelBoxDictation(s);
+      this.setState({
+        screen: "actions",
+        session: { ...s, mic: "idle" },
+        actions: { hostKey: s.hostKey, sessionId: s.sessionId, cursor: 0 },
+      });
+      return;
+    }
+    if (e.type === "tap") {
+      this.toggleBoxDictation(s);
+      return;
+    }
+    if (e.type === "scrollUp" || e.type === "scrollDown") {
+      this.scrollInputBox(e.type, s);
+    }
+  }
+
+  // Sheet-mode dispatch (Task 6): scroll moves `selected` through
+  // [...options, "Dictate answer…"], clamped; tap on an option index sends
+  // that 1-based digit as the answer (the agent appends Enter) and hands
+  // focus back to the transcript; tap on the trailing "Dictate answer…" row
+  // starts box dictation instead of answering directly — that flips
+  // questionSheetActive false for the rest of the flow (mic goes hot, then a
+  // draft lands), so the box renders/dispatches as plain input from here,
+  // and the dictated answer is later sent through the ordinary actions-menu
+  // Send path (Task 5) rather than a bespoke one. doubleTap still reaches
+  // the actions menu. The mic is guaranteed idle on entry (questionSheetActive
+  // requires it), so cancelBoxDictation below is a no-op in practice — kept
+  // anyway so no future change to this dispatch can strand a hot mic on a
+  // sheet-focus-leaving transition.
+  private onSheetBottom(e: InputEvent, s: SessionScreenState, live: SessionInfo | undefined): void {
+    const options = live?.session?.questionOptions ?? [];
+    if (e.type === "doubleTap") {
+      this.cancelBoxDictation(s);
+      this.setState({
+        screen: "actions",
+        session: { ...s, mic: "idle" },
+        actions: { hostKey: s.hostKey, sessionId: s.sessionId, cursor: 0 },
+      });
+      return;
+    }
+    if (e.type === "scrollUp" || e.type === "scrollDown") {
+      const dir = e.type === "scrollDown" ? 1 : -1;
+      const selected = clamp(s.selected + dir, 0, options.length);
+      this.setState({ session: { ...s, selected } });
+      return;
+    }
+    if (e.type === "tap") {
+      if (s.selected < options.length) {
+        const digit = String(s.selected + 1);
+        this.markPending(s.sessionId, live);
+        void this.client
+          .sendInput(s.hostKey, s.sessionId, digit)
+          .then(() => {
+            this.flash(FLASH_QUEUED);
+            this.repaint();
+          })
+          .catch(() => {
+            this.flash(FLASH_HUB_UNREACHABLE);
+            this.repaint();
+          });
+        this.setState({ session: { ...s, focus: "transcript" } });
+        return;
+      }
+      // Trailing "Dictate answer…" row.
+      this.toggleBoxDictation(s);
+    }
+  }
+
+  // Cancels a live box recording if one is active (recording/finalising) —
+  // shared by every path that leaves the bottom input focus, so a hot mic
+  // never outlives the screen it was started on. No-op for idle/error.
+  private cancelBoxDictation(s: SessionScreenState): void {
+    if (s.mic === "recording" || s.mic === "finalising") this.dictation.cancel();
+  }
+
+  // idle -> recording (dictation.start) -> finalising (dictation.stop);
+  // ignored while finalising/error so a stray extra tap can't double-fire
+  // start/stop against an in-flight result. The originating session's
+  // hostKey+sessionId are captured into the result callback so a late
+  // transcript delivered after the user navigated to a *different* session
+  // can be dropped rather than misattributed (see onBoxDictationResult).
+  private toggleBoxDictation(s: SessionScreenState): void {
+    if (s.mic === "idle") {
+      const { hostKey, sessionId } = s;
+      this.setState({ session: { ...s, mic: "recording" } });
+      this.dictation.start((r) => this.onBoxDictationResult(r, hostKey, sessionId));
+      return;
+    }
+    if (s.mic === "recording") {
+      this.setState({ session: { ...s, mic: "finalising" } });
+      this.dictation.stop();
+    }
+  }
+
+  // Delivered result -> appended to the draft (space-joined with whatever
+  // was already there), mic back to idle, and the box's scroll snapped to
+  // the tail so the just-added text is what's visible. Unavailable -> flash
+  // the reason and settle back to idle rather than stranding the box in a
+  // permanent error state the input-mode tap dispatch would otherwise never
+  // let the user out of (tap is a no-op while mic==="error").
+  //
+  // Guarded on the originating session: if the current session isn't the one
+  // the dictation started on (user navigated away mid-capture), the result
+  // is dropped — never appended to, and thus never Sent to, the wrong agent.
+  private onBoxDictationResult(result: DictationResult, hostKey: string, sessionId: string): void {
+    const s = this.state.session;
+    if (!s || s.hostKey !== hostKey || s.sessionId !== sessionId) return;
+    if (result.unavailable) {
+      this.setState({ session: { ...s, mic: "error" } });
+      this.flash(result.reason ?? "dictation unavailable");
+      this.setState({ session: { ...s, mic: "idle" } });
+      return;
+    }
+    const draft = s.draft ? `${s.draft} ${result.text}` : result.text;
+    this.setState({ session: { ...s, draft, mic: "idle", viewOffset: 0 } });
+  }
+
+  // Moves the box's view one line at a time (mirrors the transcript's
+  // step-scroll); running off either end hands focus back to the
+  // transcript rather than clamping in place — an empty draft has nothing
+  // to scroll through, so any scroll there exits immediately. Any exit to
+  // the transcript also cancels a live box recording (same hot-mic guard as
+  // the doubleTap path above).
+  private scrollInputBox(type: "scrollUp" | "scrollDown", s: SessionScreenState): void {
+    if (s.draft === "") return this.handBackToTranscript(s);
+    if (type === "scrollDown") {
+      if (s.viewOffset <= 0) return this.handBackToTranscript(s);
+      this.setState({ session: { ...s, viewOffset: s.viewOffset - 1 } });
+      return;
+    }
+    const maxOffset = draftMaxViewOffset(s.draft);
+    if (s.viewOffset >= maxOffset) return this.handBackToTranscript(s);
+    this.setState({ session: { ...s, viewOffset: s.viewOffset + 1 } });
+  }
+
+  // Hands focus back to the transcript, cancelling any live box recording
+  // and resetting the mic first so the mic never outlives the input focus.
+  private handBackToTranscript(s: SessionScreenState): void {
+    this.cancelBoxDictation(s);
+    this.setState({ session: { ...s, focus: "transcript", mic: "idle" } });
   }
 
   private clearHistoryTimer(sessionId: string): void {
@@ -736,7 +958,7 @@ export class App {
     const a = this.state.actions;
     if (!a) return this.goHome();
     if (e.type === "doubleTap") {
-      this.setState({ screen: "session", session: { hostKey: a.hostKey, sessionId: a.sessionId, offset: 0 } });
+      this.setState({ screen: "session", session: this.returnToSession(a.hostKey, a.sessionId) });
       return;
     }
     const rows = buildActionsRows(this.state, a.hostKey, a.sessionId);
@@ -755,17 +977,27 @@ export class App {
 
   private runAction(hostKey: string, sessionId: string, action: string): void {
     switch (action) {
-      case "reply":
-        this.setState({
-          screen: "reply",
-          reply: { target: { kind: "session", hostKey, sessionId, back: "session" }, phase: "listening", text: "", cursor: 0 },
-        });
-        this.startDictation();
-        return;
-      case "answer": {
-        this.setState({ screen: "question", question: { hostKey, sessionId, cursor: 0 } });
+      case "send": {
+        const sess = this.state.session;
+        const draft = sess && sess.hostKey === hostKey && sess.sessionId === sessionId ? sess.draft : "";
+        const s = findSession(this.state, hostKey, sessionId);
+        this.markPending(sessionId, s);
+        void this.client
+          .sendInput(hostKey, sessionId, draft)
+          .then(() => {
+            this.flash(FLASH_QUEUED);
+            this.repaint();
+          })
+          .catch(() => {
+            this.flash(FLASH_HUB_UNREACHABLE);
+            this.repaint();
+          });
+        this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
         return;
       }
+      case "clear":
+        this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
+        return;
       case "restart":
         this.queueAction(hostKey, sessionId, "restart");
         return;
@@ -779,9 +1011,29 @@ export class App {
         this.setState({ screen: "confirm", confirm: { action: { kind: "delete", hostKey, sessionId }, cursor: 0 } });
         return;
       case "back":
-        this.setState({ screen: "session", session: { hostKey, sessionId, offset: 0 } });
+        // Non-destructive exit: unlike Send/Clear (which must zero the
+        // draft), Back must not discard a dictated draft the user hasn't
+        // acted on yet — input mode has no tap-to-send, so the actions menu
+        // is the only route to Send, and bouncing through it must be a safe
+        // no-op. Preserve the existing session state (draft/focus/mic/
+        // viewOffset/selected) rather than minting a fresh one.
+        this.setState({ screen: "session", session: this.returnToSession(hostKey, sessionId) });
         return;
     }
+  }
+
+  // Returns to the session screen after a non-destructive actions-menu exit
+  // (doubleTap out, or the "Back" row) preserving whatever session state was
+  // already there — draft, focus, mic, viewOffset, selected — rather than
+  // resetting via newSessionState (which Send/Clear still use deliberately,
+  // since those *should* zero the draft). Falls back to a fresh state only
+  // if state.session doesn't already match this hostKey/sessionId, which
+  // shouldn't happen in practice (actions is only ever entered from this
+  // exact session) but keeps this defensive rather than silently wrong.
+  private returnToSession(hostKey: string, sessionId: string): SessionScreenState {
+    const s = this.state.session;
+    if (s && s.hostKey === hostKey && s.sessionId === sessionId) return s;
+    return newSessionState(hostKey, sessionId);
   }
 
   private queueAction(hostKey: string, sessionId: string, action: "kill" | "start" | "restart" | "resume"): void {
@@ -797,60 +1049,7 @@ export class App {
         this.flash(FLASH_HUB_UNREACHABLE);
         this.repaint();
       });
-    this.setState({ screen: "session", session: { hostKey, sessionId, offset: 0 } });
-  }
-
-  // ---- question -------------------------------------------------------
-
-  private onQuestion(e: InputEvent): void {
-    const q = this.state.question;
-    if (!q) return this.goHome();
-    if (e.type === "doubleTap") {
-      this.setState({ screen: "session", session: { hostKey: q.hostKey, sessionId: q.sessionId, offset: 0 } });
-      return;
-    }
-    const s = findSession(this.state, q.hostKey, q.sessionId);
-    const options = s?.session?.questionOptions ?? [];
-    const rowCount = options.length + 2; // options + dictate + back
-    if (e.type === "scrollDown" || e.type === "scrollUp") {
-      const dir = e.type === "scrollDown" ? 1 : -1;
-      this.setState({ question: { ...q, cursor: clamp(q.cursor + dir, 0, rowCount - 1) } });
-      return;
-    }
-    if (e.type === "tap") {
-      if (q.cursor < options.length) {
-        const digit = String(q.cursor + 1);
-        this.markPending(q.sessionId, s);
-        void this.client
-          .sendInput(q.hostKey, q.sessionId, digit)
-          .then(() => {
-            this.flash(FLASH_QUEUED);
-            this.repaint();
-          })
-          .catch(() => {
-            this.flash(FLASH_HUB_UNREACHABLE);
-            this.repaint();
-          });
-        this.setState({ screen: "session", session: { hostKey: q.hostKey, sessionId: q.sessionId, offset: 0 } });
-        return;
-      }
-      if (q.cursor === options.length) {
-        // Dictate answer…
-        this.setState({
-          screen: "reply",
-          reply: {
-            target: { kind: "session", hostKey: q.hostKey, sessionId: q.sessionId, back: "question" },
-            phase: "listening",
-            text: "",
-            cursor: 0,
-          },
-        });
-        this.startDictation();
-        return;
-      }
-      // Back
-      this.setState({ screen: "session", session: { hostKey: q.hostKey, sessionId: q.sessionId, offset: 0 } });
-    }
+    this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
   }
 
   // ---- reply (dictation) ----------------------------------------------
@@ -911,7 +1110,7 @@ export class App {
     if (r.target.kind === "session") {
       this.setState({
         screen: r.target.back,
-        session: { hostKey: r.target.hostKey, sessionId: r.target.sessionId, offset: 0 },
+        session: newSessionState(r.target.hostKey, r.target.sessionId),
       });
     } else {
       this.setState({
@@ -936,7 +1135,7 @@ export class App {
           this.flash(FLASH_HUB_UNREACHABLE);
           this.repaint();
         });
-      this.setState({ screen: "session", session: { hostKey, sessionId, offset: 0 } });
+      this.setState({ screen: "session", session: newSessionState(hostKey, sessionId) });
       return;
     }
     const { hostKey, repo, label, baseRef, branchName, model, permissionMode } = r.target;

@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { App, createInitialState, type AppState } from "./app.ts";
+import { App, createInitialState, newSessionState, type AppState } from "./app.ts";
 import type { HubClient } from "./hub-client.ts";
 import type { GlassesDisplay } from "./display/index.ts";
 import type { Dictation, DictationResult } from "./dictation.ts";
+import type { ScreenModel } from "./render.ts";
 import type { AgentInfo, InputEvent } from "./types.ts";
 import {
   installLifecycle,
@@ -26,13 +27,20 @@ function host(): SnapshotHost {
 }
 
 class FakeDisplay implements GlassesDisplay {
-  lines: string[] = [];
+  model: ScreenModel | null = null;
   teardownCalled = 0;
   private cb: ((e: InputEvent) => void) | null = null;
 
+  get lines(): string[] {
+    if (!this.model) return [];
+    return this.model.type === "lines"
+      ? this.model.lines
+      : [...this.model.transcriptLines, ...this.model.bottom.lines];
+  }
+
   async start(): Promise<void> {}
-  render(lines: string[]): void {
-    this.lines = lines;
+  render(model: ScreenModel): void {
+    this.model = model;
   }
   onInput(cb: (e: InputEvent) => void): void {
     this.cb = cb;
@@ -179,7 +187,7 @@ describe("snapshotFromState", () => {
   });
 
   it("records the session screen with its hostKey/sessionId", () => {
-    const s = state({ screen: "session", session: { hostKey: "h", sessionId: "s1", offset: 3 } });
+    const s = state({ screen: "session", session: { ...newSessionState("h", "s1"), offset: 3 } });
     expect(snapshotFromState(s)).toEqual({ screen: "session", hostKey: "h", sessionId: "s1" });
   });
 
@@ -189,11 +197,6 @@ describe("snapshotFromState", () => {
 
   it("maps the transient actions screen to its parent session", () => {
     const s = state({ screen: "actions", actions: { hostKey: "h", sessionId: "s1", cursor: 2 } });
-    expect(snapshotFromState(s)).toEqual({ screen: "session", hostKey: "h", sessionId: "s1" });
-  });
-
-  it("maps the transient question screen to its parent session", () => {
-    const s = state({ screen: "question", question: { hostKey: "h", sessionId: "s1", cursor: 1 } });
     expect(snapshotFromState(s)).toEqual({ screen: "session", hostKey: "h", sessionId: "s1" });
   });
 
@@ -268,7 +271,7 @@ describe("installLifecycle", () => {
     let snap = JSON.parse(host().__getStateSnapshot!());
     expect(snap[BACKGROUND_STATE_KEY]).toEqual({ screen: "home", hostKey: null, sessionId: null });
 
-    app.restoreScreen("session", { hostKey: "host-a", sessionId: "s1", offset: 0 });
+    app.restoreScreen("session", newSessionState("host-a", "s1"));
     snap = JSON.parse(host().__getStateSnapshot!());
     expect(snap[BACKGROUND_STATE_KEY]).toEqual({ screen: "session", hostKey: "host-a", sessionId: "s1" });
   });
@@ -284,7 +287,7 @@ describe("installLifecycle", () => {
     );
 
     expect(app.getState().screen).toBe("session");
-    expect(app.getState().session).toEqual({ hostKey: "host-a", sessionId: "s1", offset: 0 });
+    expect(app.getState().session).toEqual(newSessionState("host-a", "s1"));
   });
 
   it("restores to a plain screen when the snapshot has no session", async () => {
@@ -304,7 +307,7 @@ describe("installLifecycle", () => {
     installLifecycle(appA);
     await appA.start();
     await vi.advanceTimersByTimeAsync(0);
-    appA.restoreScreen("session", { hostKey: "host-b", sessionId: "s9", offset: 0 });
+    appA.restoreScreen("session", newSessionState("host-b", "s9"));
 
     const snapshot = host().__getStateSnapshot!();
 
@@ -318,7 +321,7 @@ describe("installLifecycle", () => {
     host().__restoreState?.(snapshot);
 
     expect(appB.getState().screen).toBe("session");
-    expect(appB.getState().session).toEqual({ hostKey: "host-b", sessionId: "s9", offset: 0 });
+    expect(appB.getState().session).toEqual(newSessionState("host-b", "s9"));
   });
 
   it("works during the boot window: snapshot and restore both function BEFORE app.start()", async () => {
@@ -337,7 +340,7 @@ describe("installLifecycle", () => {
       JSON.stringify({ [BACKGROUND_STATE_KEY]: { screen: "session", hostKey: "h", sessionId: "s1" } })
     );
     expect(app.getState().screen).toBe("session");
-    expect(app.getState().session).toEqual({ hostKey: "h", sessionId: "s1", offset: 0 });
+    expect(app.getState().session).toEqual(newSessionState("h", "s1"));
 
     // Starting afterwards keeps the restored screen (the poll merges agent
     // data but never navigates).
@@ -354,8 +357,9 @@ describe("installLifecycle", () => {
 
     // Simulate the user being mid-flow on the actions screen when the host
     // backgrounds the app: snapshot must record the parent session view.
-    app.restoreScreen("session", { hostKey: "host-a", sessionId: "s1", offset: 0 });
-    app.handleInput({ type: "tap" }); // session -> actions
+    app.restoreScreen("session", newSessionState("host-a", "s1"));
+    app.handleInput({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
+    app.handleInput({ type: "doubleTap" }); // input-mode doubleTap -> actions
     expect(app.getState().screen).toBe("actions");
 
     const snapshot = host().__getStateSnapshot!();
@@ -372,7 +376,7 @@ describe("installLifecycle", () => {
     installLifecycle(appB);
     host().__restoreState?.(snapshot);
     expect(appB.getState().screen).toBe("session");
-    expect(appB.getState().session).toEqual({ hostKey: "host-a", sessionId: "s1", offset: 0 });
+    expect(appB.getState().session).toEqual(newSessionState("host-a", "s1"));
   });
 
   it("degrades an unknown/transient screen in a stale snapshot to home on restore", async () => {
@@ -438,12 +442,14 @@ describe("lifecycle phase handlers", () => {
   });
 });
 
-// Task 7: recording + foreground-exit / abnormal-exit / system-exit MUST
-// cancel the active dictation (mic off). Ownership lives in App.pause()
-// (app.ts) — onForegroundExit and onAbnormalOrSystemExit both funnel through
-// it, never touching `dictation` directly — so driving these through the
-// same fake-driven lifecycle handlers Task 6 established also proves the
-// mic gets cancelled.
+// Recording + foreground-exit / abnormal-exit / system-exit MUST cancel the
+// active dictation (mic off). Ownership lives in App.pause() (app.ts) —
+// onForegroundExit and onAbnormalOrSystemExit both funnel through it, never
+// touching `dictation` directly. Task 5 moved dictation off the standalone
+// reply screen and into the session's bottom box directly (mic:"recording"
+// on SessionScreenState) — pause() cancels that the same way it used to
+// cancel a reply/listening dictation, so driving these through the same
+// fake-driven lifecycle handlers still proves the mic gets cancelled.
 describe("lifecycle cancels an active dictation (mic off)", () => {
   function makeAppWithSession(): { app: App; display: FakeDisplay; dictation: FakeDictation } {
     const display = new FakeDisplay();
@@ -461,34 +467,36 @@ describe("lifecycle cancels an active dictation (mic off)", () => {
     return { app, display, dictation };
   }
 
-  async function driveIntoListeningReply(app: App, display: FakeDisplay): Promise<void> {
+  async function driveIntoBoxRecording(app: App, display: FakeDisplay): Promise<void> {
     await app.start();
     await vi.advanceTimersByTimeAsync(0); // let the first poll land the session; cursor auto-snaps to it
     display.emit({ type: "tap" }); // home -> session
-    display.emit({ type: "tap" }); // session -> actions (cursor 0 = Reply)
-    display.emit({ type: "tap" }); // actions -> reply, listening
+    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (Task 4)
+    display.emit({ type: "tap" }); // input mode: idle -> recording (Task 5)
   }
 
   it("onForegroundExit cancels a recording dictation via App.pause()", async () => {
     const { app, display, dictation } = makeAppWithSession();
-    await driveIntoListeningReply(app, display);
-    expect(app.getState().reply?.phase).toBe("listening");
+    await driveIntoBoxRecording(app, display);
+    expect(app.getState().session?.mic).toBe("recording");
     expect(dictation.started).toBe(1);
 
     onForegroundExit(app);
 
     expect(dictation.cancelled).toBe(1);
+    expect(app.getState().session?.mic).toBe("idle");
     expect(app.getState().screen).toBe("session");
   });
 
   it("onAbnormalOrSystemExit cancels a recording dictation via App.pause()", async () => {
     const { app, display, dictation } = makeAppWithSession();
-    await driveIntoListeningReply(app, display);
-    expect(app.getState().reply?.phase).toBe("listening");
+    await driveIntoBoxRecording(app, display);
+    expect(app.getState().session?.mic).toBe("recording");
 
     onAbnormalOrSystemExit(app, display);
 
     expect(dictation.cancelled).toBe(1);
+    expect(app.getState().session?.mic).toBe("idle");
     expect(app.getState().screen).toBe("session");
     expect(display.teardownCalled).toBe(1); // display teardown still happens too
   });

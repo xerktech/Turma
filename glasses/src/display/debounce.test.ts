@@ -68,6 +68,30 @@ describe("createTrailingDebounce", () => {
     vi.advanceTimersByTime(120);
     expect(calls).toEqual([1, 2]);
   });
+
+  it("cancel() drops the pending trailing invocation so it never fires", () => {
+    const calls: string[] = [];
+    const debounced = createTrailingDebounce<string>((v) => calls.push(v), 120);
+    debounced("a"); // leading fire
+    debounced("stale"); // trailing scheduled
+    expect(calls).toEqual(["a"]);
+
+    debounced.cancel();
+    vi.advanceTimersByTime(200); // well past the window
+    expect(calls).toEqual(["a"]); // "stale" never flushed
+  });
+
+  it("still fires promptly on a leading edge after cancel() (lastInvokeAt untouched)", () => {
+    const calls: string[] = [];
+    const debounced = createTrailingDebounce<string>((v) => calls.push(v), 120);
+    debounced("a"); // leading at t=0
+    debounced("b"); // trailing scheduled
+    debounced.cancel(); // drop "b"
+
+    vi.advanceTimersByTime(200); // quiet, past the window
+    debounced("c"); // isolated -> leading fire
+    expect(calls).toEqual(["a", "c"]);
+  });
 });
 
 describe("capContent", () => {
