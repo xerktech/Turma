@@ -4,91 +4,46 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Turma</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/app.css">
 <style>
-  :root {
-    --page:        #f9f9f7;
-    --surface:     #fcfcfb;
-    --ink:         #0b0b0b;
-    --ink-2:       #52514e;
-    --muted:       #898781;
-    --hairline:    #e1e0d9;
-    --border:      rgba(11,11,11,0.10);
-    --good:        #0ca30c;
-    --warning:     #fab219;
-    --critical:    #d03b3b;
-    --accent:      #2a78d6;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --page:      #0d0d0d;
-      --surface:   #1a1a19;
-      --ink:       #ffffff;
-      --ink-2:     #c3c2b7;
-      --muted:     #898781;
-      --hairline:  #2c2c2a;
-      --border:    rgba(255,255,255,0.10);
-      --accent:    #3987e5;
-    }
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--page); color: var(--ink);
-    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
-  }
-  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 48px; }
-  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
-  h1 { font-size: 20px; margin: 0; font-weight: 650; }
-  header .sub { color: var(--muted); font-size: 13px; }
-  header .spacer { flex: 1; }
-
-  /* Shared page nav: pill tabs in the header on wide screens, a fixed bottom
-     tab bar on phones (same markup on all three pages). */
-  .nav-tabs { display: flex; gap: 4px; }
-  .nav-tabs a {
-    color: var(--ink-2); text-decoration: none; font-size: 13px;
-    padding: 5px 12px; border-radius: 20px; border: 1px solid transparent;
-  }
-  .nav-tabs a:hover { color: var(--accent); }
-  .nav-tabs a.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
-  .nav-tabs a.signout { color: var(--muted); margin-left: 6px; }
-  .nav-tabs a.signout:hover { color: var(--critical); }
-  .bottom-nav { display: none; }
-
+  /* index-specific layout. Tokens, base, nav, buttons, badges, status lights,
+     spinner, term overlay + responsive shell all live in /app.css. */
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 24px; }
   .tile {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 14px 16px;
   }
   .tile .label { color: var(--ink-2); font-size: 12px; margin-bottom: 4px; }
-  .tile .value { font-size: 26px; font-weight: 650; letter-spacing: -0.01em; }
+  .tile .value { font-family: var(--font-display); font-size: 26px; font-weight: 600; letter-spacing: -0.01em; }
   .tile .hint  { color: var(--muted); font-size: 11px; margin-top: 2px; }
 
   /* Hosts stack full-width — each expands into a repo → session tree. */
   .hosts { display: flex; flex-direction: column; gap: 16px; }
   .host-card {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 16px; display: flex; flex-direction: column; gap: 12px;
   }
   .host-card.offline { opacity: 0.62; }
   .host-top { display: flex; align-items: center; gap: 10px; }
-  .host-top h3 { font-size: 15px; margin: 0; font-weight: 650; flex: 1; word-break: break-all; }
+  .host-top h3 { font-size: 15px; margin: 0; font-weight: 600; flex: 1; word-break: break-all; }
   .host-meta { display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 13px; color: var(--ink-2); }
   .host-meta .m-label { color: var(--muted); }
   .host-meta b { color: var(--ink); font-weight: 600; }
-  .host-meta .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-
-  .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
-  .dot.online { background: var(--good); }
-  .dot.offline { background: var(--critical); }
+  .host-meta .path { font-family: var(--font-mono); font-size: 12px; }
 
   /* Repo blocks (collapsible) under a host. */
   .repos { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--hairline); padding-top: 12px; }
-  details.repo { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  details.repo { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; }
   details.repo > summary { list-style: none; cursor: pointer; }
   details.repo > summary::-webkit-details-marker { display: none; }
   .repo-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .repo-head .r-name { font-weight: 650; font-size: 14px; word-break: break-all; }
+  .repo-head .r-name { font-weight: 600; font-size: 14px; word-break: break-all; }
   .repo-head .r-name a { color: var(--accent); text-decoration: none; }
   .repo-head .r-name a:hover { text-decoration: underline; }
   .repo-head .r-meta { color: var(--ink-2); font-size: 12px; }
@@ -98,16 +53,16 @@
 
   /* Transient summary line after a repo prune (merged worktrees/branches swept). */
   .prune-note { color: var(--ink-2); font-size: 12px; margin-top: 8px; }
-  .prune-note.err { color: var(--bad, #d66); }
+  .prune-note.err { color: var(--critical); }
 
   /* Per-repo picker of recently killed sessions that can be resumed. */
   .resume-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
   .resume-item {
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-    background: var(--page); border: 1px dashed var(--border); border-radius: 8px;
+    background: var(--page); border: 1px dashed var(--border); border-radius: var(--radius-sm);
     padding: 8px 12px; font-size: 12.5px; color: var(--ink-2);
   }
-  .resume-item .sid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; font-size: 13px; color: var(--ink); }
+  .resume-item .sid { font-family: var(--font-mono); font-weight: 600; font-size: 13px; color: var(--ink); }
   .resume-item b { color: var(--ink); font-weight: 600; }
   .resume-item .spacer { flex: 1; }
   .resume-item .lbl, .sess-label {
@@ -119,7 +74,7 @@
      session fast path is untouched; this panel is opened by the ▾ caret). */
   .composer {
     display: flex; flex-direction: column; gap: 10px; margin-top: 10px;
-    background: var(--page); border: 1px dashed var(--border); border-radius: 8px;
+    background: var(--page); border: 1px dashed var(--border); border-radius: var(--radius-sm);
     padding: 12px;
   }
   .composer label { font-size: 11px; color: var(--muted); display: block; margin-bottom: 3px; }
@@ -129,9 +84,6 @@
     background: var(--surface); color: var(--ink);
   }
   .composer textarea { min-height: 62px; resize: vertical; }
-  .composer textarea:focus, .composer input:focus, .composer select:focus {
-    outline: none; border-color: var(--accent);
-  }
   .composer details.opts { border-top: 1px solid var(--hairline); padding-top: 10px; }
   .composer details.opts > summary {
     cursor: pointer; color: var(--muted); font-size: 12px; user-select: none; list-style: none;
@@ -162,7 +114,6 @@
   }
   .clone-bar select { max-width: 320px; flex: 1 1 200px; min-width: 150px; }
   .clone-bar input { flex: 0 1 180px; min-width: 120px; }
-  .clone-bar select:focus, .clone-bar input:focus { outline: none; border-color: var(--accent); }
   .clone-bar .spacer { flex: 1; }
   .clone-job {
     display: flex; align-items: center; gap: 8px; margin-top: 8px;
@@ -174,12 +125,12 @@
 
   .sess-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; margin-top: 10px; }
   .sess {
-    background: var(--page); border: 1px solid var(--border); border-radius: 8px;
+    background: var(--page); border: 1px solid var(--border); border-radius: var(--radius-sm);
     padding: 12px; display: flex; flex-direction: column; gap: 8px;
   }
   .sess.stopped, .sess.error { opacity: 0.9; }
   .sess-hd { display: flex; align-items: center; gap: 8px; }
-  .sess-hd .sid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; font-size: 13px; flex: 0 0 auto; }
+  .sess-hd .sid { font-family: var(--font-mono); font-weight: 600; font-size: 13px; flex: 0 0 auto; }
   /* Auto task summary: the prominent few-word "name" the agent derives from the
      session's initial prompt. Takes the middle space so the badge (margin-left:
      auto) still pins right; when absent the badge's auto margin preserves the old
@@ -189,10 +140,6 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .sess-hd .badge { margin-left: auto; }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 20px; border: 1px solid var(--border); color: var(--ink-2); white-space: nowrap; }
-  .badge.running { color: var(--good); border-color: var(--good); }
-  .badge.stopped { color: var(--muted); }
-  .badge.error { color: var(--critical); border-color: var(--critical); }
 
   dl { display: grid; grid-template-columns: 74px 1fr; gap: 3px 10px; margin: 0; font-size: 12.5px; }
   dt { color: var(--muted); }
@@ -207,7 +154,7 @@
     display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;
   }
   .usage .u-label { color: var(--muted); font-size: 11px; }
-  .usage .u-value { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .usage .u-value { font-family: var(--font-display); font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .usage .u-sub { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
   .unpriced { color: var(--warning); cursor: help; }
 
@@ -223,7 +170,7 @@
   details.logs summary { cursor: pointer; color: var(--muted); font-size: 12px; user-select: none; }
   details.logs summary:hover { color: var(--ink-2); }
   details.logs pre {
-    font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    font: 11px/1.4 var(--font-mono);
     white-space: pre-wrap; word-break: break-all;
     max-height: 260px; overflow: auto;
     background: var(--page); border: 1px solid var(--hairline); border-radius: 6px;
@@ -232,72 +179,11 @@
 
   .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 2px; }
   .sess-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
-  button {
-    font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 7px; cursor: pointer;
-    border: 1px solid var(--border); background: transparent; color: var(--ink);
-  }
-  button:hover:not(:disabled) { border-color: var(--ink-2); }
-  button.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
-  button.confirm { border-color: var(--critical); color: var(--critical); font-weight: 600; }
-  button.kill-btn { border-color: var(--critical); color: var(--critical); font-weight: 600; }
-  button.kill-btn.armed { background: var(--critical); color: #fff; border-color: var(--critical); }
-  button.btn-sm { padding: 4px 10px; font-size: 12px; }
-  button:disabled { opacity: 0.5; cursor: default; }
-
-  /* Pending-action feedback: a spinner + busy label shown from the moment a
-     command is queued until the polled state reflects it, so a click never
-     looks inert (and can't be fired twice into a duplicate session). */
-  .spin {
-    width: 11px; height: 11px; flex: none; display: inline-block;
-    border: 2px solid var(--border); border-top-color: var(--accent);
-    border-radius: 50%; vertical-align: -1px; animation: spin 0.8s linear infinite;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  button:disabled .spin { border-top-color: var(--ink-2); }
   .sess.ghost { align-items: center; justify-content: center; min-height: 118px; opacity: 0.8; }
   .sess.ghost .busy { display: flex; align-items: center; gap: 8px; color: var(--ink-2); font-size: 13px; }
 
-  .empty { color: var(--muted); text-align: center; padding: 64px 0; border: 1px dashed var(--hairline); border-radius: 10px; }
-  .footer { color: var(--muted); font-size: 12px; margin-top: 28px; }
-
-  .term-overlay {
-    display: none; position: fixed; inset: 0; z-index: 50;
-    background: rgba(0,0,0,0.62); flex-direction: column; padding: 20px;
-  }
-  .term-box {
-    flex: 1; display: flex; flex-direction: column; width: 100%; max-width: 1400px;
-    margin: 0 auto; background: #000; border: 1px solid var(--border);
-    border-radius: 10px; overflow: hidden;
-  }
-  .term-bar {
-    display: flex; align-items: center; gap: 12px; padding: 8px 12px;
-    background: var(--surface); border-bottom: 1px solid var(--hairline);
-  }
-  .term-bar .t-title { font-weight: 650; font-size: 14px; }
-  .term-bar .t-title .path { font-family: ui-monospace, Menlo, monospace; color: var(--muted); font-weight: 400; font-size: 12px; }
-  .term-bar .spacer { flex: 1; }
-  .term-bar a { color: var(--accent); text-decoration: none; font-size: 13px; }
-  .term-bar a:hover { text-decoration: underline; }
-  .term-overlay iframe { flex: 1; border: 0; width: 100%; background: #000; }
-
-  /* Phones: single-column session cards, denser padding, two-up tiles. The
-     300px session-grid min and 170px tile min overflow a narrow viewport. */
+  /* Phones: single-column session cards, denser padding, two-up tiles. */
   @media (max-width: 600px) {
-    .wrap { padding: 16px 12px 40px; }
-    header { gap: 8px 12px; margin-bottom: 16px; }
-    .nav-tabs { display: none; }
-    .bottom-nav {
-      display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
-      background: var(--surface); border-top: 1px solid var(--hairline);
-      padding: 4px 8px calc(4px + env(safe-area-inset-bottom));
-    }
-    .bottom-nav a {
-      flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
-      color: var(--muted); text-decoration: none; font-size: 11px; padding: 6px 0 4px;
-    }
-    .bottom-nav a svg { width: 21px; height: 21px; }
-    .bottom-nav a.active { color: var(--accent); }
-    body { padding-bottom: 68px; }
     .tiles { grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 18px; }
     .tile { padding: 11px 12px; }
     .tile .value { font-size: 21px; }
@@ -308,11 +194,7 @@
     .term-overlay { padding: 6px; }
     .term-bar { flex-wrap: wrap; padding: 7px 10px; gap: 6px 10px; }
   }
-
-  /* Touch devices (any width): larger tap targets. */
   @media (pointer: coarse) {
-    button { padding: 9px 15px; }
-    button.btn-sm { padding: 8px 12px; font-size: 12.5px; }
     details.logs summary, details.repo > summary { padding: 2px 0; }
   }
 </style>
@@ -320,7 +202,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Turma</h1>
+    <a class="wordmark" href="/"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
     <span class="sub">Session hosts</span>
     <span class="spacer"></span>
     <nav class="nav-tabs">

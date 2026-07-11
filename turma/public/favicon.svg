@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>Turma</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f1f1c"/>
+      <stop offset="1" stop-color="#0e0e0d"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.5">
+      <stop offset="0" stop-color="#3f8cec" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#3f8cec" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="11"/>
+    </filter>
+  </defs>
+
+  <!-- warm-dark tile -->
+  <rect width="512" height="512" rx="112" fill="url(#tile)"/>
+  <rect width="512" height="512" rx="112" fill="url(#glow)"/>
+
+  <!-- point-of-light bloom behind the lit units -->
+  <g filter="url(#soft)" opacity="0.5" fill="#3f8cec">
+    <rect x="89.77" y="89.77" width="89.79" height="89.79" rx="23.34"/>
+    <rect x="211.11" y="89.77" width="89.79" height="89.79" rx="23.34"/>
+    <rect x="332.44" y="89.77" width="89.79" height="89.79" rx="23.34"/>
+    <rect x="211.11" y="211.11" width="89.79" height="89.79" rx="23.34"/>
+    <rect x="211.11" y="332.44" width="89.79" height="89.79" rx="23.34"/>
+  </g>
+
+  <!-- dim (unlit) units -->
+  <g fill="#262d36">
+    <rect x="89.77" y="211.11" width="89.79" height="89.79" rx="23.34"/>
+    <rect x="332.44" y="211.11" width="89.79" height="89.79" rx="23.34"/>
+    <rect x="89.77" y="332.44" width="89.79" height="89.79" rx="23.34"/>
+    <rect x="332.44" y="332.44" width="89.79" height="89.79" rx="23.34"/>
+  </g>
+
+  <!-- lit units: a formation that spells "T", blue -> purple down the stem -->
+  <rect x="89.77"  y="89.77"  width="89.79" height="89.79" rx="23.34" fill="#4a95f0"/>
+  <rect x="211.11" y="89.77"  width="89.79" height="89.79" rx="23.34" fill="#4a95f0"/>
+  <rect x="332.44" y="89.77"  width="89.79" height="89.79" rx="23.34" fill="#4a95f0"/>
+  <rect x="211.11" y="211.11" width="89.79" height="89.79" rx="23.34" fill="#6271df"/>
+  <rect x="211.11" y="332.44" width="89.79" height="89.79" rx="23.34" fill="#7a4dcf"/>
+</svg>
