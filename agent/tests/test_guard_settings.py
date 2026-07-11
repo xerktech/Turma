@@ -4,8 +4,10 @@
 the module is loaded by file path (its name has a dash)."""
 
 import importlib.util
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -62,6 +64,66 @@ class TestGuardSettings(unittest.TestCase):
         path = ha.ask_script_path()
         self.assertTrue(path.endswith(os.path.join("hooks", "ask.py")))
         self.assertTrue(os.path.exists(path))
+
+
+class TestOperatorLocalPermissions(unittest.TestCase):
+    """The agent folds a user-level ~/.claude/settings.local.json (which Claude
+    Code ignores) into the injected --settings so operator pre-approvals apply."""
+
+    def _write(self, obj):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        with os.fdopen(fd, "w") as fh:
+            json.dump(obj, fh)
+        return path
+
+    def test_folds_operator_allow_and_deny(self):
+        path = self._write({"permissions": {
+            "allow": ["mcp__unifi__list_hosts", "Bash(ping *)"],
+            "deny": ["Bash(curl evil.example)"],
+        }})
+        s = ha.build_guard_settings(local_settings_path=path)
+        self.assertIn("mcp__unifi__list_hosts", s["permissions"]["allow"])
+        self.assertIn("Bash(ping *)", s["permissions"]["allow"])
+        # operator deny unions on top of the guard's own credential rules
+        self.assertIn("Bash(curl evil.example)", s["permissions"]["deny"])
+        self.assertIn("Edit(~/.claude/**)", s["permissions"]["deny"])
+
+    def test_guard_deny_precedes_and_survives(self):
+        # An operator can ADD deny rules but never drops the guard's own, which
+        # stay first so the credential protection is always in force.
+        path = self._write({"permissions": {"deny": ["Bash(foo)"]}})
+        deny = ha.build_guard_settings(local_settings_path=path)["permissions"]["deny"]
+        n = len(ha._GUARD_DENY_PATH_RULES)
+        self.assertEqual(deny[:n], list(ha._GUARD_DENY_PATH_RULES))
+        self.assertIn("Bash(foo)", deny)
+
+    def test_operator_deny_duplicate_is_not_repeated(self):
+        path = self._write({"permissions": {"deny": ["Edit(~/.claude/**)"]}})
+        deny = ha.build_guard_settings(local_settings_path=path)["permissions"]["deny"]
+        self.assertEqual(deny.count("Edit(~/.claude/**)"), 1)
+
+    def test_missing_file_is_noop(self):
+        s = ha.build_guard_settings(local_settings_path="/no/such/file.json")
+        self.assertNotIn("allow", s["permissions"])
+        self.assertEqual(s["permissions"]["deny"], list(ha._GUARD_DENY_PATH_RULES))
+
+    def test_malformed_file_fails_open(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        self.addCleanup(os.unlink, path)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("{ not json")
+        self.assertEqual(ha.operator_local_permissions(path), ([], []))
+
+    def test_dedups_and_ignores_non_strings(self):
+        path = self._write({"permissions": {"allow": ["A", "A", 123, None, "B"]}})
+        allow, _ = ha.operator_local_permissions(path)
+        self.assertEqual(allow, ["A", "B"])
+
+    def test_non_list_permission_value_is_ignored(self):
+        path = self._write({"permissions": {"allow": "Bash(rm)"}})
+        allow, _ = ha.operator_local_permissions(path)
+        self.assertEqual(allow, [])
 
 
 if __name__ == "__main__":
