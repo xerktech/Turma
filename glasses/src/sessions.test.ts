@@ -68,11 +68,11 @@ describe("liveState", () => {
 
 describe("glyph", () => {
   it.each([
-    ["working", "*"],
+    ["working", "!"],
     ["waiting", "?"],
     ["idle", "-"],
     ["stopped", "o"],
-    ["error", "!"],
+    ["error", "x"],
     ["pending", "…"],
   ] as const)("maps %s -> %s", (state, expected) => {
     expect(glyph(state)).toBe(expected);

@@ -21,12 +21,17 @@ export function liveState(s: SessionInfo): LiveState {
   return "idle";
 }
 
+// Leading status icon on each home-menu session row — chosen to be
+// glanceable on the G2's tiny monochrome display, with the two states the
+// user acts on made loud: "!" = actively working, "?" = a question from
+// Claude is waiting on you. Idle stays a quiet "-". ("!" used to mean error;
+// error moved to "x" so "!" can carry the more common working state.)
 const GLYPHS: Record<DisplayState, string> = {
-  working: "*",
+  working: "!",
   waiting: "?",
   idle: "-",
   stopped: "o",
-  error: "!",
+  error: "x",
   pending: "…",
 };
 

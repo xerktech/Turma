@@ -80,7 +80,7 @@ describe("render: home", () => {
 
     expect(lines[0]).toBe("AGENTHUB 1 run · 1 ask");
     expect(lines).toContain("> alpha");
-    expect(lines.some((l) => l.includes("* alpha·repoA"))).toBe(true);
+    expect(lines.some((l) => l.includes("! alpha·repoA"))).toBe(true);
     expect(lines.some((l) => l.includes("? alpha·repoB"))).toBe(true);
     expect(lines.some((l) => l.includes("- alpha·repoC"))).toBe(true);
     expect(lines).toContain("  beta offline");
