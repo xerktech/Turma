@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Unit tests for the agent safety guard (agent/hooks/guard.py).
 
-The guard is the single thing that makes `--permission-mode bypassPermissions`
-safe, so its classification is the security-critical surface: it must block
+The guard is the backstop that makes the hands-off permission modes (`auto` by
+default, or `bypassPermissions`) safe, so its classification is the
+security-critical surface: it must block
 catastrophic machine/whole-repo commands, PR-workflow violations, and AI
 self-attribution while NOT blocking ordinary development work.
 
