@@ -232,6 +232,55 @@ describe("render: session", () => {
     expect(model.bottom.lines.some((l) => l.includes("Deploy now?"))).toBe(true);
   });
 
+  it("shows the live status in the empty input box, but hides it once a draft is typed", () => {
+    const s = session({ id: "s1", session: signals({ transcriptAgeSec: 1 }) }); // working
+    const agents = [agent({ sessions: [s] })];
+
+    const empty = asSession(
+      render(base({ screen: "session", agents, session: newSessionState("host-a", "s1"), transcripts: { s1: { entries: [] } } }))
+    );
+    expect(empty.bottom.status).toBe("Working");
+
+    const typed = asSession(
+      render(
+        base({
+          screen: "session",
+          agents,
+          session: { ...newSessionState("host-a", "s1"), draft: "some answer" },
+          transcripts: { s1: { entries: [] } },
+        })
+      )
+    );
+    expect(typed.bottom.mode).toBe("input");
+    expect(typed.bottom.status).toBe("");
+  });
+
+  it("still shows the mic indicator while dictating even with a draft present", () => {
+    const s = session({ id: "s1", session: signals({ transcriptAgeSec: 1 }) });
+    const agents = [agent({ sessions: [s] })];
+    const model = asSession(
+      render(
+        base({
+          screen: "session",
+          agents,
+          session: { ...newSessionState("host-a", "s1"), draft: "half a sentence", mic: "recording" },
+          transcripts: { s1: { entries: [] } },
+        })
+      )
+    );
+    expect(model.bottom.status).toBe("[REC]");
+  });
+
+  it("hides the status when a question sheet fills the box", () => {
+    const s = session({ id: "s1", session: signals({ question: "Deploy now?", questionOptions: ["Yes", "No"], transcriptAgeSec: 1 }) });
+    const agents = [agent({ sessions: [s] })];
+    const model = asSession(
+      render(base({ screen: "session", agents, session: newSessionState("host-a", "s1"), transcripts: { s1: { entries: [] } } }))
+    );
+    expect(model.bottom.mode).toBe("sheet");
+    expect(model.bottom.status).toBe("");
+  });
+
   it("pages a long transcript, showing only the bottom-anchored window at offset 0", () => {
     const s = session({ id: "s1" });
     const agents = [agent({ sessions: [s] })];
