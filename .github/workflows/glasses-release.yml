@@ -5,7 +5,7 @@ name: glasses-release
 #
 # Runs post-merge on push to main, path-filtered to glasses/** (the CI gate
 # in glasses-ci.yml runs pre-merge on PRs; this is the release counterpart,
-# mirroring how agent-image.yml / agent-hub-image.yml build on push to main).
+# mirroring how turma-agent-image.yml / turma-image.yml build on push to main).
 #
 # Same self-hosted-runner constraints as the rest of the repo: reset the
 # root-owned workspace first, and run the whole npm workflow (install/build/
@@ -49,7 +49,7 @@ jobs:
           BASE="$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/VERSION")"
           VERSION="${BASE}.${{ github.run_number }}"
           TAG="glasses-v${VERSION}"
-          ASSET="agenthub-hud-v${VERSION}.ehpk"
+          ASSET="turma-hud-v${VERSION}.ehpk"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
@@ -60,7 +60,7 @@ jobs:
       # previous one instead of registering as a new build. (Only app.json is
       # touched: `evenhub pack app.json dist` reads the version from there, and
       # rewriting package.json would desync it from package-lock.json and break
-      # `npm ci`.) The pack script writes ../agenthub-hud.ehpk relative to
+      # `npm ci`.) The pack script writes ../turma-hud.ehpk relative to
       # glasses/, so the artifact lands at the workspace root.
       - name: Stamp version, install, build, pack (glasses/)
         run: |
@@ -70,7 +70,7 @@ jobs:
                    npm ci --no-audit --no-fund && npm run build && npm run pack'
 
       - name: Name the release asset
-        run: cp "$GITHUB_WORKSPACE/agenthub-hud.ehpk" "$GITHUB_WORKSPACE/${{ steps.ver.outputs.asset }}"
+        run: cp "$GITHUB_WORKSPACE/turma-hud.ehpk" "$GITHUB_WORKSPACE/${{ steps.ver.outputs.asset }}"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -78,7 +78,7 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: Glasses ${{ steps.ver.outputs.tag }}
           body: |
-            Even Hub (G2 glasses) app package for AgentHub.
+            Even Hub (G2 glasses) app package for Turma.
 
             - Version: `${{ steps.ver.outputs.version }}`
             - Commit: ${{ github.sha }}

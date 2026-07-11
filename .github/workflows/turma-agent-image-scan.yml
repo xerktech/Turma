@@ -1,8 +1,8 @@
-name: scan-agent-image
+name: scan-turma-agent-image
 
 # On PRs to main that touch the /agent build context, build the image locally
 # (no push) and scan it for OS/library CVEs and leaked secrets with Trivy.
-# Pre-merge counterpart to build-agent-image.yml, which pushes only on main.
+# Pre-merge counterpart to build-turma-agent-image.yml, which pushes only on main.
 # CLAUDE_CODE_VERSION is left at its Dockerfile default (latest) — the scan
 # cares about the assembled image, not the exact pinned tag.
 #
@@ -18,10 +18,10 @@ on:
     paths:
       - "agent/**"
       - ".trivyignore"
-      - ".github/workflows/agent-image-scan.yml"
+      - ".github/workflows/turma-agent-image-scan.yml"
 
 concurrency:
-  group: agent-image-scan-${{ github.ref }}
+  group: turma-agent-image-scan-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -32,9 +32,9 @@ jobs:
     runs-on: [self-hosted, linux]
     env:
       # Unique per-run tag: concurrent scans of different PRs on one runner
-      # would otherwise overwrite each other's local/agent:pr-scan mid-scan,
+      # would otherwise overwrite each other's local/turma-agent:pr-scan mid-scan,
       # and it lets cleanup remove exactly this run's image.
-      SCAN_TAG: local/agent:pr-${{ github.run_id }}
+      SCAN_TAG: local/turma-agent:pr-${{ github.run_id }}
     steps:
       - name: Reset workspace ownership
         run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
@@ -100,7 +100,7 @@ jobs:
       # accumulates until the disk fills (which has taken CI down). Remove only
       # this run's tag plus dangling layers — pulled base images (node, busybox)
       # stay for other jobs. Deliberately NOT `docker builder prune`: this repo's
-      # two scan jobs (agent + agent-hub) run concurrently on one runner, and an
+      # two scan jobs (turma-agent + turma) run concurrently on one runner, and an
       # `-a` cache prune here yanks build cache out from under the other job's
       # in-flight build (buildkit aborts with "graceful_stop"). Build cache is
       # bounded by buildkit's own GC and the external gha cache, so it isn't the

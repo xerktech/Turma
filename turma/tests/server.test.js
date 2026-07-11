@@ -1,8 +1,8 @@
-// Unit tests for agent-hub/server.js using node:test (built-in — keeps the
+// Unit tests for turma/server.js using node:test (built-in — keeps the
 // repo's zero-npm-dependency stance). CI runs them in a throwaway
-// node:24-alpine container: `node --test agent-hub/tests/`.
+// node:24-alpine container: `node --test turma/tests/`.
 //
-// AGENTHUB_TEST makes server.js export its internals instead of binding the
+// TURMA_TEST makes server.js export its internals instead of binding the
 // production port; the HTTP tests listen on an ephemeral port themselves.
 // notify()'s outbound ntfy POST is captured by stubbing globalThis.fetch, so
 // the alert tests observe exactly which notifications each beat fires.
@@ -18,15 +18,15 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 // Environment must be pinned BEFORE the module under test loads.
-process.env.AGENTHUB_TEST = "1";
-process.env.HUB_USER = "hubuser";
-process.env.HUB_PASSWORD = "hubpass";
-process.env.HUB_AGENT_TOKEN = "agenttok";
+process.env.TURMA_TEST = "1";
+process.env.TURMA_USER = "hubuser";
+process.env.TURMA_PASSWORD = "hubpass";
+process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.NTFY_URL = "http://ntfy.test"; // enables notify(); fetch is stubbed
 process.env.COST_ALERT_USD = "50";
 process.env.STATE_FILE = path.join(
   os.tmpdir(),
-  `agenthub-test-state-${process.pid}.json`
+  `turma-test-state-${process.pid}.json`
 );
 // Whisper STT: configured so the "enabled" code paths (transcribePcm request
 // building, the /audio WS end-to-end tests) are exercised against the real
@@ -264,7 +264,7 @@ test("session tokens: issue -> valid; tampered/expired/garbage -> invalid", () =
   // A correctly-signed but already-expired token is rejected.
   const past = "1.".concat(
     require("crypto").createHmac("sha256",
-      process.env.HUB_SESSION_SECRET ||
+      process.env.TURMA_SESSION_SECRET ||
         require("crypto").createHash("sha256").update("hubuser\nhubpass").digest("hex"))
       .update("1").digest("base64url")
   );
@@ -396,7 +396,7 @@ test("alerts: question fires on new text only, re-arms when cleared", () => {
 
 test("alerts: PR created fires once per URL (persisted prSeen)", () => {
   const beat = makeHost();
-  const url = "https://github.com/xerktech/AgentHub/pull/34";
+  const url = "https://github.com/xerktech/Turma/pull/34";
   const withPrs = (urls) => ({
     sessions: [{ id: "s1", rcName: "nas-repo-s1", session: { newPrUrls: urls } }],
   });
@@ -407,7 +407,7 @@ test("alerts: PR created fires once per URL (persisted prSeen)", () => {
   notifications.length = 0;
   beat(withPrs([url])); // agent re-delivered it: still only once
   assert.deepEqual(titles(), []);
-  beat(withPrs(["https://github.com/xerktech/AgentHub/pull/35"]));
+  beat(withPrs(["https://github.com/xerktech/Turma/pull/35"]));
   assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
 });
 
@@ -592,7 +592,7 @@ test("http: command queue rides the reply until acked", async () => {
 
   // The UI queues two session commands (as the /api/agents/... routes do).
   const spawnRes = await request("POST", "/api/agents/h1/sessions", {
-    body: { repo: "AgentHub" }, headers: userHeaders,
+    body: { repo: "Turma" }, headers: userHeaders,
   });
   assert.equal(spawnRes.status, 200);
   const killRes = await request("POST", "/api/agents/h1/sessions/ab123/kill", {
@@ -606,7 +606,7 @@ test("http: command queue rides the reply until acked", async () => {
   assert.deepEqual(
     res.body.commands,
     [
-      { type: "spawn", repo: "AgentHub", cmdId: spawnId },
+      { type: "spawn", repo: "Turma", cmdId: spawnId },
       { type: "kill", sessionId: "ab123", cmdId: killId },
     ]
   );
@@ -631,7 +631,7 @@ test("http: spawn route forwards composer options; bare spawn stays minimal", as
   // (The app no longer names branches, so there is no branchName field.)
   const full = await request("POST", "/api/agents/hc/sessions", {
     body: {
-      repo: "AgentHub", prompt: "fix the bug", label: "Fix login",
+      repo: "Turma", prompt: "fix the bug", label: "Fix login",
       baseRef: "main", model: "opus",
       permissionMode: "plan",
     },
@@ -641,7 +641,7 @@ test("http: spawn route forwards composer options; bare spawn stays minimal", as
   // Blank/omitted fields are dropped; only the ones set are forwarded, so a
   // one-click spawn stays exactly {type,repo,cmdId}.
   const bare = await request("POST", "/api/agents/hc/sessions", {
-    body: { repo: "AgentHub", prompt: "", label: "", model: "sonnet" },
+    body: { repo: "Turma", prompt: "", label: "", model: "sonnet" },
     headers: userHeaders,
   });
   assert.equal(bare.status, 200);
@@ -649,11 +649,11 @@ test("http: spawn route forwards composer options; bare spawn stays minimal", as
   const res = await beat({ device: "hc" });
   assert.deepEqual(res.body.commands, [
     {
-      type: "spawn", repo: "AgentHub", prompt: "fix the bug", label: "Fix login",
+      type: "spawn", repo: "Turma", prompt: "fix the bug", label: "Fix login",
       baseRef: "main", model: "opus",
       permissionMode: "plan", cmdId: full.body.cmdId,
     },
-    { type: "spawn", repo: "AgentHub", model: "sonnet", cmdId: bare.body.cmdId },
+    { type: "spawn", repo: "Turma", model: "sonnet", cmdId: bare.body.cmdId },
   ]);
 });
 
@@ -668,12 +668,12 @@ test("http: clone route queues a clone command; validates repo and host", async 
 
   // A valid clone rides the next reply as a {type:"clone", repo} command.
   const ok = await request("POST", "/api/agents/hcl/clone", {
-    body: { repo: "xerktech/AgentHub" }, headers: userHeaders,
+    body: { repo: "xerktech/Turma" }, headers: userHeaders,
   });
   assert.equal(ok.status, 200);
   const res = await beat({ device: "hcl" });
   assert.deepEqual(res.body.commands, [
-    { type: "clone", repo: "xerktech/AgentHub", cmdId: ok.body.cmdId },
+    { type: "clone", repo: "xerktech/Turma", cmdId: ok.body.cmdId },
   ]);
 
   // Unknown host -> 404.
@@ -689,17 +689,17 @@ test("http: prune route queues a prune command per repo; validates host", async 
   await beat({ device: "hpr" });
 
   // A valid prune rides the next reply as a {type:"prune", repo} command.
-  const ok = await request("POST", "/api/agents/hpr/repos/AgentHub/prune", {
+  const ok = await request("POST", "/api/agents/hpr/repos/Turma/prune", {
     body: {}, headers: userHeaders,
   });
   assert.equal(ok.status, 200);
   const res = await beat({ device: "hpr" });
   assert.deepEqual(res.body.commands, [
-    { type: "prune", repo: "AgentHub", cmdId: ok.body.cmdId },
+    { type: "prune", repo: "Turma", cmdId: ok.body.cmdId },
   ]);
 
   // Unknown host -> 404.
-  const ghost = await request("POST", "/api/agents/ghost/repos/AgentHub/prune", {
+  const ghost = await request("POST", "/api/agents/ghost/repos/Turma/prune", {
     body: {}, headers: userHeaders,
   });
   assert.equal(ghost.status, 404);
@@ -1084,7 +1084,7 @@ test("ws-token: issued token validates; garbage/expired/tampered are rejected", 
   // Correctly-signed but already-expired token (forged expiry, real HMAC key).
   const pastExpiry = Date.now() - 1000;
   const key =
-    process.env.HUB_SESSION_SECRET ||
+    process.env.TURMA_SESSION_SECRET ||
     require("crypto").createHash("sha256").update("hubuser\nhubpass").digest("hex");
   const mac = require("crypto")
     .createHmac("sha256", key)

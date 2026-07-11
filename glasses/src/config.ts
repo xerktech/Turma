@@ -8,7 +8,12 @@ export interface Config {
 }
 
 export const DEFAULT_POLL_MS = 6000;
-export const CONFIG_STORAGE_KEY = "agenthub.glasses.config";
+export const CONFIG_STORAGE_KEY = "turma.glasses.config";
+// Pre-Turma storage key (app was "Agent Hub"). loadConfig reads this once when
+// the new key is empty and re-saves under CONFIG_STORAGE_KEY, so a device that
+// stored its credentials before the rename doesn't have to re-enter them. Safe
+// to delete in a later cleanup once devices have re-saved under the new key.
+export const LEGACY_CONFIG_STORAGE_KEY = "agenthub.glasses.config";
 
 // The hub URL is hardcoded — the phone login page only asks for username and
 // password, exactly like the web dashboard's login. `VITE_HUB_URL` can still
@@ -52,7 +57,15 @@ function emptyConfig(): Config {
 // throwing.
 export async function loadConfig(storage: KeyValueStorage): Promise<Config> {
   const base = emptyConfig();
-  const raw = await storage.get(CONFIG_STORAGE_KEY);
+  let raw = await storage.get(CONFIG_STORAGE_KEY);
+  if (!raw) {
+    // One-time migration from the pre-Turma key.
+    const legacy = await storage.get(LEGACY_CONFIG_STORAGE_KEY);
+    if (legacy) {
+      raw = legacy;
+      await storage.set(CONFIG_STORAGE_KEY, legacy);
+    }
+  }
   if (!raw) return base;
   try {
     const parsed = JSON.parse(raw) as Partial<Config>;

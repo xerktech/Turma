@@ -4,7 +4,7 @@ set -e
 # ONE container per physical host. It no longer bakes a single repo/session:
 # the Python session manager (hub-agent.py) scans REPOS_ROOT and multiplexes N
 # worktree-backed Claude sessions, each with its own tmux (agent-<id>) + ttyd
-# (127.0.0.1:<port>, base /term/<id>), created/killed from the Agent Hub UI.
+# (127.0.0.1:<port>, base /term/<id>), created/killed from the Turma UI.
 # This entrypoint just does the Claude creds preflight, starts the reverse
 # tunnel, and then hands off to the manager as the long-lived foreground
 # process. The container stays up with ZERO sessions (no more "session ends ->
@@ -82,15 +82,15 @@ fi
 
 # --- Hub infrastructure (agent-agnostic) -----------------------------------
 # Background reverse tunnel to the hub for the web terminals. Keeps a persistent
-# OUTBOUND WebSocket to HUB_URL so the hub can reach this container's per-session
+# OUTBOUND WebSocket to TURMA_URL so the hub can reach this container's per-session
 # ttyds from any network/host. The hub tells it which port to bridge per data
-# channel (see agent/tunnel-agent.js + agent-hub/server.js).
+# channel (see agent/tunnel-agent.js + turma/server.js).
 node /usr/local/bin/tunnel-agent.js &
 
 # Session manager + heartbeat, in the FOREGROUND as the container's long-lived
-# process. It owns the persisted registry (~/.agenthub/sessions.json), scans
+# process. It owns the persisted registry (~/.turma/sessions.json), scans
 # REPOS_ROOT for repos, auto-resumes running sessions, executes hub commands
 # (spawn/kill/start/restart/delete), and heartbeats repos[]+sessions[] to the
 # hub. exec so it becomes the main process (clean signal handling / restarts).
-echo "Starting AgentHub session manager (REPOS_ROOT=${REPOS_ROOT:-/mnt/data/Docker/git})..."
+echo "Starting Turma session manager (REPOS_ROOT=${REPOS_ROOT:-/mnt/data/Docker/git})..."
 exec python3 /usr/local/bin/hub-agent.py

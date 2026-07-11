@@ -1,22 +1,22 @@
-name: build-agent-hub-image
+name: build-turma-image
 
-# Build and push the agent-hub dashboard image to GHCR whenever the
-# /agent-hub build context (or this workflow) changes on main.
+# Build and push the turma dashboard image to GHCR whenever the
+# /turma build context (or this workflow) changes on main.
 # Runs on the home-lab self-hosted runners ([self-hosted, linux]).
 on:
   push:
     branches: [main]
     paths:
-      - "agent-hub/**"
-      - ".github/workflows/agent-hub-image.yml"
+      - "turma/**"
+      - ".github/workflows/turma-image.yml"
   workflow_dispatch: {}
 
 concurrency:
-  group: agent-hub-image
+  group: turma-image
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/agent-hub
+  IMAGE: ghcr.io/${{ github.repository_owner }}/turma
 
 jobs:
   build:
@@ -49,12 +49,12 @@ jobs:
           BASE="$(tr -d '[:space:]' < VERSION)"
           VERSION="${BASE}.${{ github.run_number }}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Building agent-hub ${VERSION}"
+          echo "Building turma ${VERSION}"
 
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
-          context: ./agent-hub
+          context: ./turma
           push: true
           tags: |
             ${{ env.IMAGE }}:latest

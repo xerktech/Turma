@@ -2,7 +2,7 @@
 // screen uses while it's open. The 6s poll (app.ts) only ever sees the
 // agent's 20s heartbeat, so on its own new text lands up to ~20s late and in
 // whole blocks. This opens `/live/<host>/<session>?auth=<ws-token>` on the
-// hub (agent-hub/server.js), which asks that host's tunnel-agent to tail the
+// hub (turma/server.js), which asks that host's tunnel-agent to tail the
 // one session's transcript ~1s and push deltas back; each `{type:"tail",
 // entries}` frame is handed straight to the App, which merges it (mergeTail)
 // and typewriter-reveals the growth (reveal.ts).

@@ -1,5 +1,5 @@
-# Trivy ignore file for the agent + agent-hub image scans
-# (.github/workflows/agent-image-scan.yml, agent-hub-image-scan.yml).
+# Trivy ignore file for the turma-agent + turma image scans
+# (.github/workflows/turma-agent-image-scan.yml, turma-image-scan.yml).
 #
 # Only REVIEWED, non-actionable findings belong here, each with a reason. Any
 # HIGH/CRITICAL not listed here still fails the scan — this is a triage list,

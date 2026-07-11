@@ -12,7 +12,7 @@ ARG DOCKER_CLI_VERSION=29.6.1
 # GitHub CLI — used by Claude for PRs/issues and as git's credential helper.
 ARG GH_VERSION=2.96.0
 # ttyd — serves the in-container tmux session (the live Claude TUI) over the web
-# so the Agent Hub can attach to it. Static single-file binary.
+# so the Turma can attach to it. Static single-file binary.
 ARG TTYD_VERSION=1.7.7
 # PowerShell — cross-platform shell/scripting available to Claude. Self-contained
 # linux-x64 tarball (needs libicu, installed below). Bump as needed for CVEs.
@@ -59,7 +59,7 @@ RUN apt-get update \
 RUN git config --system credential.helper '!gh auth git-credential'
 
 LABEL org.opencontainers.image.source="https://github.com/xerktech/DockerOps" \
-      org.opencontainers.image.description="Headless Claude Code host multiplexer (worktree-backed Remote Control sessions) for the Agent Hub"
+      org.opencontainers.image.description="Headless Claude Code host multiplexer (worktree-backed Remote Control sessions) for the Turma"
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY hub-agent.py /usr/local/bin/hub-agent.py
@@ -79,7 +79,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/hub-agent.py \
 #   REPOS_ROOT      git-root to scan one level deep for repos (default /mnt/data/Docker/git)
 #   MAX_SESSIONS    cap on concurrently running sessions            (default 6)
 #   TTYD_PORT_BASE  first per-session ttyd port, allocated upward    (default 7700)
-#   HUB_URL / HUB_TOKEN / HUB_INTERVAL   hub endpoint + shared agent token + beat
+#   TURMA_URL / TURMA_TOKEN / TURMA_INTERVAL   hub endpoint + shared agent token + beat
 #   IS_SANDBOX      lets claude bypassPermissions run under root
 #   AGENT           coding agent (claude only, for now)
 WORKDIR /root

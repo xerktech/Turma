@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Standalone prover for the hub's `/audio` mic-dictation WebSocket path — no
 // glasses hardware, no build step. Just Node's stdlib plus its built-in
-// `WebSocket` global (Node >=22; see agent-hub/server.js's `/audio` handler
+// `WebSocket` global (Node >=22; see turma/server.js's `/audio` handler
 // and `GET /api/ws-token` for the protocol this replays).
 //
 // Usage:
@@ -17,7 +17,7 @@
 //                      glasses client's HubAudioDictation uses: https->wss,
 //                      http->ws).
 //   <user:pass>        HTTP Basic auth credentials for GET /api/ws-token
-//                      (the same HUB_USER:HUB_PASSWORD the hub enforces).
+//                      (the same TURMA_USER:TURMA_PASSWORD the hub enforces).
 //   <wav-or-pcm-file>  A 16kHz mono signed-16-bit-little-endian PCM file.
 //                      A standard 44-byte RIFF/WAVE header is auto-detected
 //                      (by "RIFF"/"WAVE" magic) and stripped; a bare .pcm
@@ -44,7 +44,7 @@ function usage() {
 }
 
 // RIFF/WAVE files start with the ASCII magic "RIFF" at byte 0 and "WAVE" at
-// byte 8; agent-hub/server.js's own `pcmToWav()` always writes exactly a
+// byte 8; turma/server.js's own `pcmToWav()` always writes exactly a
 // 44-byte canonical header before the raw PCM data, so stripping a fixed 44
 // bytes on that magic match is sufficient for this script's purposes. A file
 // without the magic is assumed to already be bare PCM.

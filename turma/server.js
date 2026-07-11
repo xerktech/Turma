@@ -1,4 +1,4 @@
-// agent-hub — central dashboard + terminal gateway for the Claude Code containers.
+// turma — central dashboard + terminal gateway for the Claude Code containers.
 //
 // Agents (agent image) reach this server purely OUTBOUND, so hub and
 // agents can live on any host/network (all traffic rides agents.xerktech.com):
@@ -34,18 +34,18 @@ const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under th
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
 const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted first
 
-// Single-user auth: HUB_USER/HUB_PASSWORD gate the UI and browser API. The
+// Single-user auth: TURMA_USER/TURMA_PASSWORD gate the UI and browser API. The
 // browser signs in through a real login form (/login -> POST /api/login) and
 // gets a signed, HttpOnly session cookie it replays on every same-origin
 // request; Basic auth is still accepted (curl, and the agent heartbeat
-// fallback) but browsers never see the native credential popup. HUB_AGENT_TOKEN
+// fallback) but browsers never see the native credential popup. TURMA_AGENT_TOKEN
 // is a bearer token that lets the heartbeat agents in the agent containers
 // report without user credentials. Leaving a var unset disables that check
 // (open access) — logged loudly at boot since the hub is exposed through the
 // Cloudflare tunnel.
-const HUB_USER = process.env.HUB_USER || "";
-const HUB_PASSWORD = process.env.HUB_PASSWORD || "";
-const HUB_AGENT_TOKEN = process.env.HUB_AGENT_TOKEN || "";
+const TURMA_USER = process.env.TURMA_USER || "";
+const TURMA_PASSWORD = process.env.TURMA_PASSWORD || "";
+const TURMA_AGENT_TOKEN = process.env.TURMA_AGENT_TOKEN || "";
 
 // Browser sessions: instead of the native HTTP Basic popup, the UI POSTs to
 // /api/login and we hand back a signed, HttpOnly cookie the browser replays on
@@ -53,18 +53,18 @@ const HUB_AGENT_TOKEN = process.env.HUB_AGENT_TOKEN || "";
 // auth still works for curl/agents, but browsers never see the credential
 // prompt. The signing key defaults to a hash of the configured credentials so
 // rotating the password invalidates outstanding sessions for free; set
-// HUB_SESSION_SECRET to decouple that (e.g. to survive a password rotation).
+// TURMA_SESSION_SECRET to decouple that (e.g. to survive a password rotation).
 const SESSION_COOKIE = "hub_session";
 const SESSION_TTL_MS = 30 * 24 * 3600 * 1000; // stay signed in for 30 days
 const SESSION_KEY =
-  process.env.HUB_SESSION_SECRET ||
-  crypto.createHash("sha256").update(`${HUB_USER}\n${HUB_PASSWORD}`).digest("hex");
+  process.env.TURMA_SESSION_SECRET ||
+  crypto.createHash("sha256").update(`${TURMA_USER}\n${TURMA_PASSWORD}`).digest("hex");
 
 // Injected on every proxied ttyd request so ttyd's own basic-auth
-// (-c term:$HUB_TOKEN, loopback-bound in the container) is satisfied without
+// (-c term:$TURMA_TOKEN, loopback-bound in the container) is satisfied without
 // the browser ever seeing the credentials. The terminal shares the agent
 // token — one credential per agent container for heartbeat, tunnel, and ttyd.
-const TTYD_AUTH = "Basic " + Buffer.from(`term:${HUB_AGENT_TOKEN || "changeme"}`).toString("base64");
+const TTYD_AUTH = "Basic " + Buffer.from(`term:${TURMA_AGENT_TOKEN || "changeme"}`).toString("base64");
 
 const NTFY_URL = (process.env.NTFY_URL || "").replace(/\/$/, "");
 const NTFY_TOPIC = process.env.NTFY_TOPIC || "agents";
@@ -147,7 +147,7 @@ function queueCommand(key, cmd) {
   scheduleSave();
   // Poke the agent (if its control tunnel is up) to heartbeat immediately, so
   // the command it just enqueued is delivered in the next beat's reply within
-  // ~a round-trip rather than up to a whole HUB_INTERVAL later. A missed poke
+  // ~a round-trip rather than up to a whole TURMA_INTERVAL later. A missed poke
   // (tunnel down) just falls back to the normal interval — the command still
   // rides the next scheduled beat.
   const cc = controlChannels[key];
@@ -228,7 +228,7 @@ function safeEqual(a, b) {
 
 // The single-user credentials, compared in constant time.
 function credentialsMatch(user, pass) {
-  return safeEqual(user || "", HUB_USER) && safeEqual(pass || "", HUB_PASSWORD);
+  return safeEqual(user || "", TURMA_USER) && safeEqual(pass || "", TURMA_PASSWORD);
 }
 
 // ---- Login sessions (signed cookie) -----------------------------------------
@@ -316,7 +316,7 @@ function sessionSetCookie(req, token) {
 // or the equivalent Basic-auth header (kept for curl and the agent heartbeat
 // fallback) both pass.
 function userAuthorized(req) {
-  if (!HUB_PASSWORD) return true;
+  if (!TURMA_PASSWORD) return true;
   if (sessionTokenValid(cookies(req)[SESSION_COOKIE])) return true;
   const header = req.headers.authorization || "";
   if (!header.startsWith("Basic ")) return false;
@@ -329,19 +329,19 @@ function userAuthorized(req) {
 // Agent auth (heartbeats). The user credentials also work here, so a curl
 // with the basic-auth login can exercise the endpoint.
 function agentAuthorized(req) {
-  if (!HUB_AGENT_TOKEN) return true;
+  if (!TURMA_AGENT_TOKEN) return true;
   const header = req.headers.authorization || "";
-  if (header.startsWith("Bearer ")) return safeEqual(header.slice(7), HUB_AGENT_TOKEN);
-  return userAuthorized(req) && !!HUB_PASSWORD;
+  if (header.startsWith("Bearer ")) return safeEqual(header.slice(7), TURMA_AGENT_TOKEN);
+  return userAuthorized(req) && !!TURMA_PASSWORD;
 }
 
 // Agent auth for the tunnel WebSockets. Node's browser-style WebSocket client
 // (used by tunnel-agent.js) can't set headers, so the token rides a query
 // param; a Bearer header is accepted too for tools that can send one.
 function agentWsAuthorized(url, req) {
-  if (!HUB_AGENT_TOKEN) return true;
+  if (!TURMA_AGENT_TOKEN) return true;
   const token = url.searchParams.get("token");
-  if (token) return safeEqual(token, HUB_AGENT_TOKEN);
+  if (token) return safeEqual(token, TURMA_AGENT_TOKEN);
   return agentAuthorized(req);
 }
 
@@ -890,7 +890,7 @@ const server = http.createServer(async (req, res) => {
     // Validate credentials and hand back the session cookie.
     if (req.method === "POST" && url.pathname === "/api/login") {
       const body = JSON.parse((await readBody(req)) || "{}");
-      if (HUB_PASSWORD && !credentialsMatch(body.username, body.password)) {
+      if (TURMA_PASSWORD && !credentialsMatch(body.username, body.password)) {
         return json(res, 401, { error: "invalid credentials" });
       }
       res.writeHead(200, {
@@ -1148,7 +1148,7 @@ server.on("upgrade", async (req, socket, head) => {
       sendWatch: (sessionId, worktreePath) => send(0x1, JSON.stringify({ watch: sessionId, worktreePath })),
       sendUnwatch: (sessionId) => send(0x1, JSON.stringify({ unwatch: sessionId })),
       // Nudge the agent to heartbeat NOW so a just-queued command is delivered
-      // in that beat's reply instead of waiting up to a whole HUB_INTERVAL.
+      // in that beat's reply instead of waiting up to a whole TURMA_INTERVAL.
       sendPoke: () => send(0x1, JSON.stringify({ poke: true })),
     };
     console.log(`tunnel connected: ${name}`);
@@ -1400,12 +1400,12 @@ server.on("upgrade", async (req, socket, head) => {
   socket.destroy();
 });
 
-// Test hooks: when AGENTHUB_TEST is set (never in the image — the Dockerfile
+// Test hooks: when TURMA_TEST is set (never in the image — the Dockerfile
 // runs `node server.js` with it unset), export the internals for the test
 // suite and skip binding the production port (tests listen on an ephemeral
 // port themselves). Production behavior is identical: the guard only decides
 // whether to listen.
-if (process.env.AGENTHUB_TEST) {
+if (process.env.TURMA_TEST) {
   module.exports = {
     server,
     agents,
@@ -1431,10 +1431,10 @@ if (process.env.AGENTHUB_TEST) {
     wsTokenValid,
   };
 } else {
-  if (!HUB_PASSWORD) console.warn("WARNING: HUB_USER/HUB_PASSWORD not set — UI is unauthenticated");
-  if (!HUB_AGENT_TOKEN) console.warn("WARNING: HUB_AGENT_TOKEN not set — heartbeat and tunnel endpoints are unauthenticated");
+  if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");
+  if (!TURMA_AGENT_TOKEN) console.warn("WARNING: TURMA_AGENT_TOKEN not set — heartbeat and tunnel endpoints are unauthenticated");
   server.listen(PORT, () => {
-    console.log(`agent-hub listening on :${PORT}`);
+    console.log(`turma listening on :${PORT}`);
     console.log(
       NTFY_URL
         ? `ntfy alerts -> ${NTFY_URL}/${NTFY_TOPIC} (cost threshold $${COST_ALERT_USD}/day)`

@@ -1,4 +1,4 @@
-name: build-agent-image
+name: build-turma-agent-image
 
 # Build and push the headless agent image to GHCR whenever the /agent build
 # context (or this workflow) changes on main. The image currently bundles
@@ -9,11 +9,11 @@ on:
     branches: [main]
     paths:
       - "agent/**"
-      - ".github/workflows/agent-image.yml"
+      - ".github/workflows/turma-agent-image.yml"
   workflow_dispatch: {}
 
 concurrency:
-  group: agent-image
+  group: turma-agent-image
   cancel-in-progress: true
 
 env:
@@ -47,7 +47,7 @@ jobs:
           CC_VERSION="$(docker run --rm node:24-alpine npm view @anthropic-ai/claude-code version | tr -d '[:space:]')"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "cc_version=${CC_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Building agent ${VERSION} (bundling Claude Code ${CC_VERSION})"
+          echo "Building turma-agent ${VERSION} (bundling Claude Code ${CC_VERSION})"
 
       - name: Log in to GHCR
         uses: docker/login-action@v4

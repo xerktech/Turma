@@ -1,6 +1,6 @@
 // Phone-side login page (index.html) — plain DOM, no framework. This is what
 // the user sees on their phone screen while the WebView is open; it mirrors
-// the web dashboard's login (agent-hub/public/login.html): the hub URL is
+// the web dashboard's login (turma/public/login.html): the hub URL is
 // hardcoded (config.ts `resolveHubUrl`), so it only collects a username and
 // password.
 //

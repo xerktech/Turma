@@ -34,7 +34,7 @@ export interface HubClientOptions {
   fetchFn?: typeof fetch;
 }
 
-// Typed REST client for the hub API (`agent-hub/server.js`). Every method
+// Typed REST client for the hub API (`turma/server.js`). Every method
 // sends the Basic auth header, JSON in/out; every non-2xx response throws an
 // HttpError carrying its status — except getHistory's 202 ("still fetching"),
 // which is a normal, non-throwing return per the brief's 202-pending pattern.
@@ -82,7 +82,7 @@ export class HubClient {
 
   // Resume targets a KILLED session's id (from that host's closedSessions
   // list, see types.ts's ClosedSessionInfo) — same endpoint shape as
-  // kill/start/restart (see agent-hub/server.js's sessions/<id>/<action>
+  // kill/start/restart (see turma/server.js's sessions/<id>/<action>
   // route and hub-agent.py's SessionManager.resume, which re-registers the
   // closed record and relaunches `claude --resume` on its kept branch).
   sessionAction(host: string, id: string, action: SessionAction): Promise<QueuedResponse> {

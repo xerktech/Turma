@@ -1,6 +1,6 @@
-# @agenthub/glasses
+# @turma/glasses
 
-Even Realities G2 smart-glasses client for AgentHub: a sessions list, a
+Even Realities G2 smart-glasses client for Turma: a sessions list, a
 scrollable transcript, question answering (`AskUserQuestion`), spawn/kill/
 resume of Claude Code sessions, and G2-mic dictation transcribed by the hub's
 Whisper integration. `src/app.ts` is a hardware-agnostic controller driven
@@ -73,7 +73,7 @@ touchpad produced an event won't be meaningfully exercised there either.
 
 ## Hub requirements
 
-The hub (`agent-hub/server.js`) needs its Whisper STT env vars set for
+The hub (`turma/server.js`) needs its Whisper STT env vars set for
 dictation to work — otherwise the `/audio` WebSocket still accepts
 connections but every result reports `unavailable`:
 
@@ -85,7 +85,7 @@ connections but every result reports `unavailable`:
 - `WHISPER_TIMEOUT_MS` — default `30000`.
 
 Set these in DockerOps' compose file alongside the hub's existing env
-(`HUB_USER`/`HUB_PASSWORD`/`HUB_TOKEN`/etc.).
+(`TURMA_USER`/`TURMA_PASSWORD`/`TURMA_TOKEN`/etc.).
 
 The agent side (`agent/hub-agent.py`) has its own tunables for the
 transcript-tail and history/input surfaces the glasses client polls:
@@ -106,7 +106,7 @@ Before `npm run pack`, edit `app.json`'s `permissions[].whitelist` (the
 layer, so a stale entry means the packaged app simply can't reach your hub.
 
 ```sh
-npm run pack   # builds dist/ and packages it + app.json into ../agenthub-hud.ehpk
+npm run pack   # builds dist/ and packages it + app.json into ../turma-hud.ehpk
 npx evenhub qr # sideload: generates a QR code the Even app scans to install
 ```
 
@@ -139,7 +139,7 @@ command, so the built `.ehpk` is uploaded through the web portal.
 
    ```sh
    npm run build   # tsc + vite → dist/
-   npm run pack    # evenhub pack app.json dist -o ../agenthub-hud.ehpk
+   npm run pack    # evenhub pack app.json dist -o ../turma-hud.ehpk
    ```
 
 4. **Upload the `.ehpk` in the developer portal** and create/update the app
@@ -162,7 +162,7 @@ portal:
 - **Public** — after passing review, listed in the Even Hub store for anyone to
   install (shown under "Public" plugins).
 
-**For AgentHub HUD specifically, the private/beta lane is the realistic one.**
+**For Turma HUD specifically, the private/beta lane is the realistic one.**
 The app is single-user and self-hosted: the hub URL is hardcoded
 (`DEFAULT_HUB_URL` in `src/config.ts`), it sits behind HTTP Basic auth, and the
 `app.json` `network` whitelist is pinned to one host. A public installer has no

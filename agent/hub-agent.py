@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Session manager + heartbeat agent for the agent-hub dashboard.
+"""Session manager + heartbeat agent for the turma dashboard.
 
 ONE of these runs per physical host (started by entrypoint.sh, in the
 FOREGROUND — it is the container's long-lived process). It replaces the old
@@ -8,7 +8,7 @@ multiplexer:
 
   - Scans REPOS_ROOT (default /mnt/data/Docker/git) one level deep for git
     repos and reports them to the hub.
-  - Owns a persisted session registry (~/.agenthub/sessions.json). Each session
+  - Owns a persisted session registry (~/.turma/sessions.json). Each session
     is a git *worktree* of a repo in DETACHED HEAD (the app creates no branch;
     the running agent branches its own work when ready) forked off the latest
     default branch, running its own `claude --remote-control` inside its own tmux
@@ -18,7 +18,7 @@ multiplexer:
     de-dup.
   - Auto-resumes `running` sessions on boot — WITH their conversation
     (claude --resume against the worktree's newest transcript).
-  - Remembers killed sessions (~/.agenthub/closed.json, newest 5 per repo) so
+  - Remembers killed sessions (~/.turma/closed.json, newest 5 per repo) so
     the hub can offer a per-repo "Resume" picker. Killing a session stops its
     processes but KEEPS its worktree on disk (uncommitted work survives), so a
     resume re-attaches to the same worktree with its prior conversation.
@@ -60,12 +60,12 @@ from collections import deque
 # wouldn't wake on the signal).
 _poke = threading.Event()
 
-HUB_URL = os.environ.get("HUB_URL", "http://agent-hub:8300")
+TURMA_URL = os.environ.get("TURMA_URL", "http://turma:8300")
 # Bearer token for the hub's /api/heartbeat (the UI itself sits behind basic
 # auth; this lets agents report without those user credentials). Must match
-# the hub's HUB_AGENT_TOKEN.
-HUB_TOKEN = os.environ.get("HUB_TOKEN", "")
-INTERVAL = int(os.environ.get("HUB_INTERVAL", "20"))
+# the hub's TURMA_AGENT_TOKEN.
+TURMA_TOKEN = os.environ.get("TURMA_TOKEN", "")
+INTERVAL = int(os.environ.get("TURMA_INTERVAL", "20"))
 
 # Host-multiplexer configuration (see CONTRACT / entrypoint.sh comments).
 REPOS_ROOT = os.environ.get("REPOS_ROOT", "/mnt/data/Docker/git")
@@ -82,9 +82,9 @@ ROOT_REPO_NAME = "(root)"
 
 # Where worktrees live: under a dot-dir so the repo scan never lists them, and
 # on the mounted tree so they survive a container restart.
-WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".agenthub", "worktrees")
+WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".turma", "worktrees")
 # Persisted session registry (survives container restart).
-REGISTRY_DIR = os.path.expanduser("~/.agenthub")
+REGISTRY_DIR = os.path.expanduser("~/.turma")
 REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
 # Killed-but-resumable session history (branch + transcript survive a kill).
 CLOSED_PATH = os.path.join(REGISTRY_DIR, "closed.json")
@@ -100,9 +100,9 @@ PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", "/root/.claude/projects")
 def _project_slug(path):
     """Claude Code's project-dir slug for a cwd: EVERY non-alphanumeric
     character becomes '-', not just '/'. The worktree paths this agent
-    manages always contain a dot (REPOS_ROOT/.agenthub/worktrees/<id>), so
-    the old '/'->'-' mapping produced '-.agenthub-' where Claude writes
-    '--agenthub-' — every transcript lookup missed, silently blanking
+    manages always contain a dot (REPOS_ROOT/.turma/worktrees/<id>), so
+    the old '/'->'-' mapping produced '-.turma-' where Claude writes
+    '--turma-' — every transcript lookup missed, silently blanking
     session signals, tails, history, and usage for worktree sessions."""
     return re.sub(r"[^A-Za-z0-9]", "-", path)
 # Glasses-client transcript tail: how many surviving messages to report per
@@ -998,14 +998,14 @@ def log_tail(container_id):
 
 
 def scan_repos():
-    """REPOS_ROOT children that are non-dot dirs (excluding .agenthub) with a
+    """REPOS_ROOT children that are non-dot dirs (excluding .turma) with a
     .git entry. Returns [{"name","path"}] — the multiplexer's repo list."""
     repos = []
     try:
         for name in sorted(os.listdir(REPOS_ROOT)):
             # Skip dot-dirs, our own worktree store, and the reserved root
             # pseudo-repo name so a real dir can never shadow the root entry.
-            if name.startswith(".") or name in (".agenthub", ROOT_REPO_NAME):
+            if name.startswith(".") or name in (".turma", ROOT_REPO_NAME):
                 continue
             path = os.path.join(REPOS_ROOT, name)
             if not os.path.isdir(path):
@@ -1473,7 +1473,7 @@ class SessionManager:
             "-t", "fontSize=14",
             "-t", "rendererType=canvas",
             "-t", "disableLeaveAlert=true",
-            "-c", f"term:{HUB_TOKEN or 'changeme'}",
+            "-c", f"term:{TURMA_TOKEN or 'changeme'}",
             "tmux", "attach", "-t", sess["tmuxName"],
         ]
         try:
@@ -2381,14 +2381,14 @@ class SessionManager:
         """POST one heartbeat. Returns the parsed reply dict, or None on failure
         (pending PR links are kept so they aren't lost on a failed beat)."""
         try:
-            # Explicit User-Agent: HUB_URL rides the Cloudflare tunnel, and
+            # Explicit User-Agent: TURMA_URL rides the Cloudflare tunnel, and
             # Cloudflare's Browser Integrity Check 403s (error 1010) the default
             # "Python-urllib/3.x" signature before it reaches the hub.
             headers = {"Content-Type": "application/json", "User-Agent": "hub-agent/1.0"}
-            if HUB_TOKEN:
-                headers["Authorization"] = f"Bearer {HUB_TOKEN}"
+            if TURMA_TOKEN:
+                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
             req = urllib.request.Request(
-                f"{HUB_URL}/api/heartbeat",
+                f"{TURMA_URL}/api/heartbeat",
                 data=json.dumps(payload).encode(),
                 headers=headers,
                 method="POST",
@@ -2404,7 +2404,7 @@ class SessionManager:
 
     def run_forever(self):
         log(
-            f"reporting to {HUB_URL} as {self.device} (container {self.agent_id}); "
+            f"reporting to {TURMA_URL} as {self.device} (container {self.agent_id}); "
             f"reposRoot={REPOS_ROOT} maxSessions={MAX_SESSIONS}"
         )
         # SIGUSR1 = "the hub queued a command for you — beat now" (sent by

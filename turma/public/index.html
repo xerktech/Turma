@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agent Hub</title>
+<title>Turma</title>
 <style>
   :root {
     --page:        #f9f9f7;
@@ -320,7 +320,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Agent Hub</h1>
+    <h1>Turma</h1>
     <span class="sub">Session hosts</span>
     <span class="spacer"></span>
     <nav class="nav-tabs">
@@ -410,7 +410,7 @@ function cloneText(key, v) { const d = cloneDraft.get(key) || {}; d.text = v; cl
 function cid(rk, field) { return "cmp-" + field + "-" + rk.replace(/[^A-Za-z0-9]/g, "_"); }
 // Per-repo last-used spawn options (base branch, model, permission mode, and
 // whether Options was expanded). Defensive: any storage error → plain defaults.
-function optStoreKey(repo) { return "agenthub.composer." + repo; }
+function optStoreKey(repo) { return "turma.composer." + repo; }
 function loadOpts(repo) {
   try { const o = JSON.parse(localStorage.getItem(optStoreKey(repo)) || "{}"); return o && typeof o === "object" ? o : {}; }
   catch { return {}; }

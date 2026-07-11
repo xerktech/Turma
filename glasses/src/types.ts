@@ -1,5 +1,5 @@
 // Shapes mirrored from the hub's GET /api/agents response and the per-session
-// mutation/history endpoints. Source of truth: `agent-hub/server.js` (HTTP
+// mutation/history endpoints. Source of truth: `turma/server.js` (HTTP
 // routes, response envelopes) and `agent/hub-agent.py` (`_session_payload`,
 // `_closed_payload`, `session_report`, `build_payload`) on this branch. Only
 // the fields this app reads are typed; the real payload carries more (git

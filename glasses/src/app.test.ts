@@ -188,7 +188,7 @@ describe("App", () => {
     expect(client.listAgents).toHaveBeenCalledTimes(1);
     expect(app.getState().agents).toHaveLength(1);
     expect(app.getState().sessionRefs).toHaveLength(1);
-    expect(display.lines[0]).toBe("AGENTHUB 1 run · 0 ask");
+    expect(display.lines[0]).toBe("TURMA 1 run · 0 ask");
   });
 
   it("navigates home -> session -> actions -> back to session on double-tap", async () => {
