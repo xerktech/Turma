@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { createInitialState, newSessionState, type AppState } from "./app.ts";
-import { render, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
+import { render, sessionContentLines, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
+import { charMeasure, setDefaultMeasure, type Measure } from "./text-wrap.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
 const NOW = 1_700_000_000_000;
@@ -567,5 +568,81 @@ describe("render: settings", () => {
     const state = base({ screen: "settings", agents, settings: { cursor: 0 } });
     const lines = asLines(render(state));
     expect(lines).toContain("1/2 hosts online");
+  });
+});
+
+describe("render: transcript wrap memoization (Fix 1)", () => {
+  // These tests swap the module-level default measure to a counting stand-in;
+  // restore the real charMeasure afterwards so nothing else sees the counter.
+  afterEach(() => setDefaultMeasure(charMeasure));
+
+  it("serves committed entries from cache and re-wraps only on text or measure change", () => {
+    let calls = 0;
+    const counting: Measure = (s) => {
+      calls++;
+      return charMeasure(s);
+    };
+    setDefaultMeasure(counting); // also bumps the measure generation
+
+    const longText = "the quick brown fox jumps over the lazy dog ".repeat(4);
+    const stateFor = (text: string) =>
+      base({
+        screen: "session",
+        session: null, // no reveal slicing — the entry wraps in full
+        transcripts: { s1: { entries: [{ id: "e1", role: "assistant", text }] } },
+      });
+
+    const first = sessionContentLines(stateFor(longText), "host-a", "s1");
+    const afterFirst = calls;
+    expect(afterFirst).toBeGreaterThan(0);
+    expect(first.length).toBeGreaterThan(1); // wrapped across several lines
+
+    // Same text again -> entirely a cache hit, no new measuring.
+    const second = sessionContentLines(stateFor(longText), "host-a", "s1");
+    expect(second).toEqual(first);
+    expect(calls).toBe(afterFirst);
+
+    // The entry's text grows (streaming append) -> that entry re-wraps.
+    sessionContentLines(stateFor(longText + " and some more words here"), "host-a", "s1");
+    expect(calls).toBeGreaterThan(afterFirst);
+    const afterGrow = calls;
+
+    // A measure/font swap (setDefaultMeasure bumps the generation) invalidates
+    // the cache so a wrap computed under the old metric can't be served.
+    setDefaultMeasure(counting);
+    sessionContentLines(stateFor(longText), "host-a", "s1");
+    expect(calls).toBeGreaterThan(afterGrow);
+  });
+
+  it("re-wraps the revealing prefix each tick but keeps older entries cached", () => {
+    let calls = 0;
+    const counting: Measure = (s) => {
+      calls++;
+      return charMeasure(s);
+    };
+    setDefaultMeasure(counting);
+
+    const older = "older committed assistant entry that wraps ".repeat(3);
+    const live = "streaming live turn text that grows over ticks and wraps too";
+    const stateFor = (shown: number) =>
+      base({
+        screen: "session",
+        session: newSessionState("host-a", "s1"),
+        reveal: { entryId: "__live", shown },
+        liveTurn: { sessionId: "s1", text: live },
+        transcripts: { s1: { entries: [{ id: "e-old", role: "assistant", text: older }] } },
+      });
+
+    sessionContentLines(stateFor(10), "host-a", "s1");
+    const afterFirst = calls;
+    // Next "tick": a different revealed prefix of the live turn -> only that
+    // prefix re-wraps; the older committed entry stays a cache hit.
+    sessionContentLines(stateFor(20), "host-a", "s1");
+    const perTick = calls - afterFirst;
+    expect(perTick).toBeGreaterThan(0); // the changed prefix did re-wrap
+    // Re-wrapping the whole buffer would cost at least the older entry's words
+    // too; a per-tick cost below that shows the older entry was cached.
+    const olderWords = older.trim().split(/\s+/).length;
+    expect(perTick).toBeLessThan(olderWords);
   });
 });

@@ -217,4 +217,62 @@ describe("LiveTail", () => {
     expect(FakeSocket.instances.length).toBe(0);
     expect(sched.count()).toBe(1);
   });
+
+  it("reuses the cached ws-token across a reconnect (no refetch)", async () => {
+    const { lt, sched, wsToken } = makeLiveTail();
+    lt.start("h", "s", () => {});
+    await flush();
+    expect(wsToken).toHaveBeenCalledTimes(1);
+    const first = FakeSocket.instances[0]!;
+    first.open(); // proven-good token
+    first.emit("close"); // a plain network drop, not a rejection
+    sched.fireAll();
+    await flush();
+    expect(FakeSocket.instances.length).toBe(2); // reconnected
+    expect(wsToken).toHaveBeenCalledTimes(1); // token reused, not refetched
+  });
+
+  it("reuses the cached ws-token across a session switch", async () => {
+    const { lt, wsToken } = makeLiveTail();
+    lt.start("h", "s1", () => {});
+    await flush();
+    FakeSocket.instances[0]!.open();
+    lt.start("h", "s2", () => {}); // switch sessions -> new socket
+    await flush();
+    expect(FakeSocket.instances.length).toBe(2);
+    expect(FakeSocket.instances[1]!.url).toContain("/live/h/s2");
+    expect(wsToken).toHaveBeenCalledTimes(1); // one token covers both
+  });
+
+  it("refetches the ws-token when a connection fails before opening (it may be stale)", async () => {
+    const { lt, sched, wsToken } = makeLiveTail();
+    lt.start("h", "s", () => {});
+    await flush();
+    expect(wsToken).toHaveBeenCalledTimes(1);
+    // Socket errors before ever opening — the token could have been rejected,
+    // so it's dropped and the reconnect fetches a fresh one.
+    FakeSocket.instances[0]!.emit("error");
+    sched.fireAll();
+    await flush();
+    expect(FakeSocket.instances.length).toBe(2);
+    expect(wsToken).toHaveBeenCalledTimes(2);
+  });
+
+  it("refetches a fresh ws-token once the cached one nears expiry", async () => {
+    let clock = 1_000;
+    const wsToken = vi.fn(async () => ({ token: "tok", expiresInSec: 60 }));
+    const { lt, sched } = makeLiveTail({ hubClient: { wsToken }, now: () => clock });
+    lt.start("h", "s", () => {});
+    await flush();
+    const first = FakeSocket.instances[0]!;
+    first.open();
+    first.emit("close"); // healthy drop -> token kept
+    expect(wsToken).toHaveBeenCalledTimes(1);
+    // Advance past (60s TTL - 30s skew) so the cached token is now too close to
+    // expiry to reuse.
+    clock += 40_000;
+    sched.fireAll();
+    await flush();
+    expect(wsToken).toHaveBeenCalledTimes(2);
+  });
 });

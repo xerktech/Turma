@@ -90,6 +90,37 @@ test("transcriptTail: no transcript -> []", () => {
   assert.equal(newestTranscript("/wt/does-not-exist"), null);
 });
 
+test("transcriptTail: with a cache, an unchanged file is not re-parsed", () => {
+  const wt = "/wt/cache";
+  const dir = writeTranscript(wt, "t.jsonl", [
+    { uuid: "u1", type: "user", message: { content: "one" } },
+  ]);
+  const p = path.join(dir, "t.jsonl");
+  const cache = { path: null, mtimeMs: 0, size: 0, result: [] };
+
+  const first = transcriptTail(wt, cache);
+  assert.deepEqual(first, [{ id: "u1", role: "user", text: "one" }]);
+  assert.equal(cache.path, p); // primed
+
+  // File untouched: the cache must skip the read+parse and hand back the EXACT
+  // prior result object (a re-parse would build an equal-but-distinct array).
+  const cached = transcriptTail(wt, cache);
+  assert.equal(cached, first); // same reference -> no read+parse happened
+
+  // A real change (mtime advances, new content) busts the cache and re-parses.
+  writeTranscript(wt, "t.jsonl", [
+    { uuid: "u1", type: "user", message: { content: "one" } },
+    { uuid: "a1", type: "assistant", message: { content: "two" } },
+  ]);
+  const later = Date.now() / 1000 + 5;
+  fs.utimesSync(p, later, later);
+  const reparsed = transcriptTail(wt, cache);
+  assert.deepEqual(reparsed, [
+    { id: "u1", role: "user", text: "one" },
+    { id: "a1", role: "assistant", text: "two" },
+  ]);
+});
+
 test("pokeHeartbeat signals the session-manager process (PID 1) with SIGUSR1", () => {
   // Stub process.kill so the test never actually signals anything — just
   // capture what pokeHeartbeat would send.

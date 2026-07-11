@@ -25,7 +25,7 @@ import {
   type HomeRow,
   type SessionFocus,
 } from "./render.ts";
-import type { AgentInfo, InputEvent, SessionInfo, SessionRef, SessionStatus, TailEntry } from "./types.ts";
+import type { AgentInfo, AgentsResponse, InputEvent, SessionInfo, SessionRef, SessionStatus, TailEntry } from "./types.ts";
 
 export type Screen =
   | "home"
@@ -262,9 +262,20 @@ export class App {
   }
 
   async start(): Promise<void> {
+    // Kick the first agents fetch off immediately so its network round-trip
+    // overlaps display.start() (the BLE/display bring-up) rather than following
+    // it — the list the user is waiting for is then ready the moment the
+    // display is. The paint still happens only after display.start() (the
+    // first poll runs on the scheduled tick below, once display is up), so no
+    // frame is ever rendered against an unstarted display.
+    const firstAgents = this.client.listAgents();
+    // Attach a no-op catch so an early rejection isn't an unhandled rejection
+    // while display.start() runs; poll() re-awaits the SAME promise and runs
+    // its own catch (the hub-unreachable flash) on the rejection.
+    firstAgents.catch(() => {});
     await this.display.start();
     this.display.onInput((e) => this.handleInput(e));
-    this.schedulePoll(0);
+    this.schedulePoll(0, firstAgents);
   }
 
   // Lifecycle glue (Task 7) funnels foreground-exit / abnormal-exit /
@@ -339,12 +350,12 @@ export class App {
     this.setState({ screen, session });
   }
 
-  private schedulePoll(delayMs: number): void {
+  private schedulePoll(delayMs: number, prefetched?: Promise<AgentsResponse>): void {
     // While paused, only keep polling inside a post-mutation grace window.
     if (this.paused && this.now() >= this.graceUntil) return;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = setTimeout(() => {
-      void this.poll();
+      void this.poll(prefetched);
     }, delayMs);
   }
 
@@ -496,12 +507,14 @@ export class App {
 
   // The newest entry the reveal should type: the live in-progress turn if one
   // is streaming for this session, else the newest committed transcript entry.
-  private newestRevealTarget(sessionId: string): { id: string | null; len: number } {
+  // `live` distinguishes the genuinely-streamed turn (types char-by-char) from
+  // a committed entry that lands whole (snaps in) — see advanceReveal.
+  private newestRevealTarget(sessionId: string): { id: string | null; len: number; live: boolean } {
     const lt = this.state.liveTurn;
-    if (lt && lt.sessionId === sessionId && lt.text) return { id: LIVE_TURN_ID, len: lt.text.length };
+    if (lt && lt.sessionId === sessionId && lt.text) return { id: LIVE_TURN_ID, len: lt.text.length, live: true };
     const entries = this.state.transcripts[sessionId]?.entries ?? [];
     const last = entries[entries.length - 1];
-    return { id: last?.id ?? null, len: last?.text.length ?? 0 };
+    return { id: last?.id ?? null, len: last?.text.length ?? 0, live: false };
   }
 
   private repaint(): void {
@@ -529,7 +542,7 @@ export class App {
   private reanchorReveal(sessionId: string): void {
     if (this.state.session?.sessionId !== sessionId) return;
     const target = this.newestRevealTarget(sessionId);
-    const reveal = advanceReveal(this.state.reveal, target.id, target.len, 0);
+    const reveal = advanceReveal(this.state.reveal, target.id, target.len, 0, { live: target.live });
     this.state = { ...this.state, reveal };
     this.lastRevealAt = this.now();
   }
@@ -559,7 +572,7 @@ export class App {
     const now = this.now();
     const dt = now - this.lastRevealAt;
     this.lastRevealAt = now;
-    const reveal = advanceReveal(this.state.reveal, target.id, targetLen, dt);
+    const reveal = advanceReveal(this.state.reveal, target.id, targetLen, dt, { live: target.live });
     this.state = { ...this.state, now, reveal };
     this.repaint();
     if (!revealComplete(reveal, targetLen)) this.scheduleRevealTick();
@@ -567,10 +580,13 @@ export class App {
 
   // ---- polling --------------------------------------------------------
 
-  async poll(): Promise<void> {
+  async poll(prefetched?: Promise<AgentsResponse>): Promise<void> {
     const now = this.now();
     try {
-      const res = await this.client.listAgents();
+      // On the very first poll `prefetched` is the listAgents() fetch start()
+      // already kicked off in parallel with display.start(); every later poll
+      // starts its own fetch here.
+      const res = await (prefetched ?? this.client.listAgents());
       const sessionRefs = flattenSessions(res.agents);
       // Content length of the focused session *before* this poll's tail merge,
       // so a scrolled-up view can be pinned to the same lines (see

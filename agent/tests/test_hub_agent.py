@@ -233,7 +233,7 @@ class TestSpawnOptionHelpers(unittest.TestCase):
                 ha, "run",
                 lambda cmd, cwd=None: "origin/main" if "symbolic-ref" in cmd else ""), \
              mock.patch.object(ha, "run_ok",
-                               lambda cmd, cwd=None: calls.append(cmd) or (0, "")), \
+                               lambda cmd, cwd=None, timeout=None: calls.append(cmd) or (0, "")), \
              mock.patch.object(ha, "branch_exists",
                                lambda repo, ref: ref == "refs/remotes/origin/main"):
             self.assertEqual(ha.default_base_ref("/repo"), "origin/main")
@@ -418,6 +418,13 @@ class TestRepoUsageReport(unittest.TestCase):
     def _entry(self, worktree, repo, remote):
         return {"repo": repo, "remote": remote, "slug": ha._project_slug(worktree)}
 
+    def _fold_full(self, slug):
+        # Stand-in for the manager's _fold_slug: a full (non-incremental) parse
+        # of one project slug into a fresh accumulator.
+        acc = ha._UsageAcc()
+        ha._aggregate_project(os.path.join(self.tmp, slug), acc)
+        return acc
+
     def test_merges_worktrees_per_repo_and_host_total(self):
         wt_a = "/w/.turma/worktrees/Turma/aaa"
         wt_b = "/w/.turma/worktrees/Turma/bbb"
@@ -440,7 +447,7 @@ class TestRepoUsageReport(unittest.TestCase):
             wt_b: self._entry(wt_b, "Turma", "https://github.com/xerktech/Turma.git"),
             wt_c: self._entry(wt_c, "DockerOps", "git@github.com:xerktech/DockerOps.git"),
         }
-        repo_usage, host = ha.repo_usage_report(ledger)
+        repo_usage, host = ha.repo_usage_report(ledger, self._fold_full)
         by = {r["repo"]: r for r in repo_usage}
 
         self.assertAlmostEqual(by["Turma"]["usage"]["totals"]["cost"], 7.8, places=2)
@@ -469,7 +476,7 @@ class TestRepoUsageReport(unittest.TestCase):
             wt_empty: self._entry(wt_empty, "Turma", ""),
             wt_gone: self._entry(wt_gone, "Ghost", ""),
         }
-        repo_usage, host = ha.repo_usage_report(ledger)
+        repo_usage, host = ha.repo_usage_report(ledger, self._fold_full)
         repos = {r["repo"] for r in repo_usage}
         self.assertIn("Turma", repos)      # has usage via wt_live
         self.assertNotIn("Ghost", repos)   # no transcripts -> omitted
@@ -478,9 +485,90 @@ class TestRepoUsageReport(unittest.TestCase):
         self.assertEqual(turma["remoteKey"], "Turma")
 
     def test_empty_ledger(self):
-        repo_usage, host = ha.repo_usage_report({})
+        repo_usage, host = ha.repo_usage_report({}, self._fold_full)
         self.assertEqual(repo_usage, [])
         self.assertIsNone(host)
+
+
+class TestAggregateProjectIncremental(ProjectDirMixin, unittest.TestCase):
+    """With an `offsets` dict, _aggregate_project folds only newly-appended bytes
+    across beats (the manager carries a persistent per-slug acc + offsets), but
+    the running totals must always match a from-scratch parse."""
+
+    def _entry(self, ts, mid, model, inp, out):
+        return usage_entry(ts, mid, mid, model, inp, out)
+
+    def _fold(self, acc, offsets):
+        return ha._aggregate_project(self.proj, acc, offsets)
+
+    def test_incremental_matches_full_and_only_reads_new_bytes(self):
+        path = os.path.join(self.proj, "a.jsonl")
+        write_jsonl(path, [self._entry(
+            "2026-07-01T10:00:00Z", "m1", "claude-opus-4-20250514", 1_000_000, 0)])
+
+        acc, offsets = ha._UsageAcc(), {}
+        self.assertTrue(self._fold(acc, offsets))
+        self.assertEqual(acc.totals["input"], 1_000_000)
+        off1 = offsets["a.jsonl"]
+
+        # Append a second message; the incremental beat picks up only the delta.
+        write_jsonl(path, [self._entry(
+            "2026-07-02T10:00:00Z", "m2", "claude-opus-4-20250514", 500_000, 0)])
+        self.assertTrue(self._fold(acc, offsets))
+        self.assertEqual(acc.totals["input"], 1_500_000)
+        self.assertGreater(offsets["a.jsonl"], off1)
+
+        # Same result as a cold, stateless full parse of the final file.
+        self.assertEqual(acc.totals["input"],
+                         ha.usage_report(self.WORKDIR)["totals"]["input"])
+
+    def test_cross_file_dedup_persists_across_beats(self):
+        a = os.path.join(self.proj, "a.jsonl")
+        b = os.path.join(self.proj, "b.jsonl")
+        dup = self._entry("2026-07-01T10:00:00Z", "m1", "claude-opus-4-20250514", 10, 0)
+        write_jsonl(a, [dup])
+        acc, offsets = ha._UsageAcc(), {}
+        self._fold(acc, offsets)
+        # The SAME message id later shows up appended to another transcript.
+        write_jsonl(b, [dup])
+        self._fold(acc, offsets)
+        self.assertEqual(acc.totals["input"], 10)  # counted once, not twice
+
+    def test_partial_trailing_line_deferred_then_counted(self):
+        path = os.path.join(self.proj, "a.jsonl")
+        entry = self._entry("2026-07-01T10:00:00Z", "m1", "claude-opus-4-20250514", 7, 0)
+        line = json.dumps(entry)
+        # Write the entry WITHOUT its trailing newline (an in-progress write).
+        with open(path, "w") as f:
+            f.write(line[: len(line) // 2])
+        acc, offsets = ha._UsageAcc(), {}
+        self._fold(acc, offsets)
+        self.assertEqual(acc.totals["input"], 0)  # not yet a whole line
+        # Finish the line; the offset never advanced past the partial, so the
+        # whole entry is read exactly once now.
+        with open(path, "w") as f:
+            f.write(line + "\n")
+        self._fold(acc, offsets)
+        self.assertEqual(acc.totals["input"], 7)
+
+    def test_truncation_signals_rebuild(self):
+        path = os.path.join(self.proj, "a.jsonl")
+        write_jsonl(path, [self._entry(
+            "2026-07-01T10:00:00Z", "m1", "claude-opus-4-20250514", 100, 0)])
+        acc, offsets = ha._UsageAcc(), {}
+        self.assertTrue(self._fold(acc, offsets))
+        self.assertEqual(acc.totals["input"], 100)
+        # Rewrite the file smaller: _aggregate_project reports the truncation
+        # (returns False, acc untouched) so the caller rebuilds from a fresh acc
+        # rather than adding on top of the stale running total.
+        with open(path, "w") as f:
+            f.write(json.dumps(self._entry(
+                "2026-07-02T10:00:00Z", "m2", "claude-opus-4-20250514", 5, 0)) + "\n")
+        self.assertFalse(self._fold(acc, offsets))
+        self.assertEqual(acc.totals["input"], 100)  # unchanged on the failed fold
+        fresh, foff = ha._UsageAcc(), {}
+        self.assertTrue(self._fold(fresh, foff))
+        self.assertEqual(fresh.totals["input"], 5)
 
 
 class TestLastEntry(ProjectDirMixin, unittest.TestCase):
@@ -798,7 +886,7 @@ class ManagerMixin:
             self.run_calls.append(cmd)
             return ""
 
-        def fake_run_ok(cmd, cwd=None):
+        def fake_run_ok(cmd, cwd=None, timeout=None):
             self.run_ok_calls.append(cmd)
             return 0, ""
 
@@ -1706,6 +1794,116 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
         )
 
 
+class TestBuildPayloadCaching(ManagerMixin, unittest.TestCase):
+    """The heartbeat build caches slow-changing work (usage, git facts, docker
+    log tail) off the per-beat critical path (#2/#5/#7): recomputed on the slow
+    cadence or a cache miss, reused in between, and skipped on a `light` beat."""
+
+    def _session(self, sid):
+        return {"id": sid, "repo": "R", "repoPath": "/x/R",
+                "worktreePath": f"/x/R/{sid}", "branch": None, "rcName": sid,
+                "status": "running"}
+
+    def test_usage_refresh_is_staggered_and_caches(self):
+        sm = self.make_manager()
+        sm.registry = [self._session("aaa"), self._session("bbb")]
+        calls = []
+        sm._refresh_usage = lambda sid, wt: calls.append((sid, ha._usage_slot(sid)))
+
+        # Each session refreshes only on the beat matching its own stable slot
+        # (first appearance aside), so they don't all reparse on the same beat.
+        for beat in range(ha.USAGE_EVERY):
+            calls.clear()
+            sm.usage_cache = {"aaa": {}, "bbb": {}}  # both already cached
+            sm.build_payload(beat)
+            for sid, slot in calls:
+                self.assertEqual(slot, beat % ha.USAGE_EVERY)
+        # Over a full window every session refreshed exactly once.
+        seen = set()
+        for beat in range(ha.USAGE_EVERY):
+            calls.clear()
+            sm.usage_cache = {"aaa": {}, "bbb": {}}
+            sm.build_payload(beat)
+            seen.update(sid for sid, _ in calls)
+        self.assertEqual(seen, {"aaa", "bbb"})
+
+    def test_newly_seen_session_refreshes_immediately(self):
+        sm = self.make_manager()
+        sm.registry = [self._session("aaa")]
+        refreshed = []
+        sm._refresh_usage = lambda sid, wt: refreshed.append(sid)
+        # Beat 1 is (almost certainly) not aaa's slot, but with no cached usage
+        # it must still refresh on first appearance.
+        sm.usage_cache = {}
+        sm.build_payload(1)
+        self.assertIn("aaa", refreshed)
+
+    def test_light_beat_skips_expensive_refreshes(self):
+        sm = self.make_manager()
+        sm.registry = [self._session("aaa")]
+        sm.usage_cache = {"aaa": {}}       # already cached -> no first-sight refresh
+        refreshed, gh = [], []
+        sm._refresh_usage = lambda sid, wt: refreshed.append(sid)
+        sm.refresh_github = lambda: gh.append(1)
+        log_calls = []
+        with mock.patch.object(ha, "log_tail",
+                               lambda cid: log_calls.append(cid) or "tail"):
+            # A light beat on beat 0 (which WOULD normally refresh everything)
+            # still touches none of the expensive paths.
+            sm.log_tail_cache = "cached"
+            payload = sm.build_payload(0, light=True)
+        self.assertEqual(refreshed, [])
+        self.assertEqual(gh, [])
+        self.assertEqual(log_calls, [])            # docker logs not shelled out
+        self.assertEqual(payload["logTail"], "cached")
+
+    def test_log_tail_throttled_across_beats(self):
+        sm = self.make_manager()
+        sm.registry = []
+        calls = []
+        with mock.patch.object(ha, "log_tail",
+                               lambda cid: calls.append(cid) or f"t{len(calls)}"):
+            for beat in range(ha.LOG_TAIL_EVERY + 1):
+                sm.build_payload(beat)
+        # Recomputed on beat 0 and again at LOG_TAIL_EVERY, reused in between.
+        self.assertEqual(len(calls), 2)
+
+    def test_repo_slow_facts_cached_and_recomputed_on_cadence(self):
+        sm = self.make_manager()
+        computed = []
+        with mock.patch.object(ha, "repo_slow_facts",
+                               lambda path: computed.append(path) or {"remote": path}):
+            self.assertEqual(sm._repo_slow_facts("/x/R", refresh=False), {"remote": "/x/R"})
+            self.assertEqual(computed, ["/x/R"])        # first sight -> computed
+            sm._repo_slow_facts("/x/R", refresh=False)  # cached -> not recomputed
+            self.assertEqual(computed, ["/x/R"])
+            sm._repo_slow_facts("/x/R", refresh=True)   # slow cadence -> recomputed
+            self.assertEqual(computed, ["/x/R", "/x/R"])
+
+    def test_session_git_caches_slow_and_recomputes_on_branch_change(self):
+        sm = self.make_manager()
+        sess = self._session("aaa")
+        slow_calls, sync_calls = [], []
+        with mock.patch.object(ha, "git_info_cheap",
+                               lambda wt: {"branch": self._branch}), \
+             mock.patch.object(ha, "git_info_slow",
+                               lambda wt: slow_calls.append(wt) or {"remote": "r"}), \
+             mock.patch.object(ha, "branch_sync",
+                               lambda repo, br, base: sync_calls.append(br) or {"baseRef": base}):
+            self._branch = "HEAD"          # still detached
+            gi, work = sm._session_git(sess, refresh=False)
+            self.assertEqual(gi, {"branch": "HEAD", "remote": "r"})
+            self.assertEqual(len(slow_calls), 1)       # first sight -> computed
+
+            gi, work = sm._session_git(sess, refresh=False)
+            self.assertEqual(len(slow_calls), 1)       # cached, no recompute
+
+            self._branch = "feature-x"     # agent just named its work branch
+            sm._session_git(sess, refresh=False)
+            self.assertEqual(len(slow_calls), 2)       # branch change -> recompute
+            self.assertEqual(sync_calls[-1], "feature-x")
+
+
 class TestNormalizeGithubRepo(unittest.TestCase):
     def test_plain_owner_repo(self):
         self.assertEqual(ha.normalize_github_repo("xerktech/Turma"), "xerktech/Turma")
@@ -2043,7 +2241,9 @@ class TestRepoActivitySort(ManagerMixin, unittest.TestCase):
         }
         for name, value in [
             ("scan_repos", lambda: [{"name": n, "path": "/x/" + n} for n, _ in commits]),
-            ("repo_entry", lambda r: dict(by_name[r["name"]])),
+            # repo_entry now takes cached slow facts as its second arg (ignored here).
+            ("repo_entry", lambda r, slow: dict(by_name[r["name"]])),
+            ("repo_slow_facts", lambda path: {}),
             ("root_repo_entry", lambda: {"name": "(root)", "isRoot": True}),
         ]:
             p = mock.patch.object(ha, name, value)

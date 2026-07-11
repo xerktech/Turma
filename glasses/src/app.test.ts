@@ -1423,15 +1423,13 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       expect(liveTail.isWatching("s1")).toBe(false);
     });
 
-    it("types a small live delta in over successive reveal ticks", async () => {
+    it("snaps a freshly-committed entry in immediately (it landed whole — no fake typing)", async () => {
       const app = await enterSession();
-      // A brand-new short assistant entry: re-anchors hidden, then types in.
+      // A brand-new committed transcript entry (a user echo / tool result /
+      // a message the transcript only recorded on completion): it arrived whole
+      // and was never streamed char-by-char, so it snaps to full at once.
       liveTail.deliver([{ id: "m1", role: "assistant", text: "hello world" }]); // 11 chars
-      expect(app.getState().reveal).toEqual({ entryId: "m1", shown: 0 });
-      // 80ms tick @ 150cps -> 12 chars, clamps to the 11 available.
-      await vi.advanceTimersByTimeAsync(80);
-      expect(app.getState().reveal.shown).toBe(11);
-      // The rendered assistant line shows the (now full) text.
+      expect(app.getState().reveal).toEqual({ entryId: "m1", shown: 11 });
       expect(display.lines.some((l) => l.includes("hello world"))).toBe(true);
     });
 
@@ -1443,23 +1441,28 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       expect(app.getState().reveal).toEqual({ entryId: "m1", shown: 400 });
     });
 
-    it("reveals only the typed prefix of the newest entry while typing", async () => {
+    it("reveals only the typed prefix of the newest entry during in-place growth", async () => {
       const app = await enterSession();
-      // Seed a first (older) entry via the live tail, let it finish.
+      // Seed an older entry and a newest one; both committed, so both snap in.
       liveTail.deliver([{ id: "m1", role: "assistant", text: "done" }]);
-      await vi.advanceTimersByTimeAsync(80);
-      // A new long-ish entry that will take more than one tick to type.
+      liveTail.deliver([
+        { id: "m1", role: "assistant", text: "done" },
+        { id: "m2", role: "assistant", text: "abc" }, // snaps to full (3 chars)
+      ]);
+      expect(app.getState().reveal).toEqual({ entryId: "m2", shown: 3 });
+      // The SAME entry now grows in place (e.g. a poll delivering more of a
+      // still-arriving message) — small in-place growth still types in.
       liveTail.deliver([
         { id: "m1", role: "assistant", text: "done" },
         { id: "m2", role: "assistant", text: "abcdefghijklmnopqrstuvwxyz0123456789" }, // 36 chars
       ]);
       expect(app.getState().reveal.entryId).toBe("m2");
-      await vi.advanceTimersByTimeAsync(80); // 12 chars revealed
+      await vi.advanceTimersByTimeAsync(80); // 3 + 12 chars revealed
       const state = app.getState();
-      expect(state.reveal.shown).toBe(12);
-      // Older entry stays full; newest shows only its 12-char prefix.
+      expect(state.reveal.shown).toBe(15);
+      // Older entry stays full; newest shows only its 15-char prefix.
       expect(display.lines.some((l) => l.includes("done"))).toBe(true);
-      expect(display.lines.some((l) => l.includes("abcdefghijkl") && !l.includes("mnop"))).toBe(true);
+      expect(display.lines.some((l) => l.includes("abcdefghijklmno") && !l.includes("pqrs"))).toBe(true);
     });
 
     it("stops the live tail and reveal timer on pause()", async () => {
@@ -1516,11 +1519,12 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       }));
       liveTail.deliver(older);
       await vi.advanceTimersByTimeAsync(80);
-      // A new long entry begins typing (78 chars — more than one 80ms tick,
-      // under the 200-char snap threshold).
+      // A live in-progress turn begins typing (78 chars — more than one 80ms
+      // tick, under the 200-char snap threshold). Committed entries snap, so the
+      // typewriter this test exercises is the genuinely-streamed live turn.
       const longText = "abcdefghijklmnopqrstuvwxyz".repeat(3);
-      liveTail.deliver([...older, { id: "mLast", role: "assistant", text: longText }]);
-      expect(app.getState().reveal.entryId).toBe("mLast");
+      liveTail.deliverTurn(longText);
+      expect(app.getState().reveal.entryId).toBe("__live");
 
       // Scroll up to read history — the reveal must freeze.
       display.emit({ type: "scrollUp" });
