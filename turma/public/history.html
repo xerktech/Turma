@@ -4,68 +4,25 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Turma — Usage history</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/app.css">
 <style>
-  :root {
-    --page:      #f9f9f7;
-    --surface:   #fcfcfb;
-    --ink:       #0b0b0b;
-    --ink-2:     #52514e;
-    --muted:     #898781;
-    --hairline:  #e1e0d9;
-    --border:    rgba(11,11,11,0.10);
-    --accent:    #2a78d6;
-    /* Validated categorical slots (light) — fixed order, never cycled. */
-    --s1: #2a78d6; --s2: #1baf7a; --s3: #eda100; --s4: #008300;
-    --s5: #4a3aa7; --s6: #e34948; --s7: #e87ba4; --s8: #eb6834;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --page:      #0d0d0d;
-      --surface:   #1a1a19;
-      --ink:       #ffffff;
-      --ink-2:     #c3c2b7;
-      --muted:     #898781;
-      --hairline:  #2c2c2a;
-      --border:    rgba(255,255,255,0.10);
-      --accent:    #3987e5;
-      /* Same hues, stepped for the dark surface (validated as a set). */
-      --s1: #3987e5; --s2: #199e70; --s3: #c98500; --s4: #008300;
-      --s5: #9085e9; --s6: #e66767; --s7: #d55181; --s8: #d95926;
-    }
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--page); color: var(--ink);
-    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
-  }
-  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 48px; }
-  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
-  h1 { font-size: 20px; margin: 0; font-weight: 650; }
-  header .sub { color: var(--muted); font-size: 13px; }
-  header .spacer { flex: 1; }
-
-  /* Shared page nav: pill tabs in the header on wide screens, a fixed bottom
-     tab bar on phones (same markup on all three pages). */
-  .nav-tabs { display: flex; gap: 4px; }
-  .nav-tabs a {
-    color: var(--ink-2); text-decoration: none; font-size: 13px;
-    padding: 5px 12px; border-radius: 20px; border: 1px solid transparent;
-  }
-  .nav-tabs a:hover { color: var(--accent); }
-  .nav-tabs a.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
-  .nav-tabs a.signout { color: var(--muted); margin-left: 6px; }
-  .nav-tabs a.signout:hover { color: var(--critical); }
-  .bottom-nav { display: none; }
-
+  /* history-specific layout (chart + legend + table). Tokens, base, nav, footer,
+     status live in /app.css; the categorical --s1..--s8 chart slots too. */
   .chart-card {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 14px 16px 10px; position: relative;
   }
   /* Legend doubles as the series filter: grouped by device, every item a toggle. */
   .legend { display: flex; flex-wrap: wrap; gap: 8px 26px; margin-bottom: 12px; }
   .lg-device { display: flex; align-items: center; gap: 4px 12px; flex-wrap: wrap; }
   .lg-device .dev {
-    color: var(--ink); font-weight: 650; font-size: 12.5px;
+    color: var(--ink); font-weight: 600; font-size: 12.5px;
     cursor: pointer; user-select: none; padding: 3px 2px; border-radius: 5px;
   }
   .lg-device .dev:hover { color: var(--accent); }
@@ -80,7 +37,7 @@
   .legend .item.off .name { text-decoration: line-through; }
 
   svg { display: block; width: 100%; }
-  svg text { font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--muted); font-variant-numeric: tabular-nums; }
+  svg text { font: 11px var(--font-sans); fill: var(--muted); font-variant-numeric: tabular-nums; }
   .gridline { stroke: var(--hairline); stroke-width: 1; }
   .baseline { stroke: var(--hairline); stroke-width: 1; }
   .day-hit { fill: transparent; cursor: default; outline: none; }
@@ -88,14 +45,14 @@
 
   .tooltip {
     position: absolute; pointer-events: none; z-index: 5; display: none;
-    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-md);
     padding: 8px 12px; font-size: 12px; min-width: 210px;
   }
   .tooltip .tt-date { color: var(--muted); margin-bottom: 5px; }
   .tooltip .tt-row { display: flex; align-items: center; gap: 8px; padding: 1.5px 0; }
   .tooltip .tt-key { width: 10px; height: 3px; border-radius: 2px; flex: none; }
-  .tooltip .tt-val { font-weight: 650; font-variant-numeric: tabular-nums; color: var(--ink); }
+  .tooltip .tt-val { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--ink); }
   .tooltip .tt-name { color: var(--ink-2); flex: 1; }
   .tooltip .tt-dev { color: var(--muted); }
   .tooltip .tt-tok { color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -106,7 +63,7 @@
   details.table-view summary:hover { color: var(--ink-2); }
   .table-scroll {
     overflow-x: auto; background: var(--surface);
-    border: 1px solid var(--border); border-radius: 10px; margin-top: 8px;
+    border: 1px solid var(--border); border-radius: var(--radius-md); margin-top: 8px;
   }
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
   th, td { padding: 8px 14px; text-align: right; white-space: nowrap; }
@@ -122,24 +79,8 @@
   .total-col { border-left: 1px solid var(--hairline); }
   tfoot td { border-top: 1px solid var(--hairline); font-weight: 600; font-variant-numeric: tabular-nums; }
   tfoot .label { color: var(--ink-2); font-weight: 600; }
-  .empty { color: var(--muted); text-align: center; padding: 64px 0; border: 1px dashed var(--hairline); border-radius: 10px; }
-  .footer { color: var(--muted); font-size: 12px; margin-top: 28px; }
 
   @media (max-width: 600px) {
-    .wrap { padding: 16px 12px 40px; }
-    .nav-tabs { display: none; }
-    .bottom-nav {
-      display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
-      background: var(--surface); border-top: 1px solid var(--hairline);
-      padding: 4px 8px calc(4px + env(safe-area-inset-bottom));
-    }
-    .bottom-nav a {
-      flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
-      color: var(--muted); text-decoration: none; font-size: 11px; padding: 6px 0 4px;
-    }
-    .bottom-nav a svg { width: 21px; height: 21px; }
-    .bottom-nav a.active { color: var(--accent); }
-    body { padding-bottom: 68px; }
     .chart-card { padding: 12px 10px 8px; }
     .legend { gap: 6px 16px; margin-bottom: 10px; }
     .tooltip { min-width: 150px; font-size: 11px; padding: 7px 10px; }
@@ -154,8 +95,8 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Usage history</h1>
-    <span class="sub">daily est. cost · by session</span>
+    <a class="wordmark" href="/"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
+    <span class="sub">Usage history · daily est. cost by session</span>
     <span class="spacer"></span>
     <nav class="nav-tabs">
       <a href="/">Dashboard</a>

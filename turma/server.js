@@ -493,6 +493,31 @@ const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
 const HISTORY = fs.readFileSync(path.join(__dirname, "public", "history.html"));
 const SESSIONS = fs.readFileSync(path.join(__dirname, "public", "sessions.html"));
 const LOGIN = fs.readFileSync(path.join(__dirname, "public", "login.html"));
+
+// Branded static assets: the shared stylesheet, self-hosted UI fonts (Inter +
+// Space Grotesk), and the icon/favicon set + web manifest. Read once into memory
+// and served UNAUTHENTICATED from an explicit allowlist (see the router) — the
+// login page must render its CSS/fonts/icon before any session cookie exists,
+// and none of this leaks anything (same rationale as /healthz). Icons/fonts are
+// content-hash-stable so they cache hard; app.css uses a short TTL so UI edits
+// propagate on the next deploy without a stale cache.
+const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
+// Filenames are hardcoded string literals (no request data reaches path.join) so
+// there's no path-traversal surface; the request only ever indexes this fixed map.
+const STATIC_ASSETS = {
+  "/app.css":              { body: fs.readFileSync(path.join(__dirname, "public", "app.css")),             type: "text/css; charset=utf-8",                  cache: "public, max-age=300" },
+  "/favicon.svg":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.svg")),         type: "image/svg+xml",                            cache: IMMUTABLE_CACHE },
+  "/favicon.ico":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.ico")),         type: "image/x-icon",                             cache: IMMUTABLE_CACHE },
+  "/favicon-16.png":       { body: fs.readFileSync(path.join(__dirname, "public", "favicon-16.png")),      type: "image/png",                                cache: IMMUTABLE_CACHE },
+  "/favicon-32.png":       { body: fs.readFileSync(path.join(__dirname, "public", "favicon-32.png")),      type: "image/png",                                cache: IMMUTABLE_CACHE },
+  "/apple-touch-icon.png": { body: fs.readFileSync(path.join(__dirname, "public", "apple-touch-icon.png")), type: "image/png",                               cache: IMMUTABLE_CACHE },
+  "/icon-192.png":         { body: fs.readFileSync(path.join(__dirname, "public", "icon-192.png")),        type: "image/png",                                cache: IMMUTABLE_CACHE },
+  "/icon-512.png":         { body: fs.readFileSync(path.join(__dirname, "public", "icon-512.png")),        type: "image/png",                                cache: IMMUTABLE_CACHE },
+  "/site.webmanifest":     { body: fs.readFileSync(path.join(__dirname, "public", "site.webmanifest")),    type: "application/manifest+json; charset=utf-8", cache: "public, max-age=3600" },
+  "/fonts/inter-latin-wght-normal.woff2":         { body: fs.readFileSync(path.join(__dirname, "public", "fonts", "inter-latin-wght-normal.woff2")),         type: "font/woff2", cache: IMMUTABLE_CACHE },
+  "/fonts/space-grotesk-latin-wght-normal.woff2": { body: fs.readFileSync(path.join(__dirname, "public", "fonts", "space-grotesk-latin-wght-normal.woff2")), type: "font/woff2", cache: IMMUTABLE_CACHE },
+};
+
 // Bundled web font served to the live terminal. ttyd's page is same-origin
 // (proxied under /term/<name>/), so its xterm.js can load this from the hub;
 // proxyTerm() injects the matching @font-face. A Nerd Font gives the TUI full
@@ -845,6 +870,15 @@ const server = http.createServer(async (req, res) => {
     // healthcheck 401s and autoheal restart-loops the container.
     if (url.pathname === "/healthz") {
       return json(res, 200, { ok: true });
+    }
+
+    // Branded static assets (stylesheet, UI fonts, icon/favicon set, manifest):
+    // public and served before the auth gate so the login page renders before a
+    // session exists. Explicit allowlist — no arbitrary path -> file mapping.
+    if (req.method === "GET" && Object.prototype.hasOwnProperty.call(STATIC_ASSETS, url.pathname)) {
+      const asset = STATIC_ASSETS[url.pathname];
+      res.writeHead(200, { "Content-Type": asset.type, "Cache-Control": asset.cache });
+      return res.end(asset.body);
     }
 
     // Public routes: the login page and its API need no session, and the
