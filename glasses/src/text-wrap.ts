@@ -24,8 +24,21 @@ export type Measure = (s: string) => number;
 // for every future `wrapText(text, width)` call.
 let defaultMeasure: Measure = charMeasure;
 
+// Bumped every time the default measure is re-pointed (main.ts's boot upgrade
+// to real pretext font metrics). Callers that cache wrapped output (render.ts's
+// per-entry wrap memo) fold this into their cache key, so a metric change can
+// never serve a wrap computed under the old font.
+let measureGen = 0;
+
 export function setDefaultMeasure(measure: Measure): void {
   defaultMeasure = measure;
+  measureGen++;
+}
+
+// The current default-measure generation (see setDefaultMeasure). Increments
+// on every swap; a stable value means the wrap cache stays valid.
+export function measureGeneration(): number {
+  return measureGen;
 }
 
 // Tolerance for float rounding in measure functions (px-per-char

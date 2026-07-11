@@ -604,8 +604,50 @@ async function refresh() {
   if (cache) render(cache);
 }
 renderViewbar();
+
+// ---- live push (FIX 1/#1): server-sent per-agent updates ---------------------
+// The usage chart isn't latency-critical, so SSE updates patch `cache` and
+// trigger a DEBOUNCED re-render (~1s) to avoid rebuilding the SVG on every
+// heartbeat / flickering the tooltip. The 30s poll stays as a fallback, skipped
+// while the stream is healthy.
+let sseOk = false, sseBackoff = 2000, renderTimer = null;
+function scheduleRender() {
+  if (renderTimer) return;
+  renderTimer = setTimeout(() => { renderTimer = null; if (cache) render(cache); }, 1000);
+}
+function applyAgent(rec) {
+  if (!cache) cache = { now: Date.now(), agents: [] };
+  const list = cache.agents || (cache.agents = []);
+  const i = list.findIndex(a => a.key === rec.key);
+  if (i >= 0) list[i] = rec; else list.push(rec);
+  cache.now = Date.now();
+}
+function connectSSE() {
+  let es;
+  try { es = new EventSource("/api/events"); }
+  catch { setTimeout(connectSSE, sseBackoff); return; }
+  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  es.addEventListener("agent", (e) => {
+    try { applyAgent(JSON.parse(e.data)); } catch { return; }
+    scheduleRender();
+  });
+  es.addEventListener("removed", (e) => {
+    try { const { key } = JSON.parse(e.data); if (cache) cache.agents = (cache.agents || []).filter(a => a.key !== key); }
+    catch { return; }
+    scheduleRender();
+  });
+  es.onerror = () => {
+    sseOk = false;
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(connectSSE, sseBackoff);
+      sseBackoff = Math.min(sseBackoff * 2, 30000);
+    }
+  };
+}
+
 refresh();
-setInterval(refresh, 30000);
+connectSSE();
+setInterval(() => { if (!sseOk) refresh(); }, 30000);
 let resizeTimer;
 addEventListener("resize", () => {
   clearTimeout(resizeTimer);

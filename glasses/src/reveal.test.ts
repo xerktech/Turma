@@ -45,20 +45,33 @@ describe("reveal", () => {
     expect(next).toEqual({ entryId: "a", shown: 500 });
   });
 
-  it("a brand-new small entry starts hidden then types from 0", () => {
+  it("a brand-new small LIVE turn starts hidden then types from 0", () => {
     const prev: RevealState = { entryId: "old", shown: 30 };
-    // dt=0 re-anchor: new entry, small -> shown 0 (nothing flashes full).
-    const anchored = advanceReveal(prev, "new", 20, 0);
+    // live:true — the genuinely-streamed in-progress turn. dt=0 re-anchor: new
+    // entry, small -> shown 0 (nothing flashes full).
+    const anchored = advanceReveal(prev, "new", 20, 0, { live: true });
     expect(anchored).toEqual({ entryId: "new", shown: 0 });
     // then it types in: 100ms @ 150cps = 15 chars, more dt clamps to the end.
-    expect(advanceReveal(anchored, "new", 20, 100).shown).toBe(15);
-    expect(advanceReveal(anchored, "new", 20, 200).shown).toBe(20);
+    expect(advanceReveal(anchored, "new", 20, 100, { live: true }).shown).toBe(15);
+    expect(advanceReveal(anchored, "new", 20, 200, { live: true }).shown).toBe(20);
+  });
+
+  it("a freshly-appended COMPLETE entry snaps in (it landed whole, never streamed)", () => {
+    const prev: RevealState = { entryId: "old", shown: 30 };
+    // Default (live falsey): a committed transcript entry — a user echo, a tool
+    // result — arrives whole, so it snaps rather than being fake-typed, even
+    // though it's small (20 < REVEAL_SNAP_CHARS).
+    expect(advanceReveal(prev, "new", 20, 0)).toEqual({ entryId: "new", shown: 20 });
+    // In-place growth of that same entry still types (small delta on same id).
+    const grown = advanceReveal({ entryId: "new", shown: 20 }, "new", 60, 100);
+    expect(grown.shown).toBe(35); // 20 + 15
   });
 
   it("a brand-new large entry snaps (block appeared at once)", () => {
     const prev: RevealState = { entryId: "old", shown: 30 };
-    const anchored = advanceReveal(prev, "new", 400, 0);
-    expect(anchored).toEqual({ entryId: "new", shown: 400 });
+    // Snaps whether committed (lands whole) or a live block past the threshold.
+    expect(advanceReveal(prev, "new", 400, 0)).toEqual({ entryId: "new", shown: 400 });
+    expect(advanceReveal(prev, "new", 400, 0, { live: true })).toEqual({ entryId: "new", shown: 400 });
   });
 
   it("dt=0 on the same entry holds position (re-anchor without typing)", () => {

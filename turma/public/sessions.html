@@ -384,6 +384,7 @@ async function post(url, body) {
     ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
     : { method: "POST" });
   refresh();
+  fastPoll();
 }
 function busy(key, val, run) {
   if (pending.has(key)) return;
@@ -507,8 +508,59 @@ async function refresh() {
   } catch { /* keep last data; the "updated" stamp goes stale visibly */ }
   render(cache);
 }
+
+// ---- live push (FIX 1/#1): server-sent per-agent updates on each heartbeat --
+// Same-origin EventSource rides the login cookie. Each `agent` event carries one
+// host record (as /api/agents returns it); we patch it into `cache` and
+// re-render so a new/finished/waiting session surfaces near-instantly. The poll
+// stays as a slower fallback, skipped while SSE is healthy.
+let sseOk = false, sseBackoff = 2000;
+function applyAgent(rec) {
+  const list = cache.agents || (cache.agents = []);
+  const i = list.findIndex(a => a.key === rec.key);
+  if (i >= 0) list[i] = rec; else list.push(rec);
+  cache.now = Date.now();
+}
+function connectSSE() {
+  let es;
+  try { es = new EventSource("/api/events"); }
+  catch { setTimeout(connectSSE, sseBackoff); return; }
+  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  es.addEventListener("agent", (e) => {
+    try { applyAgent(JSON.parse(e.data)); } catch { return; }
+    render(cache);
+  });
+  es.addEventListener("removed", (e) => {
+    try { const { key } = JSON.parse(e.data); cache.agents = (cache.agents || []).filter(a => a.key !== key); }
+    catch { return; }
+    render(cache);
+  });
+  es.onerror = () => {
+    sseOk = false;
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(connectSSE, sseBackoff);
+      sseBackoff = Math.min(sseBackoff * 2, 30000);
+    }
+  };
+}
+
+// Post-action fast-reflection burst (FIX 2/#4): poll at 500ms for ~4s after a
+// command when SSE isn't delivering; a no-op while SSE is healthy.
+let fastPollTimer = null, fastPollUntil = 0;
+function fastPoll() {
+  if (sseOk) return;
+  fastPollUntil = Date.now() + 4000;
+  if (fastPollTimer) return;
+  fastPollTimer = setInterval(() => {
+    if (sseOk || Date.now() > fastPollUntil) { clearInterval(fastPollTimer); fastPollTimer = null; return; }
+    refresh();
+  }, 500);
+}
+
 refresh();
-setInterval(refresh, 5000);
+connectSSE();
+// Fallback poll: slower now that SSE carries live updates, skipped while healthy.
+setInterval(() => { if (!sseOk) refresh(); }, 15000);
 </script>
 </body>
 </html>

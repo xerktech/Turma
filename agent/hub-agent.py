@@ -52,6 +52,7 @@ import sys
 import threading
 import time
 import urllib.request
+import zlib
 from collections import deque
 
 # Set by a SIGUSR1 handler (installed in run_forever). tunnel-agent.js sends
@@ -136,8 +137,18 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "4000"))
 HISTORY_MAX_MSGS = int(os.environ.get("SESSION_HISTORY_MSGS", "200"))
 
-# Transcript parsing is the expensive part; refresh it every N heartbeats.
+# Transcript parsing is the expensive part; refresh each session's usage every N
+# heartbeats — but staggered (see _usage_slot) so they don't all reparse on the
+# same beat. The same cadence gates the slow-changing git-fact cache.
 USAGE_EVERY = 15
+
+
+def _usage_slot(sid):
+    """Stable per-session beat-slot in [0, USAGE_EVERY): the session refreshes
+    its usage on beats where `beat % USAGE_EVERY == _usage_slot(sid)`, spreading
+    the transcript re-parses across the window. A stable hash (crc32, not the
+    salted builtin hash()) keeps the slot reproducible across runs."""
+    return zlib.crc32(sid.encode()) % USAGE_EVERY
 # Small pause after launching a Claude session. The whole host shares ONE
 # ~/.claude login + .claude.json, so several RC sessions coming up at the exact
 # same instant contend on that shared state; staggering reduces the contention.
@@ -219,15 +230,25 @@ def run(cmd, cwd=None):
         return ""
 
 
-def run_ok(cmd, cwd=None):
-    """Run a command, return (rc, stderr). rc is None if it couldn't launch."""
+def run_ok(cmd, cwd=None, timeout=30):
+    """Run a command, return (rc, stderr). rc is None if it couldn't launch.
+    `timeout` is capped short (FETCH_TIMEOUT_SEC) for the network `git fetch`es
+    that run on the heartbeat loop's critical path, so a slow remote can't stall
+    the loop long enough for the hub to mark the host offline."""
     try:
         out = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=30
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
         )
         return out.returncode, (out.stderr or "").strip()
     except Exception as e:
         return None, str(e)
+
+
+# Short bound for the two network `git fetch`es that run synchronously inside a
+# command handler on the main heartbeat loop (default_base_ref on spawn,
+# prune_repo). A fetch is best-effort — both already fall open to local refs —
+# so capping it can only make the loop more responsive, never less correct.
+FETCH_TIMEOUT_SEC = 8
 
 
 def slugify(s):
@@ -295,7 +316,10 @@ def default_base_ref(repo_path):
     name = default_branch_name(repo_path)
     if not name or not valid_ref_name(name):
         return None
-    run_ok(["git", "-C", repo_path, "fetch", "origin", name])  # best-effort
+    # Best-effort, short-bounded: this runs on the main loop at spawn time, so a
+    # slow remote must not stall the heartbeat (offline/no-remote just falls back).
+    run_ok(["git", "-C", repo_path, "fetch", "origin", name],
+           timeout=FETCH_TIMEOUT_SEC)
     if branch_exists(repo_path, f"refs/remotes/origin/{name}"):
         return f"origin/{name}"
     if branch_exists(repo_path, f"refs/heads/{name}"):
@@ -584,24 +608,51 @@ def device_name():
     return "unknown-device"
 
 
-def git_info(cwd):
+def git_info_cheap(cwd):
+    """Fast, fast-changing worktree facts read EVERY heartbeat: the current
+    checked-out branch and the `git status --porcelain` dirty count. None when
+    `cwd` is no longer a git worktree (e.g. removed). The slow-changing facts
+    (repo name, remote URL, last-commit line) are read separately and cached
+    across beats — see git_info_slow / SessionManager._session_git."""
     if not run(["git", "rev-parse", "--git-dir"], cwd=cwd):
         return None
     dirty = run(["git", "status", "--porcelain"], cwd=cwd)
+    return {
+        "branch": run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd),
+        "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
+    }
+
+
+def git_info_slow(cwd):
+    """Slow-changing worktree facts, cached across beats: the repo name (from the
+    remote ".../xerktech/DockerOps.git" -> "DockerOps", else the checkout's dir),
+    the origin remote URL, and the newest-commit line. {} when `cwd` isn't a git
+    worktree."""
+    if not run(["git", "rev-parse", "--git-dir"], cwd=cwd):
+        return {}
     remote = run(["git", "remote", "get-url", "origin"], cwd=cwd)
-    # Repo name from the remote (".../xerktech/DockerOps.git" -> "DockerOps"),
-    # falling back to the checkout's top-level directory name.
     name = remote.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
     if not name:
         top = run(["git", "rev-parse", "--show-toplevel"], cwd=cwd)
         name = os.path.basename(top) if top else ""
     return {
         "repoName": name,
-        "branch": run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd),
-        "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
         "lastCommit": run(["git", "log", "-1", "--format=%h %s"], cwd=cwd)[:120],
         "remote": remote,
     }
+
+
+def git_info(cwd):
+    """Full worktree facts (cheap + slow merged) — same shape as before the
+    cheap/slow split. Used off the heartbeat's hot path (root pseudo-repo entry,
+    the delete dirty-file check); the per-session heartbeat path reads the two
+    halves separately so it can cache the slow one."""
+    cheap = git_info_cheap(cwd)
+    if cheap is None:
+        return None
+    info = git_info_slow(cwd)
+    info.update(cheap)
+    return info
 
 
 def branch_exists(repo_path, ref):
@@ -673,7 +724,7 @@ def memory_usage():
 HISTORY_DAYS = 60  # per-day breakdown reported to the hub (bounds payload size)
 
 
-def _blank_bucket():
+def _usage_bucket():
     return {"input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0}
 
 
@@ -681,10 +732,11 @@ class _UsageAcc:
     """Mutable accumulator folded over one or more Claude project dirs. Kept
     separate from the public report shape so several worktrees' transcripts can
     be aggregated into one repo total (share one `seen` set so a message can't
-    double-count across a repo's worktrees)."""
+    double-count across a repo's worktrees). A per-slug instance is also carried
+    across beats for the incremental parse (see _aggregate_project)."""
 
     def __init__(self):
-        self.totals = _blank_bucket()
+        self.totals = _usage_bucket()
         self.days = {}      # "YYYY-MM-DD" (UTC) -> bucket
         self.models = {}    # model id -> message count
         self.unpriced = set()
@@ -693,90 +745,154 @@ class _UsageAcc:
         self.sessions = 0   # transcript files folded in
 
 
-def _aggregate_project(proj, acc):
-    """Fold one Claude project dir's transcript token usage into `acc`. Silently
-    no-ops on a missing/unreadable dir (the source of truth is best-effort)."""
+def _accumulate_usage(lines, acc):
+    """Fold transcript JSONL lines into `acc` in place. Only lines that mention a
+    usage block cost anything; each priced message is deduped on
+    (message id, requestId) via acc.seen, so a message re-seen across files or
+    across incremental beats counts exactly once."""
+    for line in lines:
+        if '"usage"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        msg = entry.get("message") or {}
+        usage = msg.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        key = (msg.get("id"), entry.get("requestId"))
+        if key[0] and key in acc.seen:
+            continue
+        acc.seen.add(key)
+
+        ts = entry.get("timestamp") or ""
+        if ts > acc.last_ts:
+            acc.last_ts = ts
+        model = msg.get("model") or "unknown"
+        acc.models[model] = acc.models.get(model, 0) + 1
+
+        tok = (
+            usage.get("input_tokens", 0) or 0,
+            usage.get("output_tokens", 0) or 0,
+            usage.get("cache_creation_input_tokens", 0) or 0,
+            usage.get("cache_read_input_tokens", 0) or 0,
+        )
+        # Built-in table first (authoritative); PRICING_EXTRA only covers
+        # models the built-ins don't match.
+        price = next(
+            (p for k, p in PRICING.items() if k in model), None
+        ) or next(
+            (p for k, p in PRICING_EXTRA.items() if k in model), None
+        )
+        cost = (
+            sum(t * p for t, p in zip(tok, price)) / 1e6
+            if price
+            else 0.0
+        )
+        # An unpriced model costs $0.00 — flag every bucket it lands in so the
+        # UI never understates cost silently.
+        is_unpriced = price is None and any(tok)
+        if is_unpriced:
+            acc.unpriced.add(model)
+        buckets = [acc.totals]
+        # Transcript timestamps are UTC ISO; date-prefix bucketing is close
+        # enough for a dashboard.
+        if len(ts) >= 10:
+            buckets.append(acc.days.setdefault(ts[:10], _usage_bucket()))
+        for b in buckets:
+            b["input"] += tok[0]
+            b["output"] += tok[1]
+            b["cacheWrite"] += tok[2]
+            b["cacheRead"] += tok[3]
+            b["cost"] += cost
+            if is_unpriced:
+                b["unpriced"] = True
+
+
+def _aggregate_project(proj, acc, offsets=None):
+    """Fold one Claude project dir's transcript token usage into `acc`.
+
+    With an `offsets` dict {filename: byte-offset} this parses INCREMENTALLY:
+    only bytes appended since the last call are read, and each offset advances
+    only to a newline boundary, so an entry still mid-write at a beat boundary
+    is re-read whole next beat rather than split. Returns False — without
+    counting anything more — when a tracked file shrank or vanished (its
+    already-counted bytes can't be un-counted), signalling the caller to rebuild
+    from a fresh acc. With `offsets=None` it does a plain full read (tests /
+    one-shot callers) and always returns True. Silently no-ops on a
+    missing/unreadable dir (the source of truth is best-effort)."""
     try:
         files = [f for f in os.listdir(proj) if f.endswith(".jsonl")]
     except OSError:
-        return
+        return True
+    if offsets is not None:
+        # A tracked transcript that shrank/disappeared can't be reconciled
+        # incrementally — tell the caller to start this slug's acc over.
+        present = set(files)
+        for f, off in offsets.items():
+            path = os.path.join(proj, f)
+            try:
+                size = os.stat(path).st_size
+            except OSError:
+                size = -1
+            if f not in present or size < off:
+                return False
     for fname in files:
-        acc.sessions += 1
+        path = os.path.join(proj, fname)
+        if offsets is None:
+            try:
+                with open(path, errors="replace") as fh:
+                    _accumulate_usage(fh, acc)
+            except OSError:
+                continue
+            continue
         try:
-            with open(os.path.join(proj, fname), errors="replace") as f:
-                for line in f:
-                    if '"usage"' not in line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
-                        continue
-                    msg = entry.get("message") or {}
-                    usage = msg.get("usage")
-                    if not isinstance(usage, dict):
-                        continue
-                    key = (msg.get("id"), entry.get("requestId"))
-                    if key[0] and key in acc.seen:
-                        continue
-                    acc.seen.add(key)
-
-                    ts = entry.get("timestamp") or ""
-                    if ts > acc.last_ts:
-                        acc.last_ts = ts
-                    model = msg.get("model") or "unknown"
-                    acc.models[model] = acc.models.get(model, 0) + 1
-
-                    tok = (
-                        usage.get("input_tokens", 0) or 0,
-                        usage.get("output_tokens", 0) or 0,
-                        usage.get("cache_creation_input_tokens", 0) or 0,
-                        usage.get("cache_read_input_tokens", 0) or 0,
-                    )
-                    # Built-in table first (authoritative); PRICING_EXTRA only
-                    # covers models the built-ins don't match.
-                    price = next(
-                        (p for k, p in PRICING.items() if k in model), None
-                    ) or next(
-                        (p for k, p in PRICING_EXTRA.items() if k in model), None
-                    )
-                    cost = (
-                        sum(t * p for t, p in zip(tok, price)) / 1e6
-                        if price
-                        else 0.0
-                    )
-                    # An unpriced model costs $0.00 — flag every bucket it lands
-                    # in so the UI never understates cost silently.
-                    is_unpriced = price is None and any(tok)
-                    if is_unpriced:
-                        acc.unpriced.add(model)
-                    buckets = [acc.totals]
-                    # Transcript timestamps are UTC ISO; date-prefix bucketing
-                    # is close enough for a dashboard.
-                    if len(ts) >= 10:
-                        buckets.append(acc.days.setdefault(ts[:10], _blank_bucket()))
-                    for b in buckets:
-                        b["input"] += tok[0]
-                        b["output"] += tok[1]
-                        b["cacheWrite"] += tok[2]
-                        b["cacheRead"] += tok[3]
-                        b["cost"] += cost
-                        if is_unpriced:
-                            b["unpriced"] = True
+            size = os.stat(path).st_size
         except OSError:
             continue
+        start = offsets.get(fname, 0)
+        if size <= start:
+            offsets[fname] = size
+            continue
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                chunk = fh.read(size - start)
+        except OSError:
+            continue
+        # Consume only whole lines; leave any trailing partial (an in-progress
+        # write) for a later beat, so the offset always sits on a line boundary.
+        nl = chunk.rfind(b"\n")
+        if nl < 0:
+            continue
+        _accumulate_usage(
+            chunk[:nl + 1].decode(errors="replace").splitlines(), acc)
+        offsets[fname] = start + nl + 1
+    # `sessions` is a display stat (transcript files folded in). A persistent
+    # per-slug acc holds just its own slug's file count (set, since the acc
+    # outlives the call); the full-read path accumulates across the several dirs
+    # a caller may fold into one acc.
+    if offsets is None:
+        acc.sessions += len(files)
+    else:
+        acc.sessions = len(files)
+    return True
 
 
 def _finalize_usage(acc):
-    """Turn an accumulator into the public report shape (rounded costs, capped
-    day window, today's bucket, model ranking)."""
-    today_str = time.strftime("%Y-%m-%d")
-    acc.totals["cost"] = round(acc.totals["cost"], 2)
-    days = {d: acc.days[d] for d in sorted(acc.days)[-HISTORY_DAYS:]}
+    """Snapshot the running accumulator into the heartbeat's usage shape. Rounds
+    into COPIES so the accumulator keeps its raw floats — rounding in place would
+    drift the running total a little more every incremental beat, and the same
+    per-slug acc is reused across beats and merged into repo/host totals."""
+    totals = dict(acc.totals)
+    totals["cost"] = round(totals["cost"], 2)
+    days = {d: dict(acc.days[d]) for d in sorted(acc.days)[-HISTORY_DAYS:]}
     for day in days.values():
         day["cost"] = round(day["cost"], 2)
-    today = days.get(today_str, _blank_bucket())
+    today = days.get(time.strftime("%Y-%m-%d"), _usage_bucket())
     return {
-        "totals": acc.totals,
+        "totals": totals,
         "today": today,
         "days": days,
         "sessions": acc.sessions,
@@ -790,7 +906,9 @@ def _finalize_usage(acc):
 
 def usage_report(workdir):
     """Aggregate token usage for one session's project (its worktree cwd) from
-    the transcript JSONLs. Returns None when the project dir doesn't exist."""
+    the transcript JSONLs, full-parse. Returns None when the project dir doesn't
+    exist. The live heartbeat parses incrementally instead (the manager's
+    _fold_slug); this full parse stays for tests and one-shot callers."""
     proj = os.path.join(PROJECTS_ROOT, _project_slug(workdir))
     if not os.path.isdir(proj):
         return None
@@ -802,13 +920,13 @@ def usage_report(workdir):
 def _merge_acc(dst, src):
     """Fold accumulator `src` into `dst` (pre-finalize, so costs stay full
     precision). Buckets are copied by value, so later finalizing one side never
-    disturbs the other."""
+    disturbs the other, and `src` (a persistent per-slug acc) is left intact."""
     for k in ("input", "output", "cacheWrite", "cacheRead", "cost"):
         dst.totals[k] += src.totals[k]
     if src.totals.get("unpriced"):
         dst.totals["unpriced"] = True
     for d, b in src.days.items():
-        tgt = dst.days.setdefault(d, _blank_bucket())
+        tgt = dst.days.setdefault(d, _usage_bucket())
         for k in ("input", "output", "cacheWrite", "cacheRead", "cost"):
             tgt[k] += b[k]
         if b.get("unpriced"):
@@ -849,9 +967,14 @@ def _usage_is_empty(report):
     return not any(t.get(k) for k in ("input", "output", "cacheWrite", "cacheRead"))
 
 
-def repo_usage_report(ledger):
+def repo_usage_report(ledger, fold_slug):
     """Aggregate token usage per repo across ALL known worktree transcripts, plus
     a merged host-level total. `ledger` maps worktreePath -> {repo, remote, slug}.
+    `fold_slug` is a callable slug -> _UsageAcc returning that project slug's
+    persistent, incrementally-updated accumulator, so each transcript is parsed
+    once per beat (only appended bytes) and the work is shared with per-session
+    usage rather than re-reading every transcript from scratch.
+
     Usage is folded from PROJECTS_ROOT by slug, so a repo's figure spans every
     worktree it ever had and survives kill AND delete (the transcripts outlive
     both). Each repo carries `remoteKey` (normalized origin) so the hub can unify
@@ -876,7 +999,9 @@ def repo_usage_report(ledger):
     for repo, g in by_repo.items():
         acc = _UsageAcc()
         for slug in g["slugs"]:
-            _aggregate_project(os.path.join(PROJECTS_ROOT, slug), acc)
+            # fold_slug returns the persistent per-slug acc (already folded this
+            # beat if per-session usage touched it); merging is cheap arithmetic.
+            _merge_acc(acc, fold_slug(slug))
         _merge_acc(host, acc)  # fold into the host total (seen-set union dedups)
         report = _finalize_usage(acc)
         if _usage_is_empty(report):
@@ -896,6 +1021,9 @@ def repo_usage_report(ledger):
 PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 LOG_TAIL_LINES = 50
 LOG_TAIL_MAX_BYTES = 12_000
+# `docker logs` shells out; the tail changes slowly and isn't worth a subprocess
+# every beat. Recompute it only every N beats and reuse the cache in between.
+LOG_TAIL_EVERY = 5
 
 
 def _read_tail_lines(path, max_bytes):
@@ -1239,24 +1367,34 @@ def repo_last_commit_iso(path):
         return ""
 
 
-def repo_entry(repo):
-    """Heartbeat repos[] entry: light git facts about the repo's own checkout."""
+def repo_slow_facts(path):
+    """Slow-changing repo git facts, cached across beats (each spawns a git
+    subprocess or two): the origin remote URL, the composer's base-branch choices
+    plus the default it pre-selects, and the newest-commit time (the "modified"
+    input to the activity sort — the manager combines it with per-repo session
+    activity into lastActivity and orders repos[] by it, most-recent first; see
+    build_payload)."""
+    return {
+        "remote": run(["git", "remote", "get-url", "origin"], cwd=path),
+        "branches": repo_branches(path),
+        "defaultBranch": default_branch_name(path),
+        "lastCommit": repo_last_commit_iso(path),
+    }
+
+
+def repo_entry(repo, slow):
+    """Heartbeat repos[] entry: the CHEAP, fast-changing reads done every beat
+    (current checked-out branch + `git status --porcelain` dirty count) merged
+    with the cached `slow` facts (repo_slow_facts, refreshed on the slow cadence).
+    """
     path = repo["path"]
     dirty = run(["git", "status", "--porcelain"], cwd=path)
     return {
         "name": repo["name"],
         "path": path,
         "branch": run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path),
-        "remote": run(["git", "remote", "get-url", "origin"], cwd=path),
         "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
-        # Base-branch choices for the "New session" composer (#12), plus the
-        # default the composer pre-selects (new sessions fork off latest main).
-        "branches": repo_branches(path),
-        "defaultBranch": default_branch_name(path),
-        # Newest commit time — the "modified" input to the activity sort. The
-        # manager combines it with per-repo session activity into lastActivity
-        # and orders repos[] by it (most-recent first); see build_payload().
-        "lastCommit": repo_last_commit_iso(path),
+        **slow,
     }
 
 
@@ -1487,7 +1625,17 @@ class SessionManager:
         self.ttyd = {}                           # id -> ttyd Popen (in-memory)
         self.sess_state = {}                     # id -> session_report offsets
         self.usage_cache = {}                    # id -> usage_report result
+        self.slug_usage = {}                     # project slug -> {acc, offsets}
+                                                 # persistent incremental usage fold,
+                                                 # shared by per-session + repo usage
         self.pending_prs = {}                    # id -> undelivered PR urls
+        # Slow-changing git facts cached across beats (recomputed on the slow
+        # USAGE_EVERY cadence, or on first sight): repo path -> repo_slow_facts,
+        # session id -> {liveBranch, slow git_info, branch_sync work}.
+        self.repo_facts = {}
+        self.session_facts = {}
+        # Throttled `docker logs` tail (LOG_TAIL_EVERY beats); reused in between.
+        self.log_tail_cache = None
         # Staged `history` command results awaiting the next heartbeat payload
         # (historyResults) — held across a failed POST, cleared only once
         # delivery succeeds, same lifecycle as pending_prs above.
@@ -1585,6 +1733,12 @@ class SessionManager:
             for p in stale:
                 self.usage_ledger.pop(p, None)
             self._save_ledger()
+        # Keep the per-slug usage folds bounded to slugs the ledger still tracks,
+        # so a killed/deleted session's accumulator doesn't linger forever.
+        live_slugs = {(m or {}).get("slug") or _project_slug(p)
+                      for p, m in self.usage_ledger.items()}
+        self.slug_usage = {s: v for s, v in self.slug_usage.items()
+                           if s in live_slugs}
 
     def _find(self, sid):
         return next((s for s in self.registry if s.get("id") == sid), None)
@@ -1804,6 +1958,10 @@ class SessionManager:
     def _forget_session_caches(self, sid):
         self.sess_state.pop(sid, None)
         self.usage_cache.pop(sid, None)
+        # Not slug_usage: the transcript survives kill/delete and still counts
+        # toward the persistent per-repo/host usage. It's keyed by slug (not
+        # session id) and bounded by _prune_ledger when the transcript is gone.
+        self.session_facts.pop(sid, None)
         self.pending_prs.pop(sid, None)
         # A killed/deleted session's tmux (and its blocked ask.py hook) is gone;
         # drop any leftover question rendezvous files so a dead question can't
@@ -2045,6 +2203,11 @@ class SessionManager:
             self._launch_tmux(sess)         # drops bridge-pointer + new claude
             self._launch_ttyd(sess)         # (re)ensure ttyd if it had died
             sess["errorMsg"] = None
+            # Monotonic restart marker: restart keeps id/rcName/worktree, so this
+            # counter is the only heartbeat-visible signal that the relaunch
+            # actually happened — the hub clears its "Restarting…" spinner the
+            # moment it changes instead of waiting out a blind timer.
+            sess["restartCount"] = sess.get("restartCount", 0) + 1
             log(f"restarted (cleared context) session {sid}")
         except Exception as e:
             self._set_error(sess, e)
@@ -2415,8 +2578,12 @@ class SessionManager:
         path = repo["path"]
         default = default_branch_name(path)
         # Refresh remote-tracking refs so "merged into main" reflects upstream.
+        # Short-bounded: prune runs on the main loop, so a slow fetch must not
+        # stall the heartbeat — a stale/failed fetch just compares against the
+        # refs we already have.
         if default and valid_ref_name(default):
-            run_ok(["git", "-C", path, "fetch", "--prune", "origin"])
+            run_ok(["git", "-C", path, "fetch", "--prune", "origin"],
+                   timeout=FETCH_TIMEOUT_SEC)
         tip = None
         for cand in (f"origin/{default}", default):
             if default and branch_exists(path, cand):
@@ -2591,10 +2758,34 @@ class SessionManager:
     # --- heartbeat ---------------------------------------------------------
 
     def _refresh_usage(self, sid, worktree):
+        """Per-session usage for the session card, parsed incrementally: folds
+        only the bytes appended to this worktree's transcripts since the last
+        beat (see _fold_slug), rather than re-reading them from scratch."""
         try:
-            self.usage_cache[sid] = usage_report(worktree)
+            slug = _project_slug(worktree)
+            if not os.path.isdir(os.path.join(PROJECTS_ROOT, slug)):
+                self.usage_cache[sid] = None
+                return
+            self.usage_cache[sid] = _finalize_usage(self._fold_slug(slug))
         except Exception as e:
             log(f"usage parse failed for {sid}: {e}")
+
+    def _fold_slug(self, slug):
+        """Return a project slug's persistent usage accumulator, folding any
+        bytes appended to its transcripts since the last beat (incremental).
+        Rebuilt from scratch if a transcript was truncated/rewritten so totals
+        can't overcount. Shared by per-session usage and the per-repo/host
+        aggregation, so each transcript is parsed at most once per beat."""
+        st = self.slug_usage.get(slug)
+        if st is None:
+            st = self.slug_usage[slug] = {"acc": _UsageAcc(), "offsets": {}}
+        proj = os.path.join(PROJECTS_ROOT, slug)
+        if not _aggregate_project(proj, st["acc"], st["offsets"]):
+            # A tracked transcript shrank/vanished — start this slug over so the
+            # running total still matches a from-scratch parse.
+            st = self.slug_usage[slug] = {"acc": _UsageAcc(), "offsets": {}}
+            _aggregate_project(proj, st["acc"], st["offsets"])
+        return st["acc"]
 
     def _backfill_ledger(self):
         """Ensure live and recently-closed sessions are in the attribution
@@ -2623,15 +2814,51 @@ class SessionManager:
     def _refresh_repo_usage(self):
         """Recompute the persistent host/repo usage from every known transcript.
         Independent of the live registry, so killed/deleted sessions still count.
-        Runs on the slow usage cadence (the parse is the expensive part)."""
+        Runs on the slow usage cadence; folds each slug incrementally (only bytes
+        appended since the last beat) via _fold_slug, so it no longer re-reads
+        every transcript from scratch."""
         self._backfill_ledger()
         self._prune_ledger()
         try:
-            self.repo_usage, self.host_usage = repo_usage_report(self.usage_ledger)
+            self.repo_usage, self.host_usage = repo_usage_report(
+                self.usage_ledger, self._fold_slug)
         except Exception as e:
             log(f"repo usage parse failed: {e}")
 
-    def _session_payload(self, sess):
+    def _session_git(self, sess, refresh):
+        """(git-info dict | None, branch-sync work dict) for a session's payload.
+        The CHEAP current-branch + dirty reads run every beat; the SLOW facts —
+        repo name / remote URL / last-commit line, and the branch<->base/origin
+        sync counts — are cached and only recomputed on the slow cadence
+        (`refresh`), when the session is first seen, or when its live branch
+        changed (so a session that just named its work branch updates promptly
+        without re-walking refs every beat)."""
+        sid = sess["id"]
+        gi = git_info_cheap(sess["worktreePath"])  # None if the worktree is gone
+        # The app owns no branch, so the branch to report is the LIVE one the
+        # running agent named for its work ("HEAD" = still detached, not yet
+        # branched -> no branch to sync).
+        live_branch = gi.get("branch") if gi else None
+        if live_branch == "HEAD":
+            live_branch = None
+        cached = self.session_facts.get(sid)
+        if refresh or cached is None or cached.get("liveBranch") != live_branch:
+            # Compare the live branch against what the session forked from
+            # (baseRef, e.g. origin/main), falling back to the repo's current
+            # checkout when we didn't record a base.
+            base = sess.get("baseRef") or run(
+                ["git", "-C", sess["repoPath"], "rev-parse", "--abbrev-ref", "HEAD"])
+            cached = {
+                "liveBranch": live_branch,
+                "slow": git_info_slow(sess["worktreePath"]),
+                "work": branch_sync(sess["repoPath"], live_branch, base or None),
+            }
+            self.session_facts[sid] = cached
+        if gi is not None:
+            gi.update(cached["slow"])  # fold cached repoName/remote/lastCommit in
+        return gi, cached["work"]
+
+    def _session_payload(self, sess, refresh=True):
         sid = sess["id"]
         running = sess.get("status") == "running"
         signals = None
@@ -2647,17 +2874,7 @@ class SessionManager:
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
-        gi = git_info(sess["worktreePath"])  # of the worktree (None if gone)
-        # The app owns no branch, so the branch to report is the LIVE one the
-        # running agent named for its work ("HEAD" = still detached, not yet
-        # branched -> no branch to sync). Compare it against what the session
-        # forked from (baseRef, e.g. origin/main), falling back to the repo's
-        # current checkout when we didn't record a base.
-        live_branch = gi.get("branch") if gi else None
-        if live_branch == "HEAD":
-            live_branch = None
-        base = sess.get("baseRef") or run(
-            ["git", "-C", sess["repoPath"], "rev-parse", "--abbrev-ref", "HEAD"])
+        gi, work = self._session_git(sess, refresh)
         return {
             "id": sid,
             "repo": sess["repo"],
@@ -2666,6 +2883,7 @@ class SessionManager:
             "branch": sess["branch"],           # app branch: always None now
             "root": sess.get("root", False),
             "rcName": sess["rcName"],
+            "restartCount": sess.get("restartCount", 0),  # bumps on clear-context restart
             "label": sess.get("label"),
             "summary": sess.get("summary"),   # few-word auto task name (or None)
             "model": sess.get("model"),
@@ -2680,7 +2898,7 @@ class SessionManager:
             # The live branch's relation to its base/origin, computed from the
             # shared repo so it's reported even for a stopped session. Empty
             # while the agent is still on detached HEAD (no branch to sync).
-            "work": branch_sync(sess["repoPath"], live_branch, base or None),
+            "work": work,
             "usage": self.usage_cache.get(sid),     # present for stopped too
             "session": signals,                      # running only; null otherwise
         }
@@ -2724,14 +2942,32 @@ class SessionManager:
                 activity[repo] = ts
         return activity
 
-    def _sorted_repo_entries(self):
+    def _repo_slow_facts(self, path, refresh):
+        """Cached slow git facts for a repo (remote/branches/default/lastCommit).
+        Recomputed on the slow cadence (`refresh`) or on the repo's first sight,
+        so a freshly-cloned repo gets its facts on its first appearance rather
+        than waiting up to USAGE_EVERY beats; reused from cache in between."""
+        facts = self.repo_facts.get(path)
+        if refresh or facts is None:
+            facts = repo_slow_facts(path)
+            self.repo_facts[path] = facts
+        return facts
+
+    def _sorted_repo_entries(self, refresh=True):
         """Scanned repos ordered most-recently-active first (see #-activity-sort):
         each repo's lastActivity is the later of its newest commit ("modified")
         and its newest session activity ("used"). The root pseudo-repo is pinned
         first and never ranked. Ties (e.g. never-touched repos) keep the scan's
-        alphabetical order, since Python's sort is stable."""
+        alphabetical order, since Python's sort is stable. The cheap current-
+        branch/dirty reads run every beat; the slow facts are cached (`refresh`)."""
         activity = self._repo_activity()
-        entries = [repo_entry(r) for r in scan_repos()]
+        repos = scan_repos()
+        entries = [repo_entry(r, self._repo_slow_facts(r["path"], refresh))
+                   for r in repos]
+        # Drop cache entries for repos that are gone (renamed/removed).
+        live_paths = {r["path"] for r in repos}
+        self.repo_facts = {p: f for p, f in self.repo_facts.items()
+                           if p in live_paths}
         for e in entries:
             e["lastActivity"] = max(
                 e.get("lastCommit") or "", activity.get(e["name"], "")
@@ -2739,22 +2975,46 @@ class SessionManager:
         entries.sort(key=lambda e: e.get("lastActivity") or "", reverse=True)
         return [root_repo_entry()] + entries
 
-    def build_payload(self, beat):
-        # Usage is the expensive parse — refresh on a slow cadence, but make
-        # sure any newly-seen session gets a value on first appearance.
-        if beat % USAGE_EVERY == 0:
-            for s in self.registry:
-                self._refresh_usage(s["id"], s["worktreePath"])
-            # Persistent host/repo usage — the whole-fleet, session-independent
-            # aggregation that survives kill/delete.
+    def _log_tail(self, beat, light):
+        """This container's `docker logs` tail, throttled: recomputed every
+        LOG_TAIL_EVERY beats (never on a `light` follow-up beat) and reused from
+        cache in between — it changes slowly and isn't worth a subprocess a beat."""
+        if not light and (beat % LOG_TAIL_EVERY == 0 or self.log_tail_cache is None):
+            self.log_tail_cache = log_tail(self.agent_id)
+        return self.log_tail_cache
+
+    def build_payload(self, beat, light=False):
+        """Assemble one heartbeat payload. `light` (the post-command extra beat,
+        whose only job is to reflect command results fast) skips the expensive
+        work — no slow-fact refresh, no `docker logs`, no gh sweep — and reuses
+        the caches; a session/repo that first appears on that beat still gets its
+        facts computed (cache-miss → compute now)."""
+        # Slow-changing git facts (repo remote/branches/default/lastCommit,
+        # per-session remote/lastCommit + branch-sync counts) refresh on the same
+        # cadence as usage; the cheap branch/dirty reads stay every beat.
+        refresh = (not light) and (beat % USAGE_EVERY == 0)
+
+        # Persistent host/repo usage — the whole-fleet, session-independent
+        # aggregation that survives kill/delete. On the slow cadence it folds
+        # every ledger slug incrementally (only bytes appended since last beat),
+        # so it no longer re-reads every transcript from scratch.
+        if refresh:
             self._refresh_repo_usage()
+
+        # Per-session usage is parsed incrementally now (cheap), but still
+        # staggered per session (each refreshes on its own beat within the
+        # USAGE_EVERY window instead of all at once) and always given a value on
+        # first appearance.
+        slot = beat % USAGE_EVERY
         for s in self.registry:
-            if s["id"] not in self.usage_cache:
-                self._refresh_usage(s["id"], s["worktreePath"])
+            sid = s["id"]
+            if sid not in self.usage_cache or (
+                    not light and _usage_slot(sid) == slot):
+                self._refresh_usage(sid, s["worktreePath"])
 
         # GitHub availability/repo list refreshes on its own slow cadence (a few
         # gh calls); clone jobs are reaped every beat (cheap poll()s).
-        if beat % GITHUB_REFRESH_EVERY == 0:
+        if not light and beat % GITHUB_REFRESH_EVERY == 0:
             self.refresh_github()
         self._poll_clones()
         self._poll_prunes()
@@ -2768,10 +3028,10 @@ class SessionManager:
             "startedAt": self.started_at,
             "claudeVersion": self.claude_version,
             "memory": memory_usage(),
-            "logTail": log_tail(self.agent_id),
+            "logTail": self._log_tail(beat, light),
             "reposRoot": REPOS_ROOT,
-            "repos": self._sorted_repo_entries(),
-            "sessions": [self._session_payload(s) for s in self.registry],
+            "repos": self._sorted_repo_entries(refresh),
+            "sessions": [self._session_payload(s, refresh) for s in self.registry],
             "closedSessions": self._closed_payload(),
             # Persistent usage, independent of active sessions: per-repo (keyed by
             # normalized origin so the hub can unify a repo across hosts) plus this
@@ -2846,7 +3106,9 @@ class SessionManager:
                     # Fire an immediate extra heartbeat so the UI reflects the
                     # new session state fast (don't wait a whole interval). Its
                     # reply is processed once more; cmdId de-dup stops repeats.
-                    reply2 = self.post(self.build_payload(beat))
+                    # `light` keeps this follow-up cheap — its only job is to
+                    # reflect the command results, reusing the caches.
+                    reply2 = self.post(self.build_payload(beat, light=True))
                     beat += 1
                     if reply2 is not None:
                         self.handle_commands(reply2.get("commands"))

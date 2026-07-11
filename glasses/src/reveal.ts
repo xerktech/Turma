@@ -47,6 +47,13 @@ export function fullReveal(entryId: string | null, len: number): RevealState {
 export interface RevealOpts {
   rateCps?: number;
   snapChars?: number;
+  // Whether `newestId` is the live in-progress streaming turn (render.ts's
+  // LIVE_TURN_ID), which the agent genuinely produces character-by-character
+  // and which therefore types in. Defaults false: a committed transcript entry
+  // arrives WHOLE (a user's echoed message, a tool result, any message the
+  // transcript only records on completion), was never streamed, and so snaps
+  // in on first appearance rather than being fake-typed for up to ~1.3s.
+  live?: boolean;
 }
 
 // Advance the reveal toward the newest entry (`newestId`, `targetLen` chars)
@@ -66,10 +73,17 @@ export function advanceReveal(
   const rate = opts.rateCps ?? REVEAL_RATE_CPS;
   const snap = opts.snapChars ?? REVEAL_SNAP_CHARS;
 
-  // A new entry starts hidden (typed from 0); the same entry keeps whatever
-  // was already shown. Either way, clamp to the current length in case the
-  // tail re-truncated shorter than before.
-  const base = prev.entryId === newestId ? Math.min(prev.shown, targetLen) : 0;
+  // A freshly-appended entry that isn't the live streaming turn snaps straight
+  // to full: it landed whole, so typing it would be a fake stream. Only the
+  // live turn types from 0, and (below) small in-place growth of the entry
+  // already being revealed keeps typing.
+  const sameEntry = prev.entryId === newestId;
+  if (!sameEntry && !opts.live) return { entryId: newestId, shown: targetLen };
+
+  // The same entry keeps whatever was already shown (a live turn that just
+  // appeared starts hidden, typed from 0). Either way, clamp to the current
+  // length in case the tail re-truncated shorter than before.
+  const base = sameEntry ? Math.min(prev.shown, targetLen) : 0;
   const backlog = targetLen - base;
   if (backlog <= 0) return { entryId: newestId, shown: targetLen };
   if (backlog > snap) return { entryId: newestId, shown: targetLen };

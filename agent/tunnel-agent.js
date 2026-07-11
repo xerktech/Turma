@@ -144,9 +144,24 @@ function entryText(entry) {
 
 // Last TAIL_MSGS surviving messages of a worktree's newest transcript, oldest
 // first: [{id: uuid, role, text}]. [] when there's no transcript yet.
-function transcriptTail(worktreePath) {
+//
+// Optional `cache` ({path, mtimeMs, size, result}, one per watched session)
+// skips the ~128 KB read+parse when the newest transcript is unchanged since the
+// last poll (same file, same mtime+size) — pollWatcher ticks this ~1s per
+// session and most ticks find nothing new. newestTranscript already stat'd each
+// candidate, so one more stat of the winner is cheap next to re-reading the tail.
+function transcriptTail(worktreePath, cache) {
   const p = newestTranscript(worktreePath);
-  if (!p) return [];
+  if (!p) {
+    if (cache) { cache.path = null; cache.result = []; }
+    return [];
+  }
+  let st = null;
+  try { st = fs.statSync(p); } catch {}
+  if (cache && cache.path === p && st &&
+      cache.mtimeMs === st.mtimeMs && cache.size === st.size) {
+    return cache.result; // unchanged since last poll -> reuse, no read+parse
+  }
   const tail = [];
   for (const raw of readTailLines(p, TAIL_READ_BYTES)) {
     let entry;
@@ -156,7 +171,14 @@ function transcriptTail(worktreePath) {
     if (text === null) continue;
     tail.push({ id: entry.uuid, role: entry.type, text: text.slice(0, TAIL_MSG_CHARS) });
   }
-  return tail.slice(-TAIL_MSGS);
+  const result = tail.slice(-TAIL_MSGS);
+  if (cache) {
+    cache.path = p;
+    cache.mtimeMs = st ? st.mtimeMs : 0;
+    cache.size = st ? st.size : 0;
+    cache.result = result;
+  }
+  return result;
 }
 
 // The live control WebSocket the tail deltas ride back on, and the set of
@@ -242,9 +264,10 @@ function captureLiveTurn(sessionId, cb) {
 function pollWatcher(sessionId) {
   const w = watchers.get(sessionId);
   if (!w) return;
-  // 1. Committed transcript tail (authoritative history) — unchanged.
+  // 1. Committed transcript tail (authoritative history). The per-session cache
+  //    skips the read+parse on ticks where the transcript file hasn't changed.
   let entries = null;
-  try { entries = transcriptTail(w.worktreePath); } catch { entries = null; }
+  try { entries = transcriptTail(w.worktreePath, w.tailCache); } catch { entries = null; }
   if (entries && entries.length) {
     const json = JSON.stringify(entries);
     if (json !== w.lastJson) {
@@ -273,7 +296,8 @@ function startWatch(sessionId, worktreePath) {
     log(`live tail: at MAX_WATCHERS (${MAX_WATCHERS}); ignoring watch for ${sessionId}`);
     return;
   }
-  const w = { worktreePath, lastJson: null, lastTurn: "", timer: null };
+  const w = { worktreePath, lastJson: null, lastTurn: "", timer: null,
+    tailCache: { path: null, mtimeMs: 0, size: 0, result: [] } };
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
   pollWatcher(sessionId); // emit an immediate snapshot, don't wait a full interval
