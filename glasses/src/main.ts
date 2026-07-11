@@ -76,15 +76,19 @@ async function mainBridge(bridge: ResolvedBridge): Promise<void> {
   // Device path: the glasses render via the SDK, and the phone's signed-in
   // view embeds the real hub dashboard (#dashboard iframe).
   document.body.classList.add("backend-bridge");
-  const { EvenHubDisplay } = await import("./display/evenhub.ts");
-  // Task 7: real G2-mic dictation. audio.ts touches no SDK types (structural
-  // only, like display/evenhub.ts and input/router.ts) — dynamically
-  // imported here anyway, matching this file's "bridge-path-only modules
-  // load lazily" convention.
-  const { AudioRecorder } = await import("./audio.ts");
-  const storage: KeyValueStorage = new BridgeStorage(bridge);
-  const measure = await pretextMeasure();
+  // These three are independent (two lazy bridge-path-only module imports —
+  // audio.ts is Task 7's real G2-mic dictation, both structural-only like
+  // display/evenhub.ts — plus resolving the pretext font measure), so run
+  // their round-trips concurrently rather than one after another on the cold
+  // boot path. `setDefaultMeasure` still runs before boot()/app.start(), so
+  // the first render always wraps with the real metric.
+  const [{ EvenHubDisplay }, { AudioRecorder }, measure] = await Promise.all([
+    import("./display/evenhub.ts"),
+    import("./audio.ts"),
+    pretextMeasure(),
+  ]);
   setDefaultMeasure(measure);
+  const storage: KeyValueStorage = new BridgeStorage(bridge);
 
   const display = new EvenHubDisplay(bridge);
   // Lifecycle handlers MUST be registered before app.start() — start() is

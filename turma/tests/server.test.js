@@ -375,6 +375,17 @@ test("alerts: daily cost threshold sums sessions, fires once per day", () => {
   assert.deepEqual(titles(), []);
 });
 
+test("alerts: daily cost prefers host-level usage (counts killed sessions)", () => {
+  const beat = makeHost();
+  // The host-level `usage` block is aggregated from ALL transcripts, so it
+  // exceeds the threshold even though the live sessions list is empty (their
+  // work was killed). The alert must use it rather than summing live sessions.
+  notifications.length = 0;
+  beat({ sessions: [], usage: { today: { cost: 72.5 } } });
+  assert.deepEqual(titles(), ["host1 cost alert"]);
+  assert.match(notifications[0].body, /\$72\.50/);
+});
+
 test("alerts: question fires on new text only, re-arms when cleared", () => {
   const beat = makeHost();
   const withQ = (q) => ({
@@ -829,6 +840,64 @@ test("http: input endpoint 404s unknown host and requires user auth", async () =
 
   const noAuth = await request("POST", "/api/agents/hi2/sessions/sess1/input", {
     body: { text: "hi" },
+  });
+  assert.equal(noAuth.status, 401);
+});
+
+// ---- session answer endpoint -----------------------------------------------------
+
+test("http: answer endpoint queues an answerQuestion command with the option pick", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "ha1" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/ha1/sessions/sess1/answer", {
+    body: { optionIndex: 2 }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "ha1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "answerQuestion", sessionId: "sess1", optionIndex: 2, cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: answer endpoint carries free-text custom and defaults optionIndex to -1", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "ha2" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/ha2/sessions/sess1/answer", {
+    body: { custom: "do the other thing" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "ha2" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "answerQuestion", sessionId: "sess1", optionIndex: -1,
+      custom: "do the other thing", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: answer endpoint rejects an empty answer and over-long custom", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "ha3" }, headers: agentHeaders });
+
+  const empty = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
+    body: {}, headers: userHeaders,
+  });
+  assert.equal(empty.status, 400);
+  assert.deepEqual(empty.body, { error: "optionIndex or custom required" });
+
+  const long = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
+    body: { custom: "a".repeat(4001) }, headers: userHeaders,
+  });
+  assert.equal(long.status, 400);
+  assert.deepEqual(long.body, { error: "custom too long" });
+});
+
+test("http: answer endpoint 404s unknown host and requires user auth", async () => {
+  const unknownHost = await request("POST", "/api/agents/ghost/sessions/sess1/answer", {
+    body: { optionIndex: 0 }, headers: userHeaders,
+  });
+  assert.equal(unknownHost.status, 404);
+
+  const noAuth = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
+    body: { optionIndex: 0 },
   });
   assert.equal(noAuth.status, 401);
 });
@@ -1501,4 +1570,119 @@ test("live WS: a control channel connecting after watchers exist re-arms their w
   live.socket.destroy();
   ctrl.socket.destroy();
   delete agents.rehost;
+});
+
+// ---- /api/agents ETag + 304 (FIX 3/#9) --------------------------------------
+
+test("/api/agents: emits an ETag; unchanged If-None-Match -> 304; state change re-etags", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "etag-host" }, headers: agentHeaders });
+
+  const first = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(first.status, 200);
+  const etag = first.headers.etag;
+  assert.ok(etag, "no ETag on /api/agents");
+  // no-cache (not no-store) so the browser keeps the body + revalidates.
+  assert.match(first.headers["cache-control"], /no-cache/);
+
+  // Same ETag echoed back -> cheap 304, empty body.
+  const notMod = await request("GET", "/api/agents", {
+    headers: { ...userHeaders, "if-none-match": etag },
+  });
+  assert.equal(notMod.status, 304);
+  assert.equal(notMod.raw, "");
+  assert.equal(notMod.headers.etag, etag);
+
+  // A fresh heartbeat mutates state -> cache invalidated -> new ETag, full 200.
+  await request("POST", "/api/heartbeat", { body: { device: "etag-host2" }, headers: agentHeaders });
+  const after = await request("GET", "/api/agents", {
+    headers: { ...userHeaders, "if-none-match": etag },
+  });
+  assert.equal(after.status, 200);
+  assert.ok(after.headers.etag && after.headers.etag !== etag, "ETag should change on state change");
+});
+
+test("/api/agents: queuing a command invalidates the cached ETag", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "etag-q" }, headers: agentHeaders });
+  const before = (await request("GET", "/api/agents", { headers: userHeaders })).headers.etag;
+  await request("POST", "/api/agents/etag-q/sessions", { body: { repo: "R" }, headers: userHeaders });
+  const after = (await request("GET", "/api/agents", { headers: userHeaders })).headers.etag;
+  assert.ok(after && after !== before, "queuing a command should change the ETag");
+});
+
+// ---- /api/events SSE stream (FIX 1/#1) --------------------------------------
+
+// Opens the SSE stream without buffering to end (the request helper waits for
+// 'end', which never comes for a stream). Resolves with the live response.
+function sseConnect(headers) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(baseUrl + "/api/events", { method: "GET", headers }, (res) => {
+      res.setEncoding("utf8");
+      resolve({ req, res, status: res.statusCode });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+// Accumulates parsed SSE records ({event, data}) off a streaming response.
+function collectSse(res) {
+  const events = [];
+  let buf = "";
+  res.on("data", (c) => {
+    buf += c;
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) >= 0) {
+      const raw = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const ev = {};
+      for (const line of raw.split("\n")) {
+        if (line.startsWith("event:")) ev.event = line.slice(6).trim();
+        else if (line.startsWith("data:")) ev.data = (ev.data || "") + line.slice(5).trim();
+      }
+      if (ev.event) events.push(ev);
+    }
+  });
+  return events;
+}
+
+test("SSE /api/events: unauthenticated -> 401, no stream", async () => {
+  const { res } = await sseConnect({});
+  assert.equal(res.statusCode, 401);
+  res.destroy();
+});
+
+test("SSE /api/events: authenticated stream pushes an `agent` event on heartbeat", async () => {
+  const { req, res } = await sseConnect(userHeaders);
+  assert.equal(res.statusCode, 200);
+  assert.match(res.headers["content-type"], /text\/event-stream/);
+  const events = collectSse(res);
+
+  // A heartbeat for a fresh host must fan out as an `agent` event carrying that
+  // host's serialized record (same shape as /api/agents, history stripped).
+  await request("POST", "/api/heartbeat", {
+    body: { device: "sse-host", sessions: [{ id: "z1", ttydPort: 7799 }] },
+    headers: agentHeaders,
+  });
+  await waitFor(() => events.some((e) => e.event === "agent" && JSON.parse(e.data).key === "sse-host"));
+  const rec = JSON.parse(events.find((e) => e.event === "agent" && JSON.parse(e.data).key === "sse-host").data);
+  assert.equal(rec.key, "sse-host");
+  assert.equal(rec.online, true);
+  assert.equal(rec.sessions[0].id, "z1");
+  assert.ok(!("history" in rec), "history cache must not leak into the SSE record");
+
+  req.destroy();
+  res.destroy();
+});
+
+test("SSE /api/events: pushes a `removed` event when a host is deleted", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "sse-del" }, headers: agentHeaders });
+  const { req, res } = await sseConnect(userHeaders);
+  assert.equal(res.statusCode, 200);
+  const events = collectSse(res);
+
+  await request("DELETE", "/api/agents/sse-del", { headers: userHeaders });
+  await waitFor(() => events.some((e) => e.event === "removed" && JSON.parse(e.data).key === "sse-del"));
+
+  req.destroy();
+  res.destroy();
 });

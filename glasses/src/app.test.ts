@@ -134,6 +134,7 @@ function fakeClient(overrides: Record<string, ReturnType<typeof vi.fn>> = {}) {
     sessionAction: vi.fn(async () => ({ ok: true, cmdId: "action-1" })),
     deleteSession: vi.fn(async () => ({ ok: true })),
     sendInput: vi.fn(async () => ({ ok: true, cmdId: "input-1" })),
+    answerQuestion: vi.fn(async () => ({ ok: true, cmdId: "answer-1" })),
     getHistory: vi.fn(async () => ({
       status: 200 as const,
       body: { entries: [], truncated: false, fetchedAt: Date.now() },
@@ -398,7 +399,7 @@ describe("App", () => {
     expect(app.getState().session?.selected).toBe(0);
   });
 
-  it("sheet mode: tap on option index 1 sends the 1-based digit, flashes, marks pending, and hands focus back to the transcript", async () => {
+  it("sheet mode: tap on option index 1 sends the 0-based optionIndex, flashes, marks pending, and hands focus back to the transcript", async () => {
     const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
     const app = makeApp(client);
     await toSheet(app);
@@ -406,23 +407,24 @@ describe("App", () => {
     display.emit({ type: "scrollDown" }); // selected -> 1 ("B")
     display.emit({ type: "tap" });
 
-    expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "2");
+    expect(client.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: 1 });
+    expect(client.sendInput).not.toHaveBeenCalled();
     expect(app.getState().screen).toBe("session");
     expect(app.getState().session?.focus).toBe("transcript");
     expect(app.getState().pending["s1"]).toBeDefined();
 
-    await vi.advanceTimersByTimeAsync(0); // flush the sendInput promise
+    await vi.advanceTimersByTimeAsync(0); // flush the answerQuestion promise
     expect(app.getState().flash).toBe(FLASH_QUEUED);
     expect(display.lines.some((l) => l.includes("queued"))).toBe(true);
   });
 
-  it("sheet mode: tap on option index 0 sends digit '1'", async () => {
+  it("sheet mode: tap on option index 0 sends optionIndex 0", async () => {
     const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
     const app = makeApp(client);
     await toSheet(app);
 
     display.emit({ type: "tap" }); // selected 0 = "A"
-    expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "1");
+    expect(client.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: 0 });
   });
 
   it("sheet mode: doubleTap opens the actions menu (session actions stay reachable while a question is pending)", async () => {
@@ -434,7 +436,7 @@ describe("App", () => {
     expect(app.getState().screen).toBe("actions");
   });
 
-  it("sheet mode: tap on the trailing 'Dictate answer…' row starts box dictation and hands the box to input mode; the dictated draft then sends via the ordinary actions-menu Send path", async () => {
+  it("sheet mode: tap on the trailing 'Dictate answer…' row starts box dictation and hands the box to input mode; the dictated draft then sends as a free-text answer while the question is pending", async () => {
     const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
     const app = makeApp(client);
     await toSheet(app);
@@ -462,7 +464,12 @@ describe("App", () => {
     display.emit({ type: "scrollDown" }); // 1 = Send
     display.emit({ type: "tap" }); // select Send
 
-    expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "yes deploy");
+    // A pending question routes the dictated draft to answerQuestion as a
+    // free-text ("Other") answer, not a plain typed message.
+    expect(client.answerQuestion).toHaveBeenCalledWith("host-a", "s1", {
+      optionIndex: -1,
+      custom: "yes deploy",
+    });
     expect(app.getState().screen).toBe("session");
   });
 
@@ -1416,15 +1423,13 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       expect(liveTail.isWatching("s1")).toBe(false);
     });
 
-    it("types a small live delta in over successive reveal ticks", async () => {
+    it("snaps a freshly-committed entry in immediately (it landed whole — no fake typing)", async () => {
       const app = await enterSession();
-      // A brand-new short assistant entry: re-anchors hidden, then types in.
+      // A brand-new committed transcript entry (a user echo / tool result /
+      // a message the transcript only recorded on completion): it arrived whole
+      // and was never streamed char-by-char, so it snaps to full at once.
       liveTail.deliver([{ id: "m1", role: "assistant", text: "hello world" }]); // 11 chars
-      expect(app.getState().reveal).toEqual({ entryId: "m1", shown: 0 });
-      // 80ms tick @ 150cps -> 12 chars, clamps to the 11 available.
-      await vi.advanceTimersByTimeAsync(80);
-      expect(app.getState().reveal.shown).toBe(11);
-      // The rendered assistant line shows the (now full) text.
+      expect(app.getState().reveal).toEqual({ entryId: "m1", shown: 11 });
       expect(display.lines.some((l) => l.includes("hello world"))).toBe(true);
     });
 
@@ -1436,23 +1441,28 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       expect(app.getState().reveal).toEqual({ entryId: "m1", shown: 400 });
     });
 
-    it("reveals only the typed prefix of the newest entry while typing", async () => {
+    it("reveals only the typed prefix of the newest entry during in-place growth", async () => {
       const app = await enterSession();
-      // Seed a first (older) entry via the live tail, let it finish.
+      // Seed an older entry and a newest one; both committed, so both snap in.
       liveTail.deliver([{ id: "m1", role: "assistant", text: "done" }]);
-      await vi.advanceTimersByTimeAsync(80);
-      // A new long-ish entry that will take more than one tick to type.
+      liveTail.deliver([
+        { id: "m1", role: "assistant", text: "done" },
+        { id: "m2", role: "assistant", text: "abc" }, // snaps to full (3 chars)
+      ]);
+      expect(app.getState().reveal).toEqual({ entryId: "m2", shown: 3 });
+      // The SAME entry now grows in place (e.g. a poll delivering more of a
+      // still-arriving message) — small in-place growth still types in.
       liveTail.deliver([
         { id: "m1", role: "assistant", text: "done" },
         { id: "m2", role: "assistant", text: "abcdefghijklmnopqrstuvwxyz0123456789" }, // 36 chars
       ]);
       expect(app.getState().reveal.entryId).toBe("m2");
-      await vi.advanceTimersByTimeAsync(80); // 12 chars revealed
+      await vi.advanceTimersByTimeAsync(80); // 3 + 12 chars revealed
       const state = app.getState();
-      expect(state.reveal.shown).toBe(12);
-      // Older entry stays full; newest shows only its 12-char prefix.
+      expect(state.reveal.shown).toBe(15);
+      // Older entry stays full; newest shows only its 15-char prefix.
       expect(display.lines.some((l) => l.includes("done"))).toBe(true);
-      expect(display.lines.some((l) => l.includes("abcdefghijkl") && !l.includes("mnop"))).toBe(true);
+      expect(display.lines.some((l) => l.includes("abcdefghijklmno") && !l.includes("pqrs"))).toBe(true);
     });
 
     it("stops the live tail and reveal timer on pause()", async () => {
@@ -1509,11 +1519,12 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       }));
       liveTail.deliver(older);
       await vi.advanceTimersByTimeAsync(80);
-      // A new long entry begins typing (78 chars — more than one 80ms tick,
-      // under the 200-char snap threshold).
+      // A live in-progress turn begins typing (78 chars — more than one 80ms
+      // tick, under the 200-char snap threshold). Committed entries snap, so the
+      // typewriter this test exercises is the genuinely-streamed live turn.
       const longText = "abcdefghijklmnopqrstuvwxyz".repeat(3);
-      liveTail.deliver([...older, { id: "mLast", role: "assistant", text: longText }]);
-      expect(app.getState().reveal.entryId).toBe("mLast");
+      liveTail.deliverTurn(longText);
+      expect(app.getState().reveal.entryId).toBe("__live");
 
       // Scroll up to read history — the reveal must freeze.
       display.emit({ type: "scrollUp" });

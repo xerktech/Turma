@@ -136,6 +136,66 @@ function prune() {
   }
 }
 
+// ---- /api/agents payload cache + SSE fanout ---------------------------------
+// The dashboard fleet payload is polled by every browser but changes only on a
+// heartbeat ingest or a state mutation (a command queued, a host removed, a
+// tunnel coming up/down, the offline sweep) — NOT between the ~20s beats.
+// Memoize the serialized body + its ETag so an idle poll costs a cheap 304,
+// and invalidate on every event that can change it. Separately, /api/events is
+// an SSE stream that pushes the updated per-agent record to open dashboards the
+// instant a beat lands, so Kill/Spawn/Restart/new-question/finished-turn show
+// near-instantly instead of on the next poll (see FIX 1/#1, FIX 3/#9).
+let agentsCache = null; // { body, etag } or null when stale
+const sseClients = new Set(); // open /api/events response streams
+
+function invalidateAgentsCache() { agentsCache = null; }
+
+// One agent record shaped exactly as /api/agents returns it: the (potentially
+// large) history cache stripped, plus the two time/tunnel-derived live flags.
+// Shared by the fleet payload and the SSE per-agent push so both stay in
+// lockstep.
+function serializeAgent(key, agent, now) {
+  const { history, ...a } = agent;
+  return {
+    key,
+    ...a,
+    online: now - (a.lastSeen || 0) < OFFLINE_AFTER_MS,
+    // Only true when this container's reverse tunnel is live right now.
+    terminalOnline: !!controlChannels[key],
+  };
+}
+
+// Build (and memoize) the full fleet payload the way /api/agents returns it.
+function buildAgentsCache() {
+  prune();
+  const now = Date.now();
+  const list = Object.entries(agents).map(([key, a]) => serializeAgent(key, a, now));
+  list.sort((x, y) => (x.device + x.key).localeCompare(y.device + y.key));
+  const body = JSON.stringify({ now, agents: list });
+  const etag = '"' + crypto.createHash("sha1").update(body).digest("base64") + '"';
+  agentsCache = { body, etag };
+  return agentsCache;
+}
+
+// Push one Server-Sent Event to every open /api/events stream (best-effort; a
+// dead stream is dropped on its next failed write and by its "close" handler).
+function sseBroadcast(event, dataObj) {
+  if (!sseClients.size) return;
+  const frame = `event: ${event}\ndata: ${JSON.stringify(dataObj)}\n\n`;
+  for (const res of sseClients) {
+    try { res.write(frame); } catch { sseClients.delete(res); }
+  }
+}
+
+// A host's serialized state changed: drop the cached fleet payload and push the
+// fresh record to every subscribed dashboard. Safe to call for a missing key
+// (invalidates the cache; skips the push).
+function publishAgent(key) {
+  invalidateAgentsCache();
+  const a = agents[key];
+  if (a) sseBroadcast("agent", serializeAgent(key, a, Date.now()));
+}
+
 // Append a command to a host's queue with a fresh, stable cmdId. The heartbeat
 // reply re-sends the queue every beat until the agent acks the cmdId (at-least-
 // once delivery; the agent dedupes). Returns the cmdId for the API response.
@@ -145,6 +205,9 @@ function queueCommand(key, cmd) {
   a.commands = a.commands || [];
   a.commands.push({ ...cmd, cmdId });
   scheduleSave();
+  // The queued command is part of the serialized record — refresh the cache and
+  // push it so other open dashboards reflect the in-flight command right away.
+  publishAgent(key);
   // Poke the agent (if its control tunnel is up) to heartbeat immediately, so
   // the command it just enqueued is delivered in the next beat's reply within
   // ~a round-trip rather than up to a whole TURMA_INTERVAL later. A missed poke
@@ -413,10 +476,13 @@ function heartbeatAlerts(key, prev, next) {
     }
   }
 
-  // Daily cost threshold (API-equivalent estimate): sum across the host's
-  // sessions, once per UTC day. Usage persists for stopped sessions too, so a
-  // killed session still counts toward the day's total.
-  const cost = (next.sessions || []).reduce((sum, s) => sum + (s.usage?.today?.cost || 0), 0);
+  // Daily cost threshold (API-equivalent estimate), once per UTC day. Prefer the
+  // host-level `usage` block, which the agent aggregates from ALL transcripts —
+  // so killed/deleted sessions still count. Fall back to summing live sessions
+  // for agents that predate that block.
+  const cost = next.usage
+    ? (next.usage.today?.cost || 0)
+    : (next.sessions || []).reduce((sum, s) => sum + (s.usage?.today?.cost || 0), 0);
   const day = new Date(now).toISOString().slice(0, 10);
   if (cost >= COST_ALERT_USD && alerts.costDay !== day) {
     alerts.costDay = day;
@@ -486,6 +552,9 @@ setInterval(() => {
       priority: "high",
     });
     scheduleSave();
+    // The host just crossed to offline — invalidate the cached payload (whose
+    // `online` flag is now stale) and push the transition to dashboards.
+    publishAgent(key);
   }
 }, 15 * 1000).unref();
 
@@ -780,21 +849,50 @@ function liveFanout(host, sessionId, obj) {
 
 // ---- terminal proxy ---------------------------------------------------------
 // Proxy an HTTP asset request (ttyd HTML/JS/token) through the agent's tunnel.
-// A fresh channel per request, closed by ttyd via Connection: close.
-async function proxyTerm(req, res, name, port) {
-  let channel;
-  try {
-    channel = await openChannel(name, port);
-  } catch (e) {
-    res.writeHead(502, { "Content-Type": "text/plain" });
-    return res.end(`terminal offline: ${e.message}`);
+//
+// FIX 4/#8: ttyd serves several assets (HTML, JS, CSS, the auth token) plus the
+// WS upgrade for one terminal open. Opening a fresh data channel per asset — a
+// full agent dial-back handshake (openChannel, ~a Cloudflare round-trip) each —
+// serialized the terminal's time-to-interactive. Instead we keep a per-host:port
+// keep-alive http.Agent whose createConnection dials a data channel via
+// openChannel: HTTP/1.1 keep-alive to ttyd (libwebsockets) lets the browser's
+// asset requests reuse a warm channel instead of each re-handshaking, and Node's
+// Agent transparently opens a new one if a pooled channel died. The separate WS
+// upgrade path (browser terminal socket) still opens its own dedicated channel.
+const termAgents = new Map(); // "host:port" -> keep-alive http.Agent over the tunnel
+function termAgentFor(name, port) {
+  const key = name + ":" + port;
+  let agent = termAgents.get(key);
+  if (agent) return agent;
+  agent = new http.Agent({ keepAlive: true, maxSockets: 6, maxFreeSockets: 4, timeout: 60000 });
+  // Each "socket" the Agent needs is a fresh tunnel data channel to this ttyd;
+  // once ttyd keeps it alive the Agent reuses it for the next asset request.
+  agent.createConnection = (_opts, cb) => {
+    openChannel(name, port).then((channel) => cb(null, channel), (err) => cb(err));
+  };
+  termAgents.set(key, agent);
+  return agent;
+}
+// Tear down a host's pooled terminal channels when its tunnel drops, so a later
+// asset request opens a fresh channel instead of reusing a dead one.
+function dropTermAgents(name) {
+  for (const [key, agent] of termAgents) {
+    if (key === name || key.startsWith(name + ":")) {
+      try { agent.destroy(); } catch {}
+      termAgents.delete(key);
+    }
   }
-  const headers = { ...req.headers, host: "ttyd", authorization: TTYD_AUTH, connection: "close" };
+}
+async function proxyTerm(req, res, name, port) {
+  const headers = { ...req.headers, host: "ttyd", authorization: TTYD_AUTH };
+  // Keep-alive over the pooled channel — drop any client-sent Connection header
+  // so ttyd keeps the tunnel channel open for the next asset instead of closing.
+  delete headers.connection;
   // We rewrite ttyd's HTML document to inject the terminal web font, so ask for
   // it uncompressed (small file; avoids having to gunzip before injecting).
   delete headers["accept-encoding"];
   const up = http.request(
-    { createConnection: () => channel, method: req.method, path: req.url, headers },
+    { agent: termAgentFor(name, port), host: name, port, method: req.method, path: req.url, headers },
     (upRes) => {
       // Only the top-level HTML document is buffered + rewritten; every other
       // asset (JS, token, favicon) streams straight through as before.
@@ -977,22 +1075,53 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { token: issueWsToken(), expiresInSec: WS_TOKEN_TTL_MS / 1000 });
     }
 
+    // SSE stream (FIX 1/#1): authenticated dashboards subscribe here and get an
+    // `agent` event (one serialized host record, same shape as /api/agents
+    // returns per agent) on every heartbeat ingest / state change, plus a
+    // `removed` event when a host is dropped. Rides the same login cookie/Basic
+    // auth as the rest of the UI (the auth gate above already enforced it), so
+    // there's no new token flow. Keepalive comments every 25s keep Cloudflare/
+    // proxies from dropping the otherwise-idle stream.
+    if (req.method === "GET" && url.pathname === "/api/events") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-store",
+        Connection: "keep-alive",
+        // Ask nginx/Cloudflare not to buffer the stream (else events pool up).
+        "X-Accel-Buffering": "no",
+      });
+      res.write("retry: 3000\n\n"); // client reconnect backoff hint
+      res.write(": connected\n\n");
+      sseClients.add(res);
+      const keepalive = setInterval(() => {
+        try { res.write(": keepalive\n\n"); } catch { /* dropped; close cleans up */ }
+      }, 25000);
+      keepalive.unref();
+      const drop = () => { clearInterval(keepalive); sseClients.delete(res); };
+      req.on("close", drop);
+      res.on("close", drop);
+      res.on("error", drop);
+      return;
+    }
+
+    // The fleet payload polled by every dashboard. Memoized (FIX 3/#9): the
+    // serialized body + ETag are cached and only rebuilt when invalidated by a
+    // heartbeat/mutation/tunnel/offline event, so an unchanged poll costs a
+    // cheap 304. `Cache-Control: no-cache` (not no-store) so the browser keeps
+    // the body+ETag and revalidates with If-None-Match on its next poll. The
+    // history cache is excluded from the payload (see serializeAgent).
     if (req.method === "GET" && url.pathname === "/api/agents") {
-      prune();
-      const now = Date.now();
-      // The history cache can be big (up to 8 sessions' transcripts per host)
-      // and this list is polled every few seconds by every dashboard client,
-      // so it's excluded here; GET .../sessions/<id>/history is the only
-      // place history is served.
-      const list = Object.entries(agents).map(([key, { history, ...a }]) => ({
-        key,
-        ...a,
-        online: now - (a.lastSeen || 0) < OFFLINE_AFTER_MS,
-        // Only true when this container's reverse tunnel is live right now.
-        terminalOnline: !!controlChannels[key],
-      }));
-      list.sort((x, y) => (x.device + x.key).localeCompare(y.device + y.key));
-      return json(res, 200, { now, agents: list });
+      const cached = agentsCache || buildAgentsCache();
+      if ((req.headers["if-none-match"] || "") === cached.etag) {
+        res.writeHead(304, { ETag: cached.etag, "Cache-Control": "no-cache" });
+        return res.end();
+      }
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        ETag: cached.etag,
+      });
+      return res.end(cached.body);
     }
 
     if (req.method === "POST" && url.pathname === "/api/heartbeat") {
@@ -1028,6 +1157,9 @@ const server = http.createServer(async (req, res) => {
       ingestHistory(next, historyResults);
       heartbeatAlerts(key, prev, next);
       scheduleSave();
+      // A fresh beat landed — refresh the memoized fleet payload and push the
+      // updated record to open dashboards so the UI reflects it near-instantly.
+      publishAgent(key);
       return json(res, 200, { commands });
     }
 
@@ -1093,13 +1225,31 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/input -> forward free-text input
-      // to a running session (e.g. answering a pending question). Body: {text}.
+      // to a running session (typing a message into the session). Body: {text}.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "input") {
         const body = JSON.parse((await readBody(req)) || "{}");
         const text = typeof body.text === "string" ? body.text : "";
         if (!text.trim()) return json(res, 400, { error: "text required" });
         if (text.length > 4000) return json(res, 400, { error: "text too long" });
         const cmdId = queueCommand(key, { type: "input", sessionId, text });
+        return json(res, 200, { ok: true, cmdId });
+      }
+      // POST /api/agents/<host>/sessions/<id>/answer -> answer a pending
+      // AskUserQuestion. Body: {optionIndex} (0-based option pick) and/or
+      // {custom} (free-text / "Other" answer). The agent drops the answer file
+      // the ask.py bridge is blocked on. optionIndex -1 (or omitted) means a
+      // pure free-text answer; a valid answer needs at least one of the two.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "answer") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const optionIndex = Number.isInteger(body.optionIndex) ? body.optionIndex : -1;
+        const custom = typeof body.custom === "string" ? body.custom : "";
+        if (optionIndex < 0 && !custom.trim()) {
+          return json(res, 400, { error: "optionIndex or custom required" });
+        }
+        if (custom.length > 4000) return json(res, 400, { error: "custom too long" });
+        const cmd = { type: "answerQuestion", sessionId, optionIndex };
+        if (custom) cmd.custom = custom;
+        const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });
       }
       // GET /api/agents/<host>/sessions/<id>/history -> that session's recent
@@ -1132,6 +1282,8 @@ const server = http.createServer(async (req, res) => {
       const key = decodeURIComponent(parts[2]);
       delete agents[key];
       scheduleSave();
+      invalidateAgentsCache();
+      sseBroadcast("removed", { key });
       return json(res, 200, { ok: true });
     }
 
@@ -1186,6 +1338,9 @@ server.on("upgrade", async (req, socket, head) => {
       sendPoke: () => send(0x1, JSON.stringify({ poke: true })),
     };
     console.log(`tunnel connected: ${name}`);
+    // Terminal tunnel just came up — the host's `terminalOnline` flag flipped,
+    // so refresh the cached payload and push it (Attach buttons enable live).
+    publishAgent(name);
     // A fresh (or reconnected) tunnel doesn't know which sessions the hub still
     // has live watchers for — re-arm each so an agent restart / control-channel
     // flap doesn't silently stop the live stream to already-attached glasses.
@@ -1215,7 +1370,10 @@ server.on("upgrade", async (req, socket, head) => {
       clearInterval(ping);
       if (controlChannels[name] && controlChannels[name].socket === socket) {
         delete controlChannels[name];
+        dropTermAgents(name); // discard pooled terminal channels (now dead)
         console.log(`tunnel gone: ${name}`);
+        // Tunnel down — `terminalOnline` flipped back to false; push it.
+        publishAgent(name);
       }
     };
     socket.on("close", cleanup);

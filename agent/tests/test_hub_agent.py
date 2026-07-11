@@ -233,7 +233,7 @@ class TestSpawnOptionHelpers(unittest.TestCase):
                 ha, "run",
                 lambda cmd, cwd=None: "origin/main" if "symbolic-ref" in cmd else ""), \
              mock.patch.object(ha, "run_ok",
-                               lambda cmd, cwd=None: calls.append(cmd) or (0, "")), \
+                               lambda cmd, cwd=None, timeout=None: calls.append(cmd) or (0, "")), \
              mock.patch.object(ha, "branch_exists",
                                lambda repo, ref: ref == "refs/remotes/origin/main"):
             self.assertEqual(ha.default_base_ref("/repo"), "origin/main")
@@ -299,8 +299,22 @@ class ProjectDirMixin:
         patcher = mock.patch.object(ha, "PROJECTS_ROOT", self.tmp)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Isolate the AskUserQuestion rendezvous dir so hook-file detection
+        # tests can drop req files without touching the real ~/.turma/questions.
+        self.questions_dir = os.path.join(self.tmp, "questions")
+        os.makedirs(self.questions_dir)
+        qpatcher = mock.patch.object(ha, "QUESTIONS_DIR", self.questions_dir)
+        qpatcher.start()
+        self.addCleanup(qpatcher.stop)
         self.proj = os.path.join(self.tmp, ha._project_slug(self.WORKDIR))
         os.makedirs(self.proj)
+
+    def write_question_req(self, session_id, question, options):
+        """Publish a pending-question request file the way ask.py would."""
+        req = {"sessionId": session_id, "question": question,
+               "options": [{"label": o} if isinstance(o, str) else o for o in options]}
+        with open(os.path.join(self.questions_dir, f"{session_id}.req.json"), "w") as f:
+            json.dump(req, f)
 
 
 class TestUsageReport(ProjectDirMixin, unittest.TestCase):
@@ -363,6 +377,198 @@ class TestUsageReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["totals"]["input"], 0)
         self.assertEqual(rep["days"], {})
         self.assertEqual(rep["lastActivity"], "")
+
+
+class TestNormalizeRemote(unittest.TestCase):
+    def test_forms_collapse_to_one_identity(self):
+        # ssh, scp, https, https-with-creds and a :port ssh URL all normalize to
+        # the same key, so the same repo cloned differently across hosts unifies.
+        cases = {
+            "git@github.com:Xerk/DockerOps.git": "github.com/xerk/dockerops",
+            "https://github.com/Xerk/DockerOps": "github.com/xerk/dockerops",
+            "https://github.com/Xerk/DockerOps.git": "github.com/xerk/dockerops",
+            "https://user:tok@github.com/Xerk/DockerOps.git": "github.com/xerk/dockerops",
+            "ssh://git@github.com:22/Xerk/DockerOps.git": "github.com/xerk/dockerops",
+            "https://github.com/Xerk/DockerOps/": "github.com/xerk/dockerops",
+        }
+        for raw, want in cases.items():
+            self.assertEqual(ha.normalize_remote(raw), want, raw)
+
+    def test_empty(self):
+        self.assertEqual(ha.normalize_remote(""), "")
+        self.assertEqual(ha.normalize_remote(None), "")
+
+
+class TestRepoUsageReport(unittest.TestCase):
+    """repo_usage_report() aggregates transcripts by repo via the ledger,
+    independent of any live session."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-repo-usage-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = mock.patch.object(ha, "PROJECTS_ROOT", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _proj(self, worktree):
+        d = os.path.join(self.tmp, ha._project_slug(worktree))
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _entry(self, worktree, repo, remote):
+        return {"repo": repo, "remote": remote, "slug": ha._project_slug(worktree)}
+
+    def _fold_full(self, slug):
+        # Stand-in for the manager's _fold_slug: a full (non-incremental) parse
+        # of one project slug into a fresh accumulator.
+        acc = ha._UsageAcc()
+        ha._aggregate_project(os.path.join(self.tmp, slug), acc)
+        return acc
+
+    def test_merges_worktrees_per_repo_and_host_total(self):
+        wt_a = "/w/.turma/worktrees/Turma/aaa"
+        wt_b = "/w/.turma/worktrees/Turma/bbb"
+        wt_c = "/w/.turma/worktrees/DockerOps/ccc"
+        write_jsonl(os.path.join(self._proj(wt_a), "a.jsonl"), [
+            usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
+                        "claude-opus-4-20250514", 1_000_000, 100_000),  # $7.50
+        ])
+        write_jsonl(os.path.join(self._proj(wt_b), "b.jsonl"), [
+            usage_entry("2026-07-01T12:00:00.000Z", "m2", "r2",
+                        "claude-sonnet-4-20250514", 100_000, 0),        # $0.30
+        ])
+        write_jsonl(os.path.join(self._proj(wt_c), "c.jsonl"), [
+            usage_entry("2026-07-02T09:00:00.000Z", "m3", "r3",
+                        "claude-sonnet-4-20250514", 200_000, 0),        # $0.60
+        ])
+        ledger = {
+            # Same repo, two worktrees, ssh vs https remote -> one repo series.
+            wt_a: self._entry(wt_a, "Turma", "git@github.com:xerktech/Turma.git"),
+            wt_b: self._entry(wt_b, "Turma", "https://github.com/xerktech/Turma.git"),
+            wt_c: self._entry(wt_c, "DockerOps", "git@github.com:xerktech/DockerOps.git"),
+        }
+        repo_usage, host = ha.repo_usage_report(ledger, self._fold_full)
+        by = {r["repo"]: r for r in repo_usage}
+
+        self.assertAlmostEqual(by["Turma"]["usage"]["totals"]["cost"], 7.8, places=2)
+        self.assertEqual(by["Turma"]["usage"]["totals"]["input"], 1_100_000)
+        self.assertAlmostEqual(
+            by["Turma"]["usage"]["days"]["2026-07-01"]["cost"], 7.8, places=2)
+        self.assertEqual(by["Turma"]["remoteKey"], "github.com/xerktech/turma")
+        self.assertAlmostEqual(by["DockerOps"]["usage"]["totals"]["cost"], 0.6, places=2)
+
+        self.assertAlmostEqual(host["totals"]["cost"], 7.8 + 0.6, places=2)
+        self.assertEqual(host["totals"]["input"], 1_100_000 + 200_000)
+        # Sorted by cost desc.
+        self.assertEqual(repo_usage[0]["repo"], "Turma")
+
+    def test_empty_and_missing_dirs_excluded(self):
+        wt_live = "/w/.turma/worktrees/Turma/live"
+        wt_empty = "/w/.turma/worktrees/Turma/empty"  # dir exists, no transcripts
+        wt_gone = "/w/.turma/worktrees/Ghost/gone"    # dir never created
+        write_jsonl(os.path.join(self._proj(wt_live), "a.jsonl"), [
+            usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
+                        "claude-sonnet-4-20250514", 100_000, 0),
+        ])
+        self._proj(wt_empty)
+        ledger = {
+            wt_live: self._entry(wt_live, "Turma", ""),
+            wt_empty: self._entry(wt_empty, "Turma", ""),
+            wt_gone: self._entry(wt_gone, "Ghost", ""),
+        }
+        repo_usage, host = ha.repo_usage_report(ledger, self._fold_full)
+        repos = {r["repo"] for r in repo_usage}
+        self.assertIn("Turma", repos)      # has usage via wt_live
+        self.assertNotIn("Ghost", repos)   # no transcripts -> omitted
+        # No remote -> remoteKey falls back to the repo name.
+        turma = next(r for r in repo_usage if r["repo"] == "Turma")
+        self.assertEqual(turma["remoteKey"], "Turma")
+
+    def test_empty_ledger(self):
+        repo_usage, host = ha.repo_usage_report({}, self._fold_full)
+        self.assertEqual(repo_usage, [])
+        self.assertIsNone(host)
+
+
+class TestAggregateProjectIncremental(ProjectDirMixin, unittest.TestCase):
+    """With an `offsets` dict, _aggregate_project folds only newly-appended bytes
+    across beats (the manager carries a persistent per-slug acc + offsets), but
+    the running totals must always match a from-scratch parse."""
+
+    def _entry(self, ts, mid, model, inp, out):
+        return usage_entry(ts, mid, mid, model, inp, out)
+
+    def _fold(self, acc, offsets):
+        return ha._aggregate_project(self.proj, acc, offsets)
+
+    def test_incremental_matches_full_and_only_reads_new_bytes(self):
+        path = os.path.join(self.proj, "a.jsonl")
+        write_jsonl(path, [self._entry(
+            "2026-07-01T10:00:00Z", "m1", "claude-opus-4-20250514", 1_000_000, 0)])
+
+        acc, offsets = ha._UsageAcc(), {}
+        self.assertTrue(self._fold(acc, offsets))
+        self.assertEqual(acc.totals["input"], 1_000_000)
+        off1 = offsets["a.jsonl"]
+
+        # Append a second message; the incremental beat picks up only the delta.
+        write_jsonl(path, [self._entry(
+            "2026-07-02T10:00:00Z", "m2", "claude-opus-4-20250514", 500_000, 0)])
+        self.assertTrue(self._fold(acc, offsets))
+        self.assertEqual(acc.totals["input"], 1_500_000)
+        self.assertGreater(offsets["a.jsonl"], off1)
+
+        # Same result as a cold, stateless full parse of the final file.
+        self.assertEqual(acc.totals["input"],
+                         ha.usage_report(self.WORKDIR)["totals"]["input"])
+
+    def test_cross_file_dedup_persists_across_beats(self):
+        a = os.path.join(self.proj, "a.jsonl")
+        b = os.path.join(self.proj, "b.jsonl")
+        dup = self._entry("2026-07-01T10:00:00Z", "m1", "claude-opus-4-20250514", 10, 0)
+        write_jsonl(a, [dup])
+        acc, offsets = ha._UsageAcc(), {}
+        self._fold(acc, offsets)
+        # The SAME message id later shows up appended to another transcript.
+        write_jsonl(b, [dup])
+        self._fold(acc, offsets)
+        self.assertEqual(acc.totals["input"], 10)  # counted once, not twice
+
+    def test_partial_trailing_line_deferred_then_counted(self):
+        path = os.path.join(self.proj, "a.jsonl")
+        entry = self._entry("2026-07-01T10:00:00Z", "m1", "claude-opus-4-20250514", 7, 0)
+        line = json.dumps(entry)
+        # Write the entry WITHOUT its trailing newline (an in-progress write).
+        with open(path, "w") as f:
+            f.write(line[: len(line) // 2])
+        acc, offsets = ha._UsageAcc(), {}
+        self._fold(acc, offsets)
+        self.assertEqual(acc.totals["input"], 0)  # not yet a whole line
+        # Finish the line; the offset never advanced past the partial, so the
+        # whole entry is read exactly once now.
+        with open(path, "w") as f:
+            f.write(line + "\n")
+        self._fold(acc, offsets)
+        self.assertEqual(acc.totals["input"], 7)
+
+    def test_truncation_signals_rebuild(self):
+        path = os.path.join(self.proj, "a.jsonl")
+        write_jsonl(path, [self._entry(
+            "2026-07-01T10:00:00Z", "m1", "claude-opus-4-20250514", 100, 0)])
+        acc, offsets = ha._UsageAcc(), {}
+        self.assertTrue(self._fold(acc, offsets))
+        self.assertEqual(acc.totals["input"], 100)
+        # Rewrite the file smaller: _aggregate_project reports the truncation
+        # (returns False, acc untouched) so the caller rebuilds from a fresh acc
+        # rather than adding on top of the stale running total.
+        with open(path, "w") as f:
+            f.write(json.dumps(self._entry(
+                "2026-07-02T10:00:00Z", "m2", "claude-opus-4-20250514", 5, 0)) + "\n")
+        self.assertFalse(self._fold(acc, offsets))
+        self.assertEqual(acc.totals["input"], 100)  # unchanged on the failed fold
+        fresh, foff = ha._UsageAcc(), {}
+        self.assertTrue(self._fold(fresh, foff))
+        self.assertEqual(fresh.totals["input"], 5)
 
 
 class TestLastEntry(ProjectDirMixin, unittest.TestCase):
@@ -518,38 +724,32 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, {})
         self.assertEqual(rep["questionOptions"], ["ok"])
 
-    # ---- pane fallback: pending question read from the live TUI ------------
-    # A pending AskUserQuestion isn't in the transcript yet (Claude flushes the
-    # tool_use only once answered), so when the transcript turns up nothing the
-    # report falls back to parsing the session's tmux pane.
-    PANE = (
-        "╭─ Name pick ──────────────────────────────╮\n"
-        "│ Which direction should I run with?       │\n"
-        "│                                          │\n"
-        "│ ❯ 1. Turma                               │\n"
-        "│   2. Tutela                              │\n"
-        "╰──────────────────────────────────────────╯\n"
-    )
-
-    def test_pane_fallback_fills_pending_question(self):
+    # ---- hook-file detection: pending question from the ask.py bridge -------
+    # A pending AskUserQuestion is published by the ask.py PreToolUse bridge as
+    # a <sessionId>.req.json under QUESTIONS_DIR while the tool call blocks, so
+    # session_report reads it from there (not from a scraped tmux pane).
+    def test_hook_file_fills_pending_question(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, [self.entry_with_text("working on it")])  # last entry isn't a question
-        with mock.patch.object(ha, "run", return_value=self.PANE) as m:
-            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
+        self.write_question_req("sess-1", "Which direction should I run with?",
+                                ["Turma", "Tutela"])
+        rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id="sess-1")
         self.assertEqual(rep["question"], "Which direction should I run with?")
         self.assertEqual(rep["questionOptions"], ["Turma", "Tutela"])
-        self.assertEqual(rep["questionSource"], "pane")
-        m.assert_called_once_with(["tmux", "capture-pane", "-p", "-t", "agent-abc"])
+        self.assertEqual(rep["questionSource"], "hook")
 
-    def test_pane_fallback_works_when_no_transcript_yet(self):
+    def test_hook_file_works_when_no_transcript_yet(self):
         # No .jsonl in the project dir at all — the early-return path must still
-        # consult the pane so a question asked before the first write shows up.
-        with mock.patch.object(ha, "run", return_value=self.PANE):
-            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
+        # surface the hook's request file for a question asked before any write.
+        self.write_question_req("sess-1", "Which direction should I run with?",
+                                ["Turma", "Tutela"])
+        rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id="sess-1")
         self.assertEqual(rep["question"], "Which direction should I run with?")
-        self.assertEqual(rep["questionSource"], "pane")
+        self.assertEqual(rep["questionSource"], "hook")
 
-    def test_transcript_question_wins_and_pane_not_captured(self):
+    def test_hook_file_overrides_transcript_detection(self):
+        # A live hook request is the authoritative pending signal; it wins even
+        # when the transcript scan also turned up an AskUserQuestion tool_use.
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, [{
             "type": "assistant",
@@ -559,102 +759,67 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
                                           "options": [{"label": "yes"}]}]}},
             ]},
         }])
-        with mock.patch.object(ha, "run") as m:
-            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
-        self.assertEqual(rep["question"], "from transcript")
-        self.assertEqual(rep["questionSource"], "transcript")
-        m.assert_not_called()  # transcript already answered it; no pane capture
+        self.write_question_req("sess-1", "live from hook", ["a", "b"])
+        rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id="sess-1")
+        self.assertEqual(rep["question"], "live from hook")
+        self.assertEqual(rep["questionSource"], "hook")
 
-    def test_no_tmux_name_means_no_pane_fallback(self):
+    def test_no_hook_file_means_no_hook_question(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, [self.entry_with_text("working on it")])
-        rep = ha.session_report(self.WORKDIR, {})  # no tmux_name passed
+        rep = ha.session_report(self.WORKDIR, {}, session_id="sess-1")  # no req file
         self.assertIsNone(rep["question"])
         self.assertIsNone(rep["questionSource"])
 
-
-class TestParsePaneQuestion(unittest.TestCase):
-    """The tmux-pane picker parser that backs the pending-question fallback."""
-
-    def test_boxed_picker_with_cursor(self):
-        pane = (
-            "╭─ Name pick ──────────────────────────────╮\n"
-            "│ Which direction should I run with?       │\n"
-            "│                                          │\n"
-            "│ ❯ 1. Turma                               │\n"
-            "│   2. Tutela                              │\n"
-            "│   3. Vexillum / Praetor                  │\n"
-            "│   4. None — new direction                │\n"
-            "╰──────────────────────────────────────────╯\n"
+    def test_hook_file_caps_options_and_skips_non_string_labels(self):
+        self.write_question_req(
+            "sess-1", "Pick?",
+            [{"label": "a"}, {"label": 42}, {"label": "b"},
+             {"label": "c"}, {"label": "d"}, {"label": "e"}],
         )
-        q, opts = ha.parse_pane_question(pane)
-        self.assertEqual(q, "Which direction should I run with?")
-        self.assertEqual(opts, ["Turma", "Tutela", "Vexillum / Praetor", "None — new direction"])
+        rep = ha.session_report(self.WORKDIR, {}, session_id="sess-1")
+        # Capped at the first 4 options, then non-string labels dropped — same
+        # order of operations as the transcript-detection path.
+        self.assertEqual(rep["questionOptions"], ["a", "b", "c"])
 
-    def test_bare_picker_with_cursor(self):
-        pane = "Which color?\n\n❯ 1. Red\n  2. Green\n  3. Blue\n"
-        q, opts = ha.parse_pane_question(pane)
-        self.assertEqual(q, "Which color?")
-        self.assertEqual(opts, ["Red", "Green", "Blue"])
 
-    def test_ansi_codes_stripped(self):
-        pane = "Pick one?\n\x1b[36m❯ 1. Alpha\x1b[0m\n  2. Beta\n"
-        q, opts = ha.parse_pane_question(pane)
-        self.assertEqual(q, "Pick one?")
-        self.assertEqual(opts, ["Alpha", "Beta"])
+class TestHookQuestion(unittest.TestCase):
+    """_hook_question reads the ask.py bridge's request file directly."""
 
-    def test_numbered_list_without_cursor_is_not_a_question(self):
-        # Guard against a phantom question: the assistant merely printed a
-        # numbered list and went idle. No selection cursor -> not a picker.
-        pane = "Here's the plan:\n1. First step\n2. Second step\n3. Third step\n"
-        self.assertEqual(ha.parse_pane_question(pane), (None, []))
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-hookq-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = mock.patch.object(ha, "QUESTIONS_DIR", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
 
-    def test_single_option_is_not_a_question(self):
-        pane = "Proceed?\n❯ 1. Yes\n"
-        self.assertEqual(ha.parse_pane_question(pane), (None, []))
+    def _write(self, sid, data):
+        with open(os.path.join(self.tmp, f"{sid}.req.json"), "w") as f:
+            json.dump(data, f)
 
-    def test_empty_pane(self):
-        self.assertEqual(ha.parse_pane_question(""), (None, []))
-        self.assertEqual(ha.parse_pane_question("   \n  \n"), (None, []))
+    def test_missing_file(self):
+        self.assertEqual(ha._hook_question("nope"), (None, []))
 
-    def test_options_capped_at_four_and_labels_at_80(self):
-        long = "L" * 100
-        pane = ("Pick?\n"
-                f"❯ 1. {long}\n  2. b\n  3. c\n  4. d\n  5. e\n  6. f\n")
-        q, opts = ha.parse_pane_question(pane)
-        self.assertEqual(len(opts), 4)
-        self.assertEqual(opts[0], "L" * 80)
-        self.assertEqual(opts[1:], ["b", "c", "d"])
+    def test_no_session_id(self):
+        self.assertEqual(ha._hook_question(None), (None, []))
+        self.assertEqual(ha._hook_question(""), (None, []))
 
-    def test_question_capped_at_300(self):
-        q_text = "Why? " * 100  # > 300 chars
-        pane = f"{q_text}\n❯ 1. a\n  2. b\n"
-        q, _ = ha.parse_pane_question(pane)
+    def test_reads_question_and_labels(self):
+        self._write("s", {"question": "Which?",
+                          "options": [{"label": "A"}, {"label": "B"}]})
+        self.assertEqual(ha._hook_question("s"), ("Which?", ["A", "B"]))
+
+    def test_corrupt_file_is_no_question(self):
+        with open(os.path.join(self.tmp, "s.req.json"), "w") as f:
+            f.write("{not json")
+        self.assertEqual(ha._hook_question("s"), (None, []))
+
+    def test_question_capped_at_300_and_labels_at_80(self):
+        self._write("s", {"question": "Q" * 400,
+                          "options": [{"label": "L" * 100}]})
+        q, opts = ha._hook_question("s")
         self.assertEqual(len(q), 300)
-
-    def test_wrapped_label_does_not_break_the_run(self):
-        pane = (
-            "Choose:\n"
-            "❯ 1. A very long option label that wrapped\n"
-            "     onto a second visual line\n"
-            "  2. Short\n"
-        )
-        q, opts = ha.parse_pane_question(pane)
-        self.assertEqual(q, "Choose:")
-        self.assertEqual(opts, ["A very long option label that wrapped", "Short"])
-
-    def test_boxed_header_not_mistaken_for_question(self):
-        # The header sits in the top border; the real question is below it.
-        pane = (
-            "╭─ Confirm ────────────────╮\n"
-            "│ Delete the branch?       │\n"
-            "│ ❯ 1. Yes                 │\n"
-            "│   2. No                  │\n"
-            "╰──────────────────────────╯\n"
-        )
-        q, opts = ha.parse_pane_question(pane)
-        self.assertEqual(q, "Delete the branch?")
-        self.assertEqual(opts, ["Yes", "No"])
+        self.assertEqual(opts, ["L" * 80])
 
 
 class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
@@ -721,7 +886,7 @@ class ManagerMixin:
             self.run_calls.append(cmd)
             return ""
 
-        def fake_run_ok(cmd, cwd=None):
+        def fake_run_ok(cmd, cwd=None, timeout=None):
             self.run_ok_calls.append(cmd)
             return 0, ""
 
@@ -731,6 +896,8 @@ class ManagerMixin:
             ("REGISTRY_DIR", self.tmp),
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
+            ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
+            ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", os.path.join(self.tmp, "worktrees")),
         ]:
@@ -740,6 +907,65 @@ class ManagerMixin:
 
     def make_manager(self):
         return ha.SessionManager()
+
+
+class TestUsageLedger(ManagerMixin, unittest.TestCase):
+    """The attribution ledger: written at spawn, backfilled, pruned, and — the
+    whole point — surviving a kill so usage stays reported."""
+
+    def _proj_for(self, worktree):
+        d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(worktree))
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def test_remember_persists_and_reloads(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        sm._remember_usage({"repo": "Turma", "repoPath": "/w/Turma", "worktreePath": wt})
+        self.assertIn(wt, sm.usage_ledger)
+        self.assertTrue(os.path.exists(ha.USAGE_LEDGER_PATH))
+        # A fresh manager loads the same ledger from disk.
+        self.assertEqual(self.make_manager().usage_ledger[wt]["repo"], "Turma")
+
+    def test_backfill_from_registry_and_closed(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "a", "repo": "Turma", "repoPath": "/w/Turma",
+                        "worktreePath": "/w/.turma/worktrees/Turma/aaa"}]
+        sm.closed = [{"id": "b", "repo": "DockerOps", "repoPath": "/w/DockerOps",
+                      "worktreePath": "/w/.turma/worktrees/DockerOps/bbb"}]
+        sm._backfill_ledger()
+        self.assertIn("/w/.turma/worktrees/Turma/aaa", sm.usage_ledger)
+        self.assertIn("/w/.turma/worktrees/DockerOps/bbb", sm.usage_ledger)
+
+    def test_prune_drops_entries_whose_transcripts_gone(self):
+        sm = self.make_manager()
+        wt_live = "/w/.turma/worktrees/Turma/live"
+        wt_gone = "/w/.turma/worktrees/Turma/gone"
+        self._proj_for(wt_live)
+        sm.usage_ledger = {
+            wt_live: {"repo": "Turma", "remote": "", "slug": ha._project_slug(wt_live)},
+            wt_gone: {"repo": "Turma", "remote": "", "slug": ha._project_slug(wt_gone)},
+        }
+        sm._prune_ledger()
+        self.assertIn(wt_live, sm.usage_ledger)
+        self.assertNotIn(wt_gone, sm.usage_ledger)
+
+    def test_usage_survives_kill(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        write_jsonl(os.path.join(self._proj_for(wt), "a.jsonl"), [
+            usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
+                        "claude-sonnet-4-20250514", 100_000, 0),
+        ])
+        sm._remember_usage({"repo": "Turma", "repoPath": "/w/Turma", "worktreePath": wt})
+        sm._refresh_repo_usage()
+        self.assertTrue(any(r["repo"] == "Turma" for r in sm.repo_usage))
+        # Kill: registry record dropped, caches forgotten — but the ledger and
+        # transcript remain, so the repo's usage is still aggregated and reported.
+        sm.registry = []
+        sm._refresh_repo_usage()
+        self.assertTrue(any(r["repo"] == "Turma" for r in sm.repo_usage))
+        self.assertIsNotNone(sm.host_usage)
 
 
 class TestRegistryPersistence(ManagerMixin, unittest.TestCase):
@@ -1034,12 +1260,16 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         settings = os.path.join(ha.REGISTRY_DIR, "guard-settings.json")
         self.assertEqual(
             self._claude_cmd(),
+            f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
+            f"TURMA_QUESTIONS_DIR={shlex.quote(ha.QUESTIONS_DIR)} "
             f"claude --remote-control '{sess['rcName']}' "
             f"--permission-mode auto --settings {shlex.quote(settings)}",
         )
-        # The guard settings file was written and wires the Bash PreToolUse hook.
+        # The guard settings file was written and wires the Bash guard hook plus
+        # the AskUserQuestion → glasses bridge, both as PreToolUse matchers.
         loaded = json.loads(open(settings).read())
-        self.assertEqual(loaded["hooks"]["PreToolUse"][0]["matcher"], "Bash")
+        matchers = [e["matcher"] for e in loaded["hooks"]["PreToolUse"]]
+        self.assertEqual(matchers, ["Bash", "AskUserQuestion"])
 
     def test_spawn_threads_all_options(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
@@ -1273,6 +1503,75 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.run_calls, [])
 
 
+class TestAnswerQuestion(ManagerMixin, unittest.TestCase):
+    """answer_question drops the ask.py bridge's answer file — only when a
+    request file is actually pending for that session."""
+
+    def _running_session(self, sm, sid="abcde", status="running"):
+        sess = {"id": sid, "status": status, "tmuxName": f"agent-{sid}"}
+        sm.registry = [sess]
+        return sess
+
+    def _req(self, sid):
+        with open(os.path.join(ha.QUESTIONS_DIR, f"{sid}.req.json"), "w") as f:
+            json.dump({"sessionId": sid, "question": "q",
+                       "options": [{"label": "a"}, {"label": "b"}]}, f)
+
+    def _ans(self, sid):
+        path = os.path.join(ha.QUESTIONS_DIR, f"{sid}.ans.json")
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            return json.load(f)
+
+    def test_writes_answer_file_for_option_pick(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        self._req(sess["id"])
+        sm.answer_question(sess["id"], 1, None)
+        self.assertEqual(self._ans(sess["id"]), {"optionIndex": 1})
+
+    def test_writes_answer_file_with_custom_text(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        self._req(sess["id"])
+        sm.answer_question(sess["id"], -1, "do the other thing")
+        self.assertEqual(self._ans(sess["id"]),
+                         {"optionIndex": -1, "custom": "do the other thing"})
+
+    def test_noop_when_no_request_pending(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sm.answer_question(sess["id"], 0, None)  # no req file written
+        self.assertIsNone(self._ans(sess["id"]))
+
+    def test_noop_for_unknown_or_stopped_session(self):
+        sm = self.make_manager()
+        self._req("ghost")
+        sm.registry = []
+        sm.answer_question("ghost", 0, None)
+        self.assertIsNone(self._ans("ghost"))
+
+    def test_noop_when_no_option_and_no_text(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        self._req(sess["id"])
+        sm.answer_question(sess["id"], -1, "   ")  # blank custom, negative index
+        self.assertIsNone(self._ans(sess["id"]))
+
+    def test_kill_clears_pending_question_files(self):
+        sm = self.make_manager()
+        sess = {"id": "abcde", "status": "running", "repo": "r",
+                "tmuxName": "agent-abcde", "worktreePath": "/w", "root": True}
+        sm.registry = [sess]
+        self._req("abcde")
+        with open(os.path.join(ha.QUESTIONS_DIR, "abcde.ans.json"), "w") as f:
+            f.write("{}")
+        sm.kill("abcde")
+        self.assertFalse(os.path.exists(os.path.join(ha.QUESTIONS_DIR, "abcde.req.json")))
+        self.assertFalse(os.path.exists(os.path.join(ha.QUESTIONS_DIR, "abcde.ans.json")))
+
+
 class TestHistoryCommand(ManagerMixin, unittest.TestCase):
     WORKDIR = "/w/.turma/worktrees/repo"
 
@@ -1408,6 +1707,16 @@ class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
         sm._stage_history.assert_called_once_with("s1")
         self.assertEqual(sm.acked, {"i1", "h1"})
 
+    def test_dispatches_answer_question(self):
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        sm.answer_question = mock.Mock()
+        cmds = [{"cmdId": "a1", "type": "answerQuestion", "sessionId": "s1",
+                 "optionIndex": 2, "custom": "other"}]
+        self.assertTrue(sm.handle_commands(cmds))
+        sm.answer_question.assert_called_once_with("s1", 2, "other")
+        self.assertEqual(sm.acked, {"a1"})
+
 
 class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
     """historyResults staging must mirror ackedCommands/pending_prs: appear in
@@ -1483,6 +1792,116 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(
             [r["sessionId"] for r in payload["historyResults"]], ["s1", "s2"],
         )
+
+
+class TestBuildPayloadCaching(ManagerMixin, unittest.TestCase):
+    """The heartbeat build caches slow-changing work (usage, git facts, docker
+    log tail) off the per-beat critical path (#2/#5/#7): recomputed on the slow
+    cadence or a cache miss, reused in between, and skipped on a `light` beat."""
+
+    def _session(self, sid):
+        return {"id": sid, "repo": "R", "repoPath": "/x/R",
+                "worktreePath": f"/x/R/{sid}", "branch": None, "rcName": sid,
+                "status": "running"}
+
+    def test_usage_refresh_is_staggered_and_caches(self):
+        sm = self.make_manager()
+        sm.registry = [self._session("aaa"), self._session("bbb")]
+        calls = []
+        sm._refresh_usage = lambda sid, wt: calls.append((sid, ha._usage_slot(sid)))
+
+        # Each session refreshes only on the beat matching its own stable slot
+        # (first appearance aside), so they don't all reparse on the same beat.
+        for beat in range(ha.USAGE_EVERY):
+            calls.clear()
+            sm.usage_cache = {"aaa": {}, "bbb": {}}  # both already cached
+            sm.build_payload(beat)
+            for sid, slot in calls:
+                self.assertEqual(slot, beat % ha.USAGE_EVERY)
+        # Over a full window every session refreshed exactly once.
+        seen = set()
+        for beat in range(ha.USAGE_EVERY):
+            calls.clear()
+            sm.usage_cache = {"aaa": {}, "bbb": {}}
+            sm.build_payload(beat)
+            seen.update(sid for sid, _ in calls)
+        self.assertEqual(seen, {"aaa", "bbb"})
+
+    def test_newly_seen_session_refreshes_immediately(self):
+        sm = self.make_manager()
+        sm.registry = [self._session("aaa")]
+        refreshed = []
+        sm._refresh_usage = lambda sid, wt: refreshed.append(sid)
+        # Beat 1 is (almost certainly) not aaa's slot, but with no cached usage
+        # it must still refresh on first appearance.
+        sm.usage_cache = {}
+        sm.build_payload(1)
+        self.assertIn("aaa", refreshed)
+
+    def test_light_beat_skips_expensive_refreshes(self):
+        sm = self.make_manager()
+        sm.registry = [self._session("aaa")]
+        sm.usage_cache = {"aaa": {}}       # already cached -> no first-sight refresh
+        refreshed, gh = [], []
+        sm._refresh_usage = lambda sid, wt: refreshed.append(sid)
+        sm.refresh_github = lambda: gh.append(1)
+        log_calls = []
+        with mock.patch.object(ha, "log_tail",
+                               lambda cid: log_calls.append(cid) or "tail"):
+            # A light beat on beat 0 (which WOULD normally refresh everything)
+            # still touches none of the expensive paths.
+            sm.log_tail_cache = "cached"
+            payload = sm.build_payload(0, light=True)
+        self.assertEqual(refreshed, [])
+        self.assertEqual(gh, [])
+        self.assertEqual(log_calls, [])            # docker logs not shelled out
+        self.assertEqual(payload["logTail"], "cached")
+
+    def test_log_tail_throttled_across_beats(self):
+        sm = self.make_manager()
+        sm.registry = []
+        calls = []
+        with mock.patch.object(ha, "log_tail",
+                               lambda cid: calls.append(cid) or f"t{len(calls)}"):
+            for beat in range(ha.LOG_TAIL_EVERY + 1):
+                sm.build_payload(beat)
+        # Recomputed on beat 0 and again at LOG_TAIL_EVERY, reused in between.
+        self.assertEqual(len(calls), 2)
+
+    def test_repo_slow_facts_cached_and_recomputed_on_cadence(self):
+        sm = self.make_manager()
+        computed = []
+        with mock.patch.object(ha, "repo_slow_facts",
+                               lambda path: computed.append(path) or {"remote": path}):
+            self.assertEqual(sm._repo_slow_facts("/x/R", refresh=False), {"remote": "/x/R"})
+            self.assertEqual(computed, ["/x/R"])        # first sight -> computed
+            sm._repo_slow_facts("/x/R", refresh=False)  # cached -> not recomputed
+            self.assertEqual(computed, ["/x/R"])
+            sm._repo_slow_facts("/x/R", refresh=True)   # slow cadence -> recomputed
+            self.assertEqual(computed, ["/x/R", "/x/R"])
+
+    def test_session_git_caches_slow_and_recomputes_on_branch_change(self):
+        sm = self.make_manager()
+        sess = self._session("aaa")
+        slow_calls, sync_calls = [], []
+        with mock.patch.object(ha, "git_info_cheap",
+                               lambda wt: {"branch": self._branch}), \
+             mock.patch.object(ha, "git_info_slow",
+                               lambda wt: slow_calls.append(wt) or {"remote": "r"}), \
+             mock.patch.object(ha, "branch_sync",
+                               lambda repo, br, base: sync_calls.append(br) or {"baseRef": base}):
+            self._branch = "HEAD"          # still detached
+            gi, work = sm._session_git(sess, refresh=False)
+            self.assertEqual(gi, {"branch": "HEAD", "remote": "r"})
+            self.assertEqual(len(slow_calls), 1)       # first sight -> computed
+
+            gi, work = sm._session_git(sess, refresh=False)
+            self.assertEqual(len(slow_calls), 1)       # cached, no recompute
+
+            self._branch = "feature-x"     # agent just named its work branch
+            sm._session_git(sess, refresh=False)
+            self.assertEqual(len(slow_calls), 2)       # branch change -> recompute
+            self.assertEqual(sync_calls[-1], "feature-x")
 
 
 class TestNormalizeGithubRepo(unittest.TestCase):
@@ -1822,7 +2241,9 @@ class TestRepoActivitySort(ManagerMixin, unittest.TestCase):
         }
         for name, value in [
             ("scan_repos", lambda: [{"name": n, "path": "/x/" + n} for n, _ in commits]),
-            ("repo_entry", lambda r: dict(by_name[r["name"]])),
+            # repo_entry now takes cached slow facts as its second arg (ignored here).
+            ("repo_entry", lambda r, slow: dict(by_name[r["name"]])),
+            ("repo_slow_facts", lambda path: {}),
             ("root_repo_entry", lambda: {"name": "(root)", "isRoot": True}),
         ]:
             p = mock.patch.object(ha, name, value)
@@ -1923,6 +2344,7 @@ class TestPruneRepo(unittest.TestCase):
             ("REGISTRY_DIR", self.tmp),
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
+            ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", self.wt_root),
             ("REPOS_ROOT", self.tmp),

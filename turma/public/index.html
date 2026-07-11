@@ -408,7 +408,11 @@ function reconcilePending(agents) {
       // resume re-registers a killed session, so it's done once the id is
       // reported again (even as "error" — the card then shows what went wrong).
       else if (p.kind === "resume" && s) pending.delete(key);
-      // restart keeps the session "running" with no distinct signal → timeout.
+      // restart (clear context) keeps the same rcName/worktree but bumps the
+      // agent's monotonic restartCount once the relaunch lands, so clear the
+      // moment that counter changes rather than on the blind 15s timer. If it
+      // wasn't captured (older agent), the RESTART_TTL_MS timeout is the fallback.
+      else if (p.kind === "restart" && s && p.restartCount != null && s.restartCount != null && s.restartCount !== p.restartCount) pending.delete(key);
     }
   }
 }
@@ -934,8 +938,9 @@ async function post(url, body) {
     ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
     : { method: "POST" });
   refresh();
+  fastPoll();
 }
-async function del(url) { await fetch(url, { method: "DELETE" }); refresh(); }
+async function del(url) { await fetch(url, { method: "DELETE" }); refresh(); fastPoll(); }
 
 // Two-click arm/confirm for destructive actions. The armed state lives in the
 // module-level `confirming` map so the 5s re-render keeps the button armed.
@@ -1028,8 +1033,15 @@ function resumeSession(key, id) {
 // The destructive three still arm/confirm first; the pending state begins only
 // once confirmed (inside doIt), so it reflects a real in-flight command.
 function sessRestart(key, id) {
-  twoClick("sr::" + key + "::" + id, () => busy(pendKey("restart", key, id), { kind: "restart", host: key, id },
-    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/restart`)));
+  twoClick("sr::" + key + "::" + id, () => {
+    // Capture the current restartCount so reconcilePending can clear the spinner
+    // when the agent bumps it (a real completion signal) instead of waiting out
+    // the fixed RESTART_TTL_MS timer.
+    const host = (cache.agents || []).find(a => a.key === key);
+    const sess = host && (host.sessions || []).find(s => s.id === id);
+    busy(pendKey("restart", key, id), { kind: "restart", host: key, id, restartCount: sess && sess.restartCount != null ? sess.restartCount : null },
+      () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/restart`));
+  });
 }
 function sessKill(key, id) {
   twoClick("sk::" + key + "::" + id, () => busy(pendKey("kill", key, id), { kind: "kill", host: key, id },
@@ -1120,16 +1132,79 @@ async function refresh() {
   } catch { /* keep last data; the "updated" stamp goes stale visibly */ }
   render(cache);
 }
+
+// A full-tree innerHTML swap closes any native <select> popup the user has open
+// (the clone repo picker, the composer dropdowns) mid-selection. So background
+// updates (the poll AND the SSE push) skip the re-render while a <select> is
+// focused; the data still lands in `cache` and shows on the next render once
+// they pick an option or click away. User-driven renders (actions, toggles) go
+// through render() directly and are never gated.
+function bgRender() {
+  if (document.activeElement && document.activeElement.tagName === "SELECT") return;
+  render(cache);
+}
+
+// ---- live push (FIX 1/#1): server-sent per-agent updates on each heartbeat --
+// Rides the login cookie (same-origin EventSource), so no extra auth. Each
+// `agent` event carries one host record shaped like /api/agents' per-agent
+// entry; we patch it into `cache` and re-render, so Kill/Spawn/Restart/new
+// question/finished turn appear near-instantly instead of on the next poll.
+// The poll stays as a fallback (slower cadence, skipped while SSE is healthy).
+let sseOk = false, sseBackoff = 2000;
+function applyAgent(rec) {
+  const list = cache.agents || (cache.agents = []);
+  const i = list.findIndex(a => a.key === rec.key);
+  if (i >= 0) list[i] = rec; else list.push(rec);
+  cache.now = Date.now();
+}
+function connectSSE() {
+  let es;
+  try { es = new EventSource("/api/events"); }
+  catch { setTimeout(connectSSE, sseBackoff); return; }
+  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  es.addEventListener("agent", (e) => {
+    try { applyAgent(JSON.parse(e.data)); } catch { return; }
+    bgRender();
+  });
+  es.addEventListener("removed", (e) => {
+    try { const { key } = JSON.parse(e.data); cache.agents = (cache.agents || []).filter(a => a.key !== key); }
+    catch { return; }
+    bgRender();
+  });
+  es.onerror = () => {
+    sseOk = false;
+    // The browser auto-retries an open stream; only re-create one it gave up on.
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(connectSSE, sseBackoff);
+      sseBackoff = Math.min(sseBackoff * 2, 30000);
+    }
+  };
+}
+
+// Post-action fast-reflection burst (FIX 2/#4): when SSE isn't delivering, poll
+// briefly at 500ms for ~4s after a command so the landed state surfaces quickly
+// instead of on the next slow poll. A no-op while SSE is healthy (the push
+// already delivers it).
+let fastPollTimer = null, fastPollUntil = 0;
+function fastPoll() {
+  if (sseOk) return;
+  fastPollUntil = Date.now() + 4000;
+  if (fastPollTimer) return;
+  fastPollTimer = setInterval(() => {
+    if (sseOk || Date.now() > fastPollUntil) { clearInterval(fastPollTimer); fastPollTimer = null; return; }
+    refresh();
+  }, 500);
+}
+
 refresh();
-// The periodic poll re-renders the whole tree via innerHTML, which closes any
-// native <select> popup the user has open (the clone repo picker, the composer
-// dropdowns) mid-selection. Skip the poll while a <select> is focused; it
-// resumes on the next tick once they pick an option or click away. User-driven
-// renders (actions, toggles) are unaffected — only this timer is gated.
+connectSSE();
+// Fallback poll: slower now that SSE carries live updates, and skipped entirely
+// while the stream is healthy (and while a <select> popup is open).
 setInterval(() => {
+  if (sseOk) return;
   if (document.activeElement && document.activeElement.tagName === "SELECT") return;
   refresh();
-}, 5000);
+}, 15000);
 </script>
 </body>
 </html>

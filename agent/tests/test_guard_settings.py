@@ -44,6 +44,27 @@ class TestGuardSettings(unittest.TestCase):
         cmd = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         self.assertEqual(cmd, '"py" "/x/hooks/guard.py"')
 
+    def test_registers_askuserquestion_bridge_hook(self):
+        s = ha.build_guard_settings(python_exe="/usr/bin/python3")
+        pre = s["hooks"]["PreToolUse"]
+        ask = next(e for e in pre if e["matcher"] == "AskUserQuestion")
+        hook = ask["hooks"][0]
+        self.assertIn("ask.py", hook["command"])
+        self.assertIn("/usr/bin/python3", hook["command"])
+        # Its block timeout must exceed the bridge's per-question wait so Claude
+        # doesn't kill the hook before it can deliver an answer.
+        self.assertGreater(hook["timeout"], ha.ASK_HOOK_TIMEOUT_SEC - 1)
+
+    def test_explicit_ask_path_is_used(self):
+        s = ha.build_guard_settings(python_exe="py", ask_path="/x/hooks/ask.py")
+        ask = next(e for e in s["hooks"]["PreToolUse"] if e["matcher"] == "AskUserQuestion")
+        self.assertEqual(ask["hooks"][0]["command"], '"py" "/x/hooks/ask.py"')
+
+    def test_ask_script_path_points_at_bundled_hook(self):
+        path = ha.ask_script_path()
+        self.assertTrue(path.endswith(os.path.join("hooks", "ask.py")))
+        self.assertTrue(os.path.exists(path))
+
 
 class TestOperatorLocalPermissions(unittest.TestCase):
     """The agent folds a user-level ~/.claude/settings.local.json (which Claude

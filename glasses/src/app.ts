@@ -1,4 +1,4 @@
-import type { HubClient } from "./hub-client.ts";
+import type { HubClient, QueuedResponse } from "./hub-client.ts";
 import type { GlassesDisplay } from "./display/index.ts";
 import type { Dictation, DictationResult } from "./dictation.ts";
 import { emptyBuffer, mergeTail, prependHistory, type TranscriptBuffer } from "./transcript.ts";
@@ -25,7 +25,7 @@ import {
   type HomeRow,
   type SessionFocus,
 } from "./render.ts";
-import type { AgentInfo, InputEvent, SessionInfo, SessionRef, SessionStatus, TailEntry } from "./types.ts";
+import type { AgentInfo, AgentsResponse, InputEvent, SessionInfo, SessionRef, SessionStatus, TailEntry } from "./types.ts";
 
 export type Screen =
   | "home"
@@ -262,9 +262,20 @@ export class App {
   }
 
   async start(): Promise<void> {
+    // Kick the first agents fetch off immediately so its network round-trip
+    // overlaps display.start() (the BLE/display bring-up) rather than following
+    // it — the list the user is waiting for is then ready the moment the
+    // display is. The paint still happens only after display.start() (the
+    // first poll runs on the scheduled tick below, once display is up), so no
+    // frame is ever rendered against an unstarted display.
+    const firstAgents = this.client.listAgents();
+    // Attach a no-op catch so an early rejection isn't an unhandled rejection
+    // while display.start() runs; poll() re-awaits the SAME promise and runs
+    // its own catch (the hub-unreachable flash) on the rejection.
+    firstAgents.catch(() => {});
     await this.display.start();
     this.display.onInput((e) => this.handleInput(e));
-    this.schedulePoll(0);
+    this.schedulePoll(0, firstAgents);
   }
 
   // Lifecycle glue (Task 7) funnels foreground-exit / abnormal-exit /
@@ -339,12 +350,12 @@ export class App {
     this.setState({ screen, session });
   }
 
-  private schedulePoll(delayMs: number): void {
+  private schedulePoll(delayMs: number, prefetched?: Promise<AgentsResponse>): void {
     // While paused, only keep polling inside a post-mutation grace window.
     if (this.paused && this.now() >= this.graceUntil) return;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = setTimeout(() => {
-      void this.poll();
+      void this.poll(prefetched);
     }, delayMs);
   }
 
@@ -496,12 +507,14 @@ export class App {
 
   // The newest entry the reveal should type: the live in-progress turn if one
   // is streaming for this session, else the newest committed transcript entry.
-  private newestRevealTarget(sessionId: string): { id: string | null; len: number } {
+  // `live` distinguishes the genuinely-streamed turn (types char-by-char) from
+  // a committed entry that lands whole (snaps in) — see advanceReveal.
+  private newestRevealTarget(sessionId: string): { id: string | null; len: number; live: boolean } {
     const lt = this.state.liveTurn;
-    if (lt && lt.sessionId === sessionId && lt.text) return { id: LIVE_TURN_ID, len: lt.text.length };
+    if (lt && lt.sessionId === sessionId && lt.text) return { id: LIVE_TURN_ID, len: lt.text.length, live: true };
     const entries = this.state.transcripts[sessionId]?.entries ?? [];
     const last = entries[entries.length - 1];
-    return { id: last?.id ?? null, len: last?.text.length ?? 0 };
+    return { id: last?.id ?? null, len: last?.text.length ?? 0, live: false };
   }
 
   private repaint(): void {
@@ -529,7 +542,7 @@ export class App {
   private reanchorReveal(sessionId: string): void {
     if (this.state.session?.sessionId !== sessionId) return;
     const target = this.newestRevealTarget(sessionId);
-    const reveal = advanceReveal(this.state.reveal, target.id, target.len, 0);
+    const reveal = advanceReveal(this.state.reveal, target.id, target.len, 0, { live: target.live });
     this.state = { ...this.state, reveal };
     this.lastRevealAt = this.now();
   }
@@ -559,7 +572,7 @@ export class App {
     const now = this.now();
     const dt = now - this.lastRevealAt;
     this.lastRevealAt = now;
-    const reveal = advanceReveal(this.state.reveal, target.id, targetLen, dt);
+    const reveal = advanceReveal(this.state.reveal, target.id, targetLen, dt, { live: target.live });
     this.state = { ...this.state, now, reveal };
     this.repaint();
     if (!revealComplete(reveal, targetLen)) this.scheduleRevealTick();
@@ -567,10 +580,13 @@ export class App {
 
   // ---- polling --------------------------------------------------------
 
-  async poll(): Promise<void> {
+  async poll(prefetched?: Promise<AgentsResponse>): Promise<void> {
     const now = this.now();
     try {
-      const res = await this.client.listAgents();
+      // On the very first poll `prefetched` is the listAgents() fetch start()
+      // already kicked off in parallel with display.start(); every later poll
+      // starts its own fetch here.
+      const res = await (prefetched ?? this.client.listAgents());
       const sessionRefs = flattenSessions(res.agents);
       // Content length of the focused session *before* this poll's tail merge,
       // so a scrolled-up view can be pinned to the same lines (see
@@ -905,8 +921,9 @@ export class App {
 
   // Sheet-mode dispatch (Task 6): scroll moves `selected` through
   // [...options, "Dictate answer…"], clamped; tap on an option index sends
-  // that 1-based digit as the answer (the agent appends Enter) and hands
-  // focus back to the transcript; tap on the trailing "Dictate answer…" row
+  // that 0-based optionIndex as a structured answer (answerQuestion → the
+  // agent drops the ask.py bridge's answer file) and hands focus back to the
+  // transcript; tap on the trailing "Dictate answer…" row
   // starts box dictation instead of answering directly — that flips
   // questionSheetActive false for the rest of the flow (mic goes hot, then a
   // draft lands), so the box renders/dispatches as plain input from here,
@@ -935,10 +952,9 @@ export class App {
     }
     if (e.type === "tap") {
       if (s.selected < options.length) {
-        const digit = String(s.selected + 1);
         this.markPending(s.sessionId, live);
         void this.client
-          .sendInput(s.hostKey, s.sessionId, digit)
+          .answerQuestion(s.hostKey, s.sessionId, { optionIndex: s.selected })
           .then(() => {
             this.flash(FLASH_QUEUED);
             this.repaint();
@@ -1128,8 +1144,7 @@ export class App {
         const draft = sess && sess.hostKey === hostKey && sess.sessionId === sessionId ? sess.draft : "";
         const s = findSession(this.state, hostKey, sessionId);
         this.markPending(sessionId, s);
-        void this.client
-          .sendInput(hostKey, sessionId, draft)
+        void this.submitText(hostKey, sessionId, draft)
           .then(() => {
             this.flash(FLASH_QUEUED);
             this.repaint();
@@ -1271,13 +1286,24 @@ export class App {
     }
   }
 
+  // Free-text submit to a running session. When a question is pending on that
+  // session, a dictated/typed string is its free-text ("Other") answer, so it
+  // rides answerQuestion (optionIndex -1) to the ask.py bridge; otherwise it's
+  // an ordinary message typed into the session via sendInput.
+  private submitText(hostKey: string, sessionId: string, text: string): Promise<QueuedResponse> {
+    const s = findSession(this.state, hostKey, sessionId);
+    if (s?.session?.question) {
+      return this.client.answerQuestion(hostKey, sessionId, { optionIndex: -1, custom: text });
+    }
+    return this.client.sendInput(hostKey, sessionId, text);
+  }
+
   private sendReply(r: ReplyScreenState): void {
     if (r.target.kind === "session") {
       const { hostKey, sessionId } = r.target;
       const s = findSession(this.state, hostKey, sessionId);
       this.markPending(sessionId, s);
-      void this.client
-        .sendInput(hostKey, sessionId, r.text)
+      void this.submitText(hostKey, sessionId, r.text)
         .then(() => {
           this.flash(FLASH_QUEUED);
           this.repaint();

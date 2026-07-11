@@ -18,7 +18,17 @@
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 14px 16px 10px; position: relative;
   }
-  /* Legend doubles as the series filter: grouped by device, every item a toggle. */
+  /* View switch: By repo (fleet-wide, unified across hosts) vs By host. */
+  .viewbar { display: flex; gap: 6px; margin: 2px 0 12px; }
+  .viewbar button {
+    font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
+    color: var(--ink-2); background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+  }
+  .viewbar button:hover { color: var(--ink); }
+  .viewbar button.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+
+  /* Legend doubles as the series filter: grouped, every item a toggle. */
   .legend { display: flex; flex-wrap: wrap; gap: 8px 26px; margin-bottom: 12px; }
   .lg-device { display: flex; align-items: center; gap: 4px 12px; flex-wrap: wrap; }
   .lg-device .dev {
@@ -96,7 +106,7 @@
 <div class="wrap">
   <header>
     <a class="wordmark" href="/"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
-    <span class="sub">Usage history · daily est. cost by session</span>
+    <span class="sub">Usage history · daily est. cost</span>
     <span class="spacer"></span>
     <nav class="nav-tabs">
       <a href="/">Dashboard</a>
@@ -105,8 +115,9 @@
       <a href="#" class="signout" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;">Sign out</a>
     </nav>
   </header>
+  <div class="viewbar" id="viewbar"></div>
   <div id="chart"></div>
-  <div class="footer">Daily figures are parsed from each session's Claude transcripts (UTC days) and reported by its host agent — API-equivalent cost estimates. Each series is one session (labelled <em>repo · id</em>); usage persists after a session is killed. Click a session in the legend to toggle it (click a device name to toggle all of its sessions); hover a day for the breakdown. The table view carries the same numbers for the visible series.</div>
+  <div class="footer">Daily figures are parsed from Claude transcripts (UTC days) and aggregated by each host agent across <em>all</em> of its worktrees — API-equivalent cost estimates that <strong>persist regardless of active sessions</strong> (killed, deleted, and pruned work still counts). <em>By repo</em> unifies a repo's usage across every host it runs on (matched by git origin); <em>By host</em> totals each host. Click a series in the legend to toggle it (click the group name to toggle all); hover a day for the breakdown. The table view carries the same numbers for the visible series.</div>
 </div>
 
 <nav class="bottom-nav">
@@ -138,6 +149,28 @@ const HIDDEN_KEY = "turma-hidden-sessions";
 let hidden = new Set(JSON.parse(localStorage.getItem(HIDDEN_KEY) || "[]"));
 function saveHidden() { localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hidden])); }
 
+// View mode: "repos" (fleet-wide, unified across hosts) or "hosts". Persisted.
+const MODE_KEY = "turma-usage-mode";
+let mode = localStorage.getItem(MODE_KEY) === "hosts" ? "hosts" : "repos";
+function setMode(m) {
+  if (m === mode) return;
+  mode = m;
+  localStorage.setItem(MODE_KEY, m);
+  renderViewbar();
+  if (cache) render(cache);
+}
+function renderViewbar() {
+  const bar = document.getElementById("viewbar");
+  bar.replaceChildren();
+  for (const [m, label] of [["repos", "By repo"], ["hosts", "By host"]]) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    if (mode === m) b.className = "active";
+    b.addEventListener("click", () => setMode(m));
+    bar.append(b);
+  }
+}
+
 function fmtTokens(n) {
   if (!n) return "0";
   if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
@@ -168,19 +201,80 @@ function unpricedTitle(s) {
   return "Understated — includes unpriced model(s)" + (who ? ": " + who : "");
 }
 
-// Flatten hosts → one series per session. Usage lives on each session and
-// persists even when the session is stopped, so no status filtering here.
+// --- usage merging (client-side, to unify a repo across hosts) --------------
+// Each host reports per-repo and host-total usage aggregated from ALL its
+// transcripts (independent of live sessions), so nothing here depends on a
+// session still existing. "By repo" sums those per-repo blocks across hosts.
+function blankUsage() {
+  return {
+    totals: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0, unpriced: false },
+    days: {}, unpricedModels: [],
+  };
+}
+function addBucket(dst, src) {
+  if (!src) return;
+  dst.input += src.input || 0; dst.output += src.output || 0;
+  dst.cacheWrite += src.cacheWrite || 0; dst.cacheRead += src.cacheRead || 0;
+  dst.cost += src.cost || 0;
+  if (src.unpriced) dst.unpriced = true;
+}
+function mergeUsageInto(acc, u) {
+  if (!u) return;
+  addBucket(acc.totals, u.totals);
+  for (const [d, b] of Object.entries(u.days || {})) {
+    acc.days[d] = acc.days[d] || { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0, unpriced: false };
+    addBucket(acc.days[d], b);
+  }
+  for (const m of u.unpricedModels || []) if (!acc.unpricedModels.includes(m)) acc.unpricedModels.push(m);
+}
+
+// "By repo": one series per repo, summed across every host it runs on. Repos are
+// unified by the agent-supplied `remoteKey` (normalized git origin), so the same
+// repo cloned on two hosts collapses to one series.
+function repoSeries(agents) {
+  const byKey = new Map(); // remoteKey -> merged series
+  for (const a of agents) {
+    for (const r of a.repoUsage || []) {
+      const key = r.remoteKey || r.repo || "?";
+      let g = byKey.get(key);
+      if (!g) {
+        g = { skey: "repo::" + key, group: "Repos", repo: r.repo || key,
+              id: key, hosts: new Set(), usage: blankUsage() };
+        byKey.set(key, g);
+      }
+      if (r.repo && r.repo !== "?") g.repo = r.repo;
+      g.hosts.add(a.device || a.key);
+      mergeUsageInto(g.usage, r.usage);
+    }
+  }
+  return [...byKey.values()].map(g => {
+    const hosts = [...g.hosts].sort();
+    return {
+      skey: g.skey, group: g.group, repo: g.repo, id: g.id,
+      label: g.repo,
+      device: hosts.join(", "),                 // shown as the muted host context
+      rcName: g.repo + " · " + hosts.join(", "),
+      usage: g.usage,
+    };
+  });
+}
+
+// "By host": one series per host, from its transcript-wide total (`usage`).
+function hostSeries(agents) {
+  return agents.filter(a => a.usage).map(a => ({
+    skey: "host::" + a.key,
+    group: "Hosts",
+    repo: a.device || a.key,
+    id: a.key,
+    label: a.device || a.key,
+    device: a.device || a.key,
+    rcName: a.device || a.key,
+    usage: a.usage,
+  }));
+}
+
 function toSeries(agents) {
-  return agents.flatMap(a => (a.sessions || []).map(s => ({
-    skey: a.key + "::" + s.id,
-    device: a.device || "unknown-device",
-    host: a.key,
-    repo: s.repo || "?",
-    id: s.id,
-    rcName: s.rcName,
-    label: (s.repo || "?") + " · " + s.id,
-    usage: s.usage,
-  })));
+  return mode === "hosts" ? hostSeries(agents) : repoSeries(agents);
 }
 
 function dateWindow(series) {
@@ -214,19 +308,19 @@ function assignSlots(ordered) {
 function render(data) {
   const series = toSeries(data.agents || []);
   if (!series.length) {
-    $chart.innerHTML = `<div class="empty">No sessions have reported usage yet.</div>`;
+    $chart.innerHTML = `<div class="empty">No usage reported yet (agents aggregate it within ~5 minutes of starting).</div>`;
     return;
   }
 
-  // Stable order: by device, then repo, then id — this is also the stacking and
+  // Stable order: by group, then label, then id — this is also the stacking and
   // color-assignment order.
-  const byDevice = new Map();
+  const byGroup = new Map();
   for (const s of [...series].sort((x, y) =>
-    (x.device + "\x00" + x.repo + "\x00" + x.id).localeCompare(y.device + "\x00" + y.repo + "\x00" + y.id))) {
-    if (!byDevice.has(s.device)) byDevice.set(s.device, []);
-    byDevice.get(s.device).push(s);
+    (x.group + "\x00" + x.label + "\x00" + x.id).localeCompare(y.group + "\x00" + y.label + "\x00" + y.id))) {
+    if (!byGroup.has(s.group)) byGroup.set(s.group, []);
+    byGroup.get(s.group).push(s);
   }
-  const ordered = [...byDevice.values()].flat();
+  const ordered = [...byGroup.values()].flat();
   const slotOf = assignSlots(ordered);
   const visible = ordered.filter(s => !hidden.has(s.skey));
   const dates = dateWindow(ordered);
@@ -242,23 +336,23 @@ function render(data) {
 
   const card = document.createElement("div");
   card.className = "chart-card";
-  card.append(legendEl(byDevice, slotOf));
+  card.append(legendEl(byGroup, slotOf));
   buildChart(card, visible, dates, slotOf);
   $chart.append(card, tableView(visible, dates));
 }
 
-// Legend = filter. Session items toggle one series; the device name toggles all
-// of that device's sessions at once.
-function legendEl(byDevice, slotOf) {
+// Legend = filter. Series items toggle one series; the group name toggles all
+// of that group's series at once.
+function legendEl(byGroup, slotOf) {
   const legend = document.createElement("div");
   legend.className = "legend";
-  for (const [device, list] of byDevice) {
+  for (const [groupName, list] of byGroup) {
     const group = document.createElement("span");
     group.className = "lg-device";
     const dev = document.createElement("span");
     dev.className = "dev";
-    dev.textContent = device;
-    dev.title = "Toggle all sessions on " + device;
+    dev.textContent = groupName;
+    dev.title = "Toggle all in " + groupName;
     dev.addEventListener("click", () => {
       const anyVisible = list.some(s => !hidden.has(s.skey));
       for (const s of list) anyVisible ? hidden.add(s.skey) : hidden.delete(s.skey);
@@ -310,7 +404,7 @@ function buildChart(card, list, dates, slotOf) {
   const svg = document.createElementNS(NS, "svg");
   svg.setAttribute("viewBox", `0 0 ${width} ${CHART_H}`);
   svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", "Daily estimated cost, stacked by session");
+  svg.setAttribute("aria-label", "Daily estimated cost, stacked by " + (mode === "hosts" ? "host" : "repo"));
 
   const TICKS = 4;
   for (let i = 0; i <= TICKS; i++) {
@@ -509,8 +603,51 @@ async function refresh() {
   } catch { /* keep last render */ }
   if (cache) render(cache);
 }
+renderViewbar();
+
+// ---- live push (FIX 1/#1): server-sent per-agent updates ---------------------
+// The usage chart isn't latency-critical, so SSE updates patch `cache` and
+// trigger a DEBOUNCED re-render (~1s) to avoid rebuilding the SVG on every
+// heartbeat / flickering the tooltip. The 30s poll stays as a fallback, skipped
+// while the stream is healthy.
+let sseOk = false, sseBackoff = 2000, renderTimer = null;
+function scheduleRender() {
+  if (renderTimer) return;
+  renderTimer = setTimeout(() => { renderTimer = null; if (cache) render(cache); }, 1000);
+}
+function applyAgent(rec) {
+  if (!cache) cache = { now: Date.now(), agents: [] };
+  const list = cache.agents || (cache.agents = []);
+  const i = list.findIndex(a => a.key === rec.key);
+  if (i >= 0) list[i] = rec; else list.push(rec);
+  cache.now = Date.now();
+}
+function connectSSE() {
+  let es;
+  try { es = new EventSource("/api/events"); }
+  catch { setTimeout(connectSSE, sseBackoff); return; }
+  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  es.addEventListener("agent", (e) => {
+    try { applyAgent(JSON.parse(e.data)); } catch { return; }
+    scheduleRender();
+  });
+  es.addEventListener("removed", (e) => {
+    try { const { key } = JSON.parse(e.data); if (cache) cache.agents = (cache.agents || []).filter(a => a.key !== key); }
+    catch { return; }
+    scheduleRender();
+  });
+  es.onerror = () => {
+    sseOk = false;
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(connectSSE, sseBackoff);
+      sseBackoff = Math.min(sseBackoff * 2, 30000);
+    }
+  };
+}
+
 refresh();
-setInterval(refresh, 30000);
+connectSSE();
+setInterval(() => { if (!sseOk) refresh(); }, 30000);
 let resizeTimer;
 addEventListener("resize", () => {
   clearTimeout(resizeTimer);

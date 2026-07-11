@@ -12,91 +12,123 @@
 <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="/app.css">
 <style>
-  /* sessions-specific layout. Tokens, base, nav, buttons, badges, status lights,
-     spinner, term overlay + responsive shell all live in /app.css. */
-  .wrap { max-width: 760px; }
+  /* Sessions is a two-pane app shell: a scrollable session list on the left, the
+     selected session's live terminal filling the main stage on the right. Tokens,
+     buttons, badges, status lights, spinner and the shared .term-bar live in
+     /app.css; everything below is this page's layout. */
 
-  h2 { font-size: 13px; margin: 26px 0 10px; font-weight: 600; color: var(--ink-2);
-       text-transform: uppercase; letter-spacing: 0.04em; }
-  h2 .count { color: var(--muted); font-weight: 400; text-transform: none; letter-spacing: 0; }
+  html, body { height: 100%; }
+  body { display: flex; flex-direction: column; overflow: hidden; }
 
-  /* One big tappable card per running session — the whole card attaches. */
-  .sess-list { display: flex; flex-direction: column; gap: 10px; }
-  button.scard {
-    display: flex; align-items: center; gap: 12px; width: 100%; text-align: left;
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
-    padding: 13px 15px; cursor: pointer; font: inherit; color: var(--ink);
+  /* Full-width header bar (overrides the shared centred header block). */
+  .app-header {
+    flex: none; margin: 0; padding: 12px 18px;
+    border-bottom: 1px solid var(--hairline); background: var(--surface);
   }
-  button.scard:hover:not(:disabled) { border-color: var(--accent); }
-  button.scard:disabled { cursor: default; opacity: 0.65; }
-  .scard .dot { width: 10px; height: 10px; }
-  .scard .body { flex: 1; min-width: 0; }
-  .scard .sid { font-family: var(--font-mono); font-weight: 600; font-size: 14px; overflow-wrap: anywhere; }
-  .scard .meta { color: var(--muted); font-size: 12px; margin-top: 1px; overflow-wrap: anywhere; }
-  .scard .state { font-size: 12.5px; margin-top: 3px; color: var(--ink-2); }
-  .scard .state.working { color: var(--good); }
-  .scard .state.waiting { color: var(--warning); font-weight: 600; }
-  .scard .question {
-    font-size: 12.5px; color: var(--ink-2); margin-top: 3px;
+
+  .sess-shell { flex: 1; display: flex; min-height: 0; }
+
+  /* ---- Left sidebar: new-session picker, active list, stopped list --------- */
+  .sidebar {
+    width: 340px; flex: none; border-right: 1px solid var(--hairline);
+    overflow-y: auto; padding: 14px 14px 24px; display: flex; flex-direction: column; gap: 6px;
+    scrollbar-width: thin;
+  }
+  .sidebar h2 { font-size: 12px; margin: 16px 0 8px; font-weight: 600; color: var(--ink-2);
+       text-transform: uppercase; letter-spacing: 0.04em; }
+  .sidebar h2:first-of-type { margin-top: 4px; }
+  .sidebar h2 .count { color: var(--muted); font-weight: 400; }
+  .s-list { display: flex; flex-direction: column; gap: 8px; }
+
+  /* Session card: the auto task name leads; the 5-digit id + repo sit small below. */
+  button.s-card {
+    display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    padding: 10px 12px; cursor: pointer; font: inherit; color: var(--ink);
+  }
+  button.s-card:hover:not(:disabled) { border-color: var(--accent); }
+  button.s-card:disabled { cursor: default; opacity: 0.6; }
+  .s-card.cur { border-color: var(--accent); background: var(--accent-soft); }
+  .s-card .dot { margin-top: 4px; }
+  .s-card .body { flex: 1; min-width: 0; }
+  .s-card .title { font-weight: 600; font-size: 14px; line-height: 1.3; overflow-wrap: anywhere; }
+  .s-card .meta { color: var(--muted); font-size: 11.5px; margin-top: 2px; overflow-wrap: anywhere; }
+  .s-card .meta .id { font-family: var(--font-mono); }
+  .s-card .state { font-size: 12px; margin-top: 4px; color: var(--ink-2); }
+  .s-card .state.working { color: var(--good); }
+  .s-card .state.waiting { color: var(--warning); font-weight: 600; }
+  .s-card .question {
+    font-size: 12px; color: var(--ink-2); margin-top: 3px;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   }
-  .scard .go { color: var(--accent); font-size: 13px; font-weight: 600; white-space: nowrap; }
-  .scard:disabled .go { color: var(--muted); font-weight: 400; }
 
   /* Stopped sessions: compact rows with a Start button. */
   .stopped-row {
-    display: flex; align-items: center; gap: 12px;
+    display: flex; align-items: center; gap: 10px;
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
-    padding: 11px 15px;
+    padding: 9px 12px;
   }
   .stopped-row .body { flex: 1; min-width: 0; }
-  .stopped-row .sid { font-family: var(--font-mono); font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
-  .stopped-row .meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-  .stopped-row .err { color: var(--critical); font-size: 12px; }
+  .stopped-row .title { font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
+  .stopped-row .meta { color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
+  .stopped-row .meta .id { font-family: var(--font-mono); }
+  .stopped-row .err { color: var(--critical); font-size: 11.5px; }
 
-  /* New-session picker: one block per online host, its repos as spawn buttons. */
-  .host-block {
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
-    padding: 13px 15px; margin-bottom: 10px;
-  }
-  .host-block .hname { font-weight: 600; font-size: 13.5px; margin-bottom: 8px; overflow-wrap: anywhere; }
-  .host-block .hname .dev { color: var(--muted); font-weight: 400; font-size: 12px; }
-  .repo-btns { display: flex; flex-wrap: wrap; gap: 8px; }
-
-  details.stopped-wrap summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; margin-bottom: 10px; }
+  details.stopped-wrap summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; padding: 2px 0; }
   details.stopped-wrap summary:hover { color: var(--ink-2); }
-  details.stopped-wrap .sess-list { gap: 8px; }
+  details.stopped-wrap .s-list { gap: 8px; margin-top: 8px; }
 
-  /* Terminal session-switcher strip (sessions-only). */
-  .term-switch {
-    display: flex; gap: 6px; overflow-x: auto; padding: 7px 10px;
-    background: var(--surface); border-bottom: 1px solid var(--hairline);
-    -webkit-overflow-scrolling: touch; scrollbar-width: thin;
+  /* New-session picker (top of the sidebar): each online host, its repos as spawn buttons. */
+  details.spawn-wrap > summary {
+    list-style: none; cursor: pointer; user-select: none;
+    display: flex; align-items: center; gap: 8px;
+    background: var(--accent); color: #fff; font-weight: 600; font-size: 13px;
+    padding: 9px 12px; border-radius: var(--radius-sm);
   }
-  .term-switch .chip {
-    display: inline-flex; align-items: center; gap: 6px; flex: none;
-    font: 600 12px var(--font-mono);
-    padding: 5px 11px; border-radius: 20px; border: 1px solid var(--border);
-    background: transparent; color: var(--ink-2); cursor: pointer; white-space: nowrap;
-  }
-  .term-switch .chip:hover { border-color: var(--ink-2); }
-  .term-switch .chip.cur { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
-  .term-switch .chip .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  details.spawn-wrap > summary::-webkit-details-marker { display: none; }
+  details.spawn-wrap > summary:hover { filter: brightness(1.07); }
+  details.spawn-wrap > summary .chev { margin-left: auto; transition: transform .15s; }
+  details.spawn-wrap[open] > summary .chev { transform: rotate(180deg); }
+  .spawn-body { padding: 10px 2px 4px; display: flex; flex-direction: column; gap: 10px; }
+  .host-block .hname { font-weight: 600; font-size: 12.5px; margin-bottom: 7px; overflow-wrap: anywhere; }
+  .repo-btns { display: flex; flex-wrap: wrap; gap: 7px; }
+  .repo-btns button { font-size: 12px; padding: 5px 11px; }
 
+  /* ---- Right stage: empty prompt or the live terminal --------------------- */
+  .stage { flex: 1; min-width: 0; display: flex; flex-direction: column; background: #000; }
+  .stage-empty {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; text-align: center; color: var(--muted); background: var(--page); padding: 24px;
+  }
+  .stage-empty .big { font-size: 15px; color: var(--ink-2); font-weight: 600; }
+  .stage-empty .hint { font-size: 12.5px; max-width: 420px; line-height: 1.5; }
+
+  .term-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .term-pane iframe { flex: 1; border: 0; width: 100%; background: #000; }
+  .term-bar .back-btn { display: none; }
+  .term-bar .t-title .name { font-weight: 600; }
+
+  /* ---- Responsive: stack to list → full-screen terminal on phones/tablets -- */
+  @media (max-width: 820px) {
+    .sidebar { width: 100%; border-right: 0; padding-bottom: 84px; }
+    .stage { display: none; }
+    .term-bar .back-btn { display: inline-flex; }
+    body.showing-term .sidebar { display: none; }
+    body.showing-term .app-header { display: none; }
+    body.showing-term .bottom-nav { display: none; }
+    body.showing-term .stage { display: flex; }
+    body.showing-term { padding-bottom: 0; }
+  }
   @media (max-width: 600px) {
-    .term-overlay { padding: 0; }
-    .term-box { border-radius: 0; border: 0; }
-    .term-bar { flex-wrap: wrap; padding: 7px 10px; gap: 6px 10px; }
+    .app-header { padding: 12px 14px; }
   }
   @media (pointer: coarse) {
-    .term-switch .chip { padding: 8px 13px; }
-    details.stopped-wrap summary { padding: 4px 0; }
+    details.stopped-wrap summary, details.spawn-wrap > summary { padding-top: 6px; padding-bottom: 6px; }
   }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
+  <header class="app-header">
     <a class="wordmark" href="/"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
     <span class="sub">Sessions</span>
     <span class="sub" id="counts"></span>
@@ -110,12 +142,30 @@
     <span class="sub" id="refreshed"></span>
   </header>
 
-  <div id="active"></div>
-  <div id="stopped"></div>
-  <div id="spawn"></div>
+  <div class="sess-shell">
+    <aside class="sidebar">
+      <div id="spawn"></div>
+      <div id="active"></div>
+      <div id="stopped"></div>
+    </aside>
 
-  <div class="footer">Tap a session to attach to its live terminal; use the strip at the top of the terminal to hop between sessions without detaching. Managing sessions (restart, kill, delete) and host controls live on the Dashboard.</div>
-</div>
+    <main class="stage" id="stage">
+      <div class="stage-empty" id="stageEmpty">
+        <div class="big">No session attached</div>
+        <div class="hint">Pick a session from the list to attach to its live terminal. Switching between running sessions is one click away — just choose another in the list. Managing sessions (restart, kill, delete) and host controls live on the Dashboard.</div>
+      </div>
+      <div class="term-pane" id="termPane" hidden>
+        <div class="term-bar">
+          <button class="back-btn" onclick="backToList()">‹ Sessions</button>
+          <span class="t-title"><span class="name" id="termTitle"></span> · <span class="path" id="termPath"></span></span>
+          <span class="spacer"></span>
+          <a id="termOpen" target="_blank" rel="noopener">Open in new tab ↗</a>
+          <button class="kill-btn" id="termKill" onclick="killCurrentTerminal()">Kill</button>
+        </div>
+        <iframe id="termFrame" src="about:blank" title="Live Claude session"></iframe>
+      </div>
+    </main>
+  </div>
 
 <nav class="bottom-nav">
   <a href="/">
@@ -132,20 +182,6 @@
   </a>
 </nav>
 
-<div class="term-overlay" id="termOverlay">
-  <div class="term-box">
-    <div class="term-bar">
-      <span class="t-title">Live session · <span class="path" id="termTitle"></span></span>
-      <span class="spacer"></span>
-      <a id="termOpen" target="_blank" rel="noopener">Open in new tab ↗</a>
-      <button class="kill-btn" id="termKill" onclick="killCurrentTerminal()">Kill</button>
-      <button class="primary" onclick="closeTerminal()">Close (Esc)</button>
-    </div>
-    <div class="term-switch" id="termSwitch"></div>
-    <iframe id="termFrame" src="about:blank" title="Live Claude session"></iframe>
-  </div>
-</div>
-
 <script>
 const $active = document.getElementById("active");
 const $stopped = document.getElementById("stopped");
@@ -153,8 +189,9 @@ const $spawn = document.getElementById("spawn");
 const $counts = document.getElementById("counts");
 const $refreshed = document.getElementById("refreshed");
 
-// Open/closed state of the stopped-sessions <details> survives the 5s re-render.
+// Open/closed state of the collapsible sections survives the 5s re-render.
 let stoppedOpen = false;
+let spawnOpen = false;
 
 // Optimistic pending-action feedback, same scheme as the dashboard: spawn/start
 // commands are queued on the hub and land on the next agent heartbeat, so each
@@ -231,35 +268,16 @@ function collect(agents, now) {
   return { running, stopped };
 }
 
-function render(data) {
-  const { now, agents } = data;
-  reconcilePending(agents);
-  $refreshed.textContent = "updated " + new Date(now).toLocaleTimeString();
-
-  const { running, stopped } = collect(agents, now);
-  const waiting = running.filter(x => x.live.kind === "waiting").length;
-  $counts.textContent = running.length + " running" + (waiting ? " · " + waiting + " waiting on you" : "");
-
-  $active.innerHTML = `<h2>Active <span class="count">${running.length}</span></h2>` +
-    (running.length
-      ? `<div class="sess-list">${running.map(x => activeCard(x, now)).join("")}</div>`
-      : `<div class="empty">No running sessions.${agents.some(a => a.online) ? " Start one below." : ""}</div>`);
-
-  $stopped.innerHTML = stopped.length
-    ? `<h2>Stopped <span class="count">${stopped.length}</span></h2>
-       <details class="stopped-wrap" ${stoppedOpen ? "open" : ""} ontoggle="stoppedOpen = this.open">
-         <summary>Show / hide stopped sessions</summary>
-         <div class="sess-list">${stopped.map(x => stoppedRow(x)).join("")}</div>
-       </details>`
-    : "";
-
-  const hosts = agents.filter(a => a.online && (a.repos || []).length);
-  $spawn.innerHTML = `<h2>Start a new session</h2>` +
-    (hosts.length
-      ? hosts.map(a => hostBlock(a)).join("")
-      : `<div class="empty">No online hosts with repos to start a session on.</div>`);
-
-  if ($overlay.style.display === "flex") renderSwitcher();
+// The prominent, human-friendly name for a session: the agent's auto task
+// summary first, then an explicit label, then the worktree dir, and only the
+// raw id as a last resort. This is what leads every card — the 5-digit id is
+// demoted to a small secondary tag.
+function sessTitle(s) {
+  if (s.summary) return s.summary;
+  if (s.label) return s.label;
+  if (s.root) return "⌂ Repos root";
+  const wt = String(s.worktreePath || "").split("/").filter(Boolean).pop();
+  return wt || s.id;
 }
 
 // Worktree dir name + the live branch the agent named for its work ("detached"
@@ -272,21 +290,61 @@ function sessMeta(s) {
   return [wt, branch].filter(Boolean).join(" · ");
 }
 
-function activeCard({ a, s, live }, now) {
+function render(data) {
+  const { now, agents } = data;
+  reconcilePending(agents);
+  $refreshed.textContent = "updated " + new Date(now).toLocaleTimeString();
+
+  const { running, stopped } = collect(agents, now);
+  const waiting = running.filter(x => x.live.kind === "waiting").length;
+  $counts.textContent = running.length + " running" + (waiting ? " · " + waiting + " waiting on you" : "");
+
+  const hosts = agents.filter(a => a.online && (a.repos || []).length);
+  $spawn.innerHTML = `
+    <details class="spawn-wrap" ${spawnOpen ? "open" : ""} ontoggle="spawnOpen = this.open">
+      <summary>+ New session <span class="chev">▾</span></summary>
+      <div class="spawn-body">${
+        hosts.length
+          ? hosts.map(a => hostBlock(a)).join("")
+          : `<div class="empty" style="padding:20px 0">No online hosts with repos.</div>`
+      }</div>
+    </details>`;
+
+  $active.innerHTML = `<h2>Active <span class="count">${running.length}</span></h2>` +
+    (running.length
+      ? `<div class="s-list">${running.map(x => activeCard(x)).join("")}</div>`
+      : `<div class="empty" style="padding:28px 0">No running sessions.${hosts.length ? " Start one above." : ""}</div>`);
+
+  $stopped.innerHTML = stopped.length
+    ? `<h2>Stopped <span class="count">${stopped.length}</span></h2>
+       <details class="stopped-wrap" ${stoppedOpen ? "open" : ""} ontoggle="stoppedOpen = this.open">
+         <summary>Show / hide stopped sessions</summary>
+         <div class="s-list">${stopped.map(x => stoppedRow(x)).join("")}</div>
+       </details>`
+    : "";
+
+  // If the attached session vanished (killed elsewhere, host offline), drop the
+  // stage back to the empty prompt.
+  if (currentId) {
+    const still = running.find(x => x.s.id === currentId && x.a.terminalOnline);
+    if (!still) clearStage();
+  }
+}
+
+function activeCard({ a, s, live }) {
   const attachable = a.terminalOnline;
-  const meta = esc(s.repo || "?") + " · " + esc(a.device || a.key) +
-    " · " + esc(sessMeta(s));
-  return `<button class="scard" ${attachable ? "" : "disabled"}
-      onclick="openTerminal('${esc(s.id)}')"
+  const cur = s.id === currentId;
+  const meta = `<span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}`;
+  return `<button class="s-card ${cur ? "cur" : ""}" ${attachable ? "" : "disabled"}
+      onclick="selectSession('${esc(s.id)}')"
       ${attachable ? "" : 'title="Terminal tunnel offline"'}>
     <span class="dot ${live.kind}"></span>
     <span class="body">
-      <div class="sid">${esc(s.id)}</div>
+      <div class="title">${esc(sessTitle(s))}</div>
       <div class="meta">${meta}</div>
-      <div class="state ${live.kind}">${esc(live.label)}${live.detail ? " · " + esc(live.detail) : ""}</div>
+      <div class="state ${live.kind}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
       ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
     </span>
-    <span class="go">${attachable ? "Attach ▸" : "terminal offline"}</span>
   </button>`;
 }
 
@@ -294,13 +352,13 @@ function stoppedRow({ a, s }) {
   const starting = pending.has(pendKey("start", a.key, s.id));
   return `<div class="stopped-row">
     <span class="body">
-      <div class="sid">${esc(s.id)}</div>
-      <div class="meta">${esc(s.repo || "?")} · ${esc(a.device || a.key)} · ${esc(sessMeta(s))}</div>
+      <div class="title">${esc(sessTitle(s))}</div>
+      <div class="meta"><span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}</div>
       ${s.status === "error" && s.errorMsg ? `<div class="err">${esc(s.errorMsg)}</div>` : ""}
     </span>
-    <button class="primary" ${a.online && !starting ? "" : "disabled"}
+    <button class="primary btn-sm" ${a.online && !starting ? "" : "disabled"}
         onclick="sessStart('${esc(a.key)}','${esc(s.id)}')">
-      ${starting ? '<span class="spin"></span> Starting…' : "Start"}
+      ${starting ? '<span class="spin"></span>' : "Start"}
     </button>
   </div>`;
 }
@@ -326,6 +384,7 @@ async function post(url, body) {
     ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
     : { method: "POST" });
   refresh();
+  fastPoll();
 }
 function busy(key, val, run) {
   if (pending.has(key)) return;
@@ -344,54 +403,69 @@ function sessStart(key, id) {
     () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/start`));
 }
 
-// ---- live terminal overlay with in-place session switcher --------------------
-// Same mechanism as the dashboard (/term/<id>/ in a same-origin iframe riding
-// the page's basic-auth), plus: a chip strip listing every attachable session so
-// you can switch without closing, and a history entry so the phone back button
-// closes the overlay instead of leaving the page.
-const $overlay = document.getElementById("termOverlay");
+// ---- inline live terminal on the main stage ---------------------------------
+// The sidebar IS the session switcher now: picking a card swaps the iframe in
+// place (same-origin /term/<id>/ riding the page's basic-auth), no overlay. On
+// phones the list and terminal are separate full-screen views; entering the
+// terminal pushes one history entry so the back button returns to the list.
 const $frame = document.getElementById("termFrame");
-const $switch = document.getElementById("termSwitch");
-let termOpen = false; // we pushed a history entry that popstate will consume
+const $termPane = document.getElementById("termPane");
+const $stageEmpty = document.getElementById("stageEmpty");
 let currentId = null;
+let viewPushed = false; // a history entry the back button will consume (mobile)
+const isNarrow = () => window.matchMedia("(max-width: 820px)").matches;
 
 // Navigate the iframe with location.replace(), never src= — every src
 // assignment adds a joint session-history entry, which would make the back
-// button (and our history.back() close path) step through old terminal URLs
-// instead of closing the overlay. Same-origin, so contentWindow is reachable.
+// button step through old terminal URLs instead of returning to the list.
+// Same-origin, so contentWindow is reachable.
 function navFrame(src) {
   try { $frame.contentWindow.location.replace(src); }
   catch { $frame.src = src; }
 }
-function setFrame(id) {
+function setFrame(id, s, a) {
   currentId = id;
   const src = `/term/${encodeURIComponent(id)}/`;
-  document.getElementById("termTitle").textContent = id;
+  document.getElementById("termTitle").textContent = s ? sessTitle(s) : id;
+  document.getElementById("termPath").textContent =
+    (a ? (a.device || a.key) + " · " : "") + (s ? sessMeta(s) : id);
   document.getElementById("termOpen").href = src;
   navFrame(src);
   disarmTermKill();
 }
-function openTerminal(id) {
-  setFrame(id);
-  $overlay.style.display = "flex";
-  renderSwitcher();
-  if (!termOpen) { history.pushState({ term: true }, ""); termOpen = true; }
+function selectSession(id) {
+  const now = cache.now || Date.now();
+  const { running } = collect(cache.agents || [], now);
+  const hit = running.find(x => x.s.id === id && x.a.terminalOnline);
+  if (!hit) return;
+  setFrame(id, hit.s, hit.a);
+  $termPane.hidden = false;
+  $stageEmpty.hidden = true;
+  if (isNarrow()) {
+    document.body.classList.add("showing-term");
+    if (!viewPushed) { history.pushState({ term: true }, ""); viewPushed = true; }
+  }
+  render(cache); // refresh the .cur highlight
 }
-function switchTerminal(id) {
-  if (id === currentId) return;
-  setFrame(id);
-  renderSwitcher();
-}
-function hideOverlay() {
-  $overlay.style.display = "none";
-  navFrame("about:blank"); // tear down the session's WebSocket
+function clearStage() {
   currentId = null;
+  navFrame("about:blank"); // tear down the session's WebSocket
+  $termPane.hidden = true;
+  $stageEmpty.hidden = false;
+  document.body.classList.remove("showing-term");
   disarmTermKill();
 }
+function backToList() {
+  if (viewPushed) history.back(); // popstate drops the mobile terminal view
+  else document.body.classList.remove("showing-term");
+}
+window.addEventListener("popstate", () => {
+  if (viewPushed) { viewPushed = false; document.body.classList.remove("showing-term"); }
+});
 
 // Kill the attached session from the terminal bar (same endpoint as the
-// dashboard's card Kill). Arm-then-confirm on the button itself, then close the
-// overlay since the session is going away; the 5s poll drops its card.
+// dashboard's card Kill). Arm-then-confirm on the button itself, then clear the
+// stage since the session is going away; the 5s poll drops its card.
 let termKillArmed = false, termKillTimer = null;
 function disarmTermKill() {
   termKillArmed = false;
@@ -418,38 +492,12 @@ function killCurrentTerminal() {
   }
   disarmTermKill();
   post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`);
-  closeTerminal();
+  if (viewPushed) { viewPushed = false; history.back(); }
+  clearStage();
 }
-function closeTerminal() {
-  if (termOpen) history.back(); // popstate does the actual hide
-  else hideOverlay();
-}
-window.addEventListener("popstate", () => {
-  if (termOpen) { termOpen = false; hideOverlay(); }
-});
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && $overlay.style.display === "flex") closeTerminal();
+  if (e.key === "Escape" && document.body.classList.contains("showing-term")) backToList();
 });
-
-// Chip strip inside the terminal: every attachable running session across all
-// hosts, current one highlighted, state dots live-updated by the poll.
-function renderSwitcher() {
-  const now = cache.now || Date.now();
-  const { running } = collect(cache.agents || [], now);
-  const attachable = running.filter(x => x.a.terminalOnline);
-  $switch.replaceChildren();
-  for (const x of attachable) {
-    const chip = document.createElement("button");
-    chip.className = "chip" + (x.s.id === currentId ? " cur" : "");
-    chip.addEventListener("click", () => switchTerminal(x.s.id));
-    const dot = document.createElement("span");
-    dot.className = "dot " + x.live.kind;
-    chip.append(dot, document.createTextNode(x.s.id));
-    chip.title = (x.s.repo || "?") + " · " + (x.a.device || x.a.key) + " — " + x.live.label;
-    $switch.append(chip);
-  }
-  $switch.style.display = attachable.length > 1 ? "flex" : "none";
-}
 
 let cache = { now: Date.now(), agents: [] };
 async function refresh() {
@@ -460,8 +508,59 @@ async function refresh() {
   } catch { /* keep last data; the "updated" stamp goes stale visibly */ }
   render(cache);
 }
+
+// ---- live push (FIX 1/#1): server-sent per-agent updates on each heartbeat --
+// Same-origin EventSource rides the login cookie. Each `agent` event carries one
+// host record (as /api/agents returns it); we patch it into `cache` and
+// re-render so a new/finished/waiting session surfaces near-instantly. The poll
+// stays as a slower fallback, skipped while SSE is healthy.
+let sseOk = false, sseBackoff = 2000;
+function applyAgent(rec) {
+  const list = cache.agents || (cache.agents = []);
+  const i = list.findIndex(a => a.key === rec.key);
+  if (i >= 0) list[i] = rec; else list.push(rec);
+  cache.now = Date.now();
+}
+function connectSSE() {
+  let es;
+  try { es = new EventSource("/api/events"); }
+  catch { setTimeout(connectSSE, sseBackoff); return; }
+  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  es.addEventListener("agent", (e) => {
+    try { applyAgent(JSON.parse(e.data)); } catch { return; }
+    render(cache);
+  });
+  es.addEventListener("removed", (e) => {
+    try { const { key } = JSON.parse(e.data); cache.agents = (cache.agents || []).filter(a => a.key !== key); }
+    catch { return; }
+    render(cache);
+  });
+  es.onerror = () => {
+    sseOk = false;
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(connectSSE, sseBackoff);
+      sseBackoff = Math.min(sseBackoff * 2, 30000);
+    }
+  };
+}
+
+// Post-action fast-reflection burst (FIX 2/#4): poll at 500ms for ~4s after a
+// command when SSE isn't delivering; a no-op while SSE is healthy.
+let fastPollTimer = null, fastPollUntil = 0;
+function fastPoll() {
+  if (sseOk) return;
+  fastPollUntil = Date.now() + 4000;
+  if (fastPollTimer) return;
+  fastPollTimer = setInterval(() => {
+    if (sseOk || Date.now() > fastPollUntil) { clearInterval(fastPollTimer); fastPollTimer = null; return; }
+    refresh();
+  }, 500);
+}
+
 refresh();
-setInterval(refresh, 5000);
+connectSSE();
+// Fallback poll: slower now that SSE carries live updates, skipped while healthy.
+setInterval(() => { if (!sseOk) refresh(); }, 15000);
 </script>
 </body>
 </html>
