@@ -99,24 +99,31 @@ describe("render: home", () => {
     expect(lines.some((l) => l.startsWith("> … host-a·myrepo"))).toBe(true);
   });
 
-  it("paginates when the row list overflows the display, with a p/N footer", () => {
+  it("windows a long row list into one scrollable page — no p/N footer, cursor stays visible", () => {
     const sessions = Array.from({ length: 12 }, (_, i) =>
       session({ id: `s${i}`, repo: `repo${i}`, session: signals({ transcriptAgeSec: 999 }) })
     );
     const agents: AgentInfo[] = [agent({ sessions })];
-    // rows = [hostHeader, s0..s11, newSession, settings] = 15 rows total.
-    // Page area with a footer is DISPLAY_LINES-2 = 8; cursor 0 -> page 1.
+    // rows = [hostHeader, s0..s11, newSession, settings] = 15 rows total,
+    // more than the DISPLAY_LINES-1 = 9 content lines can show at once.
     const state = base({ agents, home: { cursor: 0 } });
 
     const lines = asLines(render(state));
     expect(lines[0]).toBe("AGENTHUB 0 run · 0 ask");
-    expect(lines[lines.length - 1]).toBe("p1/2");
-    expect(lines.length).toBe(10); // header + 8 content + footer
+    // Never split into pages: no "p/N" footer, ever.
+    expect(lines.some((l) => /^p\d+\/\d+$/.test(l))).toBe(false);
+    // Header + one full window of content (DISPLAY_LINES-1 rows) = DISPLAY_LINES.
+    expect(lines.length).toBe(10);
 
-    const state2 = base({ agents, home: { cursor: 14 } }); // settings row, on page 2
+    // The cursor is always in the rendered window, wherever it sits in the list.
+    const state2 = base({ agents, home: { cursor: 14 } }); // settings row, at the very end
     const lines2 = asLines(render(state2));
-    expect(lines2[lines2.length - 1]).toBe("p2/2");
+    expect(lines2.some((l) => /^p\d+\/\d+$/.test(l))).toBe(false);
     expect(lines2.some((l) => l === "> Settings")).toBe(true);
+    // A mid-list cursor is also windowed in — the list scrolled to follow it.
+    const state3 = base({ agents, home: { cursor: 7 } }); // s6 (rows: header=0, s0=1, ...)
+    const lines3 = asLines(render(state3));
+    expect(lines3.some((l) => l.startsWith("> "))).toBe(true);
   });
 
   it("shows a flash message in place of the header", () => {

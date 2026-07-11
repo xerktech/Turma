@@ -113,6 +113,25 @@ describe("EvenHubDisplay", () => {
       expect(container.yPosition).toBe(0);
     });
 
+    it("pads the lines container so a full menu page (DISPLAY_LINES rows) fits without overflowing the canvas either way", async () => {
+      const { bridge, startCalls } = fakeBridge();
+      const display = new EvenHubDisplay(bridge);
+      await display.start();
+
+      const container = startCalls[0]!.textObject![0]!;
+      const LINE_HEIGHT = 27;
+      const DISPLAY_LINES = 10;
+      // A full menu page (e.g. the repo picker) renders header + rows up to
+      // DISPLAY_LINES lines into this container. It must fit top-to-bottom, or
+      // the firmware natively scrolls the text container on swipe (dragging the
+      // whole page) on top of our own cursor move.
+      const contentHeight = DISPLAY_LINES * LINE_HEIGHT;
+      expect(container.height! - 2 * container.paddingLength!).toBeGreaterThanOrEqual(contentHeight);
+      // Inner width still covers the wrap width (LINE_WIDTH_PX 560) so rows
+      // don't re-wrap onto an extra physical line and overflow that way either.
+      expect(container.width! - 2 * container.paddingLength!).toBeGreaterThanOrEqual(560);
+    });
+
     it("does not throw when createStartUpPageContainer rejects", async () => {
       const { bridge } = fakeBridge({
         createStartUpPageContainer: async () => {
