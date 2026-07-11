@@ -76,7 +76,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          name: Glasses ${{ steps.ver.outputs.tag }}
+          name: Turma Glasses ${{ steps.ver.outputs.tag }}
           body: |
             Even Hub (G2 glasses) app package for Turma.
 
