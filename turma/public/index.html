@@ -915,7 +915,7 @@ function composer(a, repo, rk, spawning) {
   const selBase = (o.baseRef && bases.includes(o.baseRef))
     ? o.baseRef : (repo.defaultBranch || repo.branch || "");
   const selModel = o.model || "default";
-  const selPerm = o.permissionMode || "bypassPermissions";
+  const selPerm = o.permissionMode || "auto";
   const optsExpanded = optionsOpen.has(rk);
   const opt = (v, label, sel) => `<option value="${esc(v)}"${v === sel ? " selected" : ""}>${esc(label)}</option>`;
   const submit = `startSession('${key}','${rn}')`;
@@ -949,7 +949,7 @@ function composer(a, repo, rk, spawning) {
         <div>
           <label>Permission mode</label>
           <select id="${cid(rk, "perm")}" onchange="onOptChange('${esc(rk)}','${rn}')">
-            ${opt("bypassPermissions", "bypassPermissions", selPerm)}${opt("acceptEdits", "acceptEdits", selPerm)}${opt("plan", "plan", selPerm)}${opt("default", "default", selPerm)}
+            ${opt("auto", "auto", selPerm)}${opt("bypassPermissions", "bypassPermissions", selPerm)}${opt("acceptEdits", "acceptEdits", selPerm)}${opt("plan", "plan", selPerm)}${opt("default", "default", selPerm)}
           </select>
         </div>
       </div>
@@ -1125,7 +1125,7 @@ function startSession(key, repo) {
   // an explicit base when the operator picked something other than that.
   if (baseRef && baseRef !== defBranch) body.baseRef = baseRef;
   if (model && model !== "default") body.model = model;
-  if (perm && perm !== "bypassPermissions") body.permissionMode = perm;
+  if (perm && perm !== "auto") body.permissionMode = perm;
   saveOpts(repo, { baseRef, model, permissionMode: perm, optionsExpanded: optionsOpen.has(rk) });
   composerOpen.delete(rk);
   composerDraft.delete(rk);

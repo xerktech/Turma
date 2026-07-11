@@ -259,7 +259,10 @@ class TestSpawnOptionHelpers(unittest.TestCase):
                 ha.resolve_model(bad)
 
     def test_resolve_permission_mode(self):
-        self.assertEqual(ha.resolve_permission_mode(""), "bypassPermissions")
+        self.assertEqual(ha.resolve_permission_mode(""), "auto")
+        self.assertEqual(ha.resolve_permission_mode("auto"), "auto")
+        self.assertEqual(ha.resolve_permission_mode("bypassPermissions"),
+                         "bypassPermissions")
         self.assertEqual(ha.resolve_permission_mode("acceptEdits"), "acceptEdits")
         self.assertEqual(ha.resolve_permission_mode("plan"), "plan")
         self.assertEqual(ha.resolve_permission_mode("default"), "default")
@@ -1016,7 +1019,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
 
     def test_spawn_no_options_keeps_todays_command_shape(self):
         """Regression guard: a bare spawn adds a DETACHED worktree (no -b, no
-        app branch) and launches with bypassPermissions, no --model, no
+        app branch) and launches with the default auto mode, no --model, no
         positional prompt. (No default base resolves under the fake git, so the
         detach point is HEAD — nothing trails the worktree path.)"""
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
@@ -1032,7 +1035,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(
             self._claude_cmd(),
             f"claude --remote-control '{sess['rcName']}' "
-            f"--permission-mode bypassPermissions --settings {shlex.quote(settings)}",
+            f"--permission-mode auto --settings {shlex.quote(settings)}",
         )
         # The guard settings file was written and wires the Bash PreToolUse hook.
         loaded = json.loads(open(settings).read())

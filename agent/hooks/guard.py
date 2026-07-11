@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Turma agent safety guard — a Claude Code ``PreToolUse`` hook.
 
-Every session runs the agent with ``--permission-mode bypassPermissions`` so it
-can do whatever a task needs (read, write, run builds/tests, git, network) with
-**no** per-tool approval round-trip. This hook is the single thing that makes
-that safe: it inspects every Bash tool call *before* it runs and blocks only
-three narrow categories.
+Sessions run the agent hands-off (``--permission-mode auto`` by default, or
+``bypassPermissions`` when an operator picks it) so it can do whatever a task
+needs (read, write, run builds/tests, git, network) with little or **no**
+per-tool approval round-trip. This hook is the backstop that makes that safe: it
+inspects every Bash tool call *before* it runs and blocks only three narrow
+categories.
 
 1. **destructive** — commands that would wreck the whole repository or the host
    machine: ``rm -rf`` of ``/``/home/system paths or ``.git``, disk wipes

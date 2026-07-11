@@ -256,9 +256,10 @@ def slugify(s):
 # Model aliases the UI offers -> the value handed to `claude --model`. "default"
 # (or blank) means "don't pass --model at all" (claude's own default model).
 MODEL_ALIASES = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku"}
-# Permission modes the UI offers. "bypassPermissions" is today's behavior and
-# the default; "default" means "omit --permission-mode" (claude's own default).
-PERMISSION_MODES = {"bypassPermissions", "acceptEdits", "plan", "default"}
+# Permission modes the UI offers. "auto" is the default (claude's classifier-
+# gated hands-off mode); "bypassPermissions" disables prompts entirely; "default"
+# means "omit --permission-mode" (claude's own manual-review default).
+PERMISSION_MODES = {"auto", "bypassPermissions", "acceptEdits", "plan", "default"}
 # git-ref-safe token: our allowlist is a strict subset of what git accepts, so
 # anything matching is also validated below for the few remaining git rules.
 _REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
@@ -339,10 +340,10 @@ def resolve_model(model):
 
 def resolve_permission_mode(mode):
     """Validate a UI permission-mode choice against a fixed enum. Blank ->
-    bypassPermissions (today's behavior)."""
+    auto (claude's classifier-gated hands-off default)."""
     mode = (mode or "").strip()
     if not mode:
-        return "bypassPermissions"
+        return "auto"
     if mode in PERMISSION_MODES:
         return mode
     raise ValueError(f"unknown permission mode {mode!r}")
@@ -1541,14 +1542,15 @@ class SessionManager:
         model = sess.get("model")
         if model:
             parts.append(f"--model {model}")
-        # Default (unset) preserves today's --permission-mode bypassPermissions;
-        # the explicit "default" choice omits the flag (claude's own default).
-        perm = sess.get("permissionMode") or "bypassPermissions"
+        # Default (unset) -> --permission-mode auto; the explicit "default" choice
+        # omits the flag (claude's own manual-review default).
+        perm = sess.get("permissionMode") or "auto"
         if perm != "default":
             parts.append(f"--permission-mode {perm}")
-        # Wire the PreToolUse safety guard that makes bypassPermissions safe
-        # (blocks catastrophic / policy / attribution Bash). Best-effort: if the
-        # settings file can't be written the session still launches (bare).
+        # Wire the PreToolUse safety guard (blocks catastrophic / policy /
+        # attribution Bash) — defense in depth under any mode, and what makes
+        # bypassPermissions safe. Best-effort: if the settings file can't be
+        # written the session still launches (bare).
         settings = self._ensure_guard_settings()
         if settings:
             parts.append(f"--settings {shlex.quote(settings)}")
@@ -1683,7 +1685,7 @@ class SessionManager:
             "tmuxName": f"agent-{sid}",
             "ttydPort": self._alloc_port(),
             "model": None,                  # resolved --model value (None = omit)
-            "permissionMode": "bypassPermissions",
+            "permissionMode": "auto",
             "baseRef": None,                # base branch the worktree forked from
             "status": "running",
             "createdAt": now_iso(),
@@ -1825,7 +1827,7 @@ class SessionManager:
             "tmuxName": rec.get("tmuxName") or f"agent-{sid}",
             "ttydPort": self._alloc_port(),  # old port may be taken by now
             "model": rec.get("model"),
-            "permissionMode": rec.get("permissionMode") or "bypassPermissions",
+            "permissionMode": rec.get("permissionMode") or "auto",
             "status": "running",
             "createdAt": rec.get("createdAt") or now_iso(),
             "stoppedAt": None,
