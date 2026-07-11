@@ -258,6 +258,84 @@ describe("App", () => {
     expect(app.getState().pending["spawn:host-a:myrepo"]).toBeDefined();
   });
 
+  // ---- post-mutation refresh: immediate poll + grace window -------------
+  // A bare spawn via newHost -> newRepo -> newPrompt -> "Skip (spawn now)",
+  // then flush the spawnSession promise (which triggers nudgePoll's immediate
+  // re-poll). Mirrors the "spawns on Skip" nav above.
+  async function spawnBare(app: App): Promise<void> {
+    display.emit({ type: "tap" }); // home newSession -> newHost
+    display.emit({ type: "tap" }); // pick host-a
+    display.emit({ type: "tap" }); // pick myrepo -> newPrompt
+    display.emit({ type: "scrollDown" }); // -> "Skip (spawn now)"
+    display.emit({ type: "tap" }); // spawn
+    await vi.advanceTimersByTimeAsync(0); // flush spawn promise + immediate nudge poll
+  }
+
+  it("re-polls immediately after a spawn instead of waiting a full pollMs (nudgePoll)", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent()] })),
+    });
+    const app = makeApp(client); // pollMs 6000
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.listAgents).toHaveBeenCalledTimes(1);
+
+    await spawnBare(app);
+
+    // The refresh fires right after the spawn resolves — nowhere near pollMs.
+    expect(client.spawnSession).toHaveBeenCalledTimes(1);
+    expect(client.listAgents).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps polling through the grace window after a spawn even when backgrounded", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent()] })),
+    });
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await spawnBare(app); // listAgents: 1 (start) + 1 (nudge) = 2
+    expect(client.listAgents).toHaveBeenCalledTimes(2);
+
+    app.pause(); // the HUD closes right after spawning
+
+    // Without the grace window the poll loop would freeze here; instead it
+    // keeps fetching so the just-spawned session still reaches the HUD.
+    await vi.advanceTimersByTimeAsync(6000);
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(client.listAgents).toHaveBeenCalledTimes(4);
+  });
+
+  it("stops polling once the grace window elapses", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent()] })),
+    });
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await spawnBare(app);
+    app.pause();
+
+    await vi.advanceTimersByTimeAsync(120_000); // well past POLL_GRACE_MS
+    const settled = client.listAgents.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(client.listAgents).toHaveBeenCalledTimes(settled); // no polls after grace
+  });
+
+  it("a hard pause (abnormal/system exit) cancels the grace poll immediately", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent()] })),
+    });
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await spawnBare(app); // 2 calls
+    app.pause({ hard: true });
+
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(client.listAgents).toHaveBeenCalledTimes(2); // frozen — no grace polling
+  });
+
   // ---- session bottom: AskUserQuestion sheet mode (Task 6) --------------
   // Replaces the old separate "question" screen: a pending question renders
   // inline in the session bottom bar (render.ts's sheet mode) whenever
@@ -795,6 +873,7 @@ describe("App", () => {
       listAgents: vi
         .fn()
         .mockResolvedValueOnce({ now: Date.now(), agents: [running] })
+        .mockResolvedValueOnce({ now: Date.now(), agents: [running] }) // immediate nudge poll after kill: still pending
         .mockResolvedValueOnce({ now: Date.now(), agents: [running] }) // unchanged: still pending
         .mockResolvedValue({ now: Date.now(), agents: [stopped] }), // converged: kill took effect
     });

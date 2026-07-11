@@ -200,6 +200,8 @@ export function onForegroundEnter(app: App): void {
 // (EvenHubDisplay has one — not part of the GlassesDisplay interface since
 // the DOM dev backend never needs it).
 export function onAbnormalOrSystemExit(app: App, display: { teardown?(): void }): void {
-  app.pause();
+  // Hard pause: also cancels any post-mutation grace poll, so no fetch/repaint
+  // can fire against the display we're about to tear down.
+  app.pause({ hard: true });
   display.teardown?.();
 }
