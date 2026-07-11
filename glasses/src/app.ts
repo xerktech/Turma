@@ -51,6 +51,12 @@ export interface PendingEntry {
 }
 
 export const PENDING_TIMEOUT_MS = 60 * 1000;
+// After queuing a session-list mutation (spawn/kill/resume/delete) the poll
+// loop keeps running for this long even if the plugin backgrounds right after
+// — so a session you just launched (or ended) before the HUD closed still
+// lands on the list without waiting for you to reopen the plugin. See
+// nudgePoll()/pause()/schedulePoll(). Matches the pending-overlay lifetime.
+export const POLL_GRACE_MS = 60 * 1000;
 export const FLASH_DURATION_MS = 4000;
 export const FLASH_QUEUED = "✓ queued — agent picks up in ~20s";
 export const FLASH_HUB_UNREACHABLE = "hub unreachable";
@@ -236,6 +242,10 @@ export class App {
   private revealTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRevealAt = 0;
   private paused = false;
+  // While `now() < graceUntil`, the poll loop is allowed to keep running even
+  // when paused (backgrounded). Set by nudgePoll() after a list mutation; the
+  // loop self-terminates once it elapses. See pause()/schedulePoll().
+  private graceUntil = 0;
 
   constructor(opts: AppOptions) {
     this.client = opts.client;
@@ -264,7 +274,11 @@ export class App {
   // App is the only thing that knows whether a dictation is actually active
   // (the reply screen's "listening" phase) and is already the sole caller of
   // dictation.start/stop/cancel for user-driven flows (see onReply below).
-  pause(): void {
+  // `opts.hard` (abnormal/system exit) cancels the post-mutation grace window
+  // too, so no grace poll can fire against a display that's being torn down.
+  // Plain foreground-exit keeps the grace window alive (see nudgePoll()).
+  pause(opts?: { hard?: boolean }): void {
+    if (opts?.hard) this.graceUntil = 0;
     if (this.state.screen === "reply" && this.state.reply?.phase === "listening") {
       const r = this.state.reply;
       this.dictation.cancel();
@@ -281,6 +295,11 @@ export class App {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
+    // Normally this stops the poll loop (schedulePoll no-ops while paused), but
+    // within a post-mutation grace window it re-arms the loop so a session you
+    // just spawned/killed before backgrounding still reaches the frozen HUD
+    // frame. The loop self-terminates once graceUntil elapses.
+    this.schedulePoll(this.pollMs);
     // Backgrounding also stops the live transcript stream and its reveal
     // animation — both re-established on resume() if we come back to a
     // session screen. Leaving the live WS open while backgrounded would keep
@@ -321,11 +340,25 @@ export class App {
   }
 
   private schedulePoll(delayMs: number): void {
-    if (this.paused) return;
+    // While paused, only keep polling inside a post-mutation grace window.
+    if (this.paused && this.now() >= this.graceUntil) return;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = setTimeout(() => {
       void this.poll();
     }, delayMs);
+  }
+
+  // Call right after queuing a session-list mutation (spawn/kill/resume/delete).
+  // Pulls a fresh list immediately (rather than waiting up to pollMs for the
+  // next scheduled tick, the way the web UI refreshes right after every POST)
+  // AND opens a grace window so the loop survives a background that lands
+  // moments later — see pause()/schedulePoll(). The mutation only *queues* a
+  // command on the hub, so the just-spawned session isn't in this first poll's
+  // response; the grace window is what carries the loop far enough to catch it
+  // once the agent heartbeats it in (~a few seconds via the hub's poke).
+  private nudgePoll(): void {
+    this.graceUntil = this.now() + POLL_GRACE_MS;
+    this.schedulePoll(0);
   }
 
   private setState(patch: Partial<AppState>): void {
@@ -581,7 +614,9 @@ export class App {
       // heartbeat, or a beat the live stream missed) — re-anchor the reveal so
       // that growth snaps (block) or types (small delta) exactly as a live
       // delta would, rather than flashing in at full length.
-      if (this.state.screen === "session" && this.state.session) {
+      // Skip while paused: a grace-window poll (backgrounded) should refresh
+      // the list without re-arming the reveal timer that pause() just cleared.
+      if (!this.paused && this.state.screen === "session" && this.state.session) {
         this.reanchorReveal(this.state.session.sessionId);
         this.preserveScrollOffset(beforeLen);
         this.scheduleRevealTick();
@@ -1158,6 +1193,7 @@ export class App {
       .sessionAction(hostKey, sessionId, action)
       .then(() => {
         this.flash(FLASH_QUEUED);
+        this.nudgePoll();
         this.repaint();
       })
       .catch(() => {
@@ -1259,6 +1295,7 @@ export class App {
       .spawnSession(hostKey, { repo, prompt: r.text, label, baseRef, model, permissionMode })
       .then(() => {
         this.flash(FLASH_QUEUED);
+        this.nudgePoll();
         this.repaint();
       })
       .catch(() => {
@@ -1351,6 +1388,7 @@ export class App {
           .sessionAction(n.hostKey, row.closedSessionId, "resume")
           .then(() => {
             this.flash(FLASH_QUEUED);
+            this.nudgePoll();
             this.repaint();
           })
           .catch(() => {
@@ -1392,6 +1430,7 @@ export class App {
           .spawnSession(n.hostKey, { repo: n.repo })
           .then(() => {
             this.flash(FLASH_QUEUED);
+            this.nudgePoll();
             this.repaint();
           })
           .catch(() => {
