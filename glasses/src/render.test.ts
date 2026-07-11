@@ -538,7 +538,7 @@ describe("render: confirm", () => {
 });
 
 describe("render: newRepo", () => {
-  it("lists repos plus Resume rows for repos with closed sessions", () => {
+  it("lists repos without Resume rows even when a repo has closed sessions", () => {
     const agents: AgentInfo[] = [
       agent({
         key: "host-a",
@@ -556,8 +556,8 @@ describe("render: newRepo", () => {
 
     const lines = asLines(render(state));
     expect(lines).toContain("  repoA");
-    expect(lines).toContain("> Resume old-fix");
-    expect(lines).toContain("  repoB");
+    expect(lines).toContain("> repoB");
+    expect(lines.some((l) => l.includes("Resume"))).toBe(false);
   });
 });
 
