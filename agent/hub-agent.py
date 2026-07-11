@@ -32,7 +32,9 @@ Token usage is parsed from the transcript JSONLs under
 /root/.claude/projects/<slug>/ (slug = worktree path via _project_slug); this is the
 same data ccusage reads. Live-session signals are bridge-pointer presence,
 transcript freshness, the newest entry's role/tool-use, any pending
-AskUserQuestion, and PR URLs newly appended to the transcript.
+AskUserQuestion (read from the transcript once answered, but from the live
+tmux pane while still pending — Claude flushes the tool_use only on answer),
+and PR URLs newly appended to the transcript.
 
 stdlib only — no pip installs in the image.
 """
@@ -119,6 +121,24 @@ TAIL_MSG_CHARS_FULL = int(os.environ.get("SESSION_TAIL_MSG_CHARS_FULL", "16000")
 # Terminal color/cursor codes sometimes make it into pasted transcript text;
 # strip them so the glasses client only ever sees plain text.
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+# ---- pending-question detection from the live TUI pane -------------------
+# A pending AskUserQuestion is answered before Claude flushes the tool_use to
+# the transcript, so the transcript-based scan below can't see it while it's
+# actually pending (it only appears once already answered). The one place the
+# pending question is live is the session's tmux pane, where Claude renders an
+# interactive numbered picker. These parse that pane. Box-drawing glyphs Claude
+# wraps its prompts in (stripped from line edges + used to spot separators).
+_BOX_CHARS = "─│╭╮╰╯├┤┬┴┼━┃┏┓┗┛═║╔╗╚╝╌╎┄┆┈┊"
+# A picker option line, e.g. "❯ 1. Turma", "  2) Tutela", "│ 3. Vexillum │"
+# (edges already trimmed). The leading run soaks up the selection cursor and
+# any bullet/space noise before the number.
+PANE_OPTION_RE = re.compile(r"^[\s>❯›▶▸⟩◉●○◯*.\-]*([1-9])[.)]\s+(\S.*?)\s*$")
+# Selection-cursor glyphs Claude marks the highlighted row with. Requiring one
+# in the numbered block distinguishes a live picker from an ordinary numbered
+# list the assistant merely printed and then went idle on (which would other-
+# wise surface as a phantom question). Tune here if a first on-hardware test
+# shows a different glyph.
+PANE_CURSOR_CHARS = "❯›▶▸⟩"
 # Glasses-client on-demand commands: how much typed text `input` accepts per
 # call, and how many surviving messages an on-demand `history` request returns
 # (independent of the per-heartbeat TAIL_MSGS above).
@@ -890,7 +910,81 @@ def _history_entries(path):
     return entries, byte_capped
 
 
-def session_report(workdir, state):
+def _is_border_line(clean):
+    """True for a box border/separator line (mostly box-drawing glyphs) — a
+    hard stop when scanning upward for the question text so a bordered header
+    like `╭─ Name pick ─╮` never gets mistaken for the question itself."""
+    dense = clean.replace(" ", "")
+    if not dense:
+        return False
+    box = sum(ch in _BOX_CHARS for ch in dense)
+    return box / len(dense) >= 0.5
+
+
+def parse_pane_question(pane_text):
+    """Extract a pending AskUserQuestion from a captured tmux pane, or
+    (None, []). Recognizes Claude's interactive numbered picker: a run of
+    options numbered 1..N (>=2), at least one carrying a selection cursor, with
+    the question text on the nearest non-empty line above them.
+
+    Deliberately conservative — it fills in only when the transcript scan found
+    nothing, so a false positive would surface a phantom question sheet on the
+    glasses. The cursor-glyph requirement is what keeps an ordinary numbered
+    list the assistant printed (and then went idle on) from tripping it."""
+    if not pane_text:
+        return None, []
+    lines = ANSI_RE.sub("", pane_text).splitlines()
+    # Edge-trimmed body of each line (box side-rails removed) so a boxed or
+    # bare picker parse the same way; keep them aligned with `lines` by index.
+    bodies = [ln.strip().strip(_BOX_CHARS).strip() for ln in lines]
+
+    # Walk top-down collecting the consecutive 1..N option run. A line that
+    # doesn't advance the expected number (a wrapped label, a blank) is skipped
+    # rather than breaking the run, so long labels don't truncate it.
+    opts = []            # (line_index, label)
+    expected = 1
+    for i, body in enumerate(bodies):
+        m = PANE_OPTION_RE.match(body)
+        if m and int(m.group(1)) == expected:
+            opts.append((i, m.group(2).strip()))
+            expected += 1
+    if len(opts) < 2:
+        return None, []
+
+    # A live picker highlights one row with a cursor glyph; an inert printed
+    # list has none. Check the raw option lines (pre-body-trim) for one.
+    first_i = opts[0][0]
+    last_i = opts[-1][0]
+    if not any(any(c in lines[i] for c in PANE_CURSOR_CHARS) for i in range(first_i, last_i + 1)):
+        return None, []
+
+    # Question: nearest non-empty, non-option, non-border line above the run.
+    question = None
+    for j in range(first_i - 1, -1, -1):
+        body = bodies[j]
+        if not body:
+            continue
+        if _is_border_line(body) or PANE_OPTION_RE.match(body):
+            break
+        question = body.lstrip("●○◉?›❯▶▸ ").strip()
+        break
+    if not question:
+        return None, []
+    labels = [label[:80] for _, label in opts[:4]]
+    return question[:300], labels
+
+
+def _pane_question(tmux_name):
+    """Capture a session's tmux pane and parse a pending AskUserQuestion from
+    it, or (None, []). Best-effort: a missing pane / capture failure is just no
+    question, never an error that could stall the heartbeat."""
+    if not tmux_name:
+        return None, []
+    pane = run(["tmux", "capture-pane", "-p", "-t", tmux_name])
+    return parse_pane_question(pane)
+
+
+def session_report(workdir, state, tmux_name=None):
     """Cheap per-heartbeat session signals (stat + tail reads, no full parse).
 
     state carries per-file byte offsets between beats so the PR-URL scan only
@@ -910,9 +1004,24 @@ def session_report(workdir, state):
         "lastHasToolUse": False,
         "question": None,          # pending AskUserQuestion text, if any
         "questionOptions": [],     # pending AskUserQuestion option labels, if any
+        "questionSource": None,    # "transcript" | "pane" | None — which detector fired
         "prUrls": [],              # PR links newly appended since last beat
         "tail": [],                # recent transcript messages, for the glasses client
     }
+
+    def _finish():
+        # A pending AskUserQuestion is invisible to the transcript scan above
+        # (Claude flushes the tool_use only once the question is answered), so
+        # whenever the transcript turned up nothing, read the question live from
+        # the session's TUI pane instead — that's the one place it exists while
+        # actually pending.
+        if not report["question"]:
+            pq, popts = _pane_question(tmux_name)
+            if pq:
+                report["question"] = pq
+                report["questionOptions"] = popts
+                report["questionSource"] = "pane"
+        return report
 
     newest, newest_mtime = None, 0.0
     try:
@@ -930,10 +1039,10 @@ def session_report(workdir, state):
                 newest, newest_mtime = path, st.st_mtime
     except OSError:
         state["primed"] = True
-        return report
+        return _finish()
     state["primed"] = True
     if not newest:
-        return report
+        return _finish()
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
     report["tail"] = transcript_tail(newest)
 
@@ -956,6 +1065,8 @@ def session_report(workdir, state):
                             opt["label"][:80] for opt in opts[:4]
                             if isinstance(opt, dict) and isinstance(opt.get("label"), str)
                         ]
+                        if report["question"]:
+                            report["questionSource"] = "transcript"
 
     # Incremental PR-URL scan over bytes appended to the active transcript.
     try:
@@ -977,7 +1088,7 @@ def session_report(workdir, state):
         offsets[newest] = size
     except OSError:
         pass
-    return report
+    return _finish()
 
 
 def log_tail(container_id):
@@ -2258,7 +2369,7 @@ class SessionManager:
         if running:
             try:
                 st = self.sess_state.setdefault(sid, {})
-                signals = session_report(sess["worktreePath"], st)
+                signals = session_report(sess["worktreePath"], st, sess.get("tmuxName"))
                 pend = self.pending_prs.setdefault(sid, [])
                 pend.extend(signals.pop("prUrls"))
                 del pend[:-10]

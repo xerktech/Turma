@@ -515,6 +515,144 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, {})
         self.assertEqual(rep["questionOptions"], ["ok"])
 
+    # ---- pane fallback: pending question read from the live TUI ------------
+    # A pending AskUserQuestion isn't in the transcript yet (Claude flushes the
+    # tool_use only once answered), so when the transcript turns up nothing the
+    # report falls back to parsing the session's tmux pane.
+    PANE = (
+        "╭─ Name pick ──────────────────────────────╮\n"
+        "│ Which direction should I run with?       │\n"
+        "│                                          │\n"
+        "│ ❯ 1. Turma                               │\n"
+        "│   2. Tutela                              │\n"
+        "╰──────────────────────────────────────────╯\n"
+    )
+
+    def test_pane_fallback_fills_pending_question(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("working on it")])  # last entry isn't a question
+        with mock.patch.object(ha, "run", return_value=self.PANE) as m:
+            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
+        self.assertEqual(rep["question"], "Which direction should I run with?")
+        self.assertEqual(rep["questionOptions"], ["Turma", "Tutela"])
+        self.assertEqual(rep["questionSource"], "pane")
+        m.assert_called_once_with(["tmux", "capture-pane", "-p", "-t", "agent-abc"])
+
+    def test_pane_fallback_works_when_no_transcript_yet(self):
+        # No .jsonl in the project dir at all — the early-return path must still
+        # consult the pane so a question asked before the first write shows up.
+        with mock.patch.object(ha, "run", return_value=self.PANE):
+            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
+        self.assertEqual(rep["question"], "Which direction should I run with?")
+        self.assertEqual(rep["questionSource"], "pane")
+
+    def test_transcript_question_wins_and_pane_not_captured(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [{
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "AskUserQuestion",
+                 "input": {"questions": [{"question": "from transcript",
+                                          "options": [{"label": "yes"}]}]}},
+            ]},
+        }])
+        with mock.patch.object(ha, "run") as m:
+            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
+        self.assertEqual(rep["question"], "from transcript")
+        self.assertEqual(rep["questionSource"], "transcript")
+        m.assert_not_called()  # transcript already answered it; no pane capture
+
+    def test_no_tmux_name_means_no_pane_fallback(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("working on it")])
+        rep = ha.session_report(self.WORKDIR, {})  # no tmux_name passed
+        self.assertIsNone(rep["question"])
+        self.assertIsNone(rep["questionSource"])
+
+
+class TestParsePaneQuestion(unittest.TestCase):
+    """The tmux-pane picker parser that backs the pending-question fallback."""
+
+    def test_boxed_picker_with_cursor(self):
+        pane = (
+            "╭─ Name pick ──────────────────────────────╮\n"
+            "│ Which direction should I run with?       │\n"
+            "│                                          │\n"
+            "│ ❯ 1. Turma                               │\n"
+            "│   2. Tutela                              │\n"
+            "│   3. Vexillum / Praetor                  │\n"
+            "│   4. None — new direction                │\n"
+            "╰──────────────────────────────────────────╯\n"
+        )
+        q, opts = ha.parse_pane_question(pane)
+        self.assertEqual(q, "Which direction should I run with?")
+        self.assertEqual(opts, ["Turma", "Tutela", "Vexillum / Praetor", "None — new direction"])
+
+    def test_bare_picker_with_cursor(self):
+        pane = "Which color?\n\n❯ 1. Red\n  2. Green\n  3. Blue\n"
+        q, opts = ha.parse_pane_question(pane)
+        self.assertEqual(q, "Which color?")
+        self.assertEqual(opts, ["Red", "Green", "Blue"])
+
+    def test_ansi_codes_stripped(self):
+        pane = "Pick one?\n\x1b[36m❯ 1. Alpha\x1b[0m\n  2. Beta\n"
+        q, opts = ha.parse_pane_question(pane)
+        self.assertEqual(q, "Pick one?")
+        self.assertEqual(opts, ["Alpha", "Beta"])
+
+    def test_numbered_list_without_cursor_is_not_a_question(self):
+        # Guard against a phantom question: the assistant merely printed a
+        # numbered list and went idle. No selection cursor -> not a picker.
+        pane = "Here's the plan:\n1. First step\n2. Second step\n3. Third step\n"
+        self.assertEqual(ha.parse_pane_question(pane), (None, []))
+
+    def test_single_option_is_not_a_question(self):
+        pane = "Proceed?\n❯ 1. Yes\n"
+        self.assertEqual(ha.parse_pane_question(pane), (None, []))
+
+    def test_empty_pane(self):
+        self.assertEqual(ha.parse_pane_question(""), (None, []))
+        self.assertEqual(ha.parse_pane_question("   \n  \n"), (None, []))
+
+    def test_options_capped_at_four_and_labels_at_80(self):
+        long = "L" * 100
+        pane = ("Pick?\n"
+                f"❯ 1. {long}\n  2. b\n  3. c\n  4. d\n  5. e\n  6. f\n")
+        q, opts = ha.parse_pane_question(pane)
+        self.assertEqual(len(opts), 4)
+        self.assertEqual(opts[0], "L" * 80)
+        self.assertEqual(opts[1:], ["b", "c", "d"])
+
+    def test_question_capped_at_300(self):
+        q_text = "Why? " * 100  # > 300 chars
+        pane = f"{q_text}\n❯ 1. a\n  2. b\n"
+        q, _ = ha.parse_pane_question(pane)
+        self.assertEqual(len(q), 300)
+
+    def test_wrapped_label_does_not_break_the_run(self):
+        pane = (
+            "Choose:\n"
+            "❯ 1. A very long option label that wrapped\n"
+            "     onto a second visual line\n"
+            "  2. Short\n"
+        )
+        q, opts = ha.parse_pane_question(pane)
+        self.assertEqual(q, "Choose:")
+        self.assertEqual(opts, ["A very long option label that wrapped", "Short"])
+
+    def test_boxed_header_not_mistaken_for_question(self):
+        # The header sits in the top border; the real question is below it.
+        pane = (
+            "╭─ Confirm ────────────────╮\n"
+            "│ Delete the branch?       │\n"
+            "│ ❯ 1. Yes                 │\n"
+            "│   2. No                  │\n"
+            "╰──────────────────────────╯\n"
+        )
+        q, opts = ha.parse_pane_question(pane)
+        self.assertEqual(q, "Delete the branch?")
+        self.assertEqual(opts, ["Yes", "No"])
+
 
 class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
     def test_missing_file(self):
