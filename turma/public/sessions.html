@@ -104,6 +104,12 @@
   .stage-empty .hint { font-size: 12.5px; max-width: 420px; line-height: 1.5; }
 
   .term-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  /* Both panes set `display: flex`, an author rule that would otherwise beat the
+     UA `[hidden] { display: none }` (author origin wins over UA regardless of
+     specificity) — so the JS `.hidden = true` toggle needs an author-level
+     override to actually hide the pane. Without this the "No session attached"
+     notice never clears and the terminal stacks below it. */
+  .stage-empty[hidden], .term-pane[hidden] { display: none; }
   .term-pane iframe { flex: 1; border: 0; width: 100%; background: #000; }
   .term-bar .back-btn { display: none; }
   .term-bar .t-title .name { font-weight: 600; }
