@@ -107,7 +107,7 @@ function homeHeaderText(state: AppState): string {
       else if (s === "waiting") waiting++;
     }
   }
-  return `AGENTHUB ${working} run · ${waiting} ask`;
+  return `TURMA ${working} run · ${waiting} ask`;
 }
 
 export function buildHomeRows(state: AppState): HomeRow[] {

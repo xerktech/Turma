@@ -126,7 +126,7 @@ export interface AppSnapshot {
   sessionId: string | null;
 }
 
-export const BACKGROUND_STATE_KEY = "agenthub.glasses.app";
+export const BACKGROUND_STATE_KEY = "turma.glasses.app";
 
 // Pure: AppState -> what the background snapshot should record. Exported for
 // direct unit testing of every screen's mapping.

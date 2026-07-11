@@ -2,7 +2,7 @@
 //
 // Ported from ClaudeHUD's proven `plugin/src/audio.ts` pattern (WS-first,
 // mic-second on start; mic-off-always on every teardown path), fitted to
-// this package's hub protocol (`agent-hub/server.js`'s `/audio` handler):
+// this package's hub protocol (`turma/server.js`'s `/audio` handler):
 // connect `ws(s)://<hub>/audio?auth=<token>`, stream raw 16kHz s16le mono
 // PCM as binary frames, send a `{"type":"finalize"}` text frame to trigger
 // transcription, receive one `{"type":"audio_result",...}` text frame, then

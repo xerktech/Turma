@@ -2,7 +2,7 @@
 
 ## Context
 
-The AgentHub glasses client (`glasses/`) works end to end, and we're now refining
+The Turma glasses client (`glasses/`) works end to end, and we're now refining
 the session screen. Three problems today:
 
 1. There's no persistent input affordance — dictating a reply goes through a

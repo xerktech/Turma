@@ -1,5 +1,5 @@
 // Unit tests for tunnel-agent.js's live transcript-tail helpers (node:test,
-// built-in — matches agent-hub/tests' zero-npm-dependency stance). CI runs
+// built-in — matches turma/tests' zero-npm-dependency stance). CI runs
 // them in a throwaway node:24-alpine container: `node --test agent/tests/`.
 //
 // These helpers are a JS re-implementation of hub-agent.py's transcript_tail /
@@ -19,7 +19,7 @@ const assert = require("node:assert/strict");
 const PROJECTS_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "tunnel-tail-"));
 process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
-process.env.HUB_TOKEN = "x";
+process.env.TURMA_TOKEN = "x";
 
 const { projectSlug, transcriptTail, entryText, newestTranscript, pokeHeartbeat } = require("../tunnel-agent.js");
 
@@ -33,7 +33,7 @@ function writeTranscript(worktreePath, name, entries) {
 }
 
 test("projectSlug maps every non-alphanumeric char to '-' (dotted worktree paths)", () => {
-  assert.equal(projectSlug("/mnt/data/.agenthub/worktrees/abc"), "-mnt-data--agenthub-worktrees-abc");
+  assert.equal(projectSlug("/mnt/data/.turma/worktrees/abc"), "-mnt-data--turma-worktrees-abc");
 });
 
 test("entryText: string content, ANSI-stripped list content, tool_use, drops", () => {

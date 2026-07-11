@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AgentHub agent safety guard — a Claude Code ``PreToolUse`` hook.
+"""Turma agent safety guard — a Claude Code ``PreToolUse`` hook.
 
 Every session runs the agent with ``--permission-mode bypassPermissions`` so it
 can do whatever a task needs (read, write, run builds/tests, git, network) with
@@ -15,7 +15,7 @@ three narrow categories.
    ``reset --hard`` onto a protected branch), and database drops
    (``DROP DATABASE``/``TABLE``). Denied with a reason the model self-corrects
    from. A specific destructive command an operator wants to permit can be
-   allowlisted via ``$AGENTHUB_TOOL_GRANTS`` (a CSV of ``Bash(<command>)``
+   allowlisted via ``$TURMA_TOOL_GRANTS`` (a CSV of ``Bash(<command>)``
    patterns) — the exact command only, never a blanket grant.
 
 2. **policy** — PR-workflow rules, enforced hard (no override): pushing to or
@@ -27,7 +27,7 @@ three narrow categories.
    (``Co-Authored-By: ... Claude``/``Anthropic``, ``Generated with Claude``,
    the robot emoji, ``noreply@anthropic.com``). Denied with a reason so the
    agent rewrites the message and continues. Disable with
-   ``$AGENTHUB_NO_ATTRIBUTION=0``.
+   ``$TURMA_NO_ATTRIBUTION=0``.
 
 Everything else is allowed (the hook exits 0 silently, deferring to the normal
 — here, bypass — flow).
@@ -520,8 +520,8 @@ def main(argv: list[str] | None = None) -> int:
 
     tool_name = event.get("tool_name") or ""
     tool_input = event.get("tool_input") or {}
-    overrides = _parse_overrides(os.environ.get("AGENTHUB_TOOL_GRANTS"))
-    no_attribution = os.environ.get("AGENTHUB_NO_ATTRIBUTION", "1") != "0"
+    overrides = _parse_overrides(os.environ.get("TURMA_TOOL_GRANTS"))
+    no_attribution = os.environ.get("TURMA_NO_ATTRIBUTION", "1") != "0"
 
     decision, reason, _category = decide(
         tool_name,

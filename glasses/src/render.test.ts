@@ -78,7 +78,7 @@ describe("render: home", () => {
     expect(model.type).toBe("lines");
     const lines = asLines(model);
 
-    expect(lines[0]).toBe("AGENTHUB 1 run · 1 ask");
+    expect(lines[0]).toBe("TURMA 1 run · 1 ask");
     expect(lines).toContain("> alpha");
     expect(lines.some((l) => l.includes("! alpha·repoA"))).toBe(true);
     expect(lines.some((l) => l.includes("? alpha·repoB"))).toBe(true);
@@ -109,7 +109,7 @@ describe("render: home", () => {
     const state = base({ agents, home: { cursor: 0 } });
 
     const lines = asLines(render(state));
-    expect(lines[0]).toBe("AGENTHUB 0 run · 0 ask");
+    expect(lines[0]).toBe("TURMA 0 run · 0 ask");
     // Never split into pages: no "p/N" footer, ever.
     expect(lines.some((l) => /^p\d+\/\d+$/.test(l))).toBe(false);
     // Header + one full window of content (DISPLAY_LINES-1 rows) = DISPLAY_LINES.
@@ -133,7 +133,7 @@ describe("render: home", () => {
 
   it("does not show an expired flash", () => {
     const state = base({ flash: "hub unreachable", flashUntil: NOW - 1000 });
-    expect(asLines(render(state))[0]).toBe("AGENTHUB 0 run · 0 ask");
+    expect(asLines(render(state))[0]).toBe("TURMA 0 run · 0 ask");
   });
 });
 

@@ -26,10 +26,10 @@ describe("BridgeStorage", () => {
     const storage = new BridgeStorage(bridge);
     const value = JSON.stringify({ hubUrl: "https://agents.example.com", pollMs: 6000 });
 
-    await storage.set("agenthub.glasses.config", value);
-    expect(bridge.store["agenthub.glasses.config"]).toBe(value);
+    await storage.set("turma.glasses.config", value);
+    expect(bridge.store["turma.glasses.config"]).toBe(value);
 
-    const raw = await storage.get("agenthub.glasses.config");
+    const raw = await storage.get("turma.glasses.config");
     expect(raw).toBe(value);
     expect(JSON.parse(raw as string)).toEqual({ hubUrl: "https://agents.example.com", pollMs: 6000 });
   });

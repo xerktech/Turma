@@ -15,7 +15,7 @@ COPY server.js ./
 COPY public ./public
 
 LABEL org.opencontainers.image.source="https://github.com/xerktech/DockerOps" \
-      org.opencontainers.image.description="agent-hub: dashboard for headless Claude Code containers"
+      org.opencontainers.image.description="turma: dashboard for headless Claude Code containers"
 
 EXPOSE 8300
 # /healthz is the one unauthenticated route — /api/agents now 401s without

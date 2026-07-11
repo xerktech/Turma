@@ -253,13 +253,13 @@ class TestHookEntrypoint(unittest.TestCase):
         cmd = "git commit -m 'x' -m 'Co-Authored-By: Claude'"
         proc = self._run_hook(
             {"tool_name": "Bash", "tool_input": {"command": cmd}},
-            {"AGENTHUB_NO_ATTRIBUTION": "0"},
+            {"TURMA_NO_ATTRIBUTION": "0"},
         )
         self.assertEqual(proc.stdout.strip(), "")
 
     def test_env_override_allows_destructive(self):
         event = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /opt/app"}}
-        proc = self._run_hook(event, {"AGENTHUB_TOOL_GRANTS": "Bash(rm -rf /opt/app)"})
+        proc = self._run_hook(event, {"TURMA_TOOL_GRANTS": "Bash(rm -rf /opt/app)"})
         self.assertEqual(proc.stdout.strip(), "")
 
     def test_malformed_input_fails_open(self):

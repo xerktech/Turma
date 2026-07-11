@@ -288,7 +288,7 @@ class TestSpawnOptionHelpers(unittest.TestCase):
 class ProjectDirMixin:
     """Temp PROJECTS_ROOT + a project dir for a fake worktree path."""
 
-    WORKDIR = "/w/.agenthub/worktrees/repo"
+    WORKDIR = "/w/.turma/worktrees/repo"
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="hub-agent-test-")
@@ -375,7 +375,7 @@ class TestLastEntry(ProjectDirMixin, unittest.TestCase):
 
 
 class TestSessionReport(ProjectDirMixin, unittest.TestCase):
-    PR1 = "https://github.com/xerktech/AgentHub/pull/34"
+    PR1 = "https://github.com/xerktech/Turma/pull/34"
     PR2 = "https://github.com/xerktech/DockerOps/pull/7"
 
     def entry_with_text(self, text):
@@ -606,7 +606,7 @@ class TestRegistryPersistence(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         self.assertEqual(sm.registry, [])  # fresh boot: no registry file
         sm.registry = [
-            {"id": "ab123", "repo": "AgentHub", "status": "running", "ttydPort": 7700},
+            {"id": "ab123", "repo": "Turma", "status": "running", "ttydPort": 7700},
             {"id": "cd456", "repo": "DockerOps", "status": "stopped", "ttydPort": 7701},
         ]
         sm.save()
@@ -672,7 +672,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.save = mock.Mock()
 
         cmds = [
-            {"cmdId": "c1", "type": "spawn", "repo": "AgentHub"},
+            {"cmdId": "c1", "type": "spawn", "repo": "Turma"},
             {"cmdId": "c2", "type": "kill", "sessionId": "ab123"},
             {"type": "kill", "sessionId": "no-cmd-id"},  # no cmdId -> ignored
             "not-a-dict",                                 # garbage -> ignored
@@ -680,7 +680,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         self.assertTrue(sm.handle_commands(cmds))
         # spawn now threads the composer options (all None for a bare command).
         sm.spawn.assert_called_once_with(
-            "AgentHub", prompt=None, label=None, base_ref=None,
+            "Turma", prompt=None, label=None, base_ref=None,
             model=None, permission_mode=None,
         )
         sm.kill.assert_called_once_with("ab123")
@@ -699,12 +699,12 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.spawn = mock.Mock()
         sm.save = mock.Mock()
         sm.handle_commands([{
-            "cmdId": "c9", "type": "spawn", "repo": "AgentHub",
+            "cmdId": "c9", "type": "spawn", "repo": "Turma",
             "prompt": "fix the bug", "label": "Fix login", "baseRef": "main",
             "model": "opus", "permissionMode": "plan",
         }])
         sm.spawn.assert_called_once_with(
-            "AgentHub", prompt="fix the bug", label="Fix login", base_ref="main",
+            "Turma", prompt="fix the bug", label="Fix login", base_ref="main",
             model="opus", permission_mode="plan",
         )
 
@@ -712,8 +712,8 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sm.prune_repo = mock.Mock()
         sm.save = mock.Mock()
-        sm.handle_commands([{"cmdId": "cp", "type": "prune", "repo": "AgentHub"}])
-        sm.prune_repo.assert_called_once_with("AgentHub")
+        sm.handle_commands([{"cmdId": "cp", "type": "prune", "repo": "Turma"}])
+        sm.prune_repo.assert_called_once_with("Turma")
         self.assertIn("cp", sm.acked)
 
     def test_unknown_type_and_poison_command_still_acked(self):
@@ -745,21 +745,21 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         return sm
 
     def test_spawn_creates_registry_entry(self):
-        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
-        sm.spawn("AgentHub")
+        sm.spawn("Turma")
         self.assertEqual(len(sm.registry), 1)
         sess = sm.registry[0]
         self.assertEqual(sess["status"], "running")
-        self.assertEqual(sess["repo"], "AgentHub")
+        self.assertEqual(sess["repo"], "Turma")
         # The app creates no branch — the worktree is detached, the agent branches.
         self.assertIsNone(sess["branch"])
         self.assertEqual(sess["ttydPort"], ha.TTYD_PORT_BASE)
         self.assertEqual(sess["tmuxName"], f"agent-{sess['id']}")
-        self.assertTrue(sess["rcName"].endswith(f"-AgentHub-{sess['id']}"))
+        self.assertTrue(sess["rcName"].endswith(f"-Turma-{sess['id']}"))
         self.assertEqual(
             sess["worktreePath"],
-            os.path.join(ha.WORKTREES_ROOT, "AgentHub", sess["id"]),
+            os.path.join(ha.WORKTREES_ROOT, "Turma", sess["id"]),
         )
         # git worktree add --detach (no -b) went through run_ok
         wt = next(c for c in self.run_ok_calls if "worktree" in c and "add" in c)
@@ -767,13 +767,13 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertNotIn("-b", wt)
 
     def test_spawn_refused_at_max_sessions(self):
-        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
         p = mock.patch.object(ha, "MAX_SESSIONS", 1)
         p.start()
         self.addCleanup(p.stop)
         sm.registry = [{"id": "aaaaa", "status": "running", "ttydPort": 7700}]
-        sm.spawn("AgentHub")
+        sm.spawn("Turma")
         self.assertEqual(len(sm.registry), 1)  # unchanged
 
     def test_spawn_refused_for_unknown_repo(self):
@@ -782,9 +782,9 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.registry, [])
 
     def test_kill_drops_record_but_keeps_worktree(self):
-        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
-        sm.spawn("AgentHub")
+        sm.spawn("Turma")
         sid = sm.registry[0]["id"]
         sm.usage_cache[sid] = {"totals": {}}
         self.run_ok_calls.clear()
@@ -807,9 +807,9 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertTrue(any(c.get("id") == sid for c in sm.closed))
 
     def test_delete_removes_worktree_but_touches_no_branch(self):
-        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
-        sm.spawn("AgentHub")
+        sm.spawn("Turma")
         sid = sm.registry[0]["id"]
         os.makedirs(sm.registry[0]["worktreePath"], exist_ok=True)  # so it's removed
         self.run_calls.clear()
@@ -881,9 +881,9 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         app branch) and launches with bypassPermissions, no --model, no
         positional prompt. (No default base resolves under the fake git, so the
         detach point is HEAD — nothing trails the worktree path.)"""
-        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
-        sm.spawn("AgentHub")
+        sm.spawn("Turma")
         sess = sm.registry[0]
         self.assertEqual(sess["status"], "running")
         wt = self._worktree_add_cmd()
@@ -901,7 +901,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(loaded["hooks"]["PreToolUse"][0]["matcher"], "Bash")
 
     def test_spawn_threads_all_options(self):
-        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
 
         # Make the base ref resolve (branch_exists -> run rev-parse --verify).
@@ -913,7 +913,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-        sm.spawn("AgentHub", prompt="fix the bug", label="Fix Login",
+        sm.spawn("Turma", prompt="fix the bug", label="Fix Login",
                  base_ref="develop", model="opus",
                  permission_mode="acceptEdits")
         sess = sm.registry[0]
@@ -926,7 +926,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["permissionMode"], "acceptEdits")
         self.assertEqual(sess["baseRef"], "develop")
         # Label (slugged) flavors the RC display name.
-        self.assertTrue(sess["rcName"].endswith("-AgentHub-Fix-Login"), sess["rcName"])
+        self.assertTrue(sess["rcName"].endswith("-Turma-Fix-Login"), sess["rcName"])
         # worktree add is detached and forks off the chosen base ref.
         wt = self._worktree_add_cmd()
         self.assertIn("--detach", wt)
@@ -940,31 +940,31 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertTrue(cmd.endswith(" -- 'fix the bug'"), cmd)
 
     def test_spawn_permission_mode_default_omits_flag(self):
-        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
-        sm.spawn("AgentHub", permission_mode="default")
+        sm.spawn("Turma", permission_mode="default")
         self.assertNotIn("--permission-mode", self._claude_cmd())
 
     def test_spawn_prompt_is_shell_quoted(self):
-        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
-        sm.spawn("AgentHub", prompt="rm -rf / ; echo $HOME `whoami`")
+        sm.spawn("Turma", prompt="rm -rf / ; echo $HOME `whoami`")
         cmd = self._claude_cmd()
         # The whole prompt is one shlex-quoted token after `--`; no metachar leaks.
         self.assertIn(" -- '", cmd)
         self.assertTrue(cmd.rstrip().endswith("'"))
 
     def test_spawn_rejects_missing_base_ref(self):
-        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
         # ManagerMixin's run() returns "" for everything, so no base ref resolves.
-        sm.spawn("AgentHub", base_ref="does-not-exist")
+        sm.spawn("Turma", base_ref="does-not-exist")
         self.assertEqual(sm.registry[0]["status"], "error")
 
     def test_spawn_rejects_unknown_model(self):
-        repo = {"name": "AgentHub", "path": os.path.join(self.tmp, "AgentHub")}
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
-        sm.spawn("AgentHub", model="gpt-5")
+        sm.spawn("Turma", model="gpt-5")
         self.assertEqual(sm.registry[0]["status"], "error")
 
     # --- root (repos-root) sessions ---------------------------------------
@@ -1133,7 +1133,7 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
 
 
 class TestHistoryCommand(ManagerMixin, unittest.TestCase):
-    WORKDIR = "/w/.agenthub/worktrees/repo"
+    WORKDIR = "/w/.turma/worktrees/repo"
 
     def _running_session(self, sm, sid="abcde", workdir=None):
         workdir = workdir or self.WORKDIR
@@ -1346,19 +1346,19 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
 
 class TestNormalizeGithubRepo(unittest.TestCase):
     def test_plain_owner_repo(self):
-        self.assertEqual(ha.normalize_github_repo("xerktech/AgentHub"), "xerktech/AgentHub")
-        self.assertEqual(ha.normalize_github_repo("  xerktech/AgentHub  "), "xerktech/AgentHub")
+        self.assertEqual(ha.normalize_github_repo("xerktech/Turma"), "xerktech/Turma")
+        self.assertEqual(ha.normalize_github_repo("  xerktech/Turma  "), "xerktech/Turma")
 
     def test_urls_and_git_suffix(self):
         self.assertEqual(
-            ha.normalize_github_repo("https://github.com/xerktech/AgentHub.git"),
-            "xerktech/AgentHub")
+            ha.normalize_github_repo("https://github.com/xerktech/Turma.git"),
+            "xerktech/Turma")
         self.assertEqual(
-            ha.normalize_github_repo("https://github.com/xerktech/AgentHub/"),
-            "xerktech/AgentHub")
+            ha.normalize_github_repo("https://github.com/xerktech/Turma/"),
+            "xerktech/Turma")
         self.assertEqual(
-            ha.normalize_github_repo("git@github.com:xerktech/AgentHub.git"),
-            "xerktech/AgentHub")
+            ha.normalize_github_repo("git@github.com:xerktech/Turma.git"),
+            "xerktech/Turma")
 
     def test_keeps_dots_and_dashes_in_names(self):
         self.assertEqual(ha.normalize_github_repo("my-org/re.po_name-1"), "my-org/re.po_name-1")
@@ -1393,7 +1393,7 @@ class TestListGithubRepos(unittest.TestCase):
             by_owner={
                 None: [],  # the login owns no personal repos (the org case)
                 "xerktech": [
-                    {"nameWithOwner": "xerktech/AgentHub", "updatedAt": "2026-07-02", "isPrivate": True},
+                    {"nameWithOwner": "xerktech/Turma", "updatedAt": "2026-07-02", "isPrivate": True},
                     {"nameWithOwner": "xerktech/DockerOps", "updatedAt": "2026-07-01"},
                 ],
             },
@@ -1402,9 +1402,9 @@ class TestListGithubRepos(unittest.TestCase):
                 mock.patch.dict(os.environ, {}, clear=True):
             repos = ha.list_github_repos()
         names = [r["nameWithOwner"] for r in repos]
-        self.assertEqual(names, ["xerktech/AgentHub", "xerktech/DockerOps"])  # newest first
+        self.assertEqual(names, ["xerktech/Turma", "xerktech/DockerOps"])  # newest first
         self.assertTrue(repos[0]["isPrivate"])
-        self.assertEqual(repos[0]["name"], "AgentHub")
+        self.assertEqual(repos[0]["name"], "Turma")
 
     def test_own_orgs_and_env_owners_merged_and_deduped(self):
         fake = self._fake_run(
@@ -1451,17 +1451,17 @@ class TestClone(ManagerMixin, unittest.TestCase):
 
     def test_existing_dest_refused_without_popen(self):
         sm = self.make_manager()
-        os.makedirs(os.path.join(self.repos_root, "AgentHub"))
+        os.makedirs(os.path.join(self.repos_root, "Turma"))
         with mock.patch.object(ha.subprocess, "Popen") as popen:
-            sm.clone("xerktech/AgentHub")
+            sm.clone("xerktech/Turma")
             popen.assert_not_called()
-        job = sm.clones["AgentHub"]
+        job = sm.clones["Turma"]
         self.assertEqual(job["status"], "error")
         self.assertIn("already exists", job["error"])
 
     def test_clone_launches_git_and_finishes_on_poll(self):
         sm = self.make_manager()
-        dest = os.path.join(self.repos_root, "AgentHub")
+        dest = os.path.join(self.repos_root, "Turma")
 
         class FakeProc:
             def poll(self_inner):
@@ -1473,15 +1473,15 @@ class TestClone(ManagerMixin, unittest.TestCase):
                 pass
 
         with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()) as popen:
-            sm.clone("xerktech/AgentHub")
+            sm.clone("xerktech/Turma")
             # git clone <url> <dest> was launched (not a session run_ok call).
             args = popen.call_args[0][0]
             self.assertEqual(args[:2], ["git", "clone"])
-            self.assertIn("https://github.com/xerktech/AgentHub.git", args)
+            self.assertIn("https://github.com/xerktech/Turma.git", args)
             self.assertIn(dest, args)
-        self.assertEqual(sm.clones["AgentHub"]["status"], "cloning")
+        self.assertEqual(sm.clones["Turma"]["status"], "cloning")
         sm._poll_clones()
-        self.assertEqual(sm.clones["AgentHub"]["status"], "done")
+        self.assertEqual(sm.clones["Turma"]["status"], "done")
         # The serializable view never leaks the Popen/file handles.
         payload = sm._clones_payload()[0]
         self.assertEqual(set(payload), {"name", "repo", "status", "error", "startedAt"})
@@ -1497,9 +1497,9 @@ class TestClone(ManagerMixin, unittest.TestCase):
                 pass
 
         with mock.patch.object(ha.subprocess, "Popen", return_value=FailProc()):
-            sm.clone("xerktech/AgentHub")
+            sm.clone("xerktech/Turma")
         sm._poll_clones()
-        self.assertEqual(sm.clones["AgentHub"]["status"], "error")
+        self.assertEqual(sm.clones["Turma"]["status"], "error")
 
 
 class TestCleanSummary(unittest.TestCase):
@@ -1633,12 +1633,12 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
 
 class TestProjectSlug(unittest.TestCase):
     def test_every_non_alphanumeric_becomes_dash(self):
-        # Claude Code slugs dots too: /repos/.agenthub/... -> -repos--agenthub-...
+        # Claude Code slugs dots too: /repos/.turma/... -> -repos--turma-...
         # (observed on disk; the old '/'-only mapping missed every worktree
-        # transcript because of the '.agenthub' path segment).
+        # transcript because of the '.turma' path segment).
         self.assertEqual(
-            ha._project_slug("/repos/.agenthub/worktrees/CoinBox-46578"),
-            "-repos--agenthub-worktrees-CoinBox-46578",
+            ha._project_slug("/repos/.turma/worktrees/CoinBox-46578"),
+            "-repos--turma-worktrees-CoinBox-46578",
         )
 
     def test_plain_path_matches_old_rule(self):
@@ -1657,7 +1657,7 @@ class TestScanRepos(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         os.makedirs(os.path.join(tmp, "RepoA", ".git"))
         os.makedirs(os.path.join(tmp, "plainDir"))
-        os.makedirs(os.path.join(tmp, ".agenthub", "worktrees"))
+        os.makedirs(os.path.join(tmp, ".turma", "worktrees"))
         os.makedirs(os.path.join(tmp, ".hidden", ".git"))
         with open(os.path.join(tmp, "afile"), "w") as f:
             f.write("x")

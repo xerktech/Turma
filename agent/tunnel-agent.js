@@ -1,16 +1,16 @@
 #!/usr/bin/env node
-// Reverse-tunnel client for the agent-hub terminal gateway (compose/claude-code.yaml).
+// Reverse-tunnel client for the turma terminal gateway (compose/claude-code.yaml).
 //
-// Runs in the background of every AgentHub container (started by
+// Runs in the background of every Turma container (started by
 // entrypoint.sh) alongside hub-agent.py — ONE control channel per host, keyed
 // by the host name. It keeps a persistent OUTBOUND WebSocket to the hub's
-// control endpoint. When a browser opens a session's terminal in the Agent Hub,
+// control endpoint. When a browser opens a session's terminal in the Turma,
 // the hub sends {"open":<ch>,"port":<ttydPort>} on that control channel; we then
 // dial back a data WebSocket for <ch> and bridge it to THAT session's local ttyd
 // (127.0.0.1:<port>). The host multiplexes N per-session ttyds (one per port,
 // allocated from TTYD_PORT_BASE by the manager); data channels fan out to them
 // by port while the single control channel stays per-host. Because every
-// connection here is outbound to HUB_URL, the hub and this container can live on
+// connection here is outbound to TURMA_URL, the hub and this container can live on
 // different hosts/networks — no inbound reachability required.
 //
 // Zero dependencies: Node's built-in global WebSocket does all client-side
@@ -22,11 +22,11 @@ const os = require("os");
 const path = require("path");
 const { execFileSync, execFile } = require("child_process");
 
-const HUB_URL = process.env.HUB_URL || "http://agent-hub:8300";
-// Same agent token hub-agent.py heartbeats with (the hub's HUB_AGENT_TOKEN).
+const TURMA_URL = process.env.TURMA_URL || "http://turma:8300";
+// Same agent token hub-agent.py heartbeats with (the hub's TURMA_AGENT_TOKEN).
 // Sent as a query param because the browser-style WebSocket client can't set
 // an Authorization header.
-const TOKEN = process.env.HUB_TOKEN || "";
+const TOKEN = process.env.TURMA_TOKEN || "";
 const TTYD_HOST = "127.0.0.1";
 // Fallback ttyd port when the hub doesn't specify one in the open message
 // (safety only — the multiplexed sessions always send their own port).
@@ -295,7 +295,7 @@ function stopAllWatches() {
 
 // Nudge the session-manager process (hub-agent.py) to heartbeat immediately so
 // a just-queued hub command is delivered in that beat's reply rather than up
-// to a whole HUB_INTERVAL later. entrypoint.sh `exec`s hub-agent.py as PID 1
+// to a whole TURMA_INTERVAL later. entrypoint.sh `exec`s hub-agent.py as PID 1
 // and starts this tunnel as a child, so PID 1 is the manager; it installs a
 // SIGUSR1 handler that cuts its interval sleep short. Best-effort — a failed
 // signal (e.g. running outside that entrypoint) just falls back to the
@@ -308,8 +308,8 @@ function pokeHeartbeat() {
   }
 }
 
-// ws(s):// base derived from HUB_URL's scheme.
-const WS_BASE = HUB_URL.replace(/^http/, "ws").replace(/\/+$/, "");
+// ws(s):// base derived from TURMA_URL's scheme.
+const WS_BASE = TURMA_URL.replace(/^http/, "ws").replace(/\/+$/, "");
 
 function log(msg) {
   console.log(`[tunnel-agent] ${msg}`);

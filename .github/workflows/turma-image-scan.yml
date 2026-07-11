@@ -1,22 +1,22 @@
-name: scan-agent-hub-image
+name: scan-turma-image
 
-# On PRs to main that touch the /agent-hub build context, build the image
+# On PRs to main that touch the /turma build context, build the image
 # locally (no push) and scan it for OS/library CVEs and leaked secrets with
-# Trivy. Pre-merge counterpart to build-agent-hub-image.yml (push only on main).
+# Trivy. Pre-merge counterpart to build-turma-image.yml (push only on main).
 #
 # Runs on the home-lab self-hosted runners; Trivy installed from its release
-# tarball, no SARIF upload (no GHAS) — see agent-image-scan.yml for the full
+# tarball, no SARIF upload (no GHAS) — see turma-agent-image-scan.yml for the full
 # rationale.
 on:
   pull_request:
     branches: [main]
     paths:
-      - "agent-hub/**"
+      - "turma/**"
       - ".trivyignore"
-      - ".github/workflows/agent-hub-image-scan.yml"
+      - ".github/workflows/turma-image-scan.yml"
 
 concurrency:
-  group: agent-hub-image-scan-${{ github.ref }}
+  group: turma-image-scan-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -27,9 +27,9 @@ jobs:
     runs-on: [self-hosted, linux]
     env:
       # Unique per-run tag: concurrent scans of different PRs on one runner
-      # would otherwise overwrite each other's local/agent-hub:pr-scan
+      # would otherwise overwrite each other's local/turma:pr-scan
       # mid-scan, and it lets cleanup remove exactly this run's image.
-      SCAN_TAG: local/agent-hub:pr-${{ github.run_id }}
+      SCAN_TAG: local/turma:pr-${{ github.run_id }}
     steps:
       - name: Reset workspace ownership
         run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
@@ -38,10 +38,10 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Build agent-hub image (local, no push)
+      - name: Build turma image (local, no push)
         uses: docker/build-push-action@v7
         with:
-          context: ./agent-hub
+          context: ./turma
           load: true
           push: false
           tags: ${{ env.SCAN_TAG }}
@@ -68,7 +68,7 @@ jobs:
 
       # TMPDIR/--cache-dir → runner.temp so Trivy's uncompressed-layer scratch
       # export lands on the roomy _work volume instead of the runner's small
-      # /tmp. See agent-image-scan.yml for the full rationale (that larger image
+      # /tmp. See turma-agent-image-scan.yml for the full rationale (that larger image
       # is what actually exhausted /tmp).
       - name: Trivy image scan
         env:
@@ -88,7 +88,7 @@ jobs:
       # docker daemon run after run until the disk fills (which has taken CI
       # down). Remove only this run's tag plus dangling layers — pulled base
       # images stay for other jobs. Deliberately NOT `docker builder prune`:
-      # the agent + agent-hub scan jobs run concurrently on one runner, and an
+      # the turma-agent + turma scan jobs run concurrently on one runner, and an
       # `-a` cache prune here aborts the other job's in-flight build with
       # "graceful_stop". Build cache is bounded by buildkit GC + the gha cache,
       # so it isn't the leak. Never fails the job.

@@ -410,7 +410,7 @@ describe("EvenHubDisplay", () => {
       // Going "back home" — a lines screen. The session layout (containers
       // 1-4) is on screen, so a bare textContainerUpgrade to container 0
       // would no-op; this must rebuild back to one container.
-      display.render(linesModel(["AGENTHUB 0 run", "  + New session"]));
+      display.render(linesModel(["TURMA 0 run", "  + New session"]));
 
       expect(rebuildCalls).toHaveLength(2);
       const backContainers = rebuildCalls[1]!.textObject!;
@@ -421,7 +421,7 @@ describe("EvenHubDisplay", () => {
       expect(single.isEventCapture).toBe(1);
       expect(single.width).toBe(576);
       expect(single.height).toBe(288);
-      expect(single.content).toBe("AGENTHUB 0 run\n  + New session");
+      expect(single.content).toBe("TURMA 0 run\n  + New session");
       // The transition rebuilds — it does not route through the in-place
       // upgrade path.
       expect(upgradeCalls.length).toBe(upgradesBeforeBack);

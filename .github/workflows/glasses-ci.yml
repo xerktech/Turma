@@ -6,7 +6,7 @@ name: glasses-ci
 # on the runner, so the whole npm workflow (install/typecheck/test/build)
 # runs inside a throwaway node:24-alpine container (Docker Hub pull — the
 # runner can't auth to ghcr.io), same pattern as code-scan.yml's Node test
-# job and agent-image.yml's version-lookup step.
+# job and turma-agent-image.yml's version-lookup step.
 on:
   pull_request:
     branches: [main]

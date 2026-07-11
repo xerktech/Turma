@@ -6,8 +6,8 @@ name: code-scan
 #   - hadolint : Dockerfile best-practice/quality lint (both Dockerfiles)
 #   - ShellCheck: shell correctness for entrypoint.sh
 #   - tests    : behavioral unit tests for agent/hub-agent.py (stdlib unittest)
-#                and agent-hub/server.js (built-in node:test) — see agent/tests/
-#                and agent-hub/tests/
+#                and turma/server.js (built-in node:test) — see agent/tests/
+#                and turma/tests/
 # Findings block the PR. Runs on open AND on later pushes to the PR (default
 # pull_request types) so every commit is re-checked.
 #
@@ -23,7 +23,7 @@ on:
     branches: [main]
     paths:
       - "agent/**"
-      - "agent-hub/**"
+      - "turma/**"
       - ".github/workflows/code-scan.yml"
 
 concurrency:
@@ -59,7 +59,7 @@ jobs:
       #     terminated at the Cloudflare tunnel, behind HTTP Basic auth.
       #   - missing-user-entrypoint: the containers must run as root (full host
       #     access for the RC listener / docker socket).
-      #   - dynamic-urllib-use-detected: the URL is HUB_URL from the trusted
+      #   - dynamic-urllib-use-detected: the URL is TURMA_URL from the trusted
       #     compose env, not attacker-controlled input.
       # Everything else stays blocking, so new injection/secret/unsafe-eval
       # style issues still fail the PR.
@@ -98,7 +98,7 @@ jobs:
       # Blocks only on error-level issues; warnings (e.g. unpinned apt) are
       # surfaced without failing. Tighten to `warning` to gate harder.
       - name: Run hadolint
-        run: hadolint --failure-threshold error agent/Dockerfile agent-hub/Dockerfile
+        run: hadolint --failure-threshold error agent/Dockerfile turma/Dockerfile
 
   shellcheck:
     name: ShellCheck
@@ -131,7 +131,7 @@ jobs:
       # throwaway node:24-alpine container (Docker Hub pull — the runner can't
       # auth to ghcr.io), same pattern as the build workflow's version lookup.
       # node:test is built in; the tests have zero npm dependencies.
-      - name: Node unit tests (agent-hub/server.js + agent/tunnel-agent.js)
+      - name: Node unit tests (turma/server.js + agent/tunnel-agent.js)
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE":/workspace -w /workspace node:24-alpine \
-            sh -c 'node --test agent-hub/tests/*.test.js agent/tests/*.test.js'
+            sh -c 'node --test turma/tests/*.test.js agent/tests/*.test.js'
