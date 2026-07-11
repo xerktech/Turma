@@ -93,6 +93,11 @@ CLOSED_PATH = os.path.join(REGISTRY_DIR, "closed.json")
 # Only the newest N closed sessions per repo are kept/offered for resume —
 # bounds both the file and the heartbeat payload.
 CLOSED_PER_REPO = 5
+# Durable worktree-path -> {repo, remote, slug} attribution ledger. Written at
+# spawn and NEVER dropped on kill/delete, so a transcript's token usage stays
+# traceable to its repo long after the session (and even its worktree) is gone.
+# This is what makes host/repo usage persist regardless of active sessions.
+USAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "repo-usage.json")
 # Where Claude Code keeps per-project transcript JSONLs (slug = cwd via
 # _project_slug below). Overridable so the test suite can point it at
 # fixtures; unset in production, so the default is the real path.
@@ -657,26 +662,35 @@ def memory_usage():
 HISTORY_DAYS = 60  # per-day breakdown reported to the hub (bounds payload size)
 
 
-def usage_report(workdir):
-    """Aggregate token usage for this project from the transcript JSONLs."""
-    slug = _project_slug(workdir)
-    proj = os.path.join(PROJECTS_ROOT, slug)
-    totals = {"input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0}
-    days = {}  # "YYYY-MM-DD" (UTC) -> same shape as totals
-    models = {}
-    unpriced = set()  # model ids with token usage that no pricing entry matched
-    seen = set()
-    last_ts = ""
-    sessions = 0
-    today_str = time.strftime("%Y-%m-%d")
+def _blank_bucket():
+    return {"input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0}
 
+
+class _UsageAcc:
+    """Mutable accumulator folded over one or more Claude project dirs. Kept
+    separate from the public report shape so several worktrees' transcripts can
+    be aggregated into one repo total (share one `seen` set so a message can't
+    double-count across a repo's worktrees)."""
+
+    def __init__(self):
+        self.totals = _blank_bucket()
+        self.days = {}      # "YYYY-MM-DD" (UTC) -> bucket
+        self.models = {}    # model id -> message count
+        self.unpriced = set()
+        self.seen = set()   # (message id, requestId) dedup keys
+        self.last_ts = ""
+        self.sessions = 0   # transcript files folded in
+
+
+def _aggregate_project(proj, acc):
+    """Fold one Claude project dir's transcript token usage into `acc`. Silently
+    no-ops on a missing/unreadable dir (the source of truth is best-effort)."""
     try:
         files = [f for f in os.listdir(proj) if f.endswith(".jsonl")]
     except OSError:
-        return None
-
+        return
     for fname in files:
-        sessions += 1
+        acc.sessions += 1
         try:
             with open(os.path.join(proj, fname), errors="replace") as f:
                 for line in f:
@@ -691,15 +705,15 @@ def usage_report(workdir):
                     if not isinstance(usage, dict):
                         continue
                     key = (msg.get("id"), entry.get("requestId"))
-                    if key[0] and key in seen:
+                    if key[0] and key in acc.seen:
                         continue
-                    seen.add(key)
+                    acc.seen.add(key)
 
                     ts = entry.get("timestamp") or ""
-                    if ts > last_ts:
-                        last_ts = ts
+                    if ts > acc.last_ts:
+                        acc.last_ts = ts
                     model = msg.get("model") or "unknown"
-                    models[model] = models.get(model, 0) + 1
+                    acc.models[model] = acc.models.get(model, 0) + 1
 
                     tok = (
                         usage.get("input_tokens", 0) or 0,
@@ -723,17 +737,12 @@ def usage_report(workdir):
                     # in so the UI never understates cost silently.
                     is_unpriced = price is None and any(tok)
                     if is_unpriced:
-                        unpriced.add(model)
-                    buckets = [totals]
+                        acc.unpriced.add(model)
+                    buckets = [acc.totals]
                     # Transcript timestamps are UTC ISO; date-prefix bucketing
                     # is close enough for a dashboard.
                     if len(ts) >= 10:
-                        buckets.append(
-                            days.setdefault(
-                                ts[:10],
-                                {"input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0},
-                            )
-                        )
+                        buckets.append(acc.days.setdefault(ts[:10], _blank_bucket()))
                     for b in buckets:
                         b["input"] += tok[0]
                         b["output"] += tok[1]
@@ -745,24 +754,132 @@ def usage_report(workdir):
         except OSError:
             continue
 
-    totals["cost"] = round(totals["cost"], 2)
-    days = {d: days[d] for d in sorted(days)[-HISTORY_DAYS:]}
+
+def _finalize_usage(acc):
+    """Turn an accumulator into the public report shape (rounded costs, capped
+    day window, today's bucket, model ranking)."""
+    today_str = time.strftime("%Y-%m-%d")
+    acc.totals["cost"] = round(acc.totals["cost"], 2)
+    days = {d: acc.days[d] for d in sorted(acc.days)[-HISTORY_DAYS:]}
     for day in days.values():
         day["cost"] = round(day["cost"], 2)
-    today = days.get(
-        today_str, {"input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0}
-    )
+    today = days.get(today_str, _blank_bucket())
     return {
-        "totals": totals,
+        "totals": acc.totals,
         "today": today,
         "days": days,
-        "sessions": sessions,
-        "lastActivity": last_ts,
-        "models": sorted(models, key=models.get, reverse=True),
+        "sessions": acc.sessions,
+        "lastActivity": acc.last_ts,
+        "models": sorted(acc.models, key=acc.models.get, reverse=True),
         # Models whose usage no pricing entry matched (their cost counted as
         # $0.00) — the UI flags any figure that includes them.
-        "unpricedModels": sorted(unpriced),
+        "unpricedModels": sorted(acc.unpriced),
     }
+
+
+def usage_report(workdir):
+    """Aggregate token usage for one session's project (its worktree cwd) from
+    the transcript JSONLs. Returns None when the project dir doesn't exist."""
+    proj = os.path.join(PROJECTS_ROOT, _project_slug(workdir))
+    if not os.path.isdir(proj):
+        return None
+    acc = _UsageAcc()
+    _aggregate_project(proj, acc)
+    return _finalize_usage(acc)
+
+
+def _merge_acc(dst, src):
+    """Fold accumulator `src` into `dst` (pre-finalize, so costs stay full
+    precision). Buckets are copied by value, so later finalizing one side never
+    disturbs the other."""
+    for k in ("input", "output", "cacheWrite", "cacheRead", "cost"):
+        dst.totals[k] += src.totals[k]
+    if src.totals.get("unpriced"):
+        dst.totals["unpriced"] = True
+    for d, b in src.days.items():
+        tgt = dst.days.setdefault(d, _blank_bucket())
+        for k in ("input", "output", "cacheWrite", "cacheRead", "cost"):
+            tgt[k] += b[k]
+        if b.get("unpriced"):
+            tgt["unpriced"] = True
+    for m, c in src.models.items():
+        dst.models[m] = dst.models.get(m, 0) + c
+    dst.unpriced |= src.unpriced
+    dst.seen |= src.seen
+    dst.sessions += src.sessions
+    if src.last_ts > dst.last_ts:
+        dst.last_ts = src.last_ts
+
+
+def normalize_remote(remote):
+    """Stable cross-host identity for a git origin URL, so the same repo cloned
+    on several hosts unifies. Drops scheme, credentials, user@, :port, trailing
+    slash and .git, then lowercases — collapsing e.g.
+    git@github.com:Xerk/DockerOps.git and https://github.com/Xerk/DockerOps to
+    github.com/xerk/dockerops. Empty string when there's no remote."""
+    if not remote:
+        return ""
+    r = remote.strip()
+    m = re.match(r"^[\w.+-]+@([^:/]+):(.+)$", r)  # scp-like git@host:owner/repo
+    if m:
+        r = m.group(1) + "/" + m.group(2)
+    else:
+        r = re.sub(r"^[a-zA-Z][\w.+-]*://", "", r)  # strip scheme
+        r = re.sub(r"^[^/@]+@", "", r)              # strip user[:pass]@ creds
+    r = re.sub(r":\d+/", "/", r, count=1)           # strip :port after host
+    r = r.rstrip("/")
+    if r.endswith(".git"):
+        r = r[:-4]
+    return r.lower()
+
+
+def _usage_is_empty(report):
+    t = report["totals"]
+    return not any(t.get(k) for k in ("input", "output", "cacheWrite", "cacheRead"))
+
+
+def repo_usage_report(ledger):
+    """Aggregate token usage per repo across ALL known worktree transcripts, plus
+    a merged host-level total. `ledger` maps worktreePath -> {repo, remote, slug}.
+    Usage is folded from PROJECTS_ROOT by slug, so a repo's figure spans every
+    worktree it ever had and survives kill AND delete (the transcripts outlive
+    both). Each repo carries `remoteKey` (normalized origin) so the hub can unify
+    the same repo across hosts.
+
+    Returns (repo_usage, host_usage): repo_usage is
+    [{repo, remote, remoteKey, usage}] sorted by cost desc (repos that never
+    spent anything are omitted); host_usage is the merged report, or None when no
+    transcript exists at all."""
+    by_repo = {}  # repo name -> {"remote": str, "slugs": set()}
+    for path, meta in (ledger or {}).items():
+        meta = meta or {}
+        repo = meta.get("repo") or "?"
+        slug = meta.get("slug") or _project_slug(path)
+        g = by_repo.setdefault(repo, {"remote": "", "slugs": set()})
+        g["slugs"].add(slug)
+        if not g["remote"] and meta.get("remote"):
+            g["remote"] = meta["remote"]
+
+    repo_usage = []
+    host = _UsageAcc()
+    for repo, g in by_repo.items():
+        acc = _UsageAcc()
+        for slug in g["slugs"]:
+            _aggregate_project(os.path.join(PROJECTS_ROOT, slug), acc)
+        _merge_acc(host, acc)  # fold into the host total (seen-set union dedups)
+        report = _finalize_usage(acc)
+        if _usage_is_empty(report):
+            continue
+        repo_usage.append({
+            "repo": repo,
+            "remote": g["remote"],
+            "remoteKey": normalize_remote(g["remote"]) or repo,
+            "usage": report,
+        })
+
+    host_usage = _finalize_usage(host) if host.sessions else None
+    repo_usage.sort(key=lambda r: r["usage"]["totals"]["cost"], reverse=True)
+    return repo_usage, host_usage
 
 
 PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
@@ -1394,6 +1511,14 @@ class SessionManager:
 
         self.registry = self._load_list(REGISTRY_PATH)  # persisted live sessions
         self.closed = self._load_list(CLOSED_PATH)      # killed-but-resumable
+        # Durable worktreePath -> {repo, remote, slug} attribution map, so a
+        # transcript's usage stays traceable to its repo after kill/delete.
+        self.usage_ledger = self._load_ledger()
+        # Cached host/repo usage aggregated across ALL known transcripts (refreshed
+        # on the slow USAGE_EVERY cadence, reported every beat, independent of the
+        # live registry so it persists regardless of active sessions).
+        self.repo_usage = []
+        self.host_usage = None
         self.ttyd = {}                           # id -> ttyd Popen (in-memory)
         self.sess_state = {}                     # id -> session_report offsets
         self.usage_cache = {}                    # id -> usage_report result
@@ -1439,6 +1564,62 @@ class SessionManager:
                 os.replace(tmp, path)
         except OSError as e:
             log(f"registry save failed: {e}")
+
+    # --- usage attribution ledger -----------------------------------------
+
+    def _load_ledger(self):
+        try:
+            with open(USAGE_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_ledger(self):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = USAGE_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.usage_ledger, f, indent=2)
+            os.replace(tmp, USAGE_LEDGER_PATH)
+        except OSError as e:
+            log(f"usage ledger save failed: {e}")
+
+    def _remember_usage(self, sess):
+        """Record a session's worktree -> repo attribution so its transcript's
+        token usage stays traceable to the repo forever (survives kill/delete).
+        Idempotent; keyed by worktree path (root sessions key on REPOS_ROOT).
+        `remote` is the repo's git origin, used cross-host to unify the same
+        repo across hosts."""
+        path = sess.get("worktreePath")
+        if not path:
+            return
+        remote = ""
+        try:
+            remote = run(["git", "remote", "get-url", "origin"],
+                         cwd=sess.get("repoPath") or path) or ""
+        except Exception:
+            pass
+        self.usage_ledger[path] = {
+            "repo": sess.get("repo"),
+            "remote": remote,
+            "slug": _project_slug(path),
+        }
+        self._save_ledger()
+
+    def _prune_ledger(self):
+        """Drop ledger entries whose transcript dir no longer exists — nothing
+        left to attribute, so the map can't grow without bound. Runs on the slow
+        usage cadence."""
+        stale = [
+            p for p, m in self.usage_ledger.items()
+            if not os.path.isdir(os.path.join(
+                PROJECTS_ROOT, (m or {}).get("slug") or _project_slug(p)))
+        ]
+        if stale:
+            for p in stale:
+                self.usage_ledger.pop(p, None)
+            self._save_ledger()
 
     def _find(self, sid):
         return next((s for s in self.registry if s.get("id") == sid), None)
@@ -1722,6 +1903,10 @@ class SessionManager:
                 self._worktree_add(sess, base_ref=resolved_base)
             self._launch_tmux(sess, prompt=(prompt or None))
             self._launch_ttyd(sess)
+            # Record the worktree -> repo attribution so this session's token
+            # usage stays traceable to its repo after it (and its worktree) are
+            # gone — the basis of persistent host/repo usage.
+            self._remember_usage(sess)
             # Name the session from its initial prompt, once, in the background
             # (no-op when there's no prompt). Never blocks the spawn.
             self._start_summary(sess, prompt)
@@ -2380,6 +2565,41 @@ class SessionManager:
         except Exception as e:
             log(f"usage parse failed for {sid}: {e}")
 
+    def _backfill_ledger(self):
+        """Ensure live and recently-closed sessions are in the attribution
+        ledger — covers the first run after upgrade (ledger empty but transcripts
+        already on disk) and any session predating _remember_usage."""
+        changed = False
+        for s in list(self.registry) + list(self.closed):
+            path = s.get("worktreePath")
+            if not path or path in self.usage_ledger:
+                continue
+            remote = ""
+            try:
+                remote = run(["git", "remote", "get-url", "origin"],
+                             cwd=s.get("repoPath") or path) or ""
+            except Exception:
+                pass
+            self.usage_ledger[path] = {
+                "repo": s.get("repo"),
+                "remote": remote,
+                "slug": _project_slug(path),
+            }
+            changed = True
+        if changed:
+            self._save_ledger()
+
+    def _refresh_repo_usage(self):
+        """Recompute the persistent host/repo usage from every known transcript.
+        Independent of the live registry, so killed/deleted sessions still count.
+        Runs on the slow usage cadence (the parse is the expensive part)."""
+        self._backfill_ledger()
+        self._prune_ledger()
+        try:
+            self.repo_usage, self.host_usage = repo_usage_report(self.usage_ledger)
+        except Exception as e:
+            log(f"repo usage parse failed: {e}")
+
     def _session_payload(self, sess):
         sid = sess["id"]
         running = sess.get("status") == "running"
@@ -2493,6 +2713,9 @@ class SessionManager:
         if beat % USAGE_EVERY == 0:
             for s in self.registry:
                 self._refresh_usage(s["id"], s["worktreePath"])
+            # Persistent host/repo usage — the whole-fleet, session-independent
+            # aggregation that survives kill/delete.
+            self._refresh_repo_usage()
         for s in self.registry:
             if s["id"] not in self.usage_cache:
                 self._refresh_usage(s["id"], s["worktreePath"])
@@ -2518,6 +2741,11 @@ class SessionManager:
             "repos": self._sorted_repo_entries(),
             "sessions": [self._session_payload(s) for s in self.registry],
             "closedSessions": self._closed_payload(),
+            # Persistent usage, independent of active sessions: per-repo (keyed by
+            # normalized origin so the hub can unify a repo across hosts) plus this
+            # host's merged total. Survives kill/delete/prune.
+            "repoUsage": self.repo_usage,
+            "usage": self.host_usage,
             # GitHub clone-into-root: availability + clonable repos for the hub's
             # clone control, and any in-flight/recent clone jobs.
             "github": self.github,
