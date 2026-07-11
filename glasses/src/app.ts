@@ -1,4 +1,4 @@
-import type { HubClient } from "./hub-client.ts";
+import type { HubClient, QueuedResponse } from "./hub-client.ts";
 import type { GlassesDisplay } from "./display/index.ts";
 import type { Dictation, DictationResult } from "./dictation.ts";
 import { emptyBuffer, mergeTail, prependHistory, type TranscriptBuffer } from "./transcript.ts";
@@ -905,8 +905,9 @@ export class App {
 
   // Sheet-mode dispatch (Task 6): scroll moves `selected` through
   // [...options, "Dictate answer…"], clamped; tap on an option index sends
-  // that 1-based digit as the answer (the agent appends Enter) and hands
-  // focus back to the transcript; tap on the trailing "Dictate answer…" row
+  // that 0-based optionIndex as a structured answer (answerQuestion → the
+  // agent drops the ask.py bridge's answer file) and hands focus back to the
+  // transcript; tap on the trailing "Dictate answer…" row
   // starts box dictation instead of answering directly — that flips
   // questionSheetActive false for the rest of the flow (mic goes hot, then a
   // draft lands), so the box renders/dispatches as plain input from here,
@@ -935,10 +936,9 @@ export class App {
     }
     if (e.type === "tap") {
       if (s.selected < options.length) {
-        const digit = String(s.selected + 1);
         this.markPending(s.sessionId, live);
         void this.client
-          .sendInput(s.hostKey, s.sessionId, digit)
+          .answerQuestion(s.hostKey, s.sessionId, { optionIndex: s.selected })
           .then(() => {
             this.flash(FLASH_QUEUED);
             this.repaint();
@@ -1128,8 +1128,7 @@ export class App {
         const draft = sess && sess.hostKey === hostKey && sess.sessionId === sessionId ? sess.draft : "";
         const s = findSession(this.state, hostKey, sessionId);
         this.markPending(sessionId, s);
-        void this.client
-          .sendInput(hostKey, sessionId, draft)
+        void this.submitText(hostKey, sessionId, draft)
           .then(() => {
             this.flash(FLASH_QUEUED);
             this.repaint();
@@ -1271,13 +1270,24 @@ export class App {
     }
   }
 
+  // Free-text submit to a running session. When a question is pending on that
+  // session, a dictated/typed string is its free-text ("Other") answer, so it
+  // rides answerQuestion (optionIndex -1) to the ask.py bridge; otherwise it's
+  // an ordinary message typed into the session via sendInput.
+  private submitText(hostKey: string, sessionId: string, text: string): Promise<QueuedResponse> {
+    const s = findSession(this.state, hostKey, sessionId);
+    if (s?.session?.question) {
+      return this.client.answerQuestion(hostKey, sessionId, { optionIndex: -1, custom: text });
+    }
+    return this.client.sendInput(hostKey, sessionId, text);
+  }
+
   private sendReply(r: ReplyScreenState): void {
     if (r.target.kind === "session") {
       const { hostKey, sessionId } = r.target;
       const s = findSession(this.state, hostKey, sessionId);
       this.markPending(sessionId, s);
-      void this.client
-        .sendInput(hostKey, sessionId, r.text)
+      void this.submitText(hostKey, sessionId, r.text)
         .then(() => {
           this.flash(FLASH_QUEUED);
           this.repaint();

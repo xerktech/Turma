@@ -87,6 +87,28 @@ describe("HubClient", () => {
     expect(JSON.parse(init.body as string)).toEqual({ text: "hello" });
   });
 
+  it("answerQuestion POSTs {optionIndex} to .../sessions/<id>/answer", async () => {
+    const fetchFn = fakeFetch({ ok: true, cmdId: "y" });
+    const client = new HubClient({ config, fetchFn });
+
+    await client.answerQuestion("host1", "sess1", { optionIndex: 2 });
+
+    const [url, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://hub.example.com/api/agents/host1/sessions/sess1/answer");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ optionIndex: 2 });
+  });
+
+  it("answerQuestion carries {custom} and defaults a missing optionIndex to -1", async () => {
+    const fetchFn = fakeFetch({ ok: true, cmdId: "y" });
+    const client = new HubClient({ config, fetchFn });
+
+    await client.answerQuestion("host1", "sess1", { custom: "other thing" });
+
+    const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ optionIndex: -1, custom: "other thing" });
+  });
+
   it("getHistory returns {status:200, body} on a resolved history", async () => {
     const payload = { entries: [], truncated: false, fetchedAt: 111 };
     const fetchFn = fakeFetch(payload, 200);

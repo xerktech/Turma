@@ -1096,13 +1096,31 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/input -> forward free-text input
-      // to a running session (e.g. answering a pending question). Body: {text}.
+      // to a running session (typing a message into the session). Body: {text}.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "input") {
         const body = JSON.parse((await readBody(req)) || "{}");
         const text = typeof body.text === "string" ? body.text : "";
         if (!text.trim()) return json(res, 400, { error: "text required" });
         if (text.length > 4000) return json(res, 400, { error: "text too long" });
         const cmdId = queueCommand(key, { type: "input", sessionId, text });
+        return json(res, 200, { ok: true, cmdId });
+      }
+      // POST /api/agents/<host>/sessions/<id>/answer -> answer a pending
+      // AskUserQuestion. Body: {optionIndex} (0-based option pick) and/or
+      // {custom} (free-text / "Other" answer). The agent drops the answer file
+      // the ask.py bridge is blocked on. optionIndex -1 (or omitted) means a
+      // pure free-text answer; a valid answer needs at least one of the two.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "answer") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const optionIndex = Number.isInteger(body.optionIndex) ? body.optionIndex : -1;
+        const custom = typeof body.custom === "string" ? body.custom : "";
+        if (optionIndex < 0 && !custom.trim()) {
+          return json(res, 400, { error: "optionIndex or custom required" });
+        }
+        if (custom.length > 4000) return json(res, 400, { error: "custom too long" });
+        const cmd = { type: "answerQuestion", sessionId, optionIndex };
+        if (custom) cmd.custom = custom;
+        const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });
       }
       // GET /api/agents/<host>/sessions/<id>/history -> that session's recent

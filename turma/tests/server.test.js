@@ -844,6 +844,64 @@ test("http: input endpoint 404s unknown host and requires user auth", async () =
   assert.equal(noAuth.status, 401);
 });
 
+// ---- session answer endpoint -----------------------------------------------------
+
+test("http: answer endpoint queues an answerQuestion command with the option pick", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "ha1" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/ha1/sessions/sess1/answer", {
+    body: { optionIndex: 2 }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "ha1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "answerQuestion", sessionId: "sess1", optionIndex: 2, cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: answer endpoint carries free-text custom and defaults optionIndex to -1", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "ha2" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/ha2/sessions/sess1/answer", {
+    body: { custom: "do the other thing" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "ha2" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "answerQuestion", sessionId: "sess1", optionIndex: -1,
+      custom: "do the other thing", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: answer endpoint rejects an empty answer and over-long custom", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "ha3" }, headers: agentHeaders });
+
+  const empty = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
+    body: {}, headers: userHeaders,
+  });
+  assert.equal(empty.status, 400);
+  assert.deepEqual(empty.body, { error: "optionIndex or custom required" });
+
+  const long = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
+    body: { custom: "a".repeat(4001) }, headers: userHeaders,
+  });
+  assert.equal(long.status, 400);
+  assert.deepEqual(long.body, { error: "custom too long" });
+});
+
+test("http: answer endpoint 404s unknown host and requires user auth", async () => {
+  const unknownHost = await request("POST", "/api/agents/ghost/sessions/sess1/answer", {
+    body: { optionIndex: 0 }, headers: userHeaders,
+  });
+  assert.equal(unknownHost.status, 404);
+
+  const noAuth = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
+    body: { optionIndex: 0 },
+  });
+  assert.equal(noAuth.status, 401);
+});
+
 // ---- session history endpoint ----------------------------------------------------
 
 test("http: history endpoint returns 202 pending on cache miss, single-flight on repeat GET", async () => {

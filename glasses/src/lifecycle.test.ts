@@ -113,6 +113,7 @@ function fakeClient(overrides: Record<string, ReturnType<typeof vi.fn>> = {}) {
     sessionAction: vi.fn(async () => ({ ok: true, cmdId: "action-1" })),
     deleteSession: vi.fn(async () => ({ ok: true })),
     sendInput: vi.fn(async () => ({ ok: true, cmdId: "input-1" })),
+    answerQuestion: vi.fn(async () => ({ ok: true, cmdId: "answer-1" })),
     getHistory: vi.fn(async () => ({
       status: 200 as const,
       body: { entries: [], truncated: false, fetchedAt: Date.now() },

@@ -32,9 +32,9 @@ Token usage is parsed from the transcript JSONLs under
 /root/.claude/projects/<slug>/ (slug = worktree path via _project_slug); this is the
 same data ccusage reads. Live-session signals are bridge-pointer presence,
 transcript freshness, the newest entry's role/tool-use, any pending
-AskUserQuestion (read from the transcript once answered, but from the live
-tmux pane while still pending — Claude flushes the tool_use only on answer),
-and PR URLs newly appended to the transcript.
+AskUserQuestion (surfaced by the ask.py PreToolUse bridge as a request file
+under QUESTIONS_DIR while the question blocks; a transcript scan is a fallback
+for the already-answered case), and PR URLs newly appended to the transcript.
 
 stdlib only — no pip installs in the image.
 """
@@ -88,6 +88,10 @@ WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".turma", "worktrees")
 # Persisted session registry (survives container restart).
 REGISTRY_DIR = os.path.expanduser("~/.turma")
 REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
+# Rendezvous dir for the AskUserQuestion bridge (agent/hooks/ask.py). A pending
+# question lives here as `<sessionId>.req.json`; the answer the glasses client
+# sends rides back as `<sessionId>.ans.json`. See _hook_question / answer_question.
+QUESTIONS_DIR = os.path.join(REGISTRY_DIR, "questions")
 # Killed-but-resumable session history (branch + transcript survive a kill).
 CLOSED_PATH = os.path.join(REGISTRY_DIR, "closed.json")
 # Only the newest N closed sessions per repo are kept/offered for resume —
@@ -126,24 +130,6 @@ TAIL_MSG_CHARS_FULL = int(os.environ.get("SESSION_TAIL_MSG_CHARS_FULL", "16000")
 # Terminal color/cursor codes sometimes make it into pasted transcript text;
 # strip them so the glasses client only ever sees plain text.
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-# ---- pending-question detection from the live TUI pane -------------------
-# A pending AskUserQuestion is answered before Claude flushes the tool_use to
-# the transcript, so the transcript-based scan below can't see it while it's
-# actually pending (it only appears once already answered). The one place the
-# pending question is live is the session's tmux pane, where Claude renders an
-# interactive numbered picker. These parse that pane. Box-drawing glyphs Claude
-# wraps its prompts in (stripped from line edges + used to spot separators).
-_BOX_CHARS = "─│╭╮╰╯├┤┬┴┼━┃┏┓┗┛═║╔╗╚╝╌╎┄┆┈┊"
-# A picker option line, e.g. "❯ 1. Turma", "  2) Tutela", "│ 3. Vexillum │"
-# (edges already trimmed). The leading run soaks up the selection cursor and
-# any bullet/space noise before the number.
-PANE_OPTION_RE = re.compile(r"^[\s>❯›▶▸⟩◉●○◯*.\-]*([1-9])[.)]\s+(\S.*?)\s*$")
-# Selection-cursor glyphs Claude marks the highlighted row with. Requiring one
-# in the numbered block distinguishes a live picker from an ordinary numbered
-# list the assistant merely printed and then went idle on (which would other-
-# wise surface as a phantom question). Tune here if a first on-hardware test
-# shows a different glyph.
-PANE_CURSOR_CHARS = "❯›▶▸⟩"
 # Glasses-client on-demand commands: how much typed text `input` accepts per
 # call, and how many surviving messages an on-demand `history` request returns
 # (independent of the per-heartbeat TAIL_MSGS above).
@@ -379,22 +365,47 @@ def guard_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "guard.py")
 
 
-def build_guard_settings(python_exe=None, guard_path=None):
-    """Build the dict passed to ``claude --settings``: a ``PreToolUse`` guard
-    hook over Bash plus deny rules protecting the host credential stores. The
-    bypass-mode session runs freely except for what the guard blocks (see
-    ``hooks/guard.py``)."""
+def ask_script_path():
+    """Absolute path to the bundled AskUserQuestion bridge hook (``hooks/ask.py``),
+    resolved the same way as ``guard_script_path``."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "ask.py")
+
+
+# The ask.py bridge blocks the AskUserQuestion tool call while it waits for the
+# glasses answer, so its Claude-Code hook timeout must comfortably exceed the
+# bridge's own per-question block (TURMA_QUESTION_TIMEOUT_SEC, default 600) or
+# Claude would kill the hook first. A little headroom over the 600s default.
+ASK_HOOK_TIMEOUT_SEC = 660
+
+
+def build_guard_settings(python_exe=None, guard_path=None, ask_path=None):
+    """Build the dict passed to ``claude --settings``: ``PreToolUse`` hooks over
+    Bash (the safety guard) and AskUserQuestion (the glasses answer bridge),
+    plus deny rules protecting the host credential stores. The bypass-mode
+    session runs freely except for what the guard blocks (see ``hooks/guard.py``);
+    the ask bridge routes interactive questions to the glasses (see
+    ``hooks/ask.py``)."""
     python_exe = python_exe or sys.executable or "python3"
     guard_path = guard_path or guard_script_path()
-    hook_command = f'"{python_exe}" "{guard_path}"'
+    ask_path = ask_path or ask_script_path()
+    guard_command = f'"{python_exe}" "{guard_path}"'
+    ask_command = f'"{python_exe}" "{ask_path}"'
     return {
         "permissions": {"deny": list(_GUARD_DENY_PATH_RULES)},
         "hooks": {
             "PreToolUse": [
                 {
                     "matcher": "Bash",
-                    "hooks": [{"type": "command", "command": hook_command}],
-                }
+                    "hooks": [{"type": "command", "command": guard_command}],
+                },
+                {
+                    "matcher": "AskUserQuestion",
+                    "hooks": [{
+                        "type": "command",
+                        "command": ask_command,
+                        "timeout": ASK_HOOK_TIMEOUT_SEC,
+                    }],
+                },
             ]
         },
     }
@@ -1028,81 +1039,32 @@ def _history_entries(path):
     return entries, byte_capped
 
 
-def _is_border_line(clean):
-    """True for a box border/separator line (mostly box-drawing glyphs) — a
-    hard stop when scanning upward for the question text so a bordered header
-    like `╭─ Name pick ─╮` never gets mistaken for the question itself."""
-    dense = clean.replace(" ", "")
-    if not dense:
-        return False
-    box = sum(ch in _BOX_CHARS for ch in dense)
-    return box / len(dense) >= 0.5
-
-
-def parse_pane_question(pane_text):
-    """Extract a pending AskUserQuestion from a captured tmux pane, or
-    (None, []). Recognizes Claude's interactive numbered picker: a run of
-    options numbered 1..N (>=2), at least one carrying a selection cursor, with
-    the question text on the nearest non-empty line above them.
-
-    Deliberately conservative — it fills in only when the transcript scan found
-    nothing, so a false positive would surface a phantom question sheet on the
-    glasses. The cursor-glyph requirement is what keeps an ordinary numbered
-    list the assistant printed (and then went idle on) from tripping it."""
-    if not pane_text:
+def _hook_question(session_id):
+    """Read a pending AskUserQuestion published by the ask.py PreToolUse bridge
+    for `session_id`, as (question, options) or (None, []). The bridge blocks
+    the tool call while this request file exists, so its presence is an exact
+    "a question is waiting right now" signal — no pane scraping, no transcript
+    timing. Best-effort: a missing/half-written file is just no question."""
+    if not session_id:
         return None, []
-    lines = ANSI_RE.sub("", pane_text).splitlines()
-    # Edge-trimmed body of each line (box side-rails removed) so a boxed or
-    # bare picker parse the same way; keep them aligned with `lines` by index.
-    bodies = [ln.strip().strip(_BOX_CHARS).strip() for ln in lines]
-
-    # Walk top-down collecting the consecutive 1..N option run. A line that
-    # doesn't advance the expected number (a wrapped label, a blank) is skipped
-    # rather than breaking the run, so long labels don't truncate it.
-    opts = []            # (line_index, label)
-    expected = 1
-    for i, body in enumerate(bodies):
-        m = PANE_OPTION_RE.match(body)
-        if m and int(m.group(1)) == expected:
-            opts.append((i, m.group(2).strip()))
-            expected += 1
-    if len(opts) < 2:
+    path = os.path.join(QUESTIONS_DIR, f"{session_id}.req.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            req = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
         return None, []
-
-    # A live picker highlights one row with a cursor glyph; an inert printed
-    # list has none. Check the raw option lines (pre-body-trim) for one.
-    first_i = opts[0][0]
-    last_i = opts[-1][0]
-    if not any(any(c in lines[i] for c in PANE_CURSOR_CHARS) for i in range(first_i, last_i + 1)):
+    if not isinstance(req, dict):
         return None, []
-
-    # Question: nearest non-empty, non-option, non-border line above the run.
-    question = None
-    for j in range(first_i - 1, -1, -1):
-        body = bodies[j]
-        if not body:
-            continue
-        if _is_border_line(body) or PANE_OPTION_RE.match(body):
-            break
-        question = body.lstrip("●○◉?›❯▶▸ ").strip()
-        break
-    if not question:
-        return None, []
-    labels = [label[:80] for _, label in opts[:4]]
-    return question[:300], labels
+    question = str(req.get("question") or "")[:300] or None
+    opts = req.get("options") or []
+    labels = [
+        opt["label"][:80] for opt in opts[:4]
+        if isinstance(opt, dict) and isinstance(opt.get("label"), str)
+    ]
+    return question, labels
 
 
-def _pane_question(tmux_name):
-    """Capture a session's tmux pane and parse a pending AskUserQuestion from
-    it, or (None, []). Best-effort: a missing pane / capture failure is just no
-    question, never an error that could stall the heartbeat."""
-    if not tmux_name:
-        return None, []
-    pane = run(["tmux", "capture-pane", "-p", "-t", tmux_name])
-    return parse_pane_question(pane)
-
-
-def session_report(workdir, state, tmux_name=None):
+def session_report(workdir, state, tmux_name=None, session_id=None):
     """Cheap per-heartbeat session signals (stat + tail reads, no full parse).
 
     state carries per-file byte offsets between beats so the PR-URL scan only
@@ -1122,23 +1084,21 @@ def session_report(workdir, state, tmux_name=None):
         "lastHasToolUse": False,
         "question": None,          # pending AskUserQuestion text, if any
         "questionOptions": [],     # pending AskUserQuestion option labels, if any
-        "questionSource": None,    # "transcript" | "pane" | None — which detector fired
+        "questionSource": None,    # "transcript" | "hook" | None — which detector fired
         "prUrls": [],              # PR links newly appended since last beat
         "tail": [],                # recent transcript messages, for the glasses client
     }
 
     def _finish():
-        # A pending AskUserQuestion is invisible to the transcript scan above
-        # (Claude flushes the tool_use only once the question is answered), so
-        # whenever the transcript turned up nothing, read the question live from
-        # the session's TUI pane instead — that's the one place it exists while
-        # actually pending.
-        if not report["question"]:
-            pq, popts = _pane_question(tmux_name)
-            if pq:
-                report["question"] = pq
-                report["questionOptions"] = popts
-                report["questionSource"] = "pane"
+        # The ask.py PreToolUse bridge publishes a request file for exactly as
+        # long as a question is actually blocking the tool call, so it's the
+        # authoritative pending signal — prefer it over the transcript scan
+        # (which can only see a question once it's already answered/denied).
+        hq, hopts = _hook_question(session_id)
+        if hq:
+            report["question"] = hq
+            report["questionOptions"] = hopts
+            report["questionSource"] = "hook"
         return report
 
     newest, newest_mtime = None, 0.0
@@ -1509,6 +1469,11 @@ class SessionManager:
         self.claude_version = run(["claude", "--version"])
         self.device = device_name()
 
+        # AskUserQuestion bridge rendezvous dir (ask.py writes req files here).
+        try:
+            os.makedirs(QUESTIONS_DIR, exist_ok=True)
+        except OSError:
+            pass
         self.registry = self._load_list(REGISTRY_PATH)  # persisted live sessions
         self.closed = self._load_list(CLOSED_PATH)      # killed-but-resumable
         # Durable worktreePath -> {repo, remote, slug} attribution map, so a
@@ -1754,6 +1719,17 @@ class SessionManager:
         claude_cmd = " ".join(parts)
         if prompt:
             claude_cmd += f" -- {shlex.quote(prompt)}"
+        # The AskUserQuestion bridge (hooks/ask.py) reads these off the claude
+        # process env to key its request/answer rendezvous files. Prefixed as
+        # shell assignments so tmux's `sh -c` exports them to claude and its
+        # hook subprocesses. Only sessions launched with --settings get the
+        # bridge; the one-shot summary claude (no --settings) has neither var,
+        # so ask.py passes through there.
+        env_prefix = (
+            f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
+            f"TURMA_QUESTIONS_DIR={shlex.quote(QUESTIONS_DIR)} "
+        )
+        claude_cmd = env_prefix + claude_cmd
         run(["tmux", "kill-session", "-t", sess["tmuxName"]])  # ensure clean slate
         rc, err = run_ok([
             "tmux", "new-session", "-d", "-s", sess["tmuxName"],
@@ -1829,6 +1805,10 @@ class SessionManager:
         self.sess_state.pop(sid, None)
         self.usage_cache.pop(sid, None)
         self.pending_prs.pop(sid, None)
+        # A killed/deleted session's tmux (and its blocked ask.py hook) is gone;
+        # drop any leftover question rendezvous files so a dead question can't
+        # surface as a phantom on the next beat.
+        self._clear_question_files(sid)
 
     def _set_error(self, sess, msg):
         sess["status"] = "error"
@@ -2061,6 +2041,7 @@ class SessionManager:
         try:
             self._kill_tmux(sess)          # ends the current claude
             self.sess_state.pop(sid, None)  # fresh freshness/PR tracking
+            self._clear_question_files(sid)  # drop any question the old claude was blocked on
             self._launch_tmux(sess)         # drops bridge-pointer + new claude
             self._launch_ttyd(sess)         # (re)ensure ttyd if it had died
             sess["errorMsg"] = None
@@ -2097,17 +2078,14 @@ class SessionManager:
     # --- on-demand input/history (glasses client) --------------------------
 
     def send_input(self, sid, text):
-        """Type text into a running session's Claude TUI via tmux send-keys:
-        one literal keystroke send (-l — no key-name interpretation, no
-        shell) followed by a separate Enter. This is also the path an
-        AskUserQuestion answer rides: the glasses client sends the digit
-        "1".."4" through this same method (it moves the TUI's selection) and
-        the Enter this method sends confirms it in the Remote Control TUI;
-        free-text answers go through the same path but are best-effort and
-        need on-hardware verification. `--` ends tmux's own option parsing
-        before the literal text so a dictated/typed string that happens to
-        start with '-' (e.g. "-1 on that idea") isn't misread as more
-        send-keys flags; -l still applies to everything after it."""
+        """Type free-text into a running session's Claude TUI via tmux send-keys:
+        one literal keystroke send (-l — no key-name interpretation, no shell)
+        followed by a separate Enter. This is the plain "type a message into the
+        session" path (the glasses actions-menu Send); AskUserQuestion answers
+        no longer ride it — they go through answer_question below. `--` ends
+        tmux's own option parsing before the literal text so a typed string that
+        happens to start with '-' isn't misread as more send-keys flags; -l
+        still applies to everything after it."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
@@ -2118,6 +2096,53 @@ class SessionManager:
         tmux_name = sess["tmuxName"]
         run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
         run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+
+    def _question_paths(self, sid):
+        """(req, ans) rendezvous file paths for a session's pending question."""
+        return (
+            os.path.join(QUESTIONS_DIR, f"{sid}.req.json"),
+            os.path.join(QUESTIONS_DIR, f"{sid}.ans.json"),
+        )
+
+    def _clear_question_files(self, sid):
+        """Drop any pending question rendezvous files for a session (on kill /
+        delete) so a stale question can't linger or be answered into a dead
+        hook. Best-effort — a missing file is fine."""
+        for path in self._question_paths(sid):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def answer_question(self, sid, option_index, custom):
+        """Answer a session's pending AskUserQuestion by dropping the answer file
+        the ask.py bridge is polling for. option_index is 0-based into the
+        question's options (or -1 for a free-text / "Other" answer carried in
+        custom). Only writes when a request file is actually pending, so a stray
+        answer for a session with no live question is a no-op. Written
+        atomically (temp + replace) so the blocked hook never reads a partial."""
+        sess = self._find(sid)
+        if not sess or sess.get("status") != "running":
+            return
+        req_path, ans_path = self._question_paths(sid)
+        if not os.path.exists(req_path):
+            return  # nothing waiting on this session
+        try:
+            idx = int(option_index)
+        except (TypeError, ValueError):
+            idx = -1
+        answer = {"optionIndex": idx}
+        if isinstance(custom, str) and custom.strip():
+            answer["custom"] = custom[:INPUT_MAX_CHARS]
+        elif idx < 0:
+            return  # no option and no text — nothing to answer with
+        try:
+            tmp = f"{ans_path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(answer, f)
+            os.replace(tmp, ans_path)
+        except OSError as e:
+            log(f"answer_question write failed for {sid}: {e}")
 
     def _stage_history(self, sid):
         """Handle a {type:"history"} command: locate sid's newest transcript
@@ -2539,6 +2564,12 @@ class SessionManager:
                     self.delete(cmd.get("sessionId"))
                 elif ctype == "input":
                     self.send_input(cmd.get("sessionId"), cmd.get("text") or "")
+                elif ctype == "answerQuestion":
+                    self.answer_question(
+                        cmd.get("sessionId"),
+                        cmd.get("optionIndex"),
+                        cmd.get("custom"),
+                    )
                 elif ctype == "history":
                     self._stage_history(cmd.get("sessionId"))
                 elif ctype == "clone":
@@ -2607,7 +2638,8 @@ class SessionManager:
         if running:
             try:
                 st = self.sess_state.setdefault(sid, {})
-                signals = session_report(sess["worktreePath"], st, sess.get("tmuxName"))
+                signals = session_report(sess["worktreePath"], st, sess.get("tmuxName"),
+                                         session_id=sess.get("id"))
                 pend = self.pending_prs.setdefault(sid, [])
                 pend.extend(signals.pop("prUrls"))
                 del pend[:-10]
