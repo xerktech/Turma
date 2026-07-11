@@ -1377,26 +1377,10 @@ export class App {
     if (e.type === "tap") {
       const row = rows[n.cursor];
       if (!row) return;
-      if (row.kind === "repo") {
-        this.setState({
-          screen: "newPrompt",
-          newPrompt: { hostKey: n.hostKey, repo: row.repo, cursor: 0 },
-        });
-      } else if (row.kind === "resume") {
-        this.markPending(row.closedSessionId, undefined);
-        void this.client
-          .sessionAction(n.hostKey, row.closedSessionId, "resume")
-          .then(() => {
-            this.flash(FLASH_QUEUED);
-            this.nudgePoll();
-            this.repaint();
-          })
-          .catch(() => {
-            this.flash(FLASH_HUB_UNREACHABLE);
-            this.repaint();
-          });
-        this.goHome();
-      }
+      this.setState({
+        screen: "newPrompt",
+        newPrompt: { hostKey: n.hostKey, repo: row.repo, cursor: 0 },
+      });
     }
   }
 
