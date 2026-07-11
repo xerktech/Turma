@@ -230,6 +230,8 @@
   button:hover:not(:disabled) { border-color: var(--ink-2); }
   button.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
   button.confirm { border-color: var(--critical); color: var(--critical); font-weight: 600; }
+  button.kill-btn { border-color: var(--critical); color: var(--critical); font-weight: 600; }
+  button.kill-btn.armed { background: var(--critical); color: #fff; border-color: var(--critical); }
   button.btn-sm { padding: 4px 10px; font-size: 12px; }
   button:disabled { opacity: 0.5; cursor: default; }
 
@@ -347,6 +349,7 @@
       <span class="t-title">Live session · <span class="path" id="termTitle"></span></span>
       <span class="spacer"></span>
       <a id="termOpen" target="_blank" rel="noopener">Open in new tab ↗</a>
+      <button class="kill-btn" id="termKill" onclick="killCurrentTerminal()">Kill</button>
       <button class="primary" onclick="closeTerminal()">Close (Esc)</button>
     </div>
     <iframe id="termFrame" src="about:blank" title="Live Claude session"></iframe>
@@ -1171,10 +1174,46 @@ function openTerminal(id) {
   document.getElementById("termOpen").href = src;
   $frame.src = src;
   $overlay.style.display = "flex";
+  disarmTermKill();
 }
 function closeTerminal() {
   $overlay.style.display = "none";
   $frame.src = "about:blank"; // tear down the session's WebSocket
+  disarmTermKill();
+}
+
+// Kill the attached session straight from the terminal bar. Same endpoint as the
+// card's Kill; arm-then-confirm on the button itself (this static bar isn't
+// re-rendered by the poll, so it can't share the cards' twoClick state), then
+// close the overlay since its session is going away.
+let termKillArmed = false, termKillTimer = null;
+function disarmTermKill() {
+  termKillArmed = false;
+  if (termKillTimer) { clearTimeout(termKillTimer); termKillTimer = null; }
+  const btn = document.getElementById("termKill");
+  if (btn) { btn.textContent = "Kill"; btn.classList.remove("armed"); }
+}
+function hostKeyForSession(id) {
+  for (const a of (cache.agents || []))
+    if ((a.sessions || []).some(s => s.id === id)) return a.key;
+  return null;
+}
+function killCurrentTerminal() {
+  const id = $overlay.dataset.id;
+  const btn = document.getElementById("termKill");
+  if (!id) return;
+  const key = hostKeyForSession(id);
+  if (!key) { if (btn) btn.textContent = "host offline"; return; }
+  if (!termKillArmed) {
+    termKillArmed = true;
+    if (btn) { btn.textContent = "Confirm kill"; btn.classList.add("armed"); }
+    termKillTimer = setTimeout(disarmTermKill, 3500);
+    return;
+  }
+  disarmTermKill();
+  busy(pendKey("kill", key, id), { kind: "kill", host: key, id },
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`));
+  closeTerminal();
 }
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && $overlay.style.display === "flex") closeTerminal();
