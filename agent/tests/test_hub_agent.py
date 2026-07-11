@@ -1522,20 +1522,7 @@ class TestCleanSummary(unittest.TestCase):
 
 
 class TestSessionSummaries(ManagerMixin, unittest.TestCase):
-    def _enable(self):
-        p = mock.patch.object(ha, "SESSION_SUMMARY_ENABLED", True)
-        p.start()
-        self.addCleanup(p.stop)
-
-    def test_disabled_never_launches(self):
-        sm = self.make_manager()  # feature off by default (env unset)
-        with mock.patch.object(ha.subprocess, "Popen") as popen:
-            sm._start_summary({"id": "s1"}, "do a thing")
-            popen.assert_not_called()
-        self.assertEqual(sm.summaries, {})
-
     def test_missing_prompt_skipped(self):
-        self._enable()
         sm = self.make_manager()
         with mock.patch.object(ha.subprocess, "Popen") as popen:
             sm._start_summary({"id": "s1"}, "   ")
@@ -1544,7 +1531,6 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.summaries, {})
 
     def test_launch_uses_claude_p_headless_off_the_worktree(self):
-        self._enable()
         sm = self.make_manager()
 
         class FakeProc:
@@ -1566,7 +1552,6 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
         self.assertIn("s1", sm.summaries)
 
     def test_finish_sets_name_and_reaps_job(self):
-        self._enable()
         sm = self.make_manager()
         sm.registry = [{"id": "s1", "status": "running", "summary": None}]
         sm.save = mock.Mock()
@@ -1591,7 +1576,6 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
         sm.save.assert_called_once()
 
     def test_timeout_kills_and_leaves_unnamed(self):
-        self._enable()
         sm = self.make_manager()
         sm.registry = [{"id": "s1", "status": "running", "summary": None}]
         killed = {"v": False}
@@ -1612,7 +1596,6 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
         self.assertIsNone(sm.registry[0]["summary"])
 
     def test_session_deleted_mid_summary_is_safe(self):
-        self._enable()
         sm = self.make_manager()
         sm.registry = []  # session killed/deleted while the summary ran
 
