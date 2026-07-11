@@ -502,19 +502,20 @@ const LOGIN = fs.readFileSync(path.join(__dirname, "public", "login.html"));
 // content-hash-stable so they cache hard; app.css uses a short TTL so UI edits
 // propagate on the next deploy without a stale cache.
 const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
-const readAsset = (f) => fs.readFileSync(path.join(__dirname, "public", f));
+// Filenames are hardcoded string literals (no request data reaches path.join) so
+// there's no path-traversal surface; the request only ever indexes this fixed map.
 const STATIC_ASSETS = {
-  "/app.css":              { body: readAsset("app.css"),             type: "text/css; charset=utf-8",                  cache: "public, max-age=300" },
-  "/favicon.svg":          { body: readAsset("favicon.svg"),         type: "image/svg+xml",                            cache: IMMUTABLE_CACHE },
-  "/favicon.ico":          { body: readAsset("favicon.ico"),         type: "image/x-icon",                             cache: IMMUTABLE_CACHE },
-  "/favicon-16.png":       { body: readAsset("favicon-16.png"),      type: "image/png",                                cache: IMMUTABLE_CACHE },
-  "/favicon-32.png":       { body: readAsset("favicon-32.png"),      type: "image/png",                                cache: IMMUTABLE_CACHE },
-  "/apple-touch-icon.png": { body: readAsset("apple-touch-icon.png"), type: "image/png",                               cache: IMMUTABLE_CACHE },
-  "/icon-192.png":         { body: readAsset("icon-192.png"),        type: "image/png",                                cache: IMMUTABLE_CACHE },
-  "/icon-512.png":         { body: readAsset("icon-512.png"),        type: "image/png",                                cache: IMMUTABLE_CACHE },
-  "/site.webmanifest":     { body: readAsset("site.webmanifest"),    type: "application/manifest+json; charset=utf-8", cache: "public, max-age=3600" },
-  "/fonts/inter-latin-wght-normal.woff2":         { body: readAsset("fonts/inter-latin-wght-normal.woff2"),         type: "font/woff2", cache: IMMUTABLE_CACHE },
-  "/fonts/space-grotesk-latin-wght-normal.woff2": { body: readAsset("fonts/space-grotesk-latin-wght-normal.woff2"), type: "font/woff2", cache: IMMUTABLE_CACHE },
+  "/app.css":              { body: fs.readFileSync(path.join(__dirname, "public", "app.css")),             type: "text/css; charset=utf-8",                  cache: "public, max-age=300" },
+  "/favicon.svg":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.svg")),         type: "image/svg+xml",                            cache: IMMUTABLE_CACHE },
+  "/favicon.ico":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.ico")),         type: "image/x-icon",                             cache: IMMUTABLE_CACHE },
+  "/favicon-16.png":       { body: fs.readFileSync(path.join(__dirname, "public", "favicon-16.png")),      type: "image/png",                                cache: IMMUTABLE_CACHE },
+  "/favicon-32.png":       { body: fs.readFileSync(path.join(__dirname, "public", "favicon-32.png")),      type: "image/png",                                cache: IMMUTABLE_CACHE },
+  "/apple-touch-icon.png": { body: fs.readFileSync(path.join(__dirname, "public", "apple-touch-icon.png")), type: "image/png",                               cache: IMMUTABLE_CACHE },
+  "/icon-192.png":         { body: fs.readFileSync(path.join(__dirname, "public", "icon-192.png")),        type: "image/png",                                cache: IMMUTABLE_CACHE },
+  "/icon-512.png":         { body: fs.readFileSync(path.join(__dirname, "public", "icon-512.png")),        type: "image/png",                                cache: IMMUTABLE_CACHE },
+  "/site.webmanifest":     { body: fs.readFileSync(path.join(__dirname, "public", "site.webmanifest")),    type: "application/manifest+json; charset=utf-8", cache: "public, max-age=3600" },
+  "/fonts/inter-latin-wght-normal.woff2":         { body: fs.readFileSync(path.join(__dirname, "public", "fonts", "inter-latin-wght-normal.woff2")),         type: "font/woff2", cache: IMMUTABLE_CACHE },
+  "/fonts/space-grotesk-latin-wght-normal.woff2": { body: fs.readFileSync(path.join(__dirname, "public", "fonts", "space-grotesk-latin-wght-normal.woff2")), type: "font/woff2", cache: IMMUTABLE_CACHE },
 };
 
 // Bundled web font served to the live terminal. ttyd's page is same-origin
