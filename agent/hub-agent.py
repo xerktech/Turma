@@ -365,6 +365,46 @@ _GUARD_DENY_PATH_RULES = [
     "Write(~/.config/gcloud/**)",
 ]
 
+# Operator-supplied extra permissions. Claude Code does NOT read a *user-level*
+# ~/.claude/settings.local.json — it only honors settings.local.json at the
+# PROJECT level — so any allow/deny an operator puts there is silently dropped
+# from every session. We already inject a --settings file that IS merged into
+# each session, so we fold that file's permissions.allow/deny into it and the
+# operator's pre-approvals take effect. Only the permissions block is consumed
+# (not arbitrary keys), keeping this narrow and predictable.
+USER_LOCAL_SETTINGS = os.path.join(
+    os.path.expanduser("~"), ".claude", "settings.local.json"
+)
+
+
+def operator_local_permissions(path=None):
+    """Best-effort read of permissions.allow / permissions.deny from the
+    operator's user-level ~/.claude/settings.local.json (a file Claude Code
+    itself ignores). Returns (allow, deny): de-duplicated, order-preserving
+    lists of strings. Fails open to ([], []) on a missing/malformed file or any
+    non-list / non-string content."""
+    path = path or USER_LOCAL_SETTINGS
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            perms = json.load(fh).get("permissions", {})
+    except (OSError, ValueError, AttributeError):
+        return [], []
+    if not isinstance(perms, dict):
+        return [], []
+
+    def clean(key):
+        val = perms.get(key)
+        if not isinstance(val, list):
+            return []
+        seen, out = set(), []
+        for item in val:
+            if isinstance(item, str) and item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
+    return clean("allow"), clean("deny")
+
 
 def guard_script_path():
     """Absolute path to the bundled PreToolUse guard hook. Resolves correctly
@@ -374,16 +414,28 @@ def guard_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "guard.py")
 
 
-def build_guard_settings(python_exe=None, guard_path=None):
+def build_guard_settings(python_exe=None, guard_path=None, local_settings_path=None):
     """Build the dict passed to ``claude --settings``: a ``PreToolUse`` guard
     hook over Bash plus deny rules protecting the host credential stores. The
     bypass-mode session runs freely except for what the guard blocks (see
-    ``hooks/guard.py``)."""
+    ``hooks/guard.py``).
+
+    Also folds in the operator's user-level ~/.claude/settings.local.json
+    permissions.allow/deny (which Claude Code itself ignores) so their
+    pre-approvals reach every session. The guard's own credential-store deny
+    rules are always present and can't be dropped by that file."""
     python_exe = python_exe or sys.executable or "python3"
     guard_path = guard_path or guard_script_path()
     hook_command = f'"{python_exe}" "{guard_path}"'
+    allow, deny = operator_local_permissions(local_settings_path)
+    perms = {"deny": list(_GUARD_DENY_PATH_RULES)}
+    for rule in deny:  # operator deny unions on top of the guard's own rules
+        if rule not in perms["deny"]:
+            perms["deny"].append(rule)
+    if allow:
+        perms["allow"] = allow
     return {
-        "permissions": {"deny": list(_GUARD_DENY_PATH_RULES)},
+        "permissions": perms,
         "hooks": {
             "PreToolUse": [
                 {
@@ -1516,7 +1568,9 @@ class SessionManager:
         be written, in which case the session launches without the guard layer
         rather than failing to start. The content is identical for every session
         on the host (guard path + interpreter are fixed), so it's written once
-        to ``REGISTRY_DIR/guard-settings.json`` and reused."""
+        to ``REGISTRY_DIR/guard-settings.json`` and reused. The operator's
+        ~/.claude/settings.local.json permissions are snapshotted into it at this
+        first write; restart the manager to pick up later edits to that file."""
         cached = getattr(self, "_guard_settings_path", None)
         if cached and os.path.exists(cached):
             return cached
