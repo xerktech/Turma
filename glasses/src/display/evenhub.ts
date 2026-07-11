@@ -78,6 +78,19 @@ const BOX_INSET = 2 * (BOX_PADDING + BOX_BORDER_WIDTH);
 // pad (544px inner) violated, and lines the transcript up with the box's own
 // 2px-padded text instead of indenting it 14px further in.
 const TRANSCRIPT_PADDING = 4;
+// Padding for the single full-canvas `lines` container (home + every menu
+// screen). Must match TRANSCRIPT_PADDING's two constraints, and for the same
+// reasons: a full menu page renders up to DISPLAY_LINES (10) lines — header +
+// 9 rows — which at 27px needs 270px of content height, and each line wraps at
+// LINE_WIDTH_PX (560px). The old 16px pad left only 288 - 32 = 256px of height
+// (≈9 lines, one short) AND a 544px inner width (< 560px), so on the fuller
+// menus (the repo picker especially) the content overflowed the container both
+// ways; the firmware then natively scrolled the text container on every swipe
+// on top of our own cursor move — the "scroll drags the page instead of moving
+// the selection" bug. 4px fits all 10 lines (288 - 8 = 280px ≈ 10.4 lines) and
+// keeps the inner width (576 - 8 = 568px) above the wrap width, so nothing
+// overflows and the swipe only moves the cursor.
+const LINES_PADDING = 4;
 // Status corner: sized to fit the widest label ("Working"/"[REC]" etc.)
 // without crowding the box's right/top border.
 const STATUS_WIDTH = 120;
@@ -169,7 +182,7 @@ function buildLinesContainer(content: string): TextContainerConfig {
     yPosition: 0,
     width: CANVAS_WIDTH,
     height: CANVAS_HEIGHT,
-    paddingLength: 16,
+    paddingLength: LINES_PADDING,
     containerID: CONTAINER_ID,
     containerName: CONTAINER_NAME,
     content,
