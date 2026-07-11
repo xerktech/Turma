@@ -48,7 +48,10 @@
   .repo-head .r-name a:hover { text-decoration: underline; }
   .repo-head .r-meta { color: var(--ink-2); font-size: 12px; }
   .repo-head .r-meta b { color: var(--ink); font-weight: 600; }
-  .repo-head .spacer { flex: 1; }
+  /* Keep the action buttons (incl. the blue "+ New session") right-aligned even
+     when the head wraps on narrow screens — margin-left:auto pushes the whole
+     group right whether it shares the top line or drops to its own row. */
+  .repo-head .r-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-left: auto; justify-content: flex-end; }
   .repo-empty { color: var(--muted); font-size: 12px; margin-top: 8px; }
 
   /* Transient summary line after a repo prune (merged worktrees/branches swept). */
@@ -769,11 +772,12 @@ function repoBlock(a, repo, sessList, now) {
     <summary class="repo-head">
       <span class="r-name">${repo.isRoot ? "⌂ Repos root" : repoLink(repo.remote, repo.name)}</span>
       ${meta}
-      <span class="spacer"></span>
-      ${pruneBtn}
-      ${resumeBtn}
-      ${composerBtn}
-      ${spawnBtn}
+      <span class="r-actions">
+        ${pruneBtn}
+        ${resumeBtn}
+        ${composerBtn}
+        ${spawnBtn}
+      </span>
     </summary>
     ${pruneNote}
     ${resumePanel}
