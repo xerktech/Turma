@@ -1149,6 +1149,18 @@ def repo_branches(path):
     return branches
 
 
+def repo_last_commit_iso(path):
+    """Committer date of HEAD as UTC ISO (YYYY-MM-DDTHH:MM:SSZ), '' when the repo
+    has no commits. The "modified" half of a repo's activity ranking; %ct (unix
+    ts) normalized to UTC so it compares lexicographically against the transcript
+    timestamps that supply the "used" half."""
+    ct = run(["git", "-C", path, "log", "-1", "--format=%ct", "HEAD"])
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(ct)))
+    except (TypeError, ValueError):
+        return ""
+
+
 def repo_entry(repo):
     """Heartbeat repos[] entry: light git facts about the repo's own checkout."""
     path = repo["path"]
@@ -1163,6 +1175,10 @@ def repo_entry(repo):
         # default the composer pre-selects (new sessions fork off latest main).
         "branches": repo_branches(path),
         "defaultBranch": default_branch_name(path),
+        # Newest commit time — the "modified" input to the activity sort. The
+        # manager combines it with per-repo session activity into lastActivity
+        # and orders repos[] by it (most-recent first); see build_payload().
+        "lastCommit": repo_last_commit_iso(path),
     }
 
 
@@ -2435,6 +2451,40 @@ class SessionManager:
             for c in reversed(self.closed)
         ]
 
+    def _repo_activity(self):
+        """repo-name -> newest session-activity ISO ts, the "used" half of the
+        repo activity ranking. Live sessions contribute their transcript's
+        lastActivity (from the usage cache); closed sessions fall back to when
+        they were killed. '' for a repo with no session history."""
+        activity = {}
+        for s in self.registry:
+            repo = s.get("repo")
+            u = self.usage_cache.get(s["id"]) or {}
+            ts = u.get("lastActivity") or s.get("createdAt") or ""
+            if repo and ts > activity.get(repo, ""):
+                activity[repo] = ts
+        for c in self.closed:
+            repo = c.get("repo")
+            ts = c.get("closedAt") or c.get("createdAt") or ""
+            if repo and ts > activity.get(repo, ""):
+                activity[repo] = ts
+        return activity
+
+    def _sorted_repo_entries(self):
+        """Scanned repos ordered most-recently-active first (see #-activity-sort):
+        each repo's lastActivity is the later of its newest commit ("modified")
+        and its newest session activity ("used"). The root pseudo-repo is pinned
+        first and never ranked. Ties (e.g. never-touched repos) keep the scan's
+        alphabetical order, since Python's sort is stable."""
+        activity = self._repo_activity()
+        entries = [repo_entry(r) for r in scan_repos()]
+        for e in entries:
+            e["lastActivity"] = max(
+                e.get("lastCommit") or "", activity.get(e["name"], "")
+            )
+        entries.sort(key=lambda e: e.get("lastActivity") or "", reverse=True)
+        return [root_repo_entry()] + entries
+
     def build_payload(self, beat):
         # Usage is the expensive parse — refresh on a slow cadence, but make
         # sure any newly-seen session gets a value on first appearance.
@@ -2463,7 +2513,7 @@ class SessionManager:
             "memory": memory_usage(),
             "logTail": log_tail(self.agent_id),
             "reposRoot": REPOS_ROOT,
-            "repos": [root_repo_entry()] + [repo_entry(r) for r in scan_repos()],
+            "repos": self._sorted_repo_entries(),
             "sessions": [self._session_payload(s) for s in self.registry],
             "closedSessions": self._closed_payload(),
             # GitHub clone-into-root: availability + clonable repos for the hub's
