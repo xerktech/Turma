@@ -1793,6 +1793,76 @@ class TestScanRepos(unittest.TestCase):
         )
 
 
+class TestRepoLastCommitIso(unittest.TestCase):
+    def test_unix_ts_normalized_to_utc_iso(self):
+        with mock.patch.object(ha, "run", lambda cmd, cwd=None: "1700000000"):
+            self.assertEqual(
+                ha.repo_last_commit_iso("/x"), "2023-11-14T22:13:20Z"
+            )
+
+    def test_no_commits_yields_empty(self):
+        # `git log` on a repo with no commits returns "" -> int("") -> ''.
+        with mock.patch.object(ha, "run", lambda cmd, cwd=None: ""):
+            self.assertEqual(ha.repo_last_commit_iso("/x"), "")
+
+
+class TestRepoActivitySort(ManagerMixin, unittest.TestCase):
+    """repos[] is ordered most-recently-active first (commit time OR session
+    activity, whichever is later), with the root pseudo-repo pinned first."""
+
+    def _manager_for(self, commits):
+        """commits: [(name, lastCommit_iso)] — stub scan_repos/repo_entry/
+        root_repo_entry so the sort's inputs are fully controlled."""
+        sm = self.make_manager()
+        by_name = {
+            n: {"name": n, "path": "/x/" + n, "lastCommit": c} for n, c in commits
+        }
+        for name, value in [
+            ("scan_repos", lambda: [{"name": n, "path": "/x/" + n} for n, _ in commits]),
+            ("repo_entry", lambda r: dict(by_name[r["name"]])),
+            ("root_repo_entry", lambda: {"name": "(root)", "isRoot": True}),
+        ]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        return sm
+
+    def _order(self, sm):
+        return [e["name"] for e in sm._sorted_repo_entries()]
+
+    def test_root_pinned_first_then_commit_time_desc(self):
+        sm = self._manager_for([
+            ("A", "2026-01-01T00:00:00Z"),
+            ("B", "2026-06-01T00:00:00Z"),
+            ("C", ""),  # no commits
+        ])
+        self.assertEqual(self._order(sm), ["(root)", "B", "A", "C"])
+
+    def test_session_activity_can_outrank_commit_time(self):
+        sm = self._manager_for([
+            ("A", "2026-01-01T00:00:00Z"),
+            ("B", "2026-06-01T00:00:00Z"),
+        ])
+        # A has an old commit but a very recent live session -> jumps ahead of B.
+        sm.registry = [{"id": "s1", "repo": "A"}]
+        sm.usage_cache = {"s1": {"lastActivity": "2026-12-01T00:00:00Z"}}
+        self.assertEqual(self._order(sm), ["(root)", "A", "B"])
+
+    def test_closed_session_kill_time_counts_as_activity(self):
+        sm = self._manager_for([
+            ("A", "2026-01-01T00:00:00Z"),
+            ("B", "2026-06-01T00:00:00Z"),
+        ])
+        sm.closed = [{"repo": "A", "closedAt": "2026-12-15T00:00:00Z"}]
+        self.assertEqual(self._order(sm), ["(root)", "A", "B"])
+
+    def test_ties_keep_alphabetical_scan_order(self):
+        # No commits, no sessions -> all "" activity; stable sort preserves the
+        # alphabetical order scan_repos already returns.
+        sm = self._manager_for([("A", ""), ("B", ""), ("C", "")])
+        self.assertEqual(self._order(sm), ["(root)", "A", "B", "C"])
+
+
 @unittest.skipUnless(
     hasattr(signal, "SIGUSR1"), "SIGUSR1 is POSIX-only; the agent runs on Linux"
 )
