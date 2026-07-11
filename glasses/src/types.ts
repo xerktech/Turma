@@ -56,6 +56,10 @@ export interface SessionInfo {
   repo: string;
   branch?: string;
   label?: string | null;
+  // Agent-generated few-word task name (hub-agent.py `_session_payload`),
+  // filled in async at spawn from the initial prompt. Null for bare/root
+  // spawns that had no prompt, or until the summary lands.
+  summary?: string | null;
   status: SessionStatus;
   model?: string | null;
   permissionMode?: string | null;

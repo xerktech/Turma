@@ -39,6 +39,14 @@ export function glyph(state: DisplayState): string {
   return GLYPHS[state];
 }
 
+// The user-facing name for a session row: the agent-generated few-word task
+// summary when it has one, else the short session id as a disambiguating
+// fallback (bare spawns and the repos-root pseudo-repo get no summary).
+export function sessionName(s: SessionInfo): string {
+  const summary = s.summary?.trim();
+  return summary || s.id.slice(0, 6);
+}
+
 // Flattens every host's sessions into one list, hosts sorted by device name
 // (falling back to the host key), sessions within a host sorted by
 // createdAt (missing createdAt sorts first).
