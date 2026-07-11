@@ -360,11 +360,14 @@ describe("App", () => {
     });
   }
 
+  // A pending question makes the whole session screen act as the answer sheet
+  // regardless of focus, so entering the session (one tap from home) lands
+  // straight in it — no second "arm the box" tap. From here a single tap
+  // answers the highlighted option; scroll moves the highlight first.
   async function toSheet(app: App): Promise<void> {
     await app.start();
     await vi.advanceTimersByTimeAsync(0);
-    display.emit({ type: "tap" }); // home -> session
-    display.emit({ type: "tap" }); // tap at tail -> focus:"bottom" (sheet mode: question pending)
+    display.emit({ type: "tap" }); // home -> session (sheet active: question pending)
   }
 
   function bottomMode(): string {
@@ -427,6 +430,32 @@ describe("App", () => {
     expect(client.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: 0 });
   });
 
+  it("sheet mode: a single tap answers with no prior 'arm the box' tap, even from transcript focus", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+    // Just entered the session — still transcript focus, never armed the box.
+    expect(app.getState().session?.focus).toBe("transcript");
+
+    display.emit({ type: "tap" }); // one tap answers the highlighted option
+    expect(client.answerQuestion).toHaveBeenCalledTimes(1);
+    expect(client.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: 0 });
+  });
+
+  it("sheet mode: scroll moves the option highlight rather than scrolling the transcript while a question is pending", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+    expect(app.getState().session?.focus).toBe("transcript");
+
+    // From transcript focus, a scroll now drives the sheet's selection (the
+    // sheet takes over the whole screen while a question is pending) — the
+    // transcript offset stays put.
+    display.emit({ type: "scrollDown" });
+    expect(app.getState().session?.selected).toBe(1);
+    expect(app.getState().session?.offset).toBe(0);
+  });
+
   it("sheet mode: doubleTap opens the actions menu (session actions stay reachable while a question is pending)", async () => {
     const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
     const app = makeApp(client);
@@ -473,7 +502,7 @@ describe("App", () => {
     expect(app.getState().screen).toBe("session");
   });
 
-  it("a question arriving via poll while the box mic is recording (plain input mode) cancels the mic and drops focus to the transcript", async () => {
+  it("a question arriving via poll while the box mic is recording (plain input mode) cancels the mic so it can't outlive the switch to the sheet", async () => {
     const noQuestion = agent({ sessions: [session({ session: signals({ transcriptAgeSec: 1 }) })] });
     const withQuestion = questionAgent();
     const client = fakeClient({
@@ -492,25 +521,28 @@ describe("App", () => {
     expect(app.getState().session?.mic).toBe("recording");
 
     await vi.advanceTimersByTimeAsync(1000); // 2nd poll: question now pending
+    // The hot mic is cancelled and settled to idle, which flips the box into
+    // sheet mode (mic idle + empty draft). Focus is now immaterial — the sheet
+    // takes over the whole session screen regardless of it — so a tap answers.
     expect(dictation.cancelled).toBe(1);
     expect(app.getState().session?.mic).toBe("idle");
-    expect(app.getState().session?.focus).toBe("transcript");
+    expect(bottomMode()).toBe("sheet");
   });
 
-  it("does not yank focus away from an already-pending question's sheet on subsequent polls", async () => {
+  it("preserves the sheet's highlighted option across polls while the same question stays pending", async () => {
     const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
     const app = makeApp(client, 1000);
     await toSheet(app);
 
-    display.emit({ type: "scrollDown" }); // selected -> 1, focus stays "bottom"
-    expect(app.getState().session?.focus).toBe("bottom");
+    display.emit({ type: "scrollDown" }); // selected -> 1
+    expect(app.getState().session?.selected).toBe(1);
 
     await vi.advanceTimersByTimeAsync(1000); // poll again: same question still pending
-    expect(app.getState().session?.focus).toBe("bottom");
     expect(app.getState().session?.selected).toBe(1); // untouched
+    expect(bottomMode()).toBe("sheet"); // still on the sheet
   });
 
-  it("a different question replacing the pending one mid-sheet resets `selected` back to 0", async () => {
+  it("a different question replacing the pending one resets `selected` back to 0", async () => {
     const first = questionAgentWith("pick one", ["A", "B"]);
     const second = questionAgentWith("pick two", ["X", "Y", "Z"]);
     const client = fakeClient({
@@ -531,9 +563,6 @@ describe("App", () => {
     // index couldn't have sent a wrong digit — but the highlighted row must
     // still reset rather than silently point at the wrong option.
     expect(app.getState().session?.selected).toBe(0);
-    // Still sitting in the sheet (this isn't the "question newly arrived
-    // while unfocused" case) — only the highlight resets, not the focus.
-    expect(app.getState().session?.focus).toBe("bottom");
   });
 
   // ---- bottom-box input mode: dictate / send / clear (Task 5) -----------

@@ -637,32 +637,29 @@ export class App {
         this.preserveScrollOffset(beforeLen);
         this.scheduleRevealTick();
       }
-      // A question that newly appeared while the bottom box was focused in
-      // plain input mode must not let the user's next gesture land on the
-      // freshly-arrived sheet by accident (and, if they were mid-dictation,
-      // must not leave that mic stranded hot) — cancel any live box
-      // recording and drop focus back to the transcript. Mirrors
-      // ClaudeHUD's setPendingSheet, which drops input focus the instant a
-      // sheet appears. Only fires on the *arrival* transition (prevQuestion
-      // was falsy) — an already-pending question the user is actively
-      // working the sheet for must not get its focus yanked on every poll.
-      if (this.state.session && this.state.session.focus === "bottom") {
+      // Keep the answer sheet's state coherent when a question arrives on (or
+      // is replaced on) the focused session. The sheet now takes over the
+      // session screen whenever a question is pending, so — unlike before —
+      // this no longer hinges on the bottom box being focused.
+      if (this.state.session) {
         const sess = this.state.session;
         const live = findSession(this.state, sess.hostKey, sess.sessionId);
         const nowQuestion = live?.session?.question ?? null;
         if (nowQuestion && !prevQuestion) {
+          // A question just arrived. If the box mic was hot (the user was
+          // dictating a free-text reply in plain input mode), cancel it so it
+          // can't outlive the switch to the sheet, and settle the highlight on
+          // the first option.
           if (sess.mic === "recording" || sess.mic === "finalising") this.dictation.cancel();
-          this.state = { ...this.state, session: { ...sess, mic: "idle", focus: "transcript" } };
+          const mic = sess.mic === "recording" || sess.mic === "finalising" ? "idle" : sess.mic;
+          this.state = { ...this.state, session: { ...sess, mic, selected: 0 } };
         } else if (nowQuestion && prevQuestion && nowQuestion !== prevQuestion) {
           // A *different* question replaced the one already pending on this
-          // session while the user was still sitting in its sheet (not a
-          // fresh arrival, so the branch above doesn't fire) — the sheet's
-          // highlighted row must not carry over onto the new question's own
-          // options list. Dispatch already clamps `selected` against the
-          // new options length so a stale index can't send a wrong digit,
-          // but the highlight itself would still land on the wrong row
-          // until the user scrolls. Reset it, edge-triggered the same way
-          // as the arrival guard above.
+          // session — the highlight must not carry over onto the new
+          // question's own options list. Dispatch already clamps `selected`
+          // against the new options length so a stale index can't send a wrong
+          // digit, but the highlight itself would still point at the wrong row
+          // until the user scrolls. Reset it, edge-triggered like the arrival.
           this.state = { ...this.state, session: { ...sess, selected: 0 } };
         }
       }
@@ -824,6 +821,17 @@ export class App {
   private onSession(e: InputEvent): void {
     const s = this.state.session;
     if (!s) return this.goHome();
+    // A pending question turns the whole session screen into the answer sheet,
+    // regardless of focus: scroll moves the highlighted option, a single tap
+    // answers it, doubleTap opens the actions menu. The sheet already renders
+    // whenever a question is pending (render.ts is focus-independent too), so
+    // routing here means a tap answers straight away rather than first having
+    // to "arm" the box by moving focus to it — the extra, invisible tap that
+    // made answers feel like they needed several presses.
+    const live = findSession(this.state, s.hostKey, s.sessionId);
+    if (questionSheetActive(live?.session?.question, s)) {
+      return this.onSheetBottom(e, s, live);
+    }
     if (s.focus === "bottom") return this.onSessionBottom(e, s);
     if (e.type === "doubleTap") return this.goHome();
     const area = sessionTranscriptArea(this.state, s);
@@ -966,8 +974,11 @@ export class App {
         this.setState({ session: { ...s, focus: "transcript" } });
         return;
       }
-      // Trailing "Dictate answer…" row.
-      this.toggleBoxDictation(s);
+      // Trailing "Dictate answer…" row. Move focus to the box as dictation
+      // starts: the sheet can now be reached from transcript focus (onSession
+      // delegates here on a pending question), and the input-mode box that
+      // takes over once a draft lands only receives gestures at focus "bottom".
+      this.toggleBoxDictation({ ...s, focus: "bottom" });
     }
   }
 
