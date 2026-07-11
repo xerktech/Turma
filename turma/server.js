@@ -413,10 +413,13 @@ function heartbeatAlerts(key, prev, next) {
     }
   }
 
-  // Daily cost threshold (API-equivalent estimate): sum across the host's
-  // sessions, once per UTC day. Usage persists for stopped sessions too, so a
-  // killed session still counts toward the day's total.
-  const cost = (next.sessions || []).reduce((sum, s) => sum + (s.usage?.today?.cost || 0), 0);
+  // Daily cost threshold (API-equivalent estimate), once per UTC day. Prefer the
+  // host-level `usage` block, which the agent aggregates from ALL transcripts —
+  // so killed/deleted sessions still count. Fall back to summing live sessions
+  // for agents that predate that block.
+  const cost = next.usage
+    ? (next.usage.today?.cost || 0)
+    : (next.sessions || []).reduce((sum, s) => sum + (s.usage?.today?.cost || 0), 0);
   const day = new Date(now).toISOString().slice(0, 10);
   if (cost >= COST_ALERT_USD && alerts.costDay !== day) {
     alerts.costDay = day;

@@ -365,6 +365,110 @@ class TestUsageReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["lastActivity"], "")
 
 
+class TestNormalizeRemote(unittest.TestCase):
+    def test_forms_collapse_to_one_identity(self):
+        # ssh, scp, https, https-with-creds and a :port ssh URL all normalize to
+        # the same key, so the same repo cloned differently across hosts unifies.
+        cases = {
+            "git@github.com:Xerk/DockerOps.git": "github.com/xerk/dockerops",
+            "https://github.com/Xerk/DockerOps": "github.com/xerk/dockerops",
+            "https://github.com/Xerk/DockerOps.git": "github.com/xerk/dockerops",
+            "https://user:tok@github.com/Xerk/DockerOps.git": "github.com/xerk/dockerops",
+            "ssh://git@github.com:22/Xerk/DockerOps.git": "github.com/xerk/dockerops",
+            "https://github.com/Xerk/DockerOps/": "github.com/xerk/dockerops",
+        }
+        for raw, want in cases.items():
+            self.assertEqual(ha.normalize_remote(raw), want, raw)
+
+    def test_empty(self):
+        self.assertEqual(ha.normalize_remote(""), "")
+        self.assertEqual(ha.normalize_remote(None), "")
+
+
+class TestRepoUsageReport(unittest.TestCase):
+    """repo_usage_report() aggregates transcripts by repo via the ledger,
+    independent of any live session."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-repo-usage-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = mock.patch.object(ha, "PROJECTS_ROOT", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _proj(self, worktree):
+        d = os.path.join(self.tmp, ha._project_slug(worktree))
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _entry(self, worktree, repo, remote):
+        return {"repo": repo, "remote": remote, "slug": ha._project_slug(worktree)}
+
+    def test_merges_worktrees_per_repo_and_host_total(self):
+        wt_a = "/w/.turma/worktrees/Turma/aaa"
+        wt_b = "/w/.turma/worktrees/Turma/bbb"
+        wt_c = "/w/.turma/worktrees/DockerOps/ccc"
+        write_jsonl(os.path.join(self._proj(wt_a), "a.jsonl"), [
+            usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
+                        "claude-opus-4-20250514", 1_000_000, 100_000),  # $7.50
+        ])
+        write_jsonl(os.path.join(self._proj(wt_b), "b.jsonl"), [
+            usage_entry("2026-07-01T12:00:00.000Z", "m2", "r2",
+                        "claude-sonnet-4-20250514", 100_000, 0),        # $0.30
+        ])
+        write_jsonl(os.path.join(self._proj(wt_c), "c.jsonl"), [
+            usage_entry("2026-07-02T09:00:00.000Z", "m3", "r3",
+                        "claude-sonnet-4-20250514", 200_000, 0),        # $0.60
+        ])
+        ledger = {
+            # Same repo, two worktrees, ssh vs https remote -> one repo series.
+            wt_a: self._entry(wt_a, "Turma", "git@github.com:xerktech/Turma.git"),
+            wt_b: self._entry(wt_b, "Turma", "https://github.com/xerktech/Turma.git"),
+            wt_c: self._entry(wt_c, "DockerOps", "git@github.com:xerktech/DockerOps.git"),
+        }
+        repo_usage, host = ha.repo_usage_report(ledger)
+        by = {r["repo"]: r for r in repo_usage}
+
+        self.assertAlmostEqual(by["Turma"]["usage"]["totals"]["cost"], 7.8, places=2)
+        self.assertEqual(by["Turma"]["usage"]["totals"]["input"], 1_100_000)
+        self.assertAlmostEqual(
+            by["Turma"]["usage"]["days"]["2026-07-01"]["cost"], 7.8, places=2)
+        self.assertEqual(by["Turma"]["remoteKey"], "github.com/xerktech/turma")
+        self.assertAlmostEqual(by["DockerOps"]["usage"]["totals"]["cost"], 0.6, places=2)
+
+        self.assertAlmostEqual(host["totals"]["cost"], 7.8 + 0.6, places=2)
+        self.assertEqual(host["totals"]["input"], 1_100_000 + 200_000)
+        # Sorted by cost desc.
+        self.assertEqual(repo_usage[0]["repo"], "Turma")
+
+    def test_empty_and_missing_dirs_excluded(self):
+        wt_live = "/w/.turma/worktrees/Turma/live"
+        wt_empty = "/w/.turma/worktrees/Turma/empty"  # dir exists, no transcripts
+        wt_gone = "/w/.turma/worktrees/Ghost/gone"    # dir never created
+        write_jsonl(os.path.join(self._proj(wt_live), "a.jsonl"), [
+            usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
+                        "claude-sonnet-4-20250514", 100_000, 0),
+        ])
+        self._proj(wt_empty)
+        ledger = {
+            wt_live: self._entry(wt_live, "Turma", ""),
+            wt_empty: self._entry(wt_empty, "Turma", ""),
+            wt_gone: self._entry(wt_gone, "Ghost", ""),
+        }
+        repo_usage, host = ha.repo_usage_report(ledger)
+        repos = {r["repo"] for r in repo_usage}
+        self.assertIn("Turma", repos)      # has usage via wt_live
+        self.assertNotIn("Ghost", repos)   # no transcripts -> omitted
+        # No remote -> remoteKey falls back to the repo name.
+        turma = next(r for r in repo_usage if r["repo"] == "Turma")
+        self.assertEqual(turma["remoteKey"], "Turma")
+
+    def test_empty_ledger(self):
+        repo_usage, host = ha.repo_usage_report({})
+        self.assertEqual(repo_usage, [])
+        self.assertIsNone(host)
+
+
 class TestLastEntry(ProjectDirMixin, unittest.TestCase):
     def test_skips_truncated_tail(self):
         path = os.path.join(self.proj, "t.jsonl")
@@ -731,6 +835,7 @@ class ManagerMixin:
             ("REGISTRY_DIR", self.tmp),
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
+            ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", os.path.join(self.tmp, "worktrees")),
         ]:
@@ -740,6 +845,65 @@ class ManagerMixin:
 
     def make_manager(self):
         return ha.SessionManager()
+
+
+class TestUsageLedger(ManagerMixin, unittest.TestCase):
+    """The attribution ledger: written at spawn, backfilled, pruned, and — the
+    whole point — surviving a kill so usage stays reported."""
+
+    def _proj_for(self, worktree):
+        d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(worktree))
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def test_remember_persists_and_reloads(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        sm._remember_usage({"repo": "Turma", "repoPath": "/w/Turma", "worktreePath": wt})
+        self.assertIn(wt, sm.usage_ledger)
+        self.assertTrue(os.path.exists(ha.USAGE_LEDGER_PATH))
+        # A fresh manager loads the same ledger from disk.
+        self.assertEqual(self.make_manager().usage_ledger[wt]["repo"], "Turma")
+
+    def test_backfill_from_registry_and_closed(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "a", "repo": "Turma", "repoPath": "/w/Turma",
+                        "worktreePath": "/w/.turma/worktrees/Turma/aaa"}]
+        sm.closed = [{"id": "b", "repo": "DockerOps", "repoPath": "/w/DockerOps",
+                      "worktreePath": "/w/.turma/worktrees/DockerOps/bbb"}]
+        sm._backfill_ledger()
+        self.assertIn("/w/.turma/worktrees/Turma/aaa", sm.usage_ledger)
+        self.assertIn("/w/.turma/worktrees/DockerOps/bbb", sm.usage_ledger)
+
+    def test_prune_drops_entries_whose_transcripts_gone(self):
+        sm = self.make_manager()
+        wt_live = "/w/.turma/worktrees/Turma/live"
+        wt_gone = "/w/.turma/worktrees/Turma/gone"
+        self._proj_for(wt_live)
+        sm.usage_ledger = {
+            wt_live: {"repo": "Turma", "remote": "", "slug": ha._project_slug(wt_live)},
+            wt_gone: {"repo": "Turma", "remote": "", "slug": ha._project_slug(wt_gone)},
+        }
+        sm._prune_ledger()
+        self.assertIn(wt_live, sm.usage_ledger)
+        self.assertNotIn(wt_gone, sm.usage_ledger)
+
+    def test_usage_survives_kill(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        write_jsonl(os.path.join(self._proj_for(wt), "a.jsonl"), [
+            usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
+                        "claude-sonnet-4-20250514", 100_000, 0),
+        ])
+        sm._remember_usage({"repo": "Turma", "repoPath": "/w/Turma", "worktreePath": wt})
+        sm._refresh_repo_usage()
+        self.assertTrue(any(r["repo"] == "Turma" for r in sm.repo_usage))
+        # Kill: registry record dropped, caches forgotten — but the ledger and
+        # transcript remain, so the repo's usage is still aggregated and reported.
+        sm.registry = []
+        sm._refresh_repo_usage()
+        self.assertTrue(any(r["repo"] == "Turma" for r in sm.repo_usage))
+        self.assertIsNotNone(sm.host_usage)
 
 
 class TestRegistryPersistence(ManagerMixin, unittest.TestCase):
@@ -1923,6 +2087,7 @@ class TestPruneRepo(unittest.TestCase):
             ("REGISTRY_DIR", self.tmp),
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
+            ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", self.wt_root),
             ("REPOS_ROOT", self.tmp),
