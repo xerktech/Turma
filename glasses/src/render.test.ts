@@ -80,12 +80,34 @@ describe("render: home", () => {
 
     expect(lines[0]).toBe("TURMA 1 run · 1 ask");
     expect(lines).toContain("> alpha");
-    expect(lines.some((l) => l.includes("! alpha·repoA"))).toBe(true);
-    expect(lines.some((l) => l.includes("? alpha·repoB"))).toBe(true);
-    expect(lines.some((l) => l.includes("- alpha·repoC"))).toBe(true);
+    // Rows are <repo>-<name>; the host (alpha) is the header above, not repeated.
+    expect(lines.some((l) => l.includes("! repoA-"))).toBe(true);
+    expect(lines.some((l) => l.includes("? repoB-"))).toBe(true);
+    expect(lines.some((l) => l.includes("- repoC-"))).toBe(true);
+    expect(lines.some((l) => l.includes("alpha·"))).toBe(false);
     expect(lines).toContain("  beta offline");
     expect(lines).toContain("  + New session");
     expect(lines).toContain("  Settings");
+  });
+
+  it("shows the agent-generated summary as each session's name, falling back to the short id when unnamed", () => {
+    const agents: AgentInfo[] = [
+      agent({
+        key: "alpha",
+        device: "alpha",
+        sessions: [
+          session({ id: "s-named", repo: "repoA", summary: "Adding Compose Flag" }),
+          session({ id: "abcdef123456", repo: "repoB", summary: null }),
+        ],
+      }),
+    ];
+    const lines = asLines(render(base({ agents, home: { cursor: 0 } })));
+
+    // Named session shows <repo>-<summary>, not its id.
+    expect(lines.some((l) => l.includes("repoA-Adding Compose Flag"))).toBe(true);
+    expect(lines.some((l) => l.includes("s-named"))).toBe(false);
+    // Unnamed session falls back to <repo>-<first 6 chars of id>.
+    expect(lines.some((l) => l.includes("repoB-abcdef"))).toBe(true);
   });
 
   it("marks a cursor'd session row with '>' and renders its glyph as pending overlay", () => {
@@ -96,7 +118,7 @@ describe("render: home", () => {
     const state = base({ agents, home: { cursor: 1 }, pending: { s1: { at: NOW } } });
 
     const lines = asLines(render(state));
-    expect(lines.some((l) => l.startsWith("> … host-a·myrepo"))).toBe(true);
+    expect(lines.some((l) => l.startsWith("> … myrepo-"))).toBe(true);
   });
 
   it("windows a long row list into one scrollable page — no p/N footer, cursor stays visible", () => {
@@ -501,6 +523,17 @@ describe("render: confirm", () => {
     expect(model.bottom.lines[0]).toBe("End session sess-0?");
     expect(model.bottom.lines).toContain("  Cancel");
     expect(model.bottom.lines).toContain("> Confirm");
+  });
+
+  it("names the session in the confirmation prompt when it has a summary", () => {
+    const s = session({ id: "sess-0001", summary: "Adding Compose Flag" });
+    const state = base({
+      screen: "confirm",
+      agents: [agent({ key: "host-a", sessions: [s] })],
+      confirm: { action: { kind: "kill", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 0 },
+    });
+    const model = asSession(render(state));
+    expect(model.bottom.lines[0]).toBe("End session Adding Compose Flag?");
   });
 });
 

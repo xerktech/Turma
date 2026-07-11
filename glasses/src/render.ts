@@ -4,7 +4,7 @@
 import type { AppState, ReplyScreenState, SessionScreenState } from "./app.ts";
 import { bottomBoxLines, inputBoxBody, menuBox, sheetBody, statusLabel, type MicState } from "./input-box.ts";
 import { DISPLAY_LINES, LINE_WIDTH_PX } from "./layout.ts";
-import { glyph, liveState } from "./sessions.ts";
+import { glyph, liveState, sessionName } from "./sessions.ts";
 import { wrapText } from "./text-wrap.ts";
 import type { AgentInfo, SessionInfo } from "./types.ts";
 
@@ -125,13 +125,16 @@ export function buildHomeRows(state: AppState): HomeRow[] {
       const display = state.pending[session.id] ? "pending" : liveState(session);
       const g = glyph(display);
       const labelOrRepo = session.label || session.repo;
-      const shortId = session.id.slice(0, 6);
+      const name = sessionName(session);
+      // The host is already the header above these rows, so the row itself is
+      // just <repo>-<generated name> (e.g. "Turma-Adding Compose Flag"),
+      // falling back to <repo>-<short id> when the session is unnamed.
       rows.push({
         kind: "session",
         hostKey: agent.key,
         sessionId: session.id,
         selectable: true,
-        text: `${g} ${device}·${labelOrRepo} ${shortId}`,
+        text: `${g} ${labelOrRepo}-${name}`,
       });
     }
   }
@@ -402,8 +405,9 @@ function renderReply(state: AppState): string[] {
 function confirmHeader(state: AppState): string {
   const c = state.confirm;
   if (!c) return "Confirm";
-  const id = c.action.sessionId.slice(0, 6);
-  return `End session ${id}?`;
+  const s = findSessionLocal(state, c.action.hostKey, c.action.sessionId);
+  const name = s ? sessionName(s) : c.action.sessionId.slice(0, 6);
+  return `End session ${name}?`;
 }
 
 function renderConfirm(state: AppState): ScreenModel {
