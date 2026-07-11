@@ -504,6 +504,33 @@ const TERM_FONT_STYLE =
   "<style>@font-face{font-family:'JBMNerd';" +
   "src:url('/term-font.woff2') format('woff2');font-display:swap;}</style>";
 
+// Touch-scroll shim injected into ttyd's page for phones. The Claude TUI owns
+// the alternate screen buffer, so xterm.js has no scrollable viewport — it only
+// scrolls by translating *wheel* events into arrow-key sequences. A touchscreen
+// produces no wheel events, so a finger drag scrolls nothing. This maps a
+// one-finger vertical drag onto synthetic WheelEvents on the terminal element,
+// which xterm.js then turns into scrolling just like a real mouse wheel.
+// `touch-action:none` stops the browser hijacking the same drag for pan/refresh.
+// STEP is dispatched a whole chunk at a time (well above any plausible row
+// height) so each synthetic wheel is >=1 line and never rounds to zero in the
+// alt buffer; the accumulator carries the sub-STEP remainder, keeping total
+// scroll proportional to finger travel — a fast flick emits many chunks.
+const TERM_TOUCH_SCROLL =
+  "<style>.xterm,.xterm-viewport,.xterm-screen{touch-action:none;}</style>" +
+  "<script>(function(){var STEP=30,y=null,acc=0;" +
+  "function el(){return document.querySelector('.xterm');}" +
+  "addEventListener('touchstart',function(e){" +
+  "if(e.touches.length===1){y=e.touches[0].clientY;acc=0;}else{y=null;}}," +
+  "{passive:false});" +
+  "addEventListener('touchmove',function(e){" +
+  "if(y===null||e.touches.length!==1)return;var t=el();if(!t)return;" +
+  "var ny=e.touches[0].clientY;acc+=y-ny;y=ny;e.preventDefault();" +
+  "while(Math.abs(acc)>=STEP){var d=acc>0?STEP:-STEP;acc-=d;" +
+  "t.dispatchEvent(new WheelEvent('wheel',{deltaY:d," +
+  "deltaMode:0,bubbles:true,cancelable:true}));}},{passive:false});" +
+  "addEventListener('touchend',function(){y=null;},{passive:false});" +
+  "})();</script>";
+
 // ---- minimal WebSocket server framing (RFC 6455) ----------------------------
 // We only need enough to carry an opaque byte stream (the agent's ttyd TCP
 // wire) plus text control JSON, ping/pong keepalive, and close. Frames FROM the
@@ -752,10 +779,12 @@ async function proxyTerm(req, res, name, port) {
         upRes.on("data", (c) => chunks.push(c));
         upRes.on("end", () => {
           let html = Buffer.concat(chunks).toString("utf8");
-          // Insert the @font-face before </head> (fall back to prepending).
+          // Insert the @font-face + touch-scroll shim before </head> (fall
+          // back to prepending).
+          const inject = TERM_FONT_STYLE + TERM_TOUCH_SCROLL;
           html = html.includes("</head>")
-            ? html.replace("</head>", TERM_FONT_STYLE + "</head>")
-            : TERM_FONT_STYLE + html;
+            ? html.replace("</head>", inject + "</head>")
+            : inject + html;
           const body = Buffer.from(html, "utf8");
           const h = { ...upRes.headers };
           // Content changed; drop framing headers and any CSP that would block
