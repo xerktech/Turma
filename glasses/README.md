@@ -131,8 +131,8 @@ command, so the built `.ehpk` is uploaded through the web portal.
 2. **Make `app.json` submission-ready.** Bump `version`; confirm
    `min_app_version` / `min_sdk_version`; and — most important — make sure the
    `network` permission `whitelist` lists your real hub host for **both**
-   `https://` and `wss://` (currently `https://agents.xerktech.com` and
-   `wss://agents.xerktech.com`). Reviewers enforce this whitelist at the WebView
+   `https://` and `wss://` (currently `https://turma.xerktech.com` and
+   `wss://turma.xerktech.com`). Reviewers enforce this whitelist at the WebView
    network layer, so a stale entry means the app can't reach the hub during
    review.
 3. **Build + pack** exactly as for sideload:

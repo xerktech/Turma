@@ -15,7 +15,7 @@
     {
       "name": "network",
       "desc": "Connect to your self-hosted Turma hub to list and control Claude Code sessions.",
-      "whitelist": ["https://agents.xerktech.com", "wss://agents.xerktech.com"]
+      "whitelist": ["https://turma.xerktech.com", "wss://turma.xerktech.com"]
     }
   ]
 }
