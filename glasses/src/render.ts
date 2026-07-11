@@ -11,7 +11,8 @@ import type { AgentInfo, SessionInfo } from "./types.ts";
 export { DISPLAY_LINES, LINE_WIDTH_PX };
 
 // How many lines the transcript scrolls per scroll-gesture step on the
-// session screen (distinct from the menu screens' page-at-a-time paging).
+// session screen (distinct from the menu screens, which move a cursor one row
+// at a time through a single sliding-window list).
 export const SESSION_SCROLL_STEP = 2;
 
 // Synthetic id for the in-progress assistant turn scraped live from the TUI
@@ -62,25 +63,23 @@ function markerLine(text: string, selected: boolean): string {
   return (selected ? "> " : "  ") + text;
 }
 
-interface PaginateResult<T> {
+interface WindowResult<T> {
   visible: T[];
   start: number;
-  page: number;
-  totalPages: number;
-  showFooter: boolean;
 }
 
-// Windows `rows` into fixed-size pages so `selectedIndex` is always visible;
-// pages are aligned from row 0 (no cursor-centering), which keeps the
-// windowing deterministic and easy to test. Reserves one line for a "p/N"
-// footer once the rows don't fit in a single page.
-function paginate<T>(rows: T[], selectedIndex: number, maxArea: number, footerArea: number): PaginateResult<T> {
-  const area = rows.length <= maxArea ? maxArea : footerArea;
-  const totalPages = Math.max(1, Math.ceil(rows.length / area));
-  const page = Math.min(totalPages - 1, Math.floor(Math.max(0, selectedIndex) / area));
-  const start = page * area;
-  const end = Math.min(rows.length, start + area);
-  return { visible: rows.slice(start, end), start, page: page + 1, totalPages, showFooter: totalPages > 1 };
+// A single cursor-following window over `rows` — one continuous scrollable
+// list, never split into "p/N" pages. When everything fits in `area` the whole
+// list shows; otherwise the window slides one row at a time to keep the cursor
+// centred (clamped at both ends), the same behaviour menuBox/sheetBody use for
+// their option lists. Deterministic from (rows, selectedIndex, area) alone, so
+// the pure render stays testable without carrying a scroll offset in state.
+function windowRows<T>(rows: T[], selectedIndex: number, area: number): WindowResult<T> {
+  if (rows.length <= area) return { visible: rows, start: 0 };
+  const selected = Math.max(0, Math.min(selectedIndex, rows.length - 1));
+  let start = Math.max(0, selected - Math.floor(area / 2));
+  start = Math.min(start, rows.length - area);
+  return { visible: rows.slice(start, start + area), start };
 }
 
 // ---- home -------------------------------------------------------------
@@ -144,15 +143,9 @@ export function buildHomeRows(state: AppState): HomeRow[] {
 function renderHome(state: AppState): string[] {
   const header = headerLine(state, homeHeaderText(state));
   const rows = buildHomeRows(state);
-  const { visible, start, page, totalPages, showFooter } = paginate(
-    rows,
-    state.home.cursor,
-    DISPLAY_LINES - 1,
-    DISPLAY_LINES - 2
-  );
+  const { visible, start } = windowRows(rows, state.home.cursor, DISPLAY_LINES - 1);
   const lines = [header];
   visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === state.home.cursor)));
-  if (showFooter) lines.push(`p${page}/${totalPages}`);
   return lines;
 }
 
@@ -166,7 +159,7 @@ function roleLine(role: string, text: string): string {
 
 // Every line the session screen could show, oldest first, bottom-anchored —
 // exported so app.ts can compute scroll-offset bounds from the same list
-// render() paginates. Includes the "loading earlier" indicator and the
+// render() windows. Includes the "loading earlier" indicator and the
 // pending-question/PR lines the brief calls out as rendering at the newest
 // end.
 export function sessionContentLines(state: AppState, hostKey: string, sessionId: string): string[] {
@@ -435,15 +428,9 @@ function renderNewHost(state: AppState): string[] {
   const header = headerLine(state, "New session · Choose host");
   const rows = newHostRows(state);
   if (!n) return [header];
-  const { visible, start, page, totalPages, showFooter } = paginate(
-    rows,
-    n.cursor,
-    DISPLAY_LINES - 1,
-    DISPLAY_LINES - 2
-  );
+  const { visible, start } = windowRows(rows, n.cursor, DISPLAY_LINES - 1);
   const lines = [header];
   visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === n.cursor)));
-  if (showFooter) lines.push(`p${page}/${totalPages}`);
   return lines;
 }
 
@@ -475,15 +462,9 @@ function renderNewRepo(state: AppState): string[] {
   const header = headerLine(state, `New session · ${device} · Choose repo`);
   if (!n) return [header];
   const rows = buildNewRepoRows(state, n.hostKey);
-  const { visible, start, page, totalPages, showFooter } = paginate(
-    rows,
-    n.cursor,
-    DISPLAY_LINES - 1,
-    DISPLAY_LINES - 2
-  );
+  const { visible, start } = windowRows(rows, n.cursor, DISPLAY_LINES - 1);
   const lines = [header];
   visible.forEach((row, i) => lines.push(markerLine(row.text, start + i === n.cursor)));
-  if (showFooter) lines.push(`p${page}/${totalPages}`);
   return lines;
 }
 
