@@ -110,6 +110,28 @@ export class HubClient {
     );
   }
 
+  // Answer a pending AskUserQuestion: `optionIndex` is the 0-based option pick
+  // (-1 for a pure free-text answer), `custom` carries free-text / "Other".
+  // The agent drops the answer file the session's ask.py bridge is blocked on.
+  answerQuestion(
+    host: string,
+    id: string,
+    answer: { optionIndex?: number; custom?: string }
+  ): Promise<QueuedResponse> {
+    const body: { optionIndex: number; custom?: string } = {
+      optionIndex: Number.isInteger(answer.optionIndex) ? (answer.optionIndex as number) : -1,
+    };
+    if (answer.custom) body.custom = answer.custom;
+    return this.request<QueuedResponse>(
+      `/api/agents/${encodeURIComponent(host)}/sessions/${encodeURIComponent(id)}/answer`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }
+    );
+  }
+
   // 202 ("still fetching", body {pending:true, cmdId}) is a normal return,
   // not a throw — app.ts's session screen polls this every 3s while pending.
   async getHistory(

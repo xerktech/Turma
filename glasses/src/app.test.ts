@@ -134,6 +134,7 @@ function fakeClient(overrides: Record<string, ReturnType<typeof vi.fn>> = {}) {
     sessionAction: vi.fn(async () => ({ ok: true, cmdId: "action-1" })),
     deleteSession: vi.fn(async () => ({ ok: true })),
     sendInput: vi.fn(async () => ({ ok: true, cmdId: "input-1" })),
+    answerQuestion: vi.fn(async () => ({ ok: true, cmdId: "answer-1" })),
     getHistory: vi.fn(async () => ({
       status: 200 as const,
       body: { entries: [], truncated: false, fetchedAt: Date.now() },
@@ -398,7 +399,7 @@ describe("App", () => {
     expect(app.getState().session?.selected).toBe(0);
   });
 
-  it("sheet mode: tap on option index 1 sends the 1-based digit, flashes, marks pending, and hands focus back to the transcript", async () => {
+  it("sheet mode: tap on option index 1 sends the 0-based optionIndex, flashes, marks pending, and hands focus back to the transcript", async () => {
     const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
     const app = makeApp(client);
     await toSheet(app);
@@ -406,23 +407,24 @@ describe("App", () => {
     display.emit({ type: "scrollDown" }); // selected -> 1 ("B")
     display.emit({ type: "tap" });
 
-    expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "2");
+    expect(client.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: 1 });
+    expect(client.sendInput).not.toHaveBeenCalled();
     expect(app.getState().screen).toBe("session");
     expect(app.getState().session?.focus).toBe("transcript");
     expect(app.getState().pending["s1"]).toBeDefined();
 
-    await vi.advanceTimersByTimeAsync(0); // flush the sendInput promise
+    await vi.advanceTimersByTimeAsync(0); // flush the answerQuestion promise
     expect(app.getState().flash).toBe(FLASH_QUEUED);
     expect(display.lines.some((l) => l.includes("queued"))).toBe(true);
   });
 
-  it("sheet mode: tap on option index 0 sends digit '1'", async () => {
+  it("sheet mode: tap on option index 0 sends optionIndex 0", async () => {
     const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
     const app = makeApp(client);
     await toSheet(app);
 
     display.emit({ type: "tap" }); // selected 0 = "A"
-    expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "1");
+    expect(client.answerQuestion).toHaveBeenCalledWith("host-a", "s1", { optionIndex: 0 });
   });
 
   it("sheet mode: doubleTap opens the actions menu (session actions stay reachable while a question is pending)", async () => {
@@ -434,7 +436,7 @@ describe("App", () => {
     expect(app.getState().screen).toBe("actions");
   });
 
-  it("sheet mode: tap on the trailing 'Dictate answer…' row starts box dictation and hands the box to input mode; the dictated draft then sends via the ordinary actions-menu Send path", async () => {
+  it("sheet mode: tap on the trailing 'Dictate answer…' row starts box dictation and hands the box to input mode; the dictated draft then sends as a free-text answer while the question is pending", async () => {
     const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
     const app = makeApp(client);
     await toSheet(app);
@@ -462,7 +464,12 @@ describe("App", () => {
     display.emit({ type: "scrollDown" }); // 1 = Send
     display.emit({ type: "tap" }); // select Send
 
-    expect(client.sendInput).toHaveBeenCalledWith("host-a", "s1", "yes deploy");
+    // A pending question routes the dictated draft to answerQuestion as a
+    // free-text ("Other") answer, not a plain typed message.
+    expect(client.answerQuestion).toHaveBeenCalledWith("host-a", "s1", {
+      optionIndex: -1,
+      custom: "yes deploy",
+    });
     expect(app.getState().screen).toBe("session");
   });
 

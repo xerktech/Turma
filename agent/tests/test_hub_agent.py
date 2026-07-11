@@ -299,8 +299,22 @@ class ProjectDirMixin:
         patcher = mock.patch.object(ha, "PROJECTS_ROOT", self.tmp)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Isolate the AskUserQuestion rendezvous dir so hook-file detection
+        # tests can drop req files without touching the real ~/.turma/questions.
+        self.questions_dir = os.path.join(self.tmp, "questions")
+        os.makedirs(self.questions_dir)
+        qpatcher = mock.patch.object(ha, "QUESTIONS_DIR", self.questions_dir)
+        qpatcher.start()
+        self.addCleanup(qpatcher.stop)
         self.proj = os.path.join(self.tmp, ha._project_slug(self.WORKDIR))
         os.makedirs(self.proj)
+
+    def write_question_req(self, session_id, question, options):
+        """Publish a pending-question request file the way ask.py would."""
+        req = {"sessionId": session_id, "question": question,
+               "options": [{"label": o} if isinstance(o, str) else o for o in options]}
+        with open(os.path.join(self.questions_dir, f"{session_id}.req.json"), "w") as f:
+            json.dump(req, f)
 
 
 class TestUsageReport(ProjectDirMixin, unittest.TestCase):
@@ -518,38 +532,32 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, {})
         self.assertEqual(rep["questionOptions"], ["ok"])
 
-    # ---- pane fallback: pending question read from the live TUI ------------
-    # A pending AskUserQuestion isn't in the transcript yet (Claude flushes the
-    # tool_use only once answered), so when the transcript turns up nothing the
-    # report falls back to parsing the session's tmux pane.
-    PANE = (
-        "╭─ Name pick ──────────────────────────────╮\n"
-        "│ Which direction should I run with?       │\n"
-        "│                                          │\n"
-        "│ ❯ 1. Turma                               │\n"
-        "│   2. Tutela                              │\n"
-        "╰──────────────────────────────────────────╯\n"
-    )
-
-    def test_pane_fallback_fills_pending_question(self):
+    # ---- hook-file detection: pending question from the ask.py bridge -------
+    # A pending AskUserQuestion is published by the ask.py PreToolUse bridge as
+    # a <sessionId>.req.json under QUESTIONS_DIR while the tool call blocks, so
+    # session_report reads it from there (not from a scraped tmux pane).
+    def test_hook_file_fills_pending_question(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, [self.entry_with_text("working on it")])  # last entry isn't a question
-        with mock.patch.object(ha, "run", return_value=self.PANE) as m:
-            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
+        self.write_question_req("sess-1", "Which direction should I run with?",
+                                ["Turma", "Tutela"])
+        rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id="sess-1")
         self.assertEqual(rep["question"], "Which direction should I run with?")
         self.assertEqual(rep["questionOptions"], ["Turma", "Tutela"])
-        self.assertEqual(rep["questionSource"], "pane")
-        m.assert_called_once_with(["tmux", "capture-pane", "-p", "-t", "agent-abc"])
+        self.assertEqual(rep["questionSource"], "hook")
 
-    def test_pane_fallback_works_when_no_transcript_yet(self):
+    def test_hook_file_works_when_no_transcript_yet(self):
         # No .jsonl in the project dir at all — the early-return path must still
-        # consult the pane so a question asked before the first write shows up.
-        with mock.patch.object(ha, "run", return_value=self.PANE):
-            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
+        # surface the hook's request file for a question asked before any write.
+        self.write_question_req("sess-1", "Which direction should I run with?",
+                                ["Turma", "Tutela"])
+        rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id="sess-1")
         self.assertEqual(rep["question"], "Which direction should I run with?")
-        self.assertEqual(rep["questionSource"], "pane")
+        self.assertEqual(rep["questionSource"], "hook")
 
-    def test_transcript_question_wins_and_pane_not_captured(self):
+    def test_hook_file_overrides_transcript_detection(self):
+        # A live hook request is the authoritative pending signal; it wins even
+        # when the transcript scan also turned up an AskUserQuestion tool_use.
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, [{
             "type": "assistant",
@@ -559,102 +567,67 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
                                           "options": [{"label": "yes"}]}]}},
             ]},
         }])
-        with mock.patch.object(ha, "run") as m:
-            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
-        self.assertEqual(rep["question"], "from transcript")
-        self.assertEqual(rep["questionSource"], "transcript")
-        m.assert_not_called()  # transcript already answered it; no pane capture
+        self.write_question_req("sess-1", "live from hook", ["a", "b"])
+        rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id="sess-1")
+        self.assertEqual(rep["question"], "live from hook")
+        self.assertEqual(rep["questionSource"], "hook")
 
-    def test_no_tmux_name_means_no_pane_fallback(self):
+    def test_no_hook_file_means_no_hook_question(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, [self.entry_with_text("working on it")])
-        rep = ha.session_report(self.WORKDIR, {})  # no tmux_name passed
+        rep = ha.session_report(self.WORKDIR, {}, session_id="sess-1")  # no req file
         self.assertIsNone(rep["question"])
         self.assertIsNone(rep["questionSource"])
 
-
-class TestParsePaneQuestion(unittest.TestCase):
-    """The tmux-pane picker parser that backs the pending-question fallback."""
-
-    def test_boxed_picker_with_cursor(self):
-        pane = (
-            "╭─ Name pick ──────────────────────────────╮\n"
-            "│ Which direction should I run with?       │\n"
-            "│                                          │\n"
-            "│ ❯ 1. Turma                               │\n"
-            "│   2. Tutela                              │\n"
-            "│   3. Vexillum / Praetor                  │\n"
-            "│   4. None — new direction                │\n"
-            "╰──────────────────────────────────────────╯\n"
+    def test_hook_file_caps_options_and_skips_non_string_labels(self):
+        self.write_question_req(
+            "sess-1", "Pick?",
+            [{"label": "a"}, {"label": 42}, {"label": "b"},
+             {"label": "c"}, {"label": "d"}, {"label": "e"}],
         )
-        q, opts = ha.parse_pane_question(pane)
-        self.assertEqual(q, "Which direction should I run with?")
-        self.assertEqual(opts, ["Turma", "Tutela", "Vexillum / Praetor", "None — new direction"])
+        rep = ha.session_report(self.WORKDIR, {}, session_id="sess-1")
+        # Capped at the first 4 options, then non-string labels dropped — same
+        # order of operations as the transcript-detection path.
+        self.assertEqual(rep["questionOptions"], ["a", "b", "c"])
 
-    def test_bare_picker_with_cursor(self):
-        pane = "Which color?\n\n❯ 1. Red\n  2. Green\n  3. Blue\n"
-        q, opts = ha.parse_pane_question(pane)
-        self.assertEqual(q, "Which color?")
-        self.assertEqual(opts, ["Red", "Green", "Blue"])
 
-    def test_ansi_codes_stripped(self):
-        pane = "Pick one?\n\x1b[36m❯ 1. Alpha\x1b[0m\n  2. Beta\n"
-        q, opts = ha.parse_pane_question(pane)
-        self.assertEqual(q, "Pick one?")
-        self.assertEqual(opts, ["Alpha", "Beta"])
+class TestHookQuestion(unittest.TestCase):
+    """_hook_question reads the ask.py bridge's request file directly."""
 
-    def test_numbered_list_without_cursor_is_not_a_question(self):
-        # Guard against a phantom question: the assistant merely printed a
-        # numbered list and went idle. No selection cursor -> not a picker.
-        pane = "Here's the plan:\n1. First step\n2. Second step\n3. Third step\n"
-        self.assertEqual(ha.parse_pane_question(pane), (None, []))
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-hookq-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = mock.patch.object(ha, "QUESTIONS_DIR", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
 
-    def test_single_option_is_not_a_question(self):
-        pane = "Proceed?\n❯ 1. Yes\n"
-        self.assertEqual(ha.parse_pane_question(pane), (None, []))
+    def _write(self, sid, data):
+        with open(os.path.join(self.tmp, f"{sid}.req.json"), "w") as f:
+            json.dump(data, f)
 
-    def test_empty_pane(self):
-        self.assertEqual(ha.parse_pane_question(""), (None, []))
-        self.assertEqual(ha.parse_pane_question("   \n  \n"), (None, []))
+    def test_missing_file(self):
+        self.assertEqual(ha._hook_question("nope"), (None, []))
 
-    def test_options_capped_at_four_and_labels_at_80(self):
-        long = "L" * 100
-        pane = ("Pick?\n"
-                f"❯ 1. {long}\n  2. b\n  3. c\n  4. d\n  5. e\n  6. f\n")
-        q, opts = ha.parse_pane_question(pane)
-        self.assertEqual(len(opts), 4)
-        self.assertEqual(opts[0], "L" * 80)
-        self.assertEqual(opts[1:], ["b", "c", "d"])
+    def test_no_session_id(self):
+        self.assertEqual(ha._hook_question(None), (None, []))
+        self.assertEqual(ha._hook_question(""), (None, []))
 
-    def test_question_capped_at_300(self):
-        q_text = "Why? " * 100  # > 300 chars
-        pane = f"{q_text}\n❯ 1. a\n  2. b\n"
-        q, _ = ha.parse_pane_question(pane)
+    def test_reads_question_and_labels(self):
+        self._write("s", {"question": "Which?",
+                          "options": [{"label": "A"}, {"label": "B"}]})
+        self.assertEqual(ha._hook_question("s"), ("Which?", ["A", "B"]))
+
+    def test_corrupt_file_is_no_question(self):
+        with open(os.path.join(self.tmp, "s.req.json"), "w") as f:
+            f.write("{not json")
+        self.assertEqual(ha._hook_question("s"), (None, []))
+
+    def test_question_capped_at_300_and_labels_at_80(self):
+        self._write("s", {"question": "Q" * 400,
+                          "options": [{"label": "L" * 100}]})
+        q, opts = ha._hook_question("s")
         self.assertEqual(len(q), 300)
-
-    def test_wrapped_label_does_not_break_the_run(self):
-        pane = (
-            "Choose:\n"
-            "❯ 1. A very long option label that wrapped\n"
-            "     onto a second visual line\n"
-            "  2. Short\n"
-        )
-        q, opts = ha.parse_pane_question(pane)
-        self.assertEqual(q, "Choose:")
-        self.assertEqual(opts, ["A very long option label that wrapped", "Short"])
-
-    def test_boxed_header_not_mistaken_for_question(self):
-        # The header sits in the top border; the real question is below it.
-        pane = (
-            "╭─ Confirm ────────────────╮\n"
-            "│ Delete the branch?       │\n"
-            "│ ❯ 1. Yes                 │\n"
-            "│   2. No                  │\n"
-            "╰──────────────────────────╯\n"
-        )
-        q, opts = ha.parse_pane_question(pane)
-        self.assertEqual(q, "Delete the branch?")
-        self.assertEqual(opts, ["Yes", "No"])
+        self.assertEqual(opts, ["L" * 80])
 
 
 class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
@@ -731,6 +704,7 @@ class ManagerMixin:
             ("REGISTRY_DIR", self.tmp),
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
+            ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", os.path.join(self.tmp, "worktrees")),
         ]:
@@ -1034,12 +1008,16 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         settings = os.path.join(ha.REGISTRY_DIR, "guard-settings.json")
         self.assertEqual(
             self._claude_cmd(),
+            f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
+            f"TURMA_QUESTIONS_DIR={shlex.quote(ha.QUESTIONS_DIR)} "
             f"claude --remote-control '{sess['rcName']}' "
             f"--permission-mode auto --settings {shlex.quote(settings)}",
         )
-        # The guard settings file was written and wires the Bash PreToolUse hook.
+        # The guard settings file was written and wires the Bash guard hook plus
+        # the AskUserQuestion → glasses bridge, both as PreToolUse matchers.
         loaded = json.loads(open(settings).read())
-        self.assertEqual(loaded["hooks"]["PreToolUse"][0]["matcher"], "Bash")
+        matchers = [e["matcher"] for e in loaded["hooks"]["PreToolUse"]]
+        self.assertEqual(matchers, ["Bash", "AskUserQuestion"])
 
     def test_spawn_threads_all_options(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
@@ -1273,6 +1251,75 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.run_calls, [])
 
 
+class TestAnswerQuestion(ManagerMixin, unittest.TestCase):
+    """answer_question drops the ask.py bridge's answer file — only when a
+    request file is actually pending for that session."""
+
+    def _running_session(self, sm, sid="abcde", status="running"):
+        sess = {"id": sid, "status": status, "tmuxName": f"agent-{sid}"}
+        sm.registry = [sess]
+        return sess
+
+    def _req(self, sid):
+        with open(os.path.join(ha.QUESTIONS_DIR, f"{sid}.req.json"), "w") as f:
+            json.dump({"sessionId": sid, "question": "q",
+                       "options": [{"label": "a"}, {"label": "b"}]}, f)
+
+    def _ans(self, sid):
+        path = os.path.join(ha.QUESTIONS_DIR, f"{sid}.ans.json")
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            return json.load(f)
+
+    def test_writes_answer_file_for_option_pick(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        self._req(sess["id"])
+        sm.answer_question(sess["id"], 1, None)
+        self.assertEqual(self._ans(sess["id"]), {"optionIndex": 1})
+
+    def test_writes_answer_file_with_custom_text(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        self._req(sess["id"])
+        sm.answer_question(sess["id"], -1, "do the other thing")
+        self.assertEqual(self._ans(sess["id"]),
+                         {"optionIndex": -1, "custom": "do the other thing"})
+
+    def test_noop_when_no_request_pending(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sm.answer_question(sess["id"], 0, None)  # no req file written
+        self.assertIsNone(self._ans(sess["id"]))
+
+    def test_noop_for_unknown_or_stopped_session(self):
+        sm = self.make_manager()
+        self._req("ghost")
+        sm.registry = []
+        sm.answer_question("ghost", 0, None)
+        self.assertIsNone(self._ans("ghost"))
+
+    def test_noop_when_no_option_and_no_text(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        self._req(sess["id"])
+        sm.answer_question(sess["id"], -1, "   ")  # blank custom, negative index
+        self.assertIsNone(self._ans(sess["id"]))
+
+    def test_kill_clears_pending_question_files(self):
+        sm = self.make_manager()
+        sess = {"id": "abcde", "status": "running", "repo": "r",
+                "tmuxName": "agent-abcde", "worktreePath": "/w", "root": True}
+        sm.registry = [sess]
+        self._req("abcde")
+        with open(os.path.join(ha.QUESTIONS_DIR, "abcde.ans.json"), "w") as f:
+            f.write("{}")
+        sm.kill("abcde")
+        self.assertFalse(os.path.exists(os.path.join(ha.QUESTIONS_DIR, "abcde.req.json")))
+        self.assertFalse(os.path.exists(os.path.join(ha.QUESTIONS_DIR, "abcde.ans.json")))
+
+
 class TestHistoryCommand(ManagerMixin, unittest.TestCase):
     WORKDIR = "/w/.turma/worktrees/repo"
 
@@ -1407,6 +1454,16 @@ class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
         sm.send_input.assert_called_once_with("s1", "hi")
         sm._stage_history.assert_called_once_with("s1")
         self.assertEqual(sm.acked, {"i1", "h1"})
+
+    def test_dispatches_answer_question(self):
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        sm.answer_question = mock.Mock()
+        cmds = [{"cmdId": "a1", "type": "answerQuestion", "sessionId": "s1",
+                 "optionIndex": 2, "custom": "other"}]
+        self.assertTrue(sm.handle_commands(cmds))
+        sm.answer_question.assert_called_once_with("s1", 2, "other")
+        self.assertEqual(sm.acked, {"a1"})
 
 
 class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
