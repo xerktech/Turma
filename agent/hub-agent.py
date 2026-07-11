@@ -1210,9 +1210,7 @@ def collect_github():
 # session shares the one login, so re-summarizing per beat would draw on the
 # working sessions' rate limits. Sessions spawned with no initial prompt (the
 # one-click bare spawn, the repos-root pseudo-repo) simply stay unnamed and the
-# card falls back to the label/worktree. Off unless SESSION_SUMMARY_ENABLED.
-SESSION_SUMMARY_ENABLED = os.environ.get(
-    "SESSION_SUMMARY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+# card falls back to the label/worktree.
 # Handed straight to `claude --model`; validated only against claude's own
 # aliases, but this is a fixed operator-set env, not free-form spawn input.
 SESSION_SUMMARY_MODEL = os.environ.get("SESSION_SUMMARY_MODEL", "haiku").strip() or "haiku"
@@ -1287,7 +1285,7 @@ class SessionManager:
         self.prunes = {}
         # In-flight session-summary subprocesses keyed by session id (the Popen
         # + its output file live here; the finished text lands on the session
-        # record). Empty unless SESSION_SUMMARY_ENABLED.
+        # record). Empty when no session has a prompt to summarize.
         self.summaries = {}
         # at-least-once command de-dup: cmdIds we've already executed.
         self.acked = set()
@@ -1596,7 +1594,7 @@ class SessionManager:
             self._launch_tmux(sess, prompt=(prompt or None))
             self._launch_ttyd(sess)
             # Name the session from its initial prompt, once, in the background
-            # (no-op unless enabled / no prompt). Never blocks the spawn.
+            # (no-op when there's no prompt). Never blocks the spawn.
             self._start_summary(sess, prompt)
             wt = os.path.basename(sess["worktreePath"])
             log(f"spawned session {sid} for {repo['name']} on :{sess['ttydPort']} "
@@ -1962,10 +1960,8 @@ class SessionManager:
     def _start_summary(self, sess, prompt):
         """Kick off a one-shot `claude -p` (Haiku) to name a session from its
         initial prompt, as a DETACHED subprocess reaped by _poll_summaries.
-        No-op unless the feature is enabled and there's a prompt to summarize.
+        No-op when there's no prompt to summarize (bare spawns, repos-root).
         Best-effort: any launch failure just leaves the session unnamed."""
-        if not SESSION_SUMMARY_ENABLED:
-            return
         prompt = (prompt or "").strip()
         if not prompt:
             return
