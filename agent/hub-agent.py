@@ -1245,6 +1245,47 @@ def _hook_question(session_id):
     return question, labels
 
 
+# Claude Code's TUI paints an "esc to interrupt" hint on its status line for
+# exactly as long as the model is actively working — while it's generating and
+# while a tool call it launched is still running — and drops it the instant the
+# turn ends and it's back to awaiting input. Capturing the session's tmux pane
+# and looking for that hint is the most accurate "is it working right now"
+# signal we have: it's literally the icon a human watches in the terminal, so
+# unlike transcript-mtime it stays true through a long silent Bash/build tool
+# call and flips false the moment the turn finishes (instead of lingering
+# "working" for the mtime window). The marker set is env-overridable so a TUI
+# wording change can be patched without rebuilding the image.
+PANE_BUSY_MARKERS = tuple(
+    m.strip().lower() for m in
+    os.environ.get("TURMA_PANE_BUSY_MARKERS", "esc to interrupt").split("|")
+    if m.strip()
+)
+
+
+def _pane_busy(tmux_name):
+    """Whether the session's live TUI shows the model actively working.
+
+    True  = the interrupt hint is on screen (generating or running a tool),
+    False = it isn't (turn finished, awaiting input),
+    None  = unknown — no tmux_name, markers disabled, or the pane couldn't be
+            captured (e.g. the tmux session is gone). Callers fall back to the
+            transcript-mtime heuristic on None, so an old/crashed pane degrades
+            gracefully rather than reporting a wrong state."""
+    if not tmux_name or not PANE_BUSY_MARKERS:
+        return None
+    try:
+        out = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", tmux_name],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    low = out.stdout.lower()
+    return any(m in low for m in PANE_BUSY_MARKERS)
+
+
 def session_report(workdir, state, tmux_name=None, session_id=None):
     """Cheap per-heartbeat session signals (stat + tail reads, no full parse).
 
@@ -1260,6 +1301,9 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
     seen = state.setdefault("pr_seen", set())
     report = {
         "bridgeAttached": os.path.exists(os.path.join(proj, "bridge-pointer.json")),
+        # Live "is it working right now" read straight off the session's TUI —
+        # the primary working/idle signal; transcriptAgeSec is the fallback.
+        "paneBusy": _pane_busy(tmux_name),
         "transcriptAgeSec": None,  # seconds since the newest transcript write
         "lastRole": None,          # "assistant"/"user"/... of the newest entry
         "lastHasToolUse": False,

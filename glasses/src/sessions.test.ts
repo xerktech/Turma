@@ -45,6 +45,37 @@ describe("liveState", () => {
     expect(liveState(s)).toBe("waiting");
   });
 
+  it("is 'working' when paneBusy is true, even with a stale transcript", () => {
+    const s = session({
+      status: "running",
+      session: signals({ paneBusy: true, transcriptAgeSec: 999 }),
+    });
+    expect(liveState(s)).toBe("working");
+  });
+
+  it("is 'idle' when paneBusy is false, even with a fresh transcript", () => {
+    const s = session({
+      status: "running",
+      session: signals({ paneBusy: false, transcriptAgeSec: 1 }),
+    });
+    expect(liveState(s)).toBe("idle");
+  });
+
+  it("still yields to a pending question when paneBusy is true", () => {
+    const s = session({
+      status: "running",
+      session: signals({ paneBusy: true, question: "pick one" }),
+    });
+    expect(liveState(s)).toBe("waiting");
+  });
+
+  it("falls back to transcript freshness when paneBusy is null (older agent)", () => {
+    const fresh = session({ status: "running", session: signals({ paneBusy: null, transcriptAgeSec: 89 }) });
+    expect(liveState(fresh)).toBe("working");
+    const stale = session({ status: "running", session: signals({ paneBusy: null, transcriptAgeSec: 90 }) });
+    expect(liveState(stale)).toBe("idle");
+  });
+
   it("is 'working' when the transcript was written to within 90s", () => {
     const s = session({ status: "running", session: signals({ transcriptAgeSec: 89 }) });
     expect(liveState(s)).toBe("working");

@@ -434,11 +434,16 @@ function fmtDur(ms) {
   return `${Math.round(s / 360) / 10}h`;
 }
 
-// Is this session actively working? True while its transcript was written to
-// within WORKING_WINDOW_MS (the agent reports the age at beat time; we add the
-// staleness since the host's last beat). `lastSeen` is the host's last beat.
+// Is this session actively working? Primary signal is the agent's live TUI
+// probe (paneBusy: the "esc to interrupt" hint is on screen iff the model is
+// working). Falls back to transcript freshness — written within
+// WORKING_WINDOW_MS (the agent reports the age at beat time; we add the
+// staleness since the host's last beat) — when paneBusy wasn't reported (older
+// agent, or the pane couldn't be captured). `lastSeen` is the host's last beat.
 function sessionWorking(session, lastSeen, now) {
-  const age = session.session?.transcriptAgeSec;
+  const s = session.session;
+  if (s?.paneBusy != null) return s.paneBusy;
+  const age = s?.transcriptAgeSec;
   if (age == null) return false;
   return age * 1000 + Math.max(0, now - (lastSeen || 0)) < WORKING_WINDOW_MS;
 }

@@ -783,6 +783,95 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["questionOptions"], ["a", "b", "c"])
 
 
+class TestPaneBusy(unittest.TestCase):
+    """_pane_busy reads the working/idle state straight off the session's tmux
+    pane by looking for Claude Code's 'esc to interrupt' hint. Every branch is
+    exercised against a faked subprocess.run so no real tmux is needed."""
+
+    def _capture(self, stdout="", returncode=0, raises=None):
+        def fake_run(cmd, *a, **kw):
+            self.assertEqual(cmd[:2], ["tmux", "capture-pane"])
+            self.assertIn("agent-x", cmd)  # -t <tmux_name>
+            if raises:
+                raise raises
+            return mock.Mock(stdout=stdout, returncode=returncode)
+        return fake_run
+
+    def test_none_without_tmux_name(self):
+        # No pane to read -> unknown, and no subprocess is spawned.
+        with mock.patch.object(ha.subprocess, "run",
+                               side_effect=AssertionError("should not run")):
+            self.assertIsNone(ha._pane_busy(None))
+            self.assertIsNone(ha._pane_busy(""))
+
+    def test_true_when_interrupt_hint_present(self):
+        pane = "some output\n✳ Simmering… (esc to interrupt · 12s · ↑ 1.2k tokens)\n"
+        with mock.patch.object(ha.subprocess, "run", self._capture(stdout=pane)):
+            self.assertIs(ha._pane_busy("agent-x"), True)
+
+    def test_case_insensitive_marker_match(self):
+        with mock.patch.object(ha.subprocess, "run",
+                               self._capture(stdout="ESC TO INTERRUPT")):
+            self.assertIs(ha._pane_busy("agent-x"), True)
+
+    def test_false_when_hint_absent(self):
+        # Resting: the input box / shortcuts hint, no interrupt line.
+        with mock.patch.object(ha.subprocess, "run",
+                               self._capture(stdout="> \n? for shortcuts\n")):
+            self.assertIs(ha._pane_busy("agent-x"), False)
+
+    def test_none_on_capture_failure(self):
+        # tmux session gone (nonzero) or tmux missing (raises) -> unknown, so
+        # callers fall back to the transcript-mtime heuristic.
+        with mock.patch.object(ha.subprocess, "run",
+                               self._capture(returncode=1)):
+            self.assertIsNone(ha._pane_busy("agent-x"))
+        with mock.patch.object(ha.subprocess, "run",
+                               self._capture(raises=FileNotFoundError("no tmux"))):
+            self.assertIsNone(ha._pane_busy("agent-x"))
+
+    def test_markers_configurable_via_env(self):
+        # A TUI wording change can be patched without an image rebuild.
+        markers = ha.PANE_BUSY_MARKERS
+        try:
+            ha.PANE_BUSY_MARKERS = ("press ctrl-c to stop",)
+            with mock.patch.object(ha.subprocess, "run",
+                                   self._capture(stdout="press CTRL-C to stop")):
+                self.assertIs(ha._pane_busy("agent-x"), True)
+            with mock.patch.object(ha.subprocess, "run",
+                                   self._capture(stdout="esc to interrupt")):
+                self.assertIs(ha._pane_busy("agent-x"), False)
+        finally:
+            ha.PANE_BUSY_MARKERS = markers
+
+
+class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
+    """session_report surfaces the pane probe as report['paneBusy'] on every
+    return path (even before any transcript exists)."""
+
+    def test_pane_busy_reported_with_transcript(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [{"type": "assistant",
+                            "message": {"content": [{"type": "text", "text": "hi"}]}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=True) as pb:
+            rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
+        self.assertIs(rep["paneBusy"], True)
+        pb.assert_called_once_with("agent-abc")
+
+    def test_pane_busy_reported_without_transcript(self):
+        # No transcript yet — paneBusy must still ride the early-return path.
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            rep = ha.session_report("/absent/worktree", {}, "agent-abc")
+        self.assertIs(rep["paneBusy"], False)
+
+    def test_pane_busy_defaults_none_without_tmux(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [{"type": "assistant",
+                            "message": {"content": [{"type": "text", "text": "hi"}]}}])
+        rep = ha.session_report(self.WORKDIR, {})  # no tmux_name
+        self.assertIsNone(rep["paneBusy"])
+
+
 class TestHookQuestion(unittest.TestCase):
     """_hook_question reads the ask.py bridge's request file directly."""
 
