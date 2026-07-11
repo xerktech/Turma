@@ -375,6 +375,17 @@ test("alerts: daily cost threshold sums sessions, fires once per day", () => {
   assert.deepEqual(titles(), []);
 });
 
+test("alerts: daily cost prefers host-level usage (counts killed sessions)", () => {
+  const beat = makeHost();
+  // The host-level `usage` block is aggregated from ALL transcripts, so it
+  // exceeds the threshold even though the live sessions list is empty (their
+  // work was killed). The alert must use it rather than summing live sessions.
+  notifications.length = 0;
+  beat({ sessions: [], usage: { today: { cost: 72.5 } } });
+  assert.deepEqual(titles(), ["host1 cost alert"]);
+  assert.match(notifications[0].body, /\$72\.50/);
+});
+
 test("alerts: question fires on new text only, re-arms when cleared", () => {
   const beat = makeHost();
   const withQ = (q) => ({
