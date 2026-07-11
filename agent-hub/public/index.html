@@ -179,7 +179,16 @@
   }
   .sess.stopped, .sess.error { opacity: 0.9; }
   .sess-hd { display: flex; align-items: center; gap: 8px; }
-  .sess-hd .sid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; font-size: 13px; flex: 1; }
+  .sess-hd .sid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; font-size: 13px; flex: 0 0 auto; }
+  /* Auto task summary: the prominent few-word "name" the agent derives from the
+     session's initial prompt. Takes the middle space so the badge (margin-left:
+     auto) still pins right; when absent the badge's auto margin preserves the old
+     id-left / badge-right look. */
+  .sess-summary {
+    flex: 1 1 auto; min-width: 0; font-weight: 600; font-size: 12.5px; color: var(--accent);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .sess-hd .badge { margin-left: auto; }
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 20px; border: 1px solid var(--border); color: var(--ink-2); white-space: nowrap; }
   .badge.running { color: var(--good); border-color: var(--good); }
   .badge.stopped { color: var(--muted); }
@@ -1003,6 +1012,7 @@ function sessCard(a, s, now) {
   return `<div class="sess ${st}">
     <div class="sess-hd">
       <span class="sid">${id}</span>
+      ${s.summary ? `<span class="sess-summary" title="auto task name (from the initial prompt)">${esc(s.summary)}</span>` : ""}
       ${s.label ? `<span class="sess-label" title="session label">${esc(s.label)}</span>` : ""}
       <span class="badge ${st}">${esc(st)}</span>
     </div>

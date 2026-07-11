@@ -1200,6 +1200,53 @@ def collect_github():
     return {"available": True, "login": login, "repos": list_github_repos()}
 
 
+# --- Session activity summaries ------------------------------------------------
+# Optionally give each session a few-word "name" describing its task (e.g.
+# "Adding Compose Flag"), generated once at spawn from the initial prompt by the
+# container's already-authenticated `claude` in headless print mode (`claude -p`,
+# Haiku by default). It reuses the mounted login, so there is NO external API or
+# key. The call runs as a detached subprocess reaped on later beats (never blocks
+# the heartbeat) and is deliberately ONE-SHOT — only at spawn — because every
+# session shares the one login, so re-summarizing per beat would draw on the
+# working sessions' rate limits. Sessions spawned with no initial prompt (the
+# one-click bare spawn, the repos-root pseudo-repo) simply stay unnamed and the
+# card falls back to the label/worktree. Off unless SESSION_SUMMARY_ENABLED.
+SESSION_SUMMARY_ENABLED = os.environ.get(
+    "SESSION_SUMMARY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+# Handed straight to `claude --model`; validated only against claude's own
+# aliases, but this is a fixed operator-set env, not free-form spawn input.
+SESSION_SUMMARY_MODEL = os.environ.get("SESSION_SUMMARY_MODEL", "haiku").strip() or "haiku"
+try:
+    SUMMARY_TIMEOUT_SEC = int(os.environ.get("SESSION_SUMMARY_TIMEOUT_SEC", "45"))
+except ValueError:
+    SUMMARY_TIMEOUT_SEC = 45
+SUMMARY_MAX_WORDS = 6          # cap a chatty reply so it can't bloat the card
+SUMMARY_MAX_CHARS = 48
+SUMMARY_PROMPT_CAP = 2000      # cap the task text handed to the summarizer
+SUMMARY_INSTRUCTION = (
+    "In 2-4 words, give a Title Case name for the coding task below "
+    '(e.g. "Adding Compose Flag", "Debugging Heartbeat Parser"). '
+    "Reply with ONLY the name — no quotes, no punctuation, no preamble.\n\nTask:\n"
+)
+
+
+def clean_summary(raw):
+    """Reduce raw `claude -p` output to a short display name, or None. Takes the
+    first non-empty line, strips surrounding quotes/backticks and trailing
+    punctuation, and caps to a few words / chars so a verbose reply can't blow
+    up the session card."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    line = re.sub(r"[\"'`]+", " ", line)
+    line = re.sub(r"[.\s]+$", "", line).strip()
+    if not line:
+        return None
+    capped = " ".join(line.split()[:SUMMARY_MAX_WORDS])[:SUMMARY_MAX_CHARS].strip()
+    return capped or None
+
+
 class SessionManager:
     """Owns the registry, the live tmux/ttyd/claude processes, and the
     heartbeat loop. Single-threaded: all mutations happen in the main loop, so
@@ -1238,6 +1285,10 @@ class SessionManager:
         # Recent per-repo prune results (merged branches + safe worktrees swept),
         # keyed by repo name, lingered briefly so the UI can show the summary.
         self.prunes = {}
+        # In-flight session-summary subprocesses keyed by session id (the Popen
+        # + its output file live here; the finished text lands on the session
+        # record). Empty unless SESSION_SUMMARY_ENABLED.
+        self.summaries = {}
         # at-least-once command de-dup: cmdIds we've already executed.
         self.acked = set()
         self.acked_order = deque(maxlen=1000)
@@ -1529,6 +1580,7 @@ class SessionManager:
             "createdAt": now_iso(),
             "stoppedAt": None,
             "errorMsg": None,
+            "summary": None,       # few-word task name, filled in async at spawn
         }
         self.registry.append(sess)
         try:
@@ -1543,6 +1595,9 @@ class SessionManager:
                 self._worktree_add(sess, base_ref=resolved_base)
             self._launch_tmux(sess, prompt=(prompt or None))
             self._launch_ttyd(sess)
+            # Name the session from its initial prompt, once, in the background
+            # (no-op unless enabled / no prompt). Never blocks the spawn.
+            self._start_summary(sess, prompt)
             wt = os.path.basename(sess["worktreePath"])
             log(f"spawned session {sid} for {repo['name']} on :{sess['ttydPort']} "
                 + ("(root)" if is_root else
@@ -1560,7 +1615,7 @@ class SessionManager:
         they just stop being offered)."""
         rec = {k: sess.get(k) for k in (
             "id", "repo", "repoPath", "worktreePath", "branch", "baseRef",
-            "rcName", "tmuxName", "createdAt", "label", "model",
+            "rcName", "tmuxName", "createdAt", "label", "summary", "model",
             "permissionMode", "root",
         )}
         rec["closedAt"] = now_iso()
@@ -1656,6 +1711,7 @@ class SessionManager:
             "baseRef": rec.get("baseRef"),
             "root": rec.get("root"),
             "label": rec.get("label"),
+            "summary": rec.get("summary"),   # keep the auto name across resume
             "rcName": rec.get("rcName"),
             "tmuxName": rec.get("tmuxName") or f"agent-{sid}",
             "ttydPort": self._alloc_port(),  # old port may be taken by now
@@ -1900,6 +1956,90 @@ class SessionManager:
              "startedAt": j.get("startedAt")}
             for j in self.clones.values()
         ]
+
+    # --- session activity summaries ----------------------------------------
+
+    def _start_summary(self, sess, prompt):
+        """Kick off a one-shot `claude -p` (Haiku) to name a session from its
+        initial prompt, as a DETACHED subprocess reaped by _poll_summaries.
+        No-op unless the feature is enabled and there's a prompt to summarize.
+        Best-effort: any launch failure just leaves the session unnamed."""
+        if not SESSION_SUMMARY_ENABLED:
+            return
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return
+        sid = sess["id"]
+        out_path = os.path.join(REGISTRY_DIR, f"summary-{slugify(sid)}.out")
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            outf = open(out_path, "w")
+            # Headless, text-only. cwd is REGISTRY_DIR (NOT the worktree) and no
+            # --settings is passed, so it never loads the session safety guard or
+            # explores the repo; a summarization prompt won't invoke tools, and
+            # the timeout in _poll_summaries backstops anything that hangs. The
+            # command is a list (no shell), so the prompt text can't inject.
+            proc = subprocess.Popen(
+                ["claude", "-p", "--model", SESSION_SUMMARY_MODEL,
+                 SUMMARY_INSTRUCTION + prompt[:SUMMARY_PROMPT_CAP]],
+                stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+            )
+        except Exception as e:
+            log(f"summary launch failed for {sid}: {e}")
+            return
+        self.summaries[sid] = {
+            "proc": proc, "outf": outf, "outPath": out_path,
+            "startedMono": time.time(),
+        }
+        log(f"summarizing session {sid} via claude -p ({SESSION_SUMMARY_MODEL})")
+
+    def _finish_summary(self, sid, job, summary):
+        """Tear down a summary job's file handle + temp output and, if we got a
+        name, store it on the session record (persisted so it survives beats,
+        restarts, and resume)."""
+        try:
+            if job.get("outf"):
+                job["outf"].close()
+        except Exception:
+            pass
+        try:
+            if job.get("outPath"):
+                os.remove(job["outPath"])
+        except OSError:
+            pass
+        self.summaries.pop(sid, None)
+        sess = self._find(sid)
+        if sess is None:
+            return  # killed/deleted while summarizing — nothing to name
+        if summary:
+            sess["summary"] = summary
+            self.save()
+            log(f"named session {sid}: {summary!r}")
+
+    def _poll_summaries(self):
+        """Reap finished summary subprocesses (one poll() per active job each
+        beat, like _poll_clones): on clean exit, set sess['summary'] from the
+        cleaned output; kill + drop any that overran the timeout."""
+        now = time.time()
+        for sid, job in list(self.summaries.items()):
+            proc = job.get("proc")
+            rc = proc.poll() if proc else 0
+            if rc is None:
+                if now - job.get("startedMono", now) > SUMMARY_TIMEOUT_SEC:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    self._finish_summary(sid, job, None)
+                continue
+            raw = None
+            if rc == 0:
+                try:
+                    with open(job.get("outPath") or "", errors="replace") as f:
+                        raw = f.read()
+                except OSError:
+                    raw = None
+            self._finish_summary(sid, job, clean_summary(raw))
 
     # --- prune merged branches + safe worktrees ----------------------------
 
@@ -2150,6 +2290,7 @@ class SessionManager:
             "root": sess.get("root", False),
             "rcName": sess["rcName"],
             "label": sess.get("label"),
+            "summary": sess.get("summary"),   # few-word auto task name (or None)
             "model": sess.get("model"),
             "permissionMode": sess.get("permissionMode"),
             "baseRef": sess.get("baseRef"),
@@ -2180,6 +2321,7 @@ class SessionManager:
                 "root": c.get("root", False),
                 "rcName": c.get("rcName"),
                 "label": c.get("label"),
+                "summary": c.get("summary"),
                 "createdAt": c.get("createdAt"),
                 "closedAt": c.get("closedAt"),
             }
@@ -2202,6 +2344,7 @@ class SessionManager:
             self.refresh_github()
         self._poll_clones()
         self._poll_prunes()
+        self._poll_summaries()
 
         payload = {
             # `device` (the physical host name) is the hub's identity key; agentId
