@@ -19,7 +19,7 @@ export const LEGACY_CONFIG_STORAGE_KEY = "agenthub.glasses.config";
 // password, exactly like the web dashboard's login. `VITE_HUB_URL` can still
 // override it for local dev (`npm run dev` against a mock-hub), but packaged
 // production builds always target this host.
-export const DEFAULT_HUB_URL = "https://agents.xerktech.com";
+export const DEFAULT_HUB_URL = "https://turma.xerktech.com";
 
 // The single source of truth for which hub to talk to: the dev env override
 // if present, otherwise the hardcoded production host. Never comes from a

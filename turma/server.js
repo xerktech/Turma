@@ -1,7 +1,7 @@
 // turma — central dashboard + terminal gateway for the Claude Code containers.
 //
 // Agents (agent image) reach this server purely OUTBOUND, so hub and
-// agents can live on any host/network (all traffic rides agents.xerktech.com):
+// agents can live on any host/network (all traffic rides turma.xerktech.com):
 //   1. hub-agent.py POSTs a status heartbeat every ~20s (a HOST with its repos[]
 //      and multiplexed Claude sessions[]) and picks up queued host commands
 //      (per-session spawn/kill/start/restart/resume/delete) on the reply, acking
