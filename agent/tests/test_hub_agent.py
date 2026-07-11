@@ -1502,6 +1502,135 @@ class TestClone(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.clones["AgentHub"]["status"], "error")
 
 
+class TestCleanSummary(unittest.TestCase):
+    def test_strips_quotes_and_trailing_punctuation(self):
+        self.assertEqual(ha.clean_summary('"Adding Compose Flag."'), "Adding Compose Flag")
+        self.assertEqual(ha.clean_summary("`Fix Login`"), "Fix Login")
+
+    def test_takes_first_non_empty_line(self):
+        self.assertEqual(ha.clean_summary("\n  Title Here \n more text"), "Title Here")
+
+    def test_caps_words(self):
+        self.assertEqual(
+            ha.clean_summary("one two three four five six seven eight"),
+            "one two three four five six")
+
+    def test_empty_none_and_blank_return_none(self):
+        self.assertIsNone(ha.clean_summary(""))
+        self.assertIsNone(ha.clean_summary("   \n  "))
+        self.assertIsNone(ha.clean_summary(None))
+
+
+class TestSessionSummaries(ManagerMixin, unittest.TestCase):
+    def _enable(self):
+        p = mock.patch.object(ha, "SESSION_SUMMARY_ENABLED", True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_disabled_never_launches(self):
+        sm = self.make_manager()  # feature off by default (env unset)
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm._start_summary({"id": "s1"}, "do a thing")
+            popen.assert_not_called()
+        self.assertEqual(sm.summaries, {})
+
+    def test_missing_prompt_skipped(self):
+        self._enable()
+        sm = self.make_manager()
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm._start_summary({"id": "s1"}, "   ")
+            sm._start_summary({"id": "s1"}, None)
+            popen.assert_not_called()
+        self.assertEqual(sm.summaries, {})
+
+    def test_launch_uses_claude_p_headless_off_the_worktree(self):
+        self._enable()
+        sm = self.make_manager()
+
+        class FakeProc:
+            def poll(self_i):
+                return 0
+
+            def kill(self_i):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()) as popen:
+            sm._start_summary({"id": "s1"}, "Add a docker compose flag")
+            args = popen.call_args[0][0]
+            self.assertEqual(args[:4], ["claude", "-p", "--model", ha.SESSION_SUMMARY_MODEL])
+            self.assertIn("Add a docker compose flag", args[-1])  # task in the prompt
+            # Runs in the registry dir (not a worktree) and passes no --settings,
+            # so it never loads the session safety guard.
+            self.assertEqual(popen.call_args[1]["cwd"], ha.REGISTRY_DIR)
+            self.assertNotIn("--settings", args)
+        self.assertIn("s1", sm.summaries)
+
+    def test_finish_sets_name_and_reaps_job(self):
+        self._enable()
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "summary": None}]
+        sm.save = mock.Mock()
+
+        class FakeProc:
+            def poll(self_i):
+                return 0
+
+            def kill(self_i):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()):
+            sm._start_summary(sm.registry[0], "Add a docker compose flag")
+        out_path = sm.summaries["s1"]["outPath"]
+        # The model's answer lands on the job's stdout file.
+        with open(out_path, "w") as f:
+            f.write("Adding Compose Flag\n")
+        sm._poll_summaries()
+        self.assertEqual(sm.registry[0]["summary"], "Adding Compose Flag")
+        self.assertEqual(sm.summaries, {})            # reaped
+        self.assertFalse(os.path.exists(out_path))    # temp output cleaned up
+        sm.save.assert_called_once()
+
+    def test_timeout_kills_and_leaves_unnamed(self):
+        self._enable()
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "summary": None}]
+        killed = {"v": False}
+
+        class HangProc:
+            def poll(self_i):
+                return None  # never exits
+
+            def kill(self_i):
+                killed["v"] = True
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=HangProc()):
+            sm._start_summary(sm.registry[0], "do a thing")
+        sm.summaries["s1"]["startedMono"] -= ha.SUMMARY_TIMEOUT_SEC + 1  # force overrun
+        sm._poll_summaries()
+        self.assertTrue(killed["v"])
+        self.assertEqual(sm.summaries, {})
+        self.assertIsNone(sm.registry[0]["summary"])
+
+    def test_session_deleted_mid_summary_is_safe(self):
+        self._enable()
+        sm = self.make_manager()
+        sm.registry = []  # session killed/deleted while the summary ran
+
+        class FakeProc:
+            def poll(self_i):
+                return 0
+
+            def kill(self_i):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()):
+            sm._start_summary({"id": "s1"}, "do a thing")
+        with open(sm.summaries["s1"]["outPath"], "w") as f:
+            f.write("Some Name")
+        sm._poll_summaries()  # must not raise even with no matching session
+        self.assertEqual(sm.summaries, {})
+
+
 class TestProjectSlug(unittest.TestCase):
     def test_every_non_alphanumeric_becomes_dash(self):
         # Claude Code slugs dots too: /repos/.agenthub/... -> -repos--agenthub-...
