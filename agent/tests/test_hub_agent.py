@@ -2536,5 +2536,109 @@ class TestPruneRepo(unittest.TestCase):
         self.assertEqual(sm.prunes["nope"]["status"], "error")
 
 
+def _text_entry(uuid, role, text, ts="2026-07-01T10:00:00Z"):
+    return {"type": role, "uuid": uuid, "timestamp": ts,
+            "message": {"role": role, "content": text}}
+
+
+class TestArchiveSync(ManagerMixin, unittest.TestCase):
+    """Shipping inactive-session transcripts to the hub's durable archive:
+    the manifest (what to sync) and the delta push (append-only byte ranges)."""
+
+    def _write_transcript(self, worktree, fname, entries, repo="Turma", remote="git@github.com:xerk/Turma.git"):
+        slug = ha._project_slug(worktree)
+        d = os.path.join(ha.PROJECTS_ROOT, slug)
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, fname), entries)
+        return slug
+
+    def _ledger(self, sm, worktree, repo="Turma", remote="git@github.com:xerk/Turma.git"):
+        sm.usage_ledger = {worktree: {"repo": repo, "remote": remote,
+                                      "slug": ha._project_slug(worktree)}}
+
+    def test_manifest_lists_inactive_attributed(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm.closed = [{"id": "s", "worktreePath": wt, "summary": "My Task",
+                      "createdAt": "2026-07-01T00:00:00Z"}]
+        manifest = sm._archive_manifest()
+        self.assertEqual(len(manifest), 1)
+        m = manifest[0]
+        self.assertEqual(m["transcriptId"], "t1")
+        self.assertEqual(m["repo"], "Turma")
+        self.assertEqual(m["remoteKey"], "github.com/xerk/turma")
+        self.assertEqual(m["summary"], "My Task")
+        self.assertGreater(m["size"], 0)
+        self.assertNotIn("mtime", m)  # internal sort key stripped
+
+    def test_manifest_excludes_running_session_slug(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/live"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = [{"id": "s", "worktreePath": wt, "status": "running"}]
+        self.assertEqual(sm._archive_manifest(), [])
+        # Once it stops, it becomes eligible.
+        sm.registry = [{"id": "s", "worktreePath": wt, "status": "stopped"}]
+        self.assertEqual(len(sm._archive_manifest()), 1)
+
+    def test_deltas_push_filtered_entries_and_resume(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        # A thinking + a tool_result entry are dropped by _entry_text; only the
+        # user/assistant text lines are shipped.
+        self._write_transcript(wt, "t1.jsonl", [
+            _text_entry("u1", "user", "make it searchable"),
+            {"type": "assistant", "uuid": "a1", "timestamp": "2026-07-01T10:01:00Z",
+             "message": {"role": "assistant", "content": [
+                 {"type": "thinking", "text": "hmm"},
+                 {"type": "text", "text": "added an index"}]}},
+        ])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+
+        pushed = []
+
+        def fake_post(tid, body):
+            pushed.append((tid, body))
+            return {"bytesStored": body["endOffset"]}
+
+        with mock.patch.object(sm, "_post_archive_chunk", fake_post):
+            sm._archive_deltas({})  # hub has nothing yet -> push from 0
+
+        self.assertEqual(len(pushed), 1)
+        tid, body = pushed[0]
+        self.assertEqual(tid, "t1")
+        self.assertEqual(body["startOffset"], 0)
+        texts = [e["text"] for e in body["entries"]]
+        self.assertEqual(texts, ["make it searchable", "added an index"])
+        self.assertEqual(body["meta"]["remoteKey"], "github.com/xerk/turma")
+
+        # Nothing to do when the hub is already caught up.
+        pushed.clear()
+        with mock.patch.object(sm, "_post_archive_chunk", fake_post):
+            sm._archive_deltas({"t1": body["size"]})
+        self.assertEqual(pushed, [])
+
+    def test_deltas_stop_on_no_forward_progress(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hello world")])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        calls = []
+
+        def stuck_post(tid, body):
+            calls.append(tid)
+            return {"bytesStored": 0}  # hub reports no progress (offset realign)
+
+        with mock.patch.object(sm, "_post_archive_chunk", stuck_post):
+            sm._archive_deltas({})
+        self.assertEqual(len(calls), 1)  # one attempt, then it bails (no loop)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,10 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { Duplex } = require("stream");
+// Durable, searchable archive of ended sessions (organized files on /data + a
+// node:sqlite FTS index). See archive.js. Lazily opens its DB on first use, so
+// requiring it is cheap and side-effect-free.
+const archive = require("./archive.js");
 
 const PORT = parseInt(process.env.PORT || "8300", 10);
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
@@ -992,7 +996,13 @@ const server = http.createServer(async (req, res) => {
       url.pathname === "/api/login" ||
       url.pathname === "/api/logout";
 
-    if (url.pathname === "/api/heartbeat") {
+    // The archive-ingest endpoint is agent-pushed (bearer token), like the
+    // heartbeat — it must not require the user login the rest of /api/* does.
+    const isArchiveIngest =
+      req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+      parts[3] === "archive" && parts.length === 5;
+
+    if (url.pathname === "/api/heartbeat" || isArchiveIngest) {
       if (!agentAuthorized(req)) return json(res, 401, { error: "unauthorized" });
     } else if (isLoginRoute) {
       // fall through to the handlers below
@@ -1147,6 +1157,18 @@ const server = http.createServer(async (req, res) => {
       // stored on the record verbatim.
       const historyResults = payload.historyResults;
       delete payload.historyResults;
+      // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
+      // transcripts this host could ship. We upsert their metadata rows and hand
+      // back a byte-cursor map so the agent knows what deltas to push. Kept off
+      // the persisted record (it's transient, potentially large). Best-effort:
+      // an archive/DB hiccup must never break the heartbeat.
+      const archiveManifest = payload.archiveManifest;
+      delete payload.archiveManifest;
+      let archiveHave;
+      if (Array.isArray(archiveManifest) && archiveManifest.length) {
+        try { archiveHave = archive.manifestCursors(key, archiveManifest); }
+        catch (e) { console.error(`archive manifest ingest failed: ${e.message}`); }
+      }
       const next = (agents[key] = {
         ...payload,
         // Pending host commands (spawn/kill/start/restart/resume/delete)
@@ -1165,7 +1187,66 @@ const server = http.createServer(async (req, res) => {
       // A fresh beat landed — refresh the memoized fleet payload and push the
       // updated record to open dashboards so the UI reflects it near-instantly.
       publishAgent(key);
-      return json(res, 200, { commands });
+      return json(res, 200, archiveHave ? { commands, archiveHave } : { commands });
+    }
+
+    // POST /api/agents/<host>/archive/<transcriptId> — an agent pushing one delta
+    // chunk of an inactive session's transcript into the durable hub archive.
+    // Agent-authed above. Body: {startOffset, endOffset, size, entries, meta}.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "archive" && parts.length === 5) {
+      const key = decodeURIComponent(parts[2]);
+      const transcriptId = decodeURIComponent(parts[4]);
+      if (!/^[A-Za-z0-9._-]+$/.test(transcriptId)) return json(res, 400, { error: "bad transcriptId" });
+      const body = JSON.parse((await readBody(req)) || "{}");
+      try {
+        const r = archive.ingestChunk(
+          key, transcriptId, body.meta || {},
+          Number(body.startOffset) || 0, Number(body.endOffset) || 0,
+          Array.isArray(body.entries) ? body.entries : []
+        );
+        return json(res, 200, r);
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    // GET /api/search?q=&repo=&host=&limit= — instant hub-local full-text search
+    // over every archived session (works even for offline hosts).
+    if (req.method === "GET" && url.pathname === "/api/search") {
+      const q = (url.searchParams.get("q") || "").trim();
+      if (q.length < 2) return json(res, 400, { error: "query too short" });
+      try {
+        return json(res, 200, archive.searchArchive(q, {
+          repo: url.searchParams.get("repo") || undefined,
+          host: url.searchParams.get("host") || undefined,
+          limit: url.searchParams.get("limit") || undefined,
+        }));
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    // GET /api/archive?repo=&host=&limit=&offset= — browse ended sessions.
+    if (req.method === "GET" && url.pathname === "/api/archive") {
+      try {
+        return json(res, 200, archive.listArchive({
+          repo: url.searchParams.get("repo") || undefined,
+          host: url.searchParams.get("host") || undefined,
+          limit: url.searchParams.get("limit") || undefined,
+          offset: url.searchParams.get("offset") || undefined,
+        }));
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    // GET /api/archive/<transcriptId> — one archived session's full transcript.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "archive" && parts.length === 3) {
+      const transcriptId = decodeURIComponent(parts[2]);
+      const t = archive.getTranscript(transcriptId);
+      if (!t) return json(res, 404, { error: "unknown transcript" });
+      return json(res, 200, t);
     }
 
     // POST /api/agents/<host>/clone — queue a GitHub clone into the host's
