@@ -139,6 +139,10 @@
     padding: 12px; display: flex; flex-direction: column; gap: 8px;
   }
   .sess.stopped, .sess.error { opacity: 0.9; }
+  /* Optimistic takedown: a confirmed kill immediately dims and pulses the card
+     so the shutdown reads as deliberate rather than a card blinking out. */
+  .sess.killing { border-color: color-mix(in srgb, var(--critical) 40%, var(--border)); animation: killing-pulse 1.1s ease-in-out infinite; }
+  @keyframes killing-pulse { 0%, 100% { opacity: 0.85; } 50% { opacity: 0.5; } }
   .sess-hd { display: flex; align-items: center; gap: 8px; }
   .sess-hd .sid { font-family: var(--font-mono); font-weight: 600; font-size: 13px; flex: 0 0 auto; }
   /* Auto task summary: the prominent few-word "name" the agent derives from the
@@ -170,6 +174,7 @@
 
   .sess-working { color: var(--good); }
   .sess-wait { color: var(--warning); }
+  .sess-dying { color: var(--critical); }
 
   /* Per-session work-state line: warning when there's unpushed/uncommitted
      work that a delete/kill would lose, muted when everything is safe. */
@@ -918,6 +923,11 @@ function sessCard(a, s, now) {
   const killConfirm = "Confirm kill";
 
   const sp = sessPending(a.key, s.id);
+  // A confirmed kill re-renders the card immediately (optimistic) — before the
+  // command has even reached the agent — so the takedown feels instant: the card
+  // dims and pulses, the badge flips to a "stopping" spinner, and the State row
+  // reads "shutting down…". Clears when the session drops out of the heartbeat.
+  const killing = sp === "kill";
   let actions = "";
   if (sp) {
     // A command is in flight for this session — show a single busy control and
@@ -947,12 +957,14 @@ function sessCard(a, s, now) {
         `<a href="${esc(p)}" target="_blank" rel="noopener">${esc(p.replace(/^https?:\/\//, ""))}</a>`).join("<br>")}</dd>`
     : "";
 
-  return `<div class="sess ${st}">
+  return `<div class="sess ${st}${killing ? " killing" : ""}">
     <div class="sess-hd">
       <span class="sid">${id}</span>
       ${s.summary ? `<span class="sess-summary" title="auto task name (from the initial prompt)">${esc(s.summary)}</span>` : ""}
       ${s.label ? `<span class="sess-label" title="session label">${esc(s.label)}</span>` : ""}
-      <span class="badge ${st}">${esc(st)}</span>
+      ${killing
+        ? `<span class="badge stopping"><span class="spin"></span> stopping</span>`
+        : `<span class="badge ${st}">${esc(st)}</span>`}
     </div>
     <dl>
       ${s.root
@@ -961,7 +973,9 @@ function sessCard(a, s, now) {
       <dt>Branch</dt><dd><b>${esc(sessBranch(s))}</b></dd>`}
       ${work ? `<dt>Work</dt><dd>${work}</dd>` : ""}
       <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
-      ${live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>` : ""}
+      ${killing
+        ? `<dt>State</dt><dd><b class="sess-dying">shutting down…</b></dd>`
+        : live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>` : ""}
       ${live && live.question ? `<dt>Question</dt><dd>${esc(live.question)}</dd>` : ""}
       ${st === "error" && s.errorMsg ? `<dt>Error</dt><dd class="errmsg">${esc(s.errorMsg)}</dd>` : ""}
       ${prs}
