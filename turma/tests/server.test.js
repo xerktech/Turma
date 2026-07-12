@@ -317,6 +317,16 @@ test("sessionWorking: transcript freshness plus heartbeat staleness", () => {
   assert.equal(sessionWorking({ session: { transcriptAgeSec: 0 } }, now - 120000, now), false);
 });
 
+test("sessionWorking: paneBusy is authoritative over transcript freshness", () => {
+  const now = Date.now();
+  // paneBusy true wins even over a stale transcript...
+  assert.equal(sessionWorking({ session: { paneBusy: true, transcriptAgeSec: 999 } }, now, now), true);
+  // ...and paneBusy false wins even over a fresh one.
+  assert.equal(sessionWorking({ session: { paneBusy: false, transcriptAgeSec: 0 } }, now, now), false);
+  // null paneBusy (older agent / capture failed) -> transcript-mtime fallback.
+  assert.equal(sessionWorking({ session: { paneBusy: null, transcriptAgeSec: 0 } }, now, now), true);
+});
+
 // ---- heartbeatAlerts (edge-triggered) ------------------------------------------
 
 // Drives a beat sequence the way the heartbeat handler does: alerts

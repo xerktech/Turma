@@ -27,6 +27,10 @@ export interface TailEntry {
 // "PR links to surface that we haven't shown yet".
 export interface LiveSignals {
   bridgeAttached: boolean;
+  // Live TUI probe: true = the model is actively working ("esc to interrupt"
+  // hint on screen), false = resting, null = unknown (fall back to
+  // transcriptAgeSec). Absent from older agents.
+  paneBusy?: boolean | null;
   transcriptAgeSec: number | null;
   lastRole: string | null;
   lastHasToolUse: boolean;

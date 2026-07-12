@@ -9,16 +9,20 @@ export type DisplayState = LiveState | "pending";
 
 const WORKING_WINDOW_MS = 90 * 1000;
 
-// Precedence: error > stopped > waiting > working > idle.
+// Precedence: error > stopped > waiting > working > idle. "working" is read
+// straight off the session's TUI (paneBusy: the "esc to interrupt" hint is on
+// screen iff the model is actively working), falling back to transcript
+// freshness only when the agent didn't report paneBusy (older agent, or the
+// pane couldn't be captured).
 export function liveState(s: SessionInfo): LiveState {
   if (s.status === "error") return "error";
   if (s.status === "stopped") return "stopped";
   const live = s.session;
   if (live?.question) return "waiting";
-  if (live?.transcriptAgeSec != null && live.transcriptAgeSec * 1000 < WORKING_WINDOW_MS) {
-    return "working";
-  }
-  return "idle";
+  const working = live?.paneBusy != null
+    ? live.paneBusy
+    : (live?.transcriptAgeSec != null && live.transcriptAgeSec * 1000 < WORKING_WINDOW_MS);
+  return working ? "working" : "idle";
 }
 
 // Leading status icon on each home-menu session row — chosen to be

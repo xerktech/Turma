@@ -241,15 +241,20 @@ function esc(s) {
   })[c]);
 }
 
-// Same live-state derivation as the dashboard: pending question > fresh
-// transcript writes (working) > idle. Freshness is relative to the host's last
+// Same live-state derivation as the dashboard: pending question > actively
+// working > idle. "working" is read straight off the session's TUI (paneBusy:
+// the "esc to interrupt" hint), falling back to transcript freshness only when
+// the agent didn't report paneBusy. Freshness is relative to the host's last
 // heartbeat.
 function liveState(sess, host, now) {
   const s = sess.session;
   if (s && s.question) return { kind: "waiting", label: "waiting for your answer", question: s.question };
   if (!s || s.transcriptAgeSec == null) return { kind: "idle", label: "no transcript yet" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
-  if (host.online && age < 90 * 1000)
+  const working = s.paneBusy != null
+    ? (host.online && s.paneBusy)
+    : (host.online && age < 90 * 1000);
+  if (working)
     return { kind: "working", label: "working", detail: "last write " + ago(age) };
   return { kind: "idle", label: "idle", detail: "last write " + ago(age) };
 }

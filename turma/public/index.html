@@ -527,15 +527,22 @@ function sessBranch(s) {
 }
 
 // Per-session live signals: transcript freshness => working/idle, pending
-// AskUserQuestion => waiting on the user, bridge pointer => attached. Freshness
-// is relative to the host's last heartbeat (host.lastSeen).
+// AskUserQuestion => waiting on the user, bridge pointer => attached. "working"
+// is read straight off the session's TUI (paneBusy: the "esc to interrupt"
+// hint is on screen iff the model is actively working); we fall back to the
+// transcript-freshness heuristic only when the agent didn't report paneBusy
+// (older agent, or the pane couldn't be captured). Freshness is relative to
+// the host's last heartbeat (host.lastSeen).
 function liveState(sess, host, now) {
   const s = sess.session;
   if (!s || s.transcriptAgeSec == null) return { label: "no transcript yet", cls: "" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   if (s.question)
     return { label: "waiting for your answer", cls: "sess-wait", question: s.question, busy: true };
-  if (host.online && age < 90 * 1000)
+  const working = s.paneBusy != null
+    ? (host.online && s.paneBusy)
+    : (host.online && age < 90 * 1000);
+  if (working)
     return { label: "working", cls: "sess-working", detail: "last write " + ago(age), busy: true };
   return {
     label: s.bridgeAttached ? "idle · session attached" : "idle",
