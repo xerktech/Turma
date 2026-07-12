@@ -2355,6 +2355,13 @@ class SessionManager:
         if not text.strip():
             return
         text = text[:INPUT_MAX_CHARS]
+        # Name a still-unnamed session (bare/quick spawn or repos-root, where the
+        # spawn-time summary was a no-op for lack of an initial prompt) from its
+        # first typed prompt — this message is our next chance. One-shot, gated on
+        # summaryStarted so it fires once and never on later turns.
+        if (not sess.get("summary") and not sess.get("summaryStarted")
+                and sid not in self.summaries):
+            self._start_summary(sess, text)
         tmux_name = sess["tmuxName"]
         run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
         run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
@@ -2588,6 +2595,10 @@ class SessionManager:
             "proc": proc, "outf": outf, "outPath": out_path,
             "startedMono": time.time(),
         }
+        # One-shot: mark that this session has had its (only) naming attempt, so
+        # the first-typed-prompt path in send_input never re-summarizes — even if
+        # this attempt yields no name (shared-login rate limits, #summary).
+        sess["summaryStarted"] = True
         log(f"summarizing session {sid} via claude -p ({SESSION_SUMMARY_MODEL})")
 
     def _finish_summary(self, sid, job, summary):
