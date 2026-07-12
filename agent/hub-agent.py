@@ -51,6 +51,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import zlib
 from collections import deque
@@ -107,6 +108,15 @@ USAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "repo-usage.json")
 # _project_slug below). Overridable so the test suite can point it at
 # fixtures; unset in production, so the default is the real path.
 PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", "/root/.claude/projects")
+
+# Archive sync: ship INACTIVE-session transcripts to the hub's durable, searchable
+# store (see turma/archive.js). The agent enumerates ended transcripts, and pushes
+# each as append-only byte-range deltas the hub asks for (via the archiveHave map on
+# the heartbeat reply). Bounded so a big backfill trickles in rather than flooding
+# the tunnel or blocking a beat.
+ARCHIVE_MANIFEST_MAX = int(os.environ.get("ARCHIVE_MANIFEST_MAX", "200"))
+ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read+POST per delta
+ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
 
 
 def _project_slug(path):
@@ -1737,6 +1747,10 @@ class SessionManager:
         # (historyResults) — held across a failed POST, cleared only once
         # delivery succeeds, same lifecycle as pending_prs above.
         self.history_results = []
+        # Archive sync: the manifest of inactive transcripts sent on the last slow
+        # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
+        # back we know each one's size/slug/meta to push deltas for.
+        self._archive_pending = {}
         # GitHub clone-into-root state: the cached availability/repo-list block
         # (refreshed on a slow cadence, reported every beat) and in-flight/recent
         # clone jobs keyed by dest name (the Popen lives here; only a serializable
@@ -2433,6 +2447,178 @@ class SessionManager:
             "entries": entries[-HISTORY_MAX_MSGS:],
             "truncated": truncated,
         })
+
+    # --- durable archive sync ---------------------------------------------
+    # Ship every INACTIVE session's transcript to the hub so history is durable
+    # (survives this host being wiped/offline) and searchable there. The agent
+    # is outbound-only, so it pushes: a manifest of what it has rides the slow
+    # heartbeat, the hub replies with per-transcript byte cursors (archiveHave),
+    # and the agent POSTs the missing append-only byte-range deltas.
+
+    def _running_slugs(self):
+        """Project slugs backing a currently-RUNNING session — excluded from the
+        archive (their transcript is still being written; sync it once it ends)."""
+        slugs = set()
+        for s in self.registry:
+            if s.get("status") != "running":
+                continue
+            wt = s.get("worktreePath") or (REPOS_ROOT if s.get("root") else None)
+            if wt:
+                slugs.add(_project_slug(wt))
+        return slugs
+
+    def _session_meta_by_slug(self):
+        """slug -> {createdAt, summary} drawn from live + closed session records,
+        so an archived transcript inherits its session's date and task name.
+        Newest record wins on collision (multiple sessions per worktree slug)."""
+        meta = {}
+        for rec in list(self.registry) + list(self.closed):
+            wt = rec.get("worktreePath") or (REPOS_ROOT if rec.get("root") else None)
+            if not wt:
+                continue
+            slug = _project_slug(wt)
+            summary = rec.get("summary") or rec.get("label")
+            cur = meta.get(slug)
+            created = rec.get("createdAt")
+            if cur is None or (created and created >= (cur.get("createdAt") or "")):
+                meta[slug] = {"createdAt": created, "summary": summary}
+            elif summary and not cur.get("summary"):
+                cur["summary"] = summary
+        return meta
+
+    def _archive_manifest(self):
+        """Manifest of inactive-session transcripts eligible for archive: enumerate
+        every ledger slug's *.jsonl, attribute it to a repo via the durable usage
+        ledger, skip transcripts backing a running session, and cap to the newest
+        ARCHIVE_MANIFEST_MAX (scalars only — bounds the heartbeat)."""
+        running = self._running_slugs()
+        sess_meta = self._session_meta_by_slug()
+        # slug -> {repo, remoteKey, worktree}, from the durable attribution ledger.
+        slug_attr = {}
+        for wt, m in (self.usage_ledger or {}).items():
+            m = m or {}
+            slug = m.get("slug") or _project_slug(wt)
+            slug_attr[slug] = {
+                "repo": m.get("repo") or "?",
+                "remoteKey": normalize_remote(m.get("remote")) or (m.get("repo") or "?"),
+                "worktree": wt,
+            }
+        out = []
+        for slug, attr in slug_attr.items():
+            if slug in running:
+                continue
+            proj = os.path.join(PROJECTS_ROOT, slug)
+            try:
+                names = os.listdir(proj)
+            except OSError:
+                continue
+            sm = sess_meta.get(slug, {})
+            for fname in names:
+                if not fname.endswith(".jsonl"):
+                    continue
+                path = os.path.join(proj, fname)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                out.append({
+                    "transcriptId": fname[:-6],  # strip ".jsonl"
+                    "slug": slug,
+                    "repo": attr["repo"],
+                    "remoteKey": attr["remoteKey"],
+                    "worktree": attr["worktree"],
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "endedTs": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime)),
+                    "createdAt": sm.get("createdAt"),
+                    "summary": sm.get("summary"),
+                })
+        out.sort(key=lambda m: m["mtime"], reverse=True)
+        out = out[:ARCHIVE_MANIFEST_MAX]
+        for m in out:
+            m.pop("mtime", None)  # internal sort key; not part of the payload
+        return out
+
+    def _archive_deltas(self, archive_have):
+        """Push the byte-range deltas the hub is missing for each manifest entry,
+        using the archiveHave cursors it returned. Append-only and bounded: at most
+        ARCHIVE_BEAT_BUDGET bytes per pass, so a big backfill trickles across beats.
+        A failed POST just stops this pass — the next manifest re-offers it."""
+        if not self._archive_pending:
+            return
+        budget = ARCHIVE_BEAT_BUDGET
+        for tid, m in list(self._archive_pending.items()):
+            have = int((archive_have or {}).get(tid, 0) or 0)
+            size = int(m.get("size", 0))
+            if have >= size:
+                continue
+            path = os.path.join(PROJECTS_ROOT, m["slug"], tid + ".jsonl")
+            meta = {
+                "remoteKey": m.get("remoteKey"), "repo": m.get("repo"),
+                "worktree": m.get("worktree"), "slug": m.get("slug"),
+                "createdAt": m.get("createdAt"), "endedTs": m.get("endedTs"),
+                "summary": m.get("summary"),
+            }
+            while have < size and budget > 0:
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(have)
+                        raw = f.read(ARCHIVE_CHUNK_BYTES)
+                except OSError:
+                    break
+                if not raw:
+                    break
+                nl = raw.rfind(b"\n")
+                if nl < 0:
+                    break  # no complete line in the window (pathological); skip
+                complete = raw[:nl + 1]
+                end = have + len(complete)
+                entries = []
+                for line in complete.split(b"\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    text = _entry_text(entry)
+                    if text is None:
+                        continue
+                    entries.append({
+                        "uuid": entry.get("uuid"),
+                        "role": entry.get("type"),
+                        "ts": entry.get("timestamp"),
+                        "text": text,
+                    })
+                body = {"startOffset": have, "endOffset": end, "size": size,
+                        "entries": entries, "meta": meta}
+                reply = self._post_archive_chunk(tid, body)
+                if reply is None:
+                    return  # POST failed; retry on a later beat
+                budget -= len(complete)
+                new_have = int(reply.get("bytesStored", have) or have)
+                if new_have <= have:
+                    break  # no forward progress (offset realign / hub cursor) — stop
+                have = new_have
+
+    def _post_archive_chunk(self, transcript_id, body):
+        """POST one archive delta to the hub. Returns the parsed reply
+        ({bytesStored}) or None on failure."""
+        try:
+            headers = {"Content-Type": "application/json", "User-Agent": "hub-agent/1.0"}
+            if TURMA_TOKEN:
+                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+            url = (f"{TURMA_URL}/api/agents/{urllib.parse.quote(self.device, safe='')}"
+                   f"/archive/{urllib.parse.quote(transcript_id, safe='')}")
+            req = urllib.request.Request(
+                url, data=json.dumps(body).encode(), headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                reply = json.loads(resp.read().decode() or "{}")
+            return reply if isinstance(reply, dict) else {}
+        except Exception as e:
+            log(f"archive push failed for {transcript_id}: {e}")
+            return None
 
     # --- GitHub clone-into-root -------------------------------------------
 
@@ -3160,6 +3346,14 @@ class SessionManager:
         # something to report.
         if self.history_results:
             payload["historyResults"] = list(self.history_results)
+        # Archive sync manifest on the slow cadence: the inactive transcripts the
+        # hub could pull. Remember it by id so the reply's archiveHave cursors map
+        # back to each one for the delta push (in run_forever).
+        if refresh:
+            manifest = self._archive_manifest()
+            self._archive_pending = {m["transcriptId"]: m for m in manifest}
+            if manifest:
+                payload["archiveManifest"] = manifest
         return payload
 
     def _clear_pending_prs(self):
@@ -3212,6 +3406,13 @@ class SessionManager:
             reply = self.post(self.build_payload(beat))
             beat += 1
             if reply is not None:
+                # Push archive deltas the hub asked for (byte cursors on the reply).
+                # Best-effort: a sync hiccup must never disrupt the beat loop.
+                if reply.get("archiveHave"):
+                    try:
+                        self._archive_deltas(reply["archiveHave"])
+                    except Exception as e:
+                        log(f"archive sync failed: {e}")
                 if self.handle_commands(reply.get("commands")):
                     # Fire an immediate extra heartbeat so the UI reflects the
                     # new session state fast (don't wait a whole interval). Its

@@ -10,6 +10,7 @@
 "use strict";
 
 const os = require("os");
+const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const net = require("net");
@@ -28,6 +29,9 @@ process.env.STATE_FILE = path.join(
   os.tmpdir(),
   `turma-test-state-${process.pid}.json`
 );
+// Archive (durable, searchable ended-session store) writes under a throwaway dir.
+process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-archive-"));
+process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
 // Whisper STT: configured so the "enabled" code paths (transcribePcm request
 // building, the /audio WS end-to-end tests) are exercised against the real
 // module instance. The "WHISPER_URL unset" case is tested via a separately
@@ -542,6 +546,68 @@ test("http: heartbeat auth (bearer or user basic, nothing else)", async () => {
     (await request("POST", "/api/heartbeat", { body: {}, headers: agentHeaders })).status,
     400 // device/agentId required
   );
+});
+
+// ---- archive: agent-push ingest + heartbeat cursors + search/browse/view -------
+
+test("http: archive ingest is agent-authed; search/browse/view are user-authed", async () => {
+  const meta = {
+    remoteKey: "github.com/xerk/turma", repo: "turma", worktree: "/w/ab",
+    slug: "-w-ab", createdAt: "2026-07-11T00:00:00Z", endedTs: "2026-07-11T02:00:00Z",
+    summary: "Durable Search Feature",
+  };
+  const body = {
+    startOffset: 0, endOffset: 120, size: 120, meta,
+    entries: [
+      { uuid: "e1", role: "user", ts: "2026-07-11T00:00:00Z", text: "make history durable and searchable" },
+      { uuid: "e2", role: "assistant", ts: "2026-07-11T00:01:00Z", text: "added a sqlite fts index on the hub" },
+    ],
+  };
+  // Ingest is agent-authed: rejected with no creds, accepted with the agent
+  // bearer token (and, like the heartbeat, with the user basic login too).
+  assert.equal((await request("POST", "/api/agents/nas/archive/tr1", { body })).status, 401);
+  const ok = await request("POST", "/api/agents/nas/archive/tr1", { body, headers: agentHeaders });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.bytesStored, 120);
+
+  // A hostile transcriptId is rejected before touching disk.
+  assert.equal(
+    (await request("POST", "/api/agents/nas/archive/..%2f..%2fetc", { body, headers: agentHeaders })).status, 400
+  );
+
+  // Search is user-authed and finds the ingested content, highlighted.
+  assert.equal((await request("GET", "/api/search?q=searchable")).status, 401);
+  const s = await request("GET", "/api/search?q=searchable", { headers: userHeaders });
+  assert.equal(s.status, 200);
+  const matches = s.body.groups.flatMap((g) => g.matches);
+  assert.ok(matches.some((m) => m.transcriptId === "tr1" && /<mark>/.test(m.snippet)));
+  // Too-short queries are rejected.
+  assert.equal((await request("GET", "/api/search?q=a", { headers: userHeaders })).status, 400);
+
+  // Browse lists the ended session; view returns its full transcript.
+  const list = await request("GET", "/api/archive", { headers: userHeaders });
+  assert.equal(list.status, 200);
+  assert.ok(list.body.sessions.some((x) => x.transcriptId === "tr1"));
+  const view = await request("GET", "/api/archive/tr1", { headers: userHeaders });
+  assert.equal(view.status, 200);
+  assert.equal(view.body.entries.length, 2);
+  assert.equal((await request("GET", "/api/archive/nope", { headers: userHeaders })).status, 404);
+});
+
+test("http: heartbeat carries archiveHave cursors back for a manifest", async () => {
+  // A manifest for a not-yet-synced transcript reports have=0.
+  const beat1 = {
+    device: "nas", archiveManifest: [{ transcriptId: "tr-new", slug: "s", repo: "turma", remoteKey: "github.com/xerk/turma", size: 999 }],
+  };
+  const r1 = await request("POST", "/api/heartbeat", { body: beat1, headers: agentHeaders });
+  assert.equal(r1.status, 200);
+  assert.equal(r1.body.archiveHave["tr-new"], 0);
+  // For an already-ingested transcript (tr1 above) it reports the stored bytes.
+  const beat2 = { device: "nas", archiveManifest: [{ transcriptId: "tr1", slug: "-w-ab", repo: "turma" }] };
+  const r2 = await request("POST", "/api/heartbeat", { body: beat2, headers: agentHeaders });
+  assert.equal(r2.body.archiveHave.tr1, 120);
+  // The bulky manifest is not persisted onto the agent record.
+  assert.equal(agents.nas.archiveManifest, undefined);
 });
 
 test("http: login page is public; /api/login sets a working session cookie", async () => {
