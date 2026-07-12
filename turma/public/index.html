@@ -72,7 +72,8 @@
     background: var(--page); border: 1px dashed var(--border); border-radius: var(--radius-sm);
     padding: 8px 12px; font-size: 12.5px; color: var(--ink-2);
   }
-  .resume-item .sid { font-family: var(--font-mono); font-weight: 600; font-size: 13px; color: var(--ink); }
+  .resume-item .sid { font-weight: 600; font-size: 13px; color: var(--ink); }
+  .resume-item .sid.mono { font-family: var(--font-mono); }
   .resume-item b { color: var(--ink); font-weight: 600; }
   .resume-item .spacer { flex: 1; }
   .resume-item .lbl, .sess-label {
@@ -821,8 +822,8 @@ function repoBlock(a, repo, sessList, now) {
     ? `<div class="resume-list">${closed.map(c => {
         const rp = pending.has(pendKey("resume", a.key, c.id));
         return `<div class="resume-item">
-          <span class="sid">${esc(c.id)}</span>
-          ${c.label ? `<span class="lbl">${esc(c.label)}</span>` : ""}
+          <span class="sid${c.summary || c.label ? "" : " mono"}" title="${esc(c.id)}">${esc(c.summary || c.label || c.id)}</span>
+          ${c.summary && c.label ? `<span class="lbl">${esc(c.label)}</span>` : ""}
           <span><b>${c.root ? "repos root" : esc(worktreeName(c))}</b> · killed ${c.closedAt ? esc(ago(now - Date.parse(c.closedAt))) : "–"}</span>
           <span>${esc(c.rcName || "")}</span>
           <span class="spacer"></span>
