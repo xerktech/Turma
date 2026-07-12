@@ -1261,13 +1261,35 @@ test("pcmToWav: header math holds for an empty and an odd-length payload", () =>
 
 // ---- transcribePcm ---------------------------------------------------------------
 
-test("transcribePcm: WHISPER_URL unset -> unavailable, fetch never called", async () => {
+test("transcribePcm: WHISPER_URL/LITELLM_URL unset -> unavailable, fetch never called", async () => {
   let called = false;
   globalThis.fetch = () => { called = true; return Promise.resolve({ ok: true, json: async () => ({}) }); };
-  const disabled = freshServerModule((env) => { delete env.WHISPER_URL; });
+  // WHISPER_URL derives from LITELLM_URL, so both must be unset to disable STT.
+  const disabled = freshServerModule((env) => { delete env.WHISPER_URL; delete env.LITELLM_URL; });
   const result = await disabled.transcribePcm(Buffer.from([1, 2, 3, 4]));
   assert.deepEqual(result, { text: "", unavailable: true, reason: "whisper not configured" });
   assert.equal(called, false);
+  restoreFetch();
+});
+
+test("transcribePcm: WHISPER_URL derives from LITELLM_URL when unset", async () => {
+  let captured;
+  globalThis.fetch = async (url, opts) => {
+    captured = { url, opts };
+    return { ok: true, json: async () => ({ text: "hi" }) };
+  };
+  // Only LITELLM_URL configured (LITELLM_API_KEY too): STT should hit the same
+  // instance's /audio/transcriptions with the shared credential.
+  const derived = freshServerModule((env) => {
+    delete env.WHISPER_URL;
+    delete env.WHISPER_API_KEY;
+    env.LITELLM_URL = "http://litellm.test/v1";
+    env.LITELLM_API_KEY = "litellmkey";
+  });
+  const result = await derived.transcribePcm(Buffer.from([1, 2, 3, 4]));
+  assert.deepEqual(result, { text: "hi" });
+  assert.equal(captured.url, "http://litellm.test/v1/audio/transcriptions");
+  assert.equal(captured.opts.headers.Authorization, "Bearer litellmkey");
   restoreFetch();
 });
 
@@ -1342,7 +1364,8 @@ test("transcribePcm: no Authorization header when WHISPER_API_KEY unset", async 
     captured = opts;
     return { ok: true, json: async () => ({ text: "hi" }) };
   };
-  const noKey = freshServerModule((env) => { delete env.WHISPER_API_KEY; });
+  // WHISPER_API_KEY falls back to LITELLM_API_KEY, so clear both to test no-auth.
+  const noKey = freshServerModule((env) => { delete env.WHISPER_API_KEY; delete env.LITELLM_API_KEY; });
   await noKey.transcribePcm(Buffer.from([1]));
   assert.equal(captured.headers.Authorization, undefined);
   restoreFetch();

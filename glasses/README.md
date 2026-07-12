@@ -73,14 +73,22 @@ touchpad produced an event won't be meaningfully exercised there either.
 
 ## Hub requirements
 
-The hub (`turma/server.js`) needs its Whisper STT env vars set for
+The hub (`turma/server.js`) needs the LiteLLM backend configured for
 dictation to work — otherwise the `/audio` WebSocket still accepts
-connections but every result reports `unavailable`:
+connections but every result reports `unavailable`. STT and the /chat page
+share ONE LiteLLM instance, so `LITELLM_URL` (its `/v1` base) + `LITELLM_API_KEY`
+configure both; the Whisper endpoint is derived as
+`${LITELLM_URL}/audio/transcriptions`:
 
-- `WHISPER_URL` — OpenAI-compatible Whisper server endpoint. Unset disables
-  STT.
+- `LITELLM_URL` — the LiteLLM `/v1` base; supplies both chat and STT. Unset
+  disables both.
+- `LITELLM_API_KEY` — bearer token for the LiteLLM instance (optional).
+- `WHISPER_URL` — override the STT endpoint only if the transcription server
+  lives elsewhere than the LiteLLM instance (optional; defaults to the derived
+  URL above).
+- `WHISPER_API_KEY` — override the STT bearer token (optional; defaults to
+  `LITELLM_API_KEY`).
 - `WHISPER_MODEL` — model name passed to the Whisper server (optional).
-- `WHISPER_API_KEY` — bearer token for the Whisper server (optional).
 - `WHISPER_LANGUAGE` — default `en`.
 - `WHISPER_TIMEOUT_MS` — default `30000`.
 
