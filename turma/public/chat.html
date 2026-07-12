@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turma — Chat</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/app.css">
+<style>
+  /* Chat is a two-pane app shell (like Sessions): a conversation list + search on
+     the left, the active conversation's message thread + composer on the right.
+     Tokens, buttons, the search box, status bits live in /app.css; this page's
+     layout is inline. */
+
+  html, body { height: 100%; }
+  body { display: flex; flex-direction: column; overflow: hidden; }
+
+  .app-header {
+    flex: none; margin: 0; padding: 12px 18px;
+    border-bottom: 1px solid var(--hairline); background: var(--surface);
+    display: flex; align-items: center; gap: 12px 16px;
+  }
+  .app-header .modelwrap { display: flex; align-items: center; gap: 7px; }
+  .app-header .modelwrap label { font-size: 12px; color: var(--ink-2); font-weight: 600; }
+  #model {
+    font: inherit; font-size: 13px; padding: 5px 9px; color: var(--ink);
+    background: var(--field); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    max-width: 260px;
+  }
+
+  .chat-shell { flex: 1; display: flex; min-height: 0; }
+
+  /* ---- Left sidebar: new chat, search, conversation list ------------------- */
+  .sidebar {
+    width: 320px; flex: none; border-right: 1px solid var(--hairline);
+    overflow-y: auto; padding: 14px 14px 24px; display: flex; flex-direction: column; gap: 6px;
+    scrollbar-width: thin;
+  }
+  #newChat { width: 100%; margin-bottom: 10px; }
+
+  .s-list { display: flex; flex-direction: column; gap: 8px; }
+
+  /* Conversation row: title leads; a small meta line + a delete affordance. */
+  .conv {
+    display: flex; align-items: flex-start; gap: 8px; width: 100%;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    padding: 9px 11px; cursor: pointer; color: var(--ink);
+  }
+  .conv:hover { border-color: var(--accent); }
+  .conv.cur { border-color: var(--accent); background: var(--accent-soft); }
+  .conv .body { flex: 1; min-width: 0; text-align: left; }
+  .conv .title { font-weight: 600; font-size: 13.5px; line-height: 1.3; overflow-wrap: anywhere;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .conv .meta { color: var(--muted); font-size: 11.5px; margin-top: 2px; overflow-wrap: anywhere; }
+  .conv .snippet { color: var(--ink-2); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .conv .snippet mark { background: color-mix(in srgb, var(--accent) 26%, transparent); color: inherit; border-radius: 3px; padding: 0 1px; }
+  .conv .del {
+    border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 15px;
+    line-height: 1; padding: 3px 5px; border-radius: 6px; flex: none;
+  }
+  .conv .del:hover { color: var(--critical); background: color-mix(in srgb, var(--critical) 12%, transparent); }
+  .conv .del.armed { color: #fff; background: var(--critical); }
+
+  /* Search box (reuses the Sessions styling). */
+  .searchbox { margin-bottom: 8px; position: relative; }
+  .searchbox input {
+    width: 100%; font: inherit; font-size: 13px; padding: 8px 30px 8px 11px;
+    color: var(--ink); background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+  }
+  .searchbox input:focus { outline: none; border-color: var(--accent); }
+  .searchbox .clr {
+    position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+    border: 0; background: none; color: var(--muted); cursor: pointer;
+    font-size: 16px; line-height: 1; padding: 4px; display: none;
+  }
+  .searchbox.has-q .clr { display: block; }
+  #searchResults { display: none; }
+  body.searching #searchResults { display: block; }
+  body.searching #convoList { display: none; }
+  .sidebar .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase;
+      letter-spacing: 0.04em; margin: 4px 2px 2px; }
+
+  /* ---- Right stage: thread + composer ------------------------------------- */
+  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--page); }
+
+  .thread { flex: 1; overflow-y: auto; padding: 22px 0; scrollbar-width: thin; }
+  .thread-inner { max-width: 780px; margin: 0 auto; padding: 0 20px; display: flex; flex-direction: column; gap: 16px; }
+
+  .empty-thread {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; text-align: center; color: var(--muted); padding: 24px;
+  }
+  .empty-thread .big { font-size: 16px; color: var(--ink-2); font-weight: 600; }
+  .empty-thread .hint { font-size: 13px; max-width: 440px; line-height: 1.5; }
+
+  .msg { display: flex; gap: 11px; }
+  .msg .who {
+    flex: none; width: 28px; height: 28px; border-radius: 7px; font-size: 11px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center; margin-top: 2px;
+  }
+  .msg.user .who { background: var(--accent); color: #fff; }
+  .msg.assistant .who { background: var(--surface); border: 1px solid var(--border); color: var(--ink-2); }
+  .msg .bubble { flex: 1; min-width: 0; }
+  .msg .bubble .content {
+    font-size: 14.5px; line-height: 1.6; color: var(--ink); overflow-wrap: anywhere;
+  }
+  .msg.user .bubble .content {
+    background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+    border-radius: var(--radius-md); padding: 9px 13px; white-space: pre-wrap;
+  }
+  .msg .bubble .content p { margin: 0 0 10px; }
+  .msg .bubble .content p:last-child { margin-bottom: 0; }
+  .msg .bubble .content h2 { font-size: 17px; margin: 14px 0 8px; }
+  .msg .bubble .content h3 { font-size: 15px; margin: 12px 0 6px; }
+  .msg .bubble .content ul, .msg .bubble .content ol { margin: 0 0 10px; padding-left: 22px; }
+  .msg .bubble .content li { margin: 2px 0; }
+  .msg .bubble .content a { color: var(--accent); }
+  .msg .bubble .content code {
+    font-family: var(--font-mono); font-size: 12.5px;
+    background: var(--field); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px;
+  }
+  .codeblock { position: relative; margin: 0 0 10px; }
+  .codeblock pre {
+    background: var(--field); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 11px 13px; overflow-x: auto; margin: 0;
+  }
+  .codeblock pre code { background: none; border: 0; padding: 0; font-size: 12.5px; }
+  .codeblock .copy {
+    position: absolute; top: 6px; right: 6px; font-size: 11px; padding: 3px 8px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--ink-2); cursor: pointer; opacity: 0; transition: opacity .12s;
+  }
+  .codeblock:hover .copy { opacity: 1; }
+  .msg .cursor { display: inline-block; width: 7px; height: 15px; background: var(--accent);
+      vertical-align: -2px; margin-left: 1px; animation: blink 1s steps(2) infinite; border-radius: 1px; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* Composer pinned to the bottom of the stage. */
+  .composer-wrap { flex: none; border-top: 1px solid var(--hairline); background: var(--surface); padding: 12px 0 14px; }
+  .composer { max-width: 780px; margin: 0 auto; padding: 0 20px; display: flex; gap: 10px; align-items: flex-end; }
+  .composer textarea {
+    flex: 1; resize: none; font: inherit; font-size: 14.5px; line-height: 1.5;
+    padding: 10px 12px; max-height: 200px; color: var(--ink);
+    background: var(--field); border: 1px solid var(--border); border-radius: var(--radius-md);
+  }
+  .composer textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+  .composer button.send { flex: none; padding: 10px 18px; }
+  .composer button.stop { border-color: var(--critical); color: var(--critical); background: transparent; font-weight: 600; }
+  .composer .hint { max-width: 780px; margin: 6px auto 0; padding: 0 20px; color: var(--muted); font-size: 11px; }
+
+  .banner {
+    max-width: 780px; margin: 20px auto 0; padding: 12px 14px; color: var(--critical);
+    background: color-mix(in srgb, var(--critical) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--critical) 28%, transparent); border-radius: var(--radius-sm);
+    font-size: 13px; line-height: 1.5;
+  }
+
+  @media (max-width: 720px) {
+    .sidebar { width: 100%; position: absolute; inset: 0 0 56px; z-index: 20; background: var(--page); }
+    body.in-convo .sidebar { display: none; }
+    body:not(.in-convo) .main { display: none; }
+    .app-header { padding: 12px 14px; }
+    #model { max-width: 150px; }
+    body { padding-bottom: 0; }
+  }
+</style>
+</head>
+<body>
+  <header class="app-header">
+    <a class="wordmark" href="/"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
+    <span class="sub">Chat</span>
+    <span class="spacer"></span>
+    <div class="modelwrap">
+      <label for="model">Model</label>
+      <select id="model" title="Model"></select>
+    </div>
+    <nav class="nav-tabs">
+      <a href="/">Dashboard</a>
+      <a href="/sessions">Sessions</a>
+      <a href="/history">History</a>
+      <a href="/chat" class="active">Chat</a>
+      <a href="#" class="signout" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;">Sign out</a>
+    </nav>
+  </header>
+
+  <div class="chat-shell">
+    <aside class="sidebar">
+      <button class="primary" id="newChat" onclick="newChat()">+ New chat</button>
+      <div class="searchbox" id="searchbox">
+        <input id="searchInput" type="search" autocomplete="off" spellcheck="false"
+               placeholder="Search chat history…" aria-label="Search chat history">
+        <button class="clr" id="searchClear" title="Clear" aria-label="Clear search">×</button>
+      </div>
+      <div id="searchResults" class="s-list"></div>
+      <div id="convoList" class="s-list"></div>
+    </aside>
+
+    <main class="main">
+      <div class="thread" id="thread">
+        <div class="thread-inner" id="threadInner"></div>
+      </div>
+      <div class="composer-wrap">
+        <form class="composer" id="composer" onsubmit="return false;">
+          <textarea id="input" rows="1" placeholder="Message the model…" aria-label="Message"></textarea>
+          <button class="primary send" id="send" onclick="onSend()">Send</button>
+        </form>
+        <div class="hint">Enter to send · Shift+Enter for a new line. History is stored on the hub and searchable.</div>
+      </div>
+    </main>
+  </div>
+
+<nav class="bottom-nav">
+  <a href="/">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    Dashboard
+  </a>
+  <a href="/sessions">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+    Sessions
+  </a>
+  <a href="/history">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/></svg>
+    History
+  </a>
+  <a href="/chat" class="active">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+    Chat
+  </a>
+</nav>
+
+<script>
+// ---- helpers ----------------------------------------------------------------
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[c]);
+}
+// FTS snippet()s arrive with literal <mark></mark> around hits; the rest must be
+// escaped. So escape the whole thing, then un-escape only the two mark tags.
+function decodeSnippet(s) {
+  return esc(s).replace(/&lt;mark&gt;/g, "<mark>").replace(/&lt;\/mark&gt;/g, "</mark>");
+}
+function relTime(ms) {
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+
+// Compact, escape-first markdown → HTML. Everything is HTML-escaped BEFORE any
+// formatting is applied, and fenced code is pulled out first (so its contents
+// never hit the inline rules), making the output XSS-safe by construction.
+function renderMarkdown(src) {
+  const blocks = [];
+  let s = String(src == null ? "" : src).replace(/\r\n/g, "\n");
+  // 1) fenced code -> placeholder (escaped, with a copy button)
+  s = s.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    blocks.push(`<div class="codeblock"><button class="copy" type="button">Copy</button><pre><code>${esc(code.replace(/\n$/, ""))}</code></pre></div>`);
+    return `\u0000${blocks.length - 1}\u0000`;
+  });
+  // 2) escape everything else
+  s = esc(s);
+  // 3) block-level: headings, then unordered/ordered list runs
+  s = s.replace(/^### (.*)$/gm, "<h3>$1</h3>").replace(/^## (.*)$/gm, "<h2>$1</h2>");
+  s = s.replace(/(?:^|\n)((?:[-*] .*(?:\n|$))+)/g, (m, list) => {
+    const items = list.trim().split("\n").map(l => `<li>${l.replace(/^[-*] /, "")}</li>`).join("");
+    return `\n<ul>${items}</ul>`;
+  });
+  s = s.replace(/(?:^|\n)((?:\d+\. .*(?:\n|$))+)/g, (m, list) => {
+    const items = list.trim().split("\n").map(l => `<li>${l.replace(/^\d+\. /, "")}</li>`).join("");
+    return `\n<ol>${items}</ol>`;
+  });
+  // 4) inline: code, bold, italic, links (http/https only)
+  s = s.replace(/`([^`\n]+)`/g, (_, c) => `<code>${c}</code>`)
+       .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+       .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
+       .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // 5) paragraphs from blank lines; single newlines -> <br> (but not around block tags)
+  s = s.split(/\n{2,}/).map(chunk => {
+    const t = chunk.trim();
+    if (!t) return "";
+    if (/^\s*<(ul|ol|h2|h3|div class="codeblock")/.test(t) || t.startsWith("\u0000")) return t;
+    return `<p>${t.replace(/\n/g, "<br>")}</p>`;
+  }).join("\n");
+  // 6) restore code blocks
+  s = s.replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[+i]);
+  return s;
+}
+
+// ---- state ------------------------------------------------------------------
+const $model = document.getElementById("model");
+const $convoList = document.getElementById("convoList");
+const $searchResults = document.getElementById("searchResults");
+const $searchInput = document.getElementById("searchInput");
+const $searchClear = document.getElementById("searchClear");
+const $searchbox = document.getElementById("searchbox");
+const $threadInner = document.getElementById("threadInner");
+const $thread = document.getElementById("thread");
+const $input = document.getElementById("input");
+const $send = document.getElementById("send");
+
+let conversations = [];   // sidebar metadata
+let currentId = null;     // open conversation id
+let currentMsgs = [];     // open conversation's messages
+let chatEnabled = true;   // false when LiteLLM unconfigured
+let streaming = null;     // AbortController while a reply streams
+let delArmed = null;      // conversation id whose delete is armed
+
+function api(path, opts) {
+  return fetch(path, opts).then(r => {
+    if (r.status === 401) { location.href = "/login"; throw new Error("unauthorized"); }
+    return r;
+  });
+}
+
+// ---- models -----------------------------------------------------------------
+async function loadModels() {
+  let data;
+  try { data = await (await api("/api/chat/models")).json(); }
+  catch { data = { models: [], unavailable: true, reason: "request failed" }; }
+  if (data.unavailable || !data.models || !data.models.length) {
+    chatEnabled = false;
+    $model.innerHTML = `<option>unavailable</option>`;
+    $model.disabled = true; $input.disabled = true; $send.disabled = true;
+    return data.reason || "no models";
+  }
+  chatEnabled = true;
+  const saved = localStorage.getItem("turma-chat-model");
+  const pick = (saved && data.models.includes(saved)) ? saved : (data.default || data.models[0]);
+  $model.innerHTML = data.models.map(m => `<option value="${esc(m)}"${m === pick ? " selected" : ""}>${esc(m)}</option>`).join("");
+  $model.disabled = false;
+  return null;
+}
+$model.addEventListener("change", () => {
+  // Remembered for next load; the chosen model rides each send, and the server
+  // persists it on the conversation with the turn — no request needed here.
+  localStorage.setItem("turma-chat-model", $model.value);
+});
+
+// ---- conversation list ------------------------------------------------------
+async function loadConversations() {
+  try {
+    const data = await (await api("/api/chat/conversations")).json();
+    conversations = data.conversations || [];
+  } catch { conversations = []; }
+  renderConvoList();
+}
+function convRow(c, { snippet } = {}) {
+  const cur = c.id === currentId;
+  const armed = delArmed === c.id;
+  const count = c.messageCount != null ? `${c.messageCount} msg` : "";
+  const meta = [count, relTime(c.updatedAt)].filter(Boolean).join(" · ");
+  return `<div class="conv ${cur ? "cur" : ""}" onclick="openConversation('${c.id}')">
+    <span class="body">
+      <div class="title">${esc(c.title || "New chat")}</div>
+      <div class="meta">${esc(meta)}</div>
+      ${snippet ? `<div class="snippet">${decodeSnippet(snippet)}</div>` : ""}
+    </span>
+    <button class="del ${armed ? "armed" : ""}" title="${armed ? "Click again to delete" : "Delete"}"
+      onclick="event.stopPropagation();armDelete('${c.id}')">${armed ? "✓" : "×"}</button>
+  </div>`;
+}
+function renderConvoList() {
+  if (!conversations.length) {
+    $convoList.innerHTML = `<div class="lbl">No conversations yet</div>`;
+    return;
+  }
+  $convoList.innerHTML = conversations.map(c => convRow(c)).join("");
+}
+
+// Arm-then-confirm delete (two clicks), matching the dashboard's kill pattern.
+let delTimer = null;
+function armDelete(id) {
+  if (delArmed === id) { doDelete(id); return; }
+  delArmed = id;
+  renderConvoList();
+  clearTimeout(delTimer);
+  delTimer = setTimeout(() => { delArmed = null; renderConvoList(); }, 3000);
+}
+async function doDelete(id) {
+  delArmed = null; clearTimeout(delTimer);
+  try { await api(`/api/chat/conversations/${id}`, { method: "DELETE" }); } catch { return; }
+  conversations = conversations.filter(c => c.id !== id);
+  if (currentId === id) { currentId = null; currentMsgs = []; }
+  renderConvoList();
+  if (!currentId && conversations.length) openConversation(conversations[0].id);
+  else if (!currentId) renderThread();
+}
+
+// ---- open + render a conversation -------------------------------------------
+async function openConversation(id) {
+  if (streaming) return; // don't switch mid-stream
+  try {
+    const c = await (await api(`/api/chat/conversations/${id}`)).json();
+    currentId = c.id; currentMsgs = c.messages || [];
+    if (c.model && [...$model.options].some(o => o.value === c.model)) $model.value = c.model;
+  } catch { return; }
+  document.body.classList.add("in-convo");
+  renderConvoList(); renderThread(); scrollBottom();
+  clearSearch();
+  $input.focus();
+}
+function msgHtml(m, i) {
+  const who = m.role === "user" ? "You" : "AI";
+  const content = m.role === "user" ? esc(m.content) : renderMarkdown(m.content);
+  return `<div class="msg ${m.role}" data-i="${i}">
+    <span class="who">${who}</span>
+    <div class="bubble"><div class="content">${content}</div></div>
+  </div>`;
+}
+function renderThread() {
+  if (!currentId) {
+    $threadInner.innerHTML = `<div class="empty-thread">
+      <div class="big">${chatEnabled ? "Start a conversation" : "Chat backend not configured"}</div>
+      <div class="hint">${chatEnabled
+        ? "Pick a model above and send a message, or open a past conversation from the left."
+        : "Set LITELLM_URL on the hub to enable chat. It uses the same LiteLLM instance that serves Whisper."}</div>
+    </div>`;
+    return;
+  }
+  if (!currentMsgs.length) {
+    $threadInner.innerHTML = `<div class="empty-thread"><div class="big">${esc(conversationTitle())}</div>
+      <div class="hint">Send the first message below.</div></div>`;
+    return;
+  }
+  $threadInner.innerHTML = currentMsgs.map((m, i) => msgHtml(m, i)).join("");
+}
+function conversationTitle() {
+  const c = conversations.find(x => x.id === currentId);
+  return (c && c.title) || "New chat";
+}
+function scrollBottom() { $thread.scrollTop = $thread.scrollHeight; }
+
+// ---- new chat ---------------------------------------------------------------
+async function newChat() {
+  if (!chatEnabled) return;
+  try {
+    const c = await (await api("/api/chat/conversations", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: $model.value })
+    })).json();
+    conversations.unshift({ id: c.id, title: c.title, model: c.model, createdAt: c.createdAt, updatedAt: c.updatedAt, messageCount: 0 });
+    currentId = c.id; currentMsgs = [];
+    document.body.classList.add("in-convo");
+    renderConvoList(); renderThread(); clearSearch(); $input.focus();
+  } catch { /* ignore */ }
+}
+
+// ---- send + stream ----------------------------------------------------------
+function setStreaming(ctrl) {
+  streaming = ctrl;
+  $send.textContent = "Stop";
+  $send.classList.remove("primary"); $send.classList.add("stop");
+}
+function setIdle() {
+  streaming = null;
+  $send.textContent = "Send";
+  $send.classList.add("primary"); $send.classList.remove("stop");
+}
+function onSend() {
+  if (streaming) { streaming.abort(); return; }
+  const text = $input.value.trim();
+  if (!text || !chatEnabled) return;
+  sendMessage(text);
+}
+async function sendMessage(text) {
+  if (!currentId) { await newChat(); if (!currentId) return; }
+  const model = $model.value;
+  $input.value = ""; autoGrow();
+  currentMsgs.push({ role: "user", content: text, ts: Date.now() });
+  currentMsgs.push({ role: "assistant", content: "" });
+  renderThread(); scrollBottom();
+  const asst = $threadInner.querySelector(".msg:last-child .content");
+  if (asst) asst.innerHTML = '<span class="cursor"></span>';
+
+  const ctrl = new AbortController();
+  setStreaming(ctrl);
+  let acc = "";
+  try {
+    const res = await fetch(`/api/chat/conversations/${currentId}/completion`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text, model }), signal: ctrl.signal,
+    });
+    if (res.status === 401) { location.href = "/login"; return; }
+    if (!res.body) throw new Error("no stream");
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, i); buf = buf.slice(i + 2);
+        const line = frame.split("\n").find(l => l.startsWith("data:"));
+        if (!line) continue;
+        let evt; try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (evt.type === "delta") {
+          acc += evt.text;
+          if (asst) { asst.innerHTML = renderMarkdown(acc) + '<span class="cursor"></span>'; nearBottom() && scrollBottom(); }
+        } else if (evt.type === "error") {
+          if (asst) asst.innerHTML = `<div class="banner">⚠ ${esc(evt.message || "request failed")}</div>`;
+        }
+      }
+    }
+  } catch (e) {
+    // aborted (Stop) or network error — keep whatever streamed; server persisted it.
+  } finally {
+    if (asst) asst.innerHTML = acc ? renderMarkdown(acc) : (asst.textContent || "");
+    currentMsgs[currentMsgs.length - 1] = { role: "assistant", content: acc };
+    setIdle();
+    refreshCurrentMeta();
+  }
+}
+// Keep autoscroll only when the user is already near the bottom.
+function nearBottom() { return $thread.scrollHeight - $thread.scrollTop - $thread.clientHeight < 120; }
+
+// After a turn, refresh the sidebar (title/updatedAt/count may have changed).
+async function refreshCurrentMeta() {
+  await loadConversations();
+}
+
+// ---- search -----------------------------------------------------------------
+let searchTimer = null;
+$searchInput.addEventListener("input", () => {
+  const q = $searchInput.value.trim();
+  $searchbox.classList.toggle("has-q", !!q);
+  clearTimeout(searchTimer);
+  if (!q) { document.body.classList.remove("searching"); return; }
+  searchTimer = setTimeout(() => runSearch(q), 200);
+});
+$searchClear.addEventListener("click", clearSearch);
+function clearSearch() {
+  $searchInput.value = ""; $searchbox.classList.remove("has-q");
+  document.body.classList.remove("searching");
+}
+async function runSearch(q) {
+  if (q.length < 2) return;
+  let data;
+  try { data = await (await api(`/api/chat/search?q=${encodeURIComponent(q)}`)).json(); }
+  catch { return; }
+  document.body.classList.add("searching");
+  const results = data.results || [];
+  $searchResults.innerHTML = results.length
+    ? results.map(r => convRow(
+        { id: r.id, title: r.title, updatedAt: r.updatedAt, messageCount: null },
+        { snippet: r.snippet }
+      )).join("")
+    : `<div class="lbl">No matches</div>`;
+}
+
+// ---- composer behaviors -----------------------------------------------------
+function autoGrow() {
+  $input.style.height = "auto";
+  $input.style.height = Math.min($input.scrollHeight, 200) + "px";
+}
+$input.addEventListener("input", autoGrow);
+$input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSend(); }
+});
+// Delegated copy-button handling for rendered code blocks.
+$threadInner.addEventListener("click", (e) => {
+  const btn = e.target.closest(".codeblock .copy");
+  if (!btn) return;
+  const code = btn.parentElement.querySelector("code");
+  navigator.clipboard.writeText(code ? code.textContent : "").then(() => {
+    btn.textContent = "Copied"; setTimeout(() => { btn.textContent = "Copy"; }, 1200);
+  }).catch(() => {});
+});
+
+// ---- boot -------------------------------------------------------------------
+(async function init() {
+  await loadModels();
+  await loadConversations();
+  if (conversations.length) openConversation(conversations[0].id);
+  else renderThread();
+})();
+</script>
+</body>
+</html>
