@@ -30,8 +30,15 @@
     padding: 16px; display: flex; flex-direction: column; gap: 12px;
   }
   .host-card.offline { opacity: 0.62; }
+  .host-card.collapsed { gap: 0; }
   .host-top { display: flex; align-items: center; gap: 10px; }
-  .host-top h3 { font-size: 15px; margin: 0; font-weight: 600; flex: 1; word-break: break-all; }
+  /* The name + caret toggle the host card open/closed; keep the status chip out
+     of the clickable area so tapping it doesn't collapse the card. */
+  .host-name { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+    cursor: pointer; background: none; border: 0; padding: 0; text-align: left; color: inherit; font: inherit; }
+  .host-name h3 { font-size: 15px; margin: 0; font-weight: 600; word-break: break-all; }
+  .host-name .caret { color: var(--muted); font-size: 11px; flex-shrink: 0; transition: transform 0.15s; }
+  .host-card.collapsed .host-name .caret { transform: rotate(-90deg); }
   .host-meta { display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 13px; color: var(--ink-2); }
   .host-meta .m-label { color: var(--muted); }
   .host-meta b { color: var(--ink); font-weight: 600; }
@@ -266,6 +273,24 @@ const confirming = new Map();
 const openLogs = new Set();
 const collapsedRepos = new Set();
 const resumeOpen = new Set();
+// collapsedHosts: host keys the user collapsed to just their name+status row, so
+// a page with many hosts stays browseable. Hosts default OPEN (we only remember
+// the closed ones) and, unlike the repo/log toggles, this persists to
+// localStorage so a chosen layout survives reloads.
+const HOSTS_STORE_KEY = "turma.collapsedHosts";
+const collapsedHosts = new Set(loadCollapsedHosts());
+function loadCollapsedHosts() {
+  try { const a = JSON.parse(localStorage.getItem(HOSTS_STORE_KEY) || "[]"); return Array.isArray(a) ? a : []; }
+  catch { return []; }
+}
+function saveCollapsedHosts() {
+  try { localStorage.setItem(HOSTS_STORE_KEY, JSON.stringify([...collapsedHosts])); } catch { /* private mode / quota — ignore */ }
+}
+function hostToggle(key) {
+  if (collapsedHosts.has(key)) collapsedHosts.delete(key); else collapsedHosts.add(key);
+  saveCollapsedHosts();
+  render(cache);
+}
 function logToggle(key, open) { open ? openLogs.add(key) : openLogs.delete(key); }
 function repoToggle(rkey, open) { open ? collapsedRepos.delete(rkey) : collapsedRepos.add(rkey); }
 function toggleResume(rkey) {
@@ -624,11 +649,8 @@ function hostCard(a, now) {
     ? repoEntries.map(r => repoBlock(a, r, sessions.filter(s => s.repo === r.name), now)).join("")
     : `<div class="repo-empty">No git repos found under ${esc(a.reposRoot || "the repos root")}.</div>`;
 
-  return `<div class="host-card ${a.online ? "" : "offline"}">
-    <div class="host-top">
-      <h3>${esc(a.key)}</h3>
-      <span class="status"><span class="dot ${dot}"></span>${esc(state)}</span>
-    </div>
+  const collapsed = collapsedHosts.has(a.key);
+  const body = collapsed ? "" : `
     <div class="host-meta">
       <span><span class="m-label">Claude Code</span> <b>${esc(a.claudeVersion || "–")}</b></span>
       <span><span class="m-label">Memory</span> <b>${esc(mem)}</b></span>
@@ -643,7 +665,23 @@ function hostCard(a, now) {
     </details>` : ""}
     ${a.online ? "" : `<div class="actions">
       <button onclick="removeHost('${esc(a.key)}')">Remove host</button>
-    </div>`}
+    </div>`}`;
+
+  // When collapsed, surface the session count alongside the name so the row still
+  // tells you at a glance how busy the host is without expanding it.
+  const collapsedMeta = collapsed
+    ? `<span class="status" style="color:var(--muted);font-size:12px">${runCount} running · ${sessions.length} total</span>`
+    : "";
+
+  return `<div class="host-card ${a.online ? "" : "offline"} ${collapsed ? "collapsed" : ""}">
+    <div class="host-top">
+      <button class="host-name" onclick="hostToggle('${esc(a.key)}')"
+          aria-expanded="${collapsed ? "false" : "true"}" title="${collapsed ? "Expand" : "Collapse"} host">
+        <span class="caret">▼</span><h3>${esc(a.key)}</h3>
+      </button>
+      ${collapsedMeta}
+      <span class="status"><span class="dot ${dot}"></span>${esc(state)}</span>
+    </div>${body}
   </div>`;
 }
 
