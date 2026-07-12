@@ -413,6 +413,10 @@ function openDataChannel(ch, port) {
   const ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
   const sock = net.connect(port || DEFAULT_TTYD_PORT, TTYD_HOST);
+  // Disable Nagle: terminal traffic is a stream of tiny keystroke/echo packets,
+  // and Nagle would coalesce them behind delayed-ACKs (~40ms bursts), making
+  // live typing feel choppy. We want each byte on the wire immediately.
+  sock.setNoDelay(true);
   let open = false;
   const outbox = []; // ttyd bytes produced before the WS finished connecting
 
