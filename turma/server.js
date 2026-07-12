@@ -79,28 +79,30 @@ const NTFY_USER = process.env.NTFY_USER || "";
 const NTFY_PASS = process.env.NTFY_PASS || "";
 const COST_ALERT_USD = parseFloat(process.env.COST_ALERT_USD || "75");
 
-// Whisper STT: the glasses client streams mic PCM to us over /audio and we
-// wrap+POST it to an external OpenAI-compatible Whisper server on finalize.
-// Unset WHISPER_URL disables STT (the WS endpoint still works; it just
-// returns an `unavailable` transcript instead of erroring).
-const WHISPER_URL = process.env.WHISPER_URL || "";
-const WHISPER_MODEL = process.env.WHISPER_MODEL || "";
-const WHISPER_API_KEY = process.env.WHISPER_API_KEY || "";
-const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || "en";
-const WHISPER_TIMEOUT_MS = parseInt(process.env.WHISPER_TIMEOUT_MS || "30000", 10);
-
-// ---- LiteLLM chat backend (OpenAI-compatible) -------------------------------
-// The /chat page talks to the SAME LiteLLM instance that already serves Whisper,
-// just a different endpoint: LITELLM_URL is that instance's `/v1` base, so chat
-// hits `${LITELLM_URL}/chat/completions` + `${LITELLM_URL}/models` while Whisper
-// hits the same host's `/audio/transcriptions`. The API key defaults to the
-// Whisper key (one proxy, one credential). Unset LITELLM_URL disables chat: the
-// models endpoint reports {unavailable} and completions 503 — the same "graceful
-// when unconfigured" contract as Whisper. History persists in chat.js's SQLite DB.
+// ---- LiteLLM backend (OpenAI-compatible: chat + Whisper STT) ----------------
+// ONE LiteLLM instance serves both the /chat page and Whisper STT, so a single
+// var/value configures everything: LITELLM_URL is that instance's `/v1` base, so
+// chat hits `${LITELLM_URL}/chat/completions` + `${LITELLM_URL}/models` and
+// Whisper hits `${LITELLM_URL}/audio/transcriptions` — same host, same
+// credential (LITELLM_API_KEY). Unset LITELLM_URL disables both chat and STT:
+// the models endpoint reports {unavailable}, completions 503, and transcription
+// returns an `unavailable` transcript — one "graceful when unconfigured"
+// contract. History persists in chat.js's SQLite DB.
 const LITELLM_URL = (process.env.LITELLM_URL || "").replace(/\/$/, "");
-const LITELLM_API_KEY = process.env.LITELLM_API_KEY || WHISPER_API_KEY;
+const LITELLM_API_KEY = process.env.LITELLM_API_KEY || process.env.WHISPER_API_KEY || "";
 const LITELLM_DEFAULT_MODEL = process.env.LITELLM_DEFAULT_MODEL || "";
 const LITELLM_TIMEOUT_MS = parseInt(process.env.LITELLM_TIMEOUT_MS || "120000", 10);
+
+// Whisper STT: the glasses client streams mic PCM to us over /audio and we
+// wrap+POST it to the same LiteLLM instance's OpenAI-compatible transcription
+// endpoint on finalize. Derived from LITELLM_URL / LITELLM_API_KEY by default;
+// WHISPER_URL / WHISPER_API_KEY still override if the STT server lives elsewhere.
+const WHISPER_URL =
+  process.env.WHISPER_URL || (LITELLM_URL ? `${LITELLM_URL}/audio/transcriptions` : "");
+const WHISPER_MODEL = process.env.WHISPER_MODEL || "";
+const WHISPER_API_KEY = process.env.WHISPER_API_KEY || LITELLM_API_KEY;
+const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || "en";
+const WHISPER_TIMEOUT_MS = parseInt(process.env.WHISPER_TIMEOUT_MS || "30000", 10);
 // Cap how many prior messages we replay to the model (context-window guard); the
 // full history is always kept on disk regardless.
 const CHAT_MAX_MESSAGES = parseInt(process.env.CHAT_MAX_MESSAGES || "400", 10);
@@ -1906,7 +1908,7 @@ if (process.env.TURMA_TEST) {
         : "ntfy alerts disabled (NTFY_URL not set)"
     );
     console.log(
-      WHISPER_URL ? `whisper STT -> ${WHISPER_URL}` : "whisper STT disabled (WHISPER_URL not set)"
+      WHISPER_URL ? `whisper STT -> ${WHISPER_URL}` : "whisper STT disabled (LITELLM_URL/WHISPER_URL not set)"
     );
     console.log(
       LITELLM_URL ? `litellm chat -> ${LITELLM_URL}` : "litellm chat disabled (LITELLM_URL not set)"
