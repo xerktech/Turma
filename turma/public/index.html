@@ -1149,6 +1149,29 @@ function pruneRepo(key, repo) {
 // terminal WebSocket. The hub routes <sessionId> to whichever host owns it.
 const $overlay = document.getElementById("termOverlay");
 const $frame = document.getElementById("termFrame");
+
+// On phones the soft keyboard shrinks the *visual* viewport but not the layout
+// viewport, so this `position:fixed; inset:0` overlay keeps its full height and
+// the compose bar ends up with a slab of black overlay between it and the
+// keyboard. Pin the overlay to the visual viewport while it's open so the Send
+// box rests right on top of the keyboard. No-op where visualViewport is absent.
+function syncTermViewport() {
+  const vv = window.visualViewport;
+  if (!vv || $overlay.style.display !== "flex") return;
+  $overlay.style.top = vv.offsetTop + "px";
+  $overlay.style.bottom = "auto";
+  $overlay.style.height = vv.height + "px";
+}
+function clearTermViewport() {
+  $overlay.style.top = "";
+  $overlay.style.bottom = "";
+  $overlay.style.height = "";
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", syncTermViewport);
+  window.visualViewport.addEventListener("scroll", syncTermViewport);
+}
+
 function openTerminal(id) {
   const src = `/term/${encodeURIComponent(id)}/`;
   $overlay.dataset.id = id;
@@ -1156,12 +1179,14 @@ function openTerminal(id) {
   document.getElementById("termOpen").href = src;
   $frame.src = src;
   $overlay.style.display = "flex";
+  syncTermViewport();
   disarmTermKill();
   const inp = document.getElementById("termInput");
   if (inp) { inp.value = ""; autoGrowTermInput(); }
 }
 function closeTerminal() {
   $overlay.style.display = "none";
+  clearTermViewport();
   $frame.src = "about:blank"; // tear down the session's WebSocket
   disarmTermKill();
 }
