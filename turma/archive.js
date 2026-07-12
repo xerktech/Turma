@@ -57,20 +57,16 @@ function archiveRelPath(transcriptId, meta) {
   const summary = slugify(meta.summary, "session");
   const host = slugify(meta.host, "host");
   const short = String(transcriptId || "").replace(/[^A-Za-z0-9]/g, "").slice(0, 8) || "unknown";
+  // Not path-traversable: repoFolder() and every filename part run through
+  // slugify(), which collapses anything outside [A-Za-z0-9._-] and strips
+  // leading dots/dashes — so no component can contain a separator or '..'.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
   return path.join(repoFolder(meta), `${slugify(date, "undated")}__${summary}__${host}__${short}.jsonl`);
 }
 
 // ---- database ---------------------------------------------------------------
 
 let db = null;
-
-function columnNames(table) {
-  try {
-    return new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name));
-  } catch {
-    return new Set();
-  }
-}
 
 function createSchema() {
   db.exec(`CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)`);
@@ -127,6 +123,10 @@ function tx(fn) {
 
 // Absolute path of a session's organized file (and its sidecar).
 function filePaths(relPath) {
+  // relPath is never raw input: it's produced by archiveRelPath() (all parts
+  // slugify()-sanitized) or read back from the DB filePath we wrote, so it can
+  // only ever name a child of ARCHIVE_DIR.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
   const jsonl = path.join(ARCHIVE_DIR, relPath);
   return { jsonl, meta: jsonl + ".meta", dir: path.dirname(jsonl) };
 }
@@ -345,6 +345,9 @@ function walkJsonl(dir, out) {
   let names;
   try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
   for (const d of names) {
+    // d.name is a single readdirSync entry (never contains a separator), so
+    // this stays inside `dir` — a recursive walk of our own ARCHIVE_DIR.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     const full = path.join(dir, d.name);
     if (d.isDirectory()) walkJsonl(full, out);
     else if (d.isFile() && d.name.endsWith(".jsonl")) out.push(full);
