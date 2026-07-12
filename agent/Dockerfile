@@ -6,6 +6,14 @@ FROM node:24-bookworm-slim
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
+# --- Base tooling layer (stable) --------------------------------------------
+# These pins change rarely, so they live in their own layer, ahead of and
+# separate from the volatile coding-agent installs below. That way a Claude Code
+# release bump (which changes CLAUDE_CODE_VERSION on every CI build) invalidates
+# ONLY the agent layer — this apt/curl/npm-upgrade layer stays cached and isn't
+# re-downloaded every build. The agent ARGs are deliberately declared *after*
+# this RUN so their churn can't reach back and bust this layer's cache.
+
 # Static Docker CLI only (no daemon) — bump as needed (kept current so the
 # bundled Go stdlib stays ahead of known CVEs; the image scan gates on this).
 ARG DOCKER_CLI_VERSION=29.6.1
@@ -20,18 +28,6 @@ ARG POWERSHELL_VERSION=7.6.3
 # npm — pinned ahead of the base image's bundled npm to pull in patched
 # transitive deps (e.g. undici); the image scan gates on npm's node_modules.
 ARG NPM_VERSION=11.18.0
-# Claude Code npm version. CI pins this to the latest published release so the
-# image tag reflects the bundled Claude Code version. Defaults to latest for
-# local/manual builds.
-ARG CLAUDE_CODE_VERSION=latest
-# Additional coding agents, selectable at runtime via the AGENT env var (see
-# entrypoint.sh); claude stays the default. Track latest so each rebuild pulls
-# the newest release (like CLAUDE_CODE_VERSION above); pin to a specific version
-# here if you ever need to freeze one. Auth for these is not wired up yet; only
-# claude reuses the host login today.
-ARG CODEX_VERSION=latest
-ARG COPILOT_VERSION=latest
-ARG OPENCODE_VERSION=latest
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates curl ripgrep tmux \
@@ -47,11 +43,31 @@ RUN apt-get update \
       | tar -xz -C /opt/powershell \
  && ln -s /opt/powershell/pwsh /usr/local/bin/pwsh \
  && npm install -g "npm@${NPM_VERSION}" \
- && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- Coding-agent layer (volatile) ------------------------------------------
+# CI pins these to the latest published release on every build, so they change
+# constantly. Isolated in this trailing layer, a version bump rebuilds only this
+# npm install — never the base tooling above. Keep these ARGs here (not up top)
+# so declaring them can't invalidate the base layer's cache.
+
+# Claude Code npm version. CI pins this to the latest published release so the
+# image tag reflects the bundled Claude Code version. Defaults to latest for
+# local/manual builds.
+ARG CLAUDE_CODE_VERSION=latest
+# Additional coding agents, selectable at runtime via the AGENT env var (see
+# entrypoint.sh); claude stays the default. Track latest so each rebuild pulls
+# the newest release (like CLAUDE_CODE_VERSION above); pin to a specific version
+# here if you ever need to freeze one. Auth for these is not wired up yet; only
+# claude reuses the host login today.
+ARG CODEX_VERSION=latest
+ARG COPILOT_VERSION=latest
+ARG OPENCODE_VERSION=latest
+
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
                    "@openai/codex@${CODEX_VERSION}" \
                    "@github/copilot@${COPILOT_VERSION}" \
-                   "opencode-ai@${OPENCODE_VERSION}" \
- && rm -rf /var/lib/apt/lists/*
+                   "opencode-ai@${OPENCODE_VERSION}"
 
 # Wire git to authenticate via gh, system-wide (so it applies regardless of the
 # per-repo /mnt/data .git/config that carries the commit identity). gh reads the

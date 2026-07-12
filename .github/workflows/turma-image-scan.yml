@@ -45,8 +45,10 @@ jobs:
           load: true
           push: false
           tags: ${{ env.SCAN_TAG }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Share the turma image's cache scope with the build workflow so the
+          # PR scan and the post-merge build prime each other's layer cache.
+          cache-from: type=gha,scope=turma
+          cache-to: type=gha,mode=max,scope=turma
 
       - name: Install Trivy
         run: |
