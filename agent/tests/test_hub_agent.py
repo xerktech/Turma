@@ -1525,9 +1525,54 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         return sm
 
     def _running_session(self, sm, sid="abcde", status="running"):
-        sess = {"id": sid, "status": status, "tmuxName": f"agent-{sid}"}
+        # summaryStarted=True: these tests exercise the tmux keystroke path, not
+        # naming — mark the session as already past its one-shot naming attempt
+        # so send_input doesn't launch a summary subprocess.
+        sess = {"id": sid, "status": status, "tmuxName": f"agent-{sid}",
+                "summary": None, "summaryStarted": True}
         sm.registry = [sess]
         return sess
+
+    def test_first_prompt_names_still_unnamed_session(self):
+        # A bare/quick spawn (or repos-root) has no summary and no naming attempt
+        # yet; the first typed prompt should kick off _start_summary, one-shot.
+        sm = self.make_manager()
+        sess = {"id": "abcde", "status": "running", "tmuxName": "agent-abcde",
+                "summary": None}
+        sm.registry = [sess]
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm.send_input("abcde", "Add a docker compose flag")
+        start.assert_called_once_with(sess, "Add a docker compose flag")
+        # The keystroke still goes through regardless.
+        self.assertIn(
+            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--",
+             "Add a docker compose flag"], self.run_calls)
+
+    def test_later_prompts_do_not_resummarize(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)  # summaryStarted=True already
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm.send_input(sess["id"], "another message")
+        start.assert_not_called()
+
+    def test_no_resummarize_once_named(self):
+        sm = self.make_manager()
+        sess = {"id": "abcde", "status": "running", "tmuxName": "agent-abcde",
+                "summary": "Adding Compose Flag"}
+        sm.registry = [sess]
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm.send_input("abcde", "keep going")
+        start.assert_not_called()
+
+    def test_no_resummarize_while_summary_in_flight(self):
+        sm = self.make_manager()
+        sess = {"id": "abcde", "status": "running", "tmuxName": "agent-abcde",
+                "summary": None}
+        sm.registry = [sess]
+        sm.summaries = {"abcde": {"proc": object()}}  # attempt already running
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm.send_input("abcde", "hello")
+        start.assert_not_called()
 
     def test_exact_argvs_literal_send_then_enter(self):
         sm = self.make_manager()
