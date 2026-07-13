@@ -171,6 +171,14 @@
   .tr-msg.user { align-self: flex-end; background: var(--accent-soft); color: var(--ink); }
   .tr-msg.assistant { align-self: flex-start; background: var(--surface); border: 1px solid var(--border); color: var(--ink); }
   .tr-msg .role { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 3px; }
+  .tr-msg mark { background: var(--accent-soft); color: var(--accent); padding: 0 1px; border-radius: 2px; }
+  .tr-msg.hit { box-shadow: 0 0 0 2px var(--accent); }
+  .tr-msg.flash { animation: hitFlash 1.6s ease-out 1; }
+  @keyframes hitFlash {
+    0%, 15% { background: var(--accent); color: #fff; }
+    100% { }
+  }
+  .tr-msg.assistant.hit { border-color: var(--accent); }
   .tr-empty { color: var(--muted); font-size: 13px; padding: 24px; text-align: center; }
 
   /* ---- Responsive: stack to list → full-screen terminal on phones/tablets -- */
@@ -705,7 +713,8 @@ function renderSearch() {
       <div class="grp-h">${esc(g.repo || g.remoteKey || "unknown")}</div>
       ${g.matches.map(m => `
         <button class="sr-row ${m.transcriptId === currentTranscriptId ? "cur" : ""}"
-                data-tid="${esc(m.transcriptId)}" data-title="${esc(m.summary || "")}">
+                data-tid="${esc(m.transcriptId)}" data-title="${esc(m.summary || "")}"
+                data-uuid="${esc(m.uuid || "")}" data-q="${esc(searchQuery)}">
           <div class="meta">${esc(m.role || "")}<span class="badge">${esc(m.host || "")}</span> · ${esc(shortDate(m.ts))}</div>
           <div class="snip">${safeSnippet(m.snippet || "")}</div>
         </button>`).join("")}
@@ -739,8 +748,47 @@ function renderArchive() {
     : `<div class="sr-hint">No archived sessions yet.</div>`;
 }
 
-async function openTranscript(id, title) {
+// Query tokenizer mirroring the server's ftsQuery(): the terms we visually
+// highlight in the log must be the same ones FTS actually matched on.
+function queryTerms(q) {
+  return String(q || "").toLowerCase().split(/[^a-z0-9]+/i).filter(Boolean).slice(0, 12);
+}
+// Escape-safe term highlighting: wrap each matched term in <mark> without ever
+// emitting attacker-controlled markup — split on the raw text, esc() each piece.
+function highlightTerms(text, terms) {
+  const raw = String(text || "");
+  if (!terms || !terms.length) return esc(raw);
+  const pat = terms.slice().sort((a, b) => b.length - a.length)
+    .map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const re = new RegExp(pat, "gi");
+  let out = "", last = 0, m;
+  while ((m = re.exec(raw))) {
+    if (m.index === re.lastIndex) { re.lastIndex++; continue; } // zero-width guard
+    out += esc(raw.slice(last, m.index)) + "<mark>" + esc(m[0]) + "</mark>";
+    last = m.index + m[0].length;
+  }
+  return out + esc(raw.slice(last));
+}
+// Scroll the matched message to the middle of the transcript pane and flash it.
+// Falls back to the first highlighted term when the match has no usable uuid.
+function scrollToHit(hi) {
+  const scroll = document.getElementById("trScroll");
+  let el = null;
+  if (hi && hi.uuid && window.CSS && CSS.escape) {
+    el = scroll.querySelector(`.tr-msg[data-uuid="${CSS.escape(hi.uuid)}"]`);
+  }
+  if (!el) { const mk = scroll.querySelector(".tr-msg mark"); el = mk ? mk.closest(".tr-msg") : null; }
+  if (!el) return;
+  const cRect = scroll.getBoundingClientRect(), eRect = el.getBoundingClientRect();
+  scroll.scrollTop += (eRect.top - cRect.top) - (scroll.clientHeight / 2 - el.offsetHeight / 2);
+  el.classList.add("hit");
+  el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash");
+}
+
+let trHighlight = null; // { uuid, terms } for a search-driven open (else null)
+async function openTranscript(id, title, hi) {
   currentTranscriptId = id;
+  trHighlight = hi || null;
   currentId = null;
   disarmTermKill();
   document.getElementById("trTitle").textContent = title || id;
@@ -771,12 +819,17 @@ function renderTranscript(t) {
   document.getElementById("trPath").textContent =
     [t.repo, t.host, shortDate(t.endedTs || t.createdAt)].filter(Boolean).join(" · ");
   const entries = t.entries || [];
+  const hi = trHighlight;
+  const terms = (hi && hi.terms) || [];
   document.getElementById("trScroll").innerHTML = entries.length
     ? entries.map(e => {
         const role = e.role === "user" ? "user" : "assistant";
-        return `<div class="tr-msg ${role}"><span class="role">${role}</span>${esc(e.text || "")}</div>`;
+        const body = terms.length ? highlightTerms(e.text, terms) : esc(e.text || "");
+        return `<div class="tr-msg ${role}" data-uuid="${esc(e.uuid || "")}"><span class="role">${role}</span>${body}</div>`;
       }).join("")
     : `<div class="tr-empty">This session's transcript is empty.</div>`;
+  // Jump to the actual match instead of the top of the log.
+  if (hi) scrollToHit(hi);
 }
 
 $searchInput.addEventListener("input", onSearchInput);
@@ -784,10 +837,16 @@ $searchClear.addEventListener("click", () => {
   $searchInput.value = ""; onSearchInput(); $searchInput.focus();
 });
 // Delegated: a result/archive row opens its transcript (data-* survive re-render).
+// A search-result row also carries the matched entry's uuid + the query, so the
+// transcript can scroll to and highlight the actual hit rather than the top.
 function delegateOpen(container) {
   container.addEventListener("click", (e) => {
     const btn = e.target.closest("[data-tid]");
-    if (btn) openTranscript(btn.dataset.tid, btn.dataset.title);
+    if (!btn) return;
+    const hi = (btn.dataset.q != null && btn.dataset.q !== "")
+      ? { uuid: btn.dataset.uuid || null, terms: queryTerms(btn.dataset.q) }
+      : null;
+    openTranscript(btn.dataset.tid, btn.dataset.title, hi);
   });
 }
 delegateOpen($searchResults);

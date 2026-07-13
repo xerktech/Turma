@@ -85,6 +85,8 @@ test("searchArchive: ranked, <mark>-highlighted snippets, repo/host filters", ()
   const allMatches = res.groups.flatMap((g) => g.matches);
   assert.ok(allMatches.length >= 2, "matches across both repos");
   assert.ok(allMatches.some((m) => /<mark>/.test(m.snippet)), "snippet highlights the term");
+  // Each match carries the matched entry's uuid so the UI can scroll to it.
+  assert.ok(allMatches.some((m) => m.uuid === "o1"), "match returns the matched entry uuid");
   // Grouped by remoteKey.
   assert.ok(res.groups.length >= 2);
 

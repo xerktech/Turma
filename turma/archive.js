@@ -271,7 +271,7 @@ function searchArchive(query, opts) {
   if (opts && opts.host) { where.push("s.host = ?"); args.push(opts.host); }
   const sql = `
     SELECT s.transcriptId, s.host, s.remoteKey, s.repo, s.summary, s.endedTs,
-           f.role AS role, f.ts AS ts,
+           f.role AS role, f.ts AS ts, f.uuid AS uuid,
            snippet(entries_fts, 0, '<mark>', '</mark>', '…', 12) AS snippet,
            rank AS rnk
     FROM entries_fts f JOIN sessions s ON s.transcriptId = f.transcriptId
@@ -289,7 +289,8 @@ function searchArchive(query, opts) {
     if (!g) { g = { remoteKey: key, repo: r.repo || null, matches: [] }; byKey.set(key, g); groups.push(g); }
     g.matches.push({
       transcriptId: r.transcriptId, host: r.host, summary: r.summary || null,
-      role: r.role || null, ts: r.ts || r.endedTs || null, snippet: r.snippet || "",
+      role: r.role || null, ts: r.ts || r.endedTs || null, uuid: r.uuid || null,
+      snippet: r.snippet || "",
     });
   }
   return { query: String(query || ""), groups };
