@@ -1224,6 +1224,47 @@ def _newest_transcript_path(workdir):
     return newest
 
 
+def _first_user_text(path, max_lines=500):
+    """The first genuine human prompt from the START of a transcript, or None.
+
+    Reads forward from the top and returns the first `user` entry that carries
+    real text, skipping the transcript's non-message header (mode/bridge/system
+    rows), Claude Code's `isMeta` caveat entries, and `<command-…>` slash-command
+    wrappers — so what comes back is what an initial task prompt would have been.
+    This is how a session that spawned with NO initial prompt gets named: its
+    first prompt is almost always typed into the live ttyd terminal, which writes
+    straight to the tmux pane and never reaches send_input, so the transcript —
+    which every input path lands in — is the only channel-agnostic place to find
+    it. Bounded to the first max_lines lines so an already-long resumed transcript
+    can't make this walk expensive (the real first prompt sits within the first
+    handful of entries anyway)."""
+    try:
+        with open(path, errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") != "user" or entry.get("isMeta"):
+                    continue
+                text = _entry_text(entry)
+                if not text:
+                    continue  # tool_result-only turn, or empty after stripping
+                if text.startswith("<command-") or text.startswith("<local-command"):
+                    continue  # slash-command plumbing, not a real prompt
+                return text
+    except OSError:
+        return None
+    return None
+
+
 def _history_entries(path):
     """On-demand `history` read of a transcript: bounded to the last 4 MiB
     (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
@@ -1681,11 +1722,19 @@ def collect_github():
 # container's already-authenticated `claude` in headless print mode (`claude -p`,
 # Haiku by default). It reuses the mounted login, so there is NO external API or
 # key. The call runs as a detached subprocess reaped on later beats (never blocks
-# the heartbeat) and is deliberately ONE-SHOT — only at spawn — because every
-# session shares the one login, so re-summarizing per beat would draw on the
-# working sessions' rate limits. Sessions spawned with no initial prompt (the
-# one-click bare spawn, the repos-root pseudo-repo) simply stay unnamed and the
-# card falls back to the label/worktree.
+# the heartbeat) and is deliberately ONE-SHOT — the single naming attempt per
+# session — because every session shares the one login, so re-summarizing per
+# beat would draw on the working sessions' rate limits. A session spawned with no
+# initial prompt (the one-click bare spawn, the repos-root pseudo-repo) is named
+# instead from its FIRST user prompt, read straight out of its transcript by
+# _seed_summaries() each beat (see _first_user_text). That transcript read is the
+# channel-agnostic path: the first prompt is usually typed into the live ttyd
+# terminal, which writes to the tmux pane and never reaches send_input, so keying
+# off any single input channel misses it — the transcript is where every input
+# path lands. send_input still kicks a name off immediately when a prompt does
+# arrive that way (a fast path); both are gated on summary/summaryStarted so the
+# attempt fires exactly once. A session with no prompt yet stays unnamed and the
+# card falls back to the label/worktree until one lands.
 # Handed straight to `claude --model`; validated only against claude's own
 # aliases, but this is a fixed operator-set env, not free-form spawn input.
 SESSION_SUMMARY_MODEL = os.environ.get("SESSION_SUMMARY_MODEL", "haiku").strip() or "haiku"
@@ -2835,6 +2884,34 @@ class SessionManager:
             self.save()
             log(f"named session {sid}: {summary!r}")
 
+    def _seed_summaries(self):
+        """Name any running, still-unnamed session from the first user message in
+        its transcript — the input-channel-agnostic naming path, run every beat.
+
+        A session spawned with no initial prompt (the one-click bare spawn, the
+        repos-root pseudo-repo) has nothing to summarize at spawn, and its first
+        prompt usually arrives by the user typing into the live ttyd terminal,
+        which goes straight to the tmux pane and never reaches send_input — so the
+        send_input trigger alone never fires for the most common flow. Reading the
+        transcript catches the first prompt no matter how it was entered (terminal,
+        glasses/compose-bar input, or a resumed session). One-shot per session,
+        gated exactly like the send_input path (`summary`/`summaryStarted`/in-flight)
+        so it launches `claude -p` at most once; until a first prompt lands it just
+        finds nothing and retries next beat, and once a name is set it's skipped."""
+        for sess in self.registry:
+            if sess.get("status") != "running":
+                continue
+            if sess.get("summary") or sess.get("summaryStarted"):
+                continue
+            if sess["id"] in self.summaries:
+                continue
+            path = _newest_transcript_path(sess["worktreePath"])
+            if not path:
+                continue
+            text = _first_user_text(path)
+            if text:
+                self._start_summary(sess, text)
+
     def _poll_summaries(self):
         """Reap finished summary subprocesses (one poll() per active job each
         beat, like _poll_clones): on clean exit, set sess['summary'] from the
@@ -3482,6 +3559,10 @@ class SessionManager:
             self.refresh_github()
         self._poll_clones()
         self._poll_prunes()
+        # Seed names for bare-spawned sessions from their transcript's first
+        # prompt (channel-agnostic; the live terminal bypasses send_input), then
+        # reap any finished naming subprocess.
+        self._seed_summaries()
         self._poll_summaries()
 
         payload = {
