@@ -91,6 +91,74 @@
     return out;
   }
 
+  // ---- markdown tables ------------------------------------------------------
+  // Render prose that may contain GitHub-flavoured markdown tables. A table is a
+  // header row (a line with `|`) immediately followed by a delimiter row (cells
+  // of dashes with optional leading/trailing colons for alignment), then body
+  // rows until the first line that isn't a pipe row. Recognised tables become
+  // real <table> elements (each cell linkified); everything else falls straight
+  // through linkify() so non-table prose is byte-identical to before. Cells are
+  // linkify()'d, so injection safety is inherited from esc()/linkify().
+  function splitRow(line) {
+    let s = line.trim();
+    if (s.startsWith("|")) s = s.slice(1);
+    if (s.endsWith("|")) s = s.slice(0, -1);
+    // Split on pipes that aren't backslash-escaped, then unescape `\|`.
+    return s.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
+  }
+  function hasPipe(line) { return line.indexOf("|") >= 0; }
+  function isDelimiterRow(line) {
+    if (!hasPipe(line)) return false;
+    const cells = splitRow(line);
+    return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c));
+  }
+  function cellAlign(c) {
+    const l = c.startsWith(":"), r = c.endsWith(":");
+    if (l && r) return "center";
+    if (r) return "right";
+    if (l) return "left";
+    return "";
+  }
+  function renderTable(header, aligns, rows) {
+    const cell = (tag, txt, i) => {
+      const a = aligns[i] || "";
+      return "<" + tag + (a ? ' style="text-align:' + a + '"' : "") + ">" + linkify(txt) + "</" + tag + ">";
+    };
+    let html = '<table class="md-table"><thead><tr>';
+    header.forEach((h, i) => { html += cell("th", h, i); });
+    html += "</tr></thead><tbody>";
+    for (const r of rows) {
+      html += "<tr>";
+      for (let i = 0; i < header.length; i++) html += cell("td", r[i] == null ? "" : r[i], i);
+      html += "</tr>";
+    }
+    return html + "</tbody></table>";
+  }
+  function renderProse(text) {
+    const s = String(text == null ? "" : text);
+    if (s.indexOf("|") < 0) return linkify(s); // no pipe → no table possible
+    const lines = s.split("\n");
+    let out = "", i = 0, buf = [];
+    const flush = () => { if (buf.length) { out += linkify(buf.join("\n")); buf = []; } };
+    while (i < lines.length) {
+      const isTableHead = i + 1 < lines.length && hasPipe(lines[i]) && isDelimiterRow(lines[i + 1]) &&
+        splitRow(lines[i]).length === splitRow(lines[i + 1]).length;
+      if (isTableHead) {
+        flush();
+        const header = splitRow(lines[i]);
+        const aligns = splitRow(lines[i + 1]).map(cellAlign);
+        i += 2;
+        const rows = [];
+        while (i < lines.length && lines[i].trim() !== "" && hasPipe(lines[i])) { rows.push(splitRow(lines[i])); i++; }
+        out += renderTable(header, aligns, rows);
+        continue;
+      }
+      buf.push(lines[i]); i++;
+    }
+    flush();
+    return out;
+  }
+
   // ---- state ----------------------------------------------------------------
   let gen = 0;                      // bumped on every open/close; stale async work checks it
   let hostKey = null, sessionId = null, sess = null, agent = null;
@@ -311,7 +379,7 @@
   function renderMsg(it) {
     const cls = it.role === "user" ? "user" : "assistant";
     return '<div class="tr-msg ' + cls + '"><span class="role">' + cls + "</span>" +
-      linkify(it.text) + truncBtn(it.id, it.truncated) + "</div>";
+      renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div>";
   }
 
   function renderThought(it) {
@@ -319,7 +387,7 @@
     const key = "th:" + it.id;
     return '<details class="thought" data-dkey="' + esc(key) + '"' + openAttr(key, true) +
       "><summary>💭 Thought</summary>" +
-      '<div class="thought-body">' + linkify(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
+      '<div class="thought-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
   }
 
   // ` open` when this card should be expanded: the user's explicit toggle wins,
@@ -735,7 +803,7 @@
   // in the browser (no `module`); the browser path uses window.TurmaChat above.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      mergeTail, weight, buildItems, itemsToHtml, esc, linkify,
+      mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderProse,
       __setVerbosity: (v) => { verbosity = v; },
     };
   }
