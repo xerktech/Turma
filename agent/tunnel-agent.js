@@ -140,8 +140,15 @@ function readTailLines(p, maxBytes) {
 // isn't one) so it renders as an action card instead of raw XML. Mirror of
 // hub-agent.py _parse_task_notification.
 const TASK_NOTIFICATION_RE = /^\s*<task-notification>([\s\S]*)<\/task-notification>\s*$/;
+// Literal (not dynamically-built) per-tag regexes — a hardcoded regex sidesteps
+// the ReDoS surface of new RegExp(`<${name}>…`) and keeps the tag set closed.
+const TN_TAG_RE = {
+  summary: /<summary>([\s\S]*?)<\/summary>/,
+  status: /<status>([\s\S]*?)<\/status>/,
+  result: /<result>([\s\S]*?)<\/result>/,
+};
 function tnTag(name, body) {
-  const m = new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(body);
+  const m = TN_TAG_RE[name].exec(body);
   return m ? m[1].replace(ANSI_RE, "").trim() : "";
 }
 function parseTaskNotification(text) {
