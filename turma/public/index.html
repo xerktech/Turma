@@ -75,7 +75,10 @@
   .resume-item .sid { font-weight: 600; font-size: 13px; color: var(--ink); }
   .resume-item .sid.mono { font-family: var(--font-mono); }
   .resume-item b { color: var(--ink); font-weight: 600; }
-  .resume-item .spacer { flex: 1; }
+  /* Pin the Resume button hard right; margin-left:auto keeps it right-aligned
+     even when the row's text wraps onto its own line, instead of letting it
+     wrap to the left. */
+  .resume-item .btn-sm { margin-left: auto; flex-shrink: 0; }
   .resume-item .lbl, .sess-label {
     font-family: inherit; font-weight: 600; color: var(--ink-2);
     max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -802,7 +805,6 @@ function repoBlock(a, repo, sessList, now) {
           return `<div class="resume-item">
             <span class="sid${r.summary ? "" : " mono"}" title="${esc(r.transcriptId)}">${esc(r.summary || r.transcriptId)}</span>
             <span><b>${esc(r.origin || (r.root ? "repos root" : "worktree"))}</b> · ended ${r.endedTs ? esc(ago(now - Date.parse(r.endedTs))) : "–"}</span>
-            <span class="spacer"></span>
             <button class="primary btn-sm" ${rp ? "disabled" : ""} onclick="resumeTranscript('${esc(a.key)}','${esc(r.transcriptId)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume"}</button>
           </div>`;
         }
@@ -814,7 +816,6 @@ function repoBlock(a, repo, sessList, now) {
           ${c.summary && c.label ? `<span class="lbl">${esc(c.label)}</span>` : ""}
           <span><b>${c.root ? "repos root" : esc(worktreeName(c))}</b> · killed ${c.closedAt ? esc(ago(now - Date.parse(c.closedAt))) : "–"}</span>
           <span>${esc(c.rcName || "")}</span>
-          <span class="spacer"></span>
           <button class="primary btn-sm" ${rp ? "disabled" : ""} onclick="resumeSession('${esc(a.key)}','${esc(c.id)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume"}</button>
         </div>`;
       }).join("")}</div>`
