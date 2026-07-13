@@ -195,6 +195,10 @@
   .chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--page); }
   .chat-pane[hidden] { display: none; }
   .chat-scroll { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  /* Keep each message/tool card at its natural size: in a flex column, children
+     default to flex-shrink:1, so a growing transcript would squash the existing
+     cards to fit instead of scrolling. Pin them so the container scrolls. */
+  .chat-scroll > * { flex-shrink: 0; }
   /* Text bubbles reuse the transcript bubble system: user right, agent left.
      In the live chat, agent output is borderless/background-free and tighter
      so it reads as flat prose; user input keeps its bubble. */
