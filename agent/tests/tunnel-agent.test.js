@@ -248,7 +248,9 @@ test("parsePaneLiveTurn: thinking (no assistant text yet) -> generating, empty t
     RULE,
     "  ⏵⏵ bypass permissions on · esc to interrupt · ← for agents",
   ].join("\n");
-  assert.deepEqual(parsePaneLiveTurn(pane), { generating: true, text: "" });
+  assert.deepEqual(parsePaneLiveTurn(pane), {
+    generating: true, text: "", status: { verb: "Honking", up: "", down: "", elapsed: "" },
+  });
 });
 
 test("parsePaneLiveTurn: completed turn (no 'esc to interrupt') -> not generating", () => {
@@ -263,12 +265,12 @@ test("parsePaneLiveTurn: completed turn (no 'esc to interrupt') -> not generatin
     RULE,
     "  ⏵⏵ bypass permissions on · ← for agents",
   ].join("\n");
-  assert.deepEqual(parsePaneLiveTurn(pane), { generating: false, text: "" });
+  assert.deepEqual(parsePaneLiveTurn(pane), { generating: false, text: "", status: null });
 });
 
 test("parsePaneLiveTurn: ignores the right-aligned effort indicator, empty pane", () => {
   const { parsePaneLiveTurn } = require("../tunnel-agent.js");
-  assert.deepEqual(parsePaneLiveTurn(""), { generating: false, text: "" });
+  assert.deepEqual(parsePaneLiveTurn(""), { generating: false, text: "", status: null });
   // The "● high · /effort" indicator is right-aligned (leading spaces), so a
   // pane that only has it — and no real turn — yields no assistant text.
   const pane = [
@@ -278,5 +280,51 @@ test("parsePaneLiveTurn: ignores the right-aligned effort indicator, empty pane"
     RULE,
     "  ⏵⏵ bypass permissions on · esc to interrupt · ← for agents",
   ].join("\n");
-  assert.deepEqual(parsePaneLiveTurn(pane), { generating: true, text: "" });
+  assert.deepEqual(parsePaneLiveTurn(pane), { generating: true, text: "", status: null });
+});
+
+// Regression: the working-status line's verb + token counters must NOT bleed
+// into the streamed assistant text — even when the spinner is on an animation
+// glyph (✳ here) the old fixed break-set (●❯✻✽·*) didn't cover, which is what
+// made the verb + tokens flicker in and out of the message as it animated.
+test("parsePaneLiveTurn: status line (uncovered spinner glyph) stays out of the text + is parsed", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const pane = [
+    "❯ Explain recursion",
+    "● Recursion is when a function calls itself.",
+    "  It needs a base case to stop.",
+    "✳ Cogitating… (12s · ↑ 1.2k tokens · ↓ 340 · esc to interrupt)",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ bypass permissions on · esc to interrupt · ← for agents",
+  ].join("\n");
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.generating, true);
+  assert.equal(r.text, "Recursion is when a function calls itself. It needs a base case to stop.");
+  // None of the status glyph / verb / token text leaked into the message.
+  assert.ok(!/Cogitating|tokens|1\.2k|✳/.test(r.text), "status line must not appear in the assistant text");
+  assert.deepEqual(r.status, { verb: "Cogitating", up: "1.2k", down: "340", elapsed: "12s" });
+});
+
+test("parsePaneStatus: extracts verb + up/down token counters + elapsed", () => {
+  const { parsePaneStatus } = require("../tunnel-agent.js");
+  assert.deepEqual(parsePaneStatus("✻ Herding… (esc to interrupt · ↑ 3.5k tokens · ↓ 512)"),
+    { verb: "Herding", up: "3.5k", down: "512", elapsed: "" });
+  // Bare gerund with no detail yet -> just the verb.
+  assert.deepEqual(parsePaneStatus("· Honking…"),
+    { verb: "Honking", up: "", down: "", elapsed: "" });
+  // A single count with no arrows folds into `up`.
+  assert.deepEqual(parsePaneStatus("✽ Noodling… (8s · 1.2k tokens)"),
+    { verb: "Noodling", up: "1.2k", down: "", elapsed: "8s" });
+});
+
+test("isStatusLine: recognizes spinner/verb/token lines glyph-agnostically, not prose", () => {
+  const { isStatusLine } = require("../tunnel-agent.js");
+  assert.ok(isStatusLine("✳ Cogitating… (↑ 1.2k tokens · ↓ 340)"));
+  assert.ok(isStatusLine("∗ Ruminating…"));
+  assert.ok(isStatusLine("  ⏵⏵ bypass permissions on · esc to interrupt · ← for agents"));
+  assert.ok(!isStatusLine("● Recursion is when a function calls itself."));
+  assert.ok(!isStatusLine("  It needs a base case to stop."));
+  assert.ok(!isStatusLine("✻ Worked for 4s"));
 });

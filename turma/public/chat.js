@@ -94,6 +94,7 @@
   let hostKey = null, sessionId = null, sess = null, agent = null;
   let buffer = [];                  // merged rich entries {id, role, text, blocks}
   let liveTurn = "";                // in-progress assistant text (pane scrape), "" when idle
+  let liveStatus = null;            // {verb,up,down,elapsed} working indicator, null when idle
   let ws = null, backoffIdx = 0, wsRetryTimer = null;
   let pollTimer = null;
   let cachedToken = null, tokenExp = 0;
@@ -151,6 +152,10 @@
         repaint();
       } else if (frame && frame.type === "turn" && typeof frame.text === "string") {
         liveTurn = frame.text;
+        // The working indicator (spinner verb + live token up/down counters) is
+        // pinned below the scroll, not woven into the streamed text — so it stops
+        // flickering in and out of the message as the TUI spinner animates.
+        liveStatus = frame.status || null;
         repaint();
       }
     };
@@ -389,7 +394,28 @@
     // entries only append below, so the prior offset still points at the same
     // content).
     scroll.scrollTop = pin ? scroll.scrollHeight : prevTop;
+    updateLiveStatus();
     if (liveTurn) startReveal();
+  }
+
+  // The pinned working-status bar (a sibling of the scroll, so a scroll repaint
+  // never touches it): spinner + gerund verb + live ↑/↓ token counters, mirroring
+  // the Claude Code terminal's bottom status line. Shown only while generating.
+  function updateLiveStatus() {
+    const bar = $("chatStatus");
+    if (!bar) return;
+    const st = liveStatus;
+    if (!st) { bar.hidden = true; bar.innerHTML = ""; return; }
+    const verb = esc(st.verb || "Working");
+    const toks =
+      (st.up ? '<span class="tok up">↑ ' + esc(st.up) + "</span>" : "") +
+      (st.down ? '<span class="tok down">↓ ' + esc(st.down) + "</span>" : "");
+    const elapsed = st.elapsed ? '<span class="tok elapsed">' + esc(st.elapsed) + "</span>" : "";
+    bar.hidden = false;
+    bar.innerHTML =
+      '<span class="cc-spin"></span>' +
+      '<span class="verb">' + verb + "…</span>" +
+      '<span class="toks">' + elapsed + toks + "</span>";
   }
 
   // Repaint from outside (e.g. returning from the terminal toggle).
@@ -668,7 +694,7 @@
     gen++;
     const myGen = gen;
     hostKey = hk; sessionId = id; sess = s; agent = a;
-    buffer = []; liveTurn = ""; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
+    buffer = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
     detailsOpen.clear();
     loadVerbosity(id);
     setHeader(s, a);
@@ -692,7 +718,8 @@
     if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
-    buffer = []; liveTurn = ""; questionActive = false;
+    buffer = []; liveTurn = ""; liveStatus = null; questionActive = false;
+    updateLiveStatus(); // hide the pinned bar when the view closes
   }
 
   // Called from the page's render() on each heartbeat/SSE while chat is open.
