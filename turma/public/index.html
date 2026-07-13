@@ -789,15 +789,19 @@ function repoBlock(a, repo, sessList, now) {
     ? `<div class="sess-grid">${ghost}${sessList.map(s => sessCard(a, s, now)).join("")}</div>`
     : `<div class="repo-empty">No sessions yet${canSpawn ? " — start one with “+ New session”." : "."}</div>`;
 
-  // Recently killed sessions of this repo that can be brought back with their
-  // conversation (kill keeps the branch + transcript). The agent already caps
-  // the history at 5 per repo; sort newest-first and slice defensively so the
-  // picker can never grow unbounded.
-  const closed = (a.closedSessions || [])
+  // Resumable prior sessions of this repo — the "Resume any session" picker.
+  // Prefer the agent's full per-repo list (repo.resumable: EVERY prior Claude
+  // session whose origin cwd is resumable on the host — killed/deleted/pruned
+  // Turma sessions, repo-dir "terminal" runs, and older ones, not just the last
+  // few killed). Fall back to the last-5 killed sessions (closedSessions) for
+  // agents that predate repo.resumable.
+  const resumable = Array.isArray(repo.resumable) ? repo.resumable : null;
+  const legacyClosed = resumable ? [] : (a.closedSessions || [])
     .filter(c => c.repo === repo.name)
     .sort((x, y) => String(y.closedAt || "").localeCompare(String(x.closedAt || "")))
     .slice(0, 5);
-  const canResume = a.online && !repo.missing && closed.length > 0;
+  const resumeCount = resumable ? resumable.length : legacyClosed.length;
+  const canResume = a.online && !repo.missing && resumeCount > 0;
   const resumeBtn = canResume
     ? `<button class="btn-sm" onclick="event.preventDefault();event.stopPropagation();toggleResume('${esc(rkey)}')">${resumeOpen.has(rkey) ? "Resume ▴" : "Resume ▾"}</button>`
     : "";
@@ -814,7 +818,21 @@ function repoBlock(a, repo, sessList, now) {
     ? `<div class="prune-note ${pruneRes.status === "error" ? "err" : ""}">${esc(pruneRes.status === "error" ? (pruneRes.error || "prune failed") : pruneRes.summary || "pruned")}</div>`
     : "";
   const resumePanel = canResume && resumeOpen.has(rkey)
-    ? `<div class="resume-list">${closed.map(c => {
+    ? `<div class="resume-list">${(resumable || legacyClosed).map(item => {
+        if (resumable) {
+          // A resumable transcript: resume by its id (the agent re-derives the
+          // origin cwd and re-creates the worktree if it was deleted).
+          const r = item;
+          const rp = pending.has(pendKey("resume", a.key, r.transcriptId));
+          return `<div class="resume-item">
+            <span class="sid${r.summary ? "" : " mono"}" title="${esc(r.transcriptId)}">${esc(r.summary || r.transcriptId)}</span>
+            <span><b>${esc(r.origin || (r.root ? "repos root" : "worktree"))}</b> · ended ${r.endedTs ? esc(ago(now - Date.parse(r.endedTs))) : "–"}</span>
+            <span class="spacer"></span>
+            <button class="primary btn-sm" ${rp ? "disabled" : ""} onclick="resumeTranscript('${esc(a.key)}','${esc(r.transcriptId)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume"}</button>
+          </div>`;
+        }
+        // Legacy path: a killed session from closedSessions (older agent).
+        const c = item;
         const rp = pending.has(pendKey("resume", a.key, c.id));
         return `<div class="resume-item">
           <span class="sid${c.summary || c.label ? "" : " mono"}" title="${esc(c.id)}">${esc(c.summary || c.label || c.id)}</span>
@@ -1103,6 +1121,23 @@ function sessStart(key, id) {
 function resumeSession(key, id) {
   busy(pendKey("resume", key, id), { kind: "resume", host: key, id },
     () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/resume`));
+}
+// Resume ANY prior Claude session by its transcript id (the broadened picker,
+// repo.resumable). The origin cwd is looked up from cached state (kept out of
+// the onclick markup) and sent in the body; the agent re-validates it and
+// re-creates the worktree if it was deleted. A resumed transcript spawns a
+// fresh session record, so clear the spinner like a spawn — when the repo's
+// live session count grows — rather than by a matching session id.
+function resumeTranscript(key, transcriptId) {
+  const a = (cache.agents || []).find(a => a.key === key);
+  let cwd = "", repo = "";
+  if (a) for (const r of (a.repos || [])) {
+    const hit = (r.resumable || []).find(x => x.transcriptId === transcriptId);
+    if (hit) { cwd = hit.cwd || ""; repo = r.name; break; }
+  }
+  const baseline = a ? (a.sessions || []).filter(s => s.repo === repo).length : 0;
+  busy(pendKey("resume", key, transcriptId), { kind: "spawn", host: key, repo, baseline },
+    () => post(`/api/agents/${enc(key)}/transcripts/${enc(transcriptId)}/resume`, { cwd }));
 }
 // The destructive three still arm/confirm first; the pending state begins only
 // once confirmed (inside doIt), so it reflects a real in-flight command.
