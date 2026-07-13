@@ -458,8 +458,17 @@
     // The in-progress assistant turn (streaming, text-only) as the trailing
     // bubble; its text is revealed by the typewriter loop.
     if (liveTurn) {
-      // Reset the reveal if a new/shorter turn started.
-      if (reveal.shown > liveTurn.length) reveal.shown = 0;
+      // The pane scrape's "last turn" text shrinks constantly mid-generation —
+      // a tool-use bullet (Bash(…), Read(…)) replaces the prose above it, the
+      // next tool replaces that one, content scrolls — each capture shorter than
+      // the fully-revealed previous one. CLAMP `shown` to the new length rather
+      // than resetting to 0: resetting re-types the shorter text from scratch,
+      // which reads as the last line streaming out and deleting over and over as
+      // tools run. Clamping snaps to the new text instead (mirrors the glasses
+      // reference reveal, glasses/src/reveal.ts advanceReveal). A genuinely new
+      // turn always arrives after an empty ("" -> reveal.shown=0, else-branch
+      // below) frame when generation ends, so it still types in from zero.
+      if (reveal.shown > liveTurn.length) reveal.shown = liveTurn.length;
       revealFull = liveTurn;
       const shownText = liveTurn.slice(0, Math.max(0, reveal.shown));
       html += '<div class="tr-msg assistant streaming" id="chatLiveBubble"><span class="role">assistant</span>' +
