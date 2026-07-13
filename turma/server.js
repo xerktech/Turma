@@ -1288,6 +1288,23 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, cmdId });
     }
 
+    // POST /api/agents/<host>/transcripts/<transcriptId>/resume — resume ANY
+    // prior Claude session by transcript id (the "Resume any session" picker),
+    // not just a killed Turma session from closedSessions. Body: {cwd} is the
+    // origin dir the picker showed; the agent re-reads/re-validates it and
+    // re-creates the worktree at that path if it was deleted/pruned.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "transcripts" && parts[5] === "resume" && parts.length === 6) {
+      const key = decodeURIComponent(parts[2]);
+      if (!agents[key]) return json(res, 404, { error: "unknown agent" });
+      const transcriptId = decodeURIComponent(parts[4]);
+      if (!transcriptId) return json(res, 400, { error: "transcriptId required" });
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const cwd = typeof body.cwd === "string" ? body.cwd : "";
+      const cmdId = queueCommand(key, { type: "resumeTranscript", transcriptId, cwd });
+      return json(res, 200, { ok: true, cmdId });
+    }
+
     // Session command endpoints — each queues a cmdId onto the host's command
     // queue for the agent to pick up on its next heartbeat reply. The host owns
     // the actual worktree/tmux/ttyd lifecycle; the hub only relays intent.

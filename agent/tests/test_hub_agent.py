@@ -1158,6 +1158,194 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
         self.assertFalse(sm.usage_ledger)
 
 
+class TestTranscriptCwd(unittest.TestCase):
+    """_transcript_cwd reads the real (un-slugified) cwd off a transcript's early
+    entries — the authoritative inverse of the lossy project slug, used to pick
+    the dir a resumed session must relaunch in."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-cwd-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _write(self, lines):
+        p = os.path.join(self.tmp, "t.jsonl")
+        write_jsonl(p, lines)
+        return p
+
+    def test_reads_recorded_cwd(self):
+        p = self._write([
+            {"type": "user", "cwd": "/mnt/data/git/Turma",
+             "message": {"role": "user", "content": "hi"}},
+        ])
+        self.assertEqual(ha._transcript_cwd(p), "/mnt/data/git/Turma")
+
+    def test_none_when_no_cwd(self):
+        p = self._write([usage_entry("2026-07-01T10:00:00.000Z", "m", "r",
+                                     "claude-sonnet-4-20250514", 1, 1)])
+        self.assertIsNone(ha._transcript_cwd(p))
+
+    def test_none_when_file_missing(self):
+        self.assertIsNone(ha._transcript_cwd(os.path.join(self.tmp, "nope.jsonl")))
+
+
+class TestResumableReport(ManagerMixin, unittest.TestCase):
+    """The "resume any session" picker's source: EVERY prior Claude session whose
+    origin cwd is resumable on this host, grouped by repo — Turma worktrees,
+    repo-dir "terminal" runs, and the repos-root pseudo-repo — while foreign
+    dev-machine sessions and carded (still-registered) ones are excluded."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
+        p.start()
+        self.addCleanup(p.stop)
+        # A single scanned repo "Turma" so a repo-dir cwd classifies.
+        self.repo = {"name": "Turma", "path": os.path.join(ha.REPOS_ROOT, "Turma")}
+        p2 = mock.patch.object(ha, "scan_repos", lambda: [self.repo])
+        p2.start()
+        self.addCleanup(p2.stop)
+
+    def _write_at(self, cwd, tid="t", text="do the thing"):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        write_jsonl(os.path.join(proj, tid + ".jsonl"), [
+            {"type": "user", "cwd": cwd,
+             "message": {"role": "user", "content": text}},
+        ])
+        return proj
+
+    def test_groups_worktree_repo_dir_and_root(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        self._write_at(wt, tid="wt1")
+        self._write_at(self.repo["path"], tid="rd1")     # repo-dir "terminal" run
+        self._write_at(ha.REPOS_ROOT, tid="root1")       # repos-root pseudo-repo
+        self._write_at("/home/me/elsewhere/Other", tid="foreign1")  # skipped
+        sm = self.make_manager()
+        rep = sm._resumable_report()
+        turma = {e["transcriptId"]: e for e in rep.get("Turma", [])}
+        self.assertEqual(set(turma), {"wt1", "rd1"})
+        self.assertEqual(turma["wt1"]["origin"], "abcde")
+        self.assertFalse(turma["wt1"]["root"])
+        self.assertEqual(turma["rd1"]["origin"], "repo dir")
+        self.assertEqual(turma["wt1"]["summary"], "do the thing")
+        root = rep.get(ha.ROOT_REPO_NAME, [])
+        self.assertEqual([e["transcriptId"] for e in root], ["root1"])
+        self.assertTrue(root[0]["root"])
+        # The foreign dev-machine session is not resumable here.
+        self.assertNotIn("Other", rep)
+
+    def test_excludes_carded_running_session(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "live1")
+        self._write_at(wt, tid="c1")
+        sm = self.make_manager()
+        sm.registry = [{"id": "live1", "repo": "Turma", "worktreePath": wt,
+                        "status": "running"}]
+        rep = sm._resumable_report()
+        self.assertNotIn("Turma", rep)  # its only transcript is on a live card
+
+    def test_caps_per_repo(self):
+        p = mock.patch.object(ha, "RESUMABLE_PER_REPO", 2)
+        p.start()
+        self.addCleanup(p.stop)
+        for i in range(5):
+            self._write_at(os.path.join(ha.WORKTREES_ROOT, "Turma", f"w{i}"),
+                           tid=f"t{i}")
+        sm = self.make_manager()
+        rep = sm._resumable_report()
+        self.assertEqual(len(rep["Turma"]), 2)
+
+
+class TestResumeTranscript(ManagerMixin, unittest.TestCase):
+    """resume_transcript: resume ANY prior transcript by id, cwd'd at its origin
+    (re-creating a deleted worktree at the exact path), rejecting anything not
+    resumable on this host."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
+        p.start()
+        self.addCleanup(p.stop)
+        self.repo = {"name": "Turma", "path": os.path.join(ha.REPOS_ROOT, "Turma")}
+        os.makedirs(self.repo["path"], exist_ok=True)   # repoPath must exist
+        p2 = mock.patch.object(ha, "scan_repos", lambda: [self.repo])
+        p2.start()
+        self.addCleanup(p2.stop)
+
+    def _write_at(self, cwd, tid):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        write_jsonl(os.path.join(proj, tid + ".jsonl"), [
+            {"type": "user", "cwd": cwd,
+             "message": {"role": "user", "content": "hi"}},
+        ])
+
+    def _manager(self):
+        sm = self.make_manager()
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        return sm
+
+    def test_resumes_existing_worktree_with_pinned_id(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        os.makedirs(wt, exist_ok=True)
+        self._write_at(wt, "trans1")
+        sm = self._manager()
+        sm._worktree_add = mock.Mock()
+        sm.resume_transcript("trans1", wt)
+        self.assertEqual(len(sm.registry), 1)
+        sess = sm.registry[0]
+        self.assertEqual(sess["worktreePath"], wt)
+        self.assertEqual(sess["repo"], "Turma")
+        self.assertEqual(sess["status"], "running")
+        sm._worktree_add.assert_not_called()          # worktree still present
+        self.assertEqual(sm._launch_tmux.call_args.kwargs["resume_id"], "trans1")
+
+    def test_recreates_deleted_worktree_at_origin_path(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "gone1")  # not on disk
+        self._write_at(wt, "trans2")
+        sm = self._manager()
+        sm._worktree_add = mock.Mock()
+        with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
+            sm.resume_transcript("trans2", wt)
+        self.assertEqual(len(sm.registry), 1)
+        self.assertEqual(sm.registry[0]["worktreePath"], wt)
+        sm._worktree_add.assert_called_once()         # re-added at the exact path
+        self.assertEqual(sm._launch_tmux.call_args.kwargs["resume_id"], "trans2")
+
+    def test_repo_dir_terminal_session(self):
+        cwd = self.repo["path"]
+        self._write_at(cwd, "trans3")
+        sm = self._manager()
+        sm.resume_transcript("trans3", cwd)
+        self.assertEqual(len(sm.registry), 1)
+        self.assertEqual(sm.registry[0]["worktreePath"], cwd)
+        self.assertFalse(sm.registry[0]["root"])
+
+    def test_rejects_cwd_outside_repos_root(self):
+        cwd = "/home/me/elsewhere/Other"
+        self._write_at(cwd, "trans4")
+        sm = self._manager()
+        sm.resume_transcript("trans4", cwd)
+        self.assertEqual(sm.registry, [])
+        sm._launch_tmux.assert_not_called()
+
+    def test_refuses_when_a_session_already_runs_in_that_cwd(self):
+        cwd = self.repo["path"]
+        self._write_at(cwd, "trans5")
+        sm = self._manager()
+        sm.registry = [{"id": "x", "worktreePath": cwd, "status": "running",
+                        "repo": "Turma"}]
+        sm.resume_transcript("trans5", cwd)
+        self.assertEqual(len(sm.registry), 1)         # unchanged
+        sm._launch_tmux.assert_not_called()
+
+    def test_bad_transcript_id_is_ignored(self):
+        sm = self._manager()
+        sm.resume_transcript("../etc/passwd", "/x")
+        self.assertEqual(sm.registry, [])
+        sm._launch_tmux.assert_not_called()
+
+
 class TestRegistryPersistence(ManagerMixin, unittest.TestCase):
     def test_save_load_round_trip(self):
         sm = self.make_manager()

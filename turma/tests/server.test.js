@@ -797,6 +797,40 @@ test("http: prune route queues a prune command per repo; validates host", async 
   assert.equal(ghost.status, 404);
 });
 
+test("http: transcript-resume route queues a resumeTranscript command with the cwd hint", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ device: "htr" });
+
+  const tid = "1fe17602-2537-4900-b6b9-9475d40c1ab8";
+  const cwd = "/mnt/data/git/.turma/worktrees/Turma/ab123";
+  const ok = await request(
+    "POST", `/api/agents/htr/transcripts/${tid}/resume`,
+    { body: { cwd }, headers: userHeaders });
+  assert.equal(ok.status, 200);
+  const res = await beat({ device: "htr" });
+  assert.deepEqual(res.body.commands, [
+    { type: "resumeTranscript", transcriptId: tid, cwd, cmdId: ok.body.cmdId },
+  ]);
+
+  // A missing cwd body degrades to an empty hint (the agent re-derives it).
+  // Ack the first command so only the new one rides this reply.
+  const noCwd = await request(
+    "POST", `/api/agents/htr/transcripts/${tid}/resume`,
+    { body: {}, headers: userHeaders });
+  assert.equal(noCwd.status, 200);
+  const res2 = await beat({ device: "htr", ackedCommands: [ok.body.cmdId] });
+  assert.deepEqual(res2.body.commands, [
+    { type: "resumeTranscript", transcriptId: tid, cwd: "", cmdId: noCwd.body.cmdId },
+  ]);
+
+  // Unknown host -> 404.
+  const ghost = await request(
+    "POST", `/api/agents/ghost/transcripts/${tid}/resume`,
+    { body: { cwd }, headers: userHeaders });
+  assert.equal(ghost.status, 404);
+});
+
 test("http: heartbeat passes github + clones + prunes through to /api/agents", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
