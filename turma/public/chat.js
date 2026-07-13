@@ -3,9 +3,10 @@
 // terminal" as the default running-session view: it opens the hub's live
 // transcript WebSocket (/live/<host>/<id>), renders the session as chat bubbles
 // (user right, agent left) plus collapsible tool-action cards + thinking traces,
-// and streams the in-progress turn with a typewriter reveal. Verbosity control
-// decides how much of each component (thinking / tool calls / tool outputs) is
-// shown. Ported in spirit from the glasses client (glasses/src/live.ts,
+// and streams the in-progress turn with a typewriter reveal. A three-way
+// verbosity preset (Concise hides thinking + tool actions entirely; Normal adds
+// tool cards with collapsed output; Verbose expands everything) picks how much
+// of each turn is shown. Ported in spirit from the glasses client (glasses/src/live.ts,
 // transcript.ts, reveal.ts) into framework-free, build-free browser JS.
 //
 // Reads a few shared helpers from the page's inline script (same classic-script
@@ -335,15 +336,6 @@
       '<div class="tool-body">' + body + "</div></details>";
   }
 
-  // Concise mode: collapse a run of consecutive actions into one "N actions" row.
-  function renderActionsGroup(run, gk) {
-    const names = run.map((a) => esc(a.name)).slice(0, 8).join(", ");
-    const cards = run.map((a, i) => renderActionCard(a, actionKey(a, gk, i))).join("");
-    return '<details class="actions-group" data-dkey="' + esc(gk) + '"' + openAttr(gk, false) +
-      "><summary>⚙ " + run.length + " action" + (run.length === 1 ? "" : "s") + " · " + names + "</summary>" +
-      '<div class="grp-cards">' + cards + "</div></details>";
-  }
-
   function itemsToHtml(items) {
     const out = [];
     let i = 0, g = 0;
@@ -356,8 +348,9 @@
       while (j < items.length && items[j].kind === "action") j++;
       const run = items.slice(i, j);
       const gk = "grp:" + (run[0].id || g++);
+      // Concise mode (tools hidden) omits tool actions entirely — no card, no
+      // collapsed box. Otherwise render each action as its own card.
       if (verbosity.show.tools) out.push(run.map((a, idx) => renderActionCard(a, actionKey(a, gk, idx))).join(""));
-      else out.push(renderActionsGroup(run, gk)); // collapsed count row
       i = j;
     }
     return out.join("");
@@ -483,32 +476,13 @@
     const seg = ["concise", "normal", "verbose"].map((name) =>
       '<button data-preset="' + name + '" class="' + (active === name ? "on" : "") + '">' +
       name[0].toUpperCase() + name.slice(1) + "</button>").join("");
-    const show = verbosity.show;
-    host.innerHTML =
-      '<span class="seg">' + seg + "</span>" +
-      '<span class="gear"><button class="gear-btn" id="chatGearBtn" title="Show/hide components">⚙</button>' +
-      '<span class="gear-pop" id="chatGearPop">' +
-      '<label><input type="checkbox" data-show="thinking"' + (show.thinking ? " checked" : "") + "> Thinking</label>" +
-      '<label><input type="checkbox" data-show="tools"' + (show.tools ? " checked" : "") + "> Tool calls</label>" +
-      '<label><input type="checkbox" data-show="outputs"' + (show.outputs ? " checked" : "") + "> Tool outputs</label>" +
-      "</span></span>";
+    host.innerHTML = '<span class="seg">' + seg + "</span>";
     host.querySelectorAll(".seg button").forEach((b) => b.addEventListener("click", () => {
       const name = b.getAttribute("data-preset");
       verbosity = { preset: name, show: { ...PRESETS[name] } };
       detailsOpen.clear(); // a new preset resets card open/closed to its defaults
       saveVerbosity(); renderVerbosityControl(); repaint();
     }));
-    const gearBtn = $("chatGearBtn"), pop = $("chatGearPop");
-    if (gearBtn && pop) {
-      gearBtn.addEventListener("click", (e) => { e.stopPropagation(); pop.classList.toggle("open"); });
-      pop.querySelectorAll("input[data-show]").forEach((inp) => inp.addEventListener("change", () => {
-        verbosity.show[inp.getAttribute("data-show")] = inp.checked;
-        verbosity.preset = matchPreset() || "custom";
-        detailsOpen.clear(); // a verbosity change resets card open/closed to its defaults
-        saveVerbosity(); renderVerbosityControl(); repaint();
-        const p = $("chatGearPop"); if (p) p.classList.add("open"); // keep it open while toggling
-      }));
-    }
   }
   // ---- live agent-mode / model selectors (under the compose box) ------------
   function currentModelValue() {
@@ -586,7 +560,6 @@
 
   if (typeof document !== "undefined") {
     document.addEventListener("click", () => {
-      const p = $("chatGearPop"); if (p) p.classList.remove("open");
       closeComposeMenus();
     });
   }
