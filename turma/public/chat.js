@@ -102,6 +102,9 @@
   let cachedToken = null, tokenExp = 0;
   let verbosity = { preset: "normal", show: { ...PRESETS.normal } };
   let questionActive = false;
+  // Text of a question we just answered; suppresses re-showing its box while an
+  // in-flight heartbeat still reports it as pending (cleared once it's gone).
+  let answeredQuestion = null;
 
   // reveal (only the live turn types in; committed messages render whole)
   let reveal = { shown: 0 };
@@ -589,6 +592,10 @@
     if (!box) return;
     const q = s && s.session && s.session.question;
     const opts = (s && s.session && s.session.questionOptions) || [];
+    // A stale heartbeat may still report the question we just answered; keep it
+    // hidden until the agent actually clears it, then forget the suppression.
+    if (q && q === answeredQuestion) { questionActive = false; box.hidden = true; box.innerHTML = ""; return; }
+    answeredQuestion = null;
     questionActive = !!q;
     if (!q) { box.hidden = true; box.innerHTML = ""; return; }
     box.hidden = false;
@@ -605,14 +612,23 @@
     if (!hostKey || !sessionId) return;
     const body = { optionIndex };
     if (custom) body.custom = custom;
+    // Hide the box immediately on click — the round-trip to the hub (and the
+    // agent's next heartbeat) can take a moment, and leaving it up reads as if
+    // the click didn't register. `answeredQuestion` keeps a stale heartbeat
+    // from bouncing it back; if the POST fails we re-surface it below.
+    answeredQuestion = (sess && sess.session && sess.session.question) || null;
+    questionActive = false;
+    const box = $("chatQuestion"); if (box) { box.hidden = true; box.innerHTML = ""; }
     try {
-      await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/answer", {
+      const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/answer", {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
       });
-      const box = $("chatQuestion"); if (box) { box.hidden = true; box.innerHTML = ""; }
-      questionActive = false;
+      if (!r.ok) throw new Error(String(r.status));
       if (typeof fastPoll === "function") fastPoll();
-    } catch {}
+    } catch {
+      answeredQuestion = null; // send failed — let the pending question show again
+      if (sess) updateQuestion(sess);
+    }
   }
 
   // ---- expand a truncated block via /history --------------------------------
@@ -644,20 +660,25 @@
     const text = inp.value;
     if (!text.trim()) return;
     inp.value = ""; autoGrow(); inp.focus();
+    const wasAnswer = questionActive;
     try {
       let url, body;
-      if (questionActive) {
+      if (wasAnswer) {
         url = "/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/answer";
         body = { optionIndex: -1, custom: text };
+        // Optimistically dismiss the question box (see answerQuestion).
+        answeredQuestion = (sess && sess.session && sess.session.question) || null;
+        questionActive = false;
+        const box = $("chatQuestion"); if (box) { box.hidden = true; box.innerHTML = ""; }
       } else {
         url = "/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/input";
         body = { text };
       }
       const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(String(r.status));
-      if (questionActive) { const box = $("chatQuestion"); if (box) { box.hidden = true; box.innerHTML = ""; } questionActive = false; }
       if (typeof fastPoll === "function") fastPoll();
     } catch {
+      if (wasAnswer) { answeredQuestion = null; if (sess) updateQuestion(sess); }
       if (!inp.value.trim()) { inp.value = text; autoGrow(); }
       if (btn) { btn.textContent = "Send failed"; setTimeout(() => btn.textContent = "Send", 2000); }
     }
@@ -710,7 +731,7 @@
     if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
-    buffer = []; liveTurn = ""; liveStatus = null; questionActive = false;
+    buffer = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
     updateLiveStatus(); // hide the pinned bar when the view closes
   }
 
