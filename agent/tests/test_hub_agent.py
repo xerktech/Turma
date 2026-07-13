@@ -1057,6 +1057,107 @@ class TestUsageLedger(ManagerMixin, unittest.TestCase):
         self.assertIsNotNone(sm.host_usage)
 
 
+class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
+    """Usage counts EVERY transcript on disk, not only ledger-known slugs: an
+    orphan transcript (session aged out of closed.json, or predating the ledger)
+    is adopted with best-effort attribution, and nothing is excluded — an
+    unattributable one still counts under OTHER_REPO_NAME."""
+
+    def setUp(self):
+        super().setUp()
+        # Keep REPOS_ROOT (repos-root pseudo-repo + case-2 remote lookup) inside
+        # the temp tree instead of the unpatched production default.
+        p = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _write_transcript(self, worktree):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(worktree))
+        os.makedirs(proj, exist_ok=True)
+        write_jsonl(os.path.join(proj, "t.jsonl"), [
+            usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
+                        "claude-sonnet-4-20250514", 100_000, 0),
+        ])
+        return proj
+
+    def _mk_worktree(self, repo, sid):
+        wt = os.path.join(ha.WORKTREES_ROOT, repo, sid)
+        os.makedirs(wt, exist_ok=True)
+        return wt
+
+    def test_case1_adopts_transcript_of_existing_worktree(self):
+        wt = self._mk_worktree("Turma", "abcde")
+        self._write_transcript(wt)
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertIn(wt, sm.usage_ledger)             # keyed by the real path
+        self.assertEqual(sm.usage_ledger[wt]["repo"], "Turma")
+        # ...and it now surfaces in the persistent usage report.
+        sm._refresh_repo_usage()
+        self.assertTrue(any(r["repo"] == "Turma" for r in sm.repo_usage))
+
+    def test_case2_recovers_repo_when_worktree_gone(self):
+        # Worktree deleted; the transcript's slug still carries the
+        # .turma/worktrees/<repo>/<id> shape, so the repo is recovered from it.
+        wt = os.path.join(ha.WORKTREES_ROOT, "DockerOps", "zzzzz")
+        proj = self._write_transcript(wt)
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertIn(proj, sm.usage_ledger)           # keyed by the proj dir
+        self.assertEqual(sm.usage_ledger[proj]["repo"], "DockerOps")
+        self.assertEqual(sm.usage_ledger[proj]["slug"], ha._project_slug(wt))
+
+    def test_sibling_tool_worktree_shape_attributed(self):
+        # A different tool's worktree (e.g. .agenthub/worktrees/AgentHub/<id>):
+        # not under WORKTREES_ROOT, so no exact match, but the worktrees-shaped
+        # slug still names the repo — attributed, not lumped into (other).
+        wt = "/repos/.agenthub/worktrees/AgentHub/10ab3"
+        proj = self._write_transcript(wt)
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertEqual(sm.usage_ledger[proj]["repo"], "AgentHub")
+
+    def test_repo_recovered_from_transcript_cwd(self):
+        # No worktree and no worktrees-shaped slug, but the transcript records
+        # its cwd (e.g. an operator's dev-machine session, Windows path) — the
+        # repo is read from there, not lumped into (other).
+        wt = "/home/me/OneDrive/personal/Foverlay"
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj, exist_ok=True)
+        write_jsonl(os.path.join(proj, "t.jsonl"), [
+            {"type": "user", "cwd": "C:\\Users\\me\\personal\\Foverlay",
+             "message": {"role": "user", "content": "hi"}},
+        ])
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertEqual(sm.usage_ledger[proj]["repo"], "Foverlay")
+
+    def test_unattributable_bucketed_as_other(self):
+        # No worktree, no worktrees-shaped slug, and no cwd recorded — still
+        # adopted so its cost counts, under OTHER_REPO_NAME.
+        proj = self._write_transcript("/root/scratch")  # usage_entry has no cwd
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertEqual(sm.usage_ledger[proj]["repo"], ha.OTHER_REPO_NAME)
+
+    def test_skips_already_ledgered_slug(self):
+        wt = self._mk_worktree("Turma", "abcde")
+        self._write_transcript(wt)
+        sm = self.make_manager()
+        sm.usage_ledger = {wt: {"repo": "Turma", "remote": "keep",
+                                "slug": ha._project_slug(wt)}}
+        sm._reconcile_orphan_transcripts()
+        self.assertEqual(sm.usage_ledger[wt]["remote"], "keep")  # not overwritten
+
+    def test_ignores_dir_without_transcript(self):
+        wt = self._mk_worktree("Turma", "abcde")
+        os.makedirs(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt)),
+                    exist_ok=True)  # empty project dir, no *.jsonl
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertFalse(sm.usage_ledger)
+
+
 class TestRegistryPersistence(ManagerMixin, unittest.TestCase):
     def test_save_load_round_trip(self):
         sm = self.make_manager()
