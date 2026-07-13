@@ -84,6 +84,12 @@ TTYD_PORT_BASE = int(os.environ.get("TTYD_PORT_BASE", "7700"))
 # run at a time. Parens keep it clear of any real (dir-name) repo in the scan.
 ROOT_REPO_NAME = "(root)"
 
+# Usage bucket for a transcript on disk that reconciliation can't attribute to
+# any repo (a bare `claude` run outside a managed worktree). Parenthesized like
+# ROOT_REPO_NAME so it never collides with a real repo name, and so every
+# transcript still counts toward the host total rather than being dropped.
+OTHER_REPO_NAME = "(other)"
+
 # Where worktrees live: under a dot-dir so the repo scan never lists them, and
 # on the mounted tree so they survive a container restart.
 WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".turma", "worktrees")
@@ -1030,21 +1036,22 @@ def _usage_is_empty(report):
     return not any(t.get(k) for k in ("input", "output", "cacheWrite", "cacheRead"))
 
 
-def _repo_from_worktree_slug(slug, wt_prefix):
-    """Recover the repo name from a Turma worktree's project slug when the
-    worktree itself is gone (so _existing_worktree_attrib can't map it and its
-    git origin can't be read). Worktrees live at
-    <REPOS_ROOT>/.turma/worktrees/<repo>/<id>, whose slug is
-    <wt_prefix><repo>-<id> (id = the short session id). Returns the (slugified)
-    repo name, or None when the slug isn't shaped like a Turma worktree — the
-    signal to leave a foreign claude project alone rather than adopt it.
-
-    `wt_prefix` is _project_slug(WORKTREES_ROOT) + "-", passed in so the caller
-    computes it once. rpartition keeps repo names that themselves contain a
-    slugified '-'; only the trailing <id> segment is dropped."""
-    if not slug.startswith(wt_prefix):
+def _repo_from_worktree_slug(slug):
+    """Recover the repo name from a worktree's project slug when the worktree
+    itself is gone (so _existing_worktree_attrib can't map it and its git
+    origin can't be read). Agent worktrees live at .../worktrees/<repo>/<id>,
+    whose slug ends ...-worktrees-<repo>-<id> (id = the short session id) — true
+    for Turma's own .turma/worktrees and any sibling tool's worktrees dir alike,
+    so the whole fleet's history attributes to a named repo rather than a
+    catch-all bucket. Returns the (slugified) repo name, or None when the slug
+    carries no worktrees marker (a bare `claude` run outside a managed
+    worktree). rpartition keeps repo names that themselves contain a slugified
+    '-'; only the trailing <id> segment is dropped."""
+    marker = "-worktrees-"
+    i = slug.rfind(marker)
+    if i < 0:
         return None
-    repo, _, _sid = slug[len(wt_prefix):].rpartition("-")
+    repo, _, _sid = slug[i + len(marker):].rpartition("-")
     return repo or None
 
 
@@ -3153,24 +3160,26 @@ class SessionManager:
         return by_slug
 
     def _reconcile_orphan_transcripts(self):
-        """Adopt Turma transcripts sitting in PROJECTS_ROOT that no ledger entry
-        covers, so persistent usage/cost reflects EVERY transcript on disk — not
+        """Adopt EVERY transcript sitting in PROJECTS_ROOT that no ledger entry
+        covers, so persistent usage/cost reflects every session on disk — not
         only sessions in the live registry or the last-5 closed history that
         _backfill_ledger sees. A session killed long ago (its card gone, its
         worktree maybe surviving) or one predating _remember_usage would
         otherwise silently drop out of the totals, since repo_usage_report only
-        folds slugs the ledger names.
+        folds slugs the ledger names. Nothing is excluded — an unattributable
+        transcript still counts under OTHER_REPO_NAME rather than being dropped.
 
-        Only Turma-managed transcripts are adopted; a foreign claude project on
-        the box (another tool's worktrees, a hand-run `claude`) is left alone.
         Attribution, most precise first:
           1. slug matches a worktree still on disk -> exact repo + git remote,
              keyed by the real worktree path (same fidelity as _remember_usage,
              and dedups with a future spawn there).
-          2. slug has the .../.turma/worktrees/<repo>/<id> shape but the worktree
-             is gone -> repo recovered from the slug; remote read from the repo
-             dir under REPOS_ROOT if it's still there, else left empty (the hub
-             then unifies cross-host by repo name, like any remote-less entry).
+          2. slug has the .../worktrees/<repo>/<id> shape but the worktree is
+             gone (a deleted Turma worktree, or a sibling tool's session) ->
+             repo recovered from the slug; remote read from the repo dir under
+             REPOS_ROOT if it's still there, else left empty (the hub then
+             unifies cross-host by repo name, like any remote-less entry).
+          3. anything else (a bare `claude` run outside a managed worktree) ->
+             bucketed under OTHER_REPO_NAME so it still counts.
         New entries are persisted and keyed so _prune_ledger removes them once
         the transcript dir finally disappears."""
         try:
@@ -3180,7 +3189,6 @@ class SessionManager:
         known = {(m or {}).get("slug") or _project_slug(p)
                  for p, m in self.usage_ledger.items()}
         existing = None  # built lazily — the listdirs aren't free
-        wt_prefix = _project_slug(WORKTREES_ROOT) + "-"
         added = False
         for slug in names:
             proj = os.path.join(PROJECTS_ROOT, slug)
@@ -3206,23 +3214,23 @@ class SessionManager:
                 known.add(slug)
                 added = True
                 continue
-            repo = _repo_from_worktree_slug(slug, wt_prefix)      # case 2
-            if repo:
-                remote = ""
-                repo_dir = os.path.join(REPOS_ROOT, repo)
-                if os.path.isdir(repo_dir):
-                    try:
-                        remote = run(["git", "remote", "get-url", "origin"],
-                                     cwd=repo_dir) or ""
-                    except Exception:
-                        pass
-                # Worktree gone, so no real path to key on — key by the project
-                # dir; the stored slug keeps _prune_ledger/repo_usage_report
-                # resolving it correctly.
-                self.usage_ledger[proj] = {
-                    "repo": repo, "remote": remote, "slug": slug}
-                known.add(slug)
-                added = True
+            # case 2 (repo recovered from slug) or case 3 (OTHER_REPO_NAME) —
+            # either way it's adopted, nothing is dropped.
+            repo = _repo_from_worktree_slug(slug) or OTHER_REPO_NAME
+            remote = ""
+            repo_dir = os.path.join(REPOS_ROOT, repo)
+            if os.path.isdir(repo_dir):
+                try:
+                    remote = run(["git", "remote", "get-url", "origin"],
+                                 cwd=repo_dir) or ""
+                except Exception:
+                    pass
+            # Worktree gone, so no real path to key on — key by the project dir;
+            # the stored slug keeps _prune_ledger/repo_usage_report resolving it.
+            self.usage_ledger[proj] = {
+                "repo": repo, "remote": remote, "slug": slug}
+            known.add(slug)
+            added = True
         if added:
             self._save_ledger()
 

@@ -1058,10 +1058,10 @@ class TestUsageLedger(ManagerMixin, unittest.TestCase):
 
 
 class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
-    """Usage counts EVERY Turma transcript on disk, not only ledger-known slugs:
-    an orphan transcript (session aged out of closed.json, or predating the
-    ledger) is adopted with best-effort attribution, while a foreign claude
-    project on the box is left alone."""
+    """Usage counts EVERY transcript on disk, not only ledger-known slugs: an
+    orphan transcript (session aged out of closed.json, or predating the ledger)
+    is adopted with best-effort attribution, and nothing is excluded — an
+    unattributable one still counts under OTHER_REPO_NAME."""
 
     def setUp(self):
         super().setUp()
@@ -1107,11 +1107,23 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.usage_ledger[proj]["repo"], "DockerOps")
         self.assertEqual(sm.usage_ledger[proj]["slug"], ha._project_slug(wt))
 
-    def test_foreign_project_left_alone(self):
-        self._write_transcript("/some/other/tool/worktrees/Thing/xyz")
+    def test_sibling_tool_worktree_shape_attributed(self):
+        # A different tool's worktree (e.g. .agenthub/worktrees/AgentHub/<id>):
+        # not under WORKTREES_ROOT, so no exact match, but the worktrees-shaped
+        # slug still names the repo — attributed, not lumped into (other).
+        wt = "/repos/.agenthub/worktrees/AgentHub/10ab3"
+        proj = self._write_transcript(wt)
         sm = self.make_manager()
         sm._reconcile_orphan_transcripts()
-        self.assertFalse(sm.usage_ledger)              # nothing adopted
+        self.assertEqual(sm.usage_ledger[proj]["repo"], "AgentHub")
+
+    def test_unattributable_bucketed_as_other(self):
+        # A bare `claude` run outside any managed worktree — no worktrees marker
+        # in the slug. Still adopted so its cost counts, under OTHER_REPO_NAME.
+        proj = self._write_transcript("/root/scratch")
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertEqual(sm.usage_ledger[proj]["repo"], ha.OTHER_REPO_NAME)
 
     def test_skips_already_ledgered_slug(self):
         wt = self._mk_worktree("Turma", "abcde")
