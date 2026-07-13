@@ -301,6 +301,9 @@
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .term-bar .back-btn { display: inline-flex; }
+    /* Collapse the back button to just "‹" on mobile so the whole header row
+       (back, verbosity, Terminal, Kill) fits without wrapping to a second row. */
+    .term-bar .back-btn .back-label { display: none; }
     body.showing-term .sidebar { display: none; }
     body.showing-term .app-header { display: none; }
     body.showing-term .bottom-nav { display: none; }
@@ -356,7 +359,7 @@
       </div>
       <div class="transcript-pane" id="transcriptPane" hidden>
         <div class="term-bar">
-          <button class="back-btn" onclick="backToList()">‹ Sessions</button>
+          <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <span class="t-title"><span class="name" id="trTitle"></span> · <span class="path" id="trPath"></span></span>
           <span class="spacer"></span>
         </div>
@@ -364,7 +367,7 @@
       </div>
       <div class="chat-pane" id="chatPane" hidden>
         <div class="term-bar">
-          <button class="back-btn" onclick="backToList()">‹ Sessions</button>
+          <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <span class="t-title"><span class="name" id="chatTitle"></span> · <span class="path" id="chatPath"></span></span>
           <span class="spacer"></span>
           <span class="verbosity" id="chatVerbosity"></span>
@@ -381,7 +384,7 @@
       </div>
       <div class="term-pane" id="termPane" hidden>
         <div class="term-bar">
-          <button class="back-btn" onclick="backToList()">‹ Sessions</button>
+          <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <button class="seg-toggle" id="termChatBtn" onclick="terminalToChat()" title="Back to the native chat view">◂ Chat</button>
           <span class="t-title"><span class="name" id="termTitle"></span> · <span class="path" id="termPath"></span></span>
           <span class="spacer"></span>
