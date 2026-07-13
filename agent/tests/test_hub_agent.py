@@ -962,6 +962,90 @@ class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
         self.assertEqual([e["id"] for e in tail], ["u7", "u8", "u9"])
 
 
+class TestEntryBlocks(unittest.TestCase):
+    """The rich block mapper for the native chat UI. Kept in lockstep with
+    tunnel-agent.js entryBlocks (agent/tests/tunnel-agent.test.js has the mirror
+    cases)."""
+
+    def test_string_content_one_text_block(self):
+        self.assertEqual(
+            ha._entry_blocks({"type": "user", "message": {"content": "hi"}}, ha.BLOCK_CAPS_LIVE),
+            [{"t": "text", "text": "hi"}],
+        )
+
+    def test_preserves_thinking_tool_input_and_pairing(self):
+        entry = {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "pon\x1b[0mder"},
+            {"type": "text", "text": "answer"},
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls -la", "timeout": 5}},
+        ]}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+            {"t": "thinking", "text": "ponder"},
+            {"t": "text", "text": "answer"},
+            {"t": "tool_use", "name": "Bash", "input": "ls -la", "id": "toolu_1"},
+        ])
+        # _entry_text stays the lossy backward-compat contract: thinking dropped,
+        # tool_use collapsed to [Bash].
+        self.assertEqual(ha._entry_text(entry), "answer[Bash]")
+
+    def test_tool_result_forid_iserror_and_list_content(self):
+        entry = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1",
+             "content": [{"type": "text", "text": "boom"}], "is_error": True},
+        ]}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+            {"t": "tool_result", "text": "boom", "forId": "toolu_1", "isError": True},
+        ])
+        self.assertIsNone(ha._entry_text(entry))  # unchanged: tool_result-only -> None
+
+    def test_unknown_tool_input_falls_back_to_compact_json(self):
+        blocks = ha._entry_blocks(
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "X", "input": {"a": 1, "b": "z"}}]}},
+            ha.BLOCK_CAPS_LIVE,
+        )
+        self.assertEqual(blocks, [{"t": "tool_use", "name": "X", "input": '{"a":1,"b":"z"}'}])
+
+    def test_over_cap_text_and_result_truncated(self):
+        big = "x" * (ha.BLOCK_CAPS_LIVE["text"] + 500)
+        tb = ha._entry_blocks({"type": "assistant", "message": {"content": big}}, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(len(tb["text"]), ha.BLOCK_CAPS_LIVE["text"])
+        self.assertTrue(tb["truncated"])
+
+        big_out = "y" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        rb = ha._entry_blocks(
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": big_out}]}},
+            ha.BLOCK_CAPS_LIVE,
+        )[0]
+        self.assertEqual(len(rb["text"]), ha.BLOCK_CAPS_LIVE["result"])
+        self.assertTrue(rb["truncated"])
+
+    def test_wrong_type_and_no_message_return_none_empty_content_empty_list(self):
+        self.assertIsNone(ha._entry_blocks({"type": "summary", "message": {"content": "x"}}, ha.BLOCK_CAPS_LIVE))
+        self.assertIsNone(ha._entry_blocks({"type": "user"}, ha.BLOCK_CAPS_LIVE))
+        self.assertEqual(ha._entry_blocks({"type": "assistant", "message": {"content": ""}}, ha.BLOCK_CAPS_LIVE), [])
+
+
+class TestHistoryEntriesRich(ProjectDirMixin, unittest.TestCase):
+    def test_blocks_attached_and_tool_result_only_turn_surfaces(self):
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [
+            {"uuid": "u1", "type": "user", "message": {"content": "hi"}},
+            {"uuid": "a1", "type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}},
+            # tool_result-only turn: _entry_text drops it, but the rich path keeps
+            # it (text:"" + a tool_result block) so the chat can show tool output.
+            {"uuid": "r1", "type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "file.txt"}]}},
+        ])
+        entries, capped = ha._history_entries(path)
+        self.assertFalse(capped)
+        self.assertEqual([e["id"] for e in entries], ["u1", "a1", "r1"])
+        self.assertEqual(entries[2]["text"], "")
+        self.assertEqual(entries[2]["blocks"], [{"t": "tool_result", "text": "file.txt", "forId": "t1"}])
+        self.assertEqual(entries[1]["blocks"], [{"t": "tool_use", "name": "Bash", "input": "ls", "id": "t1"}])
+
+
 class ManagerMixin:
     """SessionManager with subprocess chokepoints faked and a temp registry."""
 
@@ -2032,8 +2116,10 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.history_results, [{
             "sessionId": sess["id"],
             "entries": [
-                {"id": "u1", "role": "user", "text": "hi"},
-                {"id": "u2", "role": "assistant", "text": "hello back"},
+                {"id": "u1", "role": "user", "text": "hi",
+                 "blocks": [{"t": "text", "text": "hi"}]},
+                {"id": "u2", "role": "assistant", "text": "hello back",
+                 "blocks": [{"t": "text", "text": "hello back"}]},
             ],
             "truncated": False,
         }])

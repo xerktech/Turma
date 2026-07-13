@@ -21,7 +21,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.TURMA_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, newestTranscript, pokeHeartbeat } = require("../tunnel-agent.js");
+const { projectSlug, transcriptTail, entryText, entryBlocks, newestTranscript, pokeHeartbeat, BLOCK_CAPS_LIVE } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -50,7 +50,66 @@ test("entryText: string content, ANSI-stripped list content, tool_use, drops", (
   assert.equal(entryText({ type: "user", message: { content: [{ type: "tool_result", content: "r" }] } }), null); // tool_result only
 });
 
-test("transcriptTail: oldest-first, drops undisplayable turns, tolerates broken lines", () => {
+test("entryBlocks: string content -> one text block", () => {
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: "hi" } }, BLOCK_CAPS_LIVE), [{ t: "text", text: "hi" }]);
+});
+
+test("entryBlocks: preserves thinking, tool_use input, tool_result output that entryText drops", () => {
+  const entry = {
+    type: "assistant",
+    message: {
+      content: [
+        { type: "thinking", thinking: `pon${ESC}[0mder` },
+        { type: "text", text: "answer" },
+        { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ls -la", timeout: 5 } },
+      ],
+    },
+  };
+  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS_LIVE), [
+    { t: "thinking", text: "ponder" },
+    { t: "text", text: "answer" },
+    { t: "tool_use", name: "Bash", input: "ls -la", id: "toolu_1" },
+  ]);
+});
+
+test("entryBlocks: tool_result pairs via forId, flags isError, flattens list content", () => {
+  const entry = {
+    type: "user",
+    message: {
+      content: [
+        { type: "tool_result", tool_use_id: "toolu_1", content: [{ type: "text", text: "boom" }], is_error: true },
+      ],
+    },
+  };
+  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS_LIVE), [
+    { t: "tool_result", text: "boom", forId: "toolu_1", isError: true },
+  ]);
+});
+
+test("entryBlocks: tool_use with unknown input falls back to compact JSON", () => {
+  const blocks = entryBlocks({ type: "assistant", message: { content: [{ type: "tool_use", name: "X", input: { a: 1, b: "z" } }] } }, BLOCK_CAPS_LIVE);
+  assert.deepEqual(blocks, [{ t: "tool_use", name: "X", input: '{"a":1,"b":"z"}' }]);
+});
+
+test("entryBlocks: over-cap text/result get truncated:true and are clipped", () => {
+  const big = "x".repeat(BLOCK_CAPS_LIVE.text + 500);
+  const [tb] = entryBlocks({ type: "assistant", message: { content: big } }, BLOCK_CAPS_LIVE);
+  assert.equal(tb.text.length, BLOCK_CAPS_LIVE.text);
+  assert.equal(tb.truncated, true);
+
+  const bigOut = "y".repeat(BLOCK_CAPS_LIVE.result + 500);
+  const [rb] = entryBlocks({ type: "user", message: { content: [{ type: "tool_result", content: bigOut }] } }, BLOCK_CAPS_LIVE);
+  assert.equal(rb.text.length, BLOCK_CAPS_LIVE.result);
+  assert.equal(rb.truncated, true);
+});
+
+test("entryBlocks: wrong type / no message -> null; empty content -> []", () => {
+  assert.equal(entryBlocks({ type: "system", message: { content: "x" } }, BLOCK_CAPS_LIVE), null);
+  assert.equal(entryBlocks({ type: "user" }, BLOCK_CAPS_LIVE), null);
+  assert.deepEqual(entryBlocks({ type: "assistant", message: { content: "" } }, BLOCK_CAPS_LIVE), []);
+});
+
+test("transcriptTail: oldest-first, rich blocks, tolerates broken lines", () => {
   const wt = "/wt/a";
   writeTranscript(wt, "t.jsonl", [
     { uuid: "u1", type: "user", message: { content: "hello there" } },
@@ -60,10 +119,14 @@ test("transcriptTail: oldest-first, drops undisplayable turns, tolerates broken 
     { uuid: "a2", type: "assistant", message: { content: [{ type: "text", text: "final answer" }] } },
     { uuid: "a3", type: "assistant", message: { content: "" } },
   ]);
+  // text stays the backward-compat flat string; blocks is the additive rich
+  // feed. The tool_result-only turn (tr1) now surfaces via blocks (rich-path
+  // widening) with text:"" — a3 (empty, no blocks) is still dropped.
   assert.deepEqual(transcriptTail(wt), [
-    { id: "u1", role: "user", text: "hello there" },
-    { id: "a1", role: "assistant", text: "hi red done[Bash]" },
-    { id: "a2", role: "assistant", text: "final answer" },
+    { id: "u1", role: "user", text: "hello there", blocks: [{ t: "text", text: "hello there" }] },
+    { id: "a1", role: "assistant", text: "hi red done[Bash]", blocks: [{ t: "text", text: "hi red done" }, { t: "tool_use", name: "Bash", input: "" }] },
+    { id: "tr1", role: "user", text: "", blocks: [{ t: "tool_result", text: "ignored" }] },
+    { id: "a2", role: "assistant", text: "final answer", blocks: [{ t: "text", text: "final answer" }] },
   ]);
 });
 
@@ -99,7 +162,7 @@ test("transcriptTail: with a cache, an unchanged file is not re-parsed", () => {
   const cache = { path: null, mtimeMs: 0, size: 0, result: [] };
 
   const first = transcriptTail(wt, cache);
-  assert.deepEqual(first, [{ id: "u1", role: "user", text: "one" }]);
+  assert.deepEqual(first, [{ id: "u1", role: "user", text: "one", blocks: [{ t: "text", text: "one" }] }]);
   assert.equal(cache.path, p); // primed
 
   // File untouched: the cache must skip the read+parse and hand back the EXACT
@@ -116,8 +179,8 @@ test("transcriptTail: with a cache, an unchanged file is not re-parsed", () => {
   fs.utimesSync(p, later, later);
   const reparsed = transcriptTail(wt, cache);
   assert.deepEqual(reparsed, [
-    { id: "u1", role: "user", text: "one" },
-    { id: "a1", role: "assistant", text: "two" },
+    { id: "u1", role: "user", text: "one", blocks: [{ t: "text", text: "one" }] },
+    { id: "a1", role: "assistant", text: "two", blocks: [{ t: "text", text: "two" }] },
   ]);
 });
 
