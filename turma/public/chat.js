@@ -632,6 +632,27 @@
       apply(b.getAttribute(attr));
     }));
   }
+  // Compact PR status chip for the footer, next to 🛡 mode / 🧠 model. Shows the
+  // session's latest PR (state colour + #number + CI-check mark), links to it,
+  // and appends "+N" when the session opened more than one. "" when none.
+  function prFooterChip(s) {
+    const prs = (s && s.prs) || [];
+    if (!prs.length) return "";
+    const pr = prs[prs.length - 1];
+    const url = pr.url || "";
+    const m = url.match(/\/pull\/(\d+)/);
+    const num = pr.number ? "#" + pr.number : (m ? "#" + m[1] : "PR");
+    const state = String(pr.state || "").toUpperCase();
+    const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
+    const label = state ? state[0] + state.slice(1).toLowerCase() : "";
+    const checks = pr.checks;
+    const mark = checks === "passing" ? "✓" : checks === "failing" ? "✗" : checks === "pending" ? "●" : "";
+    const chk = mark ? ' <span class="pr-checks ' + checks + '" title="CI ' + esc(checks) + '">' + mark + "</span>" : "";
+    const more = prs.length > 1 ? " +" + (prs.length - 1) : "";
+    return '<span class="cc-opt cc-pr"><a class="pr-badge ' + cls + '" href="' + esc(url) +
+      '" target="_blank" rel="noopener" title="' + esc(pr.title || url) + '">' +
+      '<span class="pr-dot"></span>' + esc(num) + (label ? " " + esc(label) : "") + chk + esc(more) + "</a></span>";
+  }
   // fromPoll: a background heartbeat repaint — don't yank an open menu shut.
   function renderComposeOpts(fromPoll) {
     const host = $("chatComposeOpts");
@@ -644,11 +665,13 @@
         '🛡 <span class="cc-val">' + esc(optLabel(MODE_OPTS, mode)) + '</span><span class="cc-caret">▾</span></button>' +
         '<span class="cc-menu" id="ccModeMenu"><span class="cc-hint">Agent mode</span>' +
         menuHtml(MODE_OPTS, mode, "data-mode") + "</span></span>" +
-      '<span class="cc-opt cc-model">' +
-        '<button class="cc-btn" id="ccModelBtn" title="Model for this session">' +
-        '<span class="cc-val">' + esc(optLabel(MODEL_OPTS, model)) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
-        '<span class="cc-menu" id="ccModelMenu"><span class="cc-hint">Model</span>' +
-        menuHtml(MODEL_OPTS, model, "data-model") + "</span></span>";
+      '<span class="cc-right">' + prFooterChip(sess) +
+        '<span class="cc-opt cc-model">' +
+          '<button class="cc-btn" id="ccModelBtn" title="Model for this session">' +
+          '<span class="cc-val">' + esc(optLabel(MODEL_OPTS, model)) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
+          '<span class="cc-menu" id="ccModelMenu"><span class="cc-hint">Model</span>' +
+          menuHtml(MODEL_OPTS, model, "data-model") + "</span></span>" +
+      "</span>";
     wireComposeMenu("ccModeBtn", "ccModeMenu", "data-mode", setSessionMode);
     wireComposeMenu("ccModelBtn", "ccModelMenu", "data-model", setSessionModel);
   }
@@ -928,7 +951,7 @@
   // in the browser (no `module`); the browser path uses window.TurmaChat above.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderProse,
+      mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderProse, prFooterChip,
       __setVerbosity: (v) => { verbosity = v; },
       __setNoExpand: (v) => { noExpand = v; },
     };

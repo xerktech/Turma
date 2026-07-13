@@ -545,6 +545,26 @@ function sessBranch(s) {
   return (b && b !== "HEAD") ? b : "detached";
 }
 
+// GitHub-style PR status pill: state colour + #number + a trailing CI-check
+// mark (✓ passing / ✗ failing / ● pending). `pr` is the agent's compact status
+// ({url, number, title, state, checks}) or a bare {url} before the first status
+// refresh. Returns "" for a falsy pr. Kept in sync with the copy in
+// sessions.html and the footer chip in chat.js.
+function prBadgeHtml(pr) {
+  if (!pr) return "";
+  const url = pr.url || "";
+  const m = url.match(/\/pull\/(\d+)/);
+  const num = pr.number ? "#" + pr.number : (m ? "#" + m[1] : "PR");
+  const state = String(pr.state || "").toUpperCase();
+  const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
+  const label = state ? state[0] + state.slice(1).toLowerCase() : "";
+  const checks = pr.checks;
+  const mark = checks === "passing" ? "✓" : checks === "failing" ? "✗" : checks === "pending" ? "●" : "";
+  const chk = mark ? ` <span class="pr-checks ${checks}" title="CI ${esc(checks)}">${mark}</span>` : "";
+  return `<a class="pr-badge ${cls}" href="${esc(url)}" target="_blank" rel="noopener" title="${esc(pr.title || url)}">`
+    + `<span class="pr-dot"></span>${esc(num)}${label ? " " + esc(label) : ""}${chk}</a>`;
+}
+
 // Per-session live signals: transcript freshness => working/idle, pending
 // AskUserQuestion => waiting on the user, bridge pointer => attached. "working"
 // is read straight off the session's TUI (paneBusy: the "esc to interrupt"
@@ -954,9 +974,14 @@ function sessCard(a, s, now) {
       `<button class="btn-sm ${confirming.has(dKey) ? "confirm" : ""}" onclick="sessDelete('${key}','${id}')">${confirming.has(dKey) ? esc(delConfirm) : "Delete"}</button>`;
   }
 
-  const prs = st === "running" && s.session?.newPrUrls?.length
-    ? `<dt>PRs</dt><dd>${s.session.newPrUrls.map(p =>
-        `<a href="${esc(p)}" target="_blank" rel="noopener">${esc(p.replace(/^https?:\/\//, ""))}</a>`).join("<br>")}</dd>`
+  // PR links this session opened, with state + CI checks. Prefer the agent's
+  // rich `prs` status (survives the session stopping); fall back to the raw
+  // newPrUrls list (older agents / before the first status refresh).
+  const prItems = (s.prs && s.prs.length)
+    ? s.prs
+    : (s.session?.newPrUrls || []).map(u => ({ url: u }));
+  const prs = prItems.length
+    ? `<dt>PRs</dt><dd class="pr-list">${prItems.map(prBadgeHtml).join("")}</dd>`
     : "";
 
   return `<div class="sess ${st}${killing ? " killing" : ""}">

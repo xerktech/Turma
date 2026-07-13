@@ -1143,6 +1143,82 @@ def repo_usage_report(ledger, fold_slug):
 
 
 PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+
+# Beats between `gh pr view` status refreshes for the PR links a session opened
+# (~INTERVAL*N sec). Faster than the github-block cadence so CI/merge state on a
+# session card stays reasonably live, but not every beat (each is a gh network
+# call). Bounded per refresh so a host with many PRs never stalls a beat.
+PR_STATUS_REFRESH_EVERY = int(os.environ.get("TURMA_PR_REFRESH_EVERY", "3"))
+PR_STATUS_MAX = 20
+
+
+def _check_class(entry):
+    """Map one `statusCheckRollup` entry to 'pass' | 'fail' | 'pending' | None.
+
+    Rollup entries are either CheckRuns (a `status` that's COMPLETED/… plus a
+    `conclusion`) or legacy StatusContexts (a single `state`). An unfinished run
+    is pending regardless of conclusion; neutral/skipped count as non-blocking
+    passes, mirroring how GitHub renders the overall rollup."""
+    if not isinstance(entry, dict):
+        return None
+    status = str(entry.get("status") or "").upper()
+    if status and status != "COMPLETED":
+        return "pending"  # QUEUED / IN_PROGRESS / WAITING / PENDING / REQUESTED
+    concl = str(entry.get("conclusion") or entry.get("state") or "").upper()
+    if concl in ("SUCCESS", "NEUTRAL", "SKIPPED", "EXPECTED"):
+        return "pass"
+    if concl in ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED",
+                 "ERROR", "STARTUP_FAILURE", "STALE"):
+        return "fail"
+    if concl in ("PENDING", ""):
+        return "pending"
+    return None
+
+
+def _summarize_pr(data):
+    """Condense `gh pr view --json …` output to the compact status the hub cards
+    render: number, title, state (OPEN/DRAFT/MERGED/CLOSED), and a CI-check
+    rollup ('passing'/'failing'/'pending'/None) with per-bucket counts."""
+    state = str(data.get("state") or "").upper()  # OPEN / MERGED / CLOSED
+    draft = bool(data.get("isDraft"))
+    counts = {"pass": 0, "fail": 0, "pending": 0}
+    for entry in data.get("statusCheckRollup") or []:
+        cls = _check_class(entry)
+        if cls:
+            counts[cls] += 1
+    total = counts["pass"] + counts["fail"] + counts["pending"]
+    checks = None
+    if total:
+        checks = ("failing" if counts["fail"]
+                  else "pending" if counts["pending"] else "passing")
+    return {
+        "url": data.get("url"),
+        "number": data.get("number"),
+        "title": (data.get("title") or "")[:120],
+        # DRAFT is really an OPEN sub-state in the API; surface it as its own
+        # state so the card can grey it out like GitHub does.
+        "state": "DRAFT" if draft and state == "OPEN" else state,
+        "checks": checks,
+        "checkCounts": counts if total else None,
+    }
+
+
+def pr_status(url):
+    """Fetch a PR's state + CI-check rollup via `gh pr view <url>`. Returns the
+    compact status dict, or None on any failure (gh accepts the full URL, so this
+    works from any cwd as long as the login can see the repo). Best-effort and
+    network-cheap — one gh call, capped by run()'s timeout."""
+    raw = run(["gh", "pr", "view", url, "--json",
+               "number,title,state,isDraft,url,statusCheckRollup"])
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return _summarize_pr(data)
+
+
 LOG_TAIL_LINES = 50
 LOG_TAIL_MAX_BYTES = 12_000
 # `docker logs` shells out; the tail changes slowly and isn't worth a subprocess
@@ -2075,6 +2151,17 @@ class SessionManager:
                                                  # persistent incremental usage fold,
                                                  # shared by per-session + repo usage
         self.pending_prs = {}                    # id -> undelivered PR urls
+        # The PR links each session has opened, PERSISTENT across beats — unlike
+        # pending_prs, which _clear_pending_prs empties after every delivered
+        # heartbeat (it's a one-shot "new since last beat" delivery queue). This
+        # is what _session_prs / refresh_pr_status key off, so a card's PR status
+        # survives past the beat the URL was first scraped. Deduped + capped,
+        # in-memory (a restart re-learns links as new PRs appear).
+        self.session_pr_urls = {}                # id -> [unique PR urls, capped]
+        # PR link -> compact status (state + CI checks), refreshed via `gh pr
+        # view` on the PR_STATUS_REFRESH_EVERY cadence and attached to each
+        # session's payload. Keyed by URL so several sessions can share one.
+        self.pr_status_cache = {}
         # Slow-changing git facts cached across beats (recomputed on the slow
         # USAGE_EVERY cadence, or on first sight): repo path -> repo_slow_facts,
         # session id -> {liveBranch, slow git_info, branch_sync work}.
@@ -2422,6 +2509,7 @@ class SessionManager:
         # session id) and bounded by _prune_ledger when the transcript is gone.
         self.session_facts.pop(sid, None)
         self.pending_prs.pop(sid, None)
+        self.session_pr_urls.pop(sid, None)
         # A killed/deleted session's tmux (and its blocked ask.py hook) is gone;
         # drop any leftover question rendezvous files so a dead question can't
         # surface as a phantom on the next beat.
@@ -3250,6 +3338,44 @@ class SessionManager:
             log(f"github refresh failed: {e}")
             self.github = {"available": False, "login": None, "repos": []}
 
+    def refresh_pr_status(self):
+        """Refresh cached state + CI checks for the PRs live sessions opened, via
+        `gh pr view`. Slow-ish cadence, best-effort; skipped when gh has no
+        login. Only RUNNING sessions' PRs are re-polled (bounded by
+        PR_STATUS_MAX so a host with many PRs never stalls the beat), but a
+        stopped session keeps its last-known status — cache entries are pruned
+        only when NO session (running or not) references them anymore, so a
+        killed session's card still shows the merged/closed state it reached."""
+        if not self.github.get("available"):
+            return
+        referenced, wanted, seen = set(), [], set()
+        for sess in self.registry:
+            urls = self.session_pr_urls.get(sess["id"], [])
+            referenced.update(urls)
+            if sess.get("status") != "running":
+                continue
+            for url in urls:
+                if url not in seen:
+                    seen.add(url)
+                    wanted.append(url)
+        for url in list(self.pr_status_cache):
+            if url not in referenced:
+                del self.pr_status_cache[url]
+        for url in wanted[:PR_STATUS_MAX]:
+            st = pr_status(url)
+            if st is not None:
+                self.pr_status_cache[url] = st
+
+    def _session_prs(self, sid):
+        """The PR-status objects for a session's known PR links, newest last
+        (the order they were scraped). Each is the cached `gh pr view` summary,
+        or a bare {url} until the next status refresh fills it in. None when the
+        session has opened no PR."""
+        urls = self.session_pr_urls.get(sid)
+        if not urls:
+            return None
+        return [self.pr_status_cache.get(u) or {"url": u} for u in urls]
+
     def clone(self, repo_spec):
         """Clone a GitHub repo into REPOS_ROOT so it joins the scanned repo list.
 
@@ -3958,6 +4084,15 @@ class SessionManager:
                 pend.extend(signals.pop("prUrls"))
                 del pend[:-10]
                 signals["newPrUrls"] = list(pend)
+                # Also remember them persistently: pending_prs is cleared on the
+                # next delivered beat, so the durable PR-status feature reads from
+                # session_pr_urls instead (deduped, newest-last, capped).
+                if pend:
+                    known = self.session_pr_urls.setdefault(sid, [])
+                    for url in pend:
+                        if url not in known:
+                            known.append(url)
+                    del known[:-10]
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
@@ -3987,6 +4122,10 @@ class SessionManager:
             # while the agent is still on detached HEAD (no branch to sync).
             "work": work,
             "usage": self.usage_cache.get(sid),     # present for stopped too
+            # PR links this session opened + their state/CI checks (from
+            # pr_status_cache). Kept even after the session stops, as long as the
+            # session record survives. None until it opens a PR.
+            "prs": self._session_prs(sid),
             "session": signals,                      # running only; null otherwise
         }
 
@@ -4108,6 +4247,13 @@ class SessionManager:
         # gh calls); clone jobs are reaped every beat (cheap poll()s).
         if not light and beat % GITHUB_REFRESH_EVERY == 0:
             self.refresh_github()
+        # PR state + CI checks for the links live sessions opened, on a faster
+        # cadence than the github block so a card's merge/CI status stays live.
+        if not light and beat % PR_STATUS_REFRESH_EVERY == 0:
+            try:
+                self.refresh_pr_status()
+            except Exception as e:
+                log(f"pr status refresh failed: {e}")
         self._poll_clones()
         self._poll_prunes()
         # Seed names for bare-spawned sessions from their transcript's first

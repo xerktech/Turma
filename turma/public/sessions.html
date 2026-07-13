@@ -334,8 +334,11 @@
   .chat-compose textarea { flex: 1; resize: none; font: inherit; font-size: 13.5px; line-height: 1.5;
     padding: 8px 11px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--page); color: var(--ink); }
 
-  /* Live agent-mode (left) / model (right) selectors under the text box. */
+  /* Live agent-mode (left) / model (right) selectors under the text box; the
+     PR status chip (when present) rides just left of the model on the right. */
   .chat-compose-opts { display: flex; justify-content: space-between; gap: 8px; }
+  .cc-right { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .cc-right .pr-badge { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
   .cc-opt { position: relative; }
   .cc-btn { font: inherit; font-size: 11.5px; padding: 4px 10px; border-radius: 999px;
     border: 1px solid var(--border); background: var(--page); color: var(--ink-2); cursor: pointer;
@@ -680,6 +683,26 @@ function esc(s) {
   })[c]);
 }
 
+// GitHub-style PR status pill: state colour + #number + a CI-check mark. Kept in
+// sync with the copies in index.html and (as a compact chip) chat.js. Rendered
+// as a non-link <span> here because the session card is itself a <button> (a
+// nested <a> would be invalid and get hoisted out); the dashboard/footer copies
+// link to the PR.
+function prBadgeHtml(pr) {
+  if (!pr) return "";
+  const url = pr.url || "";
+  const m = url.match(/\/pull\/(\d+)/);
+  const num = pr.number ? "#" + pr.number : (m ? "#" + m[1] : "PR");
+  const state = String(pr.state || "").toUpperCase();
+  const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
+  const label = state ? state[0] + state.slice(1).toLowerCase() : "";
+  const checks = pr.checks;
+  const mark = checks === "passing" ? "✓" : checks === "failing" ? "✗" : checks === "pending" ? "●" : "";
+  const chk = mark ? ` <span class="pr-checks ${checks}" title="CI ${esc(checks)}">${mark}</span>` : "";
+  return `<span class="pr-badge ${cls}" title="${esc(pr.title || url)}">`
+    + `<span class="pr-dot"></span>${esc(num)}${label ? " " + esc(label) : ""}${chk}</span>`;
+}
+
 // Same live-state derivation as the dashboard: pending question > actively
 // working > idle. "working" is read straight off the session's TUI (paneBusy:
 // the "esc to interrupt" hint), falling back to transcript freshness only when
@@ -803,6 +826,7 @@ function activeCard({ a, s, live }) {
       <div class="meta">${meta}</div>
       <div class="state ${live.kind}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
       ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
+      ${s.prs?.length ? `<div class="pr-list">${s.prs.map(prBadgeHtml).join("")}</div>` : ""}
     </span>
   </button>`;
 }
