@@ -326,6 +326,11 @@
     const items = [];
     for (const e of entries) {
       const role = e.role === "user" ? "user" : "assistant";
+      // The live path keys the entry on `id` (uuid->id in _history_entries); the
+      // archive keeps it on `uuid` (GET /api/archive/<id>). Accept either so the
+      // same buildItems drives both — data-uuid (scroll-to-hit) and the card
+      // persistence keys stay real for archived transcripts too.
+      const eid = e.id != null ? e.id : e.uuid;
       // Older agents / the text-only cache seed carry no blocks: synthesize one.
       const blocks = (e.blocks && e.blocks.length)
         ? e.blocks
@@ -334,25 +339,25 @@
       const flush = () => { if (msg) { items.push(msg); msg = null; } };
       for (const b of blocks) {
         if (b.t === "text") {
-          if (!msg) msg = { kind: "msg", role, id: e.id, text: "", truncated: false };
+          if (!msg) msg = { kind: "msg", role, id: eid, text: "", truncated: false };
           msg.text += b.text || "";
           if (b.truncated) msg.truncated = true;
         } else if (b.t === "thinking") {
           flush();
-          items.push({ kind: "thinking", id: e.id, text: b.text || "", truncated: !!b.truncated });
+          items.push({ kind: "thinking", id: eid, text: b.text || "", truncated: !!b.truncated });
         } else if (b.t === "tool_use") {
           flush();
           const res = b.id ? resultsById.get(b.id) : null;
           items.push({
             kind: "action", id: b.id || null, name: b.name || "tool",
-            input: b.input || "", inputTrunc: !!b.truncated, entryId: e.id,
+            input: b.input || "", inputTrunc: !!b.truncated, entryId: eid,
             result: res ? { text: res.text || "", isError: !!res.isError, truncated: !!res.truncated } : null,
           });
         } else if (b.t === "tool_result") {
           if (b.forId && toolUseIds.has(b.forId)) continue; // folded into its tool_use card
           flush();
           items.push({
-            kind: "action", id: b.forId || null, name: "result", input: "", inputTrunc: false, entryId: e.id,
+            kind: "action", id: b.forId || null, name: "result", input: "", inputTrunc: false, entryId: eid,
             result: { text: b.text || "", isError: !!b.isError, truncated: !!b.truncated }, orphan: true,
           });
         } else if (b.t === "task_notification") {
@@ -366,7 +371,7 @@
             : null;
           items.push({
             kind: "action", id: null, name: b.summary || "Background task",
-            input: "", inputTrunc: false, entryId: e.id, result, task: true,
+            input: "", inputTrunc: false, entryId: eid, result, task: true,
           });
         }
       }

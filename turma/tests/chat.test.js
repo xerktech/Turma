@@ -216,6 +216,25 @@ test("render: bubbles, thinking, and tool cards carry data-uuid for scroll-to-hi
   assert.match(html, /class="action-card ok"[^>]*data-uuid="a1"/);
 });
 
+test("render: archive-shaped entries (uuid, no id) still emit a real data-uuid", () => {
+  // GET /api/archive/<id> keys the entry on `uuid`, not `id` (the live path maps
+  // uuid->id agent-side). buildItems must fall back to `uuid` so scroll-to-hit
+  // and per-card persistence keys aren't "undefined" for archived transcripts.
+  const archived = [
+    { uuid: "au1", role: "user", text: "make it searchable", blocks: [{ t: "text", text: "make it searchable" }] },
+    { uuid: "aa1", role: "assistant", text: "added an index", blocks: [
+      { t: "thinking", text: "hmm" },
+      { t: "text", text: "added an index" },
+      { t: "tool_use", id: "b1", name: "Bash", input: "ls" } ] },
+  ];
+  const html = withVerbosity("verbose", () => itemsToHtml(buildItems(archived)));
+  assert.match(html, /class="tr-msg user" data-uuid="au1"/);
+  assert.match(html, /class="tr-msg assistant" data-uuid="aa1"/);
+  assert.match(html, /class="thought"[^>]*data-uuid="aa1"/);
+  assert.match(html, /class="action-card"[^>]*data-uuid="aa1"/);
+  assert.doesNotMatch(html, /data-uuid="undefined"/);
+});
+
 test("render: HTML in transcript text is escaped (no injection)", () => {
   const items = buildItems([{ id: "x", role: "assistant", blocks: [{ t: "text", text: "<script>alert(1)</script>" }] }]);
   const html = withVerbosity("verbose", () => itemsToHtml(items));
