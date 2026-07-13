@@ -2409,6 +2409,158 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.summaries, {})
 
 
+class TestFirstUserText(unittest.TestCase):
+    """_first_user_text: pull the first genuine human prompt from the top of a
+    transcript, skipping the header, isMeta caveats, and slash-command wrappers."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="first-user-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _write(self, name, entries):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        return path
+
+    def _user(self, text, meta=False):
+        e = {"type": "user", "message": {"role": "user", "content": text}}
+        if meta:
+            e["isMeta"] = True
+        return e
+
+    def test_returns_first_real_user_prompt(self):
+        # Header rows + an assistant turn precede the human's actual first prompt.
+        path = self._write("t.jsonl", [
+            {"type": "mode"},
+            {"type": "bridge-session"},
+            {"type": "system", "isMeta": False},
+            self._user("Add a docker compose flag"),
+            {"type": "assistant", "message": {"role": "assistant",
+                                              "content": [{"type": "text", "text": "ok"}]}},
+            self._user("second message"),
+        ])
+        self.assertEqual(ha._first_user_text(path), "Add a docker compose flag")
+
+    def test_skips_meta_caveat(self):
+        # Claude Code's <local-command-caveat> lands as an isMeta user entry.
+        path = self._write("t.jsonl", [
+            self._user("<local-command-caveat>Caveat: ...", meta=True),
+            self._user("the real prompt"),
+        ])
+        self.assertEqual(ha._first_user_text(path), "the real prompt")
+
+    def test_skips_command_wrappers(self):
+        path = self._write("t.jsonl", [
+            self._user("<command-name>/clear</command-name>"),
+            self._user("<local-command-stdout>done</local-command-stdout>"),
+            self._user("actual work please"),
+        ])
+        self.assertEqual(ha._first_user_text(path), "actual work please")
+
+    def test_skips_tool_result_only_user_turns(self):
+        # A user turn that is only a tool_result has no display text -> skipped.
+        path = self._write("t.jsonl", [
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "content": "output"}]}},
+            self._user("here is the task"),
+        ])
+        self.assertEqual(ha._first_user_text(path), "here is the task")
+
+    def test_none_when_no_user_prompt_yet(self):
+        # Just-spawned session: header only, no human turn has landed.
+        path = self._write("t.jsonl", [
+            {"type": "mode"},
+            {"type": "assistant", "message": {"role": "assistant",
+                                              "content": [{"type": "text", "text": "hi"}]}},
+        ])
+        self.assertIsNone(ha._first_user_text(path))
+
+    def test_missing_file_is_none(self):
+        self.assertIsNone(ha._first_user_text(os.path.join(self.tmp, "nope.jsonl")))
+
+    def test_bounded_by_max_lines(self):
+        # The prompt sits past the line budget -> not found (bound honored).
+        entries = [{"type": "mode"}] * 10 + [self._user("late prompt")]
+        path = self._write("t.jsonl", entries)
+        self.assertIsNone(ha._first_user_text(path, max_lines=5))
+
+
+class TestSeedSummaries(ManagerMixin, unittest.TestCase):
+    """_seed_summaries: name a bare-spawned session from its transcript's first
+    prompt, regardless of which input channel typed it (the live terminal path
+    that bypasses send_input is the whole reason this exists)."""
+
+    WORKDIR = "/w/.turma/worktrees/Turma/seed"
+
+    def _transcript(self, text=None, meta_only=False):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.WORKDIR))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, "sess.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "mode"}) + "\n")
+            if text is not None:
+                f.write(json.dumps({"type": "user",
+                                    "message": {"role": "user", "content": text}}) + "\n")
+        return path
+
+    def _session(self, **over):
+        sess = {"id": "abcde", "status": "running", "worktreePath": self.WORKDIR,
+                "summary": None}
+        sess.update(over)
+        return sess
+
+    def test_names_unnamed_running_session_from_transcript(self):
+        sm = self.make_manager()
+        sm.registry = [self._session()]
+        self._transcript("Add a docker compose flag")
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_called_once_with(sm.registry[0], "Add a docker compose flag")
+
+    def test_no_transcript_prompt_yet_retries_later(self):
+        sm = self.make_manager()
+        sm.registry = [self._session()]
+        self._transcript(text=None)  # header only, no prompt landed
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()  # left unnamed, will retry next beat
+
+    def test_skips_already_named(self):
+        sm = self.make_manager()
+        sm.registry = [self._session(summary="Adding Compose Flag")]
+        self._transcript("Add a docker compose flag")
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()
+
+    def test_skips_already_attempted(self):
+        sm = self.make_manager()
+        sm.registry = [self._session(summaryStarted=True)]
+        self._transcript("Add a docker compose flag")
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()
+
+    def test_skips_summary_in_flight(self):
+        sm = self.make_manager()
+        sm.registry = [self._session()]
+        sm.summaries = {"abcde": {"proc": object()}}
+        self._transcript("Add a docker compose flag")
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()
+
+    def test_skips_non_running_session(self):
+        sm = self.make_manager()
+        sm.registry = [self._session(status="stopped")]
+        self._transcript("Add a docker compose flag")
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()
+
+
 class TestProjectSlug(unittest.TestCase):
     def test_every_non_alphanumeric_becomes_dash(self):
         # Claude Code slugs dots too: /repos/.turma/... -> -repos--turma-...
