@@ -75,12 +75,13 @@
       if (m[2]) {
         out += anchor(m[2], m[1]);            // [label](url)
       } else {
-        // Bare URL: peel trailing sentence punctuation and markdown emphasis
-        // markers (e.g. a URL wrapped in **bold**) back out of the link, and a
-        // trailing ')' only when it isn't part of the URL (e.g. a URL wrapped
-        // in parens) — keep it for balanced ones like /wiki/Foo_(bar).
+        // Bare URL: peel trailing sentence punctuation, markdown emphasis
+        // markers (e.g. a URL wrapped in **bold**), and typographic quotes
+        // (Claude often emits curly ‘’ “” around URLs) back out of the link,
+        // and a trailing ')' only when it isn't part of the URL (e.g. a URL
+        // wrapped in parens) — keep it for balanced ones like /wiki/Foo_(bar).
         let url = m[3], trail = "";
-        const tp = /[.,;:!?'"*_]+$/.exec(url);
+        const tp = /[.,;:!?'"*_‘’“”]+$/.exec(url);
         if (tp) { trail = tp[0]; url = url.slice(0, -tp[0].length); }
         if (url.endsWith(")") && !url.includes("(")) { trail = ")" + trail; url = url.slice(0, -1); }
         out += anchor(url, url) + esc(trail);
@@ -88,6 +89,74 @@
       last = m.index + m[0].length;
     }
     out += esc(s.slice(last));
+    return out;
+  }
+
+  // ---- markdown tables ------------------------------------------------------
+  // Render prose that may contain GitHub-flavoured markdown tables. A table is a
+  // header row (a line with `|`) immediately followed by a delimiter row (cells
+  // of dashes with optional leading/trailing colons for alignment), then body
+  // rows until the first line that isn't a pipe row. Recognised tables become
+  // real <table> elements (each cell linkified); everything else falls straight
+  // through linkify() so non-table prose is byte-identical to before. Cells are
+  // linkify()'d, so injection safety is inherited from esc()/linkify().
+  function splitRow(line) {
+    let s = line.trim();
+    if (s.startsWith("|")) s = s.slice(1);
+    if (s.endsWith("|")) s = s.slice(0, -1);
+    // Split on pipes that aren't backslash-escaped, then unescape `\|`.
+    return s.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
+  }
+  function hasPipe(line) { return line.indexOf("|") >= 0; }
+  function isDelimiterRow(line) {
+    if (!hasPipe(line)) return false;
+    const cells = splitRow(line);
+    return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c));
+  }
+  function cellAlign(c) {
+    const l = c.startsWith(":"), r = c.endsWith(":");
+    if (l && r) return "center";
+    if (r) return "right";
+    if (l) return "left";
+    return "";
+  }
+  function renderTable(header, aligns, rows) {
+    const cell = (tag, txt, i) => {
+      const a = aligns[i] || "";
+      return "<" + tag + (a ? ' style="text-align:' + a + '"' : "") + ">" + linkify(txt) + "</" + tag + ">";
+    };
+    let html = '<table class="md-table"><thead><tr>';
+    header.forEach((h, i) => { html += cell("th", h, i); });
+    html += "</tr></thead><tbody>";
+    for (const r of rows) {
+      html += "<tr>";
+      for (let i = 0; i < header.length; i++) html += cell("td", r[i] == null ? "" : r[i], i);
+      html += "</tr>";
+    }
+    return html + "</tbody></table>";
+  }
+  function renderProse(text) {
+    const s = String(text == null ? "" : text);
+    if (s.indexOf("|") < 0) return linkify(s); // no pipe → no table possible
+    const lines = s.split("\n");
+    let out = "", i = 0, buf = [];
+    const flush = () => { if (buf.length) { out += linkify(buf.join("\n")); buf = []; } };
+    while (i < lines.length) {
+      const isTableHead = i + 1 < lines.length && hasPipe(lines[i]) && isDelimiterRow(lines[i + 1]) &&
+        splitRow(lines[i]).length === splitRow(lines[i + 1]).length;
+      if (isTableHead) {
+        flush();
+        const header = splitRow(lines[i]);
+        const aligns = splitRow(lines[i + 1]).map(cellAlign);
+        i += 2;
+        const rows = [];
+        while (i < lines.length && lines[i].trim() !== "" && hasPipe(lines[i])) { rows.push(splitRow(lines[i])); i++; }
+        out += renderTable(header, aligns, rows);
+        continue;
+      }
+      buf.push(lines[i]); i++;
+    }
+    flush();
     return out;
   }
 
@@ -102,6 +171,9 @@
   let cachedToken = null, tokenExp = 0;
   let verbosity = { preset: "normal", show: { ...PRESETS.normal } };
   let questionActive = false;
+  // Text of a question we just answered; suppresses re-showing its box while an
+  // in-flight heartbeat still reports it as pending (cleared once it's gone).
+  let answeredQuestion = null;
 
   // reveal (only the live turn types in; committed messages render whole)
   let reveal = { shown: 0 };
@@ -311,7 +383,7 @@
   function renderMsg(it) {
     const cls = it.role === "user" ? "user" : "assistant";
     return '<div class="tr-msg ' + cls + '"><span class="role">' + cls + "</span>" +
-      linkify(it.text) + truncBtn(it.id, it.truncated) + "</div>";
+      renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div>";
   }
 
   function renderThought(it) {
@@ -319,7 +391,7 @@
     const key = "th:" + it.id;
     return '<details class="thought" data-dkey="' + esc(key) + '"' + openAttr(key, true) +
       "><summary>💭 Thought</summary>" +
-      '<div class="thought-body">' + linkify(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
+      '<div class="thought-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
   }
 
   // ` open` when this card should be expanded: the user's explicit toggle wins,
@@ -612,6 +684,10 @@
     if (!box) return;
     const q = s && s.session && s.session.question;
     const opts = (s && s.session && s.session.questionOptions) || [];
+    // A stale heartbeat may still report the question we just answered; keep it
+    // hidden until the agent actually clears it, then forget the suppression.
+    if (q && q === answeredQuestion) { questionActive = false; box.hidden = true; box.innerHTML = ""; return; }
+    answeredQuestion = null;
     questionActive = !!q;
     if (!q) { box.hidden = true; box.innerHTML = ""; return; }
     box.hidden = false;
@@ -628,14 +704,23 @@
     if (!hostKey || !sessionId) return;
     const body = { optionIndex };
     if (custom) body.custom = custom;
+    // Hide the box immediately on click — the round-trip to the hub (and the
+    // agent's next heartbeat) can take a moment, and leaving it up reads as if
+    // the click didn't register. `answeredQuestion` keeps a stale heartbeat
+    // from bouncing it back; if the POST fails we re-surface it below.
+    answeredQuestion = (sess && sess.session && sess.session.question) || null;
+    questionActive = false;
+    const box = $("chatQuestion"); if (box) { box.hidden = true; box.innerHTML = ""; }
     try {
-      await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/answer", {
+      const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/answer", {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
       });
-      const box = $("chatQuestion"); if (box) { box.hidden = true; box.innerHTML = ""; }
-      questionActive = false;
+      if (!r.ok) throw new Error(String(r.status));
       if (typeof fastPoll === "function") fastPoll();
-    } catch {}
+    } catch {
+      answeredQuestion = null; // send failed — let the pending question show again
+      if (sess) updateQuestion(sess);
+    }
   }
 
   // ---- expand a truncated block via /history --------------------------------
@@ -667,20 +752,25 @@
     const text = inp.value;
     if (!text.trim()) return;
     inp.value = ""; autoGrow(); inp.focus();
+    const wasAnswer = questionActive;
     try {
       let url, body;
-      if (questionActive) {
+      if (wasAnswer) {
         url = "/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/answer";
         body = { optionIndex: -1, custom: text };
+        // Optimistically dismiss the question box (see answerQuestion).
+        answeredQuestion = (sess && sess.session && sess.session.question) || null;
+        questionActive = false;
+        const box = $("chatQuestion"); if (box) { box.hidden = true; box.innerHTML = ""; }
       } else {
         url = "/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/input";
         body = { text };
       }
       const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(String(r.status));
-      if (questionActive) { const box = $("chatQuestion"); if (box) { box.hidden = true; box.innerHTML = ""; } questionActive = false; }
       if (typeof fastPoll === "function") fastPoll();
     } catch {
+      if (wasAnswer) { answeredQuestion = null; if (sess) updateQuestion(sess); }
       if (!inp.value.trim()) { inp.value = text; autoGrow(); }
       if (btn) { btn.textContent = "Send failed"; setTimeout(() => btn.textContent = "Send", 2000); }
     }
@@ -733,7 +823,7 @@
     if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
-    buffer = []; liveTurn = ""; liveStatus = null; questionActive = false;
+    buffer = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
     updateLiveStatus(); // hide the pinned bar when the view closes
   }
 
@@ -758,7 +848,7 @@
   // in the browser (no `module`); the browser path uses window.TurmaChat above.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      mergeTail, weight, buildItems, itemsToHtml, esc, linkify, prFooterChip,
+      mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderProse, prFooterChip,
       __setVerbosity: (v) => { verbosity = v; },
     };
   }

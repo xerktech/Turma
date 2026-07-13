@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, prFooterChip, __setVerbosity } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderProse, prFooterChip, __setVerbosity } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -227,6 +227,18 @@ test("linkify: markdown emphasis markers wrapping a bare URL stay out of the lin
   assert.doesNotMatch(html, /href="[^"]*\*/);
 });
 
+test("linkify: typographic (curly) quotes wrapping a bare URL stay out of the link", () => {
+  // Claude emits curly ‘’ “” around URLs; the closing curly quote must not be
+  // slurped into the href (the ASCII '"' peel misses these Unicode chars).
+  for (const [open, close] of [["‘", "’"], ["“", "”"]]) {
+    const html = linkify("see " + open + "https://github.com/o/r/pull/9" + close + " now");
+    assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/9"/,
+      "curly quote " + open + close + " leaked into href: " + html);
+  }
+  // A bare URL ending a clause with a curly apostrophe/quote, no opener.
+  assert.match(linkify("opened https://github.com/o/r/pull/9”"), /href="https:\/\/github\.com\/o\/r\/pull\/9"/);
+});
+
 test("linkify: markdown [text](url) becomes an anchor with the label as text", () => {
   const html = linkify("opened [PR #42](https://github.com/o/r/pull/42) just now");
   assert.equal(html,
@@ -290,4 +302,60 @@ test("prFooterChip: escapes a malicious PR title (no injection)", () => {
   const html = prFooterChip({ prs: [{ url: "https://github.com/o/r/pull/1", number: 1, state: "OPEN", title: '<img src=x onerror=alert(1)>' }] });
   assert.doesNotMatch(html, /<img/);
   assert.match(html, /&lt;img/);
+});
+
+// ---- renderProse (markdown tables in prose bubbles) ----------------------
+test("renderProse: a GFM table becomes a real <table> with header + body cells", () => {
+  const md = [
+    "| Check | Status |",
+    "|---|---|",
+    "| Semgrep SAST | ✅ pass |",
+    "| Unit tests | ✅ pass |",
+  ].join("\n");
+  const html = renderProse(md);
+  assert.match(html, /<table class="md-table">/);
+  assert.match(html, /<thead><tr><th>Check<\/th><th>Status<\/th><\/tr><\/thead>/);
+  assert.match(html, /<tbody>.*<td>Semgrep SAST<\/td><td>✅ pass<\/td>/s);
+  assert.match(html, /<td>Unit tests<\/td><td>✅ pass<\/td>/);
+  // No raw pipe characters leak into the rendered output.
+  assert.doesNotMatch(html, /\|/);
+});
+
+test("renderProse: prose around a table is linkified, the table is lifted out", () => {
+  const md = "Here are the results:\n\n| A | B |\n|---|---|\n| see https://x.io | y |\n\nDone.";
+  const html = renderProse(md);
+  assert.match(html, /Here are the results:/);
+  assert.match(html, /<table class="md-table">/);
+  // A link inside a cell is still clickable.
+  assert.match(html, /<td>see <a href="https:\/\/x\.io"[^>]*>https:\/\/x\.io<\/a><\/td>/);
+  // Trailing prose after the table is preserved.
+  assert.match(html, /Done\./);
+});
+
+test("renderProse: alignment colons in the delimiter row set text-align", () => {
+  const md = "| L | C | R |\n|:--|:-:|--:|\n| a | b | c |";
+  const html = renderProse(md);
+  assert.match(html, /<th style="text-align:left">L<\/th>/);
+  assert.match(html, /<th style="text-align:center">C<\/th>/);
+  assert.match(html, /<th style="text-align:right">R<\/th>/);
+  assert.match(html, /<td style="text-align:center">b<\/td>/);
+});
+
+test("renderProse: cell contents are HTML-escaped (no injection)", () => {
+  const md = "| Col |\n|---|\n| <script>alert(1)</script> |";
+  const html = renderProse(md);
+  assert.doesNotMatch(html, /<script>/);
+  assert.match(html, /&lt;script&gt;/);
+});
+
+test("renderProse: a lone pipe row with no delimiter stays plain (not a table)", () => {
+  // "a | b" without a following delimiter row must not become a table.
+  const html = renderProse("cost is 3 | 4 dollars");
+  assert.doesNotMatch(html, /<table/);
+  assert.match(html, /cost is 3 \| 4 dollars/);
+});
+
+test("renderProse: table-free text is byte-identical to linkify", () => {
+  const t = "opened [PR #42](https://github.com/o/r/pull/42) — <b>done</b> & dusted";
+  assert.equal(renderProse(t), linkify(t));
 });
