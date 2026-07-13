@@ -11,7 +11,7 @@ RUN npm install -g "npm@${NPM_VERSION}" && npm cache clean --force
 
 ENV NODE_ENV=production
 WORKDIR /app
-COPY server.js archive.js chat.js ./
+COPY server.js archive.js ./
 COPY public ./public
 
 LABEL org.opencontainers.image.source="https://github.com/xerktech/DockerOps" \

@@ -32,11 +32,9 @@ process.env.STATE_FILE = path.join(
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
 process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-archive-"));
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
-// Chat store (durable, searchable /chat history) writes to a throwaway DB.
-process.env.CHAT_DB = path.join(process.env.ARCHIVE_DIR, "chat.db");
-// LiteLLM chat backend: configured so the "enabled" code paths are exercised;
-// individual tests stub globalThis.fetch to mock the proxy. The "unset" branch
-// is tested via a separately required module (freshServerModule).
+// LiteLLM backend (Whisper STT derives its endpoint from this): configured so
+// the "enabled" code paths are exercised. The "unset" branch is tested via a
+// separately required module (freshServerModule).
 process.env.LITELLM_URL = "http://litellm.test/v1";
 process.env.LITELLM_API_KEY = "litellmkey";
 // Whisper STT: configured so the "enabled" code paths (transcribePcm request
@@ -70,7 +68,7 @@ const {
   heartbeatAlerts, sessionWorking,
   userAuthorized, agentAuthorized, agentWsAuthorized, fmtDur,
   credentialsMatch, issueSessionToken, sessionTokenValid,
-  pcmToWav, transcribePcm, litellmModels, deriveTitle, issueWsToken, wsTokenValid,
+  pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -615,132 +613,6 @@ test("http: heartbeat carries archiveHave cursors back for a manifest", async ()
   assert.equal(r2.body.archiveHave.tr1, 120);
   // The bulky manifest is not persisted onto the agent record.
   assert.equal(agents.nas.archiveManifest, undefined);
-});
-
-// ---- chat: LiteLLM-backed chatbot with durable, searchable history ----------
-
-// A mock LiteLLM upstream: `/models` returns a model list; `/chat/completions`
-// returns an object whose `.body` is an async iterator of OpenAI SSE chunks
-// (what the server's `for await (const chunk of up.body)` loop consumes).
-function litellmStub(chatChunks, { modelsOk = true, chatStatus = 200 } = {}) {
-  return (url, opts) => {
-    if (String(url).endsWith("/models")) {
-      return modelsOk
-        ? Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [{ id: "gpt-x" }, { id: "claude-y" }] }) })
-        : Promise.resolve({ ok: false, status: 500, json: async () => ({}) });
-    }
-    if (String(url).endsWith("/chat/completions")) {
-      if (chatStatus !== 200) return Promise.resolve({ ok: false, status: chatStatus, body: null });
-      return Promise.resolve({
-        ok: true, status: 200,
-        body: (async function* () { for (const c of chatChunks) yield Buffer.from(c); })(),
-      });
-    }
-    return ntfyFetchStub(url, opts); // fall through for any ntfy pushes
-  };
-}
-const sseDelta = (s) => `data: {"choices":[{"delta":{"content":${JSON.stringify(s)}}}]}\n\n`;
-
-test("chat: models list is fetched from LiteLLM (sorted)", async () => {
-  globalThis.fetch = litellmStub([]);
-  const r = await request("GET", "/api/chat/models", { headers: userHeaders });
-  assert.equal(r.status, 200);
-  assert.deepEqual(r.body.models, ["claude-y", "gpt-x"]);
-  assert.equal(r.body.default, "claude-y");
-  restoreFetch();
-});
-
-test("chat: LITELLM_URL unset -> models unavailable, fetch never called", async () => {
-  let called = false;
-  globalThis.fetch = () => { called = true; return Promise.resolve({ ok: true, json: async () => ({}) }); };
-  const disabled = freshServerModule((env) => { delete env.LITELLM_URL; });
-  const result = await disabled.litellmModels();
-  assert.equal(result.unavailable, true);
-  assert.equal(result.reason, "litellm not configured");
-  assert.equal(called, false);
-  restoreFetch();
-});
-
-test("chat: deriveTitle collapses whitespace and caps length", () => {
-  assert.equal(deriveTitle("  hello\n  world  "), "hello world");
-  assert.equal(deriveTitle(""), "New chat");
-  assert.equal(deriveTitle("x".repeat(200)).length, 60);
-});
-
-test("chat: conversation CRUD is user-authed; bad ids rejected", async () => {
-  // Gated: no creds -> 401.
-  assert.equal((await request("GET", "/api/chat/conversations")).status, 401);
-
-  // Create -> appears in the list -> fetchable -> deletable.
-  const created = await request("POST", "/api/chat/conversations", { body: { title: "Reusable" }, headers: userHeaders });
-  assert.equal(created.status, 200);
-  const id = created.body.id;
-  assert.match(id, /^[0-9a-f]{24,}$/);
-
-  const list = await request("GET", "/api/chat/conversations", { headers: userHeaders });
-  assert.ok(list.body.conversations.some((c) => c.id === id));
-
-  const one = await request("GET", `/api/chat/conversations/${id}`, { headers: userHeaders });
-  assert.equal(one.body.title, "Reusable");
-  assert.deepEqual(one.body.messages, []);
-
-  // Bad id -> 400 (never reaches storage).
-  assert.equal((await request("GET", "/api/chat/conversations/..%2f..%2fetc", { headers: userHeaders })).status, 400);
-
-  const del = await request("DELETE", `/api/chat/conversations/${id}`, { headers: userHeaders });
-  assert.equal(del.body.ok, true);
-  assert.equal((await request("GET", `/api/chat/conversations/${id}`, { headers: userHeaders })).status, 404);
-});
-
-test("chat: streaming completion persists both turns and auto-titles", async () => {
-  globalThis.fetch = litellmStub([sseDelta("Hel"), sseDelta("lo"), "data: [DONE]\n\n"]);
-  const c = await request("POST", "/api/chat/conversations", { body: {}, headers: userHeaders });
-  const id = c.body.id;
-
-  const res = await request("POST", `/api/chat/conversations/${id}/completion`,
-    { body: { text: "please add a compose flag", model: "gpt-x" }, headers: userHeaders });
-  assert.equal(res.status, 200);
-  // The simplified SSE framing carries the deltas and a terminal done.
-  assert.match(res.raw, /"type":"delta"/);
-  assert.match(res.raw, /"type":"done"/);
-
-  // Both turns are persisted; the conversation is titled from the first message.
-  const convo = await request("GET", `/api/chat/conversations/${id}`, { headers: userHeaders });
-  assert.equal(convo.body.title, "please add a compose flag");
-  assert.equal(convo.body.messages.length, 2);
-  assert.equal(convo.body.messages[0].role, "user");
-  assert.equal(convo.body.messages[1].role, "assistant");
-  assert.equal(convo.body.messages[1].content, "Hello");
-  restoreFetch();
-});
-
-test("chat: upstream error still persists the user turn", async () => {
-  globalThis.fetch = litellmStub([], { chatStatus: 500 });
-  const c = await request("POST", "/api/chat/conversations", { body: {}, headers: userHeaders });
-  const id = c.body.id;
-  const res = await request("POST", `/api/chat/conversations/${id}/completion`,
-    { body: { text: "this should still be saved", model: "gpt-x" }, headers: userHeaders });
-  assert.equal(res.status, 200);
-  assert.match(res.raw, /"type":"error"/);
-  const convo = await request("GET", `/api/chat/conversations/${id}`, { headers: userHeaders });
-  assert.equal(convo.body.messages.length, 1); // user turn only
-  assert.equal(convo.body.messages[0].content, "this should still be saved");
-  restoreFetch();
-});
-
-test("chat: search finds a conversation by message text (short q rejected)", async () => {
-  globalThis.fetch = litellmStub([sseDelta("indexed reply about kubernetes"), "data: [DONE]\n\n"]);
-  const c = await request("POST", "/api/chat/conversations", { body: {}, headers: userHeaders });
-  await request("POST", `/api/chat/conversations/${c.body.id}/completion`,
-    { body: { text: "a very distinctive zebra phrase", model: "gpt-x" }, headers: userHeaders });
-  restoreFetch();
-
-  const s = await request("GET", "/api/chat/search?q=zebra", { headers: userHeaders });
-  assert.equal(s.status, 200);
-  assert.ok(s.body.results.some((r) => r.id === c.body.id));
-  assert.match(s.body.results[0].snippet, /<mark>/);
-  // Too-short query is rejected.
-  assert.equal((await request("GET", "/api/chat/search?q=z", { headers: userHeaders })).status, 400);
 });
 
 test("http: login page is public; /api/login sets a working session cookie", async () => {
