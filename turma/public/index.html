@@ -754,13 +754,11 @@ function repoBlock(a, repo, sessList, now) {
   const rootBusy = repo.isRoot && sessList.some(s => s.status === "running");
   const canSpawn = a.online && !repo.missing && !rootBusy;
   const spawning = pending.has(pendKey("spawn", a.key, repo.name));
+  // "+ New session" opens the composer (task/label/options). Leaving the task
+  // blank and hitting Start spawns instantly with today's defaults, so the old
+  // one-click bare-spawn path is just the empty-composer case.
   const spawnBtn = canSpawn
-    ? `<button class="primary btn-sm" ${spawning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();newSession('${esc(a.key)}','${esc(repo.name)}')">${spawning ? '<span class="spin"></span> Starting…' : "+ New session"}</button>`
-    : "";
-  // The caret opens the composer (task/label/options). The primary button above
-  // is untouched — one click still spawns instantly with today's defaults.
-  const composerBtn = canSpawn
-    ? `<button class="btn-sm" title="New session with options" ${spawning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();toggleComposer('${esc(rkey)}','${esc(repo.name)}')">${composerOpen.has(rkey) ? "▴" : "▾"}</button>`
+    ? `<button class="primary btn-sm" ${spawning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();toggleComposer('${esc(rkey)}','${esc(repo.name)}')">${spawning ? '<span class="spin"></span> Starting…' : composerOpen.has(rkey) ? "− New session" : "+ New session"}</button>`
     : "";
   const ghost = spawning ? ghostCard() : "";
   const body = (sessList.length || spawning)
@@ -830,7 +828,6 @@ function repoBlock(a, repo, sessList, now) {
       <span class="r-actions">
         ${pruneBtn}
         ${resumeBtn}
-        ${composerBtn}
         ${spawnBtn}
       </span>
     </summary>
@@ -1033,12 +1030,6 @@ function busy(key, val, run) {
   setPending(key, val);
   render(cache);
   run();
-}
-function newSession(key, repo) {
-  const host = (cache.agents || []).find(a => a.key === key);
-  const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
-  busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
-    () => post(`/api/agents/${enc(key)}/sessions`, { repo }));
 }
 // Clone a GitHub repo into a host's REPOS_ROOT. Free-text takes precedence over
 // the dropdown selection. The dest name (last path segment, sans .git) keys the

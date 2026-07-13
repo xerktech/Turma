@@ -101,8 +101,35 @@
   details.spawn-wrap[open] > summary .chev { transform: rotate(180deg); }
   .spawn-body { padding: 10px 2px 4px; display: flex; flex-direction: column; gap: 10px; }
   .host-block .hname { font-weight: 600; font-size: 12.5px; margin-bottom: 7px; overflow-wrap: anywhere; }
-  .repo-btns { display: flex; flex-wrap: wrap; gap: 7px; }
-  .repo-btns button { font-size: 12px; padding: 5px 11px; }
+  .repo-btns { display: flex; flex-direction: column; gap: 8px; }
+  .repo-item { display: flex; flex-direction: column; align-items: stretch; }
+  .repo-item > button { align-self: flex-start; font-size: 12px; padding: 5px 11px; }
+
+  /* "New session" composer — opened by clicking a repo's button. Leaving Task
+     blank and hitting Start spawns instantly with defaults (the old one-click). */
+  .composer {
+    display: flex; flex-direction: column; gap: 10px; margin-top: 8px;
+    background: var(--page); border: 1px dashed var(--border); border-radius: var(--radius-sm);
+    padding: 11px;
+  }
+  .composer label { font-size: 11px; color: var(--muted); display: block; margin-bottom: 3px; }
+  .composer textarea, .composer input, .composer select {
+    width: 100%; box-sizing: border-box; font: inherit; font-size: 13px;
+    padding: 7px 9px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--ink);
+  }
+  .composer textarea { min-height: 58px; resize: vertical; }
+  .composer details.opts { border-top: 1px solid var(--hairline); padding-top: 10px; }
+  .composer details.opts > summary {
+    cursor: pointer; color: var(--muted); font-size: 12px; user-select: none; list-style: none;
+  }
+  .composer details.opts > summary::-webkit-details-marker { display: none; }
+  .composer details.opts > summary:hover { color: var(--ink-2); }
+  .composer .opts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+  .composer .opts-grid .full { grid-column: 1 / -1; }
+  .composer .hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .composer .cmp-actions { display: flex; align-items: center; gap: 10px; }
+  .composer .cmp-actions .spacer { flex: 1; }
 
   /* ---- Right stage: empty prompt or the live terminal --------------------- */
   .stage { flex: 1; min-width: 0; display: flex; flex-direction: column; background: #000; }
@@ -470,6 +497,131 @@ const $refreshed = document.getElementById("refreshed");
 let stoppedOpen = false;
 let spawnOpen = false;
 
+// "New session" composer state (ported from the dashboard):
+// - composerOpen:  "host::repo" whose composer panel is open
+// - optionsOpen:   "host::repo" whose nested ▸ Options disclosure is expanded
+// - composerDraft: "host::repo" -> {task,label} in-progress text, kept in memory
+//   ONLY so the poll/SSE re-render can't wipe what's being typed. Option selects
+//   (base/model/perm) persist per-repo in localStorage (loadOpts/saveOpts).
+const composerOpen = new Set();
+const optionsOpen = new Set();
+const composerDraft = new Map();
+// DOM id for a composer field, derived from the (host::repo) key + field name.
+function cid(rk, field) { return "cmp-" + field + "-" + rk.replace(/[^A-Za-z0-9]/g, "_"); }
+function optStoreKey(repo) { return "turma.composer." + repo; }
+function loadOpts(repo) {
+  try { const o = JSON.parse(localStorage.getItem(optStoreKey(repo)) || "{}"); return o && typeof o === "object" ? o : {}; }
+  catch { return {}; }
+}
+function saveOpts(repo, o) {
+  try { localStorage.setItem(optStoreKey(repo), JSON.stringify(o)); } catch { /* private mode / quota — ignore */ }
+}
+function draftSet(rk, field, value) {
+  const d = composerDraft.get(rk) || {};
+  d[field] = value;
+  composerDraft.set(rk, d);
+}
+function toggleComposer(rkey, repo) {
+  if (composerOpen.has(rkey)) composerOpen.delete(rkey);
+  else {
+    composerOpen.add(rkey);
+    if (loadOpts(repo).optionsExpanded) optionsOpen.add(rkey); else optionsOpen.delete(rkey);
+  }
+  render(cache);
+  if (composerOpen.has(rkey)) {
+    const el = document.getElementById(cid(rkey, "task"));
+    if (el) el.focus();
+  }
+}
+function onOptionsToggle(rkey, repo, open) {
+  if (open) optionsOpen.add(rkey); else optionsOpen.delete(rkey);
+  const o = loadOpts(repo); o.optionsExpanded = open; saveOpts(repo, o);
+}
+// Capture/restore focus + caret across the spawn-panel innerHTML swap so typing
+// in an open composer survives the poll / SSE re-render.
+function captureComposerFocus() {
+  const el = document.activeElement;
+  if (!el || !el.id || !el.id.startsWith("cmp-")) return null;
+  const f = { id: el.id };
+  try { f.start = el.selectionStart; f.end = el.selectionEnd; } catch { /* selects have none */ }
+  return f;
+}
+function restoreComposerFocus(f) {
+  if (!f) return;
+  const el = document.getElementById(f.id);
+  if (!el) return;
+  el.focus();
+  if (f.start != null) { try { el.setSelectionRange(f.start, f.end); } catch { /* not a text field */ } }
+}
+// Persist the composer's option selects as this repo's last-used prefs.
+function onOptChange(rk, repo) {
+  const v = id => { const el = document.getElementById(cid(rk, id)); return el ? el.value : ""; };
+  const o = loadOpts(repo);
+  o.baseRef = v("base"); o.model = v("model"); o.permissionMode = v("perm");
+  saveOpts(repo, o);
+}
+// The "New session" composer panel: Task (autofocused, Cmd/Ctrl+Enter submits),
+// Label, and a collapsed ▸ Options disclosure (base branch / model / permission
+// mode) that defaults to today's behavior. Text fields come from composerDraft
+// (survive re-render); the option selects seed from the repo's last-used prefs.
+function composer(a, repo, rk, spawning) {
+  const d = composerDraft.get(rk) || {};
+  const o = loadOpts(repo.name);
+  const key = esc(a.key), rn = esc(repo.name);
+  const bases = [];
+  for (const b of [repo.defaultBranch, repo.branch, ...(repo.branches || []), o.baseRef]) {
+    if (b && !bases.includes(b)) bases.push(b);
+  }
+  const selBase = (o.baseRef && bases.includes(o.baseRef))
+    ? o.baseRef : (repo.defaultBranch || repo.branch || "");
+  const selModel = o.model || "default";
+  const selPerm = o.permissionMode || "auto";
+  const optsExpanded = optionsOpen.has(rk);
+  const opt = (val, label, sel) => `<option value="${esc(val)}"${val === sel ? " selected" : ""}>${esc(label)}</option>`;
+  const submit = `startSession('${key}','${rn}')`;
+  return `<div class="composer">
+    <div>
+      <label>Task</label>
+      <textarea id="${cid(rk, "task")}" placeholder="Describe the task, or leave blank to start an empty session."
+        oninput="draftSet('${esc(rk)}','task',this.value)"
+        onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();${submit};}">${esc(d.task || "")}</textarea>
+    </div>
+    <div>
+      <label>Label <span class="hint">(optional)</span></label>
+      <input id="${cid(rk, "label")}" type="text" placeholder="e.g. fix login bug" value="${esc(d.label || "")}"
+        oninput="draftSet('${esc(rk)}','label',this.value)">
+    </div>
+    <details class="opts" ${optsExpanded ? "open" : ""} ontoggle="onOptionsToggle('${esc(rk)}','${rn}',this.open)">
+      <summary>${optsExpanded ? "▾" : "▸"} Options</summary>
+      <div class="opts-grid">
+        ${repo.isRoot ? "" : `<div class="full">
+          <label>Base branch <span class="hint">(fork point; latest is fetched)</span></label>
+          <select id="${cid(rk, "base")}" onchange="onOptChange('${esc(rk)}','${rn}')">
+            ${bases.map(b => opt(b, b, selBase)).join("")}
+          </select>
+        </div>`}
+        <div>
+          <label>Model</label>
+          <select id="${cid(rk, "model")}" onchange="onOptChange('${esc(rk)}','${rn}')">
+            ${opt("default", "Default", selModel)}${opt("opus", "Opus", selModel)}${opt("sonnet", "Sonnet", selModel)}${opt("haiku", "Haiku", selModel)}
+          </select>
+        </div>
+        <div>
+          <label>Permission mode</label>
+          <select id="${cid(rk, "perm")}" onchange="onOptChange('${esc(rk)}','${rn}')">
+            ${opt("auto", "auto", selPerm)}${opt("bypassPermissions", "bypassPermissions", selPerm)}${opt("acceptEdits", "acceptEdits", selPerm)}${opt("plan", "plan", selPerm)}${opt("default", "default", selPerm)}
+          </select>
+        </div>
+      </div>
+    </details>
+    <div class="cmp-actions">
+      <span class="hint">Cmd/Ctrl+Enter to start</span>
+      <span class="spacer"></span>
+      <button class="primary btn-sm" ${spawning ? "disabled" : ""} onclick="${submit}">${spawning ? '<span class="spin"></span> Starting…' : "Start"}</button>
+    </div>
+  </div>`;
+}
+
 // Optimistic pending-action feedback, same scheme as the dashboard: spawn/start
 // commands are queued on the hub and land on the next agent heartbeat, so each
 // clicked button shows a busy state until the polled data reflects the change
@@ -582,6 +734,8 @@ function render(data) {
   $counts.textContent = running.length + " running" + (waiting ? " · " + waiting + " waiting on you" : "");
 
   const hosts = agents.filter(a => a.online && (a.repos || []).length);
+  // Preserve focus/caret in an open composer across the innerHTML swap.
+  const focus = captureComposerFocus();
   $spawn.innerHTML = `
     <details class="spawn-wrap" ${spawnOpen ? "open" : ""} ontoggle="spawnOpen = this.open">
       <summary>+ New session <span class="chev">▾</span></summary>
@@ -591,6 +745,7 @@ function render(data) {
           : `<div class="empty" style="padding:20px 0">No online hosts with repos.</div>`
       }</div>
     </details>`;
+  restoreComposerFocus(focus);
 
   $active.innerHTML = `<h2>Active <span class="count">${running.length}</span></h2>` +
     (running.length
@@ -653,11 +808,17 @@ function stoppedRow({ a, s }) {
 
 function hostBlock(a) {
   const repos = (a.repos || []).map(r => {
+    const rk = a.key + "::" + r.name;
     const spawning = pending.has(pendKey("spawn", a.key, r.name));
-    return `<button class="primary" ${spawning ? "disabled" : ""}
-        onclick="newSession('${esc(a.key)}','${esc(r.name)}')">
-      ${spawning ? '<span class="spin"></span> Starting…' : "+ " + esc(r.name)}
+    const open = composerOpen.has(rk);
+    // Clicking a repo opens its composer (task/label/options). Leaving Task blank
+    // and hitting Start spawns instantly with defaults — the old one-click path.
+    const btn = `<button class="primary" ${spawning ? "disabled" : ""}
+        onclick="toggleComposer('${esc(rk)}','${esc(r.name)}')">
+      ${spawning ? '<span class="spin"></span> Starting…' : (open ? "− " : "+ ") + esc(r.name)}
     </button>`;
+    const panel = open ? composer(a, r, rk, spawning) : "";
+    return `<div class="repo-item">${btn}${panel}</div>`;
   }).join("");
   return `<div class="host-block">
     <div class="hname">${esc(a.key)}</div>
@@ -680,11 +841,32 @@ function busy(key, val, run) {
   render(cache);
   run();
 }
-function newSession(key, repo) {
+// Spawn from the composer. Reads the panel's fields, forwards only the ones that
+// differ from today's defaults (so it degrades to the bare fast path when the
+// task is left blank), persists the options, then closes + clears the composer.
+function startSession(key, repo) {
+  const rk = key + "::" + repo;
+  const v = id => { const el = document.getElementById(cid(rk, id)); return el ? el.value : ""; };
   const host = (cache.agents || []).find(a => a.key === key);
+  const repoInfo = host ? (host.repos || []).find(r => r.name === repo) : null;
+  const defBranch = repoInfo ? (repoInfo.defaultBranch || repoInfo.branch) : "";
+  const prompt = v("task").trim(), label = v("label").trim();
+  const baseRef = v("base");
+  const model = v("model"), perm = v("perm");
+  const body = { repo };
+  if (prompt) body.prompt = prompt;
+  if (label) body.label = label;
+  // Omitted base = the agent forks the latest default branch (main). Only send an
+  // explicit base when the operator picked something other than that.
+  if (baseRef && baseRef !== defBranch) body.baseRef = baseRef;
+  if (model && model !== "default") body.model = model;
+  if (perm && perm !== "auto") body.permissionMode = perm;
+  saveOpts(repo, { baseRef, model, permissionMode: perm, optionsExpanded: optionsOpen.has(rk) });
+  composerOpen.delete(rk);
+  composerDraft.delete(rk);
   const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
-    () => post(`/api/agents/${enc(key)}/sessions`, { repo }));
+    () => post(`/api/agents/${enc(key)}/sessions`, body));
 }
 function sessStart(key, id) {
   busy(pendKey("start", key, id), { kind: "start", host: key, id },
