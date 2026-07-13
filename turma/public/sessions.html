@@ -226,6 +226,12 @@
   .action-card .tool-dot { width: 7px; height: 7px; border-radius: 999px; background: var(--muted); flex: none; }
   .action-card.ok .tool-dot { background: var(--good); }
   .action-card.err .tool-dot { background: var(--critical); }
+  /* Background-task (task-notification) card: a diamond glyph + accent name so it
+     reads as a completed background agent, not a plain tool call. */
+  .action-card .tool-glyph { color: var(--accent); font-size: 10px; line-height: 1; flex: none; }
+  .action-card.task.err .tool-glyph { color: var(--critical); }
+  .action-card.task .tool-name { color: var(--accent); font-weight: 600; }
+  .action-card.task.err .tool-name { color: var(--critical); }
   .action-card .tool-body { padding: 0 11px 10px; display: flex; flex-direction: column; gap: 8px; }
   .action-card .tool-block { }
   .action-card .tool-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 3px; }

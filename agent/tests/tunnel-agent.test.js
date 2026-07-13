@@ -21,7 +21,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.TURMA_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, entryBlocks, newestTranscript, pokeHeartbeat, BLOCK_CAPS_LIVE } = require("../tunnel-agent.js");
+const { projectSlug, transcriptTail, entryText, entryBlocks, newestTranscript, pokeHeartbeat, parseTaskNotification, BLOCK_CAPS_LIVE } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -107,6 +107,55 @@ test("entryBlocks: wrong type / no message -> null; empty content -> []", () => 
   assert.equal(entryBlocks({ type: "system", message: { content: "x" } }, BLOCK_CAPS_LIVE), null);
   assert.equal(entryBlocks({ type: "user" }, BLOCK_CAPS_LIVE), null);
   assert.deepEqual(entryBlocks({ type: "assistant", message: { content: "" } }, BLOCK_CAPS_LIVE), []);
+});
+
+// Mirror of test_hub_agent.py TestTaskNotification — keep in lockstep.
+const TASK_NOTIFICATION =
+  "<task-notification>\n<task-id>af9e62627de15eaf4</task-id>\n" +
+  "<tool-use-id>toolu_01Cv</tool-use-id>\n<output-file>/tmp/x.output</output-file>\n" +
+  "<status>completed</status>\n<summary>Agent \"Confirm merge semantics\" finished</summary>\n" +
+  "<note>A task-notification fires each time this agent stops.</note>\n" +
+  "<result>The --settings file is merged as a higher-precedence layer.</result>\n" +
+  "</task-notification>";
+
+test("parseTaskNotification: extracts summary/status/result, ignores non-notifications", () => {
+  assert.deepEqual(parseTaskNotification(TASK_NOTIFICATION), {
+    summary: 'Agent "Confirm merge semantics" finished',
+    status: "completed",
+    result: "The --settings file is merged as a higher-precedence layer.",
+  });
+  assert.equal(parseTaskNotification("just a normal prompt"), null);
+  assert.equal(parseTaskNotification("talk about <task-notification> inline"), null);
+  assert.equal(parseTaskNotification(""), null);
+});
+
+test("entryBlocks: task-notification -> one task_notification block (string + list content)", () => {
+  const want = [{
+    t: "task_notification",
+    summary: 'Agent "Confirm merge semantics" finished',
+    status: "completed",
+    result: "The --settings file is merged as a higher-precedence layer.",
+  }];
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: TASK_NOTIFICATION } }, BLOCK_CAPS_LIVE), want);
+  assert.deepEqual(
+    entryBlocks({ type: "user", message: { content: [{ type: "text", text: TASK_NOTIFICATION }] } }, BLOCK_CAPS_LIVE),
+    want);
+  // entryText flattens it to summary + result (the text-only tail form).
+  assert.equal(
+    entryText({ type: "user", message: { content: TASK_NOTIFICATION } }),
+    'Agent "Confirm merge semantics" finished\n\nThe --settings file is merged as a higher-precedence layer.');
+});
+
+test("entryBlocks: background-command task-notification has no result; long result truncates", () => {
+  const bg = "<task-notification>\n<status>completed</status>\n<summary>Background command finished</summary>\n</task-notification>";
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: bg } }, BLOCK_CAPS_LIVE),
+    [{ t: "task_notification", summary: "Background command finished", status: "completed" }]);
+  const big = "z".repeat(BLOCK_CAPS_LIVE.result + 500);
+  const [block] = entryBlocks(
+    { type: "user", message: { content: `<task-notification>\n<summary>done</summary>\n<result>${big}</result>\n</task-notification>` } },
+    BLOCK_CAPS_LIVE);
+  assert.equal(block.result.length, BLOCK_CAPS_LIVE.result);
+  assert.equal(block.truncated, true);
 });
 
 test("transcriptTail: oldest-first, rich blocks, tolerates broken lines", () => {

@@ -107,6 +107,38 @@ test("buildItems: text-only entry with no blocks (older agent / seed) still bubb
   assert.deepEqual(items, [{ kind: "msg", role: "assistant", id: "a1", text: "legacy text", truncated: false }]);
 });
 
+test("buildItems: a task_notification block -> an action card, not a user bubble", () => {
+  const items = buildItems([{
+    id: "n1", role: "user", blocks: [{
+      t: "task_notification", summary: 'Agent "CI edits" finished', status: "completed", result: "all green",
+    }],
+  }]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "action");     // rendered like a tool call, not a msg
+  assert.equal(items[0].task, true);
+  assert.equal(items[0].name, 'Agent "CI edits" finished');
+  assert.equal(items[0].result.text, "all green");
+  assert.equal(items[0].result.isError, false);
+});
+
+test("buildItems: non-completed task_notification flags its result as an error", () => {
+  const items = buildItems([{
+    id: "n1", role: "user", blocks: [{ t: "task_notification", summary: "Agent died", status: "failed" }],
+  }]);
+  assert.equal(items[0].result.isError, true);
+  assert.equal(items[0].result.text, "status: failed");
+});
+
+test("render: task_notification card carries the task class + glyph, hidden by 'concise'", () => {
+  const entries = [{ id: "n1", role: "user", blocks: [{ t: "task_notification", summary: "done", status: "completed", result: "ok" }] }];
+  const shown = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
+  assert.match(shown, /class="action-card ok task"/);
+  assert.match(shown, /tool-glyph/);
+  assert.doesNotMatch(shown, /tr-msg user/); // never a user bubble
+  const concise = withVerbosity("concise", () => itemsToHtml(buildItems(entries)));
+  assert.match(concise, /actions-group/); // folded into the collapsed action-run row
+});
+
 // ---- verbosity-driven HTML rendering -------------------------------------
 const SAMPLE = [
   { id: "u1", role: "user", blocks: [{ t: "text", text: "go" }] },

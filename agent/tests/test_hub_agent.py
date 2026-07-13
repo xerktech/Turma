@@ -1026,6 +1026,83 @@ class TestEntryBlocks(unittest.TestCase):
         self.assertEqual(ha._entry_blocks({"type": "assistant", "message": {"content": ""}}, ha.BLOCK_CAPS_LIVE), [])
 
 
+TASK_NOTIFICATION = (
+    "<task-notification>\n"
+    "<task-id>af9e62627de15eaf4</task-id>\n"
+    "<tool-use-id>toolu_01CvWRpfgweEhin8tbti1Tdm</tool-use-id>\n"
+    "<output-file>/tmp/x/tasks/af9e62627de15eaf4.output</output-file>\n"
+    "<status>completed</status>\n"
+    '<summary>Agent "Confirm merge semantics" finished</summary>\n'
+    "<note>A task-notification fires each time this agent stops.</note>\n"
+    "<result>The --settings file is merged as a higher-precedence layer.</result>\n"
+    "</task-notification>"
+)
+
+
+class TestTaskNotification(unittest.TestCase):
+    """A background Task/agent finishing arrives as a user-role `<task-notification>`
+    turn; it must parse into a structured task_notification block (rendered as an
+    action card) rather than a raw-XML user bubble. Kept in lockstep with
+    tunnel-agent.js parseTaskNotification (mirror cases in tunnel-agent.test.js)."""
+
+    def test_parse_extracts_summary_status_result(self):
+        tn = ha._parse_task_notification(TASK_NOTIFICATION)
+        self.assertEqual(tn, {
+            "summary": 'Agent "Confirm merge semantics" finished',
+            "status": "completed",
+            "result": "The --settings file is merged as a higher-precedence layer.",
+        })
+
+    def test_non_notification_text_is_not_parsed(self):
+        self.assertIsNone(ha._parse_task_notification("just a normal prompt"))
+        self.assertIsNone(ha._parse_task_notification("talk about <task-notification> inline"))
+        self.assertIsNone(ha._parse_task_notification(""))
+
+    def test_blocks_emit_task_notification_from_string_content(self):
+        entry = {"type": "user", "message": {"content": TASK_NOTIFICATION}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [{
+            "t": "task_notification",
+            "summary": 'Agent "Confirm merge semantics" finished',
+            "status": "completed",
+            "result": "The --settings file is merged as a higher-precedence layer.",
+        }])
+
+    def test_blocks_emit_task_notification_from_list_text_block(self):
+        entry = {"type": "user", "message": {"content": [
+            {"type": "text", "text": TASK_NOTIFICATION}]}}
+        blocks = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)
+        self.assertEqual(blocks[0]["t"], "task_notification")
+        self.assertEqual(blocks[0]["summary"], 'Agent "Confirm merge semantics" finished')
+
+    def test_background_command_form_has_no_result(self):
+        text = (
+            "<task-notification>\n<status>completed</status>\n"
+            "<summary>Background command finished (exit code 0)</summary>\n"
+            "</task-notification>"
+        )
+        blocks = ha._entry_blocks({"type": "user", "message": {"content": text}}, ha.BLOCK_CAPS_LIVE)
+        self.assertEqual(blocks, [{
+            "t": "task_notification",
+            "summary": "Background command finished (exit code 0)",
+            "status": "completed",
+        }])
+
+    def test_long_result_is_capped_and_truncated(self):
+        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        text = f"<task-notification>\n<summary>done</summary>\n<result>{big}</result>\n</task-notification>"
+        block = ha._entry_blocks({"type": "user", "message": {"content": text}}, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(len(block["result"]), ha.BLOCK_CAPS_LIVE["result"])
+        self.assertTrue(block["truncated"])
+
+    def test_entry_text_flattens_to_summary_and_result(self):
+        entry = {"type": "user", "message": {"content": TASK_NOTIFICATION}}
+        self.assertEqual(
+            ha._entry_text(entry),
+            'Agent "Confirm merge semantics" finished\n\n'
+            "The --settings file is merged as a higher-precedence layer.",
+        )
+
+
 class TestHistoryEntriesRich(ProjectDirMixin, unittest.TestCase):
     def test_blocks_attached_and_tool_result_only_turn_surfaces(self):
         path = os.path.join(self.proj, "t.jsonl")
@@ -2741,6 +2818,14 @@ class TestFirstUserText(unittest.TestCase):
             self._user("here is the task"),
         ])
         self.assertEqual(ha._first_user_text(path), "here is the task")
+
+    def test_skips_system_sourced_turns(self):
+        # An injected turn (e.g. a task-notification) is promptSource:system, not
+        # a human prompt — it must not become the session's name.
+        notif = self._user("<task-notification>\n<summary>Agent finished</summary>\n</task-notification>")
+        notif["promptSource"] = "system"
+        path = self._write("t.jsonl", [notif, self._user("the real human prompt")])
+        self.assertEqual(ha._first_user_text(path), "the real human prompt")
 
     def test_none_when_no_user_prompt_yet(self):
         # Just-spawned session: header only, no human turn has landed.

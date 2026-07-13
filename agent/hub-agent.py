@@ -1182,6 +1182,48 @@ def _tail_entries(path):
     return entries
 
 
+# A background Task/agent finishing injects a `<task-notification>…` payload as a
+# user-role turn (origin.kind == "task-notification"), an XML-ish blob carrying a
+# <summary>, <status>, optional <note> boilerplate and the child's <result>.
+# Rendered verbatim it reads as the human typing raw XML into chat; instead we
+# parse it into a structured `task_notification` block (see _entry_blocks) that
+# the web chat shows as an action-style card, exactly like a tool call. Keep this
+# mirrored with tunnel-agent.js parseTaskNotification().
+TASK_NOTIFICATION_RE = re.compile(r"^\s*<task-notification>(.*)</task-notification>\s*$", re.DOTALL)
+
+
+def _tn_tag(name, body):
+    """Inner text of the first <name>…</name> in `body`, ANSI-stripped and
+    trimmed, or "" when absent."""
+    m = re.search(r"<%s>(.*?)</%s>" % (name, name), body, re.DOTALL)
+    return ANSI_RE.sub("", m.group(1)).strip() if m else ""
+
+
+def _parse_task_notification(text):
+    """Parse a `<task-notification>` payload into {summary, status, result}, or
+    None when `text` isn't one. Mirror of tunnel-agent.js parseTaskNotification."""
+    if not text:
+        return None
+    m = TASK_NOTIFICATION_RE.match(text)
+    if not m:
+        return None
+    body = m.group(1)
+    return {
+        "summary": _tn_tag("summary", body),
+        "status": _tn_tag("status", body),
+        "result": _tn_tag("result", body),
+    }
+
+
+def _tn_preview(tn):
+    """Flatten a parsed task-notification to display text (summary + result), the
+    text-feed form used by the glasses tail, heartbeat preview and archive."""
+    parts = [tn["summary"] or tn["status"] or "background task update"]
+    if tn["result"]:
+        parts.append(tn["result"])
+    return "\n\n".join(p for p in parts if p)
+
+
 def _entry_text(entry):
     """Map one transcript entry to display text for the glasses tail feed, or
     None to drop it (wrong type, no message, tool_result-only turn, or empty
@@ -1193,7 +1235,8 @@ def _entry_text(entry):
         return None
     content = msg.get("content")
     if isinstance(content, str):
-        text = content
+        tn = _parse_task_notification(content)
+        text = _tn_preview(tn) if tn else content
     elif isinstance(content, list):
         parts = []
         for block in content:
@@ -1201,7 +1244,9 @@ def _entry_text(entry):
                 continue
             btype = block.get("type")
             if btype == "text":
-                parts.append(str(block.get("text") or ""))
+                raw = str(block.get("text") or "")
+                tn = _parse_task_notification(raw)
+                parts.append(_tn_preview(tn) if tn else raw)
             elif btype == "tool_use" and block.get("name"):
                 parts.append(f"[{block['name']}]")
             # "thinking" and "tool_result" blocks are dropped.
@@ -1277,6 +1322,9 @@ def _entry_blocks(entry, caps):
       {t:"thinking",    text, truncated?}
       {t:"tool_use",    id, name, input, truncated?}
       {t:"tool_result", forId, text, isError?, truncated?}
+    A `<task-notification>` user turn becomes a single {t:"task_notification",
+    summary, status?, result?, truncated?} block (see _parse_task_notification)
+    so the web chat renders it as an action card, not raw XML.
     Returns [] for a user/assistant message with no renderable blocks. Keep this
     mirrored with tunnel-agent.js entryBlocks()."""
     if entry.get("type") not in ("user", "assistant"):
@@ -1297,15 +1345,35 @@ def _entry_blocks(entry, caps):
             block["truncated"] = True
         blocks.append(block)
 
+    def add_task_notification(tn):
+        summary, _ = _clip(tn["summary"], caps["input"])
+        result, rtrunc = _clip(tn["result"], caps["result"])
+        block = {"t": "task_notification", "summary": summary}
+        if tn["status"]:
+            block["status"] = tn["status"]
+        if result:
+            block["result"] = result
+        if rtrunc:
+            block["truncated"] = True
+        blocks.append(block)
+
     if isinstance(content, str):
-        add_text("text", content, caps["text"])
+        tn = _parse_task_notification(content)
+        if tn:
+            add_task_notification(tn)
+        else:
+            add_text("text", content, caps["text"])
     elif isinstance(content, list):
         for raw in content:
             if not isinstance(raw, dict):
                 continue
             btype = raw.get("type")
             if btype == "text":
-                add_text("text", str(raw.get("text") or ""), caps["text"])
+                tn = _parse_task_notification(str(raw.get("text") or ""))
+                if tn:
+                    add_task_notification(tn)
+                else:
+                    add_text("text", str(raw.get("text") or ""), caps["text"])
             elif btype == "thinking":
                 add_text("thinking", str(raw.get("thinking") or raw.get("text") or ""), caps["text"])
             elif btype == "tool_use" and raw.get("name"):
@@ -1406,6 +1474,8 @@ def _first_user_text(path, max_lines=500):
                     continue
                 if entry.get("type") != "user" or entry.get("isMeta"):
                     continue
+                if entry.get("promptSource") == "system":
+                    continue  # injected turn (e.g. a task-notification), not human
                 text = _entry_text(entry)
                 if not text:
                     continue  # tool_result-only turn, or empty after stripping
