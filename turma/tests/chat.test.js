@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, __setVerbosity } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, prFooterChip, __setVerbosity } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -259,4 +259,35 @@ test("render: a URL in an assistant bubble is rendered as a clickable link", () 
   const items = buildItems([{ id: "a1", role: "assistant", blocks: [{ t: "text", text: "PR up: https://github.com/o/r/pull/1" }] }]);
   const html = withVerbosity("normal", () => itemsToHtml(items));
   assert.match(html, /<a href="https:\/\/github\.com\/o\/r\/pull\/1" target="_blank" rel="noopener noreferrer">/);
+});
+
+test("prFooterChip: '' when the session has no PRs", () => {
+  assert.equal(prFooterChip(null), "");
+  assert.equal(prFooterChip({}), "");
+  assert.equal(prFooterChip({ prs: [] }), "");
+});
+
+test("prFooterChip: shows the latest PR with state class, number, and CI mark", () => {
+  const html = prFooterChip({ prs: [
+    { url: "https://github.com/o/r/pull/1", number: 1, state: "MERGED" },
+    { url: "https://github.com/o/r/pull/2", number: 2, state: "OPEN", checks: "passing", title: "Add flag" },
+  ] });
+  assert.match(html, /pr-badge pr-open/);          // latest (last) PR's state
+  assert.match(html, /#2 Open/);                    // number + capitalized state
+  assert.match(html, /pr-checks passing/);          // CI rollup mark
+  assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/2"/);
+  assert.match(html, /\+1</);                        // "+N" for the older PR
+  assert.match(html, /title="Add flag"/);
+});
+
+test("prFooterChip: derives #number from the URL when absent, no CI mark when unknown", () => {
+  const html = prFooterChip({ prs: [{ url: "https://github.com/o/r/pull/42" }] });
+  assert.match(html, /#42/);
+  assert.doesNotMatch(html, /pr-checks/);
+});
+
+test("prFooterChip: escapes a malicious PR title (no injection)", () => {
+  const html = prFooterChip({ prs: [{ url: "https://github.com/o/r/pull/1", number: 1, state: "OPEN", title: '<img src=x onerror=alert(1)>' }] });
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /&lt;img/);
 });

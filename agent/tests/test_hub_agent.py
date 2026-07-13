@@ -3332,5 +3332,198 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(calls), 1)  # one attempt, then it bails (no loop)
 
 
+class TestPrStatus(unittest.TestCase):
+    """The `gh pr view` status helpers: check-rollup classification, the compact
+    summary the cards render, and the URL fetch wrapper."""
+
+    def test_check_class_checkrun_states(self):
+        # Unfinished CheckRuns are pending regardless of conclusion.
+        self.assertEqual(ha._check_class({"status": "IN_PROGRESS"}), "pending")
+        self.assertEqual(ha._check_class({"status": "QUEUED"}), "pending")
+        # Completed runs classify on conclusion.
+        self.assertEqual(ha._check_class({"status": "COMPLETED", "conclusion": "SUCCESS"}), "pass")
+        self.assertEqual(ha._check_class({"status": "COMPLETED", "conclusion": "FAILURE"}), "fail")
+        self.assertEqual(ha._check_class({"status": "COMPLETED", "conclusion": "TIMED_OUT"}), "fail")
+        # Neutral / skipped are non-blocking passes.
+        self.assertEqual(ha._check_class({"status": "COMPLETED", "conclusion": "NEUTRAL"}), "pass")
+        self.assertEqual(ha._check_class({"status": "COMPLETED", "conclusion": "SKIPPED"}), "pass")
+
+    def test_check_class_statuscontext(self):
+        # Legacy StatusContext entries carry a single `state`.
+        self.assertEqual(ha._check_class({"state": "SUCCESS"}), "pass")
+        self.assertEqual(ha._check_class({"state": "FAILURE"}), "fail")
+        self.assertEqual(ha._check_class({"state": "ERROR"}), "fail")
+        self.assertEqual(ha._check_class({"state": "PENDING"}), "pending")
+
+    def test_check_class_garbage(self):
+        self.assertIsNone(ha._check_class("nope"))
+        self.assertIsNone(ha._check_class({"conclusion": "WEIRD_NEW_ENUM"}))
+
+    def test_summarize_open_passing(self):
+        out = ha._summarize_pr({
+            "number": 42, "title": "Add flag", "state": "OPEN", "isDraft": False,
+            "url": "https://github.com/o/r/pull/42",
+            "statusCheckRollup": [
+                {"status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"status": "COMPLETED", "conclusion": "SUCCESS"},
+            ],
+        })
+        self.assertEqual(out["state"], "OPEN")
+        self.assertEqual(out["number"], 42)
+        self.assertEqual(out["checks"], "passing")
+        self.assertEqual(out["checkCounts"], {"pass": 2, "fail": 0, "pending": 0})
+
+    def test_summarize_failing_wins_over_pending(self):
+        out = ha._summarize_pr({
+            "state": "OPEN",
+            "statusCheckRollup": [
+                {"status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"status": "IN_PROGRESS"},
+                {"status": "COMPLETED", "conclusion": "FAILURE"},
+            ],
+        })
+        self.assertEqual(out["checks"], "failing")
+
+    def test_summarize_pending(self):
+        out = ha._summarize_pr({
+            "state": "OPEN",
+            "statusCheckRollup": [
+                {"status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"status": "QUEUED"},
+            ],
+        })
+        self.assertEqual(out["checks"], "pending")
+
+    def test_summarize_draft_and_no_checks(self):
+        out = ha._summarize_pr({"state": "OPEN", "isDraft": True, "statusCheckRollup": []})
+        self.assertEqual(out["state"], "DRAFT")   # draft surfaced as its own state
+        self.assertIsNone(out["checks"])          # no checks -> no rollup
+        self.assertIsNone(out["checkCounts"])
+
+    def test_summarize_merged_stays_merged(self):
+        # isDraft only rewrites OPEN; a merged PR keeps its state.
+        out = ha._summarize_pr({"state": "MERGED", "isDraft": False, "statusCheckRollup": []})
+        self.assertEqual(out["state"], "MERGED")
+
+    def test_pr_status_parses_gh(self):
+        payload = json.dumps({"number": 7, "state": "OPEN", "url": "u",
+                              "statusCheckRollup": []})
+        with mock.patch.object(ha, "run", return_value=payload):
+            out = ha.pr_status("https://github.com/o/r/pull/7")
+        self.assertEqual(out["number"], 7)
+
+    def test_pr_status_none_on_failure(self):
+        with mock.patch.object(ha, "run", return_value=""):
+            self.assertIsNone(ha.pr_status("https://github.com/o/r/pull/7"))
+        with mock.patch.object(ha, "run", return_value="not json"):
+            self.assertIsNone(ha.pr_status("https://github.com/o/r/pull/7"))
+
+
+class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
+    """The manager's slow-cadence PR status refresh + per-session attachment."""
+
+    def _running_session(self, sid, urls):
+        sm = self.make_manager()
+        sm.registry = [{"id": sid, "status": "running"}]
+        sm.session_pr_urls[sid] = list(urls)
+        return sm
+
+    def test_skips_when_gh_unavailable(self):
+        sm = self._running_session("s1", ["https://github.com/o/r/pull/1"])
+        sm.github = {"available": False}
+        with mock.patch.object(ha, "pr_status") as pr:
+            sm.refresh_pr_status()
+        pr.assert_not_called()
+        self.assertEqual(sm.pr_status_cache, {})
+
+    def test_fetches_and_caches(self):
+        url = "https://github.com/o/r/pull/1"
+        sm = self._running_session("s1", [url])
+        sm.github = {"available": True}
+        with mock.patch.object(ha, "pr_status", return_value={"url": url, "state": "OPEN"}) as pr:
+            sm.refresh_pr_status()
+        pr.assert_called_once_with(url)
+        self.assertEqual(sm.pr_status_cache[url]["state"], "OPEN")
+
+    def test_prunes_unreferenced(self):
+        sm = self._running_session("s1", ["https://github.com/o/r/pull/1"])
+        sm.github = {"available": True}
+        sm.pr_status_cache = {"https://github.com/o/r/pull/99": {"state": "MERGED"}}
+        with mock.patch.object(ha, "pr_status", return_value=None):
+            sm.refresh_pr_status()
+        self.assertNotIn("https://github.com/o/r/pull/99", sm.pr_status_cache)
+
+    def test_ignores_stopped_sessions(self):
+        # A stopped session's PR is not RE-POLLED (no gh call)...
+        url = "https://github.com/o/r/pull/1"
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "stopped"}]
+        sm.session_pr_urls["s1"] = [url]
+        sm.github = {"available": True}
+        with mock.patch.object(ha, "pr_status") as pr:
+            sm.refresh_pr_status()
+        pr.assert_not_called()
+
+    def test_keeps_stopped_session_last_known_status(self):
+        # ...but its last-known status is retained (not pruned), so its card
+        # still shows the state it reached.
+        url = "https://github.com/o/r/pull/1"
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "stopped"}]
+        sm.session_pr_urls["s1"] = [url]
+        sm.pr_status_cache[url] = {"url": url, "state": "MERGED"}
+        sm.github = {"available": True}
+        with mock.patch.object(ha, "pr_status", return_value=None):
+            sm.refresh_pr_status()
+        self.assertEqual(sm.pr_status_cache[url]["state"], "MERGED")
+
+    def test_session_prs_shape(self):
+        url = "https://github.com/o/r/pull/1"
+        sm = self._running_session("s1", [url])
+        # No cache yet -> bare {url} placeholder, still attached (running or not).
+        self.assertEqual(sm._session_prs("s1"), [{"url": url}])
+        sm.pr_status_cache[url] = {"url": url, "state": "OPEN"}
+        self.assertEqual(sm._session_prs("s1"), [{"url": url, "state": "OPEN"}])
+        # A session that opened no PR reports None (so the payload key stays empty).
+        self.assertIsNone(sm._session_prs("nope"))
+
+    _SIGNAL_STUB = {
+        "tail": [], "bridgeAttached": False, "paneBusy": None,
+        "transcriptAgeSec": None, "lastRole": None, "lastHasToolUse": False,
+        "question": None, "questionOptions": [], "questionSource": None,
+    }
+
+    def test_prs_survive_pending_clear(self):
+        """The regression this whole store exists for: pending_prs is emptied on
+        every delivered beat (_clear_pending_prs), and session_report only emits
+        a PR url ONCE (offset advances past it). The PR must stay on the card
+        anyway — read from the persistent session_pr_urls, not the queue."""
+        url = "https://github.com/o/r/pull/5"
+        sm = self.make_manager()
+        sess = {"id": "s1", "status": "running", "repo": "r", "repoPath": "/p",
+                "worktreePath": "/w", "branch": None, "rcName": "n"}
+        sm.registry = [sess]
+        with mock.patch.object(sm, "_session_git", return_value=(None, {})):
+            # Beat 1: session_report scrapes the new PR url -> it's on the card.
+            with mock.patch.object(ha, "session_report",
+                                   return_value={"prUrls": [url], **self._SIGNAL_STUB}):
+                p1 = sm._session_payload(sess)
+            self.assertEqual([pr["url"] for pr in p1["prs"]], [url])
+            # A delivered heartbeat empties the per-beat delivery queue...
+            sm._clear_pending_prs()
+            self.assertEqual(sm.pending_prs["s1"], [])
+            # Beat 2: session_report emits NO new url (offset moved past it)...
+            with mock.patch.object(ha, "session_report",
+                                   return_value={"prUrls": [], **self._SIGNAL_STUB}):
+                p2 = sm._session_payload(sess)
+            # ...but the PR is STILL on the card (persistent store).
+            self.assertEqual([pr["url"] for pr in p2["prs"]], [url])
+        # And refresh_pr_status can still find it to poll after the clear.
+        sm.github = {"available": True}
+        with mock.patch.object(ha, "pr_status", return_value={"url": url, "state": "OPEN"}) as pr:
+            sm.refresh_pr_status()
+        pr.assert_called_once_with(url)
+
+
 if __name__ == "__main__":
     unittest.main()
