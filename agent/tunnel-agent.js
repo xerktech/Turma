@@ -377,10 +377,12 @@ function sendControl(obj) {
 //
 // Pure so it's unit-testable against captured pane fixtures. Returns the
 // current in-progress assistant `text` (empty when not generating / still
-// thinking) plus the parsed working-status line as `status` (verb + live token
-// up/down counters — see parsePaneStatus), so the hub can pin the working
-// indicator to the bottom of the chat instead of letting it bleed into the
-// streamed message. Anchored to the stable TUI markers: "esc to interrupt"
+// thinking) plus the parsed working footer as `status` (verb + live token
+// up/down counters from the spinner line — see parsePaneStatus — and, when
+// present, the contextual hint/task line beneath it as `status.hint`), so the
+// hub can pin the whole working indicator to the bottom of the chat instead of
+// letting any of it bleed into the streamed message. Anchored to the stable TUI
+// markers: "esc to interrupt"
 // (shown only while generating), a column-0 ● bullet (assistant text; the right-
 // aligned "● high · /effort" indicator has leading spaces and is excluded),
 // 2-space-indented continuation lines, and the input box's long ─ rule.
@@ -398,6 +400,24 @@ function isStatusLine(l) {
   if (/esc to interrupt/i.test(t)) return true;
   if (/[↑↓]\s*[\d.,]+\s*[kKmM]?\s*tokens/i.test(t)) return true;
   return /^[^\sA-Za-z0-9]\s+[A-Z][a-z]+(?:…|\.\.\.)(?:\s*\(|\s*$)/.test(t);
+}
+
+// Claude Code paints a second, indented contextual line just under the spinner
+// — a rotating tip ("⌊ Tip: Use /btw …") or an active-task hint — with a corner
+// glyph connector. It's part of the working footer, not the assistant's reply,
+// so we detect it (to keep it out of the streamed text) and surface it beside
+// the status for the pinned bar. Match the corner-glyph connector or an
+// explicit "Tip:"; keep it narrow so real prose isn't swallowed.
+function isHintLine(l) {
+  const t = String(l == null ? "" : l).trim();
+  if (!t) return false;
+  if (/^[⌊⌞└⎿⎣]\s/.test(t)) return true;
+  return /^tip:/i.test(t);
+}
+
+// Strip the leading corner glyph so the hint reads cleanly in the UI.
+function cleanHint(l) {
+  return String(l == null ? "" : l).trim().replace(/^[⌊⌞└⎿⎣]\s*/, "").trim();
 }
 
 // Parse a working-status line into { verb, up, down, elapsed } — display strings
@@ -439,29 +459,35 @@ function parsePaneLiveTurn(pane) {
     }
   }
   const convo = lines.slice(0, end);
-  // The working-status line sits just above the input box. Pull it out (for the
-  // pinned status bar) and treat it as the lower bound of the assistant text so
-  // its glyph/verb/tokens can't bleed into — or flicker within — the message.
-  let statusIdx = -1;
+  // The working footer (status line + its contextual hint/task line) sits just
+  // above the input box. Grab both — they're the last such lines — for the
+  // pinned bar; scanning independently means their order doesn't matter.
+  let statusLine = null, hintLine = null;
   for (let i = convo.length - 1; i >= 0; i--) {
-    if (isStatusLine(convo[i])) { statusIdx = i; break; }
+    if (statusLine == null && isStatusLine(convo[i])) statusLine = convo[i];
+    if (hintLine == null && isHintLine(convo[i])) hintLine = convo[i];
+    if (statusLine != null && hintLine != null) break;
   }
-  const status = statusIdx >= 0 ? parsePaneStatus(convo[statusIdx]) : null;
-  const body = statusIdx >= 0 ? convo.slice(0, statusIdx) : convo;
+  let status = null;
+  if (statusLine != null || hintLine != null) {
+    status = statusLine != null ? parsePaneStatus(statusLine) : { verb: "", up: "", down: "", elapsed: "" };
+    const h = hintLine != null ? cleanHint(hintLine) : "";
+    if (h) status.hint = h;
+  }
   // The in-progress assistant block starts at the last column-0 ● bullet.
   let start = -1;
-  for (let i = body.length - 1; i >= 0; i--) {
-    if (/^●\s/.test(body[i])) { start = i; break; }
-    if (/^❯/.test(body[i])) break; // hit the user prompt -> no text yet
+  for (let i = convo.length - 1; i >= 0; i--) {
+    if (/^●\s/.test(convo[i])) { start = i; break; }
+    if (/^❯/.test(convo[i])) break; // hit the user prompt -> no text yet
   }
   if (start < 0) return { generating: true, text: "", status }; // thinking; no text yet
   const block = [];
-  for (let i = start; i < body.length; i++) {
-    const l = body[i];
-    // Stop at the next turn marker (a new ● bullet or the ❯ prompt); the status
-    // line is already excluded above, so we needn't guess spinner glyphs here —
-    // which also stops markdown "* "/"· " lines being mistaken for a boundary.
-    if (i > start && /^[●❯]/.test(l)) break;
+  for (let i = start; i < convo.length; i++) {
+    const l = convo[i];
+    // Stop at the next turn marker (a new ● bullet or the ❯ prompt) OR any
+    // footer line — the status/spinner line and its hint/task line — so none of
+    // the working footer bleeds into the message regardless of its order.
+    if (i > start && (/^[●❯]/.test(l) || isStatusLine(l) || isHintLine(l))) break;
     block.push(i === start ? l.replace(/^●\s?/, "") : l.replace(/^ {1,3}/, ""));
   }
   // Reflow the TUI's hard-wrapped lines into flowing text; the glasses re-wrap,
@@ -729,5 +755,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parsePaneStatus, isStatusLine, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parsePaneStatus, isStatusLine, isHintLine, cleanHint, BLOCK_CAPS_LIVE };
 }

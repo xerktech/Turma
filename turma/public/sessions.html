@@ -217,9 +217,10 @@
      counters that Claude Code shows at the bottom of the terminal. A sibling of
      the scroll (not part of the message stream), so it stays put instead of
      flickering in and out of the streamed bubble. */
-  .chat-status { display: flex; align-items: center; gap: 10px; padding: 7px 14px;
+  .chat-status { display: flex; flex-direction: column; gap: 4px; padding: 7px 14px;
     border-top: 1px solid var(--border); background: var(--surface); color: var(--ink-2); font-size: 12.5px; }
   .chat-status[hidden] { display: none; }
+  .chat-status .cc-row { display: flex; align-items: center; gap: 10px; }
   .chat-status .cc-spin { width: 11px; height: 11px; flex: none; border: 2px solid var(--border);
     border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
   .chat-status .verb { font-weight: 600; color: var(--ink); }
@@ -227,6 +228,11 @@
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
   .chat-status .tok { color: var(--muted); white-space: nowrap; }
   .chat-status .tok.up { color: var(--accent); }
+  /* Claude Code's rotating tip / active-task footer — de-emphasized, aligned
+     under the verb (past the spinner), clipped to one line so it never crowds
+     the composer. */
+  .chat-status .cc-hint { padding-left: 21px; color: var(--muted); font-size: 11.5px;
+    line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* Tool-use / tool-result action card (collapsible). */
   .action-card { align-self: flex-start; max-width: 760px; width: 100%; font-size: 12.5px;
