@@ -2010,6 +2010,86 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.run_calls, [])
 
 
+class TestSetModelMode(ManagerMixin, unittest.TestCase):
+    """Live model / permission-mode switches on a running session: model via a
+    typed `/model <name>`, mode via computed Shift+Tab (BTab) presses over
+    PERM_CYCLE. Both re-validate their argument and persist the new value."""
+
+    def make_manager(self):
+        sm = super().make_manager()
+        self.run_calls.clear()
+        sm.save = mock.Mock()  # don't touch disk; just assert the record update
+        return sm
+
+    def _session(self, sm, sid="abcde", model=None, perm="auto", status="running"):
+        sess = {"id": sid, "status": status, "tmuxName": f"agent-{sid}",
+                "model": model, "permissionMode": perm}
+        sm.registry = [sess]
+        return sess
+
+    def test_set_model_types_slash_model_and_persists(self):
+        sm = self.make_manager()
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self.run_calls, [
+            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--", "/model sonnet"],
+            ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
+        ])
+        self.assertEqual(sess["model"], "sonnet")
+        sm.save.assert_called_once()
+
+    def test_set_model_default_resets_and_stores_none(self):
+        sm = self.make_manager()
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "default")
+        self.assertEqual(self.run_calls[0][-1], "/model default")
+        self.assertIsNone(sess["model"])
+
+    def test_set_model_rejects_unknown_before_any_keystroke(self):
+        sm = self.make_manager()
+        self._session(sm, model=None)
+        with self.assertRaises(ValueError):
+            sm.set_model("abcde", "gpt-9")
+        self.assertEqual(self.run_calls, [])
+
+    def test_set_model_noop_for_non_running(self):
+        sm = self.make_manager()
+        self._session(sm, status="stopped")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self.run_calls, [])
+
+    def test_set_mode_cycles_forward_the_minimal_presses(self):
+        # auto (idx 4) -> plan (idx 2) over the 5-mode cycle = (2-4) % 5 = 3.
+        sm = self.make_manager()
+        sess = self._session(sm, perm="auto")
+        sm.set_mode("abcde", "plan")
+        self.assertEqual(self.run_calls,
+                         [["tmux", "send-keys", "-t", "agent-abcde", "BTab"]] * 3)
+        self.assertEqual(sess["permissionMode"], "plan")
+        sm.save.assert_called_once()
+
+    def test_set_mode_default_to_auto_wraps_to_four(self):
+        # default (idx 0) -> auto (idx 4) = (4-0) % 5 = 4 presses.
+        sm = self.make_manager()
+        self._session(sm, perm="default")
+        sm.set_mode("abcde", "auto")
+        self.assertEqual(len(self.run_calls), 4)
+
+    def test_set_mode_noop_when_already_target(self):
+        sm = self.make_manager()
+        self._session(sm, perm="plan")
+        sm.set_mode("abcde", "plan")
+        self.assertEqual(self.run_calls, [])
+        sm.save.assert_not_called()
+
+    def test_set_mode_rejects_unknown(self):
+        sm = self.make_manager()
+        self._session(sm, perm="auto")
+        with self.assertRaises(ValueError):
+            sm.set_mode("abcde", "yolo")
+        self.assertEqual(self.run_calls, [])
+
+
 class TestAnswerQuestion(ManagerMixin, unittest.TestCase):
     """answer_question drops the ask.py bridge's answer file — only when a
     request file is actually pending for that session."""

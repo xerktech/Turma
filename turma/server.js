@@ -1348,6 +1348,28 @@ const server = http.createServer(async (req, res) => {
         const cmdId = queueCommand(key, { type: "input", sessionId, text });
         return json(res, 200, { ok: true, cmdId });
       }
+      // POST /api/agents/<host>/sessions/<id>/model -> switch a running
+      // session's model live (agent types `/model <name>`). Body: {model}, one
+      // of the composer's allowlisted aliases (default/opus/sonnet/haiku); the
+      // agent re-validates before it reaches the pane.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "model") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const model = typeof body.model === "string" ? body.model : "";
+        if (!model) return json(res, 400, { error: "model required" });
+        const cmdId = queueCommand(key, { type: "setModel", sessionId, model });
+        return json(res, 200, { ok: true, cmdId });
+      }
+      // POST /api/agents/<host>/sessions/<id>/mode -> switch a running session's
+      // permission mode live (agent injects Shift+Tab presses to cycle to it).
+      // Body: {permissionMode}, one of the composer's allowlisted modes; the
+      // agent re-validates and no-ops an off-cycle target.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "mode") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const permissionMode = typeof body.permissionMode === "string" ? body.permissionMode : "";
+        if (!permissionMode) return json(res, 400, { error: "permissionMode required" });
+        const cmdId = queueCommand(key, { type: "setMode", sessionId, permissionMode });
+        return json(res, 200, { ok: true, cmdId });
+      }
       // POST /api/agents/<host>/sessions/<id>/answer -> answer a pending
       // AskUserQuestion. Body: {optionIndex} (0-based option pick) and/or
       // {custom} (free-text / "Other" answer). The agent drops the answer file
