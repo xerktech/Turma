@@ -248,6 +248,14 @@
           <button class="kill-btn" id="termKill" onclick="killCurrentTerminal()">Kill</button>
         </div>
         <iframe id="termFrame" src="about:blank" title="Live Claude session"></iframe>
+        <!-- Local compose bar: typing here is native/zero-lag (no per-keystroke
+             round trip through the tunnels), and Enter sends the whole line via
+             the session's /input endpoint, same as the dashboard's terminal. -->
+        <div class="term-compose">
+          <textarea id="termInput" rows="1" placeholder="Type a message to the agent — Enter to send, Shift+Enter for newline"
+            oninput="autoGrowTermInput()" onkeydown="termInputKey(event)"></textarea>
+          <button class="primary" id="termSend" onclick="sendTermInput()">Send</button>
+        </div>
       </div>
     </main>
   </div>
@@ -524,6 +532,8 @@ function setFrame(id, s, a) {
   document.getElementById("termOpen").href = src;
   navFrame(src);
   disarmTermKill();
+  const inp = document.getElementById("termInput");
+  if (inp) { inp.value = ""; autoGrowTermInput(); }
 }
 function selectSession(id) {
   const now = cache.now || Date.now();
@@ -599,6 +609,46 @@ function killCurrentTerminal() {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && document.body.classList.contains("showing-term")) backToList();
 });
+
+// Local compose box under the live terminal (same as the dashboard). Typing into
+// the iframe round-trips every keystroke through two tunnels with remote echo,
+// so it feels laggy; this box is plain local text and sends the whole line at
+// once via the session's /input endpoint, which the agent types and submits.
+function autoGrowTermInput() {
+  const inp = document.getElementById("termInput");
+  if (!inp) return;
+  inp.style.height = "auto";
+  inp.style.height = Math.min(inp.scrollHeight, 160) + "px";
+}
+function termInputKey(e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendTermInput(); }
+}
+async function sendTermInput() {
+  const id = currentId;
+  const inp = document.getElementById("termInput");
+  const btn = document.getElementById("termSend");
+  if (!id || !inp) return;
+  const text = inp.value;
+  if (!text.trim()) return;
+  const key = hostKeyForSession(id);
+  if (!key) { if (btn) { btn.textContent = "host offline"; setTimeout(() => btn.textContent = "Send", 2000); } return; }
+  // Clear + refocus immediately so typing the next message never waits on the
+  // POST; restore the text if the send fails so nothing is silently lost.
+  inp.value = "";
+  autoGrowTermInput();
+  inp.focus();
+  try {
+    const r = await fetch(`/api/agents/${enc(key)}/sessions/${enc(id)}/input`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!r.ok) throw new Error(String(r.status));
+    fastPoll();
+  } catch {
+    if (!inp.value.trim()) { inp.value = text; autoGrowTermInput(); }
+    if (btn) { btn.textContent = "Send failed"; setTimeout(() => btn.textContent = "Send", 2000); }
+  }
+}
 
 // ---- durable, searchable ended-session history ------------------------------
 // Search + archive are entirely hub-local (the hub pulled each ended session's
