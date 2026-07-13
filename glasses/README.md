@@ -75,13 +75,11 @@ touchpad produced an event won't be meaningfully exercised there either.
 
 The hub (`turma/server.js`) needs the LiteLLM backend configured for
 dictation to work — otherwise the `/audio` WebSocket still accepts
-connections but every result reports `unavailable`. STT and the /chat page
-share ONE LiteLLM instance, so `LITELLM_URL` (its `/v1` base) + `LITELLM_API_KEY`
-configure both; the Whisper endpoint is derived as
-`${LITELLM_URL}/audio/transcriptions`:
+connections but every result reports `unavailable`. STT is served by a LiteLLM
+instance, so `LITELLM_URL` (its `/v1` base) + `LITELLM_API_KEY` configure it; the
+Whisper endpoint is derived as `${LITELLM_URL}/audio/transcriptions`:
 
-- `LITELLM_URL` — the LiteLLM `/v1` base; supplies both chat and STT. Unset
-  disables both.
+- `LITELLM_URL` — the LiteLLM `/v1` base; supplies STT. Unset disables it.
 - `LITELLM_API_KEY` — bearer token for the LiteLLM instance (optional).
 - `WHISPER_URL` — override the STT endpoint only if the transcription server
   lives elsewhere than the LiteLLM instance (optional; defaults to the derived

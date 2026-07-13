@@ -29,9 +29,6 @@ const { Duplex } = require("stream");
 // node:sqlite FTS index). See archive.js. Lazily opens its DB on first use, so
 // requiring it is cheap and side-effect-free.
 const archive = require("./archive.js");
-// Durable, searchable chat history for the /chat page (node:sqlite, its own DB).
-// Also lazy-opening, so requiring it is cheap. See chat.js.
-const chat = require("./chat.js");
 
 const PORT = parseInt(process.env.PORT || "8300", 10);
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
@@ -79,19 +76,13 @@ const NTFY_USER = process.env.NTFY_USER || "";
 const NTFY_PASS = process.env.NTFY_PASS || "";
 const COST_ALERT_USD = parseFloat(process.env.COST_ALERT_USD || "75");
 
-// ---- LiteLLM backend (OpenAI-compatible: chat + Whisper STT) ----------------
-// ONE LiteLLM instance serves both the /chat page and Whisper STT, so a single
-// var/value configures everything: LITELLM_URL is that instance's `/v1` base, so
-// chat hits `${LITELLM_URL}/chat/completions` + `${LITELLM_URL}/models` and
-// Whisper hits `${LITELLM_URL}/audio/transcriptions` — same host, same
-// credential (LITELLM_API_KEY). Unset LITELLM_URL disables both chat and STT:
-// the models endpoint reports {unavailable}, completions 503, and transcription
-// returns an `unavailable` transcript — one "graceful when unconfigured"
-// contract. History persists in chat.js's SQLite DB.
+// ---- LiteLLM backend (OpenAI-compatible: Whisper STT) -----------------------
+// Whisper STT is served by a LiteLLM instance's `/v1` base: LITELLM_URL points
+// at it and Whisper hits `${LITELLM_URL}/audio/transcriptions` with LITELLM_API_KEY.
+// Unset LITELLM_URL disables STT: transcription returns an `unavailable`
+// transcript — a "graceful when unconfigured" contract.
 const LITELLM_URL = (process.env.LITELLM_URL || "").replace(/\/$/, "");
 const LITELLM_API_KEY = process.env.LITELLM_API_KEY || process.env.WHISPER_API_KEY || "";
-const LITELLM_DEFAULT_MODEL = process.env.LITELLM_DEFAULT_MODEL || "";
-const LITELLM_TIMEOUT_MS = parseInt(process.env.LITELLM_TIMEOUT_MS || "120000", 10);
 
 // Whisper STT: the glasses client streams mic PCM to us over /audio and we
 // wrap+POST it to the same LiteLLM instance's OpenAI-compatible transcription
@@ -103,9 +94,6 @@ const WHISPER_MODEL = process.env.WHISPER_MODEL || "";
 const WHISPER_API_KEY = process.env.WHISPER_API_KEY || LITELLM_API_KEY;
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || "en";
 const WHISPER_TIMEOUT_MS = parseInt(process.env.WHISPER_TIMEOUT_MS || "30000", 10);
-// Cap how many prior messages we replay to the model (context-window guard); the
-// full history is always kept on disk regardless.
-const CHAT_MAX_MESSAGES = parseInt(process.env.CHAT_MAX_MESSAGES || "400", 10);
 
 // A session counts as "working" while its transcript was written to within
 // this window (agents report the age at beat time; add staleness since).
@@ -592,7 +580,6 @@ setInterval(() => {
 const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
 const HISTORY = fs.readFileSync(path.join(__dirname, "public", "history.html"));
 const SESSIONS = fs.readFileSync(path.join(__dirname, "public", "sessions.html"));
-const CHAT = fs.readFileSync(path.join(__dirname, "public", "chat.html"));
 const LOGIN = fs.readFileSync(path.join(__dirname, "public", "login.html"));
 
 // Branded static assets: the shared stylesheet, self-hosted UI fonts (Inter +
@@ -791,124 +778,6 @@ async function transcribePcm(pcm) {
   } finally {
     clearTimeout(timer);
   }
-}
-
-// ---- LiteLLM chat (models list + streaming completion) ----------------------
-
-// The models the LiteLLM proxy exposes (OpenAI `GET /v1/models`). Never throws:
-// every failure mode resolves to {models:[], unavailable, reason}, mirroring
-// transcribePcm's contract so the UI can degrade gracefully.
-async function litellmModels() {
-  if (!LITELLM_URL) return { models: [], unavailable: true, reason: "litellm not configured" };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-  try {
-    const headers = {};
-    if (LITELLM_API_KEY) headers.Authorization = `Bearer ${LITELLM_API_KEY}`;
-    const res = await fetch(`${LITELLM_URL}/models`, { headers, signal: controller.signal });
-    if (!res.ok) return { models: [], unavailable: true, reason: `litellm returned ${res.status}` };
-    const body = await res.json();
-    const models = (body.data || []).map((m) => m && m.id).filter(Boolean).sort();
-    return { models, default: LITELLM_DEFAULT_MODEL || models[0] || "" };
-  } catch (e) {
-    return { models: [], unavailable: true, reason: e.message };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// A short, plain-text title derived from the first user message (no extra model
-// call): first line, whitespace-collapsed, capped.
-function deriveTitle(text) {
-  const one = String(text || "").replace(/\s+/g, " ").trim();
-  return (one.slice(0, 60) || "New chat");
-}
-
-// Stream one chat turn. The server owns history: the client sends only the new
-// user text + chosen model. We persist the user turn immediately (durable even
-// if the stream dies), proxy LiteLLM's OpenAI SSE, re-emit a SIMPLIFIED SSE
-// framing (data: {type:"delta"|"error"|"done"}), and persist the accumulated
-// assistant reply on completion/abort. Browser Stop / navigation aborts the
-// upstream fetch via res 'close'.
-async function chatCompletion(req, res, id) {
-  const convo = chat.getConversation(id);
-  if (!convo) return json(res, 404, { error: "unknown conversation" });
-  const body = JSON.parse((await readBody(req)) || "{}");
-  const text = typeof body.text === "string" ? body.text.trim() : "";
-  if (!text) return json(res, 400, { error: "text required" });
-  if (text.length > 100000) return json(res, 400, { error: "text too long" });
-  if (!LITELLM_URL) return json(res, 503, { error: "litellm not configured" });
-  const model = body.model || convo.model || LITELLM_DEFAULT_MODEL || "";
-  if (!model) return json(res, 400, { error: "no model selected" });
-
-  // Persist the user turn now (title the conversation from the first message).
-  const firstTurn = convo.messages.length === 0;
-  chat.appendMessage(id, "user", text, {});
-  chat.touchConversation(id, { model, ...(firstTurn ? { title: deriveTitle(text) } : {}) });
-
-  const upstreamMsgs = [...convo.messages, { role: "user", content: text }]
-    .slice(-CHAT_MAX_MESSAGES)
-    .map((m) => ({ role: m.role, content: m.content }));
-
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-store",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no", // don't let nginx/Cloudflare buffer the stream
-  });
-  const send = (obj) => { try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch { /* client gone */ } };
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), LITELLM_TIMEOUT_MS);
-  const onClose = () => controller.abort(); // browser Stop / navigated away
-  res.on("close", onClose);
-
-  let acc = "";
-  let aborted = false;
-  try {
-    const headers = { "Content-Type": "application/json" };
-    if (LITELLM_API_KEY) headers.Authorization = `Bearer ${LITELLM_API_KEY}`;
-    const up = await fetch(`${LITELLM_URL}/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ model, messages: upstreamMsgs, stream: true }),
-      signal: controller.signal,
-    });
-    if (!up.ok || !up.body) {
-      send({ type: "error", message: `litellm returned ${up.status}` });
-    } else {
-      // Parse OpenAI SSE: `data: {json}` lines, `data: [DONE]` terminator.
-      // Line-buffered so an event split across TCP chunks is reassembled.
-      let buf = "";
-      const decoder = new TextDecoder();
-      for await (const chunk of up.body) {
-        buf += decoder.decode(chunk, { stream: true });
-        let nl;
-        while ((nl = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line.startsWith("data:")) continue;
-          const payload = line.slice(5).trim();
-          if (!payload || payload === "[DONE]") continue;
-          let obj;
-          try { obj = JSON.parse(payload); } catch { continue; }
-          const delta = obj.choices && obj.choices[0] && obj.choices[0].delta && obj.choices[0].delta.content;
-          if (delta) { acc += delta; send({ type: "delta", text: delta }); }
-        }
-      }
-    }
-  } catch (e) {
-    aborted = controller.signal.aborted;
-    if (!aborted) send({ type: "error", message: e.message });
-  } finally {
-    clearTimeout(timer);
-    res.off("close", onClose);
-  }
-
-  // Persist whatever assistant text we got (durable; survives restarts).
-  if (acc) chat.appendMessage(id, "assistant", acc, { model, truncated: aborted });
-  send({ type: "done", truncated: aborted });
-  try { res.end(); } catch { /* socket already torn down by the client abort */ }
 }
 
 // Wrap a handshaken data-WS socket as a raw-byte Duplex: writes become binary
@@ -1214,11 +1083,6 @@ const server = http.createServer(async (req, res) => {
       return res.end(SESSIONS);
     }
 
-    if (req.method === "GET" && (url.pathname === "/chat" || url.pathname === "/chat.html")) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      return res.end(CHAT);
-    }
-
     // Web font for the live terminal (referenced by the @font-face proxyTerm
     // injects into ttyd's page). Immutable + long-lived so the browser fetches
     // the ~1 MB file once and caches it.
@@ -1393,47 +1257,6 @@ const server = http.createServer(async (req, res) => {
       const t = archive.getTranscript(transcriptId);
       if (!t) return json(res, 404, { error: "unknown transcript" });
       return json(res, 200, t);
-    }
-
-    // ---- /chat: LiteLLM-backed chatbot with durable, searchable history -------
-    // All user-authed by the central gate above. Storage/search is chat.js
-    // (node:sqlite); model list + streaming completion proxy LiteLLM here.
-    if (parts[0] === "api" && parts[1] === "chat") {
-      // GET /api/chat/models — the LiteLLM proxy's models (or {unavailable}).
-      if (req.method === "GET" && parts[2] === "models" && parts.length === 3) {
-        return json(res, 200, await litellmModels());
-      }
-      // GET /api/chat/search?q= — full-text search across all conversations.
-      if (req.method === "GET" && parts[2] === "search" && parts.length === 3) {
-        const q = (url.searchParams.get("q") || "").trim();
-        if (q.length < 2) return json(res, 400, { error: "query too short" });
-        try { return json(res, 200, chat.searchConversations(q, { limit: url.searchParams.get("limit") || undefined })); }
-        catch (e) { return json(res, 500, { error: e.message }); }
-      }
-      if (parts[2] === "conversations") {
-        // GET list / POST create.
-        if (req.method === "GET" && parts.length === 3) return json(res, 200, chat.listConversations());
-        if (req.method === "POST" && parts.length === 3) {
-          const body = JSON.parse((await readBody(req)) || "{}");
-          return json(res, 200, chat.createConversation(body.title, body.model));
-        }
-        const id = decodeURIComponent(parts[3] || "");
-        if (id && !chat.isValidId(id)) return json(res, 400, { error: "bad conversation id" });
-        // GET one (full messages) / DELETE.
-        if (req.method === "GET" && parts.length === 4) {
-          const c = chat.getConversation(id);
-          return c ? json(res, 200, c) : json(res, 404, { error: "unknown conversation" });
-        }
-        if (req.method === "DELETE" && parts.length === 4) {
-          return chat.deleteConversation(id)
-            ? json(res, 200, { ok: true })
-            : json(res, 404, { error: "unknown conversation" });
-        }
-        // POST completion (streaming turn).
-        if (req.method === "POST" && parts.length === 5 && parts[4] === "completion") {
-          return void (await chatCompletion(req, res, id));
-        }
-      }
     }
 
     // POST /api/agents/<host>/clone — queue a GitHub clone into the host's
@@ -1892,8 +1715,6 @@ if (process.env.TURMA_TEST) {
     fmtDur,
     pcmToWav,
     transcribePcm,
-    litellmModels,
-    deriveTitle,
     issueWsToken,
     wsTokenValid,
   };
@@ -1909,9 +1730,6 @@ if (process.env.TURMA_TEST) {
     );
     console.log(
       WHISPER_URL ? `whisper STT -> ${WHISPER_URL}` : "whisper STT disabled (LITELLM_URL/WHISPER_URL not set)"
-    );
-    console.log(
-      LITELLM_URL ? `litellm chat -> ${LITELLM_URL}` : "litellm chat disabled (LITELLM_URL not set)"
     );
   });
 }
