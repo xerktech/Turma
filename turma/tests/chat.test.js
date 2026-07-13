@@ -136,7 +136,7 @@ test("render: task_notification card carries the task class + glyph, hidden by '
   assert.match(shown, /tool-glyph/);
   assert.doesNotMatch(shown, /tr-msg user/); // never a user bubble
   const concise = withVerbosity("concise", () => itemsToHtml(buildItems(entries)));
-  assert.match(concise, /actions-group/); // folded into the collapsed action-run row
+  assert.doesNotMatch(concise, /action-card/); // Concise hides tool actions (incl. task cards) entirely
 });
 
 // ---- verbosity-driven HTML rendering -------------------------------------
