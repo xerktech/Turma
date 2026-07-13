@@ -317,6 +317,13 @@ MODEL_ALIASES = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku"}
 # gated hands-off mode); "bypassPermissions" disables prompts entirely; "default"
 # means "omit --permission-mode" (claude's own manual-review default).
 PERMISSION_MODES = {"auto", "bypassPermissions", "acceptEdits", "plan", "default"}
+# The order Claude Code's Shift+Tab cycles permission modes through — each press
+# advances one step, wrapping at the end. `set_mode` computes how many Shift+Tab
+# presses to inject to move a live session from its current mode to a target one.
+# Best-effort: the modes actually present in a given session's cycle depend on how
+# it was launched (bypassPermissions only appears when launched with it; auto only
+# when the account allows it), so an off-cycle target may land elsewhere.
+PERM_CYCLE = ["default", "acceptEdits", "plan", "bypassPermissions", "auto"]
 # git-ref-safe token: our allowlist is a strict subset of what git accepts, so
 # anything matching is also validated below for the few remaining git rules.
 _REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
@@ -2741,6 +2748,51 @@ class SessionManager:
         run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
         run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
 
+    def set_model(self, sid, model):
+        """Switch a running session's model live by typing `/model <name>` into
+        its Claude TUI — the CLI applies it immediately (no picker). `default`
+        (or blank) resets to claude's own default model. Validation reuses
+        resolve_model, so only an allowlisted alias/`default` ever reaches the
+        pane, and the resolved value is stored back on the record so the
+        heartbeat/UI reflect the new model."""
+        sess = self._find(sid)
+        if not sess or sess.get("status") != "running":
+            return
+        resolved = resolve_model(model)  # None for default, else alias; raises on junk
+        arg = resolved or "default"
+        tmux_name = sess["tmuxName"]
+        run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", f"/model {arg}"])
+        run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+        sess["model"] = resolved
+        self.save()
+        log(f"set model of {sid} -> {arg}")
+
+    def set_mode(self, sid, mode):
+        """Switch a running session's permission mode live by injecting the right
+        number of Shift+Tab presses to cycle it from its current mode to the
+        target over PERM_CYCLE. Best-effort — Claude Code exposes no direct
+        set-mode command, and the cycle's actual contents depend on the launch
+        flags, so an off-cycle current/target is a no-op and a present-but-shifted
+        cycle may land nearby. The target (validated) is stored optimistically so
+        the UI reflects the intent."""
+        sess = self._find(sid)
+        if not sess or sess.get("status") != "running":
+            return
+        target = resolve_permission_mode(mode)  # validated enum; raises on junk
+        current = sess.get("permissionMode") or "auto"
+        if current == target:
+            return
+        if current not in PERM_CYCLE or target not in PERM_CYCLE:
+            log(f"set mode of {sid}: {current}->{target} not both on cycle; skipping")
+            return
+        presses = (PERM_CYCLE.index(target) - PERM_CYCLE.index(current)) % len(PERM_CYCLE)
+        tmux_name = sess["tmuxName"]
+        for _ in range(presses):
+            run(["tmux", "send-keys", "-t", tmux_name, "BTab"])
+        sess["permissionMode"] = target
+        self.save()
+        log(f"set mode of {sid} -> {target} ({presses} Shift+Tab)")
+
     def _question_paths(self, sid):
         """(req, ans) rendezvous file paths for a session's pending question."""
         return (
@@ -3546,6 +3598,10 @@ class SessionManager:
                     self.delete(cmd.get("sessionId"))
                 elif ctype == "input":
                     self.send_input(cmd.get("sessionId"), cmd.get("text") or "")
+                elif ctype == "setModel":
+                    self.set_model(cmd.get("sessionId"), cmd.get("model"))
+                elif ctype == "setMode":
+                    self.set_mode(cmd.get("sessionId"), cmd.get("permissionMode"))
                 elif ctype == "answerQuestion":
                     self.answer_question(
                         cmd.get("sessionId"),
