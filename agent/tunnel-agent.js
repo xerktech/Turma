@@ -369,14 +369,50 @@ function sendControl(obj) {
 // tail stays the authoritative record that supersedes it on completion.
 //
 // Pure so it's unit-testable against captured pane fixtures. Returns the
-// current in-progress assistant text (empty when not generating / still
-// thinking). Anchored to the stable TUI markers: "esc to interrupt" (shown
-// only while generating), a column-0 ● bullet (assistant text; the right-
+// current in-progress assistant `text` (empty when not generating / still
+// thinking) plus the parsed working-status line as `status` (verb + live token
+// up/down counters — see parsePaneStatus), so the hub can pin the working
+// indicator to the bottom of the chat instead of letting it bleed into the
+// streamed message. Anchored to the stable TUI markers: "esc to interrupt"
+// (shown only while generating), a column-0 ● bullet (assistant text; the right-
 // aligned "● high · /effort" indicator has leading spaces and is excluded),
 // 2-space-indented continuation lines, and the input box's long ─ rule.
+// The working-status line is the spinner-glyph + gerund line Claude Code paints
+// just above the input box (e.g. "Cogitating… (esc to interrupt · up 1.2k
+// tokens · down 340)"). The spinner cycles through MANY glyphs, so we match it
+// glyph-agnostically — a leading non-alphanumeric symbol, then a single
+// capitalized gerund ending in an ellipsis — plus any line carrying the "esc to
+// interrupt" hint or a token counter. Excluding it glyph-agnostically is what
+// stops the verb + token count from flickering into the assistant bubble as the
+// spinner animates through frames the old fixed glyph set didn't cover.
+function isStatusLine(l) {
+  const t = String(l == null ? "" : l).trim();
+  if (!t) return false;
+  if (/esc to interrupt/i.test(t)) return true;
+  if (/[↑↓]\s*[\d.,]+\s*[kKmM]?\s*tokens/i.test(t)) return true;
+  return /^[^\sA-Za-z0-9]\s+[A-Z][a-z]+(?:…|\.\.\.)(?:\s*\(|\s*$)/.test(t);
+}
+
+// Parse a working-status line into { verb, up, down, elapsed } — display strings
+// kept verbatim from the TUI (e.g. up: "1.2k", down: "340", elapsed: "12s").
+// Absent fields come back as "". Order/format vary across Claude Code versions,
+// so each field is matched independently rather than positionally.
+function parsePaneStatus(l) {
+  const t = String(l == null ? "" : l).trim();
+  const verb = t.match(/([A-Za-z][A-Za-z-]*)(?:…|\.\.\.)/);
+  const up = t.match(/↑\s*([\d.,]+\s*[kKmM]?)/);
+  const down = t.match(/↓\s*([\d.,]+\s*[kKmM]?)/);
+  const elapsed = t.match(/(?:^|[\s(·])(\d+)\s*s\b/);
+  const clean = (m) => (m ? m[1].replace(/\s+/g, "") : "");
+  let u = clean(up), d = clean(down);
+  // No arrows but a bare "1.2k tokens" -> treat as the primary (up) count.
+  if (!u && !d) { const tok = t.match(/([\d.,]+\s*[kKmM]?)\s*tokens/i); if (tok) u = clean(tok); }
+  return { verb: verb ? verb[1] : "", up: u, down: d, elapsed: elapsed ? elapsed[1] + "s" : "" };
+}
+
 function parsePaneLiveTurn(pane) {
   const raw = String(pane || "").replace(/\r/g, "");
-  if (!/esc to interrupt/i.test(raw)) return { generating: false, text: "" };
+  if (!/esc to interrupt/i.test(raw)) return { generating: false, text: "", status: null };
   const lines = raw.split("\n");
   const isRule = (l) => /^─{20,}$/.test(l.trim());
   // Drop the whole bottom input box (its top border ─, the ❯ prompt line(s),
@@ -396,24 +432,35 @@ function parsePaneLiveTurn(pane) {
     }
   }
   const convo = lines.slice(0, end);
+  // The working-status line sits just above the input box. Pull it out (for the
+  // pinned status bar) and treat it as the lower bound of the assistant text so
+  // its glyph/verb/tokens can't bleed into — or flicker within — the message.
+  let statusIdx = -1;
+  for (let i = convo.length - 1; i >= 0; i--) {
+    if (isStatusLine(convo[i])) { statusIdx = i; break; }
+  }
+  const status = statusIdx >= 0 ? parsePaneStatus(convo[statusIdx]) : null;
+  const body = statusIdx >= 0 ? convo.slice(0, statusIdx) : convo;
   // The in-progress assistant block starts at the last column-0 ● bullet.
   let start = -1;
-  for (let i = convo.length - 1; i >= 0; i--) {
-    if (/^●\s/.test(convo[i])) { start = i; break; }
-    if (/^❯/.test(convo[i])) break; // hit the user prompt -> no text yet
+  for (let i = body.length - 1; i >= 0; i--) {
+    if (/^●\s/.test(body[i])) { start = i; break; }
+    if (/^❯/.test(body[i])) break; // hit the user prompt -> no text yet
   }
-  if (start < 0) return { generating: true, text: "" }; // thinking; no text yet
+  if (start < 0) return { generating: true, text: "", status }; // thinking; no text yet
   const block = [];
-  for (let i = start; i < convo.length; i++) {
-    const l = convo[i];
-    // Stop at the next turn marker / spinner / status glyph.
-    if (i > start && /^[●❯✻✽·*]/.test(l)) break;
+  for (let i = start; i < body.length; i++) {
+    const l = body[i];
+    // Stop at the next turn marker (a new ● bullet or the ❯ prompt); the status
+    // line is already excluded above, so we needn't guess spinner glyphs here —
+    // which also stops markdown "* "/"· " lines being mistaken for a boundary.
+    if (i > start && /^[●❯]/.test(l)) break;
     block.push(i === start ? l.replace(/^●\s?/, "") : l.replace(/^ {1,3}/, ""));
   }
   // Reflow the TUI's hard-wrapped lines into flowing text; the glasses re-wrap,
   // and the transcript delivers the authoritative structure on completion.
   const text = block.join(" ").replace(/\s+/g, " ").trim();
-  return { generating: true, text };
+  return { generating: true, text, status };
 }
 
 // Capture the session's tmux pane (agent-<id>) and extract the in-progress
@@ -424,7 +471,7 @@ function captureLiveTurn(sessionId, cb) {
     "tmux",
     ["capture-pane", "-p", "-t", `agent-${sessionId}`],
     { timeout: 2000, maxBuffer: 1 << 20 },
-    (err, stdout) => cb(err ? { generating: false, text: "" } : parsePaneLiveTurn(stdout))
+    (err, stdout) => cb(err ? { generating: false, text: "", status: null } : parsePaneLiveTurn(stdout))
   );
 }
 
@@ -443,14 +490,19 @@ function pollWatcher(sessionId) {
     }
   }
   // 2. Live in-progress assistant turn scraped from the TUI (real-time). Sent
-  //    as its own `turn` delta; an empty text clears it (generation ended, so
-  //    the committed tail now owns that message).
+  //    as its own `turn` delta carrying the streamed text AND the parsed
+  //    working-status (verb + token counters) for the hub's pinned status bar;
+  //    an empty text + null status clears both (generation ended, so the
+  //    committed tail now owns that message). Dedup on text+status together so a
+  //    status-only change (the token counter ticking) still pushes an update.
   captureLiveTurn(sessionId, (live) => {
     if (!watchers.has(sessionId)) return; // stopped mid-capture
     const text = live.generating ? live.text : "";
-    if (text !== w.lastTurn) {
-      w.lastTurn = text;
-      sendControl({ turn: sessionId, text });
+    const status = live.generating ? (live.status || null) : null;
+    const key = text + " " + (status ? JSON.stringify(status) : "");
+    if (key !== w.lastTurn) {
+      w.lastTurn = key;
+      sendControl({ turn: sessionId, text, status });
     }
   });
 }
@@ -670,5 +722,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parsePaneStatus, isStatusLine, BLOCK_CAPS_LIVE };
 }

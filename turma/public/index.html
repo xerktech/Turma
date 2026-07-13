@@ -13,7 +13,7 @@
 <link rel="stylesheet" href="/app.css">
 <style>
   /* index-specific layout. Tokens, base, nav, buttons, badges, status lights,
-     spinner, term overlay + responsive shell all live in /app.css. */
+     spinner + responsive shell all live in /app.css. */
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 24px; }
   .tile {
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
@@ -207,8 +207,6 @@
     .host-meta { gap: 3px 14px; font-size: 12.5px; }
     details.repo { padding: 9px 10px; }
     .sess-grid { grid-template-columns: 1fr; }
-    .term-overlay { padding: 6px; }
-    .term-bar { flex-wrap: wrap; padding: 7px 10px; gap: 6px 10px; }
   }
   @media (pointer: coarse) {
     details.logs summary, details.repo > summary { padding: 2px 0; }
@@ -249,29 +247,6 @@
     History
   </a>
 </nav>
-
-<div class="term-overlay" id="termOverlay">
-  <div class="term-box">
-    <div class="term-bar">
-      <span class="t-title">Live session · <span class="path" id="termTitle"></span></span>
-      <span class="spacer"></span>
-      <a id="termOpen" target="_blank" rel="noopener">Open in new tab ↗</a>
-      <button class="kill-btn" id="termKill" onclick="killCurrentTerminal()">Kill</button>
-      <button class="primary" onclick="closeTerminal()">Close (Esc)</button>
-    </div>
-    <iframe id="termFrame" src="about:blank" title="Live Claude session"></iframe>
-    <!-- Local compose bar: typing here is native/zero-lag (no per-keystroke round
-         trip through the tunnels), and Enter sends the whole line via the
-         session's /input endpoint, delivered on a poke-expedited heartbeat.
-         Use this to type messages to the agent; the terminal above stays for
-         viewing and interactive moments (pickers, Ctrl-C). -->
-    <div class="term-compose">
-      <textarea id="termInput" rows="1" placeholder="Type a message to the agent — Enter to send, Shift+Enter for newline"
-        oninput="autoGrowTermInput()" onkeydown="termInputKey(event)"></textarea>
-      <button class="primary" id="termSend" onclick="sendTermInput()">Send</button>
-    </div>
-  </div>
-</div>
 
 <script>
 const $tiles = document.getElementById("tiles");
@@ -966,7 +941,7 @@ function sessCard(a, s, now) {
   } else if (st === "running") {
     actions =
       (canAttach
-        ? `<button class="primary btn-sm" onclick="openTerminal('${id}')">Attach ▸</button>`
+        ? `<button class="primary btn-sm" onclick="location.href='/sessions?session=${encodeURIComponent(s.id)}'">Attach ▸</button>`
         : `<button class="btn-sm" disabled title="Terminal tunnel offline">Attach</button>`) +
       `<button class="btn-sm ${confirming.has(rKey) ? "confirm" : ""}" onclick="sessRestart('${key}','${id}')">${confirming.has(rKey) ? "Confirm restart" : "Restart"}</button>` +
       // Stop the session and drop it from the hub — but KEEP its worktree on
@@ -1173,134 +1148,6 @@ function pruneRepo(key, repo) {
       () => post(`/api/agents/${enc(key)}/repos/${enc(repo)}/prune`));
   });
 }
-
-// ---- live terminal overlay (per session) -----------------------------------
-// Opens /term/<sessionId>/ in a full-screen iframe. No extra secret: the browser
-// re-sends the page's basic-auth login on the same-origin iframe requests and
-// terminal WebSocket. The hub routes <sessionId> to whichever host owns it.
-const $overlay = document.getElementById("termOverlay");
-const $frame = document.getElementById("termFrame");
-
-// On phones the soft keyboard shrinks the *visual* viewport but not the layout
-// viewport, so this `position:fixed; inset:0` overlay keeps its full height and
-// the compose bar ends up with a slab of black overlay between it and the
-// keyboard. Pin the overlay to the visual viewport while it's open so the Send
-// box rests right on top of the keyboard. No-op where visualViewport is absent.
-function syncTermViewport() {
-  const vv = window.visualViewport;
-  if (!vv || $overlay.style.display !== "flex") return;
-  $overlay.style.top = vv.offsetTop + "px";
-  $overlay.style.bottom = "auto";
-  $overlay.style.height = vv.height + "px";
-}
-function clearTermViewport() {
-  $overlay.style.top = "";
-  $overlay.style.bottom = "";
-  $overlay.style.height = "";
-}
-if (window.visualViewport) {
-  window.visualViewport.addEventListener("resize", syncTermViewport);
-  window.visualViewport.addEventListener("scroll", syncTermViewport);
-}
-
-function openTerminal(id) {
-  const src = `/term/${encodeURIComponent(id)}/`;
-  $overlay.dataset.id = id;
-  document.getElementById("termTitle").textContent = id;
-  document.getElementById("termOpen").href = src;
-  $frame.src = src;
-  $overlay.style.display = "flex";
-  syncTermViewport();
-  disarmTermKill();
-  const inp = document.getElementById("termInput");
-  if (inp) { inp.value = ""; autoGrowTermInput(); }
-}
-function closeTerminal() {
-  $overlay.style.display = "none";
-  clearTermViewport();
-  $frame.src = "about:blank"; // tear down the session's WebSocket
-  disarmTermKill();
-}
-
-// ---- local compose box (change B) ------------------------------------------
-// Typing into the live terminal iframe round-trips every keystroke through two
-// tunnels with remote echo, so it feels laggy/choppy. This box is plain local
-// text — instant, no typos-from-lag — and sends the whole line at once via the
-// session's /input endpoint (same path the glasses client uses), which the
-// agent types into the TUI and submits with Enter. Newlines collapse to spaces
-// agent-side, matching the glasses Send behavior.
-function autoGrowTermInput() {
-  const inp = document.getElementById("termInput");
-  if (!inp) return;
-  inp.style.height = "auto";
-  inp.style.height = Math.min(inp.scrollHeight, 160) + "px";
-}
-function termInputKey(e) {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendTermInput(); }
-}
-async function sendTermInput() {
-  const id = $overlay.dataset.id;
-  const inp = document.getElementById("termInput");
-  const btn = document.getElementById("termSend");
-  if (!id || !inp) return;
-  const text = inp.value;
-  if (!text.trim()) return;
-  const key = hostKeyForSession(id);
-  if (!key) { if (btn) { btn.textContent = "host offline"; setTimeout(() => btn.textContent = "Send", 2000); } return; }
-  // Clear + refocus immediately so typing the next message never waits on the
-  // POST; restore the text if the send fails so nothing is silently lost.
-  inp.value = "";
-  autoGrowTermInput();
-  inp.focus();
-  try {
-    const r = await fetch(`/api/agents/${enc(key)}/sessions/${enc(id)}/input`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
-    if (!r.ok) throw new Error(String(r.status));
-    fastPoll();
-  } catch {
-    if (!inp.value.trim()) { inp.value = text; autoGrowTermInput(); }
-    if (btn) { btn.textContent = "Send failed"; setTimeout(() => btn.textContent = "Send", 2000); }
-  }
-}
-
-// Kill the attached session straight from the terminal bar. Same endpoint as the
-// card's Kill; arm-then-confirm on the button itself (this static bar isn't
-// re-rendered by the poll, so it can't share the cards' twoClick state), then
-// close the overlay since its session is going away.
-let termKillArmed = false, termKillTimer = null;
-function disarmTermKill() {
-  termKillArmed = false;
-  if (termKillTimer) { clearTimeout(termKillTimer); termKillTimer = null; }
-  const btn = document.getElementById("termKill");
-  if (btn) { btn.textContent = "Kill"; btn.classList.remove("armed"); }
-}
-function hostKeyForSession(id) {
-  for (const a of (cache.agents || []))
-    if ((a.sessions || []).some(s => s.id === id)) return a.key;
-  return null;
-}
-function killCurrentTerminal() {
-  const id = $overlay.dataset.id;
-  const btn = document.getElementById("termKill");
-  if (!id) return;
-  const key = hostKeyForSession(id);
-  if (!key) { if (btn) btn.textContent = "host offline"; return; }
-  if (!termKillArmed) {
-    termKillArmed = true;
-    if (btn) { btn.textContent = "Confirm kill"; btn.classList.add("armed"); }
-    termKillTimer = setTimeout(disarmTermKill, 3500);
-    return;
-  }
-  disarmTermKill();
-  busy(pendKey("kill", key, id), { kind: "kill", host: key, id },
-    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`));
-  closeTerminal();
-}
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && $overlay.style.display === "flex") closeTerminal();
-});
 
 let cache = { now: Date.now(), agents: [] };
 async function refresh() {

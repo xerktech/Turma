@@ -213,6 +213,21 @@
   }
   @keyframes caret { 50% { opacity: 0; } }
 
+  /* Pinned working-status bar — the spinner + gerund verb + live token up/down
+     counters that Claude Code shows at the bottom of the terminal. A sibling of
+     the scroll (not part of the message stream), so it stays put instead of
+     flickering in and out of the streamed bubble. */
+  .chat-status { display: flex; align-items: center; gap: 10px; padding: 7px 14px;
+    border-top: 1px solid var(--border); background: var(--surface); color: var(--ink-2); font-size: 12.5px; }
+  .chat-status[hidden] { display: none; }
+  .chat-status .cc-spin { width: 11px; height: 11px; flex: none; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+  .chat-status .verb { font-weight: 600; color: var(--ink); }
+  .chat-status .toks { display: inline-flex; align-items: center; gap: 8px; margin-left: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+  .chat-status .tok { color: var(--muted); white-space: nowrap; }
+  .chat-status .tok.up { color: var(--accent); }
+
   /* Tool-use / tool-result action card (collapsible). */
   .action-card { align-self: flex-start; max-width: 760px; width: 100%; font-size: 12.5px;
     border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); overflow: hidden; }
@@ -284,9 +299,33 @@
   .chat-question .q-opt:hover { background: var(--accent); color: #fff; }
   .chat-question .q-hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
 
-  .chat-compose { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border); background: var(--surface); }
+  .chat-compose { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border); background: var(--surface); }
+  .chat-compose-row { display: flex; gap: 8px; }
   .chat-compose textarea { flex: 1; resize: none; font: inherit; font-size: 13.5px; line-height: 1.5;
     padding: 8px 11px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--page); color: var(--ink); }
+
+  /* Live agent-mode (left) / model (right) selectors under the text box. */
+  .chat-compose-opts { display: flex; justify-content: space-between; gap: 8px; }
+  .cc-opt { position: relative; }
+  .cc-btn { font: inherit; font-size: 11.5px; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--page); color: var(--ink-2); cursor: pointer;
+    display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+  .cc-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .cc-btn .cc-val { font-weight: 600; color: var(--ink); }
+  .cc-btn .cc-caret { font-size: 9px; opacity: .6; }
+  .cc-menu { position: absolute; bottom: calc(100% + 6px); min-width: 160px; z-index: 30;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    box-shadow: 0 8px 24px #0006; padding: 4px; display: none; }
+  .cc-menu.open { display: block; }
+  .cc-mode .cc-menu { left: 0; }
+  .cc-model .cc-menu { right: 0; }
+  .cc-menu button { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    width: 100%; font: inherit; font-size: 12.5px; text-align: left; padding: 6px 10px; border: 0;
+    border-radius: var(--radius-sm); background: transparent; color: var(--ink); cursor: pointer; }
+  .cc-menu button:hover { background: var(--accent-soft); }
+  .cc-menu button.on { color: var(--accent); font-weight: 600; }
+  .cc-menu button.on::after { content: "✓"; font-size: 11px; }
+  .cc-hint { display: block; font-size: 10px; color: var(--muted); padding: 4px 10px 2px; }
   .chat-empty { color: var(--muted); font-size: 13px; padding: 24px; text-align: center; }
   .term-bar .seg-toggle { font: inherit; font-size: 11px; padding: 3px 10px; border-radius: var(--radius-sm);
     border: 1px solid var(--border); background: var(--surface); color: var(--ink-2); cursor: pointer; }
@@ -307,6 +346,9 @@
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .term-bar .back-btn { display: inline-flex; }
+    /* Collapse the back button to just "‹" on mobile so the whole header row
+       (back, verbosity, Terminal, Kill) fits without wrapping to a second row. */
+    .term-bar .back-btn .back-label { display: none; }
     body.showing-term .sidebar { display: none; }
     body.showing-term .app-header { display: none; }
     body.showing-term .bottom-nav { display: none; }
@@ -362,7 +404,7 @@
       </div>
       <div class="transcript-pane" id="transcriptPane" hidden>
         <div class="term-bar">
-          <button class="back-btn" onclick="backToList()">‹ Sessions</button>
+          <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <span class="t-title"><span class="name" id="trTitle"></span> · <span class="path" id="trPath"></span></span>
           <span class="spacer"></span>
         </div>
@@ -370,7 +412,7 @@
       </div>
       <div class="chat-pane" id="chatPane" hidden>
         <div class="term-bar">
-          <button class="back-btn" onclick="backToList()">‹ Sessions</button>
+          <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <span class="t-title"><span class="name" id="chatTitle"></span> · <span class="path" id="chatPath"></span></span>
           <span class="spacer"></span>
           <span class="verbosity" id="chatVerbosity"></span>
@@ -378,16 +420,23 @@
           <button class="kill-btn" id="chatKill" onclick="killCurrentChat()">Kill</button>
         </div>
         <div class="chat-scroll" id="chatScroll"></div>
+        <div class="chat-status" id="chatStatus" hidden></div>
         <div class="chat-question" id="chatQuestion" hidden></div>
         <div class="chat-compose">
-          <textarea id="chatInput" rows="1" placeholder="Message the agent — Enter to send, Shift+Enter for newline"
-            oninput="autoGrowChatInput()" onkeydown="chatInputKey(event)"></textarea>
-          <button class="primary" id="chatSend" onclick="sendChatInput()">Send</button>
+          <div class="chat-compose-row">
+            <textarea id="chatInput" rows="1" placeholder="Message the agent — Enter to send, Shift+Enter for newline"
+              oninput="autoGrowChatInput()" onkeydown="chatInputKey(event)"></textarea>
+            <button class="primary" id="chatSend" onclick="sendChatInput()">Send</button>
+          </div>
+          <!-- Live per-session selectors: agent (permission) mode on the left,
+               model on the right. Buttons that open a dropdown; picking one
+               changes the RUNNING session (chat.js posts to .../mode | .../model). -->
+          <div class="chat-compose-opts" id="chatComposeOpts"></div>
         </div>
       </div>
       <div class="term-pane" id="termPane" hidden>
         <div class="term-bar">
-          <button class="back-btn" onclick="backToList()">‹ Sessions</button>
+          <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <button class="seg-toggle" id="termChatBtn" onclick="terminalToChat()" title="Back to the native chat view">◂ Chat</button>
           <span class="t-title"><span class="name" id="termTitle"></span> · <span class="path" id="termPath"></span></span>
           <span class="spacer"></span>
@@ -578,6 +627,8 @@ function render(data) {
       TurmaChat.onPoll(still.s);
     }
   }
+
+  tryPendingSelect(); // deep-linked ?session=<id> — open it once it's running
 }
 
 function activeCard({ a, s, live }) {
@@ -665,6 +716,19 @@ const $stageEmpty = document.getElementById("stageEmpty");
 let currentId = null;
 let viewMode = null; // "chat" | "terminal" | "transcript" | null — what the stage shows
 let viewPushed = false; // a history entry the back button will consume (mobile)
+// Deep link: the dashboard's "Attach" links here as /sessions?session=<id>. We
+// hold the requested id until that session shows up as running in a heartbeat,
+// then open it once (clearing the pending id so a later kill/reselect isn't
+// undone). Survives the async /api/agents load and any SSE-delivered arrival.
+let pendingSelect = new URLSearchParams(location.search).get("session");
+function tryPendingSelect() {
+  if (!pendingSelect) return;
+  if (sessionHit(pendingSelect)) {
+    const id = pendingSelect;
+    pendingSelect = null;
+    selectSession(id);
+  }
+}
 const isNarrow = () => window.matchMedia("(max-width: 820px)").matches;
 
 // Navigate the iframe with location.replace(), never src= — every src

@@ -1348,6 +1348,28 @@ const server = http.createServer(async (req, res) => {
         const cmdId = queueCommand(key, { type: "input", sessionId, text });
         return json(res, 200, { ok: true, cmdId });
       }
+      // POST /api/agents/<host>/sessions/<id>/model -> switch a running
+      // session's model live (agent types `/model <name>`). Body: {model}, one
+      // of the composer's allowlisted aliases (default/opus/sonnet/haiku); the
+      // agent re-validates before it reaches the pane.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "model") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const model = typeof body.model === "string" ? body.model : "";
+        if (!model) return json(res, 400, { error: "model required" });
+        const cmdId = queueCommand(key, { type: "setModel", sessionId, model });
+        return json(res, 200, { ok: true, cmdId });
+      }
+      // POST /api/agents/<host>/sessions/<id>/mode -> switch a running session's
+      // permission mode live (agent injects Shift+Tab presses to cycle to it).
+      // Body: {permissionMode}, one of the composer's allowlisted modes; the
+      // agent re-validates and no-ops an off-cycle target.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "mode") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const permissionMode = typeof body.permissionMode === "string" ? body.permissionMode : "";
+        if (!permissionMode) return json(res, 400, { error: "permissionMode required" });
+        const cmdId = queueCommand(key, { type: "setMode", sessionId, permissionMode });
+        return json(res, 200, { ok: true, cmdId });
+      }
       // POST /api/agents/<host>/sessions/<id>/answer -> answer a pending
       // AskUserQuestion. Body: {optionIndex} (0-based option pick) and/or
       // {custom} (free-text / "Other" answer). The agent drops the answer file
@@ -1465,9 +1487,11 @@ server.on("upgrade", async (req, socket, head) => {
     const ping = setInterval(() => send(0x9, Buffer.alloc(0)), 30000); // beat CF idle timeout
     // The agent pushes live deltas back on this same channel: committed
     // transcript entries as `{tail: sessionId, entries}`, and the in-progress
-    // assistant turn scraped from the TUI as `{turn: sessionId, text}` (real-
-    // time streaming — empty text clears it once the turn completes and the
-    // committed tail owns it). Everything else it sends we ignore.
+    // assistant turn scraped from the TUI as `{turn: sessionId, text, status}`
+    // (real-time streaming — `status` is the parsed working indicator, verb +
+    // token counters, for the chat's pinned status bar; empty text + null
+    // status clears it once the turn completes and the committed tail owns it).
+    // Everything else it sends we ignore.
     const parse = wsParser((op, payload) => {
       if (op === 0x8) return socket.end();
       if (op !== 0x1) return;
@@ -1476,7 +1500,7 @@ server.on("upgrade", async (req, socket, head) => {
       if (msg && msg.tail && Array.isArray(msg.entries)) {
         liveFanout(name, msg.tail, { type: "tail", entries: msg.entries });
       } else if (msg && msg.turn && typeof msg.text === "string") {
-        liveFanout(name, msg.turn, { type: "turn", text: msg.text });
+        liveFanout(name, msg.turn, { type: "turn", text: msg.text, status: msg.status || null });
       }
     });
     socket.on("data", parse);

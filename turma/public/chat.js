@@ -27,6 +27,23 @@
     verbose: { thinking: true,  tools: true,  outputs: true },
   };
 
+  // Live per-session selectors under the compose box. Values mirror the spawn
+  // composer's allowlists (the agent re-validates); picking one changes the
+  // RUNNING session — model via `/model <name>`, mode via Shift+Tab cycling.
+  const MODEL_OPTS = [
+    { value: "default", label: "Default" },
+    { value: "opus", label: "Opus" },
+    { value: "sonnet", label: "Sonnet" },
+    { value: "haiku", label: "Haiku" },
+  ];
+  const MODE_OPTS = [
+    { value: "auto", label: "auto" },
+    { value: "acceptEdits", label: "acceptEdits" },
+    { value: "plan", label: "plan" },
+    { value: "bypassPermissions", label: "bypassPermissions" },
+    { value: "default", label: "default" },
+  ];
+
   // Self-contained HTML-escape / URL-encode (identical to the page's inline
   // helpers) so chat.js has no cross-script dependency and its rendering is
   // unit-testable in Node.
@@ -77,6 +94,7 @@
   let hostKey = null, sessionId = null, sess = null, agent = null;
   let buffer = [];                  // merged rich entries {id, role, text, blocks}
   let liveTurn = "";                // in-progress assistant text (pane scrape), "" when idle
+  let liveStatus = null;            // {verb,up,down,elapsed} working indicator, null when idle
   let ws = null, backoffIdx = 0, wsRetryTimer = null;
   let pollTimer = null;
   let cachedToken = null, tokenExp = 0;
@@ -134,6 +152,10 @@
         repaint();
       } else if (frame && frame.type === "turn" && typeof frame.text === "string") {
         liveTurn = frame.text;
+        // The working indicator (spinner verb + live token up/down counters) is
+        // pinned below the scroll, not woven into the streamed text — so it stops
+        // flickering in and out of the message as the TUI spinner animates.
+        liveStatus = frame.status || null;
         repaint();
       }
     };
@@ -387,11 +409,32 @@
     // entries only append below, so the prior offset still points at the same
     // content).
     scroll.scrollTop = pin ? scroll.scrollHeight : prevTop;
+    updateLiveStatus();
     if (liveTurn) startReveal();
   }
 
+  // The pinned working-status bar (a sibling of the scroll, so a scroll repaint
+  // never touches it): spinner + gerund verb + live ↑/↓ token counters, mirroring
+  // the Claude Code terminal's bottom status line. Shown only while generating.
+  function updateLiveStatus() {
+    const bar = $("chatStatus");
+    if (!bar) return;
+    const st = liveStatus;
+    if (!st) { bar.hidden = true; bar.innerHTML = ""; return; }
+    const verb = esc(st.verb || "Working");
+    const toks =
+      (st.up ? '<span class="tok up">↑ ' + esc(st.up) + "</span>" : "") +
+      (st.down ? '<span class="tok down">↓ ' + esc(st.down) + "</span>" : "");
+    const elapsed = st.elapsed ? '<span class="tok elapsed">' + esc(st.elapsed) + "</span>" : "";
+    bar.hidden = false;
+    bar.innerHTML =
+      '<span class="cc-spin"></span>' +
+      '<span class="verb">' + verb + "…</span>" +
+      '<span class="toks">' + elapsed + toks + "</span>";
+  }
+
   // Repaint from outside (e.g. returning from the terminal toggle).
-  function repaintPublic() { renderVerbosityControl(); repaint(); }
+  function repaintPublic() { renderVerbosityControl(); renderComposeOpts(); repaint(); }
 
   // ---- typewriter reveal loop (live turn only) ------------------------------
   function startReveal() {
@@ -482,8 +525,85 @@
       }));
     }
   }
+  // ---- live agent-mode / model selectors (under the compose box) ------------
+  function currentModelValue() {
+    const m = (sess && sess.model) ? String(sess.model).toLowerCase() : "default";
+    return MODEL_OPTS.some((o) => o.value === m) ? m : "default";
+  }
+  function currentModeValue() {
+    const m = (sess && sess.permissionMode) ? sess.permissionMode : "auto";
+    return MODE_OPTS.some((o) => o.value === m) ? m : "auto";
+  }
+  function optLabel(opts, val) { const o = opts.find((x) => x.value === val); return o ? o.label : val; }
+  function menuHtml(opts, current, attr) {
+    return opts.map((o) =>
+      '<button ' + attr + '="' + esc(o.value) + '" class="' + (o.value === current ? "on" : "") + '">' +
+      '<span>' + esc(o.label) + "</span></button>").join("");
+  }
+  function closeComposeMenus() {
+    document.querySelectorAll("#chatComposeOpts .cc-menu.open").forEach((m) => m.classList.remove("open"));
+  }
+  function wireComposeMenu(btnId, menuId, attr, apply) {
+    const btn = $(btnId), menu = $(menuId);
+    if (!btn || !menu) return;
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const wasOpen = menu.classList.contains("open");
+      closeComposeMenus();
+      if (!wasOpen) menu.classList.add("open");
+    });
+    menu.querySelectorAll("button[" + attr + "]").forEach((b) => b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeComposeMenus();
+      apply(b.getAttribute(attr));
+    }));
+  }
+  // fromPoll: a background heartbeat repaint — don't yank an open menu shut.
+  function renderComposeOpts(fromPoll) {
+    const host = $("chatComposeOpts");
+    if (!host) return;
+    if (fromPoll && host.querySelector(".cc-menu.open")) return;
+    const mode = currentModeValue(), model = currentModelValue();
+    host.innerHTML =
+      '<span class="cc-opt cc-mode">' +
+        '<button class="cc-btn" id="ccModeBtn" title="Agent (permission) mode — switched live, best-effort">' +
+        '🛡 <span class="cc-val">' + esc(optLabel(MODE_OPTS, mode)) + '</span><span class="cc-caret">▾</span></button>' +
+        '<span class="cc-menu" id="ccModeMenu"><span class="cc-hint">Agent mode</span>' +
+        menuHtml(MODE_OPTS, mode, "data-mode") + "</span></span>" +
+      '<span class="cc-opt cc-model">' +
+        '<button class="cc-btn" id="ccModelBtn" title="Model for this session">' +
+        '<span class="cc-val">' + esc(optLabel(MODEL_OPTS, model)) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
+        '<span class="cc-menu" id="ccModelMenu"><span class="cc-hint">Model</span>' +
+        menuHtml(MODEL_OPTS, model, "data-model") + "</span></span>";
+    wireComposeMenu("ccModeBtn", "ccModeMenu", "data-mode", setSessionMode);
+    wireComposeMenu("ccModelBtn", "ccModelMenu", "data-model", setSessionModel);
+  }
+  async function setSessionModel(value) {
+    if (!hostKey || !sessionId || !sess || value === currentModelValue()) return;
+    sess.model = value === "default" ? null : value; // optimistic; heartbeat confirms
+    renderComposeOpts();
+    try {
+      await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/model", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: value }) });
+      if (typeof fastPoll === "function") fastPoll();
+    } catch {}
+  }
+  async function setSessionMode(value) {
+    if (!hostKey || !sessionId || !sess || value === currentModeValue()) return;
+    sess.permissionMode = value; // optimistic; heartbeat confirms
+    renderComposeOpts();
+    try {
+      await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/mode", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ permissionMode: value }) });
+      if (typeof fastPoll === "function") fastPoll();
+    } catch {}
+  }
+
   if (typeof document !== "undefined") {
-    document.addEventListener("click", () => { const p = $("chatGearPop"); if (p) p.classList.remove("open"); });
+    document.addEventListener("click", () => {
+      const p = $("chatGearPop"); if (p) p.classList.remove("open");
+      closeComposeMenus();
+    });
   }
 
   // ---- pending AskUserQuestion ---------------------------------------------
@@ -589,11 +709,12 @@
     gen++;
     const myGen = gen;
     hostKey = hk; sessionId = id; sess = s; agent = a;
-    buffer = []; liveTurn = ""; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
+    buffer = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
     detailsOpen.clear();
     loadVerbosity(id);
     setHeader(s, a);
     renderVerbosityControl();
+    renderComposeOpts();
     wireScrollDelegation();
     updateQuestion(s);
     // Instant paint from the heartbeat's cached (text-only) tail, then upgrade.
@@ -612,7 +733,8 @@
     if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
-    buffer = []; liveTurn = ""; questionActive = false;
+    buffer = []; liveTurn = ""; liveStatus = null; questionActive = false;
+    updateLiveStatus(); // hide the pinned bar when the view closes
   }
 
   // Called from the page's render() on each heartbeat/SSE while chat is open.
@@ -621,6 +743,7 @@
     sess = s;
     setHeader(s, agent);
     updateQuestion(s);
+    renderComposeOpts(true);
   }
 
   if (typeof window !== "undefined") {

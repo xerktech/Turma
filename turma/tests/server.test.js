@@ -959,6 +959,59 @@ test("http: input endpoint 404s unknown host and requires user auth", async () =
   assert.equal(noAuth.status, 401);
 });
 
+// ---- session live model / mode endpoints ----------------------------------------
+
+test("http: model endpoint queues a setModel command that rides the next heartbeat", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hm1" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/hm1/sessions/sess1/model", {
+    body: { model: "sonnet" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "hm1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "setModel", sessionId: "sess1", model: "sonnet", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: mode endpoint queues a setMode command that rides the next heartbeat", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hm2" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/hm2/sessions/sess1/mode", {
+    body: { permissionMode: "plan" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "hm2" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "setMode", sessionId: "sess1", permissionMode: "plan", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: model/mode endpoints reject missing value, 404 unknown host, require auth", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hm3" }, headers: agentHeaders });
+
+  const noModel = await request("POST", "/api/agents/hm3/sessions/sess1/model", {
+    body: {}, headers: userHeaders,
+  });
+  assert.equal(noModel.status, 400);
+  assert.deepEqual(noModel.body, { error: "model required" });
+
+  const noMode = await request("POST", "/api/agents/hm3/sessions/sess1/mode", {
+    body: {}, headers: userHeaders,
+  });
+  assert.equal(noMode.status, 400);
+  assert.deepEqual(noMode.body, { error: "permissionMode required" });
+
+  const ghost = await request("POST", "/api/agents/ghost/sessions/sess1/model", {
+    body: { model: "opus" }, headers: userHeaders,
+  });
+  assert.equal(ghost.status, 404);
+
+  const noAuth = await request("POST", "/api/agents/hm3/sessions/sess1/mode", {
+    body: { permissionMode: "plan" },
+  });
+  assert.equal(noAuth.status, 401);
+});
+
 // ---- session answer endpoint -----------------------------------------------------
 
 test("http: answer endpoint queues an answerQuestion command with the option pick", async () => {
