@@ -257,16 +257,6 @@
   .action-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0; padding: 2px 0; text-align: left; }
   .action-card .trunc:hover { text-decoration: underline; }
 
-  /* Concise "N actions" collapsed run. */
-  .actions-group { align-self: flex-start; max-width: 760px; border: 1px dashed var(--border);
-    border-radius: var(--radius-md); background: transparent; }
-  .actions-group > summary { list-style: none; cursor: pointer; user-select: none; padding: 6px 11px;
-    color: var(--muted); font-size: 12px; }
-  .actions-group > summary::-webkit-details-marker { display: none; }
-  .actions-group > summary:hover { color: var(--accent); }
-  .actions-group[open] > summary { color: var(--ink-2); }
-  .actions-group .grp-cards { padding: 4px 8px 8px; display: flex; flex-direction: column; gap: 8px; }
-
   /* Collapsed thinking trace. */
   .thought { align-self: flex-start; max-width: 760px; color: var(--muted); font-size: 12.5px; }
   .thought > summary { list-style: none; cursor: pointer; user-select: none; color: var(--muted); }
@@ -281,14 +271,6 @@
   .verbosity .seg button { font: inherit; font-size: 11px; padding: 3px 10px; background: var(--surface); border: 0;
     color: var(--muted); cursor: pointer; }
   .verbosity .seg button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-  .verbosity .gear { position: relative; }
-  .verbosity .gear-btn { font: inherit; font-size: 13px; background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius-sm); width: 26px; height: 24px; cursor: pointer; color: var(--ink-2); }
-  .verbosity .gear-pop { position: absolute; right: 0; top: 28px; z-index: 20; background: var(--surface);
-    border: 1px solid var(--border); border-radius: var(--radius-md); padding: 8px 10px; box-shadow: 0 8px 24px #0006;
-    display: none; white-space: nowrap; }
-  .verbosity .gear-pop.open { display: block; }
-  .verbosity .gear-pop label { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 0; color: var(--ink); cursor: pointer; }
 
   /* Pending-question chips. */
   .chat-question { border-top: 1px solid var(--border); padding: 10px 12px; background: var(--accent-soft); }

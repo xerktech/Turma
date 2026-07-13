@@ -156,7 +156,7 @@ test("render: user bubble is right-aligned (.tr-msg.user), assistant left (.tr-m
   assert.match(html, /class="tr-msg assistant"/);
 });
 
-test("render: Verbose shows thinking + tool card open; Concise hides thinking and collapses to a count", () => {
+test("render: Verbose shows thinking + tool card open; Concise hides thinking and omits tool actions entirely", () => {
   const items = buildItems(SAMPLE);
   const verbose = withVerbosity("verbose", () => itemsToHtml(items));
   assert.match(verbose, /class="thought"/);            // thinking shown
@@ -164,9 +164,11 @@ test("render: Verbose shows thinking + tool card open; Concise hides thinking an
   assert.match(verbose, /out\.txt/);                   // tool output present
 
   const concise = withVerbosity("concise", () => itemsToHtml(items));
-  assert.doesNotMatch(concise, /class="thought"/);   // thinking hidden
-  assert.match(concise, /class="actions-group"/);    // collapsed run
-  assert.match(concise, /1 action/);                 // count row
+  assert.doesNotMatch(concise, /class="thought"/);      // thinking hidden
+  assert.doesNotMatch(concise, /class="action-card"/);  // no tool cards
+  assert.doesNotMatch(concise, /class="actions-group"/); // no collapsed box either
+  assert.doesNotMatch(concise, /out\.txt/);             // tool output absent
+  assert.match(concise, /class="tr-msg assistant"/);    // message text still shown
 });
 
 test("render: Normal shows tool cards but collapsed (no open attr), no thinking", () => {
