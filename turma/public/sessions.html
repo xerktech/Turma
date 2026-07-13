@@ -195,7 +195,12 @@
   .chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--page); }
   .chat-pane[hidden] { display: none; }
   .chat-scroll { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
-  /* Text bubbles reuse the transcript bubble system: user right, agent left. */
+  /* Text bubbles reuse the transcript bubble system: user right, agent left.
+     In the live chat, agent output is borderless/background-free and tighter
+     so it reads as flat prose; user input keeps its bubble. */
+  .chat-scroll .tr-msg.assistant { border: none; background: none; padding: 2px 0; }
+  .chat-scroll .tr-msg.assistant.hit { box-shadow: none; }
+  .chat-scroll .tr-msg .role { display: none; }
   .chat-scroll .tr-msg.assistant.streaming::after {
     content: "▍"; margin-left: 1px; color: var(--accent); animation: caret 1s steps(1) infinite;
   }
