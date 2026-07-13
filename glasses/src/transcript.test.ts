@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { emptyBuffer, mergeTail, prependHistory } from "./transcript.ts";
+import { conciseText, emptyBuffer, mergeTail, prependHistory } from "./transcript.ts";
 import type { TailEntry } from "./types.ts";
 
 function entry(id: string, text: string, role = "assistant"): TailEntry {
@@ -89,5 +89,43 @@ describe("prependHistory", () => {
 
   it("starts with hasMore undefined until history has been fetched at least once", () => {
     expect(emptyBuffer().hasMore).toBeUndefined();
+  });
+});
+
+describe("concise ingest (matches the web chat's Concise verbosity)", () => {
+  it("strips inline [ToolName] markers from an assistant turn's text", () => {
+    expect(conciseText("done[Bash]")).toBe("done");
+    expect(conciseText("reading[Read]then[Edit]done")).toBe("readingthendone");
+    expect(conciseText("[mcp__unifi__list]checking")).toBe("checking");
+  });
+
+  it("reduces a pure tool-call turn to empty text", () => {
+    expect(conciseText("[Read][Edit]")).toBe("");
+  });
+
+  it("leaves ordinary text (including non-tool brackets) untouched", () => {
+    expect(conciseText("the value at index [0] is 3")).toBe("the value at index [0] is 3");
+    expect(conciseText("plain reply")).toBe("plain reply");
+  });
+
+  it("strips tool markers from assistant entries on the way into the buffer", () => {
+    const buf = mergeTail(emptyBuffer(), [entry("1", "compiling[Bash]done")]);
+    expect(buf.entries[0]?.text).toBe("compilingdone");
+  });
+
+  it("never rewrites user text (tool markers can't appear there, brackets are the user's)", () => {
+    const buf = mergeTail(emptyBuffer(), [entry("1", "check [Read] the docs", "user")]);
+    expect(buf.entries[0]?.text).toBe("check [Read] the docs");
+  });
+
+  it("strips markers on history entries too", () => {
+    const buf = prependHistory(emptyBuffer(), [entry("1", "ran[Grep]nothing")], false);
+    expect(buf.entries[0]?.text).toBe("rannothing");
+  });
+
+  it("keeps the shorter-preview clobber guard working on stripped lengths", () => {
+    let buf = mergeTail(emptyBuffer(), [entry("1", "a full assistant response[Bash]")]);
+    buf = mergeTail(buf, [entry("1", "a full assistant[Read]")]); // shorter preview
+    expect(buf.entries.find((e) => e.id === "1")?.text).toBe("a full assistant response");
   });
 });

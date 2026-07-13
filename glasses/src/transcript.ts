@@ -16,6 +16,31 @@ export function emptyBuffer(): TranscriptBuffer {
   return { entries: [] };
 }
 
+// The agent's cheap tail flattener (`hub-agent.py:_entry_text`) appends a
+// bracketed `[ToolName]` marker for every tool_use block in an assistant turn
+// — e.g. "done[Bash]", or a pure tool-call turn "[Read][Edit]". The
+// Sessions-page web chat now renders its "Concise" verbosity by omitting tool
+// actions entirely (only user/assistant message text shows). The glasses view
+// is inherently that same text-only surface, so we match Concise by stripping
+// those markers here, at ingest — the buffer, the typewriter reveal length, and
+// render then all see the same clean, tool-free text. Only assistant turns
+// carry the markers (tool_use blocks never appear in user turns, and
+// tool_result blocks are already dropped upstream), so user text — which may
+// legitimately contain brackets — is left untouched. Tool names are CapitalCase
+// (Bash, WebFetch, AskUserQuestion) or MCP `server__tool` identifiers, always
+// concatenated with no separator, matching the format `_entry_text` emits.
+const TOOL_MARKER = /\[[A-Za-z][A-Za-z0-9_]*\]/g;
+
+export function conciseText(text: string): string {
+  return text.replace(TOOL_MARKER, "").replace(/[ \t]+$/gm, "").trim();
+}
+
+function conciseEntry(entry: TailEntry): TailEntry {
+  if (entry.role !== "assistant") return entry;
+  const text = conciseText(entry.text);
+  return text === entry.text ? entry : { ...entry, text };
+}
+
 // Merges a freshly-polled tail into the buffer: an entry already present (by
 // id) is updated in place only when the incoming copy is at least as long as
 // the stored one — transcript entries only grow (a streaming assistant turn
@@ -28,7 +53,8 @@ export function mergeTail(buffer: TranscriptBuffer, tail: TailEntry[]): Transcri
   if (tail.length === 0) return buffer;
   const entries = buffer.entries.slice();
   const indexById = new Map(entries.map((e, i) => [e.id, i]));
-  for (const incoming of tail) {
+  for (const raw of tail) {
+    const incoming = conciseEntry(raw);
     const existingIndex = indexById.get(incoming.id);
     if (existingIndex !== undefined) {
       const existing = entries[existingIndex];
@@ -54,6 +80,6 @@ export function prependHistory(
   truncated: boolean
 ): TranscriptBuffer {
   const known = new Set(buffer.entries.map((e) => e.id));
-  const older = entries.filter((e) => !known.has(e.id));
+  const older = entries.filter((e) => !known.has(e.id)).map(conciseEntry);
   return { entries: [...older, ...buffer.entries], hasMore: truncated };
 }

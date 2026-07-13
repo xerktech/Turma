@@ -175,7 +175,7 @@ describe("render: session", () => {
 
     // No header: the first (and only) transcript line is the content itself,
     // not "host-a·myrepo" or similar.
-    expect(model.transcriptLines[0]).toBe("> hi");
+    expect(model.transcriptLines[0]).toBe("» hi");
     expect(model.transcriptLines.some((l) => l.includes("host-a"))).toBe(false);
     expect(model.bottom.mode).toBe("input");
   });
@@ -223,13 +223,60 @@ describe("render: session", () => {
 
     const model = asSession(render(state));
 
-    expect(model.transcriptLines.some((l) => l.includes("> hello"))).toBe(true);
+    expect(model.transcriptLines.some((l) => l.includes("» hello"))).toBe(true);
     expect(model.transcriptLines.some((l) => l.includes("hi there"))).toBe(true);
     // The question renders once — in the sheet, not the transcript.
     expect(model.transcriptLines.some((l) => l.includes("Deploy now?"))).toBe(false);
     expect(model.transcriptLines.some((l) => l.includes("https://github.com/x/y/pull/1"))).toBe(true);
     expect(model.bottom.mode).toBe("sheet");
     expect(model.bottom.lines.some((l) => l.includes("Deploy now?"))).toBe(true);
+  });
+
+  it("marks the operator's own turns with a '»' chevron and leaves agent replies bare, so input stands out", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: {
+        s1: {
+          entries: [
+            { id: "1", role: "user", text: "run the tests" },
+            { id: "2", role: "assistant", text: "all green" },
+          ],
+        },
+      },
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines).toContain("» run the tests");
+    expect(model.transcriptLines).toContain("all green");
+    // The agent reply carries no chevron.
+    expect(model.transcriptLines.some((l) => l === "» all green")).toBe(false);
+  });
+
+  it("renders no line for a turn that concise-ingest reduced to empty (a pure tool-call turn)", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    // The buffer stores the post-strip text; a tool-only assistant turn lands as "".
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: {
+        s1: {
+          entries: [
+            { id: "1", role: "user", text: "go" },
+            { id: "2", role: "assistant", text: "" },
+            { id: "3", role: "assistant", text: "done" },
+          ],
+        },
+      },
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines).toEqual(["» go", "done"]);
   });
 
   it("shows the live status in the empty input box, but hides it once a draft is typed", () => {
@@ -399,7 +446,7 @@ describe("render: session", () => {
 
     const model = asSession(render(state));
     expect(model.transcriptLines.some((l) => l.includes("queued"))).toBe(false);
-    expect(model.transcriptLines[0]).toBe("> hi");
+    expect(model.transcriptLines[0]).toBe("» hi");
   });
 });
 
