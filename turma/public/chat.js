@@ -281,6 +281,19 @@
             kind: "action", id: b.forId || null, name: "result", input: "", inputTrunc: false, entryId: e.id,
             result: { text: b.text || "", isError: !!b.isError, truncated: !!b.truncated }, orphan: true,
           });
+        } else if (b.t === "task_notification") {
+          // A background Task/agent finishing: render as an action card (like a
+          // tool call) rather than a raw-XML user bubble. The summary is the
+          // card title; the child's result is the expandable body.
+          flush();
+          const failed = b.status && b.status !== "completed";
+          const result = (b.result || b.status)
+            ? { text: b.result || ("status: " + b.status), isError: !!failed, truncated: !!b.truncated }
+            : null;
+          items.push({
+            kind: "action", id: null, name: b.summary || "Background task",
+            input: "", inputTrunc: false, entryId: e.id, result, task: true,
+          });
         }
       }
       flush();
@@ -328,9 +341,11 @@
         truncBtn(it.entryId, it.result.truncated) + "</div>";
     }
     if (!body) body = '<div class="tool-block"><div class="tool-label">running…</div></div>';
-    return '<details class="action-card ' + statusCls + '" data-dkey="' + esc(key) + '"' +
+    const taskCls = it.task ? " task" : "";
+    const icon = it.task ? '<span class="tool-glyph">◆</span>' : '<span class="tool-dot"></span>';
+    return '<details class="action-card' + (statusCls ? " " + statusCls : "") + taskCls + '" data-dkey="' + esc(key) + '"' +
       openAttr(key, verbosity.show.outputs) + ">" +
-      '<summary><span class="tool-dot"></span><span class="tool-name">' + esc(it.name) + "</span>" +
+      "<summary>" + icon + '<span class="tool-name">' + esc(it.name) + "</span>" +
       '<span class="tool-arg">' + argOne + "</span></summary>" +
       '<div class="tool-body">' + body + "</div></details>";
   }

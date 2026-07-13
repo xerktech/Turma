@@ -134,6 +134,38 @@ function readTailLines(p, maxBytes) {
   }
 }
 
+// A background Task/agent finishing injects a `<task-notification>…` payload as
+// a user-role turn — an XML-ish blob carrying <summary>, <status> and the
+// child's <result>. Parsed into {summary, status, result} (or null when it
+// isn't one) so it renders as an action card instead of raw XML. Mirror of
+// hub-agent.py _parse_task_notification.
+const TASK_NOTIFICATION_RE = /^\s*<task-notification>([\s\S]*)<\/task-notification>\s*$/;
+// Literal (not dynamically-built) per-tag regexes — a hardcoded regex sidesteps
+// the ReDoS surface of new RegExp(`<${name}>…`) and keeps the tag set closed.
+const TN_TAG_RE = {
+  summary: /<summary>([\s\S]*?)<\/summary>/,
+  status: /<status>([\s\S]*?)<\/status>/,
+  result: /<result>([\s\S]*?)<\/result>/,
+};
+function tnTag(name, body) {
+  const m = TN_TAG_RE[name].exec(body);
+  return m ? m[1].replace(ANSI_RE, "").trim() : "";
+}
+function parseTaskNotification(text) {
+  if (!text) return null;
+  const m = TASK_NOTIFICATION_RE.exec(text);
+  if (!m) return null;
+  const body = m[1];
+  return { summary: tnTag("summary", body), status: tnTag("status", body), result: tnTag("result", body) };
+}
+// Flatten a parsed task-notification to text-feed form (summary + result) —
+// mirror of hub-agent.py _tn_preview.
+function tnPreview(tn) {
+  const parts = [tn.summary || tn.status || "background task update"];
+  if (tn.result) parts.push(tn.result);
+  return parts.filter(Boolean).join("\n\n");
+}
+
 // One transcript entry -> glasses display text, or null to drop it (wrong
 // type, no message, tool_result-only turn, empty after ANSI strip). Mirrors
 // hub-agent.py _entry_text.
@@ -145,13 +177,16 @@ function entryText(entry) {
   const content = msg.content;
   let text;
   if (typeof content === "string") {
-    text = content;
+    const tn = parseTaskNotification(content);
+    text = tn ? tnPreview(tn) : content;
   } else if (Array.isArray(content)) {
     const parts = [];
     for (const block of content) {
       if (!block || typeof block !== "object") continue;
-      if (block.type === "text") parts.push(String(block.text || ""));
-      else if (block.type === "tool_use" && block.name) parts.push(`[${block.name}]`);
+      if (block.type === "text") {
+        const tn = parseTaskNotification(String(block.text || ""));
+        parts.push(tn ? tnPreview(tn) : String(block.text || ""));
+      } else if (block.type === "tool_use" && block.name) parts.push(`[${block.name}]`);
       // "thinking" and "tool_result" blocks are dropped.
     }
     text = parts.join("");
@@ -226,13 +261,26 @@ function entryBlocks(entry, caps) {
     if (trunc) block.truncated = true;
     blocks.push(block);
   };
+  const addTaskNotification = (tn) => {
+    const [summary] = clip(tn.summary, caps.input);
+    const [result, rtrunc] = clip(tn.result, caps.result);
+    const block = { t: "task_notification", summary };
+    if (tn.status) block.status = tn.status;
+    if (result) block.result = result;
+    if (rtrunc) block.truncated = true;
+    blocks.push(block);
+  };
   if (typeof content === "string") {
-    addText("text", content, caps.text);
+    const tn = parseTaskNotification(content);
+    if (tn) addTaskNotification(tn);
+    else addText("text", content, caps.text);
   } else if (Array.isArray(content)) {
     for (const raw of content) {
       if (!raw || typeof raw !== "object") continue;
       if (raw.type === "text") {
-        addText("text", raw.text || "", caps.text);
+        const tn = parseTaskNotification(raw.text || "");
+        if (tn) addTaskNotification(tn);
+        else addText("text", raw.text || "", caps.text);
       } else if (raw.type === "thinking") {
         addText("thinking", raw.thinking || raw.text || "", caps.text);
       } else if (raw.type === "tool_use" && raw.name) {
@@ -681,5 +729,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parsePaneStatus, isStatusLine, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parsePaneStatus, isStatusLine, BLOCK_CAPS_LIVE };
 }
