@@ -1030,6 +1030,24 @@ def _usage_is_empty(report):
     return not any(t.get(k) for k in ("input", "output", "cacheWrite", "cacheRead"))
 
 
+def _repo_from_worktree_slug(slug, wt_prefix):
+    """Recover the repo name from a Turma worktree's project slug when the
+    worktree itself is gone (so _existing_worktree_attrib can't map it and its
+    git origin can't be read). Worktrees live at
+    <REPOS_ROOT>/.turma/worktrees/<repo>/<id>, whose slug is
+    <wt_prefix><repo>-<id> (id = the short session id). Returns the (slugified)
+    repo name, or None when the slug isn't shaped like a Turma worktree — the
+    signal to leave a foreign claude project alone rather than adopt it.
+
+    `wt_prefix` is _project_slug(WORKTREES_ROOT) + "-", passed in so the caller
+    computes it once. rpartition keeps repo names that themselves contain a
+    slugified '-'; only the trailing <id> segment is dropped."""
+    if not slug.startswith(wt_prefix):
+        return None
+    repo, _, _sid = slug[len(wt_prefix):].rpartition("-")
+    return repo or None
+
+
 def repo_usage_report(ledger, fold_slug):
     """Aggregate token usage per repo across ALL known worktree transcripts, plus
     a merged host-level total. `ledger` maps worktreePath -> {repo, remote, slug}.
@@ -3107,6 +3125,107 @@ class SessionManager:
         if changed:
             self._save_ledger()
 
+    def _existing_worktree_attrib(self):
+        """Map project-slug -> (repo, worktreePath) for every worktree still on
+        disk under WORKTREES_ROOT, plus the repos-root pseudo-repo. Built the
+        non-lossy way (path -> slug), so a transcript slug that matches here can
+        be attributed exactly, using the worktree's own git origin as the
+        remote. Used by _reconcile_orphan_transcripts."""
+        by_slug = {}
+        try:
+            repos = os.listdir(WORKTREES_ROOT)
+        except OSError:
+            repos = []
+        for repo in repos:
+            rd = os.path.join(WORKTREES_ROOT, repo)
+            if not os.path.isdir(rd):
+                continue
+            try:
+                sids = os.listdir(rd)
+            except OSError:
+                continue
+            for sid in sids:
+                wt = os.path.join(rd, sid)
+                if os.path.isdir(wt):
+                    by_slug[_project_slug(wt)] = (repo, wt)
+        # Root sessions run in REPOS_ROOT itself (no worktree).
+        by_slug.setdefault(_project_slug(REPOS_ROOT), (ROOT_REPO_NAME, REPOS_ROOT))
+        return by_slug
+
+    def _reconcile_orphan_transcripts(self):
+        """Adopt Turma transcripts sitting in PROJECTS_ROOT that no ledger entry
+        covers, so persistent usage/cost reflects EVERY transcript on disk — not
+        only sessions in the live registry or the last-5 closed history that
+        _backfill_ledger sees. A session killed long ago (its card gone, its
+        worktree maybe surviving) or one predating _remember_usage would
+        otherwise silently drop out of the totals, since repo_usage_report only
+        folds slugs the ledger names.
+
+        Only Turma-managed transcripts are adopted; a foreign claude project on
+        the box (another tool's worktrees, a hand-run `claude`) is left alone.
+        Attribution, most precise first:
+          1. slug matches a worktree still on disk -> exact repo + git remote,
+             keyed by the real worktree path (same fidelity as _remember_usage,
+             and dedups with a future spawn there).
+          2. slug has the .../.turma/worktrees/<repo>/<id> shape but the worktree
+             is gone -> repo recovered from the slug; remote read from the repo
+             dir under REPOS_ROOT if it's still there, else left empty (the hub
+             then unifies cross-host by repo name, like any remote-less entry).
+        New entries are persisted and keyed so _prune_ledger removes them once
+        the transcript dir finally disappears."""
+        try:
+            names = os.listdir(PROJECTS_ROOT)
+        except OSError:
+            return
+        known = {(m or {}).get("slug") or _project_slug(p)
+                 for p, m in self.usage_ledger.items()}
+        existing = None  # built lazily — the listdirs aren't free
+        wt_prefix = _project_slug(WORKTREES_ROOT) + "-"
+        added = False
+        for slug in names:
+            proj = os.path.join(PROJECTS_ROOT, slug)
+            if slug in known or not os.path.isdir(proj):
+                continue
+            try:
+                if not any(f.endswith(".jsonl") for f in os.listdir(proj)):
+                    continue  # no transcript here — nothing to attribute
+            except OSError:
+                continue
+            if existing is None:
+                existing = self._existing_worktree_attrib()
+            if slug in existing:                                  # case 1
+                repo, wt = existing[slug]
+                remote = ""
+                try:
+                    remote = run(["git", "remote", "get-url", "origin"],
+                                 cwd=wt) or ""
+                except Exception:
+                    pass
+                self.usage_ledger[wt] = {
+                    "repo": repo, "remote": remote, "slug": slug}
+                known.add(slug)
+                added = True
+                continue
+            repo = _repo_from_worktree_slug(slug, wt_prefix)      # case 2
+            if repo:
+                remote = ""
+                repo_dir = os.path.join(REPOS_ROOT, repo)
+                if os.path.isdir(repo_dir):
+                    try:
+                        remote = run(["git", "remote", "get-url", "origin"],
+                                     cwd=repo_dir) or ""
+                    except Exception:
+                        pass
+                # Worktree gone, so no real path to key on — key by the project
+                # dir; the stored slug keeps _prune_ledger/repo_usage_report
+                # resolving it correctly.
+                self.usage_ledger[proj] = {
+                    "repo": repo, "remote": remote, "slug": slug}
+                known.add(slug)
+                added = True
+        if added:
+            self._save_ledger()
+
     def _refresh_repo_usage(self):
         """Recompute the persistent host/repo usage from every known transcript.
         Independent of the live registry, so killed/deleted sessions still count.
@@ -3114,6 +3233,7 @@ class SessionManager:
         appended since the last beat) via _fold_slug, so it no longer re-reads
         every transcript from scratch."""
         self._backfill_ledger()
+        self._reconcile_orphan_transcripts()
         self._prune_ledger()
         try:
             self.repo_usage, self.host_usage = repo_usage_report(
