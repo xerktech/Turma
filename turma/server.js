@@ -1465,9 +1465,11 @@ server.on("upgrade", async (req, socket, head) => {
     const ping = setInterval(() => send(0x9, Buffer.alloc(0)), 30000); // beat CF idle timeout
     // The agent pushes live deltas back on this same channel: committed
     // transcript entries as `{tail: sessionId, entries}`, and the in-progress
-    // assistant turn scraped from the TUI as `{turn: sessionId, text}` (real-
-    // time streaming — empty text clears it once the turn completes and the
-    // committed tail owns it). Everything else it sends we ignore.
+    // assistant turn scraped from the TUI as `{turn: sessionId, text, status}`
+    // (real-time streaming — `status` is the parsed working indicator, verb +
+    // token counters, for the chat's pinned status bar; empty text + null
+    // status clears it once the turn completes and the committed tail owns it).
+    // Everything else it sends we ignore.
     const parse = wsParser((op, payload) => {
       if (op === 0x8) return socket.end();
       if (op !== 0x1) return;
@@ -1476,7 +1478,7 @@ server.on("upgrade", async (req, socket, head) => {
       if (msg && msg.tail && Array.isArray(msg.entries)) {
         liveFanout(name, msg.tail, { type: "tail", entries: msg.entries });
       } else if (msg && msg.turn && typeof msg.text === "string") {
-        liveFanout(name, msg.turn, { type: "turn", text: msg.text });
+        liveFanout(name, msg.turn, { type: "turn", text: msg.text, status: msg.status || null });
       }
     });
     socket.on("data", parse);
