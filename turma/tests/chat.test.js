@@ -219,6 +219,14 @@ test("linkify: trailing sentence punctuation stays out of the link", () => {
   assert.match(wiki, /href="https:\/\/en\.wikipedia\.org\/wiki\/Foo_\(bar\)"/);
 });
 
+test("linkify: markdown emphasis markers wrapping a bare URL stay out of the link", () => {
+  // Claude emits PR links in bold: **https://.../pull/131** — the ** must not
+  // be slurped into the href.
+  const html = linkify("PR created: **https://github.com/xerktech/Turma/pull/131**");
+  assert.match(html, /href="https:\/\/github\.com\/xerktech\/Turma\/pull\/131"[^>]*>https:\/\/github\.com\/xerktech\/Turma\/pull\/131<\/a>/);
+  assert.doesNotMatch(html, /href="[^"]*\*/);
+});
+
 test("linkify: markdown [text](url) becomes an anchor with the label as text", () => {
   const html = linkify("opened [PR #42](https://github.com/o/r/pull/42) just now");
   assert.equal(html,
