@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderProse, __setVerbosity } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderProse, __setVerbosity, __setNoExpand } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -193,6 +193,27 @@ test("render: a truncated block emits a Show more button carrying its entry id",
   ]);
   const html = withVerbosity("verbose", () => itemsToHtml(items));
   assert.match(html, /class="trunc" data-eid="a9"/);
+});
+
+test("render: noExpand (archived view) suppresses the Show more button", () => {
+  const items = buildItems([
+    { id: "a9", role: "assistant", blocks: [{ t: "text", text: "loooong", truncated: true }] },
+  ]);
+  __setNoExpand(true);
+  try {
+    const html = withVerbosity("verbose", () => itemsToHtml(items));
+    assert.doesNotMatch(html, /class="trunc"/); // no /history to expand into in the archive
+  } finally { __setNoExpand(false); }
+});
+
+test("render: bubbles, thinking, and tool cards carry data-uuid for scroll-to-hit", () => {
+  // Both the live and archived views scroll a search hit into view by the
+  // entry's uuid, so every renderable element must expose data-uuid.
+  const html = withVerbosity("verbose", () => itemsToHtml(buildItems(SAMPLE)));
+  assert.match(html, /class="tr-msg user" data-uuid="u1"/);
+  assert.match(html, /class="tr-msg assistant" data-uuid="a1"/);
+  assert.match(html, /class="thought"[^>]*data-uuid="a1"/);
+  assert.match(html, /class="action-card ok"[^>]*data-uuid="a1"/);
 });
 
 test("render: HTML in transcript text is escaped (no injection)", () => {

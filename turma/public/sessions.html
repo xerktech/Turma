@@ -241,13 +241,15 @@
   /* Keep each message/tool card at its natural size: in a flex column, children
      default to flex-shrink:1, so a growing transcript would squash the existing
      cards to fit instead of scrolling. Pin them so the container scrolls. */
-  .chat-scroll > * { flex-shrink: 0; }
+  .chat-scroll > *, .tr-scroll > * { flex-shrink: 0; }
   /* Text bubbles reuse the transcript bubble system: user right, agent left.
      In the live chat, agent output is borderless/background-free and tighter
-     so it reads as flat prose; user input keeps its bubble. */
-  .chat-scroll .tr-msg.assistant { border: none; background: none; padding: 2px 0; }
-  .chat-scroll .tr-msg.assistant.hit { box-shadow: none; }
-  .chat-scroll .tr-msg .role { display: none; }
+     so it reads as flat prose; user input keeps its bubble. The archived
+     transcript view (.tr-scroll) renders through the same chat.js engine, so it
+     gets the identical look. */
+  .chat-scroll .tr-msg.assistant, .tr-scroll .tr-msg.assistant { border: none; background: none; padding: 2px 0; }
+  .chat-scroll .tr-msg.assistant.hit, .tr-scroll .tr-msg.assistant.hit { box-shadow: none; }
+  .chat-scroll .tr-msg .role, .tr-scroll .tr-msg .role { display: none; }
   .chat-scroll .tr-msg.assistant.streaming::after {
     content: "▍"; margin-left: 1px; color: var(--accent); animation: caret 1s steps(1) infinite;
   }
@@ -435,6 +437,7 @@
           <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
           <span class="t-title"><span class="name" id="trTitle"></span> · <span class="path" id="trPath"></span></span>
           <span class="spacer"></span>
+          <span class="verbosity" id="trVerbosity"></span>
         </div>
         <div class="tr-scroll" id="trScroll"></div>
       </div>
@@ -984,8 +987,9 @@ function enterStage() {
 }
 function clearStage() {
   currentId = null;
+  currentTranscriptId = null;
   navFrame("about:blank"); // tear down any live session's WebSocket
-  if (window.TurmaChat) TurmaChat.close(); // stop the chat live tail
+  if (window.TurmaChat) { TurmaChat.close(); TurmaChat.closeStatic(); } // stop the chat live tail + clear the archived view
   viewMode = null;
   $chatPane.hidden = true;
   $termPane.hidden = true;
@@ -1195,44 +1199,7 @@ function renderArchive() {
     : `<div class="sr-hint">No archived sessions yet.</div>`;
 }
 
-// Query tokenizer mirroring the server's ftsQuery(): the terms we visually
-// highlight in the log must be the same ones FTS actually matched on.
-function queryTerms(q) {
-  return String(q || "").toLowerCase().split(/[^a-z0-9]+/i).filter(Boolean).slice(0, 12);
-}
-// Escape-safe term highlighting: wrap each matched term in <mark> without ever
-// emitting attacker-controlled markup — split on the raw text, esc() each piece.
-function highlightTerms(text, terms) {
-  const raw = String(text || "");
-  if (!terms || !terms.length) return esc(raw);
-  const pat = terms.slice().sort((a, b) => b.length - a.length)
-    .map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
-  const re = new RegExp(pat, "gi");
-  let out = "", last = 0, m;
-  while ((m = re.exec(raw))) {
-    if (m.index === re.lastIndex) { re.lastIndex++; continue; } // zero-width guard
-    out += esc(raw.slice(last, m.index)) + "<mark>" + esc(m[0]) + "</mark>";
-    last = m.index + m[0].length;
-  }
-  return out + esc(raw.slice(last));
-}
-// Scroll the matched message to the middle of the transcript pane and flash it.
-// Falls back to the first highlighted term when the match has no usable uuid.
-function scrollToHit(hi) {
-  const scroll = document.getElementById("trScroll");
-  let el = null;
-  if (hi && hi.uuid && window.CSS && CSS.escape) {
-    el = scroll.querySelector(`.tr-msg[data-uuid="${CSS.escape(hi.uuid)}"]`);
-  }
-  if (!el) { const mk = scroll.querySelector(".tr-msg mark"); el = mk ? mk.closest(".tr-msg") : null; }
-  if (!el) return;
-  const cRect = scroll.getBoundingClientRect(), eRect = el.getBoundingClientRect();
-  scroll.scrollTop += (eRect.top - cRect.top) - (scroll.clientHeight / 2 - el.offsetHeight / 2);
-  el.classList.add("hit");
-  el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash");
-}
-
-let trHighlight = null; // { uuid, terms } for a search-driven open (else null)
+let trHighlight = null; // { uuid } for a search-driven open (else null)
 async function openTranscript(id, title, hi) {
   currentTranscriptId = id;
   trHighlight = hi || null;
@@ -1242,7 +1209,9 @@ async function openTranscript(id, title, hi) {
   document.getElementById("trPath").textContent = "loading…";
   document.getElementById("trScroll").innerHTML = `<div class="tr-empty">Loading transcript…</div>`;
   viewMode = "transcript";
-  if (window.TurmaChat) TurmaChat.close(); // leaving any live chat
+  // Leaving any live chat + clearing a prior archived view's verbosity control
+  // (renderStatic re-adds it on success; this keeps it off the loading/error views).
+  if (window.TurmaChat) { TurmaChat.close(); TurmaChat.closeStatic(); }
   $chatPane.hidden = true;
   $termPane.hidden = true;
   $stageEmpty.hidden = true;
@@ -1263,22 +1232,23 @@ async function openTranscript(id, title, hi) {
   if (currentTranscriptId !== id) return; // superseded by another click
   renderTranscript(t);
 }
+// Render an archived transcript through the SAME chat engine the live view uses
+// (chat.js), so a past session's bubbles, tool-action cards, thinking traces,
+// and verbosity control look identical. Falls back to null-safe when chat.js
+// somehow isn't loaded.
 function renderTranscript(t) {
   document.getElementById("trTitle").textContent = t.summary || t.repo || t.transcriptId;
   document.getElementById("trPath").textContent =
     [t.repo, t.host, shortDate(t.endedTs || t.createdAt)].filter(Boolean).join(" · ");
-  const entries = t.entries || [];
+  if (!window.TurmaChat || !TurmaChat.renderStatic) return;
   const hi = trHighlight;
-  const terms = (hi && hi.terms) || [];
-  document.getElementById("trScroll").innerHTML = entries.length
-    ? entries.map(e => {
-        const role = e.role === "user" ? "user" : "assistant";
-        const body = terms.length ? highlightTerms(e.text, terms) : esc(e.text || "");
-        return `<div class="tr-msg ${role}" data-uuid="${esc(e.uuid || "")}"><span class="role">${role}</span>${body}</div>`;
-      }).join("")
-    : `<div class="tr-empty">This session's transcript is empty.</div>`;
-  // Jump to the actual match instead of the top of the log.
-  if (hi) scrollToHit(hi);
+  TurmaChat.renderStatic({
+    entries: t.entries || [],
+    scrollEl: document.getElementById("trScroll"),
+    verbHost: document.getElementById("trVerbosity"),
+    transcriptId: t.transcriptId,
+    scrollUuid: hi && hi.uuid,   // scroll to + flash the matched entry, if any
+  });
 }
 
 $searchInput.addEventListener("input", onSearchInput);
@@ -1293,7 +1263,7 @@ function delegateOpen(container) {
     const btn = e.target.closest("[data-tid]");
     if (!btn) return;
     const hi = (btn.dataset.q != null && btn.dataset.q !== "")
-      ? { uuid: btn.dataset.uuid || null, terms: queryTerms(btn.dataset.q) }
+      ? { uuid: btn.dataset.uuid || null }
       : null;
     openTranscript(btn.dataset.tid, btn.dataset.title, hi);
   });

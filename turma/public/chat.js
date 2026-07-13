@@ -376,20 +376,24 @@
   }
 
   // ---- rendering ------------------------------------------------------------
+  // Static (archived) renders have no /history to expand into — the stored
+  // transcript is already the fullest copy — so the "Show more…" affordance is
+  // suppressed there; the live view keeps it.
+  let noExpand = false;
   function truncBtn(entryId, truncated) {
-    return truncated ? '<button class="trunc" data-eid="' + esc(entryId) + '">Show more…</button>' : "";
+    return (truncated && !noExpand) ? '<button class="trunc" data-eid="' + esc(entryId) + '">Show more…</button>' : "";
   }
 
   function renderMsg(it) {
     const cls = it.role === "user" ? "user" : "assistant";
-    return '<div class="tr-msg ' + cls + '"><span class="role">' + cls + "</span>" +
+    return '<div class="tr-msg ' + cls + '" data-uuid="' + esc(it.id) + '"><span class="role">' + cls + "</span>" +
       renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div>";
   }
 
   function renderThought(it) {
     if (!verbosity.show.thinking) return ""; // hidden by verbosity
     const key = "th:" + it.id;
-    return '<details class="thought" data-dkey="' + esc(key) + '"' + openAttr(key, true) +
+    return '<details class="thought" data-dkey="' + esc(key) + '" data-uuid="' + esc(it.id) + '"' + openAttr(key, true) +
       "><summary>💭 Thought</summary>" +
       '<div class="thought-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
   }
@@ -417,7 +421,8 @@
     if (!body) body = '<div class="tool-block"><div class="tool-label">running…</div></div>';
     const taskCls = it.task ? " task" : "";
     const icon = it.task ? '<span class="tool-glyph">◆</span>' : '<span class="tool-dot"></span>';
-    return '<details class="action-card' + (statusCls ? " " + statusCls : "") + taskCls + '" data-dkey="' + esc(key) + '"' +
+    return '<details class="action-card' + (statusCls ? " " + statusCls : "") + taskCls + '" data-dkey="' + esc(key) +
+      '" data-uuid="' + esc(it.entryId) + '"' +
       openAttr(key, verbosity.show.outputs) + ">" +
       "<summary>" + icon + '<span class="tool-name">' + esc(it.name) + "</span>" +
       '<span class="tool-arg">' + argOne + "</span></summary>" +
@@ -560,8 +565,10 @@
     }
     return null;
   }
-  function renderVerbosityControl() {
-    const host = $("chatVerbosity");
+  // Shared Concise/Normal/Verbose segmented control. `onPick` runs after the
+  // preset is applied (persist + repaint), so the live and static views can
+  // reuse the same widget with their own save/repaint.
+  function buildVerbositySeg(host, onPick) {
     if (!host) return;
     const active = matchPreset();
     const seg = ["concise", "normal", "verbose"].map((name) =>
@@ -572,8 +579,11 @@
       const name = b.getAttribute("data-preset");
       verbosity = { preset: name, show: { ...PRESETS[name] } };
       detailsOpen.clear(); // a new preset resets card open/closed to its defaults
-      saveVerbosity(); renderVerbosityControl(); repaint();
+      onPick();
     }));
+  }
+  function renderVerbosityControl() {
+    buildVerbositySeg($("chatVerbosity"), () => { saveVerbosity(); renderVerbosityControl(); repaint(); });
   }
   // ---- live agent-mode / model selectors (under the compose box) ------------
   function currentModelValue() {
@@ -770,13 +780,92 @@
     }, true);
   }
 
+  // ---- static (archived) transcript rendering -------------------------------
+  // An ended session pulled from the durable archive (GET /api/archive/<id>,
+  // which now carries blocks[]) rendered through the SAME buildItems +
+  // itemsToHtml pipeline as the live view — identical bubbles, tool cards,
+  // thinking traces, and verbosity control — but with no WebSocket, compose box,
+  // streaming turn, or /history expand. The two views are mutually exclusive
+  // panes, so this reuses the module-level `verbosity`/`detailsOpen` state.
+  let stScroll = null, stVerbHost = null, stTranscriptId = null, stEntries = [];
+
+  function loadStaticVerbosity(tid) {
+    // Same per-key store as the live view (keyed by transcript id), so a reader's
+    // preset sticks across opens of the same ended session.
+    let v = null;
+    try { v = JSON.parse(localStorage.getItem("turma.chat.verbosity." + tid) || "null"); } catch {}
+    if (v && v.preset && v.show && typeof v.show === "object") {
+      verbosity = { preset: v.preset, show: {
+        thinking: !!v.show.thinking, tools: !!v.show.tools, outputs: !!v.show.outputs } };
+    } else {
+      verbosity = { preset: "normal", show: { ...PRESETS.normal } };
+    }
+  }
+  function saveStaticVerbosity() {
+    try { localStorage.setItem("turma.chat.verbosity." + stTranscriptId, JSON.stringify(verbosity)); } catch {}
+  }
+  function renderStaticVerbosity() {
+    buildVerbositySeg(stVerbHost, () => { saveStaticVerbosity(); renderStaticVerbosity(); repaintStatic(); });
+  }
+  function repaintStatic() {
+    if (!stScroll) return;
+    const html = itemsToHtml(buildItems(stEntries));
+    stScroll.innerHTML = html || '<div class="tr-empty">This session\'s transcript is empty.</div>';
+  }
+  // Scroll the matched entry to the middle of the pane and flash it (a
+  // search-result open carries the hit's uuid). Bubbles + cards carry data-uuid.
+  function scrollToStaticHit(uuid) {
+    if (!stScroll || !uuid || !(window.CSS && CSS.escape)) return;
+    const el = stScroll.querySelector('[data-uuid="' + CSS.escape(uuid) + '"]');
+    if (!el) return;
+    const cRect = stScroll.getBoundingClientRect(), eRect = el.getBoundingClientRect();
+    stScroll.scrollTop += (eRect.top - cRect.top) - (stScroll.clientHeight / 2 - el.offsetHeight / 2);
+    el.classList.add("hit");
+    el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash");
+  }
+
+  // opts: { entries, scrollEl, verbHost, transcriptId, scrollUuid? }
+  function openStatic(opts) {
+    close();          // tear down any live view (ws/timers/reveal)
+    closeStatic();    // and any prior static view's verbosity control
+    opts = opts || {};
+    stScroll = opts.scrollEl || null;
+    stVerbHost = opts.verbHost || null;
+    stTranscriptId = opts.transcriptId || null;
+    stEntries = Array.isArray(opts.entries) ? opts.entries : [];
+    noExpand = true;  // no /history to expand into
+    detailsOpen.clear();
+    loadStaticVerbosity(stTranscriptId);
+    renderStaticVerbosity();
+    repaintStatic();
+    if (opts.scrollUuid) scrollToStaticHit(opts.scrollUuid);
+    // Wire card expand/collapse persistence for the static scroll too.
+    wireStaticDelegation();
+  }
+  function closeStatic() {
+    if (stVerbHost) stVerbHost.innerHTML = "";
+    stScroll = null; stVerbHost = null; stTranscriptId = null; stEntries = [];
+  }
+  function wireStaticDelegation() {
+    if (!stScroll || stScroll.dataset.wired) return;
+    stScroll.dataset.wired = "1";
+    // `toggle` doesn't bubble; capture it to remember each card's open state so a
+    // verbosity re-render doesn't snap the reader's opened cards shut.
+    stScroll.addEventListener("toggle", (e) => {
+      const d = e.target;
+      if (d && d.tagName === "DETAILS" && d.dataset && d.dataset.dkey) detailsOpen.set(d.dataset.dkey, d.open);
+    }, true);
+  }
+
   // ---- public API -----------------------------------------------------------
   function open(hk, id, s, a) {
     close();
+    closeStatic();
     gen++;
     const myGen = gen;
     hostKey = hk; sessionId = id; sess = s; agent = a;
     buffer = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
+    noExpand = false;
     detailsOpen.clear();
     loadVerbosity(id);
     setHeader(s, a);
@@ -814,7 +903,7 @@
   }
 
   if (typeof window !== "undefined") {
-    window.TurmaChat = { open, close, repaint: repaintPublic, onPoll };
+    window.TurmaChat = { open, close, repaint: repaintPublic, onPoll, renderStatic: openStatic, closeStatic };
     // Global handlers referenced by the chat pane's inline HTML attributes.
     window.autoGrowChatInput = autoGrow;
     window.chatInputKey = function (e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
@@ -827,6 +916,7 @@
     module.exports = {
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderProse,
       __setVerbosity: (v) => { verbosity = v; },
+      __setNoExpand: (v) => { noExpand = v; },
     };
   }
 })();
