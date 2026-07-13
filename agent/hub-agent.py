@@ -3159,6 +3159,41 @@ class SessionManager:
         by_slug.setdefault(_project_slug(REPOS_ROOT), (ROOT_REPO_NAME, REPOS_ROOT))
         return by_slug
 
+    def _repo_from_transcript_cwd(self, proj):
+        """Best-effort repo name for a transcript that no worktree map or slug
+        shape identifies, read from the session's own recorded cwd (Claude Code
+        stamps `cwd` on transcript entries). The cwd is the real, un-slugified
+        working dir, so its final path segment names the repo far better than
+        the lossy project slug can (…/personal/ClaudeHUD -> "ClaudeHUD"). Splits
+        on both separators, since a shared ~/.claude login also carries the
+        operator's own dev-machine sessions with Windows paths. Returns None when
+        no entry within a bounded head-scan records a cwd."""
+        try:
+            files = [f for f in os.listdir(proj) if f.endswith(".jsonl")]
+        except OSError:
+            return None
+        if not files:
+            return None
+        newest = max(files,
+                     key=lambda f: os.path.getmtime(os.path.join(proj, f)))
+        cwd = None
+        try:
+            with open(os.path.join(proj, newest)) as fh:
+                for _i, line in zip(range(200), fh):  # cwd is on early entries
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(e, dict) and e.get("cwd"):
+                        cwd = e["cwd"]
+                        break
+        except OSError:
+            return None
+        if not cwd:
+            return None
+        name = re.split(r"[\\/]+", str(cwd).strip().rstrip("\\/"))[-1]
+        return name or None
+
     def _reconcile_orphan_transcripts(self):
         """Adopt EVERY transcript sitting in PROJECTS_ROOT that no ledger entry
         covers, so persistent usage/cost reflects every session on disk — not
@@ -3178,8 +3213,11 @@ class SessionManager:
              repo recovered from the slug; remote read from the repo dir under
              REPOS_ROOT if it's still there, else left empty (the hub then
              unifies cross-host by repo name, like any remote-less entry).
-          3. anything else (a bare `claude` run outside a managed worktree) ->
-             bucketed under OTHER_REPO_NAME so it still counts.
+          3. neither of those (a bare `claude` run, or the operator's own
+             dev-machine session on the shared login) -> repo read from the
+             transcript's recorded cwd (_repo_from_transcript_cwd).
+          4. still nothing (no cwd recorded) -> bucketed under OTHER_REPO_NAME
+             so it always counts.
         New entries are persisted and keyed so _prune_ledger removes them once
         the transcript dir finally disappears."""
         try:
@@ -3214,9 +3252,11 @@ class SessionManager:
                 known.add(slug)
                 added = True
                 continue
-            # case 2 (repo recovered from slug) or case 3 (OTHER_REPO_NAME) —
-            # either way it's adopted, nothing is dropped.
-            repo = _repo_from_worktree_slug(slug) or OTHER_REPO_NAME
+            # slug shape (case 2), then the recorded cwd (case 3), then the
+            # catch-all (case 4) — either way it's adopted, nothing is dropped.
+            repo = (_repo_from_worktree_slug(slug)
+                    or self._repo_from_transcript_cwd(proj)
+                    or OTHER_REPO_NAME)
             remote = ""
             repo_dir = os.path.join(REPOS_ROOT, repo)
             if os.path.isdir(repo_dir):

@@ -1117,10 +1117,25 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
         sm._reconcile_orphan_transcripts()
         self.assertEqual(sm.usage_ledger[proj]["repo"], "AgentHub")
 
+    def test_repo_recovered_from_transcript_cwd(self):
+        # No worktree and no worktrees-shaped slug, but the transcript records
+        # its cwd (e.g. an operator's dev-machine session, Windows path) — the
+        # repo is read from there, not lumped into (other).
+        wt = "/home/me/OneDrive/personal/Foverlay"
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj, exist_ok=True)
+        write_jsonl(os.path.join(proj, "t.jsonl"), [
+            {"type": "user", "cwd": "C:\\Users\\me\\personal\\Foverlay",
+             "message": {"role": "user", "content": "hi"}},
+        ])
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertEqual(sm.usage_ledger[proj]["repo"], "Foverlay")
+
     def test_unattributable_bucketed_as_other(self):
-        # A bare `claude` run outside any managed worktree — no worktrees marker
-        # in the slug. Still adopted so its cost counts, under OTHER_REPO_NAME.
-        proj = self._write_transcript("/root/scratch")
+        # No worktree, no worktrees-shaped slug, and no cwd recorded — still
+        # adopted so its cost counts, under OTHER_REPO_NAME.
+        proj = self._write_transcript("/root/scratch")  # usage_entry has no cwd
         sm = self.make_manager()
         sm._reconcile_orphan_transcripts()
         self.assertEqual(sm.usage_ledger[proj]["repo"], ha.OTHER_REPO_NAME)
