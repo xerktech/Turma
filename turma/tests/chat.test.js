@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, __setVerbosity } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, __setVerbosity } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -166,4 +166,55 @@ test("render: HTML in transcript text is escaped (no injection)", () => {
   const html = withVerbosity("verbose", () => itemsToHtml(items));
   assert.doesNotMatch(html, /<script>alert/);
   assert.match(html, /&lt;script&gt;/);
+});
+
+// ---- linkify (clickable URLs in prose bubbles) ---------------------------
+test("linkify: a bare http(s) URL becomes a new-tab anchor", () => {
+  const html = linkify("see https://example.com/x for details");
+  assert.equal(html,
+    'see <a href="https://example.com/x" target="_blank" rel="noopener noreferrer">https://example.com/x</a> for details');
+});
+
+test("linkify: trailing sentence punctuation stays out of the link", () => {
+  assert.equal(linkify("go to https://example.com."),
+    'go to <a href="https://example.com" target="_blank" rel="noopener noreferrer">https://example.com</a>.');
+  // A URL wrapped in parens keeps the ')' out of the href...
+  assert.match(linkify("(https://example.com)"), /href="https:\/\/example\.com"[^>]*>https:\/\/example\.com<\/a>\)/);
+  // ...but a balanced paren inside the path is preserved.
+  const wiki = linkify("https://en.wikipedia.org/wiki/Foo_(bar)");
+  assert.match(wiki, /href="https:\/\/en\.wikipedia\.org\/wiki\/Foo_\(bar\)"/);
+});
+
+test("linkify: markdown [text](url) becomes an anchor with the label as text", () => {
+  const html = linkify("opened [PR #42](https://github.com/o/r/pull/42) just now");
+  assert.equal(html,
+    'opened <a href="https://github.com/o/r/pull/42" target="_blank" rel="noopener noreferrer">PR #42</a> just now');
+});
+
+test("linkify: only http/https is linkified; other schemes stay plain escaped text", () => {
+  assert.equal(linkify("run javascript:alert(1) now"), "run javascript:alert(1) now");
+  // A markdown link to a non-http scheme is NOT turned into an anchor.
+  assert.doesNotMatch(linkify("[x](javascript:alert(1))"), /<a /);
+});
+
+test("linkify: link label and non-link text are still HTML-escaped (no injection)", () => {
+  const html = linkify('<b>hi</b> https://example.com/?a=1&b=2 <script>');
+  assert.doesNotMatch(html, /<b>hi<\/b>/);
+  assert.match(html, /&lt;b&gt;hi&lt;\/b&gt;/);
+  assert.match(html, /&lt;script&gt;/);
+  // Ampersand inside the href is escaped too.
+  assert.match(html, /href="https:\/\/example\.com\/\?a=1&amp;b=2"/);
+});
+
+test("linkify: link-free text matches a plain esc()", () => {
+  const t = 'plain <text> with "quotes" & ampersand';
+  // esc() output for the same string (mirrors chat.js's esc()).
+  const escd = t.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  assert.equal(linkify(t), escd);
+});
+
+test("render: a URL in an assistant bubble is rendered as a clickable link", () => {
+  const items = buildItems([{ id: "a1", role: "assistant", blocks: [{ t: "text", text: "PR up: https://github.com/o/r/pull/1" }] }]);
+  const html = withVerbosity("normal", () => itemsToHtml(items));
+  assert.match(html, /<a href="https:\/\/github\.com\/o\/r\/pull\/1" target="_blank" rel="noopener noreferrer">/);
 });
