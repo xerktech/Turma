@@ -407,8 +407,9 @@
   }
 
   // The pinned working-status bar (a sibling of the scroll, so a scroll repaint
-  // never touches it): spinner + gerund verb + live ↑/↓ token counters, mirroring
-  // the Claude Code terminal's bottom status line. Shown only while generating.
+  // never touches it): spinner + gerund verb + live ↑/↓ token counters, plus —
+  // on a second de-emphasized line — Claude Code's contextual hint/task footer,
+  // mirroring the terminal's bottom status region. Shown only while generating.
   function updateLiveStatus() {
     const bar = $("chatStatus");
     if (!bar) return;
@@ -419,11 +420,13 @@
       (st.up ? '<span class="tok up">↑ ' + esc(st.up) + "</span>" : "") +
       (st.down ? '<span class="tok down">↓ ' + esc(st.down) + "</span>" : "");
     const elapsed = st.elapsed ? '<span class="tok elapsed">' + esc(st.elapsed) + "</span>" : "";
+    const hint = st.hint ? '<div class="cc-hint">' + esc(st.hint) + "</div>" : "";
     bar.hidden = false;
     bar.innerHTML =
-      '<span class="cc-spin"></span>' +
+      '<div class="cc-row"><span class="cc-spin"></span>' +
       '<span class="verb">' + verb + "…</span>" +
-      '<span class="toks">' + elapsed + toks + "</span>";
+      '<span class="toks">' + elapsed + toks + "</span></div>" +
+      hint;
   }
 
   // Repaint from outside (e.g. returning from the terminal toggle).

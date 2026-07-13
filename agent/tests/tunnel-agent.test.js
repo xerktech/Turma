@@ -377,3 +377,37 @@ test("isStatusLine: recognizes spinner/verb/token lines glyph-agnostically, not 
   assert.ok(!isStatusLine("  It needs a base case to stop."));
   assert.ok(!isStatusLine("✻ Worked for 4s"));
 });
+
+test("isHintLine: recognizes the corner-glyph tip/task footer, not prose", () => {
+  const { isHintLine } = require("../tunnel-agent.js");
+  assert.ok(isHintLine("  ⌊ Tip: Use /btw to ask a quick side question"));
+  assert.ok(isHintLine("└ Updating the parser"));
+  assert.ok(isHintLine("Tip: press esc to interrupt"));
+  assert.ok(!isHintLine("● Recursion is when a function calls itself."));
+  assert.ok(!isHintLine("  It needs a base case to stop."));
+});
+
+// Regression for the second working-footer line (the "⌊ Tip: …" / active-task
+// hint Claude Code paints under the spinner): it must be pulled out as
+// status.hint and kept out of the streamed text — regardless of whether it sits
+// above or below the spinner line in the pane.
+for (const [where, order] of [
+  ["above", ["● Recursion is a function calling itself.",
+             "  ⌊ Tip: Use /btw to ask a quick side question",
+             "✳ Slithering… (38s · ↓ 1.0k tokens · esc to interrupt)"]],
+  ["below", ["● Recursion is a function calling itself.",
+             "✳ Slithering… (38s · ↓ 1.0k tokens · esc to interrupt)",
+             "  ⌊ Tip: Use /btw to ask a quick side question"]],
+]) {
+  test(`parsePaneLiveTurn: contextual hint line (${where} the spinner) -> status.hint, not text`, () => {
+    const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+    const pane = ["❯ Explain recursion", ...order, RULE, "❯ ", RULE,
+      "  ⏵⏵ bypass permissions on · esc to interrupt · ← for agents"].join("\n");
+    const r = parsePaneLiveTurn(pane);
+    assert.equal(r.text, "Recursion is a function calling itself.");
+    assert.ok(!/Tip|btw/.test(r.text), "the hint line must not leak into the assistant text");
+    assert.deepEqual(r.status,
+      { verb: "Slithering", up: "", down: "1.0k", elapsed: "38s",
+        hint: "Tip: Use /btw to ask a quick side question" });
+  });
+}
