@@ -111,7 +111,29 @@ test("getTranscript reads the canonical file", () => {
   assert.equal(t.repo, "turma");
   assert.equal(t.entries.length, 3);
   assert.equal(t.entries[0].text, "please add a compose flag");
+  // Legacy text-only entries round-trip with an empty blocks[] so the chat
+  // engine synthesizes a plain bubble.
+  assert.deepEqual(t.entries[0].blocks, []);
   assert.equal(archive.getTranscript("nope"), null);
+});
+
+test("ingestChunk persists blocks[] and getTranscript returns them", () => {
+  const blocks = [
+    { t: "thinking", text: "hmm" },
+    { t: "text", text: "added an index" },
+    { t: "tool_use", id: "b1", name: "Bash", input: "ls" },
+  ];
+  archive.ingestChunk("nas", "tb", { ...META }, 0, 90, [
+    { uuid: "u1", role: "user", ts: "2026-07-10T00:00:00Z", text: "make it searchable", blocks: [{ t: "text", text: "make it searchable" }] },
+    { uuid: "a1", role: "assistant", ts: "2026-07-10T00:01:00Z", text: "added an index", blocks },
+  ]);
+  const t = archive.getTranscript("tb");
+  assert.equal(t.entries.length, 2);
+  assert.deepEqual(t.entries[1].blocks, blocks); // rich structure preserved for the chat renderer
+  // The on-disk line carries the blocks so a rebuild (files are the source of truth) keeps them.
+  const rel = archive.archiveRelPath("tb", { ...META, host: "nas" });
+  const line1 = fs.readFileSync(path.join(process.env.ARCHIVE_DIR, rel), "utf8").trim().split("\n")[1];
+  assert.deepEqual(JSON.parse(line1).blocks, blocks);
 });
 
 test("rebuildIndex repopulates search from files after the DB is deleted", () => {

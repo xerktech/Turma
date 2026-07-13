@@ -3281,13 +3281,22 @@ class SessionManager:
                     except ValueError:
                         continue
                     text = _entry_text(entry)
-                    if text is None:
+                    # Rich path (parity with _history_entries): ship the full
+                    # blocks[] — thinking, tool_use inputs, tool_result outputs —
+                    # so the hub's chat UI renders an archived session exactly like
+                    # a live one. FULL caps (the durable record is the fullest
+                    # copy; the archive has no /history to expand into). Inclusion
+                    # widens like _history_entries: a tool_result-only turn (text
+                    # is None) still has blocks and is kept.
+                    blocks = _entry_blocks(entry, BLOCK_CAPS_FULL)
+                    if text is None and not blocks:
                         continue
                     entries.append({
                         "uuid": entry.get("uuid"),
                         "role": entry.get("type"),
                         "ts": entry.get("timestamp"),
-                        "text": text,
+                        "text": text or "",
+                        "blocks": blocks or [],
                     })
                 body = {"startOffset": have, "endOffset": end, "size": size,
                         "entries": entries, "meta": meta}

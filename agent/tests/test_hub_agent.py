@@ -3280,8 +3280,9 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
     def test_deltas_push_filtered_entries_and_resume(self):
         sm = self.make_manager()
         wt = "/w/.turma/worktrees/Turma/aaa"
-        # A thinking + a tool_result entry are dropped by _entry_text; only the
-        # user/assistant text lines are shipped.
+        # The assistant turn carries a thinking + a text block; the archive now
+        # ships the full blocks[] (parity with the live chat view) alongside the
+        # flat `text`, so history renders identically to a running session.
         self._write_transcript(wt, "t1.jsonl", [
             _text_entry("u1", "user", "make it searchable"),
             {"type": "assistant", "uuid": "a1", "timestamp": "2026-07-01T10:01:00Z",
@@ -3307,6 +3308,12 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         self.assertEqual(body["startOffset"], 0)
         texts = [e["text"] for e in body["entries"]]
         self.assertEqual(texts, ["make it searchable", "added an index"])
+        # The rich blocks ride along: the assistant turn keeps its thinking trace
+        # (flattened out of `text`) so the archive chat UI can show/hide it.
+        self.assertEqual(body["entries"][1]["blocks"], [
+            {"t": "thinking", "text": "hmm"},
+            {"t": "text", "text": "added an index"},
+        ])
         self.assertEqual(body["meta"]["remoteKey"], "github.com/xerk/turma")
 
         # Nothing to do when the hub is already caught up.
@@ -3314,6 +3321,36 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         with mock.patch.object(sm, "_post_archive_chunk", fake_post):
             sm._archive_deltas({"t1": body["size"]})
         self.assertEqual(pushed, [])
+
+    def test_deltas_ship_tool_result_only_turn(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        # A turn carrying ONLY a tool_result has no display text (_entry_text
+        # returns None) but does have a renderable block; the archive widens
+        # inclusion like _history_entries so the tool output survives in history.
+        self._write_transcript(wt, "t1.jsonl", [
+            {"type": "user", "uuid": "r1", "timestamp": "2026-07-01T10:00:00Z",
+             "message": {"role": "user", "content": [
+                 {"type": "tool_result", "tool_use_id": "x1", "content": "out.txt"}]}},
+        ])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+
+        pushed = []
+
+        def fake_post(tid, body):
+            pushed.append((tid, body))
+            return {"bytesStored": body["endOffset"]}
+
+        with mock.patch.object(sm, "_post_archive_chunk", fake_post):
+            sm._archive_deltas({})
+
+        self.assertEqual(len(pushed), 1)
+        entries = pushed[0][1]["entries"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["text"], "")  # no display text...
+        self.assertEqual(entries[0]["blocks"], [   # ...but the tool output is kept
+            {"t": "tool_result", "text": "out.txt", "forId": "x1"}])
 
     def test_deltas_stop_on_no_forward_progress(self):
         sm = self.make_manager()
