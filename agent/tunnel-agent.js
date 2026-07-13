@@ -48,6 +48,12 @@ const DEFAULT_TTYD_PORT = 7681;
 // this live path keeps the FULL per-message text (TAIL_MSG_CHARS below mirrors
 // the Python reading paths' TAIL_MSG_CHARS_FULL, not the heartbeat's smaller
 // per-message preview). If that Python changes shape, change this too.
+//
+// entryBlocks() below is the same story: a line-for-line mirror of hub-agent.py
+// _entry_blocks(), the rich block feed the native chat UI renders (thinking,
+// tool inputs, tool outputs that entryText flattens away). entryText stays the
+// lossy backward-compat contract (glasses + heartbeat preview); entryBlocks is
+// the additive rich contract. Both must be changed in lockstep.
 const PROJECTS_ROOT = process.env.CLAUDE_PROJECTS_ROOT || "/root/.claude/projects";
 const LIVE_TAIL_MS = Number(process.env.LIVE_TAIL_MS) || 1000;
 const TAIL_MSGS = Number(process.env.SESSION_TAIL_MSGS) || 30;
@@ -60,6 +66,20 @@ const TAIL_READ_BYTES = 1 << 17; // ~128 KB, matches _tail_entries
 const MAX_WATCHERS = 16; // safety cap on concurrent live tails
 // eslint-disable-next-line no-control-regex
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
+
+// Rich-block caps for the live tail — mirror hub-agent.py BLOCK_CAPS_LIVE. The
+// live path ships these ~1s so it uses the tight LIVE caps; a block cut to its
+// cap is flagged truncated (the web UI fetches the fuller copy via /history,
+// which uses the looser FULL caps on the Python side).
+const BLOCK_TEXT_CHARS = Number(process.env.SESSION_BLOCK_TEXT_CHARS) || 4000;
+const BLOCK_TOOL_INPUT_CHARS = Number(process.env.SESSION_BLOCK_TOOL_INPUT_CHARS) || 1000;
+const BLOCK_TOOL_RESULT_CHARS = Number(process.env.SESSION_BLOCK_TOOL_RESULT_CHARS) || 2000;
+const BLOCK_MAX_PER_ENTRY = Number(process.env.SESSION_BLOCK_MAX_PER_ENTRY) || 48;
+const BLOCK_CAPS_LIVE = {
+  text: BLOCK_TEXT_CHARS,
+  input: BLOCK_TOOL_INPUT_CHARS,
+  result: BLOCK_TOOL_RESULT_CHARS,
+};
 
 // Claude Code's project-dir slug for a worktree cwd: every non-alphanumeric
 // char -> '-' (mirrors hub-agent.py _project_slug — a plain '/'->'-' map is
@@ -142,6 +162,103 @@ function entryText(entry) {
   return text || null;
 }
 
+// (clipped, wasTruncated). Mirror of hub-agent.py _clip.
+function clip(text, cap) {
+  text = text || "";
+  if (text.length > cap) return [text.slice(0, cap), true];
+  return [text, false];
+}
+
+// Common Claude Code tools carry their salient arg under one of these keys.
+const TOOL_INPUT_KEYS = ["command", "file_path", "path", "pattern", "url", "query", "prompt"];
+
+// Compact display string for a tool_use `input` — mirror of _tool_input_summary.
+function toolInputSummary(inp) {
+  if (inp && typeof inp === "object" && !Array.isArray(inp)) {
+    for (const key of TOOL_INPUT_KEYS) {
+      const val = inp[key];
+      if (typeof val === "string" && val.trim()) return val;
+    }
+    try { return JSON.stringify(inp); } catch { return String(inp); }
+  }
+  if (typeof inp === "string") return inp;
+  if (inp == null) return "";
+  return String(inp);
+}
+
+// Flatten a tool_result block's `content` to text — mirror of _tool_result_text.
+function toolResultText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const block of content) {
+      if (block && typeof block === "object") {
+        if (block.type === "text") parts.push(String(block.text || ""));
+        else if (block.type === "image") parts.push("[image]");
+      } else if (typeof block === "string") {
+        parts.push(block);
+      }
+    }
+    return parts.join("");
+  }
+  if (content == null) return "";
+  return String(content);
+}
+
+// Rich, order-preserving block list for one transcript entry, or null to drop
+// it (wrong type / no message object). Additive companion to entryText —
+// preserves thinking / tool_use inputs / tool_result outputs that entryText
+// flattens away. `caps` is {text, input, result}. A block cut to its cap gets
+// truncated:true. Returns [] for a user/assistant message with no renderable
+// blocks. Line-for-line mirror of hub-agent.py _entry_blocks — keep in lockstep.
+function entryBlocks(entry, caps) {
+  const type = entry.type;
+  if (type !== "user" && type !== "assistant") return null;
+  const msg = entry.message;
+  if (!msg || typeof msg !== "object") return null;
+  const content = msg.content;
+  const blocks = [];
+  const addText = (kind, text, cap) => {
+    text = String(text || "").replace(ANSI_RE, "").trim();
+    if (!text) return;
+    const [clipped, trunc] = clip(text, cap);
+    const block = { t: kind, text: clipped };
+    if (trunc) block.truncated = true;
+    blocks.push(block);
+  };
+  if (typeof content === "string") {
+    addText("text", content, caps.text);
+  } else if (Array.isArray(content)) {
+    for (const raw of content) {
+      if (!raw || typeof raw !== "object") continue;
+      if (raw.type === "text") {
+        addText("text", raw.text || "", caps.text);
+      } else if (raw.type === "thinking") {
+        addText("thinking", raw.thinking || raw.text || "", caps.text);
+      } else if (raw.type === "tool_use" && raw.name) {
+        const summary = toolInputSummary(raw.input).replace(ANSI_RE, "").trim();
+        const [clipped, trunc] = clip(summary, caps.input);
+        const block = { t: "tool_use", name: String(raw.name), input: clipped };
+        if (raw.id) block.id = raw.id;
+        if (trunc) block.truncated = true;
+        blocks.push(block);
+      } else if (raw.type === "tool_result") {
+        const text = toolResultText(raw.content).replace(ANSI_RE, "").trim();
+        const [clipped, trunc] = clip(text, caps.result);
+        const block = { t: "tool_result", text: clipped };
+        if (raw.tool_use_id) block.forId = raw.tool_use_id;
+        if (raw.is_error) block.isError = true;
+        if (trunc) block.truncated = true;
+        blocks.push(block);
+      }
+      if (blocks.length >= BLOCK_MAX_PER_ENTRY) break;
+    }
+  } else {
+    return null;
+  }
+  return blocks;
+}
+
 // Last TAIL_MSGS surviving messages of a worktree's newest transcript, oldest
 // first: [{id: uuid, role, text}]. [] when there's no transcript yet.
 //
@@ -168,8 +285,17 @@ function transcriptTail(worktreePath, cache) {
     try { entry = JSON.parse(raw); } catch { continue; }
     if (!entry || typeof entry !== "object") continue;
     const text = entryText(entry);
-    if (text === null) continue;
-    tail.push({ id: entry.uuid, role: entry.type, text: text.slice(0, TAIL_MSG_CHARS) });
+    const blocks = entryBlocks(entry, BLOCK_CAPS_LIVE);
+    // Rich path widens inclusion: a tool_result-only turn (text === null) still
+    // has renderable blocks, so keep it for the chat UI. text stays the
+    // backward-compat flat string the glasses read.
+    if (text === null && (!blocks || blocks.length === 0)) continue;
+    tail.push({
+      id: entry.uuid,
+      role: entry.type,
+      text: (text || "").slice(0, TAIL_MSG_CHARS),
+      blocks: blocks || [],
+    });
   }
   const result = tail.slice(-TAIL_MSGS);
   if (cache) {
@@ -503,5 +629,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, entryText, transcriptTail, pokeHeartbeat, parsePaneLiveTurn };
+  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, BLOCK_CAPS_LIVE };
 }

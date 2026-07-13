@@ -1622,8 +1622,16 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
   assert.equal(watch.watch, "ls1");
   assert.equal(watch.worktreePath, "/wt/ls1");
 
-  // 3. A tail delta the agent pushes on the control channel reaches the live client.
-  const delta = { tail: "ls1", entries: [{ id: "c1", role: "assistant", text: "cached and more" }] };
+  // 3. A tail delta the agent pushes on the control channel reaches the live
+  //    client — including the rich `blocks` the native chat UI renders. The hub
+  //    relays entry objects verbatim, so blocks pass through untouched.
+  const delta = { tail: "ls1", entries: [{
+    id: "c1", role: "assistant", text: "cached and more",
+    blocks: [
+      { t: "text", text: "cached and more" },
+      { t: "tool_use", name: "Bash", input: "ls -la", id: "tu1" },
+    ],
+  }] };
   ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(delta))));
   const relayed = await nextTextJson(liveFrames, 1);
   assert.equal(relayed.type, "tail");

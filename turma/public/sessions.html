@@ -181,6 +181,89 @@
   .tr-msg.assistant.hit { border-color: var(--accent); }
   .tr-empty { color: var(--muted); font-size: 13px; padding: 24px; text-align: center; }
 
+  /* ---- Right stage: native chat view of a LIVE session --------------------- */
+  .chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--page); }
+  .chat-pane[hidden] { display: none; }
+  .chat-scroll { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  /* Text bubbles reuse the transcript bubble system: user right, agent left. */
+  .chat-scroll .tr-msg.assistant.streaming::after {
+    content: "▍"; margin-left: 1px; color: var(--accent); animation: caret 1s steps(1) infinite;
+  }
+  @keyframes caret { 50% { opacity: 0; } }
+
+  /* Tool-use / tool-result action card (collapsible). */
+  .action-card { align-self: flex-start; max-width: 760px; width: 100%; font-size: 12.5px;
+    border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); overflow: hidden; }
+  .action-card > summary { list-style: none; cursor: pointer; user-select: none; padding: 7px 11px;
+    display: flex; align-items: center; gap: 8px; color: var(--ink-2); }
+  .action-card > summary::-webkit-details-marker { display: none; }
+  .action-card > summary:hover { color: var(--accent); }
+  .action-card .tool-name { font-weight: 600; color: var(--ink); }
+  .action-card .tool-arg { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+  .action-card .tool-dot { width: 7px; height: 7px; border-radius: 999px; background: var(--muted); flex: none; }
+  .action-card.ok .tool-dot { background: var(--good); }
+  .action-card.err .tool-dot { background: var(--critical); }
+  .action-card .tool-body { padding: 0 11px 10px; display: flex; flex-direction: column; gap: 8px; }
+  .action-card .tool-block { }
+  .action-card .tool-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 3px; }
+  .action-card pre { margin: 0; padding: 8px 10px; background: var(--page); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+    line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; }
+  .action-card.err pre.tool-result { border-color: var(--critical); }
+  .action-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0; padding: 2px 0; text-align: left; }
+  .action-card .trunc:hover { text-decoration: underline; }
+
+  /* Concise "N actions" collapsed run. */
+  .actions-group { align-self: flex-start; max-width: 760px; border: 1px dashed var(--border);
+    border-radius: var(--radius-md); background: transparent; }
+  .actions-group > summary { list-style: none; cursor: pointer; user-select: none; padding: 6px 11px;
+    color: var(--muted); font-size: 12px; }
+  .actions-group > summary::-webkit-details-marker { display: none; }
+  .actions-group > summary:hover { color: var(--accent); }
+  .actions-group[open] > summary { color: var(--ink-2); }
+  .actions-group .grp-cards { padding: 4px 8px 8px; display: flex; flex-direction: column; gap: 8px; }
+
+  /* Collapsed thinking trace. */
+  .thought { align-self: flex-start; max-width: 760px; color: var(--muted); font-size: 12.5px; }
+  .thought > summary { list-style: none; cursor: pointer; user-select: none; color: var(--muted); }
+  .thought > summary::-webkit-details-marker { display: none; }
+  .thought > summary:hover { color: var(--accent); }
+  .thought .thought-body { margin-top: 4px; padding: 8px 11px; border-left: 2px solid var(--border);
+    color: var(--ink-2); font-style: italic; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+  /* Verbosity control in the chat header. */
+  .verbosity { display: inline-flex; align-items: center; gap: 8px; }
+  .verbosity .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 999px; overflow: hidden; }
+  .verbosity .seg button { font: inherit; font-size: 11px; padding: 3px 10px; background: var(--surface); border: 0;
+    color: var(--muted); cursor: pointer; }
+  .verbosity .seg button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .verbosity .gear { position: relative; }
+  .verbosity .gear-btn { font: inherit; font-size: 13px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); width: 26px; height: 24px; cursor: pointer; color: var(--ink-2); }
+  .verbosity .gear-pop { position: absolute; right: 0; top: 28px; z-index: 20; background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius-md); padding: 8px 10px; box-shadow: 0 8px 24px #0006;
+    display: none; white-space: nowrap; }
+  .verbosity .gear-pop.open { display: block; }
+  .verbosity .gear-pop label { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 0; color: var(--ink); cursor: pointer; }
+
+  /* Pending-question chips. */
+  .chat-question { border-top: 1px solid var(--border); padding: 10px 12px; background: var(--accent-soft); }
+  .chat-question .q-text { font-size: 13px; color: var(--ink); margin-bottom: 8px; }
+  .chat-question .q-opts { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chat-question .q-opt { font: inherit; font-size: 12.5px; padding: 5px 12px; border-radius: 999px;
+    border: 1px solid var(--accent); background: var(--surface); color: var(--accent); cursor: pointer; }
+  .chat-question .q-opt:hover { background: var(--accent); color: #fff; }
+  .chat-question .q-hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
+
+  .chat-compose { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border); background: var(--surface); }
+  .chat-compose textarea { flex: 1; resize: none; font: inherit; font-size: 13.5px; line-height: 1.5;
+    padding: 8px 11px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--page); color: var(--ink); }
+  .chat-empty { color: var(--muted); font-size: 13px; padding: 24px; text-align: center; }
+  .term-bar .seg-toggle { font: inherit; font-size: 11px; padding: 3px 10px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: var(--surface); color: var(--ink-2); cursor: pointer; }
+  .term-bar .seg-toggle:hover { border-color: var(--accent); color: var(--accent); }
+
   /* ---- Responsive: stack to list → full-screen terminal on phones/tablets -- */
   @media (max-width: 820px) {
     .sidebar { width: 100%; border-right: 0; padding-bottom: 84px; }
@@ -247,9 +330,27 @@
         </div>
         <div class="tr-scroll" id="trScroll"></div>
       </div>
+      <div class="chat-pane" id="chatPane" hidden>
+        <div class="term-bar">
+          <button class="back-btn" onclick="backToList()">‹ Sessions</button>
+          <span class="t-title"><span class="name" id="chatTitle"></span> · <span class="path" id="chatPath"></span></span>
+          <span class="spacer"></span>
+          <span class="verbosity" id="chatVerbosity"></span>
+          <button class="seg-toggle" id="chatTermBtn" onclick="chatToTerminal()" title="Open the raw ttyd terminal for debugging">Terminal ▸</button>
+          <button class="kill-btn" id="chatKill" onclick="killCurrentChat()">Kill</button>
+        </div>
+        <div class="chat-scroll" id="chatScroll"></div>
+        <div class="chat-question" id="chatQuestion" hidden></div>
+        <div class="chat-compose">
+          <textarea id="chatInput" rows="1" placeholder="Message the agent — Enter to send, Shift+Enter for newline"
+            oninput="autoGrowChatInput()" onkeydown="chatInputKey(event)"></textarea>
+          <button class="primary" id="chatSend" onclick="sendChatInput()">Send</button>
+        </div>
+      </div>
       <div class="term-pane" id="termPane" hidden>
         <div class="term-bar">
           <button class="back-btn" onclick="backToList()">‹ Sessions</button>
+          <button class="seg-toggle" id="termChatBtn" onclick="terminalToChat()" title="Back to the native chat view">◂ Chat</button>
           <span class="t-title"><span class="name" id="termTitle"></span> · <span class="path" id="termPath"></span></span>
           <span class="spacer"></span>
           <a id="termOpen" target="_blank" rel="noopener">Open in new tab ↗</a>
@@ -434,6 +535,10 @@ function render(data) {
   if (currentId) {
     const still = running.find(x => x.s.id === currentId && x.a.terminalOnline);
     if (!still) clearStage();
+    else if ((viewMode === "chat" || viewMode === "terminal") && window.TurmaChat) {
+      // Refresh the chat header + pending-question region from the new heartbeat.
+      TurmaChat.onPoll(still.s);
+    }
   }
 }
 
@@ -516,10 +621,11 @@ function sessStart(key, id) {
 // terminal pushes one history entry so the back button returns to the list.
 const $frame = document.getElementById("termFrame");
 const $termPane = document.getElementById("termPane");
+const $chatPane = document.getElementById("chatPane");
 const $transcriptPane = document.getElementById("transcriptPane");
 const $stageEmpty = document.getElementById("stageEmpty");
 let currentId = null;
-let viewMode = null; // "terminal" | "transcript" | null — what the stage shows
+let viewMode = null; // "chat" | "terminal" | "transcript" | null — what the stage shows
 let viewPushed = false; // a history entry the back button will consume (mobile)
 const isNarrow = () => window.matchMedia("(max-width: 820px)").matches;
 
@@ -543,18 +649,46 @@ function setFrame(id, s, a) {
   const inp = document.getElementById("termInput");
   if (inp) { inp.value = ""; autoGrowTermInput(); }
 }
-function selectSession(id) {
+function sessionHit(id) {
   const now = cache.now || Date.now();
   const { running } = collect(cache.agents || [], now);
-  const hit = running.find(x => x.s.id === id && x.a.terminalOnline);
+  return running.find(x => x.s.id === id && x.a.terminalOnline) || null;
+}
+// Picking a running session now opens the NATIVE CHAT view by default (the live
+// transcript, streamed over /live, rendered as chat bubbles + tool cards). The
+// raw ttyd terminal is one "Terminal ▸" toggle away for debugging.
+function selectSession(id) {
+  const hit = sessionHit(id);
   if (!hit) return;
-  setFrame(id, hit.s, hit.a);
-  viewMode = "terminal";
-  $termPane.hidden = false;
+  currentId = id;
+  viewMode = "chat";
+  $termPane.hidden = true;
   $transcriptPane.hidden = true;
   $stageEmpty.hidden = true;
+  $chatPane.hidden = false;
+  disarmChatKill();
+  if (window.TurmaChat) TurmaChat.open(hit.a.key, id, hit.s, hit.a);
   enterStage();
   render(cache); // refresh the .cur highlight
+}
+// Swap the chat view for the raw ttyd terminal (debugging), keeping the chat's
+// live tail warm underneath so returning is instant.
+function chatToTerminal() {
+  if (!currentId) return;
+  const hit = sessionHit(currentId);
+  setFrame(currentId, hit ? hit.s : null, hit ? hit.a : null);
+  viewMode = "terminal";
+  $chatPane.hidden = true;
+  $termPane.hidden = false;
+}
+function terminalToChat() {
+  if (!currentId) return;
+  navFrame("about:blank"); // drop the terminal's WebSocket while it's hidden
+  viewMode = "chat";
+  $termPane.hidden = true;
+  $chatPane.hidden = false;
+  disarmTermKill();
+  if (window.TurmaChat) TurmaChat.repaint();
 }
 // Push one mobile history entry the back button consumes, and reveal the stage.
 function enterStage() {
@@ -566,12 +700,15 @@ function enterStage() {
 function clearStage() {
   currentId = null;
   navFrame("about:blank"); // tear down any live session's WebSocket
+  if (window.TurmaChat) TurmaChat.close(); // stop the chat live tail
   viewMode = null;
+  $chatPane.hidden = true;
   $termPane.hidden = true;
   $transcriptPane.hidden = true;
   $stageEmpty.hidden = false;
   document.body.classList.remove("showing-term");
   disarmTermKill();
+  disarmChatKill();
   renderSearch(); renderArchive(); // refresh .cur highlights
 }
 function backToList() {
@@ -610,6 +747,31 @@ function killCurrentTerminal() {
     return;
   }
   disarmTermKill();
+  post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`);
+  if (viewPushed) { viewPushed = false; history.back(); }
+  clearStage();
+}
+// Same arm-then-confirm Kill, from the chat header.
+let chatKillArmed = false, chatKillTimer = null;
+function disarmChatKill() {
+  chatKillArmed = false;
+  if (chatKillTimer) { clearTimeout(chatKillTimer); chatKillTimer = null; }
+  const btn = document.getElementById("chatKill");
+  if (btn) { btn.textContent = "Kill"; btn.classList.remove("armed"); }
+}
+function killCurrentChat() {
+  const id = currentId;
+  const btn = document.getElementById("chatKill");
+  if (!id) return;
+  const key = hostKeyForSession(id);
+  if (!key) { if (btn) btn.textContent = "host offline"; return; }
+  if (!chatKillArmed) {
+    chatKillArmed = true;
+    if (btn) { btn.textContent = "Confirm kill"; btn.classList.add("armed"); }
+    chatKillTimer = setTimeout(disarmChatKill, 3500);
+    return;
+  }
+  disarmChatKill();
   post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`);
   if (viewPushed) { viewPushed = false; history.back(); }
   clearStage();
@@ -795,6 +957,8 @@ async function openTranscript(id, title, hi) {
   document.getElementById("trPath").textContent = "loading…";
   document.getElementById("trScroll").innerHTML = `<div class="tr-empty">Loading transcript…</div>`;
   viewMode = "transcript";
+  if (window.TurmaChat) TurmaChat.close(); // leaving any live chat
+  $chatPane.hidden = true;
   $termPane.hidden = true;
   $stageEmpty.hidden = true;
   $transcriptPane.hidden = false;
@@ -921,5 +1085,9 @@ connectSSE();
 // Fallback poll: slower now that SSE carries live updates, skipped while healthy.
 setInterval(() => { if (!sseOk) refresh(); }, 15000);
 </script>
+<!-- Native chat engine: live-transcript streaming, rich block rendering,
+     verbosity control, compose + AskUserQuestion answering. Loaded after the
+     inline script so it can read its shared helpers (cache, esc, enc, …). -->
+<script src="/chat.js"></script>
 </body>
 </html>

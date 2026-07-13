@@ -144,6 +144,32 @@ TAIL_MSG_CHARS = int(os.environ.get("SESSION_TAIL_MSG_CHARS", "500"))
 # response never shows up cut off mid-sentence on the glasses. The client keeps
 # whichever copy of a message is longer, so the preview never clobbers it.
 TAIL_MSG_CHARS_FULL = int(os.environ.get("SESSION_TAIL_MSG_CHARS_FULL", "16000"))
+# Rich-block caps (native chat UI). _entry_blocks() preserves the thinking,
+# tool_use inputs and tool_result outputs that _entry_text() flattens away, so
+# the web chat can show/hide each component by verbosity. The live tail
+# (tunnel-agent.js) pushes these ~1s, so it uses the tight LIVE caps; on-demand
+# `history` uses the looser FULL caps so an "Expand" reveals genuinely more. A
+# block cut to its cap is flagged truncated:true. Keep these mirrored in
+# tunnel-agent.js.
+BLOCK_TEXT_CHARS = int(os.environ.get("SESSION_BLOCK_TEXT_CHARS", "4000"))
+BLOCK_TOOL_INPUT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_INPUT_CHARS", "1000"))
+BLOCK_TOOL_RESULT_CHARS = int(os.environ.get("SESSION_BLOCK_TOOL_RESULT_CHARS", "2000"))
+BLOCK_TEXT_CHARS_FULL = int(os.environ.get("SESSION_BLOCK_TEXT_CHARS_FULL", "16000"))
+BLOCK_TOOL_INPUT_CHARS_FULL = int(os.environ.get("SESSION_BLOCK_TOOL_INPUT_CHARS_FULL", "4000"))
+BLOCK_TOOL_RESULT_CHARS_FULL = int(os.environ.get("SESSION_BLOCK_TOOL_RESULT_CHARS_FULL", "8000"))
+# Defensive per-entry block cap so one pathological turn can't blow the tail
+# frame (each block is already char-capped above).
+BLOCK_MAX_PER_ENTRY = int(os.environ.get("SESSION_BLOCK_MAX_PER_ENTRY", "48"))
+BLOCK_CAPS_LIVE = {
+    "text": BLOCK_TEXT_CHARS,
+    "input": BLOCK_TOOL_INPUT_CHARS,
+    "result": BLOCK_TOOL_RESULT_CHARS,
+}
+BLOCK_CAPS_FULL = {
+    "text": BLOCK_TEXT_CHARS_FULL,
+    "input": BLOCK_TOOL_INPUT_CHARS_FULL,
+    "result": BLOCK_TOOL_RESULT_CHARS_FULL,
+}
 # Terminal color/cursor codes sometimes make it into pasted transcript text;
 # strip them so the glasses client only ever sees plain text.
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -1183,6 +1209,129 @@ def _entry_text(entry):
     return text or None
 
 
+def _clip(text, cap):
+    """(clipped, was_truncated). None/empty -> ("", False)."""
+    text = text or ""
+    if len(text) > cap:
+        return text[:cap], True
+    return text, False
+
+
+# Common Claude Code tools carry their salient argument under one of these keys;
+# surface it as the tool_use's one-line summary rather than a raw JSON dump.
+_TOOL_INPUT_KEYS = ("command", "file_path", "path", "pattern", "url", "query", "prompt")
+
+
+def _tool_input_summary(inp):
+    """A compact display string for a tool_use `input` object: the salient arg
+    for known tools, else a compact JSON dump, else str()."""
+    if isinstance(inp, dict):
+        for key in _TOOL_INPUT_KEYS:
+            val = inp.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        try:
+            return json.dumps(inp, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return str(inp)
+    if isinstance(inp, str):
+        return inp
+    if inp is None:
+        return ""
+    return str(inp)
+
+
+def _tool_result_text(content):
+    """Flatten a tool_result block's `content` (a string, or a list of
+    {type:'text'|'image', ...} blocks) to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(str(block.get("text") or ""))
+                elif block.get("type") == "image":
+                    parts.append("[image]")
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _entry_blocks(entry, caps):
+    """Rich, order-preserving block list for one transcript entry, or None to
+    drop it (wrong type / no message dict). Additive companion to _entry_text:
+    it PRESERVES the thinking text, tool_use inputs and tool_result outputs that
+    _entry_text() flattens away, so the native chat UI can show/hide each
+    component by verbosity. `caps` is a {text, input, result} char-limit dict
+    (BLOCK_CAPS_LIVE for the ~1s tail, BLOCK_CAPS_FULL for on-demand history); a
+    block cut to its cap gets truncated:true. Blocks:
+      {t:"text",        text}
+      {t:"thinking",    text, truncated?}
+      {t:"tool_use",    id, name, input, truncated?}
+      {t:"tool_result", forId, text, isError?, truncated?}
+    Returns [] for a user/assistant message with no renderable blocks. Keep this
+    mirrored with tunnel-agent.js entryBlocks()."""
+    if entry.get("type") not in ("user", "assistant"):
+        return None
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    blocks = []
+
+    def add_text(kind, text, cap):
+        text = ANSI_RE.sub("", text or "").strip()
+        if not text:
+            return
+        clipped, trunc = _clip(text, cap)
+        block = {"t": kind, "text": clipped}
+        if trunc:
+            block["truncated"] = True
+        blocks.append(block)
+
+    if isinstance(content, str):
+        add_text("text", content, caps["text"])
+    elif isinstance(content, list):
+        for raw in content:
+            if not isinstance(raw, dict):
+                continue
+            btype = raw.get("type")
+            if btype == "text":
+                add_text("text", str(raw.get("text") or ""), caps["text"])
+            elif btype == "thinking":
+                add_text("thinking", str(raw.get("thinking") or raw.get("text") or ""), caps["text"])
+            elif btype == "tool_use" and raw.get("name"):
+                summary = ANSI_RE.sub("", _tool_input_summary(raw.get("input"))).strip()
+                clipped, trunc = _clip(summary, caps["input"])
+                block = {"t": "tool_use", "name": str(raw["name"]), "input": clipped}
+                if raw.get("id"):
+                    block["id"] = raw["id"]
+                if trunc:
+                    block["truncated"] = True
+                blocks.append(block)
+            elif btype == "tool_result":
+                text = ANSI_RE.sub("", _tool_result_text(raw.get("content"))).strip()
+                clipped, trunc = _clip(text, caps["result"])
+                block = {"t": "tool_result", "text": clipped}
+                if raw.get("tool_use_id"):
+                    block["forId"] = raw["tool_use_id"]
+                if raw.get("is_error"):
+                    block["isError"] = True
+                if trunc:
+                    block["truncated"] = True
+                blocks.append(block)
+            if len(blocks) >= BLOCK_MAX_PER_ENTRY:
+                break
+    else:
+        return None
+    return blocks
+
+
 def transcript_tail(path):
     """Last TAIL_MSGS surviving messages of a transcript for the glasses
     client's tail feed, oldest first: [{"id": entry uuid, "role": "user"/
@@ -1286,12 +1435,18 @@ def _history_entries(path):
         if not isinstance(entry, dict):
             continue
         text = _entry_text(entry)
-        if text is None:
+        blocks = _entry_blocks(entry, BLOCK_CAPS_FULL)
+        # Rich path widens inclusion beyond _entry_text: a turn that carries only
+        # tool_result blocks (text is None) still has renderable blocks and is
+        # kept, so the chat UI can show tool output. transcript_tail keeps the
+        # old drop-when-None rule (heartbeat/archive stay lean).
+        if text is None and not blocks:
             continue
         entries.append({
             "id": entry.get("uuid"),
             "role": entry.get("type"),
-            "text": text[:TAIL_MSG_CHARS_FULL],
+            "text": (text or "")[:TAIL_MSG_CHARS_FULL],
+            "blocks": blocks or [],
         })
     return entries, byte_capped
 
