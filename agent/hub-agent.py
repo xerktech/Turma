@@ -105,6 +105,9 @@ CLOSED_PATH = os.path.join(REGISTRY_DIR, "closed.json")
 # Only the newest N closed sessions per repo are kept/offered for resume —
 # bounds both the file and the heartbeat payload.
 CLOSED_PER_REPO = 5
+# Newest N resumable transcripts offered per repo in the "Resume any session"
+# picker — bounds the heartbeat (the durable archive holds the full history).
+RESUMABLE_PER_REPO = 15
 # Durable worktree-path -> {repo, remote, slug} attribution ledger. Written at
 # spawn and NEVER dropped on kill/delete, so a transcript's token usage stays
 # traceable to its repo long after the session (and even its worktree) is gone.
@@ -1414,6 +1417,31 @@ def _first_user_text(path, max_lines=500):
     return None
 
 
+def _transcript_cwd(path):
+    """The real working directory a transcript was recorded from, or None.
+
+    Claude Code stamps the un-slugified `cwd` on its early entries; reading it
+    back is the authoritative way to invert a transcript to its origin path (the
+    project slug is lossy — every non-alphanumeric collapsed to '-'). Used both
+    to name a repo (_repo_from_transcript_cwd) and to pick the cwd a resumed
+    session must relaunch in so `claude --resume <id>` resolves it (Claude scopes
+    id lookup to the current repo's LIVE git worktrees + repo dir, so the
+    resumed session's cwd has to be that origin path). Bounded head-scan — the
+    cwd sits on the first handful of entries."""
+    try:
+        with open(path, errors="replace") as fh:
+            for _i, line in zip(range(200), fh):  # cwd is on early entries
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and e.get("cwd"):
+                    return e["cwd"]
+    except OSError:
+        return None
+    return None
+
+
 def _history_entries(path):
     """On-demand `history` read of a transcript: bounded to the last 4 MiB
     (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
@@ -1958,6 +1986,11 @@ class SessionManager:
         # live registry so it persists regardless of active sessions).
         self.repo_usage = []
         self.host_usage = None
+        # Per-repo list of resumable transcripts (EVERY prior Claude session for
+        # the repo whose origin cwd is under REPOS_ROOT — Turma worktrees, repo-dir
+        # "terminal" runs, and the repos-root pseudo-repo alike, not just the last
+        # few killed sessions). Refreshed on the slow USAGE_EVERY cadence.
+        self.resumable = {}                      # repo name -> [resumable entry]
         self.ttyd = {}                           # id -> ttyd Popen (in-memory)
         self.sess_state = {}                     # id -> session_report offsets
         self.usage_cache = {}                    # id -> usage_report result
@@ -2173,12 +2206,15 @@ class SessionManager:
         self._guard_settings_path = path
         return path
 
-    def _launch_tmux(self, sess, resume=False, prompt=None):
+    def _launch_tmux(self, sess, resume=False, prompt=None, resume_id=None):
         """(Re)launch claude for a session inside its own tmux, detached.
 
         resume=True relaunches the worktree's most recent CONVERSATION
         (claude --resume <newest transcript id>) instead of an empty context;
         it silently falls back to a fresh claude when no transcript exists.
+        resume_id pins a SPECIFIC transcript to resume (the "resume any prior
+        session" picker) instead of the worktree's newest — it's validated
+        uuid-ish before reaching the tmux command line.
 
         prompt (spawn only, #11) is delivered as claude's positional initial
         prompt — the race-free path: it is submitted as the first user turn when
@@ -2193,7 +2229,11 @@ class SessionManager:
         # to claude.ai/code + mobile under its per-session display name.
         parts = ["claude"]
         if resume:
-            claude_sid = self._latest_transcript_id(sess["worktreePath"])
+            claude_sid = None
+            if resume_id and re.fullmatch(r"[A-Za-z0-9-]+", resume_id):
+                claude_sid = resume_id  # a specific transcript from the picker
+            else:
+                claude_sid = self._latest_transcript_id(sess["worktreePath"])
             if claude_sid:
                 parts.append(f"--resume {claude_sid}")
         parts.append(f"--remote-control '{sess['rcName']}'")
@@ -2527,6 +2567,98 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
+    def resume_transcript(self, transcript_id, cwd_hint=None):
+        """Resume ANY prior Claude session by its transcript id (the "resume any
+        session" picker), not just a killed Turma session in closed.json. Locate
+        the transcript, read its ORIGIN cwd, re-create that worktree at the exact
+        path if it was deleted/pruned (Claude scopes id lookup to the repo's LIVE
+        worktrees, so the origin dir must exist for --resume to resolve), then
+        launch a fresh session cwd'd there with `claude --resume <id>`. Running
+        with cwd == the transcript's origin keeps transcript-slug == worktree-slug,
+        so all per-session reporting (tail/usage/questions/summary) keeps working.
+        A new Turma id/rcName/port is minted like spawn; the record moves nothing
+        out of closed.json (the picker lists transcripts, not closed records)."""
+        if not transcript_id or not re.fullmatch(r"[A-Za-z0-9-]+", transcript_id):
+            log(f"resumeTranscript: bad transcript id {transcript_id!r}")
+            return
+        # Find the transcript dir: trust the picker's cwd hint if it still holds
+        # the file, else scan PROJECTS_ROOT for it.
+        proj = None
+        if cwd_hint:
+            cand = os.path.join(PROJECTS_ROOT, _project_slug(cwd_hint))
+            if os.path.isfile(os.path.join(cand, transcript_id + ".jsonl")):
+                proj = cand
+        if proj is None:
+            proj = self._find_transcript_dir(transcript_id)
+        if proj is None:
+            log(f"resumeTranscript: no transcript {transcript_id}")
+            return
+        path = os.path.join(proj, transcript_id + ".jsonl")
+        cwd = _transcript_cwd(path) or cwd_hint
+        # Only a cwd under REPOS_ROOT is resumable here — never let a free-form
+        # path reach git/tmux.
+        cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
+        if not cls:
+            log(f"resumeTranscript: cwd {cwd!r} not resumable on this host")
+            return
+        repo, _origin, is_root = cls
+        cwd = os.path.normpath(cwd)
+        if self._running_count() >= MAX_SESSIONS:
+            log(f"resumeTranscript refused: at MAX_SESSIONS ({MAX_SESSIONS})")
+            return
+        if is_root and self._root_running():
+            log("resumeTranscript refused: a root session is already running")
+            return
+        # One live session per cwd: two claudes in the same dir share a project
+        # slug + RC bridge pointer and would collide (the same reason root is
+        # single). A worktree resume gets its own dir, so this only bites a repo-
+        # dir / repos-root re-resume while one is already up.
+        if any(s.get("status") == "running"
+               and os.path.normpath(s.get("worktreePath") or "") == cwd
+               for s in self.registry):
+            log(f"resumeTranscript refused: a session is already running in {cwd}")
+            return
+        repo_path = REPOS_ROOT if is_root else os.path.join(REPOS_ROOT, repo)
+        if not is_root and not os.path.isdir(repo_path):
+            log(f"resumeTranscript: repo {repo!r} is gone; cannot resume")
+            return
+        sid = self._new_id()
+        sess = {
+            "id": sid,
+            "repo": repo,
+            "repoPath": repo_path,
+            "worktreePath": cwd,
+            "branch": None,
+            "root": is_root,
+            "label": None,
+            "summary": None,       # seeded from the transcript on later beats
+            "rcName": f"{slugify(self.device)}-{slugify(repo)}-{sid}",
+            "tmuxName": f"agent-{sid}",
+            "ttydPort": self._alloc_port(),
+            "model": None,
+            "permissionMode": "auto",
+            "baseRef": None,
+            "status": "running",
+            "createdAt": now_iso(),
+            "stoppedAt": None,
+            "errorMsg": None,
+        }
+        self.registry.append(sess)
+        try:
+            # A deleted/pruned Turma worktree: re-add a detached one at the exact
+            # origin path so its slug matches the transcript and claude resolves
+            # the id. Repo-dir / repos-root cwds always exist, so this is skipped.
+            if not is_root and not os.path.isdir(cwd):
+                sess["baseRef"] = resolve_base_ref(repo_path, None)
+                self._worktree_add(sess, base_ref=sess["baseRef"])
+            self._remember_usage(sess)
+            self._launch_tmux(sess, resume=True, resume_id=transcript_id)
+            self._launch_ttyd(sess)
+            log(f"resumed transcript {transcript_id} for {repo} in {cwd} "
+                f"on :{sess['ttydPort']}")
+        except Exception as e:
+            self._set_error(sess, e)
+
     def restart(self, sid):
         """Clear context: kill claude/tmux in place, drop the bridge pointer, and
         relaunch a FRESH claude in the same worktree (new transcript/RC session).
@@ -2714,6 +2846,133 @@ class SessionManager:
             elif summary and not cur.get("summary"):
                 cur["summary"] = summary
         return meta
+
+    def _resumable_cwd_class(self, cwd, repo_names):
+        """Classify a transcript's origin cwd for the resume picker, or None when
+        it isn't resumable on this host. Returns (repo, origin_label, is_root):
+          - cwd == REPOS_ROOT           -> (ROOT_REPO_NAME, "repos root", True)
+          - cwd under WORKTREES_ROOT    -> (<repo>, <worktree-dir>, False)
+          - cwd == REPOS_ROOT/<repo>    -> (<repo>, "repo dir", False)
+          - anything else (a foreign dev-machine path, or a deeper subdir) -> None
+        Paths are normalized so a trailing slash / '..' can't slip a cwd past the
+        containment checks. WORKTREES_ROOT lives under REPOS_ROOT, so it must be
+        tested before the plain repo-dir case; the repo-dir case additionally
+        requires a single segment that names a real scanned repo (so `.turma`
+        and nested subdirs are excluded)."""
+        if not cwd:
+            return None
+        norm = os.path.normpath(cwd)
+        if norm == os.path.normpath(REPOS_ROOT):
+            return (ROOT_REPO_NAME, "repos root", True)
+        wt_root = os.path.normpath(WORKTREES_ROOT)
+        if norm.startswith(wt_root + os.sep):
+            rel = norm[len(wt_root) + 1:].split(os.sep)
+            if len(rel) == 2 and rel[0] and rel[1]:   # <repo>/<worktree-id>
+                return (rel[0], rel[1], False)
+            return None
+        root = os.path.normpath(REPOS_ROOT)
+        if norm.startswith(root + os.sep):
+            rel = norm[len(root) + 1:].split(os.sep)
+            if len(rel) == 1 and rel[0] in repo_names:
+                return (rel[0], "repo dir", False)
+        return None
+
+    def _find_transcript_dir(self, transcript_id):
+        """The PROJECTS_ROOT/<slug> dir holding <transcript_id>.jsonl, or None —
+        used to resume a picked transcript whose slug the caller didn't pin."""
+        fname = transcript_id + ".jsonl"
+        try:
+            slugs = os.listdir(PROJECTS_ROOT)
+        except OSError:
+            return None
+        for slug in slugs:
+            if os.path.isfile(os.path.join(PROJECTS_ROOT, slug, fname)):
+                return os.path.join(PROJECTS_ROOT, slug)
+        return None
+
+    def _resumable_report(self):
+        """Per-repo list of EVERY prior Claude session resumable on this host —
+        the "Resume any session" picker's source, not just the last-5 killed
+        Turma sessions in closed.json. Enumerates transcripts under PROJECTS_ROOT
+        and keeps those whose ORIGIN cwd (_transcript_cwd, falling back to the
+        ledger's real-path key) is resumable here — a Turma worktree, a repo-dir
+        "terminal" run, or the repos-root pseudo-repo (see _resumable_cwd_class).
+        A dev-machine session synced through the shared ~/.claude has a foreign
+        cwd and is skipped: visible in history/search, resumable only where it
+        ran. Transcripts backing a registered session (running or stopped — they
+        already have a card with Start) are skipped. Capped to the newest
+        RESUMABLE_PER_REPO per repo to bound the heartbeat; the summary read is
+        deferred until after the cap so it's paid only for the survivors.
+
+        Returns repo-name -> [{transcriptId, cwd, repo, root, origin, summary,
+        endedTs}] newest-first."""
+        # Slugs already represented by a session card (running or stopped).
+        carded = set()
+        for s in self.registry:
+            wt = s.get("worktreePath") or (REPOS_ROOT if s.get("root") else None)
+            if wt:
+                carded.add(_project_slug(wt))
+        repo_names = {r["name"] for r in scan_repos()}
+        # slug -> a real worktree path the ledger recorded, so a transcript whose
+        # own cwd we can't read still classifies when the ledger keyed its path.
+        slug_path = {}
+        for wt, m in (self.usage_ledger or {}).items():
+            slug = (m or {}).get("slug") or _project_slug(wt)
+            slug_path.setdefault(slug, wt)
+
+        by_repo = {}
+        try:
+            slugs = os.listdir(PROJECTS_ROOT)
+        except OSError:
+            slugs = []
+        for slug in slugs:
+            if slug in carded:
+                continue
+            proj = os.path.join(PROJECTS_ROOT, slug)
+            try:
+                names = [f for f in os.listdir(proj) if f.endswith(".jsonl")]
+            except OSError:
+                continue
+            for fname in names:
+                tid = fname[:-len(".jsonl")]
+                # The id is interpolated onto the tmux command line at resume.
+                if not re.fullmatch(r"[A-Za-z0-9-]+", tid):
+                    continue
+                path = os.path.join(proj, fname)
+                cwd = _transcript_cwd(path)
+                if not cwd:
+                    lp = slug_path.get(slug)
+                    cwd = lp if lp and _project_slug(lp) == slug else None
+                cls = self._resumable_cwd_class(cwd, repo_names)
+                if not cls:
+                    continue
+                repo, origin, root = cls
+                try:
+                    mtime = os.stat(path).st_mtime
+                except OSError:
+                    continue
+                by_repo.setdefault(repo, []).append({
+                    "transcriptId": tid,
+                    "cwd": os.path.normpath(cwd),
+                    "repo": repo,
+                    "root": root,
+                    "origin": origin,
+                    "slug": slug,          # dropped below; picks the summary source
+                    "mtime": mtime,        # dropped below; sort/cap key
+                })
+        sess_meta = self._session_meta_by_slug()
+        for repo, lst in by_repo.items():
+            lst.sort(key=lambda e: e["mtime"], reverse=True)
+            del lst[RESUMABLE_PER_REPO:]
+            for e in lst:
+                sm = sess_meta.get(e["slug"], {})
+                e["summary"] = sm.get("summary") or _first_user_text(
+                    os.path.join(PROJECTS_ROOT, e["slug"], e["transcriptId"] + ".jsonl"))
+                e["endedTs"] = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(e["mtime"]))
+                e.pop("mtime", None)
+                e.pop("slug", None)
+        return by_repo
 
     def _archive_manifest(self):
         """Manifest of inactive-session transcripts eligible for archive: enumerate
@@ -3280,6 +3539,9 @@ class SessionManager:
                     self.restart(cmd.get("sessionId"))
                 elif ctype == "resume":
                     self.resume(cmd.get("sessionId"))
+                elif ctype == "resumeTranscript":
+                    self.resume_transcript(
+                        cmd.get("transcriptId"), cmd.get("cwd"))
                 elif ctype == "delete":
                     self.delete(cmd.get("sessionId"))
                 elif ctype == "input":
@@ -3408,19 +3670,7 @@ class SessionManager:
             return None
         newest = max(files,
                      key=lambda f: os.path.getmtime(os.path.join(proj, f)))
-        cwd = None
-        try:
-            with open(os.path.join(proj, newest)) as fh:
-                for _i, line in zip(range(200), fh):  # cwd is on early entries
-                    try:
-                        e = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(e, dict) and e.get("cwd"):
-                        cwd = e["cwd"]
-                        break
-        except OSError:
-            return None
+        cwd = _transcript_cwd(os.path.join(proj, newest))
         if not cwd:
             return None
         name = re.split(r"[\\/]+", str(cwd).strip().rstrip("\\/"))[-1]
@@ -3520,6 +3770,12 @@ class SessionManager:
                 self.usage_ledger, self._fold_slug)
         except Exception as e:
             log(f"repo usage parse failed: {e}")
+        # The "resume any prior session" picker's per-repo list, computed on the
+        # same slow cadence and reported (from cache) every beat.
+        try:
+            self.resumable = self._resumable_report()
+        except Exception as e:
+            log(f"resumable scan failed: {e}")
 
     def _session_git(self, sess, refresh):
         """(git-info dict | None, branch-sync work dict) for a session's payload.
@@ -3669,7 +3925,12 @@ class SessionManager:
                 e.get("lastCommit") or "", activity.get(e["name"], "")
             )
         entries.sort(key=lambda e: e.get("lastActivity") or "", reverse=True)
-        return [root_repo_entry()] + entries
+        out = [root_repo_entry()] + entries
+        # Attach each repo's resumable-session list (cached; refreshed on the slow
+        # cadence in _refresh_repo_usage) for the "Resume any session" picker.
+        for e in out:
+            e["resumable"] = self.resumable.get(e["name"], [])
+        return out
 
     def _log_tail(self, beat, light):
         """This container's `docker logs` tail, throttled: recomputed every
