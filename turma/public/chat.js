@@ -36,6 +36,42 @@
   }
   function enc(s) { return encodeURIComponent(s); }
 
+  // Turn plain transcript text into HTML with clickable links. Bare http(s)
+  // URLs and markdown [text](url) links (http/https only) become <a> tags that
+  // open in a new tab; every other run of text is HTML-escaped exactly like
+  // esc(). Only http/https is ever linkified (no javascript:/data: hrefs), and
+  // both the label and the href are escaped, so this is as injection-safe as
+  // esc() — a bare esc() and linkify() produce identical output for link-free
+  // text. Used for prose surfaces (message bubbles, thinking traces); tool
+  // input/output <pre> blocks stay raw esc().
+  function anchor(url, label) {
+    return '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + "</a>";
+  }
+  function linkify(text) {
+    const s = String(text == null ? "" : text);
+    // Markdown link, OR a bare http(s) URL.
+    const re = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<]+)/g;
+    let out = "", last = 0, m;
+    while ((m = re.exec(s))) {
+      out += esc(s.slice(last, m.index));
+      if (m[2]) {
+        out += anchor(m[2], m[1]);            // [label](url)
+      } else {
+        // Bare URL: peel trailing sentence punctuation back out of the link,
+        // and a trailing ')' only when it isn't part of the URL (e.g. a URL
+        // wrapped in parens) — keep it for balanced ones like /wiki/Foo_(bar).
+        let url = m[3], trail = "";
+        const tp = /[.,;:!?'"]+$/.exec(url);
+        if (tp) { trail = tp[0]; url = url.slice(0, -tp[0].length); }
+        if (url.endsWith(")") && !url.includes("(")) { trail = ")" + trail; url = url.slice(0, -1); }
+        out += anchor(url, url) + esc(trail);
+      }
+      last = m.index + m[0].length;
+    }
+    out += esc(s.slice(last));
+    return out;
+  }
+
   // ---- state ----------------------------------------------------------------
   let gen = 0;                      // bumped on every open/close; stale async work checks it
   let hostKey = null, sessionId = null, sess = null, agent = null;
@@ -238,7 +274,7 @@
   function renderMsg(it) {
     const cls = it.role === "user" ? "user" : "assistant";
     return '<div class="tr-msg ' + cls + '"><span class="role">' + cls + "</span>" +
-      esc(it.text) + truncBtn(it.id, it.truncated) + "</div>";
+      linkify(it.text) + truncBtn(it.id, it.truncated) + "</div>";
   }
 
   function renderThought(it) {
@@ -246,7 +282,7 @@
     const key = "th:" + it.id;
     return '<details class="thought" data-dkey="' + esc(key) + '"' + openAttr(key, true) +
       "><summary>💭 Thought</summary>" +
-      '<div class="thought-body">' + esc(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
+      '<div class="thought-body">' + linkify(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
   }
 
   // ` open` when this card should be expanded: the user's explicit toggle wins,
@@ -584,7 +620,7 @@
   // in the browser (no `module`); the browser path uses window.TurmaChat above.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      mergeTail, weight, buildItems, itemsToHtml, esc,
+      mergeTail, weight, buildItems, itemsToHtml, esc, linkify,
       __setVerbosity: (v) => { verbosity = v; },
     };
   }
