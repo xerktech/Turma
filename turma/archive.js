@@ -178,7 +178,13 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
     let lines = "";
     for (const e of list) {
       const text = String(e.text || "");
-      lines += JSON.stringify({ uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text }) + "\n";
+      // Persist the rich blocks[] (thinking / tool_use / tool_result /
+      // task_notification) so the archive renders identically to a live session;
+      // omitted for legacy text-only pushes so those lines stay byte-identical.
+      // The FTS index still keys on `text` only (search scope unchanged).
+      const rec = { uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text };
+      if (Array.isArray(e.blocks) && e.blocks.length) rec.blocks = e.blocks;
+      lines += JSON.stringify(rec) + "\n";
       insert.run(text, transcriptId, e.uuid || null, e.role || null, e.ts || null);
     }
     if (lines) fs.appendFileSync(paths.jsonl, lines);
@@ -331,7 +337,10 @@ function getTranscript(transcriptId) {
     if (!s) continue;
     try {
       const e = JSON.parse(s);
-      if (e && typeof e === "object") entries.push({ uuid: e.uuid, role: e.role, ts: e.ts, text: e.text || "" });
+      if (e && typeof e === "object") entries.push({
+        uuid: e.uuid, role: e.role, ts: e.ts, text: e.text || "",
+        blocks: Array.isArray(e.blocks) ? e.blocks : [],
+      });
     } catch { /* skip a torn line */ }
   }
   return {
