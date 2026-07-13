@@ -227,6 +227,18 @@ test("linkify: markdown emphasis markers wrapping a bare URL stay out of the lin
   assert.doesNotMatch(html, /href="[^"]*\*/);
 });
 
+test("linkify: typographic (curly) quotes wrapping a bare URL stay out of the link", () => {
+  // Claude emits curly ‘’ “” around URLs; the closing curly quote must not be
+  // slurped into the href (the ASCII '"' peel misses these Unicode chars).
+  for (const [open, close] of [["‘", "’"], ["“", "”"]]) {
+    const html = linkify("see " + open + "https://github.com/o/r/pull/9" + close + " now");
+    assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/9"/,
+      "curly quote " + open + close + " leaked into href: " + html);
+  }
+  // A bare URL ending a clause with a curly apostrophe/quote, no opener.
+  assert.match(linkify("opened https://github.com/o/r/pull/9”"), /href="https:\/\/github\.com\/o\/r\/pull\/9"/);
+});
+
 test("linkify: markdown [text](url) becomes an anchor with the label as text", () => {
   const html = linkify("opened [PR #42](https://github.com/o/r/pull/42) just now");
   assert.equal(html,

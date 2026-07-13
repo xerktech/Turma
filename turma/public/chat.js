@@ -75,12 +75,13 @@
       if (m[2]) {
         out += anchor(m[2], m[1]);            // [label](url)
       } else {
-        // Bare URL: peel trailing sentence punctuation and markdown emphasis
-        // markers (e.g. a URL wrapped in **bold**) back out of the link, and a
-        // trailing ')' only when it isn't part of the URL (e.g. a URL wrapped
-        // in parens) — keep it for balanced ones like /wiki/Foo_(bar).
+        // Bare URL: peel trailing sentence punctuation, markdown emphasis
+        // markers (e.g. a URL wrapped in **bold**), and typographic quotes
+        // (Claude often emits curly ‘’ “” around URLs) back out of the link,
+        // and a trailing ')' only when it isn't part of the URL (e.g. a URL
+        // wrapped in parens) — keep it for balanced ones like /wiki/Foo_(bar).
         let url = m[3], trail = "";
-        const tp = /[.,;:!?'"*_]+$/.exec(url);
+        const tp = /[.,;:!?'"*_‘’“”]+$/.exec(url);
         if (tp) { trail = tp[0]; url = url.slice(0, -tp[0].length); }
         if (url.endsWith(")") && !url.includes("(")) { trail = ")" + trail; url = url.slice(0, -1); }
         out += anchor(url, url) + esc(trail);
