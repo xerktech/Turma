@@ -1,0 +1,260 @@
+package com.xerktech.turma.ui
+
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.ChatItem
+import com.xerktech.turma.core.Verbosity
+import com.xerktech.turma.core.buildItems
+import com.xerktech.turma.core.sessionBranch
+import com.xerktech.turma.core.sessionName
+import com.xerktech.turma.model.TailEntry
+import com.xerktech.turma.vm.ChatViewModel
+import com.xerktech.turma.vm.MicState
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ChatScreen(host: String, sessionId: String, onBack: () -> Unit, onTerminal: () -> Unit) {
+    val context = LocalContext.current
+    val app = context.applicationContext as TurmaApplication
+    val vm: ChatViewModel = viewModel(factory = ChatViewModel.factory(app, host, sessionId))
+    val state by vm.state.collectAsStateWithLifecycle()
+    val snackbar = remember { SnackbarHostState() }
+
+    LaunchedEffect(Unit) { vm.onEnter() }
+    LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
+
+    val displayEntries = remember(state.entries, state.liveTurn) {
+        if (state.liveTurn.isNotBlank())
+            state.entries + TailEntry(id = ChatViewModel.LIVE_TURN_ID, role = "assistant", text = state.liveTurn)
+        else state.entries
+    }
+    val revealNewestId = if (state.liveTurn.isNotBlank()) ChatViewModel.LIVE_TURN_ID else state.entries.lastOrNull()?.key
+    val items = remember(displayEntries, state.verbosity, state.reveal) {
+        buildItems(displayEntries, state.prefs, revealNewestId, state.reveal.shown)
+    }
+
+    val listState = rememberLazyListState()
+    LaunchedEffect(items.size) {
+        if (items.isNotEmpty()) listState.animateScrollToItem(items.size - 1)
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(state.session?.let { sessionName(it) } ?: "Session", maxLines = 1)
+                        state.session?.let {
+                            Text(
+                                sessionBranch(it) + if (state.connected) " · live" else "",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                            )
+                        }
+                    }
+                },
+                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+                actions = {
+                    VerbosityMenu(state.verbosity) { vm.setVerbosity(it) }
+                    IconButton(onClick = onTerminal) { Icon(Icons.Filled.Terminal, "Terminal") }
+                },
+            )
+        },
+        snackbarHost = { SnackbarHost(snackbar) },
+        bottomBar = {
+            Column {
+                state.turnStatus?.takeIf { state.liveTurn.isNotBlank() }?.let { st ->
+                    Text(
+                        "${st.verb.ifBlank { "working" }}… ${st.hint}".trim(),
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                if (state.question.isNotBlank()) {
+                    QuestionSheet(state.question, state.questionOptions) { vm.answerOption(it) }
+                }
+                ChatFooter(
+                    session = state.session,
+                    draft = state.draft,
+                    mic = state.mic,
+                    onDraft = vm::setDraft,
+                    onSend = vm::submitDraft,
+                    onMicStart = vm::startDictation,
+                    onMicStop = vm::stopDictation,
+                    onModel = vm::setModel,
+                    onMode = vm::setMode,
+                )
+            }
+        },
+    ) { pad ->
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize().padding(pad),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (state.hasMore) {
+                item { Text("· earlier history ·", Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
+            }
+            items(items.size) { i -> ChatItemView(items[i]) }
+        }
+    }
+}
+
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+private fun QuestionSheet(question: String, options: List<String>, onAnswer: (Int) -> Unit) {
+    Surface(color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.4f), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("❓ $question", fontWeight = FontWeight.Medium)
+            androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                options.forEachIndexed { i, opt ->
+                    AssistChip(onClick = { onAnswer(i) }, label = { Text(opt) })
+                }
+            }
+            Text("…or type a custom answer below.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChatFooter(
+    session: com.xerktech.turma.model.SessionInfo?,
+    draft: String,
+    mic: MicState,
+    onDraft: (String) -> Unit,
+    onSend: () -> Unit,
+    onMicStart: () -> Unit,
+    onMicStop: () -> Unit,
+    onModel: (String) -> Unit,
+    onMode: (String) -> Unit,
+) {
+    val context = LocalContext.current
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) onMicStart()
+    }
+    Column(Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            MenuChip("model: ${session?.model?.ifBlank { "default" } ?: "default"}", listOf("default", "opus", "sonnet", "haiku"), onModel)
+            MenuChip("mode: ${session?.permissionMode?.ifBlank { "auto" } ?: "auto"}", listOf("auto", "acceptEdits", "plan", "bypassPermissions", "default"), onMode)
+            session?.prs?.firstOrNull()?.let { PrBadge(it) }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = draft, onValueChange = onDraft,
+                placeholder = { Text("Message…") },
+                modifier = Modifier.weight(1f),
+                maxLines = 4,
+            )
+            IconButton(onClick = {
+                when (mic) {
+                    MicState.IDLE -> {
+                        val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                        if (granted) onMicStart() else permLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                    MicState.RECORDING -> onMicStop()
+                    MicState.FINALIZING -> {}
+                }
+            }) {
+                when (mic) {
+                    MicState.IDLE -> Icon(Icons.Filled.Mic, "Dictate")
+                    MicState.RECORDING -> Icon(Icons.Filled.Stop, "Stop", tint = MaterialTheme.colorScheme.error)
+                    MicState.FINALIZING -> CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                }
+            }
+            IconButton(onClick = onSend, enabled = draft.isNotBlank()) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
+        }
+    }
+}
+
+@Composable
+private fun VerbosityMenu(current: Verbosity, onSelect: (Verbosity) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    IconButton(onClick = { open = true }) { Icon(Icons.Filled.Tune, "Verbosity") }
+    DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+        Verbosity.entries.forEach { v ->
+            DropdownMenuItem(
+                text = { Text(v.name.lowercase().replaceFirstChar { it.uppercase() } + if (v == current) "  ✓" else "") },
+                onClick = { onSelect(v); open = false },
+            )
+        }
+    }
+}
+
+@Composable
+private fun MenuChip(label: String, options: List<String>, onSelect: (String) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        Text(
+            label,
+            Modifier
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
+                .clickable { open = true }
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.bodySmall,
+        )
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            options.forEach { o -> DropdownMenuItem(text = { Text(o) }, onClick = { onSelect(o); open = false }) }
+        }
+    }
+}

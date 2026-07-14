@@ -32,6 +32,7 @@ ARG NPM_VERSION=11.18.0
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates curl ripgrep tmux \
       python3 python3-pip python3-venv python-is-python3 libicu72 ncurses-term \
+      unzip openjdk-17-jdk-headless \
  && curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \
       | tar -xz --strip-components=1 -C /usr/local/bin docker/docker \
  && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
@@ -44,6 +45,35 @@ RUN apt-get update \
  && ln -s /opt/powershell/pwsh /usr/local/bin/pwsh \
  && npm install -g "npm@${NPM_VERSION}" \
  && rm -rf /var/lib/apt/lists/*
+
+# --- Android build tooling layer (stable, large) ----------------------------
+# JDK 17 (installed in the base apt layer above) + Gradle + the Android SDK
+# (cmdline-tools, platform-tools, one platform + build-tools) so an agent can
+# build/test Android apps (e.g. the android/ Turma client) out of the box —
+# `gradle`, `sdkmanager`, `adb`, and `aapt2` are all on PATH. Its own trailing
+# layer with its own version ARGs, placed AHEAD of the volatile coding-agent
+# ARGs below so a Claude Code release bump can't invalidate (and re-download)
+# this ~2 GB layer. Bump these pins to clear CVEs the image scan flags; add more
+# platforms/build-tools here if a project needs a different compileSdk.
+ARG GRADLE_VERSION=8.11.1
+ARG ANDROID_CMDLINE_TOOLS=11076708
+ARG ANDROID_PLATFORM=android-35
+ARG ANDROID_BUILD_TOOLS=35.0.0
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
+    ANDROID_HOME=/opt/android-sdk \
+    ANDROID_SDK_ROOT=/opt/android-sdk \
+    GRADLE_HOME=/opt/gradle/gradle-${GRADLE_VERSION}
+ENV PATH="${GRADLE_HOME}/bin:${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}"
+RUN set -eux; \
+    curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip; \
+    mkdir -p /opt/gradle; unzip -q /tmp/gradle.zip -d /opt/gradle; rm /tmp/gradle.zip; \
+    mkdir -p "${ANDROID_HOME}/cmdline-tools"; \
+    curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_CMDLINE_TOOLS}_latest.zip" -o /tmp/actools.zip; \
+    unzip -q /tmp/actools.zip -d "${ANDROID_HOME}/cmdline-tools"; rm /tmp/actools.zip; \
+    mv "${ANDROID_HOME}/cmdline-tools/cmdline-tools" "${ANDROID_HOME}/cmdline-tools/latest"; \
+    yes | sdkmanager --licenses >/dev/null; \
+    sdkmanager --install "platform-tools" "platforms;${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" >/dev/null; \
+    chmod -R a+rX "${ANDROID_HOME}" /opt/gradle
 
 # --- Coding-agent layer (volatile) ------------------------------------------
 # CI pins these to the latest published release on every build, so they change

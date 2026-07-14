@@ -1,0 +1,51 @@
+name: android-ci
+
+# PR gate for the Android client: unit-test the pure core (reveal/transcript/
+# sessions/chat-items + serialization) and assemble a debug APK. Runs inside a
+# throwaway Docker Hub image that bundles the JDK + Android SDK + Gradle (the
+# self-hosted runners can't pull ghcr.io and have no passwordless sudo), mirror-
+# ing the glasses-ci container pattern. A credential-less build is expected: no
+# google-services.json is present, so the Firebase plugin is skipped (see
+# android/app/build.gradle.kts) and push is inert — the app still builds.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "VERSION"
+      - ".github/workflows/android-ci.yml"
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+    container:
+      image: mingc/android-build-box:latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - name: Reset workspace ownership
+        working-directory: ${{ github.workspace }}
+        run: chown -R "$(id -u):$(id -g)" . || true
+
+      - uses: actions/checkout@v7
+
+      # Generate the Gradle wrapper (jar + scripts) with the image's Gradle,
+      # pinned to the version in gradle/wrapper/gradle-wrapper.properties, so the
+      # build is reproducible regardless of the image's default Gradle.
+      - name: Bootstrap Gradle wrapper
+        run: gradle wrapper --gradle-version 8.11.1 --no-daemon
+
+      - name: Unit tests (pure core)
+        run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Assemble debug APK
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: turma-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn

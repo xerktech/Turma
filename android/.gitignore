@@ -1,0 +1,23 @@
+.gradle/
+build/
+/local.properties
+*.iml
+.idea/
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Gradle wrapper jar/scripts are generated in CI (`gradle wrapper`); the pinned
+# version lives in gradle/wrapper/gradle-wrapper.properties.
+gradle/wrapper/gradle-wrapper.jar
+gradlew
+gradlew.bat
+
+# Firebase config — per-project secret, dropped in by the operator (see README).
+google-services.json
+
+# Signing
+*.keystore
+*.jks
+keystore.properties
