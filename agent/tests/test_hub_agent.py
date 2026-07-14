@@ -270,6 +270,20 @@ class TestSpawnOptionHelpers(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ha.resolve_permission_mode(bad)
 
+    def test_perm_cycle_for(self):
+        base = ["default", "acceptEdits", "plan"]
+        # Base modes / blank / unknown launch -> base cycle only, no optionals.
+        self.assertEqual(ha.perm_cycle_for("default"), base)
+        self.assertEqual(ha.perm_cycle_for("acceptEdits"), base)
+        self.assertEqual(ha.perm_cycle_for("plan"), base)
+        # None -> assume auto (Turma's launch default).
+        self.assertEqual(ha.perm_cycle_for(None), base + ["auto"])
+        self.assertEqual(ha.perm_cycle_for(""), base + ["auto"])
+        # Launching into an optional mode puts exactly that one in the cycle.
+        self.assertEqual(ha.perm_cycle_for("auto"), base + ["auto"])
+        self.assertEqual(ha.perm_cycle_for("bypassPermissions"),
+                         base + ["bypassPermissions"])
+
     def test_resolve_base_ref(self):
         # Blank / HEAD -> the latest default branch (delegates to default_base_ref).
         with mock.patch.object(ha, "default_base_ref", lambda p: "origin/main"):
@@ -2125,8 +2139,9 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
 
 class TestSetModelMode(ManagerMixin, unittest.TestCase):
     """Live model / permission-mode switches on a running session: model via a
-    typed `/model <name>`, mode via computed Shift+Tab (BTab) presses over
-    PERM_CYCLE. Both re-validate their argument and persist the new value."""
+    typed `/model <name>`, mode via computed Shift+Tab (BTab) presses over the
+    session's launch-dependent cycle (perm_cycle_for). Both re-validate their
+    argument and persist the new value."""
 
     def make_manager(self):
         sm = super().make_manager()
@@ -2134,9 +2149,13 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sm.save = mock.Mock()  # don't touch disk; just assert the record update
         return sm
 
-    def _session(self, sm, sid="abcde", model=None, perm="auto", status="running"):
+    def _session(self, sm, sid="abcde", model=None, perm="auto", status="running",
+                 launch=None):
+        # launch defaults to perm — a just-launched session's current mode is the
+        # mode it launched into, which fixes its live Shift+Tab cycle.
         sess = {"id": sid, "status": status, "tmuxName": f"agent-{sid}",
-                "model": model, "permissionMode": perm}
+                "model": model, "permissionMode": perm,
+                "launchPermissionMode": perm if launch is None else launch}
         sm.registry = [sess]
         return sess
 
@@ -2172,7 +2191,9 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.run_calls, [])
 
     def test_set_mode_cycles_forward_the_minimal_presses(self):
-        # auto (idx 4) -> plan (idx 2) over the 5-mode cycle = (2-4) % 5 = 3.
+        # An auto-launched session's cycle is [default, acceptEdits, plan, auto]
+        # (bypassPermissions is NOT reachable). auto (idx 3) -> plan (idx 2) over
+        # that 4-mode cycle = (2-3) % 4 = 3 presses.
         sm = self.make_manager()
         sess = self._session(sm, perm="auto")
         sm.set_mode("abcde", "plan")
@@ -2181,12 +2202,72 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["permissionMode"], "plan")
         sm.save.assert_called_once()
 
-    def test_set_mode_default_to_auto_wraps_to_four(self):
-        # default (idx 0) -> auto (idx 4) = (4-0) % 5 = 4 presses.
+    def test_set_mode_within_base_takes_forward_step(self):
+        # Same auto-launch cycle, now sitting at acceptEdits (idx 1) after a prior
+        # cycle. acceptEdits -> plan (idx 2) = one forward press.
         sm = self.make_manager()
-        self._session(sm, perm="default")
+        self._session(sm, perm="acceptEdits", launch="auto")
+        sm.set_mode("abcde", "plan")
+        self.assertEqual(len(self.run_calls), 1)
+
+    def test_set_mode_plan_to_auto_wraps_forward(self):
+        # auto-launch cycle [default, acceptEdits, plan, auto]. plan (idx 2) ->
+        # auto (idx 3) = one forward press.
+        sm = self.make_manager()
+        sess = self._session(sm, perm="plan", launch="auto")
         sm.set_mode("abcde", "auto")
-        self.assertEqual(len(self.run_calls), 4)
+        self.assertEqual(len(self.run_calls), 1)
+        self.assertEqual(sess["permissionMode"], "auto")
+
+    def test_set_mode_bypass_unreachable_on_auto_launch_is_noop(self):
+        # The reported bug: an auto-launched session's cycle has no
+        # bypassPermissions, so selecting it must NOT blindly cycle to some other
+        # mode — it's a no-op and the record keeps the real mode.
+        sm = self.make_manager()
+        sess = self._session(sm, perm="auto")
+        sm.set_mode("abcde", "bypassPermissions")
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(sess["permissionMode"], "auto")
+        sm.save.assert_not_called()
+
+    def test_set_mode_reaches_bypass_when_launched_into_it(self):
+        # A bypassPermissions-launched session HAS it in cycle
+        # [default, acceptEdits, plan, bypassPermissions]; bypass (idx 3) -> plan
+        # (idx 2) = (2-3) % 4 = 3 presses.
+        sm = self.make_manager()
+        sess = self._session(sm, perm="bypassPermissions")
+        sm.set_mode("abcde", "plan")
+        self.assertEqual(len(self.run_calls), 3)
+        self.assertEqual(sess["permissionMode"], "plan")
+
+    def test_set_mode_auto_unreachable_on_bypass_launch_is_noop(self):
+        # Only the launched optional is guaranteed in-cycle: a bypass-launched
+        # session can't be assumed to reach auto, so it's a no-op skip.
+        sm = self.make_manager()
+        sess = self._session(sm, perm="bypassPermissions")
+        sm.set_mode("abcde", "auto")
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(sess["permissionMode"], "bypassPermissions")
+
+    def test_set_mode_auto_unreachable_on_default_launch_is_noop(self):
+        # A default-launched session (no --permission-mode) has the base cycle
+        # only; auto is not guaranteed reachable, so selecting it is a no-op.
+        sm = self.make_manager()
+        sess = self._session(sm, perm="default")
+        sm.set_mode("abcde", "auto")
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(sess["permissionMode"], "default")
+
+    def test_set_mode_missing_launch_field_assumes_auto(self):
+        # An older session persisted before launchPermissionMode existed: fall
+        # back to the auto cycle (Turma's launch default). auto -> plan = 3.
+        sm = self.make_manager()
+        sess = {"id": "abcde", "status": "running", "tmuxName": "agent-abcde",
+                "model": None, "permissionMode": "auto"}  # no launchPermissionMode
+        sm.registry = [sess]
+        sm.set_mode("abcde", "plan")
+        self.assertEqual(len(self.run_calls), 3)
+        self.assertEqual(sess["permissionMode"], "plan")
 
     def test_set_mode_noop_when_already_target(self):
         sm = self.make_manager()
@@ -2200,6 +2281,12 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self._session(sm, perm="auto")
         with self.assertRaises(ValueError):
             sm.set_mode("abcde", "yolo")
+        self.assertEqual(self.run_calls, [])
+
+    def test_set_mode_noop_for_non_running(self):
+        sm = self.make_manager()
+        self._session(sm, perm="auto", status="stopped")
+        sm.set_mode("abcde", "plan")
         self.assertEqual(self.run_calls, [])
 
 

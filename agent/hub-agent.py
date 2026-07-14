@@ -317,13 +317,15 @@ MODEL_ALIASES = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku"}
 # gated hands-off mode); "bypassPermissions" disables prompts entirely; "default"
 # means "omit --permission-mode" (claude's own manual-review default).
 PERMISSION_MODES = {"auto", "bypassPermissions", "acceptEdits", "plan", "default"}
-# The order Claude Code's Shift+Tab cycles permission modes through — each press
-# advances one step, wrapping at the end. `set_mode` computes how many Shift+Tab
-# presses to inject to move a live session from its current mode to a target one.
-# Best-effort: the modes actually present in a given session's cycle depend on how
-# it was launched (bypassPermissions only appears when launched with it; auto only
-# when the account allows it), so an off-cycle target may land elsewhere.
-PERM_CYCLE = ["default", "acceptEdits", "plan", "bypassPermissions", "auto"]
+# Claude Code's Shift+Tab permission-mode cycle. The three BASE modes are always
+# present, in this order; each Shift+Tab press advances one step and wraps at the
+# end. The two OPTIONAL modes are conditional: `bypassPermissions` is in the cycle
+# only when the session was launched into it, and `auto` only when the launch /
+# account enables it — so the cycle a *running* session actually exposes depends
+# on how that session was launched. Computing presses against a fixed all-modes
+# list therefore lands on the wrong mode (the whole point of `perm_cycle_for`).
+PERM_CYCLE_BASE = ["default", "acceptEdits", "plan"]
+PERM_CYCLE_OPTIONAL = ["bypassPermissions", "auto"]  # canonical trailing order
 # git-ref-safe token: our allowlist is a strict subset of what git accepts, so
 # anything matching is also validated below for the few remaining git rules.
 _REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
@@ -414,6 +416,24 @@ def resolve_permission_mode(mode):
     if mode in PERMISSION_MODES:
         return mode
     raise ValueError(f"unknown permission mode {mode!r}")
+
+
+def perm_cycle_for(launch_mode):
+    """The ordered Shift+Tab permission-mode cycle a running session actually
+    exposes, given the mode it was LAUNCHED into. The three base modes are always
+    present; an optional mode (bypassPermissions / auto) is included only when the
+    session was launched into it — that's the one optional we can be certain sits
+    in this session's live cycle (bypassPermissions appears solely when claude was
+    started with it; auto only when the launch/account enables it). Appended in
+    Claude Code's canonical trailing order. `set_mode` computes its BTab presses
+    against this so the switch lands on the chosen mode instead of drifting off a
+    cycle that doesn't contain the target."""
+    cycle = list(PERM_CYCLE_BASE)
+    launch_mode = launch_mode or "auto"
+    for opt in PERM_CYCLE_OPTIONAL:
+        if launch_mode == opt:
+            cycle.append(opt)
+    return cycle
 
 
 # --- agent safety guard (--settings wiring) ------------------------------
@@ -2446,6 +2466,12 @@ class SessionManager:
         # Default (unset) -> --permission-mode auto; the explicit "default" choice
         # omits the flag (claude's own manual-review default).
         perm = sess.get("permissionMode") or "auto"
+        # Remember the mode we actually launch into: it fixes which optional modes
+        # this session's live Shift+Tab cycle exposes (see perm_cycle_for), so a
+        # later live set_mode computes presses against the real cycle rather than a
+        # fixed all-modes list. Re-set on every (re)launch, so restart/resume into
+        # a switched mode updates the basis.
+        sess["launchPermissionMode"] = perm
         if perm != "default":
             parts.append(f"--permission-mode {perm}")
         # Wire the PreToolUse safety guard (blocks catastrophic / policy /
@@ -2965,13 +2991,18 @@ class SessionManager:
         log(f"set model of {sid} -> {arg}")
 
     def set_mode(self, sid, mode):
-        """Switch a running session's permission mode live by injecting the right
-        number of Shift+Tab presses to cycle it from its current mode to the
-        target over PERM_CYCLE. Best-effort — Claude Code exposes no direct
-        set-mode command, and the cycle's actual contents depend on the launch
-        flags, so an off-cycle current/target is a no-op and a present-but-shifted
-        cycle may land nearby. The target (validated) is stored optimistically so
-        the UI reflects the intent."""
+        """Switch a running session's permission mode live by injecting the number
+        of Shift+Tab (BTab) presses that cycles it from its current mode to the
+        target. Claude Code exposes no set-mode-by-name command (only `/plan`), so
+        cycling is the only live path — but the cycle a session exposes is
+        launch-dependent (bypassPermissions/auto are in it only when launched into
+        them), so the presses are computed against THIS session's real cycle
+        (`perm_cycle_for(launchPermissionMode)`), which is what makes the switch
+        land on the chosen mode instead of drifting. A target the session's cycle
+        can't reach (e.g. bypassPermissions on an auto-launched session) is a no-op:
+        the record keeps the real mode, so the heartbeat corrects the UI's
+        optimistic guess. On success the target (validated) is stored so the UI
+        reflects it."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
@@ -2979,10 +3010,12 @@ class SessionManager:
         current = sess.get("permissionMode") or "auto"
         if current == target:
             return
-        if current not in PERM_CYCLE or target not in PERM_CYCLE:
-            log(f"set mode of {sid}: {current}->{target} not both on cycle; skipping")
+        cycle = perm_cycle_for(sess.get("launchPermissionMode"))
+        if current not in cycle or target not in cycle:
+            log(f"set mode of {sid}: {current}->{target} not both reachable in "
+                f"cycle {cycle}; skipping")
             return
-        presses = (PERM_CYCLE.index(target) - PERM_CYCLE.index(current)) % len(PERM_CYCLE)
+        presses = (cycle.index(target) - cycle.index(current)) % len(cycle)
         tmux_name = sess["tmuxName"]
         for _ in range(presses):
             run(["tmux", "send-keys", "-t", tmux_name, "BTab"])
@@ -4189,6 +4222,11 @@ class SessionManager:
             "summary": sess.get("summary"),   # few-word auto task name (or None)
             "model": sess.get("model"),
             "permissionMode": sess.get("permissionMode"),
+            # The permission modes this session's live Shift+Tab cycle can reach
+            # (base modes + whichever optional it was launched into) — the hub's
+            # mode selector offers only these, since a switch to any other mode is
+            # a no-op agent-side. Launch-dependent; see perm_cycle_for / set_mode.
+            "permissionModes": perm_cycle_for(sess.get("launchPermissionMode")),
             "baseRef": sess.get("baseRef"),
             "status": sess.get("status"),
             "ttydPort": sess.get("ttydPort"),
