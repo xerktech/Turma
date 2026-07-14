@@ -48,6 +48,14 @@ echo "ROOTDIR_OWNER=$(stat -c '%u:%g' /root)"
 touch "$REPOS_ROOT/.probe" 2>/dev/null || true
 echo "NEWFILE_OWNER=$(stat -c '%u:%g' "$REPOS_ROOT/.probe" 2>/dev/null || echo none)"
 echo "LEFTOVER_ROOT_PATHS=$(find "$REPOS_ROOT" /root/.claude -uid 0 2>/dev/null | wc -l)"
+# ~/.android is baked root-owned into the image (the Dockerfile's avdmanager
+# step), so unlike the bind mounts it arrives unwritable on every boot. The
+# Android toolchain needs to write a debug keystore here or assembleDebug can't
+# sign an APK at all, so assert the dir AND the AVD nested under it changed
+# hands — a non-recursive chown would leave the latter behind.
+echo "ANDROID_OWNER=$(stat -c '%u:%g' /root/.android 2>/dev/null || echo none)"
+echo "ANDROID_AVD_OWNER=$(stat -c '%u:%g' /root/.android/avd/turma.ini 2>/dev/null || echo none)"
+echo "ANDROID_WRITABLE=$(touch /root/.android/debug.keystore 2>/dev/null && echo yes || echo no)"
 sleep 1
 STUB
 cp "$WORK/python3" "$WORK/hub-agent.py"
@@ -60,6 +68,13 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY python3 /usr/local/bin/python3
 COPY hub-agent.py tunnel-agent.js /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/python3
+# Stand in for the real image's Android SDK layer, which runs `avdmanager` as
+# root and so bakes a root-owned ~/.android + AVD. Reproduced here (mode 0755:
+# readable, NOT writable by anyone else) because without it the reclaim
+# assertions would pass vacuously against a dir that was never root-owned.
+RUN mkdir -p /root/.android/avd/turma.avd \
+ && touch /root/.android/avd/turma.ini \
+ && chown -R 0:0 /root/.android && chmod -R 0755 /root/.android
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 DOCKERFILE
 
@@ -108,6 +123,9 @@ make_fixture "$WORK/fx1" 0 0
 out="$(run_case "$WORK/fx1")"
 expect "manager uid" "0" "$(field "$out" uid)"
 expect "tunnel uid" "0" "$(field "$out" "TUNNEL uid")"
+# Staying root means the reclaim loop never runs, so ~/.android keeps the
+# ownership the image baked — and root can write it regardless.
+expect "/root/.android left alone under root" "0:0" "$(field "$out" ANDROID_OWNER)"
 # Scan the two roots themselves, not their $WORK wrapper dir — that wrapper is
 # created by whoever runs this suite and is legitimately not root-owned, so
 # including it would fail this assertion for a reason that has nothing to do
@@ -127,6 +145,9 @@ expect "HOME stays /root" "/root" "$(field "$out" home)"
 expect "/root handed to run-as user" "1000:1000" "$(field "$out" ROOTDIR_OWNER)"
 expect "new files land host-owned" "1000:1000" "$(field "$out" NEWFILE_OWNER)"
 expect "legacy root-owned files reclaimed" "0" "$(field "$out" LEFTOVER_ROOT_PATHS)"
+expect "/root/.android handed to run-as user" "1000:1000" "$(field "$out" ANDROID_OWNER)"
+expect "/root/.android reclaimed recursively" "1000:1000" "$(field "$out" ANDROID_AVD_OWNER)"
+expect "/root/.android writable (debug keystore)" "yes" "$(field "$out" ANDROID_WRITABLE)"
 expect "nothing root-owned left on host" "0" \
   "$(docker run --rm -v "$WORK/fx2:/f" busybox find /f/repos /f/claude -user 0 | wc -l | tr -d ' ')"
 

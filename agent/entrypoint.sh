@@ -96,8 +96,16 @@ else
   # operator can no longer chown what they no longer own. Reclaim it here, once:
   # after the first boot this is a scan that finds nothing. -h so a symlink is
   # retargeted rather than followed out of the tree.
+  #
+  # ~/.android is in the list for a different reason than the rest: it isn't a
+  # host bind mount but image content, baked root-owned by the Dockerfile's
+  # avdmanager step, so it arrives unwritable on EVERY boot rather than only on
+  # legacy hosts. The Android toolchain fails hard rather than degrading without
+  # it — `assembleDebug` dies in :app:validateSigningDebug ("Unable to create
+  # debug keystore in /root/.android because it is not writable") and the
+  # emulator can't open the baked turma AVD.
   echo "[entrypoint] identity: ${RUN_USER}(${PUID}:${PGID}) — reclaiming root-owned leftovers..."
-  for p in "$REPOS_ROOT" /root/.claude /root/.claude.json /root/.turma; do
+  for p in "$REPOS_ROOT" /root/.claude /root/.claude.json /root/.turma /root/.android; do
     [ -e "$p" ] || continue
     find "$p" -uid 0 -exec chown -h "$PUID:$PGID" {} + 2>/dev/null || true
   done
