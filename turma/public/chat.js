@@ -187,6 +187,11 @@
   let revealFull = "";
   let rafId = null, lastTs = 0;
 
+  // The HTML currently in the scroll, and whether a changed paint was held back
+  // because the reader was selecting text. See repaint()/selectionInScroll().
+  let lastHtml = null;
+  let repaintDeferred = false;
+
   // User's explicit expand/collapse of <details> cards, keyed by a stable
   // data-dkey, so a repaint (a tail delta lands ~1s while working) doesn't snap
   // every card the user opened back to its verbosity default. Cleared on
@@ -465,6 +470,23 @@
     return el.scrollHeight - el.scrollTop - el.clientHeight < 60;
   }
 
+  // Is the reader mid-selection inside the transcript? A repaint replaces the
+  // scroll's innerHTML wholesale, which destroys every node the selection is
+  // anchored to — so a live session (a `turn` frame lands ~1s while the agent
+  // works) would wipe the selection out from under a reader trying to copy.
+  // Deferring the paint while a selection is live is what makes copy reliable.
+  function selectionInScroll() {
+    const scroll = $("chatScroll");
+    if (!scroll || typeof window === "undefined" || !window.getSelection) return false;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+    for (let i = 0; i < sel.rangeCount; i++) {
+      const r = sel.getRangeAt(i);
+      if (!r.collapsed && scroll.contains(r.commonAncestorContainer)) return true;
+    }
+    return false;
+  }
+
   function repaint() {
     const scroll = $("chatScroll");
     if (!scroll) return;
@@ -495,7 +517,26 @@
       revealFull = "";
       reveal.shown = 0;
     }
+    // Most repaints are no-ops: the /history poll and the ~1s `turn` frame fire
+    // whether or not anything changed, and re-writing identical HTML still
+    // destroys the selection (and the reader's place). Compare first and touch
+    // the DOM only on a real change.
+    if (html === lastHtml) {
+      updateJump();
+      updateLiveStatus();
+      if (liveTurn) startReveal();
+      return;
+    }
+    // Something DID change, but the reader is mid-selection — hold the paint and
+    // flush it once the selection clears (selectionchange, below).
+    if (selectionInScroll()) {
+      repaintDeferred = true;
+      updateLiveStatus();
+      return;
+    }
+    repaintDeferred = false;
     scroll.innerHTML = html;
+    lastHtml = html;
     // Stay pinned to the bottom while following along; otherwise hold the
     // reader's place (innerHTML replacement resets scrollTop to 0, and new
     // entries only append below, so the prior offset still points at the same
@@ -561,6 +602,10 @@
     lastTs = ts;
     const bubble = $("chatLiveBubble");
     if (!bubble || !revealFull) return; // nothing to animate
+    // The reveal rewrites the live bubble in place, so it clobbers a selection
+    // anchored inside it just like a repaint does. Idle the loop (holding the
+    // revealed text where it is) until the reader is done selecting.
+    if (selectionInScroll()) { rafId = requestAnimationFrame(tick); return; }
     const target = revealFull.length;
     if (reveal.shown < target) {
       const backlog = target - reveal.shown;
@@ -865,6 +910,13 @@
       const d = e.target;
       if (d && d.tagName === "DETAILS" && d.dataset && d.dataset.dkey) detailsOpen.set(d.dataset.dkey, d.open);
     }, true);
+    // Flush a paint that was held back while the reader had text selected, as
+    // soon as that selection collapses (a click anywhere) or moves out of the
+    // transcript. selectionchange is on the document, not the scroll, because a
+    // selection can be cleared from outside it.
+    document.addEventListener("selectionchange", () => {
+      if (repaintDeferred && !selectionInScroll()) repaint();
+    });
   }
 
   // ---- static (archived) transcript rendering -------------------------------
@@ -952,6 +1004,7 @@
     const myGen = gen;
     hostKey = hk; sessionId = id; sess = s; agent = a;
     buffer = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
+    lastHtml = null; repaintDeferred = false; // this session's paint memo starts empty
     stickBottom = true; // land at the tail on open, past the seed→history race
     noExpand = false;
     detailsOpen.clear();
@@ -978,6 +1031,7 @@
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
     buffer = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
+    lastHtml = null; repaintDeferred = false;
     updateLiveStatus(); // hide the pinned bar when the view closes
   }
 
@@ -1004,9 +1058,13 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderProse, prFooterChip,
-      filterModeOpts, MODE_OPTS,
+      filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
       __setVerbosity: (v) => { verbosity = v; },
       __setNoExpand: (v) => { noExpand = v; },
+      __setBuffer: (b) => { buffer = b; },
+      __setLiveTurn: (t) => { liveTurn = t; reveal.shown = 0; },
+      __resetPaint: () => { lastHtml = null; repaintDeferred = false; },
+      __revealShown: () => reveal.shown,
     };
   }
 })();
