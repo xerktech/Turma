@@ -93,7 +93,7 @@ fun ArchiveScreen(onBack: () -> Unit, vm: ArchiveViewModel = viewModel()) {
                         Column(Modifier.fillMaxWidth().clickable { vm.openTranscript(s.transcriptId) }.padding(16.dp, 8.dp)) {
                             Text(s.summary.ifBlank { s.repo }, fontWeight = FontWeight.Medium)
                             Text(
-                                "${s.repo} · ${s.host} · ${s.msgCount} msgs · $%.2f".format(s.cost),
+                                "${s.repo} · ${s.host} · ${s.msgCount} msgs",
                                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }

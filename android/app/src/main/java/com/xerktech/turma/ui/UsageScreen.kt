@@ -34,60 +34,75 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.xerktech.turma.vm.HistoryViewModel
+import com.xerktech.turma.vm.UsageViewModel
+
+/** Compact token count: 1.2M / 3.4k / 850. Mirrors the web UI's fmtTokens. */
+fun fmtTokens(n: Long): String = when {
+    n >= 1_000_000_000 -> "%.1fB".format(n / 1e9)
+    n >= 1_000_000 -> "%.1fM".format(n / 1e6)
+    n >= 1_000 -> "%.1fk".format(n / 1e3)
+    else -> n.toString()
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HistoryScreen(onBack: () -> Unit, vm: HistoryViewModel = viewModel()) {
+fun UsageScreen(onBack: () -> Unit, vm: UsageViewModel = viewModel()) {
     LaunchedEffect(Unit) { vm.start() }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
-    val ui = remember(fleet) { vm.compute(fleet) }
+    val ui = remember(fleet) { UsageViewModel.compute(fleet) }
     var tab by remember { mutableIntStateOf(0) }
 
     Scaffold(topBar = {
         TopAppBar(
-            title = { Text("History") },
+            title = { Text("Usage") },
             navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
         )
     }) { pad ->
         Column(Modifier.padding(pad)) {
             Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-                Stat("Today", ui.todayCost)
-                Stat("All-time", ui.totalCost)
+                Stat("Today", ui.today)
+                Stat("This week", ui.week)
+                Stat("All-time", ui.total)
             }
             TabRow(selectedTabIndex = tab) {
                 Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("By repo") })
                 Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("By host") })
+                Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("By model") })
             }
-            val rows: List<Triple<String, Double, Double>> = if (tab == 0)
-                ui.byRepo.map { Triple(it.repo, it.todayCost, it.totalCost) }
-            else ui.byHost.map { Triple(it.host, it.todayCost, it.totalCost) }
-            val maxTotal = rows.maxOfOrNull { it.third }?.takeIf { it > 0 } ?: 1.0
+            // (name, today, all-time) per row, whichever dimension is selected.
+            val rows: List<Triple<String, Long, Long>> = when (tab) {
+                0 -> ui.byRepo.map { Triple(it.repo, it.today, it.total) }
+                1 -> ui.byHost.map { Triple(it.host, it.today, it.total) }
+                else -> ui.byModel.map { Triple(it.model, it.today, it.total) }
+            }
+            val maxTotal = rows.maxOfOrNull { it.third }?.takeIf { it > 0 } ?: 1L
             LazyColumn(Modifier.padding(16.dp)) {
                 items(rows.size) { i ->
                     val (name, today, total) = rows[i]
-                    CostRow(name, today, total, total / maxTotal)
+                    UsageRow(name, today, total, total.toDouble() / maxTotal)
                 }
-                if (rows.isEmpty()) item { Text("No usage recorded yet.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                if (rows.isEmpty()) item {
+                    Text("No usage recorded yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
     }
 }
 
 @Composable
-private fun Stat(label: String, cost: Double) {
+private fun Stat(label: String, tokens: Long) {
     Column {
         Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text("$%.2f".format(cost), style = MaterialTheme.typography.headlineSmall)
+        Text(fmtTokens(tokens), style = MaterialTheme.typography.headlineSmall)
     }
 }
 
 @Composable
-private fun CostRow(name: String, today: Double, total: Double, fraction: Double) {
+private fun UsageRow(name: String, today: Long, total: Long, fraction: Double) {
     Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(name, Modifier.weight(1f), maxLines = 1)
-            Text("$%.2f".format(total), style = MaterialTheme.typography.bodyMedium)
+            Text(fmtTokens(total), style = MaterialTheme.typography.bodyMedium)
         }
         Box(
             Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp))
@@ -99,6 +114,10 @@ private fun CostRow(name: String, today: Double, total: Double, fraction: Double
                     .fillMaxWidth(fraction.coerceIn(0.02, 1.0).toFloat())
             )
         }
-        if (today > 0) Text("today $%.2f".format(today), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (today > 0) Text(
+            "today ${fmtTokens(today)}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }

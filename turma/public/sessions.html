@@ -457,7 +457,7 @@
     <nav class="nav-tabs">
       <a href="/">Dashboard</a>
       <a href="/sessions" class="active">Sessions</a>
-      <a href="/history">History</a>
+      <a href="/usage">Usage</a>
       <a href="#" class="signout" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;">Sign out</a>
     </nav>
     <span class="sub" id="refreshed"></span>
@@ -549,9 +549,9 @@
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
     Sessions
   </a>
-  <a href="/history">
+  <a href="/usage">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/></svg>
-    History
+    Usage
   </a>
 </nav>
 

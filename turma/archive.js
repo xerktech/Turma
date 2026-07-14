@@ -29,7 +29,9 @@ const { DatabaseSync } = require("node:sqlite");
 
 const ARCHIVE_DIR = process.env.ARCHIVE_DIR || "/data/archive";
 const ARCHIVE_DB = process.env.ARCHIVE_DB || path.join(ARCHIVE_DIR, "index.db");
-const SCHEMA_VERSION = 1;
+// 2: dropped the never-populated `cost` column when the product went
+// token-only. A bump recreates the tables and refills them from the files.
+const SCHEMA_VERSION = 2;
 
 // ---- filename / path building ----------------------------------------------
 
@@ -74,7 +76,7 @@ function createSchema() {
      transcriptId TEXT PRIMARY KEY,
      host TEXT, remoteKey TEXT, repo TEXT, worktree TEXT, slug TEXT,
      createdAt TEXT, endedTs TEXT, summary TEXT,
-     msgCount INTEGER DEFAULT 0, bytesStored INTEGER DEFAULT 0, cost REAL,
+     msgCount INTEGER DEFAULT 0, bytesStored INTEGER DEFAULT 0,
      filePath TEXT, updatedAt TEXT)`);
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
      text, transcriptId UNINDEXED, uuid UNINDEXED, role UNINDEXED, ts UNINDEXED)`);
@@ -92,6 +94,14 @@ function openDb() {
   const verRow = db.prepare("SELECT value FROM meta WHERE key='schemaVersion'").get();
   const ver = verRow ? parseInt(verRow.value, 10) : 0;
   const sessionCount = db.prepare("SELECT COUNT(*) AS n FROM sessions").get().n;
+  if (ver !== SCHEMA_VERSION) {
+    // A bump can drop or retype columns, and CREATE TABLE IF NOT EXISTS won't
+    // touch a table that already exists — so recreate them outright. The
+    // organized files are the source of truth; rebuildIndex() refills below.
+    db.exec("DROP TABLE IF EXISTS entries_fts");
+    db.exec("DROP TABLE IF EXISTS sessions");
+    createSchema();
+  }
   if (ver !== SCHEMA_VERSION || sessionCount === 0) {
     rebuildIndex();
     db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('schemaVersion',?)")
@@ -190,8 +200,8 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
     if (lines) fs.appendFileSync(paths.jsonl, lines);
     db.prepare(`INSERT INTO sessions(
         transcriptId, host, remoteKey, repo, worktree, slug, createdAt, endedTs,
-        summary, msgCount, bytesStored, cost, filePath, updatedAt)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        summary, msgCount, bytesStored, filePath, updatedAt)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(transcriptId) DO UPDATE SET
         host=excluded.host, remoteKey=excluded.remoteKey, repo=excluded.repo,
         worktree=excluded.worktree, slug=excluded.slug,
@@ -202,7 +212,7 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
       transcriptId, host, meta.remoteKey || null, meta.repo || null,
       meta.worktree || null, meta.slug || null, meta.createdAt || null,
       meta.endedTs || null, meta.summary || null, msgCount, bytesStored,
-      meta.cost == null ? null : Number(meta.cost), relPath, nowIso
+      relPath, nowIso
     );
   });
 
@@ -314,7 +324,7 @@ function listArchive(opts) {
   if (opts.repo) { where.push("repo = ?"); args.push(opts.repo); }
   if (opts.host) { where.push("host = ?"); args.push(opts.host); }
   const sql = `SELECT transcriptId, host, remoteKey, repo, worktree, summary,
-      createdAt, endedTs, msgCount, cost
+      createdAt, endedTs, msgCount
     FROM sessions ${where.length ? "WHERE " + where.join(" AND ") : ""}
     ORDER BY COALESCE(endedTs, createdAt, '') DESC, transcriptId DESC
     LIMIT ? OFFSET ?`;
@@ -377,8 +387,8 @@ function rebuildIndex() {
   );
   const upsert = db.prepare(`INSERT OR REPLACE INTO sessions(
       transcriptId, host, remoteKey, repo, worktree, slug, createdAt, endedTs,
-      summary, msgCount, bytesStored, cost, filePath, updatedAt)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      summary, msgCount, bytesStored, filePath, updatedAt)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   for (const jsonl of files) {
     const meta = readSidecar(jsonl + ".meta") || {};
     const transcriptId = meta.transcriptId;
@@ -400,8 +410,7 @@ function rebuildIndex() {
       upsert.run(transcriptId, meta.host || null, meta.remoteKey || null,
         meta.repo || null, meta.worktree || null, meta.slug || null,
         meta.createdAt || null, meta.endedTs || null, meta.summary || null,
-        msgCount, meta.bytesStored || 0, meta.cost == null ? null : Number(meta.cost),
-        relPath, meta.updatedAt || null);
+        msgCount, meta.bytesStored || 0, relPath, meta.updatedAt || null);
     });
   }
   return files.length;
