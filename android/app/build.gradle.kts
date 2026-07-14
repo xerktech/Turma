@@ -17,6 +17,13 @@ val runNumber: Int = (System.getenv("GITHUB_RUN_NUMBER") ?: "0").toIntOrNull() ?
 android {
     namespace = "com.xerktech.turma"
     compileSdk = 35
+    // Pin the build-tools explicitly instead of inheriting AGP's default, which
+    // for AGP 8.7.x is 34.0.0 — a version nothing else here installs. Left
+    // unpinned, Gradle tries to auto-download it into the SDK, which fails on
+    // any read-only SDK (the agent image ships build-tools 35.0.0 only, root-
+    // owned, while sessions run as the host uid). Keep in lockstep with
+    // ANDROID_BUILD_TOOLS in agent/Dockerfile and the android-ci.yml SDK step.
+    buildToolsVersion = "35.0.0"
 
     defaultConfig {
         applicationId = "com.xerktech.turma"
