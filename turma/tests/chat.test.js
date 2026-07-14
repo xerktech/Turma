@@ -139,6 +139,134 @@ test("render: task_notification card carries the task class + glyph, hidden by '
   assert.doesNotMatch(concise, /action-card/); // Concise hides tool actions (incl. task cards) entirely
 });
 
+// ---- slash-command + compact-summary turns --------------------------------
+// Claude Code writes these as USER turns; the chat must not render them as the
+// operator typing raw XML. Agent-side parity: agent/tests/test_hub_agent.py
+// TestLocalCommand / TestCompactSummary.
+
+test("buildItems: a command block + the output entry after it fold into one card", () => {
+  const items = buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact", args: "be brief" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "Compacted" }] },
+  ]);
+  assert.equal(items.length, 1);                 // the output folded into the invocation
+  assert.equal(items[0].kind, "command");
+  assert.equal(items[0].name, "/compact");
+  assert.equal(items[0].args, "be brief");
+  assert.equal(items[0].result.text, "Compacted");
+  assert.equal(items[0].result.isError, false);
+});
+
+test("buildItems: a command with no output stays a resultless chip", () => {
+  const items = buildItems([{ id: "c1", role: "user", blocks: [{ t: "command", name: "/clear" }] }]);
+  assert.equal(items[0].kind, "command");
+  assert.equal(items[0].args, "");
+  assert.equal(items[0].result, null);
+});
+
+test("buildItems: stderr output flags the command card as an error", () => {
+  const items = buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "No messages", isError: true }] },
+  ]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].result.isError, true);
+});
+
+test("buildItems: an output with no invocation ahead of it stands alone", () => {
+  // A tail window that starts mid-sequence: the command scrolled off.
+  const items = buildItems([{ id: "o1", role: "user", blocks: [{ t: "command_output", text: "Compacted" }] }]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "command");
+  assert.equal(items[0].name, "output");
+  assert.equal(items[0].result.text, "Compacted");
+});
+
+test("buildItems: a message between a command and an output stops the fold", () => {
+  const items = buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact" }] },
+    { id: "u1", role: "user", blocks: [{ t: "text", text: "actually wait" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "Compacted" }] },
+  ]);
+  assert.deepEqual(items.map((i) => i.kind), ["command", "msg", "command"]);
+  assert.equal(items[0].result, null);          // never paired across the message
+  assert.equal(items[2].name, "output");
+});
+
+test("buildItems: a compact_summary is its own item, never a bubble", () => {
+  const items = buildItems([{
+    id: "s1", role: "assistant", blocks: [{ t: "compact_summary", text: "Summary: we did things" }],
+  }]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "compact");
+  assert.equal(items[0].text, "Summary: we did things");
+});
+
+test("render: a command is a chip on the operator's side, not a bubble, in every verbosity", () => {
+  const entries = [
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact", args: "be brief" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "Compacted" }] },
+  ];
+  for (const preset of ["concise", "normal", "verbose"]) {
+    const html = withVerbosity(preset, () => itemsToHtml(buildItems(entries)));
+    assert.match(html, /class="cmd-card"/);
+    assert.match(html, /\/compact/);
+    assert.match(html, /Compacted/);
+    // It's the operator's own intent, so unlike a tool card it survives Concise…
+    assert.doesNotMatch(html, /tr-msg/);        // …but is never a chat bubble.
+  }
+});
+
+test("render: a command card collapses its output and flags stderr with .err", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "No messages", isError: true }] },
+  ])));
+  assert.match(html, /class="cmd-card err"/);
+  assert.doesNotMatch(html, /<details[^>]* open>/); // collapsed by default
+});
+
+test("render: a compact summary renders collapsed on the assistant's side", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([
+    { id: "s1", role: "assistant", blocks: [{ t: "compact_summary", text: "Summary: we did things" }] },
+  ])));
+  assert.match(html, /class="compact-card"/);
+  assert.match(html, /Context compacted/);
+  assert.match(html, /Summary: we did things/);
+  assert.doesNotMatch(html, /tr-msg user/);     // the bug: never the operator's bubble
+  assert.doesNotMatch(html, /<details[^>]* open>/);
+});
+
+test("render: HTML in a command / compact turn is escaped (no injection)", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/x", args: "<img src=x onerror=alert(1)>" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "<script>alert(1)</script>" }] },
+    { id: "s1", role: "assistant", blocks: [{ t: "compact_summary", text: "<script>alert(2)</script>" }] },
+  ])));
+  assert.doesNotMatch(html, /<img src=x/);
+  assert.doesNotMatch(html, /<script>/);
+  assert.match(html, /&lt;script&gt;/);
+});
+
+test("render: a truncated command output / compact summary offers Show more", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "cut", truncated: true }] },
+    { id: "s1", role: "assistant", blocks: [{ t: "compact_summary", text: "cut", truncated: true }] },
+  ])));
+  // The output folds into c1's card but is o1's entry — Show more must re-fetch
+  // the entry the text actually came from, not the card it's drawn in.
+  assert.match(html, /<button class="trunc" data-eid="o1">/);
+  assert.match(html, /<button class="trunc" data-eid="s1">/);
+});
+
+test("render: a folded card's truncated ARGS still expand the invocation entry", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact", args: "cut", truncated: true }] },
+  ])));
+  assert.match(html, /<button class="trunc" data-eid="c1">/);
+});
+
 // ---- verbosity-driven HTML rendering -------------------------------------
 const SAMPLE = [
   { id: "u1", role: "user", blocks: [{ t: "text", text: "go" }] },

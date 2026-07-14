@@ -315,6 +315,47 @@
   .action-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0; padding: 2px 0; text-align: left; }
   .action-card .trunc:hover { text-decoration: underline; }
 
+  /* Slash command the operator ran (/compact, /clear, …), with its output folded
+     in when it produced any. Sits on the operator's side like the bubble it
+     replaces, but reads as a chip rather than speech. */
+  .cmd-card { align-self: flex-end; max-width: 760px; font-size: 12px; border: 1px dashed var(--border);
+    border-radius: var(--radius-md); background: var(--surface); overflow: hidden; }
+  .cmd-card, .cmd-card > summary { display: flex; align-items: center; gap: 7px; padding: 5px 10px; }
+  .cmd-card > summary { list-style: none; cursor: pointer; user-select: none; padding: 5px 10px; }
+  .cmd-card > summary::-webkit-details-marker { display: none; }
+  .cmd-card > summary:hover { color: var(--accent); }
+  .cmd-card.err { border-color: var(--critical); }
+  .cmd-card .cmd-glyph { color: var(--muted); font-size: 11px; line-height: 1; flex: none; }
+  .cmd-card .cmd-name { font-weight: 600; color: var(--ink-2);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .cmd-card .cmd-args { color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; min-width: 0; }
+  /* `details` lays its body out as a flex child of the card; keep the two rows stacked. */
+  .cmd-card[open] { display: block; }
+  .cmd-card .cmd-body { padding: 0 10px 8px; }
+  .cmd-card pre { margin: 0; padding: 7px 9px; background: var(--page); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;
+    max-height: 240px; overflow: auto; }
+  .cmd-card.err pre { border-color: var(--critical); }
+  .cmd-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0;
+    padding: 2px 0; text-align: left; }
+  .cmd-card .trunc:hover { text-decoration: underline; }
+
+  /* The model's own post-compaction summary. Stored as a user turn, shown on the
+     assistant's side (it's the model's writing) and collapsed — it's long, and
+     it's context rather than conversation. */
+  .compact-card { align-self: flex-start; max-width: 760px; width: 100%; color: var(--muted); font-size: 12.5px; }
+  .compact-card > summary { list-style: none; cursor: pointer; user-select: none; color: var(--muted);
+    padding: 5px 0; border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); }
+  .compact-card > summary::-webkit-details-marker { display: none; }
+  .compact-card > summary:hover { color: var(--accent); }
+  .compact-card .compact-body { margin-top: 6px; padding: 9px 12px; border-left: 2px solid var(--border);
+    color: var(--ink-2); overflow-wrap: anywhere; }
+  .compact-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0;
+    padding: 2px 0; text-align: left; }
+  .compact-card .trunc:hover { text-decoration: underline; }
+
   /* Collapsed thinking trace. */
   .thought { align-self: flex-start; max-width: 760px; color: var(--muted); font-size: 12.5px; }
   .thought > summary { list-style: none; cursor: pointer; user-select: none; color: var(--muted); }
