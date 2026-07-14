@@ -19,7 +19,7 @@ repo (`compose/agents-truenas.yaml`).
 - **`turma/`** — the dashboard + terminal gateway (Node stdlib only). A
   **host → repo → session** tree: list repos per host, spawn a session per repo,
   and Attach / Restart (clear context) / Kill / Start / Delete per session, with
-  per-session token-usage/cost, live working/idle/waiting state, and ntfy alerts.
+  per-session token usage, live working/idle/waiting state, and ntfy alerts.
   Killing a session frees its worktree but keeps its usage history. Behind
   single-user HTTP Basic auth; agents authenticate with one shared token.
 
@@ -36,9 +36,11 @@ Image content lives here; **how it runs** (mounts, tokens, `REPOS_ROOT`,
 `compose/agents-truenas.yaml`. See `CLAUDE.md` for the full architecture, the
 session model, and the CI / PR-gate details.
 
-Cost estimates come from a built-in pricing table in `hub-agent.py`; usage from
-a model it doesn't match counts as $0.00 and is flagged ⚠ **unpriced** in the
-dashboard. The agent's optional `PRICING_JSON` env var (inline JSON,
-`{"model-substring": [input, output, cacheWrite, cacheRead]}` per MTok) adds
-rates for such unknown models only — it can never override a built-in rate. The
-loaded extras (or any parse error) are logged at boot.
+Usage is reported in **tokens**, never money — sessions run on a shared
+subscription, so a dollar figure would be notional either way. `hub-agent.py`
+parses each host's transcripts into input / output / cache-write / cache-read
+counts, split per model name and bucketed by UTC day, and reports a `today`,
+`week` (rolling 7 days) and all-time window for each. Every model counts,
+including ones the agent has never seen before — there is no table to keep
+current. The **Usage** page (`/usage`) charts the daily totals by repo or host
+and breaks them down by model.

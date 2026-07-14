@@ -40,6 +40,7 @@ stdlib only — no pip installs in the image.
 """
 
 import base64
+import datetime
 import json
 import os
 import re
@@ -200,69 +201,8 @@ def _usage_slot(sid):
 # same instant contend on that shared state; staggering reduces the contention.
 LAUNCH_STAGGER = 1.0
 
-# API-equivalent pricing per MTok (input, output, cache write, cache read).
-# Cache write = 1.25x input (5m TTL), cache read = 0.1x input. Sessions run on
-# a subscription, so this is a notional "what this would have cost via the
-# API" figure, not a bill. Matched by substring on the model id.
-PRICING = {
-    "fable": (10.0, 50.0, 12.50, 1.00),
-    "mythos": (10.0, 50.0, 12.50, 1.00),
-    "opus": (5.0, 25.0, 6.25, 0.50),
-    "sonnet": (3.0, 15.0, 3.75, 0.30),
-    "haiku": (1.0, 5.0, 1.25, 0.10),
-}
-
-
 def log(msg):
     print(f"[hub-agent] {msg}", flush=True)
-
-
-def load_pricing_extra():
-    """Extra pricing entries from the PRICING_JSON env var (inline JSON, per the
-    everything-inline-env convention): {"model-substring": [input, output,
-    cacheWrite, cacheRead]} per MTok. Consulted ONLY when the built-in PRICING
-    table has no match, so it can price new/unknown models but never override a
-    built-in rate. Anything malformed is logged loudly and the whole override
-    ignored — a bad env var must never take the agent down."""
-    raw = os.environ.get("PRICING_JSON", "").strip()
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("top level must be a JSON object")
-        extra = {}
-        for key, rates in data.items():
-            if not key or not isinstance(key, str):
-                raise ValueError(f"bad model key {key!r}")
-            if (
-                not isinstance(rates, (list, tuple))
-                or len(rates) != 4
-                or not all(
-                    isinstance(r, (int, float)) and not isinstance(r, bool) and r >= 0
-                    for r in rates
-                )
-            ):
-                raise ValueError(
-                    f"{key!r} must map to [input, output, cacheWrite, cacheRead] per MTok"
-                )
-            if key in PRICING:
-                log(f"PRICING_JSON: {key!r} duplicates a built-in entry — ignored")
-                continue
-            extra[key] = tuple(float(r) for r in rates)
-        return extra
-    except ValueError as e:
-        log(f"PRICING_JSON invalid — ignoring it entirely: {e}")
-        return {}
-
-
-PRICING_EXTRA = load_pricing_extra()
-# Logged unconditionally at boot so a bad/missing override is diagnosable from
-# the container-log tail in the hub UI.
-log(
-    "pricing extras from PRICING_JSON (consulted for unknown models only): "
-    + (", ".join(f"{k}={list(v)}" for k, v in PRICING_EXTRA.items()) or "none")
-)
 
 
 def run(cmd, cwd=None):
@@ -893,8 +833,22 @@ def memory_usage():
 HISTORY_DAYS = 60  # per-day breakdown reported to the hub (bounds payload size)
 
 
+TOKEN_KEYS = ("input", "output", "cacheWrite", "cacheRead")
+WEEK_DAYS = 7  # rolling window (UTC days, today inclusive) behind the `week` bucket
+
+
 def _usage_bucket():
-    return {"input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0}
+    return {k: 0 for k in TOKEN_KEYS}
+
+
+def _add_tokens(bucket, tok):
+    """Fold one message's (input, output, cacheWrite, cacheRead) into `bucket`."""
+    for k, n in zip(TOKEN_KEYS, tok):
+        bucket[k] += n
+
+
+def _model_acc():
+    return {"totals": _usage_bucket(), "days": {}}
 
 
 class _UsageAcc:
@@ -907,8 +861,12 @@ class _UsageAcc:
     def __init__(self):
         self.totals = _usage_bucket()
         self.days = {}      # "YYYY-MM-DD" (UTC) -> bucket
-        self.models = {}    # model id -> message count
-        self.unpriced = set()
+        # model id -> {"totals": bucket, "days": {"YYYY-MM-DD": bucket}}. The
+        # per-model day buckets never leave the agent: _finalize_usage derives
+        # each model's today/week from them and drops them, so the per-model
+        # breakdown costs a few scalars per model on the wire rather than a
+        # whole second days matrix.
+        self.models = {}
         self.seen = set()   # (message id, requestId) dedup keys
         self.last_ts = ""
         self.sessions = 0   # transcript files folded in
@@ -916,7 +874,7 @@ class _UsageAcc:
 
 def _accumulate_usage(lines, acc):
     """Fold transcript JSONL lines into `acc` in place. Only lines that mention a
-    usage block cost anything; each priced message is deduped on
+    usage block count for anything; each message is deduped on
     (message id, requestId) via acc.seen, so a message re-seen across files or
     across incremental beats counts exactly once."""
     for line in lines:
@@ -939,7 +897,6 @@ def _accumulate_usage(lines, acc):
         if ts > acc.last_ts:
             acc.last_ts = ts
         model = msg.get("model") or "unknown"
-        acc.models[model] = acc.models.get(model, 0) + 1
 
         tok = (
             usage.get("input_tokens", 0) or 0,
@@ -947,36 +904,16 @@ def _accumulate_usage(lines, acc):
             usage.get("cache_creation_input_tokens", 0) or 0,
             usage.get("cache_read_input_tokens", 0) or 0,
         )
-        # Built-in table first (authoritative); PRICING_EXTRA only covers
-        # models the built-ins don't match.
-        price = next(
-            (p for k, p in PRICING.items() if k in model), None
-        ) or next(
-            (p for k, p in PRICING_EXTRA.items() if k in model), None
-        )
-        cost = (
-            sum(t * p for t, p in zip(tok, price)) / 1e6
-            if price
-            else 0.0
-        )
-        # An unpriced model costs $0.00 — flag every bucket it lands in so the
-        # UI never understates cost silently.
-        is_unpriced = price is None and any(tok)
-        if is_unpriced:
-            acc.unpriced.add(model)
-        buckets = [acc.totals]
         # Transcript timestamps are UTC ISO; date-prefix bucketing is close
         # enough for a dashboard.
-        if len(ts) >= 10:
-            buckets.append(acc.days.setdefault(ts[:10], _usage_bucket()))
+        day = ts[:10] if len(ts) >= 10 else ""
+        m = acc.models.setdefault(model, _model_acc())
+        buckets = [acc.totals, m["totals"]]
+        if day:
+            buckets.append(acc.days.setdefault(day, _usage_bucket()))
+            buckets.append(m["days"].setdefault(day, _usage_bucket()))
         for b in buckets:
-            b["input"] += tok[0]
-            b["output"] += tok[1]
-            b["cacheWrite"] += tok[2]
-            b["cacheRead"] += tok[3]
-            b["cost"] += cost
-            if is_unpriced:
-                b["unpriced"] = True
+            _add_tokens(b, tok)
 
 
 def _aggregate_project(proj, acc, offsets=None):
@@ -1049,27 +986,73 @@ def _aggregate_project(proj, acc, offsets=None):
     return True
 
 
+def _total_tokens(bucket):
+    return sum(bucket.get(k, 0) for k in TOKEN_KEYS)
+
+
+def _utc_today():
+    """Today's UTC date. Day buckets are keyed off the transcripts' UTC ISO
+    timestamps, so `today`/`week` MUST be resolved in UTC too — reading them
+    against local time silently mis-slices the window on any host that isn't
+    on UTC (and skips/double-counts a day around its midnight)."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _week_window(today=None):
+    """The WEEK_DAYS UTC dates ending `today` (inclusive), newest last. Dated in
+    UTC via date arithmetic rather than epoch-second subtraction, which would
+    skip or repeat a day across a DST boundary on a non-UTC host."""
+    end = datetime.date.fromisoformat(today or _utc_today())
+    return [
+        (end - datetime.timedelta(days=i)).isoformat()
+        for i in range(WEEK_DAYS - 1, -1, -1)
+    ]
+
+
+def _sum_days(days, window):
+    """Total the buckets of `window`'s dates out of a {date: bucket} map."""
+    out = _usage_bucket()
+    for d in window:
+        b = days.get(d)
+        if b:
+            _add_tokens(out, [b[k] for k in TOKEN_KEYS])
+    return out
+
+
 def _finalize_usage(acc):
-    """Snapshot the running accumulator into the heartbeat's usage shape. Rounds
-    into COPIES so the accumulator keeps its raw floats — rounding in place would
-    drift the running total a little more every incremental beat, and the same
-    per-slug acc is reused across beats and merged into repo/host totals."""
-    totals = dict(acc.totals)
-    totals["cost"] = round(totals["cost"], 2)
+    """Snapshot the running accumulator into the heartbeat's usage shape. Builds
+    COPIES throughout: the same per-slug acc is reused across beats and merged
+    into repo/host totals, so a report must never alias (let alone mutate) the
+    accumulator's own buckets.
+
+    `today`/`week` are pre-sliced here rather than left to each client: the day
+    buckets are UTC and the clients aren't, and three surfaces (hub, Android,
+    glasses) would otherwise each re-derive the same window."""
+    window = _week_window()
     days = {d: dict(acc.days[d]) for d in sorted(acc.days)[-HISTORY_DAYS:]}
-    for day in days.values():
-        day["cost"] = round(day["cost"], 2)
-    today = days.get(time.strftime("%Y-%m-%d"), _usage_bucket())
     return {
-        "totals": totals,
-        "today": today,
+        "totals": dict(acc.totals),
+        "today": days.get(window[-1], _usage_bucket()),
+        "week": _sum_days(acc.days, window),
         "days": days,
         "sessions": acc.sessions,
         "lastActivity": acc.last_ts,
-        "models": sorted(acc.models, key=acc.models.get, reverse=True),
-        # Models whose usage no pricing entry matched (their cost counted as
-        # $0.00) — the UI flags any figure that includes them.
-        "unpricedModels": sorted(acc.unpriced),
+        # Per-model token counts, biggest consumer first. Each model's day
+        # buckets stay agent-side (see _UsageAcc.models) — only the three
+        # windows the UI shows travel.
+        "models": sorted(
+            (
+                {
+                    "model": name,
+                    "totals": dict(m["totals"]),
+                    "today": dict(m["days"].get(window[-1]) or _usage_bucket()),
+                    "week": _sum_days(m["days"], window),
+                }
+                for name, m in acc.models.items()
+            ),
+            key=lambda m: _total_tokens(m["totals"]),
+            reverse=True,
+        ),
     }
 
 
@@ -1086,23 +1069,23 @@ def usage_report(workdir):
     return _finalize_usage(acc)
 
 
+def _merge_bucket(dst, src):
+    for k in TOKEN_KEYS:
+        dst[k] += src.get(k, 0)
+
+
 def _merge_acc(dst, src):
-    """Fold accumulator `src` into `dst` (pre-finalize, so costs stay full
-    precision). Buckets are copied by value, so later finalizing one side never
-    disturbs the other, and `src` (a persistent per-slug acc) is left intact."""
-    for k in ("input", "output", "cacheWrite", "cacheRead", "cost"):
-        dst.totals[k] += src.totals[k]
-    if src.totals.get("unpriced"):
-        dst.totals["unpriced"] = True
+    """Fold accumulator `src` into `dst` (pre-finalize). Buckets are merged by
+    value, so later finalizing one side never disturbs the other, and `src` (a
+    persistent per-slug acc) is left intact."""
+    _merge_bucket(dst.totals, src.totals)
     for d, b in src.days.items():
-        tgt = dst.days.setdefault(d, _usage_bucket())
-        for k in ("input", "output", "cacheWrite", "cacheRead", "cost"):
-            tgt[k] += b[k]
-        if b.get("unpriced"):
-            tgt["unpriced"] = True
-    for m, c in src.models.items():
-        dst.models[m] = dst.models.get(m, 0) + c
-    dst.unpriced |= src.unpriced
+        _merge_bucket(dst.days.setdefault(d, _usage_bucket()), b)
+    for name, m in src.models.items():
+        tgt = dst.models.setdefault(name, _model_acc())
+        _merge_bucket(tgt["totals"], m["totals"])
+        for d, b in m["days"].items():
+            _merge_bucket(tgt["days"].setdefault(d, _usage_bucket()), b)
     dst.seen |= src.seen
     dst.sessions += src.sessions
     if src.last_ts > dst.last_ts:
@@ -1169,9 +1152,9 @@ def repo_usage_report(ledger, fold_slug):
     the same repo across hosts.
 
     Returns (repo_usage, host_usage): repo_usage is
-    [{repo, remote, remoteKey, usage}] sorted by cost desc (repos that never
-    spent anything are omitted); host_usage is the merged report, or None when no
-    transcript exists at all."""
+    [{repo, remote, remoteKey, usage}] sorted by total tokens desc (repos that
+    never consumed anything are omitted); host_usage is the merged report, or
+    None when no transcript exists at all."""
     by_repo = {}  # repo name -> {"remote": str, "slugs": set()}
     for path, meta in (ledger or {}).items():
         meta = meta or {}
@@ -1202,7 +1185,7 @@ def repo_usage_report(ledger, fold_slug):
         })
 
     host_usage = _finalize_usage(host) if host.sessions else None
-    repo_usage.sort(key=lambda r: r["usage"]["totals"]["cost"], reverse=True)
+    repo_usage.sort(key=lambda r: _total_tokens(r["usage"]["totals"]), reverse=True)
     return repo_usage, host_usage
 
 
@@ -4519,7 +4502,7 @@ class SessionManager:
 
     def _reconcile_orphan_transcripts(self):
         """Adopt EVERY transcript sitting in PROJECTS_ROOT that no ledger entry
-        covers, so persistent usage/cost reflects every session on disk — not
+        covers, so persistent token usage reflects every session on disk — not
         only sessions in the live registry or the last-5 closed history that
         _backfill_ledger sees. A session killed long ago (its card gone, its
         worktree maybe surviving) or one predating _remember_usage would

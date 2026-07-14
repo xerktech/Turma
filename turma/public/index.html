@@ -202,7 +202,6 @@
   .usage .u-label { color: var(--muted); font-size: 11px; }
   .usage .u-value { font-family: var(--font-display); font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .usage .u-sub { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-  .unpriced { color: var(--warning); cursor: help; }
 
   .sess-working { color: var(--good); }
   .sess-wait { color: var(--warning); }
@@ -254,7 +253,7 @@
       <a href="/" class="active">Dashboard</a>
       <a href="/sessions">Sessions</a>
       <a href="/board">Board</a>
-      <a href="/history">History</a>
+      <a href="/usage">Usage</a>
       <a href="#" class="signout" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;">Sign out</a>
     </nav>
     <span class="sub" id="refreshed"></span>
@@ -262,7 +261,7 @@
 
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
-  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. "Clone from GitHub" pulls a repo (from the host's GitHub login) into the repos root so it joins the list and can host sessions — greyed out on hosts without GitHub credentials. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
+  <div class="footer">Token figures are parsed from the Claude transcripts on each host and count every session it has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. "Clone from GitHub" pulls a repo (from the host's GitHub login) into the repos root so it joins the list and can host sessions — greyed out on hosts without GitHub credentials. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
 </div>
 
 <nav class="bottom-nav">
@@ -278,9 +277,9 @@
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="5" height="18" rx="1"/><rect x="9.5" y="3" width="5" height="12" rx="1"/><rect x="16" y="3" width="5" height="15" rx="1"/></svg>
     Board
   </a>
-  <a href="/history">
+  <a href="/usage">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/></svg>
-    History
+    Usage
   </a>
 </nav>
 
@@ -520,14 +519,6 @@ function fmtTokens(n) {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
   return String(n);
 }
-function fmtCost(c) { return c == null ? "–" : "$" + c.toFixed(2); }
-// ⚠ next to a cost figure that includes usage from models the agent's pricing
-// table doesn't know (counted at $0.00, so the figure is understated).
-function unpricedMark(bucket, u) {
-  if (!bucket || !bucket.unpriced) return "";
-  const who = (u?.unpricedModels || []).join(", ");
-  return ` <span class="unpriced" title="Understated — includes unpriced model(s)${who ? ": " + esc(who) : ""}">⚠</span>`;
-}
 function fmtBytes(b) {
   if (b == null) return "–";
   const units = ["B", "KiB", "MiB", "GiB"];
@@ -559,10 +550,23 @@ function esc(s) {
 function totalTokens(u) {
   return u ? u.input + u.output + u.cacheWrite + u.cacheRead : null;
 }
+// Fold several hosts' `models` arrays into one, biggest consumer first — the
+// same model runs on many hosts, so it has to merge by name rather than
+// concatenate. Ignores nullish entries (an agent too old to report the block).
+function mergeModels(lists) {
+  const by = new Map();
+  for (const list of lists) {
+    for (const m of list || []) by.set(m.model, (by.get(m.model) || 0) + totalTokens(m.totals));
+  }
+  return [...by.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([model]) => ({ model }));
+}
+// `models` is [{model, ...}], biggest consumer first.
 function shortModels(models) {
   if (!models || !models.length) return "–";
   return models.slice(0, 2).map(m =>
-    m.replace(/^claude-/, "").replace(/-\d{8}$/, "")
+    m.model.replace(/^claude-/, "").replace(/-\d{8}$/, "")
   ).join(", ");
 }
 // git@host:owner/repo(.git) -> https link; plain name otherwise.
@@ -681,24 +685,25 @@ function render(data) {
   const online = agents.filter(a => a.online);
   const running = sess.filter(x => x.s.status === "running");
   const waiting = sess.filter(x => x.s.status === "running" && x.s.session && x.s.session.question);
-  const tokToday = sess.reduce((t, x) => t + (totalTokens(x.s.usage?.today) || 0), 0);
-  const costToday = sess.reduce((t, x) => t + (x.s.usage?.today?.cost || 0), 0);
-  const costAll = sess.reduce((t, x) => t + (x.s.usage?.totals?.cost || 0), 0);
-  // Any unpriced usage in the mix means the $ tiles are understated — say so.
-  const unpToday = sess.some(x => x.s.usage?.today?.unpriced);
-  const unpAll = sess.some(x => x.s.usage?.totals?.unpriced);
-  const unpModels = [...new Set(sess.flatMap(x => x.s.usage?.unpricedModels || []))].join(", ");
+  // Token tiles read each host's persistent `usage` block — which the agent
+  // aggregates from EVERY transcript on the box — rather than summing the live
+  // session list, so killed, deleted and pruned work still counts toward the
+  // fleet's totals. An older agent that reports no such block falls back to the
+  // sessions it does report (understating, but only for that host).
+  const fleetTokens = (w) => agents.reduce((t, a) => t + (a.usage
+    ? (totalTokens(a.usage[w]) || 0)
+    : (a.sessions || []).reduce((n, s) => n + (totalTokens(s.usage?.[w]) || 0), 0)), 0);
+  const models = shortModels(mergeModels(agents.map(a => a.usage?.models)));
 
   $tiles.innerHTML =
     tile("Hosts online", `${online.length} / ${agents.length}`,
          [...new Set(agents.map(a => a.device))].join(", ") || "no devices yet") +
     tile("Running sessions", String(running.length), sess.length + " total") +
     tile("Waiting on you", String(waiting.length), "sessions with a question") +
-    tile("Tokens today", fmtTokens(tokToday), "all sessions, incl. cache") +
-    tile("Est. cost today", fmtCost(costToday) + (unpToday ? " ⚠" : ""),
-         unpToday ? "understated — unpriced: " + unpModels : "API-equivalent") +
-    tile("Est. cost all-time", fmtCost(costAll) + (unpAll ? " ⚠" : ""),
-         unpAll ? "understated — unpriced: " + unpModels : "API-equivalent");
+    tile("Tokens today", fmtTokens(fleetTokens("today")), "all sessions, incl. cache") +
+    tile("Tokens this week", fmtTokens(fleetTokens("week")), "last 7 days (UTC)") +
+    tile("Tokens all-time", fmtTokens(fleetTokens("totals")),
+         models === "–" ? "every session ever" : "mostly " + models);
 
   if (!agents.length) {
     $groups.innerHTML = `<div class="empty">No hosts have reported yet.<br>
@@ -1138,10 +1143,10 @@ function sessCard(a, s, now) {
     <div class="usage">
       <div><div class="u-label">Tokens today</div><div class="u-value">${fmtTokens(totalTokens(u?.today))}</div>
            <div class="u-sub">${fmtTokens(u?.today?.output)} out</div></div>
-      <div><div class="u-label">Est. today</div><div class="u-value">${fmtCost(u?.today?.cost)}${unpricedMark(u?.today, u)}</div>
-           <div class="u-sub">API-equiv.</div></div>
-      <div><div class="u-label">All-time</div><div class="u-value">${fmtCost(u?.totals?.cost)}${unpricedMark(u?.totals, u)}</div>
-           <div class="u-sub">${fmtTokens(totalTokens(u?.totals))} tokens</div></div>
+      <div><div class="u-label">This week</div><div class="u-value">${fmtTokens(totalTokens(u?.week))}</div>
+           <div class="u-sub">${fmtTokens(u?.week?.output)} out</div></div>
+      <div><div class="u-label">All-time</div><div class="u-value">${fmtTokens(totalTokens(u?.totals))}</div>
+           <div class="u-sub">${fmtTokens(u?.totals?.output)} out</div></div>
     </div>
     <div class="sess-actions">${actions}</div>
   </div>`;
