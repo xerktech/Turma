@@ -611,7 +611,11 @@ function pollWatcher(sessionId) {
     if (!watchers.has(sessionId)) return; // stopped mid-capture
     const text = live.generating ? live.text : "";
     const status = live.generating ? (live.status || null) : null;
-    const key = text + " " + (status ? JSON.stringify(status) : "");
+    // NUL separator: a byte that cannot occur in pane text. Written as an
+    // escape, not a literal: a raw NUL makes grep treat this whole file as
+    // binary and silently report no matches for anything in it (the same
+    // reason the tests keep ESC as String.fromCharCode(27)).
+    const key = text + "\u0000" + (status ? JSON.stringify(status) : "");
     if (key !== w.lastTurn) {
       w.lastTurn = key;
       sendControl({ turn: sessionId, text, status });
