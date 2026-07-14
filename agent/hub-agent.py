@@ -1632,15 +1632,54 @@ def _history_entries(path):
     return entries, byte_capped
 
 
+# A req file only marks a *live* pending question while the ask.py bridge is
+# still blocked on it; the bridge self-times-out at TURMA_QUESTION_TIMEOUT_SEC
+# and Claude kills the hook at ASK_HOOK_TIMEOUT_SEC regardless, so a req older
+# than that ceiling (plus clock-skew margin) can only be an orphan the bridge
+# left behind when its turn was killed/restarted/crashed mid-question. Reporting
+# such a stale req is exactly how a long-answered question keeps showing on the
+# card and re-opens in the chat; past this age we drop (and clean up) instead.
+QUESTION_STALE_AFTER_SEC = ASK_HOOK_TIMEOUT_SEC + 60
+
+
 def _hook_question(session_id):
-    """Read a pending AskUserQuestion published by the ask.py PreToolUse bridge
-    for `session_id`, as (question, options) or (None, []). The bridge blocks
-    the tool call while this request file exists, so its presence is an exact
-    "a question is waiting right now" signal — no pane scraping, no transcript
-    timing. Best-effort: a missing/half-written file is just no question."""
+    """Read a *live* pending AskUserQuestion published by the ask.py PreToolUse
+    bridge for `session_id`, as (question, options) or (None, []). The bridge
+    blocks the tool call while this request file exists, so its presence is an
+    exact "a question is waiting right now" signal — no pane scraping, no
+    transcript timing.
+
+    A req is only live while the bridge is actually blocked on it, so two states
+    are *not* reported (both are how an already-answered question would linger):
+      * an `.ans.json` sits beside the req — the answer has been delivered and
+        the bridge is consuming it (or died before it could), so the question is
+        effectively answered, not pending;
+      * the req has outlived the bridge's max block window — the owning bridge
+        can no longer be waiting on it (it self-times-out well before this), so
+        the file is an orphan from a killed/restarted/crashed turn.
+    A stale orphan is also cleaned up so it can't accumulate; the answered-but-
+    fresh case is left on disk for the bridge to consume normally.
+
+    Best-effort: a missing/half-written file is just no question."""
     if not session_id:
         return None, []
     path = os.path.join(QUESTIONS_DIR, f"{session_id}.req.json")
+    ans_path = os.path.join(QUESTIONS_DIR, f"{session_id}.ans.json")
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return None, []
+    # Orphaned by a dead bridge (too old to still be blocking) — drop and tidy.
+    if time.time() - mtime > QUESTION_STALE_AFTER_SEC:
+        for p in (path, ans_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return None, []
+    # Answer already delivered — the bridge is consuming it, not still asking.
+    if os.path.exists(ans_path):
+        return None, []
     try:
         with open(path, encoding="utf-8") as f:
             req = json.load(f)
@@ -2968,6 +3007,46 @@ class SessionManager:
             except OSError:
                 pass
 
+    def _tmux_alive(self, tmux_name):
+        """Whether the session's claude tmux is still up. The claude process is
+        that tmux session's only command, so a missing session means claude
+        exited (a killed/crashed/finished turn)."""
+        if not tmux_name:
+            return False
+        rc, _ = run_ok(["tmux", "has-session", "-t", tmux_name], timeout=5)
+        return rc == 0
+
+    def _sweep_orphan_questions(self):
+        """Clear AskUserQuestion rendezvous files whose owning ask.py bridge can
+        no longer be blocking on them. The bridge lives inside the session's
+        claude tmux and cleans up its own req/ans files when it unblocks; but a
+        turn that dies WITHOUT routing through our kill/restart cleanup (claude
+        crashed or exited on its own) strands them, and a stranded req is exactly
+        how a question the agent has already moved past keeps showing as pending.
+        For every session id with a leftover file, if the session isn't running
+        or its claude tmux is gone, no live bridge owns the file — drop it. A
+        still-running session with a live tmux is left alone (a real pending
+        question, or a multi-question flow mid-advance). _hook_question's own
+        answered/stale guards cover the narrower window where the tmux is still
+        up but the bridge died; this closes the common session-ended case fast
+        and keeps the rendezvous dir from accumulating orphans."""
+        try:
+            names = os.listdir(QUESTIONS_DIR)
+        except OSError:
+            return
+        sids = {
+            name[: -len(sfx)]
+            for name in names
+            for sfx in (".req.json", ".ans.json")
+            if name.endswith(sfx)
+        }
+        for sid in sids:
+            sess = self._find(sid)
+            if sess and sess.get("status") == "running" \
+                    and self._tmux_alive(sess.get("tmuxName")):
+                continue  # a live bridge may still own it
+            self._clear_question_files(sid)
+
     def answer_question(self, sid, option_index, custom):
         """Answer a session's pending AskUserQuestion by dropping the answer file
         the ask.py bridge is polling for. option_index is 0-based into the
@@ -4256,6 +4335,10 @@ class SessionManager:
                 log(f"pr status refresh failed: {e}")
         self._poll_clones()
         self._poll_prunes()
+        # Drop AskUserQuestion rendezvous files left behind by a turn that died
+        # outside our kill/restart cleanup, so a long-answered/abandoned question
+        # can't keep showing as pending on the card.
+        self._sweep_orphan_questions()
         # Seed names for bare-spawned sessions from their transcript's first
         # prompt (channel-agnostic; the live terminal bypasses send_input), then
         # reap any finished naming subprocess.

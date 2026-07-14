@@ -782,6 +782,42 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         # order of operations as the transcript-detection path.
         self.assertEqual(rep["questionOptions"], ["a", "b", "c"])
 
+    # ---- answered/orphaned req files must NOT re-surface as pending ----------
+    # Regression: a long-answered question kept showing on the card and re-opened
+    # in chat because its req file lingered after the owning ask.py bridge died.
+    def _req_ans_paths(self, sid):
+        return (os.path.join(self.questions_dir, f"{sid}.req.json"),
+                os.path.join(self.questions_dir, f"{sid}.ans.json"))
+
+    def test_hook_question_suppressed_once_answer_delivered(self):
+        # The answer file sitting beside the req means the answer has been
+        # delivered and the bridge is consuming it (or died before it could) —
+        # the question is answered, not pending, so it must not be reported.
+        self.write_question_req("sess-1", "Pick one", ["a", "b"])
+        req_path, ans_path = self._req_ans_paths("sess-1")
+        with open(ans_path, "w") as f:
+            json.dump({"optionIndex": 0}, f)
+        rep = ha.session_report(self.WORKDIR, {}, session_id="sess-1")
+        self.assertIsNone(rep["question"])
+        self.assertIsNone(rep["questionSource"])
+        # A fresh answered pair is left on disk for the live bridge to consume.
+        self.assertTrue(os.path.exists(req_path))
+
+    def test_hook_question_stale_orphan_dropped_and_cleaned(self):
+        # A req older than the bridge's max block window can only be an orphan a
+        # killed/restarted/crashed turn left behind — drop it AND clean it up so
+        # it can't keep re-surfacing (this is the exact long-answered symptom).
+        self.write_question_req("sess-1", "Pick one", ["a", "b"])
+        req_path, ans_path = self._req_ans_paths("sess-1")
+        with open(ans_path, "w") as f:
+            json.dump({"optionIndex": 0}, f)
+        old = time.time() - (ha.QUESTION_STALE_AFTER_SEC + 60)
+        os.utime(req_path, (old, old))
+        rep = ha.session_report(self.WORKDIR, {}, session_id="sess-1")
+        self.assertIsNone(rep["question"])
+        self.assertFalse(os.path.exists(req_path))
+        self.assertFalse(os.path.exists(ans_path))
+
 
 class TestPaneBusy(unittest.TestCase):
     """_pane_busy reads the working/idle state straight off the session's tmux
@@ -2234,6 +2270,68 @@ class TestAnswerQuestion(ManagerMixin, unittest.TestCase):
         sm.kill("abcde")
         self.assertFalse(os.path.exists(os.path.join(ha.QUESTIONS_DIR, "abcde.req.json")))
         self.assertFalse(os.path.exists(os.path.join(ha.QUESTIONS_DIR, "abcde.ans.json")))
+
+
+class TestSweepOrphanQuestions(ManagerMixin, unittest.TestCase):
+    """_sweep_orphan_questions drops rendezvous files whose owning ask.py bridge
+    is gone — the session isn't running, or its claude tmux has exited. This is
+    the fix for a question that keeps showing pending after a turn died outside
+    the kill/restart cleanup (claude crashed / esc-cancel / finished on its own),
+    beyond _hook_question's own answered/stale guards."""
+
+    def _files(self, sid, ans=False):
+        os.makedirs(ha.QUESTIONS_DIR, exist_ok=True)
+        with open(os.path.join(ha.QUESTIONS_DIR, f"{sid}.req.json"), "w") as f:
+            json.dump({"sessionId": sid, "question": "q", "options": []}, f)
+        if ans:
+            with open(os.path.join(ha.QUESTIONS_DIR, f"{sid}.ans.json"), "w") as f:
+                f.write("{}")
+
+    def _exists(self, sid, suffix):
+        return os.path.exists(os.path.join(ha.QUESTIONS_DIR, f"{sid}.{suffix}"))
+
+    def test_clears_files_for_unknown_session(self):
+        sm = self.make_manager()
+        sm.registry = []
+        self._files("ghost", ans=True)
+        sm._sweep_orphan_questions()
+        self.assertFalse(self._exists("ghost", "req.json"))
+        self.assertFalse(self._exists("ghost", "ans.json"))
+
+    def test_clears_files_for_stopped_session(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "stopped", "tmuxName": "agent-s1"}]
+        self._files("s1")
+        sm._sweep_orphan_questions()
+        self.assertFalse(self._exists("s1", "req.json"))
+
+    def test_clears_files_when_tmux_gone(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "tmuxName": "agent-s1"}]
+        self._files("s1")
+        with mock.patch.object(sm, "_tmux_alive", return_value=False):
+            sm._sweep_orphan_questions()
+        self.assertFalse(self._exists("s1", "req.json"))
+
+    def test_keeps_files_for_running_session_with_live_tmux(self):
+        # A real pending question (or a multi-question flow mid-advance) must be
+        # left alone — its bridge is alive and will clean up itself.
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "tmuxName": "agent-s1"}]
+        self._files("s1")
+        with mock.patch.object(sm, "_tmux_alive", return_value=True):
+            sm._sweep_orphan_questions()
+        self.assertTrue(self._exists("s1", "req.json"))
+
+    def test_tmux_alive_uses_has_session(self):
+        sm = self.make_manager()
+        self.run_ok_calls.clear()
+        self.assertTrue(sm._tmux_alive("agent-x"))  # fake_run_ok returns rc 0
+        self.assertIn(["tmux", "has-session", "-t", "agent-x"], self.run_ok_calls)
+
+    def test_tmux_alive_false_without_name(self):
+        sm = self.make_manager()
+        self.assertFalse(sm._tmux_alive(None))
 
 
 class TestHistoryCommand(ManagerMixin, unittest.TestCase):
