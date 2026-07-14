@@ -17,6 +17,10 @@ val runNumber: Int = (System.getenv("GITHUB_RUN_NUMBER") ?: "0").toIntOrNull() ?
 android {
     namespace = "com.xerktech.turma"
     compileSdk = 35
+    // Pin rather than inherit AGP's default (34.0.0): the only build-tools the
+    // CI image and the agent image install is the 35.0.0 that matches
+    // compileSdk, so the default resolves to a revision that isn't there.
+    buildToolsVersion = "35.0.0"
 
     defaultConfig {
         applicationId = "com.xerktech.turma"

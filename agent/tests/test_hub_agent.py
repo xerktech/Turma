@@ -9,6 +9,7 @@ faked at its two chokepoints, run()/run_ok(), plus Popen for ttyd — no
 docker/tmux/git needed.
 """
 
+import datetime
 import importlib.util
 import io
 import json
@@ -335,20 +336,20 @@ class TestUsageReport(ProjectDirMixin, unittest.TestCase):
     def test_missing_project_dir_returns_none(self):
         self.assertIsNone(ha.usage_report("/does/not/exist"))
 
-    def test_aggregation_dedup_and_pricing(self):
-        today = time.strftime("%Y-%m-%d")
+    def test_aggregation_dedup_and_model_tokens(self):
+        today = ha._utc_today()
         opus = usage_entry(
             "2026-07-01T10:00:00.000Z", "m1", "r1",
             "claude-opus-4-20250514", 1_000_000, 100_000,
-        )  # 1M in @ $5 + 100k out @ $25 = $7.50
+        )
         unknown = usage_entry(
             "2026-07-02T09:00:00.000Z", "m2", "r2",
             "weird-model-x", 10, 20, cw=30, cr=40,
-        )  # unknown model: tokens counted, cost 0
+        )  # a model the agent has never heard of still counts, by name
         no_id = usage_entry(
             f"{today}T01:00:00.000Z", None, None,
             "claude-sonnet-4-20250514", 100_000, 0,
-        )  # id-less entries are never deduped; sonnet 100k in = $0.30
+        )  # id-less entries are never deduped
 
         write_jsonl(os.path.join(self.proj, "a.jsonl"), [
             opus,
@@ -371,19 +372,63 @@ class TestUsageReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["totals"]["output"], 100_000 + 20)
         self.assertEqual(rep["totals"]["cacheWrite"], 30)
         self.assertEqual(rep["totals"]["cacheRead"], 40)
-        self.assertAlmostEqual(rep["totals"]["cost"], 7.5 + 0.0 + 0.6, places=2)
 
         # Per-day buckets: opus on 07-01, unknown on 07-02, sonnet today.
-        self.assertAlmostEqual(rep["days"]["2026-07-01"]["cost"], 7.5, places=2)
+        self.assertEqual(rep["days"]["2026-07-01"]["input"], 1_000_000)
         self.assertEqual(rep["days"]["2026-07-02"]["input"], 10)
-        self.assertAlmostEqual(rep["days"]["2026-07-02"]["cost"], 0.0, places=2)
         self.assertEqual(rep["today"], rep["days"][today])
         self.assertEqual(rep["today"]["input"], 200_000)
+        # Today is inside the week window; the older days are far outside it.
+        self.assertEqual(rep["week"]["input"], 200_000)
 
         self.assertEqual(rep["lastActivity"], f"{today}T01:00:00.000Z")
-        # sonnet has 2 messages, opus and weird-model-x 1 each -> sonnet first.
-        self.assertEqual(rep["models"][0], "claude-sonnet-4-20250514")
-        self.assertIn("weird-model-x", rep["models"])
+
+        # Per-model token counts, biggest consumer first. Opus leads on tokens
+        # (1.1M) despite sonnet having more messages (2) — the report ranks by
+        # what was consumed, not how many turns it took.
+        models = {m["model"]: m for m in rep["models"]}
+        self.assertEqual([m["model"] for m in rep["models"]], [
+            "claude-opus-4-20250514",
+            "claude-sonnet-4-20250514",
+            "weird-model-x",
+        ])
+        self.assertEqual(models["claude-opus-4-20250514"]["totals"], {
+            "input": 1_000_000, "output": 100_000, "cacheWrite": 0, "cacheRead": 0,
+        })
+        # The de-duped opus message counts once, on its own day, not today.
+        self.assertEqual(models["claude-opus-4-20250514"]["today"], ha._usage_bucket())
+        self.assertEqual(models["weird-model-x"]["totals"], {
+            "input": 10, "output": 20, "cacheWrite": 30, "cacheRead": 40,
+        })
+        # The id-less sonnet entry counted twice, and lands in today AND week.
+        self.assertEqual(models["claude-sonnet-4-20250514"]["today"]["input"], 200_000)
+        self.assertEqual(models["claude-sonnet-4-20250514"]["week"]["input"], 200_000)
+
+    def test_week_window_is_utc_and_rolling(self):
+        # Seven UTC days ending today, inclusive — the boundary day counts and
+        # the day before it does not.
+        window = ha._week_window("2026-07-14")
+        self.assertEqual(len(window), 7)
+        self.assertEqual(window[-1], "2026-07-14")   # today, last
+        self.assertEqual(window[0], "2026-07-08")    # oldest day still inside
+        # Crossing a month boundary is date arithmetic, not day-of-month math.
+        self.assertEqual(ha._week_window("2026-07-03")[0], "2026-06-27")
+
+    def test_week_counts_only_the_last_seven_days(self):
+        today = ha._utc_today()
+        inside = ha._week_window()[0]                 # 6 days ago: still counted
+        outside = (datetime.date.fromisoformat(today)
+                   - datetime.timedelta(days=7)).isoformat()  # 7 days ago: not
+        write_jsonl(os.path.join(self.proj, "a.jsonl"), [
+            usage_entry(f"{today}T01:00:00.000Z", "m1", "r1", "sonnet", 100, 0),
+            usage_entry(f"{inside}T01:00:00.000Z", "m2", "r2", "sonnet", 20, 0),
+            usage_entry(f"{outside}T01:00:00.000Z", "m3", "r3", "sonnet", 5_000, 0),
+        ])
+        rep = ha.usage_report(self.WORKDIR)
+        self.assertEqual(rep["today"]["input"], 100)
+        self.assertEqual(rep["week"]["input"], 120)          # today + 6-days-ago
+        self.assertEqual(rep["totals"]["input"], 5_120)      # all-time keeps all
+        self.assertEqual(rep["models"][0]["week"]["input"], 120)
 
     def test_empty_project_dir(self):
         rep = ha.usage_report(self.WORKDIR)
@@ -445,15 +490,15 @@ class TestRepoUsageReport(unittest.TestCase):
         wt_c = "/w/.turma/worktrees/DockerOps/ccc"
         write_jsonl(os.path.join(self._proj(wt_a), "a.jsonl"), [
             usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
-                        "claude-opus-4-20250514", 1_000_000, 100_000),  # $7.50
+                        "claude-opus-4-20250514", 1_000_000, 100_000),
         ])
         write_jsonl(os.path.join(self._proj(wt_b), "b.jsonl"), [
             usage_entry("2026-07-01T12:00:00.000Z", "m2", "r2",
-                        "claude-sonnet-4-20250514", 100_000, 0),        # $0.30
+                        "claude-sonnet-4-20250514", 100_000, 0),
         ])
         write_jsonl(os.path.join(self._proj(wt_c), "c.jsonl"), [
             usage_entry("2026-07-02T09:00:00.000Z", "m3", "r3",
-                        "claude-sonnet-4-20250514", 200_000, 0),        # $0.60
+                        "claude-sonnet-4-20250514", 200_000, 0),
         ])
         ledger = {
             # Same repo, two worktrees, ssh vs https remote -> one repo series.
@@ -464,16 +509,25 @@ class TestRepoUsageReport(unittest.TestCase):
         repo_usage, host = ha.repo_usage_report(ledger, self._fold_full)
         by = {r["repo"]: r for r in repo_usage}
 
-        self.assertAlmostEqual(by["Turma"]["usage"]["totals"]["cost"], 7.8, places=2)
+        # Both of Turma's worktrees fold into the one repo series.
         self.assertEqual(by["Turma"]["usage"]["totals"]["input"], 1_100_000)
-        self.assertAlmostEqual(
-            by["Turma"]["usage"]["days"]["2026-07-01"]["cost"], 7.8, places=2)
+        self.assertEqual(by["Turma"]["usage"]["days"]["2026-07-01"]["input"], 1_100_000)
         self.assertEqual(by["Turma"]["remoteKey"], "github.com/xerktech/turma")
-        self.assertAlmostEqual(by["DockerOps"]["usage"]["totals"]["cost"], 0.6, places=2)
+        self.assertEqual(by["DockerOps"]["usage"]["totals"]["input"], 200_000)
 
-        self.assertAlmostEqual(host["totals"]["cost"], 7.8 + 0.6, places=2)
+        # A repo's per-model breakdown merges across its worktrees too.
+        turma_models = {m["model"]: m for m in by["Turma"]["usage"]["models"]}
+        self.assertEqual(turma_models["claude-opus-4-20250514"]["totals"]["input"],
+                         1_000_000)
+        self.assertEqual(turma_models["claude-sonnet-4-20250514"]["totals"]["input"],
+                         100_000)
+
         self.assertEqual(host["totals"]["input"], 1_100_000 + 200_000)
-        # Sorted by cost desc.
+        # The host total merges the same model across repos (sonnet ran in both).
+        host_models = {m["model"]: m for m in host["models"]}
+        self.assertEqual(host_models["claude-sonnet-4-20250514"]["totals"]["input"],
+                         100_000 + 200_000)
+        # Sorted by total tokens desc.
         self.assertEqual(repo_usage[0]["repo"], "Turma")
 
     def test_empty_and_missing_dirs_excluded(self):
@@ -1513,7 +1567,7 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
 
     def test_unattributable_bucketed_as_other(self):
         # No worktree, no worktrees-shaped slug, and no cwd recorded — still
-        # adopted so its cost counts, under OTHER_REPO_NAME.
+        # adopted so its usage counts, under OTHER_REPO_NAME.
         proj = self._write_transcript("/root/scratch")  # usage_entry has no cwd
         sm = self.make_manager()
         sm._reconcile_orphan_transcripts()

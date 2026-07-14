@@ -16,7 +16,7 @@ import java.net.URLEncoder
 object Routes {
     const val LOGIN = "login"
     const val FLEET = "fleet"
-    const val HISTORY = "history"
+    const val USAGE = "usage"
     const val ARCHIVE = "archive"
     const val SETTINGS = "settings"
     fun chat(host: String, session: String) = "chat/${enc(host)}/${enc(session)}"
@@ -54,7 +54,7 @@ fun TurmaApp(
         composable(Routes.FLEET) {
             FleetScreen(
                 onOpenChat = { host, session -> nav.navigate(Routes.chat(host, session)) },
-                onHistory = { nav.navigate(Routes.HISTORY) },
+                onUsage = { nav.navigate(Routes.USAGE) },
                 onArchive = { nav.navigate(Routes.ARCHIVE) },
                 onSettings = { nav.navigate(Routes.SETTINGS) },
             )
@@ -82,7 +82,7 @@ fun TurmaApp(
             val session = entry.arguments?.getString("session").orEmpty()
             TerminalScreen(sessionId = session, onBack = { nav.popBackStack() })
         }
-        composable(Routes.HISTORY) { HistoryScreen(onBack = { nav.popBackStack() }) }
+        composable(Routes.USAGE) { UsageScreen(onBack = { nav.popBackStack() }) }
         composable(Routes.ARCHIVE) { ArchiveScreen(onBack = { nav.popBackStack() }) }
         composable(Routes.SETTINGS) {
             SettingsScreen(

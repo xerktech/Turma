@@ -125,16 +125,34 @@ data class PrInfo(
 @Serializable
 data class UsageInfo(
     val today: UsageBucket = UsageBucket(),
+    /** Rolling 7 UTC days ending today, pre-sliced agent-side. */
+    val week: UsageBucket = UsageBucket(),
     val totals: UsageBucket = UsageBucket(),
-    val unpricedModels: List<String> = emptyList(),
+    /** Per-model token counts, biggest consumer first. */
+    val models: List<ModelUsage> = emptyList(),
 )
 
+/**
+ * One window's token counts. The names match the wire exactly (`input`,
+ * `output`, …) — they were `inputTokens`/`outputTokens` without a @SerialName,
+ * so they never decoded and every figure read zero.
+ */
 @Serializable
 data class UsageBucket(
-    val cost: Double = 0.0,
-    val unpriced: Boolean = false,
-    val inputTokens: Long = 0,
-    val outputTokens: Long = 0,
+    val input: Long = 0,
+    val output: Long = 0,
+    val cacheWrite: Long = 0,
+    val cacheRead: Long = 0,
+) {
+    val total: Long get() = input + output + cacheWrite + cacheRead
+}
+
+@Serializable
+data class ModelUsage(
+    val model: String = "",
+    val today: UsageBucket = UsageBucket(),
+    val week: UsageBucket = UsageBucket(),
+    val totals: UsageBucket = UsageBucket(),
 )
 
 @Serializable
@@ -299,7 +317,6 @@ data class ArchiveSession(
     val createdAt: Long = 0,
     val endedTs: Long = 0,
     val msgCount: Int = 0,
-    val cost: Double = 0.0,
 )
 
 @Serializable
