@@ -41,6 +41,25 @@ jobs:
 
       - uses: actions/checkout@v7
 
+      # Trivy exports every uncompressed layer to scratch before scanning, so a
+      # scan needs roughly twice the image on free disk. The agent image grew
+      # past what this shared runner had spare (it sits ~85% full from other
+      # jobs) and the scan died with "no space left on device".
+      #
+      # The bulk of that is buildkit's local cache: the post-scan `docker rmi`
+      # reclaims 0B because the layers stay pinned by cache records, not the tag.
+      # Prune it by AGE rather than with `-a`. The cleanup note below rightly
+      # rejects an unfiltered prune — this repo's two scan jobs share one runner
+      # and `-a` yanks cache out from under the other job's in-flight build — but
+      # an until= filter can't touch a concurrent job's cache, which is fresh by
+      # definition. 24h still leaves same-day rebuilds warm.
+      - name: Reclaim disk before build
+        run: |
+          df -h / || true
+          docker image prune -f || true
+          docker builder prune -f --filter until=24h || true
+          df -h / || true
+
       - uses: docker/setup-buildx-action@v4
 
       # Build into the local docker daemon (load, not push) so Trivy can scan
