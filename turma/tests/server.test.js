@@ -23,6 +23,7 @@ process.env.TURMA_TEST = "1";
 process.env.TURMA_USER = "hubuser";
 process.env.TURMA_PASSWORD = "hubpass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
+process.env.TURMA_TRIGGER_TOKEN = "triggertok"; // programmatic /api/trigger bearer
 process.env.NTFY_URL = "http://ntfy.test"; // enables notify(); fetch is stubbed
 process.env.COST_ALERT_USD = "50";
 process.env.STATE_FILE = path.join(
@@ -70,7 +71,7 @@ const {
   server, agents, queueCommand, findSession,
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, sessionWorking,
-  userAuthorized, agentAuthorized, agentWsAuthorized, fmtDur,
+  userAuthorized, agentAuthorized, agentWsAuthorized, triggerAuthorized, fmtDur,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
 } = hub;
@@ -791,6 +792,101 @@ test("http: spawn route forwards composer options; bare spawn stays minimal", as
       permissionMode: "plan", cmdId: full.body.cmdId,
     },
     { type: "spawn", repo: "Turma", model: "sonnet", cmdId: bare.body.cmdId },
+  ]);
+});
+
+test("triggerAuthorized: trigger token OR user login, nothing else", () => {
+  const req = (h) => ({ headers: h });
+  // The dedicated trigger token passes.
+  assert.equal(triggerAuthorized(req({ authorization: "Bearer triggertok" })), true);
+  // The user login (Basic) passes too.
+  assert.equal(triggerAuthorized(req({ authorization: basic("hubuser", "hubpass") })), true);
+  // A wrong trigger token / the agent token / no header all fail (they fall
+  // through to userAuthorized, which rejects them).
+  assert.equal(triggerAuthorized(req({ authorization: "Bearer nope" })), false);
+  assert.equal(triggerAuthorized(req({ authorization: "Bearer agenttok" })), false);
+  assert.equal(triggerAuthorized(req({})), false);
+});
+
+test("http: /api/trigger auth (trigger token or user login only)", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "ht", repos: [{ name: "Turma" }] }, headers: agentHeaders,
+  });
+  const body = { hostname: "ht", repo: "Turma", prompt: "do the thing" };
+  const triggerHeaders = { authorization: "Bearer triggertok", "content-type": "application/json" };
+
+  // No auth -> 401.
+  assert.equal((await request("POST", "/api/trigger", { body })).status, 401);
+  // A bad bearer -> 401.
+  assert.equal(
+    (await request("POST", "/api/trigger", { body, headers: { authorization: "Bearer bad" } })).status,
+    401,
+  );
+  // The agent token does NOT unlock it (it's not a trigger token or a user login).
+  assert.equal(
+    (await request("POST", "/api/trigger", { body, headers: agentHeaders })).status,
+    401,
+  );
+  // The dedicated trigger token works.
+  assert.equal((await request("POST", "/api/trigger", { body, headers: triggerHeaders })).status, 200);
+  // The user login works too.
+  assert.equal((await request("POST", "/api/trigger", { body, headers: userHeaders })).status, 200);
+});
+
+test("http: /api/trigger validates required fields and host/repo", async () => {
+  const triggerHeaders = { authorization: "Bearer triggertok", "content-type": "application/json" };
+  await request("POST", "/api/heartbeat", {
+    body: { device: "htv", repos: [{ name: "Turma" }, { name: "(root)" }] }, headers: agentHeaders,
+  });
+
+  const post = (body) => request("POST", "/api/trigger", { body, headers: triggerHeaders });
+
+  // Each required field, missing -> 400.
+  assert.equal((await post({ repo: "Turma", prompt: "x" })).status, 400); // no hostname
+  assert.equal((await post({ hostname: "htv", prompt: "x" })).status, 400); // no repo
+  assert.equal((await post({ hostname: "htv", repo: "Turma" })).status, 400); // no prompt
+  // Whitespace-only counts as missing.
+  assert.equal((await post({ hostname: "htv", repo: "Turma", prompt: "   " })).status, 400);
+  // Over-long prompt -> 400.
+  assert.equal((await post({ hostname: "htv", repo: "Turma", prompt: "x".repeat(10001) })).status, 400);
+  // Unknown host -> 404.
+  assert.equal((await post({ hostname: "ghost", repo: "Turma", prompt: "x" })).status, 404);
+  // Unknown repo on a known host -> 404.
+  assert.equal((await post({ hostname: "htv", repo: "Nope", prompt: "x" })).status, 404);
+  // The "(root)" pseudo-repo is a valid target (it's in the reported repos[]).
+  assert.equal((await post({ hostname: "htv", repo: "(root)", prompt: "x" })).status, 200);
+});
+
+test("http: /api/trigger queues a spawn command with the prompt and options", async () => {
+  const triggerHeaders = { authorization: "Bearer triggertok", "content-type": "application/json" };
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ device: "htq", repos: [{ name: "Turma" }] });
+
+  // Required-only trigger -> {type:"spawn", repo, prompt}.
+  const bare = await request("POST", "/api/trigger", {
+    body: { hostname: "htq", repo: "Turma", prompt: "fix the login bug" },
+    headers: triggerHeaders,
+  });
+  assert.equal(bare.status, 200);
+  assert.equal(bare.body.ok, true);
+  // Full trigger -> the optional composer fields ride along too.
+  const full = await request("POST", "/api/trigger", {
+    body: {
+      hostname: "htq", repo: "Turma", prompt: "ship the feature",
+      label: "Ship it", baseRef: "main", model: "opus", permissionMode: "plan",
+    },
+    headers: triggerHeaders,
+  });
+  assert.equal(full.status, 200);
+
+  const res = await beat({ device: "htq" });
+  assert.deepEqual(res.body.commands, [
+    { type: "spawn", repo: "Turma", prompt: "fix the login bug", cmdId: bare.body.cmdId },
+    {
+      type: "spawn", repo: "Turma", prompt: "ship the feature", label: "Ship it",
+      baseRef: "main", model: "opus", permissionMode: "plan", cmdId: full.body.cmdId,
+    },
   ]);
 });
 

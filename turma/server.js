@@ -54,6 +54,13 @@ const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted 
 const TURMA_USER = process.env.TURMA_USER || "";
 const TURMA_PASSWORD = process.env.TURMA_PASSWORD || "";
 const TURMA_AGENT_TOKEN = process.env.TURMA_AGENT_TOKEN || "";
+// A dedicated bearer token for the programmatic session-trigger endpoint
+// (POST /api/trigger), so external automation (CI, webhooks, cron) can start a
+// session without the single-user login. It never opens the endpoint on its
+// own: when unset, /api/trigger still accepts the user login (Basic/cookie) but
+// nothing else — so leaving it blank locks out token callers rather than
+// granting open access.
+const TURMA_TRIGGER_TOKEN = process.env.TURMA_TRIGGER_TOKEN || "";
 
 // Browser sessions: instead of the native HTTP Basic popup, the UI POSTs to
 // /api/login and we hand back a signed, HttpOnly cookie the browser replays on
@@ -466,6 +473,23 @@ function agentAuthorized(req) {
   const header = req.headers.authorization || "";
   if (header.startsWith("Bearer ")) return safeEqual(header.slice(7), TURMA_AGENT_TOKEN);
   return userAuthorized(req) && !!TURMA_PASSWORD;
+}
+
+// Trigger auth (POST /api/trigger). A caller passes either the dedicated
+// TURMA_TRIGGER_TOKEN as a Bearer token (the programmatic path — CI/webhooks)
+// or the ordinary user login (Basic/cookie), so a logged-in operator or curl
+// can hit it too. The token check is skipped when TURMA_TRIGGER_TOKEN is unset,
+// but that does NOT open the endpoint: it still falls back to userAuthorized,
+// which requires the login unless TURMA_PASSWORD is itself unset (fully open
+// hub, warned about at boot). A Bearer that isn't the trigger token falls
+// through to userAuthorized too (which rejects a bad Bearer).
+function triggerAuthorized(req) {
+  const header = req.headers.authorization || "";
+  if (TURMA_TRIGGER_TOKEN && header.startsWith("Bearer ") &&
+      safeEqual(header.slice(7), TURMA_TRIGGER_TOKEN)) {
+    return true;
+  }
+  return userAuthorized(req);
 }
 
 // Agent auth for the tunnel WebSockets. Node's browser-style WebSocket client
@@ -1097,8 +1121,15 @@ const server = http.createServer(async (req, res) => {
       req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
       parts[3] === "archive" && parts.length === 5;
 
+    // The programmatic trigger endpoint carries its own bearer-token auth (or a
+    // user login), so it's gated by triggerAuthorized instead of the
+    // browser-only userAuthorized gate below.
+    const isTrigger = req.method === "POST" && url.pathname === "/api/trigger";
+
     if (url.pathname === "/api/heartbeat" || isArchiveIngest) {
       if (!agentAuthorized(req)) return json(res, 401, { error: "unauthorized" });
+    } else if (isTrigger) {
+      if (!triggerAuthorized(req)) return json(res, 401, { error: "unauthorized" });
     } else if (isLoginRoute) {
       // fall through to the handlers below
     } else if (!userAuthorized(req)) {
@@ -1406,6 +1437,43 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse((await readBody(req)) || "{}");
       const cwd = typeof body.cwd === "string" ? body.cwd : "";
       const cmdId = queueCommand(key, { type: "resumeTranscript", transcriptId, cwd });
+      return json(res, 200, { ok: true, cmdId });
+    }
+
+    // POST /api/trigger — programmatic "start a session" entry point for
+    // external automation (CI, webhooks, scripts). Unlike the browser-oriented
+    // POST /api/agents/<host>/sessions (which is user-auth-only and carries the
+    // host/repo in the URL with an optional prompt), this takes all three
+    // required inputs in the body and is authed by triggerAuthorized (the
+    // dedicated TURMA_TRIGGER_TOKEN bearer, or a user login). It validates the
+    // host AND the repo against the host's reported repos[] before queuing the
+    // same {type:"spawn"} command the composer uses, so a bad hostname/repo
+    // fails fast with a clear error instead of silently landing on the agent.
+    if (req.method === "POST" && url.pathname === "/api/trigger") {
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const hostname = typeof body.hostname === "string" ? body.hostname.trim() : "";
+      const repo = typeof body.repo === "string" ? body.repo.trim() : "";
+      const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
+      if (!hostname) return json(res, 400, { error: "hostname required" });
+      if (!repo) return json(res, 400, { error: "repo required" });
+      if (!prompt) return json(res, 400, { error: "prompt required" });
+      if (prompt.length > 10000) return json(res, 400, { error: "prompt too long" });
+      const agent = agents[hostname];
+      if (!agent) return json(res, 404, { error: "unknown host" });
+      // Validate the repo against what the host actually reports (its scanned
+      // repos plus the "(root)" pseudo-repo). Skip the check only if the host
+      // hasn't reported any repos yet, deferring to the agent's own validation.
+      const known = Array.isArray(agent.repos)
+        ? agent.repos.map((r) => r && r.name).filter(Boolean)
+        : [];
+      if (known.length && !known.includes(repo)) {
+        return json(res, 404, { error: "unknown repo" });
+      }
+      const cmd = { type: "spawn", repo, prompt };
+      for (const f of ["label", "baseRef", "model", "permissionMode"]) {
+        if (typeof body[f] === "string" && body[f].trim()) cmd[f] = body[f].trim();
+      }
+      const cmdId = queueCommand(hostname, cmd);
       return json(res, 200, { ok: true, cmdId });
     }
 
@@ -1853,6 +1921,7 @@ if (process.env.TURMA_TEST) {
     userAuthorized,
     agentAuthorized,
     agentWsAuthorized,
+    triggerAuthorized,
     safeEqual,
     credentialsMatch,
     issueSessionToken,
@@ -1870,6 +1939,7 @@ if (process.env.TURMA_TEST) {
 } else {
   if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");
   if (!TURMA_AGENT_TOKEN) console.warn("WARNING: TURMA_AGENT_TOKEN not set — heartbeat and tunnel endpoints are unauthenticated");
+  if (!TURMA_TRIGGER_TOKEN) console.warn("WARNING: TURMA_TRIGGER_TOKEN not set — POST /api/trigger accepts only the user login (no dedicated token)");
   server.listen(PORT, () => {
     console.log(`turma listening on :${PORT}`);
     console.log(
