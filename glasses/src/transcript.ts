@@ -31,13 +31,52 @@ export function emptyBuffer(): TranscriptBuffer {
 // concatenated with no separator, matching the format `_entry_text` emits.
 const TOOL_MARKER = /\[[A-Za-z][A-Za-z0-9_]*\]/g;
 
+// Markdown syntax renders as literal noise on the tiny monochrome display: the
+// glasses can't show weight, so bold `**…**` and inline `` `code` `` fences add
+// nothing but the fence characters themselves, which eat scarce width. Heading
+// hashes, list bullets, and blockquote markers are line-anchored structural
+// syntax we normalize to something legible (a bullet •, bare heading text)
+// rather than strip outright, and fenced-code fence lines are dropped entirely
+// (the code inside stays). Underscores and single asterisks are deliberately
+// left ALONE: a coding agent's prose is full of snake_case identifiers and
+// glob/`*` characters that aren't emphasis and must not be mangled.
+function stripMarkdown(text: string): string {
+  const lines = text.split("\n").map((line) => {
+    if (/^\s*```/.test(line)) return ""; // fenced-code fence -> drop the fence line
+    return line
+      .replace(/^\s{0,3}#{1,6}\s+/, "") // heading hashes -> bare heading text
+      .replace(/^(\s*)[-*+]\s+/, "$1• ") // list bullet -> •
+      .replace(/^\s{0,3}>\s?/, ""); // blockquote marker
+  });
+  return lines
+    .join("\n")
+    .replace(/`([^`]+)`/g, "$1") // inline code fences
+    .replace(/\*\*([^*]+)\*\*/g, "$1"); // bold
+}
+
+// Drops blank / whitespace-only lines entirely so a message reads as one
+// compact block instead of a wall punctuated by markdown's paragraph gaps —
+// vertical space is scarce on the 10-line canvas. Line breaks BETWEEN non-empty
+// lines (paragraph boundaries, hard-wrapped list items) are preserved; only the
+// empty rows go.
+function collapseBlankLines(text: string): string {
+  return text
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .join("\n");
+}
+
 export function conciseText(text: string): string {
-  return text.replace(TOOL_MARKER, "").replace(/[ \t]+$/gm, "").trim();
+  const stripped = stripMarkdown(text.replace(TOOL_MARKER, ""));
+  return collapseBlankLines(stripped).replace(/[ \t]+$/gm, "").trim();
 }
 
 function conciseEntry(entry: TailEntry): TailEntry {
-  if (entry.role !== "assistant") return entry;
-  const text = conciseText(entry.text);
+  // Assistant turns get the full concise treatment (tool markers + markdown +
+  // blank-line collapse); user turns are the operator's own typed/dictated text
+  // and carry no markdown or tool markers, but still have their blank lines
+  // collapsed so a multi-line dictation doesn't reintroduce the gaps.
+  const text = entry.role === "assistant" ? conciseText(entry.text) : collapseBlankLines(entry.text);
   return text === entry.text ? entry : { ...entry, text };
 }
 
