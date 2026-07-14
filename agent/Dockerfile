@@ -95,6 +95,10 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/hub-agent.py \
 #
 # Runtime env (set per-stack in DockerOps' compose; defaults live in the code):
 #   REPOS_ROOT      git-root to scan one level deep for repos (default /mnt/data/Docker/git)
+#   PUID / PGID     uid:gid to run as, so files written into the mounted git root
+#                   and ~/.claude land owned by the HOST user rather than root.
+#                   Defaults to the owner of REPOS_ROOT (root-owned root -> stay
+#                   root; user-owned root -> drop to that user). PUID=0 forces root.
 #   MAX_SESSIONS    cap on concurrently running sessions            (default 6)
 #   TTYD_PORT_BASE  first per-session ttyd port, allocated upward    (default 7700)
 #   TURMA_URL / TURMA_TOKEN / TURMA_INTERVAL   hub endpoint + shared agent token + beat
