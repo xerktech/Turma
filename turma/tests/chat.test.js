@@ -319,17 +319,21 @@ test("prFooterChip: '' when the session has no PRs", () => {
   assert.equal(prFooterChip({ prs: [] }), "");
 });
 
-test("prFooterChip: shows the latest PR with state class, number, and CI mark", () => {
+test("prFooterChip: lists every PR, newest first, each linked with state + CI mark", () => {
   const html = prFooterChip({ prs: [
     { url: "https://github.com/o/r/pull/1", number: 1, state: "MERGED" },
     { url: "https://github.com/o/r/pull/2", number: 2, state: "OPEN", checks: "passing", title: "Add flag" },
   ] });
-  assert.match(html, /pr-badge pr-open/);          // latest (last) PR's state
+  assert.match(html, /pr-badge pr-open/);          // newest PR's state
   assert.match(html, /#2 Open/);                    // number + capitalized state
+  assert.match(html, /pr-badge pr-merged/);        // older PR still shown
+  assert.match(html, /#1 Merged/);
   assert.match(html, /pr-checks passing/);          // CI rollup mark
+  assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/1"/);
   assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/2"/);
-  assert.match(html, /\+1</);                        // "+N" for the older PR
   assert.match(html, /title="Add flag"/);
+  // newest (pull/2) is rendered before the older (pull/1)
+  assert.ok(html.indexOf("pull/2") < html.indexOf("pull/1"));
 });
 
 test("prFooterChip: derives #number from the URL when absent, no CI mark when unknown", () => {
