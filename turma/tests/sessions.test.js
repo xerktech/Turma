@@ -40,8 +40,12 @@ function makeEl(id) {
 }
 
 // Build a fresh sandbox per test so state (cache, section innerHTML) never leaks.
-function loadPage() {
+// `search` seeds the page's query string (the ?session=/?spawn= deep links,
+// read once at load); `opened` collects the sessions TurmaChat.open() is asked
+// to put on the stage, which is how the select-on-arrival tests observe it.
+function loadPage({ search = "" } = {}) {
   const els = {};
+  const opened = [];
   const document = {
     getElementById(id) { return (els[id] ||= makeEl(id)); },
     querySelector() { return null; }, querySelectorAll() { return []; },
@@ -53,7 +57,7 @@ function loadPage() {
   const stubs = {
     document,
     localStorage: { _m: {}, getItem(k) { return this._m[k] ?? null; }, setItem(k, v) { this._m[k] = String(v); }, removeItem(k) { delete this._m[k]; } },
-    location: { href: "", search: "", pathname: "/sessions" },
+    location: { href: "", search, pathname: "/sessions" },
     navigator: { userAgent: "node" },
     fetch: () => new Promise(() => {}),             // never resolves -> the boot refresh() is inert
     EventSource: class { addEventListener() {} close() {} static get CLOSED() { return 2; } },
@@ -61,16 +65,26 @@ function loadPage() {
     requestAnimationFrame: () => 0, cancelAnimationFrame: noop,
     history: { replaceState: noop, pushState: noop },
     URL: global.URL, URLSearchParams: global.URLSearchParams,
-    TurmaChat: { onPoll: noop, close: noop, closeStatic: noop, renderStatic: noop },
+    TurmaChat: {
+      open: (hostKey, id) => opened.push(id),
+      onPoll: noop, close: noop, closeStatic: noop, renderStatic: noop,
+    },
     console, Date, Math, JSON, encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
     addEventListener: noop, removeEventListener: noop,
     matchMedia: () => ({ matches: false, addEventListener: noop }),
     scrollTo: noop, innerWidth: 1200, innerHeight: 800,
   };
   const names = Object.keys(stubs);
-  const fn = new Function(...names, "window", script + "\n;return { render };");
+  // The trailing return is ours, not the page's: it reaches into the module
+  // scope for the handful of functions under test. setCache stands in for the
+  // /api/agents fetch that normally fills `cache` before render() — the
+  // select-on-arrival path reads it, so a bare render() isn't enough.
+  const fn = new Function(...names, "window",
+    script + "\n;return { render, selectSession, followSpawn, setCache: (c) => { cache = c; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
-  return { render: api.render, els };
+  // One heartbeat, as the page would see it.
+  api.beat = (data) => { api.setCache(data); api.render(data); };
+  return { ...api, els, opened };
 }
 
 function host(sessions) {
@@ -131,6 +145,79 @@ test("no idle sessions: Idle section renders empty (hidden)", () => {
 
   assert.equal(els.idle.innerHTML, "");
   assert.match(els.active.innerHTML, /Active <span class="count">1<\/span>/);
+});
+
+// --- opening the session you just started ------------------------------------
+// A spawn/resume can't name its session: the agent mints the id, so the POST
+// only answers with the queued command's cmdId and the new session echoes it
+// back as `spawnCmdId` on a later beat. These cover that correlation.
+
+test("?spawn=<cmdId>: opens the session the agent mints for that command", () => {
+  const { beat, els, opened } = loadPage({ search: "?spawn=cmd-77" });
+  const { now, host: h } = host([working("11111", "Someone Else's Task")]);
+
+  // Beat 1: the spawn hasn't landed yet — nothing is opened, and the idle stage
+  // says a session is coming rather than "No session attached".
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, []);
+  assert.match(els.stageEmptyBig.innerHTML, /Starting your session/);
+
+  // Beat 2: the agent reports the session it created for cmd-77.
+  h.sessions = [...h.sessions, { ...working("99999", "My New Task"), spawnCmdId: "cmd-77" }];
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["99999"], "the followed spawn is opened on arrival");
+  assert.match(els.stageEmptyBig.innerHTML, /No session attached/, "waiting state cleared");
+
+  // It's one-shot: a later beat must not re-open (and fight a manual pick).
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["99999"]);
+});
+
+test("a spawn started on this page is followed the same way", () => {
+  const { beat, followSpawn, opened } = loadPage();
+  const { now, host: h } = host([]);
+  followSpawn("cmd-5"); // what startSession() does with the POST's reply
+
+  h.sessions = [{ ...working("abcde", "Fresh"), spawnCmdId: "cmd-5" }];
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["abcde"]);
+});
+
+test("an unrelated session's spawnCmdId is not mistaken for ours", () => {
+  const { beat, els, opened } = loadPage({ search: "?spawn=cmd-mine" });
+  const { now, host: h } = host([{ ...working("77777", "Other"), spawnCmdId: "cmd-theirs" }]);
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, [], "only the cmdId we issued may open");
+  assert.match(els.stageEmptyBig.innerHTML, /Starting your session/, "still waiting on ours");
+});
+
+test("picking a session cancels a pending follow, so the spawn can't yank the stage", () => {
+  const { beat, selectSession, opened } = loadPage({ search: "?spawn=cmd-77" });
+  const { now, host: h } = host([working("11111", "Reading This")]);
+  beat({ now, agents: [h] });
+
+  selectSession("11111");
+  assert.deepEqual(opened, ["11111"]);
+
+  // The followed spawn now lands — the operator stays where they are.
+  h.sessions = [...h.sessions, { ...working("99999", "Late Arrival"), spawnCmdId: "cmd-77" }];
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["11111"], "an explicit pick wins over the pending follow");
+});
+
+test("?session=<id>: waits for a session that isn't running yet, then opens it", () => {
+  const { beat, els, opened } = loadPage({ search: "?session=55555" });
+  const { now, host: h } = host([{ id: "55555", status: "stopped", repo: "repoX", summary: "Resuming" }]);
+
+  // A resumed session keeps its id, so the dashboard deep-links by id before the
+  // agent has relaunched it. Stopped -> not attachable yet: hold, don't open.
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, []);
+  assert.match(els.stageEmptyBig.innerHTML, /Opening session/);
+
+  h.sessions = [working("55555", "Resumed")];
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["55555"]);
 });
 
 test("the Ended-sessions archive browser is gone from the sidebar markup", () => {

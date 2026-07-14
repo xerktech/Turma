@@ -1502,10 +1502,13 @@ class TestResumeTranscript(ManagerMixin, unittest.TestCase):
         self._write_at(wt, "trans1")
         sm = self._manager()
         sm._worktree_add = mock.Mock()
-        sm.resume_transcript("trans1", wt)
+        sm.resume_transcript("trans1", wt, cmd_id="c7")
         self.assertEqual(len(sm.registry), 1)
         sess = sm.registry[0]
         self.assertEqual(sess["worktreePath"], wt)
+        # A resume mints a fresh id like spawn, so the hub correlates the same
+        # way — by the command id echoed back onto the record.
+        self.assertEqual(sess["spawnCmdId"], "c7")
         self.assertEqual(sess["repo"], "Turma")
         self.assertEqual(sess["status"], "running")
         sm._worktree_add.assert_not_called()          # worktree still present
@@ -1634,10 +1637,11 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
             "not-a-dict",                                 # garbage -> ignored
         ]
         self.assertTrue(sm.handle_commands(cmds))
-        # spawn now threads the composer options (all None for a bare command).
+        # spawn now threads the composer options (all None for a bare command)
+        # plus the cmdId, which it echoes onto the session it creates.
         sm.spawn.assert_called_once_with(
             "Turma", prompt=None, label=None, base_ref=None,
-            model=None, permission_mode=None,
+            model=None, permission_mode=None, cmd_id="c1",
         )
         sm.kill.assert_called_once_with("ab123")
         sm.save.assert_called_once()
@@ -1661,7 +1665,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         }])
         sm.spawn.assert_called_once_with(
             "Turma", prompt="fix the bug", label="Fix login", base_ref="main",
-            model="opus", permission_mode="plan",
+            model="opus", permission_mode="plan", cmd_id="c9",
         )
 
     def test_prune_command_dispatches_to_prune_repo(self):
@@ -1721,6 +1725,26 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         wt = next(c for c in self.run_ok_calls if "worktree" in c and "add" in c)
         self.assertIn("--detach", wt)
         self.assertNotIn("-b", wt)
+
+    def test_spawn_echoes_the_hub_command_id_onto_the_session(self):
+        # The hub can't name the session it asked for — we mint the id here — so
+        # it correlates by the command id, which must survive onto the record and
+        # into the heartbeat payload for the UI to open the session it started.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma", cmd_id="c42")
+        sess = sm.registry[0]
+        self.assertEqual(sess["spawnCmdId"], "c42")
+        self.assertEqual(sm._session_payload(sess, refresh=False)["spawnCmdId"], "c42")
+
+    def test_spawn_without_a_command_id_reports_none(self):
+        # Spawns that don't come from a hub command (and sessions predating the
+        # echo) simply have nothing to correlate — never a missing key.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        self.assertIsNone(sm.registry[0]["spawnCmdId"])
+        self.assertIsNone(sm._session_payload(sm.registry[0], refresh=False)["spawnCmdId"])
 
     def test_spawn_refused_at_max_sessions(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
