@@ -71,13 +71,15 @@
     font-size: 12px; color: var(--ink-2); margin-top: 3px;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   }
-  /* PR badges sit on the state line, pinned to the right, to save card height. */
+  /* PR badges sit on the state line, pinned to the right, to save card height.
+     When there are more PRs than fit, the list wraps onto its own line(s)
+     rather than spilling past the card edge over neighbouring text. */
   .s-card .state-row {
-    display: flex; align-items: center; flex-wrap: nowrap; gap: 10px; margin-top: 4px;
+    display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-top: 4px;
   }
-  .s-card .state-row .state { margin-top: 0; min-width: 0; }
-  .s-card .state-row .pr-list { flex: none; margin-left: auto; flex-wrap: nowrap; }
-  .s-card .state-row .pr-badge { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+  .s-card .state-row .state { margin-top: 0; min-width: 0; flex: 1 1 auto; }
+  .s-card .state-row .pr-list { flex: 0 1 auto; min-width: 0; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+  .s-card .state-row .pr-badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 
   /* Stopped sessions: compact rows with a Start button. */
   .stopped-row {
