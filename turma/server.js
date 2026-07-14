@@ -1530,6 +1530,18 @@ const server = http.createServer(async (req, res) => {
         const cmdId = queueCommand(key, { type: "setModel", sessionId, model });
         return json(res, 200, { ok: true, cmdId });
       }
+      // POST /api/agents/<host>/sessions/<id>/summary -> rename a session (the
+      // few-word name its card leads with, normally auto-generated at spawn).
+      // Body: {summary}; an empty/blank one clears the name back to the
+      // label/worktree fallback. Purely presentational, so it's allowed on a
+      // stopped session too; the agent caps the length it stores.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "summary") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const summary = typeof body.summary === "string" ? body.summary : "";
+        if (summary.length > 200) return json(res, 400, { error: "summary too long" });
+        const cmdId = queueCommand(key, { type: "setSummary", sessionId, summary });
+        return json(res, 200, { ok: true, cmdId });
+      }
       // POST /api/agents/<host>/sessions/<id>/mode -> switch a running session's
       // permission mode live (agent injects Shift+Tab presses to cycle to it).
       // Body: {permissionMode}, one of the composer's allowlisted modes; the

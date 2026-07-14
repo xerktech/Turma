@@ -2997,6 +2997,104 @@ class TestCleanSummary(unittest.TestCase):
         self.assertIsNone(ha.clean_summary(None))
 
 
+class TestCleanManualSummary(unittest.TestCase):
+    def test_keeps_the_text_the_operator_typed(self):
+        # Unlike clean_summary, punctuation/quotes inside a human's own name are
+        # deliberate, not model noise.
+        self.assertEqual(ha.clean_manual_summary("Malcolm's v2.1 fix"), "Malcolm's v2.1 fix")
+
+    def test_first_line_only_whitespace_collapsed(self):
+        self.assertEqual(ha.clean_manual_summary("  Fix   Login \n second line "), "Fix Login")
+
+    def test_caps_length_to_the_card_width(self):
+        self.assertEqual(len(ha.clean_manual_summary("x" * 200)), ha.SUMMARY_MAX_CHARS)
+
+    def test_word_count_is_not_capped(self):
+        # The model's reply is capped at SUMMARY_MAX_WORDS; a human's isn't.
+        self.assertEqual(ha.clean_manual_summary("one two three four five six seven"),
+                         "one two three four five six seven")
+
+    def test_blank_clears(self):
+        self.assertIsNone(ha.clean_manual_summary(""))
+        self.assertIsNone(ha.clean_manual_summary("   \n  "))
+        self.assertIsNone(ha.clean_manual_summary(None))
+
+
+class TestSetSummary(ManagerMixin, unittest.TestCase):
+    def test_renames_and_pins_the_name(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "summary": "Auto Name",
+                        "summaryRetryAt": 999}]
+        sm.set_summary("s1", "  My Own Name  ")
+        self.assertEqual(sm.registry[0]["summary"], "My Own Name")
+        self.assertTrue(sm.registry[0]["summaryManual"])
+        self.assertNotIn("summaryRetryAt", sm.registry[0])
+
+    def test_blank_clears_the_name_and_unpins(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "summary": "My Own Name",
+                        "summaryManual": True}]
+        sm.set_summary("s1", "  ")
+        self.assertIsNone(sm.registry[0]["summary"])
+        self.assertFalse(sm.registry[0]["summaryManual"])
+
+    def test_works_on_a_stopped_session(self):
+        # Presentational only — no process is touched, so state doesn't gate it.
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "stopped", "summary": None}]
+        sm.set_summary("s1", "Renamed While Stopped")
+        self.assertEqual(sm.registry[0]["summary"], "Renamed While Stopped")
+
+    def test_unknown_session_is_a_no_op(self):
+        sm = self.make_manager()
+        sm.registry = []
+        sm.set_summary("nope", "Whatever")  # must not raise
+
+    def test_manual_name_survives_an_in_flight_naming_job(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "summary": None}]
+
+        class FakeProc:
+            def poll(self_i):
+                return 0
+
+            def kill(self_i):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()):
+            sm._start_summary(sm.registry[0], "Add a docker compose flag")
+        sm.set_summary("s1", "My Own Name")          # renamed mid-flight
+        with open(sm.summaries["s1"]["outPath"], "w") as f:
+            f.write("Adding Compose Flag\n")
+        sm._poll_summaries()
+        self.assertEqual(sm.registry[0]["summary"], "My Own Name")  # operator wins
+        self.assertEqual(sm.summaries, {})                          # still reaped
+
+    def test_command_routes_to_set_summary(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "summary": None}]
+        sm.handle_commands([
+            {"cmdId": "c1", "type": "setSummary", "sessionId": "s1", "summary": "Named By Hand"},
+        ])
+        self.assertEqual(sm.registry[0]["summary"], "Named By Hand")
+
+    def test_manual_name_and_its_pin_survive_kill_then_resume(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "repo": "r", "root": True,
+                        "summary": "My Own Name", "summaryManual": True,
+                        "tmuxName": "agent-s1", "worktreePath": None,
+                        "rcName": "h-r-s1", "ttydPort": 7681}]
+        with mock.patch.object(sm, "_kill_tmux"), mock.patch.object(sm, "_kill_ttyd"):
+            sm.kill("s1")
+        rec = sm.closed[-1]
+        self.assertEqual(rec["summary"], "My Own Name")
+        self.assertTrue(rec["summaryManual"])
+        with mock.patch.object(sm, "_launch_tmux"), mock.patch.object(sm, "_launch_ttyd"):
+            sm.resume("s1")
+        self.assertEqual(sm.registry[0]["summary"], "My Own Name")
+        self.assertTrue(sm.registry[0]["summaryManual"])
+
+
 class TestSessionSummaries(ManagerMixin, unittest.TestCase):
     def test_missing_prompt_skipped(self):
         sm = self.make_manager()

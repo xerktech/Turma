@@ -31,7 +31,7 @@ function makeEl(id) {
     addEventListener() {}, removeEventListener() {},
     appendChild(c) { this.children.push(c); return c; },
     querySelector() { return null; }, querySelectorAll() { return []; },
-    closest() { return null; }, focus() {}, blur() {}, setAttribute() {}, getAttribute() { return null; },
+    closest() { return null; }, focus() {}, blur() {}, select() {}, setAttribute() {}, getAttribute() { return null; },
     getBoundingClientRect() { return { top: 0, bottom: 0, height: 0 }; },
     scrollIntoView() {}, remove() {},
   };
@@ -42,10 +42,13 @@ function makeEl(id) {
 // Build a fresh sandbox per test so state (cache, section innerHTML) never leaks.
 // `search` seeds the page's query string (the ?session=/?spawn= deep links,
 // read once at load); `opened` collects the sessions TurmaChat.open() is asked
-// to put on the stage, which is how the select-on-arrival tests observe it.
+// to put on the stage, which is how the select-on-arrival tests observe it;
+// `posts` collects the {url, body} of every command the page fires, which is how
+// the card-menu tests observe kill/rename.
 function loadPage({ search = "" } = {}) {
   const els = {};
   const opened = [];
+  const posts = [];
   const document = {
     getElementById(id) { return (els[id] ||= makeEl(id)); },
     querySelector() { return null; }, querySelectorAll() { return []; },
@@ -59,7 +62,12 @@ function loadPage({ search = "" } = {}) {
     localStorage: { _m: {}, getItem(k) { return this._m[k] ?? null; }, setItem(k, v) { this._m[k] = String(v); }, removeItem(k) { delete this._m[k]; } },
     location: { href: "", search, pathname: "/sessions" },
     navigator: { userAgent: "node" },
-    fetch: () => new Promise(() => {}),             // never resolves -> the boot refresh() is inert
+    // Records what the page asks for and never resolves, so the boot refresh()
+    // is inert and a command POST can't race a test's assertions.
+    fetch: (url, init) => {
+      if (init && init.method === "POST") posts.push({ url, body: JSON.parse(init.body || "{}") });
+      return new Promise(() => {});
+    },
     EventSource: class { addEventListener() {} close() {} static get CLOSED() { return 2; } },
     setInterval: () => 0, clearInterval: noop, setTimeout: () => 0, clearTimeout: noop,
     requestAnimationFrame: () => 0, cancelAnimationFrame: noop,
@@ -80,12 +88,16 @@ function loadPage({ search = "" } = {}) {
   // /api/agents fetch that normally fills `cache` before render() — the
   // select-on-arrival path reads it, so a bare render() isn't enough.
   const fn = new Function(...names, "window",
-    script + "\n;return { render, selectSession, followSpawn, setCache: (c) => { cache = c; } };");
+    script + "\n;return { render, selectSession, followSpawn, toggleCardMenu, cardKill,"
+      + " startRename, cancelRename, submitRename, setCache: (c) => { cache = c; },"
+      + " setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
-  return { ...api, els, opened };
+  return { ...api, els, opened, posts };
 }
+// The card's ⋯/menu buttons pass their click event on; the shim has no events.
+const click = { stopPropagation() {} };
 
 function host(sessions) {
   const now = Date.now();
@@ -145,6 +157,124 @@ test("no idle sessions: Idle section renders empty (hidden)", () => {
 
   assert.equal(els.idle.innerHTML, "");
   assert.match(els.active.innerHTML, /Active <span class="count">1<\/span>/);
+});
+
+// --- the card's ⋯ menu (rename / kill) ---------------------------------------
+
+test("each card carries a ⋯ trigger; its menu opens only for the clicked card", () => {
+  const { beat, toggleCardMenu, els } = loadPage();
+  const { now, host: h } = host([working("11111", "One"), working("22222", "Two")]);
+  beat({ now, agents: [h] });
+
+  assert.equal(els.active.innerHTML.match(/class="s-dots/g).length, 2, "one ⋯ per card");
+  assert.ok(!els.active.innerHTML.includes("s-menu"), "menus start closed");
+
+  toggleCardMenu(click, "22222");
+  const open = els.active.innerHTML;
+  assert.equal(open.match(/class="s-menu"/g).length, 1, "only the clicked card's menu opens");
+  assert.ok(open.includes("Rename…") && open.includes("Kill session"));
+  assert.ok(open.includes("cardKill(event,'hostA','22222')"), "the menu acts on its own card");
+
+  toggleCardMenu(click, "22222"); // a second click closes it
+  assert.ok(!els.active.innerHTML.includes("s-menu"));
+});
+
+test("menu Kill arms first and only fires on the confirming click", () => {
+  const { beat, toggleCardMenu, cardKill, els, posts } = loadPage();
+  const { now, host: h } = host([working("11111", "One")]);
+  beat({ now, agents: [h] });
+  toggleCardMenu(click, "11111");
+
+  cardKill(click, "hostA", "11111");
+  assert.deepEqual(posts, [], "the first click must not kill anything");
+  assert.ok(els.active.innerHTML.includes("Confirm kill"), "it arms instead");
+
+  cardKill(click, "hostA", "11111");
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, "/api/agents/hostA/sessions/11111/kill");
+  assert.ok(!els.active.innerHTML.includes("s-menu"), "the menu closes on the kill");
+});
+
+test("rename swaps the card for a field seeded with the current name, and saves it", () => {
+  const { beat, startRename, submitRename, setDraft, els, posts } = loadPage();
+  const { now, host: h } = host([working("11111", "Auto Name")]);
+  beat({ now, agents: [h] });
+
+  startRename(click, "11111");
+  const editing = els.active.innerHTML;
+  assert.ok(editing.includes('class="s-rename"'), "the card is replaced by the rename row");
+  assert.ok(editing.includes('value="Auto Name"'), "seeded with the name it's replacing");
+  assert.ok(!editing.includes('class="s-menu"'), "the menu closed behind it");
+
+  setDraft("My Own Name");
+  submitRename("hostA", "11111");
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, "/api/agents/hostA/sessions/11111/summary");
+  assert.deepEqual(posts[0].body, { summary: "My Own Name" });
+  // The rename rides the next heartbeat, so the card shows the new name now
+  // rather than sitting on the old one and reading as a no-op.
+  assert.ok(els.active.innerHTML.includes("My Own Name"));
+  assert.ok(!els.active.innerHTML.includes("Auto Name"));
+});
+
+test("the optimistic name holds until the agent reports it, then gives way", () => {
+  const { beat, startRename, submitRename, setDraft, els } = loadPage();
+  const { now, host: h } = host([working("11111", "Auto Name")]);
+  beat({ now, agents: [h] });
+  startRename(click, "11111");
+  setDraft("My Own Name");
+  submitRename("hostA", "11111");
+
+  // Beats that predate the rename landing must not flash the old name back.
+  beat({ now, agents: [h] });
+  assert.ok(els.active.innerHTML.includes("My Own Name"));
+  assert.ok(!els.active.innerHTML.includes("Auto Name"));
+
+  // The agent reports it: the overlay is dropped and the card runs on real data
+  // again (a name it later reports differently would now win, as it should).
+  h.sessions = [working("11111", "My Own Name")];
+  beat({ now, agents: [h] });
+  assert.ok(els.active.innerHTML.includes("My Own Name"));
+  h.sessions = [working("11111", "Renamed Elsewhere")];
+  beat({ now, agents: [h] });
+  assert.ok(els.active.innerHTML.includes("Renamed Elsewhere"));
+});
+
+test("an empty rename clears the name back to the label/worktree fallback", () => {
+  const { beat, startRename, submitRename, setDraft, els, posts } = loadPage();
+  const { now, host: h } = host([
+    { ...working("11111", "Auto Name"), label: "my-label" },
+  ]);
+  beat({ now, agents: [h] });
+
+  startRename(click, "11111");
+  setDraft("   ");
+  submitRename("hostA", "11111");
+  assert.deepEqual(posts[0].body, { summary: "" });
+  assert.ok(els.active.innerHTML.includes("my-label"), "falls through to the label");
+  assert.ok(!els.active.innerHTML.includes("Auto Name"));
+});
+
+test("cancelling a rename restores the card untouched", () => {
+  const { beat, startRename, cancelRename, setDraft, els, posts } = loadPage();
+  const { now, host: h } = host([working("11111", "Auto Name")]);
+  beat({ now, agents: [h] });
+
+  startRename(click, "11111");
+  setDraft("Discarded");
+  cancelRename();
+  assert.ok(!els.active.innerHTML.includes("s-rename"));
+  assert.ok(els.active.innerHTML.includes("Auto Name"));
+  assert.deepEqual(posts, [], "nothing was sent");
+});
+
+test("an idle card gets the same menu as an active one", () => {
+  const { beat, toggleCardMenu, els } = loadPage();
+  const { now, host: h } = host([idle("33333", "Quiet")]);
+  beat({ now, agents: [h] });
+  toggleCardMenu(click, "33333");
+  assert.ok(els.idle.innerHTML.includes('class="s-menu"'));
+  assert.ok(els.idle.innerHTML.includes("cardKill(event,'hostA','33333')"));
 });
 
 // --- opening the session you just started ------------------------------------

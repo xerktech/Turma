@@ -81,6 +81,44 @@
   .s-card .state-row .pr-list { flex: 0 1 auto; min-width: 0; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
   .s-card .state-row .pr-badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 
+  /* Per-card overflow menu (⋯ → Rename / Kill). The trigger and its popover are
+     SIBLINGS of button.s-card, absolutely positioned over its top-right corner —
+     the card is itself a <button>, and a nested button is invalid HTML the parser
+     hoists out. The card's right padding keeps its text clear of the trigger. */
+  .s-card-wrap { position: relative; }
+  .s-card-wrap button.s-card { padding-right: 36px; }
+  .s-dots {
+    position: absolute; top: 5px; right: 5px; z-index: 2;
+    background: none; border: 0; border-radius: 6px; cursor: pointer;
+    color: var(--muted); font-size: 15px; line-height: 1; padding: 4px 7px;
+  }
+  .s-dots:hover, .s-dots.open { background: var(--hairline); color: var(--ink); }
+  .s-menu {
+    position: absolute; top: 30px; right: 5px; z-index: 6; min-width: 150px;
+    display: flex; flex-direction: column; padding: 4px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); box-shadow: var(--shadow-md);
+  }
+  .s-menu button {
+    background: none; border: 0; border-radius: 5px; cursor: pointer;
+    text-align: left; font: inherit; font-size: 12.5px; color: var(--ink); padding: 7px 9px;
+  }
+  .s-menu button:hover { background: var(--accent-soft); }
+  .s-menu button.danger { color: var(--critical); font-weight: 600; }
+  .s-menu button.danger.armed { background: var(--critical); color: #fff; }
+
+  /* Inline rename field, opened from the menu; replaces the card while editing. */
+  .s-rename {
+    display: flex; gap: 6px; align-items: center;
+    background: var(--surface); border: 1px solid var(--accent);
+    border-radius: var(--radius-md); padding: 9px 10px;
+  }
+  .s-rename input {
+    flex: 1; min-width: 0; font: inherit; font-size: 13px; padding: 6px 8px;
+    border-radius: 6px; border: 1px solid var(--border);
+    background: var(--field); color: var(--ink);
+  }
+
   /* Stopped sessions: compact rows with a Start button. */
   .stopped-row {
     display: flex; align-items: center; gap: 10px;
@@ -535,6 +573,99 @@ let spawnOpen = false;
 const composerOpen = new Set();
 const optionsOpen = new Set();
 const composerDraft = new Map();
+
+// Per-card ⋯ menu state. Like the composer's, it lives here rather than in the
+// DOM because every poll / SSE beat re-renders the card list from scratch — an
+// open menu, an armed Kill or a half-typed rename would otherwise vanish under
+// the operator mid-interaction.
+// - menuOpenId:  session id whose ⋯ menu is open (at most one)
+// - killArmedId: session id whose menu Kill is armed — arm-then-confirm, same as
+//                the chat/terminal bars, so a mis-click can't kill a session
+// - renameId / renameDraft: the session being renamed, and the text typed so far
+// - renameOptimistic: id -> {text, at}, the name we asked the agent for, shown
+//   until it reports that name back (or the TTL expires, so a rename that never
+//   lands — dead host, lost command — can't pin a name the session doesn't have)
+let menuOpenId = null;
+let killArmedId = null;
+let killArmTimer = null;
+let renameId = null;
+let renameDraft = "";
+const renameOptimistic = new Map();
+const KILL_ARM_MS = 3500;
+// DOM id of a card's rename field (see captureFieldFocus for the "ren-" prefix).
+function renFieldId(id) { return "ren-" + String(id).replace(/[^A-Za-z0-9]/g, "_"); }
+
+function toggleCardMenu(ev, id) {
+  ev.stopPropagation();  // the card behind the ⋯ must not take the click
+  menuOpenId = menuOpenId === id ? null : id;
+  disarmCardKill();
+  render(cache);
+}
+// Any click outside an open menu dismisses it (the menu itself stops the event).
+function closeCardMenu() {
+  if (menuOpenId === null) return;
+  menuOpenId = null;
+  disarmCardKill();
+  render(cache);
+}
+document.addEventListener("click", closeCardMenu);
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  if (renameId) cancelRename();
+  else closeCardMenu();
+});
+
+function disarmCardKill() {
+  killArmedId = null;
+  if (killArmTimer) { clearTimeout(killArmTimer); killArmTimer = null; }
+}
+function cardKill(ev, host, id) {
+  ev.stopPropagation();
+  if (killArmedId !== id) {
+    killArmedId = id;
+    if (killArmTimer) clearTimeout(killArmTimer);
+    killArmTimer = setTimeout(() => { disarmCardKill(); render(cache); }, KILL_ARM_MS);
+    render(cache);
+    return;
+  }
+  disarmCardKill();
+  menuOpenId = null;
+  // The card disappears on the beat that reports the kill; nothing optimistic to
+  // paint in the meantime, so just close the menu.
+  render(cache);
+  post(`/api/agents/${enc(host)}/sessions/${enc(id)}/kill`);
+}
+
+// Rename swaps the card for an inline field seeded with the current name. The
+// name is looked up from `cache` rather than passed through the onclick — a
+// user-typed name can contain the quotes that inlining it would break on.
+function startRename(ev, id) {
+  ev.stopPropagation();
+  const s = findSession(id);
+  menuOpenId = null;
+  disarmCardKill();
+  renameId = id;
+  renameDraft = s ? sessName(s) : "";
+  render(cache);
+  const el = document.getElementById(renFieldId(id));
+  if (el) { el.focus(); el.select(); }
+}
+function cancelRename() {
+  renameId = null;
+  renameDraft = "";
+  render(cache);
+}
+function submitRename(host, id) {
+  const summary = renameDraft.trim();
+  renameId = null;
+  renameDraft = "";
+  // A rename is a queued command: it only lands on the agent's next heartbeat
+  // (seconds away), so paint the new name now — otherwise the card sits there
+  // with its old name and reads as a rename that did nothing.
+  renameOptimistic.set(id, { text: summary, at: Date.now() });
+  render(cache);
+  post(`/api/agents/${enc(host)}/sessions/${enc(id)}/summary`, { summary });
+}
 // DOM id for a composer field, derived from the (host::repo) key + field name.
 function cid(rk, field) { return "cmp-" + field + "-" + rk.replace(/[^A-Za-z0-9]/g, "_"); }
 function optStoreKey(repo) { return "turma.composer." + repo; }
@@ -566,16 +697,17 @@ function onOptionsToggle(rkey, repo, open) {
   if (open) optionsOpen.add(rkey); else optionsOpen.delete(rkey);
   const o = loadOpts(repo); o.optionsExpanded = open; saveOpts(repo, o);
 }
-// Capture/restore focus + caret across the spawn-panel innerHTML swap so typing
-// in an open composer survives the poll / SSE re-render.
-function captureComposerFocus() {
+// Capture/restore focus + caret across render()'s innerHTML swaps so typing in
+// an open composer ("cmp-" fields) or a card's rename box ("ren-") survives the
+// poll / SSE re-render.
+function captureFieldFocus() {
   const el = document.activeElement;
-  if (!el || !el.id || !el.id.startsWith("cmp-")) return null;
+  if (!el || !el.id || !/^(cmp|ren)-/.test(el.id)) return null;
   const f = { id: el.id };
   try { f.start = el.selectionStart; f.end = el.selectionEnd; } catch { /* selects have none */ }
   return f;
 }
-function restoreComposerFocus(f) {
+function restoreFieldFocus(f) {
   if (!f) return;
   const el = document.getElementById(f.id);
   if (!el) return;
@@ -667,6 +799,12 @@ function reconcilePending(agents) {
     const rk = a.key + "::" + s.repo;
     counts.set(rk, (counts.get(rk) || 0) + 1);
     index.set(a.key + "::" + s.id, s);
+    // Drop a rename overlay once the agent reports the name we asked for.
+    const o = renameOptimistic.get(s.id);
+    if (o && (s.summary || "") === o.text) renameOptimistic.delete(s.id);
+  }
+  for (const [id, o] of renameOptimistic) {
+    if (t - o.at > PENDING_TTL_MS) renameOptimistic.delete(id);
   }
   for (const [key, p] of pending) {
     if (t - p.at > PENDING_TTL_MS) { pending.delete(key); continue; }
@@ -751,12 +889,22 @@ function collect(agents, now) {
   return { running, stopped };
 }
 
-// The prominent, human-friendly name for a session: the agent's auto task
-// summary first, then an explicit label, then the worktree dir, and only the
-// raw id as a last resort. This is what leads every card — the 5-digit id is
-// demoted to a small secondary tag.
+// A session's name: whatever the agent reports (auto-generated at spawn, or one
+// the operator typed over it via the card's ⋯ → Rename), with a just-submitted
+// rename painted over it until the agent confirms. "" (a cleared name) is a real
+// answer here — it means fall through to the label/worktree, not "no override".
+function sessName(s) {
+  const o = renameOptimistic.get(s.id);
+  return (o ? o.text : s.summary) || "";
+}
+
+// The prominent, human-friendly name for a session: its name first, then an
+// explicit label, then the worktree dir, and only the raw id as a last resort.
+// This is what leads every card — the 5-digit id is demoted to a small
+// secondary tag.
 function sessTitle(s) {
-  if (s.summary) return s.summary;
+  const name = sessName(s);
+  if (name) return name;
   if (s.label) return s.label;
   if (s.root) return "⌂ Repos root";
   const wt = String(s.worktreePath || "").split("/").filter(Boolean).pop();
@@ -789,8 +937,9 @@ function render(data) {
   const idle = running.filter(x => x.live.kind === "idle");
 
   const hosts = agents.filter(a => a.online && (a.repos || []).length);
-  // Preserve focus/caret in an open composer across the innerHTML swap.
-  const focus = captureComposerFocus();
+  // Preserve focus/caret in an open composer or a card's rename box across the
+  // innerHTML swaps below; restored once every list has been rebuilt.
+  const focus = captureFieldFocus();
   $spawn.innerHTML = `
     <details class="spawn-wrap" ${spawnOpen ? "open" : ""} ontoggle="spawnOpen = this.open">
       <summary>+ New session <span class="chev">▾</span></summary>
@@ -800,7 +949,6 @@ function render(data) {
           : `<div class="empty" style="padding:20px 0">No online hosts with repos.</div>`
       }</div>
     </details>`;
-  restoreComposerFocus(focus);
 
   $active.innerHTML = `<h2>Active <span class="count">${active.length}</span></h2>` +
     (active.length
@@ -821,6 +969,8 @@ function render(data) {
        </details>`
     : "";
 
+  restoreFieldFocus(focus);
+
   // If the attached session vanished (killed elsewhere, host offline), drop the
   // stage back to the empty prompt.
   if (currentId) {
@@ -836,23 +986,60 @@ function render(data) {
 }
 
 function activeCard({ a, s, live }) {
+  if (renameId === s.id) return renameCard(a, s);
   const attachable = a.terminalOnline;
   const cur = s.id === currentId;
   const meta = `<span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}`;
-  return `<button class="s-card ${cur ? "cur" : ""}" ${attachable ? "" : "disabled"}
-      onclick="selectSession('${esc(s.id)}')"
-      ${attachable ? "" : 'title="Terminal tunnel offline"'}>
-    <span class="dot ${live.kind}"></span>
-    <span class="body">
-      <div class="title">${esc(sessTitle(s))}</div>
-      <div class="meta">${meta}</div>
-      <div class="state-row">
-        <div class="state ${live.kind}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
-        ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
-      </div>
-      ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
-    </span>
-  </button>`;
+  return `<div class="s-card-wrap">
+    <button class="s-card ${cur ? "cur" : ""}" ${attachable ? "" : "disabled"}
+        onclick="selectSession('${esc(s.id)}')"
+        ${attachable ? "" : 'title="Terminal tunnel offline"'}>
+      <span class="dot ${live.kind}"></span>
+      <span class="body">
+        <div class="title">${esc(sessTitle(s))}</div>
+        <div class="meta">${meta}</div>
+        <div class="state-row">
+          <div class="state ${live.kind}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
+          ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
+        </div>
+        ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
+      </span>
+    </button>
+    <button class="s-dots ${menuOpenId === s.id ? "open" : ""}" title="Session actions"
+        aria-label="Session actions" onclick="toggleCardMenu(event,'${esc(s.id)}')">⋯</button>
+    ${menuOpenId === s.id ? cardMenu(a, s) : ""}
+  </div>`;
+}
+
+// The card's ⋯ menu: rename the session (the name the card leads with) or kill
+// it. Kill arms on the first click and fires on the second, so the menu can be
+// browsed without consequence. Reachable on a card whose terminal tunnel is
+// offline too — the card is un-attachable then, but renaming is local to the
+// registry and a kill still rides the heartbeat.
+function cardMenu(a, s) {
+  const armed = killArmedId === s.id;
+  return `<div class="s-menu" onclick="event.stopPropagation()">
+    <button onclick="startRename(event,'${esc(s.id)}')">Rename…</button>
+    <button class="danger ${armed ? "armed" : ""}"
+        onclick="cardKill(event,'${esc(a.key)}','${esc(s.id)}')">
+      ${armed ? "Confirm kill" : "Kill session"}
+    </button>
+  </div>`;
+}
+
+// The card while it's being renamed. Enter saves, Escape cancels, an empty save
+// clears the name back to the label/worktree fallback. The text lives in
+// renameDraft so the re-render can't wipe it mid-type.
+function renameCard(a, s) {
+  const done = `submitRename('${esc(a.key)}','${esc(s.id)}')`;
+  return `<div class="s-rename" onclick="event.stopPropagation()">
+    <input id="${renFieldId(s.id)}" value="${esc(renameDraft)}" maxlength="48"
+      placeholder="${esc(sessMeta(s) || s.id)}" aria-label="Session name"
+      oninput="renameDraft = this.value"
+      onkeydown="if(event.key==='Enter'){event.preventDefault();${done};}">
+    <button class="primary btn-sm" onclick="${done}">Save</button>
+    <button class="btn-sm" onclick="cancelRename()">Cancel</button>
+  </div>`;
 }
 
 function stoppedRow({ a, s }) {
@@ -1043,6 +1230,16 @@ function setFrame(id, s, a) {
   disarmTermKill();
   const inp = document.getElementById("termInput");
   if (inp) { inp.value = ""; autoGrowTermInput(); }
+}
+// The last-reported record for a session, whatever its state — unlike
+// sessionHit() this doesn't require the host's terminal tunnel, since renaming
+// touches the registry rather than the session's pane.
+function findSession(id) {
+  for (const a of (cache.agents || [])) {
+    const s = (a.sessions || []).find(x => x.id === id);
+    if (s) return s;
+  }
+  return null;
 }
 function sessionHit(id) {
   const now = cache.now || Date.now();

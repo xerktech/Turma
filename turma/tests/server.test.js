@@ -1153,6 +1153,52 @@ test("http: model/mode endpoints reject missing value, 404 unknown host, require
   assert.equal(noAuth.status, 401);
 });
 
+// ---- session rename endpoint -----------------------------------------------------
+
+test("http: summary endpoint queues a setSummary command that rides the next heartbeat", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hs1" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/hs1/sessions/sess1/summary", {
+    body: { summary: "Named By Hand" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "hs1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "setSummary", sessionId: "sess1", summary: "Named By Hand", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: summary endpoint forwards a blank rename (clears the name), caps length, needs auth", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hs2" }, headers: agentHeaders });
+
+  // Blank is a real instruction here — it clears the name — so it queues rather
+  // than 400ing the way the input endpoint's empty text does.
+  const clear = await request("POST", "/api/agents/hs2/sessions/sess1/summary", {
+    body: { summary: "" }, headers: userHeaders,
+  });
+  assert.equal(clear.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "hs2" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "setSummary", sessionId: "sess1", summary: "", cmdId: clear.body.cmdId },
+  ]);
+
+  const tooLong = await request("POST", "/api/agents/hs2/sessions/sess1/summary", {
+    body: { summary: "x".repeat(201) }, headers: userHeaders,
+  });
+  assert.equal(tooLong.status, 400);
+  assert.deepEqual(tooLong.body, { error: "summary too long" });
+
+  const ghost = await request("POST", "/api/agents/ghost/sessions/sess1/summary", {
+    body: { summary: "hi" }, headers: userHeaders,
+  });
+  assert.equal(ghost.status, 404);
+
+  const noAuth = await request("POST", "/api/agents/hs2/sessions/sess1/summary", {
+    body: { summary: "hi" },
+  });
+  assert.equal(noAuth.status, 401);
+});
+
 // ---- session answer endpoint -----------------------------------------------------
 
 test("http: answer endpoint queues an answerQuestion command with the option pick", async () => {
