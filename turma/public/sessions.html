@@ -177,37 +177,28 @@
   /* While a query is active, #searchResults overlays the live/stopped lists. */
   #searchResults { display: none; }
   body.searching #searchResults { display: block; }
-  body.searching #active, body.searching #stopped, body.searching #spawn,
-  body.searching #archiveWrap { display: none; }
+  body.searching #active, body.searching #idle, body.searching #stopped,
+  body.searching #spawn { display: none; }
   .sr-hint { color: var(--muted); font-size: 12px; padding: 6px 2px; }
   .sr-group { margin: 10px 0 4px; }
   .sr-group > .grp-h {
     font-size: 11px; font-weight: 600; color: var(--ink-2); text-transform: uppercase;
     letter-spacing: 0.04em; margin: 8px 2px 6px;
   }
-  button.sr-row, button.arch-row {
+  button.sr-row {
     display: block; width: 100%; text-align: left; font: inherit; cursor: pointer;
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 8px 11px; margin-bottom: 6px; color: var(--ink);
   }
-  button.sr-row:hover, button.arch-row:hover { border-color: var(--accent); }
-  .sr-row.cur, .arch-row.cur { border-color: var(--accent); background: var(--accent-soft); }
-  .sr-row .meta, .arch-row .meta { color: var(--muted); font-size: 11px; margin-bottom: 3px; overflow-wrap: anywhere; }
-  .sr-row .meta .badge, .arch-row .meta .badge {
+  button.sr-row:hover { border-color: var(--accent); }
+  .sr-row.cur { border-color: var(--accent); background: var(--accent-soft); }
+  .sr-row .meta { color: var(--muted); font-size: 11px; margin-bottom: 3px; overflow-wrap: anywhere; }
+  .sr-row .meta .badge {
     display: inline-block; padding: 0 6px; border-radius: 999px; font-size: 10px;
     background: var(--accent-soft); color: var(--accent); margin-left: 5px;
   }
   .sr-row .snip { font-size: 12.5px; line-height: 1.4; color: var(--ink-2); overflow-wrap: anywhere; }
   .sr-row .snip mark { background: var(--accent-soft); color: var(--accent); padding: 0 1px; border-radius: 2px; }
-  .arch-row .title { font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
-
-  details.archive-wrap > summary {
-    list-style: none; cursor: pointer; user-select: none; color: var(--ink-2);
-    font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
-    padding: 6px 2px; margin-top: 10px;
-  }
-  details.archive-wrap > summary::-webkit-details-marker { display: none; }
-  details.archive-wrap > summary:hover { color: var(--accent); }
 
   /* ---- Right stage: read-only transcript view of an ended session ----------- */
   .transcript-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--page); }
@@ -440,13 +431,8 @@
       <div id="searchResults"></div>
       <div id="spawn"></div>
       <div id="active"></div>
+      <div id="idle"></div>
       <div id="stopped"></div>
-      <div id="archiveWrap">
-        <details class="archive-wrap" id="archiveDetails">
-          <summary><span id="archiveSummary">Ended sessions</span></summary>
-          <div class="s-list" id="archiveList"></div>
-        </details>
-      </div>
     </aside>
 
     <main class="stage" id="stage">
@@ -529,6 +515,7 @@
 
 <script>
 const $active = document.getElementById("active");
+const $idle = document.getElementById("idle");
 const $stopped = document.getElementById("stopped");
 const $spawn = document.getElementById("spawn");
 const $counts = document.getElementById("counts");
@@ -794,6 +781,12 @@ function render(data) {
   const waiting = running.filter(x => x.live.kind === "waiting").length;
   $counts.textContent = running.length + " running" + (waiting ? " · " + waiting + " waiting on you" : "");
 
+  // Running sessions split by liveness: attention-worthy (waiting/working) up
+  // top under "Active", quiet ones auto-demoted to "Idle" below. Both are still
+  // live, attachable sessions (same card); collect() already sorted `running`.
+  const active = running.filter(x => x.live.kind !== "idle");
+  const idle = running.filter(x => x.live.kind === "idle");
+
   const hosts = agents.filter(a => a.online && (a.repos || []).length);
   // Preserve focus/caret in an open composer across the innerHTML swap.
   const focus = captureComposerFocus();
@@ -808,10 +801,16 @@ function render(data) {
     </details>`;
   restoreComposerFocus(focus);
 
-  $active.innerHTML = `<h2>Active <span class="count">${running.length}</span></h2>` +
-    (running.length
-      ? `<div class="s-list">${running.map(x => activeCard(x)).join("")}</div>`
-      : `<div class="empty" style="padding:28px 0">No running sessions.${hosts.length ? " Start one above." : ""}</div>`);
+  $active.innerHTML = `<h2>Active <span class="count">${active.length}</span></h2>` +
+    (active.length
+      ? `<div class="s-list">${active.map(x => activeCard(x)).join("")}</div>`
+      : `<div class="empty" style="padding:28px 0">No active sessions.${
+          idle.length ? " See Idle below." : hosts.length ? " Start one above." : ""}</div>`);
+
+  $idle.innerHTML = idle.length
+    ? `<h2>Idle <span class="count">${idle.length}</span></h2>
+       <div class="s-list">${idle.map(x => activeCard(x)).join("")}</div>`
+    : "";
 
   $stopped.innerHTML = stopped.length
     ? `<h2>Stopped <span class="count">${stopped.length}</span></h2>
@@ -1049,7 +1048,7 @@ function clearStage() {
   document.body.classList.remove("showing-term");
   disarmTermKill();
   disarmChatKill();
-  renderSearch(); renderArchive(); // refresh .cur highlights
+  renderSearch(); // refresh .cur highlights
 }
 function backToList() {
   if (viewPushed) history.back(); // popstate drops the mobile terminal view
@@ -1168,11 +1167,8 @@ async function sendTermInput() {
 const $searchInput = document.getElementById("searchInput");
 const $searchClear = document.getElementById("searchClear");
 const $searchResults = document.getElementById("searchResults");
-const $archiveWrap = document.getElementById("archiveWrap");
 let searchQuery = "";
 let searchData = null;   // last /api/search response
-let archiveData = null;  // last /api/archive response
-let archiveOpen = false;
 let currentTranscriptId = null;
 
 // FTS snippet()s arrive with literal <mark></mark> around hits but the rest is
@@ -1223,33 +1219,6 @@ function renderSearch() {
     </div>`).join("");
 }
 
-let archiveLoading = false;
-async function loadArchive() {
-  if (archiveLoading) return;
-  archiveLoading = true;
-  try {
-    const r = await fetch("/api/archive?limit=100");
-    if (r.status === 401) return void (location.href = "/login");
-    archiveData = await r.json();
-  } catch { return; } finally { archiveLoading = false; }
-  renderArchive();
-}
-// Updates only the inner list (the <details> shell is static in the markup, so
-// filling it never re-fires the toggle handler).
-function renderArchive() {
-  const sessions = (archiveData && archiveData.sessions) || [];
-  document.getElementById("archiveSummary").textContent =
-    "Ended sessions" + (sessions.length ? " (" + sessions.length + ")" : "");
-  document.getElementById("archiveList").innerHTML = sessions.length
-    ? sessions.map(s => `
-        <button class="arch-row ${s.transcriptId === currentTranscriptId ? "cur" : ""}"
-                data-tid="${esc(s.transcriptId)}" data-title="${esc(s.summary || "")}">
-          <div class="title">${esc(s.summary || s.repo || s.transcriptId)}</div>
-          <div class="meta">${esc(s.repo || "")} · ${esc(s.host || "")} · ${esc(shortDate(s.endedTs || s.createdAt))}${s.msgCount ? " · " + s.msgCount + " msgs" : ""}</div>
-        </button>`).join("")
-    : `<div class="sr-hint">No archived sessions yet.</div>`;
-}
-
 let trHighlight = null; // { uuid } for a search-driven open (else null)
 async function openTranscript(id, title, hi) {
   currentTranscriptId = id;
@@ -1269,7 +1238,7 @@ async function openTranscript(id, title, hi) {
   $transcriptPane.hidden = false;
   navFrame("about:blank"); // ensure no live-terminal WebSocket lingers
   enterStage();
-  renderSearch(); renderArchive();
+  renderSearch();
   let t;
   try {
     const r = await fetch(`/api/archive/${enc(id)}`);
@@ -1320,13 +1289,6 @@ function delegateOpen(container) {
   });
 }
 delegateOpen($searchResults);
-delegateOpen($archiveWrap);
-// Load the archive list the first time the section is expanded (and refresh on
-// later re-opens so newly-ended sessions show up).
-document.getElementById("archiveDetails").addEventListener("toggle", function () {
-  archiveOpen = this.open;
-  if (this.open) loadArchive();
-});
 
 let cache = { now: Date.now(), agents: [] };
 async function refresh() {
