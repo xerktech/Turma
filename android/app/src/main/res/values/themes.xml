@@ -1,0 +1,9 @@
+<resources>
+    <!-- Launch theme only; the UI itself is Jetpack Compose Material3, so this
+         needs no Material Components XML dependency. -->
+    <style name="Theme.Turma" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/turma_bg</item>
+        <item name="android:statusBarColor">@color/turma_bg</item>
+        <item name="android:navigationBarColor">@color/turma_bg</item>
+    </style>
+</resources>

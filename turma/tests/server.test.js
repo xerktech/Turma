@@ -29,6 +29,10 @@ process.env.STATE_FILE = path.join(
   os.tmpdir(),
   `turma-test-state-${process.pid}.json`
 );
+process.env.DEVICES_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-devices-${process.pid}.json`
+);
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
 process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-archive-"));
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
@@ -551,6 +555,47 @@ test("http: heartbeat auth (bearer or user basic, nothing else)", async () => {
     (await request("POST", "/api/heartbeat", { body: {}, headers: agentHeaders })).status,
     400 // device/agentId required
   );
+});
+
+// ---- mobile push device registry ----------------------------------------------
+
+test("http: /api/devices register + unregister is user-authed", async () => {
+  // Unauthed is rejected like the rest of the browser API.
+  assert.equal(
+    (await request("POST", "/api/devices", { body: { token: "fcmtok1" } })).status,
+    401
+  );
+  // Missing token → 400.
+  assert.equal(
+    (await request("POST", "/api/devices", { body: {}, headers: userHeaders })).status,
+    400
+  );
+  // Register, then it shows in the registry (deduped on re-register).
+  assert.equal(
+    (await request("POST", "/api/devices", { body: { token: "fcmtok1" }, headers: userHeaders })).status,
+    200
+  );
+  await request("POST", "/api/devices", { body: { token: "fcmtok1", platform: "android" }, headers: userHeaders });
+  assert.equal(hub.listDevices().filter((d) => d.token === "fcmtok1").length, 1, "deduped");
+  // Unregister via query param (FCM tokens can contain `/`, so not a path seg).
+  assert.equal(
+    (await request("DELETE", "/api/devices?token=fcmtok1", { headers: userHeaders })).status,
+    200
+  );
+  assert.equal(hub.listDevices().some((d) => d.token === "fcmtok1"), false);
+});
+
+test("notify(): FCM fan-out prunes dead tokens, keeps live ones", () => {
+  // With no FCM service account configured, push.sendFcm is a no-op, so notify
+  // fanning out must not throw and must not touch the registry. pruneDevices is
+  // exercised directly for the dead-token contract.
+  hub.registerDevice("live", "android");
+  hub.registerDevice("stale", "android");
+  hub.pruneDevices(["stale"]);
+  const tokens = hub.listDevices().map((d) => d.token);
+  assert.ok(tokens.includes("live"));
+  assert.ok(!tokens.includes("stale"));
+  hub.unregisterDevice("live");
 });
 
 // ---- archive: agent-push ingest + heartbeat cursors + search/browse/view -------

@@ -1,0 +1,101 @@
+name: android-release
+
+# Build the Android client APK and publish it as a GitHub Release so it's a
+# one-click sideload download — the counterpart to glasses-release.yml.
+#
+# Runs post-merge on push to main, path-filtered to android/** (the pre-merge
+# gate is android-ci.yml). Mirrors glasses-release.yml / turma-*-image.yml,
+# which build on push to main.
+#
+# We ship the DEBUG APK: it's signed with the standard debug key so it installs
+# directly (like sideloading the glasses .ehpk), with no keystore/secrets to
+# manage. Swap to a signed assembleRelease here if a Play-store-grade build is
+# ever needed.
+#
+# Same self-hosted-runner + container constraints as android-ci.yml: the runners
+# can't pull ghcr.io and have no passwordless sudo, so the build runs inside a
+# Docker Hub image that bundles the JDK + Android SDK; Gradle is downloaded and
+# pinned in-job (the image doesn't put `gradle` on PATH).
+#
+# Versioning matches the repo: MAJOR.MINOR from the root VERSION file + this
+# run number as the patch. build.gradle.kts reads GITHUB_RUN_NUMBER for the
+# APK's versionName/versionCode, so the artifact and the tag stay in lockstep.
+# Tag: android-v<VERSION>.<run_number> (e.g. android-v0.2.42).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "VERSION"
+      - ".github/workflows/android-release.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: android-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # create releases + upload assets
+
+env:
+  GRADLE_VERSION: "8.11.1"
+
+jobs:
+  release:
+    name: Build, sign (debug), release
+    runs-on: [self-hosted, linux]
+    container:
+      image: mingc/android-build-box:latest
+    steps:
+      - name: Reset workspace ownership
+        working-directory: ${{ github.workspace }}
+        run: chown -R "$(id -u):$(id -g)" . || true
+
+      - uses: actions/checkout@v7
+
+      # Full build version from the VERSION file + this run number as the patch,
+      # and the release tag / asset name from it.
+      - name: Compute version
+        id: ver
+        run: |
+          BASE="$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/VERSION")"
+          VERSION="${BASE}.${{ github.run_number }}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=android-v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "asset=turma-android-v${VERSION}.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Install Gradle ${{ env.GRADLE_VERSION }}
+        run: |
+          set -eux
+          curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip
+          unzip -q -o /tmp/gradle.zip -d /opt
+          echo "/opt/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Ensure SDK packages
+        run: yes | sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
+
+      # GITHUB_RUN_NUMBER is present in the container, so build.gradle.kts stamps
+      # versionName=$VERSION / versionCode=$run_number to match the tag.
+      - name: Assemble debug APK
+        working-directory: android
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Name the release asset
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/${{ steps.ver.outputs.asset }}"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Turma Android ${{ steps.ver.outputs.tag }}
+          body: |
+            Turma Android client APK.
+
+            - Version: `${{ steps.ver.outputs.version }}`
+            - Commit: ${{ github.sha }}
+
+            Download `${{ steps.ver.outputs.asset }}` below and install it on your device
+            (enable "install unknown apps" for your browser/file manager). Debug-signed —
+            for personal sideloading, like the glasses package.
+          files: ${{ github.workspace }}/${{ steps.ver.outputs.asset }}
+          fail_on_unmatched_files: true

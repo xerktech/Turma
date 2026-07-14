@@ -29,9 +29,13 @@ const { Duplex } = require("stream");
 // node:sqlite FTS index). See archive.js. Lazily opens its DB on first use, so
 // requiring it is cheap and side-effect-free.
 const archive = require("./archive.js");
+// Mobile push (FCM) fan-out for the alert bus. Lazily/gracefully no-ops when
+// FCM_SERVICE_ACCOUNT_JSON is unset, so requiring it is side-effect-free.
+const push = require("./push.js");
 
 const PORT = parseInt(process.env.PORT || "8300", 10);
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
+const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
@@ -148,6 +152,58 @@ function prune() {
   for (const [key, a] of Object.entries(agents)) {
     if (now - (a.lastSeen || 0) > PRUNE_AFTER_MS) delete agents[key];
   }
+}
+
+// ---- mobile push device registry -------------------------------------------
+// FCM tokens the Android client has registered (POST /api/devices). notify()
+// fans every alert out to these in addition to ntfy. Persisted next to
+// STATE_FILE, same best-effort pattern (losing it just means devices re-register
+// on their next app launch). Each entry: {token, platform, addedAt, seenAt}.
+let devices = [];
+try {
+  const parsed = JSON.parse(fs.readFileSync(DEVICES_FILE, "utf8"));
+  if (Array.isArray(parsed)) devices = parsed;
+} catch {
+  /* first boot or no volume mounted */
+}
+let devSaveTimer = null;
+function scheduleDeviceSave() {
+  if (devSaveTimer) return;
+  devSaveTimer = setTimeout(() => {
+    devSaveTimer = null;
+    fs.mkdir(path.dirname(DEVICES_FILE), { recursive: true }, () => {
+      fs.writeFile(DEVICES_FILE, JSON.stringify(devices), (err) => {
+        if (err) console.error(`devices save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  devSaveTimer.unref();
+}
+function registerDevice(token, platform) {
+  const now = Date.now();
+  const existing = devices.find((d) => d.token === token);
+  if (existing) {
+    existing.platform = platform || existing.platform;
+    existing.seenAt = now;
+  } else {
+    devices.push({ token, platform: platform || "android", addedAt: now, seenAt: now });
+  }
+  scheduleDeviceSave();
+}
+function unregisterDevice(token) {
+  const before = devices.length;
+  devices = devices.filter((d) => d.token !== token);
+  if (devices.length !== before) scheduleDeviceSave();
+}
+function pruneDevices(deadTokens) {
+  if (!deadTokens || !deadTokens.length) return;
+  const dead = new Set(deadTokens);
+  const before = devices.length;
+  devices = devices.filter((d) => !dead.has(d.token));
+  if (devices.length !== before) scheduleDeviceSave();
+}
+function listDevices() {
+  return devices;
 }
 
 // ---- /api/agents payload cache + SSE fanout ---------------------------------
@@ -439,6 +495,29 @@ function notify(title, message, opts = {}) {
       if (!r.ok) console.error(`ntfy ${r.status} for "${title}"`);
     })
     .catch((e) => console.error(`ntfy failed: ${e.message}`));
+  pushFcm(title, message, opts);
+}
+
+// Fan an alert out to registered mobile devices via FCM. Independent of ntfy
+// (either can be configured without the other) and best-effort: a push failure
+// only logs. tags/priority/click/route ride as data so the app can pick the
+// notification channel and deep-link a tap to the exact session or host.
+function pushFcm(title, message, opts = {}) {
+  const tokens = listDevices();
+  if (!tokens.length) return; // no registered devices; also skips when FCM off
+  const data = {
+    tags: opts.tags || "",
+    priority: opts.priority || "default",
+  };
+  if (opts.click) data.click = opts.click;
+  if (opts.route) {
+    if (opts.route.host) data.host = opts.route.host;
+    if (opts.route.sessionId) data.sessionId = opts.route.sessionId;
+  }
+  push
+    .sendFcm(tokens.map((d) => d.token), { title, body: message, data })
+    .then((r) => pruneDevices(r.dead))
+    .catch((e) => console.error(`fcm fan-out failed: ${e.message}`));
 }
 
 function fmtDur(ms) {
@@ -475,6 +554,7 @@ function heartbeatAlerts(key, prev, next) {
   if (recovered) {
     notify(`${key} back online`, `Was offline ${fmtDur(now - alerts.offlineAt)}${where}`, {
       tags: "green_circle",
+      route: { host: key },
     });
     delete alerts.offlineAt;
   }
@@ -491,6 +571,7 @@ function heartbeatAlerts(key, prev, next) {
       notify(`${key} restart loop`, `${recent.length} container starts in 10 minutes${where}`, {
         tags: "rotating_light",
         priority: "urgent",
+        route: { host: key },
       });
     }
   }
@@ -508,6 +589,7 @@ function heartbeatAlerts(key, prev, next) {
     notify(`${key} cost alert`, `Est. $${cost.toFixed(2)} today (threshold $${COST_ALERT_USD})`, {
       tags: "moneybag",
       priority: "high",
+      route: { host: key },
     });
   }
 
@@ -522,9 +604,10 @@ function heartbeatAlerts(key, prev, next) {
     const label = session.rcName || `${key} · ${session.repo}@${session.branch}`;
     const s = session.session || {}; // null for stopped sessions
 
+    const route = { host: key, sessionId: session.id };
     if (s.question && s.question !== sa.lastQuestion) {
       sa.lastQuestion = s.question;
-      notify(`${label} has a question`, s.question, { tags: "question", priority: "high" });
+      notify(`${label} has a question`, s.question, { tags: "question", priority: "high", route });
     }
     if (!s.question) delete sa.lastQuestion;
 
@@ -532,7 +615,7 @@ function heartbeatAlerts(key, prev, next) {
       const seen = sa.prSeen || [];
       if (seen.includes(url)) continue;
       sa.prSeen = [...seen, url].slice(-20);
-      notify(`${label} created a PR`, url, { tags: "rocket", click: url });
+      notify(`${label} created a PR`, url, { tags: "rocket", click: url, route });
     }
 
     // Turn finished: was working, transcript went quiet, and the newest entry
@@ -543,7 +626,7 @@ function heartbeatAlerts(key, prev, next) {
     const working = sessionWorking(session, next.lastSeen, now);
     if (sa.wasWorking && !working && !recovered && s.lastRole === "assistant" && !s.lastHasToolUse) {
       const repo = session.git?.repoName ? ` · ${session.git.repoName}@${session.git.branch}` : "";
-      notify(`${label} finished its turn`, `Waiting for input${repo}`, { tags: "checkered_flag" });
+      notify(`${label} finished its turn`, `Waiting for input${repo}`, { tags: "checkered_flag", route });
     }
     sa.wasWorking = working;
   }
@@ -569,6 +652,7 @@ setInterval(() => {
     notify(`${key} offline`, `No heartbeat for ${fmtDur(now - (a.lastSeen || 0))}${where}`, {
       tags: "red_circle",
       priority: "high",
+      route: { host: key },
     });
     scheduleSave();
     // The host just crossed to offline — invalidate the cached payload (whose
@@ -1099,6 +1183,25 @@ const server = http.createServer(async (req, res) => {
     // an Authorization header, so the token rides the query string instead).
     if (req.method === "GET" && url.pathname === "/api/ws-token") {
       return json(res, 200, { token: issueWsToken(), expiresInSec: WS_TOKEN_TTL_MS / 1000 });
+    }
+
+    // Mobile push device registry. The Android client registers its FCM token
+    // here so hub alerts (notify()) also fan out to it; it unregisters on
+    // sign-out. User-authed like the rest of the browser API (the gate above
+    // already enforced it). Unregister takes the token as a query param, not a
+    // path segment, because FCM tokens can contain `/`.
+    if (req.method === "POST" && url.pathname === "/api/devices") {
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const token = typeof body.token === "string" ? body.token.trim() : "";
+      if (!token) return json(res, 400, { error: "token required" });
+      const platform = typeof body.platform === "string" ? body.platform : "android";
+      registerDevice(token, platform);
+      return json(res, 200, { ok: true });
+    }
+    if (req.method === "DELETE" && url.pathname === "/api/devices") {
+      const token = (url.searchParams.get("token") || "").trim();
+      if (token) unregisterDevice(token);
+      return json(res, 200, { ok: true });
     }
 
     // SSE stream (FIX 1/#1): authenticated dashboards subscribe here and get an
@@ -1759,6 +1862,10 @@ if (process.env.TURMA_TEST) {
     transcribePcm,
     issueWsToken,
     wsTokenValid,
+    registerDevice,
+    unregisterDevice,
+    listDevices,
+    pruneDevices,
   };
 } else {
   if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");

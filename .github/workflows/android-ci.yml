@@ -1,0 +1,66 @@
+name: android-ci
+
+# PR gate for the Android client: unit-test the pure core (reveal/transcript/
+# sessions/chat-items + serialization) and assemble a debug APK. Runs inside a
+# throwaway Docker Hub image that bundles the JDK + Android SDK (the self-hosted
+# runners can't pull ghcr.io and have no passwordless sudo), mirroring the
+# glasses-ci container pattern. Gradle is downloaded+pinned in-job (the image
+# doesn't put `gradle` on PATH), so the build is reproducible regardless of the
+# image's Gradle. A credential-less build is expected: no google-services.json
+# is present, so the Firebase plugin is skipped (see android/app/build.gradle.kts)
+# and push is inert — the app still builds.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "VERSION"
+      - ".github/workflows/android-ci.yml"
+
+env:
+  GRADLE_VERSION: "8.11.1"
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+    container:
+      image: mingc/android-build-box:latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - name: Reset workspace ownership
+        working-directory: ${{ github.workspace }}
+        run: chown -R "$(id -u):$(id -g)" . || true
+
+      - uses: actions/checkout@v7
+
+      # The image bundles the JDK + Android SDK but not a `gradle` on PATH.
+      # Download the pinned Gradle and expose it, so the build version is fixed
+      # by this file, not by whatever the image ships.
+      - name: Install Gradle ${{ env.GRADLE_VERSION }}
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -eux
+          curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip
+          unzip -q -o /tmp/gradle.zip -d /opt
+          echo "/opt/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+
+      # Ensure the compileSdk platform + build-tools this project needs are
+      # present (idempotent; the image usually has them, this guards a drift).
+      - name: Ensure SDK packages
+        run: yes | sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
+
+      - name: Unit tests (pure core)
+        run: gradle :app:testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Assemble debug APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: turma-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
