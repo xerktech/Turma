@@ -41,6 +41,33 @@ jobs:
 
       - uses: actions/checkout@v7
 
+      # Headroom guard, NOT a guaranteed fix — read before relying on it.
+      #
+      # Trivy exports every uncompressed layer to scratch before scanning, so a
+      # scan needs roughly twice the image in free disk. Once the agent image
+      # gained the Android emulator + system image, a scan died here with "no
+      # space left on device" on this shared runner (~85% full from other jobs,
+      # ~18G free). It passed on a re-run that happened to start with ~27G free.
+      #
+      # So the margin is thin and the real constraint is runner capacity. The
+      # prune below is a safety valve for stale cache, not the thing that made it
+      # pass: layers do stay pinned by buildkit cache records rather than the tag
+      # (the post-scan `docker rmi` reclaims 0B), but on a busy runner that cache
+      # is usually younger than the filter and this reclaims 0B too.
+      #
+      # Pruning by AGE is deliberate. The cleanup note below rightly rejects an
+      # unfiltered `-a` prune — this repo's two scan jobs share one runner and
+      # `-a` yanks cache out from under the other job's in-flight build — but an
+      # until= filter can't reach a concurrent job's cache, which is fresh by
+      # definition. If this job starts failing on disk again, the fix is runner
+      # headroom (or a shorter window here), not a bigger hammer.
+      - name: Reclaim disk before build
+        run: |
+          df -h / || true
+          docker image prune -f || true
+          docker builder prune -f --filter until=24h || true
+          df -h / || true
+
       - uses: docker/setup-buildx-action@v4
 
       # Build into the local docker daemon (load, not push) so Trivy can scan
