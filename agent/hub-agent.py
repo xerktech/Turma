@@ -436,6 +436,49 @@ def perm_cycle_for(launch_mode):
     return cycle
 
 
+# --- new-work branching policy (--append-system-prompt) -------------------
+
+# Every session's checkout can be behind the real upstream default branch. A
+# Turma worktree is detached at origin/<default> as of SPAWN time (see
+# default_base_ref) — minutes or hours stale by the time the agent branches, and
+# staler still if that spawn-time `git fetch` timed out and fell back to a local
+# ref. A repos-root session is worse: it works in the repo dirs themselves,
+# sitting on whatever branch the host last left checked out.
+#
+# There is no settings.json field that carries instructions, so the policy rides
+# --append-system-prompt on every launch. It tells the agent to refresh the base
+# ITSELF at the moment it starts work, which is the only place with enough
+# context to do it smartly: it knows whether a fetch failure is worth retrying,
+# whether there's uncommitted work to carry across, and which of several repos it
+# is about to touch. Deliberately a directive, not enforcement — the manager
+# can't know when "new work" begins.
+NEW_WORK_SYSTEM_PROMPT = """\
+Branching policy for this session (set by Turma, the agent host):
+
+Do not assume this checkout is at the latest default branch. It is either a
+detached worktree forked when this session spawned, or a repo left on whatever
+branch was last checked out on this host. Either can be well behind origin.
+
+Before starting new work in a repo — and before creating the branch you will
+commit it to — refresh the base yourself:
+  1. `git fetch origin` in that repo.
+  2. Find the default branch: `git symbolic-ref --short refs/remotes/origin/HEAD`
+     (typically origin/main, else origin/master).
+  3. Create your branch from that REMOTE ref, not from the current HEAD:
+     `git switch -c <your-branch> origin/main`.
+
+Handle the exceptions with judgment rather than stopping:
+  - If the fetch fails (offline, no remote, auth), base off the best local ref
+    instead, and say the base may be stale in your first reply and in the PR.
+  - If the checkout already has uncommitted work, carry it onto the fresh branch
+    rather than discarding it; if you can't, explain why instead of forcing it.
+  - If you are continuing existing work on a branch you already made, stay on it
+    — this applies when work STARTS, not to every commit.
+
+A session working across several repos applies this per repo, as it reaches each.
+"""
+
+
 # --- agent safety guard (--settings wiring) ------------------------------
 
 # Host credential / agent-config stores the agent must never write or delete.
@@ -2519,6 +2562,11 @@ class SessionManager:
         settings = self._ensure_guard_settings()
         if settings:
             parts.append(f"--settings {shlex.quote(settings)}")
+        # Tell the agent to fork new work off the LATEST default branch rather
+        # than this (possibly stale) checkout — see NEW_WORK_SYSTEM_PROMPT. Rides
+        # every launch, including resume: it's session policy, not spawn state.
+        parts.append(
+            f"--append-system-prompt {shlex.quote(NEW_WORK_SYSTEM_PROMPT)}")
         claude_cmd = " ".join(parts)
         if prompt:
             claude_cmd += f" -- {shlex.quote(prompt)}"

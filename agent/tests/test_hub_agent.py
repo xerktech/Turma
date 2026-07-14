@@ -1876,7 +1876,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(ha.QUESTIONS_DIR)} "
             f"claude --remote-control '{sess['rcName']}' "
-            f"--permission-mode auto --settings {shlex.quote(settings)}",
+            f"--permission-mode auto --settings {shlex.quote(settings)} "
+            f"--append-system-prompt {shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT)}",
         )
         # The guard settings file was written and wires the Bash guard hook plus
         # the AskUserQuestion → glasses bridge, both as PreToolUse matchers.
@@ -1937,6 +1938,46 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         # The whole prompt is one shlex-quoted token after `--`; no metachar leaks.
         self.assertIn(" -- '", cmd)
         self.assertTrue(cmd.rstrip().endswith("'"))
+
+    # --- new-work branching policy (--append-system-prompt) ---------------
+
+    def test_spawn_appends_new_work_branching_policy(self):
+        """Every session is told to fork new work off the latest default branch,
+        since its checkout is only as fresh as spawn time (worktree) or as the
+        host left it (repos root). Shell-quoted as one token."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        cmd = self._claude_cmd()
+        self.assertIn(
+            f"--append-system-prompt {shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT)}",
+            cmd,
+        )
+
+    def test_new_work_policy_names_the_fetch_and_remote_ref(self):
+        """The directive's load-bearing content: fetch, resolve origin/HEAD, and
+        branch off the REMOTE ref rather than the local HEAD."""
+        policy = ha.NEW_WORK_SYSTEM_PROMPT
+        self.assertIn("git fetch origin", policy)
+        self.assertIn("refs/remotes/origin/HEAD", policy)
+        self.assertIn("git switch -c <your-branch> origin/main", policy)
+
+    def test_root_session_also_gets_branching_policy(self):
+        """A repos-root session has no worktree, so it works in the repo dirs on
+        whatever branch the host left checked out — it needs this MOST."""
+        sm = self._root_ready_manager()
+        sm.spawn(ha.ROOT_REPO_NAME)
+        self.assertIn("--append-system-prompt", self._claude_cmd())
+
+    def test_resume_relaunch_keeps_branching_policy(self):
+        """It's session policy, not spawn state: a resumed session is launched
+        with it too."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        sm._launch_tmux(sess, resume=True)
+        self.assertIn("--append-system-prompt", self._claude_cmd())
 
     def test_spawn_rejects_missing_base_ref(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
