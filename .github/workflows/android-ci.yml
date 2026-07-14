@@ -16,6 +16,7 @@ on:
     paths:
       - "android/**"
       - "VERSION"
+      - "agent/Dockerfile"
       - ".github/workflows/android-ci.yml"
 
 env:
@@ -47,10 +48,41 @@ jobs:
           unzip -q -o /tmp/gradle.zip -d /opt
           echo "/opt/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
 
-      # Ensure the compileSdk platform + build-tools this project needs are
-      # present (idempotent; the image usually has them, this guards a drift).
+      # This job is a poor witness for the agent image, and once hid a total
+      # breakage: mingc/android-build-box ships MANY build-tools, so Gradle
+      # always finds what it asks for here. The agent image installs exactly one
+      # and its SDK is read-only to a session, so a project value that drifts
+      # from the image's makes Gradle try to auto-download into it — and every
+      # agent build dies ("The SDK directory is not writable") while this job
+      # stays green. Assert the pins agree rather than trusting the comments.
+      - name: Toolchain pins match the agent image
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          gradle_bt="$(grep -oP 'buildToolsVersion\s*=\s*"\K[^"]+' android/app/build.gradle.kts)"
+          gradle_sdk="$(grep -oP 'compileSdk\s*=\s*\K[0-9]+' android/app/build.gradle.kts)"
+          image_bt="$(grep -oP '^ARG ANDROID_BUILD_TOOLS=\K.*' agent/Dockerfile)"
+          image_sdk="$(grep -oP '^ARG ANDROID_PLATFORM=android-\K[0-9]+' agent/Dockerfile)"
+          echo "gradle: build-tools=${gradle_bt} compileSdk=${gradle_sdk}"
+          echo "image : build-tools=${image_bt} compileSdk=${image_sdk}"
+          if [ "$gradle_bt" != "$image_bt" ]; then
+            echo "::error::buildToolsVersion ${gradle_bt} != agent/Dockerfile ANDROID_BUILD_TOOLS ${image_bt}"
+            exit 1
+          fi
+          if [ "$gradle_sdk" != "$image_sdk" ]; then
+            echo "::error::compileSdk ${gradle_sdk} != agent/Dockerfile ANDROID_PLATFORM android-${image_sdk}"
+            exit 1
+          fi
+
+      # Install exactly what the project pins, so this job builds against the
+      # same versions the agent image has rather than whatever the image ships.
       - name: Ensure SDK packages
-        run: yes | sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          bt="$(grep -oP 'buildToolsVersion\s*=\s*"\K[^"]+' android/app/build.gradle.kts)"
+          sdk="$(grep -oP 'compileSdk\s*=\s*\K[0-9]+' android/app/build.gradle.kts)"
+          yes | sdkmanager "platform-tools" "platforms;android-${sdk}" "build-tools;${bt}" >/dev/null 2>&1 || true
 
       - name: Unit tests (pure core)
         run: gradle :app:testDebugUnitTest --no-daemon --stacktrace
