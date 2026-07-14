@@ -996,6 +996,9 @@ function sessionHit(id) {
 function selectSession(id) {
   const hit = sessionHit(id);
   if (!hit) return;
+  // Already viewing this session in chat — clicking it again should be a no-op,
+  // not tear down and rebuild the live tail (which reads as a page reload).
+  if (id === currentId && viewMode === "chat") return;
   currentId = id;
   viewMode = "chat";
   $termPane.hidden = true;
