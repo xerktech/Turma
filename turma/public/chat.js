@@ -323,6 +323,8 @@
   // ---- build display items from rich entries --------------------------------
   // Items: {kind:"msg",role,text,truncated,id} | {kind:"thinking",text,truncated,id}
   //        | {kind:"action", id, name, input, inputTrunc, result:{text,isError,truncated}|null, entryId}
+  //        | {kind:"command", id, name, args, argsTrunc, result:{text,isError,truncated}|null}
+  //        | {kind:"compact", id, text, truncated}
   function buildItems(entries) {
     const resultsById = new Map();
     const toolUseIds = new Set();
@@ -331,6 +333,11 @@
       if (b.t === "tool_result" && b.forId) resultsById.set(b.forId, b);
     }
     const items = [];
+    // A slash command's output arrives as its OWN transcript entry, right after
+    // the invocation — there's no id to pair them by (unlike tool_use/
+    // tool_result), so fold an output into the command card still open from the
+    // preceding entry, the way the transcript itself orders them.
+    let openCmd = null;
     for (const e of entries) {
       const role = e.role === "user" ? "user" : "assistant";
       // The live path keys the entry on `id` (uuid->id in _history_entries); the
@@ -345,6 +352,9 @@
       let msg = null;
       const flush = () => { if (msg) { items.push(msg); msg = null; } };
       for (const b of blocks) {
+        // Anything else between an invocation and an output means that output
+        // isn't this command's — stop holding the card open for it.
+        if (b.t !== "command" && b.t !== "command_output") openCmd = null;
         if (b.t === "text") {
           if (!msg) msg = { kind: "msg", role, id: eid, text: "", truncated: false };
           msg.text += b.text || "";
@@ -367,6 +377,31 @@
             kind: "action", id: b.forId || null, name: "result", input: "", inputTrunc: false, entryId: eid,
             result: { text: b.text || "", isError: !!b.isError, truncated: !!b.truncated }, orphan: true,
           });
+        } else if (b.t === "command") {
+          flush();
+          openCmd = {
+            kind: "command", id: eid, name: b.name || "/command",
+            args: b.args || "", argsTrunc: !!b.truncated, result: null,
+          };
+          items.push(openCmd);
+        } else if (b.t === "command_output") {
+          flush();
+          // resultId, not the card's id: the output is its OWN transcript entry,
+          // so that's the entry "Show more" has to re-fetch a fuller copy of.
+          const result = {
+            text: b.text || "", isError: !!b.isError, truncated: !!b.truncated, entryId: eid,
+          };
+          if (openCmd && !openCmd.result) {
+            openCmd.result = result;
+          } else {
+            // Output with no invocation ahead of it (scrolled-off command, or a
+            // tail window that starts mid-sequence): show it on its own.
+            items.push({ kind: "command", id: eid, name: "output", args: "", argsTrunc: false, result });
+          }
+          openCmd = null;
+        } else if (b.t === "compact_summary") {
+          flush();
+          items.push({ kind: "compact", id: eid, text: b.text || "", truncated: !!b.truncated });
         } else if (b.t === "task_notification") {
           // A background Task/agent finishing: render as an action card (like a
           // tool call) rather than a raw-XML user bubble. The summary is the
@@ -441,6 +476,35 @@
       '<div class="tool-body">' + body + "</div></details>";
   }
 
+  // A slash command the operator ran (/compact, /clear, …) and its output. Not
+  // the human talking and not a tool call: rendered as a compact chip rather
+  // than a bubble, and — unlike an action card — never hidden by Concise, since
+  // it's the operator's own intent and one line either way.
+  function renderCommandCard(it) {
+    const key = "cmd:" + it.id;
+    const head = '<span class="cmd-glyph">›</span><span class="cmd-name">' + esc(it.name) + "</span>" +
+      (it.args ? '<span class="cmd-args">' + esc(it.args.split("\n")[0]) + "</span>" : "");
+    if (!it.result) {
+      return '<div class="cmd-card" data-uuid="' + esc(it.id) + '">' + head +
+        truncBtn(it.id, it.argsTrunc) + "</div>";
+    }
+    return '<details class="cmd-card' + (it.result.isError ? " err" : "") + '" data-dkey="' + esc(key) +
+      '" data-uuid="' + esc(it.id) + '"' + openAttr(key, false) + "><summary>" + head + "</summary>" +
+      '<div class="cmd-body"><pre>' + esc(it.result.text || "(no output)") + "</pre>" +
+      truncBtn(it.result.entryId || it.id, it.result.truncated) + "</div></details>";
+  }
+
+  // The summary Claude writes when the context is compacted. The transcript
+  // stores it as a user turn, but the model wrote it — so it renders on the
+  // assistant's side, collapsed, rather than as a wall of text the operator
+  // appears to have typed.
+  function renderCompactCard(it) {
+    const key = "cmp:" + it.id;
+    return '<details class="compact-card" data-dkey="' + esc(key) + '" data-uuid="' + esc(it.id) + '"' +
+      openAttr(key, false) + "><summary>↺ Context compacted — summary of the conversation so far</summary>" +
+      '<div class="compact-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
+  }
+
   function itemsToHtml(items) {
     const out = [];
     let i = 0, g = 0;
@@ -448,6 +512,8 @@
       const it = items[i];
       if (it.kind === "msg") { out.push(renderMsg(it)); i++; continue; }
       if (it.kind === "thinking") { out.push(renderThought(it)); i++; continue; }
+      if (it.kind === "command") { out.push(renderCommandCard(it)); i++; continue; }
+      if (it.kind === "compact") { out.push(renderCompactCard(it)); i++; continue; }
       // action run
       let j = i;
       while (j < items.length && items[j].kind === "action") j++;

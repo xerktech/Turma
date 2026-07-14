@@ -166,6 +166,60 @@ function tnPreview(tn) {
   return parts.filter(Boolean).join("\n\n");
 }
 
+// Claude Code's slash-command bookkeeping turns (the ignore-this caveat, the
+// <command-name>/<command-args> invocation wrapper, and the command's
+// stdout/stderr) also land as user-role turns of raw XML. Parse them into
+// {kind:"caveat"|"command"|"output"} so entryBlocks can render a chip / output
+// card and drop the caveat. Mirror of hub-agent.py _parse_local_command.
+const LOCAL_COMMAND_CAVEAT_RE = /^\s*<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*$/;
+const COMMAND_NAME_RE = /<command-name>([\s\S]*?)<\/command-name>/;
+const COMMAND_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
+const COMMAND_STDOUT_RE = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/;
+const COMMAND_STDERR_RE = /<local-command-stderr>([\s\S]*?)<\/local-command-stderr>/;
+function parseLocalCommand(text) {
+  if (!text) return null;
+  if (LOCAL_COMMAND_CAVEAT_RE.test(text)) return { kind: "caveat" };
+  const nameM = COMMAND_NAME_RE.exec(text);
+  if (nameM) {
+    const name = nameM[1].replace(ANSI_RE, "").trim();
+    if (name) {
+      const argsM = COMMAND_ARGS_RE.exec(text);
+      return { kind: "command", name, args: argsM ? argsM[1].replace(ANSI_RE, "").trim() : "" };
+    }
+  }
+  // stderr wins over stdout when a turn carries both, so a failing command
+  // reads as an error rather than showing its (usually empty) stdout.
+  for (const [re, isError] of [[COMMAND_STDERR_RE, true], [COMMAND_STDOUT_RE, false]]) {
+    const m = re.exec(text);
+    if (m) return { kind: "output", text: m[1].replace(ANSI_RE, "").trim(), isError };
+  }
+  return null;
+}
+// Flatten a parsed local-command turn to text-feed form, or null to drop it —
+// mirror of hub-agent.py _lc_preview.
+function lcPreview(lc) {
+  if (lc.kind === "caveat") return null;
+  if (lc.kind === "command") return [lc.name, lc.args].filter(Boolean).join(" ");
+  return lc.text || null;
+}
+
+// Display role for an entry — mirror of hub-agent.py _entry_role. A compact
+// summary is written as a USER turn carrying text the model wrote about itself;
+// it reports as the assistant so the chat doesn't misattribute it to the human.
+function entryRole(entry) {
+  return entry.isCompactSummary ? "assistant" : entry.type;
+}
+
+// One text payload -> its text-feed form, or null to drop it. Mirror of
+// hub-agent.py _flatten_text.
+function flattenText(raw) {
+  const tn = parseTaskNotification(raw);
+  if (tn) return tnPreview(tn);
+  const lc = parseLocalCommand(raw);
+  if (lc) return lcPreview(lc);
+  return raw;
+}
+
 // One transcript entry -> glasses display text, or null to drop it (wrong
 // type, no message, tool_result-only turn, empty after ANSI strip). Mirrors
 // hub-agent.py _entry_text.
@@ -177,15 +231,15 @@ function entryText(entry) {
   const content = msg.content;
   let text;
   if (typeof content === "string") {
-    const tn = parseTaskNotification(content);
-    text = tn ? tnPreview(tn) : content;
+    text = flattenText(content);
+    if (text === null) return null;
   } else if (Array.isArray(content)) {
     const parts = [];
     for (const block of content) {
       if (!block || typeof block !== "object") continue;
       if (block.type === "text") {
-        const tn = parseTaskNotification(String(block.text || ""));
-        parts.push(tn ? tnPreview(tn) : String(block.text || ""));
+        const flat = flattenText(String(block.text || ""));
+        if (flat !== null) parts.push(flat);
       } else if (block.type === "tool_use" && block.name) parts.push(`[${block.name}]`);
       // "thinking" and "tool_result" blocks are dropped.
     }
@@ -270,17 +324,42 @@ function entryBlocks(entry, caps) {
     if (rtrunc) block.truncated = true;
     blocks.push(block);
   };
+  // The caveat contributes no block (its entry drops out entirely).
+  const addLocalCommand = (lc) => {
+    if (lc.kind === "command") {
+      const [name] = clip(lc.name, caps.input);
+      const [args, atrunc] = clip(lc.args, caps.input);
+      const block = { t: "command", name };
+      if (args) block.args = args;
+      if (atrunc) block.truncated = true;
+      blocks.push(block);
+    } else if (lc.kind === "output" && lc.text) {
+      const [text, trunc] = clip(lc.text, caps.result);
+      const block = { t: "command_output", text };
+      if (lc.isError) block.isError = true;
+      if (trunc) block.truncated = true;
+      blocks.push(block);
+    }
+  };
+  // One text payload -> its block(s): a task-notification card, a slash-command
+  // chip/output card, else plain text. A compact summary is prose the model
+  // wrote about the conversation so far, injected as a user turn — it gets its
+  // own block so the chat renders it as a collapsed agent-side card rather than
+  // a wall of text in a user bubble. entryRole() puts it on the assistant side.
+  const addPayload = (raw) => {
+    const tn = parseTaskNotification(raw);
+    if (tn) return addTaskNotification(tn);
+    const lc = parseLocalCommand(raw);
+    if (lc) return addLocalCommand(lc);
+    addText(entry.isCompactSummary ? "compact_summary" : "text", raw, caps.text);
+  };
   if (typeof content === "string") {
-    const tn = parseTaskNotification(content);
-    if (tn) addTaskNotification(tn);
-    else addText("text", content, caps.text);
+    addPayload(content);
   } else if (Array.isArray(content)) {
     for (const raw of content) {
       if (!raw || typeof raw !== "object") continue;
       if (raw.type === "text") {
-        const tn = parseTaskNotification(raw.text || "");
-        if (tn) addTaskNotification(tn);
-        else addText("text", raw.text || "", caps.text);
+        addPayload(raw.text || "");
       } else if (raw.type === "thinking") {
         addText("thinking", raw.thinking || raw.text || "", caps.text);
       } else if (raw.type === "tool_use" && raw.name) {
@@ -340,7 +419,7 @@ function transcriptTail(worktreePath, cache) {
     if (text === null && (!blocks || blocks.length === 0)) continue;
     tail.push({
       id: entry.uuid,
-      role: entry.type,
+      role: entryRole(entry),
       text: (text || "").slice(0, TAIL_MSG_CHARS),
       blocks: blocks || [],
     });
@@ -755,5 +834,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parsePaneStatus, isStatusLine, isHintLine, cleanHint, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, entryRole, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, cleanHint, BLOCK_CAPS_LIVE };
 }
