@@ -73,6 +73,18 @@ else
   export LOGNAME="$RUN_USER"
   chown "$PUID:$PGID" /root
 
+  # ~/.android is the one exception to the not-recursive rule above: it is image
+  # content (baked root-owned by the Dockerfile's avdmanager step), not a host
+  # bind mount, so recursing rewrites nothing of the operator's. The Android
+  # toolchain needs it writable or it fails hard rather than degrading —
+  # `assembleDebug` dies in :app:validateSigningDebug ("Unable to create debug
+  # keystore in /root/.android because it is not writable") and the emulator
+  # can't open the baked turma AVD. It is a few MB of metadata, so the recursive
+  # chown is cheap. Created here when absent so an image without the SDK layer
+  # still lands a writable dir.
+  mkdir -p /root/.android
+  chown -R "$PUID:$PGID" /root/.android
+
   # The docker socket: `docker` CLI backs the container self-inspect behind the
   # device-name probe and log tail, plus the hub-initiated restart. Root got that
   # for free; a dropped user needs to be in the group that owns the socket.
