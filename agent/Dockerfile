@@ -174,6 +174,11 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/hub-agent.py \
 #   TURMA_URL / TURMA_TOKEN / TURMA_INTERVAL   hub endpoint + shared agent token + beat
 #   IS_SANDBOX      lets claude bypassPermissions run under root
 #   AGENT           coding agent (claude only, for now)
+#   JIRA_SITE / JIRA_EMAIL / JIRA_TOKEN   optional Jira Cloud polling for the hub's
+#                   /board Kanban: the org's *.atlassian.net site + a user-scoped
+#                   API token (Basic auth, read-only — only issue search is ever
+#                   called). All three unset = feature off, zero Jira calls.
+#   TURMA_JIRA_REFRESH_EVERY   beats between Jira polls (default 30 ≈ 10 min)
 WORKDIR /root
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

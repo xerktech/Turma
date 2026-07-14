@@ -39,6 +39,7 @@ for the already-answered case), and PR URLs newly appended to the transcript.
 stdlib only — no pip installs in the image.
 """
 
+import base64
 import json
 import os
 import re
@@ -2156,6 +2157,160 @@ def collect_github():
     return {"available": True, "login": login, "repos": list_github_repos()}
 
 
+# --- Jira Cloud ticket polling --------------------------------------------------
+# Optional: with user-scoped Jira Cloud creds in the env (JIRA_SITE + JIRA_EMAIL
+# + JIRA_TOKEN — an ordinary Atlassian API token, Basic auth), the agent polls
+# the tickets assigned to that user on a slow cadence and reports them as the
+# heartbeat's `jira` block. The hub's /board page merges every host's block into
+# one cross-org Kanban, keyed by siteKey (normalized site host) so several
+# agents sharing an org collapse to one board. Read-only by construction — the
+# only endpoint ever called is issue search. Unset env = feature off: zero Jira
+# HTTP calls, and the block heartbeats as available=False.
+JIRA_SITE = os.environ.get("JIRA_SITE", "").strip()
+JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "").strip()
+JIRA_TOKEN = os.environ.get("JIRA_TOKEN", "").strip()
+try:
+    JIRA_REFRESH_EVERY = int(os.environ.get("TURMA_JIRA_REFRESH_EVERY", "30"))
+except ValueError:
+    JIRA_REFRESH_EVERY = 30   # beats between polls (30 × 20s beat ≈ 10 min)
+JIRA_TIMEOUT_SEC = 15
+JIRA_PAGE_SIZE = 100    # /search/jql hard-caps maxResults at 100
+JIRA_MAX_ACTIVE = 150   # not-Done tickets reported (bounds the heartbeat)
+JIRA_MAX_DONE = 50      # recently-Done tickets reported
+JIRA_DONE_DAYS = 14     # how far back the Done column reaches
+JIRA_MAX_PAGES = 5      # hard bound on pagination per query
+
+# Full block schema even when off/unavailable, mirroring the github block's
+# contract: the hub always sees every field, never a partial dict.
+JIRA_EMPTY = {"available": False, "site": None, "siteKey": None, "user": None,
+              "fetchedAt": None, "error": None, "truncated": False, "tickets": []}
+
+# fields.status.statusCategory.key is one of Jira's three fixed, cross-org
+# categories — the only workflow facet guaranteed to unify orgs with different
+# status schemes, hence the board's column model.
+_JIRA_CATEGORY = {"new": "todo", "indeterminate": "inprogress", "done": "done"}
+
+
+def jira_configured():
+    return bool(JIRA_SITE and JIRA_EMAIL and JIRA_TOKEN)
+
+
+def normalize_jira_site(raw):
+    """A Jira site spec ('myorg.atlassian.net', 'https://MyOrg.atlassian.net/',
+    even a pasted board URL) -> the bare lowercase host, the cross-host
+    `siteKey` the hub dedupes boards on. '' when nothing host-like remains."""
+    r = (raw or "").strip()
+    r = re.sub(r"^[a-zA-Z][\w.+-]*://", "", r)   # scheme
+    r = re.sub(r"^[^/@]+@", "", r)               # credentials
+    r = r.split("/", 1)[0].split(":", 1)[0]      # path, port
+    return r.strip(".").lower()
+
+
+def jira_get(path, params):
+    """One authenticated GET against the configured Jira Cloud site, parsed
+    JSON out. Exceptions propagate — collect_jira()'s caller turns them into
+    the block's `error` (stale-cache fail-open)."""
+    site = normalize_jira_site(JIRA_SITE)
+    url = f"https://{site}{path}?{urllib.parse.urlencode(params)}"
+    auth = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Basic {auth}",
+        "Accept": "application/json",
+        # Explicit UA for parity with the hub POSTs (some edges 403 the
+        # default Python-urllib signature).
+        "User-Agent": "turma-agent/1.0",
+    })
+    with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _shape_issue(issue, site_key):
+    """One raw REST-v3 search issue -> the compact wire ticket the board
+    renders. Everything optional degrades to None/[] rather than raising."""
+    fields = issue.get("fields") or {}
+    key = issue.get("key") or ""
+    status = fields.get("status") or {}
+    category = ((status.get("statusCategory") or {}).get("key") or "").lower()
+
+    def name_of(field):
+        v = fields.get(field)
+        return (v or {}).get("name") if isinstance(v, dict) else None
+
+    project = fields.get("project") or {}
+    parent = fields.get("parent") or {}
+    labels = fields.get("labels")
+    return {
+        "key": key,
+        "url": f"https://{site_key}/browse/{key}",
+        "summary": (fields.get("summary") or "")[:200],
+        "status": status.get("name"),                 # org-specific name (pill)
+        "statusCategory": _JIRA_CATEGORY.get(category, "todo"),  # column
+        "priority": name_of("priority"),
+        "type": name_of("issuetype"),
+        "project": project.get("key"),
+        "projectName": project.get("name"),
+        "labels": labels[:5] if isinstance(labels, list) else [],
+        "updated": fields.get("updated"),
+        "created": fields.get("created"),
+        "dueDate": fields.get("duedate"),
+        "parentKey": parent.get("key"),
+    }
+
+
+def fetch_jira_issues(jql, max_issues):
+    """All issues matching a JQL, shaped, via GET /rest/api/3/search/jql —
+    the nextPageToken-paginated replacement for the removed (410 since 2025)
+    /rest/api/3/search. Returns (tickets, truncated): truncated means the cap
+    (or the page bound) cut the result short."""
+    site_key = normalize_jira_site(JIRA_SITE)
+    tickets, token = [], None
+    for _ in range(JIRA_MAX_PAGES):
+        params = {
+            "jql": jql,
+            "maxResults": min(JIRA_PAGE_SIZE, max_issues - len(tickets)),
+            "fields": "summary,status,priority,issuetype,updated,created,"
+                      "duedate,labels,project,parent",
+        }
+        if token:
+            params["nextPageToken"] = token
+        data = jira_get("/rest/api/3/search/jql", params)
+        for issue in data.get("issues") or []:
+            tickets.append(_shape_issue(issue, site_key))
+        token = data.get("nextPageToken")
+        if not token:
+            return tickets, False
+        if len(tickets) >= max_issues:
+            return tickets[:max_issues], True
+    return tickets[:max_issues], True
+
+
+def collect_jira():
+    """The heartbeat's `jira` block: the configured user's assigned tickets on
+    this host's org. Two separate queries — active work, and a bounded window
+    of recently-Done so that column is populated without growing forever —
+    with separate caps so neither can crowd the other out."""
+    if not jira_configured():
+        return dict(JIRA_EMPTY)
+    site_key = normalize_jira_site(JIRA_SITE)
+    active, trunc_active = fetch_jira_issues(
+        "assignee = currentUser() AND statusCategory != Done"
+        " ORDER BY updated DESC", JIRA_MAX_ACTIVE)
+    done, trunc_done = fetch_jira_issues(
+        "assignee = currentUser() AND statusCategory = Done"
+        f" AND updated >= -{JIRA_DONE_DAYS}d ORDER BY updated DESC",
+        JIRA_MAX_DONE)
+    return {
+        "available": True,
+        "site": site_key,
+        "siteKey": site_key,
+        "user": JIRA_EMAIL,
+        "fetchedAt": now_iso(),
+        "error": None,
+        "truncated": trunc_active or trunc_done,
+        "tickets": active + done,
+    }
+
+
 # --- Session activity summaries ------------------------------------------------
 # Optionally give each session a few-word "name" describing its task (e.g.
 # "Adding Compose Flag"), generated once at spawn from the initial prompt by the
@@ -2323,6 +2478,9 @@ class SessionManager:
         # view is heartbeated).
         self.github = {"available": False, "login": None, "repos": []}
         self.clones = {}
+        # Jira Cloud assigned-ticket block (refreshed on its own slow cadence,
+        # reported every beat; stays the empty shape on unconfigured hosts).
+        self.jira = dict(JIRA_EMPTY)
         # Recent per-repo prune results (merged branches + safe worktrees swept),
         # keyed by repo name, lingered briefly so the UI can show the summary.
         self.prunes = {}
@@ -3552,6 +3710,20 @@ class SessionManager:
             log(f"github refresh failed: {e}")
             self.github = {"available": False, "login": None, "repos": []}
 
+    def refresh_jira(self):
+        """Refresh the cached Jira assigned-tickets block. Fail-open the
+        pr_status way, not the github-block way: a fetch error KEEPS the prior
+        tickets/fetchedAt and only records the error string, so a transient
+        Jira hiccup degrades the board to stale-but-shown (with the error
+        surfaced) rather than blanking it until the next slow beat."""
+        try:
+            self.jira = collect_jira()
+        except Exception as e:
+            log(f"jira refresh failed: {e}")
+            prev = dict(self.jira)
+            prev["error"] = str(e)[:200]
+            self.jira = prev
+
     def refresh_pr_status(self):
         """Refresh cached state + CI checks for the PRs live sessions opened, via
         `gh pr view`. Slow-ish cadence, best-effort; skipped when gh has no
@@ -4512,6 +4684,10 @@ class SessionManager:
         # gh calls); clone jobs are reaped every beat (cheap poll()s).
         if not light and beat % GITHUB_REFRESH_EVERY == 0:
             self.refresh_github()
+        # Jira assigned tickets on their own slow cadence; the configured()
+        # guard keeps unconfigured hosts at zero Jira HTTP calls forever.
+        if not light and beat % JIRA_REFRESH_EVERY == 0 and jira_configured():
+            self.refresh_jira()
         # PR state + CI checks for the links live sessions opened, on a faster
         # cadence than the github block so a card's merge/CI status stays live.
         if not light and beat % PR_STATUS_REFRESH_EVERY == 0:
@@ -4552,6 +4728,9 @@ class SessionManager:
             # GitHub clone-into-root: availability + clonable repos for the hub's
             # clone control, and any in-flight/recent clone jobs.
             "github": self.github,
+            # Jira Cloud assigned tickets (user-scoped creds); the hub's /board
+            # merges these across hosts by siteKey into one cross-org Kanban.
+            "jira": self.jira,
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),

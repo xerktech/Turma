@@ -558,6 +558,44 @@ test("http: heartbeat auth (bearer or user basic, nothing else)", async () => {
   );
 });
 
+// ---- Jira board page + heartbeat block ----------------------------------------
+
+test("http: /board page and /board.js are user-gated like the rest of the UI", async () => {
+  assert.equal((await request("GET", "/board")).status, 401);
+  assert.equal((await request("GET", "/board", { headers: agentHeaders })).status, 401);
+  const page = await request("GET", "/board", { headers: userHeaders });
+  assert.equal(page.status, 200);
+  assert.match(page.raw, /kanban|TurmaBoard/i);
+  // board.js rides the static-asset allowlist (same treatment as chat.js).
+  const js = await request("GET", "/board.js", { headers: userHeaders });
+  assert.equal(js.status, 200);
+  assert.match(js.raw, /mergeSites/);
+});
+
+test("http: a heartbeat's jira block round-trips verbatim to /api/agents", async () => {
+  const jira = {
+    available: true,
+    site: "myorg.atlassian.net",
+    siteKey: "myorg.atlassian.net",
+    user: "me@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z",
+    error: null,
+    truncated: false,
+    tickets: [{ key: "PROJ-1", url: "https://myorg.atlassian.net/browse/PROJ-1",
+                summary: "Test", status: "In Review", statusCategory: "inprogress",
+                priority: "High", type: "Bug", project: "PROJ", labels: [],
+                updated: "2026-07-14T11:00:00Z" }],
+  };
+  assert.equal(
+    (await request("POST", "/api/heartbeat", { body: { device: "jira-host", jira }, headers: agentHeaders })).status,
+    200
+  );
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = res.body.agents.find((a) => a.key === "jira-host");
+  assert.ok(rec, "heartbeated host is served");
+  assert.deepEqual(rec.jira, jira);
+});
+
 // ---- mobile push device registry ----------------------------------------------
 
 test("http: /api/devices register + unregister is user-authed", async () => {

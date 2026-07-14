@@ -688,6 +688,7 @@ setInterval(() => {
 const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
 const HISTORY = fs.readFileSync(path.join(__dirname, "public", "history.html"));
 const SESSIONS = fs.readFileSync(path.join(__dirname, "public", "sessions.html"));
+const BOARD = fs.readFileSync(path.join(__dirname, "public", "board.html"));
 const LOGIN = fs.readFileSync(path.join(__dirname, "public", "login.html"));
 
 // Branded static assets: the shared stylesheet, self-hosted UI fonts (Inter +
@@ -703,6 +704,7 @@ const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 const STATIC_ASSETS = {
   "/app.css":              { body: fs.readFileSync(path.join(__dirname, "public", "app.css")),             type: "text/css; charset=utf-8",                  cache: "public, max-age=300" },
   "/chat.js":              { body: fs.readFileSync(path.join(__dirname, "public", "chat.js")),             type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
+  "/board.js":             { body: fs.readFileSync(path.join(__dirname, "public", "board.js")),            type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
   "/favicon.svg":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.svg")),         type: "image/svg+xml",                            cache: IMMUTABLE_CACHE },
   "/favicon.ico":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.ico")),         type: "image/x-icon",                             cache: IMMUTABLE_CACHE },
   "/favicon-16.png":       { body: fs.readFileSync(path.join(__dirname, "public", "favicon-16.png")),      type: "image/png",                                cache: IMMUTABLE_CACHE },
@@ -1197,6 +1199,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && (url.pathname === "/sessions" || url.pathname === "/sessions.html")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       return res.end(SESSIONS);
+    }
+
+    // Unified Jira Kanban across every agent's org (the agents' `jira`
+    // heartbeat blocks; merging happens client-side in board.js).
+    if (req.method === "GET" && (url.pathname === "/board" || url.pathname === "/board.html")) {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(BOARD);
     }
 
     // Web font for the live terminal (referenced by the @font-face proxyTerm
