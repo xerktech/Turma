@@ -287,9 +287,14 @@ function repoSeries(agents) {
 // series carries the same normalized shape as a repo one — `models` a Map, the
 // windows always present — and every reader below works on either.
 function hostSeries(agents) {
-  return agents.filter(a => a.usage).map(a => {
+  return agents.map(a => {
     const usage = blankUsage();
-    mergeUsageInto(usage, a.usage);
+    // Prefer the host-level block (aggregated from every transcript on the
+    // box). An older agent that reports none still sends per-repo blocks, so
+    // fall back to those rather than dropping the host out of the view — the
+    // dashboard tiles and the Android client fall back the same way.
+    if (a.usage) mergeUsageInto(usage, a.usage);
+    else for (const r of a.repoUsage || []) mergeUsageInto(usage, r.usage);
     return {
       skey: "host::" + a.key,
       group: "Hosts",
@@ -300,7 +305,9 @@ function hostSeries(agents) {
       rcName: a.device || a.key,
       usage,
     };
-  });
+  // A host that has consumed nothing at all isn't a series (this is the filter
+  // the `a.usage` guard used to do implicitly).
+  }).filter(s => dayTokens(s.usage.totals) > 0);
 }
 
 function toSeries(agents) {
@@ -392,9 +399,12 @@ function textureDefs(NS, paints) {
   return defs;
 }
 
-// The HTML (legend / tooltip / model-bar) counterpart of fillOf.
+// The HTML (legend / tooltip) counterpart of fillOf. Sets background-COLOR, not
+// the `background` shorthand: the shorthand also resets background-image to
+// none, and an inline style beats the .tx-* rule, so the texture would silently
+// never paint.
 function paintSwatch(el, paint) {
-  el.style.background = paint.hue;
+  el.style.backgroundColor = paint.hue;
   if (paint.texture !== "solid") el.classList.add("tx-" + paint.texture);
 }
 
