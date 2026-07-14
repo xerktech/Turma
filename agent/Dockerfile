@@ -29,10 +29,17 @@ ARG POWERSHELL_VERSION=7.6.3
 # transitive deps (e.g. undici); the image scan gates on npm's node_modules.
 ARG NPM_VERSION=11.18.0
 
+# The libpulse0..libasound2 run of packages below are the Android emulator's
+# system shared libs (see the Android layer). It bundles most of its own deps,
+# but not these — libxkbfile1 in particular is needed by qemu-system-x86_64,
+# which fails to exec without it even fully headless. Don't prune them.
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates curl ripgrep tmux \
       python3 python3-pip python3-venv python-is-python3 libicu72 ncurses-term \
       unzip openjdk-17-jdk-headless \
+      libpulse0 libnss3 libxcomposite1 libxcursor1 libxdamage1 libxi6 libxtst6 \
+      libxrandr2 libxkbfile1 libgl1 libasound2 \
  && curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \
       | tar -xz --strip-components=1 -C /usr/local/bin docker/docker \
  && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
@@ -48,22 +55,43 @@ RUN apt-get update \
 
 # --- Android build tooling layer (stable, large) ----------------------------
 # JDK 17 (installed in the base apt layer above) + Gradle + the Android SDK
-# (cmdline-tools, platform-tools, one platform + build-tools) so an agent can
-# build/test Android apps (e.g. the android/ Turma client) out of the box —
-# `gradle`, `sdkmanager`, `adb`, and `aapt2` are all on PATH. Its own trailing
-# layer with its own version ARGs, placed AHEAD of the volatile coding-agent
-# ARGs below so a Claude Code release bump can't invalidate (and re-download)
-# this ~2 GB layer. Bump these pins to clear CVEs the image scan flags; add more
-# platforms/build-tools here if a project needs a different compileSdk.
+# (cmdline-tools, platform-tools, one platform + build-tools, the emulator + a
+# headless x86_64 system image + a pre-created AVD) so an agent can build, test,
+# AND run/troubleshoot Android apps (e.g. the android/ Turma client) out of the
+# box — `gradle`, `sdkmanager`, `avdmanager`, `emulator`, `adb`, and `aapt2` are
+# all on PATH. Its own trailing layer with its own version ARGs, placed AHEAD of
+# the volatile coding-agent ARGs below so a Claude Code release bump can't
+# invalidate (and re-download) this ~3.5 GB layer. Bump these pins to clear CVEs
+# the image scan flags; add more platforms/build-tools here if a project needs a
+# different compileSdk.
+#
+# Running the emulator needs hardware acceleration: the DockerOps compose must
+# pass the host's KVM device through to the agent container (`devices:
+# ["/dev/kvm"]`). Without it, boot the emulator in software mode
+# (`emulator -avd turma -no-window -gpu swiftshader_indirect -no-accel`), which
+# works but is slow. The X11/GL/audio shared libs the (windowless) emulator
+# still links are installed in the base apt layer above.
+#
+# The ENV PATH below covers processes that inherit the container env (hub-agent,
+# each session's claude, and its Bash tool). A *login* shell — what tmux/ttyd
+# spawns when an operator attaches — does NOT: Debian's /etc/profile
+# unconditionally resets root's PATH, dropping /opt/gradle and /opt/android-sdk
+# (tools in /usr/local/bin survive). The generated /etc/profile.d/android.sh
+# re-exports the toolchain so it's on PATH either way — keep both.
 ARG GRADLE_VERSION=8.11.1
 ARG ANDROID_CMDLINE_TOOLS=11076708
 ARG ANDROID_PLATFORM=android-35
 ARG ANDROID_BUILD_TOOLS=35.0.0
+# System-image coordinates for the emulator. google_apis (not google_apis_playstore)
+# so the image is rootable/writable for testing; x86_64 so it runs KVM-accelerated
+# on the host. The full package id is system-images;<platform>;<tag>;<abi>.
+ARG ANDROID_EMULATOR_TAG=google_apis
+ARG ANDROID_EMULATOR_ABI=x86_64
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
     ANDROID_HOME=/opt/android-sdk \
     ANDROID_SDK_ROOT=/opt/android-sdk \
     GRADLE_HOME=/opt/gradle/gradle-${GRADLE_VERSION}
-ENV PATH="${GRADLE_HOME}/bin:${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}"
+ENV PATH="${GRADLE_HOME}/bin:${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/emulator:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}:${PATH}"
 RUN set -eux; \
     curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip; \
     mkdir -p /opt/gradle; unzip -q /tmp/gradle.zip -d /opt/gradle; rm /tmp/gradle.zip; \
@@ -72,8 +100,20 @@ RUN set -eux; \
     unzip -q /tmp/actools.zip -d "${ANDROID_HOME}/cmdline-tools"; rm /tmp/actools.zip; \
     mv "${ANDROID_HOME}/cmdline-tools/cmdline-tools" "${ANDROID_HOME}/cmdline-tools/latest"; \
     yes | sdkmanager --licenses >/dev/null; \
-    sdkmanager --install "platform-tools" "platforms;${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" >/dev/null; \
-    chmod -R a+rX "${ANDROID_HOME}" /opt/gradle
+    sdkmanager --install "platform-tools" "platforms;${ANDROID_PLATFORM}" \
+      "build-tools;${ANDROID_BUILD_TOOLS}" "emulator" \
+      "system-images;${ANDROID_PLATFORM};${ANDROID_EMULATOR_TAG};${ANDROID_EMULATOR_ABI}" >/dev/null; \
+    echo "no" | avdmanager create avd -n turma --force \
+      -k "system-images;${ANDROID_PLATFORM};${ANDROID_EMULATOR_TAG};${ANDROID_EMULATOR_ABI}"; \
+    chmod -R a+rX "${ANDROID_HOME}" /opt/gradle; \
+    printf '%s\n' \
+      'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64' \
+      "export ANDROID_HOME=${ANDROID_HOME}" \
+      "export ANDROID_SDK_ROOT=${ANDROID_HOME}" \
+      "export GRADLE_HOME=${GRADLE_HOME}" \
+      "export PATH=\"\${GRADLE_HOME}/bin:\${ANDROID_HOME}/cmdline-tools/latest/bin:\${ANDROID_HOME}/emulator:\${ANDROID_HOME}/platform-tools:\${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}:\${PATH}\"" \
+      > /etc/profile.d/android.sh; \
+    chmod 0644 /etc/profile.d/android.sh
 
 # --- Coding-agent layer (volatile) ------------------------------------------
 # CI pins these to the latest published release on every build, so they change
