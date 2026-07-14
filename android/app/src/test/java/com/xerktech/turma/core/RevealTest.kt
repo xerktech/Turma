@@ -18,7 +18,8 @@ class RevealTest {
     }
 
     @Test fun `live turn with a new id types from zero`() {
-        val s = advanceReveal(RevealState("old", 5), "turn", 300, 100, live = true)
+        // target 100 stays under the 200-char snap threshold, so it types.
+        val s = advanceReveal(RevealState("old", 5), "turn", 100, 100, live = true)
         // rate 150cps * 0.1s = 15 chars
         assertEquals(15, s.shown)
         assertEquals("turn", s.entryId)
