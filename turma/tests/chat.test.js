@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderProse, prFooterChip, __setVerbosity, __setNoExpand } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderProse, prFooterChip, filterModeOpts, MODE_OPTS, __setVerbosity, __setNoExpand } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -342,6 +342,35 @@ test("prFooterChip: escapes a malicious PR title (no injection)", () => {
   const html = prFooterChip({ prs: [{ url: "https://github.com/o/r/pull/1", number: 1, state: "OPEN", title: '<img src=x onerror=alert(1)>' }] });
   assert.doesNotMatch(html, /<img/);
   assert.match(html, /&lt;img/);
+});
+
+// ---- filterModeOpts (mode selector shows only reachable modes) -----------
+const modeVals = (opts) => opts.map((o) => o.value);
+
+test("filterModeOpts: no permissionModes info -> every mode shown (older agent)", () => {
+  assert.deepEqual(filterModeOpts(MODE_OPTS, undefined, "auto"), MODE_OPTS);
+  assert.deepEqual(filterModeOpts(MODE_OPTS, null, "auto"), MODE_OPTS);
+});
+
+test("filterModeOpts: auto-launched cycle hides the unreachable bypassPermissions", () => {
+  const avail = ["default", "acceptEdits", "plan", "auto"];
+  assert.deepEqual(modeVals(filterModeOpts(MODE_OPTS, avail, "auto")),
+    ["auto", "acceptEdits", "plan", "default"]);  // MODE_OPTS order, no bypass
+});
+
+test("filterModeOpts: bypass-launched cycle shows bypass, hides the unreachable auto", () => {
+  const avail = ["default", "acceptEdits", "plan", "bypassPermissions"];
+  const vals = modeVals(filterModeOpts(MODE_OPTS, avail, "bypassPermissions"));
+  assert.ok(vals.includes("bypassPermissions"));
+  assert.ok(!vals.includes("auto"));
+});
+
+test("filterModeOpts: the current mode is always kept even if not in the reachable set", () => {
+  // Defensive: a stale current mode outside the reported cycle still appears, so
+  // the selector never hides the active choice.
+  const avail = ["default", "acceptEdits", "plan"];
+  const vals = modeVals(filterModeOpts(MODE_OPTS, avail, "bypassPermissions"));
+  assert.ok(vals.includes("bypassPermissions"));
 });
 
 // ---- renderProse (markdown tables in prose bubbles) ----------------------

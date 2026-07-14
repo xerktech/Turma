@@ -632,6 +632,20 @@
     const m = (sess && sess.permissionMode) ? sess.permissionMode : "auto";
     return MODE_OPTS.some((o) => o.value === m) ? m : "auto";
   }
+  // Restrict the mode menu to the modes this session's live Shift+Tab cycle can
+  // actually reach — the agent reports them as `session.permissionModes`
+  // (perm_cycle_for in hub-agent.py: the base modes plus whichever optional the
+  // session was launched into). Switching to a mode outside that set is a no-op
+  // agent-side, so we don't offer it. The current mode is always kept so the
+  // selector can never hide the active choice, and an older agent that omits the
+  // field falls back to showing every mode.
+  function filterModeOpts(allOpts, available, current) {
+    if (!Array.isArray(available)) return allOpts;
+    return allOpts.filter((o) => available.indexOf(o.value) !== -1 || o.value === current);
+  }
+  function availableModeOpts() {
+    return filterModeOpts(MODE_OPTS, sess && sess.permissionModes, currentModeValue());
+  }
   function optLabel(opts, val) { const o = opts.find((x) => x.value === val); return o ? o.label : val; }
   function menuHtml(opts, current, attr) {
     return opts.map((o) =>
@@ -683,12 +697,13 @@
     if (!host) return;
     if (fromPoll && host.querySelector(".cc-menu.open")) return;
     const mode = currentModeValue(), model = currentModelValue();
+    const modeOpts = availableModeOpts();
     host.innerHTML =
       '<span class="cc-opt cc-mode">' +
         '<button class="cc-btn" id="ccModeBtn" title="Agent (permission) mode — switched live, best-effort">' +
         '🛡 <span class="cc-val">' + esc(optLabel(MODE_OPTS, mode)) + '</span><span class="cc-caret">▾</span></button>' +
         '<span class="cc-menu" id="ccModeMenu"><span class="cc-hint">Agent mode</span>' +
-        menuHtml(MODE_OPTS, mode, "data-mode") + "</span></span>" +
+        menuHtml(modeOpts, mode, "data-mode") + "</span></span>" +
       '<span class="cc-right">' + prFooterChip(sess) +
         '<span class="cc-opt cc-model">' +
           '<button class="cc-btn" id="ccModelBtn" title="Model for this session">' +
@@ -986,6 +1001,7 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderProse, prFooterChip,
+      filterModeOpts, MODE_OPTS,
       __setVerbosity: (v) => { verbosity = v; },
       __setNoExpand: (v) => { noExpand = v; },
     };

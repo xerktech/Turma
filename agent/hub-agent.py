@@ -4222,6 +4222,11 @@ class SessionManager:
             "summary": sess.get("summary"),   # few-word auto task name (or None)
             "model": sess.get("model"),
             "permissionMode": sess.get("permissionMode"),
+            # The permission modes this session's live Shift+Tab cycle can reach
+            # (base modes + whichever optional it was launched into) — the hub's
+            # mode selector offers only these, since a switch to any other mode is
+            # a no-op agent-side. Launch-dependent; see perm_cycle_for / set_mode.
+            "permissionModes": perm_cycle_for(sess.get("launchPermissionMode")),
             "baseRef": sess.get("baseRef"),
             "status": sess.get("status"),
             "ttydPort": sess.get("ttydPort"),
