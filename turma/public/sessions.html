@@ -504,7 +504,7 @@
              round trip through the tunnels), and Enter sends the whole line via
              the session's /input endpoint, same as the dashboard's terminal. -->
         <div class="term-compose">
-          <textarea id="termInput" rows="1" placeholder="Type a message to the agent — Enter to send, Shift+Enter for newline"
+          <textarea id="termInput" rows="1" placeholder="Message the agent"
             oninput="autoGrowTermInput()" onkeydown="termInputKey(event)"></textarea>
           <button class="primary" id="termSend" onclick="sendTermInput()">Send</button>
         </div>
