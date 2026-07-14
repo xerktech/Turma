@@ -41,6 +41,14 @@ export function measureGeneration(): number {
   return measureGen;
 }
 
+// Measures a string with the current default measure — render.ts uses it to
+// reserve the hang-indent gutter's width when wrapping transcript turns, so a
+// prefixed continuation line never overflows the display (and picks up the same
+// pretext font metrics as wrapText once main.ts upgrades the default measure).
+export function measureDefault(s: string): number {
+  return defaultMeasure(s);
+}
+
 // Tolerance for float rounding in measure functions (px-per-char
 // multiplication isn't exact) — never lets a hair-thin overflow force an
 // extra wrap point.

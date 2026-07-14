@@ -129,3 +129,39 @@ describe("concise ingest (matches the web chat's Concise verbosity)", () => {
     expect(buf.entries.find((e) => e.id === "1")?.text).toBe("a full assistant response");
   });
 });
+
+describe("markdown de-noising (assistant text)", () => {
+  it("strips bold markers and inline code fences that render as literal noise", () => {
+    expect(conciseText("this is **important** and `code` here")).toBe("this is important and code here");
+  });
+
+  it("bares heading hashes and turns list bullets into •", () => {
+    expect(conciseText("## Plan\n- first\n- second\n* third")).toBe("Plan\n• first\n• second\n• third");
+  });
+
+  it("drops blockquote markers and fenced-code fence lines (keeping the code)", () => {
+    expect(conciseText("> quoted\n```js\nrun()\n```")).toBe("quoted\nrun()");
+  });
+
+  it("leaves snake_case identifiers and lone asterisks untouched", () => {
+    // A coding agent's prose is full of these; treating _ or a single * as
+    // emphasis would mangle real content.
+    expect(conciseText("call my_helper_fn with *.ts globs")).toBe("call my_helper_fn with *.ts globs");
+  });
+});
+
+describe("blank-line removal", () => {
+  it("collapses empty lines within an assistant turn (markdown paragraph gaps)", () => {
+    expect(conciseText("first paragraph\n\n\nsecond paragraph")).toBe("first paragraph\nsecond paragraph");
+  });
+
+  it("removes empty lines from a multi-line user turn too, without touching its text", () => {
+    const buf = mergeTail(emptyBuffer(), [entry("1", "line one\n\nline two", "user")]);
+    expect(buf.entries[0]?.text).toBe("line one\nline two");
+  });
+
+  it("leaves a single-line user turn (with brackets) exactly as typed", () => {
+    const buf = mergeTail(emptyBuffer(), [entry("1", "check [Read] the docs", "user")]);
+    expect(buf.entries[0]?.text).toBe("check [Read] the docs");
+  });
+});
