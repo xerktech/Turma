@@ -62,6 +62,9 @@ class Config private constructor(private val prefs: SharedPreferences) {
         private const val KEY_USER = "hub_user"
         private const val KEY_PASS = "hub_pass"
 
+        private const val SECURE_PREFS = "turma_secure_prefs"
+        private const val PLAIN_PREFS = "turma_prefs"
+
         @Volatile
         private var instance: Config? = null
 
@@ -69,18 +72,40 @@ class Config private constructor(private val prefs: SharedPreferences) {
             instance ?: build(context.applicationContext).also { instance = it }
         }
 
+        // Build the config store, guaranteeing this never throws — it runs in
+        // Application.onCreate, so any exception here silently kills the whole
+        // app on launch with no visible error. EncryptedSharedPreferences (the
+        // deprecated security-crypto lib) can throw on create() when its keyset
+        // is corrupt or the Android keystore is unavailable; we recover, and as
+        // a last resort fall back to plaintext app-private prefs so the app
+        // still starts (private storage, so the credential exposure is bounded).
         private fun build(context: Context): Config {
+            val prefs = securePrefs(context)
+                ?: context.getSharedPreferences(PLAIN_PREFS, Context.MODE_PRIVATE)
+            return Config(prefs)
+        }
+
+        private fun securePrefs(context: Context): SharedPreferences? = try {
+            createEncrypted(context)
+        } catch (_: Throwable) {
+            // A corrupt keyset makes create() throw every launch. Wipe the
+            // encrypted store and retry once; if it still fails, give up (the
+            // caller falls back to plaintext) rather than crash.
+            runCatching { context.deleteSharedPreferences(SECURE_PREFS) }
+            runCatching { createEncrypted(context) }.getOrNull()
+        }
+
+        private fun createEncrypted(context: Context): SharedPreferences {
             val masterKey = MasterKey.Builder(context)
                 .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
                 .build()
-            val prefs = EncryptedSharedPreferences.create(
+            return EncryptedSharedPreferences.create(
                 context,
-                "turma_secure_prefs",
+                SECURE_PREFS,
                 masterKey,
                 EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
             )
-            return Config(prefs)
         }
     }
 }
