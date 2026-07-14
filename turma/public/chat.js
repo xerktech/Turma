@@ -656,13 +656,8 @@
       apply(b.getAttribute(attr));
     }));
   }
-  // Compact PR status chip for the footer, next to 🛡 mode / 🧠 model. Shows the
-  // session's latest PR (state colour + #number + CI-check mark), links to it,
-  // and appends "+N" when the session opened more than one. "" when none.
-  function prFooterChip(s) {
-    const prs = (s && s.prs) || [];
-    if (!prs.length) return "";
-    const pr = prs[prs.length - 1];
+  // One PR badge (state colour + #number + CI-check mark), linked to the PR.
+  function prBadge(pr) {
     const url = pr.url || "";
     const m = url.match(/\/pull\/(\d+)/);
     const num = pr.number ? "#" + pr.number : (m ? "#" + m[1] : "PR");
@@ -672,10 +667,18 @@
     const checks = pr.checks;
     const mark = checks === "passing" ? "✓" : checks === "failing" ? "✗" : checks === "pending" ? "●" : "";
     const chk = mark ? ' <span class="pr-checks ' + checks + '" title="CI ' + esc(checks) + '">' + mark + "</span>" : "";
-    const more = prs.length > 1 ? " +" + (prs.length - 1) : "";
-    return '<span class="cc-opt cc-pr"><a class="pr-badge ' + cls + '" href="' + esc(url) +
+    return '<a class="pr-badge ' + cls + '" href="' + esc(url) +
       '" target="_blank" rel="noopener" title="' + esc(pr.title || url) + '">' +
-      '<span class="pr-dot"></span>' + esc(num) + (label ? " " + esc(label) : "") + chk + esc(more) + "</a></span>";
+      '<span class="pr-dot"></span>' + esc(num) + (label ? " " + esc(label) : "") + chk + "</a>";
+  }
+  // PR status chips for the footer, next to 🛡 mode / 🧠 model. Lists every PR
+  // the session opened (newest first — the freshest link leads), each linked
+  // with its own state colour + #number + CI-check mark. "" when none.
+  function prFooterChip(s) {
+    const prs = (s && s.prs) || [];
+    if (!prs.length) return "";
+    const badges = prs.slice().reverse().map(prBadge).join("");
+    return '<span class="cc-opt cc-pr">' + badges + "</span>";
   }
   // fromPoll: a background heartbeat repaint — don't yank an open menu shut.
   function renderComposeOpts(fromPoll) {
