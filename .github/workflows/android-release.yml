@@ -13,8 +13,9 @@ name: android-release
 # ever needed.
 #
 # Same self-hosted-runner + container constraints as android-ci.yml: the runners
-# can't pull ghcr.io and have no passwordless sudo, so the whole build runs
-# inside a Docker Hub image that bundles the JDK + Android SDK + Gradle.
+# can't pull ghcr.io and have no passwordless sudo, so the build runs inside a
+# Docker Hub image that bundles the JDK + Android SDK; Gradle is downloaded and
+# pinned in-job (the image doesn't put `gradle` on PATH).
 #
 # Versioning matches the repo: MAJOR.MINOR from the root VERSION file + this
 # run number as the patch. build.gradle.kts reads GITHUB_RUN_NUMBER for the
@@ -35,6 +36,9 @@ concurrency:
 
 permissions:
   contents: write # create releases + upload assets
+
+env:
+  GRADLE_VERSION: "8.11.1"
 
 jobs:
   release:
@@ -60,16 +64,21 @@ jobs:
           echo "tag=android-v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "asset=turma-android-v${VERSION}.apk" >> "$GITHUB_OUTPUT"
 
-      # Pin Gradle via the wrapper (the image's default Gradle may differ), then
-      # assemble the debug APK. GITHUB_RUN_NUMBER is present in the container, so
-      # build.gradle.kts stamps versionName=$VERSION / versionCode=$run_number.
-      - name: Bootstrap Gradle wrapper
-        working-directory: android
-        run: gradle wrapper --gradle-version 8.11.1 --no-daemon
+      - name: Install Gradle ${{ env.GRADLE_VERSION }}
+        run: |
+          set -eux
+          curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip
+          unzip -q -o /tmp/gradle.zip -d /opt
+          echo "/opt/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
 
+      - name: Ensure SDK packages
+        run: yes | sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
+
+      # GITHUB_RUN_NUMBER is present in the container, so build.gradle.kts stamps
+      # versionName=$VERSION / versionCode=$run_number to match the tag.
       - name: Assemble debug APK
         working-directory: android
-        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
 
       - name: Name the release asset
         run: cp android/app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/${{ steps.ver.outputs.asset }}"

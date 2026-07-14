@@ -17,6 +17,7 @@
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.Turma">
 
+        <!-- nosemgrep: java.android.security.exported_activity.exported_activity -- the single launcher activity must be exported; it holds no privileged control plane. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
