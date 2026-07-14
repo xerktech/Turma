@@ -557,6 +557,7 @@ const $active = document.getElementById("active");
 const $idle = document.getElementById("idle");
 const $stopped = document.getElementById("stopped");
 const $spawn = document.getElementById("spawn");
+const $sidebar = document.querySelector(".sidebar");
 const $counts = document.getElementById("counts");
 const $refreshed = document.getElementById("refreshed");
 
@@ -711,8 +712,21 @@ function restoreFieldFocus(f) {
   if (!f) return;
   const el = document.getElementById(f.id);
   if (!el) return;
-  el.focus();
+  // preventScroll: refocusing must not yank the sidebar around — we restore the
+  // scroll offset ourselves, and the field is already where the operator left it.
+  el.focus({ preventScroll: true });
   if (f.start != null) { try { el.setSelectionRange(f.start, f.end); } catch { /* not a text field */ } }
+}
+// The Task box's drag-to-resize handle writes an inline height the browser owns,
+// so the next innerHTML swap would drop it and snap the box back to min-height.
+// Snapshot each open composer's height before the swap and re-emit it as markup,
+// keyed by (host::repo) like composerDraft, so a dragged size survives the
+// re-render — and even a close/reopen of the same repo's composer.
+const composerHeight = new Map(); // "host::repo" -> inline height, e.g. "160px"
+function captureComposerHeights() {
+  for (const el of document.querySelectorAll(".composer textarea[data-rk]")) {
+    if (el.style.height) composerHeight.set(el.dataset.rk, el.style.height);
+  }
 }
 // Persist the composer's option selects as this repo's last-used prefs.
 function onOptChange(rk, repo) {
@@ -743,7 +757,9 @@ function composer(a, repo, rk, spawning) {
   return `<div class="composer">
     <div>
       <label>Task</label>
-      <textarea id="${cid(rk, "task")}" placeholder="Describe the task, or leave blank to start an empty session."
+      <textarea id="${cid(rk, "task")}" data-rk="${esc(rk)}"
+        ${composerHeight.has(rk) ? `style="height:${esc(composerHeight.get(rk))}"` : ""}
+        placeholder="Describe the task, or leave blank to start an empty session."
         oninput="draftSet('${esc(rk)}','task',this.value)"
         onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();${submit};}">${esc(d.task || "")}</textarea>
     </div>
@@ -937,9 +953,15 @@ function render(data) {
   const idle = running.filter(x => x.live.kind === "idle");
 
   const hosts = agents.filter(a => a.online && (a.repos || []).length);
-  // Preserve focus/caret in an open composer or a card's rename box across the
-  // innerHTML swaps below; restored once every list has been rebuilt.
+  // Preserve focus/caret (in an open composer or a card's rename box), the
+  // dragged Task-box height, and the sidebar's scroll offset across the
+  // innerHTML swaps below. The scroll offset matters because emptying a panel
+  // shrinks the sidebar's content, and the browser clamps scrollTop to the new
+  // (shorter) scroll range — refilling it doesn't undo the clamp, so every
+  // poll/SSE beat used to jump a scrolled sidebar back to the top.
   const focus = captureFieldFocus();
+  captureComposerHeights();
+  const scrollTop = $sidebar ? $sidebar.scrollTop : 0;
   $spawn.innerHTML = `
     <details class="spawn-wrap" ${spawnOpen ? "open" : ""} ontoggle="spawnOpen = this.open">
       <summary>+ New session <span class="chev">▾</span></summary>
@@ -969,7 +991,11 @@ function render(data) {
        </details>`
     : "";
 
+  // All the panels are back. Focus first — the rename box lives in the card
+  // lists, so it only exists now, and focusing it can itself scroll the sidebar
+  // — then undo any clamp the swaps (or that focus) caused.
   restoreFieldFocus(focus);
+  if ($sidebar && scrollTop && $sidebar.scrollTop !== scrollTop) $sidebar.scrollTop = scrollTop;
 
   // If the attached session vanished (killed elsewhere, host offline), drop the
   // stage back to the empty prompt.
@@ -1121,6 +1147,7 @@ function startSession(key, repo) {
   saveOpts(repo, { baseRef, model, permissionMode: perm, optionsExpanded: optionsOpen.has(rk) });
   composerOpen.delete(rk);
   composerDraft.delete(rk);
+  composerHeight.delete(rk);
   const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
     // Open the new session on the stage as soon as the agent reports it.
