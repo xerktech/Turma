@@ -35,7 +35,12 @@ function makeEl(id) {
     getBoundingClientRect() { return { top: 0, bottom: 0, height: 0 }; },
     scrollIntoView() {}, remove() {},
   };
-  Object.defineProperty(el, "innerHTML", { get() { return this._html; }, set(v) { this._html = String(v); } });
+  // `_onHtml` lets a test model what the real browser does around an innerHTML
+  // swap — chiefly clamping an ancestor's scrollTop while the panel is empty.
+  Object.defineProperty(el, "innerHTML", {
+    get() { return this._html; },
+    set(v) { this._html = String(v); if (this._onHtml) this._onHtml(); },
+  });
   return el;
 }
 
@@ -43,12 +48,17 @@ function makeEl(id) {
 // `search` seeds the page's query string (the ?session=/?spawn= deep links,
 // read once at load); `opened` collects the sessions TurmaChat.open() is asked
 // to put on the stage, which is how the select-on-arrival tests observe it.
-function loadPage({ search = "" } = {}) {
+// `sidebar` opts in to a stand-in for the real scrolling <aside class="sidebar">,
+// which the shim's null-returning querySelector otherwise hides from the page;
+// `textareas` is what document.querySelectorAll(".composer textarea[data-rk]")
+// finds, i.e. the composer boxes already on screen when a re-render starts.
+function loadPage({ search = "", sidebar = null, textareas = [] } = {}) {
   const els = {};
   const opened = [];
   const document = {
     getElementById(id) { return (els[id] ||= makeEl(id)); },
-    querySelector() { return null; }, querySelectorAll() { return []; },
+    querySelector(sel) { return sel === ".sidebar" ? sidebar : null; },
+    querySelectorAll(sel) { return sel.includes(".composer textarea") ? textareas : []; },
     createElement(tag) { return makeEl("<" + tag + ">"); },
     addEventListener() {}, removeEventListener() {},
     body: makeEl("body"), activeElement: null,
@@ -80,7 +90,7 @@ function loadPage({ search = "" } = {}) {
   // /api/agents fetch that normally fills `cache` before render() — the
   // select-on-arrival path reads it, so a bare render() isn't enough.
   const fn = new Function(...names, "window",
-    script + "\n;return { render, selectSession, followSpawn, setCache: (c) => { cache = c; } };");
+    script + "\n;return { render, selectSession, followSpawn, toggleComposer, setCache: (c) => { cache = c; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
@@ -227,4 +237,36 @@ test("the Ended-sessions archive browser is gone from the sidebar markup", () =>
   assert.ok(!/id="archiveWrap"/.test(html), "no #archiveWrap element");
   assert.ok(!/id="archiveDetails"/.test(html), "no #archiveDetails element");
   assert.ok(/id="idle"/.test(html), "new #idle section present");
+});
+
+// --- composer survives the poll/SSE re-render --------------------------------
+// Both of these guard the same hazard from opposite sides: render() rebuilds the
+// whole spawn panel with innerHTML on every heartbeat, and anything the browser
+// owns rather than our markup (an inline height the resize handle wrote, the
+// sidebar's scroll offset) is collateral damage unless render() carries it over.
+
+test("a Task box dragged taller keeps its height across a re-render", () => {
+  // The composer already on screen, as the resize handle left it.
+  const dragged = { style: { height: "160px" }, dataset: { rk: "hostA::repoX" } };
+  const { beat, toggleComposer, els } = loadPage({ textareas: [dragged] });
+  const { now, host: h } = host([]);
+  beat({ now, agents: [h] });
+  toggleComposer("hostA::repoX", "repoX");
+  assert.ok(els.spawn.innerHTML.includes('id="cmp-task-hostA__repoX"'), "composer is open");
+
+  beat({ now, agents: [h] }); // the heartbeat that used to snap it back to min-height
+  assert.match(els.spawn.innerHTML, /style="height:160px"/);
+});
+
+test("a scrolled sidebar stays put across a re-render", () => {
+  const sidebar = { scrollTop: 0 };
+  const { beat, els } = loadPage({ sidebar });
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+
+  sidebar.scrollTop = 240;                       // operator scrolls down
+  els.spawn._onHtml = () => { sidebar.scrollTop = 0; }; // browser clamps while the panel is empty
+  beat({ now, agents: [h] });
+
+  assert.equal(sidebar.scrollTop, 240, "render must restore the offset the swap clamped away");
 });

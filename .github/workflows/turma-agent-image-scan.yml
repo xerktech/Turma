@@ -31,9 +31,10 @@ jobs:
   scan:
     runs-on: [self-hosted, linux]
     env:
-      # Unique per-run tag: concurrent scans of different PRs on one runner
-      # would otherwise overwrite each other's local/turma-agent:pr-scan mid-scan,
-      # and it lets cleanup remove exactly this run's image.
+      # Image name recorded inside the build archive. Now only metadata (the
+      # daemon never loads it, and the archive itself is isolated in this job's
+      # runner.temp), but kept per-run so a scan's output still names the run it
+      # came from.
       SCAN_TAG: local/turma-agent:pr-${{ github.run_id }}
     steps:
       - name: Reset workspace ownership
@@ -41,43 +42,56 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      # Headroom guard, NOT a guaranteed fix — read before relying on it.
-      #
-      # Trivy exports every uncompressed layer to scratch before scanning, so a
-      # scan needs roughly twice the image in free disk. Once the agent image
-      # gained the Android emulator + system image, a scan died here with "no
-      # space left on device" on this shared runner (~85% full from other jobs,
-      # ~18G free). It passed on a re-run that happened to start with ~27G free.
-      #
-      # So the margin is thin and the real constraint is runner capacity. The
-      # prune below is a safety valve for stale cache, not the thing that made it
-      # pass: layers do stay pinned by buildkit cache records rather than the tag
-      # (the post-scan `docker rmi` reclaims 0B), but on a busy runner that cache
-      # is usually younger than the filter and this reclaims 0B too.
+      # Headroom guard. The structural fix for this job's disk problem is the
+      # build/scan handoff below (one image copy instead of three); this step
+      # just clears stale cache so the remaining copies have room.
       #
       # Pruning by AGE is deliberate. The cleanup note below rightly rejects an
       # unfiltered `-a` prune — this repo's two scan jobs share one runner and
-      # `-a` yanks cache out from under the other job's in-flight build — but an
-      # until= filter can't reach a concurrent job's cache, which is fresh by
-      # definition. If this job starts failing on disk again, the fix is runner
-      # headroom (or a shorter window here), not a bigger hammer.
+      # `-a` yanks cache out from under the other job's in-flight build. An
+      # until= filter cannot do that: buildkit ages a cache record from when it
+      # was last USED, so a concurrent build's cache is 0 minutes old and no
+      # window reaches it.
+      #
+      # The window was 24h and reclaimed 0B on every observed run — on a runner
+      # building this image for several PRs an hour, no record is ever a day
+      # idle, so the guard never fired. 3h still cannot touch a live build (they
+      # last ~10 min) but does evict the previous hours' PR scans, which is what
+      # actually accumulates here.
       - name: Reclaim disk before build
         run: |
           df -h / || true
           docker image prune -f || true
-          docker builder prune -f --filter until=24h || true
+          docker builder prune -f --filter until=3h || true
           df -h / || true
 
       - uses: docker/setup-buildx-action@v4
 
-      # Build into the local docker daemon (load, not push) so Trivy can scan
-      # the exact image this repo would ship. gha cache keeps it quick.
+      # Build to a docker-archive on disk, NOT into the local docker daemon.
+      #
+      # `load: true` was costing two extra full copies of this multi-GB image,
+      # both of which existed only to hand it from buildx to Trivy:
+      #   1. load itself exports an OCI tarball and imports it into containerd's
+      #      content store (a scan died in exactly this step: "importing to
+      #      docker … no space left on device", with 31G free);
+      #   2. `trivy image <tag>` then exports the image straight back OUT of the
+      #      daemon to its own tarball before it can read it (another scan died
+      #      there: "docker-export-… no space left on device", with 37G free —
+      #      the build itself had succeeded).
+      # So the image landed on disk ~4x at once: buildkit snapshots + content
+      # store + Trivy's re-export + Trivy's uncompressed layer scratch.
+      #
+      # Writing the archive once and pointing Trivy at it with --input drops
+      # both middle copies and deletes the two steps that actually failed. Trivy
+      # analyses a docker-archive identically to a daemon image (same layers,
+      # same flags), so the gate is unchanged. The daemon never sees the image,
+      # which is also why cleanup below is an rm rather than a docker rmi.
       - name: Build agent image (local, no push)
         uses: docker/build-push-action@v7
         with:
           context: ./agent
-          load: true
           push: false
+          outputs: type=docker,dest=${{ runner.temp }}/agent-image.tar
           tags: ${{ env.SCAN_TAG }}
           # Share the agent image's cache scope with the build workflow so the
           # PR scan and the post-merge build prime each other's layer cache.
@@ -114,7 +128,10 @@ jobs:
       # set churns with every toolchain bump, so pinning each CVE in .trivyignore
       # would be an endless chase. The agent's actual runtime (node, the manager,
       # gh, ttyd, docker CLI, PowerShell, OS packages) is still fully scanned.
-      # TMPDIR → runner.temp: Trivy exports each uncompressed image layer to a
+      # --input: scan the archive the build just wrote (see the build step) so
+      # the image is never loaded into, nor exported back out of, the daemon.
+      #
+      # TMPDIR → runner.temp: Trivy still extracts each uncompressed layer to a
       # scratch file before scanning, and the agent image (node/npm/gh/ttyd/
       # docker CLI + the Android toolchain) is large enough to blow out the
       # runner container's small /tmp ("no space left on device"). runner.temp
@@ -129,7 +146,7 @@ jobs:
           # the build-toolchain dirs skipped the secret scanner over the
           # remaining layers routinely brushes the default ceiling and dies with
           # "context deadline exceeded" (Trivy itself recommends raising it).
-          trivy image "$SCAN_TAG" \
+          trivy image --input "${RUNNER_TEMP}/agent-image.tar" \
             --scanners vuln,secret \
             --severity CRITICAL,HIGH \
             --ignore-unfixed \
@@ -142,19 +159,19 @@ jobs:
             --exit-code 1 \
             --no-progress
 
-      # The loaded image is multi-GB and nothing else removes it: left in the
-      # shared runner's docker daemon it goes dangling on the next run and
-      # accumulates until the disk fills (which has taken CI down). Remove only
-      # this run's tag plus dangling layers — pulled base images (node, busybox)
-      # stay for other jobs. Deliberately NOT `docker builder prune`: this repo's
-      # two scan jobs (turma-agent + turma) run concurrently on one runner, and an
-      # `-a` cache prune here yanks build cache out from under the other job's
-      # in-flight build (buildkit aborts with "graceful_stop"). Build cache is
-      # bounded by buildkit's own GC and the external gha cache, so it isn't the
-      # leak. Never fails the job.
+      # The build archive is multi-GB. runner.temp is cleaned per job, but this
+      # runner is shared and the next job's build starts before that helps, so
+      # drop it the moment the scan is done rather than holding it to job end.
+      # `if: always()` because a FAILING scan must not leak it either.
+      #
+      # Deliberately NOT `docker builder prune`: this repo's two scan jobs
+      # (turma-agent + turma) run concurrently on one runner, and an `-a` cache
+      # prune here yanks build cache out from under the other job's in-flight
+      # build (buildkit aborts with "graceful_stop"). The age-filtered prune at
+      # the top of this job is the safe version of that. Never fails the job.
       - name: Clean up scan image
         if: always()
         run: |
-          docker rmi -f "$SCAN_TAG" 2>/dev/null || true
+          rm -f "${RUNNER_TEMP}/agent-image.tar" || true
           docker image prune -f || true
           df -h || true

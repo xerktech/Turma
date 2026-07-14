@@ -1371,10 +1371,123 @@ def _tn_preview(tn):
     return "\n\n".join(p for p in parts if p)
 
 
+# Running a slash command writes three more XML-ish user-role turns that are not
+# the human talking either: a boilerplate <local-command-caveat> telling the
+# model to ignore what follows, the <command-name>/<command-args> invocation
+# wrapper, and the command's <local-command-stdout>/<local-command-stderr>.
+# Rendered verbatim they read as the operator typing raw XML into chat, so —
+# exactly as with <task-notification> above — we parse them here into structured
+# blocks the web chat renders as a command chip / output card, and drop the
+# caveat outright. Keep mirrored with tunnel-agent.js parseLocalCommand().
+#
+# Matched with `search`, not `match`: Claude Code emits the wrapper tags indented
+# and sometimes with sibling text, so anchoring to the whole string would miss
+# them. The caveat, by contrast, is the ENTIRE entry when present, hence fullmatch.
+LOCAL_COMMAND_CAVEAT_RE = re.compile(
+    r"\s*<local-command-caveat>.*?</local-command-caveat>\s*", re.DOTALL)
+COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.DOTALL)
+COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
+COMMAND_STDOUT_RE = re.compile(
+    r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL)
+COMMAND_STDERR_RE = re.compile(
+    r"<local-command-stderr>(.*?)</local-command-stderr>", re.DOTALL)
+
+
+def _parse_local_command(text):
+    """Parse one of Claude Code's slash-command bookkeeping turns, or None when
+    `text` isn't one. Mirror of tunnel-agent.js parseLocalCommand(). Returns:
+      {"kind": "caveat"}                        -> drop the entry entirely
+      {"kind": "command", "name", "args"}       -> the /slash invocation
+      {"kind": "output", "text", "isError"}     -> the command's stdout/stderr
+    stderr wins over stdout when a turn carries both, so a failing command reads
+    as an error rather than silently showing its (usually empty) stdout."""
+    if not text:
+        return None
+    if LOCAL_COMMAND_CAVEAT_RE.fullmatch(text):
+        return {"kind": "caveat"}
+    m = COMMAND_NAME_RE.search(text)
+    if m:
+        name = ANSI_RE.sub("", m.group(1)).strip()
+        args = COMMAND_ARGS_RE.search(text)
+        if name:
+            return {
+                "kind": "command",
+                "name": name,
+                "args": ANSI_RE.sub("", args.group(1)).strip() if args else "",
+            }
+    for regex, is_error in ((COMMAND_STDERR_RE, True), (COMMAND_STDOUT_RE, False)):
+        m = regex.search(text)
+        if m:
+            return {
+                "kind": "output",
+                "text": ANSI_RE.sub("", m.group(1)).strip(),
+                "isError": is_error,
+            }
+    return None
+
+
+def _lc_preview(lc):
+    """Flatten a parsed local-command turn to display text, the text-feed form
+    used by the glasses tail, heartbeat preview and archive — or None to drop it
+    (the caveat, and an output turn that carried nothing)."""
+    if lc["kind"] == "caveat":
+        return None
+    if lc["kind"] == "command":
+        return " ".join(p for p in (lc["name"], lc["args"]) if p)
+    return lc["text"] or None
+
+
+def _entry_first_text(entry):
+    """The entry's first raw text payload (string content, or the first `text`
+    block of list content), or "" — the pre-flatten form callers need to ask
+    what KIND of turn this is."""
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return str(block.get("text") or "")
+    return ""
+
+
+def _entry_local_command(entry):
+    """The parsed slash-command turn this entry IS, or None. Callers that want
+    to skip command plumbing must ask this rather than sniffing _entry_text's
+    output, which has already flattened the wrapper away."""
+    return _parse_local_command(_entry_first_text(entry))
+
+
+def _entry_role(entry):
+    """Display role for a transcript entry. Normally the entry type, but a
+    compact summary is written as a USER turn carrying text the model wrote
+    about itself — showing it on the human's side (as the raw transcript role
+    would) misattributes it, so it reports as the assistant."""
+    if entry.get("isCompactSummary"):
+        return "assistant"
+    return entry.get("type")
+
+
+def _flatten_text(raw):
+    """One text payload -> its text-feed form: a <task-notification> or
+    slash-command bookkeeping turn flattened to its preview, anything else
+    verbatim. None to drop the payload (a caveat / empty command output)."""
+    tn = _parse_task_notification(raw)
+    if tn:
+        return _tn_preview(tn)
+    lc = _parse_local_command(raw)
+    if lc:
+        return _lc_preview(lc)
+    return raw
+
+
 def _entry_text(entry):
     """Map one transcript entry to display text for the glasses tail feed, or
-    None to drop it (wrong type, no message, tool_result-only turn, or empty
-    after stripping ANSI)."""
+    None to drop it (wrong type, no message, tool_result-only turn, a
+    slash-command caveat, or empty after stripping ANSI)."""
     if entry.get("type") not in ("user", "assistant"):
         return None
     msg = entry.get("message")
@@ -1382,8 +1495,9 @@ def _entry_text(entry):
         return None
     content = msg.get("content")
     if isinstance(content, str):
-        tn = _parse_task_notification(content)
-        text = _tn_preview(tn) if tn else content
+        text = _flatten_text(content)
+        if text is None:
+            return None
     elif isinstance(content, list):
         parts = []
         for block in content:
@@ -1391,9 +1505,9 @@ def _entry_text(entry):
                 continue
             btype = block.get("type")
             if btype == "text":
-                raw = str(block.get("text") or "")
-                tn = _parse_task_notification(raw)
-                parts.append(_tn_preview(tn) if tn else raw)
+                flat = _flatten_text(str(block.get("text") or ""))
+                if flat is not None:
+                    parts.append(flat)
             elif btype == "tool_use" and block.get("name"):
                 parts.append(f"[{block['name']}]")
             # "thinking" and "tool_result" blocks are dropped.
@@ -1465,13 +1579,19 @@ def _entry_blocks(entry, caps):
     component by verbosity. `caps` is a {text, input, result} char-limit dict
     (BLOCK_CAPS_LIVE for the ~1s tail, BLOCK_CAPS_FULL for on-demand history); a
     block cut to its cap gets truncated:true. Blocks:
-      {t:"text",        text}
-      {t:"thinking",    text, truncated?}
-      {t:"tool_use",    id, name, input, truncated?}
-      {t:"tool_result", forId, text, isError?, truncated?}
+      {t:"text",           text}
+      {t:"thinking",       text, truncated?}
+      {t:"tool_use",       id, name, input, truncated?}
+      {t:"tool_result",    forId, text, isError?, truncated?}
+      {t:"compact_summary", text, truncated?}
+      {t:"command",        name, args?, truncated?}
+      {t:"command_output", text, isError?, truncated?}
     A `<task-notification>` user turn becomes a single {t:"task_notification",
     summary, status?, result?, truncated?} block (see _parse_task_notification)
-    so the web chat renders it as an action card, not raw XML.
+    so the web chat renders it as an action card, not raw XML. The slash-command
+    bookkeeping turns get the same treatment via _parse_local_command: the
+    invocation becomes a `command` block, its stdout/stderr a `command_output`
+    block, and the boilerplate caveat is dropped (yielding []).
     Returns [] for a user/assistant message with no renderable blocks. Keep this
     mirrored with tunnel-agent.js entryBlocks()."""
     if entry.get("type") not in ("user", "assistant"):
@@ -1504,23 +1624,53 @@ def _entry_blocks(entry, caps):
             block["truncated"] = True
         blocks.append(block)
 
-    if isinstance(content, str):
-        tn = _parse_task_notification(content)
+    def add_local_command(lc):
+        """The caveat contributes no block (its entry drops out entirely)."""
+        if lc["kind"] == "command":
+            name, _ = _clip(lc["name"], caps["input"])
+            args, atrunc = _clip(lc["args"], caps["input"])
+            block = {"t": "command", "name": name}
+            if args:
+                block["args"] = args
+            if atrunc:
+                block["truncated"] = True
+            blocks.append(block)
+        elif lc["kind"] == "output" and lc["text"]:
+            text, trunc = _clip(lc["text"], caps["result"])
+            block = {"t": "command_output", "text": text}
+            if lc["isError"]:
+                block["isError"] = True
+            if trunc:
+                block["truncated"] = True
+            blocks.append(block)
+
+    def add_payload(raw):
+        """One text payload -> its block(s): a task-notification card, a
+        slash-command chip/output card, else plain text."""
+        tn = _parse_task_notification(raw)
         if tn:
             add_task_notification(tn)
-        else:
-            add_text("text", content, caps["text"])
+            return
+        lc = _parse_local_command(raw)
+        if lc:
+            add_local_command(lc)
+            return
+        # A compact summary is prose the model wrote about the conversation so
+        # far, injected as a user turn. It gets its own block so the chat can
+        # render it as a collapsed agent-side card rather than a wall of text in
+        # a user bubble. _entry_role() puts it on the assistant's side.
+        add_text("compact_summary" if entry.get("isCompactSummary") else "text",
+                 raw, caps["text"])
+
+    if isinstance(content, str):
+        add_payload(content)
     elif isinstance(content, list):
         for raw in content:
             if not isinstance(raw, dict):
                 continue
             btype = raw.get("type")
             if btype == "text":
-                tn = _parse_task_notification(str(raw.get("text") or ""))
-                if tn:
-                    add_task_notification(tn)
-                else:
-                    add_text("text", str(raw.get("text") or ""), caps["text"])
+                add_payload(str(raw.get("text") or ""))
             elif btype == "thinking":
                 add_text("thinking", str(raw.get("thinking") or raw.get("text") or ""), caps["text"])
             elif btype == "tool_use" and raw.get("name"):
@@ -1562,7 +1712,7 @@ def transcript_tail(path):
             continue
         tail.append({
             "id": entry.get("uuid"),
-            "role": entry.get("type"),
+            "role": _entry_role(entry),
             "text": text[:TAIL_MSG_CHARS],
         })
     return tail[-TAIL_MSGS:]
@@ -1625,11 +1775,13 @@ def _first_user_text(path, max_lines=500):
                     continue
                 if entry.get("promptSource") == "system":
                     continue  # injected turn (e.g. a task-notification), not human
+                if entry.get("isCompactSummary"):
+                    continue  # the model's own summary, injected as a user turn
+                if _entry_local_command(entry):
+                    continue  # slash-command plumbing, not a real prompt
                 text = _entry_text(entry)
                 if not text:
                     continue  # tool_result-only turn, or empty after stripping
-                if text.startswith("<command-") or text.startswith("<local-command"):
-                    continue  # slash-command plumbing, not a real prompt
                 return text
     except OSError:
         return None
@@ -1691,7 +1843,7 @@ def _history_entries(path):
             continue
         entries.append({
             "id": entry.get("uuid"),
-            "role": entry.get("type"),
+            "role": _entry_role(entry),
             "text": (text or "")[:TAIL_MSG_CHARS_FULL],
             "blocks": blocks or [],
         })
@@ -3665,7 +3817,7 @@ class SessionManager:
                         continue
                     entries.append({
                         "uuid": entry.get("uuid"),
-                        "role": entry.get("type"),
+                        "role": _entry_role(entry),
                         "ts": entry.get("timestamp"),
                         "text": text or "",
                         "blocks": blocks or [],
