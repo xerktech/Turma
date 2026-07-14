@@ -57,8 +57,15 @@ jobs:
       #     SHA (this repo's convention across all workflows).
       #   - using-http-server: the hub serves plain HTTP on purpose — TLS is
       #     terminated at the Cloudflare tunnel, behind HTTP Basic auth.
-      #   - missing-user-entrypoint: the containers must run as root (full host
-      #     access for the RC listener / docker socket).
+      #   - missing-user-entrypoint: the images deliberately carry no USER
+      #     directive. The agent resolves its run-as identity at RUNTIME instead
+      #     (entrypoint.sh: PUID/PGID, else the owner of REPOS_ROOT) and setprivs
+      #     down to it, because the right uid is the host's — a property of the
+      #     mounted git root, unknowable at build time. A baked USER couldn't
+      #     express that, and the entrypoint needs root briefly anyway (create
+      #     the user, join the docker-sock group, reclaim root-owned leftovers).
+      #     Semgrep only sees the Dockerfile, so it can't see the drop; the
+      #     identity block is covered by agent/tests/test_entrypoint.sh instead.
       #   - dynamic-urllib-use-detected: the URL is TURMA_URL from the trusted
       #     compose env, not attacker-controlled input.
       # Everything else stays blocking, so new injection/secret/unsafe-eval
@@ -135,3 +142,12 @@ jobs:
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE":/workspace -w /workspace node:24-alpine \
             sh -c 'node --test turma/tests/*.test.js agent/tests/*.test.js'
+      # entrypoint.sh is PID 1 and decides which uid every session runs as —
+      # i.e. whether files land in the mounted git root owned by the host user
+      # or by root. ShellCheck only covers its syntax, so this builds the real
+      # entrypoint onto the real base image and asserts the resolved identity
+      # across root-owned / user-owned / PUID-override roots. Drives docker
+      # directly (like the Node step above), so it runs on the host, not in a
+      # container.
+      - name: Entrypoint identity tests (agent/entrypoint.sh)
+        run: ./agent/tests/test_entrypoint.sh
