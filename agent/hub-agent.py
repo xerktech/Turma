@@ -1558,9 +1558,11 @@ def _first_user_text(path, max_lines=500):
     first prompt is almost always typed into the live ttyd terminal, which writes
     straight to the tmux pane and never reaches send_input, so the transcript —
     which every input path lands in — is the only channel-agnostic place to find
-    it. Bounded to the first max_lines lines so an already-long resumed transcript
-    can't make this walk expensive (the real first prompt sits within the first
-    handful of entries anyway)."""
+    it. Reading from the top also means a naming RETRY sees the same first prompt
+    the original attempt saw, however many turns later it runs. Bounded to the
+    first max_lines lines so an already-long resumed transcript can't make this
+    walk expensive (the real first prompt sits within the first handful of entries
+    anyway)."""
     try:
         with open(path, errors="replace") as f:
             for i, line in enumerate(f):
@@ -2117,19 +2119,29 @@ def collect_github():
 # container's already-authenticated `claude` in headless print mode (`claude -p`,
 # Haiku by default). It reuses the mounted login, so there is NO external API or
 # key. The call runs as a detached subprocess reaped on later beats (never blocks
-# the heartbeat) and is deliberately ONE-SHOT — the single naming attempt per
-# session — because every session shares the one login, so re-summarizing per
-# beat would draw on the working sessions' rate limits. A session spawned with no
-# initial prompt (the one-click bare spawn, the repos-root pseudo-repo) is named
-# instead from its FIRST user prompt, read straight out of its transcript by
-# _seed_summaries() each beat (see _first_user_text). That transcript read is the
-# channel-agnostic path: the first prompt is usually typed into the live ttyd
-# terminal, which writes to the tmux pane and never reaches send_input, so keying
-# off any single input channel misses it — the transcript is where every input
-# path lands. send_input still kicks a name off immediately when a prompt does
-# arrive that way (a fast path); both are gated on summary/summaryStarted so the
-# attempt fires exactly once. A session with no prompt yet stays unnamed and the
-# card falls back to the label/worktree until one lands.
+# the heartbeat). A session spawned with no initial prompt (the one-click bare
+# spawn, the repos-root pseudo-repo) is named instead from its FIRST user prompt,
+# read straight out of its transcript by _seed_summaries() each beat (see
+# _first_user_text). That transcript read is the channel-agnostic path: the first
+# prompt is usually typed into the live ttyd terminal, which writes to the tmux
+# pane and never reaches send_input, so keying off any single input channel misses
+# it — the transcript is where every input path lands. send_input still kicks the
+# FIRST attempt off immediately when a prompt does arrive that way (a fast path).
+# A session with no prompt yet stays unnamed and the card falls back to the
+# label/worktree until one lands.
+#
+# Naming is attempted at most SUMMARY_MAX_ATTEMPTS times, spaced by a growing
+# backoff, and only ever while a session is unnamed. It is NOT one-shot: an
+# attempt can come back with no name for reasons that have nothing to do with the
+# session (a nonzero `claude -p` exit, an empty reply, the timeout below, or a
+# rate limit from the one login every session shares), and a single attempt made
+# those transient failures permanent — the card kept showing the raw session id
+# for the rest of its life, on an arbitrary subset of sessions. Retries are
+# bounded and backed off rather than per-beat precisely because of that shared
+# login: a handful of spaced attempts costs little, re-summarizing every beat
+# would eat the working sessions' rate limits. _seed_summaries() drives the
+# retries off the transcript, so a retry still names from the session's FIRST
+# prompt no matter how many turns have passed.
 # Handed straight to `claude --model`; validated only against claude's own
 # aliases, but this is a fixed operator-set env, not free-form spawn input.
 SESSION_SUMMARY_MODEL = os.environ.get("SESSION_SUMMARY_MODEL", "haiku").strip() or "haiku"
@@ -2140,6 +2152,8 @@ except ValueError:
 SUMMARY_MAX_WORDS = 6          # cap a chatty reply so it can't bloat the card
 SUMMARY_MAX_CHARS = 48
 SUMMARY_PROMPT_CAP = 2000      # cap the task text handed to the summarizer
+SUMMARY_MAX_ATTEMPTS = 3       # naming tries before a session stays unnamed for good
+SUMMARY_RETRY_BACKOFF_SEC = 90  # base gap between tries; grows with the try count
 SUMMARY_INSTRUCTION = (
     "In 2-4 words, give a Title Case name for the coding task below "
     '(e.g. "Adding Compose Flag", "Debugging Heartbeat Parser"). '
@@ -2162,6 +2176,30 @@ def clean_summary(raw):
         return None
     capped = " ".join(line.split()[:SUMMARY_MAX_WORDS])[:SUMMARY_MAX_CHARS].strip()
     return capped or None
+
+
+def _summary_attempts(sess):
+    """How many naming attempts a session has already spent.
+
+    `summaryStarted` was the original one-shot boolean and still sits on records
+    persisted by an older agent (and on ones this agent wrote before the retry
+    counter existed). Read it as "one attempt spent" rather than as a permanent
+    gate, so a session an earlier attempt failed to name becomes eligible for the
+    remaining retries instead of staying stuck on its id forever."""
+    n = sess.get("summaryAttempts")
+    if isinstance(n, int):
+        return n
+    return 1 if sess.get("summaryStarted") else 0
+
+
+def _summary_due(sess, now):
+    """True when a session still wants a name: unnamed, attempts left, and past
+    the backoff a previous failed attempt set."""
+    if sess.get("summary"):
+        return False
+    if _summary_attempts(sess) >= SUMMARY_MAX_ATTEMPTS:
+        return False
+    return now >= (sess.get("summaryRetryAt") or 0)
 
 
 class SessionManager:
@@ -2975,9 +3013,12 @@ class SessionManager:
         text = text[:INPUT_MAX_CHARS]
         # Name a still-unnamed session (bare/quick spawn or repos-root, where the
         # spawn-time summary was a no-op for lack of an initial prompt) from its
-        # first typed prompt — this message is our next chance. One-shot, gated on
-        # summaryStarted so it fires once and never on later turns.
-        if (not sess.get("summary") and not sess.get("summaryStarted")
+        # first typed prompt — this message is our next chance. Deliberately the
+        # FIRST attempt only: this is a fast path that saves waiting a beat for
+        # _seed_summaries, and later attempts belong there, where the transcript
+        # still names the session from its first prompt rather than from whatever
+        # turn happens to be typed when a retry comes due.
+        if (not sess.get("summary") and _summary_attempts(sess) == 0
                 and sid not in self.summaries):
             self._start_summary(sess, text)
         tmux_name = sess["tmuxName"]
@@ -3622,15 +3663,18 @@ class SessionManager:
     # --- session activity summaries ----------------------------------------
 
     def _start_summary(self, sess, prompt):
-        """Kick off a one-shot `claude -p` (Haiku) to name a session from its
-        initial prompt, as a DETACHED subprocess reaped by _poll_summaries.
-        No-op when there's no prompt to summarize (bare spawns, repos-root).
-        Best-effort: any launch failure just leaves the session unnamed."""
+        """Kick off a `claude -p` (Haiku) to name a session from its initial
+        prompt, as a DETACHED subprocess reaped by _poll_summaries. No-op when
+        there's no prompt to summarize (bare spawns, repos-root) — that costs no
+        attempt, since there was nothing to name yet. Best-effort: a launch
+        failure spends an attempt and schedules the next one, so a transient
+        failure doesn't leave the session unnamed for good."""
         prompt = (prompt or "").strip()
         if not prompt:
             return
         sid = sess["id"]
         out_path = os.path.join(REGISTRY_DIR, f"summary-{slugify(sid)}.out")
+        outf = None
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             outf = open(out_path, "w")
@@ -3646,21 +3690,43 @@ class SessionManager:
             )
         except Exception as e:
             log(f"summary launch failed for {sid}: {e}")
+            if outf is not None:
+                try:
+                    outf.close()
+                except Exception:
+                    pass
+            self._spend_summary_attempt(sess)
             return
         self.summaries[sid] = {
             "proc": proc, "outf": outf, "outPath": out_path,
             "startedMono": time.time(),
         }
-        # One-shot: mark that this session has had its (only) naming attempt, so
-        # the first-typed-prompt path in send_input never re-summarizes — even if
-        # this attempt yields no name (shared-login rate limits, #summary).
-        sess["summaryStarted"] = True
-        log(f"summarizing session {sid} via claude -p ({SESSION_SUMMARY_MODEL})")
+        self._spend_summary_attempt(sess)
+        attempts = _summary_attempts(sess)
+        log(f"summarizing session {sid} via claude -p ({SESSION_SUMMARY_MODEL}), "
+            f"attempt {attempts}/{SUMMARY_MAX_ATTEMPTS}")
+
+    def _spend_summary_attempt(self, sess):
+        """Count a naming attempt against a session and arm the backoff for the
+        next one. Persisted, so a manager restart mid-attempt can neither lose the
+        count (and retry forever) nor skip the retries still owed."""
+        sess["summaryAttempts"] = _summary_attempts(sess) + 1
+        sess["summaryStarted"] = True  # kept for older readers of the registry
+        # Armed up-front rather than on failure: if the manager dies while this
+        # attempt is in flight the job is lost with it, and the backoff is what
+        # makes the reload retry once instead of immediately.
+        sess["summaryRetryAt"] = (
+            time.time() + SUMMARY_RETRY_BACKOFF_SEC * sess["summaryAttempts"]
+        )
+        self.save()
 
     def _finish_summary(self, sid, job, summary):
         """Tear down a summary job's file handle + temp output and, if we got a
         name, store it on the session record (persisted so it survives beats,
-        restarts, and resume)."""
+        restarts, and resume). With no name, leave the session for the retry the
+        attempt counter still owes it (_seed_summaries picks it back up once the
+        backoff elapses) — an empty reply, a nonzero exit or a rate limit is a
+        property of the attempt, not of the session."""
         try:
             if job.get("outf"):
                 job["outf"].close()
@@ -3677,8 +3743,16 @@ class SessionManager:
             return  # killed/deleted while summarizing — nothing to name
         if summary:
             sess["summary"] = summary
+            sess.pop("summaryRetryAt", None)
             self.save()
             log(f"named session {sid}: {summary!r}")
+            return
+        attempts = _summary_attempts(sess)
+        if attempts >= SUMMARY_MAX_ATTEMPTS:
+            log(f"giving up naming session {sid} after {attempts} attempts")
+        else:
+            log(f"summary attempt {attempts} for {sid} produced no name; "
+                f"retrying in ~{SUMMARY_RETRY_BACKOFF_SEC * attempts}s")
 
     def _seed_summaries(self):
         """Name any running, still-unnamed session from the first user message in
@@ -3690,14 +3764,20 @@ class SessionManager:
         which goes straight to the tmux pane and never reaches send_input — so the
         send_input trigger alone never fires for the most common flow. Reading the
         transcript catches the first prompt no matter how it was entered (terminal,
-        glasses/compose-bar input, or a resumed session). One-shot per session,
-        gated exactly like the send_input path (`summary`/`summaryStarted`/in-flight)
-        so it launches `claude -p` at most once; until a first prompt lands it just
-        finds nothing and retries next beat, and once a name is set it's skipped."""
+        glasses/compose-bar input, or a resumed session).
+
+        This is also where a failed naming attempt gets retried, for a session
+        spawned WITH an initial prompt just as much as a bare one: the transcript
+        holds that same first prompt, so re-reading it is all a retry needs. Gated
+        by _summary_due (unnamed + attempts left + past the backoff) plus the
+        in-flight check, so at most SUMMARY_MAX_ATTEMPTS `claude -p` calls ever run
+        for a session and they stay spaced out. Until a first prompt lands it finds
+        nothing, spends no attempt, and looks again next beat."""
+        now = time.time()
         for sess in self.registry:
             if sess.get("status") != "running":
                 continue
-            if sess.get("summary") or sess.get("summaryStarted"):
+            if not _summary_due(sess, now):
                 continue
             if sess["id"] in self.summaries:
                 continue
@@ -3731,6 +3811,8 @@ class SessionManager:
                         raw = f.read()
                 except OSError:
                     raw = None
+            else:
+                log(f"summary for {sid} exited {rc}")
             self._finish_summary(sid, job, clean_summary(raw))
 
     # --- prune merged branches + safe worktrees ----------------------------
