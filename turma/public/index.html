@@ -1144,12 +1144,26 @@ function sessCard(a, s, now) {
 
 // ---- actions → endpoints ---------------------------------------------------
 function enc(s) { return encodeURIComponent(s); }
+// Returns the parsed JSON reply (or null if it isn't JSON) — the spawn/resume
+// endpoints answer with the queued command's `cmdId`, which followToSessions()
+// hands the sessions page so it can open the session that command creates.
 async function post(url, body) {
-  await fetch(url, body
+  const res = await fetch(url, body
     ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
     : { method: "POST" });
+  let out = null;
+  try { out = await res.json(); } catch { /* not JSON — nothing to correlate */ }
   refresh();
   fastPoll();
+  return out;
+}
+// Starting or resuming a session is a "go work in it" action, so hand off to the
+// sessions page and let it open the session. The id doesn't exist yet — the
+// agent mints it — so we pass the queued command's `cmdId` and the sessions page
+// matches it against the `spawnCmdId` the new session reports. A resume of a
+// KILLED session keeps its id, so that path deep-links by id directly instead.
+function followToSessions(cmdId) {
+  if (cmdId) location.href = `/sessions?spawn=${enc(cmdId)}`;
 }
 async function del(url) { await fetch(url, { method: "DELETE" }); refresh(); fastPoll(); }
 
@@ -1229,7 +1243,8 @@ function startSession(key, repo) {
   composerDraft.delete(rk);
   const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
-    () => post(`/api/agents/${enc(key)}/sessions`, body));
+    () => post(`/api/agents/${enc(key)}/sessions`, body)
+      .then(r => followToSessions(r && r.cmdId)));
 }
 function sessStart(key, id) {
   busy(pendKey("start", key, id), { kind: "start", host: key, id },
@@ -1239,7 +1254,9 @@ function sessStart(key, id) {
 // branch with its prior conversation. Not destructive, so no arm/confirm.
 function resumeSession(key, id) {
   busy(pendKey("resume", key, id), { kind: "resume", host: key, id },
-    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/resume`));
+    // A killed session keeps its id, so the sessions page can wait on it by id.
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/resume`)
+      .then(() => { location.href = `/sessions?session=${enc(id)}`; }));
 }
 // Resume ANY prior Claude session by its transcript id (the broadened picker,
 // repo.resumable). The origin cwd is looked up from cached state (kept out of
@@ -1256,7 +1273,8 @@ function resumeTranscript(key, transcriptId) {
   }
   const baseline = a ? (a.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("resume", key, transcriptId), { kind: "spawn", host: key, repo, baseline },
-    () => post(`/api/agents/${enc(key)}/transcripts/${enc(transcriptId)}/resume`, { cwd }));
+    () => post(`/api/agents/${enc(key)}/transcripts/${enc(transcriptId)}/resume`, { cwd })
+      .then(r => followToSessions(r && r.cmdId)));
 }
 // The destructive three still arm/confirm first; the pending state begins only
 // once confirmed (inside doIt), so it reflects a real in-flight command.

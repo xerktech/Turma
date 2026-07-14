@@ -2588,7 +2588,7 @@ class SessionManager:
     # --- lifecycle (executed container-side; see CONTRACT) ----------------
 
     def spawn(self, repo_name, *, prompt=None, label=None, base_ref=None,
-              model=None, permission_mode=None):
+              model=None, permission_mode=None, cmd_id=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
         The worktree is added in DETACHED HEAD forked off the latest default
@@ -2597,7 +2597,12 @@ class SessionManager:
         it flavors the claude.ai/code display name but agent-<id> tmux stays the
         canonical internal key. The options (base branch, model, permission mode)
         are validated below; a bad option fails the spawn cleanly as an error
-        card rather than reaching git/tmux or crashing the manager."""
+        card rather than reaching git/tmux or crashing the manager.
+
+        cmd_id is the hub's queued-command id. The session id is minted HERE, so
+        the hub has no handle on the session it just asked for until a later
+        beat; echoing the command id back on the record (reported as
+        `spawnCmdId`) is what lets the UI recognize its own spawn and open it."""
         if self._running_count() >= MAX_SESSIONS:
             log(f"spawn refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
@@ -2639,6 +2644,9 @@ class SessionManager:
             "stoppedAt": None,
             "errorMsg": None,
             "summary": None,       # few-word task name, filled in async at spawn
+            # The hub command that asked for this session, echoed back so the UI
+            # can correlate its POST with the id we just minted (see docstring).
+            "spawnCmdId": cmd_id,
         }
         self.registry.append(sess)
         try:
@@ -2797,7 +2805,7 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
-    def resume_transcript(self, transcript_id, cwd_hint=None):
+    def resume_transcript(self, transcript_id, cwd_hint=None, cmd_id=None):
         """Resume ANY prior Claude session by its transcript id (the "resume any
         session" picker), not just a killed Turma session in closed.json. Locate
         the transcript, read its ORIGIN cwd, re-create that worktree at the exact
@@ -2807,7 +2815,11 @@ class SessionManager:
         with cwd == the transcript's origin keeps transcript-slug == worktree-slug,
         so all per-session reporting (tail/usage/questions/summary) keeps working.
         A new Turma id/rcName/port is minted like spawn; the record moves nothing
-        out of closed.json (the picker lists transcripts, not closed records)."""
+        out of closed.json (the picker lists transcripts, not closed records).
+
+        cmd_id is echoed onto the record as `spawnCmdId` for the same reason as
+        in spawn(): a resume-by-transcript creates a session whose id the hub
+        can't predict, so that's the UI's only handle on the one it asked for."""
         if not transcript_id or not re.fullmatch(r"[A-Za-z0-9-]+", transcript_id):
             log(f"resumeTranscript: bad transcript id {transcript_id!r}")
             return
@@ -2872,6 +2884,7 @@ class SessionManager:
             "createdAt": now_iso(),
             "stoppedAt": None,
             "errorMsg": None,
+            "spawnCmdId": cmd_id,
         }
         self.registry.append(sess)
         try:
@@ -3899,6 +3912,7 @@ class SessionManager:
                         base_ref=cmd.get("baseRef"),
                         model=cmd.get("model"),
                         permission_mode=cmd.get("permissionMode"),
+                        cmd_id=cid,
                     )
                 elif ctype == "kill":
                     self.kill(cmd.get("sessionId"))
@@ -3910,7 +3924,7 @@ class SessionManager:
                     self.resume(cmd.get("sessionId"))
                 elif ctype == "resumeTranscript":
                     self.resume_transcript(
-                        cmd.get("transcriptId"), cmd.get("cwd"))
+                        cmd.get("transcriptId"), cmd.get("cwd"), cmd_id=cid)
                 elif ctype == "delete":
                     self.delete(cmd.get("sessionId"))
                 elif ctype == "input":
@@ -4220,6 +4234,10 @@ class SessionManager:
             "restartCount": sess.get("restartCount", 0),  # bumps on clear-context restart
             "label": sess.get("label"),
             "summary": sess.get("summary"),   # few-word auto task name (or None)
+            # The hub command that created this session (spawn / resumeTranscript),
+            # so the UI that issued it can find the id the agent minted and open
+            # the session. None for sessions predating the echo, or restored ones.
+            "spawnCmdId": sess.get("spawnCmdId"),
             "model": sess.get("model"),
             "permissionMode": sess.get("permissionMode"),
             # The permission modes this session's live Shift+Tab cycle can reach
