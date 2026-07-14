@@ -2984,9 +2984,11 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.registry[0]["summary"], "Adding Compose Flag")
         self.assertEqual(sm.summaries, {})            # reaped
         self.assertFalse(os.path.exists(out_path))    # temp output cleaned up
-        sm.save.assert_called_once()
+        self.assertTrue(sm.save.called)
+        # A named session owes no retry, so the armed backoff is cleared.
+        self.assertNotIn("summaryRetryAt", sm.registry[0])
 
-    def test_timeout_kills_and_leaves_unnamed(self):
+    def test_timeout_kills_and_schedules_a_retry(self):
         sm = self.make_manager()
         sm.registry = [{"id": "s1", "status": "running", "summary": None}]
         killed = {"v": False}
@@ -3005,6 +3007,68 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
         self.assertTrue(killed["v"])
         self.assertEqual(sm.summaries, {})
         self.assertIsNone(sm.registry[0]["summary"])
+        # A hung attempt is a property of the attempt, not the session: it spends
+        # one try and leaves the session eligible for the rest.
+        self.assertEqual(sm.registry[0]["summaryAttempts"], 1)
+        self.assertGreater(sm.registry[0]["summaryRetryAt"], time.time())
+
+    def test_empty_reply_schedules_a_retry(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "summary": None}]
+
+        class FakeProc:
+            def poll(self_i):
+                return 0  # clean exit, but the model said nothing
+
+            def kill(self_i):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()):
+            sm._start_summary(sm.registry[0], "do a thing")
+        sm._poll_summaries()  # stdout file is empty
+        self.assertIsNone(sm.registry[0]["summary"])
+        self.assertEqual(sm.registry[0]["summaryAttempts"], 1)
+        self.assertGreater(sm.registry[0]["summaryRetryAt"], time.time())
+
+    def test_attempts_are_capped(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "status": "running", "summary": None}
+        sm.registry = [sess]
+
+        class FakeProc:
+            def poll(self_i):
+                return 1  # every attempt fails
+
+            def kill(self_i):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()):
+            for _ in range(ha.SUMMARY_MAX_ATTEMPTS + 2):
+                sess["summaryRetryAt"] = 0  # backoff elapsed
+                if ha._summary_due(sess, time.time()):
+                    sm._start_summary(sess, "do a thing")
+                sm._poll_summaries()
+        self.assertEqual(sess["summaryAttempts"], ha.SUMMARY_MAX_ATTEMPTS)
+        self.assertFalse(ha._summary_due(sess, time.time()))  # gives up for good
+
+    def test_launch_failure_spends_an_attempt_and_retries(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "status": "running", "summary": None}
+        sm.registry = [sess]
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=OSError("boom")):
+            sm._start_summary(sess, "do a thing")
+        self.assertEqual(sm.summaries, {})
+        self.assertEqual(sess["summaryAttempts"], 1)
+        self.assertGreater(sess["summaryRetryAt"], time.time())
+
+    def test_no_prompt_spends_no_attempt(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "status": "running", "summary": None}
+        with mock.patch.object(ha.subprocess, "Popen"):
+            sm._start_summary(sess, "")
+        # Nothing to name yet is not a failed try — the bare session must keep all
+        # of its attempts for when a first prompt finally lands.
+        self.assertEqual(ha._summary_attempts(sess), 0)
 
     def test_session_deleted_mid_summary_is_safe(self):
         sm = self.make_manager()
@@ -3023,6 +3087,32 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
             f.write("Some Name")
         sm._poll_summaries()  # must not raise even with no matching session
         self.assertEqual(sm.summaries, {})
+
+
+class TestSummaryDue(unittest.TestCase):
+    def test_named_session_is_never_due(self):
+        self.assertFalse(ha._summary_due({"summary": "Adding Flag"}, 1000))
+
+    def test_unnamed_untried_session_is_due(self):
+        self.assertTrue(ha._summary_due({"summary": None}, 1000))
+
+    def test_backoff_defers_then_releases(self):
+        sess = {"summary": None, "summaryAttempts": 1, "summaryRetryAt": 1000}
+        self.assertFalse(ha._summary_due(sess, 999))
+        self.assertTrue(ha._summary_due(sess, 1000))
+
+    def test_exhausted_attempts_close_it_out(self):
+        sess = {"summary": None, "summaryAttempts": ha.SUMMARY_MAX_ATTEMPTS,
+                "summaryRetryAt": 0}
+        self.assertFalse(ha._summary_due(sess, 10_000))
+
+    def test_legacy_summary_started_counts_as_one_attempt(self):
+        # Records persisted by the one-shot agent carry summaryStarted with no
+        # counter. Reading it as "one try spent" (not as a permanent gate) is what
+        # lets a session it failed to name still get its remaining retries.
+        sess = {"summary": None, "summaryStarted": True}
+        self.assertEqual(ha._summary_attempts(sess), 1)
+        self.assertTrue(ha._summary_due(sess, 10_000))
 
 
 class TestFirstUserText(unittest.TestCase):
@@ -3159,9 +3249,31 @@ class TestSeedSummaries(ManagerMixin, unittest.TestCase):
             sm._seed_summaries()
         start.assert_not_called()
 
-    def test_skips_already_attempted(self):
+    def test_retries_a_failed_attempt_once_the_backoff_elapses(self):
+        # The bug this guards: a first attempt that came back with no name (rate
+        # limit, empty reply, timeout) used to gate the session forever, so its
+        # card showed the raw id for life.
         sm = self.make_manager()
-        sm.registry = [self._session(summaryStarted=True)]
+        sm.registry = [self._session(summaryAttempts=1, summaryRetryAt=0)]
+        self._transcript("Add a docker compose flag")
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        # Named from the FIRST prompt, same as the original attempt would have.
+        start.assert_called_once_with(sm.registry[0], "Add a docker compose flag")
+
+    def test_waits_out_the_backoff_before_retrying(self):
+        sm = self.make_manager()
+        sm.registry = [self._session(summaryAttempts=1,
+                                     summaryRetryAt=time.time() + 300)]
+        self._transcript("Add a docker compose flag")
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()  # spaced out — the login is shared
+
+    def test_skips_once_attempts_are_exhausted(self):
+        sm = self.make_manager()
+        sm.registry = [self._session(summaryAttempts=ha.SUMMARY_MAX_ATTEMPTS,
+                                     summaryRetryAt=0)]
         self._transcript("Add a docker compose flag")
         with mock.patch.object(sm, "_start_summary") as start:
             sm._seed_summaries()
