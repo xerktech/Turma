@@ -111,9 +111,10 @@
   .composer .cmp-actions .spacer { flex: 1; }
   .sess-label { font-size: 12px; }
 
-  /* "Clone from GitHub" bar at the top of a host's repo tree: a dropdown of the
-     gh login's repos + a free-text owner/repo box that clone into REPOS_ROOT.
-     Greyed out (with a note) when the host has no usable GitHub credentials. */
+  /* "Clone from GitHub" bar at the top of a host's repo tree: a searchable,
+     multi-select checkbox list of the gh login's repos + a free-text owner/repo
+     box that clone into REPOS_ROOT. Greyed out (with a note) when the host has
+     no usable GitHub credentials. */
   .clone-bar {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
     padding-bottom: 12px; border-bottom: 1px solid var(--hairline);
@@ -129,6 +130,25 @@
   .clone-bar select { max-width: 320px; flex: 1 1 200px; min-width: 150px; }
   .clone-bar input { flex: 0 1 180px; min-width: 120px; }
   .clone-bar .spacer { flex: 1; }
+  /* Searchable, multi-select repo picker. The search box filters the scrollable
+     checkbox list; checked repos accumulate in cloneDraft and clone together. */
+  .clone-picker { flex: 1 1 100%; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .clone-bar input.clone-search { flex: 1 1 100%; min-width: 0; max-width: 100%; }
+  .clone-list {
+    max-height: 168px; overflow-y: auto; display: flex; flex-direction: column;
+    border: 1px solid var(--border); border-radius: 6px; background: var(--surface);
+  }
+  .clone-opt {
+    display: flex; align-items: center; gap: 8px; padding: 5px 9px; font-size: 13px;
+    cursor: pointer; border-bottom: 1px solid var(--hairline); overflow-wrap: anywhere;
+  }
+  .clone-opt:last-child { border-bottom: none; }
+  .clone-opt:hover { background: var(--page); }
+  .clone-opt input { flex: 0 0 auto; margin: 0; }
+  .clone-opt.here { color: var(--muted); cursor: default; }
+  .clone-opt.here:hover { background: none; }
+  .clone-list-empty { padding: 8px 9px; font-size: 12.5px; color: var(--muted); }
+  .clone-count { font-size: 12px; color: var(--ink-2); }
   .clone-job {
     display: flex; align-items: center; gap: 8px; margin-top: 8px;
     font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere;
@@ -303,12 +323,37 @@ const composerOpen = new Set();
 const optionsOpen = new Set();
 const composerDraft = new Map();
 
-// - cloneDraft: host key -> {sel, text} in-progress selection/free-text for the
+// - cloneDraft: host key -> {search, picks, text} in-progress state for the
 //   "Clone from GitHub" bar, kept in memory so the 5s re-render doesn't wipe a
-//   half-typed owner/repo.
+//   half-typed search/owner-repo or the set of checked repos. `picks` is a
+//   {nameWithOwner: true} set so several repos can be selected and cloned at once.
 const cloneDraft = new Map();
-function cloneSel(key, v) { const d = cloneDraft.get(key) || {}; d.sel = v; cloneDraft.set(key, d); }
-function cloneText(key, v) { const d = cloneDraft.get(key) || {}; d.text = v; cloneDraft.set(key, d); }
+// Free-text owner/repo box. Also refreshes the Clone button's live count.
+function cloneText(key, v) { const d = cloneDraft.get(key) || {}; d.text = v; cloneDraft.set(key, d); updateCloneButton(key); }
+// Search box filters the repo list — needs a re-render to reflow the checkboxes.
+function cloneSearch(key, v) { const d = cloneDraft.get(key) || {}; d.search = v; cloneDraft.set(key, d); render(cache); }
+// Toggle one repo in the multi-select. Mutates state only + updates the button
+// count in place, so ticking boxes down a long list doesn't reset its scroll.
+function clonePick(key, spec, checked) {
+  const d = cloneDraft.get(key) || {};
+  d.picks = d.picks || {};
+  if (checked) d.picks[spec] = true; else delete d.picks[spec];
+  cloneDraft.set(key, d);
+  updateCloneButton(key);
+}
+// How many repos a Clone click would queue: every checked repo plus a non-empty
+// free-text box. Drives the button label / selected-count without a re-render.
+function clonePickCount(key) {
+  const d = cloneDraft.get(key) || {};
+  return Object.keys(d.picks || {}).length + ((d.text || "").trim() ? 1 : 0);
+}
+function updateCloneButton(key) {
+  const hid = hostId(key), n = clonePickCount(key);
+  const btn = document.getElementById("clone-btn-" + hid);
+  if (btn) { btn.textContent = n > 1 ? `Clone ${n}` : "Clone"; btn.disabled = btn.dataset.off === "1" || n === 0; }
+  const cnt = document.getElementById("clone-count-" + hid);
+  if (cnt) cnt.textContent = n ? `${n} selected` : "";
+}
 
 // DOM id for a composer field, derived from the (host::repo) key + field name.
 function cid(rk, field) { return "cmp-" + field + "-" + rk.replace(/[^A-Za-z0-9]/g, "_"); }
@@ -703,11 +748,12 @@ function hostCard(a, now) {
 function hostId(key) { return key.replace(/[^A-Za-z0-9]/g, "_"); }
 
 // "Clone from GitHub" control for a host. When the host has usable GitHub creds
-// it offers a dropdown of the login's repos (already-present ones disabled) plus
-// a free-text owner/repo box, and queues a clone into REPOS_ROOT; the repo then
-// joins the scan and becomes spawnable. With no creds it renders greyed out with
-// a note. In-flight / recent clone jobs (reported by the agent) show below, with
-// an optimistic row for one just fired but not yet echoed back.
+// it offers a searchable, multi-select checkbox list of the login's repos
+// (already-present ones disabled) plus a free-text owner/repo box, and queues a
+// clone into REPOS_ROOT for each selected repo; they then join the scan and
+// become spawnable. With no creds it renders greyed out with a note. In-flight /
+// recent clone jobs (reported by the agent) show below, with an optimistic row
+// per clone just fired but not yet echoed back.
 function cloneBar(a) {
   const gh = a.github || {};
   const hid = hostId(a.key);
@@ -735,29 +781,46 @@ function cloneBar(a) {
 
   const existing = new Set((a.repos || []).map(r => r.name));
   const d = cloneDraft.get(a.key) || {};
-  const options = (gh.repos || []).map(r => {
-    const here = existing.has(r.name);
-    const sel = r.nameWithOwner === d.sel ? " selected" : "";
-    return `<option value="${esc(r.nameWithOwner)}"${here ? " disabled" : ""}${sel}>` +
-      `${esc(r.nameWithOwner)}${r.isPrivate ? " 🔒" : ""}${here ? " · already here" : ""}</option>`;
-  }).join("");
+  const picks = d.picks || {};
   const dis = a.online ? "" : "disabled";
-  // Creds are present but the discovery sweep found nothing — say so, and point
-  // at the free-text box (which always works) so an empty dropdown isn't a dead end.
-  const emptyNote = (gh.repos || []).length === 0
-    ? `<span class="clone-note">No repos found${gh.login ? ` for ${esc(gh.login)}` : ""} — type an <code>owner/repo</code> to clone.</span>`
+  const repos = gh.repos || [];
+  // Filter the checkbox list by the search box (matches owner/repo, case-insensitive).
+  const q = (d.search || "").trim().toLowerCase();
+  const shown = q ? repos.filter(r => r.nameWithOwner.toLowerCase().includes(q)) : repos;
+  const rows = shown.map(r => {
+    const here = existing.has(r.name);
+    const checked = picks[r.nameWithOwner] ? " checked" : "";
+    return `<label class="clone-opt${here ? " here" : ""}">
+      <input type="checkbox"${checked}${here || dis ? " disabled" : ""}
+        onchange="clonePick('${esc(a.key)}','${esc(r.nameWithOwner)}',this.checked)">
+      <span>${esc(r.nameWithOwner)}${r.isPrivate ? " 🔒" : ""}${here ? " · already here" : ""}</span>
+    </label>`;
+  }).join("");
+  // The scrollable list only appears when the login reported repos. Its inner
+  // message covers "search matched nothing" vs "no repos discovered at all".
+  const listInner = repos.length === 0
+    ? `<div class="clone-list-empty">No repos found${gh.login ? ` for ${esc(gh.login)}` : ""} — type an <code>owner/repo</code> below to clone.</div>`
+    : shown.length === 0
+    ? `<div class="clone-list-empty">No repos match “${esc(d.search || "")}”.</div>`
+    : rows;
+  const searchBox = repos.length
+    ? `<input id="clone-search-${hid}" class="clone-search" type="text" placeholder="Search repos…"
+        value="${esc(d.search || "")}" ${dis} oninput="cloneSearch('${esc(a.key)}',this.value)">`
     : "";
+  const n = clonePickCount(a.key);
+  const off = dis ? "1" : "0";
   return `<div class="clone-bar">
     <span class="clone-label">Clone from GitHub${gh.login ? ` <span class="clone-note">as ${esc(gh.login)}</span>` : ""}</span>
-    <select id="clone-select-${hid}" ${dis} onchange="cloneSel('${esc(a.key)}',this.value)">
-      <option value="">Choose a repo…</option>
-      ${options}
-    </select>
+    <div class="clone-picker">
+      ${searchBox}
+      <div class="clone-list">${listInner}</div>
+    </div>
     <input id="clone-input-${hid}" type="text" placeholder="or owner/repo" value="${esc(d.text || "")}"
       ${dis} oninput="cloneText('${esc(a.key)}',this.value)"
       onkeydown="if(event.key==='Enter'){event.preventDefault();cloneRepo('${esc(a.key)}');}">
-    <button class="primary btn-sm" ${dis} onclick="cloneRepo('${esc(a.key)}')">Clone</button>
-    ${emptyNote}
+    <button id="clone-btn-${hid}" class="primary btn-sm" data-off="${off}" ${dis || n === 0 ? "disabled" : ""}
+      onclick="cloneRepo('${esc(a.key)}')">${n > 1 ? `Clone ${n}` : "Clone"}</button>
+    <span id="clone-count-${hid}" class="clone-count">${n ? `${n} selected` : ""}</span>
   </div>${jobRows}${optimistic}`;
 }
 
@@ -1056,19 +1119,25 @@ function busy(key, val, run) {
   render(cache);
   run();
 }
-// Clone a GitHub repo into a host's REPOS_ROOT. Free-text takes precedence over
-// the dropdown selection. The dest name (last path segment, sans .git) keys the
-// optimistic pending row so it clears when the agent reports the clone or the
-// repo appears in the scan.
+// Clone the selected GitHub repos into a host's REPOS_ROOT. Every checked repo
+// plus a non-empty free-text owner/repo box is queued as its own clone (the
+// endpoint takes one repo at a time). Each dest name (last path segment, sans
+// .git) keys an optimistic pending row that clears when the agent reports the
+// clone or the repo appears in the scan.
 function cloneRepo(key) {
   const d = cloneDraft.get(key) || {};
-  const spec = ((d.text || "").trim()) || (d.sel || "");
-  if (!spec) return;
-  const name = spec.replace(/\.git$/, "").replace(/\/+$/, "").split("/").pop();
-  if (!name) return;
-  busy(pendKey("clone", key, name), { kind: "clone", host: key, name, repo: spec },
-    () => post(`/api/agents/${enc(key)}/clone`, { repo: spec }));
-  cloneDraft.set(key, {}); // clear the box; progress shows as a clone-job row
+  const specs = Object.keys(d.picks || {});
+  const free = (d.text || "").trim();
+  if (free) specs.push(free);
+  if (!specs.length) return;
+  for (const spec of specs) {
+    const name = spec.replace(/\.git$/, "").replace(/\/+$/, "").split("/").pop();
+    if (!name) continue;
+    busy(pendKey("clone", key, name), { kind: "clone", host: key, name, repo: spec },
+      () => post(`/api/agents/${enc(key)}/clone`, { repo: spec }));
+  }
+  cloneDraft.set(key, {}); // clear search/picks/box; progress shows as clone-job rows
+  render(cache);
 }
 // Persist the composer's option selects as this repo's last-used prefs.
 function onOptChange(rk, repo) {
