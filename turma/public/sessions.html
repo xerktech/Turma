@@ -237,7 +237,17 @@
   /* ---- Right stage: native chat view of a LIVE session --------------------- */
   .chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--page); }
   .chat-pane[hidden] { display: none; }
+  /* Positioned so the floating "jump to latest" pill can hover at the bottom of
+     the scroll region — just above the status/question/compose stack — without
+     taking layout space or covering the text input. */
+  .chat-scroll-wrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
   .chat-scroll { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .jump-bottom { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 20;
+    font: inherit; font-size: 12px; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--ink); cursor: pointer; box-shadow: 0 4px 16px #0006;
+    display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .jump-bottom:hover { border-color: var(--accent); color: var(--accent); }
+  .jump-bottom[hidden] { display: none; }
   /* Keep each message/tool card at its natural size: in a flex column, children
      default to flex-shrink:1, so a growing transcript would squash the existing
      cards to fit instead of scrolling. Pin them so the container scrolls. */
@@ -453,7 +463,10 @@
           <button class="seg-toggle" id="chatTermBtn" onclick="chatToTerminal()" title="Open the raw ttyd terminal for debugging">Terminal ▸</button>
           <button class="kill-btn" id="chatKill" onclick="killCurrentChat()">Kill</button>
         </div>
-        <div class="chat-scroll" id="chatScroll"></div>
+        <div class="chat-scroll-wrap">
+          <div class="chat-scroll" id="chatScroll"></div>
+          <button class="jump-bottom" id="chatJump" onclick="chatJumpBottom()" hidden>↓ Jump to latest</button>
+        </div>
         <div class="chat-status" id="chatStatus" hidden></div>
         <div class="chat-question" id="chatQuestion" hidden></div>
         <div class="chat-compose">

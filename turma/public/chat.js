@@ -168,6 +168,13 @@
   let liveStatus = null;            // {verb,up,down,elapsed} working indicator, null when idle
   let ws = null, backoffIdx = 0, wsRetryTimer = null;
   let pollTimer = null;
+  // Whether the reader is following the tail. True on open (so we land at the
+  // bottom even after the async /history load grows the transcript below the
+  // seed paint) and while they're parked at the bottom; flipped false the moment
+  // they scroll up (which reveals the "jump to latest" button). This is the
+  // source of truth for auto-scroll, NOT a per-repaint scrolledToBottom() read,
+  // because that read is stale during the open-time seed→history race.
+  let stickBottom = true;
   let cachedToken = null, tokenExp = 0;
   let verbosity = { preset: "normal", show: { ...PRESETS.normal } };
   let questionActive = false;
@@ -461,7 +468,7 @@
   function repaint() {
     const scroll = $("chatScroll");
     if (!scroll) return;
-    const pin = scrolledToBottom(scroll);
+    const pin = stickBottom;
     const prevTop = scroll.scrollTop;
     const items = buildItems(buffer);
     let html = itemsToHtml(items);
@@ -494,8 +501,26 @@
     // entries only append below, so the prior offset still points at the same
     // content).
     scroll.scrollTop = pin ? scroll.scrollHeight : prevTop;
+    updateJump();
     updateLiveStatus();
     if (liveTurn) startReveal();
+  }
+
+  // The floating "jump to latest" pill hovering just above the compose box: shown
+  // only when the reader has scrolled up off the tail (and there's actually room
+  // to scroll). Clicking it (chatJumpBottom) re-pins to the bottom.
+  function updateJump() {
+    const btn = $("chatJump"), scroll = $("chatScroll");
+    if (!btn || !scroll) return;
+    const scrollable = scroll.scrollHeight - scroll.clientHeight > 60;
+    btn.hidden = stickBottom || !scrollable;
+  }
+  function jumpToBottom() {
+    const scroll = $("chatScroll");
+    if (!scroll) return;
+    stickBottom = true;
+    scroll.scrollTop = scroll.scrollHeight;
+    updateJump();
   }
 
   // The pinned working-status bar (a sibling of the scroll, so a scroll repaint
@@ -542,10 +567,9 @@
       if (backlog > REVEAL_SNAP_CHARS) reveal.shown = target;
       else reveal.shown = Math.min(target, reveal.shown + Math.max(1, Math.floor(REVEAL_RATE_CPS * dt / 1000)));
       const scroll = $("chatScroll");
-      const pin = scroll ? scrolledToBottom(scroll) : false;
       // Rebuild the bubble text: role span + revealed slice.
       bubble.innerHTML = '<span class="role">assistant</span>' + esc(revealFull.slice(0, reveal.shown));
-      if (pin && scroll) scroll.scrollTop = scroll.scrollHeight;
+      if (stickBottom && scroll) scroll.scrollTop = scroll.scrollHeight;
     }
     if (reveal.shown < target) { rafId = requestAnimationFrame(tick); }
   }
@@ -809,6 +833,14 @@
       const b = e.target.closest && e.target.closest(".trunc[data-eid]");
       if (b) { e.preventDefault(); expandEntry(b.getAttribute("data-eid")); }
     });
+    // Follow the reader: parked at the bottom → keep auto-scrolling (and hide the
+    // jump pill); scrolled up → stop pinning and reveal it. Scroll events are
+    // coalesced to the settled position, so a programmatic scroll-to-bottom in
+    // repaint() just re-affirms stickBottom rather than fighting it.
+    scroll.addEventListener("scroll", () => {
+      stickBottom = scrolledToBottom(scroll);
+      updateJump();
+    });
     // `toggle` doesn't bubble, so listen in the capture phase to record each
     // card's user-chosen open/closed state (survives the next repaint).
     scroll.addEventListener("toggle", (e) => {
@@ -902,6 +934,7 @@
     const myGen = gen;
     hostKey = hk; sessionId = id; sess = s; agent = a;
     buffer = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
+    stickBottom = true; // land at the tail on open, past the seed→history race
     noExpand = false;
     detailsOpen.clear();
     loadVerbosity(id);
@@ -945,6 +978,7 @@
     window.autoGrowChatInput = autoGrow;
     window.chatInputKey = function (e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
     window.sendChatInput = send;
+    window.chatJumpBottom = jumpToBottom;
   }
 
   // Expose the pure core (merge + item building) for Node unit tests. Harmless
