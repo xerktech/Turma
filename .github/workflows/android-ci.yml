@@ -58,7 +58,10 @@ jobs:
       - name: Toolchain pins match the agent image
         working-directory: ${{ github.workspace }}
         run: |
-          set -euo pipefail
+          # These steps run under the container's default `sh` (dash), which has
+          # no `set -o pipefail` — keep this dash-compatible, like the Gradle
+          # step above. Neither assignment below reads from a pipe.
+          set -eu
           gradle_bt="$(grep -oP 'buildToolsVersion\s*=\s*"\K[^"]+' android/app/build.gradle.kts)"
           gradle_sdk="$(grep -oP 'compileSdk\s*=\s*\K[0-9]+' android/app/build.gradle.kts)"
           image_bt="$(grep -oP '^ARG ANDROID_BUILD_TOOLS=\K.*' agent/Dockerfile)"
@@ -79,7 +82,10 @@ jobs:
       - name: Ensure SDK packages
         working-directory: ${{ github.workspace }}
         run: |
-          set -euo pipefail
+          # These steps run under the container's default `sh` (dash), which has
+          # no `set -o pipefail` — keep this dash-compatible, like the Gradle
+          # step above. Neither assignment below reads from a pipe.
+          set -eu
           bt="$(grep -oP 'buildToolsVersion\s*=\s*"\K[^"]+' android/app/build.gradle.kts)"
           sdk="$(grep -oP 'compileSdk\s*=\s*\K[0-9]+' android/app/build.gradle.kts)"
           yes | sdkmanager "platform-tools" "platforms;android-${sdk}" "build-tools;${bt}" >/dev/null 2>&1 || true

@@ -119,6 +119,14 @@ jobs:
       # docker CLI + the Android toolchain) is large enough to blow out the
       # runner container's small /tmp ("no space left on device"). runner.temp
       # lives on the roomy _work volume and is cleaned per job.
+      # timeout: Trivy's default is well under what this image needs now that the
+      # emulator layer landed, and it blows the deadline mid-layer rather than on
+      # any one file — it reports whichever file it happened to reach, e.g.
+      #   FATAL failed to analyze root/.android/avd/turma.avd/config.ini:
+      #         semaphore acquire: context deadline exceeded
+      # which is 3.5 MB of AVD metadata and not itself the cost. That reads as a
+      # scan finding but is pure flake: the same commit passes on a re-run. Give
+      # it room, per Trivy's own "provide a higher timeout value" warning.
       - name: Trivy image scan
         env:
           TMPDIR: ${{ runner.temp }}
@@ -133,6 +141,7 @@ jobs:
             --skip-dirs "opt/android-sdk" \
             --skip-dirs "usr/lib/jvm" \
             --cache-dir "${RUNNER_TEMP}/trivy-cache" \
+            --timeout 45m \
             --exit-code 1 \
             --no-progress
 
