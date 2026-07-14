@@ -26,7 +26,10 @@ function loadCloneModule() {
     localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); }, removeItem: (k) => { delete store[k]; } },
     document: {
       getElementById: (id) => els.get(id) || null,
-      querySelector: () => null, querySelectorAll: () => [], addEventListener() {},
+      querySelector: () => null,
+      // Back captureCloneScroll's `.clone-list` sweep with the fake registry.
+      querySelectorAll: (sel) => sel === ".clone-list" ? [...els.values()].filter((e) => e.__cloneList) : [],
+      addEventListener() {},
       get activeElement() { return null; },
       createElement: () => ({ style: {}, dataset: {}, classList: { add() {}, remove() {} }, setAttribute() {}, appendChild() {} }),
       body: {}, title: "",
@@ -42,7 +45,7 @@ function loadCloneModule() {
   // Expose the pieces we test and give the test a way to observe post()/render()
   // and seed `cache`, then evaluate under the stubs.
   const exportTail = `
-    ;globalThis.__clone = { cloneBar, clonePick, clonePickCount, cloneRepo, cloneSearch, cloneText, updateCloneButton, cloneDraft, hostId };
+    ;globalThis.__clone = { cloneBar, clonePick, clonePickCount, cloneRepo, cloneSearch, cloneText, updateCloneButton, cloneToggle, captureCloneScroll, restoreCloneScroll, cloneDraft, cloneOpen, hostId };
     globalThis.__setRender = (f) => { render = f; };
     globalThis.__setPost = (f) => { post = f; };
     globalThis.__setCache = (c) => { cache = c; };
@@ -59,8 +62,13 @@ function loadCloneModule() {
   const posts = [];
   g.__setRender(() => {});                       // suppress DOM re-render side-effects
   g.__setPost((url, body) => { posts.push({ url, body }); return Promise.resolve(); });
-  return { ...api, posts, els, setCache: g.__setCache };
+  // Register a fake .clone-list element so capture/restoreCloneScroll see it.
+  const addCloneList = (id, scrollTop) => { const e = { id, scrollTop, __cloneList: true }; els.set(id, e); return e; };
+  return { ...api, posts, els, addCloneList, setCache: g.__setCache };
 }
+
+// The section is collapsed by default; picker-content tests expand it first.
+function expand(m, key) { m.cloneOpen.add(key); }
 
 // A host with GitHub creds and a handful of repos, one of which is already
 // present locally (so it should render disabled).
@@ -78,10 +86,27 @@ function sampleAgent() {
   };
 }
 
+test("cloneBar: collapsed by default — header only, no picker until expanded", () => {
+  const m = loadCloneModule();
+  const a = sampleAgent();
+  m.setCache({ agents: [a] });
+  const collapsed = m.cloneBar(a);
+  assert.match(collapsed, /clone-bar collapsed/, "starts collapsed");
+  assert.match(collapsed, /Clone from GitHub/, "header label always shows");
+  assert.ok(!collapsed.includes('type="checkbox"'), "no picker while collapsed");
+  assert.ok(!collapsed.includes("clone-search-"), "no search box while collapsed");
+  // cloneToggle flips it open.
+  m.cloneToggle(a.key);
+  const opened = m.cloneBar(a);
+  assert.ok(!/clone-bar collapsed/.test(opened), "toggled open");
+  assert.ok(opened.includes('type="checkbox"'), "picker shows once expanded");
+});
+
 test("cloneBar: renders a search box + one checkbox per repo, already-present disabled", () => {
   const m = loadCloneModule();
   const a = sampleAgent();
   m.setCache({ agents: [a] });
+  expand(m, a.key);
   const html = m.cloneBar(a);
   assert.ok(html.includes(`clone-search-${m.hostId(a.key)}`), "has a search input");
   assert.equal((html.match(/type="checkbox"/g) || []).length, 4, "one checkbox per repo");
@@ -94,6 +119,7 @@ test("cloneBar: search box filters the list case-insensitively", () => {
   const m = loadCloneModule();
   const a = sampleAgent();
   m.setCache({ agents: [a] });
+  expand(m, a.key);
   m.cloneDraft.set(a.key, { search: "ME/" });
   const html = m.cloneBar(a);
   assert.ok(html.includes("me/alpha"), "keeps matches");
@@ -166,10 +192,31 @@ test("cloneRepo: no selection and empty box is a no-op", () => {
   assert.equal(m.posts.length, 0);
 });
 
+test("capture/restoreCloneScroll: preserve the list's scroll across a re-render", () => {
+  const m = loadCloneModule();
+  // A list scrolled partway down before the poll's innerHTML swap.
+  m.addCloneList("clone-list-host1", 140);
+  const snap = m.captureCloneScroll();
+  assert.deepEqual(snap, [{ id: "clone-list-host1", top: 140 }]);
+  // The swap recreates the element at scrollTop 0; restore puts it back.
+  const fresh = m.addCloneList("clone-list-host1", 0);
+  m.restoreCloneScroll(snap);
+  assert.equal(fresh.scrollTop, 140, "scroll position reapplied after re-render");
+});
+
+test("captureCloneScroll: ignores lists sitting at the top (no snapshot needed)", () => {
+  const m = loadCloneModule();
+  m.addCloneList("clone-list-host1", 0);
+  assert.deepEqual(m.captureCloneScroll(), []);
+});
+
 test("cloneBar: a host with no GitHub creds renders greyed out with no picker", () => {
   const m = loadCloneModule();
   const bare = { key: "h2", online: true, repos: [], github: { available: false } };
   m.setCache({ agents: [bare] });
+  const collapsed = m.cloneBar(bare);
+  assert.match(collapsed, /clone-bar collapsed disabled/, "greyed + collapsed by default");
+  expand(m, bare.key);
   const html = m.cloneBar(bare);
   assert.match(html, /cloning unavailable/);
   assert.ok(!html.includes('type="checkbox"'), "no picker when creds are absent");

@@ -111,25 +111,33 @@
   .composer .cmp-actions .spacer { flex: 1; }
   .sess-label { font-size: 12px; }
 
-  /* "Clone from GitHub" bar at the top of a host's repo tree: a searchable,
+  /* "Clone from GitHub" bar at the top of a host's repo tree: a collapsible
+     (collapsed by default) section whose header toggles a searchable,
      multi-select checkbox list of the gh login's repos + a free-text owner/repo
      box that clone into REPOS_ROOT. Greyed out (with a note) when the host has
      no usable GitHub credentials. */
   .clone-bar {
-    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
     padding-bottom: 12px; border-bottom: 1px solid var(--hairline);
   }
   .clone-bar.disabled { opacity: 0.75; }
+  /* Header row: caret + label, clicking it toggles the section open/closed. */
+  .clone-toggle {
+    display: flex; align-items: center; gap: 8px; width: 100%; padding: 0;
+    background: none; border: none; color: inherit; cursor: pointer; text-align: left;
+  }
+  .clone-toggle .caret { color: var(--muted); font-size: 11px; flex-shrink: 0; transition: transform 0.15s; }
+  .clone-bar.collapsed .clone-toggle .caret { transform: rotate(-90deg); }
   .clone-bar .clone-label { font-weight: 600; font-size: 13px; }
   .clone-bar .clone-note { color: var(--muted); font-weight: 400; font-size: 12px; }
-  .clone-bar select, .clone-bar input {
+  /* Expanded body: the picker row (search+list, free-text box, Clone button). */
+  .clone-body {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px;
+  }
+  .clone-body input {
     font: inherit; font-size: 13px; padding: 6px 9px; border-radius: 6px;
     border: 1px solid var(--border); background: var(--surface); color: var(--ink);
-    max-width: 100%;
+    max-width: 100%; flex: 0 1 180px; min-width: 120px;
   }
-  .clone-bar select { max-width: 320px; flex: 1 1 200px; min-width: 150px; }
-  .clone-bar input { flex: 0 1 180px; min-width: 120px; }
-  .clone-bar .spacer { flex: 1; }
   /* Searchable, multi-select repo picker. The search box filters the scrollable
      checkbox list; checked repos accumulate in cloneDraft and clone together. */
   .clone-picker { flex: 1 1 100%; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
@@ -328,6 +336,19 @@ const composerDraft = new Map();
 //   half-typed search/owner-repo or the set of checked repos. `picks` is a
 //   {nameWithOwner: true} set so several repos can be selected and cloned at once.
 const cloneDraft = new Map();
+// - cloneOpen: host keys whose "Clone from GitHub" section is expanded. Absent =
+//   collapsed, so the section starts collapsed on every host (and resets to
+//   collapsed on reload) — cloning is an occasional action, not the default view.
+const cloneOpen = new Set();
+function cloneToggle(key) {
+  if (cloneOpen.has(key)) cloneOpen.delete(key); else cloneOpen.add(key);
+  render(cache);
+  // Autofocus the search box on open (autofocus doesn't fire on innerHTML insert).
+  if (cloneOpen.has(key)) {
+    const el = document.getElementById("clone-search-" + hostId(key));
+    if (el) el.focus();
+  }
+}
 // Free-text owner/repo box. Also refreshes the Clone button's live count.
 function cloneText(key, v) { const d = cloneDraft.get(key) || {}; d.text = v; cloneDraft.set(key, d); updateCloneButton(key); }
 // Search box filters the repo list — needs a re-render to reflow the checkboxes.
@@ -682,10 +703,31 @@ function render(data) {
 
   // One container per host, so each agent IS a host — render them as a flat
   // list of host cards keyed/titled by host name (no container-name layer).
-  // Preserve focus/caret in an open composer across the full innerHTML swap.
+  // Preserve focus/caret in an open composer, and the clone list's scroll
+  // position, across the full innerHTML swap (a background poll re-render would
+  // otherwise reset a mid-scroll selection to the top).
   const focus = captureComposerFocus();
+  const scrolls = captureCloneScroll();
   $groups.innerHTML = `<div class="hosts">${agents.map(a => hostCard(a, now)).join("")}</div>`;
   restoreComposerFocus(focus);
+  restoreCloneScroll(scrolls);
+}
+
+// The clone repo picker is a scrollable list; the 5s poll's innerHTML swap
+// recreates it and would jump it back to the top mid-selection. Snapshot each
+// open list's scrollTop (keyed by its host id) and reapply it after the swap.
+function captureCloneScroll() {
+  const out = [];
+  for (const el of document.querySelectorAll(".clone-list")) {
+    if (el.id && el.scrollTop) out.push({ id: el.id, top: el.scrollTop });
+  }
+  return out;
+}
+function restoreCloneScroll(list) {
+  for (const s of (list || [])) {
+    const el = document.getElementById(s.id);
+    if (el) el.scrollTop = s.top;
+  }
 }
 
 function hostCard(a, now) {
@@ -747,16 +789,19 @@ function hostCard(a, now) {
 // DOM-safe host id for the clone control's field ids.
 function hostId(key) { return key.replace(/[^A-Za-z0-9]/g, "_"); }
 
-// "Clone from GitHub" control for a host. When the host has usable GitHub creds
-// it offers a searchable, multi-select checkbox list of the login's repos
-// (already-present ones disabled) plus a free-text owner/repo box, and queues a
-// clone into REPOS_ROOT for each selected repo; they then join the scan and
-// become spawnable. With no creds it renders greyed out with a note. In-flight /
-// recent clone jobs (reported by the agent) show below, with an optimistic row
-// per clone just fired but not yet echoed back.
+// "Clone from GitHub" control for a host — a collapsible section (collapsed by
+// default; cloneOpen tracks which hosts are expanded). Its header toggles the
+// body: when the host has usable GitHub creds the body offers a searchable,
+// multi-select checkbox list of the login's repos (already-present ones
+// disabled) plus a free-text owner/repo box, and queues a clone into REPOS_ROOT
+// for each selected repo; they then join the scan and become spawnable. With no
+// creds the body is a greyed-out note. In-flight / recent clone jobs (reported
+// by the agent) show below the section — visible even while it's collapsed — with
+// an optimistic row per clone just fired but not yet echoed back.
 function cloneBar(a) {
   const gh = a.github || {};
   const hid = hostId(a.key);
+  const open = cloneOpen.has(a.key);
   const clones = a.clones || [];
   const jobRows = clones.map(c => {
     if (c.status === "cloning")
@@ -772,13 +817,27 @@ function cloneBar(a) {
     .map(p => `<div class="clone-job"><span class="spin"></span> Cloning <b>${esc(p.repo)}</b>…</div>`)
     .join("");
 
-  if (!gh.available) {
-    return `<div class="clone-bar disabled">
-      <span class="clone-label">Clone from GitHub</span>
-      <span class="clone-note">No GitHub credentials on this host — cloning unavailable.</span>
-    </div>${jobRows}${optimistic}`;
-  }
+  const header = `<button class="clone-toggle" aria-expanded="${open}"
+      title="${open ? "Collapse" : "Expand"} clone panel" onclick="cloneToggle('${esc(a.key)}')">
+    <span class="caret">▼</span>
+    <span class="clone-label">Clone from GitHub${gh.login ? ` <span class="clone-note">as ${esc(gh.login)}</span>` : ""}</span>
+  </button>`;
 
+  // Body only renders while expanded — keeps the collapsed row cheap and, since
+  // the poll re-render then emits no picker, there's nothing to scroll-reset.
+  const inner = !open ? "" : (!gh.available
+    ? `<div class="clone-body"><span class="clone-note">No GitHub credentials on this host — cloning unavailable.</span></div>`
+    : cloneBody(a, gh, hid));
+
+  return `<div class="clone-bar${open ? "" : " collapsed"}${gh.available ? "" : " disabled"}">
+    ${header}${inner}
+  </div>${jobRows}${optimistic}`;
+}
+
+// The expanded picker: search box + scrollable multi-select list, a free-text
+// owner/repo box, and the Clone button/count. Split out of cloneBar so the
+// collapsed path stays a one-liner.
+function cloneBody(a, gh, hid) {
   const existing = new Set((a.repos || []).map(r => r.name));
   const d = cloneDraft.get(a.key) || {};
   const picks = d.picks || {};
@@ -809,11 +868,10 @@ function cloneBar(a) {
     : "";
   const n = clonePickCount(a.key);
   const off = dis ? "1" : "0";
-  return `<div class="clone-bar">
-    <span class="clone-label">Clone from GitHub${gh.login ? ` <span class="clone-note">as ${esc(gh.login)}</span>` : ""}</span>
+  return `<div class="clone-body">
     <div class="clone-picker">
       ${searchBox}
-      <div class="clone-list">${listInner}</div>
+      <div id="clone-list-${hid}" class="clone-list">${listInner}</div>
     </div>
     <input id="clone-input-${hid}" type="text" placeholder="or owner/repo" value="${esc(d.text || "")}"
       ${dis} oninput="cloneText('${esc(a.key)}',this.value)"
@@ -821,7 +879,7 @@ function cloneBar(a) {
     <button id="clone-btn-${hid}" class="primary btn-sm" data-off="${off}" ${dis || n === 0 ? "disabled" : ""}
       onclick="cloneRepo('${esc(a.key)}')">${n > 1 ? `Clone ${n}` : "Clone"}</button>
     <span id="clone-count-${hid}" class="clone-count">${n ? `${n} selected` : ""}</span>
-  </div>${jobRows}${optimistic}`;
+  </div>`;
 }
 
 function repoBlock(a, repo, sessList, now) {
