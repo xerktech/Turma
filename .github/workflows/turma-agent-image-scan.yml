@@ -29,7 +29,10 @@ permissions:
 
 jobs:
   scan:
+    # Self-hosted: builds the agent image to scan it. Even the slim tooling tier is
+    # ~3.1 GB and lands on disk several times over (snapshot + tar + Trivy scratch).
     runs-on: [self-hosted, linux]
+    timeout-minutes: 30
     env:
       # Image name recorded inside the build archive. Now only metadata (the
       # daemon never loads it, and the archive itself is isolated in this job's

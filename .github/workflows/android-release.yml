@@ -43,7 +43,10 @@ env:
 jobs:
   release:
     name: Build, sign (debug), release
+    # Self-hosted: same mingc/android-build-box container as android-ci.yml, which
+    # stays warm in this box's docker cache and would be re-pulled on a hosted VM.
     runs-on: [self-hosted, linux]
+    timeout-minutes: 30
     container:
       image: mingc/android-build-box:latest
     steps:

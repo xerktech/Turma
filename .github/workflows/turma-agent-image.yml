@@ -35,7 +35,10 @@ env:
 
 jobs:
   build:
+    # Self-hosted: builds and pushes the agent image. Warm layer cache + disk; the
+    # :emulator tier alone is 6.4 GB, well past a hosted runner's ~14 GB free.
     runs-on: [self-hosted, linux]
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
