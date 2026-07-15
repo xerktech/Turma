@@ -7,16 +7,28 @@
 # image, cross-checked against the `docker history` layer sums. Do NOT quote
 # `docker images` here: it reports ~1.5x these numbers and disagrees with both.
 #
-#   android        (default) JDK + Gradle + SDK + emulator + system image + AVD.
-#                  Agents can build, test, AND run/troubleshoot Android apps.
-#                  This is what ships as :latest. 8.1 GB (~3.7 GB compressed).
-#   android-build  JDK + Gradle + SDK build tooling, no emulator/system image.
-#                  Agents can BUILD Android apps but not boot one. 3.7 GB.
-#   tooling        No Android at all. 3.1 GB.
+#   android-build  (default) JDK + Gradle + SDK build tooling. Agents can build
+#                  and JVM-unit-test Android apps, and can drive a REMOTE device
+#                  over `adb connect` — but cannot boot an AVD in-container.
+#                  This is what ships as :latest. 2.0 GB.
+#   android        android-build + emulator + x86_64 system image + a `turma`
+#                  AVD, for booting an app in-container. Ships as :emulator,
+#                  built on workflow_dispatch only. 6.4 GB.
+#   tooling        No Android at all. 1.4 GB. CI scans this.
 #
 # Note the shape: the whole Android BUILD toolchain costs 0.6 GB, while the
-# emulator + x86_64 system image cost 4.4 GB — 7x more, and over half the
-# shipped image. That asymmetry is why they are separate tiers rather than one.
+# emulator + x86_64 system image cost 4.4 GB — 7x more. That asymmetry is why
+# they are separate tiers, and why :latest sits at android-build: it keeps every
+# capability the android/ client's CI and tests actually use (assembleDebug +
+# testDebugUnitTest; there are no instrumented tests) for 0.6 GB, and leaves the
+# 4.4 GB to the tag that needs it.
+#
+# Running an app does NOT require the :emulator tag. platform-tools (adb, 22 MB)
+# is in android-build, and adb connects to a device over TCP — so an agent can
+# install/logcat/debug against an emulator running on a KVM-capable host, or a
+# physical phone, without carrying a system image. That path is also the only
+# one with hardware acceleration today: booting the bundled AVD needs the compose
+# to pass `/dev/kvm` (see the emulator stage), which no DockerOps stack does.
 #
 # `tooling` is what CI scans (turma-agent-image-scan.yml). That is not a
 # coverage compromise: Trivy is already told to skip opt/gradle, opt/android-sdk
@@ -29,7 +41,7 @@
 # 3.1 GB, a 62% cut in what the scan job has to build, export and extract.
 #
 # Declared before the first FROM so it can be consumed by one (global ARG scope).
-ARG AGENT_BASE=android
+ARG AGENT_BASE=android-build
 
 FROM node:24-bookworm-slim AS tooling
 
@@ -188,28 +200,32 @@ RUN set -eux; \
 FROM ${AGENT_BASE} AS final
 
 # --- Coding-agent layer (volatile) ------------------------------------------
-# CI pins these to the latest published release on every build, so they change
+# CI pins this to the latest published release on every build, so it changes
 # constantly. Isolated in this trailing layer, a version bump rebuilds only this
-# npm install — never the base tooling above. Keep these ARGs here (not up top)
-# so declaring them can't invalidate the base layer's cache.
+# npm install — never the base tooling above. Keep the ARG here (not up top)
+# so declaring it can't invalidate the base layer's cache.
+#
+# This layer used to also install @openai/codex, @github/copilot and opencode-ai
+# (959 MB between them) against a runtime AGENT env var that was going to select
+# between them. That selection was never built: hub-agent.py launches `claude`
+# unconditionally, and entrypoint.sh reads AGENT only to decide whether to run
+# the claude credential preflight. Nothing in the repo ever exec'd the other
+# three, and their auth was never wired up, so they were 959 MB of unreachable
+# binaries. Re-add here (and build the dispatch) if a second agent is ever
+# genuinely wired end-to-end.
 
 # Claude Code npm version. CI pins this to the latest published release so the
 # image tag reflects the bundled Claude Code version. Defaults to latest for
 # local/manual builds.
 ARG CLAUDE_CODE_VERSION=latest
-# Additional coding agents, selectable at runtime via the AGENT env var (see
-# entrypoint.sh); claude stays the default. Track latest so each rebuild pulls
-# the newest release (like CLAUDE_CODE_VERSION above); pin to a specific version
-# here if you ever need to freeze one. Auth for these is not wired up yet; only
-# claude reuses the host login today.
-ARG CODEX_VERSION=latest
-ARG COPILOT_VERSION=latest
-ARG OPENCODE_VERSION=latest
 
+# `npm cache clean --force` in the same layer: `npm install -g` populates
+# ~/.npm with the tarballs it just unpacked, and nothing at runtime reads that
+# cache — it was shipping 697 MB of dead weight in every pull. It has to run in
+# THIS RUN, not a later one: a separate layer would delete the files in the
+# overlay but the bytes would still ship in this one.
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-                   "@openai/codex@${CODEX_VERSION}" \
-                   "@github/copilot@${COPILOT_VERSION}" \
-                   "opencode-ai@${OPENCODE_VERSION}"
+ && npm cache clean --force
 
 # Wire git to authenticate via gh, system-wide (so it applies regardless of the
 # per-repo /mnt/data .git/config that carries the commit identity). gh reads the
