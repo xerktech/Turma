@@ -203,6 +203,31 @@ function lcPreview(lc) {
   return lc.text || null;
 }
 
+// The tool_use id this user turn was PRODUCED BY, or null — mirror of
+// hub-agent.py _entry_tool_source, where the reasoning lives. Claude Code
+// writes a skill's body back as a user turn tagged with the id of the `Skill`
+// tool_use that pulled it in; on a user turn that field means the tooling
+// authored the entry, not the operator, so it is really that call's result.
+function entryToolSource(entry) {
+  if (entry.type !== "user") return null;
+  return entry.sourceToolUseID || null;
+}
+
+// The entry's first raw text payload (string content, or the first `text` block
+// of list content), or "" — mirror of hub-agent.py _entry_first_text.
+function entryFirstText(entry) {
+  const msg = entry.message;
+  if (!msg || typeof msg !== "object") return "";
+  const content = msg.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === "object" && block.type === "text") return String(block.text || "");
+    }
+  }
+  return "";
+}
+
 // Display role for an entry — mirror of hub-agent.py _entry_role. A compact
 // summary is written as a USER turn carrying text the model wrote about itself;
 // it reports as the assistant so the chat doesn't misattribute it to the human.
@@ -228,6 +253,8 @@ function entryText(entry) {
   if (type !== "user" && type !== "assistant") return null;
   const msg = entry.message;
   if (!msg || typeof msg !== "object") return null;
+  // Tool-authored: a tool_result by another name, and this feed drops those.
+  if (entryToolSource(entry)) return null;
   const content = msg.content;
   let text;
   if (typeof content === "string") {
@@ -306,6 +333,19 @@ function entryBlocks(entry, caps) {
   const msg = entry.message;
   if (!msg || typeof msg !== "object") return null;
   const content = msg.content;
+
+  // A skill body is the result of the Skill call that pulled it in: emit it as
+  // that call's tool_result so the chat folds it into the action card. Ahead of
+  // the content walk — the body arrives as an ordinary text block.
+  const toolSrc = entryToolSource(entry);
+  if (toolSrc) {
+    const text = entryFirstText(entry).replace(ANSI_RE, "").trim();
+    const [clipped, trunc] = clip(text, caps.result);
+    const block = { t: "tool_result", text: clipped, forId: toolSrc };
+    if (trunc) block.truncated = true;
+    return [block];
+  }
+
   const blocks = [];
   const addText = (kind, text, cap) => {
     text = String(text || "").replace(ANSI_RE, "").trim();
@@ -838,5 +878,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, entryRole, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, cleanHint, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, cleanHint, BLOCK_CAPS_LIVE };
 }

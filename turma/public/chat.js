@@ -335,6 +335,10 @@
     const toolUseIds = new Set();
     for (const e of entries) for (const b of (e.blocks || [])) {
       if (b.t === "tool_use" && b.id) toolUseIds.add(b.id);
+      // Last result wins, deliberately: a Skill call reports twice — a
+      // "Launching skill: <name>" stub, then the skill body itself, which the
+      // agent tags with the same tool_use id (hub-agent.py _entry_tool_source).
+      // Later means richer, and the body is what a reader opening the card wants.
       if (b.t === "tool_result" && b.forId) resultsById.set(b.forId, b);
     }
     const items = [];

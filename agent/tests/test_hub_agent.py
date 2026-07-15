@@ -1375,6 +1375,57 @@ class TestCompactSummary(unittest.TestCase):
         self.assertEqual(ha._entry_text(self._entry()), self.SUMMARY)
 
 
+class TestSkillBody(unittest.TestCase):
+    """Invoking a skill makes Claude Code write the whole SKILL.md back as a USER
+    turn — the only role tool output can ride — tagged with `sourceToolUseID`,
+    the id of the Skill tool_use that pulled it in. Taken at its wire role that
+    renders as the operator typing 150KB of skill docs into chat. It's really the
+    Skill call's result, so it reports as one and the chat folds it into that
+    call's action card."""
+
+    BODY = ("Base directory for this skill: /repos/x/.claude/skills/verify\n\n"
+            "# Verifying Turma changes\n\nPick the surface the change reaches.…")
+
+    def _entry(self):
+        return {"type": "user", "isMeta": True, "sourceToolUseID": "toolu_01ABC",
+                "message": {"role": "user", "content": [{"type": "text", "text": self.BODY}]}}
+
+    def test_tool_source_is_the_invoking_tool_use_id(self):
+        self.assertEqual(ha._entry_tool_source(self._entry()), "toolu_01ABC")
+
+    def test_ordinary_turns_have_no_tool_source(self):
+        self.assertIsNone(ha._entry_tool_source({"type": "user", "message": {"content": "hi"}}))
+        # An assistant turn is never tool-authored, whatever it carries.
+        self.assertIsNone(ha._entry_tool_source(
+            {"type": "assistant", "sourceToolUseID": "toolu_01ABC", "message": {"content": "hi"}}))
+
+    def test_blocks_emit_the_body_as_its_skill_calls_tool_result(self):
+        self.assertEqual(ha._entry_blocks(self._entry(), ha.BLOCK_CAPS_FULL),
+                         [{"t": "tool_result", "text": self.BODY, "forId": "toolu_01ABC"}])
+
+    def test_the_same_body_typed_by_a_human_stays_a_text_block(self):
+        # Only the tool tag makes it tool output — pasting a skill body by hand
+        # is the operator talking, and must still read as a user bubble.
+        entry = {"type": "user", "message": {"content": [{"type": "text", "text": self.BODY}]}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_FULL),
+                         [{"t": "text", "text": self.BODY}])
+
+    def test_a_long_body_is_capped_and_truncated(self):
+        entry = self._entry()
+        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        entry["message"]["content"] = [{"type": "text", "text": big}]
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(block["t"], "tool_result")
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["result"])
+        self.assertTrue(block["truncated"])
+
+    def test_entry_text_drops_it_like_any_tool_result(self):
+        # The text feed (glasses tail, heartbeat preview, archive index) carries
+        # no tool results; the assistant's own "[Skill]" marker already shows the
+        # invocation, so dropping the wall costs it nothing.
+        self.assertIsNone(ha._entry_text(self._entry()))
+
+
 class TestHistoryEntriesRich(ProjectDirMixin, unittest.TestCase):
     def test_blocks_attached_and_tool_result_only_turn_surfaces(self):
         path = os.path.join(self.proj, "t.jsonl")

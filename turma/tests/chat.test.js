@@ -78,6 +78,29 @@ test("buildItems: user text -> right bubble; assistant text+tool_use pairs its r
   assert.ok(!items.some((i) => i.kind === "msg" && i.role === "user" && i.text === "file.txt"));
 });
 
+test("buildItems: a skill body folds into its Skill card, never a user bubble", () => {
+  // The agent tags a skill body with the id of the Skill tool_use that pulled it
+  // in (hub-agent.py _entry_tool_source), so it arrives as that call's
+  // tool_result and pairs like any other — the operator never typed it.
+  const body = "# Verifying Turma changes\n\nPick the surface the change reaches.";
+  const items = buildItems([
+    { id: "u1", role: "user", blocks: [{ t: "text", text: "verify the board" }] },
+    { id: "a1", role: "assistant", blocks: [
+      { t: "tool_use", id: "t1", name: "Skill", input: '{"skill":"verify"}' },
+    ] },
+    // A Skill call reports twice: the launch stub, then the body tagged with the
+    // same id. Both fold into the one card, and the richer body wins.
+    { id: "r1", role: "user", blocks: [{ t: "tool_result", forId: "t1", text: "Launching skill: verify" }] },
+    { id: "s1", role: "user", blocks: [{ t: "tool_result", forId: "t1", text: body }] },
+  ]);
+  assert.deepEqual(items.map((i) => i.kind), ["msg", "action"]);
+  assert.equal(items[1].name, "Skill");
+  assert.equal(items[1].result.text, body);
+  // The one user bubble is the human's prompt — the skill body is not beside it.
+  const bubbles = items.filter((i) => i.kind === "msg" && i.role === "user");
+  assert.deepEqual(bubbles.map((b) => b.text), ["verify the board"]);
+});
+
 test("buildItems: thinking becomes its own item; error results flagged", () => {
   const items = buildItems([
     { id: "a1", role: "assistant", blocks: [
