@@ -4165,5 +4165,254 @@ class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
         pr.assert_called_once_with(url)
 
 
+class TestNormalizeJiraSite(unittest.TestCase):
+    """Every way an operator might write the site collapses to one bare
+    lowercase host — the cross-host siteKey the hub dedupes boards on."""
+
+    def test_variants_collapse(self):
+        for raw in ("myorg.atlassian.net",
+                    "MyOrg.Atlassian.Net",
+                    "https://myorg.atlassian.net",
+                    "https://myorg.atlassian.net/",
+                    "https://myorg.atlassian.net/jira/software/projects/X/boards/1",
+                    "https://user@myorg.atlassian.net:443/browse/PROJ-1"):
+            self.assertEqual(ha.normalize_jira_site(raw), "myorg.atlassian.net", raw)
+
+    def test_empty(self):
+        self.assertEqual(ha.normalize_jira_site(""), "")
+        self.assertEqual(ha.normalize_jira_site(None), "")
+
+
+class TestShapeIssue(unittest.TestCase):
+    """Raw REST-v3 search issue -> the compact wire ticket the board renders."""
+
+    def _issue(self, **overrides):
+        fields = {
+            "summary": "Fix the flux capacitor",
+            "status": {"name": "In Review",
+                       "statusCategory": {"key": "indeterminate"}},
+            "priority": {"name": "High"},
+            "issuetype": {"name": "Bug"},
+            "project": {"key": "PROJ", "name": "Project X"},
+            "labels": ["infra", "urgent"],
+            "updated": "2026-07-14T08:12:00.000+0000",
+            "created": "2026-07-01T08:12:00.000+0000",
+            "duedate": "2026-07-20",
+            "parent": {"key": "PROJ-100"},
+        }
+        fields.update(overrides)
+        return {"key": "PROJ-123", "fields": fields}
+
+    def test_full_issue(self):
+        t = ha._shape_issue(self._issue(), "myorg.atlassian.net")
+        self.assertEqual(t["key"], "PROJ-123")
+        self.assertEqual(t["url"], "https://myorg.atlassian.net/browse/PROJ-123")
+        self.assertEqual(t["summary"], "Fix the flux capacitor")
+        self.assertEqual(t["status"], "In Review")
+        self.assertEqual(t["statusCategory"], "inprogress")
+        self.assertEqual(t["priority"], "High")
+        self.assertEqual(t["type"], "Bug")
+        self.assertEqual(t["project"], "PROJ")
+        self.assertEqual(t["projectName"], "Project X")
+        self.assertEqual(t["labels"], ["infra", "urgent"])
+        self.assertEqual(t["dueDate"], "2026-07-20")
+        self.assertEqual(t["parentKey"], "PROJ-100")
+
+    def test_category_mapping(self):
+        for key, cat in (("new", "todo"), ("indeterminate", "inprogress"),
+                         ("done", "done"), ("weird-future-key", "todo")):
+            issue = self._issue(status={"name": "S",
+                                        "statusCategory": {"key": key}})
+            self.assertEqual(
+                ha._shape_issue(issue, "s")["statusCategory"], cat, key)
+
+    def test_missing_optionals_degrade_to_none(self):
+        issue = self._issue(priority=None, duedate=None, labels=None)
+        del issue["fields"]["parent"]
+        t = ha._shape_issue(issue, "s")
+        self.assertIsNone(t["priority"])
+        self.assertIsNone(t["dueDate"])
+        self.assertIsNone(t["parentKey"])
+        self.assertEqual(t["labels"], [])
+
+    def test_caps(self):
+        issue = self._issue(summary="x" * 500,
+                            labels=[f"l{i}" for i in range(20)])
+        t = ha._shape_issue(issue, "s")
+        self.assertEqual(len(t["summary"]), 200)
+        self.assertEqual(len(t["labels"]), 5)
+
+    def test_empty_issue_never_raises(self):
+        t = ha._shape_issue({}, "s")
+        self.assertEqual(t["statusCategory"], "todo")
+        self.assertEqual(t["summary"], "")
+
+
+def _jira_page(keys, next_token=None):
+    page = {"issues": [
+        {"key": k, "fields": {"summary": k,
+                              "status": {"name": "To Do",
+                                         "statusCategory": {"key": "new"}}}}
+        for k in keys]}
+    if next_token:
+        page["nextPageToken"] = next_token
+    return page
+
+
+class TestFetchJiraIssues(unittest.TestCase):
+    """Pagination against /rest/api/3/search/jql (the nextPageToken API that
+    replaced the removed /rest/api/3/search) and the truncation cap."""
+
+    def test_stitches_pages_via_next_page_token(self):
+        pages = [_jira_page(["A-1", "A-2"], next_token="tok1"),
+                 _jira_page(["A-3"])]
+        calls = []
+
+        def fake_get(path, params):
+            calls.append((path, dict(params)))
+            return pages[len(calls) - 1]
+
+        with mock.patch.object(ha, "JIRA_SITE", "myorg.atlassian.net"), \
+             mock.patch.object(ha, "jira_get", fake_get):
+            tickets, truncated = ha.fetch_jira_issues("jql here", 100)
+        self.assertEqual([t["key"] for t in tickets], ["A-1", "A-2", "A-3"])
+        self.assertFalse(truncated)
+        # The new endpoint, never the removed one, on every page.
+        self.assertTrue(all(p == "/rest/api/3/search/jql" for p, _ in calls))
+        self.assertNotIn("nextPageToken", calls[0][1])
+        self.assertEqual(calls[1][1]["nextPageToken"], "tok1")
+        self.assertIn("summary", calls[0][1]["fields"])
+
+    def test_cap_stops_pagination_and_flags_truncated(self):
+        def fake_get(path, params):
+            return _jira_page(["B-1", "B-2"], next_token="more")
+
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "jira_get", fake_get):
+            tickets, truncated = ha.fetch_jira_issues("jql", 3)
+        self.assertEqual(len(tickets), 3)
+        self.assertTrue(truncated)
+
+    def test_page_bound_flags_truncated(self):
+        def fake_get(path, params):
+            return _jira_page(["C-1"], next_token="forever")
+
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "jira_get", fake_get):
+            tickets, truncated = ha.fetch_jira_issues("jql", 1000)
+        self.assertEqual(len(tickets), ha.JIRA_MAX_PAGES)
+        self.assertTrue(truncated)
+
+
+class TestCollectJira(unittest.TestCase):
+    def test_unconfigured_full_schema_no_http(self):
+        with mock.patch.object(ha, "JIRA_SITE", ""), \
+             mock.patch.object(ha, "JIRA_EMAIL", ""), \
+             mock.patch.object(ha, "JIRA_TOKEN", ""), \
+             mock.patch.object(ha, "jira_get") as get:
+            block = ha.collect_jira()
+        get.assert_not_called()
+        self.assertEqual(block, ha.JIRA_EMPTY)
+        self.assertIsNot(block, ha.JIRA_EMPTY)   # a copy, never the shared dict
+
+    def test_configured_issues_both_queries(self):
+        jqls = []
+
+        def fake_fetch(jql, cap):
+            jqls.append(jql)
+            key = "D-1" if "!= Done" in jql else "D-2"
+            return ([ha._shape_issue({"key": key, "fields": {}}, "s")],
+                    False)
+
+        with mock.patch.object(ha, "JIRA_SITE", "MyOrg.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "me@x.com"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "tok"), \
+             mock.patch.object(ha, "fetch_jira_issues", fake_fetch):
+            block = ha.collect_jira()
+        self.assertTrue(block["available"])
+        self.assertEqual(block["siteKey"], "myorg.atlassian.net")
+        self.assertEqual(block["user"], "me@x.com")
+        self.assertIsNone(block["error"])
+        self.assertFalse(block["truncated"])
+        self.assertEqual([t["key"] for t in block["tickets"]], ["D-1", "D-2"])
+        self.assertTrue(block["fetchedAt"])
+        # Active work and recently-Done are separate queries with separate caps.
+        self.assertEqual(len(jqls), 2)
+        self.assertIn("statusCategory != Done", jqls[0])
+        self.assertIn("statusCategory = Done", jqls[1])
+        self.assertIn(f"-{ha.JIRA_DONE_DAYS}d", jqls[1])
+
+    def test_truncated_rolls_up(self):
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "e"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "t"), \
+             mock.patch.object(ha, "fetch_jira_issues",
+                               side_effect=[([], True), ([], False)]):
+            self.assertTrue(ha.collect_jira()["truncated"])
+
+
+class TestRefreshJira(ManagerMixin, unittest.TestCase):
+    """The manager's slow-cadence Jira refresh: stale-cache fail-open (a fetch
+    error keeps the prior tickets and surfaces only the error string)."""
+
+    def test_success_replaces_block(self):
+        sm = self.make_manager()
+        fresh = {**ha.JIRA_EMPTY, "available": True, "tickets": [{"key": "A-1"}]}
+        with mock.patch.object(ha, "collect_jira", return_value=fresh):
+            sm.refresh_jira()
+        self.assertEqual(sm.jira["tickets"], [{"key": "A-1"}])
+
+    def test_failure_keeps_stale_tickets_and_sets_error(self):
+        sm = self.make_manager()
+        sm.jira = {**ha.JIRA_EMPTY, "available": True,
+                   "fetchedAt": "2026-07-14T00:00:00Z",
+                   "tickets": [{"key": "A-1"}]}
+        with mock.patch.object(ha, "collect_jira",
+                               side_effect=RuntimeError("boom " + "x" * 300)):
+            sm.refresh_jira()
+        self.assertEqual(sm.jira["tickets"], [{"key": "A-1"}])       # stale kept
+        self.assertEqual(sm.jira["fetchedAt"], "2026-07-14T00:00:00Z")
+        self.assertTrue(sm.jira["error"].startswith("boom"))
+        self.assertLessEqual(len(sm.jira["error"]), 200)
+
+    def test_success_after_failure_clears_error(self):
+        sm = self.make_manager()
+        sm.jira = {**ha.JIRA_EMPTY, "error": "old failure"}
+        fresh = {**ha.JIRA_EMPTY, "available": True}
+        with mock.patch.object(ha, "collect_jira", return_value=fresh):
+            sm.refresh_jira()
+        self.assertIsNone(sm.jira["error"])
+
+    def test_payload_cadence_and_light_gating(self):
+        sm = self.make_manager()
+        sm.registry = []
+        calls = []
+        sm.refresh_jira = lambda: calls.append(1)
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "e"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "t"):
+            payload = sm.build_payload(0)                 # beat 0 -> refresh
+            self.assertEqual(len(calls), 1)
+            sm.build_payload(1)                           # off-cadence -> no
+            self.assertEqual(len(calls), 1)
+            sm.build_payload(ha.JIRA_REFRESH_EVERY)       # on-cadence -> yes
+            self.assertEqual(len(calls), 2)
+            sm.build_payload(0, light=True)               # light beat -> no
+            self.assertEqual(len(calls), 2)
+        # The cached block rides every payload regardless.
+        self.assertIn("jira", payload)
+        self.assertEqual(payload["jira"], sm.jira)
+
+    def test_payload_skips_refresh_when_unconfigured(self):
+        sm = self.make_manager()
+        sm.registry = []
+        calls = []
+        sm.refresh_jira = lambda: calls.append(1)
+        with mock.patch.object(ha, "JIRA_SITE", ""):
+            payload = sm.build_payload(0)
+        self.assertEqual(calls, [])                       # zero Jira work
+        self.assertEqual(payload["jira"], ha.JIRA_EMPTY)  # block still present
+
+
 if __name__ == "__main__":
     unittest.main()

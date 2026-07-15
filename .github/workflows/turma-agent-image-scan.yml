@@ -141,6 +141,11 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
+          # --timeout well above the 5m default: the agent image is large
+          # (node/npm/gh/ttyd/docker CLI + the Android toolchain), and even with
+          # the build-toolchain dirs skipped the secret scanner over the
+          # remaining layers routinely brushes the default ceiling and dies with
+          # "context deadline exceeded" (Trivy itself recommends raising it).
           trivy image --input "${RUNNER_TEMP}/agent-image.tar" \
             --scanners vuln,secret \
             --severity CRITICAL,HIGH \
@@ -150,6 +155,7 @@ jobs:
             --skip-dirs "opt/android-sdk" \
             --skip-dirs "usr/lib/jvm" \
             --cache-dir "${RUNNER_TEMP}/trivy-cache" \
+            --timeout 15m \
             --exit-code 1 \
             --no-progress
 

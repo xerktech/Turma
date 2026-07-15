@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turma — Board</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a class="wordmark" href="/"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
+    <span class="sub">Jira board · assigned tickets across orgs</span>
+    <span class="spacer"></span>
+    <nav class="nav-tabs">
+      <a href="/">Dashboard</a>
+      <a href="/sessions">Sessions</a>
+      <a href="/board" class="active">Board</a>
+      <a href="/history">History</a>
+      <a href="#" class="signout" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;">Sign out</a>
+    </nav>
+  </header>
+  <div class="org-chips" id="chips"></div>
+  <div id="board"></div>
+  <div class="footer">Each host agent polls its org's Jira Cloud with user-scoped creds (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code> in the agent's env) for tickets assigned to that user — active work plus the last two weeks of Done — and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns are Jira's universal status categories; each card's pill shows the org's own status name. Pull-only: nothing here writes to Jira.</div>
+</div>
+
+<nav class="bottom-nav">
+  <a href="/">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    Dashboard
+  </a>
+  <a href="/sessions">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+    Sessions
+  </a>
+  <a href="/board" class="active">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="5" height="18" rx="1"/><rect x="9.5" y="3" width="5" height="12" rx="1"/><rect x="16" y="3" width="5" height="15" rx="1"/></svg>
+    Board
+  </a>
+  <a href="/history">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/></svg>
+    History
+  </a>
+</nav>
+
+<script src="/board.js"></script>
+<script>
+const B = window.TurmaBoard;
+const $chips = document.getElementById("chips");
+const $board = document.getElementById("board");
+
+// Selected org filter persists across visits ("" = all orgs).
+const ORG_KEY = "turma-board-org";
+let orgFilter = localStorage.getItem(ORG_KEY) || "";
+function setOrg(k) {
+  orgFilter = k;
+  localStorage.setItem(ORG_KEY, k);
+  if (cache) render(cache);
+}
+
+function esc(s) { return B.esc(s); }
+
+function render(data) {
+  const sites = B.mergeSites(data.agents || []);
+  if (!sites.length) {
+    $chips.replaceChildren();
+    $board.innerHTML = `<div class="empty">No Jira tickets reported yet. Set <code>JIRA_SITE</code>, <code>JIRA_EMAIL</code>, and <code>JIRA_TOKEN</code> in an agent's environment to connect its org.</div>`;
+    return;
+  }
+  const allKeys = sites.map(s => s.siteKey);
+  if (orgFilter && !allKeys.includes(orgFilter)) orgFilter = "";
+
+  // Chips: All + one per org, colored by the org's stable palette slot, with
+  // a staleness note when none of the org's reporting hosts is online.
+  $chips.replaceChildren();
+  const mkChip = (label, key, extra) => {
+    const b = document.createElement("button");
+    b.className = "org-chip" + (orgFilter === key ? " active" : "");
+    b.innerHTML = extra ? esc(label) + extra : esc(label);
+    if (key) b.style.setProperty("--org", B.orgColor(key, allKeys));
+    b.addEventListener("click", () => setOrg(key));
+    return b;
+  };
+  $chips.append(mkChip("All orgs", ""));
+  for (const s of sites) {
+    let extra = ` <span class="chip-n">${s.tickets.length}</span>`;
+    if (!s.online) {
+      const age = B.ageStr(s.lastFetched);
+      extra += ` <span class="chip-stale" title="No host reporting this org is online — showing its last report">⚠ offline${age ? " · synced " + esc(age) + " ago" : ""}</span>`;
+    }
+    $chips.append(mkChip(s.siteKey, s.siteKey, extra));
+  }
+
+  $board.innerHTML = B.boardHtml(sites, orgFilter, { allKeys });
+}
+
+let cache = null, etag = null;
+async function refresh() {
+  try {
+    const r = await fetch("/api/agents", { headers: etag ? { "If-None-Match": etag } : {} });
+    if (r.status === 401) return void (location.href = "/login");
+    if (r.status === 304) return;
+    etag = r.headers.get("ETag");
+    cache = await r.json();
+  } catch { /* keep last render */ }
+  if (cache) render(cache);
+}
+
+// Live push: same SSE pattern as the other pages — patch the cached agent
+// record and re-render (debounced); the 15s poll stays as a fallback only.
+let sseOk = false, sseBackoff = 2000, renderTimer = null;
+function scheduleRender() {
+  if (renderTimer) return;
+  renderTimer = setTimeout(() => { renderTimer = null; if (cache) render(cache); }, 1000);
+}
+function applyAgent(rec) {
+  if (!cache) cache = { now: Date.now(), agents: [] };
+  const list = cache.agents || (cache.agents = []);
+  const i = list.findIndex(a => a.key === rec.key);
+  if (i >= 0) list[i] = rec; else list.push(rec);
+}
+function connectSSE() {
+  let es;
+  try { es = new EventSource("/api/events"); }
+  catch { setTimeout(connectSSE, sseBackoff); return; }
+  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  es.addEventListener("agent", (e) => {
+    try { applyAgent(JSON.parse(e.data)); } catch { return; }
+    scheduleRender();
+  });
+  es.addEventListener("removed", (e) => {
+    try { const { key } = JSON.parse(e.data); if (cache) cache.agents = (cache.agents || []).filter(a => a.key !== key); }
+    catch { return; }
+    scheduleRender();
+  });
+  es.onerror = () => {
+    sseOk = false;
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(connectSSE, sseBackoff);
+      sseBackoff = Math.min(sseBackoff * 2, 30000);
+    }
+  };
+}
+
+refresh();
+connectSSE();
+setInterval(() => { if (!sseOk) refresh(); }, 15000);
+</script>
+</body>
+</html>
