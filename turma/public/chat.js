@@ -94,14 +94,58 @@
     return out;
   }
 
+  // ---- inline code spans ----------------------------------------------------
+  // `code` inside a run of prose. A backtick string opens a span that closes on
+  // the next backtick string of EXACTLY the same length (so ``a `b` c`` holds a
+  // literal backtick), and an unclosed run is literal text — both GFM rules.
+  //
+  // A span never crosses a line break: a stray backtick would otherwise swallow
+  // everything down to the next one, taking whole paragraphs (and any table in
+  // them) into a code span. GFM allows the wrap; transcript prose is full of
+  // lone backticks, so the trade isn't worth it.
+  //
+  // The span body is esc()'d and NOT linkified — a URL in `code` is being shown,
+  // not offered — while the prose around it still goes through linkify().
+  function codeSpan(body) {
+    // GFM strips one leading + trailing space, so `` ` `` can hold a backtick.
+    let b = body;
+    if (b.length > 2 && b.startsWith(" ") && b.endsWith(" ") && b.trim() !== "") b = b.slice(1, -1);
+    return '<code class="md-code-inline">' + esc(b) + "</code>";
+  }
+  function runLen(s, i) { let n = 0; while (s[i + n] === "`") n++; return n; }
+  function renderInline(text) {
+    const s = String(text == null ? "" : text);
+    if (s.indexOf("`") < 0) return linkify(s); // no backtick → nothing to lift out
+    let out = "", i = 0;
+    while (i < s.length) {
+      const open = s.indexOf("`", i);
+      if (open < 0) { out += linkify(s.slice(i)); break; }
+      const n = runLen(s, open);
+      // Scan for a closing run of the same length, bailing at a line break.
+      let j = open + n, close = -1;
+      while (j < s.length) {
+        const c = s.indexOf("`", j);
+        if (c < 0 || s.slice(open + n, c).indexOf("\n") >= 0) break;
+        const m = runLen(s, c);
+        if (m === n) { close = c; break; }
+        j = c + m;
+      }
+      if (close < 0) { out += linkify(s.slice(i, open + n)); i = open + n; continue; } // unclosed: literal
+      out += linkify(s.slice(i, open)) + codeSpan(s.slice(open + n, close));
+      i = close + n;
+    }
+    return out;
+  }
+
   // ---- markdown tables ------------------------------------------------------
   // Render prose that may contain GitHub-flavoured markdown tables. A table is a
   // header row (a line with `|`) immediately followed by a delimiter row (cells
   // of dashes with optional leading/trailing colons for alignment), then body
   // rows until the first line that isn't a pipe row. Recognised tables become
-  // real <table> elements (each cell linkified); everything else falls straight
-  // through linkify() so non-table prose is byte-identical to before. Cells are
-  // linkify()'d, so injection safety is inherited from esc()/linkify().
+  // real <table> elements; everything else falls straight through renderInline()
+  // so non-table prose is byte-identical to before. Cells and prose alike are
+  // renderInline()'d, so injection safety is inherited from esc()/linkify() and
+  // `code` works in a cell too.
   //
   // renderProse() runs the fenced-code pass over this one (see below), so a
   // pipe row inside a code block is never mistaken for a table.
@@ -128,7 +172,7 @@
   function renderTable(header, aligns, rows) {
     const cell = (tag, txt, i) => {
       const a = aligns[i] || "";
-      return "<" + tag + (a ? ' style="text-align:' + a + '"' : "") + ">" + linkify(txt) + "</" + tag + ">";
+      return "<" + tag + (a ? ' style="text-align:' + a + '"' : "") + ">" + renderInline(txt) + "</" + tag + ">";
     };
     let html = '<table class="md-table"><thead><tr>';
     header.forEach((h, i) => { html += cell("th", h, i); });
@@ -142,10 +186,10 @@
   }
   function renderTables(text) {
     const s = String(text == null ? "" : text);
-    if (s.indexOf("|") < 0) return linkify(s); // no pipe → no table possible
+    if (s.indexOf("|") < 0) return renderInline(s); // no pipe → no table possible
     const lines = s.split("\n");
     let out = "", i = 0, buf = [];
-    const flush = () => { if (buf.length) { out += linkify(buf.join("\n")); buf = []; } };
+    const flush = () => { if (buf.length) { out += renderInline(buf.join("\n")); buf = []; } };
     while (i < lines.length) {
       const isTableHead = i + 1 < lines.length && hasPipe(lines[i]) && isDelimiterRow(lines[i + 1]) &&
         splitRow(lines[i]).length === splitRow(lines[i + 1]).length;
@@ -1304,7 +1348,7 @@
   // in the browser (no `module`); the browser path uses window.TurmaChat above.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderProse, prFooterChip,
+      mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, prFooterChip,
       agentsHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
       isBusy, updateComposeAction,
       __setLiveStatus: (st) => { liveStatus = st; },

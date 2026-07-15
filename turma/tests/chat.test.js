@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderProse, prFooterChip, agentsHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, agentsHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -641,15 +641,82 @@ test("renderProse: a longer closing fence closes the block", () => {
 });
 
 test("renderProse: inline backticks in prose don't open a block", () => {
-  // A fence line must be the fence plus at most a one-word info string.
+  // A fence line must be the fence plus at most a one-word info string; these
+  // are inline spans (see renderInline) sitting mid-sentence, not blocks.
   const html = renderProse("run ```npm ci``` first, then ``` npm test ``` after");
   assert.doesNotMatch(html, /<pre/);
-  assert.match(html, /run ```npm ci``` first/);
+  assert.match(html, /run <code class="md-code-inline">npm ci<\/code> first/);
 });
 
 test("renderProse: fence-free text is byte-identical to the table renderer", () => {
   const t = "opened [PR #42](https://github.com/o/r/pull/42) — <b>done</b> & dusted";
   assert.equal(renderProse(t), linkify(t));
+});
+
+// ---- renderInline (inline `code` spans in prose) -------------------------
+test("renderInline: a backtick span becomes a <code> chip", () => {
+  assert.equal(renderInline("run `npm ci` first"),
+    'run <code class="md-code-inline">npm ci</code> first');
+});
+
+test("renderInline: span contents are escaped and never linkified", () => {
+  const html = renderInline("hit `https://x.io/<b>` then");
+  assert.doesNotMatch(html, /<a /);        // a URL being shown, not offered
+  assert.doesNotMatch(html, /<b>/);
+  assert.match(html, /<code class="md-code-inline">https:\/\/x\.io\/&lt;b&gt;<\/code>/);
+});
+
+test("renderInline: prose around a span is still linkified", () => {
+  const html = renderInline("see https://x.io for `--flag` docs");
+  assert.match(html, /<a href="https:\/\/x\.io"/);
+  assert.match(html, /<code class="md-code-inline">--flag<\/code>/);
+});
+
+test("renderInline: an unclosed backtick is literal text", () => {
+  const html = renderInline("a lone ` backtick sits here");
+  assert.doesNotMatch(html, /<code/);
+  assert.match(html, /a lone ` backtick sits here/);
+});
+
+test("renderInline: a span never crosses a line break", () => {
+  // Two stray backticks on different lines must not swallow the lines between.
+  const html = renderInline("first ` line\nsecond ` line");
+  assert.doesNotMatch(html, /<code/);
+  assert.match(html, /first ` line\nsecond ` line/);
+});
+
+test("renderInline: a double-backtick span can hold a literal backtick", () => {
+  assert.equal(renderInline("write ``a `b` c`` here"),
+    'write <code class="md-code-inline">a `b` c</code> here');
+});
+
+test("renderInline: one leading+trailing space is stripped (GFM)", () => {
+  assert.equal(renderInline("a `` ` `` b"), 'a <code class="md-code-inline">`</code> b');
+  // ...but an all-space body is left alone, and a single side isn't stripped.
+  assert.equal(renderInline("a ` x ` b"), 'a <code class="md-code-inline">x</code> b');
+  assert.equal(renderInline("a ` x` b"), 'a <code class="md-code-inline"> x</code> b');
+});
+
+test("renderInline: several spans in one line all render", () => {
+  const html = renderInline("`a` then `b` then `c`");
+  assert.equal((html.match(/<code class="md-code-inline">/g) || []).length, 3);
+});
+
+test("renderInline: backtick-free text is byte-identical to linkify", () => {
+  const t = "opened [PR #42](https://github.com/o/r/pull/42) — <b>done</b> & dusted";
+  assert.equal(renderInline(t), linkify(t));
+});
+
+test("renderProse: `code` works inside a table cell", () => {
+  const html = renderProse("| Flag | Use |\n|---|---|\n| `--fabric` | on in prod |");
+  assert.match(html, /<td><code class="md-code-inline">--fabric<\/code><\/td>/);
+});
+
+test("renderProse: backticks inside a fenced block stay literal", () => {
+  // The fence pass runs first, so the block body is never inline-scanned.
+  const html = renderProse("```sh\necho `date`\n```");
+  assert.doesNotMatch(html, /md-code-inline/);
+  assert.match(html, /<code>echo `date`<\/code>/);
 });
 
 // ---- agentsHtml: the live pane agent-list rendered under the status bar ------

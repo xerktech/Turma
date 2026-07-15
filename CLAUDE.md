@@ -521,14 +521,20 @@ Cloudflare tunnel; port 8300 on the LAN.
   `reveal.ts`).
 - Bubble prose is rendered by `renderProse` (`chat.js`), which lifts markdown out of the transcript's
   plain text: **fenced ` ``` ` blocks** become `<pre class="md-code">` (language chip from the info
-  string), GFM **tables** become real `<table>`s, and everything else is linkified.
+  string), inline **` `code` ` spans** become `<code class="md-code-inline">` chips (`renderInline`),
+  GFM **tables** become real `<table>`s, and everything else is linkified.
+  - The passes nest outward-in — fence, then table, then inline, then link — so each only ever sees
+    text the outer ones didn't claim, and a code body is never linkified at any level.
+  - An inline span never crosses a line break: transcript prose is full of lone backticks, and a
+    stray one would otherwise swallow whole paragraphs (and any table in them) into a span.
   - The fence pass runs above the table pass, so a pipe row inside a code block isn't read as a table,
     and a code body is only ever `esc()`'d — never linkified.
   - An **unterminated fence renders as code**: mid-stream the typewriter hasn't revealed the closer
     yet, and the partial body must not flash as prose first.
   - A non-wrapping `pre` has the min-content width of its longest line, which a shrink-to-fit bubble
-    won't size below — so the code-carrying container is a `minmax(0, 1fr)` grid (scoped by `:has()`),
-    which floors that at 0 and hands the overflow to the block's own scroller.
+    won't size below — so a code-carrying bubble is given a **definite** `width: min(760px, 100%)`
+    (scoped by `:has()`), taking it out of shrink-to-fit sizing so the overflow lands on the block's
+    own scroller. Not a grid track: that would tear inline `code`/links onto their own lines.
   - Tests: the `renderProse` cases in `turma/tests/chat.test.js`.
 - A per-session **verbosity control** (Concise/Normal/Verbose presets + per-type thinking/tool-calls/
   tool-outputs toggles, persisted in `localStorage`) filters which `blocks[]` components show — a pure
