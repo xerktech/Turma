@@ -257,7 +257,6 @@
 <script>
 const $tiles = document.getElementById("tiles");
 const $groups = document.getElementById("groups");
-const $refreshed = document.getElementById("hdrStatus"); // shared header slot (nav.js)
 
 // The tree re-renders every 5s. These module-level stores survive re-render so
 // open panels and in-progress two-click actions are not lost mid-poll.
@@ -649,7 +648,6 @@ function tile(label, value, hint) {
 function render(data) {
   const { now, agents } = data;
   reconcilePending(agents);
-  $refreshed.textContent = "updated " + new Date(now).toLocaleTimeString();
 
   // Aggregate across every session on every host.
   const sess = agents.flatMap(a => (a.sessions || []).map(s => ({ s, host: a })));

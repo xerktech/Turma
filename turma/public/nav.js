@@ -5,10 +5,10 @@
 // its own full-width bar; only some pages carried a status slot).
 //
 // The header markup this builds is IDENTICAL on every page. Everything a page
-// wants to say about itself goes in the three slots — #hdrSub (static
-// descriptor), #hdrMeta (dynamic, left) and #hdrStatus (dynamic, right) — which
-// the page's own script fills. An unfilled slot collapses (`.sub:empty` in
-// app.css), so pages using fewer slots still ship the same DOM.
+// wants to say about itself goes in the two slots — #hdrSub (the static
+// descriptor) and #hdrMeta (dynamic) — which the page's own script fills. An
+// unfilled slot collapses (`.sub:empty` in app.css), so pages using fewer slots
+// still ship the same DOM.
 //
 // Loaded by every page in the browser (window.TurmaNav) and require()d directly
 // by tests/nav.test.js, the same dual-export pattern as chat.js / board.js.
@@ -64,7 +64,6 @@
     <span class="sub" id="hdrMeta"></span>
     <span class="spacer"></span>
     ${tabsHtml(active)}
-    <span class="sub" id="hdrStatus"></span>
   </div>`;
   }
 
