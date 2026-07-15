@@ -595,3 +595,76 @@ for (const [where, order] of [
         hint: "Tip: Use /btw to ask a quick side question" });
   });
 }
+
+test("parseAgentList: rows -> {sel,type,label}; main has no label", () => {
+  const { parseAgentList } = require("../tunnel-agent.js");
+  const rows = [
+    "◉ main",
+    "○ Explore   Explore Jira agent-side code",
+    "○ Explore   Explore board page hub-side",
+  ];
+  assert.deepEqual(parseAgentList(rows), [
+    { sel: true, type: "main", label: "" },
+    { sel: false, type: "Explore", label: "Explore Jira agent-side code" },
+    { sel: false, type: "Explore", label: "Explore board page hub-side" },
+  ]);
+});
+
+test("parseAgentList: alternate radio glyphs + multi-word types, ignores non-rows", () => {
+  const { parseAgentList } = require("../tunnel-agent.js");
+  const rows = [
+    "  ⏵⏵ auto mode on · esc to interrupt · ← for agents · ↓ to manage",
+    "",
+    "● main",
+    "◯ general-purpose   Migrate the config loader",
+  ];
+  // The mode line and blank line carry no radio glyph, so they're not rows.
+  assert.deepEqual(parseAgentList(rows), [
+    { sel: true, type: "main", label: "" },
+    { sel: false, type: "general-purpose", label: "Migrate the config loader" },
+  ]);
+});
+
+// parsePaneLiveTurn surfaces the agent-manager list (below the input box) as
+// status.agents, and it must never bleed into the streamed assistant text.
+test("parsePaneLiveTurn: agent-manager list -> status.agents, not text", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const pane = [
+    "❯ Explore the codebase",
+    "● Kicking off two explorers.",
+    "✳ Zesting… (45s · ↓ 2.3k tokens · esc to interrupt)",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents · ↓ to manage",
+    "",
+    "◉ main",
+    "○ Explore   Explore Jira agent-side code",
+    "○ Explore   Explore board page hub-side",
+  ].join("\n");
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.generating, true);
+  assert.equal(r.text, "Kicking off two explorers.");
+  assert.ok(!/Explore Jira|main|board page/.test(r.text), "agent list must not leak into the text");
+  assert.deepEqual(r.status.agents, [
+    { sel: true, type: "main", label: "" },
+    { sel: false, type: "Explore", label: "Explore Jira agent-side code" },
+    { sel: false, type: "Explore", label: "Explore board page hub-side" },
+  ]);
+});
+
+// No agent list expanded -> status has no `agents` key at all (so the UI shows
+// nothing rather than an empty list).
+test("parsePaneLiveTurn: no agent-manager list -> status without agents key", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const pane = [
+    "❯ hi",
+    "✳ Zesting… (2s · esc to interrupt)",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ auto mode on · esc to interrupt · ← for agents · ↓ to manage",
+  ].join("\n");
+  const r = parsePaneLiveTurn(pane);
+  assert.ok(r.status && !("agents" in r.status), "no expanded list -> no agents key");
+});

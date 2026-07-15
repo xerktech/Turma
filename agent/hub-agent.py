@@ -1887,6 +1887,76 @@ def _history_entries(path):
     return entries, byte_capped
 
 
+# The Task tool's result text carries the spawned agent's id ("agentId: <id>"),
+# which is also its subagent-transcript filename (subagents/agent-<id>.jsonl).
+_AGENT_ID_RE = re.compile(r"agentId:\s*([A-Za-z0-9_-]+)")
+
+
+def _subagents_dir(main_path):
+    """The subagents/ dir Claude Code writes background-agent transcripts into,
+    a sibling of the main transcript keyed on its id:
+    <PROJECTS_ROOT>/<slug>/<id>.jsonl -> <PROJECTS_ROOT>/<slug>/<id>/subagents/."""
+    stem = main_path[:-len(".jsonl")] if main_path.endswith(".jsonl") else main_path
+    return os.path.join(stem, "subagents")
+
+
+def _resolve_subagent(main_path, agent_type, label):
+    """Map a pane agent-list row (its `type` + short `label`/description) to the
+    background agent's transcript file, via the main transcript's Task calls.
+
+    A Task tool_use carries {subagent_type, description}; its paired tool_result
+    text carries "agentId: <id>", and that id names the subagent transcript
+    (subagents/agent-<id>.jsonl). We read the main transcript, index Task calls
+    by tool_use id, resolve each id's agentId from its result, then pick the
+    NEWEST call whose type+description match the clicked row (exact, else a
+    prefix match so a pane-truncated label still resolves). Returns the subagent
+    transcript path, or None when nothing matches / the file is absent — a miss
+    must not raise (the caller stages an empty result)."""
+    want_type = (agent_type or "").strip()
+    want_label = (label or "").strip()
+    if not want_type:
+        return None
+    tasks = []          # [(tool_use_id, description)] for the wanted type, in order
+    agent_ids = {}      # tool_use_id -> agentId (from the paired result)
+    for raw in _read_tail_lines(main_path, 1 << 23):  # last 8 MiB
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        msg = entry.get("message") if isinstance(entry, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") == "Task":
+                inp = block.get("input") or {}
+                if str(inp.get("subagent_type") or "").strip() == want_type:
+                    tasks.append((block.get("id"),
+                                  str(inp.get("description") or "").strip()))
+            elif block.get("type") == "tool_result":
+                m = _AGENT_ID_RE.search(_tool_result_text(block.get("content")))
+                if m and block.get("tool_use_id"):
+                    agent_ids[block["tool_use_id"]] = m.group(1)
+
+    def _matches(desc):
+        if not want_label or desc == want_label:
+            return True
+        return desc.startswith(want_label) or want_label.startswith(desc)
+
+    for tool_id, desc in reversed(tasks):  # newest matching call wins
+        if not _matches(desc):
+            continue
+        aid = agent_ids.get(tool_id)
+        if not aid:
+            continue
+        path = os.path.join(_subagents_dir(main_path), f"agent-{aid}.jsonl")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 # A req file only marks a *live* pending question while the ask.py bridge is
 # still blocked on it; the bridge self-times-out at TURMA_QUESTION_TIMEOUT_SEC
 # and Claude kills the hook at ASK_HOOK_TIMEOUT_SEC regardless, so a req older
@@ -3114,6 +3184,10 @@ class SessionManager:
         # (historyResults) — held across a failed POST, cleared only once
         # delivery succeeds, same lifecycle as pending_prs above.
         self.history_results = []
+        # Staged `subagentHistory` results (one background agent's transcript,
+        # fetched when an operator clicks a live agent-list row) — same
+        # staged-until-delivered lifecycle as history_results.
+        self.subagent_history_results = []
         # Staged `jiraIssue` command results (one issue's description/comments,
         # fetched on demand when an operator expands a board ticket) awaiting
         # the next heartbeat payload — same held-across-a-failed-POST lifecycle
@@ -4350,6 +4424,27 @@ class SessionManager:
             "truncated": truncated,
         })
 
+    def _stage_subagent_history(self, sid, agent_type, label):
+        """Handle a {type:"subagentHistory"} command: resolve the clicked pane
+        agent-list row (type + label) to its background-agent transcript and
+        stage a bounded read for the next heartbeat (subagentHistoryResults).
+        The row key (sessionId+type+label) is echoed back so the hub can match
+        the delivery to the outstanding request. Any miss (unknown session,
+        unresolved agent, absent file) stages an empty result rather than
+        raising — a poison row must not take down the heartbeat loop."""
+        result = {"sessionId": sid, "type": agent_type or "",
+                  "label": label or "", "entries": [], "truncated": False}
+        sess = self._find(sid)
+        main = _newest_transcript_path(sess["worktreePath"]) if sess else None
+        path = _resolve_subagent(main, agent_type, label) if main else None
+        if not path:
+            self.subagent_history_results.append(result)
+            return
+        entries, byte_capped = _history_entries(path)
+        result["entries"] = entries[-HISTORY_MAX_MSGS:]
+        result["truncated"] = byte_capped or len(entries) > HISTORY_MAX_MSGS
+        self.subagent_history_results.append(result)
+
     def _stage_jira_issue(self, key):
         """Handle a {type:"jiraIssue"} command: fetch that issue's full detail
         and stage it for the next heartbeat payload (jiraIssueResults). Every
@@ -5235,6 +5330,9 @@ class SessionManager:
                     )
                 elif ctype == "history":
                     self._stage_history(cmd.get("sessionId"))
+                elif ctype == "subagentHistory":
+                    self._stage_subagent_history(
+                        cmd.get("sessionId"), cmd.get("agentType"), cmd.get("label"))
                 elif ctype == "jiraIssue":
                     self._stage_jira_issue(cmd.get("issueKey"))
                 elif ctype == "clone":
@@ -5760,6 +5858,8 @@ class SessionManager:
         # something to report.
         if self.history_results:
             payload["historyResults"] = list(self.history_results)
+        if self.subagent_history_results:
+            payload["subagentHistoryResults"] = list(self.subagent_history_results)
         if self.jira_issue_results:
             payload["jiraIssueResults"] = list(self.jira_issue_results)
         # Archive sync manifest on the slow cadence: the inactive transcripts the
@@ -5796,6 +5896,7 @@ class SessionManager:
                 reply = json.loads(resp.read().decode() or "{}")
             self._clear_pending_prs()  # delivered
             self.history_results.clear()  # delivered — same lifecycle
+            self.subagent_history_results.clear()  # delivered — same lifecycle
             self.jira_issue_results.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
         except Exception as e:

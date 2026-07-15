@@ -659,7 +659,43 @@
       '<div class="cc-row"><span class="cc-spin"></span>' +
       '<span class="verb">' + verb + "…</span>" +
       '<span class="toks">' + elapsed + toks + "</span></div>" +
-      hint;
+      hint +
+      agentsHtml(st.agents);
+    wireAgentDelegation(bar);
+  }
+
+  // The live agent-manager list scraped from the pane (parseAgentList in
+  // tunnel-agent.js). Each subagent row is a button that opens that background
+  // agent's transcript (see openSubagentView); "main" is the session itself —
+  // already on screen — so it's a plain marker, not a link. Absent/empty -> "".
+  function agentsHtml(agents) {
+    if (!Array.isArray(agents) || !agents.length) return "";
+    const rows = agents.map((a) => {
+      const dot = '<span class="dot' + (a.sel ? " sel" : "") + '"></span>';
+      const type = '<span class="atype">' + esc(a.type) + "</span>";
+      const label = a.label ? '<span class="alabel">' + esc(a.label) + "</span>" : "";
+      // "main" (the parent conversation) has no separate transcript to open.
+      if (a.type === "main" && !a.label) return '<div class="cc-agent main">' + dot + type + "</div>";
+      return '<button type="button" class="cc-agent" data-atype="' + esc(a.type) +
+        '" data-alabel="' + esc(a.label || "") + '">' + dot + type + label + "</button>";
+    });
+    return '<div class="cc-agents"><div class="cc-agents-hd">Agents</div>' + rows.join("") + "</div>";
+  }
+
+  // One delegated click handler on the status bar: a subagent row opens its
+  // transcript through the host page (openSubagentView, defined in sessions.html)
+  // — chat.js has the host/session, the host owns the read-only stage.
+  function wireAgentDelegation(bar) {
+    if (!bar || bar.dataset.agentsWired) return;
+    bar.dataset.agentsWired = "1";
+    bar.addEventListener("click", (e) => {
+      const b = e.target.closest && e.target.closest(".cc-agent[data-atype]");
+      if (!b) return;
+      e.preventDefault();
+      if (typeof window.openSubagentView === "function") {
+        window.openSubagentView(b.getAttribute("data-atype"), b.getAttribute("data-alabel") || "");
+      }
+    });
   }
 
   // Repaint from outside (e.g. returning from the terminal toggle).
@@ -1133,7 +1169,7 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderProse, prFooterChip,
-      filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
+      agentsHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
       __setVerbosity: (v) => { verbosity = v; },
       __setNoExpand: (v) => { noExpand = v; },
       __setBuffer: (b) => { buffer = b; },

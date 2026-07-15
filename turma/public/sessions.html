@@ -324,6 +324,23 @@
      per to-do item, stacking below the verb. */
   .chat-status .cc-hint { padding-left: 21px; color: var(--muted); font-size: 11.5px;
     line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Live agent-manager list scraped from the pane: the parent "main" plus each
+     background subagent. A subagent row is a button that opens its transcript;
+     "main" is a plain marker. */
+  .chat-status .cc-agents { display: flex; flex-direction: column; gap: 2px; padding-left: 21px; }
+  .chat-status .cc-agents-hd { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--muted); margin-top: 2px; }
+  .chat-status .cc-agent { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
+    padding: 2px 4px; border: 0; border-radius: 5px; background: none; color: var(--ink-2);
+    font: inherit; font-size: 11.5px; cursor: pointer; }
+  .chat-status button.cc-agent:hover { background: var(--surface-2, rgba(127,127,127,0.12)); color: var(--ink); }
+  .chat-status .cc-agent.main { cursor: default; }
+  .chat-status .cc-agent .dot { width: 8px; height: 8px; flex: none; border-radius: 50%;
+    border: 1.5px solid var(--muted); }
+  .chat-status .cc-agent .dot.sel { background: var(--accent); border-color: var(--accent); }
+  .chat-status .cc-agent .atype { font-weight: 600; color: var(--ink); flex: none; }
+  .chat-status .cc-agent .alabel { color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
 
   /* Tool-use / tool-result action card (collapsible). */
   .action-card { align-self: flex-start; max-width: 760px; width: 100%; font-size: 12.5px;
@@ -532,7 +549,7 @@
       </div>
       <div class="transcript-pane" id="transcriptPane" hidden>
         <div class="term-bar">
-          <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
+          <button class="back-btn" onclick="transcriptBack()">‹<span class="back-label" id="trBackLabel"> Sessions</span></button>
           <span class="t-title"><span class="name" id="trTitle"></span> · <span class="path" id="trPath"></span></span>
           <span class="spacer"></span>
           <span class="verbosity" id="trVerbosity"></span>
@@ -1229,7 +1246,11 @@ const $chatPane = document.getElementById("chatPane");
 const $transcriptPane = document.getElementById("transcriptPane");
 const $stageEmpty = document.getElementById("stageEmpty");
 let currentId = null;
-let viewMode = null; // "chat" | "terminal" | "transcript" | null — what the stage shows
+let viewMode = null; // "chat" | "terminal" | "transcript" | "subagent" | null — what the stage shows
+// When a subagent transcript is open (clicked from a live session's agent list),
+// this holds the live session id to return to, so the transcript pane's Back
+// button reopens the session rather than dropping to the list.
+let subagentReturn = null;
 let viewPushed = false; // a history entry the back button will consume (mobile)
 // Deep link: the dashboard's "Attach" links here as /sessions?session=<id>. We
 // hold the requested id until that session shows up as running in a heartbeat,
@@ -1386,6 +1407,7 @@ function enterStage() {
 function clearStage() {
   currentId = null;
   currentTranscriptId = null;
+  subagentReturn = null;
   navFrame("about:blank"); // tear down any live session's WebSocket
   if (window.TurmaChat) { TurmaChat.close(); TurmaChat.closeStatic(); } // stop the chat live tail + clear the archived view
   viewMode = null;
@@ -1593,6 +1615,8 @@ let trHighlight = null; // { uuid } for a search-driven open (else null)
 async function openTranscript(id, title, hi) {
   currentTranscriptId = id;
   trHighlight = hi || null;
+  subagentReturn = null; // an archive open -> Back goes to the list
+  document.getElementById("trBackLabel").textContent = " Sessions";
   currentId = null;
   disarmTermKill();
   document.getElementById("trTitle").textContent = title || id;
@@ -1621,6 +1645,83 @@ async function openTranscript(id, title, hi) {
   }
   if (currentTranscriptId !== id) return; // superseded by another click
   renderTranscript(t);
+}
+
+// Open one live background agent's transcript in the read-only transcript pane,
+// clicked from the current session's pane agent-list (chat.js -> here). Reuses
+// the archive viewer's stage + chat engine; Back returns to the live session
+// (subagentReturn) rather than the sessions list. type+label identify the row
+// (see the /subagents/history endpoint); a virtual id keeps verbosity scoped.
+async function openSubagentView(type, label) {
+  const liveId = currentId;
+  const key = liveId && hostKeyForSession(liveId);
+  if (!key) return;
+  const vid = "subagent::" + liveId + "::" + type + "::" + label;
+  currentTranscriptId = vid;
+  trHighlight = null;
+  subagentReturn = liveId;   // Back reopens the session, not the list
+  viewMode = "subagent";
+  document.getElementById("trBackLabel").textContent = " Session";
+  document.getElementById("trTitle").textContent = type;
+  document.getElementById("trPath").textContent = label || "background agent";
+  document.getElementById("trScroll").innerHTML = `<div class="tr-empty">Loading agent transcript…</div>`;
+  if (window.TurmaChat) TurmaChat.closeStatic(); // leave the live tail running underneath
+  $chatPane.hidden = true;
+  $termPane.hidden = true;
+  $stageEmpty.hidden = true;
+  $transcriptPane.hidden = false;
+  enterStage();
+  renderSearch();
+  const qs = `type=${enc(type)}&label=${enc(label || "")}`;
+  const url = `/api/agents/${enc(key)}/sessions/${enc(liveId)}/subagents/history?${qs}`;
+  // The agent fetches on demand: a cache miss 202s until the next heartbeat
+  // delivers it. Poll a bounded number of times, then give up gracefully.
+  for (let i = 0; i < 12; i++) {
+    let r;
+    try { r = await fetch(url); } catch { break; }
+    if (r.status === 401) return void (location.href = "/login");
+    if (currentTranscriptId !== vid) return; // superseded by another click
+    if (r.status === 200) {
+      let t; try { t = await r.json(); } catch { break; }
+      if (currentTranscriptId !== vid) return;
+      if (window.TurmaChat && TurmaChat.renderStatic) {
+        TurmaChat.renderStatic({
+          entries: t.entries || [],
+          scrollEl: document.getElementById("trScroll"),
+          verbHost: document.getElementById("trVerbosity"),
+          transcriptId: vid,
+        });
+      }
+      return;
+    }
+    if (r.status !== 202) break;
+    await new Promise((res) => setTimeout(res, 1200));
+  }
+  if (currentTranscriptId === vid) {
+    document.getElementById("trScroll").innerHTML =
+      `<div class="tr-empty">Agent transcript unavailable.</div>`;
+  }
+}
+window.openSubagentView = openSubagentView;
+
+// The transcript pane's Back button: return to the live session it was opened
+// from (a subagent view), else fall back to the sessions list (archive view).
+function transcriptBack() {
+  const back = subagentReturn;
+  subagentReturn = null;
+  document.getElementById("trBackLabel").textContent = " Sessions";
+  if (back != null) {
+    if (window.TurmaChat) TurmaChat.closeStatic();
+    $transcriptPane.hidden = true;
+    viewMode = null;      // force selectSession to re-enter the chat view
+    currentTranscriptId = null;
+    // The session may have ended while its agent transcript was open — reopen it
+    // if it's still running, otherwise drop to the empty stage.
+    if (sessionHit(back)) selectSession(back);
+    else clearStage();
+    return;
+  }
+  backToList();
 }
 // Render an archived transcript through the SAME chat engine the live view uses
 // (chat.js), so a past session's bubbles, tool-action cards, thinking traces,
