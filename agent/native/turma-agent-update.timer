@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic Turma agent self-update
+
+[Timer]
+# First check shortly after boot, then every 6h. Persistent catches up a check
+# missed while the WSL distro was shut down.
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

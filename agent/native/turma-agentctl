@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# turma-agentctl — non-systemd process control for the native Turma agent.
+#
+# For WSL distros where systemd isn't enabled ([boot] systemd=true absent from
+# /etc/wsl.conf). Manages the manager (the exec'd `turma-agent` launcher) via a
+# pidfile, plus the background auto-update poller. Two kill scopes mirror the
+# systemd unit's KillMode=process vs. a full teardown:
+#
+#   restart  — kill ONLY the manager pid (not its process group), so the tmux
+#              server, claude, and ttyd children survive; then start again, which
+#              reconciles the tunnel and re-adopts the live sessions on boot.
+#              This is what the auto-updater calls on non-systemd hosts.
+#   stop     — full teardown of the control plane: manager + tunnel + update
+#              poller. Still LEAVES tmux/ttyd running (a later `start` re-adopts),
+#              matching the systemd manual-stop behavior and Turma's "kill keeps
+#              the worktree/session" philosophy.
+set -eu
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"   # $PREFIX/bin
+PREFIX="$(dirname "$SELF_DIR")"
+
+RUNDIR="${XDG_RUNTIME_DIR:-$HOME/.turma}"
+PIDFILE="$RUNDIR/turma-agent.pid"
+UPDATE_PIDFILE="$RUNDIR/turma-agent-update.pid"
+LOG="$HOME/.turma/agent.log"
+mkdir -p "$HOME/.turma" "$RUNDIR" 2>/dev/null || true
+
+_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+_pid()   { [ -f "$PIDFILE" ] && cat "$PIDFILE" 2>/dev/null || true; }
+
+start() {
+  pid="$(_pid)"
+  if _alive "$pid"; then
+    echo "turma-agent already running (pid $pid)"
+  else
+    # setsid so the manager leads its own session/process group: `restart` can
+    # then signal just the manager pid without the shell's job control, and the
+    # backgrounded tunnel/ttyd aren't tied to this controlling terminal.
+    setsid nohup "$PREFIX/bin/turma-agent" >>"$LOG" 2>&1 &
+    echo $! >"$PIDFILE"
+    echo "turma-agent started (pid $(_pid)); logs: $LOG"
+  fi
+  # Auto-update poller — the non-systemd stand-in for the update timer.
+  upid="$([ -f "$UPDATE_PIDFILE" ] && cat "$UPDATE_PIDFILE" 2>/dev/null || true)"
+  if ! _alive "$upid" && [ -x "$PREFIX/bin/turma-agent-update" ]; then
+    setsid nohup "$PREFIX/bin/turma-agent-update" --loop >>"$HOME/.turma/update.log" 2>&1 &
+    echo $! >"$UPDATE_PIDFILE"
+    echo "auto-update poller started (pid $(cat "$UPDATE_PIDFILE"))"
+  fi
+}
+
+# Kill only the manager pid, preserving tmux/ttyd/claude.
+kill_manager() {
+  pid="$(_pid)"
+  if _alive "$pid"; then kill "$pid" 2>/dev/null || true; fi
+  rm -f "$PIDFILE"
+}
+
+stop() {
+  kill_manager
+  # Tear down the rest of the control plane (tunnel + update poller); leave the
+  # sessions (tmux/ttyd) running.
+  pkill -f "$PREFIX/tunnel-agent.js" 2>/dev/null || true
+  upid="$([ -f "$UPDATE_PIDFILE" ] && cat "$UPDATE_PIDFILE" 2>/dev/null || true)"
+  if _alive "$upid"; then kill "$upid" 2>/dev/null || true; fi
+  rm -f "$UPDATE_PIDFILE"
+  echo "turma-agent stopped (sessions left running)"
+}
+
+restart() {
+  # Manager-only restart: sessions survive, the new manager re-adopts them.
+  kill_manager
+  # Give the old manager a moment to release before the new one binds/reads.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    pid="$(_pid)"; _alive "$pid" || break
+    sleep 0.2
+  done
+  start
+}
+
+status() {
+  pid="$(_pid)"
+  if _alive "$pid"; then echo "turma-agent: running (pid $pid)"; else echo "turma-agent: stopped"; fi
+  upid="$([ -f "$UPDATE_PIDFILE" ] && cat "$UPDATE_PIDFILE" 2>/dev/null || true)"
+  if _alive "$upid"; then echo "auto-update poller: running (pid $upid)"; else echo "auto-update poller: stopped"; fi
+}
+
+case "${1:-}" in
+  start)    start ;;
+  stop)     stop ;;
+  restart)  restart ;;
+  status)   status ;;
+  logs)     exec tail -n "${2:-200}" -f "$LOG" ;;
+  update)   exec "$PREFIX/bin/turma-agent-update" ;;
+  *)
+    echo "usage: turma-agentctl {start|stop|restart|status|logs [N]|update}" >&2
+    exit 2 ;;
+esac

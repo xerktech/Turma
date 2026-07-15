@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# turma-agent-update — self-updater for the native Turma agent.
+#
+# Polls the native release stream (GitHub Releases tagged `agent-native-v*`),
+# and when a newer build exists, downloads + verifies it, swaps the runtime
+# files into $PREFIX, and restarts JUST the manager — which re-adopts the live
+# sessions on boot (see resume_on_boot in hub-agent.py). So an update never stops
+# active claude sessions; the web UI briefly disconnects and reconnects.
+#
+# Auth reuses the host's existing `gh` login (already used for private git), so
+# it works against a private repo with no extra token. Falls back to the REST
+# API with $GH_TOKEN when `gh` is absent.
+set -eu
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"   # $PREFIX/bin
+PREFIX="$(dirname "$SELF_DIR")"
+
+REPO="${TURMA_REPO:-xerktech/turma}"
+TAG_PREFIX="agent-native-v"
+INTERVAL="${TURMA_UPDATE_INTERVAL:-21600}"   # 6h default for --loop
+LOG="$HOME/.turma/update.log"
+LOCK="$HOME/.turma/update.lock"
+mkdir -p "$HOME/.turma" 2>/dev/null || true
+
+logmsg() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG" >&2; }
+
+installed_version() {
+  [ -f "$PREFIX/VERSION" ] && tr -d '[:space:]' <"$PREFIX/VERSION" || echo "0.0.0"
+}
+
+# is $1 strictly newer than $2 (dotted numeric, e.g. 0.2.123)?
+newer_than() {
+  [ "$1" != "$2" ] && \
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
+# Print the highest available native version (bare, no prefix), or nothing.
+latest_version() {
+  local tags
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    tags="$(gh api "repos/$REPO/releases?per_page=100" -q '.[].tag_name' 2>/dev/null || true)"
+  elif [ -n "${GH_TOKEN:-}" ]; then
+    tags="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/releases?per_page=100" 2>/dev/null \
+            | grep -o '"tag_name":[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || true)"
+  else
+    logmsg "no gh login and no GH_TOKEN — auto-update disabled"
+    return 0
+  fi
+  printf '%s\n' "$tags" \
+    | grep "^${TAG_PREFIX}" \
+    | sed "s/^${TAG_PREFIX}//" \
+    | sort -V | tail -n1
+}
+
+download_release() {  # <tag> <destdir>
+  local tag="$1" dst="$2"
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    gh release download "$tag" --repo "$REPO" \
+      --pattern '*.tar.gz' --pattern '*.sha256' --dir "$dst" --clobber
+  elif [ -n "${GH_TOKEN:-}" ]; then
+    # REST assets API: works for private repos with the octet-stream Accept.
+    local api="https://api.github.com/repos/$REPO/releases/tags/$tag"
+    curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$api" 2>/dev/null \
+      | grep -o '"url":[[:space:]]*"[^"]*assets/[0-9]*"' \
+      | sed 's/.*"\(.*\)"$/\1/' \
+      | while read -r aurl; do
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/octet-stream" -O -J --output-dir "$dst" "$aurl"
+        done
+  else
+    return 1
+  fi
+}
+
+run_once() {
+  local cur latest tag stage tgz
+  cur="$(installed_version)"
+  latest="$(latest_version || true)"
+  if [ -z "$latest" ]; then
+    logmsg "no native release found (or auth unavailable); staying at $cur"
+    return 0
+  fi
+  if ! newer_than "$latest" "$cur"; then
+    logmsg "up to date ($cur; latest $latest)"
+    return 0
+  fi
+  tag="${TAG_PREFIX}${latest}"
+  logmsg "update available: $cur -> $latest ($tag)"
+
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/turma-update.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$stage' '$PREFIX.update'" RETURN
+
+  if ! download_release "$tag" "$stage"; then
+    logmsg "download failed for $tag; keeping $cur"; return 0
+  fi
+  tgz="$(find "$stage" -maxdepth 1 -name '*.tar.gz' | head -n1)"
+  [ -n "$tgz" ] || { logmsg "no tarball asset in $tag; keeping $cur"; return 0; }
+  # Verify checksum if a sidecar shipped.
+  if find "$stage" -maxdepth 1 -name '*.sha256' | grep -q .; then
+    if ! ( cd "$stage" && sha256sum -c ./*.sha256 >/dev/null 2>&1 ); then
+      logmsg "checksum FAILED for $tag; refusing to install"; return 0
+    fi
+  fi
+
+  # Extract to a SIBLING dir on the same filesystem as $PREFIX so the file swap
+  # below is an atomic rename (safe even for this running script's own file).
+  rm -rf "$PREFIX.update"; mkdir -p "$PREFIX.update"
+  tar xzf "$tgz" -C "$PREFIX.update"
+  local src="$PREFIX.update"
+  # Some tarballs wrap contents in a single top dir — descend if so.
+  [ -f "$src/hub-agent.py" ] || src="$(dirname "$(find "$PREFIX.update" -name hub-agent.py | head -n1)")"
+  if [ ! -f "$src/hub-agent.py" ] || [ ! -f "$src/tunnel-agent.js" ]; then
+    logmsg "staged payload incomplete; refusing to install"; return 0
+  fi
+
+  # Swap runtime files via rename (mv on same fs). hub-agent.py + hooks/ move
+  # together. bin scripts, tunnel, tmux.conf, and VERSION follow.
+  mkdir -p "$PREFIX/bin"
+  mv -f "$src/hub-agent.py" "$PREFIX/hub-agent.py"
+  rm -rf "$PREFIX/hooks"; mv -f "$src/hooks" "$PREFIX/hooks"
+  mv -f "$src/tunnel-agent.js" "$PREFIX/tunnel-agent.js"
+  [ -f "$src/tmux.conf" ] && mv -f "$src/tmux.conf" "$PREFIX/tmux.conf"
+  for b in turma-agent turma-agentctl turma-agent-update; do
+    [ -f "$src/$b" ] && { mv -f "$src/$b" "$PREFIX/bin/$b"; chmod +x "$PREFIX/bin/$b"; }
+  done
+  chmod +x "$PREFIX/hooks/"*.py 2>/dev/null || true
+  echo "$latest" >"$PREFIX/VERSION"
+  logmsg "installed $latest; restarting manager (sessions preserved)"
+
+  # Restart just the manager. KillMode=process / manager-only kill keeps
+  # tmux/claude/ttyd alive; the new manager adopts them.
+  if [ -d /run/systemd/system ] && systemctl --user show-environment >/dev/null 2>&1; then
+    systemctl --user restart turma-agent || logmsg "systemctl restart failed"
+  else
+    "$PREFIX/bin/turma-agentctl" restart || logmsg "turma-agentctl restart failed"
+  fi
+  logmsg "update complete: now $latest"
+}
+
+main() {
+  local loop=no
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --loop) loop=yes ;;
+      --interval) shift; INTERVAL="$1" ;;
+      *) echo "usage: turma-agent-update [--loop] [--interval SECONDS]" >&2; exit 2 ;;
+    esac
+    shift
+  done
+
+  # Single-flight: never let two update runs race on the swap.
+  exec 9>"$LOCK"
+  if ! flock -n 9; then
+    logmsg "another update run holds the lock; exiting"; exit 0
+  fi
+
+  if [ "$loop" = yes ]; then
+    logmsg "auto-update poller started (every ${INTERVAL}s, repo $REPO)"
+    while true; do
+      run_once || logmsg "update check errored (continuing)"
+      sleep "$INTERVAL"
+    done
+  else
+    run_once
+  fi
+}
+
+main "$@"

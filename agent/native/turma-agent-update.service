@@ -1,0 +1,10 @@
+[Unit]
+Description=Turma agent self-update check
+# Don't run the check while the box is offline.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/turma-agent/turma-agent.env
+ExecStart=%h/.local/share/turma-agent/bin/turma-agent-update

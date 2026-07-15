@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# turma-agent — native (non-Docker) launcher for the Turma per-host agent.
+#
+# This is the RUNTIME HALF of agent/entrypoint.sh, minus every container and
+# privilege-drop bit. A native install runs directly as the invoking user, whose
+# $HOME and repo ownership are already correct, so there is NO setpriv, no
+# uid/gid resolution, no chown, no docker-socket group join, and HOME is never
+# forced — the very machinery entrypoint.sh needs only because it boots as root
+# inside a container.
+#
+# It sources the config env file, sets native-safe defaults (notably pointing
+# CLAUDE_PROJECTS_ROOT at the real $HOME instead of the container's /root), does
+# a log-only credentials preflight (idling ONLY when the Claude login is
+# missing), (re)starts the outbound reverse tunnel, then exec's the session
+# manager as the long-lived foreground process.
+set -eu
+
+# Resolve the install prefix from our own location ($PREFIX/bin/turma-agent).
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"   # $PREFIX/bin
+PREFIX="$(dirname "$SELF_DIR")"             # $PREFIX
+
+# Load config. Same plain KEY=value format systemd's EnvironmentFile consumes;
+# `set -a` exports every assignment so it reaches hub-agent.py as an env var.
+CFG="${TURMA_AGENT_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/turma-agent/turma-agent.env}"
+if [ -f "$CFG" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$CFG"
+  set +a
+fi
+
+# Native-safe defaults, applied only when the config left a key blank/unset (the
+# `:-` treats an empty value as unset, which is why the template ships these
+# blank). PATH gets $PREFIX/bin so a bundled static ttyd is found.
+export PATH="$PREFIX/bin:$PATH"
+export CLAUDE_PROJECTS_ROOT="${CLAUDE_PROJECTS_ROOT:-$HOME/.claude/projects}"
+export REPOS_ROOT="${REPOS_ROOT:-$HOME/git}"
+export DEVICE_NAME="${DEVICE_NAME:-$(hostname)}"
+
+CREDS="$HOME/.claude/.credentials.json"
+
+# Log-only creds preflight, mirroring entrypoint.sh's checks but pointed at the
+# real $HOME. Never fatal here — the claude idling case is handled separately in
+# the run path so `--preflight` can report without hanging.
+report_creds() {
+  if [ -f "$CREDS" ]; then
+    echo "[turma-agent] claude: subscription credentials present"
+  else
+    echo "[turma-agent] claude: NO credentials at $CREDS — run 'claude /login' on this host"
+  fi
+  if command -v gh >/dev/null 2>&1; then
+    if gh auth status >/dev/null 2>&1; then
+      echo "[turma-agent] gh: authenticated as $(gh api user -q .login 2>/dev/null || echo '?')"
+    else
+      echo "[turma-agent] gh: NOT authenticated — private git ops and 'gh pr create' will fail (run: gh auth login)"
+    fi
+  fi
+  # Cloud CLIs are optional and usually absent natively; the command -v guard
+  # makes this silently no-op. Keyed on a login-marker FILE, never the store dir
+  # (each CLI creates its own store just by running) — same rule as entrypoint.sh.
+  for pair in "aws:$HOME/.aws/credentials" \
+              "az:$HOME/.azure/msal_token_cache.json" \
+              "terraform:$HOME/.terraform.d/credentials.tfrc.json"; do
+    cli="${pair%%:*}"; marker="${pair#*:}"
+    command -v "$cli" >/dev/null 2>&1 || continue
+    if [ -e "$marker" ]; then
+      echo "[turma-agent] $cli: host creds present"
+    else
+      echo "[turma-agent] $cli: installed; no creds on this device — ignoring"
+    fi
+  done
+}
+
+# Report-only mode for install.sh --verify: no idling, no launches.
+if [ "${1:-}" = "--preflight" ]; then
+  echo "[turma-agent] preflight (PREFIX=$PREFIX)"
+  report_creds
+  for t in claude git tmux ttyd node python3; do
+    if command -v "$t" >/dev/null 2>&1; then
+      echo "[turma-agent] tool $t: $(command -v "$t")"
+    else
+      echo "[turma-agent] tool $t: MISSING"
+    fi
+  done
+  exit 0
+fi
+
+report_creds
+
+# The one fatal check: Remote Control needs a subscription OAuth login. Idle
+# rather than crash-loop, so a systemd service self-heals the moment the user
+# logs in on the host without needing a manual restart.
+if [ ! -f "$CREDS" ]; then
+  echo "=================================================================="
+  echo " No Claude subscription credentials at $CREDS"
+  echo
+  echo " Log in on this host:   claude /login"
+  echo " (Remote Control requires a subscription OAuth login; a setup-token"
+  echo "  is inference-only and can't host RC.)"
+  echo
+  echo " Idling until credentials exist..."
+  echo "=================================================================="
+  exec sleep infinity
+fi
+
+# Reconcile the reverse tunnel: kill any prior instance first, so each (re)start
+# replaces the tunnel with the current code and never leaves a duplicate. This
+# matters because the systemd unit uses KillMode=process — on a manager restart
+# the old tunnel survives, and we want exactly one. Restarting the tunnel only
+# blips the web UI; it never touches tmux/claude.
+pkill -f "$PREFIX/tunnel-agent.js" 2>/dev/null || true
+node "$PREFIX/tunnel-agent.js" &
+
+echo "[turma-agent] starting session manager (REPOS_ROOT=$REPOS_ROOT DEVICE_NAME=$DEVICE_NAME)"
+exec python3 "$PREFIX/hub-agent.py"

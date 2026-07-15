@@ -2070,6 +2070,117 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.save.assert_not_called()
 
 
+class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
+    """Boot re-adopts a session whose claude tmux is STILL ALIVE instead of
+    killing+relaunching it — the property that lets the native agent update
+    itself (restart just this manager) without stopping active sessions. When
+    the tmux is gone it falls back to today's --resume relaunch."""
+
+    def _running_sess(self):
+        return {
+            "id": "aaaaa", "status": "running", "ttydPort": 7700,
+            "worktreePath": self.tmp,  # exists, so it isn't demoted
+            "tmuxName": "agent-aaaaa",
+        }
+
+    def test_adopts_live_tmux_without_relaunch(self):
+        sm = self.make_manager()
+        sm.registry = [self._running_sess()]
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(sm, "_tmux_alive", return_value=True):
+            sm.resume_on_boot()
+        # The live claude is left running: no kill, no relaunch...
+        sm._launch_tmux.assert_not_called()
+        # ...but the ttyd bridge is re-ensured, and the session stays running.
+        sm._launch_ttyd.assert_called_once()
+        self.assertEqual(sm.registry[0]["status"], "running")
+
+    def test_relaunches_when_tmux_gone(self):
+        sm = self.make_manager()
+        sm.registry = [self._running_sess()]
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(sm, "_tmux_alive", return_value=False):
+            sm.resume_on_boot()
+        # Whole tree died (container restart / reboot): relaunch with --resume,
+        # continuing the prior conversation.
+        sm._launch_tmux.assert_called_once()
+        self.assertTrue(sm._launch_tmux.call_args.kwargs.get("resume"))
+        sm._launch_ttyd.assert_called_once()
+
+    def test_worktree_gone_is_demoted(self):
+        sm = self.make_manager()
+        sess = self._running_sess()
+        sess["worktreePath"] = os.path.join(self.tmp, "vanished")
+        sm.registry = [sess]
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(sm, "_tmux_alive", return_value=True):
+            sm.resume_on_boot()
+        self.assertEqual(sess["status"], "stopped")
+        sm._launch_tmux.assert_not_called()
+        sm._launch_ttyd.assert_not_called()
+
+    def test_launch_ttyd_adopts_our_surviving_ttyd(self):
+        # A ttyd WE launched that survived a manager restart still holds the port
+        # and its pid is alive. _launch_ttyd must adopt it (no rebind, no Popen).
+        sm = self.make_manager()
+        sess = self._running_sess()
+        sess["ttydPid"] = 5150
+        with mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_port_open", return_value=True), \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm._launch_ttyd(sess)
+        popen.assert_not_called()
+        self.assertNotIn(sess["id"], sm.ttyd)
+
+    def test_launch_ttyd_does_not_adopt_a_reused_open_port(self):
+        # Fresh spawn onto a port that happens to be open (just freed by a killed
+        # session whose ttyd hasn't died): no ttydPid, so we must NOT adopt — we
+        # launch our own, avoiding attaching to the wrong session's terminal.
+        sm = self.make_manager()
+        sess = self._running_sess()  # no ttydPid
+
+        class FakeProc:
+            pid = 7000
+            def poll(self_i):
+                return None
+
+        with mock.patch.object(ha, "_port_open", return_value=True), \
+             mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()) as popen:
+            sm._launch_ttyd(sess)
+        popen.assert_called_once()
+        self.assertEqual(sess["ttydPid"], 7000)
+
+    def test_launch_ttyd_persists_pid_when_port_free(self):
+        sm = self.make_manager()
+        sess = self._running_sess()
+
+        class FakeProc:
+            pid = 4242
+            def poll(self_i):
+                return None
+
+        with mock.patch.object(ha, "_port_open", return_value=False), \
+             mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()):
+            sm._launch_ttyd(sess)
+        # The pid is persisted so a later manager can reap an adopted orphan.
+        self.assertEqual(sess["ttydPid"], 4242)
+        self.assertIs(sm.ttyd[sess["id"]].pid, 4242)
+
+    def test_kill_ttyd_reaps_adopted_orphan_by_pid(self):
+        # An adopted ttyd isn't in self.ttyd; _kill_ttyd must still reap it via
+        # the persisted pid so stop/delete don't leak the process and its port.
+        sm = self.make_manager()
+        sess = self._running_sess()
+        sess["ttydPid"] = 9191
+        sm.registry = [sess]
+        with mock.patch.object(ha.os, "kill") as oskill:
+            sm._kill_ttyd(sess["id"])
+        oskill.assert_called_once_with(9191, ha.signal.SIGTERM)
+
+
 class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
     def make_spawn_ready_manager(self, repos):
         sm = self.make_manager()

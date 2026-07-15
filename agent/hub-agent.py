@@ -234,6 +234,33 @@ def run_ok(cmd, cwd=None, timeout=30):
         return None, str(e)
 
 
+def _port_open(port, host="127.0.0.1", timeout=0.3):
+    """Whether something is already listening on a local TCP port. Used to detect
+    a per-session ttyd that survived a *manager* restart (tmux and ttyd are their
+    own daemons, so they outlive this process) — the loopback bridge the tunnel
+    drives is still up, so we can adopt it instead of rebinding the port. Cheap
+    connect-probe; any error (nothing listening, bad port) reads as closed."""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            return s.connect_ex((host, port)) == 0
+    except OSError:
+        return False
+
+
+def _pid_alive(pid):
+    """Whether a pid is a live process (signal 0 probes without delivering)."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 # Short bound for the two network `git fetch`es that run synchronously inside a
 # command handler on the main heartbeat loop (default_base_ref on spawn,
 # prune_repo). A fetch is best-effort — both already fall open to local refs —
@@ -3807,7 +3834,19 @@ class SessionManager:
         basic auth (-c) keyed off the shared agent token as defense in depth."""
         proc = self.ttyd.get(sess["id"])
         if proc is not None and proc.poll() is None:
-            return  # already serving (e.g. restart keeps ttyd up)
+            return  # already serving (e.g. an in-process restart keeps ttyd up)
+        # Adopt a ttyd of OURS that outlived a *manager* restart: ttyd is its own
+        # daemon, so on a native in-place update (systemd KillMode=process /
+        # manager-only kill) the old ttyd keeps holding this session's stable
+        # port. Re-binding would fail; instead adopt it — its `tmux attach -t
+        # <name>` re-resolves to the (same-named) live tmux per browser
+        # connection, so it keeps serving with no rebind and no terminal blip.
+        # Gate on OUR persisted `ttydPid` still being alive (not the bare port):
+        # a fresh spawn has no ttydPid, so a port just freed by a killed session
+        # and reallocated here can't be mistaken for a survivor to adopt.
+        adopted = sess.get("ttydPid")
+        if adopted and _pid_alive(adopted) and _port_open(sess.get("ttydPort")):
+            return
         args = [
             "ttyd", "-p", str(sess["ttydPort"]), "-i", "127.0.0.1",
             "-b", f"/term/{sess['id']}", "-W", "-m", "8",
@@ -3819,9 +3858,11 @@ class SessionManager:
             "tmux", "attach", "-t", sess["tmuxName"],
         ]
         try:
-            self.ttyd[sess["id"]] = subprocess.Popen(
+            proc = subprocess.Popen(
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
+            self.ttyd[sess["id"]] = proc
+            sess["ttydPid"] = proc.pid  # persisted so a later manager can reap it
         except Exception as e:
             raise RuntimeError(f"ttyd launch failed: {e}")
 
@@ -3834,6 +3875,17 @@ class SessionManager:
             try:
                 proc.terminate()
             except Exception:
+                pass
+        # Also reap a ttyd we ADOPTED rather than launched (one that outlived a
+        # prior manager, so it's not in self.ttyd): the persisted pid is that same
+        # live process. Without this, stop/delete would leak the orphan and its
+        # port. Best-effort — a recycled/dead pid just fails harmlessly.
+        sess = self._find(sid)
+        pid = sess.get("ttydPid") if sess else None
+        if pid and (proc is None or proc.pid != pid):
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except (OSError, ValueError):
                 pass
 
     def _worktree_add(self, sess, base_ref=None):
@@ -5310,8 +5362,20 @@ class SessionManager:
     # --- boot auto-resume --------------------------------------------------
 
     def resume_on_boot(self):
-        """Relaunch running sessions whose worktree survived — continuing their
-        prior conversation, not a fresh context; demote the rest."""
+        """Bring running sessions back under management. Two paths:
+
+        * ADOPT — the session's claude tmux is STILL ALIVE. tmux is its own
+          daemon, so it (and the running claude, mid-turn included) survives a
+          restart of just THIS manager process — the native in-place-update case
+          (systemd KillMode=process, or a manager-only kill). Re-launching would
+          `tmux kill-session` the live claude and abort its turn, so instead we
+          leave it untouched and only re-ensure the ttyd bridge. This is what lets
+          an agent update itself without stopping active sessions.
+        * RELAUNCH — the tmux is gone (the whole process tree died, e.g. a Docker
+          container restart, a host reboot, or a crash). Then we relaunch with
+          --resume, continuing the prior CONVERSATION (not a fresh context).
+
+        Either way, a session whose worktree vanished is demoted to stopped."""
         for sess in self.registry:
             if sess.get("status") != "running":
                 continue  # stopped stays stopped (kept for usage; resumable)
@@ -5321,6 +5385,13 @@ class SessionManager:
                 log(f"resume: worktree gone for {sess['id']}, marking stopped")
                 continue
             try:
+                if self._tmux_alive(sess.get("tmuxName")):
+                    # Adopt: claude keeps running; just re-ensure the ttyd (adopts
+                    # a surviving one by port, else relaunches). No launch stagger
+                    # — nothing contends on the shared login, we started no claude.
+                    self._launch_ttyd(sess)
+                    log(f"adopted live session {sess['id']} on :{sess['ttydPort']}")
+                    continue
                 self._launch_tmux(sess, resume=True)
                 self._launch_ttyd(sess)
                 log(f"resumed session {sess['id']} on :{sess['ttydPort']}")

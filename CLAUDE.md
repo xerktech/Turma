@@ -101,6 +101,14 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Drives each session's worktree + tmux + ttyd.
 - Heartbeats the repo list, one record per session, and a container-log tail — see "Heartbeat" below.
 - On boot it auto-resumes sessions that were `running`.
+  - `resume_on_boot` **adopts** a session whose claude tmux is still alive (tmux/ttyd are their own
+    daemons, so they outlive a restart of just this manager) — it skips the relaunch and only
+    re-ensures the ttyd, leaving the running claude (mid-turn included) untouched. This is what lets
+    the native agent update itself in place without stopping sessions. It falls back to the old
+    `--resume` relaunch only when the tmux is gone (container restart, reboot, crash).
+  - ttyd is adopted by port when our persisted `ttydPid` is still alive; `_kill_ttyd` reaps that pid
+    so an adopted ttyd isn't leaked on stop/delete.
+  - Tests: `TestResumeOnBootAdopt`.
 
 ### Commands
 
@@ -336,6 +344,31 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Creds preflight, then launches the tunnel and `exec`s the session manager as PID 1 — the container
   stays up with zero sessions.
 - See "Run-as identity" under Conventions for the uid resolution it performs first.
+
+### `native/` — non-Docker install (WSL/Linux)
+
+- A package that installs the SAME `hub-agent.py`/`tunnel-agent.js`/`hooks/`/`tmux.conf` onto a host
+  and reuses its built-in tooling, instead of the container — for a WSL box that already has git,
+  node, python, and a logged-in Claude. See `agent/native/README.md`.
+- `turma-agent` — the launcher: the runtime half of `entrypoint.sh` minus every container/privilege
+  bit (no setpriv/uid-gid/chown/docker-group/HOME forcing; runs as the invoking user). Sources the
+  config, defaults `CLAUDE_PROJECTS_ROOT=$HOME/.claude/projects` (the one env that decouples from the
+  container's hardcoded `/root`) and `DEVICE_NAME=$(hostname)`, idles on missing claude creds,
+  reconciles + backgrounds the tunnel, execs the manager.
+- `install.sh` — idempotent installer (`--verify`/`--uninstall`): auto-installs prereqs (apt + npm +
+  pinned static ttyd), lays files into a prefix keeping `hub-agent.py` and `hooks/` siblings, writes a
+  `chmod 600` config, wires the service, writes `$PREFIX/VERSION`.
+- Service: a systemd **user** unit with `KillMode=process` (so a restart signals only the manager,
+  leaving tmux/claude/ttyd/tunnel alive), plus a nohup `turma-agentctl` fallback for WSL without
+  systemd. Both preserve running sessions across a restart via the adopt-on-boot path above.
+- `turma-agent-update` — self-updater: polls the `agent-native-v*` releases via `gh`, verifies the
+  sha256, swaps files, restarts the manager (which re-adopts live sessions) — so an update never stops
+  active sessions, the UI just reconnects. Driven by a systemd timer or a `--loop` poller.
+- Not installed natively: cloud CLIs (aws/az/terraform) + PowerShell; the container is for those.
+- Additive: nothing under `native/` edits the shared runtime files; the one enabling change is
+  `resume_on_boot`'s adopt path (above), which is backward-compatible with the container.
+- Released by `.github/workflows/turma-agent-native.yml` as a versioned tarball (own `run_number`
+  stream, shared `MAJOR.MINOR`), which the updater consumes.
 
 ### `tunnel-agent.js`
 
@@ -782,6 +815,9 @@ GHCR image builds and PR gates — see Build & Deploy below.
   APK — `android-release.yml`, post-merge on `android/**`, a debug-signed sideload APK built in the
   same Docker Hub Android-SDK container as the CI gate).
 - Watchtower keeps `:latest` current on the host.
+- `.github/workflows/turma-agent-native.yml` publishes the non-Docker agent (`agent/native/`) as an
+  `agent-native-v<VERSION.run_number>` tarball release (pure `tar`, no toolchain), which the native
+  agent's own updater polls — the Watchtower equivalent for a host install.
 - The DockerOps `compose/turma-truenas.yaml` references `ghcr.io/xerktech/turma-agent:latest` — keep
   that image ref in sync if you ever rename it here.
 
