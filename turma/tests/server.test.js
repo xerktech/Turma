@@ -1491,6 +1491,76 @@ test("http: history cache eviction — capped at 8 sessions, oldest fetchedAt ev
   assert.ok(keys.includes("s9"), "newest session (s9) should remain");
 });
 
+// ---- subagent (background-agent) transcript endpoint ------------------------
+
+test("http: subagent-history 202s on cache miss, single-flight per (session,type,label)", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "sh1" }, headers: agentHeaders });
+
+  const q = "/api/agents/sh1/sessions/s1/subagents/history?type=Explore&label=Map%20the%20code";
+  const first = await request("GET", q, { headers: userHeaders });
+  assert.equal(first.status, 202);
+  assert.ok(first.body.cmdId);
+
+  // Same row again -> reuse the outstanding command (no duplicate).
+  const second = await request("GET", q, { headers: userHeaders });
+  assert.equal(second.body.cmdId, first.body.cmdId);
+
+  // A different label is a distinct row -> a distinct command.
+  const other = await request(
+    "GET", "/api/agents/sh1/sessions/s1/subagents/history?type=Explore&label=Other", { headers: userHeaders });
+  assert.notEqual(other.body.cmdId, first.body.cmdId);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "sh1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Map the code", cmdId: first.body.cmdId },
+    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Other", cmdId: other.body.cmdId },
+  ]);
+});
+
+test("http: subagent-history requires a type", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "sh2" }, headers: agentHeaders });
+  const res = await request(
+    "GET", "/api/agents/sh2/sessions/s1/subagents/history?label=x", { headers: userHeaders });
+  assert.equal(res.status, 400);
+});
+
+test("http: heartbeat subagentHistoryResults populate the cache; GET returns 200 while fresh", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "sh3" }, headers: agentHeaders });
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "sh3",
+      subagentHistoryResults: [
+        { sessionId: "s1", type: "Explore", label: "Map the code",
+          entries: [{ id: "1", role: "assistant", text: "done" }], truncated: false },
+      ],
+    },
+    headers: agentHeaders,
+  });
+
+  const res = await request(
+    "GET", "/api/agents/sh3/sessions/s1/subagents/history?type=Explore&label=Map%20the%20code",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.entries, [{ id: "1", role: "assistant", text: "done" }]);
+});
+
+test("http: /api/agents does not serialize the subagentHistory cache", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "sh4" }, headers: agentHeaders });
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "sh4",
+      subagentHistoryResults: [
+        { sessionId: "s1", type: "Explore", label: "x", entries: [], truncated: false },
+      ],
+    },
+    headers: agentHeaders,
+  });
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  for (const a of list.body.agents) {
+    assert.ok(!("subagentHistory" in a), `agent ${a.key} leaked its subagentHistory cache`);
+  }
+});
+
 // ---- board ticket detail endpoint -------------------------------------------
 // GET /api/jira/<siteKey>/<issueKey>: the board's expanded ticket view. The hub
 // holds no Jira creds, so it routes to a host reporting that org and rides the

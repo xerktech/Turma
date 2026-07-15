@@ -239,7 +239,7 @@ function invalidateAgentsCache() { agentsCache = null; }
 // Shared by the fleet payload and the SSE per-agent push so both stay in
 // lockstep.
 function serializeAgent(key, agent, now) {
-  const { history, jiraIssues, ...a } = agent;
+  const { history, subagentHistory, jiraIssues, ...a } = agent;
   return {
     key,
     ...a,
@@ -328,6 +328,35 @@ function ingestHistory(agent, historyResults) {
       .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
       .slice(0, over)
       .forEach(([sessionId]) => delete agent.history[sessionId]);
+  }
+}
+
+// The cache key for one background agent's transcript (see the {type:
+// "subagentHistory"} command): a session can run several agents of the same
+// type, so the short description/label disambiguates them. NUL-separated
+// because neither field can contain it.
+function subagentKey(sessionId, type, label) {
+  return String(sessionId) + " " + String(type || "") + " " + String(label || "");
+}
+
+// Same lifecycle as ingestHistory, keyed by (session,type,label) — merges the
+// agent's `subagentHistoryResults`, then evicts by age and caps the cache.
+function ingestSubagentHistory(agent, results) {
+  const now = Date.now();
+  for (const r of results || []) {
+    if (!r || !r.sessionId) continue;
+    agent.subagentHistory[subagentKey(r.sessionId, r.type, r.label)] =
+      { entries: r.entries, truncated: r.truncated, fetchedAt: now };
+  }
+  for (const [k, h] of Object.entries(agent.subagentHistory)) {
+    if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.subagentHistory[k];
+  }
+  const over = Object.keys(agent.subagentHistory).length - HISTORY_MAX_SESSIONS;
+  if (over > 0) {
+    Object.entries(agent.subagentHistory)
+      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
+      .slice(0, over)
+      .forEach(([k]) => delete agent.subagentHistory[k]);
   }
 }
 
@@ -1346,6 +1375,10 @@ const server = http.createServer(async (req, res) => {
       // stored on the record verbatim.
       const historyResults = payload.historyResults;
       delete payload.historyResults;
+      // On-demand background-agent transcripts the agent fetched since the last
+      // beat (see the {type:"subagentHistory"} command); cached like history.
+      const subagentHistoryResults = payload.subagentHistoryResults;
+      delete payload.subagentHistoryResults;
       // On-demand Jira issue detail the agent fetched since the last beat (see
       // the {type:"jiraIssue"} command); cached below, like historyResults.
       const jiraIssueResults = payload.jiraIssueResults;
@@ -1373,11 +1406,15 @@ const server = http.createServer(async (req, res) => {
         // Per-session history cache (see the /history route); survives across
         // beats like the rest of agent state.
         history: prev.history || {},
+        // Per-(session,type,label) background-agent transcript cache (see the
+        // /subagents/history route); like `history`, survives across beats.
+        subagentHistory: prev.subagentHistory || {},
         // Per-issue Jira detail cache (see the /api/jira route); like `history`,
         // survives across beats.
         jiraIssues: prev.jiraIssues || {},
       });
       ingestHistory(next, historyResults);
+      ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);
       heartbeatAlerts(key, prev, next);
       scheduleSave();
@@ -1677,6 +1714,30 @@ const server = http.createServer(async (req, res) => {
         const pending = (agents[key].commands || [])
           .find((c) => c.type === "history" && c.sessionId === sessionId);
         const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "history", sessionId });
+        return json(res, 202, { pending: true, cmdId });
+      }
+      // GET /api/agents/<host>/sessions/<id>/subagents/history?type=&label= ->
+      // the transcript of one live background agent the session spawned (the
+      // pane agent-list row identifies it by type + short description). Same
+      // fresh-cache / queue-and-202 / single-flight shape as /history.
+      if (req.method === "GET" && parts.length === 7 &&
+          parts[5] === "subagents" && parts[6] === "history") {
+        const agentType = (url.searchParams.get("type") || "").trim();
+        const label = (url.searchParams.get("label") || "").trim();
+        if (!agentType) return json(res, 400, { error: "type required" });
+        const cached = (agents[key].subagentHistory || {})[subagentKey(sessionId, agentType, label)];
+        if (cached && Date.now() - cached.fetchedAt < HISTORY_FRESH_MS) {
+          return json(res, 200, {
+            entries: cached.entries,
+            truncated: cached.truncated,
+            fetchedAt: cached.fetchedAt,
+          });
+        }
+        const pending = (agents[key].commands || []).find(
+          (c) => c.type === "subagentHistory" && c.sessionId === sessionId &&
+            c.agentType === agentType && (c.label || "") === label);
+        const cmdId = pending ? pending.cmdId
+          : queueCommand(key, { type: "subagentHistory", sessionId, agentType, label });
         return json(res, 202, { pending: true, cmdId });
       }
       // DELETE /api/agents/<host>/sessions/<id>

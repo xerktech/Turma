@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderProse, prFooterChip, filterModeOpts, MODE_OPTS, __setVerbosity, __setNoExpand } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderProse, prFooterChip, agentsHtml, filterModeOpts, MODE_OPTS, __setVerbosity, __setNoExpand } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -582,4 +582,30 @@ test("renderProse: a lone pipe row with no delimiter stays plain (not a table)",
 test("renderProse: table-free text is byte-identical to linkify", () => {
   const t = "opened [PR #42](https://github.com/o/r/pull/42) — <b>done</b> & dusted";
   assert.equal(renderProse(t), linkify(t));
+});
+
+// ---- agentsHtml: the live pane agent-list rendered under the status bar ------
+
+test("agentsHtml: '' when there are no agents", () => {
+  assert.equal(agentsHtml(null), "");
+  assert.equal(agentsHtml([]), "");
+});
+
+test("agentsHtml: subagents are buttons carrying type+label; 'main' is a plain marker", () => {
+  const html = agentsHtml([
+    { sel: true, type: "main", label: "" },
+    { sel: false, type: "Explore", label: "Explore Jira agent-side code" },
+  ]);
+  // main: not a button (no separate transcript), carries the selected dot.
+  assert.match(html, /<div class="cc-agent main"><span class="dot sel">/);
+  assert.doesNotMatch(html, /<button[^>]*>[^<]*main/);
+  // subagent: a button with the data-attrs openSubagentView reads.
+  assert.match(html, /<button type="button" class="cc-agent" data-atype="Explore" data-alabel="Explore Jira agent-side code">/);
+  assert.match(html, /<span class="alabel">Explore Jira agent-side code<\/span>/);
+});
+
+test("agentsHtml: escapes type + label (no attribute/markup injection)", () => {
+  const html = agentsHtml([{ sel: false, type: "Ex\"plore", label: '<img src=x onerror=1>' }]);
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /data-alabel="&lt;img/);
 });

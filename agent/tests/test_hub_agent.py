@@ -3372,6 +3372,126 @@ class TestCleanManualSummary(unittest.TestCase):
         self.assertIsNone(ha.clean_manual_summary(None))
 
 
+class TestResolveSubagent(unittest.TestCase):
+    """_resolve_subagent maps a pane agent-list row (type + description) to the
+    background agent's transcript, via the main transcript's Task call + its
+    result's 'agentId: <id>'."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-sub-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _main_with_task(self, agent_id, subagent_type, description):
+        """Write a main transcript holding one Task tool_use + its tool_result
+        (carrying agentId) and the subagent transcript it names. Returns the
+        main transcript path."""
+        main = os.path.join(self.tmp, "main.jsonl")
+        tool_id = "toolu_" + agent_id
+        lines = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": tool_id, "name": "Task",
+                 "input": {"subagent_type": subagent_type,
+                           "description": description, "prompt": "go"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": [
+                    {"type": "text",
+                     "text": f"Async agent launched successfully.\nagentId: {agent_id} (internal)"}]}]}},
+        ]
+        with open(main, "w") as f:
+            for e in lines:
+                f.write(json.dumps(e) + "\n")
+        subdir = os.path.join(self.tmp, "main", "subagents")
+        os.makedirs(subdir)
+        sub = os.path.join(subdir, f"agent-{agent_id}.jsonl")
+        with open(sub, "w") as f:
+            f.write(json.dumps({"agentId": agent_id, "isSidechain": True,
+                                "message": {"content": "working"}}) + "\n")
+        return main, sub
+
+    def test_resolves_exact_type_and_label(self):
+        main, sub = self._main_with_task("abc123", "Explore", "Find the parser")
+        self.assertEqual(ha._resolve_subagent(main, "Explore", "Find the parser"), sub)
+
+    def test_resolves_truncated_label_by_prefix(self):
+        main, sub = self._main_with_task("abc123", "Explore", "Find the parser code")
+        # A pane-truncated label (a prefix) still resolves.
+        self.assertEqual(ha._resolve_subagent(main, "Explore", "Find the parser"), sub)
+
+    def test_newest_matching_task_wins(self):
+        main = os.path.join(self.tmp, "main.jsonl")
+        subdir = os.path.join(self.tmp, "main", "subagents")
+        os.makedirs(subdir)
+        rows = []
+        for aid in ("old1", "new2"):
+            tid = "toolu_" + aid
+            rows.append({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": tid, "name": "Task",
+                 "input": {"subagent_type": "Explore", "description": "Same task"}}]}})
+            rows.append({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tid, "content":
+                 f"agentId: {aid}"}]}})
+            with open(os.path.join(subdir, f"agent-{aid}.jsonl"), "w") as f:
+                f.write("{}\n")
+        with open(main, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        self.assertEqual(ha._resolve_subagent(main, "Explore", "Same task"),
+                         os.path.join(subdir, "agent-new2.jsonl"))
+
+    def test_no_match_or_missing_file_returns_none(self):
+        main, _sub = self._main_with_task("abc123", "Explore", "Find the parser")
+        self.assertIsNone(ha._resolve_subagent(main, "general-purpose", "Find the parser"))
+        self.assertIsNone(ha._resolve_subagent(main, "Explore", "Nonexistent"))
+        # main is the pseudo-agent — never a subagent file.
+        self.assertIsNone(ha._resolve_subagent(main, "main", ""))
+
+
+class TestStageSubagentHistory(ManagerMixin, unittest.TestCase):
+    def _setup_session(self, sm):
+        wt = "/w/.turma/worktrees/repo/aaa"
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj)
+        main = os.path.join(proj, "trans1.jsonl")
+        tool_id = "toolu_xyz"
+        with open(main, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": tool_id, "name": "Task",
+                 "input": {"subagent_type": "Explore", "description": "Map the code"}}]}}) + "\n")
+            f.write(json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tool_id,
+                 "content": "agentId: sub777"}]}}) + "\n")
+        subdir = os.path.join(proj, "trans1", "subagents")
+        os.makedirs(subdir)
+        with open(os.path.join(subdir, "agent-sub777.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "user", "uuid": "u1",
+                                "message": {"content": "explore this repo"}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "uuid": "u2",
+                                "message": {"content": [{"type": "text", "text": "done exploring"}]}}) + "\n")
+        sm.registry = [{"id": "s1", "status": "running", "worktreePath": wt}]
+
+    def test_stages_the_resolved_subagent_transcript(self):
+        sm = self.make_manager()
+        self._setup_session(sm)
+        sm._stage_subagent_history("s1", "Explore", "Map the code")
+        self.assertEqual(len(sm.subagent_history_results), 1)
+        r = sm.subagent_history_results[0]
+        self.assertEqual((r["sessionId"], r["type"], r["label"]),
+                         ("s1", "Explore", "Map the code"))
+        self.assertTrue(any("done exploring" in (e.get("text") or "") for e in r["entries"]))
+
+    def test_unresolved_row_stages_empty_result(self):
+        sm = self.make_manager()
+        self._setup_session(sm)
+        sm._stage_subagent_history("s1", "Explore", "No such agent")
+        self.assertEqual(sm.subagent_history_results[0]["entries"], [])
+
+    def test_unknown_session_stages_empty_without_raising(self):
+        sm = self.make_manager()
+        sm.registry = []
+        sm._stage_subagent_history("ghost", "Explore", "x")
+        self.assertEqual(sm.subagent_history_results[0]["entries"], [])
+
+
 class TestSetSummary(ManagerMixin, unittest.TestCase):
     def test_renames_and_pins_the_name(self):
         sm = self.make_manager()

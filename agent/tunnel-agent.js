@@ -551,6 +551,33 @@ function isChecklistLine(l) {
   return /^(?:[⌊⌞└⎿⎣]\s*)?[✓✔☑☒☐□■◼◻▪▫]\s/u.test(t);
 }
 
+// Claude Code's agent-manager list (opened with ↓/← from the working footer)
+// paints one row per live agent below the input box: a radio glyph
+// (◉/● = the one currently in focus, ○/◯ = a background agent), then the agent
+// type, then — for a subagent — its short description. e.g. "◉ main",
+// "○ Explore   Explore Jira agent-side code". We surface it beside the working
+// status so the web chat can list the live agents and open one. Type and label
+// are separated by the TUI's 2+-space gutter; "main" has no label. Scanned only
+// in the footer region (below the input box) — see parsePaneLiveTurn — so the
+// column-0 ● assistant-text bullet can never be mistaken for a focused agent.
+const AGENT_ROW_RE = /^\s*([◉●◯○])\s+(\S.*?)\s*$/;
+function parseAgentList(lines) {
+  const agents = [];
+  for (const raw of lines || []) {
+    const m = AGENT_ROW_RE.exec(String(raw == null ? "" : raw));
+    if (!m) continue;
+    const parts = m[2].split(/\s{2,}/);
+    const type = (parts[0] || "").trim();
+    if (!type) continue;
+    agents.push({
+      sel: /[◉●]/.test(m[1]),
+      type,
+      label: parts.slice(1).join(" ").trim(),
+    });
+  }
+  return agents;
+}
+
 // Parse a working-status line into { verb, up, down, elapsed } — display strings
 // kept verbatim from the TUI (e.g. up: "1.2k", down: "340", elapsed: "12s").
 // Absent fields come back as "". Order/format vary across Claude Code versions,
@@ -616,6 +643,15 @@ function parsePaneLiveTurn(pane) {
       const h = hintBlock.map(cleanHint).filter(Boolean).join("\n");
       if (h) status.hint = h;
     }
+  }
+  // The agent-manager list, when expanded, is painted BELOW the input box
+  // (after `bottom`, the box's bottom rule) alongside the mode line — a region
+  // the convo slice above intentionally drops. Parse it there so the assistant
+  // block can't swallow it and the column-0 ● bullet can't fake a row.
+  const agents = bottom >= 0 ? parseAgentList(lines.slice(bottom + 1)) : [];
+  if (agents.length) {
+    status = status || { verb: "", up: "", down: "", elapsed: "" };
+    status.agents = agents;
   }
   // The in-progress assistant block starts at the last column-0 ● bullet.
   let start = -1;
@@ -902,5 +938,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, parseAgentList, BLOCK_CAPS_LIVE };
 }
