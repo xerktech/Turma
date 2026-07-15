@@ -453,12 +453,18 @@
   .term-bar .seg-toggle { font: inherit; font-size: 11px; padding: 3px 10px; border-radius: var(--radius-sm);
     border: 1px solid var(--border); background: var(--surface); color: var(--ink-2); cursor: pointer; }
   .term-bar .seg-toggle:hover { border-color: var(--accent); color: var(--accent); }
+  /* Stop (interrupt the current turn) sits between the view toggle and Kill.
+     Warning-coloured rather than critical: it interrupts, it doesn't destroy. */
+  .term-bar .stop-btn { font: inherit; font-size: 11px; padding: 3px 10px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: var(--surface); color: var(--ink-2); cursor: pointer; }
+  .term-bar .stop-btn:hover:not(:disabled) { border-color: var(--warning); color: var(--warning); }
+  .term-bar .stop-btn:disabled { opacity: 0.6; cursor: default; }
 
   /* ---- Responsive: stack to list → full-screen terminal on phones/tablets -- */
   @media (max-width: 820px) {
     .sidebar { width: 100%; border-right: 0; padding-bottom: 84px; }
     .stage { display: none; overflow-x: hidden; }
-    /* The header packs a lot (back, title+path, verbosity, Terminal, Kill) — in a
+    /* The header packs a lot (back, title+path, verbosity, Terminal, Stop, Kill) — in a
        nowrap row it overflowed the viewport and let the page scroll sideways. Let
        it wrap, drop the flex spacer that pushed the buttons to full width, and give
        the title its own row where it truncates instead of pushing the bar wider. */
@@ -469,8 +475,10 @@
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .term-bar .back-btn { display: inline-flex; }
-    /* Collapse the back button to just "‹" on mobile so the whole header row
-       (back, verbosity, Terminal, Kill) fits without wrapping to a second row. */
+    /* Collapse the back button to just "‹" on mobile to buy the row width back.
+       With Stop in the bar the controls (back, verbosity, Terminal, Stop, Kill)
+       no longer fit on one phone-width line and wrap to a second — which the
+       wrap rule above handles; the title still gets its own row below both. */
     .term-bar .back-btn .back-label { display: none; }
     body.showing-term .sidebar { display: none; }
     body.showing-term .app-header { display: none; }
@@ -537,6 +545,8 @@
           <span class="spacer"></span>
           <span class="verbosity" id="chatVerbosity"></span>
           <button class="seg-toggle" id="chatTermBtn" onclick="chatToTerminal()" title="Open the raw ttyd terminal for debugging">Terminal ▸</button>
+          <button class="stop-btn" id="chatStop" onclick="stopCurrentSession('chat')"
+            title="Stop the agent's current turn (Esc) — the session keeps running">◼ Stop</button>
           <button class="kill-btn" id="chatKill" onclick="killCurrentChat()">Kill</button>
         </div>
         <div class="chat-scroll-wrap">
@@ -564,6 +574,8 @@
           <span class="t-title"><span class="name" id="termTitle"></span> · <span class="path" id="termPath"></span></span>
           <span class="spacer"></span>
           <a id="termOpen" target="_blank" rel="noopener">Open in new tab ↗</a>
+          <button class="stop-btn" id="termStop" onclick="stopCurrentSession('terminal')"
+            title="Stop the agent's current turn (Esc) — the session keeps running">◼ Stop</button>
           <button class="kill-btn" id="termKill" onclick="killCurrentTerminal()">Kill</button>
         </div>
         <iframe id="termFrame" src="about:blank" title="Live Claude session"></iframe>
@@ -1424,6 +1436,28 @@ function killCurrentTerminal() {
   post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`);
   if (viewPushed) { viewPushed = false; history.back(); }
   clearStage();
+}
+// Stop the attached session's in-flight turn, from either bar (chat header or
+// terminal header). Posts .../interrupt, which the agent delivers as an Escape
+// keypress into the session's TUI: the turn is cancelled, the session keeps
+// running with its conversation intact. Unlike Kill there's no arm-then-confirm
+// — nothing is destroyed, and a turn you stopped by mistake can just be re-asked
+// — and the stage stays where it is. The button acks locally for a moment
+// because the interrupt only lands on the agent's next heartbeat, so the pane's
+// working/idle state won't reflect it for a beat or two.
+const STOP_ACK_MS = 1500;
+function stopCurrentSession(view) {
+  const id = currentId;
+  const btn = document.getElementById(view === "chat" ? "chatStop" : "termStop");
+  if (!id) return;
+  const key = hostKeyForSession(id);
+  if (!key) { if (btn) btn.textContent = "host offline"; return; }
+  post(`/api/agents/${enc(key)}/sessions/${enc(id)}/interrupt`);
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Stopping…";
+    setTimeout(() => { btn.disabled = false; btn.textContent = "◼ Stop"; }, STOP_ACK_MS);
+  }
 }
 // Same arm-then-confirm Kill, from the chat header.
 let chatKillArmed = false, chatKillTimer = null;

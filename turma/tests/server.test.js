@@ -1191,6 +1191,34 @@ test("http: input endpoint 404s unknown host and requires user auth", async () =
   assert.equal(noAuth.status, 401);
 });
 
+// ---- session interrupt endpoint --------------------------------------------------
+
+test("http: interrupt endpoint queues an interrupt command that rides the next heartbeat", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hx1" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/hx1/sessions/sess1/interrupt", {
+    headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.ok(res.body.cmdId);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "hx1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "interrupt", sessionId: "sess1", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: interrupt endpoint 404s unknown host and requires user auth", async () => {
+  const unknownHost = await request("POST", "/api/agents/ghost/sessions/sess1/interrupt", {
+    headers: userHeaders,
+  });
+  assert.equal(unknownHost.status, 404);
+
+  await request("POST", "/api/heartbeat", { body: { device: "hx2" }, headers: agentHeaders });
+  const noAuth = await request("POST", "/api/agents/hx2/sessions/sess1/interrupt", {});
+  assert.equal(noAuth.status, 401);
+});
+
 // ---- session live model / mode endpoints ----------------------------------------
 
 test("http: model endpoint queues a setModel command that rides the next heartbeat", async () => {
