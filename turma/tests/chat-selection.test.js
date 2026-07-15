@@ -32,6 +32,8 @@ function makeEl(id) {
 
 globalThis.document = {
   getElementById: (id) => (id === "chatScroll" ? scroll : id === "chatLiveBubble" ? bubble : null),
+  // repaint() also repaints the compose button (Send/Stop); no button here.
+  querySelectorAll: () => [],
   addEventListener() {},
 };
 globalThis.window = { getSelection: () => selection };

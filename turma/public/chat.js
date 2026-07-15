@@ -21,6 +21,8 @@
   const POLL_MS = 6000;             // /history fallback cadence when the WS is down
   const HISTORY_RETRY_MS = 1200;    // poll cadence while /history returns 202
   const HISTORY_MAX_RETRIES = 12;
+  const STOP_SUPPRESS_MS = 4000;    // how long a clicked Stop overrides the busy read
+  const ACTION_FAIL_MS = 2000;      // how long the compose button shows a failure
 
   const PRESETS = {
     concise: { thinking: false, tools: false, outputs: false },
@@ -181,6 +183,10 @@
   // Text of a question we just answered; suppresses re-showing its box while an
   // in-flight heartbeat still reports it as pending (cleared once it's gone).
   let answeredQuestion = null;
+  // When Stop was clicked, or 0. See composeBusy().
+  let stopPendingAt = 0;
+  // Until when the compose button is showing a transient failure message.
+  let actionFailUntil = 0;
 
   // reveal (only the live turn types in; committed messages render whole)
   let reveal = { shown: 0 };
@@ -639,6 +645,9 @@
   // on a second de-emphasized line — Claude Code's contextual hint/task footer,
   // mirroring the terminal's bottom status region. Shown only while generating.
   function updateLiveStatus() {
+    // The compose button reads the same liveStatus this bar does — repaint it
+    // here so both surfaces flip on the same ~1s frame.
+    updateComposeAction();
     const bar = $("chatStatus");
     if (!bar) return;
     const st = liveStatus;
@@ -662,6 +671,81 @@
       hint +
       agentsHtml(st.agents);
     wireAgentDelegation(bar);
+  }
+
+  // ---- the compose button: Send when idle, Stop while the agent works --------
+  // There's only ever one thing to do with the agent's turn — start it or end it
+  // — so one button at the bottom of the compose box does both, rather than a
+  // separate Stop parked in the header away from where the operator is typing.
+  //
+  // `liveStatus` is the busy read because it's the fastest one on the page: the
+  // tunnel scrapes the pane's "esc to interrupt" hint every ~1s and pushes a
+  // `turn` frame carrying the status (null the moment generating ends), where the
+  // heartbeat's paneBusy is a beat or more behind. When the socket is down and no
+  // frames arrive, liveStatus stays null and the button stays Send — the safe
+  // degradation, since a Stop that can't see the turn is worse than no Stop.
+  function composeBusy() {
+    if (!liveStatus) { stopPendingAt = 0; return false; }
+    // A clicked Stop only lands on the agent's next beat, so the pane keeps
+    // reporting the turn for a second or two afterwards. Hand the button back to
+    // Send immediately anyway — the operator asked for the turn to end and
+    // shouldn't watch a dead Stop to find out it worked. If the turn is somehow
+    // still alive once the window lapses, the interrupt didn't take and Stop
+    // legitimately comes back.
+    if (stopPendingAt) {
+      if (Date.now() - stopPendingAt < STOP_SUPPRESS_MS) return false;
+      stopPendingAt = 0;
+    }
+    return true;
+  }
+  function isBusy() { return composeBusy(); }
+
+  // Paint every compose button on the page (the chat's and — while the terminal
+  // toggle is showing, with this engine still warm underneath it — the
+  // terminal's) from the one busy read.
+  function updateComposeAction() {
+    if (typeof document === "undefined") return;
+    const busy = composeBusy();
+    if (actionFailUntil && Date.now() < actionFailUntil) return; // let the failure text stand
+    actionFailUntil = 0;
+    const btns = document.querySelectorAll(".compose-action");
+    for (const btn of btns) {
+      btn.classList.toggle("stop", busy);
+      btn.textContent = busy ? "◼ Stop" : "Send";
+      btn.title = busy
+        ? "Stop the agent's current turn (Esc) — the session keeps running"
+        : "Send this message to the agent";
+    }
+  }
+  // Show a transient failure on the compose button, then repaint it normally.
+  function actionFailed(text) {
+    actionFailUntil = Date.now() + ACTION_FAIL_MS;
+    const btns = document.querySelectorAll(".compose-action");
+    for (const btn of btns) btn.textContent = text;
+    setTimeout(() => { actionFailUntil = 0; updateComposeAction(); }, ACTION_FAIL_MS);
+  }
+
+  // Interrupt the in-flight turn: POST .../interrupt, which the agent delivers as
+  // an Escape into the session's TUI — the turn is cancelled, the session and its
+  // conversation keep running. Nothing is destroyed, so there's no arm-then-
+  // confirm step the way Kill has.
+  async function stop() {
+    if (!hostKey || !sessionId) return;
+    stopPendingAt = Date.now();
+    updateComposeAction();
+    // Nothing else repaints once the pane goes quiet, so re-check the button when
+    // the suppression window lapses.
+    setTimeout(updateComposeAction, STOP_SUPPRESS_MS + 50);
+    try {
+      const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/interrupt",
+        { method: "POST" });
+      if (!r.ok) throw new Error(String(r.status));
+      if (typeof fastPoll === "function") fastPoll();
+    } catch {
+      stopPendingAt = 0; // the turn is still running — give Stop back right away
+      updateComposeAction();
+      actionFailed("Stop failed");
+    }
   }
 
   // The live agent-manager list scraped from the pane (parseAgentList in
@@ -969,7 +1053,7 @@
     inp.style.height = Math.min(inp.scrollHeight, 160) + "px";
   }
   async function send() {
-    const inp = $("chatInput"), btn = $("chatSend");
+    const inp = $("chatInput");
     if (!inp || !hostKey || !sessionId) return;
     const text = inp.value;
     if (!text.trim()) return;
@@ -994,7 +1078,7 @@
     } catch {
       if (wasAnswer) { answeredQuestion = null; if (sess) updateQuestion(sess); }
       if (!inp.value.trim()) { inp.value = text; autoGrow(); }
-      if (btn) { btn.textContent = "Send failed"; setTimeout(() => btn.textContent = "Send", 2000); }
+      actionFailed("Send failed");
     }
   }
 
@@ -1115,6 +1199,7 @@
     const myGen = gen;
     hostKey = hk; sessionId = id; sess = s; agent = a;
     buffer = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
+    stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send
     lastHtml = null; repaintDeferred = false; // this session's paint memo starts empty
     stickBottom = true; // land at the tail on open, past the seed→history race
     noExpand = false;
@@ -1142,6 +1227,7 @@
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
     buffer = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
+    stopPendingAt = 0; actionFailUntil = 0;
     lastHtml = null; repaintDeferred = false;
     updateLiveStatus(); // hide the pinned bar when the view closes
   }
@@ -1156,11 +1242,16 @@
   }
 
   if (typeof window !== "undefined") {
-    window.TurmaChat = { open, close, repaint: repaintPublic, onPoll, renderStatic: openStatic, closeStatic };
+    window.TurmaChat = { open, close, repaint: repaintPublic, onPoll, renderStatic: openStatic, closeStatic,
+      isBusy, stop, actionFailed };
     // Global handlers referenced by the chat pane's inline HTML attributes.
     window.autoGrowChatInput = autoGrow;
+    // Enter always sends: a queued message is a normal thing to type mid-turn,
+    // and the key isn't the button — only the click target changes with the turn.
     window.chatInputKey = function (e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
     window.sendChatInput = send;
+    // The one compose button: Stop while the agent is generating, Send otherwise.
+    window.chatComposeAction = function () { if (composeBusy()) stop(); else send(); };
     window.chatJumpBottom = jumpToBottom;
   }
 
@@ -1170,6 +1261,9 @@
     module.exports = {
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderProse, prFooterChip,
       agentsHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
+      isBusy, updateComposeAction,
+      __setLiveStatus: (st) => { liveStatus = st; },
+      __stopPending: (t) => { stopPendingAt = t; },
       __setVerbosity: (v) => { verbosity = v; },
       __setNoExpand: (v) => { noExpand = v; },
       __setBuffer: (b) => { buffer = b; },
