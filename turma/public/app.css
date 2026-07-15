@@ -287,6 +287,26 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .kc-prio.prio-low { color: var(--muted); }
 .kc-due { color: var(--muted); }
 .kc-due.overdue { color: var(--critical); font-weight: 600; }
+/* The agent's triaged repo for a ticket. Cloned repos read as solid/actionable;
+   an uncloned one is dashed (it's a real answer, but you'd clone it first); "no
+   repo" recedes to muted — it's the absence of a suggestion, not a suggestion. */
+/* inline-block, NOT inline-flex: as a flex item of .kc-meta this blockifies, and
+   text-overflow can only ellipsise a block's text — inside a flex container the
+   name is anonymous flex content and gets hard-cut mid-letter instead. */
+.kc-repo {
+  display: inline-block; vertical-align: middle;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--page);
+  color: var(--ink-2); font-family: var(--font-mono); font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Only the card is tight enough to need the cap; the detail panel has room. */
+.kanban-card .kc-repo { max-width: 15ch; }
+.kc-repo.kc-repo-uncloned { border-style: dashed; color: var(--muted); }
+.kc-repo.kc-repo-none {
+  border: 0; background: none; padding: 0; color: var(--muted);
+  font-style: italic; font-family: var(--font-sans);
+}
 .kc-org {
   display: inline-flex; align-items: center; gap: 5px;
   color: var(--muted); font-family: var(--font-mono); font-size: 10.5px;

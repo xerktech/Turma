@@ -12,6 +12,7 @@ const {
   mergeSites, categoryOf, ticketSort, orgColor, ageStr, prioClass,
   cardHtml, boardHtml, detailHtml, textHtml, linkify,
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
+  repoChipHtml, repoFieldHtml,
 } = require("../public/board.js");
 
 function ticket(key, over = {}) {
@@ -437,4 +438,112 @@ test("jiraRefreshPending: tolerates missing commands/garbage entries", () => {
   assert.equal(jiraRefreshPending([null, undefined], ["hostA"]), false);
   assert.equal(jiraRefreshPending([agent("hostA", block(), { commands: [null] })], ["hostA"]), false);
   assert.equal(jiraRefreshPending([], ["hostA"]), false);
+});
+
+// ---- triaged repo chip ------------------------------------------------------
+// The agent guesses which repo a ticket's work belongs in (hub-agent.py's
+// "Jira -> repo triage") and stamps it on the ticket as `repoGuess`. These
+// assert the three states stay visually distinguishable, since the whole value
+// of the chip is that "ready to work in", "clone it first", and "no repo fits"
+// are different answers.
+
+test("repoChipHtml: a cloned repo reads as a plain, actionable chip", () => {
+  const html = repoChipHtml(ticket("X-1", {
+    repoGuess: { repo: "Turma", cloned: true, reason: "board code lives there" },
+  }));
+  assert.ok(html.includes(">Turma<"));
+  assert.ok(html.includes(`class="kc-repo"`), "cloned repos get no modifier class");
+  assert.ok(html.includes("board code lives there"), "the why rides as a tooltip");
+});
+
+test("repoChipHtml: an uncloned repo is marked as needing a clone first", () => {
+  const html = repoChipHtml(ticket("X-1", {
+    repoGuess: { repo: "Widget", cloned: false, nameWithOwner: "xerktech/Widget" },
+  }));
+  assert.ok(html.includes("kc-repo-uncloned"));
+  assert.ok(html.includes("not cloned on this host"));
+});
+
+test("repoChipHtml: a declined ticket says so rather than naming a repo", () => {
+  const html = repoChipHtml(ticket("X-1", { repoGuess: { repo: null, cloned: false } }));
+  assert.ok(html.includes("kc-repo-none"));
+  assert.ok(html.includes(">no repo<"));
+});
+
+test("repoChipHtml: an untriaged ticket gets no chip at all", () => {
+  // "Not looked at yet" is NOT the same claim as "no repo fits" — a ticket the
+  // agent hasn't reached must not render as though the model rejected it.
+  assert.equal(repoChipHtml(ticket("X-1")), "");
+  assert.equal(repoChipHtml(ticket("X-1", { repoGuess: null })), "");
+  assert.equal(repoChipHtml({}), "");
+  assert.equal(repoChipHtml(null), "");
+});
+
+test("cardHtml: the repo chip rides the card, before the org chip", () => {
+  const html = cardHtml(ticket("X-1", {
+    repoGuess: { repo: "Turma", cloned: true, reason: "" },
+  }), { siteKey: "myorg.atlassian.net" }, {});
+  assert.ok(html.includes("kc-repo"));
+  // kc-org is margin-left:auto, so anything after it would be pushed off the
+  // right edge of the meta row.
+  assert.ok(html.indexOf("kc-repo") < html.indexOf("kc-org"));
+});
+
+test("cardHtml: an untriaged card is unchanged", () => {
+  assert.ok(!cardHtml(ticket("X-1"), { siteKey: "s" }, {}).includes("kc-repo"));
+});
+
+test("repoChipHtml: escapes a hostile repo name and reason", () => {
+  // The name is allowlisted agent-side, but the chip must not be the only thing
+  // standing between a compromised heartbeat and script execution.
+  const html = repoChipHtml(ticket("X-1", {
+    repoGuess: {
+      repo: '<img src=x onerror=alert(1)>',
+      cloned: true,
+      reason: '"><script>alert(1)</script>',
+    },
+  }));
+  assert.ok(!html.includes("<img"));
+  assert.ok(!html.includes("<script"));
+});
+
+test("repoFieldHtml: the detail panel spells out what the chip implied", () => {
+  const html = repoFieldHtml(ticket("X-1", {
+    repoGuess: {
+      repo: "Widget", cloned: false, nameWithOwner: "xerktech/Widget",
+      reason: "the widget API",
+    },
+  }));
+  assert.ok(html.includes("Widget"));
+  assert.ok(html.includes("xerktech/Widget"));
+  assert.ok(html.includes("not cloned on this host"));
+  assert.ok(html.includes("the widget API"));
+});
+
+test("repoFieldHtml: declined and untriaged stay distinct", () => {
+  assert.ok(repoFieldHtml(ticket("X-1", { repoGuess: { repo: null } }))
+    .includes("No repository fits"));
+  assert.equal(repoFieldHtml(ticket("X-1")), "");
+});
+
+test("detailHtml: shows the guess from the card, which the Jira fetch lacks", () => {
+  // repoGuess only ever exists on the heartbeat ticket — the on-demand issue
+  // fetch comes straight from Jira, which knows nothing about repos. So a
+  // landed `detail` must not blank the row.
+  const t = ticket("X-1", { repoGuess: { repo: "Turma", cloned: true, reason: "" } });
+  for (const d of [null, detail()]) {
+    const html = detailHtml(t, d, { siteKey: "myorg.atlassian.net" });
+    assert.ok(html.includes("<dt>Repo</dt>"), String(d));
+    assert.ok(html.includes(">Turma<"), String(d));
+  }
+});
+
+test("detailHtml: no Repo row for an untriaged ticket", () => {
+  assert.ok(!detailHtml(ticket("X-1"), detail(), {}).includes("<dt>Repo</dt>"));
+});
+
+test("mergeSites: the repo guess survives the cross-host merge", () => {
+  const t = ticket("X-1", { repoGuess: { repo: "Turma", cloned: true, reason: "" } });
+  const sites = mergeSites([agent("hostA", block({ tickets: [t] }))]);
+  assert.deepEqual(sites[0].tickets[0].repoGuess, { repo: "Turma", cloned: true, reason: "" });
 });

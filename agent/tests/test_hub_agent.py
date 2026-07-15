@@ -1420,6 +1420,7 @@ class ManagerMixin:
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", os.path.join(self.tmp, "worktrees")),
         ]:
@@ -3950,6 +3951,7 @@ class TestPruneRepo(unittest.TestCase):
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", self.wt_root),
             ("REPOS_ROOT", self.tmp),
@@ -4894,6 +4896,524 @@ class TestRefreshJira(ManagerMixin, unittest.TestCase):
         self.assertEqual(calls, [])                       # zero Jira work
         self.assertEqual(payload["jira"], ha.JIRA_EMPTY)  # block still present
         self.assertFalse(payload["jira"]["configured"])
+
+
+class TestTriageCandidates(unittest.TestCase):
+    """The candidate set a ticket may be matched to: cloned repos first, then the
+    org's clonable ones. This list IS the org boundary and the allowlist."""
+
+    def test_cloned_repos_come_first_and_are_marked(self):
+        cands = ha._triage_candidates(
+            [{"name": "Turma"}, {"name": "DockerOps"}],
+            [{"nameWithOwner": "xerktech/Other", "name": "Other"}])
+        self.assertEqual([c["name"] for c in cands], ["Turma", "DockerOps", "Other"])
+        self.assertEqual([c["cloned"] for c in cands], [True, True, False])
+
+    def test_uncloned_org_repos_are_selectable_and_keep_their_owner(self):
+        cands = ha._triage_candidates([], [
+            {"nameWithOwner": "xerktech/Widget", "name": "Widget",
+             "description": "the widget service"},
+        ])
+        self.assertEqual(cands, [{"name": "Widget", "cloned": False,
+                                  "nameWithOwner": "xerktech/Widget",
+                                  "description": "the widget service"}])
+
+    def test_a_cloned_repo_shadows_its_own_gh_listing(self):
+        # The same repo arrives twice (scanned on disk + listed by gh). It must
+        # collapse to ONE candidate, and to the cloned one — otherwise the model
+        # sees a duplicate name and the "prefer cloned" hint is meaningless.
+        cands = ha._triage_candidates(
+            [{"name": "Turma"}],
+            [{"nameWithOwner": "xerktech/Turma", "name": "Turma"}])
+        self.assertEqual(len(cands), 1)
+        self.assertTrue(cands[0]["cloned"])
+
+    def test_a_cloned_repo_inherits_its_gh_description(self):
+        # The scan knows a name and nothing else. Shadowing the gh half outright
+        # would leave the candidates the prompt tells the model to PREFER as bare
+        # names — describing worst exactly the repos most likely to win.
+        cands = ha._triage_candidates(
+            [{"name": "Turma"}],
+            [{"nameWithOwner": "xerktech/Turma", "name": "Turma",
+              "description": "agent fleet hub"}])
+        self.assertEqual(cands[0]["description"], "agent fleet hub")
+        self.assertEqual(cands[0]["nameWithOwner"], "xerktech/Turma")
+
+    def test_truncation_is_stable_against_gh_updatedat_churn(self):
+        # gh lists repos updatedAt-DESC, so a cut in THAT order makes the surviving
+        # name set move whenever anyone pushes to a cold repo — which would defeat
+        # _candidates_fingerprint's names-only design and re-triage the board on
+        # every sweep. The candidate cut must not depend on updatedAt at all.
+        gh = [{"nameWithOwner": f"o/r{i:03d}", "name": f"r{i:03d}",
+               "updatedAt": f"2026-01-{(i % 28) + 1:02d}T00:00:00Z"} for i in range(300)]
+        before = ha._triage_candidates([], gh)
+        shuffled = list(reversed(gh))   # the same repos, a later sweep's order
+        after = ha._triage_candidates([], shuffled)
+        self.assertEqual([c["name"] for c in before], [c["name"] for c in after])
+        self.assertEqual(ha._candidates_fingerprint(before),
+                         ha._candidates_fingerprint(after))
+
+    def test_root_pseudo_repo_is_never_a_candidate(self):
+        cands = ha._triage_candidates([{"name": ha.ROOT_REPO_NAME}], [])
+        self.assertEqual(cands, [])
+
+    def test_candidate_list_is_bounded(self):
+        gh = [{"nameWithOwner": f"o/r{i}", "name": f"r{i}"} for i in range(400)]
+        self.assertEqual(len(ha._triage_candidates([], gh)), ha.JIRA_TRIAGE_CANDIDATES)
+
+
+class TestTriageFingerprints(unittest.TestCase):
+    """What re-triages a ticket and — just as important — what doesn't."""
+
+    def test_ticket_text_change_invalidates(self):
+        a = {"summary": "Fix login", "type": "Bug", "project": "ENG", "labels": []}
+        b = {**a, "summary": "Fix logout"}
+        self.assertNotEqual(ha._ticket_fingerprint(a), ha._ticket_fingerprint(b))
+
+    def test_status_or_updated_churn_does_not_invalidate(self):
+        # A ticket moving column, or any field edit bumping `updated`, is not new
+        # information about WHICH REPO the work belongs in. Re-triaging on it
+        # would burn the shared login re-deciding the same answer.
+        a = {"summary": "Fix login", "type": "Bug", "project": "ENG", "labels": [],
+             "status": "To Do", "updated": "2026-07-01T00:00:00Z"}
+        b = {**a, "status": "In Progress", "updated": "2026-07-15T00:00:00Z"}
+        self.assertEqual(ha._ticket_fingerprint(a), ha._ticket_fingerprint(b))
+
+    def test_new_candidate_repo_invalidates(self):
+        one = ha._triage_candidates([{"name": "Turma"}], [])
+        two = ha._triage_candidates([{"name": "Turma"}, {"name": "Widget"}], [])
+        self.assertNotEqual(ha._candidates_fingerprint(one),
+                            ha._candidates_fingerprint(two))
+
+    def test_cloning_an_existing_candidate_invalidates(self):
+        # Same repo, now on disk: worth re-deciding, since "prefer cloned" may
+        # now pull a ticket to it.
+        before = ha._triage_candidates([], [{"nameWithOwner": "o/Widget", "name": "Widget"}])
+        after = ha._triage_candidates([{"name": "Widget"}], [])
+        self.assertNotEqual(ha._candidates_fingerprint(before),
+                            ha._candidates_fingerprint(after))
+
+    def test_gh_metadata_churn_does_not_invalidate(self):
+        # The regression this guards: the gh block re-sweeps on its own cadence
+        # and `updatedAt`/`description` move constantly. Hashing them would
+        # re-triage the ENTIRE board every sweep, forever.
+        before = ha._triage_candidates([], [
+            {"nameWithOwner": "o/Widget", "name": "Widget",
+             "description": "old", "updatedAt": "2026-01-01T00:00:00Z"}])
+        after = ha._triage_candidates([], [
+            {"nameWithOwner": "o/Widget", "name": "Widget",
+             "description": "new words entirely", "updatedAt": "2026-07-15T00:00:00Z"}])
+        self.assertEqual(ha._candidates_fingerprint(before),
+                         ha._candidates_fingerprint(after))
+
+    def test_candidate_order_does_not_invalidate(self):
+        a = [{"name": "A", "cloned": True}, {"name": "B", "cloned": False}]
+        self.assertEqual(ha._candidates_fingerprint(a),
+                         ha._candidates_fingerprint(list(reversed(a))))
+
+    def test_fingerprints_are_stable_across_processes(self):
+        # crc32, not the salted builtin hash: a per-process salt would invalidate
+        # the whole ledger on every manager restart.
+        import subprocess
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import importlib.util,sys;"
+             f"spec=importlib.util.spec_from_file_location('ha', {ha.__file__!r});"
+             "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);"
+             "print(m._ticket_fingerprint({'summary':'Fix login'}))"],
+            capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(),
+                         str(ha._ticket_fingerprint({"summary": "Fix login"})))
+
+
+class TestParseTriage(unittest.TestCase):
+    """The trust boundary: a model reply becomes a decision only if it names a
+    repo from the candidate list."""
+
+    def setUp(self):
+        self.cands = ha._triage_candidates(
+            [{"name": "Turma"}], [{"nameWithOwner": "xerktech/Widget", "name": "Widget"}])
+        self.tickets = [{"key": "ENG-1"}, {"key": "ENG-2"}]
+
+    def test_parses_repo_and_reason(self):
+        out = ha._parse_triage(
+            '{"ENG-1": {"repo": "Turma", "why": "heartbeat code"}}',
+            self.tickets, self.cands)
+        self.assertEqual(out["ENG-1"], {"repo": "Turma", "cloned": True,
+                                        "nameWithOwner": None,
+                                        "reason": "heartbeat code"})
+
+    def test_uncloned_candidate_keeps_its_owner(self):
+        out = ha._parse_triage('{"ENG-1": {"repo": "Widget"}}', self.tickets, self.cands)
+        self.assertEqual(out["ENG-1"]["nameWithOwner"], "xerktech/Widget")
+        self.assertFalse(out["ENG-1"]["cloned"])
+
+    def test_hallucinated_repo_is_no_answer_not_a_no_repo_verdict(self):
+        # The model picks from a list, so an off-list name is invented. That's a
+        # BROKEN attempt — omitting the key leaves the ticket undecided so the
+        # retry picks it up. Recording it as "no repo fits" would paint a
+        # confident chip asserting something the model never said, and (decisions
+        # are never re-triaged) leave it there for good.
+        out = ha._parse_triage(
+            '{"ENG-1": {"repo": "totally-made-up", "why": "vibes"}}',
+            self.tickets, self.cands)
+        self.assertEqual(out, {})
+
+    def test_null_is_an_answer_meaning_no_repo_fits(self):
+        # The one case that IS a verdict: null was asked for and means what it says.
+        for raw in ['{"ENG-1": null}', '{"ENG-1": {"repo": null}}']:
+            out = ha._parse_triage(raw, self.tickets, self.cands)
+            self.assertEqual(out["ENG-1"]["repo"], None, raw)
+
+    def test_unreadable_value_shapes_are_no_answer(self):
+        # Haiku deviating from the asked-for shape ({"repository": ...}, a bare
+        # list) must retry, not silently become "no repo fits" for the batch.
+        for raw in ['{"ENG-1": {"repository": "Turma"}}',
+                    '{"ENG-1": ["Turma"]}',
+                    '{"ENG-1": 42}',
+                    '{"ENG-1": {"why": "no repo key at all"}}']:
+            self.assertEqual(ha._parse_triage(raw, self.tickets, self.cands), {}, raw)
+
+    def test_unasked_keys_are_ignored(self):
+        out = ha._parse_triage(
+            '{"ENG-1": {"repo": "Turma"}, "OPS-9": {"repo": "Turma"}}',
+            self.tickets, self.cands)
+        self.assertEqual(list(out), ["ENG-1"])
+
+    def test_bare_string_reply_is_tolerated(self):
+        out = ha._parse_triage('{"ENG-1": "Turma"}', self.tickets, self.cands)
+        self.assertEqual(out["ENG-1"]["repo"], "Turma")
+
+    def test_json_in_a_fence_or_prose_is_recovered(self):
+        for raw in ['```json\n{"ENG-1": {"repo": "Turma"}}\n```',
+                    'Sure! Here you go:\n{"ENG-1": {"repo": "Turma"}}\nHope that helps.']:
+            out = ha._parse_triage(raw, self.tickets, self.cands)
+            self.assertEqual(out["ENG-1"]["repo"], "Turma", raw)
+
+    def test_unusable_reply_is_no_decision_not_a_null_decision(self):
+        # An empty/garbage reply is a failed ATTEMPT (retry it), not the model
+        # saying "no repo fits" (which would render a chip and never retry).
+        for raw in ["", None, "I could not determine this.", "{oops", "[1,2]"]:
+            self.assertEqual(ha._parse_triage(raw, self.tickets, self.cands), {}, repr(raw))
+
+    def test_reason_is_capped(self):
+        out = ha._parse_triage(
+            '{"ENG-1": {"repo": "Turma", "why": "%s"}}' % ("x" * 400),
+            self.tickets, self.cands)
+        self.assertEqual(len(out["ENG-1"]["reason"]), ha.JIRA_TRIAGE_REASON_MAX)
+
+
+class TestJiraTriage(ManagerMixin, unittest.TestCase):
+    """The triage lifecycle on the manager: batching, caching, retries, and the
+    repoGuess that rides the heartbeat."""
+
+    def setUp(self):
+        super().setUp()
+        self.popen_calls = []
+        p = mock.patch.object(ha, "scan_repos",
+                              return_value=[{"name": "Turma",
+                                             "path": os.path.join(self.tmp, "Turma")}])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _configured(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t")
+
+    def _manager(self, tickets):
+        sm = self.make_manager()
+        sm.jira = {**ha.JIRA_EMPTY, "available": True, "configured": True,
+                   "siteKey": "s.atlassian.net", "tickets": tickets}
+        sm.github = {"available": True, "login": "x",
+                     "repos": [{"nameWithOwner": "xerktech/Widget", "name": "Widget"}]}
+        return sm
+
+    def _fake_popen(self, reply, rc=0):
+        """Stand in for the detached `claude -p`: record the argv and write the
+        reply where the real subprocess's stdout redirect would have put it."""
+        test = self
+
+        class FakeProc:
+            def __init__(self, cmd, stdout=None, **kw):
+                test.popen_calls.append(cmd)
+                if reply is not None and stdout is not None:
+                    stdout.write(reply)
+                    stdout.flush()
+
+            def poll(self):
+                return rc
+
+            def kill(self):
+                pass
+
+        return mock.patch.object(ha.subprocess, "Popen", FakeProc)
+
+    def test_triage_decides_and_stamps_repo_guess_on_the_ticket(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen(
+                '{"ENG-1": {"repo": "Turma", "why": "heartbeat lives there"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"], {
+            "repo": "Turma", "cloned": True, "nameWithOwner": None,
+            "reason": "heartbeat lives there",
+            "at": sm.jira["tickets"][0]["repoGuess"]["at"],
+        })
+
+    def test_untriaged_ticket_carries_no_guess_at_all(self):
+        # Absence must not read as "no repo fits" — the board draws nothing for
+        # a ticket it simply hasn't looked at yet.
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        sm._apply_triage()
+        self.assertNotIn("repoGuess", sm.jira["tickets"][0])
+
+    def test_declined_ticket_carries_an_explicit_null_repo(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Design review"}])
+        with self._configured(), self._fake_popen('{"ENG-1": null}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        self.assertIn("repoGuess", sm.jira["tickets"][0])
+        self.assertIsNone(sm.jira["tickets"][0]["repoGuess"]["repo"])
+
+    def test_the_model_only_ever_sees_candidate_repos(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), self._fake_popen('{"ENG-1": null}'):
+            sm._start_jira_triage()
+        prompt = self.popen_calls[0][-1]
+        self.assertIn("Turma [cloned]", prompt)
+        self.assertIn("- Widget", prompt)
+        self.assertIn("ENG-1: x", prompt)
+
+    def test_launch_is_headless_and_never_enters_a_repo(self):
+        # Same posture as the session summarizer: no --settings (so no guard to
+        # load), cwd outside any worktree, argv list (so ticket text can't inject).
+        sm = self._manager([{"key": "ENG-1", "summary": "x; rm -rf /"}])
+        with self._configured(), self._fake_popen('{"ENG-1": null}'):
+            sm._start_jira_triage()
+        cmd = self.popen_calls[0]
+        self.assertEqual(cmd[:4], ["claude", "-p", "--model", ha.JIRA_TRIAGE_MODEL])
+        self.assertEqual(len(cmd), 5)          # the prompt is ONE argv element
+        self.assertNotIn("--settings", cmd)
+
+    def test_a_settled_board_costs_nothing(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+            self.popen_calls.clear()
+            for _ in range(5):
+                sm._start_jira_triage()
+        self.assertEqual(self.popen_calls, [])
+
+    def test_decisions_survive_a_manager_restart(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        again = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        again._apply_triage()
+        self.assertEqual(again.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+        self.popen_calls.clear()
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            again._start_jira_triage()
+        self.assertEqual(self.popen_calls, [])   # no re-run
+
+    def test_edited_ticket_is_retriaged(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "Rewrite the Widget API"}]
+        self.popen_calls.clear()
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Widget"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        self.assertEqual(len(self.popen_calls), 1)
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Widget")
+
+    def test_a_stale_decision_keeps_rendering_until_a_new_one_lands(self):
+        # Stale means "re-triage this", NOT "stop showing it". The old answer is
+        # the best one available until a better one arrives, and blanking it here
+        # would wipe every chip on the board over a transient (a gh hiccup
+        # restales every ticket at once).
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "Rewrite the Widget API"}]
+        with self._configured(), self._fake_popen(None):
+            sm._start_jira_triage()   # re-triage in flight
+        sm._apply_triage()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+    def test_a_failed_attempt_does_not_destroy_the_existing_decision(self):
+        # The regression: an unrelated transient (a rate limit on the one shared
+        # ~/.claude login) must not cost the board a decision it already paid for.
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "Rewrite the Widget API"}]
+        with self._configured(), self._fake_popen("garbage"):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()    # attempt fails outright
+        sm._apply_triage()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+    def test_a_gh_outage_neither_restales_nor_blanks_the_board(self):
+        # refresh_github blanks the block to repos:[] on ANY error — on that field
+        # alone, identical to "the org has no repos". Triaging against it would
+        # re-run the whole board through the model twice (once when gh breaks,
+        # once when it recovers) and burn every ticket's retry budget.
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        sm.github = {"available": False, "login": None, "repos": []}   # gh hiccup
+        self.popen_calls.clear()
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+        self.assertEqual(self.popen_calls, [], "no re-triage from a gh outage")
+        sm._apply_triage()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+    def test_a_new_question_gets_a_fresh_retry_budget(self):
+        # attempts are scoped to the question being asked, not to the ticket's
+        # life. A lifetime counter would let three invalidations spread over months
+        # permanently ban a ticket from re-triage — freezing a now-wrong chip.
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        for i in range(ha.JIRA_TRIAGE_MAX_ATTEMPTS):
+            with self._configured(), self._fake_popen("garbage"), \
+                 mock.patch.object(ha.time, "time", return_value=1e9 + i * 1e6):
+                sm._start_jira_triage()
+                sm._poll_jira_triage()
+        self.popen_calls.clear()
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "a different ticket now"}]
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        self.assertEqual(len(self.popen_calls), 1, "exhausted budget must not carry over")
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+    def test_a_landed_decision_clears_the_attempt_run(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), self._fake_popen("garbage"):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()    # burns attempt 1
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'), \
+             mock.patch.object(ha.time, "time", return_value=1e12):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()    # succeeds on attempt 2
+        entry = sm.triage_ledger["s.atlassian.net/ENG-1"]
+        self.assertTrue(entry["decided"])
+        for k in ("attempts", "retryAt", "tryTicketFp", "tryCandFp"):
+            self.assertNotIn(k, entry)
+
+    def test_batch_is_bounded_and_one_job_runs_at_a_time(self):
+        tickets = [{"key": f"ENG-{i}", "summary": f"t{i}"} for i in range(60)]
+        sm = self._manager(tickets)
+        with self._configured(), self._fake_popen(None):
+            sm._start_jira_triage()
+            sm._start_jira_triage()   # a job is in flight; must not fork another
+        self.assertEqual(len(self.popen_calls), 1)
+        self.assertEqual(self.popen_calls[0][-1].count("(type:"), 0)
+        self.assertEqual(len(sm.triage_job["batch"]), ha.JIRA_TRIAGE_BATCH)
+
+    def test_a_backlog_drains_over_later_beats(self):
+        tickets = [{"key": f"ENG-{i}", "summary": f"t{i}"} for i in range(60)]
+        sm = self._manager(tickets)
+        seen = set()
+        for _ in range(3):
+            reply = json.dumps({t["key"]: {"repo": "Turma"} for t in tickets})
+            with self._configured(), self._fake_popen(reply):
+                sm._start_jira_triage()
+                sm._poll_jira_triage()
+        for t in sm.jira["tickets"]:
+            seen.add(t.get("repoGuess", {}).get("repo"))
+        self.assertEqual(seen, {"Turma"})   # all 60 decided in 3 batches of 25
+
+    def test_unanswered_ticket_retries_then_gives_up(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        for i in range(ha.JIRA_TRIAGE_MAX_ATTEMPTS + 2):
+            with self._configured(), self._fake_popen("garbage"),                  mock.patch.object(ha.time, "time", return_value=1e9 + i * 1e6):
+                sm._start_jira_triage()
+                sm._poll_jira_triage()
+        self.assertEqual(len(self.popen_calls), ha.JIRA_TRIAGE_MAX_ATTEMPTS)
+        self.assertNotIn("repoGuess", sm.jira["tickets"][0])
+
+    def test_backoff_spaces_the_retries(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), self._fake_popen("garbage"):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+            self.popen_calls.clear()
+            sm._start_jira_triage()   # immediately after: still inside the backoff
+        self.assertEqual(self.popen_calls, [])
+
+    def test_timeout_kills_the_job_and_frees_the_slot(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), self._fake_popen(None, rc=None):
+            sm._start_jira_triage()
+            sm.triage_job["startedMono"] -= ha.JIRA_TRIAGE_TIMEOUT_SEC + 1
+            sm._poll_jira_triage()
+        self.assertIsNone(sm.triage_job)
+
+    def test_unconfigured_host_never_triages(self):
+        sm = self.make_manager()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN=""), \
+             self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+        self.assertEqual(self.popen_calls, [])
+        self.assertIsNone(sm.triage_job)
+
+    def test_no_candidates_means_no_triage(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        sm.github = {"available": False, "login": None, "repos": []}
+        with self._configured(), mock.patch.object(ha, "scan_repos", return_value=[]), \
+             self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+        self.assertEqual(self.popen_calls, [])
+
+    def test_refresh_jira_restamps_guesses_onto_the_new_tickets(self):
+        # collect_jira() builds fresh dicts every poll; without the re-stamp the
+        # board's chips would blank on every slow beat.
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        fresh = {**ha.JIRA_EMPTY, "available": True, "siteKey": "s.atlassian.net",
+                 "tickets": [{"key": "ENG-1", "summary": "Fix the heartbeat"}]}
+        with mock.patch.object(ha, "collect_jira", return_value=fresh):
+            sm.refresh_jira()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+    def test_ledger_is_bounded(self):
+        sm = self._manager([])
+        for i in range(ha.JIRA_TRIAGE_LEDGER_MAX + 50):
+            sm.triage_ledger[f"s/OLD-{i}"] = {"decided": True, "repo": "Turma",
+                                              "at": f"2026-01-01T00:00:{i:02d}Z"}
+        sm._prune_triage_ledger()
+        self.assertEqual(len(sm.triage_ledger), ha.JIRA_TRIAGE_LEDGER_MAX)
+
+    def test_prune_keeps_work_still_owed(self):
+        # An undecided entry is a retry the manager still owes; dropping it would
+        # silently cancel that work.
+        sm = self._manager([])
+        for i in range(ha.JIRA_TRIAGE_LEDGER_MAX + 10):
+            sm.triage_ledger[f"s/OLD-{i}"] = {"decided": True, "repo": "Turma",
+                                              "at": f"2026-01-01T00:00:{i:02d}Z"}
+        sm.triage_ledger["s/NEW-1"] = {"decided": False, "attempts": 1}
+        sm._prune_triage_ledger()
+        self.assertIn("s/NEW-1", sm.triage_ledger)
+
+    def test_triage_never_raises_out_of_the_heartbeat(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        sm.registry = []
+        with self._configured(), \
+             mock.patch.object(ha.subprocess, "Popen", side_effect=OSError("no claude")):
+            payload = sm.build_payload(1)
+        self.assertIn("jira", payload)
+        self.assertIsNone(sm.triage_job)
 
 
 if __name__ == "__main__":
