@@ -69,12 +69,17 @@ ensure_node() {
   fi
   if have_sudo || [ "$(id -u)" = 0 ]; then
     info "installing Node ${NODE_MAJOR_MIN}.x (NodeSource)"
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_MIN}.x" | $SUDO -E bash -
+    # Download the setup script to a file and run it as a separate step rather
+    # than piping curl straight into a shell (avoids the pipe-to-shell foot-gun;
+    # the file could also be inspected/checksummed if ever needed).
+    local ns; ns="$(mktemp)"
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_MIN}.x" -o "$ns"
+    $SUDO -E bash "$ns"
+    rm -f "$ns"
     $SUDO apt-get install -y nodejs
   else
-    warn "node >= ${NODE_MAJOR_MIN} required and no sudo. Install via nvm:"
-    warn "  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash"
-    warn "  nvm install ${NODE_MAJOR_MIN}"
+    warn "node >= ${NODE_MAJOR_MIN} required and no sudo. Install it via nvm"
+    warn "  (see https://github.com/nvm-sh/nvm), then:  nvm install ${NODE_MAJOR_MIN}"
   fi
 }
 
@@ -189,9 +194,11 @@ install_service() {
     # Keep the user manager alive across logout (so the agent survives with no
     # shell open). Best-effort; needs a one-time sudo.
     if have loginctl; then
-      $SUDO loginctl enable-linger "$USER" 2>/dev/null \
-        && info "lingering enabled for $USER" \
-        || warn "could not enable-linger (run: sudo loginctl enable-linger $USER)"
+      if $SUDO loginctl enable-linger "$USER" 2>/dev/null; then
+        info "lingering enabled for $USER"
+      else
+        warn "could not enable-linger (run: sudo loginctl enable-linger $USER)"
+      fi
     fi
     info "service: systemctl --user status turma-agent"
   else
@@ -230,7 +237,7 @@ do_verify() {
   echo "  node major: $(node_major) (need >= $NODE_MAJOR_MIN)"
   if [ -f "$CFG" ]; then
     echo "  config: $CFG"
-    grep -q '^TURMA_TOKEN=.\+' "$CFG" && echo "  TURMA_TOKEN: set" || { echo "  TURMA_TOKEN: EMPTY (edit $CFG)"; ok=1; }
+    if grep -q '^TURMA_TOKEN=.\+' "$CFG"; then echo "  TURMA_TOKEN: set"; else echo "  TURMA_TOKEN: EMPTY (edit $CFG)"; ok=1; fi
   else
     echo "  config: MISSING ($CFG)"; ok=1
   fi
@@ -286,6 +293,8 @@ info "Done. Next steps:"
 info "  1) Edit $CFG — set TURMA_URL and TURMA_TOKEN."
 info "  2) Log in to Claude on this host if you haven't:  claude /login"
 info "  3) (optional) gh auth login   — for private git and 'gh pr create'."
-systemd_user_ok \
-  && info "  4) It's running under systemd:  systemctl --user status turma-agent" \
-  || info "  4) Start it:  $PREFIX/bin/turma-agentctl start"
+if systemd_user_ok; then
+  info "  4) It's running under systemd:  systemctl --user status turma-agent"
+else
+  info "  4) Start it:  $PREFIX/bin/turma-agentctl start"
+fi
