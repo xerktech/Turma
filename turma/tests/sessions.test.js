@@ -100,6 +100,7 @@ function loadPage({ search = "", sidebar = null, textareas = [] } = {}) {
   const fn = new Function(...names, "window",
     script + "\n;return { render, selectSession, followSpawn, toggleComposer,"
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
+      + " stopCurrentSession,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
@@ -343,6 +344,40 @@ test("picking a session cancels a pending follow, so the spawn can't yank the st
   h.sessions = [...h.sessions, { ...working("99999", "Late Arrival"), spawnCmdId: "cmd-77" }];
   beat({ now, agents: [h] });
   assert.deepEqual(opened, ["11111"], "an explicit pick wins over the pending follow");
+});
+
+// --- the Stop button (chat + terminal bars) ----------------------------------
+
+test("Stop interrupts the attached session's turn from either bar, with no confirm step", () => {
+  for (const view of ["chat", "terminal"]) {
+    const { beat, selectSession, stopCurrentSession, els, posts } = loadPage();
+    const { now, host: h } = host([working("11111", "Long Turn")]);
+    beat({ now, agents: [h] });
+    selectSession("11111");
+
+    // Unlike Kill, one click is the whole interaction — nothing is destroyed.
+    stopCurrentSession(view);
+    assert.equal(posts.length, 1, `${view}: the first click stops the turn`);
+    assert.equal(posts[0].url, "/api/agents/hostA/sessions/11111/interrupt");
+
+    // The button acks locally, since the interrupt only lands on the next beat.
+    const btn = els[view === "chat" ? "chatStop" : "termStop"];
+    assert.equal(btn.textContent, "Stopping…");
+    assert.equal(btn.disabled, true);
+  }
+});
+
+test("Stop is a no-op once the attached session is gone", () => {
+  const { beat, selectSession, stopCurrentSession, posts } = loadPage();
+  stopCurrentSession("chat");
+  assert.deepEqual(posts, [], "nothing is attached yet");
+
+  const { now, host: h } = host([working("11111", "Long Turn")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+  beat({ now, agents: [] }); // the session vanished -> render() clears the stage
+  stopCurrentSession("chat");
+  assert.deepEqual(posts, [], "no session left to interrupt");
 });
 
 test("?session=<id>: waits for a session that isn't running yet, then opens it", () => {

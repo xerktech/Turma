@@ -1590,6 +1590,14 @@ const server = http.createServer(async (req, res) => {
         const cmdId = queueCommand(key, { type: parts[5], sessionId });
         return json(res, 200, { ok: true, cmdId });
       }
+      // POST /api/agents/<host>/sessions/<id>/interrupt -> stop the turn a
+      // running session has in flight (the agent sends Escape to its TUI). The
+      // session survives with its conversation intact — this is the gentle
+      // sibling of kill/restart, so it takes no body and needs no confirmation.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "interrupt") {
+        const cmdId = queueCommand(key, { type: "interrupt", sessionId });
+        return json(res, 200, { ok: true, cmdId });
+      }
       // POST /api/agents/<host>/sessions/<id>/input -> forward free-text input
       // to a running session (typing a message into the session). Body: {text}.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "input") {
