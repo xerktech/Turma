@@ -131,12 +131,16 @@
     return "";
   }
 
+  function overdueOf(t, now) {
+    return !!(t.dueDate && categoryOf(t) !== "done" &&
+      t.dueDate < new Date(now ?? Date.now()).toISOString().slice(0, 10));
+  }
+
   function cardHtml(t, site, opts) {
     const o = opts || {};
     const color = o.color || "var(--muted)";
     const now = o.now;
-    const overdue = t.dueDate && categoryOf(t) !== "done" &&
-      t.dueDate < new Date(now ?? Date.now()).toISOString().slice(0, 10);
+    const overdue = overdueOf(t, now);
     const bits = [];
     if (t.status) bits.push(`<span class="jira-status">${esc(t.status)}</span>`);
     if (t.priority) {
@@ -146,7 +150,14 @@
       bits.push(`<span class="kc-due${overdue ? " overdue" : ""}">due ${esc(t.dueDate)}</span>`);
     }
     bits.push(`<span class="kc-org" style="--org:${esc(color)}" title="${esc(site && site.siteKey || "")}">${esc(t.project || "")}</span>`);
-    return `<div class="kanban-card">
+    // The card itself opens the detail view (data-* carry what the click
+    // handler needs to route the fetch: the issue and its owning org). It's a
+    // div, not a button, because it contains the kc-key link out to Jira and a
+    // nested interactive element would be invalid HTML — hence the explicit
+    // role/tabindex, and the handler's own Enter/Space keying.
+    return `<div class="kanban-card" role="button" tabindex="0"
+      data-key="${esc(t.key)}" data-site="${esc(site && site.siteKey || "")}"
+      aria-label="${esc(t.key + ": " + (t.summary || ""))}">
       <div class="kc-top">
         <a class="kc-key" href="${esc(t.url || "#")}" target="_blank" rel="noopener">${esc(t.key)}</a>
         <span class="kc-type">${esc(t.type || "")}</span>
@@ -155,6 +166,134 @@
       <div class="kc-summary">${esc(t.summary || "")}</div>
       <div class="kc-meta">${bits.join("")}</div>
     </div>`;
+  }
+
+  // --- expanded ticket detail ---------------------------------------------
+  // The card only carries what fits on it; description and comments are fetched
+  // on demand (GET /api/jira/<siteKey>/<key>, which routes to the host holding
+  // that org's creds). So the detail view renders in two passes: immediately
+  // from the card's own heartbeat fields, then again once `detail` lands. Pure
+  // string work, like everything else here.
+
+  // Plain text (Jira ADF flattened agent-side) -> paragraphs, preserving the
+  // blank-line breaks the flattener emits. Escaped, then linkified: a bare URL
+  // in a description or comment is usually the point of it (a PR, a log, a
+  // spec), so it's worth a click.
+  function textHtml(s) {
+    const paras = String(s ?? "").split(/\n{2,}/).filter(p => p.trim());
+    return paras.map(p => {
+      const lines = p.split("\n").map(l => linkify(esc(l))).join("<br>");
+      return `<p>${lines}</p>`;
+    }).join("");
+  }
+
+  // Runs on ALREADY-ESCAPED text, so the pattern can't see a quote or angle
+  // bracket — an injected href is impossible. Trailing punctuation is left out
+  // of the href ("see https://x/y." shouldn't link the period), as is a
+  // trailing "&…;" entity fragment from the escaping.
+  function linkify(escaped) {
+    return escaped.replace(/https?:\/\/[^\s<]+/g, (m) => {
+      const url = m.replace(/(&[a-z]+;|[.,;:!?)\]}]+)+$/i, "");
+      if (!url) return m;
+      return `<a href="${url}" target="_blank" rel="noopener">${url}</a>` + m.slice(url.length);
+    });
+  }
+
+  function fmtDate(iso) {
+    if (!iso) return "";
+    const t = Date.parse(iso);
+    if (Number.isNaN(t)) return String(iso);
+    const d = new Date(t);
+    return d.toLocaleString(undefined, {
+      year: "numeric", month: "short", day: "numeric",
+      hour: "2-digit", minute: "2-digit",
+    });
+  }
+
+  function fieldRow(label, valueHtml) {
+    if (!valueHtml) return "";
+    return `<div class="td-field"><dt>${esc(label)}</dt><dd>${valueHtml}</dd></div>`;
+  }
+
+  // `t` is the card's ticket (always present); `detail` is the fetched issue
+  // (null until it lands). opts: {color, now, siteKey, error, loading}.
+  function detailHtml(t, detail, opts) {
+    const o = opts || {};
+    const d = detail || {};
+    // Prefer the fetched copy field-by-field: it's newer than the last board
+    // poll, so an issue reprioritized since the beat reads correctly here.
+    const v = (k) => (d[k] != null && d[k] !== "" ? d[k] : t[k]);
+    const now = o.now;
+    const overdue = overdueOf({ dueDate: v("dueDate"), statusCategory: v("statusCategory") }, now);
+
+    const labels = Array.isArray(d.labels) && d.labels.length ? d.labels
+      : (Array.isArray(t.labels) ? t.labels : []);
+    const fields = [
+      fieldRow("Status", v("status") ? `<span class="jira-status">${esc(v("status"))}</span>` : ""),
+      fieldRow("Resolution", d.resolution ? esc(d.resolution) : ""),
+      fieldRow("Priority", v("priority")
+        ? `<span class="kc-prio ${prioClass(v("priority"))}">${esc(v("priority"))}</span>` : ""),
+      fieldRow("Type", v("type") ? esc(v("type")) : ""),
+      fieldRow("Assignee", d.assignee ? esc(d.assignee) : ""),
+      fieldRow("Reporter", d.reporter ? esc(d.reporter) : ""),
+      fieldRow("Project", v("projectName")
+        ? `${esc(v("projectName"))} <span class="td-dim">(${esc(v("project") || "")})</span>`
+        : (v("project") ? esc(v("project")) : "")),
+      fieldRow("Parent", v("parentKey")
+        ? esc(v("parentKey")) + (d.parentSummary ? ` <span class="td-dim">${esc(d.parentSummary)}</span>` : "")
+        : ""),
+      fieldRow("Created", v("created") ? esc(fmtDate(v("created"))) : ""),
+      fieldRow("Updated", v("updated") ? esc(fmtDate(v("updated"))) : ""),
+      fieldRow("Due", v("dueDate")
+        ? `<span class="${overdue ? "kc-due overdue" : "kc-due"}">${esc(v("dueDate"))}</span>` : ""),
+      fieldRow("Labels", labels.length
+        ? labels.map(l => `<span class="td-label">${esc(l)}</span>`).join(" ") : ""),
+    ].join("");
+
+    // Description/comments only exist once the fetch lands, so until then this
+    // section carries the loading or error state rather than an empty void.
+    let body;
+    if (o.error) {
+      body = `<div class="td-note td-err">Couldn't load the full ticket — ${esc(o.error)}. <a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">Open in Jira</a> instead.</div>`;
+    } else if (!detail) {
+      body = `<div class="td-note">Loading description and comments…</div>`;
+    } else {
+      const desc = d.description
+        ? textHtml(d.description) +
+          (d.descriptionTruncated ? `<div class="td-note">Description truncated — <a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">read the rest in Jira</a>.</div>` : "")
+        : `<div class="td-none">No description.</div>`;
+      const comments = d.comments || [];
+      const dropped = Math.max(0, (d.commentTotal || comments.length) - comments.length);
+      const cHtml = comments.length
+        ? comments.map(c => `<div class="td-comment">
+            <div class="td-chead"><span class="td-cauthor">${esc(c.author || "Unknown")}</span>
+              <span class="td-cwhen" title="${esc(c.created || "")}">${esc(ageStr(c.updated || c.created, now))}</span></div>
+            <div class="td-cbody">${textHtml(c.body)}${c.truncated ? `<div class="td-note">Comment truncated.</div>` : ""}</div>
+          </div>`).join("")
+        : `<div class="td-none">No comments.</div>`;
+      body = `<section class="td-section">
+          <h3>Description</h3>${desc}
+        </section>
+        <section class="td-section">
+          <h3>Comments <span class="td-dim">${d.commentTotal || comments.length}</span></h3>
+          ${dropped ? `<div class="td-note">Showing the ${comments.length} newest — <a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">${dropped} older in Jira</a>.</div>` : ""}
+          ${cHtml}
+        </section>`;
+    }
+
+    const color = o.color || "var(--muted)";
+    return `<div class="td-head">
+        <div class="td-crumbs">
+          <span class="kc-org" style="--org:${esc(color)}" title="${esc(o.siteKey || "")}">${esc(v("project") || "")}</span>
+          <a class="kc-key" href="${esc(v("url") || "#")}" target="_blank" rel="noopener">${esc(t.key)}</a>
+          <span class="kc-type">${esc(v("type") || "")}</span>
+        </div>
+        <button class="td-close" type="button" aria-label="Close">✕</button>
+      </div>
+      <h2 class="td-summary">${esc(v("summary") || "")}</h2>
+      <dl class="td-fields">${fields}</dl>
+      ${body}
+      <div class="td-foot"><a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">Open in Jira ↗</a></div>`;
   }
 
   // The three-column board for the selected sites (filter = a siteKey, or
@@ -193,7 +332,7 @@
 
   const api = {
     CATEGORIES, mergeSites, categoryOf, ticketSort, orgColor, ageStr,
-    prioClass, cardHtml, boardHtml, esc,
+    prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
   };
   if (typeof window !== "undefined") window.TurmaBoard = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
