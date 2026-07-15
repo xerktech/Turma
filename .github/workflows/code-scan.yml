@@ -11,13 +11,15 @@ name: code-scan
 # Findings block the PR. Runs on open AND on later pushes to the PR (default
 # pull_request types) so every commit is re-checked.
 #
-# Runs on the home-lab self-hosted runners ([self-hosted, linux]). Notes that
-# shape these jobs (see the sibling SwitchBoard repo, which established the
-# pattern): the runner has no passwordless sudo (install CLIs to
-# $HOME/.local/bin), cannot auth to ghcr.io (so hadolint's Docker action is
-# swapped for the release binary), and has no GitHub Advanced Security (so
-# there is no code-scanning API to upload SARIF to — findings live in the job
-# log + exit codes). setup-python + pip and Docker actions do work here.
+# Runs on GitHub-hosted `ubuntu-latest`, NOT the self-hosted box. These four
+# jobs do well under two minutes of work each and need no warm docker cache and
+# no big disk, so the only thing self-hosting bought them was a queue: the box
+# is a 3-job concurrency cap and these were measured waiting up to 26 minutes to
+# do 48 seconds of work. Hosted gives 20 concurrent jobs at 4 dedicated vCPU.
+# It also lifts the constraints the self-hosted box imposed — a hosted runner
+# has passwordless sudo, node/npm preinstalled, and can authenticate to ghcr.io.
+# Keep image BUILDS on self-hosted (see turma-agent-image-scan.yml); they're the
+# jobs that actually need the layer cache and the disk.
 on:
   pull_request:
     branches: [main]
@@ -36,16 +38,25 @@ permissions:
 jobs:
   semgrep:
     name: Semgrep SAST
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      # pip's HTTP cache, so semgrep's wheels aren't re-fetched every run. Keyed
+      # on this file because that's what pins the install; a plain restore-key
+      # fallback still gives a warm-ish cache when the key misses.
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-semgrep-${{ runner.os }}-${{ hashFiles('.github/workflows/code-scan.yml') }}
+          restore-keys: |
+            pip-semgrep-${{ runner.os }}-
       - name: Install Semgrep
-        run: pip install --no-cache-dir semgrep
+        run: pip install semgrep
       # p/default = high-signal security+correctness rules for JS/Python; the
       # extra packs add Dockerfile and hardcoded-secret coverage. --error makes
       # any finding fail the job; findings print to the job log.
@@ -84,15 +95,15 @@ jobs:
 
   hadolint:
     name: Hadolint
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
       - uses: actions/checkout@v7
+      # The release binary rather than hadolint-action: the action pulls
+      # ghcr.io/hadolint/hadolint, and this job used to run where ghcr auth
+      # wasn't possible. On a hosted runner the action would work — but the
+      # binary is a 2 MB curl with no image pull, so it stays the cheaper path.
       - name: Install hadolint
-        # hadolint-action pulls ghcr.io/hadolint/hadolint, which this
-        # self-hosted runner cannot authenticate to; install the release
-        # binary instead (no-sudo pattern).
         run: |
           set -euo pipefail
           VERSION=2.14.0
@@ -109,22 +120,19 @@ jobs:
 
   shellcheck:
     name: ShellCheck
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
       - uses: actions/checkout@v7
       # Finds every shell script in the repo and lints per its shebang
-      # (entrypoint.sh is #!/bin/sh). Fails the job on any finding. This action
-      # runs a downloaded binary (no ghcr.io pull), so it works on the runner.
+      # (entrypoint.sh is #!/bin/sh). Fails the job on any finding.
       - uses: ludeeus/action-shellcheck@2.0.0
 
   tests:
     name: Unit tests
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
       - uses: actions/checkout@v7
       # Same setup-python the Semgrep job already relies on; the tests are
       # stdlib unittest only (no pip installs — mirrors the image's no-pip
@@ -132,22 +140,23 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      # Node 24 to match the agent/turma images' base. This used to run in a
+      # throwaway node:24-alpine container because the self-hosted runner had no
+      # node on PATH; a hosted runner has node, so setup-node pins the version
+      # directly and skips the image pull. node:test is built in; the tests have
+      # zero npm dependencies, so there is nothing to install.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
       - name: Python unit tests (agent/hub-agent.py)
         run: python3 -m unittest discover -s agent/tests -p "test_*.py" -v
-      # node/npm aren't on the self-hosted runner, so run the Node suite in a
-      # throwaway node:24-alpine container (Docker Hub pull — the runner can't
-      # auth to ghcr.io), same pattern as the build workflow's version lookup.
-      # node:test is built in; the tests have zero npm dependencies.
       - name: Node unit tests (turma/server.js + agent/tunnel-agent.js)
-        run: |
-          docker run --rm -v "$GITHUB_WORKSPACE":/workspace -w /workspace node:24-alpine \
-            sh -c 'node --test turma/tests/*.test.js agent/tests/*.test.js'
+        run: node --test turma/tests/*.test.js agent/tests/*.test.js
       # entrypoint.sh is PID 1 and decides which uid every session runs as —
       # i.e. whether files land in the mounted git root owned by the host user
       # or by root. ShellCheck only covers its syntax, so this builds the real
       # entrypoint onto the real base image and asserts the resolved identity
       # across root-owned / user-owned / PUID-override roots. Drives docker
-      # directly (like the Node step above), so it runs on the host, not in a
-      # container.
+      # directly, which a hosted runner provides.
       - name: Entrypoint identity tests (agent/entrypoint.sh)
         run: ./agent/tests/test_entrypoint.sh

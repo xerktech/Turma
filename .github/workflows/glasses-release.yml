@@ -7,10 +7,12 @@ name: glasses-release
 # in glasses-ci.yml runs pre-merge on PRs; this is the release counterpart,
 # mirroring how turma-agent-image.yml / turma-image.yml build on push to main).
 #
-# Same self-hosted-runner constraints as the rest of the repo: reset the
-# root-owned workspace first, and run the whole npm workflow (install/build/
-# pack) inside a throwaway node:24-alpine container (Docker Hub pull — the
-# runner can't auth to ghcr.io, and npm isn't on the runner itself).
+# Runs on GitHub-hosted `ubuntu-latest`, like its glasses-ci.yml counterpart:
+# an npm build plus a release upload needs neither a warm docker cache nor a big
+# disk, so the self-hosted box only added queue time. The workspace-ownership
+# reset and the node:24-alpine container this job used to carry were both
+# workarounds for that box (persistent root-owned workspace; no npm on PATH) and
+# are unnecessary on a fresh hosted VM.
 #
 # Versioning matches the rest of the repo: the MAJOR.MINOR lives in the root
 # VERSION file and this pipeline appends its Actions run number as the patch,
@@ -33,12 +35,21 @@ permissions:
 jobs:
   release:
     name: Build, pack, release
-    runs-on: [self-hosted, linux]
+    # GitHub-hosted: an npm build + a release upload. No docker layer cache to
+    # keep warm, nothing large on disk — nothing self-hosting was buying it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
-
       - uses: actions/checkout@v7
+
+      # Node 24 to match the base the glasses client is developed against. This
+      # job used to drive npm inside a throwaway node:24-alpine container purely
+      # because the self-hosted box had no npm on PATH; a hosted runner has node.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: glasses/package-lock.json
 
       # Compose the full build version from the repo VERSION file (MAJOR.MINOR)
       # plus this run number as the patch, and the release tag / asset name from
@@ -63,11 +74,15 @@ jobs:
       # `npm ci`.) The pack script writes ../turma-hud.ehpk relative to
       # glasses/, so the artifact lands at the workspace root.
       - name: Stamp version, install, build, pack (glasses/)
+        working-directory: glasses
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          docker run --rm -e VERSION="${{ steps.ver.outputs.version }}" \
-            -v "$GITHUB_WORKSPACE":/workspace -w /workspace/glasses node:24-alpine \
-            sh -c 'node -e "const fs=require(\"fs\");const j=JSON.parse(fs.readFileSync(\"app.json\"));j.version=process.env.VERSION;fs.writeFileSync(\"app.json\",JSON.stringify(j,null,2)+\"\n\")" &&
-                   npm ci --no-audit --no-fund && npm run build && npm run pack'
+          set -euo pipefail
+          node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync("app.json"));j.version=process.env.VERSION;fs.writeFileSync("app.json",JSON.stringify(j,null,2)+"\n")'
+          npm ci --no-audit --no-fund
+          npm run build
+          npm run pack
 
       - name: Name the release asset
         run: cp "$GITHUB_WORKSPACE/turma-hud.ehpk" "$GITHUB_WORKSPACE/${{ steps.ver.outputs.asset }}"
@@ -87,9 +102,7 @@ jobs:
           files: ${{ github.workspace }}/${{ steps.ver.outputs.asset }}
           fail_on_unmatched_files: true
 
-      # Keep the shared runner's disk at a steady state; never fail the job.
-      - name: Clean up dangling images
-        if: always()
-        run: |
-          docker image prune -f || true
-          df -h || true
+      # (The docker prune that used to close this job is gone with the move to a
+      # hosted runner: the VM is destroyed after the job, so there is nothing to
+      # reclaim. Pruning is the runner host's job anyway — on the shared box it
+      # could abort a concurrent build.)
