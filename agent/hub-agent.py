@@ -1199,6 +1199,16 @@ def repo_usage_report(ledger, fold_slug):
 
 PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 
+# The Bash command that OPENS a pull request. `gh pr create` prints the new PR's
+# URL as its own output, and that pairing — this command, this output — is the
+# only thing in a transcript that says the session opened the PR rather than
+# merely looked at one. See _scan_pr_line.
+PR_CREATE_RE = re.compile(r"\bgh\s+pr\s+create\b")
+# Unresolved `gh pr create` tool_use ids remembered per session between beats.
+# Capped: a call whose result never lands (the turn was interrupted, the pane
+# died) must not grow the set for the life of the session.
+PR_CALLS_MAX = 20
+
 # Beats between `gh pr view` status refreshes for the PR links a session opened
 # (~INTERVAL*N sec). Faster than the github-block cadence so CI/merge state on a
 # session card stays reasonably live, but not every beat (each is a gh network
@@ -1591,6 +1601,47 @@ def _tool_result_text(content):
     if content is None:
         return ""
     return str(content)
+
+
+def _scan_pr_line(raw, state, report):
+    """Fold one appended transcript line into a session's PR-URL scan.
+
+    Attribution is deliberately narrow: a URL counts only when it comes back in
+    a `gh pr create` call's OWN tool_result — i.e. the session literally opened
+    that PR. A PR link reaches a transcript a dozen other ways (`gh pr
+    list`/`view`/`checks` output, a link the operator pasted, the model quoting
+    a PR another session opened), and taking any of those as "this session's
+    PR" is what used to hang a chip — and fire a "created a PR" alert — on the
+    wrong card, for a PR the session never touched.
+
+    The call and its result are separate entries and routinely land in
+    different beats, so the pending tool_use ids live in `state` across beats.
+    """
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return  # partial write, or the backlog cap's leading fragment
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return
+    calls = state.setdefault("pr_calls", [])
+    seen = state.setdefault("pr_seen", set())
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use":
+            cmd = (block.get("input") or {}).get("command")
+            if (block.get("name") == "Bash" and isinstance(cmd, str)
+                    and PR_CREATE_RE.search(cmd) and block.get("id")):
+                calls.append(block["id"])
+                del calls[:-PR_CALLS_MAX]
+        elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
+            for m in PR_URL_RE.finditer(_tool_result_text(block.get("content"))):
+                url = m.group(0)
+                if url not in seen:
+                    seen.add(url)
+                    report["prUrls"].append(url)
 
 
 def _entry_blocks(entry, caps):
@@ -2070,15 +2121,15 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
     """Cheap per-heartbeat session signals (stat + tail reads, no full parse).
 
     state carries per-file byte offsets between beats so the PR-URL scan only
-    reads what was appended since the last beat. The first call primes the
-    offsets to EOF for every existing transcript, so a restarted agent never
-    replays PR links from old sessions.
+    reads what was appended since the last beat (plus the scan's own carry-over
+    — see _scan_pr_line). The first call primes the offsets to EOF for every
+    existing transcript, so a restarted agent never replays PR links from old
+    sessions.
     """
     slug = _project_slug(workdir)
     proj = os.path.join(PROJECTS_ROOT, slug)
     primed = state.get("primed", False)
     offsets = state.setdefault("offsets", {})
-    seen = state.setdefault("pr_seen", set())
     report = {
         "bridgeAttached": os.path.exists(os.path.join(proj, "bridge-pointer.json")),
         # Live "is it working right now" read straight off the session's TUI —
@@ -2151,7 +2202,11 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
                         if report["question"]:
                             report["questionSource"] = "transcript"
 
-    # Incremental PR-URL scan over bytes appended to the active transcript.
+    # Incremental scan over the bytes appended to the active transcript, for the
+    # PRs this session OPENED (see _scan_pr_line for what counts). Only COMPLETE
+    # JSONL lines are consumed — the offset stops at the last newline, so an
+    # entry still being written is re-read whole next beat rather than parsed in
+    # half and lost.
     try:
         size = os.stat(newest).st_size
         start = offsets.get(newest, 0)
@@ -2159,16 +2214,17 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
             start = size  # file was truncated/rewritten; don't rescan
         if size - start > 1 << 22:
             start = size - (1 << 22)  # cap a huge backlog at 4 MiB
+        consumed = start
         if size > start:
             with open(newest, "rb") as f:
                 f.seek(start)
-                chunk = f.read(size - start).decode(errors="replace")
-            for m in PR_URL_RE.finditer(chunk):
-                url = m.group(0)
-                if url not in seen:
-                    seen.add(url)
-                    report["prUrls"].append(url)
-        offsets[newest] = size
+                raw = f.read(size - start)
+            end = raw.rfind(b"\n") + 1  # 0 when no line has completed yet
+            for line in raw[:end].split(b"\n"):
+                if line.strip():
+                    _scan_pr_line(line, state, report)
+            consumed = start + end
+        offsets[newest] = consumed
     except OSError:
         pass
     return _finish()

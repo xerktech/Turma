@@ -661,6 +661,28 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
             "message": {"content": [{"type": "text", "text": text}]},
         }
 
+    def pr_create_call(self, tool_id, cmd="gh pr create --fill"):
+        return {
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "id": tool_id, "name": "Bash",
+                 "input": {"command": cmd}},
+            ]},
+        }
+
+    def tool_result(self, tool_id, text):
+        return {
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": text},
+            ]},
+        }
+
+    def opened_pr(self, url, tool_id="t1"):
+        """The two entries a real `gh pr create` leaves behind: the call, then
+        its output — which is the new PR's URL."""
+        return [self.pr_create_call(tool_id), self.tool_result(tool_id, url)]
+
     def test_missing_project_dir(self):
         state = {}
         rep = ha.session_report("/absent/worktree", state)
@@ -671,23 +693,78 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
 
     def test_prime_to_eof_then_incremental_pr_scan(self):
         path = os.path.join(self.proj, "s.jsonl")
-        write_jsonl(path, [self.entry_with_text(f"old PR: {self.PR1}")])
+        write_jsonl(path, self.opened_pr(self.PR1, "old"))
 
         state = {}
         rep = ha.session_report(self.WORKDIR, state)
         # First beat primes offsets to EOF: pre-existing PR link NOT replayed.
         self.assertEqual(rep["prUrls"], [])
-        self.assertEqual(rep["lastRole"], "assistant")
         self.assertIsNotNone(rep["transcriptAgeSec"])
 
-        write_jsonl(path, [self.entry_with_text(f"opened {self.PR2} just now")])
+        write_jsonl(path, self.opened_pr(self.PR2, "new"))
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [self.PR2])
 
-        # Same URL appended again -> already seen, not re-reported.
-        write_jsonl(path, [self.entry_with_text(f"again {self.PR2}")])
+        # Same URL out of a second create (a re-run) -> already seen, not
+        # re-reported.
+        write_jsonl(path, self.opened_pr(self.PR2, "again"))
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [])
+
+    def test_pr_url_only_mentioned_is_not_this_sessions_pr(self):
+        """The bug this scan's narrowness exists for: a PR link a session merely
+        SAW — `gh pr list` output, a link the operator pasted, the model quoting
+        another session's PR — is not a PR this session opened, and must not
+        chip its card."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        listed = f"#34\tSome older work\tfeat/thing\t{self.PR1}"
+        write_jsonl(path, [
+            # Prose quoting a PR, a user pasting one...
+            self.entry_with_text(f"I opened {self.PR2} earlier"),
+            {"type": "user", "message": {"content": [
+                {"type": "text", "text": f"what is {self.PR2} about?"}]}},
+            # ...and a read-only gh call whose output is full of other PRs.
+            self.pr_create_call("read", cmd="gh pr list --limit 5"),
+            self.tool_result("read", listed),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [])
+
+    def test_pr_create_result_lands_on_a_later_beat(self):
+        """The call and its output are separate entries, and a `gh pr create`
+        that spans a beat boundary still resolves — the pending id carries."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        write_jsonl(path, [self.pr_create_call("t9")])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+        write_jsonl(path, [self.tool_result("t9", f"{self.PR1}\n")])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
+
+    def test_partial_line_is_reread_whole_next_beat(self):
+        """The offset stops at the last newline, so an entry still being written
+        is parsed once, whole — not lost as two unparseable halves."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        line = json.dumps(self.tool_result("t1", self.PR1))
+        write_jsonl(path, [self.pr_create_call("t1")])
+        with open(path, "a") as f:  # first half of the result entry, no newline
+            f.write(line[:40])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+        with open(path, "a") as f:
+            f.write(line[40:] + "\n")
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
 
     def test_truncated_file_resets_offset_without_rescan(self):
         path = os.path.join(self.proj, "s.jsonl")
@@ -698,12 +775,13 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         # Rewrite shorter (context clear / rotation). The old bytes contain a
         # PR URL, but offset resets to the new size — nothing is rescanned.
         with open(path, "w") as f:
-            f.write(json.dumps(self.entry_with_text(f"reset {self.PR1}")) + "\n")
+            for e in self.opened_pr(self.PR1, "reset"):
+                f.write(json.dumps(e) + "\n")
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [])
 
         # Appends after the truncation ARE picked up.
-        write_jsonl(path, [self.entry_with_text(f"new {self.PR2}")])
+        write_jsonl(path, self.opened_pr(self.PR2, "after"))
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [self.PR2])
 
