@@ -383,6 +383,24 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 The central dashboard for the per-host agent containers: https://turma.xerktech.com via the
 Cloudflare tunnel; port 8300 on the LAN.
 
+### Shared site chrome (`turma/public/nav.js`)
+
+- The header and the phone bottom-nav are built by one module (`nav.js`, dual-exported for tests like
+  `chat.js`/`board.js`) and are **identical on every page** — pages hand-roll neither.
+- Each page mounts them with `<header class="site-header" id="siteHeader" data-page="…" data-sub="…">`
+  + `<nav class="bottom-nav" id="bottomNav">` and one `<script src="/nav.js">`; `data-page` lights that
+  page's tab in BOTH navs, so a tab list and a bottom bar can't disagree.
+- Everything page-specific goes in the three slots the page's own script fills — `#hdrSub` (static
+  descriptor), `#hdrMeta` (dynamic, left) and `#hdrStatus` (dynamic, right). An unfilled slot collapses
+  (`.site-header .sub:empty`), so pages using fewer slots still ship the same DOM.
+- The header is full-bleed and `.site-header-in` caps its row at `--wrap`, lining it up with a `.wrap`
+  page's content; `sessions.html`'s shell is full-bleed instead, so it sets `--wrap: none` rather than
+  restyling the header (the `.app-header` bar it used to override with is gone).
+- It's mounted synchronously at the bottom of `<body>` — after both placeholders exist, before the
+  page's own script reads the slots.
+- Tests: `turma/tests/nav.test.js`, which asserts the invariants drift broke (one active tab, same
+  header DOM across pages) and that no page re-grows its own copy.
+
 ### Fleet tree (host → repo → session)
 
 - Each host has a **"Clone from GitHub" bar**: a dropdown of the host's `gh` login's repos

@@ -30,11 +30,10 @@
     overflow: hidden; overscroll-behavior: none;
   }
 
-  /* Full-width header bar (overrides the shared centred header block). */
-  .app-header {
-    flex: none; margin: 0; padding: 12px 18px;
-    border-bottom: 1px solid var(--hairline); background: var(--surface);
-  }
+  /* The shared .site-header (app.css) renders here unchanged. This page's shell
+     is full-bleed rather than a centred .wrap, so --wrap is released and the
+     header row spans the shell instead of floating over it in a 1180px column. */
+  :root { --wrap: none; }
 
   .sess-shell { flex: 1; display: flex; min-height: 0; }
 
@@ -546,13 +545,10 @@
     /* Collapse the back button to just "‹" on mobile to buy the row width back. */
     .term-bar .back-btn .back-label { display: none; }
     body.showing-term .sidebar { display: none; }
-    body.showing-term .app-header { display: none; }
+    body.showing-term .site-header { display: none; }
     body.showing-term .bottom-nav { display: none; }
     body.showing-term .stage { display: flex; }
     body.showing-term { padding-bottom: 0; }
-  }
-  @media (max-width: 600px) {
-    .app-header { padding: 12px 14px; }
   }
   @media (pointer: coarse) {
     details.stopped-wrap summary, details.spawn-wrap > summary { padding-top: 6px; padding-bottom: 6px; }
@@ -560,20 +556,7 @@
 </style>
 </head>
 <body>
-  <header class="app-header">
-    <a class="wordmark" href="/"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
-    <span class="sub">Sessions</span>
-    <span class="sub" id="counts"></span>
-    <span class="spacer"></span>
-    <nav class="nav-tabs">
-      <a href="/">Dashboard</a>
-      <a href="/sessions" class="active">Sessions</a>
-      <a href="/board">Board</a>
-      <a href="/usage">Usage</a>
-      <a href="#" class="signout" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;">Sign out</a>
-    </nav>
-    <span class="sub" id="refreshed"></span>
-  </header>
+  <header class="site-header" id="siteHeader" data-page="sessions" data-sub="Sessions"></header>
 
   <div class="sess-shell">
     <aside class="sidebar">
@@ -652,24 +635,8 @@
     </main>
   </div>
 
-<nav class="bottom-nav">
-  <a href="/">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-    Dashboard
-  </a>
-  <a href="/sessions" class="active">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
-    Sessions
-  </a>
-  <a href="/board">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="5" height="18" rx="1"/><rect x="9.5" y="3" width="5" height="12" rx="1"/><rect x="16" y="3" width="5" height="15" rx="1"/></svg>
-    Board
-  </a>
-  <a href="/usage">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/></svg>
-    Usage
-  </a>
-</nav>
+<nav class="bottom-nav" id="bottomNav"></nav>
+<script src="/nav.js"></script>
 
 <script>
 const $active = document.getElementById("active");
@@ -677,8 +644,10 @@ const $idle = document.getElementById("idle");
 const $stopped = document.getElementById("stopped");
 const $spawn = document.getElementById("spawn");
 const $sidebar = document.querySelector(".sidebar");
-const $counts = document.getElementById("counts");
-const $refreshed = document.getElementById("refreshed");
+// The header slots nav.js mounts: #hdrMeta (running/waiting counts) and
+// #hdrStatus (last-refresh stamp). See public/nav.js.
+const $counts = document.getElementById("hdrMeta");
+const $refreshed = document.getElementById("hdrStatus");
 
 // Open/closed state of the collapsible sections survives the 5s re-render.
 let stoppedOpen = false;
