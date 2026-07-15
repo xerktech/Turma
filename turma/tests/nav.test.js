@@ -39,13 +39,30 @@ test("nav: the header is identical across pages apart from the active tab and th
   for (const html of rendered) assert.equal(html, rendered[0]);
 });
 
-test("nav: the header carries all three slots on every page, empty by default", () => {
+test("nav: the header carries both slots on every page, empty by default", () => {
   for (const p of PAGES) {
     const html = siteHeaderHtml(p.id, "");
-    for (const id of ["hdrSub", "hdrMeta", "hdrStatus"]) {
+    for (const id of ["hdrSub", "hdrMeta"]) {
       assert.match(html, new RegExp(`<span class="sub" id="${id}"></span>`),
         `${p.id} is missing an empty #${id} slot`);
     }
+  }
+});
+
+// The header ends at the tabs. A right-hand slot existed only to carry an
+// "updated <time>" stamp on dashboard/sessions; that was dropped, so the slot
+// would be dead DOM on all four pages.
+test("nav: the header carries no slot after the tabs", () => {
+  const html = siteHeaderHtml("dashboard", "Session hosts");
+  assert.doesNotMatch(html, /hdrStatus/);
+  assert.match(html, /<\/nav>\s*<\/div>$/, "the tabs must be the last thing in the header row");
+});
+
+test("nav: no page paints a last-refreshed stamp into the header", () => {
+  for (const f of PAGE_FILES) {
+    const src = fs.readFileSync(path.join(PUBLIC, f), "utf8");
+    assert.doesNotMatch(src, /hdrStatus/, `${f} references the removed status slot`);
+    assert.doesNotMatch(src, /"updated "/, `${f} still paints an "updated <time>" stamp`);
   }
 });
 

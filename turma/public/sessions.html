@@ -644,10 +644,9 @@ const $idle = document.getElementById("idle");
 const $stopped = document.getElementById("stopped");
 const $spawn = document.getElementById("spawn");
 const $sidebar = document.querySelector(".sidebar");
-// The header slots nav.js mounts: #hdrMeta (running/waiting counts) and
-// #hdrStatus (last-refresh stamp). See public/nav.js.
+// The header slot nav.js mounts for this page's running/waiting counts.
+// See public/nav.js.
 const $counts = document.getElementById("hdrMeta");
-const $refreshed = document.getElementById("hdrStatus");
 
 // Open/closed state of the collapsible sections survives the 5s re-render.
 let stoppedOpen = false;
@@ -1028,7 +1027,6 @@ function sessMeta(s) {
 function render(data) {
   const { now, agents } = data;
   reconcilePending(agents);
-  $refreshed.textContent = "updated " + new Date(now).toLocaleTimeString();
 
   const { running, stopped } = collect(agents, now);
   const waiting = running.filter(x => x.live.kind === "waiting").length;

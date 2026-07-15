@@ -390,9 +390,12 @@ Cloudflare tunnel; port 8300 on the LAN.
 - Each page mounts them with `<header class="site-header" id="siteHeader" data-page="…" data-sub="…">`
   + `<nav class="bottom-nav" id="bottomNav">` and one `<script src="/nav.js">`; `data-page` lights that
   page's tab in BOTH navs, so a tab list and a bottom bar can't disagree.
-- Everything page-specific goes in the three slots the page's own script fills — `#hdrSub` (static
-  descriptor), `#hdrMeta` (dynamic, left) and `#hdrStatus` (dynamic, right). An unfilled slot collapses
-  (`.site-header .sub:empty`), so pages using fewer slots still ship the same DOM.
+- Everything page-specific goes in the two slots the page's own script fills — `#hdrSub` (static
+  descriptor) and `#hdrMeta` (dynamic). An unfilled slot collapses (`.site-header .sub:empty`), so
+  pages using fewer slots still ship the same DOM.
+- The row **ends at the tabs**: there is no right-hand slot. One existed to carry an "updated \<time\>"
+  stamp on dashboard/sessions, which was dropped as noise (the fleet polls constantly, so the stamp
+  only ever said "seconds ago" while re-rendering every beat).
 - The header is full-bleed and `.site-header-in` caps its row at `--wrap` and centres it, so every
   page's chrome lands in the same 1180px column as a `.wrap` page's content — including
   `sessions.html`, whose shell below stays full-bleed while its header row does not. Letting that page
