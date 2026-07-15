@@ -297,6 +297,15 @@
     content: attr(data-lang); display: block; margin-bottom: 5px;
     font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase;
     letter-spacing: 0.05em; color: var(--muted); }
+  /* Inline `code` spans (chat.js renderInline()). Sized in em so the chip tracks
+     whatever it's set in (bubble, cell, thinking trace), and upright since the
+     thinking trace is italic. `anywhere` because an inline span is the one code
+     surface that can't scroll — a long `path/to/thing` has to break somewhere. */
+  .tr-msg .md-code-inline, .thought-body .md-code-inline, .compact-body .md-code-inline,
+  .md-table .md-code-inline {
+    font-family: var(--font-mono); font-size: 0.88em; font-style: normal;
+    background: var(--page); border: 1px solid var(--border); border-radius: 4px;
+    padding: 0.1em 0.35em; overflow-wrap: anywhere; }
   /* Auto-linkified URLs in chat bubbles + thinking traces (chat.js linkify()). */
   .tr-msg a, .thought-body a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
   .tr-msg a:hover, .thought-body a:hover { text-decoration: none; }

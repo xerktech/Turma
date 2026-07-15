@@ -521,7 +521,12 @@ Cloudflare tunnel; port 8300 on the LAN.
   `reveal.ts`).
 - Bubble prose is rendered by `renderProse` (`chat.js`), which lifts markdown out of the transcript's
   plain text: **fenced ` ``` ` blocks** become `<pre class="md-code">` (language chip from the info
-  string), GFM **tables** become real `<table>`s, and everything else is linkified.
+  string), inline **` `code` ` spans** become `<code class="md-code-inline">` chips (`renderInline`),
+  GFM **tables** become real `<table>`s, and everything else is linkified.
+  - The passes nest outward-in — fence, then table, then inline, then link — so each only ever sees
+    text the outer ones didn't claim, and a code body is never linkified at any level.
+  - An inline span never crosses a line break: transcript prose is full of lone backticks, and a
+    stray one would otherwise swallow whole paragraphs (and any table in them) into a span.
   - The fence pass runs above the table pass, so a pipe row inside a code block isn't read as a table,
     and a code body is only ever `esc()`'d — never linkified.
   - An **unterminated fence renders as code**: mid-stream the typewriter hasn't revealed the closer
