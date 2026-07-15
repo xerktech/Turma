@@ -1444,6 +1444,29 @@ def _entry_local_command(entry):
     return _parse_local_command(_entry_first_text(entry))
 
 
+def _entry_tool_source(entry):
+    """The tool_use id this user turn was PRODUCED BY, or None.
+
+    Claude Code feeds a skill's body back to the model by writing it as a
+    user-role turn — role `user` is the only channel tool output can travel on —
+    tagged with `sourceToolUseID`, the id of the `Skill` tool_use that pulled it
+    in. So on a user turn that field means "the tooling authored this, not the
+    operator": every such entry on this box resolves to a Skill call.
+
+    Taken at its wire role the entry renders as the human typing a whole
+    SKILL.md into chat (151KB for some skills). It is really the tool's result,
+    so that's what we emit: _entry_blocks() hands it back as the tool_result of
+    its own Skill call, which the chat pairs into that call's action card, and
+    _entry_text() drops it like any other tool_result. Keyed on sourceToolUseID
+    rather than the broader `isMeta`, which also tags hook feedback, command
+    caveats and resume prompts — turns with quite different authors.
+
+    Mirror of tunnel-agent.js entryToolSource()."""
+    if entry.get("type") != "user":
+        return None
+    return entry.get("sourceToolUseID") or None
+
+
 def _entry_role(entry):
     """Display role for a transcript entry. Normally the entry type, but a
     compact summary is written as a USER turn carrying text the model wrote
@@ -1469,9 +1492,17 @@ def _flatten_text(raw):
 
 def _entry_text(entry):
     """Map one transcript entry to display text for the glasses tail feed, or
-    None to drop it (wrong type, no message, tool_result-only turn, a
-    slash-command caveat, or empty after stripping ANSI)."""
+    None to drop it (wrong type, no message, tool_result-only turn, a skill body
+    (_entry_tool_source), a slash-command caveat, or empty after stripping
+    ANSI)."""
     if entry.get("type") not in ("user", "assistant"):
+        return None
+    # Tool-authored: a tool_result by another name, and this feed drops those.
+    # The invoking `[Skill]` tool_use still shows in the assistant turn, and its
+    # arguments ride that call's input, so nothing readable is lost — only the
+    # SKILL.md wall, which would otherwise dominate the tail, the heartbeat
+    # preview and the archive's search index.
+    if _entry_tool_source(entry):
         return None
     msg = entry.get("message")
     if not isinstance(msg, dict):
@@ -1569,6 +1600,10 @@ def _entry_blocks(entry, caps):
       {t:"compact_summary", text, truncated?}
       {t:"command",        name, args?, truncated?}
       {t:"command_output", text, isError?, truncated?}
+    A skill body — a user turn Claude Code wrote as the result of a `Skill` tool
+    call (see _entry_tool_source) — becomes that call's {t:"tool_result"} block,
+    so the chat folds it into the Skill action card it belongs to instead of
+    rendering a SKILL.md-sized operator bubble.
     A `<task-notification>` user turn becomes a single {t:"task_notification",
     summary, status?, result?, truncated?} block (see _parse_task_notification)
     so the web chat renders it as an action card, not raw XML. The slash-command
@@ -1583,6 +1618,21 @@ def _entry_blocks(entry, caps):
     if not isinstance(msg, dict):
         return None
     content = msg.get("content")
+
+    # A skill body is the result of the Skill call that pulled it in: emit it as
+    # that call's tool_result and let the chat's existing tool_use/tool_result
+    # pairing fold it into the action card. Ahead of the content walk, because
+    # the body arrives as an ordinary text block and would otherwise read as
+    # operator prose.
+    tool_src = _entry_tool_source(entry)
+    if tool_src:
+        text = ANSI_RE.sub("", _entry_first_text(entry)).strip()
+        clipped, trunc = _clip(text, caps["result"])
+        block = {"t": "tool_result", "text": clipped, "forId": tool_src}
+        if trunc:
+            block["truncated"] = True
+        return [block]
+
     blocks = []
 
     def add_text(kind, text, cap):

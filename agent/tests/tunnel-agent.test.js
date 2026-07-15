@@ -21,7 +21,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.TURMA_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, newestTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, BLOCK_CAPS_LIVE } = require("../tunnel-agent.js");
+const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, BLOCK_CAPS_LIVE } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -234,6 +234,36 @@ test("entryRole/entryBlocks: a compact summary is the assistant's, not the user'
     [{ t: "text", text: summary }]);
   // The text feed keeps the prose; only the role moved.
   assert.equal(entryText(entry), summary);
+});
+
+test("entryToolSource/entryBlocks: a skill body is its Skill call's result, not a user turn", () => {
+  const body = "Base directory for this skill: /repos/x/.claude/skills/verify\n\n# Verifying Turma changes";
+  const entry = {
+    type: "user", isMeta: true, sourceToolUseID: "toolu_01ABC",
+    message: { role: "user", content: [{ type: "text", text: body }] },
+  };
+  assert.equal(entryToolSource(entry), "toolu_01ABC");
+  assert.equal(entryToolSource({ type: "user", message: { content: "hi" } }), null);
+  // An assistant turn is never tool-authored, whatever it carries.
+  assert.equal(entryToolSource({ type: "assistant", sourceToolUseID: "toolu_01ABC", message: {} }), null);
+  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS_LIVE),
+    [{ t: "tool_result", text: body, forId: "toolu_01ABC" }]);
+  // The same body typed by a human is the operator talking: still a text block.
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: [{ type: "text", text: body }] } }, BLOCK_CAPS_LIVE),
+    [{ t: "text", text: body }]);
+  // The text feed carries no tool results, so it drops the wall.
+  assert.equal(entryText(entry), null);
+});
+
+test("entryBlocks: a long skill body is capped and truncated", () => {
+  const big = "z".repeat(BLOCK_CAPS_LIVE.result + 500);
+  const [block] = entryBlocks({
+    type: "user", sourceToolUseID: "toolu_01ABC",
+    message: { content: [{ type: "text", text: big }] },
+  }, BLOCK_CAPS_LIVE);
+  assert.equal(block.t, "tool_result");
+  assert.equal(block.text.length, BLOCK_CAPS_LIVE.result);
+  assert.equal(block.truncated, true);
 });
 
 test("transcriptTail: a compact summary rides under the assistant role", () => {
