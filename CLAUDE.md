@@ -416,6 +416,14 @@ Cloudflare tunnel; port 8300 on the LAN.
   `sessions.html`, whose shell below stays full-bleed while its header row does not. Letting that page
   release `--wrap` instead stretched the wordmark and tabs to the window edges and looked nothing like
   the others; the `.app-header` bar it used to override with is gone.
+- Because that row is **centred**, the viewport it centres in must not depend on whether a page
+  scrolls, so `app.css` reserves the scrollbar gutter globally (`html { scrollbar-gutter: stable }`).
+  The dashboard always overflows and the other pages often don't, so without it the dashboard centred
+  in a 15px-narrower window and its header sat 7.5px left of every other page's.
+- That gutter is reserved on `sessions.html` too, which never scrolls (`html { overflow: hidden }`) —
+  the 15px it gives up is exactly what keeps its header on the same pixels as the rest. The strip is
+  invisible (the shell's right edge is page-coloured), and real phones use overlay scrollbars, for
+  which the property is a no-op.
 - The gap under the header is a **margin, not padding**, so it still collapses with the first content
   element's own margin exactly as the old in-`.wrap` header did — with padding it doesn't collapse and
   every `.wrap` page's content sits 2px low.
