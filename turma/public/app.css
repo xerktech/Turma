@@ -85,6 +85,14 @@
 
 /* ---- Base ---------------------------------------------------------------- */
 * { box-sizing: border-box; }
+
+/* Always reserve the scrollbar's gutter, so the viewport a page centres in does
+   not depend on whether that page happens to be long enough to scroll. Without
+   it the dashboard (the one page that always overflows) centred its header in a
+   15px-narrower window than board/usage/sessions, sitting 7.5px left of theirs —
+   the shared header's own markup was identical, it was the column that moved. */
+html { scrollbar-gutter: stable; }
+
 body {
   margin: 0;
   background: var(--page);
@@ -105,8 +113,9 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
    Full-bleed, with its row capped at --wrap and centred, so it lands in the
    same 1180px column as a page's content and reads identically everywhere —
    including sessions.html, whose shell below is full-bleed while its header
-   row is not. Page-specific text lives only in the #hdrSub/#hdrMeta/#hdrStatus
-   slots; an unfilled slot collapses so it costs no gap.
+   row is not. Page-specific text lives only in the #hdrSub/#hdrMeta slots; an
+   unfilled slot collapses so it costs no gap. The centring depends on the
+   scrollbar gutter reserved above — see `html` in Base.
    The gap below is a MARGIN, not padding, so it still collapses with the first
    content element's own margin exactly as the old in-.wrap header did. */
 .site-header { flex: none; margin-bottom: 20px; }

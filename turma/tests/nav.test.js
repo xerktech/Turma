@@ -137,6 +137,25 @@ test("nav: the header's bottom gap is a margin, so it still collapses with conte
   assert.match(inner[1], /max-width:\s*var\(--wrap\)/);
 });
 
+// The header row is centred, so the column it centres in must not depend on
+// whether a page is long enough to scroll. The dashboard always overflows and
+// board/usage/sessions often don't: without a reserved gutter the dashboard
+// centred in a 15px-narrower viewport and its header sat 7.5px left of theirs.
+test("nav: the scrollbar gutter is reserved, so a scrolling page centres like a short one", () => {
+  const css = fs.readFileSync(path.join(PUBLIC, "app.css"), "utf8");
+  const html = /^html\s*\{([^}]*)\}/m.exec(css);
+  assert.ok(html, "no html rule in app.css");
+  assert.match(html[1], /scrollbar-gutter:\s*stable/);
+});
+
+test("nav: no page opts out of the reserved gutter", () => {
+  for (const f of PAGE_FILES) {
+    const src = fs.readFileSync(path.join(PUBLIC, f), "utf8");
+    assert.doesNotMatch(src, /scrollbar-gutter\s*:\s*auto/,
+      `${f} releases the scrollbar gutter, which shifts its header off every other page's`);
+  }
+});
+
 test("nav: each page declares its own sub-header text and its own tab", () => {
   const subs = new Map();
   for (const f of PAGE_FILES) {
