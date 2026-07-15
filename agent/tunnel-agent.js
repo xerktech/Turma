@@ -539,6 +539,18 @@ function cleanHint(l) {
   return String(l == null ? "" : l).trim().replace(/^[⌊⌞└⎿⎣]\s*/, "").trim();
 }
 
+// An active-task checklist item Claude Code paints beneath the spinner: an
+// optional tree connector then a to-do status glyph (done ✓ / active ■ /
+// pending □). Only the first item carries the connector; the rest are bare, so
+// isHintLine alone catches just that first item. Requiring a status glyph is
+// what keeps this from swallowing a `⎿`-connected tool-result line (its glyph
+// is followed by prose, not a checkbox).
+function isChecklistLine(l) {
+  const t = String(l == null ? "" : l).trim();
+  if (!t) return false;
+  return /^(?:[⌊⌞└⎿⎣]\s*)?[✓✔☑☒☐□■◼◻▪▫]\s/u.test(t);
+}
+
 // Parse a working-status line into { verb, up, down, elapsed } — display strings
 // kept verbatim from the TUI (e.g. up: "1.2k", down: "340", elapsed: "12s").
 // Absent fields come back as "". Order/format vary across Claude Code versions,
@@ -581,17 +593,29 @@ function parsePaneLiveTurn(pane) {
   // The working footer (status line + its contextual hint/task line) sits just
   // above the input box. Grab both — they're the last such lines — for the
   // pinned bar; scanning independently means their order doesn't matter.
-  let statusLine = null, hintLine = null;
+  let statusLine = null, hintIdx = -1;
   for (let i = convo.length - 1; i >= 0; i--) {
     if (statusLine == null && isStatusLine(convo[i])) statusLine = convo[i];
-    if (hintLine == null && isHintLine(convo[i])) hintLine = convo[i];
-    if (statusLine != null && hintLine != null) break;
+    if (hintIdx < 0 && isHintLine(convo[i])) hintIdx = i;
+    if (statusLine != null && hintIdx >= 0) break;
   }
   let status = null;
-  if (statusLine != null || hintLine != null) {
+  if (statusLine != null || hintIdx >= 0) {
     status = statusLine != null ? parsePaneStatus(statusLine) : { verb: "", up: "", down: "", elapsed: "" };
-    const h = hintLine != null ? cleanHint(hintLine) : "";
-    if (h) status.hint = h;
+    if (hintIdx >= 0) {
+      // The hint is either a single rotating tip / active-task line or the head
+      // of a multi-line to-do checklist (a corner-glyph item followed by bare
+      // checkbox items). When it's a checklist, gather the contiguous block that
+      // follows so the WHOLE list — not just its first item — reaches the footer.
+      const hintBlock = [convo[hintIdx]];
+      if (isChecklistLine(convo[hintIdx])) {
+        for (let j = hintIdx + 1; j < convo.length && isChecklistLine(convo[j]); j++) {
+          hintBlock.push(convo[j]);
+        }
+      }
+      const h = hintBlock.map(cleanHint).filter(Boolean).join("\n");
+      if (h) status.hint = h;
+    }
   }
   // The in-progress assistant block starts at the last column-0 ● bullet.
   let start = -1;
@@ -606,7 +630,7 @@ function parsePaneLiveTurn(pane) {
     // Stop at the next turn marker (a new ● bullet or the ❯ prompt) OR any
     // footer line — the status/spinner line and its hint/task line — so none of
     // the working footer bleeds into the message regardless of its order.
-    if (i > start && (/^[●❯]/.test(l) || isStatusLine(l) || isHintLine(l))) break;
+    if (i > start && (/^[●❯]/.test(l) || isStatusLine(l) || isHintLine(l) || isChecklistLine(l))) break;
     block.push(i === start ? l.replace(/^●\s?/, "") : l.replace(/^ {1,3}/, ""));
   }
   // Reflow the TUI's hard-wrapped lines into flowing text; the glasses re-wrap,
@@ -878,5 +902,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, cleanHint, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, BLOCK_CAPS_LIVE };
 }
