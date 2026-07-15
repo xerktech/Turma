@@ -519,6 +519,17 @@ Cloudflare tunnel; port 8300 on the LAN.
   input + its paired tool_result output, error-styled) and collapsed thinking traces, the in-progress
   turn typing in via a typewriter reveal (ported from the glasses `live.ts`/`transcript.ts`/
   `reveal.ts`).
+- Bubble prose is rendered by `renderProse` (`chat.js`), which lifts markdown out of the transcript's
+  plain text: **fenced ` ``` ` blocks** become `<pre class="md-code">` (language chip from the info
+  string), GFM **tables** become real `<table>`s, and everything else is linkified.
+  - The fence pass runs above the table pass, so a pipe row inside a code block isn't read as a table,
+    and a code body is only ever `esc()`'d — never linkified.
+  - An **unterminated fence renders as code**: mid-stream the typewriter hasn't revealed the closer
+    yet, and the partial body must not flash as prose first.
+  - A non-wrapping `pre` has the min-content width of its longest line, which a shrink-to-fit bubble
+    won't size below — so the code-carrying container is a `minmax(0, 1fr)` grid (scoped by `:has()`),
+    which floors that at 0 and hands the overflow to the block's own scroller.
+  - Tests: the `renderProse` cases in `turma/tests/chat.test.js`.
 - A per-session **verbosity control** (Concise/Normal/Verbose presets + per-type thinking/tool-calls/
   tool-outputs toggles, persisted in `localStorage`) filters which `blocks[]` components show — a pure
   client-side filter over the already-received buffer.

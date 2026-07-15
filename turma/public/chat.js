@@ -100,6 +100,9 @@
   // real <table> elements (each cell linkified); everything else falls straight
   // through linkify() so non-table prose is byte-identical to before. Cells are
   // linkify()'d, so injection safety is inherited from esc()/linkify().
+  //
+  // renderProse() runs the fenced-code pass over this one (see below), so a
+  // pipe row inside a code block is never mistaken for a table.
   function splitRow(line) {
     let s = line.trim();
     if (s.startsWith("|")) s = s.slice(1);
@@ -135,7 +138,7 @@
     }
     return html + "</tbody></table>";
   }
-  function renderProse(text) {
+  function renderTables(text) {
     const s = String(text == null ? "" : text);
     if (s.indexOf("|") < 0) return linkify(s); // no pipe → no table possible
     const lines = s.split("\n");
@@ -152,6 +155,48 @@
         const rows = [];
         while (i < lines.length && lines[i].trim() !== "" && hasPipe(lines[i])) { rows.push(splitRow(lines[i])); i++; }
         out += renderTable(header, aligns, rows);
+        continue;
+      }
+      buf.push(lines[i]); i++;
+    }
+    flush();
+    return out;
+  }
+
+  // ---- fenced code blocks ---------------------------------------------------
+  // A ``` fence opens a code block that runs to the next fence of at least the
+  // same length (or, unterminated, to the end of the text — which is the normal
+  // case mid-stream, while the typewriter is still revealing the block, and is
+  // why an open fence renders as code rather than waiting for its closer).
+  //
+  // The opening line must be the fence plus at most a one-word info string
+  // (```hcl), so an inline run of backticks in prose can't open a block. The
+  // body is never linkified or table-scanned — it's code, and esc() alone is
+  // what makes it injection-safe.
+  const FENCE_OPEN = /^\s*(`{3,})[ \t]*([^\s`]*)[ \t]*$/;
+  function fenceCloses(line, open) {
+    const m = /^\s*(`{3,})[ \t]*$/.exec(line);
+    return !!m && m[1].length >= open.length;
+  }
+  function renderCode(lang, body) {
+    return '<pre class="md-code"' + (lang ? ' data-lang="' + esc(lang) + '"' : "") +
+      "><code>" + esc(body) + "</code></pre>";
+  }
+  function renderProse(text) {
+    const s = String(text == null ? "" : text);
+    if (s.indexOf("```") < 0) return renderTables(s); // no fence → nothing to lift out
+    const lines = s.split("\n");
+    let out = "", i = 0, buf = [];
+    const flush = () => { if (buf.length) { out += renderTables(buf.join("\n")); buf = []; } };
+    while (i < lines.length) {
+      const open = FENCE_OPEN.exec(lines[i]);
+      if (open) {
+        flush();
+        i++;
+        const body = [];
+        while (i < lines.length && !fenceCloses(lines[i], open[1])) { body.push(lines[i]); i++; }
+        i++; // consume the closer; past the end already for an unterminated block
+        out += renderCode(open[2], body.join("\n"));
         continue;
       }
       buf.push(lines[i]); i++;
