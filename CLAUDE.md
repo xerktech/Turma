@@ -527,8 +527,9 @@ Cloudflare tunnel; port 8300 on the LAN.
   - An **unterminated fence renders as code**: mid-stream the typewriter hasn't revealed the closer
     yet, and the partial body must not flash as prose first.
   - A non-wrapping `pre` has the min-content width of its longest line, which a shrink-to-fit bubble
-    won't size below — so the code-carrying container is a `minmax(0, 1fr)` grid (scoped by `:has()`),
-    which floors that at 0 and hands the overflow to the block's own scroller.
+    won't size below — so a code-carrying bubble is given a **definite** `width: min(760px, 100%)`
+    (scoped by `:has()`), taking it out of shrink-to-fit sizing so the overflow lands on the block's
+    own scroller. Not a grid track: that would tear inline `code`/links onto their own lines.
   - Tests: the `renderProse` cases in `turma/tests/chat.test.js`.
 - A per-session **verbosity control** (Concise/Normal/Verbose presets + per-type thinking/tool-calls/
   tool-outputs toggles, persisted in `localStorage`) filters which `blocks[]` components show — a pure
