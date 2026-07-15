@@ -29,7 +29,10 @@ permissions:
 
 jobs:
   scan:
+    # Self-hosted: builds the agent image to scan it. Even the slim tooling tier is
+    # ~3.1 GB and lands on disk several times over (snapshot + tar + Trivy scratch).
     runs-on: [self-hosted, linux]
+    timeout-minutes: 30
     env:
       # Image name recorded inside the build archive. Now only metadata (the
       # daemon never loads it, and the archive itself is isolated in this job's
@@ -93,8 +96,32 @@ jobs:
           push: false
           outputs: type=docker,dest=${{ runner.temp }}/agent-image.tar
           tags: ${{ env.SCAN_TAG }}
+          # Scan the `tooling` tier — the image WITHOUT the Android stages (see
+          # AGENT_BASE at the top of agent/Dockerfile). Trivy is already told to
+          # --skip-dirs opt/gradle, opt/android-sdk and usr/lib/jvm below, which
+          # is every path those stages write, so building them here produced
+          # 5.0 GB that the scanner then ignored byte for byte. The findings are
+          # unchanged — OS packages come from the dpkg record and npm packages
+          # from /usr/local/lib/node_modules, both of which live in `tooling` and
+          # are scanned exactly as before (verified by scanning both tiers with
+          # these exact flags and diffing: same 231 OS packages, same findings).
+          #
+          # What changes is the disk this job touches: the image it builds,
+          # exports to a tar, and hands Trivy drops 8.1 GB -> 3.1 GB uncompressed
+          # (62%). That is the figure that matters here — not the ~3.7 -> ~1.4 GB
+          # compressed/registry one — because every copy this job lands on the
+          # runner is uncompressed: the buildkit snapshot, the exported tar, and
+          # Trivy's own per-layer scratch extraction. Several of those coexist,
+          # and up to three of these scans share one runner, which is what kept
+          # exhausting the disk (see the reclaim step above) and what grew the
+          # runner's volume 50 -> 120 -> 250 GB in three weeks.
+          build-args: |
+            AGENT_BASE=tooling
           # Share the agent image's cache scope with the build workflow so the
-          # PR scan and the post-merge build prime each other's layer cache.
+          # PR scan and the post-merge build prime each other's layer cache. The
+          # `tooling` layers are common to both tiers, so the scan still primes
+          # the post-merge build's base — it just no longer primes (or pays for)
+          # the Android layers the build alone needs.
           cache-from: type=gha,scope=turma-agent
           cache-to: type=gha,mode=max,scope=turma-agent
 
@@ -128,14 +155,26 @@ jobs:
       # set churns with every toolchain bump, so pinning each CVE in .trivyignore
       # would be an endless chase. The agent's actual runtime (node, the manager,
       # gh, ttyd, docker CLI, PowerShell, OS packages) is still fully scanned.
+      #
+      # Since the build step above targets the `tooling` tier, opt/gradle and
+      # opt/android-sdk no longer EXIST in the scanned image and these two flags
+      # are inert — kept deliberately, because they are what makes dropping those
+      # stages a no-op for coverage, and because this command must stay correct
+      # if anyone repoints the build at a tier that does bundle them. usr/lib/jvm
+      # is NOT inert: the JDK is an apt package and still ships in `tooling`, so
+      # this flag still does real work skipping its bundled jars — while openjdk's
+      # own CVEs keep being reported from the dpkg record, which --skip-dirs
+      # doesn't touch. That asymmetry is the whole reason the tiers are safe to
+      # split; don't "clean up" these flags without re-reading it.
+      #
       # --input: scan the archive the build just wrote (see the build step) so
       # the image is never loaded into, nor exported back out of, the daemon.
       #
       # TMPDIR → runner.temp: Trivy still extracts each uncompressed layer to a
-      # scratch file before scanning, and the agent image (node/npm/gh/ttyd/
-      # docker CLI + the Android toolchain) is large enough to blow out the
-      # runner container's small /tmp ("no space left on device"). runner.temp
-      # lives on the roomy _work volume and is cleaned per job.
+      # scratch file before scanning, and even the `tooling` tier (node/npm/gh/
+      # ttyd/docker CLI/PowerShell) can blow out the runner container's small
+      # /tmp ("no space left on device"). runner.temp lives on the roomy _work
+      # volume and is cleaned per job.
       - name: Trivy image scan
         env:
           TMPDIR: ${{ runner.temp }}

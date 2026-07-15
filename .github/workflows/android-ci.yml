@@ -18,12 +18,30 @@ on:
       - "VERSION"
       - ".github/workflows/android-ci.yml"
 
+# Was missing entirely, which made this the one workflow where pushing twice to
+# a PR left the superseded run alive — and it's the most expensive non-image PR
+# job in the repo, so each orphan held one of the box's three runners for its
+# full duration.
+concurrency:
+  group: android-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   GRADLE_VERSION: "8.11.1"
 
 jobs:
   build:
+    # Self-hosted, and here that's earned rather than inherited: the job runs in
+    # mingc/android-build-box, a multi-GB image that stays warm in the box's
+    # docker cache. On a hosted runner it would be re-pulled every run.
+    #
+    # Worth revisiting: ubuntu-latest ships a JDK and Android SDK preinstalled,
+    # so dropping the container (setup-java + the preinstalled SDK) would move
+    # this to hosted AND delete the Gradle download and sdkmanager steps below.
+    # Left alone for now because it's a behavioural change to the toolchain, not
+    # a routing change.
     runs-on: [self-hosted, linux]
+    timeout-minutes: 30
     container:
       image: mingc/android-build-box:latest
     defaults:

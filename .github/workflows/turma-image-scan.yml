@@ -24,7 +24,10 @@ permissions:
 
 jobs:
   scan:
+    # Self-hosted: builds a container image to scan it — wants the warm layer cache
+    # and the disk headroom a hosted runner's ~14 GB doesn't give.
     runs-on: [self-hosted, linux]
+    timeout-minutes: 30
     env:
       # Unique per-run tag: concurrent scans of different PRs on one runner
       # would otherwise overwrite each other's local/turma:pr-scan
