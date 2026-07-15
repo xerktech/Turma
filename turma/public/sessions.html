@@ -266,17 +266,23 @@
      stretching the layout — same deal as .md-table above.
 
      A `pre` that doesn't wrap has a min-content width of its longest line, and
-     a shrink-to-fit bubble won't size below that — so on a narrow viewport a
-     long code line pushed the whole bubble (and .tr-scroll with it) sideways
-     instead of scrolling inside the block. Sizing the code-carrying container
-     as a grid with a minmax(0, 1fr) track floors that contribution at 0, which
-     hands the overflow back to the block's own scroller. It's scoped with
-     :has() so ordinary bubbles keep their plain block layout, and it beats
-     capping the code (width:0/contain:inline-size) — those drop the block out
-     of the bubble's width entirely, so it scrolls on a wide screen too. */
-  .tr-msg:has(.md-code) { display: grid; grid-template-columns: minmax(0, 1fr); }
-  .thought-body:has(.md-code), .compact-body:has(.md-code) {
-    display: grid; grid-template-columns: minmax(0, 1fr); }
+     a shrink-to-fit box won't size below that — so on a narrow viewport a long
+     code line pushed the whole bubble (and .tr-scroll with it) sideways instead
+     of scrolling inside the block. Giving the code-carrying box a DEFINITE
+     width takes it out of shrink-to-fit sizing entirely, so there's no
+     min-content floor to defeat and the overflow lands on the block's own
+     scroller. min(760px, 100%) keeps the bubble's usual cap on a wide screen.
+
+     Scoped with :has() so ordinary bubbles keep hugging their text — a bubble
+     carrying a code block goes full width, which is the conventional look.
+
+     Do NOT do this by making the box a grid/flex container (a minmax(0, 1fr)
+     track floors the contribution at 0 and looks right at first): that turns
+     every child into a block-level item, so inline `code` chips and links get
+     torn onto their own full-width lines mid-sentence. Nor by capping the code
+     itself (width:0 / contain:inline-size) — that drops the block out of the
+     bubble's width entirely, so it scrolls on a wide screen where it'd fit. */
+  .tr-msg:has(.md-code), .thought:has(.md-code) { width: min(760px, 100%); }
   .tr-msg .md-code, .thought-body .md-code, .compact-body .md-code {
     margin: 6px 0; padding: 8px 10px; background: var(--page);
     border: 1px solid var(--border); border-radius: var(--radius-sm);
