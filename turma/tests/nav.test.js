@@ -94,6 +94,32 @@ test("nav: every page mounts the shared chrome and hand-rolls none of it", () =>
   }
 });
 
+// The header row is centred in the --wrap column on EVERY page, sessions.html
+// included. It once released --wrap there (its shell below is full-bleed), which
+// stretched the wordmark to x=20 and flung the tabs to the window edge — nothing
+// like the board/usage header it is supposed to match.
+test("nav: no page releases --wrap and stretches the header to the window edges", () => {
+  for (const f of PAGE_FILES) {
+    const src = fs.readFileSync(path.join(PUBLIC, f), "utf8");
+    assert.doesNotMatch(src, /--wrap\s*:\s*(none|100%|auto)/,
+      `${f} releases --wrap, which un-caps the shared header row`);
+  }
+});
+
+// The header's bottom gap must stay a margin: .wrap pages' first content element
+// carries its own top margin (.board-bar has 2px), which collapses with a margin
+// and does NOT collapse with padding — the difference is a 2px content shift.
+test("nav: the header's bottom gap is a margin, so it still collapses with content", () => {
+  const css = fs.readFileSync(path.join(PUBLIC, "app.css"), "utf8");
+  const rule = /\.site-header\s*\{([^}]*)\}/.exec(css);
+  assert.ok(rule, "no .site-header rule");
+  assert.match(rule[1], /margin-bottom:\s*20px/);
+  const inner = /\.site-header-in\s*\{([^}]*)\}/.exec(css);
+  assert.ok(inner, "no .site-header-in rule");
+  assert.match(inner[1], /padding:\s*24px\s+20px\s+0\b/, "the row's bottom spacing must not be padding");
+  assert.match(inner[1], /max-width:\s*var\(--wrap\)/);
+});
+
 test("nav: each page declares its own sub-header text and its own tab", () => {
   const subs = new Map();
   for (const f of PAGE_FILES) {
