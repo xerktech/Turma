@@ -27,6 +27,16 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      # Per-job docker config. The self-hosted box runs 3 runners as ONE user, so
+      # the default ~/.docker/config.json is shared by every concurrent job — and
+      # docker/login-action's post-cleanup `docker logout` (logout: true is its
+      # default) deletes the ghcr.io entry out of that shared file. Any other job
+      # finishing or being cancelled mid-build therefore strips this job's
+      # credentials, and the push falls back to an anonymous token -> 403.
+      # Scoping DOCKER_CONFIG to RUNNER_TEMP (fresh per job, wiped after) makes
+      # login/logout job-local. Keep this on any job here that logs in to GHCR.
+      DOCKER_CONFIG: ${{ runner.temp }}/.docker
     steps:
       - name: Reset workspace ownership
         run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
