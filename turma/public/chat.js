@@ -648,7 +648,12 @@
       (st.up ? '<span class="tok up">↑ ' + esc(st.up) + "</span>" : "") +
       (st.down ? '<span class="tok down">↓ ' + esc(st.down) + "</span>" : "");
     const elapsed = st.elapsed ? '<span class="tok elapsed">' + esc(st.elapsed) + "</span>" : "";
-    const hint = st.hint ? '<div class="cc-hint">' + esc(st.hint) + "</div>" : "";
+    // The hint is one rotating tip/task line, or an active-task checklist the
+    // agent sends newline-joined (a to-do item per line) — render each on its
+    // own row so the whole list shows below the verb, not just the first item.
+    const hint = st.hint
+      ? st.hint.split("\n").map((h) => '<div class="cc-hint">' + esc(h) + "</div>").join("")
+      : "";
     bar.hidden = false;
     bar.innerHTML =
       '<div class="cc-row"><span class="cc-spin"></span>' +

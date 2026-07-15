@@ -505,6 +505,72 @@ test("isHintLine: recognizes the corner-glyph tip/task footer, not prose", () =>
   assert.ok(!isHintLine("  It needs a base case to stop."));
 });
 
+test("isChecklistLine: recognizes to-do items (connector or bare), not tool results", () => {
+  const { isChecklistLine } = require("../tunnel-agent.js");
+  assert.ok(isChecklistLine("  └ ✓ Add agent-side Jira repo triage machinery"));
+  assert.ok(isChecklistLine("    ✓ Wire triage into the heartbeat"));
+  assert.ok(isChecklistLine("    ■ Test agent triage + board rendering"));
+  assert.ok(isChecklistLine("    □ Update CLAUDE.md"));
+  // A `⎿`-connected tool-result line has prose after the glyph, not a checkbox.
+  assert.ok(!isChecklistLine("  ⎿ Running tests..."));
+  assert.ok(!isChecklistLine("  ⌊ Tip: Use /btw to ask a quick side question"));
+  assert.ok(!isChecklistLine("● Recursion is when a function calls itself."));
+});
+
+// Regression for the reported bug: a multi-line active-task checklist under the
+// spinner must come through WHOLE as status.hint (newline-joined), not just its
+// first item. Only the first item carries the corner connector; the rest are
+// bare checkbox lines the old single-line hint capture dropped.
+test("parsePaneLiveTurn: full active-task checklist -> multi-line status.hint", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const pane = [
+    "❯ Do the triage work",
+    "● Working through the plan.",
+    "· Testing triage and rendering… (13m 46s · ↓ 53.2k tokens · esc to interrupt)",
+    "  └ ✓ Add agent-side Jira repo triage machinery",
+    "    ✓ Wire triage into the heartbeat",
+    "    ✓ Render the repo chip on the board",
+    "    ■ Test agent triage + board rendering",
+    "    □ Update CLAUDE.md",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ bypass permissions on · esc to interrupt · ← for agents",
+  ].join("\n");
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.generating, true);
+  assert.equal(r.text, "Working through the plan.");
+  assert.equal(r.status.hint, [
+    "✓ Add agent-side Jira repo triage machinery",
+    "✓ Wire triage into the heartbeat",
+    "✓ Render the repo chip on the board",
+    "■ Test agent triage + board rendering",
+    "□ Update CLAUDE.md",
+  ].join("\n"));
+  // The checklist must not bleed into the streamed assistant text.
+  assert.ok(!/CLAUDE\.md|heartbeat/.test(r.text));
+});
+
+// A `⎿` tool-result line sitting between the assistant text and the checklist
+// footer must not be swept into the hint (its glyph is followed by prose).
+test("parsePaneLiveTurn: tool-result line above the checklist stays out of the hint", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const pane = [
+    "❯ Do the work",
+    "● Let me run the tests.",
+    "  ⎿ Running tests...",
+    "· Testing… (12s · ↓ 1.0k tokens · esc to interrupt)",
+    "  └ ✓ First task",
+    "    □ Second task",
+    RULE,
+    "❯ ",
+    RULE,
+  ].join("\n");
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.status.hint, ["✓ First task", "□ Second task"].join("\n"));
+  assert.ok(!/Running tests/.test(r.status.hint));
+});
+
 // Regression for the second working-footer line (the "⌊ Tip: …" / active-task
 // hint Claude Code paints under the spinner): it must be pulled out as
 // status.hint and kept out of the streamed text — regardless of whether it sits
