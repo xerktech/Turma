@@ -10,11 +10,18 @@
 #   android-build  (default) JDK + Gradle + SDK build tooling. Agents can build
 #                  and JVM-unit-test Android apps, and can drive a REMOTE device
 #                  over `adb connect` — but cannot boot an AVD in-container.
-#                  This is what ships as :latest. 2.0 GB.
+#                  This is what ships as :latest. 3.0 GB.
 #   android        android-build + emulator + x86_64 system image + a `turma`
 #                  AVD, for booting an app in-container. Ships as :emulator,
-#                  built on workflow_dispatch only. 6.4 GB.
-#   tooling        No Android at all. 1.4 GB. CI scans this.
+#                  built on workflow_dispatch only. 7.4 GB.
+#   tooling        No Android at all. 2.4 GB. CI scans this.
+#
+# Every tier grew 1.0 GB when the cloud CLIs (terraform/az/aws — see their layer
+# below) landed in `tooling`. They are NOT a tier of their own: unlike Android,
+# which is a whole toolchain most sessions never invoke, these are credential-
+# bearing runtime tools, they are what the Trivy gate most wants to see, and a
+# fourth tier would double the tag matrix to spare :latest a third of what the
+# emulator alone costs.
 #
 # Note the shape: the whole Android BUILD toolchain costs 0.6 GB, while the
 # emulator + x86_64 system image cost 4.4 GB — 7x more. That asymmetry is why
@@ -97,6 +104,65 @@ RUN apt-get update \
  && ln -s /opt/powershell/pwsh /usr/local/bin/pwsh \
  && npm install -g "npm@${NPM_VERSION}" \
  && rm -rf /var/lib/apt/lists/*
+
+# --- Cloud CLI layer (stable, ~1.0 GB) --------------------------------------
+# terraform + az + aws, so a session can manage infrastructure the same way it
+# already manages GitHub through `gh`. Each reuses the HOST's credentials via a
+# bind mount (/root/.aws, /root/.azure, /root/.terraform.d) exactly as claude
+# and gh do — nothing here logs in, bakes a credential, or fails when a host has
+# no creds to mount; see the preflight in entrypoint.sh.
+#
+# Its own layer, ahead of the volatile agent layer below for the same reason the
+# Android one is: a Claude Code bump must not re-download a GB of CLIs. Sizes
+# below are on-disk (`du` inside the image), consistent with the tier figures at
+# the top of this file:
+#   azure-cli   628 MB  (bundles its own CPython + the SDK, in /opt/az)
+#   aws-cli     240 MB  (bundles its own CPython, in /opt/aws-cli)
+#   terraform    96 MB  (one static Go binary)
+# That ~1.0 GB lands in `tooling`, so EVERY tier carries it and CI scans it —
+# deliberate on both counts. These are network-facing runtime tools that talk to
+# cloud control planes with real credentials, which is exactly the surface the
+# Trivy gate is for, unlike the build toolchains it skips.
+#
+# az comes from Microsoft's apt repo rather than their install script so it has a
+# dpkg record for Trivy to scan and a version to pin; aws and terraform ship as
+# vendored archives with no repo, so they're pinned by URL like ttyd/docker.
+# Bump these pins to clear CVEs the image scan flags.
+#
+# Part of `tooling` (not a stage of its own) because every tier and the CI scan
+# need it — the tiers below are Android-only supersets. Its own RUN, after the
+# base one, so the two cache independently.
+#
+# The trailing `rm -rf` undoes the smoke test's side effects, and is not
+# cosmetic: merely running `az version` writes a full /root/.azure (empty
+# azureProfile.json included) and `terraform version` writes /root/.terraform.d.
+# Baked into the image, those are credential stores present on every host that
+# mounts none — which is exactly what entrypoint.sh's preflight reads. It keys on
+# a login-marker file rather than the directory for the same reason; keep both,
+# they cover different halves of it (a store the BUILD baked vs one a session
+# creates by running `az` at all).
+ARG TERRAFORM_VERSION=1.15.8
+ARG AWS_CLI_VERSION=2.35.23
+ARG AZURE_CLI_VERSION=2.88.0-1~bookworm
+RUN set -eux; \
+    curl -fsSL "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
+      -o /tmp/terraform.zip; \
+    unzip -q /tmp/terraform.zip -d /usr/local/bin terraform; \
+    rm /tmp/terraform.zip; \
+    chmod +x /usr/local/bin/terraform; \
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${AWS_CLI_VERSION}.zip" -o /tmp/awscli.zip; \
+    unzip -q /tmp/awscli.zip -d /tmp; \
+    /tmp/aws/install --bin-dir /usr/local/bin --install-dir /opt/aws-cli; \
+    rm -rf /tmp/aws /tmp/awscli.zip; \
+    mkdir -p /etc/apt/keyrings; \
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc -o /etc/apt/keyrings/microsoft.asc; \
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.asc] https://packages.microsoft.com/repos/azure-cli/ bookworm main" \
+      > /etc/apt/sources.list.d/azure-cli.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends "azure-cli=${AZURE_CLI_VERSION}"; \
+    rm -rf /var/lib/apt/lists/*; \
+    terraform version; aws --version; az version; \
+    rm -rf /root/.azure /root/.terraform.d
 
 # --- Android BUILD tooling layer (stable, ~0.5 GB) --------------------------
 # JDK 17 (installed in the base apt layer above) + Gradle + the Android SDK
@@ -262,6 +328,15 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/hub-agent.py \
 #   TURMA_URL / TURMA_TOKEN / TURMA_INTERVAL   hub endpoint + shared agent token + beat
 #   IS_SANDBOX      lets claude bypassPermissions run under root
 #   AGENT           coding agent (claude only, for now)
+#
+# Credential mounts (all OPTIONAL and per-host; DockerOps' compose decides which
+# a host gets). Each is the HOST's own store, reused read-through exactly like
+# /root/.claude and /root/.config/gh — the image logs in as nobody and bakes no
+# credential. A host that mounts none still boots and runs sessions; its cloud
+# CLIs are simply unauthenticated. See the preflight in entrypoint.sh.
+#   /root/.aws          aws CLI   — config + credentials (or AWS_* env creds)
+#   /root/.azure        az CLI    — azureProfile.json + the MSAL token cache
+#   /root/.terraform.d  terraform — credentials.tfrc.json, for Terraform Cloud
 #   JIRA_SITE / JIRA_EMAIL / JIRA_TOKEN   optional Jira Cloud polling for the hub's
 #                   /board Kanban: the org's *.atlassian.net site + a user-scoped
 #                   API token (Basic auth, read-only — only issue search is ever

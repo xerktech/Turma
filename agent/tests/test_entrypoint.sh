@@ -54,12 +54,21 @@ cp "$WORK/python3" "$WORK/hub-agent.py"
 echo 'console.log("TUNNEL uid=" + process.getuid() + " gid=" + process.getgid());' \
   > "$WORK/tunnel-agent.js"
 
+# Stand-ins for the cloud CLIs the real image bundles. The preflight only ever
+# probes `command -v` and the creds store on disk — it deliberately never runs
+# these — so a stub on PATH exercises it exactly as the 1 GB of real ones would.
+for cli in aws az terraform; do
+  printf '#!/bin/sh\necho "%s stub should not be invoked" >&2\nexit 1\n' "$cli" \
+    > "$WORK/$cli"
+done
+
 cat > "$WORK/Dockerfile" <<'DOCKERFILE'
 FROM node:24-bookworm-slim
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY python3 /usr/local/bin/python3
-COPY hub-agent.py tunnel-agent.js /usr/local/bin/
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/python3
+COPY hub-agent.py tunnel-agent.js aws az terraform /usr/local/bin/
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/python3 \
+      /usr/local/bin/aws /usr/local/bin/az /usr/local/bin/terraform
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 DOCKERFILE
 
@@ -152,6 +161,77 @@ make_fixture "$WORK/fx5" 1000 1000
 out="$(run_case "$WORK/fx5" -e PUID=0 -e PGID=1000)"
 expect "manager uid" "0" "$(field "$out" uid)"
 expect "manager gid" "0" "$(field "$out" gid)"
+
+# --- Case 6: cloud CLIs with no creds on the device --------------------------
+# The point of the preflight: a host that mounts no cloud creds is a supported
+# configuration, so the CLIs are reported as ignored and the container STILL
+# boots. Guards against the preflight ever growing the claude one's idle-forever
+# behaviour, which would take a host's sessions down over creds no session needs.
+echo "== case: no cloud creds mounted is ignored, not fatal"
+make_fixture "$WORK/fx6" 0 0
+out="$(run_case "$WORK/fx6")"
+for cli in aws az terraform; do
+  if echo "$out" | grep -q "\[entrypoint\] ${cli}: installed; no creds on this device"; then
+    echo "  ok: ${cli} reported as ignored"
+  else
+    echo "  FAIL: ${cli} — no 'ignoring' line in output"; FAILED=1
+  fi
+done
+expect "manager still starts" "0" "$(field "$out" uid)"
+
+# --- Case 7: mounted host cred stores are found ------------------------------
+# Each store is the host's own, reused read-through like ~/.claude — so what the
+# preflight must report is the MOUNT, on the same evidence the CLI itself uses.
+echo "== case: mounted cloud cred stores are reported"
+make_fixture "$WORK/fx7" 0 0
+mkdir -p "$WORK/fx7/aws" "$WORK/fx7/azure" "$WORK/fx7/terraform.d"
+touch "$WORK/fx7/aws/credentials" "$WORK/fx7/azure/msal_token_cache.json" \
+  "$WORK/fx7/terraform.d/credentials.tfrc.json"
+out="$(run_case "$WORK/fx7" \
+  -v "$WORK/fx7/aws:/root/.aws" \
+  -v "$WORK/fx7/azure:/root/.azure" \
+  -v "$WORK/fx7/terraform.d:/root/.terraform.d")"
+for pair in "aws:/root/.aws" "az:/root/.azure" "terraform:/root/.terraform.d"; do
+  cli="${pair%%:*}"; store="${pair#*:}"
+  if echo "$out" | grep -q "\[entrypoint\] ${cli}: host creds mounted at ${store}"; then
+    echo "  ok: ${cli} creds found at ${store}"
+  else
+    echo "  FAIL: ${cli} — ${store} mounted but not reported"; FAILED=1
+  fi
+done
+
+# --- Case 8: a store with no login in it is still "no creds" -----------------
+# The CLIs create their own stores just by running (`az version` writes a whole
+# ~/.azure, azureProfile.json and all), so on any host where a session has once
+# run one, a directory-presence check claims creds that were never there. Caught
+# exactly this way: the first build of this image reported az and terraform
+# creds on a container with nothing mounted.
+echo "== case: an empty/self-created store is not mistaken for creds"
+make_fixture "$WORK/fx8" 0 0
+mkdir -p "$WORK/fx8/azure" "$WORK/fx8/terraform.d"
+touch "$WORK/fx8/azure/azureProfile.json" "$WORK/fx8/terraform.d/checkpoint_cache"
+out="$(run_case "$WORK/fx8" \
+  -v "$WORK/fx8/azure:/root/.azure" \
+  -v "$WORK/fx8/terraform.d:/root/.terraform.d")"
+for cli in az terraform; do
+  if echo "$out" | grep -q "\[entrypoint\] ${cli}: installed; no creds on this device"; then
+    echo "  ok: ${cli} store without a login reads as no creds"
+  else
+    echo "  FAIL: ${cli} — self-created store reported as creds"; FAILED=1
+  fi
+done
+
+# --- Case 9: aws env credentials count as creds ------------------------------
+# AWS_* env creds authenticate the CLI with no ~/.aws at all, so reporting that
+# host as credential-less would be a lie about a working setup.
+echo "== case: AWS_* env creds are recognised without a store"
+make_fixture "$WORK/fx9" 0 0
+out="$(run_case "$WORK/fx9" -e AWS_ACCESS_KEY_ID=AKIAEXAMPLE)"
+if echo "$out" | grep -q "\[entrypoint\] aws: credentials from the environment"; then
+  echo "  ok: aws env creds recognised"
+else
+  echo "  FAIL: aws — env creds not recognised"; FAILED=1
+fi
 
 echo
 if [ "$FAILED" -eq 0 ]; then echo "all entrypoint identity cases passed"; else echo "FAILURES"; fi

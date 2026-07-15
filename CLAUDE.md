@@ -776,6 +776,35 @@ Because the images bundle third-party binaries, keep the pinned tool versions cu
 most CVEs are cleared. Genuinely non-actionable upstream base-image findings go in the root
 `.trivyignore` (a reviewed triage list, each with a reason); anything unlisted still fails the scan.
 
+### The agent image's cloud CLIs
+
+- The agent image bundles **terraform, `az` and `aws`** (pinned via `TERRAFORM_VERSION`/
+  `AZURE_CLI_VERSION`/`AWS_CLI_VERSION` in `agent/Dockerfile`), so a session can manage
+  infrastructure the same way it already manages GitHub through `gh`.
+- They live in the `tooling` stage, so **every tier carries them and the CI scan covers them** — they
+  are credential-bearing tools that talk to cloud control planes, which is the surface the Trivy gate
+  exists for, unlike the build toolchains it skips. Cost: ~1.0 GB on every tier (az 628 MB + aws
+  240 MB + terraform 96 MB — az and aws each vendor their own CPython).
+- **Creds are the host's, reused through optional bind mounts** exactly like `~/.claude` and
+  `~/.config/gh`; the image logs in as nobody and bakes no credential:
+  - `/root/.aws` (or `AWS_*` env creds) — `aws`
+  - `/root/.azure` — `az`
+  - `/root/.terraform.d` — terraform, for a Terraform Cloud backend
+- **A host that mounts none is a supported configuration, not an error.** `entrypoint.sh`'s preflight
+  only LOGS which stores it found and never idles the container the way the claude preflight does — a
+  missing `~/.azure` says nothing about whether the host can run sessions.
+- It keys on a **login-marker file** (`~/.aws/credentials`, `~/.azure/msal_token_cache.json`,
+  `~/.terraform.d/credentials.tfrc.json`), never on the store directory, because each CLI creates its
+  own store just by RUNNING: `az version` alone writes a whole `~/.azure`, empty `azureProfile.json`
+  included. The Dockerfile's build-time smoke test drops the stores it creates for the same reason —
+  a baked store is one that exists on every host that mounts none.
+- The preflight is a file check rather than `aws sts get-caller-identity`/`az account show`: those are
+  slow (the aws one is a network round trip) and would tax boot on every host to report what the
+  mount's absence already says. An expired token is the CLI's problem to report in-session.
+- The guard's `permissions.deny` protects `~/.azure` and `~/.terraform.d` alongside `~/.aws`/`~/.ssh`
+  — these stores are shared by every session on the box, so an agent editing one breaks the others.
+- Tests: `agent/tests/test_entrypoint.sh` (the cloud-creds cases), `test_guard_settings.py`.
+
 ### The agent image's Android toolchain
 
 - The images bundle the docker CLI, `gh`, ttyd, npm, and — in the agent image — a **JDK 17 + Gradle +
