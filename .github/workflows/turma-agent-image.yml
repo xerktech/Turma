@@ -42,12 +42,15 @@ jobs:
     permissions:
       contents: read
       packages: write
-    env:
-      # Per-job docker config — see the same block in turma-image.yml. The 3
-      # runners share one HOME, so another job's login-action logout wipes the
-      # ghcr.io credentials this job's push needs. RUNNER_TEMP is per-job.
-      DOCKER_CONFIG: ${{ runner.temp }}/.docker
     steps:
+      # Per-job docker config — see the fuller comment in turma-image.yml. The 3
+      # runners share one HOME, so another job's login-action logout wipes the
+      # ghcr.io credentials this job's push needs. RUNNER_TEMP is per-job. Set in
+      # a step, not a job-level `env:`, because the `runner` context isn't
+      # available there — that's a schema error GitHub rejects the file over.
+      - name: Scope docker config to this job
+        run: echo "DOCKER_CONFIG=${RUNNER_TEMP}/.docker" >> "$GITHUB_ENV"
+
       - name: Reset workspace ownership
         run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
 
