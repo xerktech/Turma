@@ -95,12 +95,26 @@ body {
 }
 h1, h2, h3 { font-family: var(--font-display); }
 
-.wrap { max-width: var(--wrap); margin: 0 auto; padding: 24px 20px 48px; }
+/* The page's content column. Its top padding lives on .site-header-in above,
+   which sits outside .wrap so the header can be full-bleed. */
+.wrap { max-width: var(--wrap); margin: 0 auto; padding: 0 20px 48px; }
 
-header { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; margin-bottom: 20px; }
 h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
-header .sub { color: var(--muted); font-size: 13px; }
-header .spacer { flex: 1; }
+
+/* ---- Site header: identical on every page, built by nav.js ---------------
+   The header itself is full-bleed and its inner row is capped at the same
+   --wrap as a page's content, so it lines up with .wrap pages (index/board/
+   usage) and spans the shell on the full-bleed one (sessions, which sets
+   --wrap: none). Page-specific text lives only in the #hdrSub/#hdrMeta/
+   #hdrStatus slots; an unfilled slot collapses so it costs no gap. */
+.site-header { flex: none; }
+.site-header-in {
+  max-width: var(--wrap); margin: 0 auto; padding: 24px 20px 20px;
+  display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap;
+}
+.site-header .sub { color: var(--muted); font-size: 13px; }
+.site-header .sub:empty { display: none; }
+.site-header .spacer { flex: 1; }
 
 /* Global focus: keyboard users get a clear accent ring; mouse clicks don't. */
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -433,8 +447,8 @@ body.td-open { overflow: hidden; }
 
 /* ---- Responsive: phone bottom nav + roomier touch targets ---------------- */
 @media (max-width: 600px) {
-  .wrap { padding: 16px 12px 40px; }
-  header { gap: 8px 12px; margin-bottom: 16px; }
+  .wrap { padding: 0 12px 40px; }
+  .site-header-in { padding: 16px 12px; gap: 8px 12px; }
   .nav-tabs { display: none; }
   .bottom-nav {
     display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;

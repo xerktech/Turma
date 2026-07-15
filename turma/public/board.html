@@ -13,19 +13,9 @@
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
+<header class="site-header" id="siteHeader" data-page="board"
+        data-sub="Jira board · assigned tickets across orgs"></header>
 <div class="wrap">
-  <header>
-    <a class="wordmark" href="/"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
-    <span class="sub">Jira board · assigned tickets across orgs</span>
-    <span class="spacer"></span>
-    <nav class="nav-tabs">
-      <a href="/">Dashboard</a>
-      <a href="/sessions">Sessions</a>
-      <a href="/board" class="active">Board</a>
-      <a href="/usage">Usage</a>
-      <a href="#" class="signout" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;">Sign out</a>
-    </nav>
-  </header>
   <div class="board-bar">
     <div class="org-chips" id="chips"></div>
     <button id="refresh" class="board-refresh" title="Re-poll Jira on every connected host now">
@@ -40,24 +30,8 @@
   <div class="footer">Each host agent polls its org's Jira Cloud with user-scoped creds (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code> in the agent's env) for tickets assigned to that user — active work plus the last two weeks of Done — and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns are Jira's universal status categories; each card's pill shows the org's own status name. Pull-only: nothing here writes to Jira.</div>
 </div>
 
-<nav class="bottom-nav">
-  <a href="/">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-    Dashboard
-  </a>
-  <a href="/sessions">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
-    Sessions
-  </a>
-  <a href="/board" class="active">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="5" height="18" rx="1"/><rect x="9.5" y="3" width="5" height="12" rx="1"/><rect x="16" y="3" width="5" height="15" rx="1"/></svg>
-    Board
-  </a>
-  <a href="/usage">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/></svg>
-    Usage
-  </a>
-</nav>
+<nav class="bottom-nav" id="bottomNav"></nav>
+<script src="/nav.js"></script>
 
 <script src="/board.js"></script>
 <script>
