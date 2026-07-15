@@ -164,7 +164,22 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   live.
 - Cached by URL in `pr_status_cache` and attached as `session.prs`; kept even after the session
   stops, and None until it opens a PR.
-- Tests: `agent/tests/test_hub_agent.py` (`TestPrStatus`, `TestRefreshPrStatus`).
+- **Which PRs are "a session's"** is decided by `_scan_pr_line`, and the rule is deliberately narrow:
+  a URL counts only when it comes back in a **`gh pr create` call's own `tool_result`** — the one
+  event in a transcript that says this session OPENED that PR.
+  - The scan used to regex any `…/pull/<n>` URL out of the appended transcript bytes, which also
+    caught every PR a session merely READ — `gh pr list`/`view`/`checks` output, a link the operator
+    pasted, the model quoting another session's PR — and hung a chip (and fired a "created a PR"
+    alert) on a card for work that session never did. Replayed over the 127 real transcripts on the
+    dev box, the narrow rule kept all 50 real links and dropped 43 false ones.
+  - The call and its result are separate entries and routinely land in different beats, so the
+    pending `gh pr create` tool_use ids carry across beats in the session's scan state (capped).
+  - The scan therefore parses whole JSONL lines rather than raw bytes: the byte offset stops at the
+    last newline, so a half-written entry is re-read whole next beat instead of being lost.
+  - Cost of the narrowness: a PR opened some other way (a subagent's own transcript, an MCP GitHub
+    tool, the web UI) gets no chip. Widen by teaching `_scan_pr_line` another creation event — never
+    by going back to scanning loose text.
+- Tests: `agent/tests/test_hub_agent.py` (`TestPrStatus`, `TestRefreshPrStatus`, `TestSessionReport`).
 
 ### Usage aggregates and the attribution ledger
 
