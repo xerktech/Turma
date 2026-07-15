@@ -20,7 +20,10 @@ env:
 
 jobs:
   build:
+    # Self-hosted: builds and pushes a container image, so the warm docker layer
+    # cache here is the point.
     runs-on: [self-hosted, linux]
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write

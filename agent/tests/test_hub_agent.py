@@ -9,6 +9,7 @@ faked at its two chokepoints, run()/run_ok(), plus Popen for ttyd — no
 docker/tmux/git needed.
 """
 
+import datetime
 import importlib.util
 import io
 import json
@@ -335,20 +336,20 @@ class TestUsageReport(ProjectDirMixin, unittest.TestCase):
     def test_missing_project_dir_returns_none(self):
         self.assertIsNone(ha.usage_report("/does/not/exist"))
 
-    def test_aggregation_dedup_and_pricing(self):
-        today = time.strftime("%Y-%m-%d")
+    def test_aggregation_dedup_and_model_tokens(self):
+        today = ha._utc_today()
         opus = usage_entry(
             "2026-07-01T10:00:00.000Z", "m1", "r1",
             "claude-opus-4-20250514", 1_000_000, 100_000,
-        )  # 1M in @ $5 + 100k out @ $25 = $7.50
+        )
         unknown = usage_entry(
             "2026-07-02T09:00:00.000Z", "m2", "r2",
             "weird-model-x", 10, 20, cw=30, cr=40,
-        )  # unknown model: tokens counted, cost 0
+        )  # a model the agent has never heard of still counts, by name
         no_id = usage_entry(
             f"{today}T01:00:00.000Z", None, None,
             "claude-sonnet-4-20250514", 100_000, 0,
-        )  # id-less entries are never deduped; sonnet 100k in = $0.30
+        )  # id-less entries are never deduped
 
         write_jsonl(os.path.join(self.proj, "a.jsonl"), [
             opus,
@@ -371,19 +372,63 @@ class TestUsageReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["totals"]["output"], 100_000 + 20)
         self.assertEqual(rep["totals"]["cacheWrite"], 30)
         self.assertEqual(rep["totals"]["cacheRead"], 40)
-        self.assertAlmostEqual(rep["totals"]["cost"], 7.5 + 0.0 + 0.6, places=2)
 
         # Per-day buckets: opus on 07-01, unknown on 07-02, sonnet today.
-        self.assertAlmostEqual(rep["days"]["2026-07-01"]["cost"], 7.5, places=2)
+        self.assertEqual(rep["days"]["2026-07-01"]["input"], 1_000_000)
         self.assertEqual(rep["days"]["2026-07-02"]["input"], 10)
-        self.assertAlmostEqual(rep["days"]["2026-07-02"]["cost"], 0.0, places=2)
         self.assertEqual(rep["today"], rep["days"][today])
         self.assertEqual(rep["today"]["input"], 200_000)
+        # Today is inside the week window; the older days are far outside it.
+        self.assertEqual(rep["week"]["input"], 200_000)
 
         self.assertEqual(rep["lastActivity"], f"{today}T01:00:00.000Z")
-        # sonnet has 2 messages, opus and weird-model-x 1 each -> sonnet first.
-        self.assertEqual(rep["models"][0], "claude-sonnet-4-20250514")
-        self.assertIn("weird-model-x", rep["models"])
+
+        # Per-model token counts, biggest consumer first. Opus leads on tokens
+        # (1.1M) despite sonnet having more messages (2) — the report ranks by
+        # what was consumed, not how many turns it took.
+        models = {m["model"]: m for m in rep["models"]}
+        self.assertEqual([m["model"] for m in rep["models"]], [
+            "claude-opus-4-20250514",
+            "claude-sonnet-4-20250514",
+            "weird-model-x",
+        ])
+        self.assertEqual(models["claude-opus-4-20250514"]["totals"], {
+            "input": 1_000_000, "output": 100_000, "cacheWrite": 0, "cacheRead": 0,
+        })
+        # The de-duped opus message counts once, on its own day, not today.
+        self.assertEqual(models["claude-opus-4-20250514"]["today"], ha._usage_bucket())
+        self.assertEqual(models["weird-model-x"]["totals"], {
+            "input": 10, "output": 20, "cacheWrite": 30, "cacheRead": 40,
+        })
+        # The id-less sonnet entry counted twice, and lands in today AND week.
+        self.assertEqual(models["claude-sonnet-4-20250514"]["today"]["input"], 200_000)
+        self.assertEqual(models["claude-sonnet-4-20250514"]["week"]["input"], 200_000)
+
+    def test_week_window_is_utc_and_rolling(self):
+        # Seven UTC days ending today, inclusive — the boundary day counts and
+        # the day before it does not.
+        window = ha._week_window("2026-07-14")
+        self.assertEqual(len(window), 7)
+        self.assertEqual(window[-1], "2026-07-14")   # today, last
+        self.assertEqual(window[0], "2026-07-08")    # oldest day still inside
+        # Crossing a month boundary is date arithmetic, not day-of-month math.
+        self.assertEqual(ha._week_window("2026-07-03")[0], "2026-06-27")
+
+    def test_week_counts_only_the_last_seven_days(self):
+        today = ha._utc_today()
+        inside = ha._week_window()[0]                 # 6 days ago: still counted
+        outside = (datetime.date.fromisoformat(today)
+                   - datetime.timedelta(days=7)).isoformat()  # 7 days ago: not
+        write_jsonl(os.path.join(self.proj, "a.jsonl"), [
+            usage_entry(f"{today}T01:00:00.000Z", "m1", "r1", "sonnet", 100, 0),
+            usage_entry(f"{inside}T01:00:00.000Z", "m2", "r2", "sonnet", 20, 0),
+            usage_entry(f"{outside}T01:00:00.000Z", "m3", "r3", "sonnet", 5_000, 0),
+        ])
+        rep = ha.usage_report(self.WORKDIR)
+        self.assertEqual(rep["today"]["input"], 100)
+        self.assertEqual(rep["week"]["input"], 120)          # today + 6-days-ago
+        self.assertEqual(rep["totals"]["input"], 5_120)      # all-time keeps all
+        self.assertEqual(rep["models"][0]["week"]["input"], 120)
 
     def test_empty_project_dir(self):
         rep = ha.usage_report(self.WORKDIR)
@@ -445,15 +490,15 @@ class TestRepoUsageReport(unittest.TestCase):
         wt_c = "/w/.turma/worktrees/DockerOps/ccc"
         write_jsonl(os.path.join(self._proj(wt_a), "a.jsonl"), [
             usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
-                        "claude-opus-4-20250514", 1_000_000, 100_000),  # $7.50
+                        "claude-opus-4-20250514", 1_000_000, 100_000),
         ])
         write_jsonl(os.path.join(self._proj(wt_b), "b.jsonl"), [
             usage_entry("2026-07-01T12:00:00.000Z", "m2", "r2",
-                        "claude-sonnet-4-20250514", 100_000, 0),        # $0.30
+                        "claude-sonnet-4-20250514", 100_000, 0),
         ])
         write_jsonl(os.path.join(self._proj(wt_c), "c.jsonl"), [
             usage_entry("2026-07-02T09:00:00.000Z", "m3", "r3",
-                        "claude-sonnet-4-20250514", 200_000, 0),        # $0.60
+                        "claude-sonnet-4-20250514", 200_000, 0),
         ])
         ledger = {
             # Same repo, two worktrees, ssh vs https remote -> one repo series.
@@ -464,16 +509,25 @@ class TestRepoUsageReport(unittest.TestCase):
         repo_usage, host = ha.repo_usage_report(ledger, self._fold_full)
         by = {r["repo"]: r for r in repo_usage}
 
-        self.assertAlmostEqual(by["Turma"]["usage"]["totals"]["cost"], 7.8, places=2)
+        # Both of Turma's worktrees fold into the one repo series.
         self.assertEqual(by["Turma"]["usage"]["totals"]["input"], 1_100_000)
-        self.assertAlmostEqual(
-            by["Turma"]["usage"]["days"]["2026-07-01"]["cost"], 7.8, places=2)
+        self.assertEqual(by["Turma"]["usage"]["days"]["2026-07-01"]["input"], 1_100_000)
         self.assertEqual(by["Turma"]["remoteKey"], "github.com/xerktech/turma")
-        self.assertAlmostEqual(by["DockerOps"]["usage"]["totals"]["cost"], 0.6, places=2)
+        self.assertEqual(by["DockerOps"]["usage"]["totals"]["input"], 200_000)
 
-        self.assertAlmostEqual(host["totals"]["cost"], 7.8 + 0.6, places=2)
+        # A repo's per-model breakdown merges across its worktrees too.
+        turma_models = {m["model"]: m for m in by["Turma"]["usage"]["models"]}
+        self.assertEqual(turma_models["claude-opus-4-20250514"]["totals"]["input"],
+                         1_000_000)
+        self.assertEqual(turma_models["claude-sonnet-4-20250514"]["totals"]["input"],
+                         100_000)
+
         self.assertEqual(host["totals"]["input"], 1_100_000 + 200_000)
-        # Sorted by cost desc.
+        # The host total merges the same model across repos (sonnet ran in both).
+        host_models = {m["model"]: m for m in host["models"]}
+        self.assertEqual(host_models["claude-sonnet-4-20250514"]["totals"]["input"],
+                         100_000 + 200_000)
+        # Sorted by total tokens desc.
         self.assertEqual(repo_usage[0]["repo"], "Turma")
 
     def test_empty_and_missing_dirs_excluded(self):
@@ -1153,6 +1207,174 @@ class TestTaskNotification(unittest.TestCase):
         )
 
 
+# The three bookkeeping turns Claude Code writes for `/compact summaries appear
+# as user text`, verbatim from a real transcript (note the indentation on the
+# invocation wrapper — it is not anchored to the start of a line).
+COMMAND_CAVEAT = (
+    "<local-command-caveat>Caveat: The messages below were generated by the user "
+    "while running local commands. DO NOT respond to these messages or otherwise "
+    "consider them in your response unless the user explicitly asks you to."
+    "</local-command-caveat>"
+)
+COMMAND_INVOCATION = (
+    "<command-name>/compact</command-name>\n"
+    "            <command-message>compact</command-message>\n"
+    "            <command-args>summaries appear as user text</command-args>"
+)
+COMMAND_STDOUT = "<local-command-stdout>Compacted (ctrl+o to see full summary)</local-command-stdout>"
+
+
+class TestLocalCommand(unittest.TestCase):
+    """Running a slash command writes three XML-ish USER turns (the caveat, the
+    invocation wrapper, the command's output). Rendered verbatim they read as the
+    operator typing raw XML into chat, so they must parse into structured blocks
+    — and the caveat must drop out entirely. Kept in lockstep with
+    tunnel-agent.js parseLocalCommand (mirror cases in tunnel-agent.test.js)."""
+
+    def test_parse_caveat(self):
+        self.assertEqual(ha._parse_local_command(COMMAND_CAVEAT), {"kind": "caveat"})
+
+    def test_parse_invocation_extracts_name_and_args(self):
+        self.assertEqual(ha._parse_local_command(COMMAND_INVOCATION), {
+            "kind": "command",
+            "name": "/compact",
+            "args": "summaries appear as user text",
+        })
+
+    def test_parse_invocation_without_args(self):
+        text = "<command-name>/clear</command-name>\n<command-args></command-args>"
+        self.assertEqual(ha._parse_local_command(text),
+                         {"kind": "command", "name": "/clear", "args": ""})
+
+    def test_parse_stdout_and_stderr(self):
+        self.assertEqual(ha._parse_local_command(COMMAND_STDOUT), {
+            "kind": "output",
+            "text": "Compacted (ctrl+o to see full summary)",
+            "isError": False,
+        })
+        self.assertEqual(
+            ha._parse_local_command("<local-command-stderr>Error: No messages</local-command-stderr>"),
+            {"kind": "output", "text": "Error: No messages", "isError": True},
+        )
+
+    def test_stderr_wins_when_a_turn_carries_both(self):
+        text = ("<local-command-stdout></local-command-stdout>"
+                "<local-command-stderr>boom</local-command-stderr>")
+        self.assertEqual(ha._parse_local_command(text),
+                         {"kind": "output", "text": "boom", "isError": True})
+
+    def test_non_command_text_is_not_parsed(self):
+        self.assertIsNone(ha._parse_local_command("just a normal prompt"))
+        self.assertIsNone(ha._parse_local_command("talk about <command-name> inline"))
+        self.assertIsNone(ha._parse_local_command(""))
+
+    def test_caveat_needs_the_whole_entry(self):
+        # Prose that merely quotes the caveat is the human talking; only a turn
+        # that IS the caveat gets dropped.
+        text = "why does <local-command-caveat>x</local-command-caveat> show up?"
+        self.assertIsNone(ha._parse_local_command(text))
+
+    def test_blocks_drop_the_caveat_entirely(self):
+        entry = {"type": "user", "isMeta": True, "message": {"content": COMMAND_CAVEAT}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [])
+        self.assertIsNone(ha._entry_text(entry))
+
+    def test_blocks_emit_command_from_string_and_list_content(self):
+        expected = [{"t": "command", "name": "/compact", "args": "summaries appear as user text"}]
+        self.assertEqual(
+            ha._entry_blocks({"type": "user", "message": {"content": COMMAND_INVOCATION}},
+                             ha.BLOCK_CAPS_LIVE),
+            expected)
+        self.assertEqual(
+            ha._entry_blocks({"type": "user", "message": {"content": [
+                {"type": "text", "text": COMMAND_INVOCATION}]}}, ha.BLOCK_CAPS_LIVE),
+            expected)
+
+    def test_blocks_omit_empty_args(self):
+        text = "<command-name>/clear</command-name>\n<command-args></command-args>"
+        self.assertEqual(ha._entry_blocks({"type": "user", "message": {"content": text}},
+                                          ha.BLOCK_CAPS_LIVE),
+                         [{"t": "command", "name": "/clear"}])
+
+    def test_blocks_emit_command_output(self):
+        entry = {"type": "user", "message": {"content": COMMAND_STDOUT}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE),
+                         [{"t": "command_output", "text": "Compacted (ctrl+o to see full summary)"}])
+
+    def test_blocks_flag_stderr_output_as_an_error(self):
+        entry = {"type": "user", "message": {"content":
+                 "<local-command-stderr>Error: No messages to compact</local-command-stderr>"}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE),
+                         [{"t": "command_output", "text": "Error: No messages to compact",
+                           "isError": True}])
+
+    def test_empty_output_yields_no_block(self):
+        entry = {"type": "user", "message": {"content":
+                 "<local-command-stdout></local-command-stdout>"}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [])
+        self.assertIsNone(ha._entry_text(entry))
+
+    def test_long_output_is_capped_and_truncated(self):
+        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        entry = {"type": "user", "message": {"content":
+                 f"<local-command-stdout>{big}</local-command-stdout>"}}
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["result"])
+        self.assertTrue(block["truncated"])
+
+    def test_entry_text_flattens_command_and_output(self):
+        self.assertEqual(
+            ha._entry_text({"type": "user", "message": {"content": COMMAND_INVOCATION}}),
+            "/compact summaries appear as user text")
+        self.assertEqual(
+            ha._entry_text({"type": "user", "message": {"content": COMMAND_STDOUT}}),
+            "Compacted (ctrl+o to see full summary)")
+
+
+class TestCompactSummary(unittest.TestCase):
+    """`/compact` writes its summary as a USER turn, but the text is the MODEL's
+    writing about the conversation so far. It must report as the assistant (so
+    the chat doesn't render it as a wall of text the operator typed) and carry
+    its own block kind so the UI can collapse it."""
+
+    SUMMARY = ("This session is being continued from a previous conversation that ran "
+               "out of context.\n\nSummary:\n1. Primary Request and Intent: …")
+
+    def _entry(self):
+        return {"type": "user", "isCompactSummary": True,
+                "message": {"role": "user", "content": self.SUMMARY}}
+
+    def test_role_reports_as_assistant(self):
+        self.assertEqual(ha._entry_role(self._entry()), "assistant")
+
+    def test_ordinary_turns_keep_their_own_role(self):
+        self.assertEqual(ha._entry_role({"type": "user", "message": {"content": "hi"}}), "user")
+        self.assertEqual(ha._entry_role({"type": "assistant", "message": {"content": "hi"}}),
+                         "assistant")
+
+    def test_blocks_emit_a_compact_summary_block(self):
+        self.assertEqual(ha._entry_blocks(self._entry(), ha.BLOCK_CAPS_FULL),
+                         [{"t": "compact_summary", "text": self.SUMMARY}])
+
+    def test_an_ordinary_user_turn_stays_a_text_block(self):
+        entry = {"type": "user", "message": {"content": self.SUMMARY}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_FULL),
+                         [{"t": "text", "text": self.SUMMARY}])
+
+    def test_long_summary_is_capped_and_truncated(self):
+        big = "z" * (ha.BLOCK_CAPS_LIVE["text"] + 500)
+        entry = {"type": "user", "isCompactSummary": True, "message": {"content": big}}
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(block["t"], "compact_summary")
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["text"])
+        self.assertTrue(block["truncated"])
+
+    def test_entry_text_keeps_the_summary_prose(self):
+        # The text feed is the lossy contract: the summary stays readable there,
+        # it just rides under the assistant role now.
+        self.assertEqual(ha._entry_text(self._entry()), self.SUMMARY)
+
+
 class TestHistoryEntriesRich(ProjectDirMixin, unittest.TestCase):
     def test_blocks_attached_and_tool_result_only_turn_surfaces(self):
         path = os.path.join(self.proj, "t.jsonl")
@@ -1345,7 +1567,7 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
 
     def test_unattributable_bucketed_as_other(self):
         # No worktree, no worktrees-shaped slug, and no cwd recorded — still
-        # adopted so its cost counts, under OTHER_REPO_NAME.
+        # adopted so its usage counts, under OTHER_REPO_NAME.
         proj = self._write_transcript("/root/scratch")  # usage_entry has no cwd
         sm = self.make_manager()
         sm._reconcile_orphan_transcripts()
@@ -3328,6 +3550,25 @@ class TestFirstUserText(unittest.TestCase):
         ])
         self.assertEqual(ha._first_user_text(path), "actual work please")
 
+    def test_skips_command_wrappers_the_chat_now_flattens(self):
+        # _entry_text renders the wrapper as "/compact <args>" for the chat, so
+        # this skip has to key on the turn's KIND, not on the display text still
+        # looking like raw XML — else a session gets named after its slash command.
+        path = self._write("t.jsonl", [
+            self._user(COMMAND_INVOCATION),
+            self._user(COMMAND_STDOUT),
+            self._user("actual work please"),
+        ])
+        self.assertEqual(ha._first_user_text(path), "actual work please")
+
+    def test_skips_a_compact_summary(self):
+        # A resumed-after-compaction transcript opens with the model's own
+        # summary on a user turn; the human's prompt is what names the session.
+        summary = dict(self._user("This session is being continued from a previous…"))
+        summary["isCompactSummary"] = True
+        path = self._write("t.jsonl", [summary, self._user("actual work please")])
+        self.assertEqual(ha._first_user_text(path), "actual work please")
+
     def test_skips_tool_result_only_user_turns(self):
         # A user turn that is only a tool_result has no display text -> skipped.
         path = self._write("t.jsonl", [
@@ -4020,6 +4261,255 @@ class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "pr_status", return_value={"url": url, "state": "OPEN"}) as pr:
             sm.refresh_pr_status()
         pr.assert_called_once_with(url)
+
+
+class TestNormalizeJiraSite(unittest.TestCase):
+    """Every way an operator might write the site collapses to one bare
+    lowercase host — the cross-host siteKey the hub dedupes boards on."""
+
+    def test_variants_collapse(self):
+        for raw in ("myorg.atlassian.net",
+                    "MyOrg.Atlassian.Net",
+                    "https://myorg.atlassian.net",
+                    "https://myorg.atlassian.net/",
+                    "https://myorg.atlassian.net/jira/software/projects/X/boards/1",
+                    "https://user@myorg.atlassian.net:443/browse/PROJ-1"):
+            self.assertEqual(ha.normalize_jira_site(raw), "myorg.atlassian.net", raw)
+
+    def test_empty(self):
+        self.assertEqual(ha.normalize_jira_site(""), "")
+        self.assertEqual(ha.normalize_jira_site(None), "")
+
+
+class TestShapeIssue(unittest.TestCase):
+    """Raw REST-v3 search issue -> the compact wire ticket the board renders."""
+
+    def _issue(self, **overrides):
+        fields = {
+            "summary": "Fix the flux capacitor",
+            "status": {"name": "In Review",
+                       "statusCategory": {"key": "indeterminate"}},
+            "priority": {"name": "High"},
+            "issuetype": {"name": "Bug"},
+            "project": {"key": "PROJ", "name": "Project X"},
+            "labels": ["infra", "urgent"],
+            "updated": "2026-07-14T08:12:00.000+0000",
+            "created": "2026-07-01T08:12:00.000+0000",
+            "duedate": "2026-07-20",
+            "parent": {"key": "PROJ-100"},
+        }
+        fields.update(overrides)
+        return {"key": "PROJ-123", "fields": fields}
+
+    def test_full_issue(self):
+        t = ha._shape_issue(self._issue(), "myorg.atlassian.net")
+        self.assertEqual(t["key"], "PROJ-123")
+        self.assertEqual(t["url"], "https://myorg.atlassian.net/browse/PROJ-123")
+        self.assertEqual(t["summary"], "Fix the flux capacitor")
+        self.assertEqual(t["status"], "In Review")
+        self.assertEqual(t["statusCategory"], "inprogress")
+        self.assertEqual(t["priority"], "High")
+        self.assertEqual(t["type"], "Bug")
+        self.assertEqual(t["project"], "PROJ")
+        self.assertEqual(t["projectName"], "Project X")
+        self.assertEqual(t["labels"], ["infra", "urgent"])
+        self.assertEqual(t["dueDate"], "2026-07-20")
+        self.assertEqual(t["parentKey"], "PROJ-100")
+
+    def test_category_mapping(self):
+        for key, cat in (("new", "todo"), ("indeterminate", "inprogress"),
+                         ("done", "done"), ("weird-future-key", "todo")):
+            issue = self._issue(status={"name": "S",
+                                        "statusCategory": {"key": key}})
+            self.assertEqual(
+                ha._shape_issue(issue, "s")["statusCategory"], cat, key)
+
+    def test_missing_optionals_degrade_to_none(self):
+        issue = self._issue(priority=None, duedate=None, labels=None)
+        del issue["fields"]["parent"]
+        t = ha._shape_issue(issue, "s")
+        self.assertIsNone(t["priority"])
+        self.assertIsNone(t["dueDate"])
+        self.assertIsNone(t["parentKey"])
+        self.assertEqual(t["labels"], [])
+
+    def test_caps(self):
+        issue = self._issue(summary="x" * 500,
+                            labels=[f"l{i}" for i in range(20)])
+        t = ha._shape_issue(issue, "s")
+        self.assertEqual(len(t["summary"]), 200)
+        self.assertEqual(len(t["labels"]), 5)
+
+    def test_empty_issue_never_raises(self):
+        t = ha._shape_issue({}, "s")
+        self.assertEqual(t["statusCategory"], "todo")
+        self.assertEqual(t["summary"], "")
+
+
+def _jira_page(keys, next_token=None):
+    page = {"issues": [
+        {"key": k, "fields": {"summary": k,
+                              "status": {"name": "To Do",
+                                         "statusCategory": {"key": "new"}}}}
+        for k in keys]}
+    if next_token:
+        page["nextPageToken"] = next_token
+    return page
+
+
+class TestFetchJiraIssues(unittest.TestCase):
+    """Pagination against /rest/api/3/search/jql (the nextPageToken API that
+    replaced the removed /rest/api/3/search) and the truncation cap."""
+
+    def test_stitches_pages_via_next_page_token(self):
+        pages = [_jira_page(["A-1", "A-2"], next_token="tok1"),
+                 _jira_page(["A-3"])]
+        calls = []
+
+        def fake_get(path, params):
+            calls.append((path, dict(params)))
+            return pages[len(calls) - 1]
+
+        with mock.patch.object(ha, "JIRA_SITE", "myorg.atlassian.net"), \
+             mock.patch.object(ha, "jira_get", fake_get):
+            tickets, truncated = ha.fetch_jira_issues("jql here", 100)
+        self.assertEqual([t["key"] for t in tickets], ["A-1", "A-2", "A-3"])
+        self.assertFalse(truncated)
+        # The new endpoint, never the removed one, on every page.
+        self.assertTrue(all(p == "/rest/api/3/search/jql" for p, _ in calls))
+        self.assertNotIn("nextPageToken", calls[0][1])
+        self.assertEqual(calls[1][1]["nextPageToken"], "tok1")
+        self.assertIn("summary", calls[0][1]["fields"])
+
+    def test_cap_stops_pagination_and_flags_truncated(self):
+        def fake_get(path, params):
+            return _jira_page(["B-1", "B-2"], next_token="more")
+
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "jira_get", fake_get):
+            tickets, truncated = ha.fetch_jira_issues("jql", 3)
+        self.assertEqual(len(tickets), 3)
+        self.assertTrue(truncated)
+
+    def test_page_bound_flags_truncated(self):
+        def fake_get(path, params):
+            return _jira_page(["C-1"], next_token="forever")
+
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "jira_get", fake_get):
+            tickets, truncated = ha.fetch_jira_issues("jql", 1000)
+        self.assertEqual(len(tickets), ha.JIRA_MAX_PAGES)
+        self.assertTrue(truncated)
+
+
+class TestCollectJira(unittest.TestCase):
+    def test_unconfigured_full_schema_no_http(self):
+        with mock.patch.object(ha, "JIRA_SITE", ""), \
+             mock.patch.object(ha, "JIRA_EMAIL", ""), \
+             mock.patch.object(ha, "JIRA_TOKEN", ""), \
+             mock.patch.object(ha, "jira_get") as get:
+            block = ha.collect_jira()
+        get.assert_not_called()
+        self.assertEqual(block, ha.JIRA_EMPTY)
+        self.assertIsNot(block, ha.JIRA_EMPTY)   # a copy, never the shared dict
+
+    def test_configured_issues_both_queries(self):
+        jqls = []
+
+        def fake_fetch(jql, cap):
+            jqls.append(jql)
+            key = "D-1" if "!= Done" in jql else "D-2"
+            return ([ha._shape_issue({"key": key, "fields": {}}, "s")],
+                    False)
+
+        with mock.patch.object(ha, "JIRA_SITE", "MyOrg.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "me@x.com"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "tok"), \
+             mock.patch.object(ha, "fetch_jira_issues", fake_fetch):
+            block = ha.collect_jira()
+        self.assertTrue(block["available"])
+        self.assertEqual(block["siteKey"], "myorg.atlassian.net")
+        self.assertEqual(block["user"], "me@x.com")
+        self.assertIsNone(block["error"])
+        self.assertFalse(block["truncated"])
+        self.assertEqual([t["key"] for t in block["tickets"]], ["D-1", "D-2"])
+        self.assertTrue(block["fetchedAt"])
+        # Active work and recently-Done are separate queries with separate caps.
+        self.assertEqual(len(jqls), 2)
+        self.assertIn("statusCategory != Done", jqls[0])
+        self.assertIn("statusCategory = Done", jqls[1])
+        self.assertIn(f"-{ha.JIRA_DONE_DAYS}d", jqls[1])
+
+    def test_truncated_rolls_up(self):
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "e"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "t"), \
+             mock.patch.object(ha, "fetch_jira_issues",
+                               side_effect=[([], True), ([], False)]):
+            self.assertTrue(ha.collect_jira()["truncated"])
+
+
+class TestRefreshJira(ManagerMixin, unittest.TestCase):
+    """The manager's slow-cadence Jira refresh: stale-cache fail-open (a fetch
+    error keeps the prior tickets and surfaces only the error string)."""
+
+    def test_success_replaces_block(self):
+        sm = self.make_manager()
+        fresh = {**ha.JIRA_EMPTY, "available": True, "tickets": [{"key": "A-1"}]}
+        with mock.patch.object(ha, "collect_jira", return_value=fresh):
+            sm.refresh_jira()
+        self.assertEqual(sm.jira["tickets"], [{"key": "A-1"}])
+
+    def test_failure_keeps_stale_tickets_and_sets_error(self):
+        sm = self.make_manager()
+        sm.jira = {**ha.JIRA_EMPTY, "available": True,
+                   "fetchedAt": "2026-07-14T00:00:00Z",
+                   "tickets": [{"key": "A-1"}]}
+        with mock.patch.object(ha, "collect_jira",
+                               side_effect=RuntimeError("boom " + "x" * 300)):
+            sm.refresh_jira()
+        self.assertEqual(sm.jira["tickets"], [{"key": "A-1"}])       # stale kept
+        self.assertEqual(sm.jira["fetchedAt"], "2026-07-14T00:00:00Z")
+        self.assertTrue(sm.jira["error"].startswith("boom"))
+        self.assertLessEqual(len(sm.jira["error"]), 200)
+
+    def test_success_after_failure_clears_error(self):
+        sm = self.make_manager()
+        sm.jira = {**ha.JIRA_EMPTY, "error": "old failure"}
+        fresh = {**ha.JIRA_EMPTY, "available": True}
+        with mock.patch.object(ha, "collect_jira", return_value=fresh):
+            sm.refresh_jira()
+        self.assertIsNone(sm.jira["error"])
+
+    def test_payload_cadence_and_light_gating(self):
+        sm = self.make_manager()
+        sm.registry = []
+        calls = []
+        sm.refresh_jira = lambda: calls.append(1)
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "e"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "t"):
+            payload = sm.build_payload(0)                 # beat 0 -> refresh
+            self.assertEqual(len(calls), 1)
+            sm.build_payload(1)                           # off-cadence -> no
+            self.assertEqual(len(calls), 1)
+            sm.build_payload(ha.JIRA_REFRESH_EVERY)       # on-cadence -> yes
+            self.assertEqual(len(calls), 2)
+            sm.build_payload(0, light=True)               # light beat -> no
+            self.assertEqual(len(calls), 2)
+        # The cached block rides every payload regardless.
+        self.assertIn("jira", payload)
+        self.assertEqual(payload["jira"], sm.jira)
+
+    def test_payload_skips_refresh_when_unconfigured(self):
+        sm = self.make_manager()
+        sm.registry = []
+        calls = []
+        sm.refresh_jira = lambda: calls.append(1)
+        with mock.patch.object(ha, "JIRA_SITE", ""):
+            payload = sm.build_payload(0)
+        self.assertEqual(calls, [])                       # zero Jira work
+        self.assertEqual(payload["jira"], ha.JIRA_EMPTY)  # block still present
 
 
 if __name__ == "__main__":

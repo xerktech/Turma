@@ -25,7 +25,6 @@ process.env.TURMA_PASSWORD = "hubpass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.TURMA_TRIGGER_TOKEN = "triggertok"; // programmatic /api/trigger bearer
 process.env.NTFY_URL = "http://ntfy.test"; // enables notify(); fetch is stubbed
-process.env.COST_ALERT_USD = "50";
 process.env.STATE_FILE = path.join(
   os.tmpdir(),
   `turma-test-state-${process.pid}.json`
@@ -384,32 +383,6 @@ test("alerts: restart loop needs 3 boots in 10m, then holds off 30m", () => {
   assert.deepEqual(titles(), []);
 });
 
-test("alerts: daily cost threshold sums sessions, fires once per day", () => {
-  const beat = makeHost();
-  const sessions = [
-    { id: "s1", usage: { today: { cost: 30 } } },
-    { id: "s2", usage: { today: { cost: 25 } } }, // 55 >= threshold 50
-  ];
-  notifications.length = 0;
-  beat({ sessions });
-  assert.deepEqual(titles(), ["host1 cost alert"]);
-  assert.match(notifications[0].body, /\$55\.00/);
-  notifications.length = 0;
-  beat({ sessions }); // same UTC day: no re-fire
-  assert.deepEqual(titles(), []);
-});
-
-test("alerts: daily cost prefers host-level usage (counts killed sessions)", () => {
-  const beat = makeHost();
-  // The host-level `usage` block is aggregated from ALL transcripts, so it
-  // exceeds the threshold even though the live sessions list is empty (their
-  // work was killed). The alert must use it rather than summing live sessions.
-  notifications.length = 0;
-  beat({ sessions: [], usage: { today: { cost: 72.5 } } });
-  assert.deepEqual(titles(), ["host1 cost alert"]);
-  assert.match(notifications[0].body, /\$72\.50/);
-});
-
 test("alerts: question fires on new text only, re-arms when cleared", () => {
   const beat = makeHost();
   const withQ = (q) => ({
@@ -556,6 +529,44 @@ test("http: heartbeat auth (bearer or user basic, nothing else)", async () => {
     (await request("POST", "/api/heartbeat", { body: {}, headers: agentHeaders })).status,
     400 // device/agentId required
   );
+});
+
+// ---- Jira board page + heartbeat block ----------------------------------------
+
+test("http: /board page and /board.js are user-gated like the rest of the UI", async () => {
+  assert.equal((await request("GET", "/board")).status, 401);
+  assert.equal((await request("GET", "/board", { headers: agentHeaders })).status, 401);
+  const page = await request("GET", "/board", { headers: userHeaders });
+  assert.equal(page.status, 200);
+  assert.match(page.raw, /kanban|TurmaBoard/i);
+  // board.js rides the static-asset allowlist (same treatment as chat.js).
+  const js = await request("GET", "/board.js", { headers: userHeaders });
+  assert.equal(js.status, 200);
+  assert.match(js.raw, /mergeSites/);
+});
+
+test("http: a heartbeat's jira block round-trips verbatim to /api/agents", async () => {
+  const jira = {
+    available: true,
+    site: "myorg.atlassian.net",
+    siteKey: "myorg.atlassian.net",
+    user: "me@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z",
+    error: null,
+    truncated: false,
+    tickets: [{ key: "PROJ-1", url: "https://myorg.atlassian.net/browse/PROJ-1",
+                summary: "Test", status: "In Review", statusCategory: "inprogress",
+                priority: "High", type: "Bug", project: "PROJ", labels: [],
+                updated: "2026-07-14T11:00:00Z" }],
+  };
+  assert.equal(
+    (await request("POST", "/api/heartbeat", { body: { device: "jira-host", jira }, headers: agentHeaders })).status,
+    200
+  );
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = res.body.agents.find((a) => a.key === "jira-host");
+  assert.ok(rec, "heartbeated host is served");
+  assert.deepEqual(rec.jira, jira);
 });
 
 // ---- mobile push device registry ----------------------------------------------
@@ -717,6 +728,20 @@ test("http: unauthenticated HTML navigation redirects to /login (no Basic popup)
   // A deep link carries a next= so login can bounce back to it.
   const deep = await request("GET", "/sessions", { headers: { accept: "text/html" } });
   assert.equal(deep.headers.location, "/login?next=%2Fsessions");
+});
+
+test("http: /usage serves the page and /history redirects to it", async () => {
+  for (const p of ["/usage", "/usage.html"]) {
+    const res = await request("GET", p, { headers: userHeaders });
+    assert.equal(res.status, 200, p);
+    assert.match(res.headers["content-type"], /text\/html/);
+  }
+  // The page was /history before it went token-only; old bookmarks must land.
+  for (const p of ["/history", "/history.html"]) {
+    const res = await request("GET", p, { headers: userHeaders });
+    assert.equal(res.status, 301, p);
+    assert.equal(res.headers.location, "/usage");
+  }
 });
 
 test("http: command queue rides the reply until acked", async () => {

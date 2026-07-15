@@ -12,10 +12,16 @@ set -e
 # restart/clear-context is now a per-session op the manager performs).
 
 # Which coding agent this container runs. Selected by the AGENT env var (set
-# per-stack in DockerOps). Defaults to claude; only claude is wired up today
-# (it reuses the host's login via the /root/.claude bind mount and is the only
-# agent the manager knows how to Remote-Control). The other agents are still
-# installed in the image for future use.
+# per-stack in DockerOps). Defaults to claude, and claude is the ONLY agent
+# installed or supported: it reuses the host's login via the /root/.claude bind
+# mount and is the only agent the manager knows how to Remote-Control
+# (hub-agent.py launches `claude` unconditionally — it never reads AGENT).
+# The image used to also carry codex/copilot/opencode against a dispatch that
+# was never built; they were dropped rather than keep shipping 959 MB of
+# binaries nothing could reach. All this var still does is gate the claude
+# credential preflight below, so a non-claude value skips that check and then
+# gets a claude session anyway. Wire up real dispatch here (and re-add the
+# install in agent/Dockerfile) if a second agent is ever supported.
 AGENT="${AGENT:-claude}"
 
 # --- Run-as identity (agent-agnostic) --------------------------------------

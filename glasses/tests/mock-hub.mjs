@@ -56,7 +56,7 @@ function makeFixture() {
           createdAt: isoAgo(1800),
           stoppedAt: null,
           errorMsg: null,
-          usage: { today: { input: 12000, output: 3400, cacheWrite: 500, cacheRead: 9000, cost: 1.23 } },
+          usage: { today: { input: 12000, output: 3400, cacheWrite: 500, cacheRead: 9000 } },
           session: {
             bridgeAttached: true,
             transcriptAgeSec: 12,
@@ -79,7 +79,7 @@ function makeFixture() {
           createdAt: isoAgo(900),
           stoppedAt: null,
           errorMsg: null,
-          usage: { today: { input: 4000, output: 900, cacheWrite: 0, cacheRead: 0, cost: 0.31 } },
+          usage: { today: { input: 4000, output: 900, cacheWrite: 0, cacheRead: 0 } },
           session: {
             bridgeAttached: true,
             transcriptAgeSec: 200,
@@ -125,7 +125,7 @@ function makeFixture() {
           createdAt: isoAgo(5000),
           stoppedAt: isoAgo(100),
           errorMsg: null,
-          usage: { today: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 } },
+          usage: { today: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 } },
           session: null,
         },
       ],
@@ -209,7 +209,7 @@ const server = http.createServer(async (req, res) => {
             createdAt: new Date().toISOString(),
             stoppedAt: null,
             errorMsg: null,
-            usage: { today: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 } },
+            usage: { today: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 } },
             session: {
               bridgeAttached: true,
               transcriptAgeSec: 0,
@@ -250,7 +250,7 @@ const server = http.createServer(async (req, res) => {
                 createdAt: closed.createdAt,
                 stoppedAt: null,
                 errorMsg: null,
-                usage: { today: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 } },
+                usage: { today: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 } },
                 session: {
                   bridgeAttached: true,
                   transcriptAgeSec: 0,

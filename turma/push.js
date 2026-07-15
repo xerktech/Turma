@@ -1,7 +1,7 @@
 // turma — mobile push (Firebase Cloud Messaging) fan-out for the alert bus.
 //
 // The hub already funnels every edge-triggered alert through server.js's
-// notify() (host offline/recovered, restart loop, cost threshold, question
+// notify() (host offline/recovered, restart loop, question
 // waiting, PR created, turn finished). This module lets notify() ALSO deliver
 // those alerts to registered mobile devices (the Android client) via FCM, in
 // addition to the existing ntfy push — so the phone gets OS-level notifications

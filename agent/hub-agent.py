@@ -39,6 +39,8 @@ for the already-answered case), and PR URLs newly appended to the transcript.
 stdlib only — no pip installs in the image.
 """
 
+import base64
+import datetime
 import json
 import os
 import re
@@ -199,69 +201,8 @@ def _usage_slot(sid):
 # same instant contend on that shared state; staggering reduces the contention.
 LAUNCH_STAGGER = 1.0
 
-# API-equivalent pricing per MTok (input, output, cache write, cache read).
-# Cache write = 1.25x input (5m TTL), cache read = 0.1x input. Sessions run on
-# a subscription, so this is a notional "what this would have cost via the
-# API" figure, not a bill. Matched by substring on the model id.
-PRICING = {
-    "fable": (10.0, 50.0, 12.50, 1.00),
-    "mythos": (10.0, 50.0, 12.50, 1.00),
-    "opus": (5.0, 25.0, 6.25, 0.50),
-    "sonnet": (3.0, 15.0, 3.75, 0.30),
-    "haiku": (1.0, 5.0, 1.25, 0.10),
-}
-
-
 def log(msg):
     print(f"[hub-agent] {msg}", flush=True)
-
-
-def load_pricing_extra():
-    """Extra pricing entries from the PRICING_JSON env var (inline JSON, per the
-    everything-inline-env convention): {"model-substring": [input, output,
-    cacheWrite, cacheRead]} per MTok. Consulted ONLY when the built-in PRICING
-    table has no match, so it can price new/unknown models but never override a
-    built-in rate. Anything malformed is logged loudly and the whole override
-    ignored — a bad env var must never take the agent down."""
-    raw = os.environ.get("PRICING_JSON", "").strip()
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("top level must be a JSON object")
-        extra = {}
-        for key, rates in data.items():
-            if not key or not isinstance(key, str):
-                raise ValueError(f"bad model key {key!r}")
-            if (
-                not isinstance(rates, (list, tuple))
-                or len(rates) != 4
-                or not all(
-                    isinstance(r, (int, float)) and not isinstance(r, bool) and r >= 0
-                    for r in rates
-                )
-            ):
-                raise ValueError(
-                    f"{key!r} must map to [input, output, cacheWrite, cacheRead] per MTok"
-                )
-            if key in PRICING:
-                log(f"PRICING_JSON: {key!r} duplicates a built-in entry — ignored")
-                continue
-            extra[key] = tuple(float(r) for r in rates)
-        return extra
-    except ValueError as e:
-        log(f"PRICING_JSON invalid — ignoring it entirely: {e}")
-        return {}
-
-
-PRICING_EXTRA = load_pricing_extra()
-# Logged unconditionally at boot so a bad/missing override is diagnosable from
-# the container-log tail in the hub UI.
-log(
-    "pricing extras from PRICING_JSON (consulted for unknown models only): "
-    + (", ".join(f"{k}={list(v)}" for k, v in PRICING_EXTRA.items()) or "none")
-)
 
 
 def run(cmd, cwd=None):
@@ -892,8 +833,22 @@ def memory_usage():
 HISTORY_DAYS = 60  # per-day breakdown reported to the hub (bounds payload size)
 
 
+TOKEN_KEYS = ("input", "output", "cacheWrite", "cacheRead")
+WEEK_DAYS = 7  # rolling window (UTC days, today inclusive) behind the `week` bucket
+
+
 def _usage_bucket():
-    return {"input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0}
+    return {k: 0 for k in TOKEN_KEYS}
+
+
+def _add_tokens(bucket, tok):
+    """Fold one message's (input, output, cacheWrite, cacheRead) into `bucket`."""
+    for k, n in zip(TOKEN_KEYS, tok):
+        bucket[k] += n
+
+
+def _model_acc():
+    return {"totals": _usage_bucket(), "days": {}}
 
 
 class _UsageAcc:
@@ -906,8 +861,12 @@ class _UsageAcc:
     def __init__(self):
         self.totals = _usage_bucket()
         self.days = {}      # "YYYY-MM-DD" (UTC) -> bucket
-        self.models = {}    # model id -> message count
-        self.unpriced = set()
+        # model id -> {"totals": bucket, "days": {"YYYY-MM-DD": bucket}}. The
+        # per-model day buckets never leave the agent: _finalize_usage derives
+        # each model's today/week from them and drops them, so the per-model
+        # breakdown costs a few scalars per model on the wire rather than a
+        # whole second days matrix.
+        self.models = {}
         self.seen = set()   # (message id, requestId) dedup keys
         self.last_ts = ""
         self.sessions = 0   # transcript files folded in
@@ -915,7 +874,7 @@ class _UsageAcc:
 
 def _accumulate_usage(lines, acc):
     """Fold transcript JSONL lines into `acc` in place. Only lines that mention a
-    usage block cost anything; each priced message is deduped on
+    usage block count for anything; each message is deduped on
     (message id, requestId) via acc.seen, so a message re-seen across files or
     across incremental beats counts exactly once."""
     for line in lines:
@@ -938,7 +897,6 @@ def _accumulate_usage(lines, acc):
         if ts > acc.last_ts:
             acc.last_ts = ts
         model = msg.get("model") or "unknown"
-        acc.models[model] = acc.models.get(model, 0) + 1
 
         tok = (
             usage.get("input_tokens", 0) or 0,
@@ -946,36 +904,16 @@ def _accumulate_usage(lines, acc):
             usage.get("cache_creation_input_tokens", 0) or 0,
             usage.get("cache_read_input_tokens", 0) or 0,
         )
-        # Built-in table first (authoritative); PRICING_EXTRA only covers
-        # models the built-ins don't match.
-        price = next(
-            (p for k, p in PRICING.items() if k in model), None
-        ) or next(
-            (p for k, p in PRICING_EXTRA.items() if k in model), None
-        )
-        cost = (
-            sum(t * p for t, p in zip(tok, price)) / 1e6
-            if price
-            else 0.0
-        )
-        # An unpriced model costs $0.00 — flag every bucket it lands in so the
-        # UI never understates cost silently.
-        is_unpriced = price is None and any(tok)
-        if is_unpriced:
-            acc.unpriced.add(model)
-        buckets = [acc.totals]
         # Transcript timestamps are UTC ISO; date-prefix bucketing is close
         # enough for a dashboard.
-        if len(ts) >= 10:
-            buckets.append(acc.days.setdefault(ts[:10], _usage_bucket()))
+        day = ts[:10] if len(ts) >= 10 else ""
+        m = acc.models.setdefault(model, _model_acc())
+        buckets = [acc.totals, m["totals"]]
+        if day:
+            buckets.append(acc.days.setdefault(day, _usage_bucket()))
+            buckets.append(m["days"].setdefault(day, _usage_bucket()))
         for b in buckets:
-            b["input"] += tok[0]
-            b["output"] += tok[1]
-            b["cacheWrite"] += tok[2]
-            b["cacheRead"] += tok[3]
-            b["cost"] += cost
-            if is_unpriced:
-                b["unpriced"] = True
+            _add_tokens(b, tok)
 
 
 def _aggregate_project(proj, acc, offsets=None):
@@ -1048,27 +986,73 @@ def _aggregate_project(proj, acc, offsets=None):
     return True
 
 
+def _total_tokens(bucket):
+    return sum(bucket.get(k, 0) for k in TOKEN_KEYS)
+
+
+def _utc_today():
+    """Today's UTC date. Day buckets are keyed off the transcripts' UTC ISO
+    timestamps, so `today`/`week` MUST be resolved in UTC too — reading them
+    against local time silently mis-slices the window on any host that isn't
+    on UTC (and skips/double-counts a day around its midnight)."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _week_window(today=None):
+    """The WEEK_DAYS UTC dates ending `today` (inclusive), newest last. Dated in
+    UTC via date arithmetic rather than epoch-second subtraction, which would
+    skip or repeat a day across a DST boundary on a non-UTC host."""
+    end = datetime.date.fromisoformat(today or _utc_today())
+    return [
+        (end - datetime.timedelta(days=i)).isoformat()
+        for i in range(WEEK_DAYS - 1, -1, -1)
+    ]
+
+
+def _sum_days(days, window):
+    """Total the buckets of `window`'s dates out of a {date: bucket} map."""
+    out = _usage_bucket()
+    for d in window:
+        b = days.get(d)
+        if b:
+            _add_tokens(out, [b[k] for k in TOKEN_KEYS])
+    return out
+
+
 def _finalize_usage(acc):
-    """Snapshot the running accumulator into the heartbeat's usage shape. Rounds
-    into COPIES so the accumulator keeps its raw floats — rounding in place would
-    drift the running total a little more every incremental beat, and the same
-    per-slug acc is reused across beats and merged into repo/host totals."""
-    totals = dict(acc.totals)
-    totals["cost"] = round(totals["cost"], 2)
+    """Snapshot the running accumulator into the heartbeat's usage shape. Builds
+    COPIES throughout: the same per-slug acc is reused across beats and merged
+    into repo/host totals, so a report must never alias (let alone mutate) the
+    accumulator's own buckets.
+
+    `today`/`week` are pre-sliced here rather than left to each client: the day
+    buckets are UTC and the clients aren't, and three surfaces (hub, Android,
+    glasses) would otherwise each re-derive the same window."""
+    window = _week_window()
     days = {d: dict(acc.days[d]) for d in sorted(acc.days)[-HISTORY_DAYS:]}
-    for day in days.values():
-        day["cost"] = round(day["cost"], 2)
-    today = days.get(time.strftime("%Y-%m-%d"), _usage_bucket())
     return {
-        "totals": totals,
-        "today": today,
+        "totals": dict(acc.totals),
+        "today": days.get(window[-1], _usage_bucket()),
+        "week": _sum_days(acc.days, window),
         "days": days,
         "sessions": acc.sessions,
         "lastActivity": acc.last_ts,
-        "models": sorted(acc.models, key=acc.models.get, reverse=True),
-        # Models whose usage no pricing entry matched (their cost counted as
-        # $0.00) — the UI flags any figure that includes them.
-        "unpricedModels": sorted(acc.unpriced),
+        # Per-model token counts, biggest consumer first. Each model's day
+        # buckets stay agent-side (see _UsageAcc.models) — only the three
+        # windows the UI shows travel.
+        "models": sorted(
+            (
+                {
+                    "model": name,
+                    "totals": dict(m["totals"]),
+                    "today": dict(m["days"].get(window[-1]) or _usage_bucket()),
+                    "week": _sum_days(m["days"], window),
+                }
+                for name, m in acc.models.items()
+            ),
+            key=lambda m: _total_tokens(m["totals"]),
+            reverse=True,
+        ),
     }
 
 
@@ -1085,23 +1069,23 @@ def usage_report(workdir):
     return _finalize_usage(acc)
 
 
+def _merge_bucket(dst, src):
+    for k in TOKEN_KEYS:
+        dst[k] += src.get(k, 0)
+
+
 def _merge_acc(dst, src):
-    """Fold accumulator `src` into `dst` (pre-finalize, so costs stay full
-    precision). Buckets are copied by value, so later finalizing one side never
-    disturbs the other, and `src` (a persistent per-slug acc) is left intact."""
-    for k in ("input", "output", "cacheWrite", "cacheRead", "cost"):
-        dst.totals[k] += src.totals[k]
-    if src.totals.get("unpriced"):
-        dst.totals["unpriced"] = True
+    """Fold accumulator `src` into `dst` (pre-finalize). Buckets are merged by
+    value, so later finalizing one side never disturbs the other, and `src` (a
+    persistent per-slug acc) is left intact."""
+    _merge_bucket(dst.totals, src.totals)
     for d, b in src.days.items():
-        tgt = dst.days.setdefault(d, _usage_bucket())
-        for k in ("input", "output", "cacheWrite", "cacheRead", "cost"):
-            tgt[k] += b[k]
-        if b.get("unpriced"):
-            tgt["unpriced"] = True
-    for m, c in src.models.items():
-        dst.models[m] = dst.models.get(m, 0) + c
-    dst.unpriced |= src.unpriced
+        _merge_bucket(dst.days.setdefault(d, _usage_bucket()), b)
+    for name, m in src.models.items():
+        tgt = dst.models.setdefault(name, _model_acc())
+        _merge_bucket(tgt["totals"], m["totals"])
+        for d, b in m["days"].items():
+            _merge_bucket(tgt["days"].setdefault(d, _usage_bucket()), b)
     dst.seen |= src.seen
     dst.sessions += src.sessions
     if src.last_ts > dst.last_ts:
@@ -1168,9 +1152,9 @@ def repo_usage_report(ledger, fold_slug):
     the same repo across hosts.
 
     Returns (repo_usage, host_usage): repo_usage is
-    [{repo, remote, remoteKey, usage}] sorted by cost desc (repos that never
-    spent anything are omitted); host_usage is the merged report, or None when no
-    transcript exists at all."""
+    [{repo, remote, remoteKey, usage}] sorted by total tokens desc (repos that
+    never consumed anything are omitted); host_usage is the merged report, or
+    None when no transcript exists at all."""
     by_repo = {}  # repo name -> {"remote": str, "slugs": set()}
     for path, meta in (ledger or {}).items():
         meta = meta or {}
@@ -1201,7 +1185,7 @@ def repo_usage_report(ledger, fold_slug):
         })
 
     host_usage = _finalize_usage(host) if host.sessions else None
-    repo_usage.sort(key=lambda r: r["usage"]["totals"]["cost"], reverse=True)
+    repo_usage.sort(key=lambda r: _total_tokens(r["usage"]["totals"]), reverse=True)
     return repo_usage, host_usage
 
 
@@ -1370,10 +1354,123 @@ def _tn_preview(tn):
     return "\n\n".join(p for p in parts if p)
 
 
+# Running a slash command writes three more XML-ish user-role turns that are not
+# the human talking either: a boilerplate <local-command-caveat> telling the
+# model to ignore what follows, the <command-name>/<command-args> invocation
+# wrapper, and the command's <local-command-stdout>/<local-command-stderr>.
+# Rendered verbatim they read as the operator typing raw XML into chat, so —
+# exactly as with <task-notification> above — we parse them here into structured
+# blocks the web chat renders as a command chip / output card, and drop the
+# caveat outright. Keep mirrored with tunnel-agent.js parseLocalCommand().
+#
+# Matched with `search`, not `match`: Claude Code emits the wrapper tags indented
+# and sometimes with sibling text, so anchoring to the whole string would miss
+# them. The caveat, by contrast, is the ENTIRE entry when present, hence fullmatch.
+LOCAL_COMMAND_CAVEAT_RE = re.compile(
+    r"\s*<local-command-caveat>.*?</local-command-caveat>\s*", re.DOTALL)
+COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.DOTALL)
+COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
+COMMAND_STDOUT_RE = re.compile(
+    r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL)
+COMMAND_STDERR_RE = re.compile(
+    r"<local-command-stderr>(.*?)</local-command-stderr>", re.DOTALL)
+
+
+def _parse_local_command(text):
+    """Parse one of Claude Code's slash-command bookkeeping turns, or None when
+    `text` isn't one. Mirror of tunnel-agent.js parseLocalCommand(). Returns:
+      {"kind": "caveat"}                        -> drop the entry entirely
+      {"kind": "command", "name", "args"}       -> the /slash invocation
+      {"kind": "output", "text", "isError"}     -> the command's stdout/stderr
+    stderr wins over stdout when a turn carries both, so a failing command reads
+    as an error rather than silently showing its (usually empty) stdout."""
+    if not text:
+        return None
+    if LOCAL_COMMAND_CAVEAT_RE.fullmatch(text):
+        return {"kind": "caveat"}
+    m = COMMAND_NAME_RE.search(text)
+    if m:
+        name = ANSI_RE.sub("", m.group(1)).strip()
+        args = COMMAND_ARGS_RE.search(text)
+        if name:
+            return {
+                "kind": "command",
+                "name": name,
+                "args": ANSI_RE.sub("", args.group(1)).strip() if args else "",
+            }
+    for regex, is_error in ((COMMAND_STDERR_RE, True), (COMMAND_STDOUT_RE, False)):
+        m = regex.search(text)
+        if m:
+            return {
+                "kind": "output",
+                "text": ANSI_RE.sub("", m.group(1)).strip(),
+                "isError": is_error,
+            }
+    return None
+
+
+def _lc_preview(lc):
+    """Flatten a parsed local-command turn to display text, the text-feed form
+    used by the glasses tail, heartbeat preview and archive — or None to drop it
+    (the caveat, and an output turn that carried nothing)."""
+    if lc["kind"] == "caveat":
+        return None
+    if lc["kind"] == "command":
+        return " ".join(p for p in (lc["name"], lc["args"]) if p)
+    return lc["text"] or None
+
+
+def _entry_first_text(entry):
+    """The entry's first raw text payload (string content, or the first `text`
+    block of list content), or "" — the pre-flatten form callers need to ask
+    what KIND of turn this is."""
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return str(block.get("text") or "")
+    return ""
+
+
+def _entry_local_command(entry):
+    """The parsed slash-command turn this entry IS, or None. Callers that want
+    to skip command plumbing must ask this rather than sniffing _entry_text's
+    output, which has already flattened the wrapper away."""
+    return _parse_local_command(_entry_first_text(entry))
+
+
+def _entry_role(entry):
+    """Display role for a transcript entry. Normally the entry type, but a
+    compact summary is written as a USER turn carrying text the model wrote
+    about itself — showing it on the human's side (as the raw transcript role
+    would) misattributes it, so it reports as the assistant."""
+    if entry.get("isCompactSummary"):
+        return "assistant"
+    return entry.get("type")
+
+
+def _flatten_text(raw):
+    """One text payload -> its text-feed form: a <task-notification> or
+    slash-command bookkeeping turn flattened to its preview, anything else
+    verbatim. None to drop the payload (a caveat / empty command output)."""
+    tn = _parse_task_notification(raw)
+    if tn:
+        return _tn_preview(tn)
+    lc = _parse_local_command(raw)
+    if lc:
+        return _lc_preview(lc)
+    return raw
+
+
 def _entry_text(entry):
     """Map one transcript entry to display text for the glasses tail feed, or
-    None to drop it (wrong type, no message, tool_result-only turn, or empty
-    after stripping ANSI)."""
+    None to drop it (wrong type, no message, tool_result-only turn, a
+    slash-command caveat, or empty after stripping ANSI)."""
     if entry.get("type") not in ("user", "assistant"):
         return None
     msg = entry.get("message")
@@ -1381,8 +1478,9 @@ def _entry_text(entry):
         return None
     content = msg.get("content")
     if isinstance(content, str):
-        tn = _parse_task_notification(content)
-        text = _tn_preview(tn) if tn else content
+        text = _flatten_text(content)
+        if text is None:
+            return None
     elif isinstance(content, list):
         parts = []
         for block in content:
@@ -1390,9 +1488,9 @@ def _entry_text(entry):
                 continue
             btype = block.get("type")
             if btype == "text":
-                raw = str(block.get("text") or "")
-                tn = _parse_task_notification(raw)
-                parts.append(_tn_preview(tn) if tn else raw)
+                flat = _flatten_text(str(block.get("text") or ""))
+                if flat is not None:
+                    parts.append(flat)
             elif btype == "tool_use" and block.get("name"):
                 parts.append(f"[{block['name']}]")
             # "thinking" and "tool_result" blocks are dropped.
@@ -1464,13 +1562,19 @@ def _entry_blocks(entry, caps):
     component by verbosity. `caps` is a {text, input, result} char-limit dict
     (BLOCK_CAPS_LIVE for the ~1s tail, BLOCK_CAPS_FULL for on-demand history); a
     block cut to its cap gets truncated:true. Blocks:
-      {t:"text",        text}
-      {t:"thinking",    text, truncated?}
-      {t:"tool_use",    id, name, input, truncated?}
-      {t:"tool_result", forId, text, isError?, truncated?}
+      {t:"text",           text}
+      {t:"thinking",       text, truncated?}
+      {t:"tool_use",       id, name, input, truncated?}
+      {t:"tool_result",    forId, text, isError?, truncated?}
+      {t:"compact_summary", text, truncated?}
+      {t:"command",        name, args?, truncated?}
+      {t:"command_output", text, isError?, truncated?}
     A `<task-notification>` user turn becomes a single {t:"task_notification",
     summary, status?, result?, truncated?} block (see _parse_task_notification)
-    so the web chat renders it as an action card, not raw XML.
+    so the web chat renders it as an action card, not raw XML. The slash-command
+    bookkeeping turns get the same treatment via _parse_local_command: the
+    invocation becomes a `command` block, its stdout/stderr a `command_output`
+    block, and the boilerplate caveat is dropped (yielding []).
     Returns [] for a user/assistant message with no renderable blocks. Keep this
     mirrored with tunnel-agent.js entryBlocks()."""
     if entry.get("type") not in ("user", "assistant"):
@@ -1503,23 +1607,53 @@ def _entry_blocks(entry, caps):
             block["truncated"] = True
         blocks.append(block)
 
-    if isinstance(content, str):
-        tn = _parse_task_notification(content)
+    def add_local_command(lc):
+        """The caveat contributes no block (its entry drops out entirely)."""
+        if lc["kind"] == "command":
+            name, _ = _clip(lc["name"], caps["input"])
+            args, atrunc = _clip(lc["args"], caps["input"])
+            block = {"t": "command", "name": name}
+            if args:
+                block["args"] = args
+            if atrunc:
+                block["truncated"] = True
+            blocks.append(block)
+        elif lc["kind"] == "output" and lc["text"]:
+            text, trunc = _clip(lc["text"], caps["result"])
+            block = {"t": "command_output", "text": text}
+            if lc["isError"]:
+                block["isError"] = True
+            if trunc:
+                block["truncated"] = True
+            blocks.append(block)
+
+    def add_payload(raw):
+        """One text payload -> its block(s): a task-notification card, a
+        slash-command chip/output card, else plain text."""
+        tn = _parse_task_notification(raw)
         if tn:
             add_task_notification(tn)
-        else:
-            add_text("text", content, caps["text"])
+            return
+        lc = _parse_local_command(raw)
+        if lc:
+            add_local_command(lc)
+            return
+        # A compact summary is prose the model wrote about the conversation so
+        # far, injected as a user turn. It gets its own block so the chat can
+        # render it as a collapsed agent-side card rather than a wall of text in
+        # a user bubble. _entry_role() puts it on the assistant's side.
+        add_text("compact_summary" if entry.get("isCompactSummary") else "text",
+                 raw, caps["text"])
+
+    if isinstance(content, str):
+        add_payload(content)
     elif isinstance(content, list):
         for raw in content:
             if not isinstance(raw, dict):
                 continue
             btype = raw.get("type")
             if btype == "text":
-                tn = _parse_task_notification(str(raw.get("text") or ""))
-                if tn:
-                    add_task_notification(tn)
-                else:
-                    add_text("text", str(raw.get("text") or ""), caps["text"])
+                add_payload(str(raw.get("text") or ""))
             elif btype == "thinking":
                 add_text("thinking", str(raw.get("thinking") or raw.get("text") or ""), caps["text"])
             elif btype == "tool_use" and raw.get("name"):
@@ -1561,7 +1695,7 @@ def transcript_tail(path):
             continue
         tail.append({
             "id": entry.get("uuid"),
-            "role": entry.get("type"),
+            "role": _entry_role(entry),
             "text": text[:TAIL_MSG_CHARS],
         })
     return tail[-TAIL_MSGS:]
@@ -1624,11 +1758,13 @@ def _first_user_text(path, max_lines=500):
                     continue
                 if entry.get("promptSource") == "system":
                     continue  # injected turn (e.g. a task-notification), not human
+                if entry.get("isCompactSummary"):
+                    continue  # the model's own summary, injected as a user turn
+                if _entry_local_command(entry):
+                    continue  # slash-command plumbing, not a real prompt
                 text = _entry_text(entry)
                 if not text:
                     continue  # tool_result-only turn, or empty after stripping
-                if text.startswith("<command-") or text.startswith("<local-command"):
-                    continue  # slash-command plumbing, not a real prompt
                 return text
     except OSError:
         return None
@@ -1690,7 +1826,7 @@ def _history_entries(path):
             continue
         entries.append({
             "id": entry.get("uuid"),
-            "role": entry.get("type"),
+            "role": _entry_role(entry),
             "text": (text or "")[:TAIL_MSG_CHARS_FULL],
             "blocks": blocks or [],
         })
@@ -2156,6 +2292,160 @@ def collect_github():
     return {"available": True, "login": login, "repos": list_github_repos()}
 
 
+# --- Jira Cloud ticket polling --------------------------------------------------
+# Optional: with user-scoped Jira Cloud creds in the env (JIRA_SITE + JIRA_EMAIL
+# + JIRA_TOKEN — an ordinary Atlassian API token, Basic auth), the agent polls
+# the tickets assigned to that user on a slow cadence and reports them as the
+# heartbeat's `jira` block. The hub's /board page merges every host's block into
+# one cross-org Kanban, keyed by siteKey (normalized site host) so several
+# agents sharing an org collapse to one board. Read-only by construction — the
+# only endpoint ever called is issue search. Unset env = feature off: zero Jira
+# HTTP calls, and the block heartbeats as available=False.
+JIRA_SITE = os.environ.get("JIRA_SITE", "").strip()
+JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "").strip()
+JIRA_TOKEN = os.environ.get("JIRA_TOKEN", "").strip()
+try:
+    JIRA_REFRESH_EVERY = int(os.environ.get("TURMA_JIRA_REFRESH_EVERY", "30"))
+except ValueError:
+    JIRA_REFRESH_EVERY = 30   # beats between polls (30 × 20s beat ≈ 10 min)
+JIRA_TIMEOUT_SEC = 15
+JIRA_PAGE_SIZE = 100    # /search/jql hard-caps maxResults at 100
+JIRA_MAX_ACTIVE = 150   # not-Done tickets reported (bounds the heartbeat)
+JIRA_MAX_DONE = 50      # recently-Done tickets reported
+JIRA_DONE_DAYS = 14     # how far back the Done column reaches
+JIRA_MAX_PAGES = 5      # hard bound on pagination per query
+
+# Full block schema even when off/unavailable, mirroring the github block's
+# contract: the hub always sees every field, never a partial dict.
+JIRA_EMPTY = {"available": False, "site": None, "siteKey": None, "user": None,
+              "fetchedAt": None, "error": None, "truncated": False, "tickets": []}
+
+# fields.status.statusCategory.key is one of Jira's three fixed, cross-org
+# categories — the only workflow facet guaranteed to unify orgs with different
+# status schemes, hence the board's column model.
+_JIRA_CATEGORY = {"new": "todo", "indeterminate": "inprogress", "done": "done"}
+
+
+def jira_configured():
+    return bool(JIRA_SITE and JIRA_EMAIL and JIRA_TOKEN)
+
+
+def normalize_jira_site(raw):
+    """A Jira site spec ('myorg.atlassian.net', 'https://MyOrg.atlassian.net/',
+    even a pasted board URL) -> the bare lowercase host, the cross-host
+    `siteKey` the hub dedupes boards on. '' when nothing host-like remains."""
+    r = (raw or "").strip()
+    r = re.sub(r"^[a-zA-Z][\w.+-]*://", "", r)   # scheme
+    r = re.sub(r"^[^/@]+@", "", r)               # credentials
+    r = r.split("/", 1)[0].split(":", 1)[0]      # path, port
+    return r.strip(".").lower()
+
+
+def jira_get(path, params):
+    """One authenticated GET against the configured Jira Cloud site, parsed
+    JSON out. Exceptions propagate — collect_jira()'s caller turns them into
+    the block's `error` (stale-cache fail-open)."""
+    site = normalize_jira_site(JIRA_SITE)
+    url = f"https://{site}{path}?{urllib.parse.urlencode(params)}"
+    auth = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Basic {auth}",
+        "Accept": "application/json",
+        # Explicit UA for parity with the hub POSTs (some edges 403 the
+        # default Python-urllib signature).
+        "User-Agent": "turma-agent/1.0",
+    })
+    with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _shape_issue(issue, site_key):
+    """One raw REST-v3 search issue -> the compact wire ticket the board
+    renders. Everything optional degrades to None/[] rather than raising."""
+    fields = issue.get("fields") or {}
+    key = issue.get("key") or ""
+    status = fields.get("status") or {}
+    category = ((status.get("statusCategory") or {}).get("key") or "").lower()
+
+    def name_of(field):
+        v = fields.get(field)
+        return (v or {}).get("name") if isinstance(v, dict) else None
+
+    project = fields.get("project") or {}
+    parent = fields.get("parent") or {}
+    labels = fields.get("labels")
+    return {
+        "key": key,
+        "url": f"https://{site_key}/browse/{key}",
+        "summary": (fields.get("summary") or "")[:200],
+        "status": status.get("name"),                 # org-specific name (pill)
+        "statusCategory": _JIRA_CATEGORY.get(category, "todo"),  # column
+        "priority": name_of("priority"),
+        "type": name_of("issuetype"),
+        "project": project.get("key"),
+        "projectName": project.get("name"),
+        "labels": labels[:5] if isinstance(labels, list) else [],
+        "updated": fields.get("updated"),
+        "created": fields.get("created"),
+        "dueDate": fields.get("duedate"),
+        "parentKey": parent.get("key"),
+    }
+
+
+def fetch_jira_issues(jql, max_issues):
+    """All issues matching a JQL, shaped, via GET /rest/api/3/search/jql —
+    the nextPageToken-paginated replacement for the removed (410 since 2025)
+    /rest/api/3/search. Returns (tickets, truncated): truncated means the cap
+    (or the page bound) cut the result short."""
+    site_key = normalize_jira_site(JIRA_SITE)
+    tickets, token = [], None
+    for _ in range(JIRA_MAX_PAGES):
+        params = {
+            "jql": jql,
+            "maxResults": min(JIRA_PAGE_SIZE, max_issues - len(tickets)),
+            "fields": "summary,status,priority,issuetype,updated,created,"
+                      "duedate,labels,project,parent",
+        }
+        if token:
+            params["nextPageToken"] = token
+        data = jira_get("/rest/api/3/search/jql", params)
+        for issue in data.get("issues") or []:
+            tickets.append(_shape_issue(issue, site_key))
+        token = data.get("nextPageToken")
+        if not token:
+            return tickets, False
+        if len(tickets) >= max_issues:
+            return tickets[:max_issues], True
+    return tickets[:max_issues], True
+
+
+def collect_jira():
+    """The heartbeat's `jira` block: the configured user's assigned tickets on
+    this host's org. Two separate queries — active work, and a bounded window
+    of recently-Done so that column is populated without growing forever —
+    with separate caps so neither can crowd the other out."""
+    if not jira_configured():
+        return dict(JIRA_EMPTY)
+    site_key = normalize_jira_site(JIRA_SITE)
+    active, trunc_active = fetch_jira_issues(
+        "assignee = currentUser() AND statusCategory != Done"
+        " ORDER BY updated DESC", JIRA_MAX_ACTIVE)
+    done, trunc_done = fetch_jira_issues(
+        "assignee = currentUser() AND statusCategory = Done"
+        f" AND updated >= -{JIRA_DONE_DAYS}d ORDER BY updated DESC",
+        JIRA_MAX_DONE)
+    return {
+        "available": True,
+        "site": site_key,
+        "siteKey": site_key,
+        "user": JIRA_EMAIL,
+        "fetchedAt": now_iso(),
+        "error": None,
+        "truncated": trunc_active or trunc_done,
+        "tickets": active + done,
+    }
+
+
 # --- Session activity summaries ------------------------------------------------
 # Optionally give each session a few-word "name" describing its task (e.g.
 # "Adding Compose Flag"), generated once at spawn from the initial prompt by the
@@ -2334,6 +2624,9 @@ class SessionManager:
         # view is heartbeated).
         self.github = {"available": False, "login": None, "repos": []}
         self.clones = {}
+        # Jira Cloud assigned-ticket block (refreshed on its own slow cadence,
+        # reported every beat; stays the empty shape on unconfigured hosts).
+        self.jira = dict(JIRA_EMPTY)
         # Recent per-repo prune results (merged branches + safe worktrees swept),
         # keyed by repo name, lingered briefly so the UI can show the summary.
         self.prunes = {}
@@ -3543,7 +3836,7 @@ class SessionManager:
                         continue
                     entries.append({
                         "uuid": entry.get("uuid"),
-                        "role": entry.get("type"),
+                        "role": _entry_role(entry),
                         "ts": entry.get("timestamp"),
                         "text": text or "",
                         "blocks": blocks or [],
@@ -3587,6 +3880,20 @@ class SessionManager:
         except Exception as e:
             log(f"github refresh failed: {e}")
             self.github = {"available": False, "login": None, "repos": []}
+
+    def refresh_jira(self):
+        """Refresh the cached Jira assigned-tickets block. Fail-open the
+        pr_status way, not the github-block way: a fetch error KEEPS the prior
+        tickets/fetchedAt and only records the error string, so a transient
+        Jira hiccup degrades the board to stale-but-shown (with the error
+        surfaced) rather than blanking it until the next slow beat."""
+        try:
+            self.jira = collect_jira()
+        except Exception as e:
+            log(f"jira refresh failed: {e}")
+            prev = dict(self.jira)
+            prev["error"] = str(e)[:200]
+            self.jira = prev
 
     def refresh_pr_status(self):
         """Refresh cached state + CI checks for the PRs live sessions opened, via
@@ -4235,7 +4542,7 @@ class SessionManager:
 
     def _reconcile_orphan_transcripts(self):
         """Adopt EVERY transcript sitting in PROJECTS_ROOT that no ledger entry
-        covers, so persistent usage/cost reflects every session on disk — not
+        covers, so persistent token usage reflects every session on disk — not
         only sessions in the live registry or the last-5 closed history that
         _backfill_ledger sees. A session killed long ago (its card gone, its
         worktree maybe surviving) or one predating _remember_usage would
@@ -4552,6 +4859,10 @@ class SessionManager:
         # gh calls); clone jobs are reaped every beat (cheap poll()s).
         if not light and beat % GITHUB_REFRESH_EVERY == 0:
             self.refresh_github()
+        # Jira assigned tickets on their own slow cadence; the configured()
+        # guard keeps unconfigured hosts at zero Jira HTTP calls forever.
+        if not light and beat % JIRA_REFRESH_EVERY == 0 and jira_configured():
+            self.refresh_jira()
         # PR state + CI checks for the links live sessions opened, on a faster
         # cadence than the github block so a card's merge/CI status stays live.
         if not light and beat % PR_STATUS_REFRESH_EVERY == 0:
@@ -4592,6 +4903,9 @@ class SessionManager:
             # GitHub clone-into-root: availability + clonable repos for the hub's
             # clone control, and any in-flight/recent clone jobs.
             "github": self.github,
+            # Jira Cloud assigned tickets (user-scoped creds); the hub's /board
+            # merges these across hosts by siteKey into one cross-org Kanban.
+            "jira": self.jira,
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),

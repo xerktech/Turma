@@ -15,7 +15,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
-import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -59,7 +59,7 @@ import com.xerktech.turma.vm.FleetViewModel
 @Composable
 fun FleetScreen(
     onOpenChat: (String, String) -> Unit,
-    onHistory: () -> Unit,
+    onUsage: () -> Unit,
     onArchive: () -> Unit,
     onSettings: () -> Unit,
     vm: FleetViewModel = viewModel(),
@@ -83,7 +83,7 @@ fun FleetScreen(
                 title = { Text("Turma") },
                 actions = {
                     IconButton(onClick = onArchive) { Icon(Icons.Filled.Search, "Search / archive") }
-                    IconButton(onClick = onHistory) { Icon(Icons.Filled.History, "History") }
+                    IconButton(onClick = onUsage) { Icon(Icons.Filled.BarChart, "Usage") }
                     IconButton(onClick = { vm.refresh() }) { Icon(Icons.Filled.Refresh, "Refresh") }
                     IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, "Settings") }
                 },
@@ -264,8 +264,12 @@ private fun SessionRow(session: SessionInfo, state: LiveState, onClick: () -> Un
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text("· ${liveStateLabel(state)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                session.usage?.today?.cost?.takeIf { it > 0 }?.let {
-                    Text("· $%.2f".format(it), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                session.usage?.today?.total?.takeIf { it > 0 }?.let {
+                    Text(
+                        "· ${fmtTokens(it)} today",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         }

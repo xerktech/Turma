@@ -13,8 +13,8 @@
 //      through that data channel. See the reverse-tunnel section below.
 //
 // It also pushes edge-triggered alerts to the self-hosted ntfy (grafana.yaml)
-// on the `agents` topic: container offline/recovered, crash loops, daily
-// cost threshold, turn finished / question waiting for input, and PR created.
+// on the `agents` topic: container offline/recovered, crash loops, turn
+// finished / question waiting for input, and PR created.
 // Set NTFY_URL (plus NTFY_USER/NTFY_PASS) to enable; unset disables alerts.
 //
 // stdlib only — no npm dependencies (the agent dials with Node's built-in
@@ -85,7 +85,6 @@ const NTFY_URL = (process.env.NTFY_URL || "").replace(/\/$/, "");
 const NTFY_TOPIC = process.env.NTFY_TOPIC || "agents";
 const NTFY_USER = process.env.NTFY_USER || "";
 const NTFY_PASS = process.env.NTFY_PASS || "";
-const COST_ALERT_USD = parseFloat(process.env.COST_ALERT_USD || "75");
 
 // ---- LiteLLM backend (OpenAI-compatible: Whisper STT) -----------------------
 // Whisper STT is served by a LiteLLM instance's `/v1` base: LITELLM_URL points
@@ -600,23 +599,6 @@ function heartbeatAlerts(key, prev, next) {
     }
   }
 
-  // Daily cost threshold (API-equivalent estimate), once per UTC day. Prefer the
-  // host-level `usage` block, which the agent aggregates from ALL transcripts —
-  // so killed/deleted sessions still count. Fall back to summing live sessions
-  // for agents that predate that block.
-  const cost = next.usage
-    ? (next.usage.today?.cost || 0)
-    : (next.sessions || []).reduce((sum, s) => sum + (s.usage?.today?.cost || 0), 0);
-  const day = new Date(now).toISOString().slice(0, 10);
-  if (cost >= COST_ALERT_USD && alerts.costDay !== day) {
-    alerts.costDay = day;
-    notify(`${key} cost alert`, `Est. $${cost.toFixed(2)} today (threshold $${COST_ALERT_USD})`, {
-      tags: "moneybag",
-      priority: "high",
-      route: { host: key },
-    });
-  }
-
   // Per-session events from each session's transcript probe. Bookkeeping is
   // nested per sessionId so questions/PRs/turns don't cross-fire between the
   // several Claude sessions a host runs at once.
@@ -686,8 +668,9 @@ setInterval(() => {
 }, 15 * 1000).unref();
 
 const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
-const HISTORY = fs.readFileSync(path.join(__dirname, "public", "history.html"));
+const USAGE = fs.readFileSync(path.join(__dirname, "public", "usage.html"));
 const SESSIONS = fs.readFileSync(path.join(__dirname, "public", "sessions.html"));
+const BOARD = fs.readFileSync(path.join(__dirname, "public", "board.html"));
 const LOGIN = fs.readFileSync(path.join(__dirname, "public", "login.html"));
 
 // Branded static assets: the shared stylesheet, self-hosted UI fonts (Inter +
@@ -703,6 +686,7 @@ const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 const STATIC_ASSETS = {
   "/app.css":              { body: fs.readFileSync(path.join(__dirname, "public", "app.css")),             type: "text/css; charset=utf-8",                  cache: "public, max-age=300" },
   "/chat.js":              { body: fs.readFileSync(path.join(__dirname, "public", "chat.js")),             type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
+  "/board.js":             { body: fs.readFileSync(path.join(__dirname, "public", "board.js")),            type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
   "/favicon.svg":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.svg")),         type: "image/svg+xml",                            cache: IMMUTABLE_CACHE },
   "/favicon.ico":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.ico")),         type: "image/x-icon",                             cache: IMMUTABLE_CACHE },
   "/favicon-16.png":       { body: fs.readFileSync(path.join(__dirname, "public", "favicon-16.png")),      type: "image/png",                                cache: IMMUTABLE_CACHE },
@@ -1189,14 +1173,28 @@ const server = http.createServer(async (req, res) => {
       return res.end(INDEX);
     }
 
-    if (req.method === "GET" && (url.pathname === "/history" || url.pathname === "/history.html")) {
+    if (req.method === "GET" && (url.pathname === "/usage" || url.pathname === "/usage.html")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      return res.end(HISTORY);
+      return res.end(USAGE);
+    }
+
+    // The page was /history until it dropped cost and became token-only. Keep
+    // old bookmarks and the Android client's deep links working.
+    if (req.method === "GET" && (url.pathname === "/history" || url.pathname === "/history.html")) {
+      res.writeHead(301, { Location: "/usage" });
+      return res.end();
     }
 
     if (req.method === "GET" && (url.pathname === "/sessions" || url.pathname === "/sessions.html")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       return res.end(SESSIONS);
+    }
+
+    // Unified Jira Kanban across every agent's org (the agents' `jira`
+    // heartbeat blocks; merging happens client-side in board.js).
+    if (req.method === "GET" && (url.pathname === "/board" || url.pathname === "/board.html")) {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(BOARD);
     }
 
     // Web font for the live terminal (referenced by the @font-face proxyTerm
@@ -1956,7 +1954,7 @@ if (process.env.TURMA_TEST) {
     console.log(`turma listening on :${PORT}`);
     console.log(
       NTFY_URL
-        ? `ntfy alerts -> ${NTFY_URL}/${NTFY_TOPIC} (cost threshold $${COST_ALERT_USD}/day)`
+        ? `ntfy alerts -> ${NTFY_URL}/${NTFY_TOPIC}`
         : "ntfy alerts disabled (NTFY_URL not set)"
     );
     console.log(
