@@ -2331,8 +2331,15 @@ JIRA_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
 
 # Full block schema even when off/unavailable, mirroring the github block's
 # contract: the hub always sees every field, never a partial dict.
-JIRA_EMPTY = {"available": False, "site": None, "siteKey": None, "user": None,
-              "fetchedAt": None, "error": None, "truncated": False, "tickets": []}
+#
+# `configured` is creds-present, which is NOT the same as `available` (a
+# successful poll). A host whose very first poll failed looks identical to an
+# unconfigured one on every other field — both are available=False/siteKey=None
+# — so this is the only thing that lets the hub aim a manual refresh at the
+# configured-but-failing host that most needs the retry.
+JIRA_EMPTY = {"available": False, "configured": False, "site": None,
+              "siteKey": None, "user": None, "fetchedAt": None, "error": None,
+              "truncated": False, "tickets": []}
 
 # fields.status.statusCategory.key is one of Jira's three fixed, cross-org
 # categories — the only workflow facet guaranteed to unify orgs with different
@@ -2342,6 +2349,15 @@ _JIRA_CATEGORY = {"new": "todo", "indeterminate": "inprogress", "done": "done"}
 
 def jira_configured():
     return bool(JIRA_SITE and JIRA_EMAIL and JIRA_TOKEN)
+
+
+def jira_empty():
+    """The off/never-polled block, stamped with whether creds are present. The
+    creds are read once at import, so `configured` is fixed for the process —
+    every later block (success or fail-open) carries it forward unchanged."""
+    block = dict(JIRA_EMPTY)
+    block["configured"] = jira_configured()
+    return block
 
 
 def normalize_jira_site(raw):
@@ -2439,7 +2455,7 @@ def collect_jira():
     of recently-Done so that column is populated without growing forever —
     with separate caps so neither can crowd the other out."""
     if not jira_configured():
-        return dict(JIRA_EMPTY)
+        return jira_empty()
     site_key = normalize_jira_site(JIRA_SITE)
     active, trunc_active = fetch_jira_issues(
         "assignee = currentUser() AND statusCategory != Done"
@@ -2450,6 +2466,7 @@ def collect_jira():
         JIRA_MAX_DONE)
     return {
         "available": True,
+        "configured": True,
         "site": site_key,
         "siteKey": site_key,
         "user": JIRA_EMAIL,
@@ -2778,9 +2795,10 @@ class SessionManager:
         # view is heartbeated).
         self.github = {"available": False, "login": None, "repos": []}
         self.clones = {}
-        # Jira Cloud assigned-ticket block (refreshed on its own slow cadence,
-        # reported every beat; stays the empty shape on unconfigured hosts).
-        self.jira = dict(JIRA_EMPTY)
+        # Jira Cloud assigned-ticket block (refreshed on its own slow cadence
+        # or on a hub `refreshJira` command, reported every beat; stays the
+        # empty shape on unconfigured hosts).
+        self.jira = jira_empty()
         # Recent per-repo prune results (merged branches + safe worktrees swept),
         # keyed by repo name, lingered briefly so the UI can show the summary.
         self.prunes = {}
@@ -4601,6 +4619,17 @@ class SessionManager:
                     self.clone(cmd.get("repo"))
                 elif ctype == "prune":
                     self.prune_repo(cmd.get("repo"))
+                elif ctype == "refreshJira":
+                    # The board's manual refresh. Re-checking configured() here
+                    # (the hub already targets configured hosts) keeps the
+                    # "unset env = zero Jira HTTP calls, ever" guarantee a
+                    # property of the agent rather than of hub-side targeting.
+                    # Runs inline like the scheduled poll it short-circuits, so
+                    # it costs the beat exactly what that poll already does, and
+                    # handle_commands' immediate follow-up beat carries the
+                    # fresh block straight back.
+                    if jira_configured():
+                        self.refresh_jira()
                 else:
                     log(f"unknown command type {ctype!r} (cmdId {cid})")
             except Exception as e:

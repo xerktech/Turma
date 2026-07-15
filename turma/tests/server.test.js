@@ -963,6 +963,72 @@ test("http: prune route queues a prune command per repo; validates host", async 
   assert.equal(ghost.status, 404);
 });
 
+test("http: jira refresh fans out to configured hosts only, and dedupes", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+
+  // Three shapes the fan-out has to tell apart: a healthy configured host, a
+  // configured host whose polls fail (available=false, siteKey=null — the one a
+  // manual retry is FOR), and a host with no Jira at all.
+  await beat({ device: "jok", jira: { configured: true, available: true, siteKey: "a.atlassian.net" } });
+  await beat({ device: "jerr", jira: { configured: true, available: false, siteKey: null, error: "HTTP Error 503" } });
+  await beat({ device: "joff", jira: { configured: false, available: false, siteKey: null } });
+
+  const ok = await request("POST", "/api/jira/refresh", { body: {}, headers: userHeaders });
+  assert.equal(ok.status, 200);
+  // Membership, not equality: the suite's agents map is shared, so other tests'
+  // hosts legitimately show up in a fleet-wide fan-out.
+  assert.ok(ok.body.hosts.includes("jok"), "healthy configured host targeted");
+  assert.ok(ok.body.hosts.includes("jerr"), "failing configured host targeted");
+  assert.ok(!ok.body.hosts.includes("joff"), "unconfigured host NOT targeted");
+  assert.ok(ok.body.queued.includes("jok") && ok.body.queued.includes("jerr"));
+
+  for (const host of ["jok", "jerr"]) {
+    const res = await beat({ device: host });
+    assert.deepEqual(
+      res.body.commands.map((c) => c.type), ["refreshJira"],
+      `${host} should hold exactly one refreshJira`);
+  }
+  // The unconfigured host is left alone entirely.
+  const off = await beat({ device: "joff" });
+  assert.deepEqual(off.body.commands, []);
+});
+
+test("http: jira refresh collapses a mashed button into one poll per host", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ device: "jmash", jira: { configured: true, available: true, siteKey: "a.atlassian.net" } });
+
+  const first = await request("POST", "/api/jira/refresh", { body: {}, headers: userHeaders });
+  assert.ok(first.body.queued.includes("jmash"));
+  // Second click while the first is still unacked: still reported as targeted,
+  // but nothing new queued — else each click costs a full re-poll.
+  const second = await request("POST", "/api/jira/refresh", { body: {}, headers: userHeaders });
+  assert.ok(second.body.hosts.includes("jmash"), "still targeted (a refresh is in flight)");
+  assert.ok(!second.body.queued.includes("jmash"), "but not re-queued");
+
+  const res = await beat({ device: "jmash" });
+  assert.equal(res.body.commands.filter((c) => c.type === "refreshJira").length, 1);
+});
+
+test("http: jira refresh targets pre-`configured` agents on siteKey alone", async () => {
+  // An agent predating the `configured` field reports only a siteKey; it must
+  // stay refreshable rather than silently dropping out of the fan-out.
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ device: "jold", jira: { available: true, siteKey: "old.atlassian.net" } });
+
+  const ok = await request("POST", "/api/jira/refresh", { body: {}, headers: userHeaders });
+  assert.ok(ok.body.hosts.includes("jold"));
+  const res = await beat({ device: "jold" });
+  assert.deepEqual(res.body.commands.map((c) => c.type), ["refreshJira"]);
+});
+
+test("http: jira refresh requires the user login", async () => {
+  const r = await request("POST", "/api/jira/refresh", { body: {} });
+  assert.equal(r.status, 401);
+});
+
 test("http: transcript-resume route queues a resumeTranscript command with the cwd hint", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });

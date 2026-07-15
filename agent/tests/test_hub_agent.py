@@ -1876,6 +1876,29 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.spawn.assert_not_called()
         sm.kill.assert_not_called()
 
+    def test_refresh_jira_command_polls_when_configured(self):
+        sm = self.make_manager()
+        sm.refresh_jira = mock.Mock()
+        sm.save = mock.Mock()
+        with mock.patch.object(ha, "jira_configured", return_value=True):
+            self.assertTrue(sm.handle_commands(
+                [{"cmdId": "j1", "type": "refreshJira"}]))
+        sm.refresh_jira.assert_called_once_with()
+        self.assertEqual(sm.acked, {"j1"})
+
+    def test_refresh_jira_command_is_a_noop_when_unconfigured(self):
+        # The "unset env = zero Jira HTTP calls, ever" guarantee has to hold
+        # even against a command an older/confused hub aimed at this host.
+        sm = self.make_manager()
+        sm.refresh_jira = mock.Mock()
+        sm.save = mock.Mock()
+        with mock.patch.object(ha, "jira_configured", return_value=False):
+            self.assertTrue(sm.handle_commands(
+                [{"cmdId": "j2", "type": "refreshJira"}]))
+        sm.refresh_jira.assert_not_called()
+        # Still acked — an unexecutable command must not redeliver forever.
+        self.assertEqual(sm.acked, {"j2"})
+
     def test_spawn_command_threads_composer_options(self):
         sm = self.make_manager()
         sm.spawn = mock.Mock()
@@ -4412,6 +4435,25 @@ class TestCollectJira(unittest.TestCase):
         get.assert_not_called()
         self.assertEqual(block, ha.JIRA_EMPTY)
         self.assertIsNot(block, ha.JIRA_EMPTY)   # a copy, never the shared dict
+        self.assertFalse(block["configured"])
+
+    def test_configured_flag_marks_creds_not_success(self):
+        # `configured` is what lets the hub aim the board's manual refresh at a
+        # host whose polls are FAILING — which reports available=False and is
+        # otherwise indistinguishable from a host with no Jira at all.
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "e@x.com"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "t"):
+            empty = ha.jira_empty()
+            self.assertTrue(empty["configured"])
+            self.assertFalse(empty["available"])  # creds != a successful poll
+
+            with mock.patch.object(ha, "fetch_jira_issues",
+                                   return_value=([], False)):
+                block = ha.collect_jira()
+        self.assertTrue(block["configured"])
+        self.assertTrue(block["available"])
+
 
     def test_configured_issues_both_queries(self):
         jqls = []
@@ -4735,6 +4777,23 @@ class TestRefreshJira(ManagerMixin, unittest.TestCase):
         self.assertTrue(sm.jira["error"].startswith("boom"))
         self.assertLessEqual(len(sm.jira["error"]), 200)
 
+    def test_failed_first_poll_still_reports_configured(self):
+        # The regression the board's manual refresh depends on: a host whose
+        # very FIRST poll fails must still advertise configured=True, or the hub
+        # filters it out of the fan-out and the button can never retry the one
+        # host that's actually broken. (This is the real 503-at-boot case.)
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "e@x.com"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "t"):
+            sm = self.make_manager()
+            with mock.patch.object(ha, "collect_jira",
+                                   side_effect=RuntimeError("HTTP Error 503")):
+                sm.refresh_jira()
+        self.assertTrue(sm.jira["configured"])
+        self.assertFalse(sm.jira["available"])   # indistinguishable from "off"...
+        self.assertIsNone(sm.jira["siteKey"])    # ...on every field but the flag
+        self.assertIn("503", sm.jira["error"])
+
     def test_success_after_failure_clears_error(self):
         sm = self.make_manager()
         sm.jira = {**ha.JIRA_EMPTY, "error": "old failure"}
@@ -4764,14 +4823,22 @@ class TestRefreshJira(ManagerMixin, unittest.TestCase):
         self.assertEqual(payload["jira"], sm.jira)
 
     def test_payload_skips_refresh_when_unconfigured(self):
-        sm = self.make_manager()
-        sm.registry = []
-        calls = []
-        sm.refresh_jira = lambda: calls.append(1)
-        with mock.patch.object(ha, "JIRA_SITE", ""):
+        # The manager is built INSIDE the patch: the block's `configured` flag
+        # is stamped at init from the creds, so a host is only genuinely
+        # unconfigured if it was unconfigured when it started. (Constructing it
+        # outside also leaks the ambient JIRA_* env of whatever box runs the
+        # suite — a real agent container has creds.)
+        with mock.patch.object(ha, "JIRA_SITE", ""), \
+             mock.patch.object(ha, "JIRA_EMAIL", ""), \
+             mock.patch.object(ha, "JIRA_TOKEN", ""):
+            sm = self.make_manager()
+            sm.registry = []
+            calls = []
+            sm.refresh_jira = lambda: calls.append(1)
             payload = sm.build_payload(0)
         self.assertEqual(calls, [])                       # zero Jira work
         self.assertEqual(payload["jira"], ha.JIRA_EMPTY)  # block still present
+        self.assertFalse(payload["jira"]["configured"])
 
 
 if __name__ == "__main__":

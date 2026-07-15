@@ -26,7 +26,13 @@
       <a href="#" class="signout" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;">Sign out</a>
     </nav>
   </header>
-  <div class="org-chips" id="chips"></div>
+  <div class="board-bar">
+    <div class="org-chips" id="chips"></div>
+    <button id="refresh" class="board-refresh" title="Re-poll Jira on every connected host now">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+      <span id="refreshLabel">Refresh</span>
+    </button>
+  </div>
   <div id="board"></div>
   <div class="td-backdrop" id="detailBackdrop" hidden>
     <div class="td-panel" id="detailPanel" role="dialog" aria-modal="true" aria-label="Ticket detail"></div>
@@ -75,6 +81,10 @@ function esc(s) { return B.esc(s); }
 let lastSites = [], lastAllKeys = [];
 
 function render(data) {
+  // Ahead of the empty-board early-return below, so a refresh still resolves on
+  // a fleet whose blocks are all unavailable (hoisted; `pending` is live by the
+  // time anything renders).
+  checkRefreshDone();
   const sites = B.mergeSites(data.agents || []);
   lastSites = sites; lastAllKeys = sites.map(s => s.siteKey);
   if (!sites.length) {
@@ -205,6 +215,65 @@ $board.addEventListener("keydown", (e) => {
 $panel.addEventListener("click", (e) => { if (e.target.closest(".td-close")) closeDetail(); });
 $backdrop.addEventListener("click", (e) => { if (e.target === $backdrop) closeDetail(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && openTicketState) closeDetail(); });
+
+// --- Manual refresh ---------------------------------------------------------
+// The board is a merge of every host's Jira block, so the button re-polls the
+// whole fleet (POST /api/jira/refresh queues a refreshJira per configured
+// host). The round trip is queue -> agent's next beat -> Jira -> beat back, so
+// instead of guessing a delay we hold the busy state until the fleet's records
+// say it actually ran; render() calls back in as SSE/poll deliver them.
+const $refresh = document.getElementById("refresh");
+const $refreshLabel = document.getElementById("refreshLabel");
+const REFRESH_TIMEOUT_MS = 45000;
+let pending = null; // { hosts, mark, saw, timer } while a refresh is in flight
+
+function setRefresh(busy, label) {
+  $refresh.classList.toggle("busy", busy);
+  $refresh.disabled = busy;
+  $refreshLabel.textContent = label;
+}
+
+function endRefresh(label) {
+  if (pending) { clearTimeout(pending.timer); pending = null; }
+  setRefresh(false, label);
+  // Let the outcome sit long enough to read, then go back to a plain button —
+  // unless another refresh has since started.
+  if (label !== "Refresh") {
+    setTimeout(() => { if (!pending) setRefresh(false, "Refresh"); }, 2500);
+  }
+}
+
+function checkRefreshDone() {
+  if (!pending || !cache) return;
+  const list = cache.agents || [];
+  if (B.jiraRefreshPending(list, pending.hosts)) { pending.saw = true; return; }
+  // Done when either we watched the command land and clear, or — if the ack
+  // beat us to the first render and we never caught it in flight — the
+  // freshness watermark moved. Together these close the race in both
+  // directions; the timeout covers a host that simply never beats.
+  if (!pending.saw && B.newestFetchedAt(list) <= pending.mark) return;
+  endRefresh(B.jiraRefreshFailed(list, pending.hosts) ? "Refresh failed" : "Updated");
+}
+
+$refresh.addEventListener("click", async () => {
+  if (pending) return;
+  const mark = cache ? B.newestFetchedAt(cache.agents || []) : "";
+  setRefresh(true, "Refreshing…");
+  let r;
+  try { r = await fetch("/api/jira/refresh", { method: "POST" }); }
+  catch { return void endRefresh("Refresh failed"); }
+  if (r.status === 401) return void (location.href = "/login");
+  if (!r.ok) return void endRefresh("Refresh failed");
+  let body = {};
+  try { body = await r.json(); } catch { /* fall through to the host check */ }
+  const hosts = body.hosts || [];
+  // No Jira-configured host: nothing will ever land, so say so now rather than
+  // spin for the full timeout.
+  if (!hosts.length) return void endRefresh("No Jira hosts");
+  pending = { hosts, mark, saw: false,
+              timer: setTimeout(() => endRefresh("Timed out"), REFRESH_TIMEOUT_MS) };
+  checkRefreshDone(); // a beat may have landed during the round trip
+});
 
 let cache = null, etag = null;
 async function refresh() {
