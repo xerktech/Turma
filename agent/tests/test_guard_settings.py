@@ -34,6 +34,19 @@ class TestGuardSettings(unittest.TestCase):
         self.assertIn("Edit(~/.claude/**)", deny)
         self.assertIn("Write(~/.aws/**)", deny)
 
+    def test_denies_cloud_cli_credential_writes(self):
+        # The cloud CLIs the image bundles authenticate off the HOST's mounted
+        # stores, so the agent editing one out from under the operator breaks
+        # every other session on the box, not just its own.
+        deny = ha.build_guard_settings()["permissions"]["deny"]
+        for rule in (
+            "Edit(~/.azure/**)",
+            "Write(~/.azure/**)",
+            "Edit(~/.terraform.d/**)",
+            "Write(~/.terraform.d/**)",
+        ):
+            self.assertIn(rule, deny)
+
     def test_guard_script_path_points_at_bundled_hook(self):
         path = ha.guard_script_path()
         self.assertTrue(path.endswith(os.path.join("hooks", "guard.py")))

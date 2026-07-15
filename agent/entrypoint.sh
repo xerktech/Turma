@@ -103,7 +103,8 @@ else
   # after the first boot this is a scan that finds nothing. -h so a symlink is
   # retargeted rather than followed out of the tree.
   echo "[entrypoint] identity: ${RUN_USER}(${PUID}:${PGID}) — reclaiming root-owned leftovers..."
-  for p in "$REPOS_ROOT" /root/.claude /root/.claude.json /root/.turma; do
+  for p in "$REPOS_ROOT" /root/.claude /root/.claude.json /root/.turma \
+           /root/.aws /root/.azure /root/.terraform.d; do
     [ -e "$p" ] || continue
     find "$p" -uid 0 -exec chown -h "$PUID:$PGID" {} + 2>/dev/null || true
   done
@@ -178,6 +179,73 @@ if command -v gh >/dev/null 2>&1; then
     echo "[entrypoint]     docker exec -it $(hostname) gh auth login --hostname github.com"
   fi
 fi
+
+# --- Cloud CLI creds preflight (agent-agnostic) ----------------------------
+# terraform, az and aws are installed in every image, but their credentials are
+# the HOST's, reused through bind mounts exactly like claude (/root/.claude) and
+# gh (/root/.config/gh):
+#   /root/.aws          aws  — config + credentials
+#   /root/.azure        az   — azureProfile.json + the MSAL token cache
+#   /root/.terraform.d  terraform — credentials.tfrc.json (Terraform Cloud)
+# A host with none of them mounted is a SUPPORTED configuration, not an error:
+# the CLIs stay on PATH and unauthenticated, which is all a host that never
+# touches a cloud needs. So this block only ever logs — it is not fatal, it
+# creates nothing, and it must never idle the container the way the claude
+# preflight above does, because a missing ~/.azure says nothing about whether
+# this host can run sessions.
+#
+# Deliberately a presence check rather than `aws sts get-caller-identity` /
+# `az account show`: those are slow (the aws one is a network round trip with
+# its own retry budget) and would tax boot on every host — most of them — to
+# report what the mount's absence already says. A stale/expired token is the
+# CLI's problem to report at the point of use, in the session, where the agent
+# can actually see the error and re-login.
+env_creds_set() {
+  for v in "$@"; do
+    eval "val=\${$v:-}"
+    [ -n "$val" ] && return 0
+  done
+  return 1
+}
+
+# cloud_creds <label> <cli> <store> <marker>... — report where (if anywhere)
+# this CLI's credentials come from. Silent for a CLI that isn't installed, so an
+# image that drops one doesn't log about it.
+#
+# Keyed on a marker FILE that only a real login leaves behind, never on the store
+# directory existing: each CLI creates its OWN store the first time it runs at
+# all. `az version` alone writes a whole /root/.azure — including an empty
+# azureProfile.json, which is why even that isn't a marker — and `terraform
+# version` writes /root/.terraform.d. So on any host where a session has ever run
+# one of these, a directory check reports creds that aren't there.
+cloud_creds() {
+  label="$1"; cli="$2"; store="$3"; shift 3
+  command -v "$cli" >/dev/null 2>&1 || return 0
+  for marker in "$@"; do
+    if [ -e "$marker" ]; then
+      echo "[entrypoint] ${label}: host creds mounted at ${store}"
+      return 0
+    fi
+  done
+  echo "[entrypoint] ${label}: installed; no creds on this device (${store}) — ignoring"
+}
+
+# aws also authenticates straight from AWS_* env creds with no ~/.aws at all, so
+# a host set up that way must not be reported as credential-less. az has no
+# equivalent (its env vars only feed `az login --service-principal`, an explicit
+# command) and terraform's Terraform Cloud token can also arrive as a
+# TF_TOKEN_<host> var whose name is per-host and so not probed here. Provider
+# creds (AWS_*, ARM_*) are the provider's business, not ours.
+if command -v aws >/dev/null 2>&1 \
+   && env_creds_set AWS_ACCESS_KEY_ID AWS_PROFILE AWS_ROLE_ARN; then
+  echo "[entrypoint] aws: credentials from the environment"
+else
+  cloud_creds "aws" aws /root/.aws /root/.aws/credentials /root/.aws/config
+fi
+cloud_creds "az" az /root/.azure \
+  /root/.azure/msal_token_cache.json /root/.azure/service_principal_entries.json
+cloud_creds "terraform" terraform /root/.terraform.d \
+  /root/.terraform.d/credentials.tfrc.json
 
 # --- Host identity (agent-agnostic) ----------------------------------------
 # The hub keys each agent by its physical host name (device). A container can't

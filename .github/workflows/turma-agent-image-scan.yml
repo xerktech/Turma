@@ -30,7 +30,8 @@ permissions:
 jobs:
   scan:
     # Self-hosted: builds the agent image to scan it. Even the slim tooling tier is
-    # ~3.1 GB and lands on disk several times over (snapshot + tar + Trivy scratch).
+    # ~4.1 GB (it carries the cloud CLIs — see agent/Dockerfile) and lands on disk
+    # several times over (snapshot + tar + Trivy scratch).
     runs-on: [self-hosted, linux]
     timeout-minutes: 30
     env:
