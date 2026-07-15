@@ -115,6 +115,10 @@ RESUMABLE_PER_REPO = 15
 # traceable to its repo long after the session (and even its worktree) is gone.
 # This is what makes host/repo usage persist regardless of active sessions.
 USAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "repo-usage.json")
+# Cached Jira-ticket -> repo triage decisions, keyed by "<siteKey>/<issueKey>".
+# Persisted so a triaged board survives a manager restart without re-running the
+# model over every ticket. See the "Jira -> repo triage" section.
+TRIAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-repos.json")
 # Where Claude Code keeps per-project transcript JSONLs (slug = cwd via
 # _project_slug below). Overridable so the test suite can point it at
 # fixtures; unset in production, so the default is the real path.
@@ -2662,6 +2666,286 @@ def fetch_jira_issue(key):
     return _shape_issue_detail(data, site_key)
 
 
+# --- Jira -> repo triage -------------------------------------------------------
+# Guess WHICH REPO each assigned ticket's work belongs in, so the board card can
+# say where a ticket would be worked. Like the session summaries below, this runs
+# on the container's already-authenticated `claude` in headless print mode (Haiku
+# by default) — the mounted login, so no external API, key, or cost env — as a
+# detached subprocess reaped on later beats.
+#
+# It runs on the AGENT rather than the hub because this host is the only place
+# the three inputs meet: the Jira creds (hence the tickets), the scanned repos in
+# REPOS_ROOT, and the `gh` sweep of clonable repos. That colocation is also what
+# enforces "same org": only the host holding an org's Jira creds ever classifies
+# that org's tickets, so a ticket can only ever be matched to a repo that host can
+# actually reach. Candidates are its cloned repos (preferred — see the prompt)
+# plus everything its gh login can clone, so an uncloned repo is still selectable.
+#
+# The model picks from a fixed candidate list and its answer is validated back
+# against that list (_parse_triage): a name that isn't a candidate is DROPPED, not
+# rendered. Nothing here is trusted into a shell, a path, or a URL — the guess is
+# presentational, and the board never acts on it.
+#
+# Triage is cached in a ledger (~/.turma/jira-repos.json) keyed by site+issue, so
+# it runs ONCE per ticket rather than per beat: re-triage only when the ticket's
+# own text changes or the candidate repo set does (cloning a repo should let it
+# win a ticket it's a better fit for). The candidate fingerprint deliberately
+# hashes only repo NAMES — the gh block's `updatedAt` churns constantly and would
+# otherwise re-triage the whole board on every sweep.
+JIRA_TRIAGE_MODEL = os.environ.get("JIRA_TRIAGE_MODEL", "haiku").strip() or "haiku"
+try:
+    JIRA_TRIAGE_TIMEOUT_SEC = int(os.environ.get("JIRA_TRIAGE_TIMEOUT_SEC", "120"))
+except ValueError:
+    JIRA_TRIAGE_TIMEOUT_SEC = 120
+JIRA_TRIAGE_BATCH = 25          # tickets per `claude -p` call (one call in flight)
+JIRA_TRIAGE_CANDIDATES = 200    # candidate repos shown to the model (bounds the prompt)
+JIRA_TRIAGE_MAX_ATTEMPTS = 3    # tries before a ticket stays unclassified for good
+JIRA_TRIAGE_BACKOFF_SEC = 300   # base gap between tries; grows with the try count
+JIRA_TRIAGE_REASON_MAX = 120    # per-ticket rationale kept (a card tooltip, not an essay)
+JIRA_TRIAGE_LEDGER_MAX = 500    # ledger entries kept (bounds the file)
+JIRA_TRIAGE_INSTRUCTION = (
+    "You are triaging Jira tickets to the code repository each one's work "
+    "belongs in.\n\n"
+    "Rules:\n"
+    "- Choose ONLY from the candidate repositories listed below. Never invent a "
+    "name.\n"
+    "- Prefer a repository marked [cloned] when it fits the ticket as well as an "
+    "uncloned one; pick an uncloned one when it is a clearly better fit.\n"
+    "- If no repository plausibly fits (for example a pure design, meeting, or "
+    "access-request ticket), use null. Do not guess.\n\n"
+    "Reply with ONLY a JSON object mapping each ticket key to either null or "
+    '{\"repo\": \"<exact candidate name>\", \"why\": \"<max 12 words>\"}. '
+    "No markdown fences, no preamble.\n\n"
+)
+
+
+def _triage_candidates(repos, github):
+    """The repos a ticket on this host may be matched to: its cloned repos first
+    (they carry `cloned`, which the prompt tells the model to prefer), then every
+    repo its gh login can clone. Deduped by repo name — a cloned repo and its gh
+    listing are the same repo, and the cloned copy is the one worth preferring.
+
+    Keyed on the bare repo NAME (not owner/repo) because that is what the board
+    shows and what a scanned REPOS_ROOT dir is called; a name collision across two
+    owners collapses to the first, which is the cloned one when there is one.
+
+    A cloned repo INHERITS its gh listing's description and owner rather than
+    shadowing them: the scan knows a repo's name and nothing else, so dropping the
+    gh half would leave the candidates the prompt says to PREFER as bare names —
+    describing worst exactly the repos most likely to win.
+
+    The gh tail is sorted by name, not left in gh's `updatedAt` order, because it
+    is about to be truncated: an updatedAt-ordered cut makes the surviving NAME set
+    move whenever anyone pushes to a cold repo, which would defeat
+    _candidates_fingerprint's whole reason for hashing names only and re-triage the
+    board every gh sweep."""
+    by_name = {}
+    for r in github or []:
+        nwo = (r or {}).get("nameWithOwner") or ""
+        name = (r or {}).get("name") or nwo.split("/")[-1]
+        if name and name not in by_name:
+            by_name[name] = r
+    out, seen = [], set()
+    for r in repos or []:
+        name = (r or {}).get("name")
+        if not name or name == ROOT_REPO_NAME or name in seen:
+            continue
+        seen.add(name)
+        gh = by_name.get(name) or {}
+        out.append({"name": name, "cloned": True,
+                    "nameWithOwner": gh.get("nameWithOwner") or None,
+                    "description": (gh.get("description") or "")[:120]})
+    for name in sorted(by_name):
+        if name in seen:
+            continue
+        seen.add(name)
+        r = by_name[name]
+        out.append({"name": name, "cloned": False,
+                    "nameWithOwner": r.get("nameWithOwner") or None,
+                    "description": (r.get("description") or "")[:120]})
+    return out[:JIRA_TRIAGE_CANDIDATES]
+
+
+def _triage_fingerprint(parts):
+    """A stable fingerprint for cache invalidation. crc32 for the same reason
+    _usage_slot uses it — the builtin hash is salted per process and would
+    invalidate the whole ledger on every restart."""
+    return zlib.crc32("\x00".join(parts).encode()) & 0xFFFFFFFF
+
+
+def _ticket_fingerprint(t):
+    """Changes when the text a triage decision was made FROM changes. Deliberately
+    not `updated`, which moves on any field edit (a status transition, an assignee
+    change) and would re-triage a ticket whose description never moved."""
+    labels = (t or {}).get("labels")
+    return _triage_fingerprint([
+        str((t or {}).get("summary") or ""),
+        str((t or {}).get("type") or ""),
+        str((t or {}).get("project") or ""),
+        ",".join(labels) if isinstance(labels, list) else "",
+    ])
+
+
+def _candidates_fingerprint(cands):
+    """Changes when the repos on offer change — names and cloned-ness only. NOT
+    descriptions or gh's `updatedAt`, which churn on their own and would re-triage
+    every ticket on the board for no new information."""
+    return _triage_fingerprint(
+        sorted(f"{c['name']}:{int(bool(c.get('cloned')))}" for c in cands))
+
+
+def _triage_key(site_key, issue_key):
+    return f"{site_key or ''}/{issue_key}"
+
+
+# A ledger entry holds two independent things, and keeping them apart is what
+# makes the cache safe:
+#
+#   the DECISION   — repo/cloned/nameWithOwner/reason/at, plus ticketFp/candFp
+#                    recording the question it ANSWERS.
+#   the ATTEMPT RUN — attempts/retryAt, plus tryTicketFp/tryCandFp recording the
+#                    question currently being ASKED.
+#
+# They were originally one blob, and the two bugs that produced are worth
+# remembering: starting an attempt overwrote the decision, so an unrelated
+# transient (a `gh` hiccup blanking the repo list) blanked every repo chip on the
+# board until a replacement landed; and the attempt counter, never reset, made
+# three invalidations spread over a ticket's whole life a PERMANENT ban on
+# re-triaging it — the exact opposite of what invalidation exists for.
+
+def _triage_stale(entry, ticket_fp, cand_fp):
+    """True when an entry's decision doesn't answer the question now being asked —
+    never decided, decided from different ticket text, or decided against a
+    different candidate set. Stale means "re-triage this"; it does NOT mean "stop
+    showing it". The old answer keeps rendering until a new one lands, because a
+    slightly outdated repo chip beats a board that blanks whenever a repo is
+    cloned or a gh sweep stumbles."""
+    if not isinstance(entry, dict) or not entry.get("decided"):
+        return True
+    return entry.get("ticketFp") != ticket_fp or entry.get("candFp") != cand_fp
+
+
+def _triage_attempts(entry, ticket_fp, cand_fp):
+    """How many attempts have been spent on the question currently being asked.
+
+    Scoped to the question rather than to the ticket's lifetime: a changed ticket
+    or candidate set is a NEW question, and it gets a fresh budget. A lifetime
+    counter would let three invalidations spaced months apart disqualify a ticket
+    from ever being triaged again, freezing a now-wrong chip on the board for
+    good."""
+    if not isinstance(entry, dict):
+        return 0
+    if entry.get("tryTicketFp") != ticket_fp or entry.get("tryCandFp") != cand_fp:
+        return 0    # the attempts on record were spent answering something else
+    n = entry.get("attempts")
+    return n if isinstance(n, int) else 0
+
+
+def _triage_prompt(tickets, cands):
+    """The candidate list + the ticket list, as text. Ticket text is DATA here: it
+    reaches `claude -p` as a single argv element (no shell), the model's reply is
+    allowlist-checked against `cands`, and the result is only ever rendered as a
+    chip — so a ticket summary carrying prompt-injection text can at worst make a
+    card name the wrong candidate repo."""
+    lines = [JIRA_TRIAGE_INSTRUCTION, "Candidate repositories:"]
+    for c in cands:
+        mark = " [cloned]" if c.get("cloned") else ""
+        desc = f" — {c['description']}" if c.get("description") else ""
+        lines.append(f"- {c['name']}{mark}{desc}")
+    lines.append("\nTickets:")
+    for t in tickets:
+        bits = [f"- {t.get('key')}: {t.get('summary') or ''}"]
+        if t.get("type"):
+            bits.append(f"(type: {t['type']})")
+        if t.get("project"):
+            bits.append(f"(project: {t['project']})")
+        labels = t.get("labels")
+        if isinstance(labels, list) and labels:
+            bits.append(f"(labels: {', '.join(labels)})")
+        lines.append(" ".join(bits))
+    return "\n".join(lines)
+
+
+def _extract_json_object(raw):
+    """The outermost {...} in a model reply, parsed. `claude -p` is asked for bare
+    JSON but will sometimes wrap it in prose or a ```json fence; slicing to the
+    outermost braces handles both without a fence-stripping special case."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _parse_triage(raw, tickets, cands):
+    """Model reply -> {issueKey: {repo, cloned, nameWithOwner, reason}}, where
+    repo is None for "no repo fits".
+
+    This is the trust boundary, and it draws a sharp line between the model's two
+    very different kinds of non-answer:
+
+    - An EXPLICIT null is a verdict. It was asked for, it means "no repo fits", and
+      it becomes a decision the board renders as the muted "no repo" chip.
+    - Anything unreadable — a value whose shape we can't parse, or a repo name that
+      isn't on the candidate list (a hallucination; the model is choosing from a
+      list, so off-list is definitionally made up) — is a FAILED ATTEMPT. Its key
+      is simply omitted, leaving the ticket undecided so the caller's retry picks
+      it up.
+
+    Conflating the two is the trap: recording a garbled reply as "no repo fits"
+    would paint a confident chip asserting something the model never said, and —
+    because a decision is never re-triaged — leave it there for good. A key that
+    wasn't asked about is ignored outright. An entirely unusable reply returns {},
+    which the caller likewise counts as a failed attempt."""
+    data = _extract_json_object(raw)
+    if data is None:
+        return {}
+    by_name = {c["name"]: c for c in cands}
+    asked = {t.get("key") for t in tickets}
+    decline = {"repo": None, "cloned": False, "nameWithOwner": None, "reason": ""}
+    out = {}
+    for key, val in data.items():
+        if key not in asked:
+            continue
+        if val is None:
+            out[key] = dict(decline)   # the model was asked for null and meant it
+            continue
+        why = ""
+        if isinstance(val, dict):
+            if "repo" not in val:
+                continue      # unreadable shape -> no answer for this ticket
+            name = val.get("repo")
+            why = str(val.get("why") or "")[:JIRA_TRIAGE_REASON_MAX]
+        elif isinstance(val, str):
+            name = val        # tolerate a bare "KEY": "repo" reply
+        else:
+            continue          # a list/number is not an answer we can read
+        if name is None:
+            out[key] = dict(decline)   # explicit {"repo": null}
+            continue
+        cand = by_name.get(name) if isinstance(name, str) else None
+        if cand is None:
+            # A name that isn't on the list is a BROKEN attempt, not a verdict of
+            # "no repo fits" — recording it as the latter would render a confident
+            # muted chip that is never revisited. Omitting the key leaves the
+            # ticket undecided, so the caller's retry picks it back up.
+            log(f"triage: dropping non-candidate repo {name!r} for {key}")
+            continue
+        out[key] = {
+            "repo": cand["name"],
+            "cloned": bool(cand.get("cloned")),
+            "nameWithOwner": cand.get("nameWithOwner"),
+            "reason": why,
+        }
+    return out
+
+
 # --- Session activity summaries ------------------------------------------------
 # Optionally give each session a few-word "name" describing its task (e.g.
 # "Adding Compose Flag"), generated once at spawn from the initial prompt by the
@@ -2856,6 +3140,16 @@ class SessionManager:
         # + its output file live here; the finished text lands on the session
         # record). Empty when no session has a prompt to summarize.
         self.summaries = {}
+        # Cached Jira-ticket -> repo triage decisions (persisted), plus the single
+        # in-flight triage subprocess. At most one runs at a time: a backlog
+        # trickles out a batch per jira beat rather than forking N models at once
+        # against the one shared login. Both stay empty on unconfigured hosts.
+        self.triage_ledger = self._load_triage_ledger()
+        self.triage_job = None
+        # Last SUCCESSFUL gh repo sweep, held so a failed one (which blanks the
+        # github block to repos:[]) can't be mistaken for an empty org — see
+        # _start_jira_triage.
+        self.triage_gh_repos = []
         # at-least-once command de-dup: cmdIds we've already executed.
         self.acked = set()
         self.acked_order = deque(maxlen=1000)
@@ -2880,6 +3174,259 @@ class SessionManager:
                 os.replace(tmp, path)
         except OSError as e:
             log(f"registry save failed: {e}")
+
+    # --- Jira -> repo triage ----------------------------------------------
+
+    def _load_triage_ledger(self):
+        try:
+            with open(TRIAGE_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_triage_ledger(self):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = TRIAGE_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.triage_ledger, f, indent=2)
+            os.replace(tmp, TRIAGE_LEDGER_PATH)
+        except OSError as e:
+            log(f"triage ledger save failed: {e}")
+
+    def _triage_due(self, tickets, cand_fp, now, site_key):
+        """The tickets wanting a decision right now: stale, attempts left, and
+        past the backoff a previous failed attempt set. Bounded to one batch —
+        the rest come back on later beats."""
+        due = []
+        for t in tickets:
+            key = t.get("key")
+            if not key:
+                continue
+            entry = self.triage_ledger.get(_triage_key(site_key, key))
+            tfp = _ticket_fingerprint(t)
+            if not _triage_stale(entry, tfp, cand_fp):
+                continue
+            attempts = _triage_attempts(entry, tfp, cand_fp)
+            if attempts >= JIRA_TRIAGE_MAX_ATTEMPTS:
+                continue
+            # The backoff is only this question's to enforce; `attempts` is 0 when
+            # the retryAt on record was armed answering a different one.
+            if attempts and now < (entry.get("retryAt") or 0):
+                continue
+            due.append(t)
+            if len(due) >= JIRA_TRIAGE_BATCH:
+                break
+        return due
+
+    def _start_jira_triage(self):
+        """Kick off one batch of Jira ticket -> repo triage as a DETACHED
+        `claude -p` reaped by _poll_jira_triage. No-op when a job is already in
+        flight, when Jira is off, when there are no candidate repos, or when every
+        ticket already has a fresh decision — so a settled board costs nothing."""
+        if self.triage_job is not None or not jira_configured():
+            return
+        tickets = self.jira.get("tickets") or []
+        if not tickets:
+            return
+        # refresh_github blanks the block to repos:[] on ANY error, which on this
+        # field alone is indistinguishable from "the org has no repos". Triaging
+        # against that would drop every uncloned candidate, restale every ticket,
+        # and re-run the whole board through the model twice — once when gh
+        # stumbles and again when it recovers. So only a SUCCESSFUL sweep updates
+        # the candidate repos; otherwise the last good list stands. A host with no
+        # gh at all never sets it and triages against its cloned repos, which is
+        # the correct candidate set for that host.
+        gh = self.github or {}
+        if gh.get("available"):
+            self.triage_gh_repos = list(gh.get("repos") or [])
+        cands = _triage_candidates(self._triage_repos(), self.triage_gh_repos)
+        if not cands:
+            return  # nothing to choose from; leave the tickets untriaged
+        cand_fp = _candidates_fingerprint(cands)
+        site_key = self.jira.get("siteKey")
+        batch = self._triage_due(tickets, cand_fp, time.time(), site_key)
+        if not batch:
+            return
+        out_path = os.path.join(REGISTRY_DIR, "jira-triage.out")
+        outf = None
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            outf = open(out_path, "w")
+            # Same posture as _start_summary: headless, cwd is REGISTRY_DIR (NOT a
+            # repo) and no --settings, so it never loads the session guard or
+            # explores a worktree — it decides from the candidate list in the
+            # prompt alone. The command is a list (no shell), so ticket text can't
+            # inject, and _poll_jira_triage's timeout backstops a hang.
+            proc = subprocess.Popen(
+                ["claude", "-p", "--model", JIRA_TRIAGE_MODEL,
+                 _triage_prompt(batch, cands)],
+                stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+            )
+        except Exception as e:
+            log(f"jira triage launch failed: {e}")
+            if outf is not None:
+                try:
+                    outf.close()
+                except Exception:
+                    pass
+            self._spend_triage_attempts(batch, cand_fp, site_key)
+            return
+        self.triage_job = {
+            "proc": proc, "outf": outf, "outPath": out_path,
+            "startedMono": time.time(), "batch": batch, "cands": cands,
+            "candFp": cand_fp,
+            # Pinned rather than re-read at reap time: the ledger key a decision
+            # lands under must be the one its attempt was counted under, and a job
+            # outlives the beat that started it.
+            "siteKey": site_key,
+        }
+        self._spend_triage_attempts(batch, cand_fp, site_key)
+        log(f"triaging {len(batch)} jira ticket(s) to repos via claude -p "
+            f"({JIRA_TRIAGE_MODEL}), {len(cands)} candidates")
+
+    def _spend_triage_attempts(self, batch, cand_fp, site_key):
+        """Count an attempt against each ticket in a batch and arm its backoff.
+        Armed up-front like _spend_summary_attempt: if the manager dies mid-batch
+        the job dies with it, and the persisted count is what makes the reload
+        retry once rather than loop.
+
+        Touches ONLY the attempt-run fields. Any decision already on the entry is
+        left intact and keeps rendering while this attempt runs — it is the best
+        answer available until a better one lands, and destroying it here would
+        blank the board on nothing more than a transient."""
+        for t in batch:
+            lkey = _triage_key(site_key, t.get("key"))
+            entry = dict(self.triage_ledger.get(lkey) or {})
+            tfp = _ticket_fingerprint(t)
+            prev = _triage_attempts(entry, tfp, cand_fp)
+            entry["attempts"] = prev + 1
+            entry["retryAt"] = time.time() + JIRA_TRIAGE_BACKOFF_SEC * (prev + 1)
+            entry["tryTicketFp"] = tfp
+            entry["tryCandFp"] = cand_fp
+            self.triage_ledger[lkey] = entry
+        self._prune_triage_ledger()
+        self._save_triage_ledger()
+
+    def _finish_jira_triage(self, job, results):
+        """Tear down a triage job and merge whatever it decided into the ledger.
+        A ticket the reply didn't cover keeps the attempt it spent and comes back
+        on the next beat once its backoff elapses."""
+        try:
+            if job.get("outf"):
+                job["outf"].close()
+        except Exception:
+            pass
+        try:
+            if job.get("outPath"):
+                os.remove(job["outPath"])
+        except OSError:
+            pass
+        self.triage_job = None
+        decided = 0
+        for t in job.get("batch") or []:
+            key = t.get("key")
+            if key not in results:
+                continue
+            lkey = _triage_key(job.get("siteKey"), key)
+            entry = dict(self.triage_ledger.get(lkey) or {})
+            entry.update(results[key])
+            entry["decided"] = True
+            entry["at"] = now_iso()
+            # Stamp the question this decision ANSWERS (the one the batch was built
+            # from, not whatever the block says now), and close out the attempt run
+            # — a landed answer owes no more retries, and leaving the counter to
+            # accumulate across a ticket's life would eventually ban it from being
+            # re-triaged at all.
+            entry["ticketFp"] = _ticket_fingerprint(t)
+            entry["candFp"] = job.get("candFp")
+            for k in ("attempts", "retryAt", "tryTicketFp", "tryCandFp"):
+                entry.pop(k, None)
+            self.triage_ledger[lkey] = entry
+            decided += 1
+        if decided:
+            self._save_triage_ledger()
+            self._apply_triage()
+        missed = len(job.get("batch") or []) - decided
+        log(f"jira triage: decided {decided} ticket(s)"
+            + (f", {missed} unanswered (will retry)" if missed else ""))
+
+    def _poll_jira_triage(self):
+        """Reap the in-flight triage subprocess (one non-blocking poll() per beat,
+        like _poll_summaries): on clean exit merge the validated decisions; kill
+        and drop anything that overran the timeout."""
+        job = self.triage_job
+        if job is None:
+            return
+        proc = job.get("proc")
+        rc = proc.poll() if proc else 0
+        if rc is None:
+            if time.time() - job.get("startedMono", 0) > JIRA_TRIAGE_TIMEOUT_SEC:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                log("jira triage timed out")
+                self._finish_jira_triage(job, {})
+            return
+        raw = None
+        if rc == 0:
+            try:
+                with open(job.get("outPath") or "", errors="replace") as f:
+                    raw = f.read()
+            except OSError:
+                raw = None
+        else:
+            log(f"jira triage exited {rc}")
+        self._finish_jira_triage(
+            job, _parse_triage(raw, job.get("batch") or [], job.get("cands") or []))
+
+    def _triage_repos(self):
+        """The host's cloned repos as triage candidates. Reads the scan directly
+        rather than _sorted_repo_entries: triage only needs names, and the scan is
+        the cheap half (no per-repo git calls, no root pseudo-repo)."""
+        try:
+            return scan_repos()
+        except Exception as e:
+            log(f"triage repo scan failed: {e}")
+            return []
+
+    def _prune_triage_ledger(self):
+        """Bound the ledger. Entries are dropped oldest-decision-first; an
+        undecided entry (in flight or awaiting a retry) sorts newest so a prune
+        can't silently cancel work still owed."""
+        over = len(self.triage_ledger) - JIRA_TRIAGE_LEDGER_MAX
+        if over <= 0:
+            return
+        order = sorted(self.triage_ledger.items(),
+                       key=lambda kv: (kv[1] or {}).get("at") or "￿")
+        for lkey, _ in order[:over]:
+            self.triage_ledger.pop(lkey, None)
+
+    def _apply_triage(self):
+        """Stamp each cached decision onto its ticket in the live jira block, so
+        the guess rides the ordinary heartbeat rather than needing a channel of its
+        own. Idempotent — called after every jira refresh and every merge.
+
+        Only DECIDED entries produce a repoGuess: a ticket that hasn't been triaged
+        yet carries no key at all (the board shows no chip, which is honest — it
+        isn't "no repo fits", it's "not looked at yet"), while one the model
+        declined carries repo=None, which the board renders as the greyed
+        no-repo chip."""
+        site_key = self.jira.get("siteKey")
+        for t in self.jira.get("tickets") or []:
+            entry = self.triage_ledger.get(_triage_key(site_key, t.get("key")))
+            if not isinstance(entry, dict) or not entry.get("decided"):
+                t.pop("repoGuess", None)
+                continue
+            t["repoGuess"] = {
+                "repo": entry.get("repo"),
+                "cloned": bool(entry.get("cloned")),
+                "nameWithOwner": entry.get("nameWithOwner"),
+                "reason": entry.get("reason") or "",
+                "at": entry.get("at"),
+            }
 
     # --- usage attribution ledger -----------------------------------------
 
@@ -4158,6 +4705,10 @@ class SessionManager:
             prev = dict(self.jira)
             prev["error"] = str(e)[:200]
             self.jira = prev
+        # Re-stamp cached repo guesses onto the freshly-collected tickets: a
+        # collect_jira() builds new ticket dicts, so without this every beat that
+        # refreshed would blank the board's repo chips until the next triage.
+        self._apply_triage()
 
     def refresh_pr_status(self):
         """Refresh cached state + CI checks for the PRs live sessions opened, via
@@ -5142,6 +5693,21 @@ class SessionManager:
         # guard keeps unconfigured hosts at zero Jira HTTP calls forever.
         if not light and beat % JIRA_REFRESH_EVERY == 0 and jira_configured():
             self.refresh_jira()
+        # Ticket -> repo triage. Attempted every beat rather than on the slow jira
+        # cadence: it's one batch in flight at a time, so a freshly-polled board
+        # would otherwise take an hour of 10-minute beats to classify instead of a
+        # few minutes. Both calls no-op immediately on a settled board (nothing
+        # stale) and on an unconfigured host (no tickets), so the steady-state cost
+        # is a fingerprint check.
+        # Both halves are wrapped, not just the start: this runs on the heartbeat
+        # path of the PID-1 manager, and a repo chip is never worth taking the
+        # host's sessions down for.
+        if not light:
+            try:
+                self._poll_jira_triage()
+                self._start_jira_triage()
+            except Exception as e:
+                log(f"jira triage failed: {e}")
         # PR state + CI checks for the links live sessions opened, on a faster
         # cadence than the github block so a card's merge/CI status stays live.
         if not light and beat % PR_STATUS_REFRESH_EVERY == 0:

@@ -136,6 +136,28 @@
       t.dueDate < new Date(now ?? Date.now()).toISOString().slice(0, 10));
   }
 
+  // The agent's guessed repo for a ticket (see the Jira -> repo triage section
+  // in hub-agent.py), as a card chip. Three states, deliberately distinct:
+  //   - a repo cloned on the reporting host  -> plain chip, ready to work in
+  //   - a repo only in the org's gh listing  -> dashed chip, needs cloning first
+  //   - the model declined (no repo fits)    -> greyed "no repo"
+  // A ticket with no `repoGuess` at all hasn't been triaged yet and gets NO chip:
+  // that is not the same claim as "no repo fits", and it resolves within a beat
+  // or two. The reason rides as a tooltip — it's a rationale, not a headline.
+  function repoChipHtml(t) {
+    const g = t && t.repoGuess;
+    if (!g) return "";
+    if (!g.repo) {
+      return `<span class="kc-repo kc-repo-none" title="No repository fits this ticket">no repo</span>`;
+    }
+    const cls = g.cloned ? "kc-repo" : "kc-repo kc-repo-uncloned";
+    const tip = [
+      g.cloned ? "" : "not cloned on this host",
+      g.reason || "",
+    ].filter(Boolean).join(" — ");
+    return `<span class="${cls}" title="${esc(tip || g.repo)}">${esc(g.repo)}</span>`;
+  }
+
   function cardHtml(t, site, opts) {
     const o = opts || {};
     const color = o.color || "var(--muted)";
@@ -149,6 +171,8 @@
     if (t.dueDate) {
       bits.push(`<span class="kc-due${overdue ? " overdue" : ""}">due ${esc(t.dueDate)}</span>`);
     }
+    const repo = repoChipHtml(t);
+    if (repo) bits.push(repo);
     bits.push(`<span class="kc-org" style="--org:${esc(color)}" title="${esc(site && site.siteKey || "")}">${esc(t.project || "")}</span>`);
     // The card itself opens the detail view (data-* carry what the click
     // handler needs to route the fetch: the issue and its owning org). It's a
@@ -215,6 +239,21 @@
     return `<div class="td-field"><dt>${esc(label)}</dt><dd>${valueHtml}</dd></div>`;
   }
 
+  // The triaged repo, for the detail panel's field list: the same three states as
+  // the card chip, but with room to say what the chip could only imply.
+  function repoFieldHtml(t) {
+    const g = t && t.repoGuess;
+    if (!g) return "";
+    if (!g.repo) return `<span class="td-dim">No repository fits this ticket</span>`;
+    const bits = [`<span class="kc-repo${g.cloned ? "" : " kc-repo-uncloned"}">${esc(g.repo)}</span>`];
+    if (g.nameWithOwner && g.nameWithOwner !== g.repo) {
+      bits.push(`<span class="td-dim">${esc(g.nameWithOwner)}</span>`);
+    }
+    if (!g.cloned) bits.push(`<span class="td-dim">(not cloned on this host)</span>`);
+    if (g.reason) bits.push(`<span class="td-dim">— ${esc(g.reason)}</span>`);
+    return bits.join(" ");
+  }
+
   // `t` is the card's ticket (always present); `detail` is the fetched issue
   // (null until it lands). opts: {color, now, siteKey, error, loading}.
   function detailHtml(t, detail, opts) {
@@ -234,6 +273,11 @@
       fieldRow("Priority", v("priority")
         ? `<span class="kc-prio ${prioClass(v("priority"))}">${esc(v("priority"))}</span>` : ""),
       fieldRow("Type", v("type") ? esc(v("type")) : ""),
+      // The guess only ever rides the heartbeat ticket — the on-demand issue
+      // fetch comes straight from Jira, which knows nothing about repos — so this
+      // reads `t` directly rather than through v(). Spelled out here (rationale
+      // and clone state as text) where the card only had room for a chip.
+      fieldRow("Repo", repoFieldHtml(t)),
       fieldRow("Assignee", d.assignee ? esc(d.assignee) : ""),
       fieldRow("Reporter", d.reporter ? esc(d.reporter) : ""),
       fieldRow("Project", v("projectName")
@@ -377,6 +421,7 @@
   const api = {
     CATEGORIES, mergeSites, categoryOf, ticketSort, orgColor, ageStr,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
+    repoChipHtml, repoFieldHtml,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   };
   if (typeof window !== "undefined") window.TurmaBoard = api;
