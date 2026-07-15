@@ -393,9 +393,14 @@ Cloudflare tunnel; port 8300 on the LAN.
 - Everything page-specific goes in the three slots the page's own script fills — `#hdrSub` (static
   descriptor), `#hdrMeta` (dynamic, left) and `#hdrStatus` (dynamic, right). An unfilled slot collapses
   (`.site-header .sub:empty`), so pages using fewer slots still ship the same DOM.
-- The header is full-bleed and `.site-header-in` caps its row at `--wrap`, lining it up with a `.wrap`
-  page's content; `sessions.html`'s shell is full-bleed instead, so it sets `--wrap: none` rather than
-  restyling the header (the `.app-header` bar it used to override with is gone).
+- The header is full-bleed and `.site-header-in` caps its row at `--wrap` and centres it, so every
+  page's chrome lands in the same 1180px column as a `.wrap` page's content — including
+  `sessions.html`, whose shell below stays full-bleed while its header row does not. Letting that page
+  release `--wrap` instead stretched the wordmark and tabs to the window edges and looked nothing like
+  the others; the `.app-header` bar it used to override with is gone.
+- The gap under the header is a **margin, not padding**, so it still collapses with the first content
+  element's own margin exactly as the old in-`.wrap` header did — with padding it doesn't collapse and
+  every `.wrap` page's content sits 2px low.
 - It's mounted synchronously at the bottom of `<body>` — after both placeholders exist, before the
   page's own script reads the slots.
 - Tests: `turma/tests/nav.test.js`, which asserts the invariants drift broke (one active tab, same

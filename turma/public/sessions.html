@@ -30,10 +30,10 @@
     overflow: hidden; overscroll-behavior: none;
   }
 
-  /* The shared .site-header (app.css) renders here unchanged. This page's shell
-     is full-bleed rather than a centred .wrap, so --wrap is released and the
-     header row spans the shell instead of floating over it in a 1180px column. */
-  :root { --wrap: none; }
+  /* The shared .site-header (app.css) renders here unchanged — same centred
+     1180px row as every other page. The shell below it stays full-bleed; only
+     the header row is capped, so this page's chrome reads identically to
+     board/usage rather than stretching the wordmark and tabs to the edges. */
 
   .sess-shell { flex: 1; display: flex; min-height: 0; }
 

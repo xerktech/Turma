@@ -102,14 +102,16 @@ h1, h2, h3 { font-family: var(--font-display); }
 h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 
 /* ---- Site header: identical on every page, built by nav.js ---------------
-   The header itself is full-bleed and its inner row is capped at the same
-   --wrap as a page's content, so it lines up with .wrap pages (index/board/
-   usage) and spans the shell on the full-bleed one (sessions, which sets
-   --wrap: none). Page-specific text lives only in the #hdrSub/#hdrMeta/
-   #hdrStatus slots; an unfilled slot collapses so it costs no gap. */
-.site-header { flex: none; }
+   Full-bleed, with its row capped at --wrap and centred, so it lands in the
+   same 1180px column as a page's content and reads identically everywhere —
+   including sessions.html, whose shell below is full-bleed while its header
+   row is not. Page-specific text lives only in the #hdrSub/#hdrMeta/#hdrStatus
+   slots; an unfilled slot collapses so it costs no gap.
+   The gap below is a MARGIN, not padding, so it still collapses with the first
+   content element's own margin exactly as the old in-.wrap header did. */
+.site-header { flex: none; margin-bottom: 20px; }
 .site-header-in {
-  max-width: var(--wrap); margin: 0 auto; padding: 24px 20px 20px;
+  max-width: var(--wrap); margin: 0 auto; padding: 24px 20px 0;
   display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap;
 }
 .site-header .sub { color: var(--muted); font-size: 13px; }
@@ -448,7 +450,8 @@ body.td-open { overflow: hidden; }
 /* ---- Responsive: phone bottom nav + roomier touch targets ---------------- */
 @media (max-width: 600px) {
   .wrap { padding: 0 12px 40px; }
-  .site-header-in { padding: 16px 12px; gap: 8px 12px; }
+  .site-header { margin-bottom: 16px; }
+  .site-header-in { padding: 16px 12px 0; gap: 8px 12px; }
   .nav-tabs { display: none; }
   .bottom-nav {
     display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
