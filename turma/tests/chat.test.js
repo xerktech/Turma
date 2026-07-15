@@ -584,6 +584,74 @@ test("renderProse: table-free text is byte-identical to linkify", () => {
   assert.equal(renderProse(t), linkify(t));
 });
 
+// ---- renderProse (fenced code blocks in prose bubbles) -------------------
+test("renderProse: a fenced block becomes a <pre> tagged with its language", () => {
+  const md = 'Try this:\n\n```hcl\nfeatures = local.env_features[var.environment]\n```\n\nThen apply.';
+  const html = renderProse(md);
+  assert.match(html, /<pre class="md-code" data-lang="hcl"><code>features = local\.env_features\[var\.environment\]<\/code><\/pre>/);
+  // Prose either side survives, and no fence markers leak through.
+  assert.match(html, /Try this:/);
+  assert.match(html, /Then apply\./);
+  assert.doesNotMatch(html, /```/);
+});
+
+test("renderProse: a fence with no info string omits data-lang", () => {
+  assert.match(renderProse("```\nplain\n```"), /<pre class="md-code"><code>plain<\/code><\/pre>/);
+});
+
+test("renderProse: code body is escaped and never linkified", () => {
+  const html = renderProse('```js\nconst u = "https://x.io"; // <script>alert(1)</script>\n```');
+  assert.doesNotMatch(html, /<script>/);
+  assert.doesNotMatch(html, /<a /);           // a URL in code stays text
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.match(html, /&quot;https:\/\/x\.io&quot;/);
+});
+
+test("renderProse: blank lines and indentation inside a block are preserved", () => {
+  const md = "```py\ndef f():\n    return 1\n\n\nx = f()\n```";
+  assert.match(renderProse(md), /<code>def f\(\):\n    return 1\n\n\nx = f\(\)<\/code>/);
+});
+
+test("renderProse: an unterminated fence still renders as code (mid-stream)", () => {
+  // The typewriter reveals a block a chunk at a time; the closer hasn't arrived
+  // yet, and the partial body must not flash as prose in the meantime.
+  const html = renderProse("Here:\n```hcl\nenv_features = {\n  dev = {");
+  assert.match(html, /<pre class="md-code" data-lang="hcl"><code>env_features = \{\n {2}dev = \{<\/code><\/pre>/);
+  assert.match(html, /Here:/);
+});
+
+test("renderProse: pipe rows inside a code block are not read as a table", () => {
+  const md = "```sh\n| Col |\n|---|\n| a |\n```";
+  const html = renderProse(md);
+  assert.doesNotMatch(html, /<table/);
+  assert.match(html, /<code>\| Col \|\n\|---\|\n\| a \|<\/code>/);
+});
+
+test("renderProse: a table after a code block is still a table", () => {
+  const html = renderProse("```\ncode\n```\n\n| A |\n|---|\n| b |");
+  assert.match(html, /<pre class="md-code"><code>code<\/code><\/pre>/);
+  assert.match(html, /<table class="md-table">/);
+});
+
+test("renderProse: a longer closing fence closes the block", () => {
+  // ````…```` wraps a body that itself contains a ``` fence.
+  const html = renderProse("````md\n```\ninner\n```\n````\nafter");
+  assert.match(html, /<code>```\ninner\n```<\/code>/);
+  assert.match(html, /after/);
+});
+
+test("renderProse: inline backticks in prose don't open a block", () => {
+  // A fence line must be the fence plus at most a one-word info string.
+  const html = renderProse("run ```npm ci``` first, then ``` npm test ``` after");
+  assert.doesNotMatch(html, /<pre/);
+  assert.match(html, /run ```npm ci``` first/);
+});
+
+test("renderProse: fence-free text is byte-identical to the table renderer", () => {
+  const t = "opened [PR #42](https://github.com/o/r/pull/42) — <b>done</b> & dusted";
+  assert.equal(renderProse(t), linkify(t));
+});
+
 // ---- agentsHtml: the live pane agent-list rendered under the status bar ------
 
 test("agentsHtml: '' when there are no agents", () => {
