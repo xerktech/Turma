@@ -1475,6 +1475,35 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, cmdId });
     }
 
+    // POST /api/jira/refresh — the /board page's manual refresh: re-poll Jira
+    // now rather than waiting out each agent's slow cadence (30 beats). It fans
+    // out across hosts because the board is a MERGE of every host's block —
+    // refreshing a single org would leave the rest of one board stale under a
+    // button that reads "Refresh".
+    //
+    // Targets `configured` (creds present), not `available` (a poll has
+    // succeeded): a host whose polls are failing reports available=false, and
+    // that is precisely the host a manual retry is for. `|| siteKey` keeps
+    // agents predating the `configured` field targetable on the only evidence
+    // they report. Hosts with no Jira at all are skipped, so an unconfigured
+    // fleet gets no commands (the agent re-checks anyway).
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts[2] === "refresh" && parts.length === 3) {
+      const hosts = Object.keys(agents).filter((k) => {
+        const j = agents[k] && agents[k].jira;
+        return !!j && (j.configured === true || !!j.siteKey);
+      });
+      // Collapse a mashed button: a host already holding an unacked refresh
+      // would otherwise run one full re-poll per click. `hosts` still reports
+      // it as targeted (a refresh IS in flight for it), while `queued` names
+      // only what this call actually enqueued.
+      const queued = hosts.filter(
+        (k) => !(agents[k].commands || []).some((c) => c.type === "refreshJira")
+      );
+      for (const k of queued) queueCommand(k, { type: "refreshJira" });
+      return json(res, 200, { ok: true, hosts, queued });
+    }
+
     // POST /api/agents/<host>/transcripts/<transcriptId>/resume — resume ANY
     // prior Claude session by transcript id (the "Resume any session" picker),
     // not just a killed Turma session from closedSessions. Body: {cwd} is the

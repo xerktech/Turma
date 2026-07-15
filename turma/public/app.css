@@ -214,6 +214,27 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 }
 
 /* ---- Jira board (/board) -------------------------------------------------- */
+/* Board toolbar: org chips run wide, the refresh button stays pinned right.
+   `align-items: flex-start` keeps the button from stretching when the chips
+   wrap to a second row. */
+.board-bar { display: flex; align-items: flex-start; gap: 10px; margin: 2px 0 14px; }
+.board-bar .org-chips { flex: 1; min-width: 0; margin: 0; }
+.board-refresh {
+  font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
+  color: var(--ink-2); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 999px;
+  display: inline-flex; align-items: center; gap: 6px; flex: none;
+}
+.board-refresh svg { width: 13px; height: 13px; flex: none; }
+.board-refresh:hover:not(:disabled) { color: var(--ink); }
+.board-refresh:disabled { cursor: default; color: var(--muted); }
+.board-refresh.busy svg { animation: board-spin 0.9s linear infinite; }
+@keyframes board-spin { to { transform: rotate(360deg); } }
+/* Respect a reduced-motion preference: the label still says "Refreshing…". */
+@media (prefers-reduced-motion: reduce) {
+  .board-refresh.busy svg { animation: none; }
+}
+
 .org-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 14px; }
 .org-chip {
   font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;

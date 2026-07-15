@@ -330,9 +330,54 @@
     return notes.join("") + `<div class="kanban-cols">${cols.join("")}</div>`;
   }
 
+  // Newest `fetchedAt` across every agent's jira block ("" when none report
+  // one) — the board's freshness watermark. The manual refresh watches this
+  // advance to know a re-poll actually LANDED, rather than assuming it did
+  // after a fixed delay: the round trip is a queued command + the agent's next
+  // beat, whose latency depends on the host's interval and Jira's own speed.
+  // Same lexicographic-compare-on-fixed-format-UTC assumption as mergeSites.
+  function newestFetchedAt(agents) {
+    let newest = "";
+    for (const a of agents || []) {
+      const f = a && a.jira && a.jira.fetchedAt;
+      if (f && String(f) > newest) newest = String(f);
+    }
+    return newest;
+  }
+
+  // Is a manual refresh still in flight across `hosts`? True while any of them
+  // still holds an unacked refreshJira. The hub drops a command from the record
+  // the moment the agent acks it, so this flips false once the fleet has
+  // EXECUTED the re-poll — including a poll that failed, which the watermark
+  // above can't see (the fail-open keeps the old tickets and only sets `error`,
+  // leaving fetchedAt untouched) and would otherwise wait out its full timeout.
+  function jiraRefreshPending(agents, hosts) {
+    const want = new Set(hosts || []);
+    for (const a of agents || []) {
+      if (!a || !want.has(a.key)) continue;
+      if ((a.commands || []).some(c => c && c.type === "refreshJira")) return true;
+    }
+    return false;
+  }
+
+  // Did a finished refresh fail OUTRIGHT — i.e. did every targeted host come
+  // back with an error? Deliberately not "any host errored": one permanently
+  // broken host would then label every refresh a failure even when the rest of
+  // the fleet updated fine (each org's own error still shows on its column).
+  // A successful poll always returns a block with error=null, so a lingering
+  // error belongs to the poll we just triggered — which is why this reads the
+  // error rather than inferring failure from a frozen fetchedAt, whose 1-second
+  // resolution can't distinguish "failed" from "polled twice in one second".
+  function jiraRefreshFailed(agents, hosts) {
+    const want = new Set(hosts || []);
+    const targeted = (agents || []).filter(a => a && want.has(a.key));
+    return targeted.length > 0 && targeted.every(a => !!(a.jira && a.jira.error));
+  }
+
   const api = {
     CATEGORIES, mergeSites, categoryOf, ticketSort, orgColor, ageStr,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
+    newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   };
   if (typeof window !== "undefined") window.TurmaBoard = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;

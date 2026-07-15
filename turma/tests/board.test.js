@@ -11,6 +11,7 @@ const assert = require("node:assert/strict");
 const {
   mergeSites, categoryOf, ticketSort, orgColor, ageStr, prioClass,
   cardHtml, boardHtml, detailHtml, textHtml, linkify,
+  newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
 } = require("../public/board.js");
 
 function ticket(key, over = {}) {
@@ -361,4 +362,79 @@ test("linkify: an escaped entity right after a URL is not swallowed into the hre
   const html = textHtml('go to https://ex.com/a "now"');
   assert.ok(html.includes('href="https://ex.com/a"'), html);
   assert.ok(!html.includes('href="https://ex.com/a&quot;'), "the escaped quote stays out of the href");
+});
+
+// --- Manual refresh (the /board Refresh button's completion signals) --------
+
+test("newestFetchedAt: the watermark is the newest block across the fleet", () => {
+  assert.equal(newestFetchedAt([
+    agent("hostA", block({ fetchedAt: "2026-07-14T11:00:00Z" })),
+    agent("hostB", block({ fetchedAt: "2026-07-14T12:00:00Z" })),
+    agent("hostC", block({ fetchedAt: "2026-07-14T10:00:00Z" })),
+  ]), "2026-07-14T12:00:00Z");
+});
+
+test("newestFetchedAt: degrades to '' for empty/never-polled/jira-less fleets", () => {
+  // "" is the click-time mark on a cold board; every real fetchedAt sorts
+  // above it, so the first poll to land still reads as an advance.
+  assert.equal(newestFetchedAt([]), "");
+  assert.equal(newestFetchedAt(undefined), "");
+  assert.equal(newestFetchedAt([{ key: "bare", device: "bare" }]), "");
+  assert.equal(newestFetchedAt([agent("hostA", block({ fetchedAt: null }))]), "");
+  assert.ok(newestFetchedAt([agent("hostA", block())]) > "");
+});
+
+test("jiraRefreshPending: true only while a targeted host holds an unacked refreshJira", () => {
+  const pendingHost = agent("hostA", block(), {
+    commands: [{ type: "refreshJira", cmdId: "c1" }],
+  });
+  const idleHost = agent("hostB", block(), { commands: [] });
+
+  assert.equal(jiraRefreshPending([pendingHost, idleHost], ["hostA", "hostB"]), true);
+  assert.equal(jiraRefreshPending([idleHost], ["hostB"]), false);
+  // The hub drops the command once the agent acks it -> the refresh is done.
+  assert.equal(jiraRefreshPending([agent("hostA", block(), { commands: [] })], ["hostA"]), false);
+});
+
+test("jiraRefreshPending: ignores untargeted hosts and unrelated commands", () => {
+  // Another dashboard's prune, or a refresh on a host this click didn't target,
+  // must not hold this button busy.
+  const other = agent("hostZ", block(), { commands: [{ type: "refreshJira", cmdId: "c9" }] });
+  assert.equal(jiraRefreshPending([other], ["hostA"]), false);
+
+  const busyElsewhere = agent("hostA", block(), {
+    commands: [{ type: "prune", repo: "Turma", cmdId: "c2" }],
+  });
+  assert.equal(jiraRefreshPending([busyElsewhere], ["hostA"]), false);
+});
+
+test("jiraRefreshFailed: only when EVERY targeted host errored", () => {
+  // The regression a browser run caught: one permanently-broken host (a host
+  // whose creds/site are wrong, say) must not label a refresh that updated the
+  // rest of the fleet as a failure.
+  const okHost = agent("hostA", block({ error: null }));
+  const badHost = agent("hostB", block({ error: "HTTP Error 503" }));
+
+  assert.equal(jiraRefreshFailed([okHost, badHost], ["hostA", "hostB"]), false);
+  assert.equal(jiraRefreshFailed([badHost], ["hostB"]), true);
+  assert.equal(jiraRefreshFailed([okHost], ["hostA"]), false);
+  // Only the targeted hosts count — an untargeted host's error is not ours.
+  assert.equal(jiraRefreshFailed([okHost, badHost], ["hostA"]), false);
+  assert.equal(jiraRefreshFailed([okHost, badHost], ["hostB"]), true);
+});
+
+test("jiraRefreshFailed: no targeted host on record is not a failure", () => {
+  // Nothing to judge yet (records not arrived) must not read as failure.
+  assert.equal(jiraRefreshFailed([], ["hostA"]), false);
+  assert.equal(jiraRefreshFailed(undefined, ["hostA"]), false);
+  assert.equal(jiraRefreshFailed([agent("hostA", block())], []), false);
+  // A targeted host with no jira block at all isn't an error either.
+  assert.equal(jiraRefreshFailed([{ key: "hostA", device: "hostA" }], ["hostA"]), false);
+});
+
+test("jiraRefreshPending: tolerates missing commands/garbage entries", () => {
+  assert.equal(jiraRefreshPending([agent("hostA", block())], ["hostA"]), false);
+  assert.equal(jiraRefreshPending([null, undefined], ["hostA"]), false);
+  assert.equal(jiraRefreshPending([agent("hostA", block(), { commands: [null] })], ["hostA"]), false);
+  assert.equal(jiraRefreshPending([], ["hostA"]), false);
 });
