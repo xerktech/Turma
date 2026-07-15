@@ -97,14 +97,14 @@ jobs:
           # AGENT_BASE at the top of agent/Dockerfile). Trivy is already told to
           # --skip-dirs opt/gradle, opt/android-sdk and usr/lib/jvm below, which
           # is every path those stages write, so building them here produced
-          # 7.7 GB that the scanner then ignored byte for byte. The findings are
+          # 5.0 GB that the scanner then ignored byte for byte. The findings are
           # unchanged — OS packages come from the dpkg record and npm packages
           # from /usr/local/lib/node_modules, both of which live in `tooling` and
           # are scanned exactly as before (verified by scanning both tiers with
           # these exact flags and diffing: same 231 OS packages, same findings).
           #
           # What changes is the disk this job touches: the image it builds,
-          # exports to a tar, and hands Trivy drops 12.4 GB -> 4.7 GB uncompressed
+          # exports to a tar, and hands Trivy drops 8.1 GB -> 3.1 GB uncompressed
           # (62%). That is the figure that matters here — not the ~3.7 -> ~1.4 GB
           # compressed/registry one — because every copy this job lands on the
           # runner is uncompressed: the buildkit snapshot, the exported tar, and

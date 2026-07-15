@@ -1,19 +1,22 @@
 # Which toolchain tier the final image is assembled on top of. The build is a
 # chain of stages — tooling -> android-build -> android — each a superset of the
 # last, and this ARG picks where the volatile agent layer lands. Sizes below are
-# UNCOMPRESSED/on-disk (what `docker images` reports, what buildkit snapshots,
-# and what Trivy extracts) rather than the compressed registry figure, because
-# disk on the shared CI runner is the constraint that motivated the split:
+# UNCOMPRESSED/on-disk (what buildkit snapshots and what Trivy extracts) rather
+# than the compressed registry figure, because disk on the shared CI runner is
+# the constraint that motivated the split. They are `du` totals inside each
+# image, cross-checked against the `docker history` layer sums. Do NOT quote
+# `docker images` here: it reports ~1.5x these numbers and disagrees with both.
 #
 #   android        (default) JDK + Gradle + SDK + emulator + system image + AVD.
 #                  Agents can build, test, AND run/troubleshoot Android apps.
-#                  This is what ships as :latest. 12.4 GB (~3.7 GB compressed).
+#                  This is what ships as :latest. 8.1 GB (~3.7 GB compressed).
 #   android-build  JDK + Gradle + SDK build tooling, no emulator/system image.
-#                  Agents can BUILD Android apps but not boot one. 5.7 GB.
-#   tooling        No Android at all. 4.7 GB (~1.4 GB compressed).
+#                  Agents can BUILD Android apps but not boot one. 3.7 GB.
+#   tooling        No Android at all. 3.1 GB.
 #
-# The emulator + x86_64 system image alone account for 6.7 GB of that — over
-# half the shipped image — which is why they get their own tier.
+# Note the shape: the whole Android BUILD toolchain costs 0.6 GB, while the
+# emulator + x86_64 system image cost 4.4 GB — 7x more, and over half the
+# shipped image. That asymmetry is why they are separate tiers rather than one.
 #
 # `tooling` is what CI scans (turma-agent-image-scan.yml). That is not a
 # coverage compromise: Trivy is already told to skip opt/gradle, opt/android-sdk
@@ -22,8 +25,8 @@
 # its dpkg record (which is what Trivy actually reports openjdk CVEs from,
 # independent of --skip-dirs) is scanned exactly as before. Verified by scanning
 # both tiers with the CI flags and diffing: identical OS-package inventory (231
-# packages, openjdk-17-jdk-headless included) and identical findings; 12.4 GB ->
-# 4.7 GB, a 62% cut in what the scan job has to build, export and extract.
+# packages, openjdk-17-jdk-headless included) and identical findings; 8.1 GB ->
+# 3.1 GB, a 62% cut in what the scan job has to build, export and extract.
 #
 # Declared before the first FROM so it can be consumed by one (global ARG scope).
 ARG AGENT_BASE=android
