@@ -2498,6 +2498,52 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.run_calls, [])
 
 
+class TestInterrupt(ManagerMixin, unittest.TestCase):
+    """Stop the turn a running session has in flight: a single Escape into its
+    TUI, which cancels the generation/tool call and leaves the session running
+    with its conversation intact."""
+
+    def make_manager(self):
+        sm = super().make_manager()
+        self.run_calls.clear()  # drop __init__'s own run() calls
+        return sm
+
+    def _session(self, sm, status="running"):
+        sess = {"id": "abcde", "status": status, "tmuxName": "agent-abcde"}
+        sm.registry = [sess]
+        return sess
+
+    def test_sends_escape_to_the_session_pane(self):
+        sm = self.make_manager()
+        self._session(sm)
+        sm.interrupt("abcde")
+        self.assertEqual(
+            self.run_calls, [["tmux", "send-keys", "-t", "agent-abcde", "Escape"]])
+
+    def test_noop_for_stopped_session(self):
+        sm = self.make_manager()
+        self._session(sm, status="stopped")
+        sm.interrupt("abcde")
+        self.assertEqual(self.run_calls, [])
+
+    def test_noop_for_unknown_session(self):
+        sm = self.make_manager()
+        self._session(sm)
+        sm.interrupt("nope")
+        self.assertEqual(self.run_calls, [])
+
+    def test_idle_session_is_still_interrupted(self):
+        # Stop is deliberately not gated on paneBusy: that read is up to a beat
+        # stale when the operator clicks, and Escape into an idle pane is
+        # harmless — refusing would break the case the button exists for.
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["paneBusy"] = False
+        sm.interrupt("abcde")
+        self.assertEqual(
+            self.run_calls, [["tmux", "send-keys", "-t", "agent-abcde", "Escape"]])
+
+
 class TestSetModelMode(ManagerMixin, unittest.TestCase):
     """Live model / permission-mode switches on a running session: model via a
     typed `/model <name>`, mode via computed Shift+Tab (BTab) presses over the
@@ -2918,6 +2964,15 @@ class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
         sm.send_input.assert_called_once_with("s1", "hi")
         sm._stage_history.assert_called_once_with("s1")
         self.assertEqual(sm.acked, {"i1", "h1"})
+
+    def test_dispatches_interrupt(self):
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        sm.interrupt = mock.Mock()
+        cmds = [{"cmdId": "x1", "type": "interrupt", "sessionId": "s1"}]
+        self.assertTrue(sm.handle_commands(cmds))
+        sm.interrupt.assert_called_once_with("s1")
+        self.assertEqual(sm.acked, {"x1"})
 
     def test_dispatches_answer_question(self):
         sm = self.make_manager()

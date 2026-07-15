@@ -3600,6 +3600,25 @@ class SessionManager:
         run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
         run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
 
+    def interrupt(self, sid):
+        """Stop a running session's in-flight turn without ending the session:
+        send Escape to its Claude TUI — exactly the key an operator sitting at
+        the live terminal would press. Claude Code cancels the generation or
+        tool call in flight and drops back to the prompt with the conversation
+        intact, so the session stays running and can be typed at again. This is
+        the gentle counterpart to kill (which ends the session) and restart
+        (which clears its context).
+
+        Deliberately NOT gated on paneBusy: that read is up to a beat stale by
+        the time the operator clicks Stop, and Escape into an idle pane is
+        harmless (it clears whatever is half-typed on the input line), so
+        refusing on a stale idle read would break the case the button is for."""
+        sess = self._find(sid)
+        if not sess or sess.get("status") != "running":
+            return
+        run(["tmux", "send-keys", "-t", sess["tmuxName"], "Escape"])
+        log(f"interrupted session {sid}")
+
     def set_summary(self, sid, summary):
         """Rename a session: replace the auto-generated few-word name the card
         leads with by one the operator typed. Works on a stopped session too (the
@@ -4649,6 +4668,8 @@ class SessionManager:
                     self.delete(cmd.get("sessionId"))
                 elif ctype == "input":
                     self.send_input(cmd.get("sessionId"), cmd.get("text") or "")
+                elif ctype == "interrupt":
+                    self.interrupt(cmd.get("sessionId"))
                 elif ctype == "setSummary":
                     self.set_summary(cmd.get("sessionId"), cmd.get("summary"))
                 elif ctype == "setModel":
