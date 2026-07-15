@@ -58,6 +58,7 @@ function loadPage({ search = "", sidebar = null, textareas = [] } = {}) {
   const els = {};
   const opened = [];
   const posts = [];
+  const chat = { busy: false, stopped: 0 };
   const document = {
     getElementById(id) { return (els[id] ||= makeEl(id)); },
     querySelector(sel) { return sel === ".sidebar" ? sidebar : null; },
@@ -86,6 +87,10 @@ function loadPage({ search = "", sidebar = null, textareas = [] } = {}) {
     TurmaChat: {
       open: (hostKey, id) => opened.push(id),
       onPoll: noop, close: noop, closeStatic: noop, renderStatic: noop,
+      // The chat engine owns the live busy read and the interrupt; the terminal's
+      // compose button just defers to it. `busy` is what a test flips to model a
+      // turn being in flight, and `stopped` records the delegation.
+      isBusy: () => chat.busy, stop: () => { chat.stopped++; }, actionFailed: noop,
     },
     console, Date, Math, JSON, encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
     addEventListener: noop, removeEventListener: noop,
@@ -100,12 +105,12 @@ function loadPage({ search = "", sidebar = null, textareas = [] } = {}) {
   const fn = new Function(...names, "window",
     script + "\n;return { render, selectSession, followSpawn, toggleComposer,"
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
-      + " stopCurrentSession,"
+      + " termComposeAction,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
-  return { ...api, els, opened, posts };
+  return { ...api, els, opened, posts, chat };
 }
 // The card's ⋯/menu buttons pass their click event on; the shim has no events.
 const click = { stopPropagation() {} };
@@ -346,38 +351,38 @@ test("picking a session cancels a pending follow, so the spawn can't yank the st
   assert.deepEqual(opened, ["11111"], "an explicit pick wins over the pending follow");
 });
 
-// --- the Stop button (chat + terminal bars) ----------------------------------
+// --- the terminal's Send/Stop compose button ---------------------------------
+// (The chat pane's own button is chat.js's — see chat.test.js.)
 
-test("Stop interrupts the attached session's turn from either bar, with no confirm step", () => {
-  for (const view of ["chat", "terminal"]) {
-    const { beat, selectSession, stopCurrentSession, els, posts } = loadPage();
-    const { now, host: h } = host([working("11111", "Long Turn")]);
-    beat({ now, agents: [h] });
-    selectSession("11111");
-
-    // Unlike Kill, one click is the whole interaction — nothing is destroyed.
-    stopCurrentSession(view);
-    assert.equal(posts.length, 1, `${view}: the first click stops the turn`);
-    assert.equal(posts[0].url, "/api/agents/hostA/sessions/11111/interrupt");
-
-    // The button acks locally, since the interrupt only lands on the next beat.
-    const btn = els[view === "chat" ? "chatStop" : "termStop"];
-    assert.equal(btn.textContent, "Stopping…");
-    assert.equal(btn.disabled, true);
-  }
-});
-
-test("Stop is a no-op once the attached session is gone", () => {
-  const { beat, selectSession, stopCurrentSession, posts } = loadPage();
-  stopCurrentSession("chat");
-  assert.deepEqual(posts, [], "nothing is attached yet");
-
+test("terminal compose: Stop delegates to the chat engine while the agent works", () => {
+  const { beat, selectSession, termComposeAction, posts, chat } = loadPage();
   const { now, host: h } = host([working("11111", "Long Turn")]);
   beat({ now, agents: [h] });
   selectSession("11111");
-  beat({ now, agents: [] }); // the session vanished -> render() clears the stage
-  stopCurrentSession("chat");
-  assert.deepEqual(posts, [], "no session left to interrupt");
+
+  chat.busy = true;
+  termComposeAction();
+  // One click is the whole interaction — unlike Kill, nothing is destroyed, so
+  // there's no arm-then-confirm step. The engine owns the interrupt POST so the
+  // two compose buttons can't disagree about the turn's state.
+  assert.equal(chat.stopped, 1, "the click stops the turn");
+  assert.deepEqual(posts, [], "the page doesn't post the interrupt itself");
+});
+
+test("terminal compose: the same button sends the typed message when idle", () => {
+  const { beat, selectSession, termComposeAction, els, posts, chat } = loadPage();
+  const { now, host: h } = host([idle("11111", "Waiting")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+
+  chat.busy = false;
+  els.termInput = makeEl("termInput");
+  els.termInput.value = "do the thing";
+  termComposeAction();
+  assert.equal(chat.stopped, 0, "an idle agent has no turn to stop");
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, "/api/agents/hostA/sessions/11111/input");
+  assert.equal(posts[0].body.text, "do the thing");
 });
 
 test("?session=<id>: waits for a session that isn't running yet, then opens it", () => {

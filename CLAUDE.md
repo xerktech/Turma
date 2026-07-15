@@ -560,14 +560,29 @@ Cloudflare tunnel; port 8300 on the LAN.
 
 #### Stop button
 
-- Both the chat header and the terminal header carry a **◼ Stop** button that interrupts the turn the
-  attached session has in flight (`stopCurrentSession` →
-  `POST /api/agents/<host>/sessions/<id>/interrupt` → an `interrupt` command → the agent's Escape into
-  the pane; see the agent bullet).
-- Unlike the Kill beside it, Stop arms nothing and confirms nothing (it destroys no work — a turn
-  stopped by mistake can just be re-asked) and leaves the session on the stage.
-- The button acks locally for ~1.5s because the interrupt only lands on the agent's next heartbeat, so
-  the pane's working/idle read won't reflect it for a beat or two.
+- **The compose button IS the Stop button**, in both the chat and terminal views: while the attached
+  agent is generating it becomes a warning-coloured **◼ Stop**, and it's back to **Send** the moment
+  the turn ends. There is only ever one thing to do with the turn, and the button that does it sits
+  where the operator is already typing rather than in the header.
+- Stop interrupts the turn the session has in flight (`chatComposeAction`/`termComposeAction` →
+  `stop()` in `chat.js` → `POST /api/agents/<host>/sessions/<id>/interrupt` → an `interrupt` command →
+  the agent's Escape into the pane; see the agent bullet).
+- Unlike Kill, Stop arms nothing and confirms nothing (it destroys no work — a turn stopped by mistake
+  can just be re-asked) and leaves the session on the stage.
+- **Enter in the text box always sends**, whatever the button shows: queuing a message mid-turn is
+  normal, and only the click target changes with the turn.
+- The busy read is `chat.js`'s `liveStatus` — the ~1s pane scrape pushed as `turn` frames — NOT the
+  heartbeat's `paneBusy`, which is a beat or more behind a button the operator is watching. With the
+  live socket down no frames arrive, `liveStatus` stays null, and the button stays Send: a Stop that
+  can't see the turn is worse than no Stop.
+- A clicked Stop flips to Send **immediately** (`stopPendingAt`, `composeBusy()`), without waiting for
+  the pane to stop reporting the turn — the interrupt only lands on the agent's next heartbeat, and
+  the operator shouldn't have to watch a dead Stop to learn it worked. If the turn outlives the
+  `STOP_SUPPRESS_MS` window the interrupt didn't take, and Stop legitimately comes back.
+- `chat.js` paints every `.compose-action` button on the page from that one read, so the terminal's
+  button (its engine stays warm underneath the toggle) can't disagree with the chat's.
+- Tests: the compose-button cases in `turma/tests/chat.test.js` and the `termComposeAction` cases in
+  `turma/tests/sessions.test.js`.
 
 ### Durable archive
 

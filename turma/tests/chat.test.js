@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderProse, prFooterChip, agentsHtml, filterModeOpts, MODE_OPTS, __setVerbosity, __setNoExpand } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderProse, prFooterChip, agentsHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -608,4 +608,76 @@ test("agentsHtml: escapes type + label (no attribute/markup injection)", () => {
   const html = agentsHtml([{ sel: false, type: "Ex\"plore", label: '<img src=x onerror=1>' }]);
   assert.doesNotMatch(html, /<img/);
   assert.match(html, /data-alabel="&lt;img/);
+});
+
+
+// --- the compose button: Send when idle, Stop while the agent works -----------
+// The busy read is the live pane status (a `turn` frame every ~1s), not the
+// heartbeat, so the button flips within a second of the turn starting or ending.
+
+function fakeButtons(n = 2) {
+  const btns = [];
+  for (let i = 0; i < n; i++) {
+    btns.push({
+      textContent: "Send", title: "", _s: new Set(),
+      classList: { _s: new Set(), toggle(c, f) { f ? this._s.add(c) : this._s.delete(c); },
+        contains(c) { return this._s.has(c); } },
+    });
+  }
+  global.document = { querySelectorAll: (sel) => (sel === ".compose-action" ? btns : []) };
+  return btns;
+}
+function clearDom() { delete global.document; }
+
+test("compose button: idle -> Send, generating -> Stop", () => {
+  const btns = fakeButtons();
+  __stopPending(0);
+
+  __setLiveStatus(null);
+  updateComposeAction();
+  assert.equal(btns[0].textContent, "Send");
+  assert.equal(btns[0].classList.contains("stop"), false);
+  assert.equal(isBusy(), false);
+
+  __setLiveStatus({ verb: "Thinking", up: "1.2k" });
+  updateComposeAction();
+  assert.equal(isBusy(), true);
+  // Every compose button on the page (chat's and the terminal toggle's) flips
+  // together — they read the one status.
+  for (const b of btns) {
+    assert.equal(b.textContent, "◼ Stop");
+    assert.equal(b.classList.contains("stop"), true);
+  }
+  clearDom();
+});
+
+test("compose button: a clicked Stop hands the button back to Send immediately", () => {
+  const btns = fakeButtons();
+  // The turn is still being reported — the interrupt only lands on the agent's
+  // next beat — but the operator already asked for it to end.
+  __setLiveStatus({ verb: "Thinking" });
+  __stopPending(Date.now());
+  updateComposeAction();
+  assert.equal(isBusy(), false, "no waiting on the pane to catch up");
+  assert.equal(btns[0].textContent, "Send");
+  clearDom();
+});
+
+test("compose button: a Stop that never landed gives Stop back", () => {
+  fakeButtons();
+  __setLiveStatus({ verb: "Thinking" });
+  __stopPending(Date.now() - 60000); // clicked long ago; the turn outlived it
+  assert.equal(isBusy(), true, "the turn is still running, so Stop is live again");
+  clearDom();
+});
+
+test("compose button: the turn ending clears a pending Stop", () => {
+  fakeButtons();
+  __setLiveStatus(null);
+  __stopPending(Date.now());
+  assert.equal(isBusy(), false);
+  // The suppression is spent, so the NEXT turn shows Stop from its first frame.
+  __setLiveStatus({ verb: "Thinking" });
+  assert.equal(isBusy(), true);
+  clearDom();
 });
