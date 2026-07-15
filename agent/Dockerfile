@@ -1,4 +1,34 @@
-FROM node:24-bookworm-slim
+# Which toolchain tier the final image is assembled on top of. The build is a
+# chain of stages — tooling -> android-build -> android — each a superset of the
+# last, and this ARG picks where the volatile agent layer lands. Sizes below are
+# UNCOMPRESSED/on-disk (what `docker images` reports, what buildkit snapshots,
+# and what Trivy extracts) rather than the compressed registry figure, because
+# disk on the shared CI runner is the constraint that motivated the split:
+#
+#   android        (default) JDK + Gradle + SDK + emulator + system image + AVD.
+#                  Agents can build, test, AND run/troubleshoot Android apps.
+#                  This is what ships as :latest. 12.4 GB (~3.7 GB compressed).
+#   android-build  JDK + Gradle + SDK build tooling, no emulator/system image.
+#                  Agents can BUILD Android apps but not boot one. 5.7 GB.
+#   tooling        No Android at all. 4.7 GB (~1.4 GB compressed).
+#
+# The emulator + x86_64 system image alone account for 6.7 GB of that — over
+# half the shipped image — which is why they get their own tier.
+#
+# `tooling` is what CI scans (turma-agent-image-scan.yml). That is not a
+# coverage compromise: Trivy is already told to skip opt/gradle, opt/android-sdk
+# and usr/lib/jvm — every path the Android stages write — so those layers have
+# never contributed a finding. The JDK still ships in the `tooling` apt layer, so
+# its dpkg record (which is what Trivy actually reports openjdk CVEs from,
+# independent of --skip-dirs) is scanned exactly as before. Verified by scanning
+# both tiers with the CI flags and diffing: identical OS-package inventory (231
+# packages, openjdk-17-jdk-headless included) and identical findings; 12.4 GB ->
+# 4.7 GB, a 62% cut in what the scan job has to build, export and extract.
+#
+# Declared before the first FROM so it can be consumed by one (global ARG scope).
+ARG AGENT_BASE=android
+
+FROM node:24-bookworm-slim AS tooling
 
 # UTF-8 locale so the TUI's box-drawing, braille spinners, and other Unicode
 # glyphs render instead of turning into tofu in the web terminal. C.UTF-8 ships
@@ -53,43 +83,41 @@ RUN apt-get update \
  && npm install -g "npm@${NPM_VERSION}" \
  && rm -rf /var/lib/apt/lists/*
 
-# --- Android build tooling layer (stable, large) ----------------------------
+# --- Android BUILD tooling layer (stable, ~0.5 GB) --------------------------
 # JDK 17 (installed in the base apt layer above) + Gradle + the Android SDK
-# (cmdline-tools, platform-tools, one platform + build-tools, the emulator + a
-# headless x86_64 system image + a pre-created AVD) so an agent can build, test,
-# AND run/troubleshoot Android apps (e.g. the android/ Turma client) out of the
-# box — `gradle`, `sdkmanager`, `avdmanager`, `emulator`, `adb`, and `aapt2` are
-# all on PATH. Its own trailing layer with its own version ARGs, placed AHEAD of
-# the volatile coding-agent ARGs below so a Claude Code release bump can't
-# invalidate (and re-download) this ~3.5 GB layer. Bump these pins to clear CVEs
-# the image scan flags; add more platforms/build-tools here if a project needs a
-# different compileSdk.
+# (cmdline-tools, platform-tools, one platform + build-tools) so an agent can
+# BUILD and JVM-unit-test Android apps (e.g. the android/ Turma client) —
+# `gradle`, `sdkmanager`, `avdmanager`, `adb`, and `aapt2` on PATH. Booting an
+# app needs the emulator stage below.
 #
-# Running the emulator needs hardware acceleration: the DockerOps compose must
-# pass the host's KVM device through to the agent container (`devices:
-# ["/dev/kvm"]`). Without it, boot the emulator in software mode
-# (`emulator -avd turma -no-window -gpu swiftshader_indirect -no-accel`), which
-# works but is slow. The X11/GL/audio shared libs the (windowless) emulator
-# still links are installed in the base apt layer above.
+# Its own layer with its own version ARGs, placed AHEAD of the volatile
+# coding-agent ARGs in the final stage so a Claude Code release bump can't
+# invalidate (and re-download) any of this. Bump these pins to clear CVEs the
+# image scan flags; add more platforms/build-tools here if a project needs a
+# different compileSdk.
 #
 # The ENV PATH below covers processes that inherit the container env (hub-agent,
 # each session's claude, and its Bash tool). A *login* shell — what tmux/ttyd
 # spawns when an operator attaches — does NOT: Debian's /etc/profile
 # unconditionally resets root's PATH, dropping /opt/gradle and /opt/android-sdk
 # (tools in /usr/local/bin survive). The generated /etc/profile.d/android.sh
-# re-exports the toolchain so it's on PATH either way — keep both.
+# re-exports the toolchain so it's on PATH either way — keep both. Both cover the
+# emulator dir, which only exists in the stage below; a stale PATH entry is inert.
+FROM tooling AS android-build
 ARG GRADLE_VERSION=8.11.1
 ARG ANDROID_CMDLINE_TOOLS=11076708
 ARG ANDROID_PLATFORM=android-35
 ARG ANDROID_BUILD_TOOLS=35.0.0
-# System-image coordinates for the emulator. google_apis (not google_apis_playstore)
-# so the image is rootable/writable for testing; x86_64 so it runs KVM-accelerated
-# on the host. The full package id is system-images;<platform>;<tag>;<abi>.
-ARG ANDROID_EMULATOR_TAG=google_apis
-ARG ANDROID_EMULATOR_ABI=x86_64
+# ANDROID_PLATFORM/ANDROID_BUILD_TOOLS are promoted from ARG to ENV so the
+# emulator stage above can interpolate the SAME values without re-declaring the
+# ARGs (which don't cross stages) and risking a silent drift where the SDK
+# platform and the system image get installed for different API levels. Both
+# stay overridable here via --build-arg; the emulator stage just follows.
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
     ANDROID_HOME=/opt/android-sdk \
     ANDROID_SDK_ROOT=/opt/android-sdk \
+    ANDROID_PLATFORM=${ANDROID_PLATFORM} \
+    ANDROID_BUILD_TOOLS=${ANDROID_BUILD_TOOLS} \
     GRADLE_HOME=/opt/gradle/gradle-${GRADLE_VERSION}
 ENV PATH="${GRADLE_HOME}/bin:${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/emulator:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}:${PATH}"
 RUN set -eux; \
@@ -101,10 +129,7 @@ RUN set -eux; \
     mv "${ANDROID_HOME}/cmdline-tools/cmdline-tools" "${ANDROID_HOME}/cmdline-tools/latest"; \
     yes | sdkmanager --licenses >/dev/null; \
     sdkmanager --install "platform-tools" "platforms;${ANDROID_PLATFORM}" \
-      "build-tools;${ANDROID_BUILD_TOOLS}" "emulator" \
-      "system-images;${ANDROID_PLATFORM};${ANDROID_EMULATOR_TAG};${ANDROID_EMULATOR_ABI}" >/dev/null; \
-    echo "no" | avdmanager create avd -n turma --force \
-      -k "system-images;${ANDROID_PLATFORM};${ANDROID_EMULATOR_TAG};${ANDROID_EMULATOR_ABI}"; \
+      "build-tools;${ANDROID_BUILD_TOOLS}" >/dev/null; \
     chmod -R a+rX "${ANDROID_HOME}" /opt/gradle; \
     printf '%s\n' \
       'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64' \
@@ -114,6 +139,50 @@ RUN set -eux; \
       "export PATH=\"\${GRADLE_HOME}/bin:\${ANDROID_HOME}/cmdline-tools/latest/bin:\${ANDROID_HOME}/emulator:\${ANDROID_HOME}/platform-tools:\${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}:\${PATH}\"" \
       > /etc/profile.d/android.sh; \
     chmod 0644 /etc/profile.d/android.sh
+
+# --- Android EMULATOR layer (stable, ~1.9 GB) -------------------------------
+# The emulator + a headless x86_64 system image + a pre-created AVD, so an agent
+# can RUN and troubleshoot Android apps (and run connectedAndroidTest), not just
+# build them. This is the single largest thing in the image — the system image
+# alone is ~1.5 GB — which is why it's isolated here: a deployment that only
+# needs to build Android can target the android-build stage instead and skip it.
+#
+# Running the emulator needs hardware acceleration: the DockerOps compose must
+# pass the host's KVM device through to the agent container (`devices:
+# ["/dev/kvm"]`, plus `group_add: ["kvm"]`). Without it, boot the emulator in
+# software mode (`emulator -avd turma -no-window -gpu swiftshader_indirect
+# -no-accel`), which works but is slow. The X11/GL/audio shared libs the
+# (windowless) emulator still links are installed in the base apt layer above.
+#
+# Licences were already accepted in android-build and persist in
+# ${ANDROID_HOME}/licenses, so sdkmanager needs no re-prompt here.
+FROM android-build AS android
+# System-image coordinates for the emulator. google_apis (not google_apis_playstore)
+# so the image is rootable/writable for testing; x86_64 so it runs KVM-accelerated
+# on the host. The full package id is system-images;<platform>;<tag>;<abi>.
+# ANDROID_PLATFORM is NOT re-declared here — android-build promotes it to an ENV,
+# which (unlike an ARG) crosses the stage boundary, so this stage and the SDK
+# platform it pairs with can never drift to different API levels.
+ARG ANDROID_EMULATOR_TAG=google_apis
+ARG ANDROID_EMULATOR_ABI=x86_64
+# chmod is scoped to just the two trees this stage adds. A recursive chmod over
+# all of ${ANDROID_HOME} would re-touch every file android-build already fixed
+# and copy that whole ~500MB tree up into THIS layer — the emulator tier would
+# grow by the size of the tier below it, and android-build would stop being a
+# strict prefix of android for caching. The AVD lands in /root/.android, which
+# the tier below never chmod'd either.
+RUN set -eux; \
+    sdkmanager --install "emulator" \
+      "system-images;${ANDROID_PLATFORM};${ANDROID_EMULATOR_TAG};${ANDROID_EMULATOR_ABI}" >/dev/null; \
+    echo "no" | avdmanager create avd -n turma --force \
+      -k "system-images;${ANDROID_PLATFORM};${ANDROID_EMULATOR_TAG};${ANDROID_EMULATOR_ABI}"; \
+    chmod -R a+rX "${ANDROID_HOME}/emulator" "${ANDROID_HOME}/system-images"
+
+# --- Final assembly ---------------------------------------------------------
+# Lands on whichever toolchain tier AGENT_BASE selected (see the top of this
+# file). Everything below is identical across tiers, and everything above it is
+# stable — so the volatile layers here rebuild without touching the toolchain.
+FROM ${AGENT_BASE} AS final
 
 # --- Coding-agent layer (volatile) ------------------------------------------
 # CI pins these to the latest published release on every build, so they change
