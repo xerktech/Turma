@@ -28,6 +28,9 @@
   </header>
   <div class="org-chips" id="chips"></div>
   <div id="board"></div>
+  <div class="td-backdrop" id="detailBackdrop" hidden>
+    <div class="td-panel" id="detailPanel" role="dialog" aria-modal="true" aria-label="Ticket detail"></div>
+  </div>
   <div class="footer">Each host agent polls its org's Jira Cloud with user-scoped creds (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code> in the agent's env) for tickets assigned to that user — active work plus the last two weeks of Done — and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns are Jira's universal status categories; each card's pill shows the org's own status name. Pull-only: nothing here writes to Jira.</div>
 </div>
 
@@ -67,14 +70,19 @@ function setOrg(k) {
 
 function esc(s) { return B.esc(s); }
 
+// The merged view the last render drew, so a card click can find its ticket
+// (and its org color) without re-merging.
+let lastSites = [], lastAllKeys = [];
+
 function render(data) {
   const sites = B.mergeSites(data.agents || []);
+  lastSites = sites; lastAllKeys = sites.map(s => s.siteKey);
   if (!sites.length) {
     $chips.replaceChildren();
     $board.innerHTML = `<div class="empty">No Jira tickets reported yet. Set <code>JIRA_SITE</code>, <code>JIRA_EMAIL</code>, and <code>JIRA_TOKEN</code> in an agent's environment to connect its org.</div>`;
     return;
   }
-  const allKeys = sites.map(s => s.siteKey);
+  const allKeys = lastAllKeys;
   if (orgFilter && !allKeys.includes(orgFilter)) orgFilter = "";
 
   // Chips: All + one per org, colored by the org's stable palette slot, with
@@ -100,6 +108,103 @@ function render(data) {
 
   $board.innerHTML = B.boardHtml(sites, orgFilter, { allKeys });
 }
+
+// ---- Expanded ticket detail --------------------------------------------
+// A card click opens the panel immediately, painted from the card's own
+// heartbeat fields, and fills in description + comments once the on-demand
+// fetch lands (GET /api/jira/<siteKey>/<key>: 200 with the issue if the hub has
+// a fresh copy, else 202 while the owning host fetches it on its next beat —
+// so we poll). `openSeq` invalidates an in-flight fetch whose panel has since
+// been closed or replaced.
+const $backdrop = document.getElementById("detailBackdrop");
+const $panel = document.getElementById("detailPanel");
+let openTicketState = null, openSeq = 0, lastFocus = null;
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function paintDetail() {
+  const s = openTicketState;
+  if (!s) return;
+  $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
+    color: B.orgColor(s.siteKey, lastAllKeys),
+    siteKey: s.siteKey,
+    error: s.error,
+  });
+}
+
+function closeDetail() {
+  openSeq++;               // abandon any in-flight fetch for this panel
+  openTicketState = null;
+  $backdrop.hidden = true;
+  $panel.replaceChildren();
+  document.body.classList.remove("td-open");
+  if (lastFocus && document.contains(lastFocus)) lastFocus.focus();
+  lastFocus = null;
+}
+
+async function fetchDetail(siteKey, key, alive) {
+  const url = `/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(key)}`;
+  const deadline = Date.now() + 45000;   // the host beats every ~20s; 2 shots
+  let delay = 600;
+  while (alive() && Date.now() < deadline) {
+    let r;
+    try { r = await fetch(url); }
+    catch { return { error: "the hub is unreachable" }; }
+    if (r.status === 401) { location.href = "/login"; return {}; }
+    if (r.status === 202) {              // queued on the host — wait for its beat
+      await sleep(delay);
+      delay = Math.min(delay * 1.5, 3000);
+      continue;
+    }
+    let d = {};
+    try { d = await r.json(); } catch { /* non-JSON error body */ }
+    if (!r.ok) return { error: d.error || `HTTP ${r.status}` };
+    return d;
+  }
+  return alive() ? { error: "the host didn't answer in time" } : {};
+}
+
+async function openDetail(key, siteKey, fromEl) {
+  const site = lastSites.find(s => s.siteKey === siteKey);
+  const ticket = site && site.tickets.find(t => t.key === key);
+  if (!ticket) return;
+  const mySeq = ++openSeq;
+  const alive = () => openSeq === mySeq;
+  lastFocus = fromEl || null;
+  openTicketState = { key, siteKey, ticket, detail: null, error: null };
+  paintDetail();
+  $backdrop.hidden = false;
+  document.body.classList.add("td-open");
+  $panel.scrollTop = 0;
+  const close = $panel.querySelector(".td-close");
+  if (close) close.focus();
+
+  const d = await fetchDetail(siteKey, key, alive);
+  if (!alive()) return;                  // closed, or another ticket opened
+  openTicketState.detail = d.issue || null;
+  openTicketState.error = d.issue ? null : (d.error || "the host reported no issue");
+  paintDetail();
+}
+
+// Delegated: the board re-renders on every beat, so per-card listeners would be
+// re-bound constantly (and leak). A click on the kc-key link is left alone —
+// that's the deliberate way out to Jira.
+$board.addEventListener("click", (e) => {
+  if (e.target.closest(".kc-key")) return;
+  const card = e.target.closest(".kanban-card");
+  if (card) openDetail(card.dataset.key, card.dataset.site, card);
+});
+$board.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  if (e.target.closest(".kc-key")) return;
+  const card = e.target.closest(".kanban-card");
+  if (!card) return;
+  e.preventDefault();                    // Space would scroll the page
+  openDetail(card.dataset.key, card.dataset.site, card);
+});
+$panel.addEventListener("click", (e) => { if (e.target.closest(".td-close")) closeDetail(); });
+$backdrop.addEventListener("click", (e) => { if (e.target === $backdrop) closeDetail(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && openTicketState) closeDetail(); });
 
 let cache = null, etag = null;
 async function refresh() {

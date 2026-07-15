@@ -41,6 +41,13 @@ const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
 const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted first
+// Board ticket detail (description + comments), fetched on demand from the host
+// that owns the org's Jira creds. Cached briefly so reopening a ticket, or two
+// dashboards viewing one, doesn't re-hit Jira; kept much shorter-lived than a
+// transcript because a ticket is edited by other people while you read it.
+const JIRA_ISSUE_FRESH_MS = 60 * 1000; // serve a cached issue under this age
+const JIRA_ISSUE_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
+const JIRA_ISSUE_MAX = 40; // cap per-host cache; oldest fetchedAt evicted first
 
 // Single-user auth: TURMA_USER/TURMA_PASSWORD gate the UI and browser API. The
 // browser signs in through a real login form (/login -> POST /api/login) and
@@ -227,11 +234,12 @@ const sseClients = new Set(); // open /api/events response streams
 function invalidateAgentsCache() { agentsCache = null; }
 
 // One agent record shaped exactly as /api/agents returns it: the (potentially
-// large) history cache stripped, plus the two time/tunnel-derived live flags.
+// large) on-demand caches (session history, Jira issue detail) stripped — each
+// has its own route — plus the two time/tunnel-derived live flags.
 // Shared by the fleet payload and the SSE per-agent push so both stay in
 // lockstep.
 function serializeAgent(key, agent, now) {
-  const { history, ...a } = agent;
+  const { history, jiraIssues, ...a } = agent;
   return {
     key,
     ...a,
@@ -321,6 +329,44 @@ function ingestHistory(agent, historyResults) {
       .slice(0, over)
       .forEach(([sessionId]) => delete agent.history[sessionId]);
   }
+}
+
+// Merge the agent's on-demand Jira issue deliveries (heartbeat
+// `jiraIssueResults`) into the host's per-issue cache, bounded the same way as
+// ingestHistory. A result carrying an `error` is cached too — otherwise the
+// board would re-queue a doomed fetch (a deleted issue, a permissions wall) on
+// every poll for as long as the ticket stays open.
+function ingestJiraIssues(agent, jiraIssueResults) {
+  const now = Date.now();
+  for (const r of jiraIssueResults || []) {
+    if (!r || !r.key) continue;
+    agent.jiraIssues[r.key] = { issue: r.issue || null, error: r.error || null, fetchedAt: now };
+  }
+  for (const [key, e] of Object.entries(agent.jiraIssues)) {
+    if (now - e.fetchedAt > JIRA_ISSUE_MAX_AGE_MS) delete agent.jiraIssues[key];
+  }
+  const over = Object.keys(agent.jiraIssues).length - JIRA_ISSUE_MAX;
+  if (over > 0) {
+    Object.entries(agent.jiraIssues)
+      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
+      .slice(0, over)
+      .forEach(([key]) => delete agent.jiraIssues[key]);
+  }
+}
+
+// Which HOST should answer for a Jira org (siteKey): a host whose `jira` block
+// reports that site — preferring an ONLINE one, since an offline host's queued
+// command would sit undelivered until it returns. null when no host covers the
+// org (or the only ones that do are offline, and `requireOnline`).
+function findJiraHost(siteKey, requireOnline) {
+  const now = Date.now();
+  let stale = null;
+  for (const [key, a] of Object.entries(agents)) {
+    if (!a.jira || a.jira.siteKey !== siteKey) continue;
+    if (now - (a.lastSeen || 0) < OFFLINE_AFTER_MS) return key;
+    stale = stale || key;
+  }
+  return requireOnline ? null : stale;
 }
 
 // Which HOST owns a given sessionId, and that session's ttyd port. Sessions are
@@ -1300,6 +1346,10 @@ const server = http.createServer(async (req, res) => {
       // stored on the record verbatim.
       const historyResults = payload.historyResults;
       delete payload.historyResults;
+      // On-demand Jira issue detail the agent fetched since the last beat (see
+      // the {type:"jiraIssue"} command); cached below, like historyResults.
+      const jiraIssueResults = payload.jiraIssueResults;
+      delete payload.jiraIssueResults;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -1323,8 +1373,12 @@ const server = http.createServer(async (req, res) => {
         // Per-session history cache (see the /history route); survives across
         // beats like the rest of agent state.
         history: prev.history || {},
+        // Per-issue Jira detail cache (see the /api/jira route); like `history`,
+        // survives across beats.
+        jiraIssues: prev.jiraIssues || {},
       });
       ingestHistory(next, historyResults);
+      ingestJiraIssues(next, jiraIssueResults);
       heartbeatAlerts(key, prev, next);
       scheduleSave();
       // A fresh beat landed — refresh the memoized fleet payload and push the
@@ -1602,6 +1656,46 @@ const server = http.createServer(async (req, res) => {
       invalidateAgentsCache();
       sseBroadcast("removed", { key });
       return json(res, 200, { ok: true });
+    }
+
+    // GET /api/jira/<siteKey>/<issueKey> -> one ticket's full detail
+    // (description + comments) for the board's expanded view. The hub holds no
+    // Jira creds — they're per-host, user-scoped env — so this routes to a host
+    // reporting that org and rides the same {command -> staged result -> next
+    // beat} path as session history: a fresh cached issue is served outright,
+    // otherwise a fetch is queued (single-flight per key) and reported pending
+    // for the client to poll. Read-only; nothing here writes to Jira.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "jira" && parts.length === 4) {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!/^[A-Za-z][A-Za-z0-9_]*-[0-9]+$/.test(issueKey)) {
+        return json(res, 400, { error: "not a Jira issue key" });
+      }
+      // Fall back to an offline host's cache: its last fetch of this ticket is
+      // still worth showing (the board already shows its stale tickets), even
+      // though we can't queue a refresh for it.
+      const key = findJiraHost(siteKey, true) || findJiraHost(siteKey, false);
+      if (!key) return json(res, 404, { error: "no host reports that Jira org" });
+      const cached = (agents[key].jiraIssues || {})[issueKey];
+      if (cached && Date.now() - cached.fetchedAt < JIRA_ISSUE_FRESH_MS) {
+        return json(res, 200, cached.error
+          ? { error: cached.error, fetchedAt: cached.fetchedAt }
+          : { issue: cached.issue, fetchedAt: cached.fetchedAt });
+      }
+      if (Date.now() - (agents[key].lastSeen || 0) >= OFFLINE_AFTER_MS) {
+        // Offline: a queued command would never be delivered, so answer with
+        // whatever we last got rather than leaving the client polling forever.
+        if (cached) {
+          return json(res, 200, cached.error
+            ? { error: cached.error, fetchedAt: cached.fetchedAt, stale: true }
+            : { issue: cached.issue, fetchedAt: cached.fetchedAt, stale: true });
+        }
+        return json(res, 503, { error: `host ${key} is offline` });
+      }
+      const pending = (agents[key].commands || [])
+        .find((c) => c.type === "jiraIssue" && c.issueKey === issueKey);
+      const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "jiraIssue", issueKey });
+      return json(res, 202, { pending: true, cmdId });
     }
 
     // Terminal proxy: /term/<sessionId>/… -> the ttyd of the host that owns

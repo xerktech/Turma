@@ -4449,6 +4449,268 @@ class TestCollectJira(unittest.TestCase):
             self.assertTrue(ha.collect_jira()["truncated"])
 
 
+def _adf(*content):
+    return {"type": "doc", "version": 1, "content": list(content)}
+
+
+def _para(*content):
+    return {"type": "paragraph", "content": list(content)}
+
+
+def _txt(text, marks=None):
+    node = {"type": "text", "text": text}
+    if marks:
+        node["marks"] = marks
+    return node
+
+
+class TestAdfText(unittest.TestCase):
+    """Jira's rich text (ADF node tree) -> the plain text the board renders."""
+
+    def test_paragraphs_separated(self):
+        doc = _adf(_para(_txt("first")), _para(_txt("second")))
+        self.assertEqual(ha.adf_plain(doc, 999), ("first\n\nsecond", False))
+
+    def test_plain_string_body(self):
+        # REST v2 / some webhooks send a bare string, not a node tree.
+        self.assertEqual(ha.adf_plain("just text", 999), ("just text", False))
+
+    def test_link_mark_keeps_href(self):
+        doc = _adf(_para(_txt("the PR", [{"type": "link", "attrs": {"href": "https://x/1"}}])))
+        self.assertEqual(ha.adf_plain(doc, 999)[0], "the PR (https://x/1)")
+
+    def test_link_mark_skips_redundant_href(self):
+        url = "https://x/1"
+        doc = _adf(_para(_txt(url, [{"type": "link", "attrs": {"href": url}}])))
+        self.assertEqual(ha.adf_plain(doc, 999)[0], url)
+
+    def test_lists_bullets_and_hard_breaks(self):
+        doc = _adf({"type": "bulletList", "content": [
+            {"type": "listItem", "content": [_para(_txt("one"))]},
+            {"type": "listItem", "content": [_para(_txt("two"))]},
+        ]}, _para(_txt("a"), {"type": "hardBreak"}, _txt("b")))
+        self.assertEqual(ha.adf_plain(doc, 999)[0], "- one\n- two\n\na\nb")
+
+    def test_mention_emoji_card_and_table(self):
+        doc = _adf(
+            _para(_txt("cc "), {"type": "mention", "attrs": {"text": "@Sam"}}),
+            {"type": "table", "content": [{"type": "tableRow", "content": [
+                {"type": "tableCell", "content": [_para(_txt("k"))]},
+                {"type": "tableCell", "content": [_para(_txt("v"))]},
+            ]}]},
+            _para({"type": "inlineCard", "attrs": {"url": "https://x/2"}}),
+        )
+        self.assertEqual(ha.adf_plain(doc, 999)[0], "cc @Sam\n\nk | v\n\nhttps://x/2")
+
+    def test_unknown_node_still_yields_its_text(self):
+        doc = _adf({"type": "someFutureThing", "content": [_para(_txt("kept"))]})
+        self.assertEqual(ha.adf_plain(doc, 999)[0], "kept")
+
+    def test_malformed_never_raises(self):
+        for bad in (None, 12, [], {"type": "text"}, {"content": None},
+                    {"type": "paragraph", "content": "nope"},
+                    {"type": "text", "text": "x", "marks": ["junk"]}):
+            ha.adf_plain(bad, 99)   # just must not raise
+
+    def test_clip_reports_truncation(self):
+        doc = _adf(_para(_txt("x" * 50)))
+        text, trunc = ha.adf_plain(doc, 10)
+        self.assertEqual(text, "x" * 10)
+        self.assertTrue(trunc)
+        self.assertFalse(ha.adf_plain(doc, 50)[1])
+
+    def test_blank_line_runs_collapse(self):
+        doc = _adf(_para(_txt("a")), _para(), _para(), _para(_txt("b")))
+        self.assertEqual(ha.adf_plain(doc, 999)[0], "a\n\nb")
+
+
+def _issue_detail_payload(**over):
+    fields = {
+        "summary": "Fix the thing",
+        "status": {"name": "In Review", "statusCategory": {"key": "indeterminate"}},
+        "priority": {"name": "High"},
+        "issuetype": {"name": "Bug"},
+        "project": {"key": "ENG", "name": "Engineering"},
+        "parent": {"key": "ENG-1", "fields": {"summary": "the epic"}},
+        "labels": ["a", "b"],
+        "updated": "2026-07-14T10:00:00.000+0000",
+        "created": "2026-07-01T10:00:00.000+0000",
+        "duedate": "2026-07-20",
+        "resolution": {"name": "Done"},
+        "reporter": {"displayName": "Ada"},
+        "assignee": {"displayName": "Grace"},
+        "description": _adf(_para(_txt("why it matters"))),
+        "comment": {"total": 2, "comments": [
+            {"id": "1", "author": {"displayName": "Ada"},
+             "created": "2026-07-02T10:00:00.000+0000",
+             "updated": "2026-07-02T10:00:00.000+0000",
+             "body": _adf(_para(_txt("first note")))},
+            {"id": "2", "author": {"displayName": "Grace"},
+             "created": "2026-07-03T10:00:00.000+0000",
+             "updated": "2026-07-03T10:00:00.000+0000",
+             "body": _adf(_para(_txt("second note")))},
+        ]},
+    }
+    fields.update(over.pop("fields", {}))
+    return {"key": "ENG-42", "fields": fields, **over}
+
+
+class TestShapeIssueDetail(unittest.TestCase):
+    """The expanded-view shape: the card's fields plus description/comments."""
+
+    def test_full_shape(self):
+        d = ha._shape_issue_detail(_issue_detail_payload(), "myorg.atlassian.net")
+        # Everything the card already had still rides along.
+        self.assertEqual(d["key"], "ENG-42")
+        self.assertEqual(d["url"], "https://myorg.atlassian.net/browse/ENG-42")
+        self.assertEqual(d["status"], "In Review")
+        self.assertEqual(d["statusCategory"], "inprogress")
+        self.assertEqual(d["priority"], "High")
+        self.assertEqual(d["project"], "ENG")
+        # …plus what only the detail view shows.
+        self.assertEqual(d["description"], "why it matters")
+        self.assertFalse(d["descriptionTruncated"])
+        self.assertEqual(d["reporter"], "Ada")
+        self.assertEqual(d["assignee"], "Grace")
+        self.assertEqual(d["resolution"], "Done")
+        self.assertEqual(d["parentSummary"], "the epic")
+        self.assertEqual([c["body"] for c in d["comments"]], ["first note", "second note"])
+        self.assertEqual([c["author"] for c in d["comments"]], ["Ada", "Grace"])
+        self.assertEqual(d["commentTotal"], 2)
+        self.assertTrue(d["fetchedAt"])
+
+    def test_keeps_newest_comments_and_reports_total(self):
+        many = [{"id": str(i), "author": {"displayName": "A"},
+                 "body": _adf(_para(_txt(f"c{i}")))}
+                for i in range(ha.JIRA_COMMENT_MAX + 5)]
+        d = ha._shape_issue_detail(
+            _issue_detail_payload(fields={"comment": {"total": len(many), "comments": many}}),
+            "s")
+        self.assertEqual(len(d["comments"]), ha.JIRA_COMMENT_MAX)
+        # Jira lists comments oldest-first; the newest are the ones kept.
+        self.assertEqual(d["comments"][-1]["body"], f"c{len(many) - 1}")
+        self.assertEqual(d["commentTotal"], len(many))   # so the UI can say what it dropped
+
+    def test_long_text_truncated_and_flagged(self):
+        big = _adf(_para(_txt("x" * (ha.JIRA_DESC_MAX_CHARS + 100))))
+        huge = _adf(_para(_txt("y" * (ha.JIRA_COMMENT_MAX_CHARS + 100))))
+        d = ha._shape_issue_detail(_issue_detail_payload(fields={
+            "description": big,
+            "comment": {"total": 1, "comments": [{"id": "1", "body": huge}]},
+        }), "s")
+        self.assertEqual(len(d["description"]), ha.JIRA_DESC_MAX_CHARS)
+        self.assertTrue(d["descriptionTruncated"])
+        self.assertEqual(len(d["comments"][0]["body"]), ha.JIRA_COMMENT_MAX_CHARS)
+        self.assertTrue(d["comments"][0]["truncated"])
+
+    def test_empty_fields_degrade_not_raise(self):
+        d = ha._shape_issue_detail({"key": "X-1", "fields": {}}, "s")
+        self.assertEqual(d["description"], "")
+        self.assertEqual(d["comments"], [])
+        self.assertEqual(d["commentTotal"], 0)
+        self.assertIsNone(d["reporter"])
+        self.assertIsNone(d["resolution"])
+        self.assertEqual(d["labels"], [])
+        self.assertIsNone(d["parentSummary"])
+
+    def test_junk_comment_container_ignored(self):
+        for junk in ("nope", {"comments": "nope"}, {}, None):
+            d = ha._shape_issue_detail(
+                _issue_detail_payload(fields={"comment": junk}), "s")
+            self.assertEqual(d["comments"], [])
+
+    def test_detail_keeps_more_labels_than_the_card(self):
+        labels = [f"l{i}" for i in range(ha.JIRA_DETAIL_LABELS_MAX + 5)]
+        payload = _issue_detail_payload(fields={"labels": labels})
+        self.assertEqual(len(ha._shape_issue(payload, "s")["labels"]), 5)
+        self.assertEqual(len(ha._shape_issue_detail(payload, "s")["labels"]),
+                         ha.JIRA_DETAIL_LABELS_MAX)
+
+
+class TestFetchJiraIssue(unittest.TestCase):
+    def test_requests_the_issue_with_detail_fields(self):
+        seen = {}
+
+        def fake_get(path, params):
+            seen["path"], seen["params"] = path, params
+            return _issue_detail_payload()
+
+        with mock.patch.object(ha, "JIRA_SITE", "MyOrg.atlassian.net"), \
+             mock.patch.object(ha, "jira_get", fake_get):
+            d = ha.fetch_jira_issue("ENG-42")
+        self.assertEqual(seen["path"], "/rest/api/3/issue/ENG-42")
+        for f in ("description", "comment", "reporter", "assignee"):
+            self.assertIn(f, seen["params"]["fields"])
+        self.assertEqual(d["key"], "ENG-42")
+        self.assertEqual(d["url"], "https://myorg.atlassian.net/browse/ENG-42")
+
+
+class TestStageJiraIssue(ManagerMixin, unittest.TestCase):
+    """The {type:"jiraIssue"} command: every path stages a result (the board is
+    waiting on this key) and none of them raises out of the heartbeat loop."""
+
+    def _configured(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t")
+
+    def test_success_stages_issue(self):
+        sm = self.make_manager()
+        with self._configured(), \
+             mock.patch.object(ha, "fetch_jira_issue",
+                               return_value={"key": "ENG-42"}) as f:
+            sm._stage_jira_issue("ENG-42")
+        f.assert_called_once_with("ENG-42")
+        self.assertEqual(sm.jira_issue_results,
+                         [{"key": "ENG-42", "issue": {"key": "ENG-42"}, "error": None}])
+
+    def test_fetch_error_stages_error_not_raises(self):
+        sm = self.make_manager()
+        with self._configured(), \
+             mock.patch.object(ha, "fetch_jira_issue",
+                               side_effect=RuntimeError("404 " + "x" * 300)):
+            sm._stage_jira_issue("ENG-42")
+        r = sm.jira_issue_results[0]
+        self.assertIsNone(r["issue"])
+        self.assertTrue(r["error"].startswith("404"))
+        self.assertLessEqual(len(r["error"]), 200)
+
+    def test_bad_key_never_reaches_jira(self):
+        sm = self.make_manager()
+        bad = ["", None, "../../secrets", "ENG-42/comment", "ENG 42", "42",
+               "ENG-", "ENG-42?x=1", "-1"]
+        with self._configured(), mock.patch.object(ha, "fetch_jira_issue") as f:
+            for k in bad:
+                sm._stage_jira_issue(k)
+        f.assert_not_called()
+        self.assertEqual(len(sm.jira_issue_results), len(bad))
+        for r in sm.jira_issue_results:
+            self.assertEqual(r["error"], "not a Jira issue key")
+
+    def test_unconfigured_host_says_so_without_fetching(self):
+        sm = self.make_manager()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN=""), \
+             mock.patch.object(ha, "fetch_jira_issue") as f:
+            sm._stage_jira_issue("ENG-42")
+        f.assert_not_called()
+        self.assertIn("no Jira credentials", sm.jira_issue_results[0]["error"])
+
+    def test_command_routes_and_acks(self):
+        sm = self.make_manager()
+        with self._configured(), \
+             mock.patch.object(ha, "fetch_jira_issue", return_value={"key": "ENG-9"}):
+            sm.handle_commands([{"cmdId": "c1", "type": "jiraIssue", "issueKey": "ENG-9"}])
+        self.assertEqual(sm.jira_issue_results[0]["key"], "ENG-9")
+        self.assertIn("c1", sm.acked)
+
+    def test_results_ride_the_payload_only_when_staged(self):
+        sm = self.make_manager()
+        sm.registry = []
+        self.assertNotIn("jiraIssueResults", sm.build_payload(1))
+        sm.jira_issue_results = [{"key": "ENG-9", "issue": None, "error": "x"}]
+        self.assertEqual(sm.build_payload(1)["jiraIssueResults"],
+                         [{"key": "ENG-9", "issue": None, "error": "x"}])
+
+
 class TestRefreshJira(ManagerMixin, unittest.TestCase):
     """The manager's slow-cadence Jira refresh: stale-cache fail-open (a fetch
     error keeps the prior tickets and surfaces only the error string)."""

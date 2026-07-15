@@ -1397,6 +1397,167 @@ test("http: history cache eviction — capped at 8 sessions, oldest fetchedAt ev
   assert.ok(keys.includes("s9"), "newest session (s9) should remain");
 });
 
+// ---- board ticket detail endpoint -------------------------------------------
+// GET /api/jira/<siteKey>/<issueKey>: the board's expanded ticket view. The hub
+// holds no Jira creds, so it routes to a host reporting that org and rides the
+// heartbeat command path (same shape as session history).
+
+const jiraBeat = (device, siteKey, extra = {}) =>
+  request("POST", "/api/heartbeat", {
+    body: { device, jira: { available: true, siteKey, user: `${device}@x.com`, tickets: [] }, ...extra },
+    headers: agentHeaders,
+  });
+
+test("http: ticket detail returns 202 pending on cache miss, single-flight on repeat GET", async () => {
+  await jiraBeat("jd1", "org1.atlassian.net");
+
+  const first = await request("GET", "/api/jira/org1.atlassian.net/ENG-42", { headers: userHeaders });
+  assert.equal(first.status, 202);
+  assert.equal(first.body.pending, true);
+  assert.ok(first.body.cmdId);
+
+  // A second viewer (or a re-open) must not queue a duplicate fetch.
+  const second = await request("GET", "/api/jira/org1.atlassian.net/ENG-42", { headers: userHeaders });
+  assert.equal(second.status, 202);
+  assert.equal(second.body.cmdId, first.body.cmdId);
+
+  // A DIFFERENT issue is its own command, though.
+  const other = await request("GET", "/api/jira/org1.atlassian.net/ENG-43", { headers: userHeaders });
+  assert.notEqual(other.body.cmdId, first.body.cmdId);
+
+  const beat = await jiraBeat("jd1", "org1.atlassian.net");
+  assert.deepEqual(beat.body.commands, [
+    { type: "jiraIssue", issueKey: "ENG-42", cmdId: first.body.cmdId },
+    { type: "jiraIssue", issueKey: "ENG-43", cmdId: other.body.cmdId },
+  ]);
+});
+
+test("http: heartbeat jiraIssueResults populate the cache; GET returns 200 while fresh", async () => {
+  await jiraBeat("jd2", "org2.atlassian.net");
+  await request("GET", "/api/jira/org2.atlassian.net/ENG-1", { headers: userHeaders }); // queue it
+
+  const issue = { key: "ENG-1", summary: "Fix it", description: "why", comments: [] };
+  await jiraBeat("jd2", "org2.atlassian.net", {
+    jiraIssueResults: [{ key: "ENG-1", issue, error: null }],
+  });
+
+  const res = await request("GET", "/api/jira/org2.atlassian.net/ENG-1", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.issue, issue);
+  assert.ok(res.body.fetchedAt);
+});
+
+test("http: a ticket the host couldn't fetch caches its error rather than re-queueing forever", async () => {
+  await jiraBeat("jd3", "org3.atlassian.net");
+  await jiraBeat("jd3", "org3.atlassian.net", {
+    jiraIssueResults: [{ key: "ENG-9", issue: null, error: "HTTP Error 404: Not Found" }],
+  });
+
+  const res = await request("GET", "/api/jira/org3.atlassian.net/ENG-9", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.error, "HTTP Error 404: Not Found");
+  assert.equal(res.body.issue, undefined);
+  // The board polls while a ticket is open; a doomed fetch must not re-queue.
+  assert.equal((agents.jd3.commands || []).length, 0);
+});
+
+test("http: stale cached ticket detail (>1 minute) is re-queued instead of served", async () => {
+  await jiraBeat("jd4", "org4.atlassian.net");
+  await jiraBeat("jd4", "org4.atlassian.net", {
+    jiraIssueResults: [{ key: "ENG-2", issue: { key: "ENG-2" }, error: null }],
+  });
+  assert.ok(agents.jd4.jiraIssues["ENG-2"]);
+  agents.jd4.jiraIssues["ENG-2"].fetchedAt = Date.now() - 2 * 60 * 1000; // fudge stale
+
+  const res = await request("GET", "/api/jira/org4.atlassian.net/ENG-2", { headers: userHeaders });
+  assert.equal(res.status, 202);
+  assert.equal(res.body.pending, true);
+});
+
+test("http: ticket detail 404s an org no host reports", async () => {
+  const res = await request("GET", "/api/jira/nobody.atlassian.net/ENG-1", { headers: userHeaders });
+  assert.equal(res.status, 404);
+});
+
+test("http: ticket detail rejects a non-issue-key path segment before routing", async () => {
+  await jiraBeat("jd5", "org5.atlassian.net");
+  for (const bad of ["..%2F..%2Fsecret", "ENG-42%3Fx%3D1", "42", "ENG-", "ENG%2042"]) {
+    const res = await request("GET", `/api/jira/org5.atlassian.net/${bad}`, { headers: userHeaders });
+    assert.equal(res.status, 400, `${bad} should be rejected`);
+  }
+  assert.equal((agents.jd5.commands || []).length, 0);
+});
+
+test("http: ticket detail prefers an ONLINE host of the org; offline-only serves its cache", async () => {
+  await jiraBeat("jdOff", "org6.atlassian.net", {
+    jiraIssueResults: [{ key: "ENG-7", issue: { key: "ENG-7", summary: "stale copy" }, error: null }],
+  });
+  await jiraBeat("jdOn", "org6.atlassian.net");
+  agents.jdOff.lastSeen = Date.now() - 10 * 60 * 1000; // offline
+  agents.jdOff.jiraIssues["ENG-7"].fetchedAt = Date.now() - 10 * 60 * 1000;
+
+  // The online host is asked, even though only the offline one has a copy.
+  const res = await request("GET", "/api/jira/org6.atlassian.net/ENG-7", { headers: userHeaders });
+  assert.equal(res.status, 202);
+  assert.equal((agents.jdOn.commands || []).length, 1);
+  assert.equal((agents.jdOff.commands || []).length, 0, "an offline host must not be queued");
+
+  // With the org's only host offline, its last copy beats leaving the panel
+  // spinning on a command that will never be delivered.
+  delete agents.jdOn;
+  const stale = await request("GET", "/api/jira/org6.atlassian.net/ENG-7", { headers: userHeaders });
+  assert.equal(stale.status, 200);
+  assert.equal(stale.body.issue.summary, "stale copy");
+  assert.equal(stale.body.stale, true);
+});
+
+test("http: an offline host with nothing cached says so rather than queueing", async () => {
+  await jiraBeat("jd7", "org7.atlassian.net");
+  agents.jd7.lastSeen = Date.now() - 10 * 60 * 1000;
+  const res = await request("GET", "/api/jira/org7.atlassian.net/ENG-1", { headers: userHeaders });
+  assert.equal(res.status, 503);
+  assert.match(res.body.error, /offline/);
+  assert.equal((agents.jd7.commands || []).length, 0);
+});
+
+test("http: ticket detail requires the user login", async () => {
+  await jiraBeat("jd8", "org8.atlassian.net");
+  const res = await request("GET", "/api/jira/org8.atlassian.net/ENG-1");
+  assert.equal(res.status, 401);
+});
+
+test("http: /api/agents does not serialize the jiraIssues cache (served only by /api/jira)", async () => {
+  await jiraBeat("jd9", "org9.atlassian.net", {
+    jiraIssueResults: [{ key: "ENG-1", issue: { key: "ENG-1", description: "x".repeat(500) }, error: null }],
+  });
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  for (const a of list.body.agents) {
+    assert.ok(!("jiraIssues" in a), `agent ${a.key} leaked its ticket cache into /api/agents`);
+  }
+  // The `jira` block itself (the board's tickets) still ships, though.
+  const rec = list.body.agents.find((a) => a.key === "jd9");
+  assert.equal(rec.jira.siteKey, "org9.atlassian.net");
+});
+
+test("http: ticket cache eviction — older than 10 minutes dropped, capped at 40 issues", async () => {
+  await jiraBeat("jdA", "orgA.atlassian.net", {
+    jiraIssueResults: [{ key: "OLD-1", issue: { key: "OLD-1" }, error: null }],
+  });
+  agents.jdA.jiraIssues["OLD-1"].fetchedAt = Date.now() - 11 * 60 * 1000;
+  await jiraBeat("jdA", "orgA.atlassian.net"); // any ingest re-sweeps
+  assert.equal(agents.jdA.jiraIssues["OLD-1"], undefined);
+
+  for (let i = 1; i <= 41; i++) {
+    await jiraBeat("jdA", "orgA.atlassian.net", {
+      jiraIssueResults: [{ key: `E-${i}`, issue: { key: `E-${i}` }, error: null }],
+    });
+  }
+  const keys = Object.keys(agents.jdA.jiraIssues);
+  assert.equal(keys.length, 40, "cache should be capped at 40 issues");
+  assert.ok(!keys.includes("E-1"), "oldest issue should have been evicted");
+  assert.ok(keys.includes("E-41"), "newest issue should remain");
+});
+
 // ---- pcmToWav ------------------------------------------------------------------
 
 test("pcmToWav: RIFF/WAVE header fields for 16kHz s16le mono", () => {

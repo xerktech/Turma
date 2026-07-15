@@ -2315,6 +2315,20 @@ JIRA_MAX_DONE = 50      # recently-Done tickets reported
 JIRA_DONE_DAYS = 14     # how far back the Done column reaches
 JIRA_MAX_PAGES = 5      # hard bound on pagination per query
 
+# On-demand single-issue detail (the board's expanded ticket view). The board
+# card's fields ride the heartbeat for every ticket; description + comments are
+# far too big for that, so they're fetched one issue at a time when an operator
+# actually opens a ticket — the same {command -> staged result -> next beat}
+# path the session `history` command uses.
+JIRA_DESC_MAX_CHARS = 8000      # per-issue description text kept
+JIRA_COMMENT_MAX = 20           # newest comments kept
+JIRA_COMMENT_MAX_CHARS = 2000   # per-comment text kept
+JIRA_DETAIL_LABELS_MAX = 20     # labels kept (the card shape caps at 5)
+# An issue key is interpolated into a REST path, so it's allowlist-checked
+# against Jira's own key grammar (PROJECT-123) before it ever reaches a URL —
+# the same "nothing free-form reaches the shell" stance as the spawn options.
+JIRA_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
+
 # Full block schema even when off/unavailable, mirroring the github block's
 # contract: the hub always sees every field, never a partial dict.
 JIRA_EMPTY = {"available": False, "site": None, "siteKey": None, "user": None,
@@ -2444,6 +2458,141 @@ def collect_jira():
         "truncated": trunc_active or trunc_done,
         "tickets": active + done,
     }
+
+
+# --- Jira issue detail (on-demand) ---------------------------------------------
+# Jira Cloud's REST v3 returns rich text (descriptions, comment bodies) as ADF —
+# Atlassian Document Format, a nested {type, content[], attrs} node tree, not
+# HTML or markdown. The board renders plain text, so the agent flattens it here
+# rather than shipping the tree and re-implementing the walk in the browser.
+# Only the shapes Jira actually emits are special-cased; anything unrecognized
+# still recurses into its `content`, so an unknown node degrades to its text
+# instead of vanishing.
+
+_ADF_BLOCKS = {"paragraph", "heading", "blockquote", "codeBlock", "panel",
+               "bulletList", "orderedList", "taskList", "table", "mediaGroup",
+               "mediaSingle", "expand", "nestedExpand"}
+
+
+def adf_text(node):
+    """An ADF node (or a plain string — REST v2 and some webhooks send one) ->
+    plain text. Best-effort and total: never raises on a malformed tree, just
+    returns what it could read."""
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(adf_text(n) for n in node)
+    if not isinstance(node, dict):
+        return ""
+    t = node.get("type")
+    attrs = node.get("attrs") if isinstance(node.get("attrs"), dict) else {}
+
+    if t == "text":
+        txt = node.get("text") or ""
+        # A link's href is part of the detail an operator is reviewing, so keep
+        # it alongside the anchor text unless the text already is the URL.
+        for m in node.get("marks") or []:
+            if isinstance(m, dict) and m.get("type") == "link":
+                href = (m.get("attrs") or {}).get("href")
+                if href and href != txt:
+                    txt = f"{txt} ({href})"
+        return txt
+    if t == "hardBreak":
+        return "\n"
+    if t == "rule":
+        return "\n---\n"
+    if t == "mention":
+        return "@" + str(attrs.get("text") or attrs.get("displayName") or "").lstrip("@")
+    if t == "emoji":
+        return str(attrs.get("text") or attrs.get("shortName") or "")
+    if t in ("inlineCard", "blockCard", "embedCard"):
+        return str(attrs.get("url") or "")
+    if t == "media":
+        return f"[attachment: {attrs.get('alt') or attrs.get('id') or ''}]"
+    if t == "tableRow":
+        cells = [adf_text(c).strip() for c in node.get("content") or []]
+        return " | ".join(cells) + "\n"
+
+    inner = "".join(adf_text(c) for c in node.get("content") or [])
+    if t in ("listItem", "taskItem"):
+        return "- " + inner.strip() + "\n"
+    if t in _ADF_BLOCKS:
+        return inner.strip("\n") + "\n\n"
+    return inner
+
+
+def adf_plain(node, limit):
+    """adf_text() normalized for display and clipped: (text, truncated). Runs of
+    blank lines collapse to one so a paragraph-heavy description doesn't render
+    as a column of gaps."""
+    text = re.sub(r"\n{3,}", "\n\n", adf_text(node)).strip()
+    if len(text) <= limit:
+        return text, False
+    return text[:limit].rstrip(), True
+
+
+def _shape_issue_detail(issue, site_key):
+    """One raw REST-v3 GET-issue response -> the card shape plus everything the
+    expanded view adds: description, comments, people, full labels."""
+    detail = _shape_issue(issue, site_key)
+    fields = issue.get("fields") or {}
+
+    def person(field):
+        v = fields.get(field)
+        return (v or {}).get("displayName") if isinstance(v, dict) else None
+
+    desc, desc_trunc = adf_plain(fields.get("description"), JIRA_DESC_MAX_CHARS)
+    detail["description"] = desc
+    detail["descriptionTruncated"] = desc_trunc
+    detail["reporter"] = person("reporter")
+    detail["assignee"] = person("assignee")
+    detail["resolution"] = (fields.get("resolution") or {}).get("name") \
+        if isinstance(fields.get("resolution"), dict) else None
+    labels = fields.get("labels")
+    detail["labels"] = labels[:JIRA_DETAIL_LABELS_MAX] if isinstance(labels, list) else []
+    parent = fields.get("parent") or {}
+    detail["parentSummary"] = ((parent.get("fields") or {}).get("summary")
+                               if isinstance(parent.get("fields"), dict) else None)
+
+    # `comment` is a paginated container: {comments:[…oldest first], total}. We
+    # keep the NEWEST few — a long thread's recent replies are the ones being
+    # reviewed — and report `commentTotal` so the UI can say what it dropped.
+    block = fields.get("comment") if isinstance(fields.get("comment"), dict) else {}
+    raw = block.get("comments") if isinstance(block.get("comments"), list) else []
+    comments = []
+    for c in raw[-JIRA_COMMENT_MAX:]:
+        if not isinstance(c, dict):
+            continue
+        body, trunc = adf_plain(c.get("body"), JIRA_COMMENT_MAX_CHARS)
+        author = c.get("author")
+        comments.append({
+            "id": c.get("id"),
+            "author": (author or {}).get("displayName") if isinstance(author, dict) else None,
+            "created": c.get("created"),
+            "updated": c.get("updated"),
+            "body": body,
+            "truncated": trunc,
+        })
+    detail["comments"] = comments
+    total = block.get("total")
+    detail["commentTotal"] = total if isinstance(total, int) else len(comments)
+    detail["fetchedAt"] = now_iso()
+    return detail
+
+
+def fetch_jira_issue(key):
+    """One issue's full detail. Exceptions propagate — _stage_jira_issue turns
+    them into the staged result's `error` so the board can say why."""
+    site_key = normalize_jira_site(JIRA_SITE)
+    data = jira_get(
+        f"/rest/api/3/issue/{urllib.parse.quote(key)}",
+        {"fields": "summary,status,priority,issuetype,updated,created,duedate,"
+                   "labels,project,parent,description,reporter,assignee,"
+                   "resolution,comment"},
+    )
+    return _shape_issue_detail(data, site_key)
 
 
 # --- Session activity summaries ------------------------------------------------
@@ -2614,6 +2763,11 @@ class SessionManager:
         # (historyResults) — held across a failed POST, cleared only once
         # delivery succeeds, same lifecycle as pending_prs above.
         self.history_results = []
+        # Staged `jiraIssue` command results (one issue's description/comments,
+        # fetched on demand when an operator expands a board ticket) awaiting
+        # the next heartbeat payload — same held-across-a-failed-POST lifecycle
+        # as history_results.
+        self.jira_issue_results = []
         # Archive sync: the manifest of inactive transcripts sent on the last slow
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
@@ -3562,6 +3716,29 @@ class SessionManager:
             "truncated": truncated,
         })
 
+    def _stage_jira_issue(self, key):
+        """Handle a {type:"jiraIssue"} command: fetch that issue's full detail
+        and stage it for the next heartbeat payload (jiraIssueResults). Every
+        failure path stages a result carrying an `error` rather than raising —
+        the board is waiting on this key, so it needs an answer either way, and
+        a poison key must not take down the heartbeat loop."""
+        k = (key or "").strip()
+        if not JIRA_KEY_RE.match(k):
+            self.jira_issue_results.append(
+                {"key": k[:50], "issue": None, "error": "not a Jira issue key"})
+            return
+        if not jira_configured():
+            self.jira_issue_results.append(
+                {"key": k, "issue": None, "error": "no Jira credentials on this host"})
+            return
+        try:
+            issue = fetch_jira_issue(k)
+            self.jira_issue_results.append({"key": k, "issue": issue, "error": None})
+        except Exception as e:
+            log(f"jira issue fetch failed for {k}: {e}")
+            self.jira_issue_results.append(
+                {"key": k, "issue": None, "error": str(e)[:200]})
+
     # --- durable archive sync ---------------------------------------------
     # Ship every INACTIVE session's transcript to the hub so history is durable
     # (survives this host being wiped/offline) and searchable there. The agent
@@ -4418,6 +4595,8 @@ class SessionManager:
                     )
                 elif ctype == "history":
                     self._stage_history(cmd.get("sessionId"))
+                elif ctype == "jiraIssue":
+                    self._stage_jira_issue(cmd.get("issueKey"))
                 elif ctype == "clone":
                     self.clone(cmd.get("repo"))
                 elif ctype == "prune":
@@ -4915,6 +5094,8 @@ class SessionManager:
         # something to report.
         if self.history_results:
             payload["historyResults"] = list(self.history_results)
+        if self.jira_issue_results:
+            payload["jiraIssueResults"] = list(self.jira_issue_results)
         # Archive sync manifest on the slow cadence: the inactive transcripts the
         # hub could pull. Remember it by id so the reply's archiveHave cursors map
         # back to each one for the delta push (in run_forever).
@@ -4949,6 +5130,7 @@ class SessionManager:
                 reply = json.loads(resp.read().decode() or "{}")
             self._clear_pending_prs()  # delivered
             self.history_results.clear()  # delivered — same lifecycle
+            self.jira_issue_results.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
         except Exception as e:
             log(f"heartbeat failed: {e}")
