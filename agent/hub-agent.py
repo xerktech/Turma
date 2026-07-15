@@ -2511,6 +2511,17 @@ def clean_summary(raw):
     return capped or None
 
 
+def clean_manual_summary(raw):
+    """Reduce an operator-typed session name to a display name, or None to clear
+    it. Unlike clean_summary (which tames a chatty model reply), this keeps the
+    text the operator actually typed — only the first line, whitespace collapsed,
+    and capped to the same width the card can show. Nothing is stripped from
+    inside it: an apostrophe or a version number is a deliberate part of a name a
+    human chose, where in a model's reply it was noise."""
+    line = next((ln.strip() for ln in (raw or "").splitlines() if ln.strip()), "")
+    return " ".join(line.split())[:SUMMARY_MAX_CHARS].strip() or None
+
+
 def _summary_attempts(sess):
     """How many naming attempts a session has already spent.
 
@@ -3064,8 +3075,8 @@ class SessionManager:
         they just stop being offered)."""
         rec = {k: sess.get(k) for k in (
             "id", "repo", "repoPath", "worktreePath", "branch", "baseRef",
-            "rcName", "tmuxName", "createdAt", "label", "summary", "model",
-            "permissionMode", "root",
+            "rcName", "tmuxName", "createdAt", "label", "summary",
+            "summaryManual", "model", "permissionMode", "root",
         )}
         rec["closedAt"] = now_iso()
         self.closed = [c for c in self.closed if c.get("id") != rec["id"]]
@@ -3160,7 +3171,8 @@ class SessionManager:
             "baseRef": rec.get("baseRef"),
             "root": rec.get("root"),
             "label": rec.get("label"),
-            "summary": rec.get("summary"),   # keep the auto name across resume
+            "summary": rec.get("summary"),   # keep the name across resume...
+            "summaryManual": rec.get("summaryManual"),  # ...pinned if it was typed
             "rcName": rec.get("rcName"),
             "tmuxName": rec.get("tmuxName") or f"agent-{sid}",
             "ttydPort": self._alloc_port(),  # old port may be taken by now
@@ -3365,6 +3377,30 @@ class SessionManager:
         tmux_name = sess["tmuxName"]
         run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
         run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+
+    def set_summary(self, sid, summary):
+        """Rename a session: replace the auto-generated few-word name the card
+        leads with by one the operator typed. Works on a stopped session too (the
+        name is presentational — no process is touched), and is persisted like the
+        auto name, so it survives beats, restart and resume.
+
+        A manual name pins the card: `summaryManual` stops _finish_summary from
+        clobbering it should a naming job still be in flight, and _summary_due
+        already declines to start new ones while a session has any name. A blank
+        rename clears the name — the card falls back to the label/worktree, and
+        auto-naming resumes if the session still has attempts left, which is the
+        only way back to it."""
+        sess = self._find(sid)
+        if not sess:
+            return
+        name = clean_manual_summary(summary)
+        sess["summary"] = name
+        sess["summaryManual"] = bool(name)
+        if name:
+            sess.pop("summaryRetryAt", None)
+        self.save()
+        log(f"renamed session {sid} -> {name!r}" if name
+            else f"cleared name of session {sid}")
 
     def set_model(self, sid, model):
         """Switch a running session's model live by typing `/model <name>` into
@@ -4096,6 +4132,8 @@ class SessionManager:
         sess = self._find(sid)
         if sess is None:
             return  # killed/deleted while summarizing — nothing to name
+        if sess.get("summaryManual"):
+            return  # operator renamed it mid-flight; their name wins
         if summary:
             sess["summary"] = summary
             sess.pop("summaryRetryAt", None)
@@ -4366,6 +4404,8 @@ class SessionManager:
                     self.delete(cmd.get("sessionId"))
                 elif ctype == "input":
                     self.send_input(cmd.get("sessionId"), cmd.get("text") or "")
+                elif ctype == "setSummary":
+                    self.set_summary(cmd.get("sessionId"), cmd.get("summary"))
                 elif ctype == "setModel":
                     self.set_model(cmd.get("sessionId"), cmd.get("model"))
                 elif ctype == "setMode":
@@ -4670,7 +4710,7 @@ class SessionManager:
             "rcName": sess["rcName"],
             "restartCount": sess.get("restartCount", 0),  # bumps on clear-context restart
             "label": sess.get("label"),
-            "summary": sess.get("summary"),   # few-word auto task name (or None)
+            "summary": sess.get("summary"),   # few-word task name (or None)
             # The hub command that created this session (spawn / resumeTranscript),
             # so the UI that issued it can find the id the agent minted and open
             # the session. None for sessions predating the echo, or restored ones.
