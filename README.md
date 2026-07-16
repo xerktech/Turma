@@ -108,14 +108,25 @@ The compose files are commented in full; the three things worth knowing up front
 ### Beyond Docker
 
 An agent can also be installed **natively** on a Linux/WSL host that already has
-git, node, python, and a logged-in Claude — same session model, no image:
+git, node, python, and a logged-in Claude — same session model, no image. This
+needs no checkout: it fetches the latest native release, verifies its checksum,
+and installs it.
 
 ```sh
-cd agent/native && ./install.sh      # then edit ~/.config/turma-agent/turma-agent.env
-./install.sh --verify                # files, tools, config, service, login
+curl -fsSL https://raw.githubusercontent.com/xerktech/turma/main/agent/native/bootstrap.sh | bash
 ```
 
-It self-updates from the `agent-native-v*` releases without stopping running
+Then edit `~/.config/turma-agent/turma-agent.env` (hub URL + token). Options
+pass through after `-s --`, so the same line does the installer's other modes:
+
+```sh
+curl -fsSL .../bootstrap.sh | bash -s -- --autostart
+curl -fsSL .../bootstrap.sh | bash -s -- --verify     # files, tools, config, service, login
+```
+
+From a checkout, `cd agent/native && ./install.sh` does the same thing.
+
+It self-updates from the release stream afterwards without stopping running
 sessions. See [`agent/native/README.md`](agent/native/README.md).
 
 ## Clients

@@ -358,6 +358,18 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - `install.sh` — idempotent installer (`--verify`/`--uninstall`): auto-installs prereqs (apt + npm +
   pinned static ttyd), lays files into a prefix keeping `hub-agent.py` and `hooks/` siblings, writes a
   `chmod 600` config, wires the service, writes `$PREFIX/VERSION`.
+- `bootstrap.sh` — the README's `curl … | bash` front door: the way IN for a host with no checkout.
+  Resolves the newest native tarball, verifies its sha256, unpacks to a temp dir, and `exec`s the
+  `install.sh` inside it with every arg passed through (`bash -s -- --autostart`). Duplicates none of
+  install.sh; `install.sh` isn't copied into `$PREFIX`, so `--verify`/`--uninstall` on a bootstrapped
+  host re-run through it (both act on the existing `$PREFIX`, not the tarball they arrive in).
+  - It resolves by the version in the **asset's own filename**, never the release tag — a release
+    carries an unchanged native build forward under its original older name, so the newest tag can
+    hold an older tarball and a tag-derived name would 404. Matching asset names also covers the
+    legacy `agent-native-v*` stream with no tag-scheme branch to keep in sync.
+  - Anonymous (public repo — no `gh`/token, unlike the updater) and parser-free: it runs BEFORE
+    install.sh apt-installs python3, so the release stream is read with grep/sed, not JSON.
+  - Tests: `agent/tests/test_bootstrap.sh` (wired into `code-scan.yml` beside the updater's).
 - Service: a systemd **user** unit with `KillMode=process` (so a restart signals only the manager,
   leaving tmux/claude/ttyd/tunnel alive), plus a nohup `turma-agentctl` fallback for WSL without
   systemd. Both preserve running sessions across a restart via the adopt-on-boot path above.
