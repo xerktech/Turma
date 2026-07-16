@@ -48,4 +48,11 @@ function detectChanges(paths, opts) {
   return changed;
 }
 
-module.exports = { COMPONENTS, componentsForPath, detectChanges };
+// The distinct source dirs a component can live under. release.yml's push:main
+// filter has to restate these as globs (a trigger can't call into JS); this is
+// what its test asserts against, so the two can't drift apart silently.
+function componentPrefixes() {
+  return PREFIX_MAP.map(({ prefix }) => prefix);
+}
+
+module.exports = { COMPONENTS, componentsForPath, detectChanges, componentPrefixes };

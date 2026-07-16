@@ -992,6 +992,10 @@ GHCR image builds and PR gates — see Build & Deploy below.
 - Trigger: `workflow_dispatch` (with `dry_run` defaulting on) plus `push: main` for auto patch
   releases. A manual `minor`/`major` dispatch bumps `VERSION`, rolls the intervening patches into
   `CHANGELOG.md`, and force-builds every component.
+- The `push: main` trigger is **path-filtered to the four component source dirs**, restating
+  `changes.js`'s `PREFIX_MAP` because a workflow trigger can't call into JS; a test asserts the two
+  match. A docs-only merge deliberately cuts no release — every component would be carried, so the
+  tag would publish nothing new.
 - `.github/workflows/agent-emulator-image.yml` builds the opt-in `:emulator` agent tier on demand —
   not a release component (nothing consumes it), so it carries no unified version.
 
