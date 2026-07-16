@@ -519,6 +519,23 @@ function uptime(startedAt, now) {
   if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
   return Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h";
 }
+// The coding agent a host runs, for its header's "Agent" row: "Claude Code
+// 2.1.211". The agent reports {name, version} so the hub never has to guess
+// which CLI a host launched (the image is agent-generic by design).
+//
+// An older agent reports only the raw `claude --version` string — "2.1.211
+// (Claude Code)" — which is parsed to the same shape here rather than rendered
+// as-is, since under a label it read "Claude Code 2.1.211 (Claude Code)". An
+// unparseable string is shown whole beside the only agent such a build can be
+// running; the name is worth more than the reply's exact shape.
+function codingAgent(a) {
+  const c = a.codingAgent;
+  if (c && c.version) return `${c.name || "Claude Code"} ${c.version}`;
+  const raw = (a.claudeVersion || "").trim();
+  if (!raw) return "–";
+  const m = raw.match(/^(\S+)\s+\((.+)\)$/);
+  return m ? `${m[2]} ${m[1]}` : `Claude Code ${raw}`;
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -739,8 +756,8 @@ function hostCard(a, now) {
   const collapsed = collapsedHosts.has(a.key);
   const body = collapsed ? "" : `
     <div class="host-meta">
-      <span><span class="m-label">Agent</span> <b>${esc(a.agentVersion || "–")}</b></span>
-      <span><span class="m-label">Claude Code</span> <b>${esc(a.claudeVersion || "–")}</b></span>
+      <span><span class="m-label">Agent</span> <b>${esc(codingAgent(a))}</b></span>
+      <span><span class="m-label">Turma</span> <b>${esc(a.agentVersion || "–")}</b></span>
       <span><span class="m-label">Memory</span> <b>${esc(mem)}</b></span>
       <span><span class="m-label">Uptime</span> <b>${esc(uptime(a.startedAt, now))}</b> · last seen ${esc(ago(now - a.lastSeen))}</span>
       <span><span class="m-label">Repos root</span> <span class="path">${esc(a.reposRoot || "–")}</span></span>
