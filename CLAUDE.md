@@ -922,7 +922,7 @@ most CVEs are cleared. Genuinely non-actionable upstream base-image findings go 
     compose to pass `/dev/kvm` (no stack does) and otherwise falls back to slow software rendering.
   - If you genuinely need an in-container AVD, `:emulator` (the `android` tier, 6.4 GB,
     `ANDROID_EMULATOR_TAG`/`ANDROID_EMULATOR_ABI`) is built on demand via `workflow_dispatch` on
-    `turma-agent-image.yml`.
+    `agent-emulator-image.yml`.
 
 ### Self-hosted runner constraints
 
