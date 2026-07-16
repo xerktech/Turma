@@ -911,7 +911,7 @@ most CVEs are cleared. Genuinely non-actionable upstream base-image findings go 
 ### Self-hosted runner constraints
 
 **All workflows run on the home-lab self-hosted runners** (`runs-on: [self-hosted, linux]`).
-Constraints that shape the jobs (established in the sibling SwitchBoard repo):
+Constraints that shape the jobs:
 
 - Every job starts with a "Reset workspace ownership" step — Docker steps leave root-owned files on
   the persistent runner.
@@ -1006,14 +1006,15 @@ Constraints that shape the jobs (established in the sibling SwitchBoard repo):
   attribution blocking toggles via `$TURMA_NO_ATTRIBUTION=0`.
 - The guard fails open on malformed input, and if the settings file can't be written the session still
   launches (without the guard).
-- Ported from the sibling SwitchBoard repo (`worker/hooks/guard.py`); keep the two in rough sync.
+- Adapted from an equivalent guard hook maintained outside this repo; if you have that copy, keep
+  the two in rough sync.
 - Tests: `agent/tests/test_guard.py`, `test_guard_settings.py`.
 
 ### AskUserQuestion answer bridge
 
 - The same generated `--settings` file wires a **second `PreToolUse` hook over `AskUserQuestion`** —
   `agent/hooks/ask.py`, stdlib-only, shipped to `/usr/local/bin/hooks/ask.py` — the glasses answer
-  bridge (modeled on the sibling ClaudeHUD broker's `claude-hook.mjs`).
+  bridge.
 - Claude's own `AskUserQuestion` picker is a TUI affordance the glasses client isn't attached to, so
   instead of scraping the tmux pane and typing a digit back (the old, unreliable path), the hook
   intercepts the tool call: for each question it writes `~/.turma/questions/<sessionId>.req.json`

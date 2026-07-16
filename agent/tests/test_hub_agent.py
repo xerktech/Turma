@@ -4155,8 +4155,8 @@ class TestProjectSlug(unittest.TestCase):
 
     def test_windows_style_path(self):
         self.assertEqual(
-            ha._project_slug(r"C:\Users\me/.switchboard"),
-            "C--Users-me--switchboard",
+            ha._project_slug(r"C:\Users\me/.myapp"),
+            "C--Users-me--myapp",
         )
 
 

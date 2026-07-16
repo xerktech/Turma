@@ -12,8 +12,8 @@ the session screen. Three problems today:
 3. Transcript scrolling jumps a **full page** per gesture (`app.ts` moves the
    offset by `SESSION_CONTENT_AREA` ≈ 9 lines), which feels jumpy.
 
-The sibling ClaudeHUD app solves this with a persistent bottom **input strip**
-plus bottom-anchored **sheets** for questions. We're porting that model, adapted
+A proven model for this is a persistent bottom **input strip** plus
+bottom-anchored **sheets** for questions. We're adopting that model, adapted
 to our architecture (polling, not streaming; the question data already arrives
 in the agent heartbeat as `session.question` + `session.questionOptions`).
 
@@ -64,15 +64,15 @@ type BottomModel =
   corner — built via `rebuildPageContainer` when the layout structure changes
   (screen enter/leave, box height change, input↔sheet mode change) and
   `textContainerUpgrade` for text-only updates within a container. Exactly one
-  container keeps `isEventCapture: 1` (a full-canvas transparent overlay, as
-  ClaudeHUD does) so gesture routing stays in app code.
+  container keeps `isEventCapture: 1` (a full-canvas transparent overlay) so
+  gesture routing stays in app code.
 - **`display/dom.ts`** (dev backend): render `session` by stacking the
   transcript, a divider line, and the box body/options in the `<pre>`, so the
   DOM dev path stays usable without the SDK.
 
-A new **`src/input-box.ts`** owns the box geometry and body text, ported from
-ClaudeHUD's `input-strip.ts`: bottom-anchored, min 1 line, grows in line steps
-with wrapped content, caps at half-canvas (144px). Pure functions, unit-tested.
+A new **`src/input-box.ts`** owns the box geometry and body text:
+bottom-anchored, min 1 line, grows in line steps with wrapped content, caps at
+half-canvas (144px). Pure functions, unit-tested.
 
 ## The bottom bar: two modes
 
@@ -116,7 +116,7 @@ a `selected` option index. Four gestures (`tap`, `doubleTap`, `scrollUp`,
 
 **Bottom focus — input mode (no question):**
 - tap → start / stop dictation (via the existing `HubAudioDictation`; the
-  transcript appends to the box body with a joining space, like ClaudeHUD).
+  transcript appends to the box body with a joining space).
 - scroll → scroll within a tall box; at the top/bottom edge, hand focus back to
   the transcript (empty box hands back immediately).
 - double-tap → open the actions menu.
@@ -130,7 +130,7 @@ a `selected` option index. Four gestures (`tap`, `doubleTap`, `scrollUp`,
   `Clear` → wipe the box.
 
 When a question appears while the user is in input focus, focus drops to the
-transcript (so the new sheet isn't accidentally acted on) — mirrors ClaudeHUD.
+transcript (so the new sheet isn't accidentally acted on).
 
 ## Header removal & scroll
 
@@ -146,8 +146,8 @@ transcript (so the new sheet isn't accidentally acted on) — mirrors ClaudeHUD.
 
 - `glasses/src/render.ts` — return `ScreenModel`; session layout (drop header,
   build transcript window + bottom model); keep other screens as `lines`.
-- `glasses/src/input-box.ts` — **new**: box geometry + body/sheet text (ported
-  from ClaudeHUD `input-strip.ts` + `prompt-sheet.ts`), pure + tested.
+- `glasses/src/input-box.ts` — **new**: box geometry + body/sheet text, pure +
+  tested.
 - `glasses/src/display/index.ts` — `render(model: ScreenModel)` interface.
 - `glasses/src/display/evenhub.ts` — multi-container session layout; single
   container for `lines`.

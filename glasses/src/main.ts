@@ -95,8 +95,8 @@ async function mainBridge(bridge: ResolvedBridge): Promise<void> {
   // what subscribes the display's onEvenHubEvent listener, and the host may
   // call __getStateSnapshot/__restoreState (or deliver FOREGROUND_EXIT) as
   // soon as events go live. Registering afterwards would silently drop
-  // anything that fires during the boot window (ClaudeHUD's "register
-  // before onEvenHubEvent" rule) — hence the beforeStart hook.
+  // anything that fires during the boot window (the "register before
+  // onEvenHubEvent" rule) — hence the beforeStart hook.
   await boot(
     storage,
     display,

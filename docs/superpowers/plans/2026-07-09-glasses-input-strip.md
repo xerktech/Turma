@@ -4,9 +4,9 @@
 
 **Goal:** Give the glasses session screen a persistent bordered bottom bar that is the dictation target by default and that a pending `AskUserQuestion` takes over (question text grows the bar; options scrollable + selectable inline). Remove the header line; make transcript scrolling ~2 lines/gesture.
 
-**Architecture:** Generalize the renderer from `render(state) → string[]` to `render(state) → ScreenModel` (a discriminated union). Every screen except the session screen returns `{type:"lines"}` unchanged. The session screen returns `{type:"session", transcriptLines, bottom}` where `bottom` is an input box or a question sheet. The Even Hub backend builds three containers for `session` (transcript + bordered box + status corner) and one for `lines`; the DOM dev backend stacks them. Session-screen interaction adopts ClaudeHUD's transcript-vs-bottom focus model.
+**Architecture:** Generalize the renderer from `render(state) → string[]` to `render(state) → ScreenModel` (a discriminated union). Every screen except the session screen returns `{type:"lines"}` unchanged. The session screen returns `{type:"session", transcriptLines, bottom}` where `bottom` is an input box or a question sheet. The Even Hub backend builds three containers for `session` (transcript + bordered box + status corner) and one for `lines`; the DOM dev backend stacks them. Session-screen interaction adopts a transcript-vs-bottom focus model.
 
-**Tech Stack:** TypeScript (strict), Vite, Vitest, `@evenrealities/even_hub_sdk` (structural typing only, dynamically imported in `evenhub.ts`). Screen behaviour is ported from the ClaudeHUD plugin's `input-strip`/`prompt-sheet`/`chat`/`text-wrap` screens (a separate, private project — not required to build or work on this repo).
+**Tech Stack:** TypeScript (strict), Vite, Vitest, `@evenrealities/even_hub_sdk` (structural typing only, dynamically imported in `evenhub.ts`). Screen behaviour follows an established input-strip / prompt-sheet / chat / text-wrap model, adapted to this package's units.
 
 ## Global Constraints
 
@@ -25,7 +25,7 @@
 - Create: `glasses/src/input-box.ts`
 - Test: `glasses/src/input-box.test.ts`
 
-Port the pure helpers from ClaudeHUD `plugin/src/screens/input-strip.ts` (box geometry, body text, status label) and the sheet-body idea from `prompt-sheet.ts`, adapted to our units (`DISPLAY_LINES`, `LINE_WIDTH_PX`, half-canvas cap = 5 lines of the 10). This task is pure data → strings; no SDK, no state machine.
+Write the pure helpers (box geometry, body text, status label) plus the sheet body, in our units (`DISPLAY_LINES`, `LINE_WIDTH_PX`, half-canvas cap = 5 lines of the 10). This task is pure data → strings; no SDK, no state machine.
 
 **Interfaces — Produces:**
 ```ts
@@ -119,7 +119,7 @@ export function render(state: AppState): ScreenModel; // was: string[]
   2. bordered box container (bottom-anchored, `borderWidth:1, borderRadius:12, borderColor:15`, height = `bottomBoxLines*27 + inset`), content = `bottom.lines.join("\n")`,
   3. status corner container (top-right of the box), content = `bottom.status`,
   4. a full-canvas transparent `isEventCapture:1` overlay (the only capture container).
-  Port container geometry/ID conventions from ClaudeHUD `input-strip.ts` (`INPUT_BOX_CONTAINER_ID`, `STATUS_CORNER_*`) and the `rebuildPageContainer` call shape from ClaudeHUD `chat.ts:buildPage` (~line 385-482, 460). Track the last layout signature (mode + line counts) to decide rebuild vs upgrade. Keep the 120ms debounce for the text-upgrade path; rebuilds are immediate but only on structural change.
+  Follow the established container geometry/ID conventions (`INPUT_BOX_CONTAINER_ID`, `STATUS_CORNER_*`) and the `rebuildPageContainer` call shape. Track the last layout signature (mode + line counts) to decide rebuild vs upgrade. Keep the 120ms debounce for the text-upgrade path; rebuilds are immediate but only on structural change.
 
 - [ ] **Step 1: Update failing tests:** with a fake bridge, assert `render({type:"lines",...})` calls `textContainerUpgrade` (single container, unchanged); `render({type:"session",...})` first call issues a `rebuildPageContainer` with a transcript container + a bordered box container (`borderWidth:1`) + a status container + one `isEventCapture:1` overlay; a second session render with the **same** shape but changed text uses `textContainerUpgrade` (no rebuild); a mode switch input→sheet triggers a rebuild.
 - [ ] **Step 2: Run** `npm test -- evenhub` → FAIL.
@@ -203,7 +203,7 @@ interface SessionScreenState {
   - `scrollUp`/`scrollDown` → move `selected` through `[...options, "Dictate answer…"]`, clamped.
   - `tap` → if `selected` is an option index → `sendInput(host, id, String(selected+1))`, flash `✓ queued`, `focus:"transcript"`; if it's the trailing "Dictate answer…" row → switch to input mode dictation (start dictation; the resulting draft is sent as the answer via the same send path).
   - `doubleTap` → open the actions menu (which now also lists session actions while a question is pending).
-- When a question appears while `focus==="bottom"` in input mode, drop `focus:"transcript"` on the next state derivation (so the new sheet isn't accidentally acted on) — mirror ClaudeHUD.
+- When a question appears while `focus==="bottom"` in input mode, drop `focus:"transcript"` on the next state derivation (so the new sheet isn't accidentally acted on).
 - Remove `screen:"question"`, the `question` state field, `onQuestion`, and `renderQuestion`. Redirect the old `case "answer"` action (in `buildActionsRows`/actions handling) so that selecting "Answer question" just focuses the bottom bar (the sheet is already there) — or drop the "answer" row entirely since the sheet is always visible when a question is pending. Prefer dropping the "answer" row.
 
 - [ ] **Step 1: Failing tests:** a session with a pending question renders `bottom.mode==="sheet"`; in bottom focus, scroll moves `selected`; `tap` on option index 1 calls `sendInput(host,id,"2")` and flashes; `tap` on the "Dictate answer…" row starts dictation; a question arriving while in input focus resets `focus:"transcript"`. Remove obsolete question-screen tests.

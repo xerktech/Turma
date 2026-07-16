@@ -9,8 +9,7 @@ and typing a digit back into it (the previous approach) was unreliable: the
 pane parse saw phantom/garbled questions and the injected keystroke didn't
 select+submit in ``--remote-control`` mode.
 
-This hook replaces both halves with a structured round-trip, mirroring the
-sibling ClaudeHUD broker's ``claude-hook.mjs``:
+This hook replaces both halves with a structured round-trip:
 
   * On an ``AskUserQuestion`` tool call Claude pipes the ``questions[]`` array
     on stdin. For each question we write a request file
@@ -20,8 +19,7 @@ sibling ClaudeHUD broker's ``claude-hook.mjs``:
   * The collected answers are returned as ``permissionDecision: "deny"`` with a
     structured ``permissionDecisionReason`` JSON blob. ``PreToolUse`` can't
     carry typed answer data through an *allow*, so deny-with-reason is the
-    channel — Claude reads the answers out of the tool_result and proceeds
-    (the same trick ClaudeHUD relies on).
+    channel — Claude reads the answers out of the tool_result and proceeds.
 
 Because AskUserQuestion for one session is serialized (Claude blocks on the
 tool), there is at most one pending question per session at a time, so the
