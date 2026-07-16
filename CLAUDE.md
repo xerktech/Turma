@@ -645,6 +645,16 @@ Cloudflare tunnel; port 8300 on the LAN.
   client-side filter over the already-received buffer.
 - Typed prompts go to `POST .../input`; pending `AskUserQuestion`s answer via option chips / custom
   text to `POST .../answer`.
+- The pending-question box renders Claude Code's full picker, not just labels: each option is a card with
+  its `description` and a collapsible **`preview`** (the rendered mockup/code the TUI shows), plus a
+  `header` chip and an "n of N" progress counter for a multi-question call.
+  - These ride new heartbeat fields (`questionOptionsRich`/`questionHeader`/`questionIndex`/
+    `questionTotal`/`questionMulti`) alongside the backward-compat `questionOptions` labels, so older
+    clients (glasses/android) keep rendering the flat pick list unchanged.
+  - A **`multiSelect`** question renders checkboxes + a Submit button that `POST`s `optionIndices` (a
+    list); `answer_question`/`ask.py` accept that list and feed the model the multi-pick shape.
+  - `optionCardHtml` (unit-tested in `chat.test.js`) builds each card; the agent side is
+    `_question_options`/`_hook_question` + `TestHookQuestion`/`TestAnswerQuestion`/`test_ask.py`.
 - The compose footer's live agent-mode / model selectors are joined by a compact **PR status chip**
   (the session's latest PR, `prFooterChip` in `chat.js`, unit-tested in `chat.test.js`) when it has
   one.

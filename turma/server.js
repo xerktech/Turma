@@ -1681,19 +1681,24 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/answer -> answer a pending
-      // AskUserQuestion. Body: {optionIndex} (0-based option pick) and/or
-      // {custom} (free-text / "Other" answer). The agent drops the answer file
-      // the ask.py bridge is blocked on. optionIndex -1 (or omitted) means a
-      // pure free-text answer; a valid answer needs at least one of the two.
+      // AskUserQuestion. Body: {optionIndex} (0-based single pick), or
+      // {optionIndices} (a list, for a multiSelect question), and/or {custom}
+      // (free-text / "Other" answer). The agent drops the answer file the ask.py
+      // bridge is blocked on. No option and no text means nothing to answer with.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "answer") {
         const body = JSON.parse((await readBody(req)) || "{}");
         const optionIndex = Number.isInteger(body.optionIndex) ? body.optionIndex : -1;
+        const optionIndices = Array.isArray(body.optionIndices)
+          ? body.optionIndices.filter((n) => Number.isInteger(n) && n >= 0)
+          : null;
         const custom = typeof body.custom === "string" ? body.custom : "";
-        if (optionIndex < 0 && !custom.trim()) {
-          return json(res, 400, { error: "optionIndex or custom required" });
+        const hasPick = optionIndex >= 0 || (optionIndices && optionIndices.length > 0);
+        if (!hasPick && !custom.trim()) {
+          return json(res, 400, { error: "optionIndex, optionIndices or custom required" });
         }
         if (custom.length > 4000) return json(res, 400, { error: "custom too long" });
         const cmd = { type: "answerQuestion", sessionId, optionIndex };
+        if (optionIndices && optionIndices.length) cmd.optionIndices = optionIndices;
         if (custom) cmd.custom = custom;
         const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });

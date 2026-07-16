@@ -1334,6 +1334,20 @@ test("http: answer endpoint queues an answerQuestion command with the option pic
   ]);
 });
 
+test("http: answer endpoint carries a multiSelect optionIndices list", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "ha1b" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/ha1b/sessions/sess1/answer", {
+    body: { optionIndex: -1, optionIndices: [0, 2, "bad", -1] }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "ha1b" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "answerQuestion", sessionId: "sess1", optionIndex: -1,
+      optionIndices: [0, 2], cmdId: res.body.cmdId },  // non-int / negative filtered out
+  ]);
+});
+
 test("http: answer endpoint carries free-text custom and defaults optionIndex to -1", async () => {
   await request("POST", "/api/heartbeat", { body: { device: "ha2" }, headers: agentHeaders });
   const res = await request("POST", "/api/agents/ha2/sessions/sess1/answer", {
@@ -1355,7 +1369,7 @@ test("http: answer endpoint rejects an empty answer and over-long custom", async
     body: {}, headers: userHeaders,
   });
   assert.equal(empty.status, 400);
-  assert.deepEqual(empty.body, { error: "optionIndex or custom required" });
+  assert.deepEqual(empty.body, { error: "optionIndex, optionIndices or custom required" });
 
   const long = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
     body: { custom: "a".repeat(4001) }, headers: userHeaders,
