@@ -5,9 +5,10 @@ name: code-scan
 #   - Semgrep  : SAST over the JS/Python code, Dockerfiles, and secret patterns
 #   - hadolint : Dockerfile best-practice/quality lint (both Dockerfiles)
 #   - ShellCheck: shell correctness for entrypoint.sh
-#   - tests    : behavioral unit tests for agent/hub-agent.py (stdlib unittest)
-#                and turma/server.js (built-in node:test) — see agent/tests/
-#                and turma/tests/
+#   - tests    : behavioral unit tests for agent/hub-agent.py (stdlib unittest),
+#                turma/server.js (built-in node:test), and the release scripts
+#                (.github/scripts) — see agent/tests/, turma/tests/, and
+#                .github/scripts/tests/
 # Findings block the PR. Runs on open AND on later pushes to the PR (default
 # pull_request types) so every commit is re-checked.
 #
@@ -26,6 +27,7 @@ on:
     paths:
       - "agent/**"
       - "turma/**"
+      - ".github/scripts/**"
       - ".github/workflows/code-scan.yml"
 
 concurrency:
@@ -150,8 +152,8 @@ jobs:
           node-version: "24"
       - name: Python unit tests (agent/hub-agent.py)
         run: python3 -m unittest discover -s agent/tests -p "test_*.py" -v
-      - name: Node unit tests (turma/server.js + agent/tunnel-agent.js)
-        run: node --test turma/tests/*.test.js agent/tests/*.test.js
+      - name: Node unit tests (turma/server.js + agent/tunnel-agent.js + release scripts)
+        run: node --test turma/tests/*.test.js agent/tests/*.test.js .github/scripts/tests/*.test.js
       # entrypoint.sh is PID 1 and decides which uid every session runs as —
       # i.e. whether files land in the mounted git root owned by the host user
       # or by root. ShellCheck only covers its syntax, so this builds the real
