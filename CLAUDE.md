@@ -67,9 +67,18 @@ This replaced the old model of one fixed-repo container per session.
 ### Kill, resume, delete
 
 - Sessions are spawned/killed/started/restarted/deleted from the hub.
-- **Killing** a session removes it from the hub (registry record dropped) but KEEPS its worktree on
-  disk (uncommitted work survives), its conversation, and its token-usage history. Transcripts live
-  under `~/.claude/projects`, keyed by worktree path, separate from the worktree files.
+- **Killing** a session removes it from the hub's ACTIVE list (registry record dropped) but KEEPS its
+  worktree on disk (uncommitted work survives), its conversation, and its token-usage history.
+  Transcripts live under `~/.claude/projects`, keyed by worktree path, separate from the worktree
+  files.
+- It is not gone from the UI, though: it moves to the Sessions page's **Ended sessions** list (see
+  that page's bullet), from which it can be read and resumed.
+- On the way out, `_remember_closed` **snapshots onto the closed record** the two things the live
+  caches are about to forget — the `prUrls` this session opened, and its `transcriptId`. Both are
+  keyed by session id in caches `_forget_session_caches` drops moments later, so the snapshot is the
+  only thing that keeps an ended session's PR chips and conversation reachable. The PR *status* stays
+  in `pr_status_cache` (`refresh_pr_status` counts closed records as referenced, so killing a session
+  can't evict the state its ended card shows; it is not re-polled, same rule as a stopped session).
 - Each repo's **"Resume"** picker lists **every prior Claude session for the repo** whose origin cwd
   is resumable on this host — `repo.resumable` from `_resumable_report()`: killed/deleted/pruned
   Turma sessions, repo-dir "terminal"/dev runs on the host, and older ones aged out of
@@ -667,6 +676,38 @@ Cloudflare tunnel; port 8300 on the LAN.
   list.
 - Tests: the `agentsHtml` cases in `turma/tests/chat.test.js` and the subagent-history endpoint cases
   in `turma/tests/server.test.js`.
+
+#### Ended sessions
+
+- The sidebar's third section (below Active/Idle), **collapsed by default** — it's history, and it
+  only grows. Replaced the old "Stopped" list, which showed only half the story.
+- It merges the two channels an over-but-resumable session arrives on, because the operator draws no
+  distinction between them — both are "a session I'm done with, for now":
+  - **killed** — dropped from the registry into the agent's closed history (`a.closedSessions`);
+  - **stopped** — its claude exited on its own, so a non-running record stays in `a.sessions`.
+- Sorted **most recently ended first** (`endedMs`, from `closedAt`/`stoppedAt`) — the one you just
+  killed is the one you're most likely to want back. An undated record (an older agent) sorts oldest
+  rather than to an arbitrary spot.
+- **Clicking a row opens that session read-only on the stage** — deliberately the same
+  `#transcriptPane` the archive/subagent views use, which is exactly the surface an ended session
+  should get: scrollable conversation + a verbosity control, and **no terminal toggle and no compose
+  box**, because there is no live pty to attach to and nothing to type at. `resetEndedBar()` is what
+  keeps the pane's shared PR/Resume bar from leaking into those other two views.
+- The conversation is read from the hub's **archive** (`GET /api/archive/<transcriptId>`, via the
+  `transcriptId` the agent now reports), so it works even for an offline host. A just-killed session
+  legitimately hasn't synced yet (archive push is on the slow usage cadence) and says so rather than
+  reading as history lost.
+- Its **PRs are chips on the stage bar and are LINKS there** (`prBadgeLinkHtml`) — the sidebar copy
+  stays an inert `<span>` because the card is a `<button>`. A PR is often the whole reason to open an
+  ended session.
+- **Resume** sits on both the row and the stage bar, and dispatches on how the session ended: killed →
+  `.../resume` (re-registers it under the same id), stopped → `.../start`. It then hands off to the
+  live session like a spawn does. Nothing removes it from the list — the list is DERIVED, so it drops
+  out on the beat the agent reports it running.
+- Resume needs the host **online** (it rides the heartbeat); reading the conversation does not, so the
+  card stays clickable on a dead host while its Resume is disabled.
+- Tests: the Ended-sessions cases in `turma/tests/sessions.test.js`, plus `TestRefreshPrStatus` /
+  `TestSessionLifecycle` in `agent/tests/test_hub_agent.py`.
 
 #### Session card ⋯ menu
 

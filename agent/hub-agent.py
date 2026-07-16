@@ -4034,6 +4034,22 @@ class SessionManager:
             "summaryManual", "model", "permissionMode", "root",
         )}
         rec["closedAt"] = now_iso()
+        # Snapshot the two things the live caches are about to forget, so the
+        # hub's Ended-sessions view can still show what this session did:
+        #
+        # - prUrls: the PRs it opened. session_pr_urls is keyed by session id and
+        #   dropped by _forget_session_caches moments from now, so the URLs have
+        #   to move onto the record itself. Their STATUS stays in pr_status_cache
+        #   (refresh_pr_status counts these as referenced, so it won't evict them).
+        # - transcriptId: which conversation was this session's. Resolved now,
+        #   while the worktree→slug mapping is unambiguous, rather than re-derived
+        #   later from a path that a delete/prune may since have removed.
+        #
+        # Both are persisted with the record (closed.json), so they survive a
+        # manager restart exactly as the rest of the closed history does.
+        rec["prUrls"] = list(self.session_pr_urls.get(sess["id"]) or [])
+        wt = sess.get("worktreePath") or (REPOS_ROOT if sess.get("root") else None)
+        rec["transcriptId"] = self._latest_transcript_id(wt) if wt else None
         self.closed = [c for c in self.closed if c.get("id") != rec["id"]]
         self.closed.append(rec)
         # Trim per repo, newest first (the list is in close order).
@@ -4924,7 +4940,13 @@ class SessionManager:
         PR_STATUS_MAX so a host with many PRs never stalls the beat), but a
         stopped session keeps its last-known status — cache entries are pruned
         only when NO session (running or not) references them anymore, so a
-        killed session's card still shows the merged/closed state it reached."""
+        killed session's card still shows the merged/closed state it reached.
+
+        "No session" spans the closed history too: a killed session is dropped
+        from the registry but keeps its own `prUrls` snapshot (_remember_closed),
+        and the hub's Ended-sessions view renders those chips. Without counting
+        them as referenced, the very act of killing a session would evict the PR
+        status its ended card is about to show."""
         if not self.github.get("available"):
             return
         referenced, wanted, seen = set(), [], set()
@@ -4937,6 +4959,10 @@ class SessionManager:
                 if url not in seen:
                     seen.add(url)
                     wanted.append(url)
+        # Closed records are never re-polled — same rule as a stopped session,
+        # whose last-known status is what its card has always shown.
+        for rec in self.closed:
+            referenced.update(rec.get("prUrls") or [])
         for url in list(self.pr_status_cache):
             if url not in referenced:
                 del self.pr_status_cache[url]
@@ -5797,13 +5823,20 @@ class SessionManager:
             # pr_status_cache). Kept even after the session stops, as long as the
             # session record survives. None until it opens a PR.
             "prs": self._session_prs(sid),
+            # Which conversation this session is having, so the hub can open it
+            # read-only from the archive once it has ENDED. Resolved for stopped
+            # sessions only: a running one is read live over /live (and this is a
+            # listdir the hot path shouldn't pay for on every beat), while a
+            # stopped one is a bounded handful sitting in the Ended list.
+            "transcriptId": (None if running else
+                             self._latest_transcript_id(sess["worktreePath"])),
             "session": signals,                      # running only; null otherwise
         }
 
     def _closed_payload(self):
-        """Killed-but-resumable sessions for the hub's per-repo Resume picker,
-        newest first. Already capped at CLOSED_PER_REPO per repo, so this can
-        never balloon the heartbeat."""
+        """Killed-but-resumable sessions for the hub's per-repo Resume picker and
+        its Ended-sessions list, newest first. Already capped at CLOSED_PER_REPO
+        per repo, so this can never balloon the heartbeat."""
         return [
             {
                 "id": c.get("id"),
@@ -5816,9 +5849,28 @@ class SessionManager:
                 "summary": c.get("summary"),
                 "createdAt": c.get("createdAt"),
                 "closedAt": c.get("closedAt"),
+                # The conversation this session had, so the Ended-sessions view
+                # can open it read-only from the hub's archive. Absent on records
+                # written by an agent predating the snapshot (see _remember_closed).
+                "transcriptId": c.get("transcriptId"),
+                # Its PRs, resolved through the same status cache a live card
+                # reads — so an ended session's chips carry the state/CI rollup
+                # they reached, not a bare link. None when it opened none, which
+                # matches the live payload's "no PRs" shape.
+                "prs": self._closed_prs(c),
             }
             for c in reversed(self.closed)
         ]
+
+    def _closed_prs(self, rec):
+        """PR-status objects for a closed record's snapshotted PR links, in the
+        order they were scraped — the closed-history counterpart of
+        _session_prs, reading the record instead of the live session_pr_urls
+        (which kill() drops). None when the session opened no PR."""
+        urls = rec.get("prUrls")
+        if not urls:
+            return None
+        return [self.pr_status_cache.get(u) or {"url": u} for u in urls]
 
     def _repo_activity(self):
         """repo-name -> newest session-activity ISO ts, the "used" half of the

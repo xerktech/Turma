@@ -105,7 +105,7 @@ function loadPage({ search = "", sidebar = null, textareas = [] } = {}) {
   const fn = new Function(...names, "window",
     script + "\n;return { render, selectSession, followSpawn, toggleComposer,"
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
-      + " termComposeAction,"
+      + " termComposeAction, openEndedSession, resumeEnded, openTranscript,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
@@ -151,7 +151,7 @@ test("running sessions split: working/waiting -> Active, idle -> Idle", () => {
   assert.ok(i.includes("Idle Task A") && i.includes("Idle Task B"));
   assert.ok(!i.includes("Working Task"), "working sessions must not appear under Idle");
 
-  assert.ok(els.stopped.innerHTML.includes("Dead Task"), "stopped section still renders");
+  assert.ok(els.ended.innerHTML.includes("Dead Task"), "ended section still renders");
 });
 
 test("all running idle: Active shows empty-state pointing at Idle; Idle lists them", () => {
@@ -400,13 +400,195 @@ test("?session=<id>: waits for a session that isn't running yet, then opens it",
   assert.deepEqual(opened, ["55555"]);
 });
 
-test("the Ended-sessions archive browser is gone from the sidebar markup", () => {
-  // The archive list + its toggle were removed; only the search box remains as
-  // the path to ended-session history. Guards against a regression re-adding it.
-  assert.ok(!html.includes("Ended sessions"), "no 'Ended sessions' header");
+test("the archive BROWSER is still gone from the sidebar markup", () => {
+  // The old #archiveWrap/#archiveDetails list paged GET /api/archive to enumerate
+  // every archived transcript on the hub, and was dropped as redundant with the
+  // search box, which reaches the same history by content instead of by scrolling.
+  // That removal still stands and this guards it.
+  //
+  // It does NOT guard the string "Ended sessions", which this test used to assert
+  // was absent: the sidebar's Ended-sessions section is a different thing that
+  // reuses the name. It lists the SESSIONS this fleet has ended (killed + stopped,
+  // from the heartbeat) so they can be read and resumed — a lifecycle control, not
+  // an archive index. Its rows are bounded by the fleet's own closed history, it
+  // carries Resume + PR state the browser never had, and it pages nothing.
   assert.ok(!/id="archiveWrap"/.test(html), "no #archiveWrap element");
   assert.ok(!/id="archiveDetails"/.test(html), "no #archiveDetails element");
-  assert.ok(/id="idle"/.test(html), "new #idle section present");
+  assert.ok(!/\/api\/archive\?/.test(html), "sidebar must not page the archive index");
+  assert.ok(/id="idle"/.test(html), "#idle section present");
+  assert.ok(/id="ended"/.test(html), "#ended section present");
+});
+
+// --- Ended sessions ----------------------------------------------------------
+// A killed session and a stopped one reach the page down different channels
+// (a.closedSessions vs a non-running a.sessions record) and resume through
+// different endpoints, but the operator sees one list. These cover the merge,
+// the ordering, and that an ended session's stage view stays read-only.
+
+// A killed session, as the agent's closed history reports it.
+const closed = (id, summary, closedAt, extra) => ({
+  id, repo: "repoX", summary, closedAt, worktreePath: "/g/.turma/worktrees/" + id, ...extra,
+});
+
+test("Ended sessions merges killed + stopped, newest-ended first", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([
+    working("11111", "Live One"),
+    { id: "22222", status: "stopped", repo: "repoX", summary: "Stopped Mid",
+      stoppedAt: "2026-07-15T12:00:00Z" },
+  ]);
+  h.closedSessions = [
+    closed("33333", "Killed Oldest", "2026-07-15T09:00:00Z"),
+    closed("44444", "Killed Newest", "2026-07-15T18:00:00Z"),
+  ];
+  beat({ now, agents: [h] });
+
+  const e = els.ended.innerHTML;
+  assert.match(e, /Ended sessions <span class="count">3<\/span>/);
+  assert.ok(!e.includes("Live One"), "a running session is not ended");
+  // Newest kill at the top, and the stopped one interleaves by ITS OWN end time
+  // rather than being segregated into a second list.
+  const order = ["Killed Newest", "Stopped Mid", "Killed Oldest"].map((t) => e.indexOf(t));
+  assert.ok(order.every((i) => i >= 0), "all three ended sessions listed");
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), "sorted newest-ended first");
+});
+
+test("Ended sessions is collapsed by default and hidden when there are none", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([working("11111", "Live One")]);
+  els.ended.innerHTML = "SENTINEL";
+  beat({ now, agents: [h] });
+  assert.equal(els.ended.innerHTML, "", "no ended sessions -> no section");
+
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z")];
+  beat({ now, agents: [h] });
+  // <details> with no `open` attribute — the list is history, so it stays folded
+  // until asked for.
+  assert.match(els.ended.innerHTML, /<details class="ended-wrap-sec"/);
+  assert.ok(!/<details class="ended-wrap-sec"[^>]*\sopen/.test(els.ended.innerHTML),
+    "the ended list must start collapsed");
+});
+
+test("resuming dispatches on how the session ended: killed -> resume, stopped -> start", () => {
+  const { beat, resumeEnded, posts } = loadPage();
+  const { now, host: h } = host([
+    { id: "22222", status: "stopped", repo: "repoX", summary: "Stopped Mid",
+      stoppedAt: "2026-07-15T12:00:00Z" },
+  ]);
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z")];
+  beat({ now, agents: [h] });
+
+  // A killed session was dropped from the registry; only `resume` can re-register
+  // it. A stopped one still has its record and just needs relaunching.
+  resumeEnded(click, "33333");
+  resumeEnded(click, "22222");
+  assert.deepEqual(posts.map((p) => p.url), [
+    "/api/agents/hostA/sessions/33333/resume",
+    "/api/agents/hostA/sessions/22222/start",
+  ]);
+});
+
+test("a resumed session is followed onto the stage once it comes back running", () => {
+  const { beat, resumeEnded, opened } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z")];
+  beat({ now, agents: [h] });
+
+  resumeEnded(click, "33333");
+  assert.deepEqual(opened, [], "nothing to open until the agent relaunches it");
+
+  // The agent re-registers it under the same id on a later beat: it leaves the
+  // ended list of its own accord (the list is derived) and lands on the stage.
+  h.closedSessions = [];
+  h.sessions = [working("33333", "Killed")];
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["33333"]);
+});
+
+test("an ended session's card carries Resume and its PR chips", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z", {
+    prs: [{ url: "https://github.com/o/r/pull/7", number: 7, state: "MERGED", checks: "passing" }],
+  })];
+  beat({ now, agents: [h] });
+
+  const e = els.ended.innerHTML;
+  assert.match(e, /class="s-resume"/, "Resume button present");
+  assert.match(e, /resumeEnded\(event,'33333'\)/);
+  assert.ok(e.includes("#7 Merged"), "the PR state it reached still shows");
+  // The card is a <button>, so its chips must stay inert spans — a nested <a>
+  // is invalid HTML the parser hoists out of the button.
+  assert.ok(!/<a class="pr-badge/.test(e), "card chips are spans, not links");
+});
+
+test("Resume is disabled while its host is offline, but the card still opens", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.online = false;
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z")];
+  beat({ now, agents: [h] });
+
+  const e = els.ended.innerHTML;
+  // Resume rides the heartbeat, so it needs the host. Reading the conversation
+  // does not — the hub archived it — so the card itself stays clickable.
+  assert.match(e, /<button class="s-resume" disabled/);
+  assert.match(e, /onclick="openEndedSession\('33333'\)"/);
+  assert.ok(!/class="s-card ended[^"]*" disabled/.test(e), "card must stay clickable offline");
+});
+
+test("resumeEnded is a no-op for an offline host", () => {
+  const { beat, resumeEnded, posts } = loadPage();
+  const { now, host: h } = host([]);
+  h.online = false;
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z")];
+  beat({ now, agents: [h] });
+  resumeEnded(click, "33333");
+  assert.deepEqual(posts, [], "no command can be queued on a host that can't take it");
+});
+
+test("opening an ended session shows PRs + Resume and never a terminal or compose box", () => {
+  const { beat, openEndedSession, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z", {
+    transcriptId: "t-abc",
+    prs: [{ url: "https://github.com/o/r/pull/7", number: 7, state: "OPEN", checks: "failing" }],
+  })];
+  beat({ now, agents: [h] });
+  openEndedSession("33333");
+
+  // The read-only transcript pane — not the chat pane (compose box) and not the
+  // terminal pane. That IS the "no textbox, no terminal" requirement.
+  assert.equal(els.transcriptPane.hidden, false);
+  assert.equal(els.chatPane.hidden, true);
+  assert.equal(els.termPane.hidden, true);
+  assert.equal(els.trResume.hidden, false, "Resume offered on the stage");
+  assert.equal(els.trPrs.hidden, false);
+  // On the stage the chips ARE links — nothing wraps them, so a PR can be clicked
+  // through to GitHub, which is often the reason to open an ended session at all.
+  assert.match(els.trPrs.innerHTML, /<a href="https:\/\/github.com\/o\/r\/pull\/7"/);
+  assert.match(els.trPrs.innerHTML, /#7 Open/);
+});
+
+test("the ended-session bar is cleared when the pane is reused for an archive transcript", () => {
+  const { beat, openEndedSession, openTranscript, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z", {
+    transcriptId: "t-abc", prs: [{ url: "https://github.com/o/r/pull/7", number: 7, state: "OPEN" }],
+  })];
+  beat({ now, agents: [h] });
+  openEndedSession("33333");
+  assert.equal(els.trResume.hidden, false);
+  assert.equal(els.trPrs.hidden, false);
+
+  // The archive + subagent views share this one pane. A search result is a
+  // transcript, not a live registry record, so it has nothing to resume — a
+  // Resume button left over from the previous view would act on the wrong
+  // session entirely.
+  openTranscript("t-other", "Some Archived Session", null);
+  assert.equal(els.trResume.hidden, true, "Resume cleared for the archive view");
+  assert.equal(els.trPrs.hidden, true, "PR chips cleared for the archive view");
+  assert.equal(els.trPrs.innerHTML, "");
 });
 
 // --- composer survives the poll/SSE re-render --------------------------------
