@@ -2,9 +2,7 @@
 // (how many lines it occupies) and the text bodies for its two modes —
 // free-text input and the AskUserQuestion sheet — plus the right-corner
 // status label. No SDK, no state machine, no Date.now: everything here is
-// data in, strings out. Ported from ClaudeHUD's plugin/src/screens/
-// input-strip.ts (box body + status label) and prompt-sheet.ts (sheet
-// windowing idea), adapted to this codebase's units.
+// data in, strings out.
 import { DISPLAY_LINES, LINE_WIDTH_PX } from "./layout.ts";
 import { wrapText } from "./text-wrap.ts";
 

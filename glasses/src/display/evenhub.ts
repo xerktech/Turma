@@ -1,6 +1,6 @@
 // Even Hub SDK display backend — implements `GlassesDisplay` over the real
-// G2 hardware path (see glasses-ui / handle-input / device-features skills
-// and ClaudeHUD's `plugin/src/main.ts` for the ported patterns).
+// G2 hardware path (see the glasses-ui / handle-input / device-features
+// skills).
 //
 // This file never imports `@evenrealities/even_hub_sdk` — the bridge and its
 // container payloads are typed structurally right here (a small subset of
@@ -42,10 +42,9 @@ const REBUILD_MAX_CONTENT_CHARS = 1000;
 //
 // The session screen's bordered bottom box (input or AskUserQuestion sheet)
 // is drawn as three containers stacked with a fourth full-canvas transparent
-// event-capture overlay, ported from ClaudeHUD's
-// plugin/src/screens/input-strip.ts (border/inset conventions, status-corner
-// geometry) and chat.ts's buildPage (container list shape + the
-// rebuildPageContainer call). IDs are distinct from the single-container
+// event-capture overlay, following the established border/inset conventions,
+// status-corner geometry, and container-list shape for the
+// `rebuildPageContainer` call. IDs are distinct from the single-container
 // `lines` path's CONTAINER_ID (0) — a `rebuildPageContainer` call replaces
 // the whole page, so there's no need for continuity between the two shapes,
 // only that each container list itself uses unique IDs.

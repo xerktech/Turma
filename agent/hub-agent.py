@@ -5581,7 +5581,7 @@ class SessionManager:
         shape identifies, read from the session's own recorded cwd (Claude Code
         stamps `cwd` on transcript entries). The cwd is the real, un-slugified
         working dir, so its final path segment names the repo far better than
-        the lossy project slug can (…/personal/ClaudeHUD -> "ClaudeHUD"). Splits
+        the lossy project slug can (…/personal/Widget -> "Widget"). Splits
         on both separators, since a shared ~/.claude login also carries the
         operator's own dev-machine sessions with Windows paths. Returns None when
         no entry within a bounded head-scan records a cwd."""
