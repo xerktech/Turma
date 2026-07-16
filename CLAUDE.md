@@ -44,6 +44,9 @@ This replaced the old model of one fixed-repo container per session.
 - **The app creates no branch of its own.** The running agent creates and names its own branch when
   its work is ready, and that live branch (read from the worktree's git HEAD) shows on the session
   card; until then the card reads "detached".
+- A session spawned from a Jira ticket is told the exact branch NAME to use (`PROJ-123`, `-1`, `-2`),
+  but still cuts it itself — the worktree stays detached and this invariant holds. See "Ticket branch
+  naming" under the agent.
 - The session runs its own `claude --remote-control` in its own tmux (`agent-<id>`) + loopback ttyd,
   with an optional initial task prompt delivered as claude's positional prompt, and an optional
   `--model`/`--permission-mode` from the composer.
@@ -134,6 +137,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   branch (skipping any still backing a session or holding uncommitted changes), then deletes local
   branches merged into it, reporting a summary that rides the heartbeat.
 - `jiraIssue` — fetch one issue on demand; see "Jira block" below.
+- `spawnTicket` — start a session to WORK a Jira ticket; see "Jira ticket sessions" below.
 - `subagentHistory` — open a background subagent's own transcript; see "Live working footer and agent
   list" below.
 
@@ -326,6 +330,51 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Tuned only by `JIRA_TRIAGE_MODEL` (default `haiku`) / `JIRA_TRIAGE_TIMEOUT_SEC`.
 - Tests: `agent/tests/test_hub_agent.py` (`TestTriageCandidates`, `TestTriageFingerprints`,
   `TestParseTriage`, `TestJiraTriage`).
+
+### Jira ticket sessions
+
+- The board's per-card **start button** spawns a session to work a ticket: a `{type:"spawnTicket",
+  issueKey}` command → `spawn_ticket()`.
+- It runs agent-side for the same reason the triage does — this host is the only place the Jira creds
+  (hence the ticket's full text), the triage ledger (hence its repo), and the repos themselves meet.
+- **The hub sends only the issue key.** Everything else is re-derived from LOCAL state: the repo from
+  this host's own triage ledger (and it must still be in `scan_repos()`), the ticket from a fresh
+  `fetch_jira_issue`. So a board a beat or two stale can't spawn against a repo the ticket has since
+  been re-triaged away from. The hub's job is purely ROUTING (see the /board bullet).
+- The fetched ticket becomes the **initial prompt** (`build_ticket_prompt`: fields, description, the
+  newest `TICKET_PROMPT_COMMENTS` comments), because the session has no Jira creds of its own — that
+  text is all it will ever see of the ticket, which the prompt says plainly while pointing at the URL.
+- The ticket is carried on the session record as `ticket` = `{key, siteKey, url, summary, branch}`,
+  persisted, heartbeated, and surviving kill/resume. **That record IS the ticket ↔ session link** —
+  there is no hub-side ticket store, and the board reverse-indexes the fleet payload it already polls.
+- A ticket-backed session is **named from its ticket** (`"PROJ-123 <summary>"`, via
+  `clean_manual_summary`) instead of paying a `claude -p` to derive a worse name from a ticket-sized
+  prompt.
+- Refusals log and return like spawn's own (no record to hang an error on yet); each case is one the
+  board's button already prevents. A failed fetch raises to `handle_commands`, which logs and acks —
+  a session working a ticket it can't see would be worse than no session.
+- Nothing is ever written to Jira: the board stays pull-only, and the link lives in Turma only.
+- Tests: `agent/tests/test_hub_agent.py` (`TestSpawnTicket`, `TestBuildTicketPrompt`).
+
+#### Ticket branch naming
+
+- The branch is **decided at spawn** (`_reserve_ticket_branch`) and injected into that session's
+  appended system prompt (`TICKET_BRANCH_PROMPT`) as an exact instruction — the name has to be
+  derivable from the ticket by a human scanning branches, and the -1/-2 suffix needs a branch scan the
+  agent has no particular reason to do correctly.
+- `next_ticket_branch` hands out the bare ticket key, else the first free `key-1`/`key-2`/… It fills a
+  gap left by a deleted branch rather than counting how many ever existed.
+- **"Taken" is the union of git and the registry**, and it needs both: `branch_names()` reads local
+  heads plus remote branches (after a short-bounded fetch, so a branch pushed from another host or
+  merged-and-pruned locally still counts), while a session that hasn't branched YET owns its name with
+  git knowing nothing — so two sessions started back-to-back on one ticket must not both be told
+  `PROJ-123`.
+- **The app still creates no branch**: the worktree stays `--detach` and the invariant holds. This
+  decides the NAME deterministically; the agent still cuts it, from the refreshed remote default per
+  the ordinary policy the directive extends.
+- A resume re-tells the persisted name rather than reserving a fresh one — otherwise a session would
+  be handed `-1` against its own first branch.
+- Tests: `TestNextTicketBranch`, `TestBranchNames`, plus the reserve/resume cases in `TestSpawnTicket`.
 
 ### GitHub block and cloning
 
@@ -577,6 +626,52 @@ Cloudflare tunnel; port 8300 on the LAN.
   (`repoFieldHtml`), which reads `t.repoGuess` directly rather than through the panel's usual `v()`
   field-preference helper, because the guess only ever exists on the heartbeat ticket — the on-demand
   issue fetch comes straight from Jira, which knows nothing about repos.
+
+#### Starting a session on a ticket
+
+- Each card carries a **start button** that spawns a session to work that ticket:
+  `POST /api/jira/<siteKey>/<issueKey>/session` → a `spawnTicket` command (see the agent bullet).
+- **The hub's whole job here is ROUTING**, since it's the only party that sees the whole fleet. It
+  sends just the issue key; the agent re-derives repo, ticket text and branch from its own state.
+- `findTicketHost` needs an ONLINE host that reports the org **and** has the ticket's repo cloned —
+  two different requirements, and `findJiraHost` only covers the first: with two hosts on one org, the
+  one holding the creds isn't necessarily the one holding the repo, and a spawn on a host without it
+  just logs a refusal the operator never sees.
+- Online is **required**, not preferred (unlike the read-only ticket GET, which happily serves an
+  offline host's cache): a spawn queued onto a sleeping host lands whenever it wakes, which is a
+  surprise, not a feature.
+- `ticketRepo` resolves the repo from the **freshest** reporting block — the same rule `mergeSites`
+  renders by, so the hub resolves against the copy the operator actually clicked.
+- Org is checked before repo: an org nobody reports has no ticket to be untriaged, and answering "no
+  triaged repo yet" would send the operator hunting a triage problem they don't have.
+- Single-flight per ticket, like the `jiraIssue` fetch: a double-click must not start two sessions.
+  A second session on a ticket is supported — that's what the `+` button and the -1/-2 branch are for.
+- The button's four states are deliberately distinct (`ticketStartHtml`): a triaged+cloned ticket gets
+  a live button; an uncloned repo gets a disabled one saying to clone it first; a "no repo" verdict and
+  an untriaged ticket get none at all. A failed start renders its reason beside a LIVE button (every
+  failure is fleet-state, so the operator needs both the reason and the retry).
+- In-flight state clears on **evidence**, not a timer: a session reporting the spawn's `cmdId`, or the
+  command clearing from the host's queue — which is what covers a spawn the agent REFUSED, whose ack is
+  the only signal a board that never sees a session would get.
+- Tests: the ticket-session cases in `turma/tests/server.test.js` and `board.test.js`.
+
+#### Ticket ↔ session chips
+
+- A ticket's sessions show as chips on its card, from `ticketSessionIndex` — a reverse index of the
+  fleet payload's `session.ticket`, so **no hub-side ticket store exists to keep in sync**, and a
+  killed session still shows (the record outlives the process).
+- The chip is **labelled with the BRANCH**, not the session name: a ticket-spawned session is named
+  from its ticket, so its name only repeats the key and summary already on the card, while the branch
+  is the one thing that tells two sessions on one ticket apart. An operator's rename (`summaryManual`)
+  means that name, so it leads once it exists. The live git branch beats the reserved one — the
+  reservation is what the agent was TOLD, git is what it did.
+- The chip's label ellipsises on **its own element**: `.kc-sess` is a flex container, and
+  `text-overflow` can't clip anonymous flex content — it hard-cuts mid-letter (the same trap `.kc-repo`
+  documents).
+- The reverse link rides the session: the Sessions page's card meta shows the ticket key (a plain span
+  — the card is a `<button>` and can't hold a link), and the chat footer carries a linked `jira-chip`
+  beside the PR chip (`ticketFooterChip`), out to Jira rather than back to the board — from inside a
+  session the useful thing is the live ticket.
 
 #### Ticket detail panel
 

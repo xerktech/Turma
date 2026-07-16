@@ -332,6 +332,48 @@ button:disabled .spin { border-top-color: var(--ink-2); }
   border: 0; background: none; padding: 0; color: var(--muted);
   font-style: italic; font-family: var(--font-sans);
 }
+/* Start-a-session-on-this-ticket, and the sessions it started. Both sit in
+   .kc-meta between the repo chip and the org, i.e. before the margin-left:auto
+   that pins .kc-org right. */
+.kc-start {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--page);
+  color: var(--ink-2); font: inherit; font-size: 10.5px; line-height: 1.5;
+  cursor: pointer; white-space: nowrap;
+}
+.kc-start:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.kc-start:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+/* Not cloned / no online host: the ticket has a repo, so the button stays put
+   and says why rather than vanishing. */
+.kc-start:disabled { opacity: .5; cursor: not-allowed; }
+/* Once the ticket has a session, starting ANOTHER is the rare case — shrink it
+   to a "+" so it stops competing with the session chips for the card's width. */
+.kc-start.kc-start-more { padding: 1px 6px; font-weight: 600; color: var(--muted); }
+.kc-start.kc-start-busy { color: var(--muted); border-style: dashed; cursor: default; }
+.kc-start-err {
+  color: var(--critical); font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 22ch;
+}
+/* A session working this ticket. Same chip metrics as .kc-repo so a card's meta
+   row reads as one family; the dot carries the run state. */
+.kc-sess {
+  display: inline-flex; align-items: center; gap: 5px; vertical-align: middle;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--page);
+  color: var(--ink-2); font-family: var(--font-mono); font-size: 10.5px;
+  text-decoration: none; max-width: 22ch;
+}
+/* The name ellipsises on its own element, not on .kc-sess: text-overflow can
+   only clip a BLOCK's text, and inside the flex chip a bare label would be
+   anonymous flex content and get hard-cut mid-letter. Same trap as .kc-repo. */
+.kc-sess .kc-sess-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kc-sess:hover { border-color: var(--accent); color: var(--accent); }
+.kc-sess-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--good); flex: none; }
+.kc-sess.kc-sess-off { color: var(--muted); }
+.kc-sess.kc-sess-off .kc-sess-dot { background: var(--muted); }
+.kc-sess.kc-sess-err { color: var(--critical); border-color: var(--critical); }
+.kc-sess.kc-sess-err .kc-sess-dot { background: var(--critical); }
 .kc-org {
   display: inline-flex; align-items: center; gap: 5px;
   color: var(--muted); font-family: var(--font-mono); font-size: 10.5px;
