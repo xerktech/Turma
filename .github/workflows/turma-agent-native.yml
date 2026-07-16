@@ -7,6 +7,8 @@ name: turma-agent-native
 # Post-merge on push to main, path-filtered to agent/** (same source the Docker
 # image build watches). Mirrors android-release.yml / glasses-release.yml.
 #
+# Runs on GitHub-hosted `ubuntu-latest`.
+#
 # Pure `tar` — no build toolchain — so it just stages the runtime files and the
 # native scripts, tars them, emits a .sha256 sidecar (the updater verifies it),
 # and publishes both assets. Self-contained: install.sh's source-probe finds the
@@ -33,13 +35,13 @@ permissions:
 jobs:
   release:
     name: Package and release the native agent
-    runs-on: [self-hosted, linux]
+    # Hosted: this job is `tar` and `sha256sum` over a few dozen KB of scripts.
+    # It has no image to build, no cache to keep warm and nothing to reach on the
+    # home lab, so self-hosting only ever bought it a place in the box's 3-job
+    # queue.
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Reset workspace ownership
-        working-directory: ${{ github.workspace }}
-        run: chown -R "$(id -u):$(id -g)" . || true
-
       - uses: actions/checkout@v7
 
       - name: Compute version
