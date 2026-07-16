@@ -739,6 +739,7 @@ function hostCard(a, now) {
   const collapsed = collapsedHosts.has(a.key);
   const body = collapsed ? "" : `
     <div class="host-meta">
+      <span><span class="m-label">Agent</span> <b>${esc(a.agentVersion || "–")}</b></span>
       <span><span class="m-label">Claude Code</span> <b>${esc(a.claudeVersion || "–")}</b></span>
       <span><span class="m-label">Memory</span> <b>${esc(mem)}</b></span>
       <span><span class="m-label">Uptime</span> <b>${esc(uptime(a.startedAt, now))}</b> · last seen ${esc(ago(now - a.lastSeen))}</span>

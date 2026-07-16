@@ -301,6 +301,13 @@ RUN git config --system credential.helper '!gh auth git-credential'
 LABEL org.opencontainers.image.source="https://github.com/xerktech/DockerOps" \
       org.opencontainers.image.description="Headless Claude Code host multiplexer (worktree-backed Remote Control sessions) for the Turma"
 
+# This image's own unified release version, reported on the heartbeat so the hub
+# shows which build a host is running. release.yml passes the release version as
+# a build-arg; the native install reads a VERSION file next to hub-agent.py
+# instead (see agent_version() there). "dev" for a local/manual build.
+ARG TURMA_AGENT_VERSION=dev
+ENV TURMA_AGENT_VERSION=${TURMA_AGENT_VERSION}
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY hub-agent.py /usr/local/bin/hub-agent.py
 COPY tunnel-agent.js /usr/local/bin/tunnel-agent.js

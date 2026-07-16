@@ -752,6 +752,38 @@ def device_name():
     return "unknown-device"
 
 
+def agent_version():
+    """This build's own version — the unified release version (see RELEASING.md)
+    of the code currently running, reported on the heartbeat so the hub's host
+    header can show which build a host is on.
+
+    The two install shapes stamp it differently, so both are read here:
+      1. TURMA_AGENT_VERSION env — the container image bakes it at build time
+         (release.yml passes the release version as a build-arg), and it doubles
+         as an operator override anywhere.
+      2. A VERSION file next to this script — what native/install.sh writes into
+         its prefix, alongside hub-agent.py, on every install and self-update.
+      3. The repo-root VERSION (a dev checkout running agent/hub-agent.py
+         straight out of the tree) — bare MAJOR.MINOR, same fallback install.sh
+         uses.
+    None when nothing stamped it, which the hub renders as unknown rather than
+    guessing a number.
+    """
+    env = os.environ.get("TURMA_AGENT_VERSION", "").strip()
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, "VERSION"), os.path.join(here, os.pardir, "VERSION")):
+        try:
+            with open(path) as f:
+                ver = f.read().strip()
+            if ver:
+                return ver
+        except OSError:
+            pass
+    return None
+
+
 def git_info_cheap(cwd):
     """Fast, fast-changing worktree facts read EVERY heartbeat: the current
     checked-out branch and the `git status --porcelain` dirty count. None when
@@ -3220,6 +3252,9 @@ class SessionManager:
             ["docker", "inspect", "--format", "{{.State.StartedAt}}", self.agent_id]
         )
         self.claude_version = run(["claude", "--version"])
+        # This build's own version (baked env / installed VERSION file), read once
+        # — it can't change without the process being replaced.
+        self.agent_version = agent_version()
         self.device = device_name()
 
         # AskUserQuestion bridge rendezvous dir (ask.py writes req files here).
@@ -6014,6 +6049,7 @@ class SessionManager:
             "agentId": self.agent_id,
             "device": self.device,
             "startedAt": self.started_at,
+            "agentVersion": self.agent_version,
             "claudeVersion": self.claude_version,
             "memory": memory_usage(),
             "logTail": self._log_tail(beat, light),
