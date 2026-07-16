@@ -5439,9 +5439,11 @@ class TestRefreshJira(ManagerMixin, unittest.TestCase):
             self.assertEqual(len(calls), 2)
             sm.build_payload(0, light=True)               # light beat -> no
             self.assertEqual(len(calls), 2)
-        # The cached block rides every payload regardless.
+        # The cached block rides every payload regardless, carrying the polled
+        # fields verbatim plus the picker's repo options.
         self.assertIn("jira", payload)
-        self.assertEqual(payload["jira"], sm.jira)
+        self.assertEqual({k: v for k, v in payload["jira"].items()
+                          if k != "repoOptions"}, sm.jira)
 
     def test_payload_skips_refresh_when_unconfigured(self):
         # The manager is built INSIDE the patch: the block's `configured` flag
@@ -5720,7 +5722,7 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
             sm._poll_jira_triage()
         self.assertEqual(sm.jira["tickets"][0]["repoGuess"], {
             "repo": "Turma", "cloned": True, "nameWithOwner": None,
-            "reason": "heartbeat lives there",
+            "reason": "heartbeat lives there", "manual": False,
             "at": sm.jira["tickets"][0]["repoGuess"]["at"],
         })
 
@@ -5950,6 +5952,219 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "collect_jira", return_value=fresh):
             sm.refresh_jira()
         self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+
+class TestSetJiraRepo(ManagerMixin, unittest.TestCase):
+    """The operator's own answer to which repo a ticket belongs in — a manual pin
+    that outranks the model and is never re-triaged, the same posture a hand-typed
+    session rename takes against the auto-summarizer."""
+
+    def setUp(self):
+        super().setUp()
+        self.popen_calls = []
+        p = mock.patch.object(ha, "scan_repos",
+                              return_value=[{"name": "Turma",
+                                             "path": os.path.join(self.tmp, "Turma")}])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _configured(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t")
+
+    def _manager(self, tickets=None):
+        sm = self.make_manager()
+        sm.jira = {**ha.JIRA_EMPTY, "available": True, "configured": True,
+                   "siteKey": "s.atlassian.net",
+                   "tickets": tickets if tickets is not None
+                   else [{"key": "ENG-1", "summary": "x"}]}
+        sm.github = {"available": True, "login": "x",
+                     "repos": [{"nameWithOwner": "xerktech/Widget", "name": "Widget"}]}
+        sm._refresh_triage_candidates()
+        return sm
+
+    def _fake_popen(self, reply, rc=0):
+        test = self
+
+        class FakeProc:
+            def __init__(self, cmd, stdout=None, **kw):
+                test.popen_calls.append(cmd)
+                if reply is not None and stdout is not None:
+                    stdout.write(reply)
+                    stdout.flush()
+
+            def poll(self):
+                return rc
+
+            def kill(self):
+                pass
+
+        return mock.patch.object(ha.subprocess, "Popen", FakeProc)
+
+    def test_pins_a_cloned_repo_and_marks_it_manual(self):
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Turma")
+        g = sm.jira["tickets"][0]["repoGuess"]
+        self.assertEqual(g["repo"], "Turma")
+        self.assertTrue(g["cloned"])
+        self.assertTrue(g["manual"])
+
+    def test_pins_an_uncloned_repo_too(self):
+        # The whole point of offering uncloned repos: a ticket can belong to a repo
+        # this host hasn't cloned yet, and saying so is a real answer.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Widget")
+        g = sm.jira["tickets"][0]["repoGuess"]
+        self.assertEqual(g["repo"], "Widget")
+        self.assertFalse(g["cloned"])
+        self.assertEqual(g["nameWithOwner"], "xerktech/Widget")
+        self.assertTrue(g["manual"])
+
+    def test_an_explicit_none_is_a_manual_no_repo_fits(self):
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", None)
+        g = sm.jira["tickets"][0]["repoGuess"]
+        self.assertIsNone(g["repo"])
+        self.assertTrue(g["manual"])
+
+    def test_a_manual_pin_is_never_re_triaged(self):
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Widget")
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+        self.assertEqual(self.popen_calls, [], "a pinned ticket must not be triaged")
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Widget")
+
+    def test_a_pin_survives_the_ticket_text_changing(self):
+        # A ticket edit restales an AUTO decision; it must not unpin a manual one.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Widget")
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "completely rewritten"}]
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+        self.assertEqual(self.popen_calls, [])
+        sm._apply_triage()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Widget")
+
+    def test_a_pin_landing_mid_flight_beats_the_model_reply(self):
+        # The batch was built before the override existed, so its reply answers a
+        # question no longer being asked.
+        sm = self._manager()
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm.set_jira_repo("ENG-1", "Widget")   # operator overrides mid-flight
+            sm._poll_jira_triage()
+        g = sm.jira["tickets"][0]["repoGuess"]
+        self.assertEqual(g["repo"], "Widget")
+        self.assertTrue(g["manual"])
+
+    def test_auto_releases_the_pin_with_a_full_retry_budget(self):
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Widget")
+        sm.set_jira_repo("ENG-1", None, auto=True)
+        self.assertNotIn("s.atlassian.net/ENG-1", sm.triage_ledger)
+        self.assertNotIn("repoGuess", sm.jira["tickets"][0])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+        self.assertFalse(sm.jira["tickets"][0]["repoGuess"]["manual"])
+
+    def test_a_non_candidate_repo_is_refused(self):
+        # The operator is likelier right than the model, but the request still
+        # arrives over HTTP, and a name this host can't offer is one its own picker
+        # never showed.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "NotARepo")
+        self.assertNotIn("repoGuess", sm.jira["tickets"][0])
+        self.assertNotIn("s.atlassian.net/ENG-1", sm.triage_ledger)
+
+    def test_a_bad_issue_key_is_refused_before_it_reaches_the_ledger(self):
+        sm = self._manager()
+        for bad in ["../../etc/passwd", "", "42", "ENG-", None]:
+            sm.set_jira_repo(bad, "Turma")
+        self.assertEqual(sm.triage_ledger, {})
+
+    def test_a_command_for_another_org_is_refused(self):
+        # The hub routes by siteKey; a mismatch means it reached the wrong host,
+        # and filing it under ours would corrupt a key another board reads.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Turma", site_key="other.atlassian.net")
+        self.assertEqual(sm.triage_ledger, {})
+        sm.set_jira_repo("ENG-1", "Turma", site_key="s.atlassian.net")
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+    def test_a_pin_persists_across_a_manager_restart(self):
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Widget")
+        sm2 = self._manager()
+        self.assertTrue(sm2.triage_ledger["s.atlassian.net/ENG-1"]["manual"])
+        sm2._apply_triage()
+        self.assertEqual(sm2.jira["tickets"][0]["repoGuess"]["repo"], "Widget")
+
+    def test_cloning_a_pinned_repo_updates_its_clone_state(self):
+        # A pin never re-triages, so a stored cloned:false would outlive the clone
+        # forever and leave the chip dashed for good.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Widget")
+        self.assertFalse(sm.jira["tickets"][0]["repoGuess"]["cloned"])
+        with mock.patch.object(ha, "scan_repos", return_value=[
+                {"name": "Turma", "path": os.path.join(self.tmp, "Turma")},
+                {"name": "Widget", "path": os.path.join(self.tmp, "Widget")}]):
+            sm._refresh_triage_candidates()
+        sm._apply_triage()
+        self.assertTrue(sm.jira["tickets"][0]["repoGuess"]["cloned"])
+
+    def test_a_gh_outage_does_not_flip_a_pinned_repo_to_uncloned(self):
+        # The candidate list blanks on a failed sweep; absence there is not
+        # evidence a repo stopped being cloned.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Turma")
+        sm.github = {"available": False, "login": None, "repos": []}
+        with mock.patch.object(ha, "scan_repos", return_value=[]):
+            sm._refresh_triage_candidates()
+        sm._apply_triage()
+        self.assertTrue(sm.jira["tickets"][0]["repoGuess"]["cloned"])
+
+    def test_a_pin_is_evicted_last_when_the_ledger_is_bounded(self):
+        # An auto decision a prune drops is recomputed next beat; a pin is the one
+        # thing here that cannot be regenerated.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Turma")
+        for i in range(ha.JIRA_TRIAGE_LEDGER_MAX + 10):
+            sm.triage_ledger[f"s.atlassian.net/AUTO-{i}"] = {
+                "decided": True, "repo": "Turma", "at": "2999-01-01T00:00:00Z"}
+        sm._prune_triage_ledger()
+        self.assertIn("s.atlassian.net/ENG-1", sm.triage_ledger)
+
+    def test_the_picker_options_ride_the_heartbeat_and_match_the_allowlist(self):
+        # The board offers exactly what set_jira_repo accepts — the two read the
+        # same list, so they cannot drift.
+        sm = self._manager()
+        with self._configured():
+            payload = sm.build_payload(1)
+        names = [o["name"] for o in payload["jira"]["repoOptions"]]
+        self.assertEqual(sorted(names), ["Turma", "Widget"])
+        for name in names:
+            sm.set_jira_repo("ENG-1", name)
+            self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], name)
+
+    def test_an_unconfigured_host_ships_no_picker_options(self):
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN=""):
+            sm = self.make_manager()
+            payload = sm.build_payload(1)
+        self.assertNotIn("repoOptions", payload["jira"])
+
+    def test_the_command_reaches_set_jira_repo(self):
+        sm = self._manager()
+        sm.handle_commands([{"cmdId": "c1", "type": "setJiraRepo",
+                             "siteKey": "s.atlassian.net", "issueKey": "ENG-1",
+                             "repo": "Widget", "auto": False}])
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Widget")
+        sm.handle_commands([{"cmdId": "c2", "type": "setJiraRepo",
+                             "siteKey": "s.atlassian.net", "issueKey": "ENG-1",
+                             "repo": None, "auto": True}])
+        self.assertNotIn("repoGuess", sm.jira["tickets"][0])
 
     def test_ledger_is_bounded(self):
         sm = self._manager([])

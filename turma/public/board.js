@@ -76,8 +76,19 @@
           error: null,
           truncated: false,
           tickets: [],
+          repoOptions: [],
           _byKey: new Map(),
+          _byRepo: new Map(),
         });
+      }
+      // The repo choices the manual picker offers, unioned across the hosts
+      // reporting this org: a repo cloned on ANY of them is offerable, and the
+      // override fans out to all of them anyway. A cloned copy wins the dedupe —
+      // `cloned` is host-relative, and "someone here has it" is the useful claim.
+      for (const o of block.repoOptions || []) {
+        if (!o || !o.name) continue;
+        const seen = entry._byRepo.get(o.name);
+        if (!seen || (o.cloned && !seen.cloned)) entry._byRepo.set(o.name, o);
       }
       if (block.user && !entry.users.includes(block.user)) entry.users.push(block.user);
       if (String(block.fetchedAt || "") > String(entry.lastFetched || "")) {
@@ -98,6 +109,11 @@
       .map(e => {
         e.tickets = [...e._byKey.values()];
         delete e._byKey;
+        // Cloned repos first (they're the ones you can work in today), then by
+        // name — the picker's own order, so it doesn't inherit the scan's.
+        e.repoOptions = [...e._byRepo.values()].sort((x, y) =>
+          (y.cloned ? 1 : 0) - (x.cloned ? 1 : 0) || x.name.localeCompare(y.name));
+        delete e._byRepo;
         e.users.sort();
         return e;
       })
@@ -360,18 +376,83 @@
   }
 
   // The triaged repo, for the detail panel's field list: the same three states as
-  // the card chip, but with room to say what the chip could only imply.
-  function repoFieldHtml(t) {
+  // the card chip, but with room to say what the chip could only imply — plus the
+  // Change control, since this row is the one place with room to correct it.
+  //
+  // A manual pin says so rather than dressing itself as a guess: the rationale
+  // line is the model's reasoning, and an operator's choice has none to show.
+  function repoFieldHtml(t, opts) {
+    const o = opts || {};
     const g = t && t.repoGuess;
-    if (!g) return "";
-    if (!g.repo) return `<span class="td-dim">No repository fits this ticket</span>`;
-    const bits = [`<span class="kc-repo${g.cloned ? "" : " kc-repo-uncloned"}">${esc(g.repo)}</span>`];
-    if (g.nameWithOwner && g.nameWithOwner !== g.repo) {
-      bits.push(`<span class="td-dim">${esc(g.nameWithOwner)}</span>`);
+    const bits = [];
+    if (!g) {
+      // Untriaged. The chip renders nothing here (absence isn't "no repo fits"),
+      // but the row still appears so the operator can answer before the model
+      // does — a ticket nobody has classified is exactly one worth pinning.
+      bits.push(`<span class="td-dim">Not triaged yet</span>`);
+    } else if (!g.repo) {
+      bits.push(`<span class="td-dim">${g.manual
+        ? "No repository — set by you"
+        : "No repository fits this ticket"}</span>`);
+    } else {
+      bits.push(`<span class="kc-repo${g.cloned ? "" : " kc-repo-uncloned"}">${esc(g.repo)}</span>`);
+      if (g.nameWithOwner && g.nameWithOwner !== g.repo) {
+        bits.push(`<span class="td-dim">${esc(g.nameWithOwner)}</span>`);
+      }
+      if (!g.cloned) bits.push(`<span class="td-dim">(not cloned on this host)</span>`);
+      if (g.manual) bits.push(`<span class="td-dim">— set by you</span>`);
+      else if (g.reason) bits.push(`<span class="td-dim">— ${esc(g.reason)}</span>`);
     }
-    if (!g.cloned) bits.push(`<span class="td-dim">(not cloned on this host)</span>`);
-    if (g.reason) bits.push(`<span class="td-dim">— ${esc(g.reason)}</span>`);
+    if (o.editable) {
+      bits.push(`<button type="button" class="td-edit" data-repo-edit="1">Change</button>`);
+    }
+    // A failed save is reported ON the row it failed to change, next to the value
+    // it left behind — the optimistic paint has already been rolled back, so
+    // without this the row would just silently snap to its old value.
+    if (o.error) bits.push(`<span class="td-err-inline">Couldn't save — ${esc(o.error)}</span>`);
     return bits.join(" ");
+  }
+
+  // The picker itself, shown in place of the row once "Change" is clicked. Its
+  // options are the host's OWN candidate list (jira.repoOptions), which is the
+  // same list set_jira_repo allowlists against — so every option here is one the
+  // agent will accept, and the two can't drift.
+  //
+  // Both non-repo choices are spelled out as real options rather than left to a
+  // stray empty value: "no repo fits" and "let the model decide" are genuinely
+  // different answers, and the agent treats them differently (a pin vs. dropping
+  // the pin), so the UI must not blur them either.
+  function repoPickerHtml(t, options) {
+    const g = (t && t.repoGuess) || null;
+    // Only a MANUAL repo preselects. An auto guess of "Turma" is the model's
+    // answer, and the operator's current setting is "let it decide" — preselecting
+    // Turma would misreport that as a pin they'd made, and quietly turn a Save
+    // they meant as "leave it alone" into one.
+    const pinned = !!(g && g.manual);
+    const cur = pinned && g.repo ? g.repo : null;
+    const opts = (options || []).filter(o => o && o.name);
+    const cloned = opts.filter(o => o.cloned);
+    const uncloned = opts.filter(o => !o.cloned);
+    const optHtml = (o) => `<option value="${esc(o.name)}"${
+      o.name === cur ? " selected" : ""}>${esc(o.name)}${
+      o.nameWithOwner && o.nameWithOwner !== o.name ? ` (${esc(o.nameWithOwner)})` : ""}</option>`;
+    const group = (label, list) => list.length
+      ? `<optgroup label="${esc(label)}">${list.map(optHtml).join("")}</optgroup>` : "";
+    // `__auto__`/`__none__` are sentinels, not repo names: a repo can't be called
+    // either (the agent's own names come from directory + gh listings, and the
+    // endpoint's name pattern would reject the underscores anyway), and the
+    // handler maps them to {auto:true} / {repo:null} before anything is sent.
+    const sel = `<select class="td-repo-select" data-repo-select="1">
+      <option value="__auto__"${pinned ? "" : " selected"}>Let the agent decide</option>
+      <option value="__none__"${pinned && !g.repo ? " selected" : ""}>No repository fits</option>
+      ${group("Cloned on this host", cloned)}
+      ${group("Not cloned", uncloned)}
+    </select>`;
+    return `<div class="td-repo-edit">${sel}
+      <button type="button" class="td-edit" data-repo-save="1">Save</button>
+      <button type="button" class="td-edit" data-repo-cancel="1">Cancel</button>
+      ${opts.length ? "" : `<span class="td-dim">No repos reported by this host</span>`}
+    </div>`;
   }
 
   // `t` is the card's ticket (always present); `detail` is the fetched issue
@@ -397,7 +478,11 @@
       // fetch comes straight from Jira, which knows nothing about repos — so this
       // reads `t` directly rather than through v(). Spelled out here (rationale
       // and clone state as text) where the card only had room for a chip.
-      fieldRow("Repo", repoFieldHtml(t)),
+      // `editing` swaps the row for the picker in place: it's the same field, and
+      // the operator is answering the question the row just asked.
+      fieldRow("Repo", o.editing
+        ? repoPickerHtml(t, o.repoOptions)
+        : repoFieldHtml(t, { editable: !!o.canEdit, error: o.repoError })),
       fieldRow("Assignee", d.assignee ? esc(d.assignee) : ""),
       fieldRow("Reporter", d.reporter ? esc(d.reporter) : ""),
       fieldRow("Project", v("projectName")
@@ -545,7 +630,7 @@
   const api = {
     CATEGORIES, mergeSites, categoryOf, ticketSort, orgColor, orgName, ageStr,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
-    repoChipHtml, repoFieldHtml,
+    repoChipHtml, repoFieldHtml, repoPickerHtml,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   };

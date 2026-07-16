@@ -12,7 +12,7 @@ const {
   mergeSites, categoryOf, ticketSort, orgColor, orgName, ageStr, prioClass,
   cardHtml, boardHtml, detailHtml, textHtml, linkify,
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
-  repoChipHtml, repoFieldHtml,
+  repoChipHtml, repoFieldHtml, repoPickerHtml,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
 } = require("../public/board.js");
 
@@ -535,9 +535,72 @@ test("repoFieldHtml: the detail panel spells out what the chip implied", () => {
 });
 
 test("repoFieldHtml: declined and untriaged stay distinct", () => {
-  assert.ok(repoFieldHtml(ticket("X-1", { repoGuess: { repo: null } }))
-    .includes("No repository fits"));
-  assert.equal(repoFieldHtml(ticket("X-1")), "");
+  // The panel has room to say which it is, so unlike the card chip (which draws
+  // nothing at all for an untriaged ticket) it states both — but it must never
+  // report "not looked at yet" as the verdict "nothing fits".
+  const declined = repoFieldHtml(ticket("X-1", { repoGuess: { repo: null } }));
+  const untriaged = repoFieldHtml(ticket("X-1"));
+  assert.ok(declined.includes("No repository fits"));
+  assert.ok(untriaged.includes("Not triaged yet"));
+  assert.ok(!untriaged.includes("No repository fits"));
+});
+
+test("repoFieldHtml: a manual pin says so instead of borrowing a rationale", () => {
+  const html = repoFieldHtml(ticket("X-1", {
+    repoGuess: { repo: "Turma", cloned: true, reason: "stale model reason", manual: true },
+  }));
+  assert.ok(html.includes("set by you"));
+  assert.ok(!html.includes("stale model reason"));
+});
+
+test("repoFieldHtml: the Change control appears only when a host can take it", () => {
+  const t = ticket("X-1", { repoGuess: { repo: "Turma", cloned: true } });
+  assert.ok(repoFieldHtml(t, { editable: true }).includes("data-repo-edit"));
+  assert.ok(!repoFieldHtml(t, { editable: false }).includes("data-repo-edit"));
+});
+
+test("repoPickerHtml: only a manual pin preselects a repo", () => {
+  const opts = [{ name: "Turma", cloned: true }, { name: "Widget", cloned: false }];
+  // An auto guess of Turma means the operator's setting is "let it decide" —
+  // preselecting Turma would turn a Save meant as "leave it" into a pin.
+  const auto = repoPickerHtml(ticket("X-1", {
+    repoGuess: { repo: "Turma", cloned: true, manual: false },
+  }), opts);
+  assert.ok(/<option value="__auto__" selected>/.test(auto));
+  assert.ok(!/<option value="Turma" selected>/.test(auto));
+
+  const pinned = repoPickerHtml(ticket("X-1", {
+    repoGuess: { repo: "Turma", cloned: true, manual: true },
+  }), opts);
+  assert.ok(/<option value="Turma" selected>/.test(pinned));
+  assert.ok(!/<option value="__auto__" selected>/.test(pinned));
+
+  const none = repoPickerHtml(ticket("X-1", {
+    repoGuess: { repo: null, manual: true },
+  }), opts);
+  assert.ok(/<option value="__none__" selected>/.test(none));
+});
+
+test("repoPickerHtml: cloned and uncloned repos are offered, in separate groups", () => {
+  const html = repoPickerHtml(ticket("X-1"), [
+    { name: "Turma", cloned: true }, { name: "Widget", cloned: false, nameWithOwner: "x/Widget" },
+  ]);
+  assert.ok(html.includes('<optgroup label="Cloned on this host">'));
+  assert.ok(html.includes('<optgroup label="Not cloned">'));
+  assert.ok(html.includes('value="Turma"'));
+  assert.ok(html.includes('value="Widget"'));
+  assert.ok(html.includes("x/Widget"));
+  // Both non-repo answers are real options: "nothing fits" and "let the model
+  // decide" are different claims and the agent acts on them differently.
+  assert.ok(html.includes('value="__auto__"'));
+  assert.ok(html.includes('value="__none__"'));
+});
+
+test("repoPickerHtml: a hostile repo name can't break out of the option", () => {
+  const html = repoPickerHtml(ticket("X-1"), [
+    { name: '"><script>alert(1)</script>', cloned: true },
+  ]);
+  assert.ok(!html.includes("<script"));
 });
 
 test("detailHtml: shows the guess from the card, which the Jira fetch lacks", () => {
@@ -552,8 +615,54 @@ test("detailHtml: shows the guess from the card, which the Jira fetch lacks", ()
   }
 });
 
-test("detailHtml: no Repo row for an untriaged ticket", () => {
-  assert.ok(!detailHtml(ticket("X-1"), detail(), {}).includes("<dt>Repo</dt>"));
+test("detailHtml: an untriaged ticket still gets a Repo row to answer from", () => {
+  // The card draws no chip for one (absence isn't a verdict), but the panel is
+  // where an override is made, and a ticket nobody has classified is exactly the
+  // one worth pinning by hand — so the row is present and says which state it's
+  // in rather than vanishing.
+  const html = detailHtml(ticket("X-1"), detail(), { canEdit: true });
+  assert.ok(html.includes("<dt>Repo</dt>"));
+  assert.ok(html.includes("Not triaged yet"));
+  assert.ok(html.includes("data-repo-edit"));
+});
+
+test("detailHtml: editing swaps the Repo row for the picker in place", () => {
+  const t = ticket("X-1", { repoGuess: { repo: "Turma", cloned: true } });
+  const html = detailHtml(t, detail(), {
+    editing: true, canEdit: true, repoOptions: [{ name: "Turma", cloned: true }],
+  });
+  assert.ok(html.includes("<dt>Repo</dt>"));
+  assert.ok(html.includes("data-repo-select"));
+  assert.ok(html.includes("data-repo-save"));
+  assert.ok(!html.includes("data-repo-edit"));
+});
+
+test("detailHtml: a failed save is reported on the row it failed to change", () => {
+  const html = detailHtml(ticket("X-1"), detail(), {
+    canEdit: true, repoError: "host is offline",
+  });
+  assert.ok(html.includes("Couldn't save"));
+  assert.ok(html.includes("host is offline"));
+});
+
+test("mergeSites: picker options union across the org's hosts, cloned winning", () => {
+  // `cloned` is host-relative, so a repo cloned on ANY host of the org is
+  // offerable — the override fans out to all of them anyway.
+  const sites = mergeSites([
+    agent("hostA", block({ siteKey: "s.atlassian.net", user: "a", fetchedAt: "2026-01-02",
+      repoOptions: [{ name: "Turma", cloned: false }, { name: "OnlyA", cloned: true }] })),
+    agent("hostB", block({ siteKey: "s.atlassian.net", user: "b", fetchedAt: "2026-01-01",
+      repoOptions: [{ name: "Turma", cloned: true }] })),
+  ]);
+  assert.deepEqual(sites[0].repoOptions, [
+    { name: "OnlyA", cloned: true },
+    { name: "Turma", cloned: true },
+  ]);
+});
+
+test("mergeSites: an org whose hosts report no options gets an empty list", () => {
+  const sites = mergeSites([agent("hostA", block({ tickets: [ticket("X-1")] }))]);
+  assert.deepEqual(sites[0].repoOptions, []);
 });
 
 test("mergeSites: the repo guess survives the cross-host merge", () => {

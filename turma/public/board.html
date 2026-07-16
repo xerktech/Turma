@@ -175,11 +175,66 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 function paintDetail() {
   const s = openTicketState;
   if (!s) return;
+  const site = lastSites.find(x => x.siteKey === s.siteKey);
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
     color: B.orgColor(s.siteKey, lastAllKeys),
     siteKey: s.siteKey,
     error: s.error,
+    // The override rides the heartbeat, so it needs a live host to reach; an
+    // offline org's ticket is still readable, just not re-assignable.
+    canEdit: !!(site && site.online),
+    editing: s.editing,
+    repoError: s.repoError,
+    repoOptions: (site && site.repoOptions) || [],
   });
+  if (s.editing) {
+    const sel = $panel.querySelector("[data-repo-select]");
+    if (sel) sel.focus();
+  }
+}
+
+// The operator's own repo answer. Painted optimistically: the pin only becomes
+// real on the agent's next beat (the command rides the heartbeat reply), and the
+// board would otherwise sit showing the model's old guess for a full interval
+// after a Save that worked. A failure repaints from the real state and says so.
+async function saveRepo(value) {
+  const s = openTicketState;
+  if (!s) return;
+  const body = value === "__auto__" ? { auto: true }
+    : value === "__none__" ? { repo: null }
+    : { repo: value };
+  s.editing = false;
+  const prev = s.ticket.repoGuess;
+  if (body.auto) delete s.ticket.repoGuess;
+  else {
+    const opt = ((lastSites.find(x => x.siteKey === s.siteKey) || {}).repoOptions || [])
+      .find(o => o.name === body.repo);
+    s.ticket.repoGuess = {
+      repo: body.repo, cloned: !!(opt && opt.cloned),
+      nameWithOwner: (opt && opt.nameWithOwner) || null,
+      reason: "", manual: true, at: null,
+    };
+  }
+  paintDetail();
+  let ok = false, err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/repo`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    ok = r.ok;
+    if (!ok) {
+      let d = {};
+      try { d = await r.json(); } catch { /* non-JSON error body */ }
+      err = d.error || `HTTP ${r.status}`;
+    }
+  } catch { err = "the hub is unreachable"; }
+  if (!ok && openTicketState === s) {
+    s.ticket.repoGuess = prev;   // the optimistic paint was a lie; take it back
+    s.repoError = err;
+    paintDetail();
+  }
 }
 
 function closeDetail() {
@@ -262,7 +317,24 @@ $board.addEventListener("keydown", (e) => {
   e.preventDefault();                    // Space would scroll the page
   openDetail(card.dataset.key, card.dataset.site, card);
 });
-$panel.addEventListener("click", (e) => { if (e.target.closest(".td-close")) closeDetail(); });
+$panel.addEventListener("click", (e) => {
+  if (e.target.closest(".td-close")) return closeDetail();
+  if (!openTicketState) return;
+  if (e.target.closest("[data-repo-edit]")) {
+    openTicketState.editing = true;
+    openTicketState.repoError = "";   // a new attempt clears the old complaint
+    return paintDetail();
+  }
+  if (e.target.closest("[data-repo-cancel]")) {
+    openTicketState.editing = false;
+    return paintDetail();
+  }
+  if (e.target.closest("[data-repo-save]")) {
+    const sel = $panel.querySelector("[data-repo-select]");
+    if (sel) saveRepo(sel.value);
+    return;
+  }
+});
 $backdrop.addEventListener("click", (e) => { if (e.target === $backdrop) closeDetail(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && openTicketState) closeDetail(); });
 

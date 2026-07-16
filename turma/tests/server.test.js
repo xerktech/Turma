@@ -1657,6 +1657,90 @@ test("http: ticket detail 404s an org no host reports", async () => {
   assert.equal(res.status, 404);
 });
 
+// POST /api/jira/<siteKey>/<issueKey>/repo — the operator's manual repo override.
+// Writes to the AGENT's triage ledger via the heartbeat command path; nothing
+// here writes to Jira, which stays pull-only.
+
+const setRepo = (site, key, body) =>
+  request("POST", `/api/jira/${site}/${key}/repo`, { body, headers: userHeaders });
+
+test("http: setting a ticket's repo queues setJiraRepo on the org's host", async () => {
+  await jiraBeat("jr1", "r1.atlassian.net");
+  const res = await setRepo("r1.atlassian.net", "ENG-7", { repo: "Turma" });
+  assert.equal(res.status, 202);
+  assert.equal(res.body.ok, true);
+  assert.deepEqual(res.body.hosts, ["jr1"]);
+
+  const beat = await jiraBeat("jr1", "r1.atlassian.net");
+  assert.deepEqual(beat.body.commands, [{
+    type: "setJiraRepo", siteKey: "r1.atlassian.net", issueKey: "ENG-7",
+    repo: "Turma", auto: false, cmdId: res.body.cmdId,
+  }]);
+});
+
+test("http: {repo:null} and {auto:true} are carried as the distinct answers they are", async () => {
+  await jiraBeat("jr2", "r2.atlassian.net");
+  await setRepo("r2.atlassian.net", "ENG-1", { repo: null });
+  await setRepo("r2.atlassian.net", "ENG-2", { auto: true });
+  const beat = await jiraBeat("jr2", "r2.atlassian.net");
+  const [none, auto] = beat.body.commands;
+  assert.equal(none.repo, null);
+  assert.equal(none.auto, false);   // an explicit "nothing fits" IS a decision
+  assert.equal(auto.auto, true);    // "let the model decide" releases the pin
+});
+
+test("http: a body with neither repo nor auto is a 400, not a silent decline", async () => {
+  // A lost field must never paint a confident "no repo fits" chip.
+  await jiraBeat("jr3", "r3.atlassian.net");
+  const res = await setRepo("r3.atlassian.net", "ENG-1", {});
+  assert.equal(res.status, 400);
+  assert.equal((agents.jr3.commands || []).length, 0);
+});
+
+test("http: setting a repo rejects a bad issue key or repo name before routing", async () => {
+  await jiraBeat("jr4", "r4.atlassian.net");
+  for (const bad of ["..%2F..%2Fsecret", "42", "ENG-"]) {
+    const res = await setRepo("r4.atlassian.net", bad, { repo: "Turma" });
+    assert.equal(res.status, 400, `${bad} should be rejected`);
+  }
+  for (const bad of ["../etc", "a b", "x;y", 42, {}]) {
+    const res = await setRepo("r4.atlassian.net", "ENG-1", { repo: bad });
+    assert.equal(res.status, 400, `${JSON.stringify(bad)} should be rejected`);
+  }
+  assert.equal((agents.jr4.commands || []).length, 0);
+});
+
+test("http: setting a repo fans out to every host reporting the org", async () => {
+  // The ledger is per-host but the board merges hosts by siteKey, so pinning on
+  // only one would flicker as the merge picked a different host's block.
+  await jiraBeat("jr5a", "r5.atlassian.net");
+  await jiraBeat("jr5b", "r5.atlassian.net");
+  const res = await setRepo("r5.atlassian.net", "ENG-1", { repo: "Turma" });
+  assert.equal(res.status, 202);
+  assert.deepEqual(res.body.hosts.sort(), ["jr5a", "jr5b"]);
+  assert.equal((agents.jr5a.commands || []).length, 1);
+  assert.equal((agents.jr5b.commands || []).length, 1);
+});
+
+test("http: setting a repo 404s when the org's only host is offline", async () => {
+  // Unlike a READ (which can serve a stale cache), this rides the heartbeat —
+  // an offline host would take it whenever it returned, long after the operator
+  // stopped looking at the board.
+  await jiraBeat("jr6", "r6.atlassian.net");
+  agents.jr6.lastSeen = Date.now() - 10 * 60 * 1000;
+  const res = await setRepo("r6.atlassian.net", "ENG-1", { repo: "Turma" });
+  assert.equal(res.status, 404);
+});
+
+test("http: setting a ticket's repo requires the user login", async () => {
+  await jiraBeat("jr7", "r7.atlassian.net");
+  const res = await request("POST", "/api/jira/r7.atlassian.net/ENG-1/repo", {
+    body: { repo: "Turma" },
+  });
+  assert.equal(res.status, 401);
+  assert.equal((agents.jr7.commands || []).length, 0);
+});
+
 test("http: ticket detail rejects a non-issue-key path segment before routing", async () => {
   await jiraBeat("jd5", "org5.atlassian.net");
   for (const bad of ["..%2F..%2Fsecret", "ENG-42%3Fx%3D1", "42", "ENG-", "ENG%2042"]) {

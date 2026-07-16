@@ -1854,6 +1854,11 @@ const server = http.createServer(async (req, res) => {
     // name from its own local state, so a board that's a beat or two stale can't
     // spawn against a repo the ticket has since been re-triaged away from.
     //
+    // That re-derivation is also what makes a manual override (the /repo route
+    // below) authoritative here for free: the agent reads its own ledger, where a
+    // pin outranks the model, so a ticket the operator re-assigned spawns in the
+    // repo THEY chose without this route knowing the override exists.
+    //
     // The reply is the queued cmdId, which the agent echoes back on the session it
     // mints as `spawnCmdId` — the same correlation handle the composer's spawn
     // uses, since the session id doesn't exist yet at POST time.
@@ -1886,6 +1891,60 @@ const server = http.createServer(async (req, res) => {
       const cmdId = pending ? pending.cmdId
         : queueCommand(host, { type: "spawnTicket", issueKey });
       return json(res, 200, { ok: true, cmdId, host, repo });
+    }
+
+    // POST /api/jira/<siteKey>/<issueKey>/repo — the operator's own answer to
+    // which repo a ticket belongs in, overriding the agent's guess.
+    // Body: {repo:"<name>"} to pin one, {repo:null} for "no repo fits", or
+    // {auto:true} to release the pin back to the model.
+    //
+    // This writes to the AGENT's triage ledger, not to Jira — the board stays
+    // pull-only with respect to Jira itself; nothing here touches the issue.
+    //
+    // It fans out to EVERY host reporting that org, not just the one findJiraHost
+    // would pick for a read. The ledger is per-host while the board merges hosts
+    // by siteKey (freshest block wins), so pinning on only one host would leave
+    // the override flickering in and out as the merge picked a different host's
+    // block. The repo name is allowlist-checked host-side against that host's own
+    // candidates; a host that can't offer it declines and logs, which is why this
+    // reports what it queued rather than claiming success for the fleet.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "repo") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!/^[A-Za-z][A-Za-z0-9_]*-[0-9]+$/.test(issueKey)) {
+        return json(res, 400, { error: "not a Jira issue key" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const auto = body.auto === true;
+      // `repo` absent and auto unset is a malformed request, not a decline —
+      // "no repo fits" must be an explicit null, exactly as _parse_triage
+      // requires of the model. Conflating them would let a body that lost a
+      // field silently paint a "no repo" chip.
+      if (!auto && !("repo" in body)) {
+        return json(res, 400, { error: "body needs {repo} or {auto:true}" });
+      }
+      const repo = auto ? null : body.repo;
+      if (!auto && repo !== null &&
+          !(typeof repo === "string" && /^[A-Za-z0-9._-]+$/.test(repo))) {
+        return json(res, 400, { error: "not a repo name" });
+      }
+      // Online only: this rides the heartbeat reply, and an offline host would
+      // take the command whenever it came back — long after the operator gave up
+      // and stopped looking at the board.
+      const hosts = Object.keys(agents).filter((k) => {
+        const a = agents[k];
+        return a && a.jira && a.jira.siteKey === siteKey &&
+          Date.now() - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
+      });
+      if (!hosts.length) {
+        return json(res, 404, { error: "no online host reports that Jira org" });
+      }
+      let cmdId = null;
+      for (const k of hosts) {
+        cmdId = queueCommand(k, { type: "setJiraRepo", siteKey, issueKey, repo, auto });
+      }
+      return json(res, 202, { ok: true, hosts, cmdId });
     }
 
     // Terminal proxy: /term/<sessionId>/… -> the ttyd of the host that owns
