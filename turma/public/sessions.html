@@ -809,10 +809,24 @@ function restoreFieldFocus(f) {
 // Snapshot each open composer's height before the swap and re-emit it as markup,
 // keyed by (host::repo) like composerDraft, so a dragged size survives the
 // re-render — and even a close/reopen of the same repo's composer.
+// A textarea's own scroll offset is browser state on the element, not markup, so
+// the swap drops that too: a Task box holding more text than it shows snapped
+// back to its first line on every beat, mid-sentence. Restoring the caret isn't
+// enough — a caret can sit off-screen — so the offset is carried over itself.
 const composerHeight = new Map(); // "host::repo" -> inline height, e.g. "160px"
+const composerScroll = new Map(); // "host::repo" -> textarea scrollTop, e.g. 48
 function captureComposerHeights() {
   for (const el of document.querySelectorAll(".composer textarea[data-rk]")) {
     if (el.style.height) composerHeight.set(el.dataset.rk, el.style.height);
+    composerScroll.set(el.dataset.rk, el.scrollTop || 0);
+  }
+}
+// Runs after the swap, on the fresh boxes; scrollTop clamps itself to the new
+// content, so a shrunken draft just lands at the bottom rather than out of range.
+function restoreComposerScrolls() {
+  for (const el of document.querySelectorAll(".composer textarea[data-rk]")) {
+    const y = composerScroll.get(el.dataset.rk);
+    if (y) el.scrollTop = y;
   }
 }
 // Persist the composer's option selects as this repo's last-used prefs.
@@ -1081,6 +1095,9 @@ function render(data) {
   // lists, so it only exists now, and focusing it can itself scroll the sidebar
   // — then undo any clamp the swaps (or that focus) caused.
   restoreFieldFocus(focus);
+  // After the focus, whose setSelectionRange scrolls the box to the caret: the
+  // offset the operator was actually looking at is the one that should win.
+  restoreComposerScrolls();
   if ($sidebar && scrollTop && $sidebar.scrollTop !== scrollTop) $sidebar.scrollTop = scrollTop;
 
   // If the attached session vanished (killed elsewhere, host offline), drop the
@@ -1234,6 +1251,7 @@ function startSession(key, repo) {
   composerOpen.delete(rk);
   composerDraft.delete(rk);
   composerHeight.delete(rk);
+  composerScroll.delete(rk);
   const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
     // Open the new session on the stage as soon as the agent reports it.

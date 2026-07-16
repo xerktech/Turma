@@ -162,27 +162,21 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   # --------------------------------------------------------- build: turma -----
-  # Self-hosted: builds and pushes a container image, so the warm docker layer
-  # cache here is the point.
+  # Hosted, like every workflow in this repo: the layer cache is `type=gha`
+  # (GitHub-side, so it follows the job here rather than living on a box). The
+  # per-job DOCKER_CONFIG and workspace-ownership steps this used to carry were
+  # artefacts of the shared self-hosted box; a hosted runner is a fresh VM.
   build-turma-image:
     needs: [plan, bump]
     if: >-
       !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
       && needs.plan.outputs.build_turma == 'true'
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       packages: write
     steps:
-      # Per-job docker config. The 3 runners share one HOME, so login-action's
-      # post-cleanup logout in any concurrent job would strip the ghcr.io creds
-      # this push needs. RUNNER_TEMP is per-job. Set in a step, not job-level
-      # env:, because the `runner` context isn't available there.
-      - name: Scope docker config to this job
-        run: echo "DOCKER_CONFIG=${RUNNER_TEMP}/.docker" >> "$GITHUB_ENV"
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
@@ -207,30 +201,35 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
             org.opencontainers.image.version=${{ needs.plan.outputs.version }}
-      - name: Clean up dangling images
-        if: always()
-        run: docker image prune -f || true
-
   # --------------------------------------------------------- build: agent -----
-  # Self-hosted: warm layer cache + disk (the android-build tier is ~2 GB).
+  # Hosted. This is the biggest build in the repo; its layer cache is `type=gha`
+  # (GitHub-side, so it follows the job) and its disk is handled by the reclaim
+  # step below, which frees more than the box ever had spare.
   build-agent-image:
     needs: [plan, bump]
     if: >-
       !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
       && needs.plan.outputs.build_agent_image == 'true'
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Scope docker config to this job
-        run: echo "DOCKER_CONFIG=${RUNNER_TEMP}/.docker" >> "$GITHUB_ENV"
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+      # ~25 GB of preinstalled toolchains this job never uses, against ~14 GB
+      # free — and it builds ~2 GB of image (plus buildkit snapshots and the
+      # cache export) entirely inside the Dockerfile. Safe to delete the runner's
+      # own Android SDK precisely because the build is hermetic: the image
+      # downloads its own. Never fails the job.
+      - name: Free up disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
       # The bundled Claude Code release is pinned into the build (contents can't
       # drift), resolved via a throwaway node container (no npm on the runner).
       # NOT part of the version.
@@ -264,9 +263,6 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
             org.opencontainers.image.version=${{ needs.plan.outputs.version }}
-      - name: Clean up dangling images
-        if: always()
-        run: docker image prune -f || true
 
   # ------------------------------------------------------- build: glasses -----
   # GitHub-hosted: an npm build + pack, no docker cache to keep warm.
@@ -310,32 +306,32 @@ jobs:
           if-no-files-found: error
 
   # ------------------------------------------------------- build: android -----
-  # Self-hosted: the mingc/android-build-box container stays warm in this box's
-  # docker cache (it's a Docker Hub image, so ghcr-pull limits don't apply).
+  # Hosted: a hosted runner ships the Android SDK and a JDK, so this needs no
+  # container at all — the mingc/android-build-box image it used to run in only
+  # existed to give the box a toolchain. Gradle is downloaded + pinned in-job.
   build-android:
     needs: [plan, bump]
     if: >-
       !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
       && needs.plan.outputs.build_android == 'true'
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    container:
-      image: mingc/android-build-box:latest
     env:
       GRADLE_VERSION: "8.11.1"
     steps:
-      - name: Reset workspace ownership
-        working-directory: ${{ github.workspace }}
-        run: chown -R "$(id -u):$(id -g)" . || true
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
-      - name: Install Gradle
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install Gradle ${{ env.GRADLE_VERSION }}
         run: |
           set -eux
-          curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip
-          unzip -q -o /tmp/gradle.zip -d /opt
-          echo "/opt/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+          curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o "${RUNNER_TEMP}/gradle.zip"
+          unzip -q -o "${RUNNER_TEMP}/gradle.zip" -d "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
       - name: Ensure SDK packages
         run: yes | sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
       # build.gradle.kts reads TURMA_VERSION / TURMA_VERSION_CODE (see the file);

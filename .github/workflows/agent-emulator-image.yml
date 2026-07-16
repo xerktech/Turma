@@ -10,8 +10,10 @@ name: agent-emulator-image
 # Extracted from the old turma-agent-image.yml when releases were unified; the
 # `:latest`/versioned agent image is now built by release.yml.
 #
-# Self-hosted: the :emulator tier alone is 6.4 GB, well past a hosted runner's
-# ~14 GB free, and it reuses the warm turma-agent layer cache on the box.
+# Hosted, like every workflow here. The :emulator tier is the repo's high-water
+# mark for disk (6.4 GB) — hence the reclaim step below, which frees ~25 GB of
+# preinstalled toolchains and gives it more headroom than the box ever had. Its
+# layer cache is `type=gha`, GitHub-side, so it follows the job.
 on:
   workflow_dispatch:
     inputs:
@@ -29,23 +31,25 @@ env:
 
 jobs:
   build:
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
       packages: write
     steps:
-      # Per-job docker config — the 3 runners share one HOME, so another job's
-      # login-action logout would wipe the ghcr.io credentials this push needs.
-      # RUNNER_TEMP is per-job. Set in a step, not a job-level `env:`, because the
-      # `runner` context isn't available there (a schema error GitHub rejects).
-      - name: Scope docker config to this job
-        run: echo "DOCKER_CONFIG=${RUNNER_TEMP}/.docker" >> "$GITHUB_ENV"
-
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
-
       - uses: actions/checkout@v7
+
+      # ~25 GB of preinstalled toolchains this job never uses, against ~14 GB
+      # free — and this tier builds 6.4 GB of image (plus buildkit snapshots)
+      # entirely inside the Dockerfile. Safe to delete the runner's own Android
+      # SDK precisely because the build is hermetic: the image downloads its own.
+      # Never fails the job.
+      - name: Free up disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
 
       # The bundled Claude Code release is pinned into the build (so image
       # contents can't drift); resolved via a throwaway node container since the
@@ -86,9 +90,3 @@ jobs:
           cache-from: type=gha,scope=turma-agent
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
-
-      - name: Clean up dangling images
-        if: always()
-        run: |
-          docker image prune -f || true
-          df -h || true

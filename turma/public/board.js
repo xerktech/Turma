@@ -104,6 +104,19 @@
       .sort((x, y) => x.siteKey.localeCompare(y.siteKey));
   }
 
+  // A siteKey is the Jira site's host ("myorg.atlassian.net"), but the org name
+  // is the only part of it a human reads, so every surface that shows a site to
+  // one shows this instead — the board's org chips and the dashboard's host
+  // rows. The full siteKey stays the identity everything is keyed and routed on;
+  // this is presentational only.
+  //
+  // Only the Jira Cloud suffix is stripped: on a site that isn't *.atlassian.net
+  // the whole host IS the org's name there, and trimming a suffix off it would
+  // invent one.
+  function orgName(siteKey) {
+    return String(siteKey ?? "").replace(/\.atlassian\.net$/i, "");
+  }
+
   // Stable org color: position in the sorted key list -> --s1..--s8 (the same
   // palette trick the history chart uses), so a site keeps its hue as long as
   // the set of sites is stable, regardless of filter or ordering.
@@ -419,7 +432,7 @@
   }
 
   const api = {
-    CATEGORIES, mergeSites, categoryOf, ticketSort, orgColor, ageStr,
+    CATEGORIES, mergeSites, categoryOf, ticketSort, orgColor, orgName, ageStr,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
