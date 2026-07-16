@@ -428,6 +428,21 @@ test("a Task box dragged taller keeps its height across a re-render", () => {
   assert.match(els.spawn.innerHTML, /style="height:160px"/);
 });
 
+test("a scrolled-down Task box keeps its offset across a re-render", () => {
+  // A composer already on screen, scrolled past its first screen of typed text.
+  const box = { style: {}, dataset: { rk: "hostA::repoX" }, scrollTop: 0 };
+  const { beat, toggleComposer, els } = loadPage({ textareas: [box] });
+  const { now, host: h } = host([]);
+  beat({ now, agents: [h] });
+  toggleComposer("hostA::repoX", "repoX");
+
+  box.scrollTop = 96;                                // operator types past the fold
+  els.spawn._onHtml = () => { box.scrollTop = 0; };  // the swap rebuilds the box at the top
+  beat({ now, agents: [h] }); // the heartbeat that used to yank the text back up
+
+  assert.equal(box.scrollTop, 96, "render must restore the offset the swap dropped");
+});
+
 test("a scrolled sidebar stays put across a re-render", () => {
   const sidebar = { scrollTop: 0 };
   const { beat, els } = loadPage({ sidebar });
