@@ -361,14 +361,17 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Service: a systemd **user** unit with `KillMode=process` (so a restart signals only the manager,
   leaving tmux/claude/ttyd/tunnel alive), plus a nohup `turma-agentctl` fallback for WSL without
   systemd. Both preserve running sessions across a restart via the adopt-on-boot path above.
-- `turma-agent-update` — self-updater: polls the `agent-native-v*` releases via `gh`, verifies the
-  sha256, swaps files, restarts the manager (which re-adopts live sessions) — so an update never stops
-  active sessions, the UI just reconnects. Driven by a systemd timer or a `--loop` poller.
+- `turma-agent-update` — self-updater: reads the unified release stream via `gh`, comparing the
+  release `manifest.json`'s **agent-native component version** (never the release tag — a release can
+  carry an unchanged older native build under a newer tag), verifies the sha256, swaps files, restarts
+  the manager (which re-adopts live sessions) — so an update never stops active sessions, the UI just
+  reconnects. Falls back to the legacy `agent-native-v*` stream when no unified release exists. Driven
+  by a systemd timer or a `--loop` poller. Tests: `agent/tests/test_turma_agent_update.sh`.
 - Not installed natively: cloud CLIs (aws/az/terraform) + PowerShell; the container is for those.
 - Additive: nothing under `native/` edits the shared runtime files; the one enabling change is
   `resume_on_boot`'s adopt path (above), which is backward-compatible with the container.
-- Released by `.github/workflows/turma-agent-native.yml` as a versioned tarball (own `run_number`
-  stream, shared `MAJOR.MINOR`), which the updater consumes.
+- The native tarball is one component of the unified `release.yml` (see Unified releases); the updater
+  consumes it from that stream.
 
 ### `tunnel-agent.js`
 
@@ -800,34 +803,44 @@ GHCR image builds and PR gates — see Build & Deploy below.
 
 ## Build & Deploy
 
-### Unified versioning
+### Unified releases
 
-- The repo-wide `MAJOR.MINOR` lives in the root **`VERSION`** file (currently `0.1`).
-- Every build pipeline appends its GitHub Actions `run_number` as the patch, yielding one full
-  version per build (`VERSION.run_number`, e.g. `0.1.42`).
-- Bump `VERSION` when you cut a new minor/major; the run number moves on its own.
-- All the pipelines (agent image, turma image, glasses release, android release) read the same file,
-  so their versions stay in lockstep.
+- **One release = one `v<MAJOR>.<MINOR>.<PATCH>` tag = all five components + a changelog**, cut by
+  `.github/workflows/release.yml`. See `RELEASING.md` for the operator story and
+  `.github/scripts/README.md` for the logic. This replaced five per-component release/build workflows
+  whose independent `run_number` patches drifted out of lockstep.
+- The root **`VERSION`** file holds `MAJOR.MINOR` only. The **patch is derived from the existing `v*`
+  tags** (`max` on that line + 1), never committed — so the auto-patch path is read-only against the
+  repo and can't re-trigger itself. Bump `VERSION` only for a minor/major.
+- The five components: `turma` image, `agent` image, glasses `.ehpk`, android `.apk`, native agent
+  tarball. All version math (tag-derived patch, android `versionCode` packing, the strictly-greater
+  guard) lives in the tested `.github/scripts` — not in YAML or Kotlin.
 
-### Image builds
+### What a release builds vs carries
 
-- `.github/workflows/turma-agent-image.yml` builds `ghcr.io/xerktech/turma-agent` on any change under
-  `agent/**`. Its version tag is the unified `VERSION.run_number` semver.
-  - The bundled Claude Code release is still pinned into the build via the `CLAUDE_CODE_VERSION`
-    build-arg (so the image contents can't drift), but it is **not** part of the version — it's
-    resolved only to feed that build-arg and never appears in a tag or label.
-- `.github/workflows/turma-image.yml` builds `ghcr.io/xerktech/turma` on any change under `turma/**`,
-  tagged with the same `VERSION.run_number` semver.
-- These push `:latest` (images) / a `VERSION.run_number` versioned tag / `:sha-<sha>` (images), a
-  `glasses-v<VERSION.run_number>` release tag, or an `android-v<VERSION.run_number>` release tag (the
-  APK — `android-release.yml`, post-merge on `android/**`, a debug-signed sideload APK built in the
-  same Docker Hub Android-SDK container as the CI gate).
-- Watchtower keeps `:latest` current on the host.
-- `.github/workflows/turma-agent-native.yml` publishes the non-Docker agent (`agent/native/`) as an
-  `agent-native-v<VERSION.run_number>` tarball release (pure `tar`, no toolchain), which the native
-  agent's own updater polls — the Watchtower equivalent for a host install.
-- The DockerOps `compose/turma-truenas.yaml` references `ghcr.io/xerktech/turma-agent:latest` — keep
-  that image ref in sync if you ever rename it here.
+- Only **changed** components build; **unchanged** ones are **carried** — their prior artifact is
+  published in the new release at its own prior version, not rebuilt. A glasses-only merge builds the
+  new `.ehpk` at the release version and copies the previous `turma-android-v*.apk` (etc.) onto the
+  release unchanged. So every release publishes all five components; a carried one just reads its
+  older version.
+- **Images**: built when changed; when carried, the manifest references the prior `:version` tag (no
+  retag — `:0.3.9` pointing at `0.3.4` bits would be the same lie as renaming a carried asset). A
+  carried image's `:latest` is already correct, so Watchtower needs nothing.
+- **Assets** (`.ehpk`/`.apk`/`.tar.gz`): a carried asset is copied forward under its **original name**
+  (the filename must describe the bits — Even Hub / Android version installs by the version baked
+  inside the file). A built asset is named at the new version.
+- A per-release **`manifest.json`** (attached to every release) is the machine-readable source of
+  truth for each component's version + where its bits live — read by the next release's `plan`, the
+  native updater, and humans. The release notes render a rebuilt/carried table from it.
+- The bundled Claude Code release is pinned into the agent image via `CLAUDE_CODE_VERSION` (contents
+  can't drift) but is **not** part of the version — resolved only to feed the build-arg.
+- Watchtower keeps `:latest` current on the host; the DockerOps `compose/turma-truenas.yaml`
+  references `ghcr.io/xerktech/turma-agent:latest` — keep that ref in sync if renamed here.
+- Trigger: `workflow_dispatch` (with `dry_run` defaulting on) plus `push: main` for auto patch
+  releases. A manual `minor`/`major` dispatch bumps `VERSION`, rolls the intervening patches into
+  `CHANGELOG.md`, and force-builds every component.
+- `.github/workflows/agent-emulator-image.yml` builds the opt-in `:emulator` agent tier on demand —
+  not a release component (nothing consumes it), so it carries no unified version.
 
 ### Deployment (DockerOps, not here)
 
@@ -862,8 +875,11 @@ push) and block the merge on findings:
 - `glasses-ci.yml` — path-filtered to `glasses/**`, runs that package's typecheck + Vitest suite +
   production build inside a throwaway `node:24-alpine` container.
 - `android-ci.yml` — path-filtered to `android/**`, runs the client's JVM unit tests +
-  `assembleDebug` inside a Docker Hub Android-SDK container (the release counterpart is
-  `android-release.yml`).
+  `assembleDebug` inside a Docker Hub Android-SDK container.
+
+Every component is built and published post-merge by the single `release.yml` (see Unified releases);
+these gates just block a bad merge. `code-scan.yml` also unit-tests the release logic
+(`.github/scripts/tests`) and the native updater (`agent/tests/test_turma_agent_update.sh`).
 
 Because the images bundle third-party binaries, keep the pinned tool versions current — that's how
 most CVEs are cleared. Genuinely non-actionable upstream base-image findings go in the root
@@ -914,7 +930,7 @@ most CVEs are cleared. Genuinely non-actionable upstream base-image findings go 
     compose to pass `/dev/kvm` (no stack does) and otherwise falls back to slow software rendering.
   - If you genuinely need an in-container AVD, `:emulator` (the `android` tier, 6.4 GB,
     `ANDROID_EMULATOR_TAG`/`ANDROID_EMULATOR_ABI`) is built on demand via `workflow_dispatch` on
-    `turma-agent-image.yml`.
+    `agent-emulator-image.yml`.
 
 ### Where jobs run
 
