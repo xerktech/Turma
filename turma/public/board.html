@@ -72,11 +72,17 @@ function render(data) {
   // Chips: All + one per org, colored by the org's stable palette slot, with
   // a staleness note when none of the org's reporting hosts is online.
   $chips.replaceChildren();
+  // A chip is LABELLED with the org name but still filters on the full siteKey,
+  // which stays the identity the board is keyed on; the site host rides along as
+  // the chip's tooltip for anyone who wants to see which Jira it actually is.
   const mkChip = (label, key, extra) => {
     const b = document.createElement("button");
     b.className = "org-chip" + (orgFilter === key ? " active" : "");
     b.innerHTML = extra ? esc(label) + extra : esc(label);
-    if (key) b.style.setProperty("--org", B.orgColor(key, allKeys));
+    if (key) {
+      b.style.setProperty("--org", B.orgColor(key, allKeys));
+      b.title = key;
+    }
     b.addEventListener("click", () => setOrg(key));
     return b;
   };
@@ -87,7 +93,7 @@ function render(data) {
       const age = B.ageStr(s.lastFetched);
       extra += ` <span class="chip-stale" title="No host reporting this org is online — showing its last report">⚠ offline${age ? " · synced " + esc(age) + " ago" : ""}</span>`;
     }
-    $chips.append(mkChip(s.siteKey, s.siteKey, extra));
+    $chips.append(mkChip(B.orgName(s.siteKey), s.siteKey, extra));
   }
 
   $board.innerHTML = B.boardHtml(sites, orgFilter, { allKeys });

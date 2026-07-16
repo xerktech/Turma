@@ -37,6 +37,9 @@
   .host-name { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
     cursor: pointer; background: none; border: 0; padding: 0; text-align: left; color: inherit; font: inherit; }
   .host-name h3 { font-size: 15px; margin: 0; font-weight: 600; word-break: break-all; }
+  /* The host's Jira org, alongside the hostname: a descriptor of the row, not a
+     second name for it, so it reads lighter than the hostname it follows. */
+  .host-name h3 .host-org { color: var(--muted); font-weight: 500; }
   .host-name .caret { color: var(--muted); font-size: 11px; flex-shrink: 0; transition: transform 0.15s; }
   .host-card.collapsed .host-name .caret { transform: rotate(-90deg); }
   .host-meta { display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 13px; color: var(--ink-2); }
@@ -253,6 +256,11 @@
 
 <nav class="bottom-nav" id="bottomNav"></nav>
 <script src="/nav.js"></script>
+
+<!-- For TurmaBoard.orgName: the host rows name each host's Jira org, and that
+     siteKey -> org-name rule is the board's, so the dashboard borrows it rather
+     than growing a second copy to drift from. -->
+<script src="/board.js"></script>
 
 <script>
 const $tiles = document.getElementById("tiles");
@@ -753,11 +761,17 @@ function hostCard(a, now) {
     ? `<span class="status" style="color:var(--muted);font-size:12px">${runCount} running · ${sessions.length} total</span>`
     : "";
 
+  // The org whose Jira this host polls, alongside its name — a host with no Jira
+  // creds reports no siteKey and just shows its name, so the suffix is only ever
+  // there when it says something.
+  const org = window.TurmaBoard.orgName(a.jira && a.jira.siteKey);
+
   return `<div class="host-card ${a.online ? "" : "offline"} ${collapsed ? "collapsed" : ""}">
     <div class="host-top">
       <button class="host-name" onclick="hostToggle('${esc(a.key)}')"
           aria-expanded="${collapsed ? "false" : "true"}" title="${collapsed ? "Expand" : "Collapse"} host">
-        <span class="caret">▼</span><h3>${esc(a.key)}</h3>
+        <span class="caret">▼</span>
+        <h3>${esc(a.key)}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
       </button>
       ${collapsedMeta}
       <span class="status"><span class="dot ${dot}"></span>${esc(state)}</span>
