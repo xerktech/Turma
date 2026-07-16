@@ -1,22 +1,37 @@
 #!/usr/bin/env bash
 # turma-agent-update — self-updater for the native Turma agent.
 #
-# Polls the native release stream (GitHub Releases tagged `agent-native-v*`),
-# and when a newer build exists, downloads + verifies it, swaps the runtime
-# files into $PREFIX, and restarts JUST the manager — which re-adopts the live
-# sessions on boot (see resume_on_boot in hub-agent.py). So an update never stops
-# active claude sessions; the web UI briefly disconnects and reconnects.
+# Polls the release stream and, when a newer native build exists, downloads +
+# verifies it, swaps the runtime files into $PREFIX, and restarts JUST the
+# manager — which re-adopts the live sessions on boot (see resume_on_boot in
+# hub-agent.py). So an update never stops active claude sessions; the web UI
+# briefly disconnects and reconnects.
+#
+# Two release schemes, tried in order:
+#   1. UNIFIED (current): one `v<M>.<m>.<p>` release per build carries all
+#      components + a `manifest.json`. We compare the manifest's AGENT-NATIVE
+#      COMPONENT version against what's installed — never the release tag —
+#      because a release can CARRY an unchanged (older) native tarball while its
+#      own tag moves ahead. Comparing the tag would reinstall the same bits on
+#      every poll and mis-stamp VERSION forever; comparing the component version
+#      makes a carried release a correct no-op. The asset is downloaded by the
+#      exact name + release the manifest records (a carried asset lives on an
+#      older release under an older name).
+#   2. LEGACY (pre-cutover / rollback): the old per-component `agent-native-v*`
+#      stream. Used only when no `v*` release with a parseable manifest exists,
+#      so a host survives the cutover in either direction.
 #
 # Auth reuses the host's existing `gh` login (already used for private git), so
 # it works against a private repo with no extra token. Falls back to the REST
-# API with $GH_TOKEN when `gh` is absent.
+# API with $GH_TOKEN when `gh` is absent. Manifest JSON is parsed with python3,
+# which the native agent requires anyway (it runs hub-agent.py) — no jq needed.
 set -eu
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"   # $PREFIX/bin
 PREFIX="$(dirname "$SELF_DIR")"
 
 REPO="${TURMA_REPO:-xerktech/turma}"
-TAG_PREFIX="agent-native-v"
+LEGACY_TAG_PREFIX="agent-native-v"
 INTERVAL="${TURMA_UPDATE_INTERVAL:-21600}"   # 6h default for --loop
 LOG="$HOME/.turma/update.log"
 LOCK="$HOME/.turma/update.lock"
@@ -24,95 +39,110 @@ mkdir -p "$HOME/.turma" 2>/dev/null || true
 
 logmsg() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG" >&2; }
 
+have_gh() { command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; }
+
 installed_version() {
   [ -f "$PREFIX/VERSION" ] && tr -d '[:space:]' <"$PREFIX/VERSION" || echo "0.0.0"
 }
 
-# is $1 strictly newer than $2 (dotted numeric, e.g. 0.2.123)?
+# is $1 strictly newer than $2 (dotted numeric, e.g. 0.3.12)?
 newer_than() {
   [ "$1" != "$2" ] && \
     [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
 }
 
-# Print the highest available native version (bare, no prefix), or nothing.
-latest_version() {
-  local tags
-  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    tags="$(gh api "repos/$REPO/releases?per_page=100" -q '.[].tag_name' 2>/dev/null || true)"
+# All release tag names, one per line (both schemes). Empty on auth failure.
+all_tags() {
+  if have_gh; then
+    gh api "repos/$REPO/releases?per_page=100" -q '.[].tag_name' 2>/dev/null || true
   elif [ -n "${GH_TOKEN:-}" ]; then
-    tags="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/$REPO/releases?per_page=100" 2>/dev/null \
-            | grep -o '"tag_name":[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || true)"
-  else
-    logmsg "no gh login and no GH_TOKEN — auto-update disabled"
-    return 0
+    curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+         "https://api.github.com/repos/$REPO/releases?per_page=100" 2>/dev/null \
+      | grep -o '"tag_name":[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || true
   fi
-  printf '%s\n' "$tags" \
-    | grep "^${TAG_PREFIX}" \
-    | sed "s/^${TAG_PREFIX}//" \
-    | sort -V | tail -n1
 }
 
-download_release() {  # <tag> <destdir>
-  local tag="$1" dst="$2"
-  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    gh release download "$tag" --repo "$REPO" \
-      --pattern '*.tar.gz' --pattern '*.sha256' --dir "$dst" --clobber
+# Highest unified v<M>.<m>.<p> tag, or empty. Legacy-prefixed tags are excluded.
+latest_unified_tag() {
+  all_tags | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1
+}
+
+# Highest legacy native version (bare, no prefix), or empty.
+latest_legacy_version() {
+  all_tags | grep "^${LEGACY_TAG_PREFIX}" | sed "s/^${LEGACY_TAG_PREFIX}//" | sort -V | tail -n1
+}
+
+# Download named assets from a specific release tag into a dir.
+download_assets() {  # <tag> <destdir> <pattern...>
+  local tag="$1" dst="$2"; shift 2
+  if have_gh; then
+    local args=()
+    local p; for p in "$@"; do args+=(--pattern "$p"); done
+    gh release download "$tag" --repo "$REPO" "${args[@]}" --dir "$dst" --clobber
   elif [ -n "${GH_TOKEN:-}" ]; then
-    # REST assets API: works for private repos with the octet-stream Accept.
+    # REST assets API: match asset names against the requested patterns.
     local api="https://api.github.com/repos/$REPO/releases/tags/$tag"
-    curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$api" 2>/dev/null \
-      | grep -o '"url":[[:space:]]*"[^"]*assets/[0-9]*"' \
-      | sed 's/.*"\(.*\)"$/\1/' \
-      | while read -r aurl; do
-          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-               -H "Accept: application/octet-stream" -O -J --output-dir "$dst" "$aurl"
-        done
+    local json; json="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$api" 2>/dev/null || true)"
+    [ -n "$json" ] || return 1
+    local names; names="$(printf '%s' "$json" \
+      | grep -o '"name":[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/')"
+    local want got=0
+    for want in "$@"; do
+      # Glob-match each requested pattern against the asset names.
+      local name
+      while IFS= read -r name; do
+        # shellcheck disable=SC2254
+        case "$name" in
+          $want)
+            local aurl
+            aurl="$(printf '%s' "$json" | python3 -c '
+import json,sys
+rel=json.load(sys.stdin)
+n=sys.argv[1]
+for a in rel.get("assets",[]):
+    if a.get("name")==n: print(a.get("url","")); break
+' "$name" 2>/dev/null || true)"
+            [ -n "$aurl" ] || continue
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                 -H "Accept: application/octet-stream" -o "$dst/$name" "$aurl" && got=1
+            ;;
+        esac
+      done <<EOF
+$names
+EOF
+    done
+    [ "$got" = 1 ]
   else
     return 1
   fi
 }
 
-run_once() {
-  local cur latest tag stage tgz
-  cur="$(installed_version)"
-  latest="$(latest_version || true)"
-  if [ -z "$latest" ]; then
-    logmsg "no native release found (or auth unavailable); staying at $cur"
-    return 0
-  fi
-  if ! newer_than "$latest" "$cur"; then
-    logmsg "up to date ($cur; latest $latest)"
-    return 0
-  fi
-  tag="${TAG_PREFIX}${latest}"
-  logmsg "update available: $cur -> $latest ($tag)"
+# Read a scalar field of the agent-native component from a manifest file.
+manifest_native_field() {  # <manifest_file> <field>
+  python3 -c '
+import json,sys
+try:
+    m=json.load(open(sys.argv[1]))
+    c=m.get("components",{}).get("agent-native",{})
+    v=c.get(sys.argv[2])
+    print(v if v is not None else "")
+except Exception:
+    print("")
+' "$1" "$2" 2>/dev/null || true
+}
 
-  stage="$(mktemp -d "${TMPDIR:-/tmp}/turma-update.XXXXXX")"
-  # shellcheck disable=SC2064
-  trap "rm -rf '$stage' '$PREFIX.update'" RETURN
-
-  if ! download_release "$tag" "$stage"; then
-    logmsg "download failed for $tag; keeping $cur"; return 0
-  fi
-  tgz="$(find "$stage" -maxdepth 1 -name '*.tar.gz' | head -n1)"
-  [ -n "$tgz" ] || { logmsg "no tarball asset in $tag; keeping $cur"; return 0; }
-  # Verify checksum if a sidecar shipped.
-  if find "$stage" -maxdepth 1 -name '*.sha256' | grep -q .; then
-    if ! ( cd "$stage" && sha256sum -c ./*.sha256 >/dev/null 2>&1 ); then
-      logmsg "checksum FAILED for $tag; refusing to install"; return 0
-    fi
-  fi
-
-  # Extract to a SIBLING dir on the same filesystem as $PREFIX so the file swap
-  # below is an atomic rename (safe even for this running script's own file).
+# Extract the staged tarball, validate the payload, swap runtime files in via
+# atomic renames, stamp $version, and restart just the manager. $tgz must be
+# verified before this is called.
+install_payload() {  # <tgz> <version>
+  local tgz="$1" version="$2" src
   rm -rf "$PREFIX.update"; mkdir -p "$PREFIX.update"
   tar xzf "$tgz" -C "$PREFIX.update"
-  local src="$PREFIX.update"
+  src="$PREFIX.update"
   # Some tarballs wrap contents in a single top dir — descend if so.
   [ -f "$src/hub-agent.py" ] || src="$(dirname "$(find "$PREFIX.update" -name hub-agent.py | head -n1)")"
   if [ ! -f "$src/hub-agent.py" ] || [ ! -f "$src/tunnel-agent.js" ]; then
-    logmsg "staged payload incomplete; refusing to install"; return 0
+    logmsg "staged payload incomplete; refusing to install"; return 1
   fi
 
   # Swap runtime files via rename (mv on same fs). hub-agent.py + hooks/ move
@@ -122,12 +152,13 @@ run_once() {
   rm -rf "$PREFIX/hooks"; mv -f "$src/hooks" "$PREFIX/hooks"
   mv -f "$src/tunnel-agent.js" "$PREFIX/tunnel-agent.js"
   [ -f "$src/tmux.conf" ] && mv -f "$src/tmux.conf" "$PREFIX/tmux.conf"
+  local b
   for b in turma-agent turma-agentctl turma-agent-update; do
     [ -f "$src/$b" ] && { mv -f "$src/$b" "$PREFIX/bin/$b"; chmod +x "$PREFIX/bin/$b"; }
   done
   chmod +x "$PREFIX/hooks/"*.py 2>/dev/null || true
-  echo "$latest" >"$PREFIX/VERSION"
-  logmsg "installed $latest; restarting manager (sessions preserved)"
+  echo "$version" >"$PREFIX/VERSION"
+  logmsg "installed $version; restarting manager (sessions preserved)"
 
   # Restart just the manager. KillMode=process / manager-only kill keeps
   # tmux/claude/ttyd alive; the new manager adopts them.
@@ -136,7 +167,86 @@ run_once() {
   else
     "$PREFIX/bin/turma-agentctl" restart || logmsg "turma-agentctl restart failed"
   fi
-  logmsg "update complete: now $latest"
+  logmsg "update complete: now $version"
+}
+
+# Verify a staged tarball's sha256 sidecar (if present) then install it.
+verify_and_install() {  # <stage> <version>
+  local stage="$1" version="$2" tgz
+  tgz="$(find "$stage" -maxdepth 1 -name '*.tar.gz' | head -n1)"
+  [ -n "$tgz" ] || { logmsg "no tarball asset staged; keeping install"; return 1; }
+  if find "$stage" -maxdepth 1 -name '*.sha256' | grep -q .; then
+    if ! ( cd "$stage" && sha256sum -c ./*.sha256 >/dev/null 2>&1 ); then
+      logmsg "checksum FAILED; refusing to install"; return 1
+    fi
+  fi
+  install_payload "$tgz" "$version"
+}
+
+# Unified scheme. Returns 0 if it handled the decision (installed or up-to-date),
+# 1 if it couldn't (no unified release / unparseable manifest) so the caller
+# falls back to legacy.
+try_unified() {  # <cur> <stage>
+  local cur="$1" stage="$2" utag mdir comp_version asset sha release_tag
+  utag="$(latest_unified_tag || true)"
+  [ -n "$utag" ] || return 1
+
+  mdir="$stage/manifest"; mkdir -p "$mdir"
+  download_assets "$utag" "$mdir" 'manifest.json' >/dev/null 2>&1 || true
+  [ -f "$mdir/manifest.json" ] || { logmsg "unified release $utag has no manifest.json; trying legacy"; return 1; }
+
+  comp_version="$(manifest_native_field "$mdir/manifest.json" version)"
+  asset="$(manifest_native_field "$mdir/manifest.json" asset)"
+  sha="$(manifest_native_field "$mdir/manifest.json" sha256_asset)"
+  release_tag="$(manifest_native_field "$mdir/manifest.json" release_tag)"
+  if [ -z "$comp_version" ] || [ -z "$asset" ] || [ -z "$release_tag" ]; then
+    logmsg "manifest.json missing agent-native fields; trying legacy"; return 1
+  fi
+
+  if ! newer_than "$comp_version" "$cur"; then
+    logmsg "up to date ($cur; latest release $utag carries native $comp_version)"
+    return 0
+  fi
+  logmsg "update available: $cur -> $comp_version (from $release_tag, release $utag)"
+
+  local dl="$stage/payload"; mkdir -p "$dl"
+  if [ -n "$sha" ]; then
+    download_assets "$release_tag" "$dl" "$asset" "$sha" || { logmsg "download failed for $asset; keeping $cur"; return 0; }
+  else
+    download_assets "$release_tag" "$dl" "$asset" || { logmsg "download failed for $asset; keeping $cur"; return 0; }
+  fi
+  verify_and_install "$dl" "$comp_version" || true
+  return 0
+}
+
+# Legacy scheme (pre-cutover / rollback): the old agent-native-v* stream.
+try_legacy() {  # <cur> <stage>
+  local cur="$1" stage="$2" latest tag dl
+  latest="$(latest_legacy_version || true)"
+  if [ -z "$latest" ]; then
+    logmsg "no native release found (or auth unavailable); staying at $cur"
+    return 0
+  fi
+  if ! newer_than "$latest" "$cur"; then
+    logmsg "up to date ($cur; latest $latest)"
+    return 0
+  fi
+  tag="${LEGACY_TAG_PREFIX}${latest}"
+  logmsg "update available (legacy): $cur -> $latest ($tag)"
+  dl="$stage/payload"; mkdir -p "$dl"
+  download_assets "$tag" "$dl" '*.tar.gz' '*.sha256' || { logmsg "download failed for $tag; keeping $cur"; return 0; }
+  verify_and_install "$dl" "$latest" || true
+}
+
+run_once() {
+  local cur stage
+  cur="$(installed_version)"
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/turma-update.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$stage' '$PREFIX.update'" RETURN
+
+  try_unified "$cur" "$stage" && return 0
+  try_legacy "$cur" "$stage"
 }
 
 main() {
