@@ -162,3 +162,9 @@ jobs:
       # directly, which a hosted runner provides.
       - name: Entrypoint identity tests (agent/entrypoint.sh)
         run: ./agent/tests/test_entrypoint.sh
+      # The native updater is the only runtime consumer of the release tag
+      # scheme and runs on deployed hosts; ShellCheck covers its syntax, this
+      # covers its decision (component-version vs tag comparison, carried-release
+      # no-op, checksum refusal, legacy fallback). Pure shell + a gh stub.
+      - name: Native updater tests (agent/native/turma-agent-update)
+        run: ./agent/tests/test_turma_agent_update.sh

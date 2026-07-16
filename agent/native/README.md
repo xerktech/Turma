@@ -72,13 +72,21 @@ token):
 
 ## Auto-update
 
-The agent polls the `agent-native-v*` GitHub Releases (via your `gh` login),
-and when a newer build ships it downloads + checksum-verifies it, swaps the
-files, and restarts the manager. **Running sessions are not stopped** — the
-tmux/claude processes keep running; the web UI briefly disconnects and
-reconnects once the manager is back. Driven by a systemd timer (every 6h), or
-the `turma-agent-update --loop` poller on non-systemd hosts. Force a check with
+The agent polls the GitHub Releases (via your `gh` login), and when a newer
+native build ships it downloads + checksum-verifies it, swaps the files, and
+restarts the manager. **Running sessions are not stopped** — the tmux/claude
+processes keep running; the web UI briefly disconnects and reconnects once the
+manager is back. Driven by a systemd timer (every 6h), or the
+`turma-agent-update --loop` poller on non-systemd hosts. Force a check with
 `turma-agent-update` (or `turma-agentctl update`).
+
+It reads the unified release stream: each `v<MAJOR>.<MINOR>.<PATCH>` release
+carries a `manifest.json`, and the updater compares the manifest's **agent-native
+component version** against the installed one — never the release tag, since a
+release can carry an unchanged (older) native build under a newer tag. The asset
+is fetched by the exact name and release the manifest records. If no unified
+release exists (a rollback, or before the cutover) it falls back to the legacy
+`agent-native-v*` stream, so a host self-updates correctly either way.
 
 ## Verify / uninstall
 
