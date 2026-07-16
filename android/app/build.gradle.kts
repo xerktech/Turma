@@ -7,12 +7,15 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
-// versionName tracks the repo-wide MAJOR.MINOR in the root VERSION file (repo
-// convention — see CLAUDE.md), suffixed with the CI run number for a full
-// version. versionCode is that run number (monotonic per build).
-val repoVersion: String = File(rootDir.parentFile, "VERSION").takeIf { it.exists() }
-    ?.readText()?.trim() ?: "0.0"
-val runNumber: Int = (System.getenv("GITHUB_RUN_NUMBER") ?: "0").toIntOrNull() ?: 0
+// The unified release pipeline stamps the version via env vars: TURMA_VERSION
+// (the full MAJOR.MINOR.PATCH) and TURMA_VERSION_CODE (the monotonic packed
+// code), both computed by the one tested place — .github/scripts/version.js —
+// rather than duplicating the packing arithmetic here in Kotlin. A local or CI
+// build without them (e.g. android-ci.yml's assembleDebug) falls back to the
+// repo VERSION with a placeholder patch and versionCode 1.
+val turmaVersion: String = System.getenv("TURMA_VERSION")
+    ?: ((File(rootDir.parentFile, "VERSION").takeIf { it.exists() }?.readText()?.trim() ?: "0.0") + ".0")
+val turmaVersionCode: Int = (System.getenv("TURMA_VERSION_CODE") ?: "").toIntOrNull() ?: 1
 
 android {
     namespace = "com.xerktech.turma"
@@ -26,8 +29,8 @@ android {
         applicationId = "com.xerktech.turma"
         minSdk = 26
         targetSdk = 35
-        versionCode = if (runNumber > 0) runNumber else 1
-        versionName = "$repoVersion.$runNumber"
+        versionCode = turmaVersionCode
+        versionName = turmaVersion
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
     }

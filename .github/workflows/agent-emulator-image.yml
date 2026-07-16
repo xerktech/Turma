@@ -1,0 +1,94 @@
+name: agent-emulator-image
+
+# Builds the OPT-IN :emulator tier of the agent image (the `android` base in
+# agent/Dockerfile): the android-build tier + the in-container emulator and an
+# x86_64 system image (+4.4 GB). Nothing in DockerOps or CI consumes it, so it
+# is NOT a release component and carries no unified version — it's a
+# build-it-when-you-need-an-AVD convenience, kept out of release.yml so the
+# per-release path never spends 4.4 GB on a tag no stack pulls.
+#
+# Extracted from the old turma-agent-image.yml when releases were unified; the
+# `:latest`/versioned agent image is now built by release.yml.
+#
+# Self-hosted: the :emulator tier alone is 6.4 GB, well past a hosted runner's
+# ~14 GB free, and it reuses the warm turma-agent layer cache on the box.
+on:
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        description: "Extra tag to publish alongside :emulator (optional, e.g. a version)"
+        type: string
+        default: ""
+
+concurrency:
+  group: agent-emulator-image
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/turma-agent
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Per-job docker config — the 3 runners share one HOME, so another job's
+      # login-action logout would wipe the ghcr.io credentials this push needs.
+      # RUNNER_TEMP is per-job. Set in a step, not a job-level `env:`, because the
+      # `runner` context isn't available there (a schema error GitHub rejects).
+      - name: Scope docker config to this job
+        run: echo "DOCKER_CONFIG=${RUNNER_TEMP}/.docker" >> "$GITHUB_ENV"
+
+      - name: Reset workspace ownership
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
+
+      - uses: actions/checkout@v7
+
+      # The bundled Claude Code release is pinned into the build (so image
+      # contents can't drift); resolved via a throwaway node container since the
+      # self-hosted runner has no npm on PATH. Not part of any version.
+      - name: Resolve Claude Code version
+        id: cc
+        run: |
+          set -euo pipefail
+          CC_VERSION="$(docker run --rm node:24-alpine npm view @anthropic-ai/claude-code version | tr -d '[:space:]')"
+          echo "version=${CC_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and push (:emulator — android tier)
+        uses: docker/build-push-action@v7
+        with:
+          context: ./agent
+          push: true
+          build-args: |
+            AGENT_BASE=android
+            CLAUDE_CODE_VERSION=${{ steps.cc.outputs.version }}
+          tags: |
+            ${{ env.IMAGE }}:emulator
+            ${{ env.IMAGE }}:emulator-sha-${{ github.sha }}
+            ${{ inputs.tag_suffix != '' && format('{0}:emulator-{1}', env.IMAGE, inputs.tag_suffix) || '' }}
+          # cache-FROM only, deliberately. The emulator layer is 4.4 GB
+          # uncompressed; writing it back with mode=max would evict most of the
+          # shared 10 GB Actions cache that every other build depends on, to speed
+          # up a tag built by hand a few times a year. Reading the turma-agent
+          # scope still gives it every layer below the emulator.
+          cache-from: type=gha,scope=turma-agent
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Clean up dangling images
+        if: always()
+        run: |
+          docker image prune -f || true
+          df -h || true

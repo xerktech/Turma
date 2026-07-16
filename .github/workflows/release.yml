@@ -1,0 +1,511 @@
+name: release
+
+# The unified release pipeline: ONE v<MAJOR>.<MINOR>.<PATCH> tag per release,
+# carrying ALL five components (turma image, agent image, glasses .ehpk, android
+# .apk, native agent tarball) + a changelog. Replaces the five per-component
+# release/build workflows. See RELEASING.md and .github/scripts/README.md.
+#
+# Model:
+#   - PATCH is derived from the existing v* tags (max+1), never committed — so
+#     the auto-patch path is read-only against the repo and can't re-trigger
+#     itself. Root VERSION holds MAJOR.MINOR only.
+#   - Only CHANGED components build; unchanged ones are CARRIED — their image
+#     stays referenced at its own older version (never retagged), and their
+#     release asset is copied forward under its original name. All the
+#     build-vs-carry logic lives in the tested .github/scripts, not in this YAML.
+#   - A manual minor/major (workflow_dispatch) bumps VERSION, rolls the
+#     intervening patches into CHANGELOG.md, and force-builds every component.
+#
+# dry_run (the dispatch DEFAULT) exercises everything except the mutations:
+# builds run with push:false, assets upload to Actions artifacts, and no tag /
+# release / commit is created. It's the break-glass diagnostic — keep it.
+#
+# NOTE: this starts workflow_dispatch-only. The `push: main` auto-release
+# trigger is added in a follow-up once v0.3.0 has been cut by hand and watched.
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "patch (auto), or a manual minor/major bump"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      dry_run:
+        description: "Rehearse without pushing/tagging/releasing"
+        type: boolean
+        default: true
+      force_all:
+        description: "Build every component even if unchanged"
+        type: boolean
+        default: false
+
+# Global, unqualified group with cancel-in-progress:false — serialize ALL
+# releases so two never race on the tag/registry. Rapid merges queue (and older
+# pending runs supersede), which is safe because the changelog is range-based:
+# the surviving release still covers the superseded merges' PRs.
+concurrency:
+  group: turma-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # tags, releases, the VERSION/CHANGELOG bump commit
+  packages: write # ghcr push
+  pull-requests: read # changelog from merged PRs
+
+env:
+  TURMA_IMAGE: ghcr.io/${{ github.repository_owner }}/turma
+  AGENT_IMAGE: ghcr.io/${{ github.repository_owner }}/turma-agent
+
+jobs:
+  # ------------------------------------------------------------------ plan ----
+  # Read-only: compute version/tag and the per-component build matrix from the
+  # tags + the diff since the previous release. See .github/scripts/plan.js.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      prev_tag: ${{ steps.plan.outputs.prev_tag }}
+      changed: ${{ steps.plan.outputs.changed }}
+      android_version_code: ${{ steps.plan.outputs.android_version_code }}
+      base_major: ${{ steps.plan.outputs.base_major }}
+      base_minor: ${{ steps.plan.outputs.base_minor }}
+      release_type: ${{ steps.plan.outputs.release_type }}
+      build_turma: ${{ steps.plan.outputs.build_turma }}
+      build_agent_image: ${{ steps.plan.outputs.build_agent_image }}
+      build_agent_native: ${{ steps.plan.outputs.build_agent_native }}
+      build_glasses: ${{ steps.plan.outputs.build_glasses }}
+      build_android: ${{ steps.plan.outputs.build_android }}
+      dry_run: ${{ steps.flags.outputs.dry_run }}
+      sha: ${{ github.sha }}
+    steps:
+      # Full history + tags: nextPatch reads every v* tag, and the changelog
+      # walks the range since the previous release. The default shallow checkout
+      # fetches no tags, which would make nextPatch return 0 forever.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Resolve flags
+        id: flags
+        run: |
+          # On a push trigger there are no inputs -> a real (non-dry) release.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=${{ inputs.dry_run }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Compute plan
+        id: plan
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type || 'patch' }}
+          FORCE_ALL: ${{ inputs.force_all || 'false' }}
+        run: node .github/scripts/plan.js
+      - name: Summary
+        run: |
+          {
+            echo "## Release ${{ steps.plan.outputs.tag }} (${{ steps.plan.outputs.release_type }}, dry_run=${{ steps.flags.outputs.dry_run }})"
+            echo "Previous: ${{ steps.plan.outputs.prev_tag || '(none)' }}"
+            echo '```json'
+            echo '${{ steps.plan.outputs.changed }}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ bump ----
+  # Minor/major only, and only for real: commit the new VERSION + a CHANGELOG.md
+  # rollup to main BEFORE the builds, so the tag lands on a commit whose VERSION
+  # already matches. Patch releases never touch the repo.
+  bump:
+    needs: plan
+    if: >-
+      !cancelled() && needs.plan.result == 'success'
+      && needs.plan.outputs.release_type != 'patch'
+      && needs.plan.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Bump VERSION + roll up CHANGELOG.md
+        env:
+          NEW_VERSION: ${{ needs.plan.outputs.version }}
+          BASE_MAJOR: ${{ needs.plan.outputs.base_major }}
+          BASE_MINOR: ${{ needs.plan.outputs.base_minor }}
+        run: |
+          set -euo pipefail
+          # The version file holds MAJOR.MINOR only; the bumped base is version
+          # minus its patch.
+          printf '%s.%s' "$BASE_MAJOR" "$BASE_MINOR" > VERSION
+          DATE="$(date -u +%Y-%m-%d)" NEW_VERSION="$NEW_VERSION" \
+            BASE_MAJOR="$BASE_MAJOR" BASE_MINOR="$BASE_MINOR" \
+            node .github/scripts/changelog-cli.js
+      - name: Commit + push
+        id: commit
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION CHANGELOG.md
+          git commit -m "Release ${{ needs.plan.outputs.tag }}"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------- build: turma -----
+  # Self-hosted: builds and pushes a container image, so the warm docker layer
+  # cache here is the point.
+  build-turma-image:
+    needs: [plan, bump]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
+      && needs.plan.outputs.build_turma == 'true'
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Per-job docker config. The 3 runners share one HOME, so login-action's
+      # post-cleanup logout in any concurrent job would strip the ghcr.io creds
+      # this push needs. RUNNER_TEMP is per-job. Set in a step, not job-level
+      # env:, because the `runner` context isn't available there.
+      - name: Scope docker config to this job
+        run: echo "DOCKER_CONFIG=${RUNNER_TEMP}/.docker" >> "$GITHUB_ENV"
+      - name: Reset workspace ownership
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v4
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ./turma
+          push: ${{ needs.plan.outputs.dry_run != 'true' }}
+          tags: |
+            ${{ env.TURMA_IMAGE }}:latest
+            ${{ env.TURMA_IMAGE }}:${{ needs.plan.outputs.version }}
+            ${{ env.TURMA_IMAGE }}:sha-${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+          cache-from: type=gha,scope=turma
+          cache-to: type=gha,mode=max,scope=turma
+          labels: |
+            org.opencontainers.image.revision=${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+      - name: Clean up dangling images
+        if: always()
+        run: docker image prune -f || true
+
+  # --------------------------------------------------------- build: agent -----
+  # Self-hosted: warm layer cache + disk (the android-build tier is ~2 GB).
+  build-agent-image:
+    needs: [plan, bump]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
+      && needs.plan.outputs.build_agent_image == 'true'
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Scope docker config to this job
+        run: echo "DOCKER_CONFIG=${RUNNER_TEMP}/.docker" >> "$GITHUB_ENV"
+      - name: Reset workspace ownership
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+      # The bundled Claude Code release is pinned into the build (contents can't
+      # drift), resolved via a throwaway node container (no npm on the runner).
+      # NOT part of the version.
+      - name: Resolve Claude Code version
+        id: cc
+        run: |
+          set -euo pipefail
+          CC_VERSION="$(docker run --rm node:24-alpine npm view @anthropic-ai/claude-code version | tr -d '[:space:]')"
+          echo "version=${CC_VERSION}" >> "$GITHUB_OUTPUT"
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v4
+      - name: Build and push (:latest — android-build tier)
+        uses: docker/build-push-action@v7
+        with:
+          context: ./agent
+          push: ${{ needs.plan.outputs.dry_run != 'true' }}
+          build-args: |
+            AGENT_BASE=android-build
+            CLAUDE_CODE_VERSION=${{ steps.cc.outputs.version }}
+          tags: |
+            ${{ env.AGENT_IMAGE }}:latest
+            ${{ env.AGENT_IMAGE }}:${{ needs.plan.outputs.version }}
+            ${{ env.AGENT_IMAGE }}:sha-${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+          cache-from: type=gha,scope=turma-agent
+          cache-to: type=gha,mode=max,scope=turma-agent
+          labels: |
+            org.opencontainers.image.revision=${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+      - name: Clean up dangling images
+        if: always()
+        run: docker image prune -f || true
+
+  # ------------------------------------------------------- build: glasses -----
+  # GitHub-hosted: an npm build + pack, no docker cache to keep warm.
+  build-glasses:
+    needs: [plan, bump]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
+      && needs.plan.outputs.build_glasses == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: glasses/package-lock.json
+      # Stamp the unified version into app.json before packing — Even Hub keys
+      # sideloaded installs on app.json's "version", so it MUST increase per
+      # build. Only app.json is touched (evenhub pack reads the version there;
+      # rewriting package.json would desync package-lock.json and break npm ci).
+      # The pack script writes ../turma-hud.ehpk (repo root).
+      - name: Stamp version, install, build, pack
+        working-directory: glasses
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync("app.json"));j.version=process.env.VERSION;fs.writeFileSync("app.json",JSON.stringify(j,null,2)+"\n")'
+          npm ci --no-audit --no-fund
+          npm run build
+          npm run pack
+      - name: Name the asset
+        run: cp "$GITHUB_WORKSPACE/turma-hud.ehpk" "$GITHUB_WORKSPACE/turma-hud-v${{ needs.plan.outputs.version }}.ehpk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-glasses
+          path: turma-hud-v${{ needs.plan.outputs.version }}.ehpk
+          if-no-files-found: error
+
+  # ------------------------------------------------------- build: android -----
+  # Self-hosted: the mingc/android-build-box container stays warm in this box's
+  # docker cache (it's a Docker Hub image, so ghcr-pull limits don't apply).
+  build-android:
+    needs: [plan, bump]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
+      && needs.plan.outputs.build_android == 'true'
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 30
+    container:
+      image: mingc/android-build-box:latest
+    env:
+      GRADLE_VERSION: "8.11.1"
+    steps:
+      - name: Reset workspace ownership
+        working-directory: ${{ github.workspace }}
+        run: chown -R "$(id -u):$(id -g)" . || true
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+      - name: Install Gradle
+        run: |
+          set -eux
+          curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip
+          unzip -q -o /tmp/gradle.zip -d /opt
+          echo "/opt/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+      - name: Ensure SDK packages
+        run: yes | sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
+      # build.gradle.kts reads TURMA_VERSION / TURMA_VERSION_CODE (see the file);
+      # the packed versionCode comes from the tested version.js, not run_number.
+      - name: Assemble debug APK
+        working-directory: android
+        env:
+          TURMA_VERSION: ${{ needs.plan.outputs.version }}
+          TURMA_VERSION_CODE: ${{ needs.plan.outputs.android_version_code }}
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+      - name: Name the asset
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/turma-android-v${{ needs.plan.outputs.version }}.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-android
+          path: turma-android-v${{ needs.plan.outputs.version }}.apk
+          if-no-files-found: error
+
+  # -------------------------------------------------- build: agent-native -----
+  # GitHub-hosted: pure cp + tar + sha256, needs no docker/disk/network reach.
+  build-agent-native:
+    needs: [plan, bump]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
+      && needs.plan.outputs.build_agent_native == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+      - name: Stage payload + tar + checksum
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -eux
+          STAGE="$RUNNER_TEMP/turma-agent-native"
+          rm -rf "$STAGE"; mkdir -p "$STAGE/hooks"
+          # Native scripts + units + docs (flat, so install.sh's source-probe
+          # sees hub-agent.py right next to itself).
+          cp agent/native/install.sh \
+             agent/native/turma-agent \
+             agent/native/turma-agentctl \
+             agent/native/turma-agent-update \
+             agent/native/turma-agent.service \
+             agent/native/turma-agent-update.service \
+             agent/native/turma-agent-update.timer \
+             agent/native/turma-agent.env \
+             agent/native/README.md "$STAGE/"
+          cp agent/hub-agent.py agent/tunnel-agent.js agent/tmux.conf "$STAGE/"
+          cp agent/hooks/*.py "$STAGE/hooks/"
+          echo "$VERSION" > "$STAGE/VERSION"
+          ASSET="turma-agent-native-v${VERSION}.tar.gz"
+          tar czf "$GITHUB_WORKSPACE/$ASSET" -C "$STAGE" .
+          ( cd "$GITHUB_WORKSPACE" && sha256sum "$ASSET" > "$ASSET.sha256" )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-agent-native
+          path: |
+            turma-agent-native-v${{ needs.plan.outputs.version }}.tar.gz
+            turma-agent-native-v${{ needs.plan.outputs.version }}.tar.gz.sha256
+          if-no-files-found: error
+
+  # --------------------------------------------------------------- publish ----
+  # Runs last. Assembles manifest.json + release notes, carries unchanged assets
+  # forward, and (unless dry_run) creates the tag + release. Runs unless a build
+  # that was SUPPOSED to run failed (a skipped/carried component is fine).
+  publish:
+    needs:
+      [plan, bump, build-turma-image, build-agent-image, build-glasses, build-android, build-agent-native]
+    if: >-
+      !cancelled() && needs.plan.result == 'success'
+      && needs.bump.result != 'failure'
+      && needs.build-turma-image.result != 'failure'
+      && needs.build-agent-image.result != 'failure'
+      && needs.build-glasses.result != 'failure'
+      && needs.build-android.result != 'failure'
+      && needs.build-agent-native.result != 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      # Collect whatever the build jobs produced into dist/ (flattened).
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: asset-*
+          path: dist
+          merge-multiple: true
+      - name: Compose manifest + notes + carry plan
+        env:
+          VERSION_FULL: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          PREV_TAG: ${{ needs.plan.outputs.prev_tag }}
+          CHANGED: ${{ needs.plan.outputs.changed }}
+          ANDROID_VERSION_CODE: ${{ needs.plan.outputs.android_version_code }}
+          COMMIT: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+          OUT_DIR: meta
+        run: |
+          set -euo pipefail
+          mkdir -p meta dist
+          RELEASED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            VERSION_FULL="$VERSION_FULL" TAG="$TAG" PREV_TAG="$PREV_TAG" \
+            CHANGED="$CHANGED" ANDROID_VERSION_CODE="$ANDROID_VERSION_CODE" \
+            COMMIT="$COMMIT" OUT_DIR="$OUT_DIR" \
+            node .github/scripts/publish.js
+      # Copy each carried (unchanged) asset forward from the release it lives on,
+      # under its original name — executing the plan publish.js computed.
+      - name: Fetch carried assets
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, subprocess, os
+          plan = json.load(open("meta/carry-plan.json"))
+          for a in plan:
+              pats = ["--pattern", a["asset"]]
+              if a.get("sha256_asset"):
+                  pats += ["--pattern", a["sha256_asset"]]
+              subprocess.run(["gh", "release", "download", a["from_release"],
+                              *pats, "--dir", "dist", "--clobber"], check=True)
+          print(f"carried {len(plan)} asset(s)")
+          PY
+      - name: Dry run — publish nothing, upload for inspection
+        if: needs.plan.outputs.dry_run == 'true'
+        run: |
+          {
+            echo "## DRY RUN ${{ needs.plan.outputs.tag }}"
+            echo "No tag, release, or commit created. Composed metadata + assets uploaded as artifacts."
+            echo '### Release notes'
+            cat meta/release-notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: needs.plan.outputs.dry_run == 'true'
+        with:
+          name: release-dry-run-${{ needs.plan.outputs.version }}
+          path: |
+            meta/
+            dist/
+      - name: Create tag + release
+        if: needs.plan.outputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          cp meta/manifest.json dist/manifest.json
+          gh release create "${{ needs.plan.outputs.tag }}" \
+            --target "${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}" \
+            --title "Turma ${{ needs.plan.outputs.tag }}" \
+            --notes-file meta/release-notes.md \
+            dist/*
+      # Legacy self-heal: when agent-native was actually built, also publish an
+      # agent-native-v<version> alias release so a host that hasn't yet taken the
+      # manifest-aware updater still self-heals (agent-native-v* > its installed
+      # version under sort -V). Removed once the fleet is confirmed migrated.
+      - name: Publish legacy agent-native alias
+        if: >-
+          needs.plan.outputs.dry_run != 'true'
+          && needs.plan.outputs.build_agent_native == 'true'
+        run: |
+          set -euo pipefail
+          V="${{ needs.plan.outputs.version }}"
+          gh release create "agent-native-v${V}" \
+            --target "${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}" \
+            --title "Turma native agent agent-native-v${V}" \
+            --notes "Native agent ${V}. Alias of release ${{ needs.plan.outputs.tag }} for hosts on the legacy updater; see RELEASING.md." \
+            "dist/turma-agent-native-v${V}.tar.gz" \
+            "dist/turma-agent-native-v${V}.tar.gz.sha256"
