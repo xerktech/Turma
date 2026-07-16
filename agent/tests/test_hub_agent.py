@@ -1936,6 +1936,78 @@ class TestResumableReport(ManagerMixin, unittest.TestCase):
         rep = sm._resumable_report()
         self.assertEqual(len(rep["Turma"]), 2)
 
+    def test_survives_a_wiped_registry_dir(self):
+        """The report is what makes the hub's Ended list durable, so it must be
+        derivable from the bind-mounted transcripts ALONE. ~/.turma is the
+        container's writable layer: an agent update recreates the container and
+        takes sessions.json, closed.json and the usage ledger with it. What's
+        left is ~/.claude/projects and each transcript's own recorded cwd."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "gone1")
+        self._write_at(wt, tid="t1", text="the work it was doing")
+        sm = self.make_manager()
+        sm.registry, sm.closed, sm.usage_ledger = [], [], {}   # as if ~/.turma went
+
+        rep = sm._resumable_report()
+        self.assertEqual([e["transcriptId"] for e in rep["Turma"]], ["t1"])
+        self.assertEqual(rep["Turma"][0]["cwd"], wt)
+        self.assertEqual(rep["Turma"][0]["summary"], "the work it was doing")
+
+    def test_entries_carry_their_slug(self):
+        """_sorted_repo_entries()'s per-beat carded filter keys on it (below), so it
+        is reported rather than dropped after picking the summary source."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "w1")
+        self._write_at(wt, tid="t1")
+        sm = self.make_manager()
+        self.assertEqual(sm._resumable_report()["Turma"][0]["slug"],
+                         ha._project_slug(wt))
+
+    def test_report_re_cuts_a_stale_scan_against_the_live_registry(self):
+        """The scan is cached across the slow beats between refreshes, so on its
+        own it still lists a session that has since been RESUMED and is running
+        right now — offering Resume for a live session, and showing it in the
+        hub's Active and Ended lists at once. The registry is current every beat,
+        so the cut is re-applied at report time."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "w1")
+        self._write_at(wt, tid="t1")
+        sm = self.make_manager()
+        sm.resumable = sm._resumable_report()           # scanned while it was ended
+        self.assertEqual(len(sm.resumable["Turma"]), 1)
+
+        # It gets resumed. The cache still says otherwise until the next slow beat.
+        sm.registry = [{"id": "w1", "repo": "Turma", "worktreePath": wt,
+                        "status": "running"}]
+        turma = next(r for r in sm._sorted_repo_entries(refresh=False)
+                     if r["name"] == "Turma")
+        self.assertEqual(turma["resumable"], [],
+                         "a running session must not be offered for resume")
+        self.assertEqual(len(sm.resumable["Turma"]), 1,
+                         "the filter is a view — it must not mutate the cache")
+
+        # Killed again: the record leaves the registry, and it comes straight back
+        # without waiting out a rescan.
+        sm.registry = []
+        turma = next(r for r in sm._sorted_repo_entries(refresh=False)
+                     if r["name"] == "Turma")
+        self.assertEqual([e["transcriptId"] for e in turma["resumable"]], ["t1"])
+
+
+class TestCardedSlugs(ManagerMixin, unittest.TestCase):
+    """_carded_slugs: every registry session's project slug, running or stopped —
+    the sessions that already have a card of their own."""
+
+    def test_covers_running_stopped_and_root(self):
+        sm = self.make_manager()
+        sm.registry = [
+            {"id": "a", "worktreePath": "/g/.turma/worktrees/r/a", "status": "running"},
+            {"id": "b", "worktreePath": "/g/.turma/worktrees/r/b", "status": "stopped"},
+            {"id": "c", "worktreePath": ha.REPOS_ROOT, "root": True, "status": "running"},
+        ]
+        self.assertEqual(sm._carded_slugs(), {
+            ha._project_slug("/g/.turma/worktrees/r/a"),
+            ha._project_slug("/g/.turma/worktrees/r/b"),
+            ha._project_slug(ha.REPOS_ROOT),
+        })
+
 
 class TestResumeTranscript(ManagerMixin, unittest.TestCase):
     """resume_transcript: resume ANY prior transcript by id, cwd'd at its origin
@@ -2438,12 +2510,17 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm._session_payload(sess, refresh=False)["transcriptId"],
                          sess["claudeSessionId"])
 
-    def test_unpinned_session_payload_carries_its_transcript_id_when_stopped(self):
+    def test_unpinned_session_payload_carries_its_transcript_id_running_or_stopped(self):
         """A session spawned before the pin has no id to report, so the payload
-        falls back to the newest transcript in its project dir — but only once
-        stopped (its claude exited on its own, and unlike a killed session there
-        is no closed record to snapshot onto). A running one is read live over
-        /live, and this is a listdir the per-beat hot path shouldn't pay for."""
+        falls back to the newest transcript in its project dir.
+
+        It pays that listdir while RUNNING too. The lookup used to be skipped for
+        a running session (it's read live over /live, not opened from the
+        archive), but the hub's Ended list now dedupes on this id, and a running
+        session is the one case where a duplicate is intolerable: the durable
+        side of that list is a transcript scan that's minutes stale by design, so
+        with nothing to recognise a just-resumed session by it would show as
+        running and ended at once."""
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("Turma")
@@ -2454,10 +2531,24 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         with open(os.path.join(proj, "t-xyz.jsonl"), "w") as f:
             f.write("{}\n")
 
-        self.assertIsNone(sm._session_payload(sess, refresh=False)["transcriptId"],
-                          "a running session must not pay for the lookup")
+        self.assertEqual(sm._session_payload(sess, refresh=False)["transcriptId"], "t-xyz")
         sess["status"] = "stopped"
         self.assertEqual(sm._session_payload(sess, refresh=False)["transcriptId"], "t-xyz")
+
+    def test_unpinned_session_payload_transcript_id_is_none_before_one_exists(self):
+        """An unpinned session that hasn't written a transcript yet has no id to
+        report and nothing on disk to guess from. The key is still present and
+        null — the hub reads it unconditionally to key its Ended-list dedupe, and
+        a missing key would read as a session with no conversation rather than
+        one whose conversation hasn't started."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        sess["claudeSessionId"] = None   # as an older agent left it
+        payload = sm._session_payload(sess, refresh=False)
+        self.assertIn("transcriptId", payload)
+        self.assertIsNone(payload["transcriptId"])
 
     def test_closed_payload_is_null_safe_for_a_session_with_no_pr_or_transcript(self):
         """The common case: a session killed before it opened a PR, and (on an

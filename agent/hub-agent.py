@@ -109,13 +109,28 @@ REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
 # sends rides back as `<sessionId>.ans.json`. See _hook_question / answer_question.
 QUESTIONS_DIR = os.path.join(REGISTRY_DIR, "questions")
 # Killed-but-resumable session history (branch + transcript survive a kill).
+#
+# This is a CACHE of what a kill knew, not the record of it. It buys a killed
+# session two things the transcript scan below can't recover — the PRs it opened
+# and its original session id, so `resume` can hand it straight back — and it
+# buys them from the moment of the kill, without waiting out a slow beat. It is
+# NOT the history: it lives in ~/.turma, which on a container host is the image's
+# writable layer and does not survive an agent update, and it holds only the
+# newest few per repo either way. Anything that has to still be there afterwards
+# belongs on the durable side (the transcripts, and the hub's archive).
 CLOSED_PATH = os.path.join(REGISTRY_DIR, "closed.json")
 # Only the newest N closed sessions per repo are kept/offered for resume —
-# bounds both the file and the heartbeat payload.
+# bounds both the file and the heartbeat payload. Older kills don't fall out of
+# the hub's Ended list when they fall out of here; they keep listing through the
+# resumable scan, just without their PR chips.
 CLOSED_PER_REPO = 5
-# Newest N resumable transcripts offered per repo in the "Resume any session"
-# picker — bounds the heartbeat (the durable archive holds the full history).
-RESUMABLE_PER_REPO = 15
+# Newest N resumable transcripts reported per repo. This is the durable side of
+# the hub's Ended-sessions list and the "Resume any session" picker: unlike
+# closed.json it is re-derived from the transcripts on disk, so it is what makes
+# both survive an agent restart. Sized well above CLOSED_PER_REPO because "every
+# session I ended" is the point of it, and bounded at all only to bound the
+# heartbeat — the hub's archive holds the tail beyond this, searchably.
+RESUMABLE_PER_REPO = 50
 # Durable worktree-path -> {repo, remote, slug} attribution ledger. Written at
 # spawn and NEVER dropped on kill/delete, so a transcript's token usage stays
 # traceable to its repo long after the session (and even its worktree) is gone.
@@ -5302,6 +5317,18 @@ class SessionManager:
                 slugs.add(_project_slug(wt))
         return slugs
 
+    def _carded_slugs(self):
+        """Project slugs backing ANY registry session, running or stopped — the
+        ones that already have a session card of their own, with its own Start.
+        _resumable_report skips these so the picker never offers to resume a
+        session the hub is already showing."""
+        slugs = set()
+        for s in self.registry:
+            wt = s.get("worktreePath") or (REPOS_ROOT if s.get("root") else None)
+            if wt:
+                slugs.add(_project_slug(wt))
+        return slugs
+
     def _session_meta_by_slug(self):
         """slug -> {createdAt, summary} drawn from live + closed session records,
         so an archived transcript inherits its session's date and task name.
@@ -5378,14 +5405,13 @@ class SessionManager:
         RESUMABLE_PER_REPO per repo to bound the heartbeat; the summary read is
         deferred until after the cap so it's paid only for the survivors.
 
-        Returns repo-name -> [{transcriptId, cwd, repo, root, origin, summary,
-        endedTs}] newest-first."""
-        # Slugs already represented by a session card (running or stopped).
-        carded = set()
-        for s in self.registry:
-            wt = s.get("worktreePath") or (REPOS_ROOT if s.get("root") else None)
-            if wt:
-                carded.add(_project_slug(wt))
+        Returns repo-name -> [{transcriptId, cwd, repo, root, origin, slug,
+        summary, endedTs}] newest-first."""
+        # Slugs already represented by a session card (running or stopped). This
+        # is the scan-time cut; because the scan is cached across the slow beats
+        # between refreshes, _sorted_repo_entries() re-applies it against
+        # registry every beat — see the filter there.
+        carded = self._carded_slugs()
         repo_names = {r["name"] for r in scan_repos()}
         # slug -> a real worktree path the ledger recorded, so a transcript whose
         # own cwd we can't read still classifies when the ledger keyed its path.
@@ -5431,7 +5457,9 @@ class SessionManager:
                     "repo": repo,
                     "root": root,
                     "origin": origin,
-                    "slug": slug,          # dropped below; picks the summary source
+                    # Reported, not dropped: it picks the summary source below,
+                    # and _sorted_repo_entries()'s per-beat carded filter keys on it.
+                    "slug": slug,
                     "mtime": mtime,        # dropped below; sort/cap key
                 })
         sess_meta = self._session_meta_by_slug()
@@ -5445,7 +5473,6 @@ class SessionManager:
                 e["endedTs"] = time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(e["mtime"]))
                 e.pop("mtime", None)
-                e.pop("slug", None)
         return by_repo
 
     def _archive_manifest(self):
@@ -6527,14 +6554,20 @@ class SessionManager:
             # the live tail at it (rather than at whatever shares its project
             # dir) while it runs.
             #
-            # A pinned session already knows its id, so reporting it is free and
-            # it is reported whether running or not. An unpinned one (an agent
-            # predating the pin) still costs a listdir to guess at, so that stays
-            # stopped-only: a running one is read live over /live, and the hot
-            # path shouldn't pay for it every beat.
+            # Reported whether running or not. Free for a pinned session, which
+            # already knows its id; an unpinned one (an agent predating the pin)
+            # costs a listdir to guess at, and the hot path now pays that every
+            # beat on purpose. It's the id the hub's Ended list dedupes on, and a
+            # RUNNING session is the one case where a duplicate is intolerable:
+            # the durable side of that list is a transcript scan that's minutes
+            # stale by design, so without this there is nothing to recognise a
+            # just-resumed session by and it shows as running and ended at once.
+            #
+            # Deliberately not _session_transcript_id, which answers None until
+            # the file exists: the pinned id is the conversation this session
+            # WILL have, and the hub needs it before the first turn lands.
             "transcriptId": (sess.get("claudeSessionId")
-                             or (None if running else
-                                 self._latest_transcript_id(sess["worktreePath"]))),
+                             or self._latest_transcript_id(sess["worktreePath"])),
             "session": signals,                      # running only; null otherwise
         }
 
@@ -6629,9 +6662,19 @@ class SessionManager:
         entries.sort(key=lambda e: e.get("lastActivity") or "", reverse=True)
         out = [root_repo_entry()] + entries
         # Attach each repo's resumable-session list (cached; refreshed on the slow
-        # cadence in _refresh_repo_usage) for the "Resume any session" picker.
+        # cadence in _refresh_repo_usage) for the "Resume any session" picker and
+        # the hub's Ended-sessions list.
+        #
+        # The cut against carded slugs is re-applied here, every beat, rather than
+        # trusted from the scan: the scan is minutes stale by design, so between
+        # refreshes it still lists a session that has since been resumed and is
+        # running right now. Reporting that would offer "Resume" for a live
+        # session and, on the hub, show it in both the Active and Ended lists at
+        # once. The registry is current every beat, so this is where the answer is.
+        carded = self._carded_slugs()
         for e in out:
-            e["resumable"] = self.resumable.get(e["name"], [])
+            e["resumable"] = [r for r in self.resumable.get(e["name"], [])
+                              if r.get("slug") not in carded]
         return out
 
     def _log_tail(self, beat, light):
