@@ -167,6 +167,52 @@ class TestDeviceName(unittest.TestCase):
             self._run(docker_name="docker-desktop", smb_name=""), "unknown-device")
 
 
+class TestAgentVersion(unittest.TestCase):
+    """This build's own version, as heartbeated for the hub's host header:
+    baked env (container image) -> VERSION beside hub-agent.py (native install)
+    -> repo-root VERSION (dev checkout) -> None."""
+
+    def _run(self, *, env=None, prefix_version=None, root_version=None):
+        """Resolve agent_version() with hub-agent.py pretending to live in a
+        temp dir, so the VERSION files a real install/checkout would leave next
+        to it can be laid out per-case."""
+        with tempfile.TemporaryDirectory() as tmp:
+            here = os.path.join(tmp, "prefix")
+            os.makedirs(here)
+            if prefix_version is not None:
+                with open(os.path.join(here, "VERSION"), "w") as f:
+                    f.write(prefix_version)
+            if root_version is not None:
+                with open(os.path.join(tmp, "VERSION"), "w") as f:
+                    f.write(root_version)
+            with mock.patch.dict(os.environ, env or {}, clear=True), \
+                    mock.patch.object(ha, "__file__",
+                                      os.path.join(here, "hub-agent.py")):
+                return ha.agent_version()
+
+    def test_env_wins_first(self):
+        # The image bakes TURMA_AGENT_VERSION at build time; it beats any file
+        # and doubles as an operator override.
+        self.assertEqual(
+            self._run(env={"TURMA_AGENT_VERSION": "0.4.2"},
+                      prefix_version="0.3.9", root_version="0.3"),
+            "0.4.2",
+        )
+
+    def test_installed_version_file_beats_repo_root(self):
+        # native/install.sh stamps VERSION into the prefix beside hub-agent.py.
+        self.assertEqual(self._run(prefix_version="0.3.9\n", root_version="0.3"), "0.3.9")
+
+    def test_repo_root_version_used_for_a_dev_checkout(self):
+        self.assertEqual(self._run(root_version="0.3\n"), "0.3")
+
+    def test_unstamped_build_reports_nothing(self):
+        # Nothing to read -> None, so the hub says "unknown" rather than showing
+        # a version this build can't actually vouch for.
+        self.assertIsNone(self._run())
+        self.assertIsNone(self._run(env={"TURMA_AGENT_VERSION": "  "}))
+
+
 class TestSmbHostName(unittest.TestCase):
     """The SMB2/NTLM computer-name extraction (Docker Desktop / WSL2 path)."""
 

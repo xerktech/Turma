@@ -154,6 +154,11 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - **One record per session**: git state, per-session token usage, live-session signals (below), new
   PR links, and PR status (below).
 - A **container-log tail**.
+- The build's **own version** (`agentVersion`, shown in the dashboard's host header): `agent_version()`
+  reads the `TURMA_AGENT_VERSION` the image bakes at build time (release.yml passes the release
+  version as a build-arg), else the `VERSION` file `native/install.sh` stamps beside `hub-agent.py`,
+  else the repo-root `VERSION` for a dev checkout — and reports `null` rather than a guess when
+  nothing stamped it. Tests: `TestAgentVersion`.
 
 #### Live-session signals
 
