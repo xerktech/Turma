@@ -23,6 +23,8 @@ FAILED=0
 
 pass() { echo "  ok: $1"; }
 fail() { echo "  FAIL: $1"; FAILED=1; }
+# assert <expected> <actual> <ok-msg> <fail-msg>
+assert_eq() { if [ "$1" = "$2" ]; then pass "$3"; else fail "$4"; fi; }
 
 # --- Build a valid native tarball + sha256 sidecar for a given version -------
 # The payload must satisfy install_payload's completeness check (hub-agent.py +
@@ -155,7 +157,7 @@ echo "test_turma_agent_update.sh"
 d="$(new_gh_dir)"
 add_unified_release "$d" "v0.3.5" "0.3.5" "v0.3.5"
 got="$(run_case "0.3.0" "$d")"
-[ "$got" = "0.3.5" ] && pass "newer component installs (-> $got)" || fail "expected 0.3.5, got $got"
+assert_eq "0.3.5" "$got" "newer component installs (-> $got)" "expected 0.3.5, got $got"
 rm -rf "$d"
 
 # 2. Carried release: tag moved to v0.3.9 but native component stayed 0.3.0 ==
@@ -164,7 +166,7 @@ rm -rf "$d"
 d="$(new_gh_dir)"
 add_unified_release "$d" "v0.3.9" "0.3.0" "v0.3.0"
 got="$(run_case "0.3.0" "$d")"
-[ "$got" = "0.3.0" ] && pass "carried release is a no-op despite newer tag (stayed $got)" || fail "carried release wrongly changed VERSION to $got"
+assert_eq "0.3.0" "$got" "carried release is a no-op despite newer tag (stayed $got)" "carried release wrongly changed VERSION to $got"
 rm -rf "$d"
 
 # 3. Carried-but-newer asset lives on an OLDER release: manifest on v0.3.9 says
@@ -172,7 +174,7 @@ rm -rf "$d"
 d="$(new_gh_dir)"
 add_unified_release "$d" "v0.3.9" "0.3.4" "v0.3.4"
 got="$(run_case "0.3.0" "$d")"
-[ "$got" = "0.3.4" ] && pass "resolves carried asset from its own release_tag (-> $got)" || fail "expected 0.3.4 from v0.3.4, got $got"
+assert_eq "0.3.4" "$got" "resolves carried asset from its own release_tag (-> $got)" "expected 0.3.4 from v0.3.4, got $got"
 rm -rf "$d"
 
 # 4. Checksum mismatch -> refuses, VERSION unchanged.
@@ -181,7 +183,7 @@ add_unified_release "$d" "v0.3.5" "0.3.5" "v0.3.5"
 # Corrupt the tarball after the sha sidecar was written.
 echo "corruption" >> "$d/assets/v0.3.5/turma-agent-native-v0.3.5.tar.gz"
 got="$(run_case "0.3.0" "$d")"
-[ "$got" = "0.3.0" ] && pass "checksum mismatch refuses install (stayed $got)" || fail "installed a corrupt tarball (VERSION now $got)"
+assert_eq "0.3.0" "$got" "checksum mismatch refuses install (stayed $got)" "installed a corrupt tarball (VERSION now $got)"
 rm -rf "$d"
 
 # 5. No unified release, only legacy agent-native-v* -> legacy fallback installs.
@@ -190,14 +192,14 @@ echo "agent-native-v0.2.9" >> "$d/tags"
 mkdir -p "$d/assets/agent-native-v0.2.9"
 make_tarball "0.2.9" "$d/assets/agent-native-v0.2.9" >/dev/null
 got="$(run_case "0.2.5" "$d")"
-[ "$got" = "0.2.9" ] && pass "legacy fallback installs when no unified release exists (-> $got)" || fail "legacy fallback failed, got $got"
+assert_eq "0.2.9" "$got" "legacy fallback installs when no unified release exists (-> $got)" "legacy fallback failed, got $got"
 rm -rf "$d"
 
 # 6. Unified present but up to date -> no-op.
 d="$(new_gh_dir)"
 add_unified_release "$d" "v0.3.5" "0.3.5" "v0.3.5"
 got="$(run_case "0.3.5" "$d")"
-[ "$got" = "0.3.5" ] && pass "up-to-date unified release is a no-op (stayed $got)" || fail "reinstalled an up-to-date version, got $got"
+assert_eq "0.3.5" "$got" "up-to-date unified release is a no-op (stayed $got)" "reinstalled an up-to-date version, got $got"
 rm -rf "$d"
 
 if [ "$FAILED" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
