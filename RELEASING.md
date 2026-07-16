@@ -15,8 +15,11 @@ the logic lives in `.github/scripts/` (see its README).
 
 ## Patch releases (automatic)
 
-Every merge to `main` cuts a patch release. `plan` diffs the merge against the
-previous release tag and decides, per component, **build or carry**:
+Every merge to `main` that touches a component's source (`turma/`, `agent/`,
+`glasses/`, `android/`) cuts a patch release — a merge that touches only docs or
+the release machinery does not, since every component would be carried and the
+release would publish nothing new. `plan` diffs the merge against the previous
+release tag and decides, per component, **build or carry**:
 
 - **Changed** components are rebuilt at the new version.
 - **Unchanged** components are **carried**: their prior artifact is published in

@@ -10,8 +10,15 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
+// execFileSync returns NULL — not "" — whenever stdout is redirected away
+// (stdio: "ignore"), so a caller that shells out purely for the side effect and
+// ignores the chatter must not have `.toString()` called on its result. Coerce
+// here rather than at each call site: the throw is a TypeError, which any
+// caller wrapping run() in a try/catch reads as "the command failed", turning a
+// silenced-output bug into a plausible-looking empty answer.
 function run(cmd, args, opts) {
-  return execFileSync(cmd, args, Object.assign({ encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }, opts)).toString();
+  const out = execFileSync(cmd, args, Object.assign({ encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }, opts));
+  return out === null ? "" : out.toString();
 }
 
 function git(args) {

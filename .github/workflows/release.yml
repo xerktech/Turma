@@ -20,9 +20,23 @@ name: release
 # builds run with push:false, assets upload to Actions artifacts, and no tag /
 # release / commit is created. It's the break-glass diagnostic — keep it.
 #
-# NOTE: this starts workflow_dispatch-only. The `push: main` auto-release
-# trigger is added in a follow-up once v0.3.0 has been cut by hand and watched.
+# Triggers:
+#   - push: main   — the auto patch release. Path-filtered to the four component
+#     source dirs, because a release whose every component is CARRIED publishes
+#     nothing new: a docs-only or .github-only merge would still mint a tag and
+#     re-attach the previous release's five assets verbatim. Changing the release
+#     machinery itself is therefore NOT a trigger — rehearse those with a
+#     dry_run dispatch, and they take effect on the next real component merge.
+#   - workflow_dispatch — manual minor/major, force_all, and the dry_run
+#     rehearsal.
 on:
+  push:
+    branches: [main]
+    paths:
+      - "turma/**"
+      - "agent/**"
+      - "glasses/**"
+      - "android/**"
   workflow_dispatch:
     inputs:
       release_type:

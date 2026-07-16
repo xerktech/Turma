@@ -2,6 +2,8 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const C = require("../changes.js");
 
 test("componentsForPath maps top-level dirs; agent/** fans out to both agent components", () => {
@@ -40,4 +42,23 @@ test("detectChanges forceAll marks every component regardless of paths", () => {
 test("detectChanges with no matching paths builds nothing", () => {
   const changed = C.detectChanges(["VERSION", "CHANGELOG.md"], {});
   for (const c of C.COMPONENTS) assert.equal(changed[c], false);
+});
+
+// release.yml's `push:` filter has to restate PREFIX_MAP's prefixes as globs,
+// because a workflow trigger can't call into JS — the gate that decides whether
+// a merge starts a release at all is the one part of the path->component map
+// that lives outside this file. Drift is silent and one-directional: a component
+// dir added here but not there just never auto-releases, which looks exactly
+// like the release pipeline working fine until someone checks the tags.
+test("release.yml's push paths cover exactly the PREFIX_MAP component dirs", () => {
+  const yml = fs.readFileSync(
+    path.join(__dirname, "..", "..", "workflows", "release.yml"),
+    "utf8",
+  );
+  const block = yml.match(/\n {2}push:\n {4}branches: \[main\]\n {4}paths:\n((?: {6}- ".*"\n)+)/);
+  assert.ok(block, "release.yml has no push:main paths: block in the expected shape");
+
+  const globs = [...block[1].matchAll(/- "(.*)"/g)].map((m) => m[1]);
+  const expected = C.componentPrefixes().map((p) => `${p}**`);
+  assert.deepEqual(globs.slice().sort(), expected.slice().sort());
 });
