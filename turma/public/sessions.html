@@ -37,7 +37,7 @@
 
   .sess-shell { flex: 1; display: flex; min-height: 0; }
 
-  /* ---- Left sidebar: new-session picker, active list, stopped list --------- */
+  /* ---- Left sidebar: new-session picker, active list, ended list ----------- */
   .sidebar {
     width: 340px; flex: none; border-right: 1px solid var(--hairline);
     overflow-y: auto; padding: 14px 14px 24px; display: flex; flex-direction: column; gap: 6px;
@@ -118,21 +118,41 @@
     background: var(--field); color: var(--ink);
   }
 
-  /* Stopped sessions: compact rows with a Start button. */
-  .stopped-row {
-    display: flex; align-items: center; gap: 10px;
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
-    padding: 9px 12px;
+  /* Ended sessions (killed, or exited on their own): the same clickable card as
+     a live session — clicking one opens its conversation read-only on the stage
+     — with a Resume button as an absolutely-positioned SIBLING, exactly like the
+     live card's ⋯ trigger and for the same reason (the card is a <button>, and a
+     nested button is invalid HTML the parser hoists out). */
+  .s-card.ended .dot { background: none; border: 1.5px solid var(--muted); box-sizing: border-box; }
+  .s-card-wrap.ended-wrap button.s-card { padding-right: 78px; }
+  .s-resume {
+    position: absolute; top: 7px; right: 6px; z-index: 2;
+    font: inherit; font-size: 11.5px; font-weight: 600; padding: 4px 10px;
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--surface); color: var(--ink-2); cursor: pointer;
   }
-  .stopped-row .body { flex: 1; min-width: 0; }
-  .stopped-row .title { font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
-  .stopped-row .meta { color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
-  .stopped-row .meta .id { font-family: var(--font-mono); }
-  .stopped-row .err { color: var(--critical); font-size: 11.5px; }
+  .s-resume:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .s-resume:disabled { opacity: 0.6; cursor: default; }
+  .s-card .err { color: var(--critical); font-size: 11.5px; margin-top: 3px; overflow-wrap: anywhere; }
 
-  details.stopped-wrap summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; padding: 2px 0; }
-  details.stopped-wrap summary:hover { color: var(--ink-2); }
-  details.stopped-wrap .s-list { gap: 8px; margin-top: 8px; }
+  details.ended-wrap-sec summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; padding: 2px 0; }
+  details.ended-wrap-sec summary:hover { color: var(--ink-2); }
+  details.ended-wrap-sec .s-list { gap: 8px; margin-top: 8px; }
+
+  /* The ended-session stage bar carries what the live chat's bar can't offer a
+     session that is over: its PRs (clickable here — the stage is not a button),
+     and Resume. There is deliberately no Terminal toggle and no compose box:
+     nothing is running to attach a pty to or to type at. */
+  .term-bar .tr-prs { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+  .term-bar .tr-prs .pr-badge { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+  .term-bar .resume-btn {
+    font: inherit; font-size: 12px; font-weight: 600; padding: 4px 12px;
+    border: 1px solid var(--accent); border-radius: var(--radius-sm);
+    background: var(--accent); color: #fff; cursor: pointer; white-space: nowrap;
+  }
+  .term-bar .resume-btn:hover:not(:disabled) { filter: brightness(1.07); }
+  .term-bar .resume-btn:disabled { opacity: 0.65; cursor: default; }
+  .term-bar .resume-btn[hidden], .term-bar .tr-prs[hidden] { display: none; }
 
   /* New-session picker (top of the sidebar): each online host, its repos as spawn buttons. */
   details.spawn-wrap > summary {
@@ -211,10 +231,10 @@
     font-size: 16px; line-height: 1; padding: 4px; display: none;
   }
   .searchbox.has-q .clr { display: block; }
-  /* While a query is active, #searchResults overlays the live/stopped lists. */
+  /* While a query is active, #searchResults overlays the live/ended lists. */
   #searchResults { display: none; }
   body.searching #searchResults { display: block; }
-  body.searching #active, body.searching #idle, body.searching #stopped,
+  body.searching #active, body.searching #idle, body.searching #ended,
   body.searching #spawn { display: none; }
   .sr-hint { color: var(--muted); font-size: 12px; padding: 6px 2px; }
   .sr-group { margin: 10px 0 4px; }
@@ -551,7 +571,7 @@
     body.showing-term { padding-bottom: 0; }
   }
   @media (pointer: coarse) {
-    details.stopped-wrap summary, details.spawn-wrap > summary { padding-top: 6px; padding-bottom: 6px; }
+    details.ended-wrap-sec summary, details.spawn-wrap > summary { padding-top: 6px; padding-bottom: 6px; }
   }
 </style>
 </head>
@@ -569,7 +589,7 @@
       <div id="spawn"></div>
       <div id="active"></div>
       <div id="idle"></div>
-      <div id="stopped"></div>
+      <div id="ended"></div>
     </aside>
 
     <main class="stage" id="stage">
@@ -582,7 +602,9 @@
           <button class="back-btn" onclick="transcriptBack()">‹<span class="back-label" id="trBackLabel"> Sessions</span></button>
           <span class="t-title"><span class="name" id="trTitle"></span> · <span class="path" id="trPath"></span></span>
           <span class="spacer"></span>
+          <span class="tr-prs" id="trPrs" hidden></span>
           <span class="verbosity" id="trVerbosity"></span>
+          <button class="resume-btn" id="trResume" hidden onclick="resumeCurrentEnded()">Resume</button>
         </div>
         <div class="tr-scroll" id="trScroll"></div>
       </div>
@@ -641,7 +663,7 @@
 <script>
 const $active = document.getElementById("active");
 const $idle = document.getElementById("idle");
-const $stopped = document.getElementById("stopped");
+const $ended = document.getElementById("ended");
 const $spawn = document.getElementById("spawn");
 const $sidebar = document.querySelector(".sidebar");
 // The header slot nav.js mounts for this page's running/waiting counts.
@@ -649,8 +671,12 @@ const $sidebar = document.querySelector(".sidebar");
 const $counts = document.getElementById("hdrMeta");
 
 // Open/closed state of the collapsible sections survives the 5s re-render.
-let stoppedOpen = false;
+// Ended sessions start collapsed: they're history, and the list only grows.
+let endedOpen = false;
 let spawnOpen = false;
+// The ended session currently open on the stage (its `.cur` highlight + what
+// the pane's Resume button acts on), or null.
+let endedViewId = null;
 
 // "New session" composer state (ported from the dashboard):
 // - composerOpen:  "host::repo" whose composer panel is open
@@ -989,21 +1015,54 @@ function liveState(sess, host, now) {
 // Running sessions sorted attention-first: waiting on you, then working, then
 // idle; freshest activity first within each group.
 const KIND_ORDER = { waiting: 0, working: 1, idle: 2 };
+// A session is "ended" if it is over but still resumable, and that covers two
+// records the agent reports through different channels:
+//
+//  - KILLED ("closed"): killed from the hub, so the agent DROPPED its registry
+//    record and moved it to the closed history (a.closedSessions). Its worktree
+//    and conversation survive; `resume` brings it back under the same id.
+//  - STOPPED: its claude exited on its own (or errored), so the record stays in
+//    a.sessions with a non-running status; `start` relaunches it in place.
+//
+// The operator drew no such distinction — both are "a session I'm done with, for
+// now" — so they land in one list, sorted by when they ended, newest first.
+// `kind` is what the row's Resume button dispatches on, and the only place the
+// two shapes are told apart after this.
+function endedEntry(a, s, kind) {
+  const endedAt = kind === "closed" ? s.closedAt : s.stoppedAt;
+  return {
+    a, s, kind,
+    id: s.id,
+    // Sort key. A record with no timestamp (an older agent's closed.json, a
+    // session stopped before stoppedAt was written) sorts oldest rather than
+    // NaN-ing its way to an arbitrary spot in the list.
+    endedMs: Date.parse(endedAt || "") || 0,
+    endedAt,
+  };
+}
 function collect(agents, now) {
-  const running = [], stopped = [];
-  for (const a of agents) for (const s of (a.sessions || [])) {
-    if (s.status === "running") {
-      running.push({ a, s, live: liveState(s, a, now) });
-    } else {
-      stopped.push({ a, s });
+  const running = [], ended = [];
+  for (const a of agents) {
+    for (const s of (a.sessions || [])) {
+      if (s.status === "running") running.push({ a, s, live: liveState(s, a, now) });
+      else ended.push(endedEntry(a, s, "stopped"));
     }
+    for (const c of (a.closedSessions || [])) ended.push(endedEntry(a, c, "closed"));
   }
   running.sort((x, y) =>
     (KIND_ORDER[x.live.kind] - KIND_ORDER[y.live.kind]) ||
     ((y.s.session?.transcriptAgeSec == null ? -1 : -y.s.session.transcriptAgeSec) -
      (x.s.session?.transcriptAgeSec == null ? -1 : -x.s.session.transcriptAgeSec)));
-  stopped.sort((x, y) => (x.a.key + x.s.id).localeCompare(y.a.key + y.s.id));
-  return { running, stopped };
+  // Most recently ended first — the one you just killed is the one you're most
+  // likely to want back. Ties (same-second kills, or two undated records) fall
+  // back to the id so the order is at least stable across beats.
+  ended.sort((x, y) => (y.endedMs - x.endedMs) || String(x.id).localeCompare(String(y.id)));
+  return { running, ended };
+}
+// The ended entry for a session id, whatever channel reported it.
+function findEnded(id) {
+  const { ended } = collect(cache.agents || [], cache.now || Date.now());
+  return ended.find(e => e.id === id) || null;
 }
 
 // A session's name: whatever the agent reports (auto-generated at spawn, or one
@@ -1042,7 +1101,7 @@ function render(data) {
   const { now, agents } = data;
   reconcilePending(agents);
 
-  const { running, stopped } = collect(agents, now);
+  const { running, ended } = collect(agents, now);
   const waiting = running.filter(x => x.live.kind === "waiting").length;
   $counts.textContent = running.length + " running" + (waiting ? " · " + waiting + " waiting on you" : "");
 
@@ -1083,11 +1142,14 @@ function render(data) {
        <div class="s-list">${idle.map(x => activeCard(x)).join("")}</div>`
     : "";
 
-  $stopped.innerHTML = stopped.length
-    ? `<h2>Stopped <span class="count">${stopped.length}</span></h2>
-       <details class="stopped-wrap" ${stoppedOpen ? "open" : ""} ontoggle="stoppedOpen = this.open">
-         <summary>Show / hide stopped sessions</summary>
-         <div class="s-list">${stopped.map(x => stoppedRow(x)).join("")}</div>
+  // Ended sessions: collapsed by default (they're history, not the work at
+  // hand), and re-collapsing on its own would fight the operator, so the open
+  // state rides `endedOpen` across the beat re-render like every other panel.
+  $ended.innerHTML = ended.length
+    ? `<h2>Ended sessions <span class="count">${ended.length}</span></h2>
+       <details class="ended-wrap-sec" ${endedOpen ? "open" : ""} ontoggle="endedOpen = this.open">
+         <summary>Show / hide ended sessions</summary>
+         <div class="s-list">${ended.map(x => endedRow(x)).join("")}</div>
        </details>`
     : "";
 
@@ -1171,17 +1233,35 @@ function renameCard(a, s) {
   </div>`;
 }
 
-function stoppedRow({ a, s }) {
-  const starting = pending.has(pendKey("start", a.key, s.id));
-  return `<div class="stopped-row">
-    <span class="body">
-      <div class="title">${esc(sessTitle(s))}</div>
-      <div class="meta"><span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}</div>
-      ${s.status === "error" && s.errorMsg ? `<div class="err">${esc(s.errorMsg)}</div>` : ""}
-    </span>
-    <button class="primary btn-sm" ${a.online && !starting ? "" : "disabled"}
-        onclick="sessStart('${esc(a.key)}','${esc(s.id)}')">
-      ${starting ? '<span class="spin"></span>' : "Start"}
+// One ended session. The card body is a button that opens its conversation
+// read-only on the stage; Resume sits beside it (a sibling, not a child — see
+// the .s-resume CSS) and brings the session back to life. Resume needs the host
+// to be ONLINE (it rides the heartbeat as a command); reading the history does
+// not (the hub archived it), so the card stays clickable on a dead host.
+function endedRow(e) {
+  const { a, s, kind } = e;
+  const resuming = pending.has(pendKey("start", a.key, e.id));
+  const cur = e.id === endedViewId;
+  const when = e.endedMs ? ago(Date.now() - e.endedMs) : "";
+  const state = (kind === "closed" ? "killed" : (s.status === "error" ? "failed" : "stopped"))
+    + (when ? " " + when : "");
+  return `<div class="s-card-wrap ended-wrap">
+    <button class="s-card ended ${cur ? "cur" : ""}" onclick="openEndedSession('${esc(e.id)}')">
+      <span class="dot"></span>
+      <span class="body">
+        <div class="title">${esc(sessTitle(s))}</div>
+        <div class="meta"><span class="id">${esc(e.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}</div>
+        <div class="state-row">
+          <div class="state">${esc(state)}</div>
+          ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
+        </div>
+        ${s.status === "error" && s.errorMsg ? `<div class="err">${esc(s.errorMsg)}</div>` : ""}
+      </span>
+    </button>
+    <button class="s-resume" ${a.online && !resuming ? "" : "disabled"}
+        ${a.online ? "" : 'title="Host offline"'}
+        onclick="resumeEnded(event,'${esc(e.id)}')">
+      ${resuming ? '<span class="spin"></span>' : "Resume"}
     </button>
   </div>`;
 }
@@ -1258,9 +1338,32 @@ function startSession(key, repo) {
     () => post(`/api/agents/${enc(key)}/sessions`, body)
       .then(r => followSpawn(r && r.cmdId)));
 }
-function sessStart(key, id) {
-  busy(pendKey("start", key, id), { kind: "start", host: key, id },
-    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/start`));
+// Bring an ended session back. The endpoint depends on which channel reported
+// it (see endedEntry): a KILLED session was dropped from the registry and comes
+// back via `resume` (same id, same worktree, its conversation resumed), while a
+// merely stopped one still has its record and just needs `start`. Either way the
+// agent reports it as running on a following beat, which is what drops it out of
+// the ended list — the list is derived, so there is nothing here to remove.
+function resumeEnded(ev, id) {
+  if (ev) ev.stopPropagation();
+  const e = findEnded(id);
+  if (!e || !e.a.online) return;
+  const verb = e.kind === "closed" ? "resume" : "start";
+  // Resuming is an intent to work in it, so hand off to the live session the way
+  // spawning does. The id survives both paths, so this is the plain by-id wait —
+  // no spawnCmdId correlation needed.
+  pendingSelect = id;
+  pendingSpawn = null;
+  followedSpawn = false;
+  // Only drop the stage if it's showing the very session being resumed; a
+  // Resume clicked from the sidebar must not clear something else being read.
+  if (endedViewId === id) clearStage();
+  busy(pendKey("start", e.a.key, id), { kind: "start", host: e.a.key, id },
+    () => post(`/api/agents/${enc(e.a.key)}/sessions/${enc(id)}/${verb}`));
+}
+// The ended-session pane's own Resume button.
+function resumeCurrentEnded() {
+  if (endedViewId) resumeEnded(null, endedViewId);
 }
 
 // ---- inline live terminal on the main stage ---------------------------------
@@ -1397,6 +1500,7 @@ function selectSession(id) {
   if (id === currentId && viewMode === "chat") return;
   currentId = id;
   viewMode = "chat";
+  resetEndedBar();   // leaving any ended-session view (incl. one just resumed)
   $termPane.hidden = true;
   $transcriptPane.hidden = true;
   $stageEmpty.hidden = true;
@@ -1436,6 +1540,7 @@ function clearStage() {
   currentId = null;
   currentTranscriptId = null;
   subagentReturn = null;
+  resetEndedBar();
   navFrame("about:blank"); // tear down any live session's WebSocket
   if (window.TurmaChat) { TurmaChat.close(); TurmaChat.closeStatic(); } // stop the chat live tail + clear the archived view
   viewMode = null;
@@ -1630,8 +1735,105 @@ function renderSearch() {
     </div>`).join("");
 }
 
+// Clickable PR pill for the STAGE. Identical to prBadgeHtml above but rendered
+// as a real <a>: that copy has to be an inert <span> because it lives inside the
+// session card's <button>, and this one doesn't — an ended session's PR is often
+// the whole reason you opened it, so it links out to GitHub.
+function prBadgeLinkHtml(pr) {
+  const span = prBadgeHtml(pr);
+  if (!span) return "";
+  const url = pr && pr.url ? pr.url : "";
+  return span
+    .replace(/^<span /, `<a href="${esc(url)}" target="_blank" rel="noopener" `)
+    .replace(/<\/span>$/, "</a>");
+}
+
+// Open an ENDED session read-only on the stage: its conversation (from the hub's
+// durable archive, so it works even for an offline host), its PRs, and a Resume
+// button. Deliberately reuses the archive/subagent transcript pane, which is
+// exactly the surface an ended session should get — scrollable history, a
+// verbosity control, and NO terminal toggle or compose box, because there is no
+// live pty to attach to and nothing to type at.
+async function openEndedSession(id) {
+  const e = findEnded(id);
+  if (!e) return;
+  // An explicit pick wins over anything we were waiting to open.
+  pendingSpawn = null;
+  pendingSelect = null;
+  followedSpawn = false;
+  endedViewId = id;
+  currentId = null;
+  currentTranscriptId = null;
+  subagentReturn = null;
+  trHighlight = null;
+  viewMode = "ended";
+  document.getElementById("trBackLabel").textContent = " Sessions";
+  document.getElementById("trTitle").textContent = sessTitle(e.s);
+  document.getElementById("trPath").textContent =
+    [(e.a.device || e.a.key), sessMeta(e.s), e.endedMs ? "ended " + ago(Date.now() - e.endedMs) : ""]
+      .filter(Boolean).join(" · ");
+  const $prs = document.getElementById("trPrs");
+  $prs.innerHTML = (e.s.prs || []).map(prBadgeLinkHtml).join("");
+  $prs.hidden = !(e.s.prs && e.s.prs.length);
+  const $res = document.getElementById("trResume");
+  $res.hidden = false;
+  $res.disabled = !e.a.online;
+  $res.title = e.a.online ? "Bring this session back" : "Host offline";
+  document.getElementById("trScroll").innerHTML = `<div class="tr-empty">Loading conversation…</div>`;
+  // Leave any live chat + clear a prior archived view's verbosity control.
+  if (window.TurmaChat) { TurmaChat.close(); TurmaChat.closeStatic(); }
+  $chatPane.hidden = true;
+  $termPane.hidden = true;
+  $stageEmpty.hidden = true;
+  $transcriptPane.hidden = false;
+  navFrame("about:blank"); // ensure no live-terminal WebSocket lingers
+  disarmTermKill();
+  enterStage();
+  render(cache);   // refresh the .cur highlight on the ended list
+  const tid = e.s.transcriptId;
+  if (!tid) {
+    // An older agent's record, or a session that never wrote a transcript.
+    document.getElementById("trScroll").innerHTML =
+      `<div class="tr-empty">No conversation recorded for this session.</div>`;
+    return;
+  }
+  let t;
+  try {
+    const r = await fetch(`/api/archive/${enc(tid)}`);
+    if (r.status === 401) return void (location.href = "/login");
+    if (!r.ok) throw new Error(String(r.status));
+    t = await r.json();
+  } catch {
+    if (endedViewId !== id) return;
+    // The agent ships ended transcripts to the archive on its slow usage
+    // cadence, so a just-killed session is legitimately not there yet. Say that,
+    // rather than the flat "unavailable" that reads as history lost.
+    document.getElementById("trScroll").innerHTML =
+      `<div class="tr-empty">This session's conversation hasn't reached the archive yet — it syncs within a few minutes of ending. Resume still works.</div>`;
+    return;
+  }
+  if (endedViewId !== id) return; // superseded by another click
+  if (!window.TurmaChat || !TurmaChat.renderStatic) return;
+  TurmaChat.renderStatic({
+    entries: t.entries || [],
+    scrollEl: document.getElementById("trScroll"),
+    verbHost: document.getElementById("trVerbosity"),
+    transcriptId: tid,
+  });
+}
+
 let trHighlight = null; // { uuid } for a search-driven open (else null)
+// The PR chips + Resume button belong to the ended-session view alone; the
+// archive and subagent views share this pane, so each open clears them.
+function resetEndedBar() {
+  endedViewId = null;
+  const $prs = document.getElementById("trPrs");
+  const $res = document.getElementById("trResume");
+  if ($prs) { $prs.hidden = true; $prs.innerHTML = ""; }
+  if ($res) { $res.hidden = true; }
+}
 async function openTranscript(id, title, hi) {
+  resetEndedBar();
   currentTranscriptId = id;
   trHighlight = hi || null;
   subagentReturn = null; // an archive open -> Back goes to the list
@@ -1675,6 +1877,7 @@ async function openSubagentView(type, label) {
   const liveId = currentId;
   const key = liveId && hostKeyForSession(liveId);
   if (!key) return;
+  resetEndedBar();
   const vid = "subagent::" + liveId + "::" + type + "::" + label;
   currentTranscriptId = vid;
   trHighlight = null;

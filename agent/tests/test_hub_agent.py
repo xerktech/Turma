@@ -2272,6 +2272,68 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         # It is offered for resume (closed history records it).
         self.assertTrue(any(c.get("id") == sid for c in sm.closed))
 
+    def test_kill_snapshots_prs_and_transcript_onto_the_closed_record(self):
+        """kill() drops the live caches keyed by session id, so the two things
+        the hub's Ended-sessions view needs — which PRs this session opened, and
+        which conversation was its own — have to move onto the closed record on
+        the way out, or they are simply gone."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        sid = sess["id"]
+        url = "https://github.com/o/r/pull/7"
+        sm.session_pr_urls[sid] = [url]
+        sm.pr_status_cache[url] = {"url": url, "state": "MERGED", "checks": "passing"}
+        # The transcript this session was having.
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, "t-abc.jsonl"), "w") as f:
+            f.write("{}\n")
+
+        sm.kill(sid)
+
+        rec = next(c for c in sm.closed if c["id"] == sid)
+        self.assertEqual(rec["prUrls"], [url])
+        self.assertEqual(rec["transcriptId"], "t-abc")
+        # The live cache is gone, but the payload still resolves full PR status
+        # through the snapshot — the whole point of keeping the URLs.
+        self.assertNotIn(sid, sm.session_pr_urls)
+        entry = next(c for c in sm._closed_payload() if c["id"] == sid)
+        self.assertEqual(entry["prs"], [{"url": url, "state": "MERGED", "checks": "passing"}])
+        self.assertEqual(entry["transcriptId"], "t-abc")
+
+    def test_stopped_session_payload_carries_its_transcript_id(self):
+        """A stopped session (its claude exited on its own) keeps its registry
+        record, so unlike a killed one there is no closed record to snapshot
+        onto — the payload resolves the transcript instead. Only when stopped:
+        a running session is read live over /live, and this is a listdir the
+        per-beat hot path shouldn't pay for."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, "t-xyz.jsonl"), "w") as f:
+            f.write("{}\n")
+
+        self.assertIsNone(sm._session_payload(sess, refresh=False)["transcriptId"],
+                          "a running session must not pay for the lookup")
+        sess["status"] = "stopped"
+        self.assertEqual(sm._session_payload(sess, refresh=False)["transcriptId"], "t-xyz")
+
+    def test_closed_payload_is_null_safe_for_a_session_with_no_pr_or_transcript(self):
+        """The common case: a session killed before it opened a PR, and (on an
+        older agent's closed.json) one recorded before the snapshot existed. The
+        keys must still be present and null rather than absent — the hub reads
+        them unconditionally."""
+        sm = self.make_manager()
+        sm.closed = [{"id": "s1", "repo": "r"}]   # a pre-snapshot record
+        entry = sm._closed_payload()[0]
+        self.assertIsNone(entry["prs"])
+        self.assertIsNone(entry["transcriptId"])
+
     def test_delete_removes_worktree_but_touches_no_branch(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
@@ -4654,6 +4716,34 @@ class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "pr_status", return_value=None):
             sm.refresh_pr_status()
         self.assertEqual(sm.pr_status_cache[url]["state"], "MERGED")
+
+    def test_keeps_killed_session_last_known_status(self):
+        """A killed session has NO registry record — only a closed record holding
+        its own prUrls. Its status must survive the sweep anyway: the Ended
+        sessions list renders those chips, so evicting them here would mean the
+        act of killing a session blanked the PR state its ended card shows."""
+        url = "https://github.com/o/r/pull/1"
+        sm = self.make_manager()
+        sm.registry = []
+        sm.closed = [{"id": "s1", "repo": "r", "prUrls": [url]}]
+        sm.pr_status_cache[url] = {"url": url, "state": "MERGED"}
+        sm.github = {"available": True}
+        with mock.patch.object(ha, "pr_status") as pr:
+            sm.refresh_pr_status()
+        pr.assert_not_called()   # not re-polled, same rule as a stopped session
+        self.assertEqual(sm.pr_status_cache[url]["state"], "MERGED")
+
+    def test_closed_prs_shape(self):
+        url = "https://github.com/o/r/pull/1"
+        sm = self.make_manager()
+        rec = {"id": "s1", "prUrls": [url]}
+        # Mirrors _session_prs: a bare {url} placeholder until the status lands.
+        self.assertEqual(sm._closed_prs(rec), [{"url": url}])
+        sm.pr_status_cache[url] = {"url": url, "state": "MERGED"}
+        self.assertEqual(sm._closed_prs(rec), [{"url": url, "state": "MERGED"}])
+        # A session that opened no PR reports None, like the live payload.
+        self.assertIsNone(sm._closed_prs({"id": "s2"}))
+        self.assertIsNone(sm._closed_prs({"id": "s3", "prUrls": []}))
 
     def test_session_prs_shape(self):
         url = "https://github.com/o/r/pull/1"
