@@ -167,6 +167,38 @@ class TestDeviceName(unittest.TestCase):
             self._run(docker_name="docker-desktop", smb_name=""), "unknown-device")
 
 
+class TestCodingAgent(unittest.TestCase):
+    """Which coding agent this host runs, as heartbeated for the hub's header.
+    The name comes out of the CLI's own --version reply so it stays right if the
+    product renames itself, with the build's default as the fallback."""
+
+    def _run(self, out):
+        with mock.patch.object(ha, "run", return_value=out):
+            return ha.coding_agent()
+
+    def test_version_reply_is_split_into_name_and_version(self):
+        # `claude --version` prints "<version> (<product>)".
+        self.assertEqual(
+            self._run("2.1.211 (Claude Code)"),
+            {"name": "Claude Code", "version": "2.1.211"},
+        )
+
+    def test_product_name_is_read_from_the_reply_not_assumed(self):
+        self.assertEqual(
+            self._run("1.0.0 (Claude Code Next)"),
+            {"name": "Claude Code Next", "version": "1.0.0"},
+        )
+
+    def test_unparseable_reply_keeps_the_whole_string_as_the_version(self):
+        # Still more use to the operator than dropping it.
+        self.assertEqual(
+            self._run("2.1.211"), {"name": "Claude Code", "version": "2.1.211"})
+
+    def test_cli_that_cannot_be_run_reports_nothing(self):
+        # run() returns "" on any failure; the hub renders unknown.
+        self.assertIsNone(self._run(""))
+
+
 class TestAgentVersion(unittest.TestCase):
     """This build's own version, as heartbeated for the hub's host header:
     baked env (container image) -> VERSION beside hub-agent.py (native install)

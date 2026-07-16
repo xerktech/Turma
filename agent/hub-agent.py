@@ -92,6 +92,11 @@ ROOT_REPO_NAME = "(root)"
 # transcript still counts toward the host total rather than being dropped.
 OTHER_REPO_NAME = "(other)"
 
+# The coding agent this build launches for its sessions. Only a fallback: the
+# name is normally read out of the CLI's own `--version` reply (coding_agent()),
+# so it stays right if the product renames itself.
+CODING_AGENT_NAME = "Claude Code"
+
 # Where worktrees live: under a dot-dir so the repo scan never lists them, and
 # on the mounted tree so they survive a container restart.
 WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".turma", "worktrees")
@@ -806,6 +811,29 @@ def agent_version():
         except OSError:
             pass
     return None
+
+
+def coding_agent():
+    """Which coding agent this host runs for its sessions, and its version —
+    heartbeated as `codingAgent` for the hub's host header.
+
+    The NAME is reported rather than left for the hub to assume: this image is
+    deliberately agent-generic (Claude Code today, another CLI later), and this
+    process is the only party that knows which one it actually execs.
+
+    `claude --version` prints "<version> (<product>)" — "2.1.211 (Claude Code)" —
+    so the parenthesized product name is preferred over the hardcoded default.
+    An unparseable reply keeps the whole string as the version, which still tells
+    the operator more than nothing. None when the CLI can't be run at all, which
+    the hub renders as unknown.
+    """
+    out = run(["claude", "--version"])
+    if not out:
+        return None
+    m = re.match(r"^(\S+)\s+\((.+)\)$", out)
+    if m:
+        return {"name": m.group(2).strip(), "version": m.group(1)}
+    return {"name": CODING_AGENT_NAME, "version": out}
 
 
 def git_info_cheap(cwd):
@@ -3471,7 +3499,12 @@ class SessionManager:
         self.started_at = run(
             ["docker", "inspect", "--format", "{{.State.StartedAt}}", self.agent_id]
         )
+        # Which coding agent this host runs, and its version. The raw string is
+        # kept alongside the parsed {name, version} purely for hubs predating
+        # `codingAgent` — the two update independently, so a new agent must not
+        # blank an old hub's header.
         self.claude_version = run(["claude", "--version"])
+        self.coding_agent = coding_agent()
         # This build's own version (baked env / installed VERSION file), read once
         # — it can't change without the process being replaced.
         self.agent_version = agent_version()
@@ -6565,6 +6598,7 @@ class SessionManager:
             "device": self.device,
             "startedAt": self.started_at,
             "agentVersion": self.agent_version,
+            "codingAgent": self.coding_agent,
             "claudeVersion": self.claude_version,
             "memory": memory_usage(),
             "logTail": self._log_tail(beat, light),

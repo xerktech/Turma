@@ -165,6 +165,17 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   version as a build-arg), else the `VERSION` file `native/install.sh` stamps beside `hub-agent.py`,
   else the repo-root `VERSION` for a dev checkout — and reports `null` rather than a guess when
   nothing stamped it. Tests: `TestAgentVersion`.
+- The **coding agent** it runs for its sessions (`codingAgent` = `{name, version}`, the dashboard host
+  header's "Agent" row; the build's own version sits beside it as "Turma"): `coding_agent()` splits
+  `claude --version`'s `"<version> (<product>)"` reply, preferring the product name it names over the
+  `CODING_AGENT_NAME` default, so the name stays right if the product renames itself.
+  - The NAME is reported rather than left for the hub to assume, because the image is agent-generic
+    (Claude Code today, another CLI later) and only the agent knows which one it execs.
+  - The raw string still rides as `claudeVersion` for hubs predating the field — the two update
+    independently, so a new agent must not blank an old hub's header. The hub parses that legacy
+    string the same way (`codingAgent()` in `index.html`), which is what stops it rendering as
+    "Claude Code 2.1.211 (Claude Code)" under a label that already said Claude Code.
+  - Tests: `TestCodingAgent`, `turma/tests/host-header.test.js`.
 
 #### Live-session signals
 
