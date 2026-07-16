@@ -1929,22 +1929,28 @@ const server = http.createServer(async (req, res) => {
           !(typeof repo === "string" && /^[A-Za-z0-9._-]+$/.test(repo))) {
         return json(res, 400, { error: "not a repo name" });
       }
-      // Online only: this rides the heartbeat reply, and an offline host would
-      // take the command whenever it came back — long after the operator gave up
-      // and stopped looking at the board.
-      const hosts = Object.keys(agents).filter((k) => {
-        const a = agents[k];
-        return a && a.jira && a.jira.siteKey === siteKey &&
-          Date.now() - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
-      });
+      // Every host reporting the org, INCLUDING offline ones. Commands are queued
+      // and at-least-once, so an offline host takes the pin whenever it returns —
+      // which is the point: a host that misses it comes back reporting the model's
+      // old guess, and (with the freshest block winning the merge) can silently
+      // revert an override the operator already made. Landing late beats never
+      // landing. `setJiraRepo` is idempotent, so a delayed delivery is harmless.
+      //
+      // `online` is still what the BOARD gates its Change control on — an operator
+      // watching wants the pin to show up now, not in an hour — but that is a UI
+      // judgement about feedback, not a reason to let the fleet diverge.
+      const hosts = Object.keys(agents).filter(
+        (k) => agents[k] && agents[k].jira && agents[k].jira.siteKey === siteKey);
       if (!hosts.length) {
-        return json(res, 404, { error: "no online host reports that Jira org" });
+        return json(res, 404, { error: "no host reports that Jira org" });
       }
+      const online = hosts.filter(
+        (k) => Date.now() - (agents[k].lastSeen || 0) < OFFLINE_AFTER_MS);
       let cmdId = null;
       for (const k of hosts) {
         cmdId = queueCommand(k, { type: "setJiraRepo", siteKey, issueKey, repo, auto });
       }
-      return json(res, 202, { ok: true, hosts, cmdId });
+      return json(res, 202, { ok: true, hosts, online, cmdId });
     }
 
     // Terminal proxy: /term/<sessionId>/… -> the ttyd of the host that owns

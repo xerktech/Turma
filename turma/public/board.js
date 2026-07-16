@@ -42,15 +42,30 @@
   // when all of a site's agents share one token — the common case.
   function mergeSites(agents) {
     const byUser = new Map();  // siteKey \x00 user -> {block, agent}
-    const reporters = new Map(); // siteKey -> {hosts:Set, online:boolean}
+    const reporters = new Map(); // siteKey -> {hosts:Set, online:boolean, repos:Map}
     for (const a of agents || []) {
       const j = a && a.jira;
       if (!j || !j.siteKey) continue;
       const site = j.siteKey;
       let rep = reporters.get(site);
-      if (!rep) reporters.set(site, rep = { hosts: new Set(), online: false });
+      if (!rep) reporters.set(site, rep = { hosts: new Set(), online: false, repos: new Map() });
       rep.hosts.add(a.device || a.key || "?");
       if (a.online) rep.online = true;
+      // The manual picker's repo choices, unioned over EVERY host reporting this
+      // org — collected here, alongside the hosts, rather than in the winners
+      // loop below. The blocks that survive `byUser` are one per (site, user),
+      // and the common case is that an org's hosts all poll as the SAME user, so
+      // the winners loop sees exactly one of them: the picker would then offer
+      // whichever host happened to poll Jira last, and a repo cloned only on the
+      // other would vanish from the dropdown.
+      //
+      // `cloned` is host-relative and a cloned copy wins the dedupe: the pin fans
+      // out to every host anyway, and "someone here has it" is the useful claim.
+      for (const o of j.repoOptions || []) {
+        if (!o || !o.name) continue;
+        const seen = rep.repos.get(o.name);
+        if (!seen || (o.cloned && !seen.cloned)) rep.repos.set(o.name, o);
+      }
       const key = site + "\x00" + (j.user || "");
       const prev = byUser.get(key);
       if (!prev || String(j.fetchedAt || "") > String(prev.block.fetchedAt || "")) {
@@ -66,7 +81,7 @@
       const site = block.siteKey;
       let entry = bySite.get(site);
       if (!entry) {
-        const rep = reporters.get(site) || { hosts: new Set(), online: false };
+        const rep = reporters.get(site) || { hosts: new Set(), online: false, repos: new Map() };
         bySite.set(site, entry = {
           siteKey: site,
           users: [],
@@ -76,19 +91,12 @@
           error: null,
           truncated: false,
           tickets: [],
-          repoOptions: [],
+          // Cloned repos first (the ones you can work in today), then by name —
+          // the picker's own order, so it doesn't inherit the scan's.
+          repoOptions: [...rep.repos.values()].sort((x, y) =>
+            (y.cloned ? 1 : 0) - (x.cloned ? 1 : 0) || x.name.localeCompare(y.name)),
           _byKey: new Map(),
-          _byRepo: new Map(),
         });
-      }
-      // The repo choices the manual picker offers, unioned across the hosts
-      // reporting this org: a repo cloned on ANY of them is offerable, and the
-      // override fans out to all of them anyway. A cloned copy wins the dedupe —
-      // `cloned` is host-relative, and "someone here has it" is the useful claim.
-      for (const o of block.repoOptions || []) {
-        if (!o || !o.name) continue;
-        const seen = entry._byRepo.get(o.name);
-        if (!seen || (o.cloned && !seen.cloned)) entry._byRepo.set(o.name, o);
       }
       if (block.user && !entry.users.includes(block.user)) entry.users.push(block.user);
       if (String(block.fetchedAt || "") > String(entry.lastFetched || "")) {
@@ -109,11 +117,6 @@
       .map(e => {
         e.tickets = [...e._byKey.values()];
         delete e._byKey;
-        // Cloned repos first (they're the ones you can work in today), then by
-        // name — the picker's own order, so it doesn't inherit the scan's.
-        e.repoOptions = [...e._byRepo.values()].sort((x, y) =>
-          (y.cloned ? 1 : 0) - (x.cloned ? 1 : 0) || x.name.localeCompare(y.name));
-        delete e._byRepo;
         e.users.sort();
         return e;
       })
@@ -431,6 +434,19 @@
     const pinned = !!(g && g.manual);
     const cur = pinned && g.repo ? g.repo : null;
     const opts = (options || []).filter(o => o && o.name);
+    // A pinned repo that has fallen OUT of the options (deleted from the org, off
+    // the candidate cap's tail, or a `gh` sweep that blanked the list) is carried
+    // back in as its own option, so it can stay `selected`.
+    //
+    // Without this the select has nothing selected and the browser falls back to
+    // its first option — "Let the agent decide" — which both misreports the
+    // current state and turns an untouched Save into a silent release of the pin.
+    // `_apply_triage` deliberately keeps rendering such a repo (absence from the
+    // list isn't evidence the pin is wrong), so this state is reachable by design
+    // and the picker has to tell the same story the row does.
+    const orphan = cur && !opts.some(o => o.name === cur)
+      ? { name: cur, cloned: !!(g && g.cloned), nameWithOwner: g && g.nameWithOwner }
+      : null;
     const cloned = opts.filter(o => o.cloned);
     const uncloned = opts.filter(o => !o.cloned);
     const optHtml = (o) => `<option value="${esc(o.name)}"${
@@ -445,13 +461,14 @@
     const sel = `<select class="td-repo-select" data-repo-select="1">
       <option value="__auto__"${pinned ? "" : " selected"}>Let the agent decide</option>
       <option value="__none__"${pinned && !g.repo ? " selected" : ""}>No repository fits</option>
-      ${group("Cloned on this host", cloned)}
+      ${group("Currently set", orphan ? [orphan] : [])}
+      ${group("Cloned", cloned)}
       ${group("Not cloned", uncloned)}
     </select>`;
     return `<div class="td-repo-edit">${sel}
       <button type="button" class="td-edit" data-repo-save="1">Save</button>
       <button type="button" class="td-edit" data-repo-cancel="1">Cancel</button>
-      ${opts.length ? "" : `<span class="td-dim">No repos reported by this host</span>`}
+      ${opts.length || orphan ? "" : `<span class="td-dim">No repos reported for this org</span>`}
     </div>`;
   }
 

@@ -1722,13 +1722,22 @@ test("http: setting a repo fans out to every host reporting the org", async () =
   assert.equal((agents.jr5b.commands || []).length, 1);
 });
 
-test("http: setting a repo 404s when the org's only host is offline", async () => {
-  // Unlike a READ (which can serve a stale cache), this rides the heartbeat —
-  // an offline host would take it whenever it returned, long after the operator
-  // stopped looking at the board.
-  await jiraBeat("jr6", "r6.atlassian.net");
-  agents.jr6.lastSeen = Date.now() - 10 * 60 * 1000;
+test("http: an offline host of the org is still queued the pin", async () => {
+  // Commands are queued and at-least-once, so it takes the pin when it returns.
+  // Skipping it would let it come back reporting the model's old guess and — with
+  // the freshest block winning the merge — silently revert the override.
+  await jiraBeat("jr6a", "r6.atlassian.net");
+  await jiraBeat("jr6b", "r6.atlassian.net");
+  agents.jr6b.lastSeen = Date.now() - 10 * 60 * 1000;
   const res = await setRepo("r6.atlassian.net", "ENG-1", { repo: "Turma" });
+  assert.equal(res.status, 202);
+  assert.deepEqual(res.body.hosts.sort(), ["jr6a", "jr6b"]);
+  assert.deepEqual(res.body.online, ["jr6a"]);
+  assert.equal((agents.jr6b.commands || []).length, 1, "the offline host is queued too");
+});
+
+test("http: setting a repo 404s only when NO host reports the org", async () => {
+  const res = await setRepo("nobody.atlassian.net", "ENG-1", { repo: "Turma" });
   assert.equal(res.status, 404);
 });
 

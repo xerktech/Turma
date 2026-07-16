@@ -585,7 +585,7 @@ test("repoPickerHtml: cloned and uncloned repos are offered, in separate groups"
   const html = repoPickerHtml(ticket("X-1"), [
     { name: "Turma", cloned: true }, { name: "Widget", cloned: false, nameWithOwner: "x/Widget" },
   ]);
-  assert.ok(html.includes('<optgroup label="Cloned on this host">'));
+  assert.ok(html.includes('<optgroup label="Cloned">'));
   assert.ok(html.includes('<optgroup label="Not cloned">'));
   assert.ok(html.includes('value="Turma"'));
   assert.ok(html.includes('value="Widget"'));
@@ -594,6 +594,29 @@ test("repoPickerHtml: cloned and uncloned repos are offered, in separate groups"
   // decide" are different claims and the agent acts on them differently.
   assert.ok(html.includes('value="__auto__"'));
   assert.ok(html.includes('value="__none__"'));
+});
+
+test("repoPickerHtml: a pin whose repo left the options stays selected", () => {
+  // The regression this guards: with nothing selected the browser falls back to
+  // its FIRST option — "Let the agent decide" — so the picker misreported the
+  // pin, and an untouched Save silently released it. `_apply_triage` keeps
+  // rendering such a repo on purpose, so this state is reachable by design.
+  const html = repoPickerHtml(ticket("X-1", {
+    repoGuess: { repo: "legacy-api", cloned: false, manual: true },
+  }), [{ name: "Turma", cloned: true }]);
+  assert.ok(/<option value="legacy-api" selected>/.test(html));
+  assert.ok(!/<option value="__auto__" selected>/.test(html));
+  assert.ok(html.includes('<optgroup label="Currently set">'));
+});
+
+test("repoPickerHtml: an auto guess whose repo left the options doesn't get carried in", () => {
+  // Only a pin is preselected, so there's nothing to preserve — the current
+  // setting really is "let it decide".
+  const html = repoPickerHtml(ticket("X-1", {
+    repoGuess: { repo: "legacy-api", cloned: false, manual: false },
+  }), [{ name: "Turma", cloned: true }]);
+  assert.ok(/<option value="__auto__" selected>/.test(html));
+  assert.ok(!html.includes("legacy-api"));
 });
 
 test("repoPickerHtml: a hostile repo name can't break out of the option", () => {
@@ -658,6 +681,21 @@ test("mergeSites: picker options union across the org's hosts, cloned winning", 
     { name: "OnlyA", cloned: true },
     { name: "Turma", cloned: true },
   ]);
+});
+
+test("mergeSites: picker options survive the same-user block dedupe", () => {
+  // The regression this guards: options were unioned over the blocks that WIN
+  // `byUser`, which is one per (site, user) — and an org's hosts commonly all
+  // poll as the same user. The loser's repos vanished from the picker, so which
+  // repos you could pin depended on which host polled Jira last.
+  const sites = mergeSites([
+    agent("nas", block({ siteKey: "s.atlassian.net", user: "me@x.com", fetchedAt: "2026-01-02",
+      repoOptions: [{ name: "OnlyNas", cloned: true }] })),
+    agent("wsl", block({ siteKey: "s.atlassian.net", user: "me@x.com", fetchedAt: "2026-01-01",
+      repoOptions: [{ name: "OnlyWsl", cloned: true }] })),
+  ]);
+  assert.equal(sites[0].users.length, 1, "one user: the blocks really do dedupe");
+  assert.deepEqual(sites[0].repoOptions.map(o => o.name), ["OnlyNas", "OnlyWsl"]);
 });
 
 test("mergeSites: an org whose hosts report no options gets an empty list", () => {
