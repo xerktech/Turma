@@ -147,6 +147,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   branches merged into it, reporting a summary that rides the heartbeat.
 - `jiraIssue` — fetch one issue on demand; see "Jira block" below.
 - `spawnTicket` — start a session to WORK a Jira ticket; see "Jira ticket sessions" below.
+- `setJiraRepo` — the operator's own repo for a ticket, overriding the guess; see "Manual repo
+  override" below.
 - `subagentHistory` — open a background subagent's own transcript; see "Live working footer and agent
   list" below.
 
@@ -303,6 +305,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   name before truncating so that an `updatedAt`-ordered cut can't make the surviving name set move
   either).
 - Cloning a repo *does* re-triage, so a newly-cloned repo can win a ticket it fits better.
+- A **manual pin** (see "Manual repo override" below) is the exception to all of it: `_triage_due`
+  skips it, so it is never re-triaged and never spends an attempt.
 - Two rules follow from the split and are worth not undoing:
   - **Stale means "re-triage this", never "stop showing it"** — the old answer keeps rendering until a
     replacement lands, because a whole-board invalidation (one clone, one gh sweep) would otherwise
@@ -344,6 +348,68 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Tuned only by `JIRA_TRIAGE_MODEL` (default `haiku`) / `JIRA_TRIAGE_TIMEOUT_SEC`.
 - Tests: `agent/tests/test_hub_agent.py` (`TestTriageCandidates`, `TestTriageFingerprints`,
   `TestParseTriage`, `TestJiraTriage`).
+
+#### Manual repo override
+
+- The operator can **set a ticket's repo by hand** from the board's ticket detail panel, overriding
+  the guess: `setJiraRepo` → `set_jira_repo()`, which writes a ledger entry flagged `manual`.
+- It takes the same posture against the model that a hand-typed session rename takes against the
+  auto-summarizer, and for the same reason — a human's answer is the better one, so nothing may
+  quietly overwrite it:
+  - `_triage_due` skips a manual entry entirely (never re-triaged, no attempt spent), which is what
+    makes the pin a pin;
+  - `_finish_jira_triage` drops a reply for a ticket pinned while its batch was in flight — that
+    batch was built before the override existed, so it answers a question no longer being asked;
+  - `_prune_triage_ledger` evicts manual entries last: an auto decision it drops is recomputed next
+    beat, but a pin is the one thing in the ledger that cannot be regenerated.
+- Three answers, deliberately distinct — the middle one is the whole reason `auto` is a separate
+  field rather than an absent `repo`:
+  - `{repo:"<name>"}` pins that repo;
+  - `{repo:null}` is a manual **"no repo fits"** — an assertion, and a decision;
+  - `{auto:true}` **releases** the pin (drops the entry), so the ticket re-triages from scratch with
+    a **fresh** attempt budget. Reusing a spent budget could leave a released ticket permanently
+    unguessed.
+- **Un-cloned repos are offerable**, not just cloned ones: a ticket can belong to a repo this host
+  hasn't cloned, and saying so is a real answer (the board renders it dashed, as it does an un-cloned
+  guess).
+- The name is **allowlist-checked host-side against that host's own candidates**, exactly like the
+  model's reply, and the stored repo/cloned/`nameWithOwner` are read off the **candidate**, never off
+  the request. The operator is likelier right than the model, but the request still arrives over
+  HTTP, and a name this host can't offer is one its own picker never showed.
+- The candidate list is heartbeated as **`jira.repoOptions`** (`_jira_payload`, names + clone state
+  only — the descriptions would be dead weight every beat). It is deliberately **one list serving
+  both** the model's prompt and the board's picker, via `_refresh_triage_candidates`: the picker
+  exists to offer exactly what `set_jira_repo` accepts, so the two must not drift.
+- `_apply_triage` re-reads clone state from the **current** candidates rather than trusting what the
+  decision recorded. Cloning a repo re-triages an auto guess (its `candFp` moves) but a pin never
+  re-triages, so a stored `cloned:false` would outlive the clone forever and leave the chip dashed
+  for good. A repo absent from the list right now keeps its stored state — the list blanks on a
+  failed gh sweep, and absence there isn't evidence a repo stopped being cloned.
+- `POST /api/jira/<siteKey>/<issueKey>/repo` **fans out to every host reporting that org** — including
+  OFFLINE ones, unlike `POST /api/jira/refresh`. The ledger is per-host while the board merges hosts
+  by `siteKey` (freshest block wins), so a host that misses the pin comes back reporting the model's
+  old guess and can silently revert it. Commands are queued and at-least-once and `set_jira_repo` is
+  idempotent, so landing late beats never landing. The board still gates its **Change** control on an
+  ONLINE host — that's a UI judgement about feedback, not a reason to let the fleet diverge.
+- This writes to the **agent's ledger, not to Jira** — the board stays pull-only with respect to Jira
+  itself.
+- A pin also decides **where a ticket session spawns**, for free and without either side knowing about
+  the other: `spawn_ticket` re-derives the repo from this host's own ledger (see "Jira ticket
+  sessions"), where a pin outranks the model. It still re-checks `scan_repos()`, so pinning an
+  un-cloned repo names the ticket's home without pretending a session can start there yet.
+- **Known limits, all of them multi-host-per-org** (the deployment is one host per org — the host
+  holding that org's Jira creds — so none of these bite it today):
+  - The hub 202s on QUEUE, and a host whose candidates lack the repo refuses it **log-only**. The
+    picker offers the union of the org's hosts' options, so on a multi-host org it can offer a repo
+    one host will reject; the board can't report that. The panel self-corrects within
+    `REPO_SETTLE_MS` (it re-reads the ticket each beat and stops holding the optimistic paint), so
+    the failure mode is a pin that visibly reverts rather than a lie that persists.
+  - `cloned` is host-relative and each host records its own, so two hosts can report different
+    `repoGuess.cloned` for one pin and the chip's dashed-ness follows whichever block wins the merge.
+  - Widening the allowlist to the fleet's option list (rather than each host's own) would fix both,
+    at the cost of the property that a host only ever records repos it can actually see.
+- Tests: `agent/tests/test_hub_agent.py` (`TestSetJiraRepo`), the `repoPickerHtml`/`repoFieldHtml`
+  cases in `turma/tests/board.test.js`, and the `/repo` endpoint cases in `turma/tests/server.test.js`.
 
 ### Jira ticket sessions
 
@@ -640,6 +706,7 @@ Cloudflare tunnel; port 8300 on the LAN.
   (`repoFieldHtml`), which reads `t.repoGuess` directly rather than through the panel's usual `v()`
   field-preference helper, because the guess only ever exists on the heartbeat ticket — the on-demand
   issue fetch comes straight from Jira, which knows nothing about repos.
+- The Repo row is also where the guess is **corrected by hand** — see the detail panel's own bullet.
 
 #### Starting a session on a ticket
 
@@ -701,6 +768,46 @@ Cloudflare tunnel; port 8300 on the LAN.
 - The fetched copy wins field-by-field over the card's older heartbeat values.
 - Agent-side text is already plain (see the ADF note in the agent bullet), so the panel escapes first
   and linkifies after — a bare URL in a description is usually the point of it.
+
+##### Changing the repo by hand
+
+- The panel's **Repo row carries a "Change" control** that swaps the row in place for a picker of the
+  org's `jira.repoOptions` — cloned and un-cloned repos in separate `optgroup`s, plus "No repository
+  fits" and "Let the agent decide". It's the same field the row was already reporting, and the
+  operator is answering the question it just asked. Saving `POST`s to
+  `/api/jira/<siteKey>/<issueKey>/repo` (see the agent's "Manual repo override" bullet for the whole
+  path).
+- The row is present even for an **untriaged** ticket, reading "Not triaged yet": the card draws no
+  chip for one (absence isn't a verdict), but the panel is where an override is made, and a ticket
+  nobody has classified is exactly the one worth pinning. It states which state it's in rather than
+  vanishing, so it still never reports "not looked at yet" as "nothing fits".
+- **Only a manual pin preselects a repo** in the picker. An auto guess of "Turma" is the model's
+  answer, and the operator's current setting is "let it decide" — preselecting Turma would misreport
+  that as a pin they'd made, and quietly turn a Save they meant as "leave it alone" into one.
+- Options are merged **across the org's hosts** (`mergeSites`, cloned winning the dedupe): `cloned` is
+  host-relative, the override fans out to every host anyway, and "someone here has it" is the useful
+  claim. They're collected next to `hosts`, over EVERY agent — not in the winners loop, whose blocks
+  are one per (site, user), and an org's hosts commonly all poll as the same user, so the picker
+  would otherwise offer only whichever host polled Jira last.
+- A pinned repo that has **left** the options (deleted, off the candidate cap's tail, a blanked `gh`
+  sweep) is carried back in under "Currently set" so it can stay selected. With nothing selected the
+  browser falls back to its first option — "Let the agent decide" — which misreports the pin and turns
+  an untouched Save into a silent release of it. `_apply_triage` keeps rendering such a repo on
+  purpose, so the picker has to tell the same story the row does.
+- The save is painted **optimistically** — the pin only becomes real on the agent's next beat, and the
+  board would otherwise sit showing the old guess for a full interval after a Save that worked. A
+  failed request rolls the paint back and says so on the row it failed to change.
+- `refreshOpenTicket` re-points the open panel at the rebuilt ticket each beat (`mergeSites` builds
+  fresh objects, so the panel would otherwise render its opening snapshot forever). It holds the
+  optimistic paint for `REPO_SETTLE_MS` — the command legitimately hasn't landed yet — and after that
+  the heartbeat wins, which is what stops the panel insisting on a pin the agent silently refused. It
+  repaints only when a rendered field actually changed (the panel is innerHTML-replaced, and an
+  unconditional repaint would throw away the scroll position of anyone reading a long description),
+  and never while the picker is open.
+- "Change" only appears when a host of that org is **online**: the command rides the heartbeat, so an
+  offline org's ticket stays readable but not re-assignable.
+- The edit state lives in a page variable, not the DOM — the same rule the session card's ⋯ menu
+  follows.
 
 #### Refresh button
 

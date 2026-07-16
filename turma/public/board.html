@@ -61,6 +61,7 @@ function render(data) {
   checkRefreshDone();
   const sites = B.mergeSites(data.agents || []);
   lastSites = sites; lastAllKeys = sites.map(s => s.siteKey);
+  refreshOpenTicket();
   if (!sites.length) {
     $chips.replaceChildren();
     $board.innerHTML = `<div class="empty">No Jira tickets reported yet. Set <code>JIRA_SITE</code>, <code>JIRA_EMAIL</code>, and <code>JIRA_TOKEN</code> in an agent's environment to connect its org.</div>`;
@@ -175,11 +176,121 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 function paintDetail() {
   const s = openTicketState;
   if (!s) return;
+  const site = lastSites.find(x => x.siteKey === s.siteKey);
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
     color: B.orgColor(s.siteKey, lastAllKeys),
     siteKey: s.siteKey,
     error: s.error,
+    // The override rides the heartbeat, so it needs a live host to reach; an
+    // offline org's ticket is still readable, just not re-assignable.
+    canEdit: !!(site && site.online),
+    editing: s.editing,
+    repoError: s.repoError,
+    repoOptions: (site && site.repoOptions) || [],
   });
+  if (s.editing) {
+    const sel = $panel.querySelector("[data-repo-select]");
+    if (sel) sel.focus();
+  }
+}
+
+// How long a saved repo keeps its optimistic paint before the heartbeat's word is
+// taken as final. Two-ish beats: the command has to reach the host and its next
+// block has to come back carrying the pin.
+const REPO_SETTLE_MS = 45000;
+
+// Re-point an open panel at the rebuilt ticket each beat. `mergeSites` builds
+// fresh objects every render, so the panel would otherwise keep rendering the
+// snapshot it opened with — forever.
+//
+// This is what lets the truth reassert itself after a manual repo save. The paint
+// is optimistic and the hub 202s on QUEUE, so the agent can still refuse the pin
+// (a stale board offering a repo it no longer has) with nothing to report back;
+// without re-reading, the panel would insist on a pin that never landed until it
+// was closed and reopened.
+//
+// Within REPO_SETTLE_MS of a save the optimistic value is re-applied over the
+// beat's, since the command legitimately hasn't landed yet and reverting to the
+// old guess for a beat or two would read as the save failing. After that the
+// heartbeat wins, whatever it says.
+//
+// It repaints ONLY when something it renders actually changed: the panel is
+// innerHTML-replaced, so an unconditional repaint every beat would throw away the
+// scroll position of anyone reading a long description. And it never repaints
+// while the picker is open — a beat must not swap the select out mid-edit.
+function refreshOpenTicket() {
+  const s = openTicketState;
+  if (!s) return;
+  const site = lastSites.find(x => x.siteKey === s.siteKey);
+  const fresh = site && site.tickets.find(t => t.key === s.key);
+  if (!fresh) return;
+  if (s.repoPendingUntil && Date.now() < s.repoPendingUntil) {
+    if (s.repoPending) fresh.repoGuess = s.repoPending;
+    else delete fresh.repoGuess;
+  } else {
+    s.repoPendingUntil = 0;
+  }
+  const shown = (g) => (g ? `${g.repo}|${!!g.cloned}|${!!g.manual}` : "");
+  const changed = shown(fresh.repoGuess) !== shown(s.ticket.repoGuess);
+  s.ticket = fresh;
+  if (changed && !s.editing) paintDetail();
+}
+
+// The operator's own repo answer. Painted optimistically: the pin only becomes
+// real on the agent's next beat (the command rides the heartbeat reply), and the
+// board would otherwise sit showing the model's old guess for a full interval
+// after a Save that worked. A failure repaints from the real state and says so.
+async function saveRepo(value) {
+  const s = openTicketState;
+  if (!s) return;
+  const body = value === "__auto__" ? { auto: true }
+    : value === "__none__" ? { repo: null }
+    : { repo: value };
+  s.editing = false;
+  s.repoError = "";
+  const prev = s.ticket.repoGuess;
+  let guess = null;
+  if (!body.auto) {
+    const opt = ((lastSites.find(x => x.siteKey === s.siteKey) || {}).repoOptions || [])
+      .find(o => o.name === body.repo);
+    guess = {
+      repo: body.repo, cloned: !!(opt && opt.cloned),
+      nameWithOwner: (opt && opt.nameWithOwner) || null,
+      reason: "", manual: true, at: null,
+    };
+  }
+  // Held against the next couple of beats by refreshOpenTicket, which would
+  // otherwise revert this to the model's old guess the moment a heartbeat lands —
+  // the command hasn't reached the host yet, so the block legitimately still
+  // carries the old answer, and a flicker back would read as the save failing.
+  s.repoPending = guess;
+  s.repoPendingUntil = Date.now() + REPO_SETTLE_MS;
+  if (guess) s.ticket.repoGuess = guess;
+  else delete s.ticket.repoGuess;
+  paintDetail();
+  let ok = false, err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/repo`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    ok = r.ok;
+    if (!ok) {
+      let d = {};
+      try { d = await r.json(); } catch { /* non-JSON error body */ }
+      err = d.error || `HTTP ${r.status}`;
+    }
+  } catch { err = "the hub is unreachable"; }
+  if (!ok && openTicketState === s) {
+    // The optimistic paint was a lie; take it back, and stop holding it against
+    // the heartbeat — nothing is coming.
+    s.repoPending = null;
+    s.repoPendingUntil = 0;
+    if (prev) s.ticket.repoGuess = prev; else delete s.ticket.repoGuess;
+    s.repoError = err;
+    paintDetail();
+  }
 }
 
 function closeDetail() {
@@ -262,7 +373,24 @@ $board.addEventListener("keydown", (e) => {
   e.preventDefault();                    // Space would scroll the page
   openDetail(card.dataset.key, card.dataset.site, card);
 });
-$panel.addEventListener("click", (e) => { if (e.target.closest(".td-close")) closeDetail(); });
+$panel.addEventListener("click", (e) => {
+  if (e.target.closest(".td-close")) return closeDetail();
+  if (!openTicketState) return;
+  if (e.target.closest("[data-repo-edit]")) {
+    openTicketState.editing = true;
+    openTicketState.repoError = "";   // a new attempt clears the old complaint
+    return paintDetail();
+  }
+  if (e.target.closest("[data-repo-cancel]")) {
+    openTicketState.editing = false;
+    return paintDetail();
+  }
+  if (e.target.closest("[data-repo-save]")) {
+    const sel = $panel.querySelector("[data-repo-select]");
+    if (sel) saveRepo(sel.value);
+    return;
+  }
+});
 $backdrop.addEventListener("click", (e) => { if (e.target === $backdrop) closeDetail(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && openTicketState) closeDetail(); });
 

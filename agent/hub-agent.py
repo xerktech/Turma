@@ -3566,6 +3566,13 @@ class SessionManager:
         # github block to repos:[]) can't be mistaken for an empty org — see
         # _start_jira_triage.
         self.triage_gh_repos = []
+        # The repos a ticket may be assigned to on this host, recomputed each beat
+        # by _refresh_triage_candidates. It is deliberately ONE list serving two
+        # callers: the choice list the model triages from, and (heartbeated as
+        # jira.repoOptions) the options the board's manual picker offers. They must
+        # not drift — the picker exists to offer exactly what set_jira_repo will
+        # accept, and both validate against this.
+        self.triage_cands = []
         # at-least-once command de-dup: cmdIds we've already executed.
         self.acked = set()
         self.acked_order = deque(maxlen=1000)
@@ -3621,6 +3628,13 @@ class SessionManager:
             if not key:
                 continue
             entry = self.triage_ledger.get(_triage_key(site_key, key))
+            # An operator's own answer outranks anything the model would decide, so
+            # a manual pin is never re-triaged and never spends an attempt. It is
+            # the same rule _summary_due applies to a hand-renamed session, and the
+            # ONLY way back to auto is the operator clearing it (set_jira_repo with
+            # auto=True), which drops the entry outright.
+            if isinstance(entry, dict) and entry.get("manual"):
+                continue
             tfp = _ticket_fingerprint(t)
             if not _triage_stale(entry, tfp, cand_fp):
                 continue
@@ -3636,28 +3650,46 @@ class SessionManager:
                 break
         return due
 
+    def _refresh_triage_candidates(self):
+        """Recompute the repos a ticket may be assigned to on this host, and cache
+        them on `self.triage_cands`.
+
+        refresh_github blanks the block to repos:[] on ANY error, which on this
+        field alone is indistinguishable from "the org has no repos". Triaging
+        against that would drop every uncloned candidate, restale every ticket, and
+        re-run the whole board through the model twice — once when gh stumbles and
+        again when it recovers. So only a SUCCESSFUL sweep updates the candidate
+        repos; otherwise the last good list stands. A host with no gh at all never
+        sets it and triages against its cloned repos, which is the correct
+        candidate set for that host.
+
+        The same list is the operator's picker options and set_jira_repo's
+        allowlist, so a repo the board offers is by construction one this host will
+        accept."""
+        gh = self.github or {}
+        if gh.get("available"):
+            self.triage_gh_repos = list(gh.get("repos") or [])
+        self.triage_cands = _triage_candidates(self._triage_repos(),
+                                               self.triage_gh_repos)
+        return self.triage_cands
+
     def _start_jira_triage(self):
         """Kick off one batch of Jira ticket -> repo triage as a DETACHED
         `claude -p` reaped by _poll_jira_triage. No-op when a job is already in
         flight, when Jira is off, when there are no candidate repos, or when every
         ticket already has a fresh decision — so a settled board costs nothing."""
-        if self.triage_job is not None or not jira_configured():
+        if not jira_configured():
+            return
+        # Refreshed BEFORE the in-flight check: the board's picker reads this list
+        # every beat, and freezing it for the length of a triage job would offer
+        # the operator a stale set of repos (a just-cloned one missing) for as long
+        # as the model happened to be running.
+        cands = self._refresh_triage_candidates()
+        if self.triage_job is not None:
             return
         tickets = self.jira.get("tickets") or []
         if not tickets:
             return
-        # refresh_github blanks the block to repos:[] on ANY error, which on this
-        # field alone is indistinguishable from "the org has no repos". Triaging
-        # against that would drop every uncloned candidate, restale every ticket,
-        # and re-run the whole board through the model twice — once when gh
-        # stumbles and again when it recovers. So only a SUCCESSFUL sweep updates
-        # the candidate repos; otherwise the last good list stands. A host with no
-        # gh at all never sets it and triages against its cloned repos, which is
-        # the correct candidate set for that host.
-        gh = self.github or {}
-        if gh.get("available"):
-            self.triage_gh_repos = list(gh.get("repos") or [])
-        cands = _triage_candidates(self._triage_repos(), self.triage_gh_repos)
         if not cands:
             return  # nothing to choose from; leave the tickets untriaged
         cand_fp = _candidates_fingerprint(cands)
@@ -3747,6 +3779,13 @@ class SessionManager:
                 continue
             lkey = _triage_key(job.get("siteKey"), key)
             entry = dict(self.triage_ledger.get(lkey) or {})
+            # The operator overrode this ticket while the model was still deciding
+            # it. Their answer wins: the batch was built before the override
+            # existed, so this reply is an answer to a question that is no longer
+            # being asked. Mirrors _finish_summary declining to clobber a manual
+            # rename.
+            if entry.get("manual"):
+                continue
             entry.update(results[key])
             entry["decided"] = True
             entry["at"] = now_iso()
@@ -3811,12 +3850,18 @@ class SessionManager:
     def _prune_triage_ledger(self):
         """Bound the ledger. Entries are dropped oldest-decision-first; an
         undecided entry (in flight or awaiting a retry) sorts newest so a prune
-        can't silently cancel work still owed."""
+        can't silently cancel work still owed.
+
+        A MANUAL entry sorts alongside those and is evicted last: an auto decision
+        the prune drops is simply recomputed on the next beat, but a pin the
+        operator typed is the one thing here that cannot be regenerated, and losing
+        it would silently hand the ticket back to the model."""
         over = len(self.triage_ledger) - JIRA_TRIAGE_LEDGER_MAX
         if over <= 0:
             return
         order = sorted(self.triage_ledger.items(),
-                       key=lambda kv: (kv[1] or {}).get("at") or "￿")
+                       key=lambda kv: ("￿" if (kv[1] or {}).get("manual")
+                                       else (kv[1] or {}).get("at") or "￿"))
         for lkey, _ in order[:over]:
             self.triage_ledger.pop(lkey, None)
 
@@ -3829,18 +3874,34 @@ class SessionManager:
         yet carries no key at all (the board shows no chip, which is honest — it
         isn't "no repo fits", it's "not looked at yet"), while one the model
         declined carries repo=None, which the board renders as the greyed
-        no-repo chip."""
+        no-repo chip.
+
+        A `manual` decision is the operator's own and reads identically apart from
+        the flag, which the board uses to say who chose."""
         site_key = self.jira.get("siteKey")
+        by_name = {c["name"]: c for c in (self.triage_cands or [])}
         for t in self.jira.get("tickets") or []:
             entry = self.triage_ledger.get(_triage_key(site_key, t.get("key")))
             if not isinstance(entry, dict) or not entry.get("decided"):
                 t.pop("repoGuess", None)
                 continue
+            repo = entry.get("repo")
+            # Clone state is re-read from the CURRENT candidates rather than
+            # trusted from when the decision landed. Cloning a repo re-triages an
+            # auto guess (candFp moves), but a manual pin never re-triages at all,
+            # so a stored `cloned:false` would outlive the clone forever and the
+            # chip would stay dashed for good.
+            #
+            # A repo missing from the list right now keeps its stored state: the
+            # list blanks on a failed gh sweep, and absence there is not evidence a
+            # repo stopped being cloned.
+            cand = by_name.get(repo) if repo else None
             t["repoGuess"] = {
-                "repo": entry.get("repo"),
-                "cloned": bool(entry.get("cloned")),
-                "nameWithOwner": entry.get("nameWithOwner"),
+                "repo": repo,
+                "cloned": bool(cand.get("cloned")) if cand else bool(entry.get("cloned")),
+                "nameWithOwner": (cand or {}).get("nameWithOwner") or entry.get("nameWithOwner"),
                 "reason": entry.get("reason") or "",
+                "manual": bool(entry.get("manual")),
                 "at": entry.get("at"),
             }
 
@@ -4967,6 +5028,90 @@ class SessionManager:
         result["truncated"] = byte_capped or len(entries) > HISTORY_MAX_MSGS
         self.subagent_history_results.append(result)
 
+    def set_jira_repo(self, issue_key, repo, auto=False, site_key=None):
+        """Handle a {type:"setJiraRepo"} command: the operator's own answer to
+        "which repo does this ticket belong in", overriding the model's guess.
+
+        Three outcomes, matching the three the board can ask for:
+          auto=True     -> drop the entry entirely, releasing the pin. The ticket
+                           re-triages from scratch on a later beat with a FULL
+                           attempt budget, which is what "use the AI guess again"
+                           has to mean — reusing a spent budget could leave a
+                           cleared ticket permanently unguessed.
+          repo=None     -> a manual "no repo fits" (the muted chip). Explicit, and
+                           deliberately distinct from auto=True: the operator
+                           asserting nothing fits is an ANSWER, not an absence.
+          repo="<name>" -> pin that repo.
+
+        The name is allowlist-checked against this host's own candidates, exactly
+        like the model's reply in _parse_triage, and the recorded repo/cloned/
+        nameWithOwner are read off the CANDIDATE — never off the request. The
+        operator is more trustworthy than the model, but the request still arrives
+        over HTTP, and a value that only ever renders as a chip has no business
+        being anything but a name this host already knows.
+
+        An unknown repo is refused rather than recorded: a name this host can't
+        offer is one its picker never showed, so it is a bug or a stale client, and
+        recording it would paint a chip for a repo that doesn't exist here."""
+        k = (issue_key or "").strip()
+        if not JIRA_KEY_RE.match(k):
+            log(f"setJiraRepo: ignoring bad issue key {k[:50]!r}")
+            return
+        mine = self.jira.get("siteKey")
+        if not mine:
+            log(f"setJiraRepo: no Jira org on this host, ignoring {k}")
+            return
+        # The hub routes by siteKey, so a mismatch means the command reached the
+        # wrong host. Filing it under our own org would corrupt a ledger key that
+        # another host's board is reading.
+        if site_key and site_key != mine:
+            log(f"setJiraRepo: {k} is for {site_key!r}, not this host's {mine!r}")
+            return
+        lkey = _triage_key(mine, k)
+        if auto:
+            if self.triage_ledger.pop(lkey, None) is None:
+                return
+            self._save_triage_ledger()
+            self._apply_triage()
+            log(f"setJiraRepo: {k} released back to auto triage")
+            return
+        entry = {"decided": True, "manual": True, "at": now_iso(), "reason": ""}
+        if repo is None:
+            entry.update({"repo": None, "cloned": False, "nameWithOwner": None})
+        else:
+            cand = next((c for c in (self.triage_cands or [])
+                         if c.get("name") == repo), None)
+            if cand is None:
+                log(f"setJiraRepo: refusing non-candidate repo {str(repo)[:80]!r} for {k}")
+                return
+            entry.update({"repo": cand["name"], "cloned": bool(cand.get("cloned")),
+                          "nameWithOwner": cand.get("nameWithOwner")})
+        self.triage_ledger[lkey] = entry
+        self._prune_triage_ledger()
+        self._save_triage_ledger()
+        self._apply_triage()
+        log(f"setJiraRepo: {k} -> {entry['repo'] or 'no repo'} (manual)")
+
+    def _jira_payload(self):
+        """The jira block as it ships: what the poll returned, plus the repo
+        choices the board's manual picker offers (`repoOptions`).
+
+        Composed here rather than stamped onto self.jira because collect_jira
+        builds fresh dicts on every poll — the same reason _apply_triage has to
+        re-stamp the guesses. It stays out of collect_jira itself, which owns only
+        what Jira told us; repos are this host's knowledge, not Jira's.
+
+        Only the name and clone state ride: the picker labels a repo and marks
+        whether it's here, and the candidates' descriptions (up to 200 × 120 chars)
+        would be dead weight on every beat for a tooltip nobody reads. An
+        unconfigured host has no board and ships nothing extra."""
+        if not self.jira.get("configured"):
+            return self.jira
+        opts = [{"name": c["name"], "cloned": bool(c.get("cloned")),
+                 "nameWithOwner": c.get("nameWithOwner")}
+                for c in (self.triage_cands or [])]
+        return dict(self.jira, repoOptions=opts)
+
     def _stage_jira_issue(self, key):
         """Handle a {type:"jiraIssue"} command: fetch that issue's full detail
         and stage it for the next heartbeat payload (jiraIssueResults). Every
@@ -5889,6 +6034,10 @@ class SessionManager:
                         cmd.get("sessionId"), cmd.get("agentType"), cmd.get("label"))
                 elif ctype == "jiraIssue":
                     self._stage_jira_issue(cmd.get("issueKey"))
+                elif ctype == "setJiraRepo":
+                    self.set_jira_repo(
+                        cmd.get("issueKey"), cmd.get("repo"),
+                        auto=bool(cmd.get("auto")), site_key=cmd.get("siteKey"))
                 elif ctype == "clone":
                     self.clone(cmd.get("repo"))
                 elif ctype == "prune":
@@ -6433,7 +6582,7 @@ class SessionManager:
             "github": self.github,
             # Jira Cloud assigned tickets (user-scoped creds); the hub's /board
             # merges these across hosts by siteKey into one cross-org Kanban.
-            "jira": self.jira,
+            "jira": self._jira_payload(),
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),
