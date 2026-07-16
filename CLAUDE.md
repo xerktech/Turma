@@ -119,9 +119,17 @@ This replaced the old model of one fixed-repo container per session.
 - On the way out, `_remember_closed` **snapshots onto the closed record** the two things the live
   caches are about to forget — the `prUrls` this session opened, and its `transcriptId`. Both are
   keyed by session id in caches `_forget_session_caches` drops moments later, so the snapshot is the
-  only thing that keeps an ended session's PR chips and conversation reachable. The PR *status* stays
-  in `pr_status_cache` (`refresh_pr_status` counts closed records as referenced, so killing a session
+  only thing that keeps an ended session's PR chips reachable. The PR *status* stays in
+  `pr_status_cache` (`refresh_pr_status` counts closed records as referenced, so killing a session
   can't evict the state its ended card shows; it is not re-polled, same rule as a stopped session).
+- The closed history is a **cache of what a kill knew, not the record that it happened**. It buys the
+  PR links and the original session id (so `resume` hands it straight back), from the instant of the
+  kill rather than a slow beat later. It is not the history: `closed.json` lives in `~/.turma`, which
+  on a container host is the image's writable layer and does not survive an agent update, and it keeps
+  only `CLOSED_PER_REPO` per repo regardless. **Anything that must still be there afterwards belongs
+  on the durable side** — the transcripts under the `~/.claude` mount (which `_resumable_report()`
+  re-derives from, and which is what keeps a killed session in the hub's Ended list across a restart)
+  and the hub's own archive.
 - Each repo's **"Resume"** picker lists **every prior Claude session for the repo** whose origin cwd
   is resumable on this host — `repo.resumable` from `_resumable_report()`: killed/deleted/pruned
   Turma sessions, repo-dir "terminal"/dev runs on the host, and older ones aged out of
@@ -949,13 +957,33 @@ Cloudflare tunnel; port 8300 on the LAN.
 
 - The sidebar's third section (below Active/Idle), **collapsed by default** — it's history, and it
   only grows. Replaced the old "Stopped" list, which showed only half the story.
-- It merges the two channels an over-but-resumable session arrives on, because the operator draws no
-  distinction between them — both are "a session I'm done with, for now":
+- It merges the three channels an over-but-resumable session arrives on, because the operator draws no
+  distinction between them — all are "a session I'm done with, for now":
   - **killed** — dropped from the registry into the agent's closed history (`a.closedSessions`);
-  - **stopped** — its claude exited on its own, so a non-running record stays in `a.sessions`.
-- Sorted **most recently ended first** (`endedMs`, from `closedAt`/`stoppedAt`) — the one you just
-  killed is the one you're most likely to want back. An undated record (an older agent) sorts oldest
-  rather than to an arbitrary spot.
+  - **stopped** — its claude exited on its own, so a non-running record stays in `a.sessions`;
+  - **resumable** — a transcript from each repo's `resumable` scan, with no registry record of any
+    kind behind it.
+- The third channel is what makes the list **durable**, and it is the point of the merge. The first
+  two are read out of `~/.turma`, which on a container host is the image's writable layer: an agent
+  update recreates the container and takes `sessions.json` and `closed.json` with it, so a list built
+  only from them empties on every update. `closed.json` is capped at `CLOSED_PER_REPO` besides, so it
+  was never the whole history even on a host that kept it. `resumable` is re-derived every slow beat
+  from the transcripts under `~/.claude/projects` (a bind mount) plus each transcript's own recorded
+  cwd, so it survives the wipe and carries every prior session, not the newest few.
+- The channels are **deduped on `<host>::<transcriptId>`**, and a registry-backed record always wins:
+  a killed session is reported through both its closed record AND (once the slow scan catches up)
+  `resumable`, and only the record knows the PRs it opened, when it was really killed, and that
+  `resume` can have it back under its original id. So a kill that ages out of `closed.json` keeps
+  listing — it just loses its PR chips, which is the honest degradation (there is no record left to
+  have snapshotted them onto).
+- Sorted **most recently ended first** (`endedMs`, from `closedAt`/`stoppedAt`/`endedTs` — note
+  `resumableSession()` must copy `endedTs` onto the record it shapes, since that is where `endedEntry`
+  reads the sort key from). The one you just killed is the one you're most likely to want back. An
+  undated record (an older agent) sorts oldest rather than to an arbitrary spot.
+- A **running** session is never also listed as ended. The agent re-cuts the cached scan against its
+  live registry every beat (see `_sorted_repo_entries`), and the page independently dedupes resumable
+  rows against every reported session's `transcriptId` — which is why `_session_payload` reports that
+  id for running sessions too, even though they're read live and never opened from the archive.
 - **Clicking a row opens that session read-only on the stage** — deliberately the same
   `#transcriptPane` the archive/subagent views use, which is exactly the surface an ended session
   should get: scrollable conversation + a verbosity control, and **no terminal toggle and no compose
@@ -969,13 +997,19 @@ Cloudflare tunnel; port 8300 on the LAN.
   stays an inert `<span>` because the card is a `<button>`. A PR is often the whole reason to open an
   ended session.
 - **Resume** sits on both the row and the stage bar, and dispatches on how the session ended: killed →
-  `.../resume` (re-registers it under the same id), stopped → `.../start`. It then hands off to the
-  live session like a spawn does. Nothing removes it from the list — the list is DERIVED, so it drops
-  out on the beat the agent reports it running.
+  `.../resume` (re-registers it under the same id), stopped → `.../start`, resumable →
+  `.../transcripts/<id>/resume` with its origin cwd (the agent re-validates the path and re-creates
+  the dir if a prune removed it). It then hands off to the live session like a spawn does. Nothing
+  removes it from the list — the list is DERIVED, so it drops out on the beat the agent reports it
+  running.
+- The resumable path is the one that comes back under a **new id** (the agent mints it), so it follows
+  its queued command's `cmdId` like a spawn, and its row spinner clears on the repo's session count
+  growing rather than on a by-id match that would never land.
 - Resume needs the host **online** (it rides the heartbeat); reading the conversation does not, so the
   card stays clickable on a dead host while its Resume is disabled.
-- Tests: the Ended-sessions cases in `turma/tests/sessions.test.js`, plus `TestRefreshPrStatus` /
-  `TestSessionLifecycle` in `agent/tests/test_hub_agent.py`.
+- Tests: the Ended-sessions cases in `turma/tests/sessions.test.js` (including the agent-restart and
+  dedupe cases), plus `TestRefreshPrStatus` / `TestSessionLifecycle` / `TestResumableReport` /
+  `TestCardedSlugs` in `agent/tests/test_hub_agent.py`.
 
 #### Session card ⋯ menu
 

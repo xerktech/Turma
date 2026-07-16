@@ -1046,7 +1046,7 @@ function liveState(sess, host, now) {
 // Running sessions sorted attention-first: waiting on you, then working, then
 // idle; freshest activity first within each group.
 const KIND_ORDER = { waiting: 0, working: 1, idle: 2 };
-// A session is "ended" if it is over but still resumable, and that covers two
+// A session is "ended" if it is over but still resumable, and that covers three
 // records the agent reports through different channels:
 //
 //  - KILLED ("closed"): killed from the hub, so the agent DROPPED its registry
@@ -1054,13 +1054,27 @@ const KIND_ORDER = { waiting: 0, working: 1, idle: 2 };
 //    and conversation survive; `resume` brings it back under the same id.
 //  - STOPPED: its claude exited on its own (or errored), so the record stays in
 //    a.sessions with a non-running status; `start` relaunches it in place.
+//  - RESUMABLE: a transcript from the agent's per-repo `resumable` scan, with no
+//    registry record of any kind behind it. `resumeTranscript` relaunches it at
+//    its own origin cwd, under a NEW session id.
 //
-// The operator drew no such distinction — both are "a session I'm done with, for
-// now" — so they land in one list, sorted by when they ended, newest first.
-// `kind` is what the row's Resume button dispatches on, and the only place the
-// two shapes are told apart after this.
+// The operator drew no such distinction — all three are "a session I'm done
+// with, for now" — so they land in one list, sorted by when they ended, newest
+// first. `kind` is what the row's Resume button dispatches on, and the only
+// place the shapes are told apart after this.
+//
+// The third channel is what makes the list DURABLE and complete. The first two
+// are read out of ~/.turma (sessions.json / closed.json), which on a container
+// host is the image's writable layer — an agent update recreates the container
+// and takes both with it, emptying this list. closed.json is capped at 5 per
+// repo besides, so it was never the whole history even on a host that kept it.
+// `resumable` is re-derived every slow beat from the transcripts under
+// ~/.claude/projects (a bind mount) plus each transcript's own recorded cwd, so
+// it survives that wipe and carries every prior session, not the newest few.
 function endedEntry(a, s, kind) {
-  const endedAt = kind === "closed" ? s.closedAt : s.stoppedAt;
+  const endedAt = kind === "closed" ? s.closedAt
+    : kind === "resumable" ? s.endedTs
+    : s.stoppedAt;
   return {
     a, s, kind,
     id: s.id,
@@ -1071,14 +1085,56 @@ function endedEntry(a, s, kind) {
     endedAt,
   };
 }
+// Shape one `repo.resumable` transcript into the session-like record the rest of
+// the ended list reads. It has no session id of its own — the registry either
+// forgot it or never knew it — so the row is keyed on its transcript, which is
+// the only identity it has and the one resumeTranscript takes.
+function resumableSession(t) {
+  return {
+    id: "t:" + t.transcriptId,
+    transcriptId: t.transcriptId,
+    repo: t.repo,
+    root: !!t.root,
+    summary: t.summary,
+    worktreePath: t.cwd,
+    endedTs: t.endedTs,   // the sort key — endedEntry reads it off this record
+    // No prs: PR links are snapshotted onto a closed record at kill time, and a
+    // transcript recovered by the scan has no record to have snapshotted them
+    // onto. The chips come back if its closed record is still around to win the
+    // dedupe below.
+  };
+}
 function collect(agents, now) {
   const running = [], ended = [];
+  // <host>::<transcriptId> of every session a registry-backed record covers.
+  // A killed session is reported through BOTH channels by construction — its
+  // closed record, and (once the slow scan catches up) its transcript in
+  // `resumable` — so the two have to collapse to one row. The record wins: it
+  // knows what the scan can't, namely the PRs it opened, when it was really
+  // killed, and that `resume` can have it back under its original id.
+  const carded = new Set();
+  const key = (a, tid) => a.key + "::" + tid;
   for (const a of agents) {
     for (const s of (a.sessions || [])) {
       if (s.status === "running") running.push({ a, s, live: liveState(s, a, now) });
       else ended.push(endedEntry(a, s, "stopped"));
+      if (s.transcriptId) carded.add(key(a, s.transcriptId));
     }
-    for (const c of (a.closedSessions || [])) ended.push(endedEntry(a, c, "closed"));
+    for (const c of (a.closedSessions || [])) {
+      ended.push(endedEntry(a, c, "closed"));
+      if (c.transcriptId) carded.add(key(a, c.transcriptId));
+    }
+  }
+  // Second pass, so a resumable row is only ever a fallback for a session no
+  // record above already speaks for.
+  for (const a of agents) {
+    for (const r of (a.repos || [])) {
+      for (const t of (r.resumable || [])) {
+        if (!t.transcriptId || carded.has(key(a, t.transcriptId))) continue;
+        carded.add(key(a, t.transcriptId));   // repos can report a shared origin
+        ended.push(endedEntry(a, resumableSession(t), "resumable"));
+      }
+    }
   }
   running.sort((x, y) =>
     (KIND_ORDER[x.live.kind] - KIND_ORDER[y.live.kind]) ||
@@ -1123,8 +1179,12 @@ function sessTitle(s) {
 function sessMeta(s) {
   if (s.root) return "repos root";
   const wt = String(s.worktreePath || "").split("/").filter(Boolean).pop();
+  // "detached" is a READING of the agent's git report, not the absence of one.
+  // A session recovered from the transcript scan has no git block at all — we
+  // don't know what it was on — so it says nothing rather than asserting a
+  // detached HEAD it was never told about.
   const b = s.git && s.git.branch;
-  const branch = (b && b !== "HEAD") ? b : "detached";
+  const branch = s.git ? ((b && b !== "HEAD") ? b : "detached") : null;
   return [wt, branch].filter(Boolean).join(" · ");
 }
 
@@ -1268,6 +1328,15 @@ function renameCard(a, s) {
   </div>`;
 }
 
+// What the row shows where a session card shows its id. A session id is 5 hex
+// chars; a resumable row is keyed on a 36-char transcript UUID instead, which
+// would swamp the meta line, so it's shortened to the same visual weight. It's a
+// label, not a handle — the row still dispatches on the full e.id.
+function endedRowId(e) {
+  return e.kind === "resumable"
+    ? String(e.s.transcriptId || "").slice(0, 8)
+    : e.id;
+}
 // One ended session. The card body is a button that opens its conversation
 // read-only on the stage; Resume sits beside it (a sibling, not a child — see
 // the .s-resume CSS) and brings the session back to life. Resume needs the host
@@ -1278,14 +1347,18 @@ function endedRow(e) {
   const resuming = pending.has(pendKey("start", a.key, e.id));
   const cur = e.id === endedViewId;
   const when = e.endedMs ? ago(Date.now() - e.endedMs) : "";
-  const state = (kind === "closed" ? "killed" : (s.status === "error" ? "failed" : "stopped"))
+  // A resumable row is a bare transcript: nothing recorded WHY it ended, only
+  // that it did, so it says the one thing that's true of all of them.
+  const state = (kind === "closed" ? "killed"
+    : kind === "resumable" ? "ended"
+    : (s.status === "error" ? "failed" : "stopped"))
     + (when ? " " + when : "");
   return `<div class="s-card-wrap ended-wrap">
     <button class="s-card ended ${cur ? "cur" : ""}" onclick="openEndedSession('${esc(e.id)}')">
       <span class="dot"></span>
       <span class="body">
         <div class="title">${esc(sessTitle(s))}</div>
-        <div class="meta"><span class="id">${esc(e.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}</div>
+        <div class="meta"><span class="id">${esc(endedRowId(e))}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}</div>
         <div class="state-row">
           <div class="state">${esc(state)}</div>
           ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
@@ -1375,26 +1448,45 @@ function startSession(key, repo) {
 }
 // Bring an ended session back. The endpoint depends on which channel reported
 // it (see endedEntry): a KILLED session was dropped from the registry and comes
-// back via `resume` (same id, same worktree, its conversation resumed), while a
-// merely stopped one still has its record and just needs `start`. Either way the
-// agent reports it as running on a following beat, which is what drops it out of
-// the ended list — the list is derived, so there is nothing here to remove.
+// back via `resume` (same id, same worktree, its conversation resumed); a merely
+// stopped one still has its record and just needs `start`; and one recovered by
+// the transcript scan has no record at all, so `resumeTranscript` relaunches it
+// at its own origin cwd — re-creating that dir if a delete/prune removed it —
+// under a NEW id the agent mints. Either way the agent reports it running on a
+// following beat, which is what drops it out of the ended list: the list is
+// derived, so there is nothing here to remove.
 function resumeEnded(ev, id) {
   if (ev) ev.stopPropagation();
   const e = findEnded(id);
   if (!e || !e.a.online) return;
-  const verb = e.kind === "closed" ? "resume" : "start";
   // Resuming is an intent to work in it, so hand off to the live session the way
-  // spawning does. The id survives both paths, so this is the plain by-id wait —
-  // no spawnCmdId correlation needed.
-  pendingSelect = id;
+  // spawning does. A resumed transcript lands under an id only the agent knows,
+  // so that one follows the queued command's cmdId (like a spawn); the other two
+  // keep their own id and can take the plain by-id wait.
   pendingSpawn = null;
   followedSpawn = false;
+  pendingSelect = e.kind === "resumable" ? null : id;
   // Only drop the stage if it's showing the very session being resumed; a
   // Resume clicked from the sidebar must not clear something else being read.
   if (endedViewId === id) clearStage();
-  busy(pendKey("start", e.a.key, id), { kind: "start", host: e.a.key, id },
-    () => post(`/api/agents/${enc(e.a.key)}/sessions/${enc(id)}/${verb}`));
+  const url = e.kind === "resumable"
+    ? `/api/agents/${enc(e.a.key)}/transcripts/${enc(e.s.transcriptId)}/resume`
+    : `/api/agents/${enc(e.a.key)}/sessions/${enc(id)}/${e.kind === "closed" ? "resume" : "start"}`;
+  // The origin cwd the row was built from; the agent re-validates it and won't
+  // take a path outside its repos root.
+  const body = e.kind === "resumable" ? { cwd: e.s.worktreePath || "" } : null;
+  // What clears the row's spinner. The by-id wait can't see a resumed transcript
+  // — it arrives under an id that didn't exist when the button was clicked — so
+  // that one watches its repo's session count grow instead, the same signal the
+  // dashboard's Resume picker uses.
+  const val = e.kind === "resumable"
+    ? { kind: "spawn", host: e.a.key, repo: e.s.repo,
+        baseline: (e.a.sessions || []).filter(s => s.repo === e.s.repo).length }
+    : { kind: "start", host: e.a.key, id };
+  busy(pendKey("start", e.a.key, id), val,
+    () => post(url, body).then(r => {
+      if (e.kind === "resumable") followSpawn(r && r.cmdId);
+    }));
 }
 // The ended-session pane's own Resume button.
 function resumeCurrentEnded() {

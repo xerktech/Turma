@@ -54,7 +54,11 @@ function makeEl(id) {
 // which the shim's null-returning querySelector otherwise hides from the page;
 // `textareas` is what document.querySelectorAll(".composer textarea[data-rk]")
 // finds, i.e. the composer boxes already on screen when a re-render starts.
-function loadPage({ search = "", sidebar = null, textareas = [] } = {}) {
+// `postReply`: opt a test into POSTs that actually answer, with this as the JSON
+// body. Off by default — a POST that never settles is what keeps the boot
+// refresh() inert for every other test, and only the paths that correlate a
+// reply (the cmdId a resumed transcript comes back under) need it.
+function loadPage({ search = "", sidebar = null, textareas = [], postReply = null } = {}) {
   const els = {};
   const opened = [];
   const posts = [];
@@ -76,7 +80,10 @@ function loadPage({ search = "", sidebar = null, textareas = [] } = {}) {
     // Records what the page asks for and never resolves, so the boot refresh()
     // is inert and a command POST can't race a test's assertions.
     fetch: (url, init) => {
-      if (init && init.method === "POST") posts.push({ url, body: JSON.parse(init.body || "{}") });
+      if (init && init.method === "POST") {
+        posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+        if (postReply) return Promise.resolve({ ok: true, status: 200, json: async () => postReply });
+      }
       return new Promise(() => {});
     },
     EventSource: class { addEventListener() {} close() {} static get CLOSED() { return 2; } },
@@ -520,6 +527,133 @@ test("an ended session's card carries Resume and its PR chips", () => {
   // The card is a <button>, so its chips must stay inert spans — a nested <a>
   // is invalid HTML the parser hoists out of the button.
   assert.ok(!/<a class="pr-badge/.test(e), "card chips are spans, not links");
+});
+
+// --- Ended sessions: the durable channel -------------------------------------
+// closed.json and sessions.json live in the agent's ~/.turma, which on a
+// container host is the image's writable layer — an agent update recreates the
+// container and both are gone, so a list built only from them empties on every
+// update. repo.resumable is re-derived from the transcripts under ~/.claude (a
+// bind mount), so it is what carries the list across a restart, and it isn't
+// capped at CLOSED_PER_REPO either. These cover the third channel, its dedupe
+// against the first two, and its own resume path.
+
+// A prior session as the agent's transcript scan reports it: no session id and
+// no PR links, because there is no registry record left to have held them.
+const resumable = (tid, summary, endedTs, extra) => ({
+  transcriptId: tid, summary, endedTs, repo: "repoX",
+  cwd: "/g/.turma/worktrees/repoX/" + tid, slug: "-g--turma-worktrees-repoX-" + tid,
+  origin: tid, root: false, ...extra,
+});
+const withResumable = (h, list) => { h.repos = [{ name: "repoX", resumable: list }]; return h; };
+
+test("ended sessions survive an agent restart that empties ~/.turma", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([]);
+  // The agent came back with no registry and no closed history — exactly what a
+  // recreated container reports. Only the transcript scan is left, and the list
+  // has to be built out of it rather than reading empty.
+  h.sessions = [];
+  h.closedSessions = [];
+  // Transcript ids deliberately sort OPPOSITE to the end times: ties fall back to
+  // the id, so ids that agree with the times would let a row that never got a
+  // sort key at all still land in the right order, for the wrong reason.
+  withResumable(h, [
+    resumable("t-zzz", "Recovered Newer", "2026-07-15T18:00:00Z"),
+    resumable("t-aaa", "Recovered Older", "2026-07-15T09:00:00Z"),
+  ]);
+  beat({ now, agents: [h] });
+
+  const e = els.ended.innerHTML;
+  assert.match(e, /Ended sessions <span class="count">2<\/span>/);
+  const order = ["Recovered Newer", "Recovered Older"].map((t) => e.indexOf(t));
+  assert.ok(order.every((i) => i >= 0), "both recovered sessions listed");
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), "sorted newest-ended first");
+  assert.match(e, /class="s-resume"/, "a recovered session is still resumable");
+  // The row has to SAY when it ended, which is the same field the sort reads.
+  assert.match(e, /ended \d+[smhd]/, "a recovered row carries its end time");
+});
+
+test("all three channels interleave into one list by when they ended", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([
+    { id: "22222", status: "stopped", repo: "repoX", summary: "Stopped Mid",
+      stoppedAt: "2026-07-15T12:00:00Z" },
+  ]);
+  h.closedSessions = [closed("33333", "Killed Newest", "2026-07-15T18:00:00Z")];
+  withResumable(h, [resumable("t-old", "Scanned Oldest", "2026-07-15T06:00:00Z")]);
+  beat({ now, agents: [h] });
+
+  const e = els.ended.innerHTML;
+  assert.match(e, /Ended sessions <span class="count">3<\/span>/);
+  const order = ["Killed Newest", "Stopped Mid", "Scanned Oldest"].map((t) => e.indexOf(t));
+  assert.ok(order.every((i) => i >= 0), "all three channels listed");
+  assert.deepEqual(order, [...order].sort((a, b) => a - b),
+    "one list ordered by end time, not grouped by channel");
+});
+
+test("a killed session reported through both channels collapses to one row", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([]);
+  // The scan finds a killed session's transcript too, so for as long as its
+  // closed record survives it is reported twice. The record has to win: it is
+  // the only one of the two that knows the PRs and the original id.
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z", {
+    transcriptId: "t-dup",
+    prs: [{ url: "https://github.com/o/r/pull/7", number: 7, state: "MERGED", checks: "passing" }],
+  })];
+  withResumable(h, [resumable("t-dup", "Killed", "2026-07-15T09:00:01Z")]);
+  beat({ now, agents: [h] });
+
+  const e = els.ended.innerHTML;
+  assert.match(e, /Ended sessions <span class="count">1<\/span>/, "one session, one row");
+  assert.ok(e.includes("#7 Merged"), "the surviving row is the one carrying the PR chips");
+  assert.match(e, /resumeEnded\(event,'33333'\)/, "and it resumes by its own session id");
+});
+
+test("a running session's transcript is never also listed as ended", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([
+    { ...working("11111", "Live One"), transcriptId: "t-live" },
+  ]);
+  // The agent cuts these against its live registry every beat, but the page must
+  // not depend on that: a session listed as both running and ended at once is
+  // the worst version of this list being wrong.
+  withResumable(h, [resumable("t-live", "Live One", "2026-07-15T09:00:00Z")]);
+  beat({ now, agents: [h] });
+  assert.equal(els.ended.innerHTML, "", "nothing ended — that transcript is live");
+});
+
+test("resuming a scanned transcript posts to resumeTranscript with its origin cwd", () => {
+  const { beat, resumeEnded, posts } = loadPage();
+  const { now, host: h } = host([]);
+  withResumable(h, [resumable("t-abc", "Recovered", "2026-07-15T09:00:00Z")]);
+  beat({ now, agents: [h] });
+
+  // No registry record exists to `resume` or `start` — the transcript is the only
+  // handle, and the agent re-creates its origin dir if a prune removed it.
+  resumeEnded(click, "t:t-abc");
+  assert.deepEqual(posts.map((p) => p.url),
+    ["/api/agents/hostA/transcripts/t-abc/resume"]);
+  assert.deepEqual(posts[0].body, { cwd: "/g/.turma/worktrees/repoX/t-abc" });
+});
+
+test("a resumed transcript is followed onto the stage under its new id", async () => {
+  const { beat, resumeEnded, opened } = loadPage({ postReply: { ok: true, cmdId: "cmd-9" } });
+  const { now, host: h } = host([]);
+  withResumable(h, [resumable("t-abc", "Recovered", "2026-07-15T09:00:00Z")]);
+  beat({ now, agents: [h] });
+
+  resumeEnded(click, "t:t-abc");
+  assert.deepEqual(opened, [], "nothing to open until the agent relaunches it");
+  await new Promise((r) => setImmediate(r)); // let the POST's reply land
+
+  // Unlike a killed session, this comes back under an id the agent mints, so the
+  // page can only recognise it by the cmdId its own POST was answered with.
+  h.repos = [{ name: "repoX", resumable: [] }];
+  h.sessions = [{ ...working("99999", "Recovered"), spawnCmdId: "cmd-9" }];
+  beat({ now, agents: [h] });
+  assert.deepEqual(opened, ["99999"]);
 });
 
 test("Resume is disabled while its host is offline, but the card still opens", () => {
