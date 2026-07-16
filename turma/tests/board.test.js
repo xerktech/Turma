@@ -9,7 +9,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  mergeSites, categoryOf, ticketSort, orgColor, ageStr, prioClass,
+  mergeSites, categoryOf, ticketSort, orgColor, orgName, ageStr, prioClass,
   cardHtml, boardHtml, detailHtml, textHtml, linkify,
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   repoChipHtml, repoFieldHtml,
@@ -133,6 +133,19 @@ test("orgColor: stable slot regardless of list order, wraps past 8", () => {
   assert.equal(orgColor("b.net", [...keys].reverse()), "var(--s2)", "order-independent");
   const many = Array.from({ length: 9 }, (_, i) => `s${i}.net`);
   assert.equal(orgColor("s8.net", many), "var(--s1)", "9th key wraps to slot 1");
+});
+
+test("orgName: the org, not the Jira Cloud host", () => {
+  assert.equal(orgName("myorg.atlassian.net"), "myorg");
+  assert.equal(orgName("MyOrg.Atlassian.Net"), "MyOrg", "case-insensitive suffix");
+  // Only the Jira Cloud suffix goes: on any other host the whole host is the
+  // org's name there, and a site merely CONTAINING the suffix keeps it.
+  assert.equal(orgName("jira.example.com"), "jira.example.com");
+  assert.equal(orgName("atlassian.net.example.com"), "atlassian.net.example.com");
+  // A host with no Jira reports no siteKey — the empty string the dashboard
+  // renders as no org suffix at all.
+  assert.equal(orgName(null), "");
+  assert.equal(orgName(undefined), "");
 });
 
 test("ageStr: human ages from ISO timestamps (Jira's +0000 offset included)", () => {

@@ -467,6 +467,9 @@ Cloudflare tunnel; port 8300 on the LAN.
 
 ### Fleet tree (host → repo → session)
 
+- Each host row reads **`<hostname> - <org>`** — the org whose Jira that host polls, from its `jira`
+  block's `siteKey` via `TurmaBoard.orgName` (which is why the dashboard loads `board.js`). A host
+  with no Jira creds reports no `siteKey` and shows its name alone.
 - Each host has a **"Clone from GitHub" bar**: a dropdown of the host's `gh` login's repos
   (already-present ones disabled) plus a free-text `owner/repo` box, which clones a repo into the
   repos root so it joins the tree. It's greyed out with a note on hosts reporting no GitHub creds.
@@ -536,6 +539,10 @@ Cloudflare tunnel; port 8300 on the LAN.
   wins per site+user; different users on one site union, deduped by issue key).
 - Columns are Jira's three universal status categories, and each card's pill shows the org's own
   status name.
+- The org filter chips are **labelled by `orgName(siteKey)`** — the site host minus its
+  `.atlassian.net` suffix, since the org is the only part of it a human reads (the full host stays as
+  the chip's tooltip). Presentational only: the chip still filters on, and the board stays keyed on,
+  the whole `siteKey`. A non-`atlassian.net` site keeps its whole host, which is its name there.
 - Pull-only: nothing on this page writes to Jira.
 - Tests: `turma/tests/board.test.js`, plus the ticket-detail and jira-refresh endpoint cases in
   `server.test.js`.
