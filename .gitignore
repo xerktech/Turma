@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Local compose secrets — never commit
+.env

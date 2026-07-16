@@ -1,0 +1,121 @@
+# Turma agent — one container per host, mounted at that host's git root.
+#
+#   cp .env.example .env && $EDITOR .env
+#   docker compose -f agent.yaml up -d
+#
+# Run one of these on EACH machine you want sessions to run on. It scans
+# REPOS_ROOT one level deep for git repos and, on command from the hub, spawns
+# worktree-backed Claude Code sessions.
+#
+# It connects purely OUTBOUND to TURMA_URL, so the host needs no inbound
+# exposure, no port forward, and no static address. Each session's terminal is
+# served by a loopback-only ttyd and reaches the hub through that same outbound
+# tunnel — which is why nothing here publishes a port.
+#
+# Prerequisite: this host must have a logged-in Claude. The container reuses the
+# HOST's login through the ~/.claude bind mount and never runs `claude /login`
+# itself — see "Log in on the host" in the root README. Without it the container
+# boots and idles.
+
+services:
+  agent-host:
+    image: ghcr.io/xerktech/turma-agent:latest
+    container_name: turma-agent
+    restart: unless-stopped
+
+    environment:
+      # The hub's URL, reachable from this host. Use the public/tunnel URL when
+      # the agent is on a different machine than the hub.
+      TURMA_URL: "${HUB_URL:?set HUB_URL in .env}"
+      # Must equal the hub's TURMA_AGENT_TOKEN. Also doubles as the basic-auth
+      # password for each session's ttyd, so do not leave it empty — an empty
+      # value silently falls back to the literal "changeme".
+      TURMA_TOKEN: "${TURMA_AGENT_TOKEN:?set TURMA_AGENT_TOKEN in .env}"
+
+      # How the hub keys and labels this host. Defaults to a docker/SMB probe;
+      # set it explicitly and the probe is skipped.
+      DEVICE_NAME: "${AGENT_DEVICE_NAME:-my-host}"
+
+      # The git root to scan, as seen INSIDE the container — deliberately a
+      # fixed path, not your host path. The host side is HOST_REPOS_ROOT in the
+      # bind mount below. (Named apart on purpose: compose lets the calling
+      # shell's environment override .env, and REPOS_ROOT is exported inside
+      # every agent container, so a .env REPOS_ROOT would be silently ignored
+      # by anyone running this from a Turma session.)
+      REPOS_ROOT: "/repos"
+
+      # Concurrent sessions. Sized against this host's RAM/CPU and the fact that
+      # every session shares the one mounted Claude login.
+      MAX_SESSIONS: "${AGENT_MAX_SESSIONS:-6}"
+
+      # First loopback port for per-session ttyd; a session takes the next free
+      # port from here. Not published — the tunnel carries it.
+      TTYD_PORT_BASE: "7700"
+
+      # Lets a session opt into --permission-mode bypassPermissions while
+      # running as root. Harmless on a host that drops to a non-root uid (see
+      # PUID below), which does not need it.
+      IS_SANDBOX: "1"
+
+      # Identity to run as. Leave unset and the entrypoint auto-detects it from
+      # REPOS_ROOT's owner, which is what you want: a root-owned git root stays
+      # root, a user-owned one (a desktop/WSL ~/git) drops to that user, so
+      # nothing lands root-owned in your own repos. Set PUID=0 to force root.
+      # PUID: "1000"
+      # PGID: "1000"
+
+      # --- Optional: Jira. Unset = feature off, zero Jira HTTP. Read-only:
+      # the only endpoints ever called are issue search and issue GET.
+      # JIRA_SITE: "${AGENT_JIRA_SITE:-}"          # https://your-org.atlassian.net
+      # JIRA_EMAIL: "${AGENT_JIRA_EMAIL:-}"
+      # JIRA_TOKEN: "${AGENT_JIRA_TOKEN:-}"
+
+      # Optional: extra owners to offer in the hub's clone dropdown, beyond the
+      # gh login's own repos and orgs. Comma-separated.
+      # GH_CLONE_OWNERS: "${AGENT_GH_CLONE_OWNERS:-}"
+
+    volumes:
+      # --- The git root. Sessions' worktrees and every file they edit land
+      # here, on the host, owned by the uid resolved above.
+      - "${HOST_REPOS_ROOT:?set HOST_REPOS_ROOT in .env}:/repos"
+
+      # --- The Claude login + transcripts. REQUIRED. This is the host's own
+      # login, reused; the image bakes no credential. HOME stays /root inside
+      # the container, so these paths are fixed.
+      - "${HOME}/.claude:/root/.claude"
+      - "${HOME}/.claude.json:/root/.claude.json"
+
+      # --- gh login. Needed for private clones and `gh pr create`.
+      # Must be a plaintext oauth_token in hosts.yml — there is no OS keyring in
+      # the container. Linux hosts already store it that way. A Windows host
+      # keeps it in Credential Manager instead, so seed it from INSIDE the
+      # container once: docker exec -it turma-agent gh auth login
+      - "${HOME}/.config/gh:/root/.config/gh"
+
+      # --- The agent's own state. Worth persisting: this holds the session
+      # registry that auto-resume reads on boot, and the durable usage ledger
+      # that keeps transcripts attributable to a repo after their session is
+      # gone. Without it, recreating the container (an image update, say)
+      # silently drops both.
+      - turma-agent-state:/root/.turma
+
+      # --- Docker socket. Used for the device-name probe, the container-log
+      # tail on the heartbeat, and hub-initiated restarts. Drop it and those
+      # degrade; sessions still run.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # --- Optional cloud credentials, reused from the host exactly like the
+      # two above. Mounting none is a supported configuration: the entrypoint
+      # only logs which stores it found and never idles over a missing one.
+      # - "${HOME}/.aws:/root/.aws"
+      # - "${HOME}/.azure:/root/.azure"
+      # - "${HOME}/.terraform.d:/root/.terraform.d"
+
+    # One container hosts MAX_SESSIONS concurrent Claude sessions, so size these
+    # against that number rather than against a single session.
+    mem_limit: "${AGENT_MEM_LIMIT:-12g}"
+    cpus: ${AGENT_CPUS:-6}
+    pids_limit: 4096
+
+volumes:
+  turma-agent-state:
