@@ -158,14 +158,39 @@ function renderChangelogSection(opts) {
 
 const CHANGELOG_MARKER = "<!-- releases:newest-first -->";
 
+// The version token from a "## <version> ..." heading line, else null.
+function headingVersion(line) {
+  if (!line.startsWith("## ")) return null;
+  const rest = line.slice(3).trim();
+  return rest ? rest.split(/\s+/)[0] : null;
+}
+
+// Drop the "## <version> ... " section (heading through the line before the next
+// "## " heading, or EOF) via line iteration — deliberately NOT a dynamic RegExp,
+// both to dodge a ReDoS and because the version string is untrusted-ish input.
+function removeSection(md, version) {
+  const out = [];
+  let skipping = false;
+  for (const line of md.split("\n")) {
+    if (line.startsWith("## ")) {
+      if (headingVersion(line) === version) {
+        skipping = true;
+        continue;
+      }
+      skipping = false; // a different section heading ends the skip
+    }
+    if (!skipping) out.push(line);
+  }
+  return out.join("\n").replace(/^\n+/, "");
+}
+
 // Prepend `section` under the newest-first marker, idempotently: if a section
 // for the same version already exists it's replaced (re-running a dispatch
 // doesn't double-insert). `section` must start with its own `## <version> ` line.
 function insertSection(existingMd, section) {
   const md = String(existingMd);
   const markerIdx = md.indexOf(CHANGELOG_MARKER);
-  const versionMatch = /^##\s+(\S+)/.exec(section);
-  const version = versionMatch ? versionMatch[1] : null;
+  const version = headingVersion(section.split("\n")[0]);
 
   let head;
   let rest;
@@ -179,11 +204,7 @@ function insertSection(existingMd, section) {
   }
 
   // Drop any existing section for this version so re-runs are idempotent.
-  if (version) {
-    const esc = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp(`(^|\\n)##\\s+${esc}(?:\\s|$)[\\s\\S]*?(?=\\n##\\s|$)`);
-    rest = rest.replace(re, "").replace(/^\n+/, "");
-  }
+  if (version) rest = removeSection(rest, version);
 
   const sec = section.replace(/\s*$/, "") + "\n";
   return `${head}\n\n${sec}${rest ? "\n" + rest.replace(/\s*$/, "") + "\n" : ""}`;
