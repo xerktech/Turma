@@ -124,7 +124,7 @@ expect "tunnel uid" "0" "$(field "$out" "TUNNEL uid")"
 expect "no chown of a root-owned tree" "0" \
   "$(docker run --rm -v "$WORK/fx1:/f" busybox find /f/repos /f/claude ! -user 0 | wc -l | tr -d ' ')"
 
-# --- Case 2: user-owned git root (WSL / desktop, e.g. maxai) -----------------
+# --- Case 2: user-owned git root (WSL / desktop) ------------------------------
 # The reason this change exists: drop to the owning uid, and reclaim what the
 # pre-drop image already left root-owned.
 echo "== case: user-owned REPOS_ROOT drops to that uid and self-heals"

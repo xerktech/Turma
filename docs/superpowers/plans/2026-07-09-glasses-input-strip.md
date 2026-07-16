@@ -6,7 +6,7 @@
 
 **Architecture:** Generalize the renderer from `render(state) → string[]` to `render(state) → ScreenModel` (a discriminated union). Every screen except the session screen returns `{type:"lines"}` unchanged. The session screen returns `{type:"session", transcriptLines, bottom}` where `bottom` is an input box or a question sheet. The Even Hub backend builds three containers for `session` (transcript + bordered box + status corner) and one for `lines`; the DOM dev backend stacks them. Session-screen interaction adopts ClaudeHUD's transcript-vs-bottom focus model.
 
-**Tech Stack:** TypeScript (strict), Vite, Vitest, `@evenrealities/even_hub_sdk` (structural typing only, dynamically imported in `evenhub.ts`). Reference port source: `C:\Users\mhabeeb\OneDrive\Projects\Code\personal\xerktech\ClaudeHUD\plugin\src\screens\{input-strip,prompt-sheet,chat,text-wrap}.ts` and the `.claude/skills/{glasses-ui,sdk-reference}` skills under ClaudeHUD.
+**Tech Stack:** TypeScript (strict), Vite, Vitest, `@evenrealities/even_hub_sdk` (structural typing only, dynamically imported in `evenhub.ts`). Screen behaviour is ported from the ClaudeHUD plugin's `input-strip`/`prompt-sheet`/`chat`/`text-wrap` screens (a separate, private project — not required to build or work on this repo).
 
 ## Global Constraints
 

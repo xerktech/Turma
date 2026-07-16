@@ -48,12 +48,23 @@ npm run dev         # in another — Vite dev server, DOM backend
 `npm run dev` opens a keyboard-driven DOM stand-in for the glasses display:
 arrow keys scroll, Enter taps, Escape double-taps (back).
 
-The hub URL is hardcoded (`DEFAULT_HUB_URL` in `src/config.ts`) so the phone
-login page only asks for a username and password, exactly like the web
-dashboard's login. For local dev, `VITE_HUB_URL` overrides that target (e.g.
-to point at the mock-hub or a LAN hub), and `VITE_HUB_USER` /
+The hub URL is entered on the phone login page, alongside the username and
+password — the hub is self-hosted, so the app ships no default host. It is
+persisted with the credentials (`BridgeStorage` survives Even app restarts), so
+it is typed **once per device** and prefilled from then on, including across a
+sign-out (which clears the credentials but keeps the hub). A scheme-less host
+like `turma.example.com` is fine — `normalizeHubUrl` adds the `https://`.
+
+For local dev, `VITE_HUB_URL` still overrides the target (e.g. to point at the
+mock-hub or a LAN hub) and takes precedence over anything stored on the device,
+so a stored value can't hijack `npm run dev`. `VITE_HUB_USER` /
 `VITE_HUB_PASSWORD` prefill the credentials — set them in a `.env.local` Vite
 picks up before running `npm run dev`.
+
+Note the hub you enter must still be listed in `app.json`'s `network`
+whitelist: the Even WebView enforces it at the network layer, and it is fixed
+at pack time. The login field makes the app forkable (package it with your own
+host), not able to reach an arbitrary hub at runtime.
 
 ## Simulator
 
@@ -169,12 +180,14 @@ portal:
   install (shown under "Public" plugins).
 
 **For Turma HUD specifically, the private/beta lane is the realistic one.**
-The app is single-user and self-hosted: the hub URL is hardcoded
-(`DEFAULT_HUB_URL` in `src/config.ts`), it sits behind HTTP Basic auth, and the
+The app is single-user and self-hosted: it sits behind HTTP Basic auth, and the
 `app.json` `network` whitelist is pinned to one host. A public installer has no
 reachable hub and no credentials, so a public store listing wouldn't be usable.
-Going genuinely public would first require making the hub URL user-configurable
-at login and loosening/parameterizing the `network` whitelist accordingly.
+The hub URL is now user-configurable at login (it used to be hardcoded), which
+was half of what going genuinely public needs; the remaining half is the
+`network` whitelist, which the WebView enforces and which is fixed at pack
+time — a build can only reach the hosts it was packaged for, whatever the
+login page accepts.
 
 ## Testing the hub audio path without glasses
 
@@ -189,9 +202,9 @@ to exercise the whole STT path without hardware.
 ## On-hardware QA checklist
 
 - Whitelist edited to your hub host and the app sideloads/opens OK.
-- Signed in via the phone login page (matches the web dashboard's login —
-  username + password; the hub URL is hardcoded in `src/config.ts`) and the
-  glasses-display mirror appears.
+- Signed in via the phone login page (hub URL + username + password) and the
+  glasses-display mirror appears. The hub URL must match a host in the
+  `app.json` whitelist above, and should be prefilled on any later sign-in.
 - Session list matches the web dashboard.
 - Each lifecycle action (spawn/kill/start/restart/resume) shows queued (…)
   then converges within ~40s.

@@ -116,8 +116,10 @@
   body.backend-dom #glasses-display { display: block; }
 </style>
 
-<!-- Login card — matches the web dashboard's login page. The hub URL is
-     hardcoded (config.ts), so only username + password are collected. -->
+<!-- Login card — matches the web dashboard's login page, plus a hub URL field
+     (the hub is self-hosted, so there is no default host to assume). The URL is
+     persisted with the credentials, so it is entered once per device and
+     prefilled on every later sign-in. -->
 <div class="card" id="login">
   <div class="brand">
     <span class="mark">
@@ -130,6 +132,15 @@
   <div class="error" id="login-error"></div>
 
   <form id="login-form" autocomplete="on">
+    <!-- Deliberately type="text" (not type="url") and not `required`: both hand
+         native constraint validation a veto over submit, and it rejects the
+         scheme-less "turma.example.com" a phone keyboard invites — so the
+         browser would block the form with its own bubble before config.ts's
+         `normalizeHubUrl` ever got to add the https:// for you. inputmode="url"
+         still gets the URL keyboard. Blank/typo handling is ours, in JS. -->
+    <label>Hub URL
+      <input id="hub-url" name="url" type="text" inputmode="url" autocomplete="url" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="https://turma.example.com" />
+    </label>
     <label>Username
       <input id="hub-user" name="username" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" autofocus required />
     </label>

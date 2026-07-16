@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   CONFIG_STORAGE_KEY,
+  isConfigured,
   LEGACY_CONFIG_STORAGE_KEY,
   loadConfig,
+  normalizeHubUrl,
   saveConfig,
   type Config,
 } from "./config.ts";
@@ -60,5 +62,71 @@ describe("loadConfig legacy key migration", () => {
     expect(storage.store[LEGACY_CONFIG_STORAGE_KEY]).toBeUndefined();
     const cfg = await loadConfig(storage);
     expect(cfg.user).toBe("a");
+  });
+});
+
+describe("normalizeHubUrl", () => {
+  it("defaults a missing scheme to https (a phone keyboard omits it)", () => {
+    expect(normalizeHubUrl("turma.example.com")).toBe("https://turma.example.com");
+  });
+
+  it("leaves an explicit scheme alone, including http for a LAN hub", () => {
+    expect(normalizeHubUrl("http://192.168.1.10:8300")).toBe("http://192.168.1.10:8300");
+    expect(normalizeHubUrl("https://turma.example.com")).toBe("https://turma.example.com");
+  });
+
+  it("trims surrounding space and strips trailing slashes so callers can append paths", () => {
+    expect(normalizeHubUrl("  https://turma.example.com//  ")).toBe("https://turma.example.com");
+  });
+
+  it("maps blank input to blank rather than a bare scheme", () => {
+    expect(normalizeHubUrl("")).toBe("");
+    expect(normalizeHubUrl("   ")).toBe("");
+  });
+});
+
+describe("loadConfig hub URL", () => {
+  const stored = (hubUrl: unknown): Record<string, string> => ({
+    [CONFIG_STORAGE_KEY]: JSON.stringify({ hubUrl, user: "u", password: "p", pollMs: 6000 }),
+  });
+
+  it("honors the stored hub URL — the whole point of persisting it", async () => {
+    const cfg = await loadConfig(fakeStorage(stored("https://hub.example.org")));
+    expect(cfg.hubUrl).toBe("https://hub.example.org");
+  });
+
+  it("normalizes the stored value, so a config saved by an older build still works", async () => {
+    const cfg = await loadConfig(fakeStorage(stored("https://hub.example.org/")));
+    expect(cfg.hubUrl).toBe("https://hub.example.org");
+  });
+
+  it("has no baked-in host: an unconfigured device loads a blank hub URL", async () => {
+    const cfg = await loadConfig(fakeStorage());
+    expect(cfg.hubUrl).toBe("");
+  });
+
+  it("falls back to blank when the stored hub URL is the wrong type", async () => {
+    const cfg = await loadConfig(fakeStorage(stored(42)));
+    expect(cfg.hubUrl).toBe("");
+  });
+});
+
+describe("isConfigured", () => {
+  const cfg = (over: Partial<Config> = {}): Config => ({
+    hubUrl: "https://turma.example.com",
+    user: "u",
+    password: "p",
+    pollMs: 6000,
+    ...over,
+  });
+
+  it("is true only once a hub and both credentials are present", () => {
+    expect(isConfigured(cfg())).toBe(true);
+  });
+
+  it("is false when any one of them is missing", () => {
+    expect(isConfigured(cfg({ hubUrl: "" }))).toBe(false);
+    expect(isConfigured(cfg({ user: "" }))).toBe(false);
+    expect(isConfigured(cfg({ password: "" }))).toBe(false);
   });
 });
