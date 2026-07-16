@@ -336,7 +336,7 @@ function ingestHistory(agent, historyResults) {
 // type, so the short description/label disambiguates them. NUL-separated
 // because neither field can contain it.
 function subagentKey(sessionId, type, label) {
-  return String(sessionId) + " " + String(type || "") + " " + String(label || "");
+  return String(sessionId) + "\0" + String(type || "") + "\0" + String(label || "");
 }
 
 // Same lifecycle as ingestHistory, keyed by (session,type,label) — merges the

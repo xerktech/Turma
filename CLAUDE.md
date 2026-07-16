@@ -943,7 +943,7 @@ Constraints that shape the jobs (established in the sibling SwitchBoard repo):
   user whose repos these are.
   - A root-owned git root (the TrueNAS stack) resolves to `0:0` and the container stays root exactly
     as before.
-  - A user-owned git root (WSL/desktop, e.g. maxai's `/home/mhabeeb/git`) resolves to that uid and the
+  - A user-owned git root (WSL/desktop, e.g. `/home/<user>/git`) resolves to that uid and the
     container drops to it, so nothing lands root-owned in the operator's own repo or `~/.claude`.
   - `PUID=0` forces the old always-root behaviour.
 - Because it drops, the entrypoint also:
