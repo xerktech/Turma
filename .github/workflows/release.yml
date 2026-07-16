@@ -92,12 +92,20 @@ jobs:
           node-version: "24"
       - name: Resolve flags
         id: flags
+        # Interpolated through env: rather than ${{ }} inside run:, which
+        # expands into the shell script itself and is a SAST finding (the
+        # Semgrep gate blocks on it). Neither value is attacker-controlled
+        # here, but the safe shape costs nothing and keeps the rule honest for
+        # the ones that would be.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           # On a push trigger there are no inputs -> a real (non-dry) release.
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "$EVENT_NAME" = "push" ]; then
             echo "dry_run=false" >> "$GITHUB_OUTPUT"
           else
-            echo "dry_run=${{ inputs.dry_run }}" >> "$GITHUB_OUTPUT"
+            echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
           fi
       - name: Compute plan
         id: plan

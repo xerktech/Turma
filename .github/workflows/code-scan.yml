@@ -30,7 +30,13 @@ on:
       - "agent/**"
       - "turma/**"
       - ".github/scripts/**"
-      - ".github/workflows/code-scan.yml"
+      # Every workflow, not just this one: Semgrep's shell-injection rules read
+      # the workflows themselves, so scoping this to code-scan.yml meant a
+      # `run:` step interpolating ${{ }} could land in any OTHER workflow
+      # without the gate that exists to catch it ever running. One did — see the
+      # Resolve flags step in release.yml. Workflow edits are rare, so the wider
+      # trigger costs little.
+      - ".github/workflows/**"
 
 concurrency:
   group: code-scan-${{ github.ref }}
