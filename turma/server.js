@@ -398,6 +398,49 @@ function findJiraHost(siteKey, requireOnline) {
   return requireOnline ? null : stale;
 }
 
+// The repo an org's board says a ticket belongs in, as triaged by whichever host
+// reported it (see the Jira -> repo triage section in hub-agent.py). null when no
+// host reports the ticket, or none has triaged it yet, or the model declined it.
+// The FRESHEST reporting block wins, matching how board.js merges the same
+// tickets for display — the hub must resolve against what the operator clicked.
+function ticketRepo(siteKey, issueKey) {
+  let best = null, bestAt = "";
+  for (const a of Object.values(agents)) {
+    if (!a.jira || a.jira.siteKey !== siteKey) continue;
+    const t = (a.jira.tickets || []).find((x) => x && x.key === issueKey);
+    if (!t || !t.repoGuess || !t.repoGuess.repo) continue;
+    const at = String(a.jira.fetchedAt || "");
+    if (!best || at > bestAt) { best = t.repoGuess.repo; bestAt = at; }
+  }
+  return best;
+}
+
+// Which HOST should run a ticket's session: an ONLINE host that both reports the
+// org and has the ticket's repo cloned. Those are two different requirements and
+// findJiraHost only covers the first — with two hosts on one org, the one holding
+// the creds is not necessarily the one holding the repo, and a spawn on a host
+// without the repo just logs a refusal the operator never sees.
+//
+// Online is required rather than preferred (unlike the read-only GET above, which
+// happily serves an offline host's cache): a spawn queued onto a sleeping host
+// would land whenever it next wakes, which is a surprise, not a feature.
+// Returns {host} | {error, status}.
+function findTicketHost(siteKey, repo) {
+  const now = Date.now();
+  let offline = false, wrongRepo = false;
+  for (const [key, a] of Object.entries(agents)) {
+    if (!a.jira || a.jira.siteKey !== siteKey) continue;
+    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) { offline = true; continue; }
+    if (!(a.repos || []).some((r) => r && r.name === repo)) { wrongRepo = true; continue; }
+    return { host: key };
+  }
+  if (wrongRepo) {
+    return { status: 409, error: `no online host for that org has ${repo} cloned` };
+  }
+  if (offline) return { status: 503, error: "every host reporting that Jira org is offline" };
+  return { status: 404, error: "no host reports that Jira org" };
+}
+
 // Which HOST owns a given sessionId, and that session's ttyd port. Sessions are
 // per-host but sessionIds are globally unique, so /term/<sessionId> can be
 // routed by scanning every host's sessions[]. null if no host reports it.
@@ -1800,6 +1843,49 @@ const server = http.createServer(async (req, res) => {
         .find((c) => c.type === "jiraIssue" && c.issueKey === issueKey);
       const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "jiraIssue", issueKey });
       return json(res, 202, { pending: true, cmdId });
+    }
+
+    // POST /api/jira/<siteKey>/<issueKey>/session -> start a session to work
+    // this ticket (the board card's start button).
+    //
+    // The hub's whole job here is ROUTING — picking the one host that can do the
+    // work — because it's the only party that sees the whole fleet. It sends just
+    // the issue key: the agent re-derives the repo, the ticket text and the branch
+    // name from its own local state, so a board that's a beat or two stale can't
+    // spawn against a repo the ticket has since been re-triaged away from.
+    //
+    // The reply is the queued cmdId, which the agent echoes back on the session it
+    // mints as `spawnCmdId` — the same correlation handle the composer's spawn
+    // uses, since the session id doesn't exist yet at POST time.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "session") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!/^[A-Za-z][A-Za-z0-9_]*-[0-9]+$/.test(issueKey)) {
+        return json(res, 400, { error: "not a Jira issue key" });
+      }
+      // Org first, then the repo: an org nobody reports has no ticket to be
+      // untriaged, and answering "no triaged repo yet" for it would send the
+      // operator looking for a triage problem they don't have.
+      if (!findJiraHost(siteKey, false)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      const repo = ticketRepo(siteKey, issueKey);
+      // The button is only enabled on a triaged, cloned ticket, so this is a
+      // stale board (or a hand-rolled POST) rather than a normal path.
+      if (!repo) {
+        return json(res, 409, { error: "that ticket has no triaged repo yet" });
+      }
+      const { host, error, status } = findTicketHost(siteKey, repo);
+      if (!host) return json(res, status, { error });
+      // Single-flight per ticket, like the jiraIssue fetch above: a double-click
+      // (or a click while the first spawn is still riding the queue) must not
+      // start two sessions on one ticket.
+      const pending = (agents[host].commands || [])
+        .find((c) => c.type === "spawnTicket" && c.issueKey === issueKey);
+      const cmdId = pending ? pending.cmdId
+        : queueCommand(host, { type: "spawnTicket", issueKey });
+      return json(res, 200, { ok: true, cmdId, host, repo });
     }
 
     // Terminal proxy: /term/<sessionId>/… -> the ttyd of the host that owns

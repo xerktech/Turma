@@ -13,6 +13,7 @@ const {
   cardHtml, boardHtml, detailHtml, textHtml, linkify,
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   repoChipHtml, repoFieldHtml,
+  ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
 } = require("../public/board.js");
 
 function ticket(key, over = {}) {
@@ -559,4 +560,225 @@ test("mergeSites: the repo guess survives the cross-host merge", () => {
   const t = ticket("X-1", { repoGuess: { repo: "Turma", cloned: true, reason: "" } });
   const sites = mergeSites([agent("hostA", block({ tickets: [t] }))]);
   assert.deepEqual(sites[0].tickets[0].repoGuess, { repo: "Turma", cloned: true, reason: "" });
+});
+
+// ---- ticket -> session link + the start button -------------------------------
+// The agent stamps `session.ticket` on any session it spawns from a ticket; the
+// board walks that backwards out of the fleet payload it already polls. These
+// assert the link survives the walk and that the four button states stay
+// distinguishable — "start it", "starting", "clone it first" and "not triaged"
+// are four different answers, and only one of them is a working button.
+
+function sess(id, over = {}) {
+  return { id, status: "running", createdAt: "2026-07-14T10:00:00Z", ...over };
+}
+function tsess(id, key, over = {}) {
+  return sess(id, {
+    ticket: { key, siteKey: "myorg.atlassian.net", branch: key,
+              url: `https://myorg.atlassian.net/browse/${key}` },
+    ...over,
+  });
+}
+const guess = (over = {}) => ({ repoGuess: { repo: "Turma", cloned: true, reason: "", ...over } });
+
+test("ticketSessionIndex: finds a ticket's sessions across the fleet", () => {
+  const idx = ticketSessionIndex([
+    agent("hostA", block(), { sessions: [tsess("s1", "X-1"), sess("s9")] }),
+    agent("hostB", block(), { sessions: [tsess("s2", "X-1"), tsess("s3", "X-2")] }),
+  ]);
+  assert.deepEqual(
+    ticketSessionsOf(idx, "myorg.atlassian.net", "X-1").map(s => s.id), ["s1", "s2"]);
+  assert.deepEqual(
+    ticketSessionsOf(idx, "myorg.atlassian.net", "X-2").map(s => s.id), ["s3"]);
+  // A session with no ticket is simply not in the index.
+  assert.deepEqual(ticketSessionsOf(idx, "myorg.atlassian.net", "X-9"), []);
+});
+
+test("ticketSessionIndex: the host is carried onto each session", () => {
+  const idx = ticketSessionIndex([agent("hostA", block(), { sessions: [tsess("s1", "X-1")] })]);
+  assert.equal(ticketSessionsOf(idx, "myorg.atlassian.net", "X-1")[0].host, "hostA");
+});
+
+test("ticketSessionIndex: same key in two orgs never collides", () => {
+  // Issue keys are only unique WITHIN a site, and the board is cross-org.
+  const other = { ...tsess("s2", "X-1"), ticket: { key: "X-1", siteKey: "other.atlassian.net" } };
+  const idx = ticketSessionIndex([agent("hostA", block(), { sessions: [tsess("s1", "X-1"), other] })]);
+  assert.deepEqual(ticketSessionsOf(idx, "myorg.atlassian.net", "X-1").map(s => s.id), ["s1"]);
+  assert.deepEqual(ticketSessionsOf(idx, "other.atlassian.net", "X-1").map(s => s.id), ["s2"]);
+});
+
+test("ticketSessionIndex: sessions read oldest first (branch order)", () => {
+  // The first session on a ticket holds the bare X-1 branch; -1 came after it.
+  const idx = ticketSessionIndex([agent("hostA", block(), {
+    sessions: [tsess("new", "X-1", { createdAt: "2026-07-14T12:00:00Z" }),
+               tsess("old", "X-1", { createdAt: "2026-07-14T09:00:00Z" })],
+  })]);
+  assert.deepEqual(ticketSessionsOf(idx, "myorg.atlassian.net", "X-1").map(s => s.id),
+    ["old", "new"]);
+});
+
+test("ticketSessionIndex: a killed session still shows on its ticket", () => {
+  // The record outlives the process, so the link does too — that's the point of
+  // hanging it on the session rather than on a hub-side store.
+  const idx = ticketSessionIndex([agent("hostA", block(), {
+    sessions: [tsess("s1", "X-1", { status: "stopped" })],
+  })]);
+  assert.equal(ticketSessionsOf(idx, "myorg.atlassian.net", "X-1").length, 1);
+});
+
+test("sessionChipHtml: links into the session and shows its live state", () => {
+  const html = sessionChipHtml(tsess("abc12", "X-1", { summary: "X-1 Fixing The Board" }));
+  assert.ok(html.includes(`href="/sessions?session=abc12"`));
+  assert.ok(html.includes("running"));
+  assert.ok(!html.includes("kc-sess-off"));
+});
+
+test("sessionChipHtml: labels with the BRANCH, not the ticket-derived name", () => {
+  // The session is named FROM the ticket, so its name just repeats the key and
+  // summary already on this card; the branch is what tells two sessions apart.
+  const html = sessionChipHtml(tsess("s1", "X-1", {
+    summary: "X-1 Fixing The Board", git: { branch: "X-1-2" },
+  }));
+  assert.ok(html.includes(">X-1-2<"), "the branch is the label");
+  assert.ok(!html.includes(">X-1 Fixing The Board<"), "the name must not be the label");
+  assert.ok(html.includes(`title="X-1 Fixing The Board · running"`), "the name rides the tooltip");
+});
+
+test("sessionChipHtml: an operator's rename beats the branch", () => {
+  // A typed name is deliberate; the branch is derived. summaryManual is the flag
+  // that tells them apart.
+  const html = sessionChipHtml(tsess("s1", "X-1", {
+    summary: "Chasing The Real Bug", summaryManual: true, git: { branch: "X-1-2" },
+  }));
+  assert.ok(html.includes(">Chasing The Real Bug<"));
+  assert.ok(html.includes("branch X-1-2"), "the branch drops to the tooltip");
+});
+
+test("sessionChipHtml: the label can ellipsise (its own element, not the flex chip)", () => {
+  // text-overflow can't clip anonymous flex content — it hard-cuts mid-letter.
+  const html = sessionChipHtml(tsess("s1", "X-1"));
+  assert.ok(/<span class="kc-sess-name">/.test(html));
+});
+
+test("sessionChipHtml: a stopped session is visibly not running", () => {
+  const html = sessionChipHtml(tsess("s1", "X-1", { status: "stopped", summary: "Done Thing" }));
+  assert.ok(html.includes("kc-sess-off"));
+  assert.ok(html.includes("stopped"));
+});
+
+test("sessionChipHtml: an errored session reads as failed, not merely stopped", () => {
+  const html = sessionChipHtml(tsess("s1", "X-1", { status: "error" }));
+  assert.ok(html.includes("kc-sess-err"));
+  assert.ok(html.includes("failed"));
+});
+
+test("sessionChipHtml: prefers the LIVE branch over the reserved one", () => {
+  // The reservation is what the agent was TOLD; git is what it did.
+  const html = sessionChipHtml(tsess("s1", "X-1", { git: { branch: "X-1-actual" } }));
+  assert.ok(html.includes(">X-1-actual<"));
+});
+
+test("sessionChipHtml: falls back to the reserved branch, then the id", () => {
+  // Before the agent branches there's no live branch, only the reserved one.
+  assert.ok(sessionChipHtml(tsess("s1", "X-1")).includes(">X-1<"));
+  assert.ok(sessionChipHtml(sess("s1", { ticket: { key: "X-1" } })).includes(">s1<"));
+});
+
+test("sessionChipHtml: escapes a hostile session name", () => {
+  const html = sessionChipHtml(tsess("s1", "X-1", {
+    summary: `<img src=x onerror=1>`, summaryManual: true,
+  }));
+  assert.ok(!html.includes("<img"));
+  assert.ok(html.includes("&lt;img"));
+});
+
+test("ticketStartHtml: a triaged, cloned ticket gets a working start button", () => {
+  const html = ticketStartHtml(ticket("X-1", guess()), [], null);
+  assert.ok(html.includes(`data-start="X-1"`), "the handler routes off data-start");
+  assert.ok(html.includes("Start session"));
+  assert.ok(!html.includes("disabled"));
+});
+
+test("ticketStartHtml: an untriaged ticket gets no button at all", () => {
+  // "not looked at yet" is not "no repo fits" — neither is something to start.
+  assert.equal(ticketStartHtml(ticket("X-1"), [], null), "");
+  assert.equal(ticketStartHtml(ticket("X-1", { repoGuess: { repo: null } }), [], null), "");
+});
+
+test("ticketStartHtml: an uncloned repo disables the button and says why", () => {
+  const html = ticketStartHtml(ticket("X-1", guess({ cloned: false })), [], null);
+  assert.ok(html.includes("disabled"));
+  assert.ok(html.includes("isn't cloned"));
+  assert.ok(!html.includes("data-start"), "a disabled button must not be clickable");
+});
+
+test("ticketStartHtml: an in-flight start shows busy, not a second button", () => {
+  const html = ticketStartHtml(ticket("X-1", guess()), [], { pending: true });
+  assert.ok(html.includes("kc-start-busy"));
+  assert.ok(html.includes("starting"));
+  assert.ok(!html.includes("data-start"), "no re-click while a spawn is in flight");
+});
+
+test("ticketStartHtml: a failed start shows the reason AND keeps the button", () => {
+  // Every failure here is fleet-state ("no online host", "not cloned there"), so
+  // the operator needs both the reason and the retry.
+  const html = ticketStartHtml(ticket("X-1", guess()), [], { error: "no online host" });
+  assert.ok(html.includes("kc-start-err"));
+  assert.ok(html.includes("no online host"));
+  assert.ok(html.includes("data-start"), "the retry stays clickable");
+});
+
+test("ticketStartHtml: a started ticket shows its session, and can start another", () => {
+  const html = ticketStartHtml(ticket("X-1", guess()), [tsess("s1", "X-1")], null);
+  assert.ok(html.includes(`href="/sessions?session=s1"`));
+  assert.ok(html.includes("kc-start-more"), "the button compacts to a +");
+  assert.ok(html.includes("data-start"), "a second session on a ticket is supported");
+  assert.ok(html.includes("its own branch"));
+});
+
+test("ticketStartHtml: chips for every session on the ticket", () => {
+  const html = ticketStartHtml(ticket("X-1", guess()),
+    [tsess("s1", "X-1"), tsess("s2", "X-1")], null);
+  assert.ok(html.includes("session=s1") && html.includes("session=s2"));
+});
+
+test("ticketStartHtml: an untriaged ticket still shows sessions it has", () => {
+  // The repo guess can go stale/absent; sessions already started are facts.
+  const html = ticketStartHtml(ticket("X-1"), [tsess("s1", "X-1")], null);
+  assert.ok(html.includes("session=s1"));
+  assert.ok(!html.includes("data-start"));
+});
+
+test("ticketStartHtml: escapes a hostile error", () => {
+  const html = ticketStartHtml(ticket("X-1", guess()), [], { error: `<img src=x>` });
+  assert.ok(!html.includes("<img"));
+});
+
+test("cardHtml: the start control sits before the org (which is margin-left:auto)", () => {
+  const html = cardHtml(ticket("X-1", guess()), { siteKey: "myorg.atlassian.net" },
+    { sessions: [], start: null });
+  assert.ok(html.includes("data-start"));
+  assert.ok(html.indexOf("kc-start") < html.indexOf("kc-org"));
+  assert.ok(html.indexOf("kc-repo") < html.indexOf("kc-start"), "repo, then start");
+});
+
+test("boardHtml: wires each card to its own sessions and start state", () => {
+  const t1 = ticket("X-1", { ...guess(), statusCategory: "todo" });
+  const t2 = ticket("X-2", { ...guess(), statusCategory: "todo" });
+  const sites = mergeSites([agent("hostA", block({ tickets: [t1, t2] }), {
+    sessions: [tsess("s1", "X-1")],
+  })]);
+  const html = boardHtml(sites, "", {
+    sessionIndex: ticketSessionIndex([agent("hostA", block(), { sessions: [tsess("s1", "X-1")] })]),
+    starts: new Map([["myorg.atlassian.net\x00X-2", { pending: true }]]),
+  });
+  assert.ok(html.includes("session=s1"), "X-1 shows its session");
+  assert.ok(html.includes("kc-start-busy"), "X-2 shows its in-flight start");
+});
+
+test("boardHtml: no session index or starts is fine (an ordinary render)", () => {
+  const sites = mergeSites([agent("hostA", block({ tickets: [ticket("X-1", guess())] }))]);
+  const html = boardHtml(sites, "", {});
+  assert.ok(html.includes("data-start"));
+  assert.ok(!html.includes("kc-start-busy"));
 });

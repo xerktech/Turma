@@ -262,6 +262,7 @@ jobs:
           build-args: |
             AGENT_BASE=android-build
             CLAUDE_CODE_VERSION=${{ steps.cc.outputs.version }}
+            TURMA_AGENT_VERSION=${{ needs.plan.outputs.version }}
           tags: |
             ${{ env.AGENT_IMAGE }}:latest
             ${{ env.AGENT_IMAGE }}:${{ needs.plan.outputs.version }}

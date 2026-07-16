@@ -1023,6 +1023,19 @@
     const badges = prs.slice().reverse().map(prBadge).join("");
     return '<span class="cc-opt cc-pr">' + badges + "</span>";
   }
+  // The Jira ticket this session was spawned to work (session.ticket, stamped by
+  // the agent at spawn) — the reverse of the board's ticket -> session link, for
+  // the footer beside the PR chip. It links out to JIRA rather than back to the
+  // board: from inside the session, the useful thing is the live ticket, and the
+  // board card is one click away on the nav anyway. "" for an ordinary session.
+  function ticketFooterChip(s) {
+    const t = (s && s.ticket) || null;
+    if (!t || !t.key) return "";
+    const tip = [t.summary, t.branch ? "branch " + t.branch : ""].filter(Boolean).join(" · ");
+    return '<span class="cc-opt cc-ticket">' +
+      '<a class="jira-chip" href="' + esc(t.url || "#") + '" target="_blank" rel="noopener"' +
+      ' title="' + esc(tip || t.key) + '">' + esc(t.key) + "</a></span>";
+  }
   // fromPoll: a background heartbeat repaint — don't yank an open menu shut.
   function renderComposeOpts(fromPoll) {
     const host = $("chatComposeOpts");
@@ -1036,7 +1049,7 @@
         '🛡 <span class="cc-val">' + esc(optLabel(MODE_OPTS, mode)) + '</span><span class="cc-caret">▾</span></button>' +
         '<span class="cc-menu" id="ccModeMenu"><span class="cc-hint">Agent mode</span>' +
         menuHtml(modeOpts, mode, "data-mode") + "</span></span>" +
-      '<span class="cc-right">' + prFooterChip(sess) +
+      '<span class="cc-right">' + ticketFooterChip(sess) + prFooterChip(sess) +
         '<span class="cc-opt cc-model">' +
           '<button class="cc-btn" id="ccModelBtn" title="Model for this session">' +
           '<span class="cc-val">' + esc(optLabel(MODEL_OPTS, model)) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
@@ -1404,6 +1417,7 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, prFooterChip,
+      ticketFooterChip,
       agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
       isBusy, updateComposeAction,
       __setLiveStatus: (st) => { liveStatus = st; },

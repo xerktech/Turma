@@ -171,6 +171,108 @@
     return `<span class="${cls}" title="${esc(tip || g.repo)}">${esc(g.repo)}</span>`;
   }
 
+  // --- ticket -> session link ----------------------------------------------
+  // The agent stamps the ticket onto the session record it spawns (session.ticket
+  // = {key, siteKey, url, summary, branch}); this indexes the fleet payload the
+  // board already polls to walk that link backwards, keyed "<siteKey>\x00<key>".
+  //
+  // That's the whole link: there is no hub-side ticket store to keep in sync, and
+  // because the record outlives the process, a killed session still shows on its
+  // ticket. Nothing is written to Jira — the link lives in Turma only.
+  function ticketSessionIndex(agents) {
+    const idx = new Map();
+    for (const a of agents || []) {
+      for (const s of a.sessions || []) {
+        const t = s && s.ticket;
+        if (!t || !t.key) continue;
+        const k = (t.siteKey || "") + "\x00" + t.key;
+        if (!idx.has(k)) idx.set(k, []);
+        idx.get(k).push({ ...s, host: a.key || a.device });
+      }
+    }
+    // Oldest first: the first session on a ticket is the one holding the bare
+    // PROJ-123 branch, so the chips read in the order the branches were cut.
+    for (const list of idx.values()) {
+      list.sort((x, y) => String(x.createdAt || "").localeCompare(String(y.createdAt || "")));
+    }
+    return idx;
+  }
+
+  function ticketSessionsOf(idx, siteKey, key) {
+    return (idx && idx.get((siteKey || "") + "\x00" + key)) || [];
+  }
+
+  // One of a ticket's sessions, as a chip linking into it. The dot carries the
+  // run state, read from the session's own live record — so the card says what
+  // that work is actually doing, not merely that it was once started.
+  //
+  // The label is the BRANCH, not the session name: a ticket-spawned session is
+  // named from its ticket, so its name just repeats the key and summary already
+  // printed on this card, while the branch (-1, -2) is the one thing that tells
+  // two sessions on one ticket apart. The live branch wins over the reserved one
+  // — the reservation is what the agent was TOLD, git is what it did. An operator
+  // who renames a session means that name, so it leads once it exists; a session
+  // that has neither yet falls back to its id.
+  function sessionChipHtml(s) {
+    const branch = (s.git && s.git.branch) || (s.ticket && s.ticket.branch);
+    const renamed = s.summaryManual ? s.summary : null;
+    const label = renamed || branch || s.summary || s.label || s.id;
+    const stopped = s.status !== "running";
+    const state = s.status === "error" ? "failed" : (stopped ? "stopped" : "running");
+    const tip = [s.summary || s.label, branch && branch !== label ? "branch " + branch : "", state]
+      .filter(Boolean).join(" · ");
+    const cls = "kc-sess" + (s.status === "error" ? " kc-sess-err" : stopped ? " kc-sess-off" : "");
+    // The label is its own element so it can ellipsise: .kc-sess is a flex
+    // container, and text-overflow can't touch anonymous flex content — it would
+    // hard-cut mid-letter. As a flex ITEM this span is blockified, so it can.
+    return `<a class="${cls}" href="/sessions?session=${encodeURIComponent(s.id)}"
+      title="${esc(tip || label)}"
+      ><span class="kc-sess-dot"></span><span class="kc-sess-name">${esc(label)}</span></a>`;
+  }
+
+  // The card's session control: its sessions, plus the button that starts one.
+  // `start` is this ticket's in-flight state ({pending} | {error}), or null.
+  // States, in the order they're decided:
+  //   - no triaged repo    -> no button at all. There is nothing to start against,
+  //                           and the repo chip beside this already says why (a
+  //                           "no repo" verdict, or no chip while untriaged).
+  //   - a spawn in flight  -> a busy marker. The session id doesn't exist until
+  //                           the agent mints it a beat later, so this covers the
+  //                           gap the POST can't.
+  //   - repo not cloned    -> disabled, saying so. The ticket HAS a repo, and
+  //                           "clone it first" is more useful than a missing button.
+  //   - ready              -> the start button.
+  // A failed start renders its reason BESIDE a live button rather than replacing
+  // it: every failure here is a fleet-state one (no online host, repo not cloned
+  // there, not triaged yet), so the operator needs both the reason and the retry.
+  // Once a ticket has sessions the button stays, compacted to a "+": a second
+  // session on one ticket is supported (it gets the -1/-2 branch), just not the
+  // common case, so it stops competing with the chips for the card's width.
+  function ticketStartHtml(t, sessions, start) {
+    const g = t && t.repoGuess;
+    const chips = (sessions || []).map(sessionChipHtml).join("");
+    if (!g || !g.repo) return chips;
+    const st = start || {};
+    if (st.pending) {
+      return chips + `<span class="kc-start kc-start-busy"
+        title="Starting a session for ${esc(t.key)}…">⏳ starting…</span>`;
+    }
+    const err = st.error
+      ? `<span class="kc-start-err" title="${esc(st.error)}">⚠ ${esc(st.error)}</span>`
+      : "";
+    if (!g.cloned) {
+      return chips + err + `<button class="kc-start" type="button" disabled
+        title="${esc(g.repo)} isn't cloned on the host reporting this org — clone it first">☐ Start session</button>`;
+    }
+    const more = (sessions || []).length > 0;
+    const tip = more
+      ? `Start another session on ${t.key} — it gets its own branch`
+      : `Start a session on ${t.key} in ${g.repo}`;
+    return chips + err + `<button class="kc-start${more ? " kc-start-more" : ""}" type="button"
+      data-start="${esc(t.key)}" title="${esc(tip)}"
+      aria-label="${esc(tip)}">${more ? "+" : "☐ Start session"}</button>`;
+  }
+
   function cardHtml(t, site, opts) {
     const o = opts || {};
     const color = o.color || "var(--muted)";
@@ -186,12 +288,17 @@
     }
     const repo = repoChipHtml(t);
     if (repo) bits.push(repo);
+    const start = ticketStartHtml(t, o.sessions, o.start);
+    if (start) bits.push(start);
     bits.push(`<span class="kc-org" style="--org:${esc(color)}" title="${esc(site && site.siteKey || "")}">${esc(t.project || "")}</span>`);
     // The card itself opens the detail view (data-* carry what the click
     // handler needs to route the fetch: the issue and its owning org). It's a
-    // div, not a button, because it contains the kc-key link out to Jira and a
-    // nested interactive element would be invalid HTML — hence the explicit
-    // role/tabindex, and the handler's own Enter/Space keying.
+    // div, not a button, because it contains the kc-key link out to Jira, the
+    // start button and any session chips — nested interactive elements, which a
+    // real <button> could not legally hold — hence the explicit role/tabindex,
+    // and the handler's own Enter/Space keying. Each of those children is
+    // early-returned by the board's delegated handlers so it does its own thing
+    // rather than also opening the panel.
     return `<div class="kanban-card" role="button" tabindex="0"
       data-key="${esc(t.key)}" data-site="${esc(site && site.siteKey || "")}"
       aria-label="${esc(t.key + ": " + (t.summary || ""))}">
@@ -370,7 +477,11 @@
     const cols = CATEGORIES.map(([cat, label]) => {
       const list = cards[cat].sort((x, y) => ticketSort(x.t, y.t));
       const body = list.length
-        ? list.map(c => cardHtml(c.t, c.site, { color: c.color, now: o.now })).join("")
+        ? list.map(c => cardHtml(c.t, c.site, {
+            color: c.color, now: o.now,
+            sessions: ticketSessionsOf(o.sessionIndex, c.site.siteKey, c.t.key),
+            start: o.starts && o.starts.get((c.site.siteKey || "") + "\x00" + c.t.key),
+          })).join("")
         : `<div class="kc-none">none</div>`;
       return `<div class="kanban-col${cat === "done" ? " kanban-done" : ""}">
         <div class="kc-head">${label} <span class="kc-count">${list.length}</span></div>
@@ -435,6 +546,7 @@
     CATEGORIES, mergeSites, categoryOf, ticketSort, orgColor, orgName, ageStr,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml,
+    ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   };
   if (typeof window !== "undefined") window.TurmaBoard = api;

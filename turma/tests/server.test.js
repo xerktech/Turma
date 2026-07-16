@@ -1704,6 +1704,142 @@ test("http: ticket detail requires the user login", async () => {
   assert.equal(res.status, 401);
 });
 
+// POST /api/jira/<siteKey>/<issueKey>/session: the board card's start button.
+// The hub's whole job is ROUTING — finding the one host that has both the org's
+// Jira creds and the ticket's repo — since it's the only party that sees the
+// whole fleet. It sends only the issue key; the agent re-derives the rest.
+
+// A host reporting `site`, with `repos` cloned, and `key` triaged to `repo`.
+const ticketBeat = (device, site, { repo = "Turma", repos = ["Turma"], key = "ENG-5",
+                                    cloned = true, fetchedAt = "2026-07-14T12:00:00Z" } = {}) =>
+  request("POST", "/api/heartbeat", {
+    body: {
+      device,
+      repos: repos.map((name) => ({ name, path: `/git/${name}` })),
+      jira: {
+        available: true, configured: true, siteKey: site, user: `${device}@x.com`,
+        fetchedAt,
+        tickets: [{ key, summary: "Fix it", repoGuess: repo ? { repo, cloned } : null }],
+      },
+    },
+    headers: agentHeaders,
+  });
+
+test("http: starting a ticket session queues spawnTicket on the org's host", async () => {
+  await ticketBeat("ts1", "t1.atlassian.net");
+  const res = await request("POST", "/api/jira/t1.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.host, "ts1");
+  assert.equal(res.body.repo, "Turma");
+  assert.ok(res.body.cmdId);
+  // Only the key travels: the agent re-derives repo, ticket text and branch from
+  // its own state, so a stale board can't aim a spawn at the wrong repo.
+  assert.deepEqual(agents.ts1.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: the ticket spawn rides the heartbeat like any other command", async () => {
+  await ticketBeat("ts2", "t2.atlassian.net");
+  const res = await request("POST", "/api/jira/t2.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  const beat = await ticketBeat("ts2", "t2.atlassian.net");
+  assert.deepEqual(beat.body.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: a mashed start button is single-flighted into one spawn", async () => {
+  // Two sessions on one ticket is a real feature, but a double-click isn't how
+  // you ask for it.
+  await ticketBeat("ts3", "t3.atlassian.net");
+  const first = await request("POST", "/api/jira/t3.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  const second = await request("POST", "/api/jira/t3.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(second.body.cmdId, first.body.cmdId);
+  assert.equal(agents.ts3.commands.length, 1);
+});
+
+test("http: the host must have the ticket's repo, not just the org's creds", async () => {
+  // Two hosts share the org; only one has the repo. Routing on siteKey alone
+  // would spawn on a host that would just log a refusal nobody sees.
+  await ticketBeat("tsCreds", "t4.atlassian.net", { repos: ["Other"] });
+  await ticketBeat("tsRepo", "t4.atlassian.net", { repos: ["Turma"] });
+  const res = await request("POST", "/api/jira/t4.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.host, "tsRepo");
+  assert.equal((agents.tsCreds.commands || []).length, 0);
+});
+
+test("http: no online host has the repo -> 409 saying so", async () => {
+  await ticketBeat("ts5", "t5.atlassian.net", { repos: ["Other"] });
+  const res = await request("POST", "/api/jira/t5.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /Turma/);
+  assert.equal((agents.ts5.commands || []).length, 0);
+});
+
+test("http: an offline host is never queued a spawn — it 503s instead", async () => {
+  // Unlike the read-only GET, which happily serves an offline host's cache: a
+  // spawn landing whenever the host next wakes is a surprise, not a feature.
+  await ticketBeat("ts6", "t6.atlassian.net");
+  agents.ts6.lastSeen = Date.now() - 10 * 60 * 1000;
+  const res = await request("POST", "/api/jira/t6.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 503);
+  assert.match(res.body.error, /offline/);
+  assert.equal((agents.ts6.commands || []).length, 0);
+});
+
+test("http: an untriaged ticket 409s rather than guessing a repo", async () => {
+  await ticketBeat("ts7", "t7.atlassian.net", { repo: null });
+  const res = await request("POST", "/api/jira/t7.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /triaged/);
+  assert.equal((agents.ts7.commands || []).length, 0);
+});
+
+test("http: an unknown org 404s", async () => {
+  const res = await request("POST", "/api/jira/nobody.atlassian.net/ENG-1/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 404);
+});
+
+test("http: the freshest reporting block decides the repo", async () => {
+  // board.js merges on freshest-block-wins, so the hub must resolve against the
+  // same copy the operator actually clicked.
+  await ticketBeat("tsOld", "t8.atlassian.net",
+    { repo: "Stale", repos: ["Stale", "Fresh"], fetchedAt: "2026-07-14T10:00:00Z" });
+  await ticketBeat("tsNew", "t8.atlassian.net",
+    { repo: "Fresh", repos: ["Stale", "Fresh"], fetchedAt: "2026-07-14T12:00:00Z" });
+  const res = await request("POST", "/api/jira/t8.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.body.repo, "Fresh");
+});
+
+test("http: a start rejects a non-issue-key path segment before routing", async () => {
+  await ticketBeat("ts9", "t9.atlassian.net");
+  for (const bad of ["..%2F..%2Fsecret", "ENG-42%3Fx%3D1", "42", "ENG-", "ENG%2042"]) {
+    const res = await request("POST", `/api/jira/t9.atlassian.net/${bad}/session`,
+      { headers: userHeaders });
+    assert.equal(res.status, 400, `${bad} should be rejected`);
+  }
+  assert.equal((agents.ts9.commands || []).length, 0);
+});
+
+test("http: starting a ticket session requires the user login", async () => {
+  await ticketBeat("ts10", "t10.atlassian.net");
+  const res = await request("POST", "/api/jira/t10.atlassian.net/ENG-5/session");
+  assert.equal(res.status, 401);
+  assert.equal((agents.ts10.commands || []).length, 0);
+});
+
 test("http: /api/agents does not serialize the jiraIssues cache (served only by /api/jira)", async () => {
   await jiraBeat("jd9", "org9.atlassian.net", {
     jiraIssueResults: [{ key: "ENG-1", issue: { key: "ENG-1", description: "x".repeat(500) }, error: null }],
