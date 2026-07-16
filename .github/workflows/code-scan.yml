@@ -12,15 +12,17 @@ name: code-scan
 # Findings block the PR. Runs on open AND on later pushes to the PR (default
 # pull_request types) so every commit is re-checked.
 #
-# Runs on GitHub-hosted `ubuntu-latest`, NOT the self-hosted box. These four
-# jobs do well under two minutes of work each and need no warm docker cache and
-# no big disk, so the only thing self-hosting bought them was a queue: the box
-# is a 3-job concurrency cap and these were measured waiting up to 26 minutes to
-# do 48 seconds of work. Hosted gives 20 concurrent jobs at 4 dedicated vCPU.
-# It also lifts the constraints the self-hosted box imposed — a hosted runner
-# has passwordless sudo, node/npm preinstalled, and can authenticate to ghcr.io.
-# Keep image BUILDS on self-hosted (see turma-agent-image-scan.yml); they're the
-# jobs that actually need the layer cache and the disk.
+# Runs on GitHub-hosted `ubuntu-latest`. These four jobs do well under two
+# minutes of work each and need no warm docker cache and no big disk, so the only
+# thing self-hosting bought them was a queue: the box is a 3-job concurrency cap
+# and these were measured waiting up to 26 minutes to do 48 seconds of work.
+# Hosted gives 20 concurrent jobs at 4 dedicated vCPU. It also lifts the
+# constraints the box imposed — a hosted runner has passwordless sudo, node/npm
+# preinstalled, and can authenticate to ghcr.io.
+#
+# This was the first workflow moved; every workflow in the repo now runs hosted,
+# image builds included (their layer cache is `type=gha`, which is GitHub-side
+# and moves with the job — see turma-agent-image-scan.yml for the disk story).
 on:
   pull_request:
     branches: [main]
