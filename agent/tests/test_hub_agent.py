@@ -5912,5 +5912,318 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
         self.assertIsNone(sm.triage_job)
 
 
+class TestNextTicketBranch(unittest.TestCase):
+    """The ticket -> branch name rule: the bare key, then -1/-2 as it's taken."""
+
+    def test_bare_key_when_nothing_holds_it(self):
+        self.assertEqual(ha.next_ticket_branch("PROJ-123", set()), "PROJ-123")
+
+    def test_suffixes_climb_past_taken_names(self):
+        self.assertEqual(ha.next_ticket_branch("PROJ-123", {"PROJ-123"}), "PROJ-123-1")
+        self.assertEqual(
+            ha.next_ticket_branch("PROJ-123", {"PROJ-123", "PROJ-123-1"}), "PROJ-123-2")
+
+    def test_fills_a_gap_left_by_a_deleted_branch(self):
+        # -1 was merged and pruned. The rule is "first free name", not "count how
+        # many ever existed" — otherwise a pruned repo keeps climbing forever.
+        self.assertEqual(
+            ha.next_ticket_branch("PROJ-123", {"PROJ-123", "PROJ-123-2"}), "PROJ-123-1")
+
+    def test_a_similar_key_is_not_a_collision(self):
+        # PROJ-1230 shares a prefix but is a different ticket entirely.
+        self.assertEqual(ha.next_ticket_branch("PROJ-123", {"PROJ-1230"}), "PROJ-123")
+
+    def test_blank_entries_are_ignored(self):
+        self.assertEqual(ha.next_ticket_branch("PROJ-123", ["", None, "  "]), "PROJ-123")
+
+    def test_none_when_every_suffix_is_taken(self):
+        taken = {"PROJ-9"} | {f"PROJ-9-{n}"
+                              for n in range(1, ha.TICKET_BRANCH_MAX_SUFFIX + 1)}
+        self.assertIsNone(ha.next_ticket_branch("PROJ-9", taken))
+
+
+class TestBranchNames(unittest.TestCase):
+    """Every name a new branch could collide with: local heads, plus remote
+    branches reduced to the name they'd have locally."""
+
+    def _names(self, refs):
+        with mock.patch.object(ha, "run", lambda cmd, cwd=None: "\n".join(refs)):
+            return ha.branch_names("/repo")
+
+    def test_local_and_remote_branches_both_count(self):
+        # A branch pushed for this ticket from another host counts even on a host
+        # that has never checked it out — that's the point of reading remotes.
+        self.assertEqual(
+            self._names(["refs/heads/main", "refs/heads/PROJ-1",
+                         "refs/remotes/origin/PROJ-2"]),
+            {"main", "PROJ-1", "PROJ-2"})
+
+    def test_origin_head_is_not_a_name(self):
+        # It's a symbolic alias for the default branch, not a branch anyone took.
+        self.assertEqual(self._names(["refs/remotes/origin/HEAD"]), set())
+
+    def test_a_slashed_branch_keeps_its_whole_name(self):
+        # Only the REMOTE prefix is stripped; "feat/x" is the branch's real name.
+        self.assertEqual(
+            self._names(["refs/heads/feat/x", "refs/remotes/origin/feat/y"]),
+            {"feat/x", "feat/y"})
+
+    def test_junk_lines_are_skipped(self):
+        self.assertEqual(self._names(["", "  ", "refs/tags/v1", "refs/heads/ok"]),
+                         {"ok"})
+
+
+class TestBuildTicketPrompt(unittest.TestCase):
+    """The ticket -> initial prompt. The session has no Jira creds of its own, so
+    this text is all it will ever see of the ticket."""
+
+    def _detail(self, **over):
+        d = {"key": "PROJ-7", "summary": "Fix the board",
+             "url": "https://x.atlassian.net/browse/PROJ-7",
+             "status": "In Progress", "type": "Bug", "priority": "High",
+             "assignee": "Ann", "description": "The board is broken.",
+             "comments": [], "commentTotal": 0}
+        d.update(over)
+        return d
+
+    def test_carries_the_ticket_text(self):
+        p = ha.build_ticket_prompt(self._detail())
+        for want in ("PROJ-7", "Fix the board", "In Progress", "High", "Ann",
+                     "The board is broken.",
+                     "https://x.atlassian.net/browse/PROJ-7"):
+            self.assertIn(want, p)
+
+    def test_says_plainly_that_it_is_a_snapshot(self):
+        # The session can't re-read Jira itself, so the prompt has to be honest
+        # about what it is and point at the live copy.
+        p = ha.build_ticket_prompt(self._detail())
+        self.assertIn("snapshot", p)
+
+    def test_missing_fields_are_omitted_rather_than_blank(self):
+        p = ha.build_ticket_prompt({"key": "PROJ-8"})
+        self.assertIn("PROJ-8", p)
+        self.assertNotIn("Priority:", p)
+        self.assertNotIn("Assignee:", p)
+        self.assertIn("_No description._", p)
+        self.assertIn("_No comments._", p)
+
+    def test_comments_are_inlined_newest_first_kept(self):
+        cs = [{"author": f"U{i}", "created": "2026-01-01", "body": f"note {i}"}
+              for i in range(12)]
+        p = ha.build_ticket_prompt(self._detail(comments=cs, commentTotal=12))
+        self.assertIn("note 11", p)       # newest kept
+        self.assertNotIn("note 0\n", p)   # oldest dropped by the cap
+        self.assertIn("2 older are in Jira", p)
+
+    def test_labels_and_parent_are_flattened(self):
+        p = ha.build_ticket_prompt(self._detail(
+            labels=["ops", "urgent"], parentKey="PROJ-1", parentSummary="Epic"))
+        self.assertIn("ops, urgent", p)
+        self.assertIn("PROJ-1 — Epic", p)
+
+    def test_never_raises_on_a_junk_detail(self):
+        # It's built from a network response; a shape surprise must not take the
+        # spawn (and with it the manager's beat) down.
+        for junk in (None, {}, {"comments": [None, "x"], "labels": "nope"},
+                     {"key": "P-1", "comments": [{}]}):
+            self.assertIsInstance(ha.build_ticket_prompt(junk), str)
+
+
+class TestSpawnTicket(ManagerMixin, unittest.TestCase):
+    """The board's start button, agent-side: resolve the repo from THIS host's
+    triage ledger, fetch the ticket, reserve a branch, spawn."""
+
+    SITE = "x.atlassian.net"
+
+    def make_ticket_manager(self, *, repos=None, decided=True, repo="Turma"):
+        if repos is None:
+            repos = [{"name": "Turma", "path": os.path.join(self.tmp, "Turma")}]
+        sm = self.make_manager()
+        for name, value in [("scan_repos", lambda: repos),
+                            ("JIRA_SITE", self.SITE),
+                            ("JIRA_EMAIL", "a@b.c"),
+                            ("JIRA_TOKEN", "t")]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        if decided:
+            sm.triage_ledger[ha._triage_key(self.SITE, "PROJ-7")] = {
+                "decided": True, "repo": repo, "cloned": True, "reason": "it's there"}
+        sm._launch_ttyd = mock.Mock()   # avoid the real Popen
+        return sm
+
+    def _detail(self, **over):
+        d = {"key": "PROJ-7", "summary": "Fix the board",
+             "url": f"https://{self.SITE}/browse/PROJ-7",
+             "description": "broken", "comments": []}
+        d.update(over)
+        return d
+
+    def _launches(self):
+        return [c for c in self.run_ok_calls if c and c[0] == "tmux" and "new-session" in c]
+
+    def test_spawns_with_the_ticket_and_a_reserved_branch(self):
+        sm = self.make_ticket_manager()
+        sm._start_summary = mock.Mock()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", cmd_id="c1")
+        self.assertEqual(len(sm.registry), 1)
+        sess = sm.registry[0]
+        self.assertEqual(sess["repo"], "Turma")
+        self.assertEqual(sess["spawnCmdId"], "c1")     # the UI's handle on it
+        self.assertEqual(sess["ticket"], {
+            "key": "PROJ-7", "siteKey": self.SITE,
+            "url": f"https://{self.SITE}/browse/PROJ-7",
+            "summary": "Fix the board", "branch": "PROJ-7",
+        })
+        # The ticket names the session, so no `claude -p` naming job is spent.
+        self.assertEqual(sess["summary"], "PROJ-7 Fix the board")
+        sm._start_summary.assert_not_called()
+        # ...and the link rides the heartbeat, which is what the board indexes.
+        self.assertEqual(
+            sm._session_payload(sess, refresh=False)["ticket"]["key"], "PROJ-7")
+
+    def test_the_ticket_text_is_the_initial_prompt(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue",
+                               lambda k: self._detail(description="the board is broken")):
+            sm.spawn_ticket("PROJ-7")
+        cmd = self._launches()[-1][-1]
+        self.assertIn("the board is broken", cmd)
+
+    def test_the_reserved_branch_rides_the_system_prompt(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        cmd = self._launches()[-1][-1]
+        self.assertIn("--append-system-prompt", cmd)
+        self.assertIn("Name the branch you create for it exactly: PROJ-7", cmd)
+        # The directive EXTENDS the branching policy rather than replacing it —
+        # the branch still has to be cut from the refreshed remote default.
+        self.assertIn("git fetch origin", cmd)
+
+    def test_a_second_session_on_one_ticket_gets_the_next_branch(self):
+        # The first session hasn't branched yet, so git knows nothing about its
+        # name (branch_names sees an empty repo here) — the reservation has to
+        # come from the registry, or both would be told "PROJ-7".
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual([s["ticket"]["branch"] for s in sm.registry],
+                         ["PROJ-7", "PROJ-7-1"])
+
+    def test_an_existing_branch_in_git_is_avoided(self):
+        # The ticket was worked months ago and the branch pushed; the name is
+        # taken even though this manager has no session for it.
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "run",
+                               lambda cmd, cwd=None: "refs/remotes/origin/PROJ-7"), \
+             mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry[0]["ticket"]["branch"], "PROJ-7-1")
+
+    def test_the_ticket_survives_kill_and_resume(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        sid = sm.registry[0]["id"]
+        sm.kill(sid)
+        sm.resume(sid)
+        sess = next(s for s in sm.registry if s["id"] == sid)
+        # The reserved name is re-TOLD, not re-reserved: it's what this session
+        # is, and re-reserving would hand it -1 against its own first branch.
+        self.assertEqual(sess["ticket"]["branch"], "PROJ-7")
+        self.assertIn("Name the branch you create for it exactly: PROJ-7",
+                      self._launches()[-1][-1])
+
+    def test_an_ordinary_session_reports_no_ticket(self):
+        sm = self.make_ticket_manager()
+        sm.spawn("Turma")
+        self.assertIsNone(sm.registry[0]["ticket"])
+        self.assertIsNone(
+            sm._session_payload(sm.registry[0], refresh=False)["ticket"])
+
+    def test_refuses_an_untriaged_ticket_without_calling_jira(self):
+        sm = self.make_ticket_manager(decided=False)
+        with mock.patch.object(ha, "fetch_jira_issue") as f:
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry, [])
+        f.assert_not_called()
+
+    def test_refuses_a_repo_that_is_not_cloned_here(self):
+        # The ledger's `cloned` is as of triage time; scan_repos() is now.
+        sm = self.make_ticket_manager(repo="Elsewhere")
+        with mock.patch.object(ha, "fetch_jira_issue") as f:
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry, [])
+        f.assert_not_called()
+
+    def test_refuses_anything_that_is_not_a_jira_key(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue") as f:
+            for bad in ("", None, "PROJ", "-1", "../../etc/passwd",
+                        "PROJ-7; rm -rf /", "PROJ-7 && curl x"):
+                sm.spawn_ticket(bad)
+        self.assertEqual(sm.registry, [])
+        f.assert_not_called()
+
+    def test_an_unconfigured_host_makes_no_jira_call(self):
+        # "unset creds = zero Jira HTTP, ever" stays a property of the AGENT, not
+        # of the hub's targeting — same stance as refreshJira.
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "JIRA_TOKEN", ""), \
+             mock.patch.object(ha, "fetch_jira_issue") as f:
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry, [])
+        f.assert_not_called()
+
+    def test_a_failed_fetch_does_not_spawn_a_blind_session(self):
+        # handle_commands logs and acks it. A session working a ticket it can't
+        # see would be worse than no session.
+        sm = self.make_ticket_manager()
+
+        def boom(_k):
+            raise RuntimeError("jira 500")
+
+        with mock.patch.object(ha, "fetch_jira_issue", boom):
+            sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
+                                 "cmdId": "c9"}])
+        self.assertEqual(sm.registry, [])
+        self.assertIn("c9", sm.acked)
+
+    def test_handle_commands_dispatches_spawn_ticket(self):
+        sm = self.make_ticket_manager()
+        sm.spawn_ticket = mock.Mock()
+        sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
+                             "cmdId": "c9"}])
+        sm.spawn_ticket.assert_called_once_with("PROJ-7", cmd_id="c9")
+
+    def test_hostile_ticket_text_cannot_break_out_of_the_command_line(self):
+        # Ticket text is the one genuinely untrusted input here: unlike an
+        # operator-typed prompt, ANY Jira user can write a description or comment,
+        # and it lands on the tmux command line. shlex.quote is what holds — this
+        # pins that it's actually applied to every field that reaches the prompt.
+        evil = "'; touch /tmp/pwned; echo '"
+        detail = self._detail(
+            summary=evil, description=evil, labels=[evil],
+            comments=[{"author": evil, "body": evil, "created": evil}])
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: detail):
+            sm.spawn_ticket("PROJ-7")
+        cmd = self._launches()[-1][-1]
+        # The payload rides as DATA, with every quote it carries neutralised.
+        self.assertIn("touch /tmp/pwned", cmd)
+        self.assertIn("'\"'\"'", cmd, "shlex.quote's escaped-quote form")
+        # The proof it can't ESCAPE is the round trip, not a substring search
+        # (the escaped form '"'"'; touch … happens to CONTAIN the raw payload):
+        # the command parses back into shell words with the whole prompt as
+        # exactly one of them, byte-for-byte what we built...
+        words = shlex.split(cmd)
+        self.assertEqual(words[-1], ha.build_ticket_prompt(detail))
+        # ...so nothing the ticket carried ever became a word of its own.
+        self.assertNotIn("touch", words)
+
+
 if __name__ == "__main__":
     unittest.main()

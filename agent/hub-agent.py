@@ -450,6 +450,30 @@ Handle the exceptions with judgment rather than stopping:
 A session working across several repos applies this per repo, as it reaches each.
 """
 
+# Extends the policy above for a session spawned to work a Jira ticket. The
+# branch name is decided at spawn (see _reserve_ticket_branch) rather than left
+# to the agent for two reasons: it has to be derivable from the ticket by a human
+# scanning branches, and the -1/-2 suffix needs a scan of every existing local
+# and remote branch that the agent has no particular reason to do correctly.
+#
+# It rides the same --append-system-prompt as the policy it extends, on every
+# launch including resume. The name is persisted on the session record, so a
+# resumed session is told the same name it was told at spawn rather than
+# re-deriving one against a repo whose branches have since moved.
+TICKET_BRANCH_PROMPT = """
+This session is work on Jira ticket {key}, whose full text is in your first
+user message.
+
+Name the branch you create for it exactly: {branch}
+
+That exact name is reserved for this session and already accounts for any branch
+this ticket has been worked on before (hence a possible -1/-2 suffix), so use it
+rather than deriving your own name from the ticket key.
+
+Everything above still applies: cut that branch from the REFRESHED remote default
+branch, not from this checkout.
+"""
+
 
 # --- agent safety guard (--settings wiring) ------------------------------
 
@@ -2855,6 +2879,130 @@ def fetch_jira_issue(key):
     return _shape_issue_detail(data, site_key)
 
 
+# --- Jira ticket sessions ------------------------------------------------------
+# Spawn a session to WORK a ticket: the board's per-card start button. Like the
+# triage above, this runs agent-side because this host is the only place the
+# three inputs meet — the Jira creds (hence the ticket's full text), the triage
+# ledger (hence which repo it belongs in), and the repos themselves.
+
+TICKET_PROMPT_COMMENTS = 10          # newest comments inlined into the prompt
+TICKET_BRANCH_MAX_SUFFIX = 200       # -1..-200 before we give up naming it
+
+
+def next_ticket_branch(issue_key, taken):
+    """The branch name for a new session on `issue_key`: the bare ticket key, or
+    the first free key-1/key-2/... when it's already taken. None when even the
+    suffixes are exhausted (the caller then just lets the agent name its own —
+    an absurd number of branches for one ticket is not worth failing a spawn)."""
+    taken = {str(t).strip() for t in (taken or []) if str(t or "").strip()}
+    if issue_key not in taken:
+        return issue_key
+    for n in range(1, TICKET_BRANCH_MAX_SUFFIX + 1):
+        cand = f"{issue_key}-{n}"
+        if cand not in taken:
+            return cand
+    return None
+
+
+def branch_names(repo_path):
+    """Every branch name a new branch here could collide with: local heads, plus
+    remote-tracking branches reduced to the name they'd have locally (a pushed
+    `origin/PROJ-123` means that ticket already has a branch, even on a host that
+    has never checked it out). origin/HEAD is skipped — it's a symbolic alias for
+    the default branch, not a name anyone would take."""
+    out = run(["git", "-C", repo_path, "for-each-ref", "--format=%(refname)",
+               "refs/heads", "refs/remotes"])
+    names = set()
+    for line in out.splitlines():
+        ref = line.strip()
+        if ref.startswith("refs/heads/"):
+            names.add(ref[len("refs/heads/"):])
+        elif ref.startswith("refs/remotes/"):
+            rest = ref[len("refs/remotes/"):]
+            # "<remote>/<branch>" -> "<branch>"; a bare "refs/remotes/<remote>"
+            # has no branch part to take.
+            if "/" in rest:
+                name = rest.split("/", 1)[1]
+                if name != "HEAD":
+                    names.add(name)
+    return names
+
+
+def build_ticket_prompt(detail):
+    """A fetched ticket -> the initial task prompt for its session: everything the
+    agent would otherwise have to go and read, inlined.
+
+    The session has no Jira creds of its own (they live in the manager's env, not
+    the worktree), so this text is all it will ever see of the ticket — hence the
+    header saying plainly that it's a spawn-time snapshot and pointing at the URL
+    for the live copy. Caps mirror the detail fetch's own (description and comment
+    bodies are already clipped agent-side by _shape_issue_detail)."""
+    d = detail or {}
+    key = d.get("key") or ""
+    summary = (d.get("summary") or "").strip()
+    head = f"Work Jira ticket {key}." if key else "Work the Jira ticket below."
+    out = [
+        head + " Its full text, as fetched from Jira when this session spawned,"
+        " follows. That is a snapshot — if something looks stale or contradictory,"
+        " the ticket's own URL below is the live copy.",
+        "",
+        f"# {key}: {summary}".strip(": ") if (key or summary) else "# Ticket",
+    ]
+    project = d.get("projectName") or d.get("project")
+    if project and d.get("projectName") and d.get("project"):
+        project = f"{d['projectName']} ({d['project']})"
+    parent = d.get("parentKey")
+    if parent and d.get("parentSummary"):
+        parent = f"{parent} — {d['parentSummary']}"
+    labels = d.get("labels")
+    fields = [
+        ("URL", d.get("url")),
+        ("Status", d.get("status")),
+        ("Type", d.get("type")),
+        ("Priority", d.get("priority")),
+        ("Assignee", d.get("assignee")),
+        ("Reporter", d.get("reporter")),
+        ("Project", project),
+        ("Parent", parent),
+        ("Due", d.get("dueDate")),
+        ("Labels", ", ".join(labels) if isinstance(labels, list) and labels else None),
+    ]
+    rows = [f"- {label}: {value}" for label, value in fields if value]
+    if rows:
+        out += ["", *rows]
+
+    desc = (d.get("description") or "").strip()
+    out += ["", "## Description", ""]
+    out.append(desc or "_No description._")
+    if d.get("descriptionTruncated"):
+        out.append("\n_(description truncated — the rest is in Jira)_")
+
+    comments = [c for c in (d.get("comments") or []) if isinstance(c, dict)]
+    shown = comments[-TICKET_PROMPT_COMMENTS:]
+    total = d.get("commentTotal")
+    total = total if isinstance(total, int) else len(comments)
+    out += ["", f"## Comments ({total})", ""]
+    if not shown:
+        out.append("_No comments._")
+    else:
+        dropped = total - len(shown)
+        if dropped > 0:
+            out.append(f"_Showing the {len(shown)} newest; {dropped} older are in Jira._\n")
+        for c in shown:
+            who = c.get("author") or "Unknown"
+            when = c.get("created") or ""
+            body = (c.get("body") or "").strip() or "_(empty)_"
+            out.append(f"**{who}**{f' — {when}' if when else ''}\n{body}\n")
+
+    out += [
+        "",
+        "Start by working out what this ticket actually asks for, then do it. If"
+        " the ticket is ambiguous enough that you'd be guessing at the goal, ask"
+        " rather than guess.",
+    ]
+    return "\n".join(out)
+
+
 # --- Jira -> repo triage -------------------------------------------------------
 # Guess WHICH REPO each assigned ticket's work belongs in, so the board card can
 # say where a ticket would be worked. Like the session summaries below, this runs
@@ -3834,8 +3982,18 @@ class SessionManager:
         # Tell the agent to fork new work off the LATEST default branch rather
         # than this (possibly stale) checkout — see NEW_WORK_SYSTEM_PROMPT. Rides
         # every launch, including resume: it's session policy, not spawn state.
-        parts.append(
-            f"--append-system-prompt {shlex.quote(NEW_WORK_SYSTEM_PROMPT)}")
+        # A ticket-backed session extends that policy with the exact branch name
+        # reserved for it at spawn (TICKET_BRANCH_PROMPT) — concatenated onto the
+        # same flag rather than passed as a second one, since it's a continuation
+        # of the same policy, and the reserved name is read from the persisted
+        # record so a resume repeats the name spawn chose.
+        policy = NEW_WORK_SYSTEM_PROMPT
+        ticket = sess.get("ticket") or {}
+        if ticket.get("branch"):
+            policy += TICKET_BRANCH_PROMPT.format(
+                key=ticket.get("key") or "this session's ticket",
+                branch=ticket["branch"])
+        parts.append(f"--append-system-prompt {shlex.quote(policy)}")
         claude_cmd = " ".join(parts)
         if prompt:
             claude_cmd += f" -- {shlex.quote(prompt)}"
@@ -3968,7 +4126,7 @@ class SessionManager:
     # --- lifecycle (executed container-side; see CONTRACT) ----------------
 
     def spawn(self, repo_name, *, prompt=None, label=None, base_ref=None,
-              model=None, permission_mode=None, cmd_id=None):
+              model=None, permission_mode=None, ticket=None, cmd_id=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
         The worktree is added in DETACHED HEAD forked off the latest default
@@ -3978,6 +4136,12 @@ class SessionManager:
         canonical internal key. The options (base branch, model, permission mode)
         are validated below; a bad option fails the spawn cleanly as an error
         card rather than reaching git/tmux or crashing the manager.
+
+        ticket is the Jira ticket this session was spawned to work (spawn_ticket's
+        caller shape: key/siteKey/url/summary/branch), or None for an ordinary
+        session. It is carried on the record rather than acted on here: it names
+        the session, rides the heartbeat so the board can link ticket -> session,
+        and its reserved `branch` is what _launch_tmux tells the agent to use.
 
         cmd_id is the hub's queued-command id. The session id is minted HERE, so
         the hub has no handle on the session it just asked for until a later
@@ -4003,6 +4167,15 @@ class SessionManager:
         label = (label or "").strip() or None
         # Prefer a slugged label in the RC display name; fall back to the id.
         rc_slug = slugify(label) if label else ""
+        # A ticket-backed session already HAS a good name — the ticket's key and
+        # summary, which is what an operator scanning cards is looking for — so it
+        # is named here rather than paying a `claude -p` to derive a worse one from
+        # the (now ticket-sized) prompt we built. Cleaned like an operator-typed
+        # name, not like a model's chatty reply: every word of it is deliberate.
+        ticket_summary = None
+        if ticket and ticket.get("key"):
+            ticket_summary = clean_manual_summary(
+                f"{ticket['key']} {ticket.get('summary') or ''}")
         sess = {
             "id": sid,
             "repo": repo["name"],
@@ -4023,7 +4196,12 @@ class SessionManager:
             "createdAt": now_iso(),
             "stoppedAt": None,
             "errorMsg": None,
-            "summary": None,       # few-word task name, filled in async at spawn
+            # Few-word task name: already known for a ticket, else filled in async.
+            "summary": ticket_summary,
+            # The Jira ticket this session works, or None. Set before the try
+            # below so even a spawn that fails validation lands as an error card
+            # the board can still tie back to its ticket.
+            "ticket": ticket or None,
             # The hub command that asked for this session, echoed back so the UI
             # can correlate its POST with the id we just minted (see docstring).
             "spawnCmdId": cmd_id,
@@ -4046,17 +4224,103 @@ class SessionManager:
             # gone — the basis of persistent host/repo usage.
             self._remember_usage(sess)
             # Name the session from its initial prompt, once, in the background
-            # (no-op when there's no prompt). Never blocks the spawn.
-            self._start_summary(sess, prompt)
+            # (no-op when there's no prompt). Never blocks the spawn. Skipped
+            # entirely when the ticket already named it above.
+            if not ticket_summary:
+                self._start_summary(sess, prompt)
             wt = os.path.basename(sess["worktreePath"])
             log(f"spawned session {sid} for {repo['name']} on :{sess['ttydPort']} "
                 + ("(root)" if is_root else
                    f"(detached worktree {wt}"
                    + (f", base {resolved_base}" if resolved_base else "")
                    + ")")
-                + (f" label {label!r}" if label else ""))
+                + (f" label {label!r}" if label else "")
+                + (f" ticket {ticket['key']}"
+                   + (f" -> branch {ticket['branch']}" if ticket.get("branch") else "")
+                   if ticket else ""))
         except Exception as e:
             self._set_error(sess, e)
+
+    def _reserve_ticket_branch(self, repo_path, issue_key):
+        """The branch name a new session on `issue_key` will be told to use.
+
+        "Taken" is the union of two things, and it needs both:
+          - what git knows — local heads plus remote branches, after a best-effort
+            fetch, so a branch pushed for this ticket from another host (or one
+            merged and pruned locally months ago) still counts;
+          - what THIS manager has already handed out — a session that hasn't
+            branched yet owns its name without git knowing anything about it, so
+            two sessions started back-to-back on one ticket must not both be told
+            "PROJ-123".
+
+        The fetch is short-bounded like every other spawn-time fetch: this runs on
+        the main loop, and offline just means we name against what we have."""
+        run_ok(["git", "-C", repo_path, "fetch", "origin"],
+               timeout=FETCH_TIMEOUT_SEC)
+        taken = branch_names(repo_path)
+        for s in self.registry:
+            t = s.get("ticket") or {}
+            if t.get("branch") and s.get("repoPath") == repo_path:
+                taken.add(t["branch"])
+        branch = next_ticket_branch(issue_key, taken)
+        # The key is already JIRA_KEY_RE-clean and so is a valid ref name, but this
+        # name reaches a command line via the system prompt and the record, so it
+        # gets the same allowlist gate as any other ref we hand out.
+        if branch and not valid_ref_name(branch):
+            return None
+        return branch
+
+    def spawn_ticket(self, issue_key, cmd_id=None):
+        """Spawn a session to work a Jira ticket — the board's per-card start
+        button.
+
+        Everything is re-derived from LOCAL state rather than trusted from the
+        command: the hub only chooses which host (an online one reporting the org
+        with the repo cloned), and a board that is a beat or two stale must not be
+        able to spawn against the wrong repo. So the repo comes from this host's
+        own triage ledger and must still be in scan_repos(), and the ticket text
+        comes from a fresh fetch rather than the heartbeat's card fields.
+
+        Refusals log and return, like spawn's own: there is no session record to
+        hang an error on yet, and each case is one the board's button is already
+        supposed to prevent (it only enables on a triaged, cloned repo). A fetch
+        that fails raises to handle_commands, which logs and acks — the board's
+        start button times out and says so rather than spinning forever."""
+        key = (issue_key or "").strip()
+        if not JIRA_KEY_RE.match(key):
+            log(f"spawnTicket refused: {key[:50]!r} is not a Jira issue key")
+            return
+        # Re-checked here (the hub already targets a host reporting this org) to
+        # keep "unset creds = zero Jira HTTP, ever" a property of the agent rather
+        # than of hub-side targeting — same stance as refreshJira.
+        if not jira_configured():
+            log(f"spawnTicket refused: no Jira credentials on this host ({key})")
+            return
+        site_key = normalize_jira_site(JIRA_SITE)
+        entry = self.triage_ledger.get(_triage_key(site_key, key))
+        if not isinstance(entry, dict) or not entry.get("decided") or not entry.get("repo"):
+            log(f"spawnTicket refused: {key} has no triaged repo on this host")
+            return
+        repo_name = entry["repo"]
+        # The ledger's `cloned` is as of triage time; scan_repos() is now. spawn()
+        # would refuse an unknown repo anyway, but that refusal couldn't say why.
+        repo = next((r for r in scan_repos() if r["name"] == repo_name), None)
+        if not repo:
+            log(f"spawnTicket refused: {key}'s repo {repo_name!r} is not cloned here")
+            return
+        detail = fetch_jira_issue(key)
+        branch = self._reserve_ticket_branch(repo["path"], key)
+        ticket = {
+            "key": key,
+            "siteKey": site_key,
+            "url": detail.get("url") or f"https://{site_key}/browse/{key}",
+            "summary": (detail.get("summary") or "")[:200],
+            # None when the name couldn't be reserved — the agent then names its
+            # own branch under the ordinary policy, which is worse but not broken.
+            "branch": branch,
+        }
+        self.spawn(repo_name, prompt=build_ticket_prompt(detail), ticket=ticket,
+                   cmd_id=cmd_id)
 
     def _remember_closed(self, sess):
         """Record a killed session in the closed history so the hub can offer
@@ -4066,7 +4330,7 @@ class SessionManager:
         rec = {k: sess.get(k) for k in (
             "id", "repo", "repoPath", "worktreePath", "branch", "baseRef",
             "rcName", "tmuxName", "createdAt", "label", "summary",
-            "summaryManual", "model", "permissionMode", "root",
+            "summaryManual", "model", "permissionMode", "root", "ticket",
         )}
         rec["closedAt"] = now_iso()
         # Snapshot the two things the live caches are about to forget, so the
@@ -4179,6 +4443,10 @@ class SessionManager:
             "label": rec.get("label"),
             "summary": rec.get("summary"),   # keep the name across resume...
             "summaryManual": rec.get("summaryManual"),  # ...pinned if it was typed
+            # The ticket (and its reserved branch name) survives a kill/resume:
+            # it's what this session IS, and _launch_tmux re-tells the agent the
+            # same branch name rather than reserving a fresh one.
+            "ticket": rec.get("ticket"),
             "rcName": rec.get("rcName"),
             "tmuxName": rec.get("tmuxName") or f"agent-{sid}",
             "ttydPort": self._alloc_port(),  # old port may be taken by now
@@ -5491,6 +5759,8 @@ class SessionManager:
                         permission_mode=cmd.get("permissionMode"),
                         cmd_id=cid,
                     )
+                elif ctype == "spawnTicket":
+                    self.spawn_ticket(cmd.get("issueKey"), cmd_id=cid)
                 elif ctype == "kill":
                     self.kill(cmd.get("sessionId"))
                 elif ctype == "start":
@@ -5831,6 +6101,10 @@ class SessionManager:
             "restartCount": sess.get("restartCount", 0),  # bumps on clear-context restart
             "label": sess.get("label"),
             "summary": sess.get("summary"),   # few-word task name (or None)
+            # The Jira ticket this session was spawned to work — {key, siteKey,
+            # url, summary, branch} — or None. The board reverse-indexes it to
+            # link a ticket to its sessions; the session card links back out.
+            "ticket": sess.get("ticket"),
             # The hub command that created this session (spawn / resumeTranscript),
             # so the UI that issued it can find the id the agent minted and open
             # the session. None for sessions predating the echo, or restored ones.

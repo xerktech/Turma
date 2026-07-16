@@ -96,7 +96,67 @@ function render(data) {
     $chips.append(mkChip(B.orgName(s.siteKey), s.siteKey, extra));
   }
 
-  $board.innerHTML = B.boardHtml(sites, orgFilter, { allKeys });
+  const sessionIndex = B.ticketSessionIndex(data.agents || []);
+  $board.innerHTML = B.boardHtml(sites, orgFilter, {
+    allKeys, sessionIndex, starts: sweepStarts(data.agents || [], sessionIndex),
+  });
+}
+
+// --- Start a session on a ticket -------------------------------------------
+// The card's start button POSTs to the hub, which routes the spawn to a host
+// holding both the org's Jira creds and the ticket's repo; the agent mints the
+// session id a beat or two later. Between the POST and that beat there's a gap
+// with nothing to link to, which the `pending` state covers.
+//
+// Pending is cleared by EVIDENCE, not a timer: either a session reporting this
+// spawn's cmdId shows up (the card gains a real chip), or the command clears
+// from the host's queue — which is what covers a spawn the agent REFUSED, whose
+// ack is the only signal a board that never sees a session would ever get. The
+// timeout is just the backstop for a host that stops beating mid-spawn.
+//
+// A failed POST parks the reason on the ticket instead of throwing a dialog, so
+// it renders on the card that caused it (same inline-.err convention as the
+// dashboard's clone/prune notes) and clears on the next attempt.
+const START_TIMEOUT_MS = 60000;
+const starts = new Map(); // "<siteKey>\x00<key>" -> {pending, cmdId, host, at} | {error}
+
+function startKey(siteKey, key) { return (siteKey || "") + "\x00" + key; }
+
+function sweepStarts(agents, sessionIndex) {
+  const now = Date.now();
+  for (const [k, p] of [...starts]) {
+    if (!p.pending) continue;              // an error sits until the next click
+    const [siteKey, issueKey] = k.split("\x00");
+    const landed = B.ticketSessionsOf(sessionIndex, siteKey, issueKey)
+      .some(s => s.spawnCmdId === p.cmdId);
+    const host = (agents || []).find(a => a.key === p.host);
+    // No `host` means the agent dropped out of the fleet entirely — hold until
+    // the timeout rather than reading a fleet we can't see as "done".
+    const acked = host && !(host.commands || []).some(c => c && c.cmdId === p.cmdId);
+    if (landed || acked) starts.delete(k);
+    else if (now - p.at > START_TIMEOUT_MS) {
+      starts.set(k, { error: "the host didn't start it in time" });
+    }
+  }
+  return starts;
+}
+
+async function startSession(issueKey, siteKey, btn) {
+  const k = startKey(siteKey, issueKey);
+  if (starts.get(k)?.pending) return;
+  starts.delete(k);                        // clear a previous failure's note
+  if (btn) btn.disabled = true;            // until the next render paints ⏳
+  const fail = (error) => { starts.set(k, { error }); if (cache) render(cache); };
+  let r, body = {};
+  try {
+    r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(issueKey)}/session`,
+                    { method: "POST" });
+  } catch { return void fail("the hub is unreachable"); }
+  if (r.status === 401) return void (location.href = "/login");
+  try { body = await r.json(); } catch { /* non-JSON error body */ }
+  if (!r.ok) return void fail(body.error || `HTTP ${r.status}`);
+  starts.set(k, { pending: true, cmdId: body.cmdId, host: body.host, at: Date.now() });
+  if (cache) render(cache);
 }
 
 // ---- Expanded ticket detail --------------------------------------------
@@ -177,16 +237,26 @@ async function openDetail(key, siteKey, fromEl) {
 }
 
 // Delegated: the board re-renders on every beat, so per-card listeners would be
-// re-bound constantly (and leak). A click on the kc-key link is left alone —
-// that's the deliberate way out to Jira.
+// re-bound constantly (and leak). The card's own interactive children are left
+// alone — kc-key is the deliberate way out to Jira, kc-sess into the session —
+// and kc-start does its own thing below instead of opening the panel.
+const CARD_OWN = ".kc-key, .kc-sess, .kc-start";
 $board.addEventListener("click", (e) => {
-  if (e.target.closest(".kc-key")) return;
+  const start = e.target.closest(".kc-start[data-start]");
+  if (start) {
+    const card = start.closest(".kanban-card");
+    if (card) startSession(start.dataset.start, card.dataset.site, start);
+    return;
+  }
+  if (e.target.closest(CARD_OWN)) return;
   const card = e.target.closest(".kanban-card");
   if (card) openDetail(card.dataset.key, card.dataset.site, card);
 });
 $board.addEventListener("keydown", (e) => {
   if (e.key !== "Enter" && e.key !== " ") return;
-  if (e.target.closest(".kc-key")) return;
+  // A focused button/link handles its own keying; only the card itself needs
+  // Enter/Space taught to it (it's a div with role=button).
+  if (e.target.closest(CARD_OWN)) return;
   const card = e.target.closest(".kanban-card");
   if (!card) return;
   e.preventDefault();                    // Space would scroll the page

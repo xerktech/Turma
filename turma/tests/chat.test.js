@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, agentsHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, agentsHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -491,6 +491,45 @@ test("prFooterChip: derives #number from the URL when absent, no CI mark when un
   const html = prFooterChip({ prs: [{ url: "https://github.com/o/r/pull/42" }] });
   assert.match(html, /#42/);
   assert.doesNotMatch(html, /pr-checks/);
+});
+
+// The Jira ticket this session was spawned to work — the reverse of the board's
+// ticket -> session link. It links out to Jira, not back to the board: from
+// inside a session, the useful thing is the live ticket.
+
+test("ticketFooterChip: '' for an ordinary session (not started from a ticket)", () => {
+  assert.equal(ticketFooterChip(null), "");
+  assert.equal(ticketFooterChip({}), "");
+  assert.equal(ticketFooterChip({ ticket: null }), "");
+  assert.equal(ticketFooterChip({ ticket: {} }), "");
+});
+
+test("ticketFooterChip: shows the key and links out to the live ticket", () => {
+  const html = ticketFooterChip({ ticket: {
+    key: "ENG-42", url: "https://myorg.atlassian.net/browse/ENG-42",
+    summary: "Fix the board", branch: "ENG-42-1",
+  } });
+  assert.match(html, /jira-chip/);
+  assert.match(html, />ENG-42</);
+  assert.match(html, /href="https:\/\/myorg\.atlassian\.net\/browse\/ENG-42"/);
+  assert.match(html, /target="_blank"/);
+  // The summary and the branch it was told to use ride as the tooltip — the
+  // chip itself only has room for the key.
+  assert.match(html, /title="Fix the board · branch ENG-42-1"/);
+});
+
+test("ticketFooterChip: a ticket with no url still renders (never a broken chip)", () => {
+  const html = ticketFooterChip({ ticket: { key: "ENG-1" } });
+  assert.match(html, />ENG-1</);
+  assert.match(html, /title="ENG-1"/);
+});
+
+test("ticketFooterChip: escapes a malicious ticket summary (no injection)", () => {
+  const html = ticketFooterChip({ ticket: {
+    key: "ENG-1", url: "https://x/browse/ENG-1", summary: '<img src=x onerror=alert(1)>',
+  } });
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /&lt;img/);
 });
 
 test("prFooterChip: escapes a malicious PR title (no injection)", () => {
