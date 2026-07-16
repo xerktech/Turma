@@ -34,13 +34,39 @@ Run with `--no-install-deps` to skip all of that and only lay down files.
 
 ## Install
 
+No checkout needed — `bootstrap.sh` fetches the latest native release,
+checksum-verifies it, and hands off to the `install.sh` inside it:
+
 ```sh
-./install.sh                 # from a repo checkout or an extracted release tarball
+curl -fsSL https://raw.githubusercontent.com/xerktech/turma/main/agent/native/bootstrap.sh | bash
+```
+
+Everything after `-s --` is passed straight through to `install.sh`, so the
+one-liner supports every option the checkout does:
+
+```sh
+curl -fsSL .../bootstrap.sh | bash -s -- --autostart --prefix /opt/turma
+```
+
+Or, from a repo checkout / an extracted release tarball:
+
+```sh
+./install.sh
 # options: --prefix DIR  --no-install-deps  --autostart  --verify  --uninstall
 ```
 
 Default install prefix is `~/.local/share/turma-agent`; config is
 `~/.config/turma-agent/turma-agent.env`.
+
+`bootstrap.sh` is only the way IN — once installed, `turma-agent-update` keeps
+the host current. It resolves the newest native build by the version in the
+**asset's own filename**, not by release tag: a release carries an unchanged
+native build forward under its original older name, so the newest tag does not
+always name the newest native tarball. It is anonymous (the repo is public, so
+no `gh` login or token, unlike the updater), and needs only curl + tar +
+sha256sum, since it runs before `install.sh` has installed anything — including
+python3, which is why it reads the release stream with grep rather than a JSON
+parser.
 
 ## Configure
 
@@ -93,6 +119,14 @@ release exists (a rollback, or before the cutover) it falls back to the legacy
 ```sh
 ./install.sh --verify       # files, tools, config, service, login — a status table
 ./install.sh --uninstall    # removes $PREFIX + units; preserves config/~/.turma/~/.claude
+```
+
+`install.sh` is not copied into the prefix, so on a host installed via the
+one-liner these run through `bootstrap.sh` — both modes act on the existing
+`$PREFIX`, not on the tarball they arrive in:
+
+```sh
+curl -fsSL .../bootstrap.sh | bash -s -- --verify
 ```
 
 ## Known limitations (graceful degradation)

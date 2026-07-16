@@ -170,3 +170,9 @@ jobs:
       # no-op, checksum refusal, legacy fallback). Pure shell + a gh stub.
       - name: Native updater tests (agent/native/turma-agent-update)
         run: ./agent/tests/test_turma_agent_update.sh
+      # bootstrap.sh is the README's curl|bash front door, so it runs off main
+      # on hosts with no checkout — a bug there has no deployed copy to fix.
+      # Covers its resolution decision (carried assets, newest build) and its
+      # refusal to install unverified bits. Pure shell + a curl stub.
+      - name: Native bootstrap tests (agent/native/bootstrap.sh)
+        run: ./agent/tests/test_bootstrap.sh
