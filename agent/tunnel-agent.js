@@ -35,11 +35,13 @@ const DEFAULT_TTYD_PORT = 7681;
 // ---- live transcript tail ---------------------------------------------------
 // The near-real-time path for the glasses' session screen. When a glasses
 // client is watching a session, the hub sends {"watch":<sessionId>,
-// "worktreePath":<path>} on the control channel; we then tail that ONE
-// transcript every LIVE_TAIL_MS and push {"tail":<sessionId>,"entries":[...]}
-// deltas straight back on the same control channel (the hub fans them out to
-// the watching glasses). {"unwatch":<sessionId>} stops it. Tailing runs only
-// while a session is actively watched, so idle sessions cost nothing.
+// "worktreePath":<path>,"transcriptId":<id>} on the control channel — the id
+// naming which transcript in that cwd's project dir is the session's own (see
+// sessionTranscript). We then tail that ONE transcript every LIVE_TAIL_MS and
+// push {"tail":<sessionId>,"entries":[...]} deltas straight back on the same
+// control channel (the hub fans them out to the watching glasses).
+// {"unwatch":<sessionId>} stops it. Tailing runs only while a session is
+// actively watched, so idle sessions cost nothing.
 //
 // The transcript read here is a deliberate re-implementation of hub-agent.py's
 // transcript_tail / _entry_text / _project_slug (same entry->text mapping,
@@ -86,6 +88,29 @@ const BLOCK_CAPS_LIVE = {
 // wrong for the dotted worktree paths this agent uses).
 function projectSlug(p) {
   return p.replace(/[^A-Za-z0-9]/g, "-");
+}
+
+// The transcript to tail for a watched session: the one the hub named
+// (<transcriptId>.jsonl in the session cwd's project-slug dir), else the newest
+// in that dir. Null when the named one doesn't exist yet, or when there is
+// nothing in the dir at all.
+//
+// The id is what makes a repos-root session tail its OWN conversation: every
+// root session shares REPOS_ROOT as its cwd, hence one project dir, so newest-
+// mtime hands a fresh root session the previous one's transcript (XERK-6). A
+// named-but-absent file means the session hasn't spoken yet — never fall back to
+// newest there, that IS the bug. A hub predating the pin sends no id, leaving
+// the newest-mtime rule it always used. Mirrors _session_transcript_path in
+// hub-agent.py.
+function sessionTranscript(worktreePath, transcriptId) {
+  if (!transcriptId) return newestTranscript(worktreePath);
+  // Same containment argument as newestTranscript's slug, applied to the id: a
+  // path can only be built from a plain uuid-ish word, so it names a child of
+  // the slug dir and nothing else.
+  if (!/^[A-Za-z0-9-]+$/.test(transcriptId)) return null;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  const p = path.join(PROJECTS_ROOT, projectSlug(worktreePath), `${transcriptId}.jsonl`);
+  return fs.existsSync(p) ? p : null;
 }
 
 // Newest *.jsonl transcript for a worktree (its project-slug dir), or null.
@@ -430,12 +455,12 @@ function entryBlocks(entry, caps) {
 // first: [{id: uuid, role, text}]. [] when there's no transcript yet.
 //
 // Optional `cache` ({path, mtimeMs, size, result}, one per watched session)
-// skips the ~128 KB read+parse when the newest transcript is unchanged since the
-// last poll (same file, same mtime+size) — pollWatcher ticks this ~1s per
-// session and most ticks find nothing new. newestTranscript already stat'd each
-// candidate, so one more stat of the winner is cheap next to re-reading the tail.
-function transcriptTail(worktreePath, cache) {
-  const p = newestTranscript(worktreePath);
+// skips the ~128 KB read+parse when the transcript is unchanged since the last
+// poll (same file, same mtime+size) — pollWatcher ticks this ~1s per session and
+// most ticks find nothing new. sessionTranscript already stat'd the candidates,
+// so one more stat of the winner is cheap next to re-reading the tail.
+function transcriptTail(worktreePath, cache, transcriptId) {
+  const p = sessionTranscript(worktreePath, transcriptId);
   if (!p) {
     if (cache) { cache.path = null; cache.result = []; }
     return [];
@@ -693,7 +718,8 @@ function pollWatcher(sessionId) {
   // 1. Committed transcript tail (authoritative history). The per-session cache
   //    skips the read+parse on ticks where the transcript file hasn't changed.
   let entries = null;
-  try { entries = transcriptTail(w.worktreePath, w.tailCache); } catch { entries = null; }
+  try { entries = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId); }
+  catch { entries = null; }
   if (entries && entries.length) {
     const json = JSON.stringify(entries);
     if (json !== w.lastJson) {
@@ -723,15 +749,23 @@ function pollWatcher(sessionId) {
   });
 }
 
-function startWatch(sessionId, worktreePath) {
+function startWatch(sessionId, worktreePath, transcriptId) {
   if (!sessionId || !worktreePath) return;
   const existing = watchers.get(sessionId);
-  if (existing) { existing.worktreePath = worktreePath; return; } // already tailing
+  if (existing) {
+    // A re-armed watch (control-channel flap) carries the hub's current view of
+    // where this session's transcript is; a restart-clear-context moves it, so
+    // take the newer answer rather than keeping the one we started with.
+    existing.worktreePath = worktreePath;
+    existing.transcriptId = transcriptId || null;
+    return; // already tailing
+  }
   if (watchers.size >= MAX_WATCHERS) {
     log(`live tail: at MAX_WATCHERS (${MAX_WATCHERS}); ignoring watch for ${sessionId}`);
     return;
   }
-  const w = { worktreePath, lastJson: null, lastTurn: "", timer: null,
+  const w = { worktreePath, transcriptId: transcriptId || null,
+    lastJson: null, lastTurn: "", timer: null,
     tailCache: { path: null, mtimeMs: 0, size: 0, result: [] } };
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
@@ -905,8 +939,10 @@ function connectControl() {
       openDataChannel(String(msg.open), port);
     } else if (msg.watch) {
       // The hub re-sends a watch for every still-attached glasses client on
-      // reconnect, so startWatch is idempotent (it just refreshes the path).
-      startWatch(String(msg.watch), msg.worktreePath ? String(msg.worktreePath) : "");
+      // reconnect, and again whenever a watched session's transcript moves, so
+      // startWatch is idempotent (it just refreshes the target).
+      startWatch(String(msg.watch), msg.worktreePath ? String(msg.worktreePath) : "",
+        msg.transcriptId ? String(msg.transcriptId) : "");
     } else if (msg.unwatch) {
       stopWatch(String(msg.unwatch));
     } else if (msg.poke) {
@@ -938,5 +974,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, parseAgentList, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, parseAgentList, BLOCK_CAPS_LIVE };
 }

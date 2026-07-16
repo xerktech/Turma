@@ -2462,6 +2462,7 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
       {
         id: "ls1",
         worktreePath: "/wt/ls1",
+        transcriptId: "conv-ls1",
         session: { tail: [{ id: "c1", role: "assistant", text: "cached" }] },
       },
     ],
@@ -2484,10 +2485,15 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
   assert.equal(seed.type, "tail");
   assert.deepEqual(seed.entries, [{ id: "c1", role: "assistant", text: "cached" }]);
 
-  // 2. The agent was told to start tailing, with the worktree path.
+  // 2. The agent was told to start tailing, with everything it needs to find
+  //    the transcript: the worktree path (-> the project dir) and the id naming
+  //    this session's own conversation inside it. Root sessions share one
+  //    project dir, so without the id the agent tails the newest transcript
+  //    there — the previous root session's (XERK-6).
   const watch = await nextTextJson(ctrlFrames, 0);
   assert.equal(watch.watch, "ls1");
   assert.equal(watch.worktreePath, "/wt/ls1");
+  assert.equal(watch.transcriptId, "conv-ls1");
 
   // 3. A tail delta the agent pushes on the control channel reaches the live
   //    client — including the rich `blocks` the native chat UI renders. The hub
@@ -2531,7 +2537,8 @@ test("live WS: a control channel connecting after watchers exist re-arms their w
     lastSeen: Date.now(),
     commands: [],
     history: {},
-    sessions: [{ id: "rs1", worktreePath: "/wt/rs1", session: { tail: [] } }],
+    sessions: [{ id: "rs1", worktreePath: "/wt/rs1", transcriptId: "conv-rs1",
+      session: { tail: [] } }],
   };
 
   // Watcher attaches while the tunnel is offline (no control channel yet).
@@ -2539,16 +2546,63 @@ test("live WS: a control channel connecting after watchers exist re-arms their w
   const live = await wsConnect(`/live/rehost/rs1?auth=${token}`);
   assert.match(live.statusLine, /^HTTP\/1\.1 101/);
 
-  // Now the tunnel connects — it must be told to watch the already-attached session.
+  // Now the tunnel connects — it must be told to watch the already-attached
+  // session, and re-armed with the same target a first watch would carry.
   const ctrl = await wsConnect(`/agent/control?name=rehost&token=agenttok`);
   const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
   const watch = await nextTextJson(ctrlFrames, 0);
   assert.equal(watch.watch, "rs1");
   assert.equal(watch.worktreePath, "/wt/rs1");
+  assert.equal(watch.transcriptId, "conv-rs1");
 
   live.socket.destroy();
   ctrl.socket.destroy();
   delete agents.rehost;
+});
+
+test("live WS: a watched session whose transcript MOVES is re-armed onto the new one", async () => {
+  // "Restart (clear context)" relaunches claude on a fresh transcript. A watch
+  // is otherwise sent once and held for its lifetime, so without a re-arm the
+  // agent keeps tailing a file the session will never write to again and the
+  // chat freezes on the pre-restart conversation.
+  const beat = (transcriptId) => request("POST", "/api/heartbeat", {
+    body: {
+      device: "movehost",
+      sessions: [{ id: "ms1", worktreePath: "/wt/ms1", transcriptId, session: { tail: [] } }],
+    },
+    headers: agentHeaders,
+  });
+  await beat("conv-one");
+
+  const ctrl = await wsConnect(`/agent/control?name=movehost&token=agenttok`);
+  const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
+  const token = await issueToken();
+  const live = await wsConnect(`/live/movehost/ms1?auth=${token}`);
+  assert.match(live.statusLine, /^HTTP\/1\.1 101/);
+
+  // finally, not a tail of straight-line destroys: an open socket keeps the
+  // run's event loop alive, so a failing assertion here would hang the suite
+  // instead of reporting itself.
+  try {
+    const first = await nextTextJson(ctrlFrames, 0);
+    assert.equal(first.transcriptId, "conv-one");
+
+    // A beat reporting the same transcript is not a move — nothing is re-sent.
+    await beat("conv-one");
+    // The restart lands: a new conversation, so the watch follows it.
+    await beat("conv-two");
+    // Frame 1 is the SECOND control frame ever sent. Asserting the move landed
+    // there is also what proves the unchanged beat above sent nothing: had it
+    // re-armed, this would read conv-one.
+    const rearm = await nextTextJson(ctrlFrames, 1);
+    assert.equal(rearm.watch, "ms1");
+    assert.equal(rearm.worktreePath, "/wt/ms1");
+    assert.equal(rearm.transcriptId, "conv-two");
+  } finally {
+    live.socket.destroy();
+    ctrl.socket.destroy();
+    delete agents.movehost;
+  }
 });
 
 // ---- /api/agents ETag + 304 (FIX 3/#9) --------------------------------------

@@ -66,6 +66,46 @@ This replaced the old model of one fixed-repo container per session.
   pointer), so **at most one root session runs per host at a time** (enforced on spawn/start/resume).
 - It's still killable/resumable like any session; its transcript persists under `REPOS_ROOT`'s
   project slug.
+- Because they share it, that ONE project slug dir accumulates EVERY root session's transcript —
+  which is what makes "this session's conversation" a real question here and a tautology everywhere
+  else. See "Which transcript is a session's" below; a root session is the only thing that
+  distinguishes the two rules, and it is why the pin exists at all.
+
+### Which transcript is a session's
+
+- Every launch **pins claude's session id** — `--session-id <uuid4>` minted in `_launch_tmux` for a
+  fresh conversation, or the `--resume` id for a rejoined one — and persists it on the record as
+  `claudeSessionId`. Claude Code names the transcript after that id, so a session's conversation is
+  `<claudeSessionId>.jsonl` under its cwd's project slug, known by name from before its first byte.
+- `_session_transcript_path()` is the one resolver every surface goes through (heartbeat signals +
+  tail, `history`, subagent resolution, summary seeding, the closed record's `transcriptId`, and the
+  `--resume` target), and the hub heartbeats the id so `tunnel-agent.js`'s live tail (`watch` →
+  `sessionTranscript`, the mirrored JS copy) points at the same file.
+- This **replaced a newest-mtime rule** ("whichever `*.jsonl` in the project dir was written last"),
+  which is exact when the dir holds one session's transcripts — a worktree session, whose cwd is its
+  own — and wrong for a root session, whose dir holds every root session ever run. There, the newest
+  was the PREVIOUS root session's until the new claude wrote its first entry, so a fresh root session
+  opened onto the last one's whole chat, was named from its first prompt, and on resume *relaunched
+  it* (XERK-6).
+- **A pinned session with no transcript on disk has not spoken, and resolves to nothing.** Never add a
+  newest-mtime fallback for that case: falling back is the bug, and it reads as an empty conversation
+  exactly once — before the first turn — which is the truth.
+- A session launched by an agent predating the pin carries no id and keeps the newest-mtime rule,
+  which is all it ever had; the payload likewise only pays for the stopped-only listdir for those.
+- Naming the transcript means the hub must say when the name CHANGES: a watch is sent once (first
+  watcher / control reconnect) and held for its lifetime, so `rearmMovedWatches` re-sends it when a
+  watched session's heartbeat `transcriptId` moves. Only "Restart (clear context)" moves it, and
+  without the re-arm that session's chat freezes on the pre-restart conversation — the agent keeps
+  tailing a file nothing will write to again, and the `/history` poll that would correct it only runs
+  while the socket is DOWN. The newest-mtime rule needed no such signal (it rolled over by itself),
+  so this is the cost of the pin, not an accident of it.
+- Still slug-keyed, and so still sharing one identity across a root session's neighbours: archival's
+  running-session exclusion (`_running_slugs`) and the summary/date an archived or resumable
+  transcript inherits (`_session_meta_by_slug`). Both are now fixable the same way, per transcript
+  rather than per slug.
+- Tests: `TestRootSessionIsolation` in `agent/tests/test_hub_agent.py` (which runs the real
+  A-converses-ends-B-spawns sequence), the `sessionTranscript` cases in
+  `agent/tests/tunnel-agent.test.js`, and the live-WS watch cases in `turma/tests/server.test.js`.
 
 ### Kill, resume, delete
 

@@ -2372,34 +2372,51 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         url = "https://github.com/o/r/pull/7"
         sm.session_pr_urls[sid] = [url]
         sm.pr_status_cache[url] = {"url": url, "state": "MERGED", "checks": "passing"}
-        # The transcript this session was having.
+        # The transcript this session was having — the one its launch pinned.
+        cs = sess["claudeSessionId"]
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
         os.makedirs(proj, exist_ok=True)
-        with open(os.path.join(proj, "t-abc.jsonl"), "w") as f:
+        with open(os.path.join(proj, f"{cs}.jsonl"), "w") as f:
             f.write("{}\n")
 
         sm.kill(sid)
 
         rec = next(c for c in sm.closed if c["id"] == sid)
         self.assertEqual(rec["prUrls"], [url])
-        self.assertEqual(rec["transcriptId"], "t-abc")
+        self.assertEqual(rec["transcriptId"], cs)
         # The live cache is gone, but the payload still resolves full PR status
         # through the snapshot — the whole point of keeping the URLs.
         self.assertNotIn(sid, sm.session_pr_urls)
         entry = next(c for c in sm._closed_payload() if c["id"] == sid)
         self.assertEqual(entry["prs"], [{"url": url, "state": "MERGED", "checks": "passing"}])
-        self.assertEqual(entry["transcriptId"], "t-abc")
+        self.assertEqual(entry["transcriptId"], cs)
 
-    def test_stopped_session_payload_carries_its_transcript_id(self):
-        """A stopped session (its claude exited on its own) keeps its registry
-        record, so unlike a killed one there is no closed record to snapshot
-        onto — the payload resolves the transcript instead. Only when stopped:
-        a running session is read live over /live, and this is a listdir the
-        per-beat hot path shouldn't pay for."""
+    def test_session_payload_reports_the_pinned_transcript_id_while_running(self):
+        """The pin makes a session's conversation free to name, so the payload
+        reports it from the moment it spawns — no listdir, running or not. The
+        hub needs it live: it's what points the live tail at THIS session's
+        transcript rather than the newest one sharing its project dir."""
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("Turma")
         sess = sm.registry[0]
+        self.assertEqual(sm._session_payload(sess, refresh=False)["transcriptId"],
+                         sess["claudeSessionId"])
+        sess["status"] = "stopped"
+        self.assertEqual(sm._session_payload(sess, refresh=False)["transcriptId"],
+                         sess["claudeSessionId"])
+
+    def test_unpinned_session_payload_carries_its_transcript_id_when_stopped(self):
+        """A session spawned before the pin has no id to report, so the payload
+        falls back to the newest transcript in its project dir — but only once
+        stopped (its claude exited on its own, and unlike a killed session there
+        is no closed record to snapshot onto). A running one is read live over
+        /live, and this is a listdir the per-beat hot path shouldn't pay for."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        sess["claudeSessionId"] = None  # as an older agent left it
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
         os.makedirs(proj, exist_ok=True)
         with open(os.path.join(proj, "t-xyz.jsonl"), "w") as f:
@@ -2494,8 +2511,9 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
     def test_spawn_no_options_keeps_todays_command_shape(self):
         """Regression guard: a bare spawn adds a DETACHED worktree (no -b, no
         app branch) and launches with the default auto mode, no --model, no
-        positional prompt. (No default base resolves under the fake git, so the
-        detach point is HEAD — nothing trails the worktree path.)"""
+        positional prompt, on a freshly minted claude session id. (No default
+        base resolves under the fake git, so the detach point is HEAD — nothing
+        trails the worktree path.)"""
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("Turma")
@@ -2510,7 +2528,8 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             self._claude_cmd(),
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(ha.QUESTIONS_DIR)} "
-            f"claude --remote-control '{sess['rcName']}' "
+            f"claude --session-id {sess['claudeSessionId']} "
+            f"--remote-control '{sess['rcName']}' "
             f"--permission-mode auto --settings {shlex.quote(settings)} "
             f"--append-system-prompt {shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT)}",
         )
@@ -4218,6 +4237,224 @@ class TestFirstUserText(unittest.TestCase):
         entries = [{"type": "mode"}] * 10 + [self._user("late prompt")]
         path = self._write("t.jsonl", entries)
         self.assertIsNone(ha._first_user_text(path, max_lines=5))
+
+
+class TestRootSessionIsolation(ManagerMixin, unittest.TestCase):
+    """XERK-6: a fresh root session must not open onto the previous one's chat.
+
+    Every repos-root session runs at REPOS_ROOT, so they all share ONE
+    ~/.claude/projects slug dir — unlike a worktree session, whose cwd (and
+    therefore slug) is its own. Resolving "this session's transcript" as
+    "the newest *.jsonl in that dir" is exact for a worktree and wrong here: the
+    newest is the PREVIOUS root session's until the new claude writes its first
+    entry, so a just-spawned root session reported that session's tail, served
+    its history, seeded its name from its first prompt — and on resume relaunched
+    it. Pinning claude's session id per launch (--session-id) is what tells the
+    two apart.
+
+    Each test runs the real sequence: root session A converses, ends, root
+    session B spawns.
+    """
+
+    def setUp(self):
+        super().setUp()
+        for name, value in [("REPOS_ROOT", self.tmp)]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(ha, "scan_repos", lambda: [])  # root needs no repo
+        p.start()
+        self.addCleanup(p.stop)
+        # The one project dir every root session's transcript lands in.
+        self.proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.tmp))
+        os.makedirs(self.proj, exist_ok=True)
+
+    def _manager(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()  # avoid the real Popen
+        return sm
+
+    def _converse(self, sess, text, mtime):
+        """Write the transcript claude would have written for `sess`, at a fixed
+        mtime so "newest" is unambiguous rather than a filesystem-clock race."""
+        path = os.path.join(self.proj, f"{sess['claudeSessionId']}.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "mode"}) + "\n")
+            f.write(json.dumps({"type": "user", "uuid": f"u-{text}",
+                                "message": {"role": "user", "content": text}}) + "\n")
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def _spawn_root(self, sm):
+        sm.spawn(ha.ROOT_REPO_NAME)
+        return sm.registry[-1]
+
+    def test_each_root_session_is_pinned_to_its_own_claude_session_id(self):
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+        self.assertTrue(a["claudeSessionId"] and b["claudeSessionId"])
+        self.assertNotEqual(a["claudeSessionId"], b["claudeSessionId"],
+                            "two root sessions must not share a conversation")
+        # Both were LAUNCHED under those ids, not just labelled with them.
+        launches = [c[-1] for c in self.run_ok_calls if "new-session" in c]
+        self.assertIn(f"--session-id {a['claudeSessionId']}", launches[0])
+        self.assertIn(f"--session-id {b['claudeSessionId']}", launches[1])
+
+    def test_new_root_session_does_not_report_the_previous_ones_tail(self):
+        # The reported symptom: session A's whole history showing up in B.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "session A work", mtime=1000)
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+
+        # B has not spoken yet: no transcript, so nothing to show.
+        rep = ha.session_report(self.tmp, {}, claude_sid=b["claudeSessionId"])
+        self.assertEqual(rep["tail"], [])
+        self.assertIsNone(rep["transcriptAgeSec"])
+
+        # ...and once it does speak, it shows ITS conversation, not A's.
+        self._converse(b, "session B work", mtime=2000)
+        rep = ha.session_report(self.tmp, {}, claude_sid=b["claudeSessionId"])
+        self.assertEqual([e["text"] for e in rep["tail"]], ["session B work"])
+
+    def test_a_root_session_reports_its_own_tail_even_when_not_the_newest(self):
+        # mtime order is not session order: A is still the newest file on disk
+        # while B is spawning, and B's own transcript stays older than a root
+        # session that outlives it. Only the pin distinguishes them.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "session A work", mtime=9000)  # the newest file
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+        self._converse(b, "session B work", mtime=1000)  # older, but B's own
+
+        rep = ha.session_report(self.tmp, {}, claude_sid=b["claudeSessionId"])
+        self.assertEqual([e["text"] for e in rep["tail"]], ["session B work"])
+        # The rule this replaced, on the same fixture, is what shipped the bug:
+        # B's card showing A's chat. If this ever stops differing, the test above
+        # has stopped proving anything.
+        stale = ha.session_report(self.tmp, {}, claude_sid=None)
+        self.assertEqual([e["text"] for e in stale["tail"]], ["session A work"])
+
+    def test_history_serves_the_new_root_sessions_own_conversation(self):
+        # The chat view's initial scrollback comes from here, so this is the
+        # other half of "the whole previous chat history is there".
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "session A work", mtime=1000)
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+
+        sm._stage_history(b["id"])
+        self.assertEqual(sm.history_results[-1]["entries"], [],
+                         "a root session that hasn't spoken has no history")
+
+        self._converse(b, "session B work", mtime=2000)
+        sm._stage_history(b["id"])
+        self.assertEqual([e["text"] for e in sm.history_results[-1]["entries"]],
+                         ["session B work"])
+
+    def test_new_root_session_is_not_named_from_the_previous_ones_prompt(self):
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "Add a docker compose flag", mtime=1000)
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()  # B has no prompt of its own yet
+
+        self._converse(b, "Fix the board filter", mtime=2000)
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_called_once_with(b, "Fix the board filter")
+
+    def test_resuming_a_root_session_rejoins_its_own_conversation(self):
+        # The worst form of the bug: not just displaying the wrong history but
+        # handing the relaunched claude someone else's context.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "session A work", mtime=1000)
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+        self._converse(b, "session B work", mtime=9000)  # B's is now the newest
+        sm.kill(b["id"])
+
+        sm.resume(a["id"])
+        cmd = [c[-1] for c in self.run_ok_calls if "new-session" in c][-1]
+        self.assertIn(f"--resume {a['claudeSessionId']}", cmd)
+        self.assertNotIn(b["claudeSessionId"], cmd)
+
+    def test_killing_a_root_session_records_its_own_transcript_id(self):
+        # What the Ended-sessions card opens from the archive.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "session A work", mtime=1000)
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+        self._converse(b, "session B work", mtime=9000)
+        sm.kill(b["id"])
+
+        rec_a = next(c for c in sm.closed if c["id"] == a["id"])
+        self.assertEqual(rec_a["transcriptId"], a["claudeSessionId"])
+        rec_b = next(c for c in sm.closed if c["id"] == b["id"])
+        self.assertEqual(rec_b["transcriptId"], b["claudeSessionId"])
+
+    def test_restart_moves_a_root_session_to_a_fresh_conversation(self):
+        # "Restart (clear context)" means a new conversation, and the session has
+        # to follow it — its pre-restart transcript stays the newest on disk.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "before the restart", mtime=9000)
+        before = a["claudeSessionId"]
+
+        sm.restart(a["id"])
+
+        self.assertNotEqual(a["claudeSessionId"], before)
+        cmd = [c[-1] for c in self.run_ok_calls if "new-session" in c][-1]
+        self.assertIn(f"--session-id {a['claudeSessionId']}", cmd)
+        self.assertNotIn("--resume", cmd)
+        rep = ha.session_report(self.tmp, {}, claude_sid=a["claudeSessionId"])
+        self.assertEqual(rep["tail"], [], "cleared context, not the old chat")
+
+    def test_a_session_predating_the_pin_keeps_the_newest_transcript_rule(self):
+        # An agent update must not blank the history of a session already
+        # running under the old rule: with no id there is nothing to pin to, and
+        # newest-mtime is the only handle it ever had.
+        sm = self._manager()
+        legacy = self._spawn_root(sm)
+        path = os.path.join(self.proj, "legacy-transcript.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "user", "uuid": "u1",
+                                "message": {"role": "user", "content": "old work"}}) + "\n")
+        legacy["claudeSessionId"] = None  # as an older agent left the record
+
+        rep = ha.session_report(self.tmp, {}, claude_sid=None)
+        self.assertEqual([e["text"] for e in rep["tail"]], ["old work"])
+        self.assertEqual(ha._session_transcript_path(legacy), path)
+        sm._stage_history(legacy["id"])
+        self.assertEqual([e["text"] for e in sm.history_results[-1]["entries"]],
+                         ["old work"])
+
+    def test_a_worktree_session_resolves_the_same_either_way(self):
+        # The pin is not a root-only special case; it's the general rule, and a
+        # worktree session (private slug dir) must answer identically under it.
+        sm = self._manager()
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        with mock.patch.object(ha, "scan_repos", lambda: [repo]):
+            sm.spawn("Turma")
+        sess = sm.registry[-1]
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, f"{sess['claudeSessionId']}.jsonl")
+        with open(path, "w") as f:
+            f.write("{}\n")
+        self.assertEqual(ha._session_transcript_path(sess), path)
+        self.assertEqual(ha._newest_transcript_path(sess["worktreePath"]), path)
 
 
 class TestSeedSummaries(ManagerMixin, unittest.TestCase):
