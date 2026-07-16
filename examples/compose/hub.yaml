@@ -1,0 +1,67 @@
+# Turma hub — the dashboard, terminal gateway, and durable archive.
+#
+#   cp .env.example .env && $EDITOR .env
+#   docker compose -f hub.yaml up -d
+#
+# Run ONE of these per fleet, somewhere every agent host can reach outbound.
+# Agents connect out to it; it never dials an agent, so it needs no route back
+# into the hosts it manages.
+
+services:
+  turma:
+    image: ghcr.io/xerktech/turma:latest
+    container_name: turma
+    restart: unless-stopped
+
+    ports:
+      - "8300:8300"
+
+    environment:
+      # --- Auth. Every check below FAILS OPEN when its variable is unset, and
+      # the hub warns at boot rather than refusing to start. Set all three.
+      TURMA_USER: "${TURMA_USER:?set TURMA_USER in .env}"
+      TURMA_PASSWORD: "${TURMA_PASSWORD:?set TURMA_PASSWORD in .env}"
+      # Shared with every agent, where it is named TURMA_TOKEN.
+      TURMA_AGENT_TOKEN: "${TURMA_AGENT_TOKEN:?set TURMA_AGENT_TOKEN in .env}"
+
+      # Optional: bearer token for POST /api/trigger (CI, webhooks). Unlike the
+      # two above this one does NOT fail open — leaving it unset just means the
+      # endpoint accepts only a logged-in operator, never an anonymous caller.
+      # TURMA_TRIGGER_TOKEN: "${TURMA_TRIGGER_TOKEN:-}"
+
+      # Optional: ntfy alerts (host offline, question waiting, PR opened, ...).
+      # Unset NTFY_URL disables them.
+      # NTFY_URL: "${NTFY_URL:-}"
+      # NTFY_TOPIC: "${NTFY_TOPIC:-agents}"
+      # NTFY_USER: "${NTFY_USER:-}"
+      # NTFY_PASS: "${NTFY_PASS:-}"
+
+      # Optional: Whisper STT for glasses/Android dictation, via any
+      # OpenAI-compatible endpoint (e.g. a LiteLLM instance). Point this at the
+      # /v1 base; the hub derives /audio/transcriptions from it.
+      # LITELLM_URL: "${LITELLM_URL:-}"
+      # LITELLM_API_KEY: "${LITELLM_API_KEY:-}"
+
+      # Optional: FCM push to the Android client. Inline service-account JSON.
+      # FCM_SERVICE_ACCOUNT_JSON: "${FCM_SERVICE_ACCOUNT_JSON:-}"
+
+      # Silences node:sqlite's ExperimentalWarning from the archive index.
+      NODE_NO_WARNINGS: "1"
+
+    volumes:
+      # MUST be persistent. Holds state.json, devices.json, and archive/ — the
+      # durable transcript history of every ended session. The FTS index inside
+      # it is disposable (rebuilt from the files), the .jsonl files are not.
+      - turma-data:/data
+
+    healthcheck:
+      # /healthz is the only unauthenticated route, precisely so a healthcheck
+      # doesn't need credentials.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8300/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  turma-data:
