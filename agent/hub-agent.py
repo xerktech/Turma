@@ -55,6 +55,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 import zlib
 from collections import deque
 
@@ -147,6 +148,10 @@ def _project_slug(path):
     '--turma-' — every transcript lookup missed, silently blanking
     session signals, tails, history, and usage for worktree sessions."""
     return re.sub(r"[^A-Za-z0-9]", "-", path)
+# A claude session id, which is both a transcript FILENAME and a token we
+# interpolate into the tmux command line (--session-id / --resume). Never let
+# anything through that isn't a plain uuid-ish word.
+VALID_CLAUDE_SID_RE = re.compile(r"[A-Za-z0-9-]+")
 # Glasses-client transcript tail: how many surviving messages to report per
 # beat, and how many chars of each to keep (payload-size bounds).
 TAIL_MSGS = int(os.environ.get("SESSION_TAIL_MSGS", "30"))
@@ -1944,6 +1949,47 @@ def _newest_transcript_path(workdir):
     return newest
 
 
+def _pinned_transcript_path(workdir, claude_sid):
+    """Path of the transcript claude was PINNED to for a session, or None.
+
+    Every launch fixes claude's session id (--session-id on a fresh one, the
+    --resume id otherwise), and Claude Code names the transcript after it, so
+    the file is <claude_sid>.jsonl under the cwd's project slug. None when the
+    session predates the pin (no id) or claude hasn't written its first entry
+    yet — see _session_transcript_path for why that is NOT a fallback."""
+    if not claude_sid or not VALID_CLAUDE_SID_RE.fullmatch(claude_sid):
+        return None
+    path = os.path.join(PROJECTS_ROOT, _project_slug(workdir),
+                        f"{claude_sid}.jsonl")
+    return path if os.path.exists(path) else None
+
+
+def _session_transcript_path(sess):
+    """The transcript THIS session's conversation lives in, or None.
+
+    Resolved from the session's own pinned claude id rather than "whichever
+    *.jsonl in the project dir was written most recently". The two rules agree
+    for a worktree session — its cwd is unique, so its slug dir holds only its
+    own transcripts — and disagree for exactly one thing: the repos-root
+    pseudo-repo, where every root session ever run shares REPOS_ROOT as its cwd
+    and therefore one slug dir. There, newest-mtime resolved a brand-new root
+    session to the PREVIOUS root session's conversation, which is what made a
+    fresh root session open onto the last one's whole chat history (XERK-6),
+    seed its name off that session's first prompt, and — worst — resume it.
+
+    A pinned session with no transcript on disk yet has not started a
+    conversation, and returns None rather than falling back to newest-mtime.
+    The fallback IS the bug: in a shared slug dir it silently answers with a
+    neighbour's conversation. Sessions launched by an agent predating the pin
+    carry no id and keep the newest-mtime rule, which is all they ever had."""
+    wt = sess.get("worktreePath") or (REPOS_ROOT if sess.get("root") else None)
+    if not wt:
+        return None
+    if sess.get("claudeSessionId"):
+        return _pinned_transcript_path(wt, sess["claudeSessionId"])
+    return _newest_transcript_path(wt)
+
+
 def _first_user_text(path, max_lines=500):
     """The first genuine human prompt from the START of a transcript, or None.
 
@@ -2285,7 +2331,8 @@ def _pane_busy(tmux_name):
     return any(m in low for m in PANE_BUSY_MARKERS)
 
 
-def session_report(workdir, state, tmux_name=None, session_id=None):
+def session_report(workdir, state, tmux_name=None, session_id=None,
+                   claude_sid=None):
     """Cheap per-heartbeat session signals (stat + tail reads, no full parse).
 
     state carries per-file byte offsets between beats so the PR-URL scan only
@@ -2293,6 +2340,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
     — see _scan_pr_line). The first call primes the offsets to EOF for every
     existing transcript, so a restarted agent never replays PR links from old
     sessions.
+
+    claude_sid pins WHICH transcript in the project dir is this session's (see
+    _session_transcript_path); without one — a session from an agent predating
+    the pin — the newest by mtime is the best guess available.
     """
     slug = _project_slug(workdir)
     proj = os.path.join(PROJECTS_ROOT, slug)
@@ -2337,7 +2388,15 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
             report["questionSource"] = "hook"
         return report
 
+    # One listdir serves both jobs: priming every file's offset (so a restarted
+    # agent doesn't replay old PR links) and finding this session's transcript.
+    # An unusable id matches no file rather than falling back — a session that
+    # HAS an id reports on its own conversation or on none, same as
+    # _session_transcript_path.
+    pinned = (os.path.join(proj, f"{claude_sid}.jsonl")
+              if claude_sid and VALID_CLAUDE_SID_RE.fullmatch(claude_sid) else "")
     newest, newest_mtime = None, 0.0
+    found, found_mtime = None, 0.0
     try:
         for fname in os.listdir(proj):
             if not fname.endswith(".jsonl"):
@@ -2349,12 +2408,19 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
                 continue
             if not primed:
                 offsets[path] = st.st_size
+            if path == pinned:
+                found, found_mtime = path, st.st_mtime
             if st.st_mtime > newest_mtime:
                 newest, newest_mtime = path, st.st_mtime
     except OSError:
         state["primed"] = True
         return _finish()
     state["primed"] = True
+    if claude_sid:
+        # A pinned session reports on its own transcript or on none at all: an
+        # absent file means it hasn't spoken yet, NOT that the newest neighbour
+        # in a shared project dir is its conversation.
+        newest, newest_mtime = found, found_mtime
     if not newest:
         return _finish()
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
@@ -4058,7 +4124,7 @@ class SessionManager:
                 sid = fname[:-len(".jsonl")]
                 # The id is interpolated into the tmux command line; never pass
                 # through a name that isn't a plain uuid-ish token.
-                if not re.fullmatch(r"[A-Za-z0-9-]+", sid):
+                if not VALID_CLAUDE_SID_RE.fullmatch(sid):
                     continue
                 try:
                     mtime = os.stat(os.path.join(proj, fname)).st_mtime
@@ -4069,6 +4135,21 @@ class SessionManager:
         except OSError:
             return None
         return newest
+
+    def _session_transcript_id(self, sess):
+        """Claude session id of THIS session's conversation, or None if it has
+        not had one yet. See _session_transcript_path — this is the same
+        resolution, reported as an id rather than opened as a path.
+
+        Re-validated on the way out, like _latest_transcript_id: the pinned
+        branch validates the id before building a path from it, but the unpinned
+        one derives an id from a FILENAME on disk, which nothing vets. Both feed
+        callers that put it on a command line."""
+        path = _session_transcript_path(sess)
+        if not path:
+            return None
+        sid = os.path.basename(path)[:-len(".jsonl")]
+        return sid if VALID_CLAUDE_SID_RE.fullmatch(sid) else None
 
     def _ensure_guard_settings(self):
         """Write (once per manager) the Claude ``--settings`` file that wires
@@ -4115,14 +4196,36 @@ class SessionManager:
         # bypassPermissions run under root; --remote-control bridges the session
         # to claude.ai/code + mobile under its per-session display name.
         parts = ["claude"]
+        # Fix WHICH conversation this session is, on every launch. A resume joins
+        # an existing one; anything else opens a new one under an id we mint here
+        # rather than letting claude pick its own — see _session_transcript_path
+        # for why the session has to know its own transcript by name.
+        claude_sid = None
         if resume:
-            claude_sid = None
-            if resume_id and re.fullmatch(r"[A-Za-z0-9-]+", resume_id):
+            if resume_id and VALID_CLAUDE_SID_RE.fullmatch(resume_id):
                 claude_sid = resume_id  # a specific transcript from the picker
+            elif sess.get("claudeSessionId"):
+                # This session's OWN conversation, not the newest one sharing its
+                # project dir: for a root session those differ, and resuming the
+                # neighbour would hand it someone else's context. Resolved only
+                # if it's really on disk — claude errors out on an id it can't
+                # resolve, and a session killed before its first turn has none to
+                # rejoin, so it (correctly) opens a fresh one below.
+                claude_sid = self._session_transcript_id(sess)
             else:
+                # Launched by an agent predating the pin: newest-mtime is the only
+                # handle it ever had on its conversation. Keep it.
                 claude_sid = self._latest_transcript_id(sess["worktreePath"])
-            if claude_sid:
-                parts.append(f"--resume {claude_sid}")
+        if claude_sid:
+            parts.append(f"--resume {claude_sid}")
+        else:
+            # Fresh conversation (spawn, restart-clear-context, or a resume with
+            # nothing to resume). --session-id names its transcript up front, so
+            # this session is identifiable from its first byte rather than from
+            # whenever it happens to out-mtime its neighbours.
+            claude_sid = str(uuid.uuid4())
+            parts.append(f"--session-id {claude_sid}")
+        sess["claudeSessionId"] = claude_sid
         parts.append(f"--remote-control '{sess['rcName']}'")
         model = sess.get("model")
         if model:
@@ -4351,6 +4454,8 @@ class SessionManager:
                              else os.path.join(WORKTREES_ROOT, repo["name"], sid)),
             "branch": None,        # app owns no branch; the agent names its own
             "root": is_root,
+            # The claude conversation this session IS; pinned by _launch_tmux.
+            "claudeSessionId": None,
             "label": label,
             "rcName": f"{slugify(self.device)}-{slugify(repo['name'])}-{rc_slug or sid}",
             "tmuxName": f"agent-{sid}",
@@ -4497,6 +4602,10 @@ class SessionManager:
             "id", "repo", "repoPath", "worktreePath", "branch", "baseRef",
             "rcName", "tmuxName", "createdAt", "label", "summary",
             "summaryManual", "model", "permissionMode", "root", "ticket",
+            # Which conversation this session WAS. Carried so a resume rejoins
+            # its own rather than whatever now happens to be newest in a shared
+            # project dir (root sessions share one) — see _launch_tmux.
+            "claudeSessionId",
         )}
         rec["closedAt"] = now_iso()
         # Snapshot the two things the live caches are about to forget, so the
@@ -4513,8 +4622,7 @@ class SessionManager:
         # Both are persisted with the record (closed.json), so they survive a
         # manager restart exactly as the rest of the closed history does.
         rec["prUrls"] = list(self.session_pr_urls.get(sess["id"]) or [])
-        wt = sess.get("worktreePath") or (REPOS_ROOT if sess.get("root") else None)
-        rec["transcriptId"] = self._latest_transcript_id(wt) if wt else None
+        rec["transcriptId"] = self._session_transcript_id(sess)
         self.closed = [c for c in self.closed if c.get("id") != rec["id"]]
         self.closed.append(rec)
         # Trim per repo, newest first (the list is in close order).
@@ -4613,6 +4721,10 @@ class SessionManager:
             # it's what this session IS, and _launch_tmux re-tells the agent the
             # same branch name rather than reserving a fresh one.
             "ticket": rec.get("ticket"),
+            # The conversation this session was having, so _launch_tmux rejoins
+            # THAT one. Root sessions share a project dir, so "the newest
+            # transcript here" is not the same question as "this session's".
+            "claudeSessionId": rec.get("claudeSessionId"),
             "rcName": rec.get("rcName"),
             "tmuxName": rec.get("tmuxName") or f"agent-{sid}",
             "ttydPort": self._alloc_port(),  # old port may be taken by now
@@ -4651,7 +4763,7 @@ class SessionManager:
         cmd_id is echoed onto the record as `spawnCmdId` for the same reason as
         in spawn(): a resume-by-transcript creates a session whose id the hub
         can't predict, so that's the UI's only handle on the one it asked for."""
-        if not transcript_id or not re.fullmatch(r"[A-Za-z0-9-]+", transcript_id):
+        if not transcript_id or not VALID_CLAUDE_SID_RE.fullmatch(transcript_id):
             log(f"resumeTranscript: bad transcript id {transcript_id!r}")
             return
         # Find the transcript dir: trust the picker's cwd hint if it still holds
@@ -4703,6 +4815,9 @@ class SessionManager:
             "worktreePath": cwd,
             "branch": None,
             "root": is_root,
+            # The transcript being resumed IS this session's conversation;
+            # _launch_tmux pins it from resume_id.
+            "claudeSessionId": None,
             "label": None,
             "summary": None,       # seeded from the transcript on later beats
             "rcName": f"{slugify(self.device)}-{slugify(repo)}-{sid}",
@@ -5026,7 +5141,7 @@ class SessionManager:
         stages an empty result instead of raising — a poison sessionId must
         not take down the heartbeat loop."""
         sess = self._find(sid)
-        path = _newest_transcript_path(sess["worktreePath"]) if sess else None
+        path = _session_transcript_path(sess) if sess else None
         if not path:
             self.history_results.append(
                 {"sessionId": sid, "entries": [], "truncated": False}
@@ -5051,7 +5166,7 @@ class SessionManager:
         result = {"sessionId": sid, "type": agent_type or "",
                   "label": label or "", "entries": [], "truncated": False}
         sess = self._find(sid)
-        main = _newest_transcript_path(sess["worktreePath"]) if sess else None
+        main = _session_transcript_path(sess) if sess else None
         path = _resolve_subagent(main, agent_type, label) if main else None
         if not path:
             self.subagent_history_results.append(result)
@@ -5295,7 +5410,7 @@ class SessionManager:
             for fname in names:
                 tid = fname[:-len(".jsonl")]
                 # The id is interpolated onto the tmux command line at resume.
-                if not re.fullmatch(r"[A-Za-z0-9-]+", tid):
+                if not VALID_CLAUDE_SID_RE.fullmatch(tid):
                     continue
                 path = os.path.join(proj, fname)
                 cwd = _transcript_cwd(path)
@@ -5794,7 +5909,7 @@ class SessionManager:
                 continue
             if sess["id"] in self.summaries:
                 continue
-            path = _newest_transcript_path(sess["worktreePath"])
+            path = _session_transcript_path(sess)
             if not path:
                 continue
             text = _first_user_text(path)
@@ -6346,7 +6461,8 @@ class SessionManager:
             try:
                 st = self.sess_state.setdefault(sid, {})
                 signals = session_report(sess["worktreePath"], st, sess.get("tmuxName"),
-                                         session_id=sess.get("id"))
+                                         session_id=sess.get("id"),
+                                         claude_sid=sess.get("claudeSessionId"))
                 pend = self.pending_prs.setdefault(sid, [])
                 pend.extend(signals.pop("prUrls"))
                 del pend[:-10]
@@ -6406,13 +6522,19 @@ class SessionManager:
             # pr_status_cache). Kept even after the session stops, as long as the
             # session record survives. None until it opens a PR.
             "prs": self._session_prs(sid),
-            # Which conversation this session is having, so the hub can open it
-            # read-only from the archive once it has ENDED. Resolved for stopped
-            # sessions only: a running one is read live over /live (and this is a
-            # listdir the hot path shouldn't pay for on every beat), while a
-            # stopped one is a bounded handful sitting in the Ended list.
-            "transcriptId": (None if running else
-                             self._latest_transcript_id(sess["worktreePath"])),
+            # Which conversation this session is having: the hub opens it
+            # read-only from the archive once the session has ENDED, and points
+            # the live tail at it (rather than at whatever shares its project
+            # dir) while it runs.
+            #
+            # A pinned session already knows its id, so reporting it is free and
+            # it is reported whether running or not. An unpinned one (an agent
+            # predating the pin) still costs a listdir to guess at, so that stays
+            # stopped-only: a running one is read live over /live, and the hot
+            # path shouldn't pay for it every beat.
+            "transcriptId": (sess.get("claudeSessionId")
+                             or (None if running else
+                                 self._latest_transcript_id(sess["worktreePath"]))),
             "session": signals,                      # running only; null otherwise
         }
 

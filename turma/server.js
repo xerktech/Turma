@@ -1055,11 +1055,43 @@ function openChannel(name, port) {
 // best-effort: if the control channel is offline the glasses simply keep
 // getting the (slower) heartbeat tail via the poll.
 
-// The session's worktree path as last reported on a heartbeat — what the agent
-// needs to locate the transcript. null if the session isn't known.
-function worktreePathFor(host, sessionId) {
+// Where the agent should look for a session's transcript, as last reported on a
+// heartbeat: its worktree path (which resolves to the project dir) plus the
+// transcript id naming its own conversation within that dir. The id matters for
+// repos-root sessions, whose project dir is shared by every root session ever
+// run — without it the agent tails whichever transcript there is newest, which
+// is the previous session's (XERK-6). null if the session isn't known;
+// transcriptId is null for an agent predating the pin, which leaves it on the
+// newest-mtime rule it always used.
+function watchTargetFor(host, sessionId) {
   const sess = (agents[host]?.sessions || []).find((s) => s.id === sessionId);
-  return sess?.worktreePath || null;
+  if (!sess?.worktreePath) return null;
+  return { worktreePath: sess.worktreePath, transcriptId: sess.transcriptId || null };
+}
+
+// A watched session's conversation MOVED — "Restart (clear context)" relaunches
+// claude on a fresh transcript — so re-arm the agent's tail onto the new one.
+//
+// A watch is otherwise sent once (on first watcher / control reconnect) and the
+// agent holds that target for the life of the watch, so without this the tail
+// stays pinned to a file the restarted session will never write to again: it
+// reports no deltas, and the chat sits frozen on the pre-restart conversation
+// with nothing to correct it (the /history poll only runs while the socket is
+// DOWN, and this one is healthy). Naming the transcript is what introduced the
+// need — the newest-mtime rule this replaced rolled onto the new file by itself.
+function rearmMovedWatches(host, prev, next) {
+  const cc = controlChannels[host];
+  const watched = liveClients[host];
+  if (!cc || !watched) return;
+  const before = new Map((prev?.sessions || []).map((s) => [s.id, s.transcriptId || null]));
+  for (const sess of next?.sessions || []) {
+    if (!watched[sess.id] || !sess.worktreePath) continue;
+    const now = sess.transcriptId || null;
+    // Only on a real move. An agent predating the pin reports null every beat,
+    // which is not a move — and re-arming on every beat would be a no-op anyway.
+    if (!before.has(sess.id) || before.get(sess.id) === now) continue;
+    cc.sendWatch(sess.id, { worktreePath: sess.worktreePath, transcriptId: now });
+  }
 }
 
 // Send one JSON text frame to a single live subscriber socket (best-effort).
@@ -1461,6 +1493,7 @@ const server = http.createServer(async (req, res) => {
       ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);
       heartbeatAlerts(key, prev, next);
+      rearmMovedWatches(key, prev, next);
       scheduleSave();
       // A fresh beat landed — refresh the memoized fleet payload and push the
       // updated record to open dashboards so the UI reflects it near-instantly.
@@ -1995,9 +2028,10 @@ server.on("upgrade", async (req, socket, head) => {
       // Tell the agent which ttyd port to bridge this data channel to (per
       // session); it defaults to 7681 if the port is ever absent.
       sendOpen: (ch, port) => send(0x1, JSON.stringify({ open: ch, port })),
-      // Start/stop the agent's live tail of one session's transcript. worktreePath
-      // is where the agent looks up the transcript (see tunnel-agent.js).
-      sendWatch: (sessionId, worktreePath) => send(0x1, JSON.stringify({ watch: sessionId, worktreePath })),
+      // Start/stop the agent's live tail of one session's transcript. See
+      // watchTargetFor for what the agent needs to locate it.
+      sendWatch: (sessionId, target) =>
+        send(0x1, JSON.stringify({ watch: sessionId, ...target })),
       sendUnwatch: (sessionId) => send(0x1, JSON.stringify({ unwatch: sessionId })),
       // Nudge the agent to heartbeat NOW so a just-queued command is delivered
       // in that beat's reply instead of waiting up to a whole TURMA_INTERVAL.
@@ -2011,8 +2045,8 @@ server.on("upgrade", async (req, socket, head) => {
     // has live watchers for — re-arm each so an agent restart / control-channel
     // flap doesn't silently stop the live stream to already-attached glasses.
     for (const sessionId of Object.keys(liveClients[name] || {})) {
-      const wp = worktreePathFor(name, sessionId);
-      if (wp) controlChannels[name].sendWatch(sessionId, wp);
+      const target = watchTargetFor(name, sessionId);
+      if (target) controlChannels[name].sendWatch(sessionId, target);
     }
     const ping = setInterval(() => send(0x9, Buffer.alloc(0)), 30000); // beat CF idle timeout
     // The agent pushes live deltas back on this same channel: committed
@@ -2101,8 +2135,8 @@ server.on("upgrade", async (req, socket, head) => {
 
     // First watcher for this session -> ask the agent to start tailing it.
     if (first) {
-      const wp = worktreePathFor(host, sessionId);
-      if (wp && controlChannels[host]) controlChannels[host].sendWatch(sessionId, wp);
+      const target = watchTargetFor(host, sessionId);
+      if (target && controlChannels[host]) controlChannels[host].sendWatch(sessionId, target);
     }
 
     const ping = setInterval(() => {

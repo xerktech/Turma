@@ -21,7 +21,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.TURMA_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, BLOCK_CAPS_LIVE } = require("../tunnel-agent.js");
+const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, BLOCK_CAPS_LIVE } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -318,6 +318,46 @@ test("transcriptTail: picks the newest transcript, caps at 30 messages", () => {
 test("transcriptTail: no transcript -> []", () => {
   assert.deepEqual(transcriptTail("/wt/does-not-exist"), []);
   assert.equal(newestTranscript("/wt/does-not-exist"), null);
+});
+
+// XERK-6: every repos-root session shares REPOS_ROOT as its cwd, so one project
+// dir holds every root session's transcript and "the newest one here" is not the
+// same question as "this session's". The hub names the id; these are the rules
+// for using it. Mirrors _session_transcript_path in hub-agent.py.
+test("sessionTranscript: the named transcript wins over a newer neighbour", () => {
+  const wt = "/wt/root-shared";
+  const dir = writeTranscript(wt, "sess-a.jsonl", [
+    { uuid: "a1", type: "user", message: { content: "session A work" } },
+  ]);
+  writeTranscript(wt, "sess-b.jsonl", [
+    { uuid: "b1", type: "user", message: { content: "session B work" } },
+  ]);
+  // A is the newest on disk; B is the session we're watching.
+  fs.utimesSync(path.join(dir, "sess-b.jsonl"), new Date(1000), new Date(1000));
+  fs.utimesSync(path.join(dir, "sess-a.jsonl"), new Date(9000), new Date(9000));
+
+  assert.equal(sessionTranscript(wt, "sess-b"), path.join(dir, "sess-b.jsonl"));
+  assert.deepEqual(transcriptTail(wt, null, "sess-b").map((e) => e.text), ["session B work"]);
+  // Without an id — a hub predating the pin — newest-mtime is all there is.
+  assert.equal(sessionTranscript(wt, null), path.join(dir, "sess-a.jsonl"));
+  assert.deepEqual(transcriptTail(wt, null).map((e) => e.text), ["session A work"]);
+});
+
+test("sessionTranscript: a named-but-absent transcript is empty, never a neighbour's", () => {
+  // A root session that hasn't spoken yet. Falling back to newest here is the
+  // bug itself: it would tail the previous root session's conversation.
+  const wt = "/wt/root-unspoken";
+  writeTranscript(wt, "sess-a.jsonl", [
+    { uuid: "a1", type: "user", message: { content: "session A work" } },
+  ]);
+  assert.equal(sessionTranscript(wt, "sess-new"), null);
+  assert.deepEqual(transcriptTail(wt, null, "sess-new"), []);
+});
+
+test("sessionTranscript: a traversing id names nothing", () => {
+  const wt = "/wt/root-shared";
+  assert.equal(sessionTranscript(wt, "../../etc/passwd"), null);
+  assert.equal(sessionTranscript(wt, "a/b"), null);
 });
 
 test("transcriptTail: with a cache, an unchanged file is not re-parsed", () => {
