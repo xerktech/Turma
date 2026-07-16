@@ -162,6 +162,46 @@ class AskHookTest(unittest.TestCase):
         self.assertEqual(captured["options"],
                          [{"label": "yes"}, {"label": "no", "description": "wait"}])
 
+    def test_request_file_carries_option_preview(self):
+        captured = {}
+
+        def worker():
+            deadline = time.time() + 4.0
+            while time.time() < deadline:
+                if os.path.exists(self.req):
+                    with open(self.req) as f:
+                        captured.update(json.load(f))
+                    with open(self.ans, "w") as f:
+                        json.dump({"optionIndex": 0}, f)
+                    return
+                time.sleep(0.02)
+        t = threading.Thread(target=worker)
+        t.start()
+        self.addCleanup(t.join)
+        run_main(
+            ask_event([{"question": "Pick", "options": [
+                {"label": "a", "description": "d", "preview": "mock preview"},
+            ]}]),
+            self.env,
+        )
+        self.assertEqual(captured["options"],
+                         [{"label": "a", "description": "d", "preview": "mock preview"}])
+
+    def test_multi_select_round_trip(self):
+        # A multiSelect answer sends optionIndices; the record carries the list
+        # of labels rather than a single label.
+        self._answer_when_asked({"optionIndices": [0, 2]})
+        rc, out = run_main(
+            ask_event([{"question": "Which features?", "multiSelect": True,
+                        "options": [{"label": "A"}, {"label": "B"}, {"label": "C"}]}]),
+            self.env,
+        )
+        payload = json.loads(self._decision(out)["permissionDecisionReason"])
+        ans = payload["answers"][0]
+        self.assertEqual(ans["optionIndices"], [0, 2])
+        self.assertEqual(ans["labels"], ["A", "C"])
+        self.assertNotIn("optionIndex", ans)
+
     def test_timeout_denies_with_marker(self):
         # No answering thread: the hook self-times-out and reports a no-answer.
         self.env["TURMA_QUESTION_TIMEOUT_SEC"] = "0.3"

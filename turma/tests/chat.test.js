@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, agentsHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -782,6 +782,45 @@ test("agentsHtml: escapes type + label (no attribute/markup injection)", () => {
   const html = agentsHtml([{ sel: false, type: "Ex\"plore", label: '<img src=x onerror=1>' }]);
   assert.doesNotMatch(html, /<img/);
   assert.match(html, /data-alabel="&lt;img/);
+});
+
+
+// --- optionCardHtml: an AskUserQuestion option card ---------------------------
+
+test("optionCardHtml: single-select renders a Choose button, no checkbox", () => {
+  const html = optionCardHtml({ label: "One-shot" }, 0, false);
+  assert.match(html, /class="q-opt-pick" data-idx="0"/);
+  assert.match(html, /One-shot/);
+  assert.doesNotMatch(html, /type="checkbox"/);
+});
+
+test("optionCardHtml: multiSelect renders a checkbox bound to its label", () => {
+  const html = optionCardHtml({ label: "Feature A" }, 1, true);
+  assert.match(html, /type="checkbox" class="q-check" id="qopt-1" data-idx="1"/);
+  assert.match(html, /<label class="q-opt-label" for="qopt-1">Feature A<\/label>/);
+  assert.doesNotMatch(html, /q-opt-pick/);
+});
+
+test("optionCardHtml: description and preview render when present", () => {
+  const html = optionCardHtml(
+    { label: "L", description: "what it means", preview: "Card meta row" }, 0, false);
+  assert.match(html, /class="q-opt-desc">what it means</);
+  assert.match(html, /<details class="q-prev-wrap">/);
+  assert.match(html, /class="q-prev">Card meta row<\/pre>/);
+});
+
+test("optionCardHtml: no description/preview -> only the head", () => {
+  const html = optionCardHtml({ label: "L" }, 0, false);
+  assert.doesNotMatch(html, /q-opt-desc/);
+  assert.doesNotMatch(html, /q-prev/);
+});
+
+test("optionCardHtml: escapes label, description and preview (no injection)", () => {
+  const html = optionCardHtml(
+    { label: '<b>x', description: '<i>d', preview: '<script>y</script>' }, 0, false);
+  assert.doesNotMatch(html, /<b>x/);
+  assert.doesNotMatch(html, /<script>y/);
+  assert.match(html, /&lt;script&gt;y/);
 });
 
 

@@ -930,6 +930,28 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["questionOptions"], ["Turma", "Tutela"])
         self.assertEqual(rep["questionSource"], "hook")
 
+    def test_hook_file_fills_rich_question_fields(self):
+        # The rich picker fields (header, position, multiSelect, per-option
+        # description/preview) ride the heartbeat alongside the flat labels.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("working on it")])
+        req = {"sessionId": "sess-1", "question": "What should it mean?",
+               "header": "Semantics", "index": 0, "total": 4, "multiSelect": True,
+               "options": [{"label": "One-shot", "description": "start now",
+                            "preview": "Card meta row: [Start]"},
+                           {"label": "Standing", "description": "auto-spawn"}]}
+        with open(os.path.join(self.questions_dir, "sess-1.req.json"), "w") as f:
+            json.dump(req, f)
+        rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id="sess-1")
+        self.assertEqual(rep["questionOptions"], ["One-shot", "Standing"])
+        self.assertEqual(rep["questionHeader"], "Semantics")
+        self.assertEqual(rep["questionIndex"], 0)
+        self.assertEqual(rep["questionTotal"], 4)
+        self.assertTrue(rep["questionMulti"])
+        self.assertEqual(rep["questionOptionsRich"][0],
+                         {"label": "One-shot", "description": "start now",
+                          "preview": "Card meta row: [Start]"})
+
     def test_hook_file_works_when_no_transcript_yet(self):
         # No .jsonl in the project dir at all — the early-return path must still
         # surface the hook's request file for a question asked before any write.
@@ -1115,28 +1137,47 @@ class TestHookQuestion(unittest.TestCase):
             json.dump(data, f)
 
     def test_missing_file(self):
-        self.assertEqual(ha._hook_question("nope"), (None, []))
+        self.assertIsNone(ha._hook_question("nope"))
 
     def test_no_session_id(self):
-        self.assertEqual(ha._hook_question(None), (None, []))
-        self.assertEqual(ha._hook_question(""), (None, []))
+        self.assertIsNone(ha._hook_question(None))
+        self.assertIsNone(ha._hook_question(""))
 
     def test_reads_question_and_labels(self):
         self._write("s", {"question": "Which?",
                           "options": [{"label": "A"}, {"label": "B"}]})
-        self.assertEqual(ha._hook_question("s"), ("Which?", ["A", "B"]))
+        hq = ha._hook_question("s")
+        self.assertEqual(hq["question"], "Which?")
+        self.assertEqual(hq["labels"], ["A", "B"])
+        self.assertEqual(hq["options"], [{"label": "A"}, {"label": "B"}])
+        self.assertIsNone(hq["header"])
+        self.assertFalse(hq["multi"])
+
+    def test_reads_rich_option_fields(self):
+        self._write("s", {"question": "Pick", "header": "Semantics",
+                          "index": 2, "total": 4, "multiSelect": True,
+                          "options": [{"label": "A", "description": "d",
+                                       "preview": "P" * 5000}]})
+        hq = ha._hook_question("s")
+        self.assertEqual(hq["header"], "Semantics")
+        self.assertEqual(hq["index"], 2)
+        self.assertEqual(hq["total"], 4)
+        self.assertTrue(hq["multi"])
+        opt = hq["options"][0]
+        self.assertEqual(opt["description"], "d")
+        self.assertEqual(len(opt["preview"]), ha._Q_PREVIEW_MAX)  # capped
 
     def test_corrupt_file_is_no_question(self):
         with open(os.path.join(self.tmp, "s.req.json"), "w") as f:
             f.write("{not json")
-        self.assertEqual(ha._hook_question("s"), (None, []))
+        self.assertIsNone(ha._hook_question("s"))
 
     def test_question_capped_at_300_and_labels_at_80(self):
         self._write("s", {"question": "Q" * 400,
                           "options": [{"label": "L" * 100}]})
-        q, opts = ha._hook_question("s")
-        self.assertEqual(len(q), 300)
-        self.assertEqual(opts, ["L" * 80])
+        hq = ha._hook_question("s")
+        self.assertEqual(len(hq["question"]), 300)
+        self.assertEqual(hq["labels"], ["L" * 80])
 
 
 class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
@@ -3051,6 +3092,23 @@ class TestAnswerQuestion(ManagerMixin, unittest.TestCase):
         sm.answer_question(sess["id"], -1, "   ")  # blank custom, negative index
         self.assertIsNone(self._ans(sess["id"]))
 
+    def test_writes_multi_select_answer(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        self._req(sess["id"])
+        # A multiSelect answer carries a list; the single-index compat key is the
+        # first pick. Duplicates and negatives are sanitized out.
+        sm.answer_question(sess["id"], -1, None, [2, 0, 2, -1])
+        self.assertEqual(self._ans(sess["id"]),
+                         {"optionIndices": [2, 0], "optionIndex": 2})
+
+    def test_empty_multi_select_list_falls_back_to_single(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        self._req(sess["id"])
+        sm.answer_question(sess["id"], 1, None, [])  # empty list -> single index
+        self.assertEqual(self._ans(sess["id"]), {"optionIndex": 1})
+
     def test_kill_clears_pending_question_files(self):
         sm = self.make_manager()
         sess = {"id": "abcde", "status": "running", "repo": "r",
@@ -3279,8 +3337,18 @@ class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
         cmds = [{"cmdId": "a1", "type": "answerQuestion", "sessionId": "s1",
                  "optionIndex": 2, "custom": "other"}]
         self.assertTrue(sm.handle_commands(cmds))
-        sm.answer_question.assert_called_once_with("s1", 2, "other")
+        sm.answer_question.assert_called_once_with("s1", 2, "other", None)
         self.assertEqual(sm.acked, {"a1"})
+
+    def test_dispatches_answer_question_multi(self):
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        sm.answer_question = mock.Mock()
+        cmds = [{"cmdId": "a2", "type": "answerQuestion", "sessionId": "s1",
+                 "optionIndex": -1, "optionIndices": [0, 2]}]
+        self.assertTrue(sm.handle_commands(cmds))
+        sm.answer_question.assert_called_once_with("s1", -1, None, [0, 2])
+        self.assertEqual(sm.acked, {"a2"})
 
 
 class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):

@@ -2107,10 +2107,15 @@ QUESTION_STALE_AFTER_SEC = ASK_HOOK_TIMEOUT_SEC + 60
 
 def _hook_question(session_id):
     """Read a *live* pending AskUserQuestion published by the ask.py PreToolUse
-    bridge for `session_id`, as (question, options) or (None, []). The bridge
-    blocks the tool call while this request file exists, so its presence is an
-    exact "a question is waiting right now" signal — no pane scraping, no
-    transcript timing.
+    bridge for `session_id`, as a rich dict or None. The bridge blocks the tool
+    call while this request file exists, so its presence is an exact "a question
+    is waiting right now" signal — no pane scraping, no transcript timing.
+
+    The dict carries everything the native chat needs to render the picker the
+    TUI shows: ``question`` text, backward-compat ``labels`` (option labels
+    only), the richer ``options`` (``[{label, description?, preview?}]``), the
+    question ``header`` chip, its ``index``/``total`` position in a multi-question
+    call, and whether it's ``multi``-select. None when no question is pending.
 
     A req is only live while the bridge is actually blocked on it, so two states
     are *not* reported (both are how an already-answered question would linger):
@@ -2125,13 +2130,13 @@ def _hook_question(session_id):
 
     Best-effort: a missing/half-written file is just no question."""
     if not session_id:
-        return None, []
+        return None
     path = os.path.join(QUESTIONS_DIR, f"{session_id}.req.json")
     ans_path = os.path.join(QUESTIONS_DIR, f"{session_id}.ans.json")
     try:
         mtime = os.stat(path).st_mtime
     except OSError:
-        return None, []
+        return None
     # Orphaned by a dead bridge (too old to still be blocking) — drop and tidy.
     if time.time() - mtime > QUESTION_STALE_AFTER_SEC:
         for p in (path, ans_path):
@@ -2139,24 +2144,76 @@ def _hook_question(session_id):
                 os.remove(p)
             except OSError:
                 pass
-        return None, []
+        return None
     # Answer already delivered — the bridge is consuming it, not still asking.
     if os.path.exists(ans_path):
-        return None, []
+        return None
     try:
         with open(path, encoding="utf-8") as f:
             req = json.load(f)
     except (FileNotFoundError, ValueError, OSError):
-        return None, []
+        return None
     if not isinstance(req, dict):
-        return None, []
+        return None
     question = str(req.get("question") or "")[:300] or None
-    opts = req.get("options") or []
-    labels = [
-        opt["label"][:80] for opt in opts[:4]
+    if not question:
+        return None
+    return {
+        "question": question,
+        "labels": _question_labels(req.get("options")),
+        "options": _question_options(req.get("options")),
+        "header": _question_header(req.get("header")),
+        "index": req.get("index") if isinstance(req.get("index"), int) else 0,
+        "total": req.get("total") if isinstance(req.get("total"), int) else 1,
+        "multi": req.get("multiSelect") is True,
+    }
+
+
+# Per-option caps for the heartbeat. Previews (rendered mockups/code) are the
+# heaviest field, so they're capped hardest here — the on-demand history read
+# isn't a factor since a pending question rides the live heartbeat, not history.
+_Q_LABEL_MAX = 80
+_Q_DESC_MAX = 400
+_Q_PREVIEW_MAX = 1200
+_Q_OPTS_MAX = 4
+
+
+def _question_labels(opts):
+    """Backward-compat: the option *labels* only, for older clients (glasses,
+    android) that render a flat pick list."""
+    if not isinstance(opts, list):
+        return []
+    return [
+        opt["label"][:_Q_LABEL_MAX] for opt in opts[:_Q_OPTS_MAX]
         if isinstance(opt, dict) and isinstance(opt.get("label"), str)
     ]
-    return question, labels
+
+
+def _question_options(opts):
+    """Rich options — ``[{label, description?, preview?}]`` — for the native chat
+    to render option cards with the description and preview the TUI shows."""
+    out = []
+    if not isinstance(opts, list):
+        return out
+    for opt in opts[:_Q_OPTS_MAX]:
+        if not (isinstance(opt, dict) and isinstance(opt.get("label"), str)):
+            continue
+        item = {"label": opt["label"][:_Q_LABEL_MAX]}
+        desc = opt.get("description")
+        if isinstance(desc, str) and desc:
+            item["description"] = desc[:_Q_DESC_MAX]
+        preview = opt.get("preview")
+        if isinstance(preview, str) and preview:
+            item["preview"] = preview[:_Q_PREVIEW_MAX]
+        out.append(item)
+    return out
+
+
+def _question_header(header):
+    """The question's short header chip (e.g. "Semantics"), or None."""
+    if isinstance(header, str) and header.strip():
+        return header[:24]
+    return None
 
 
 # Claude Code's TUI paints an "esc to interrupt" hint on its status line for
@@ -2223,6 +2280,13 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
         "lastHasToolUse": False,
         "question": None,          # pending AskUserQuestion text, if any
         "questionOptions": [],     # pending AskUserQuestion option labels, if any
+        # Rich pending-question fields for the native chat picker (backward-compat
+        # clients ignore these and read `questionOptions` labels):
+        "questionOptionsRich": [], # [{label, description?, preview?}] for option cards
+        "questionHeader": None,    # short header chip, e.g. "Semantics"
+        "questionIndex": None,     # 0-based position in a multi-question call
+        "questionTotal": None,     # count of questions in the call
+        "questionMulti": False,    # multiSelect (pick several, then submit)
         "questionSource": None,    # "transcript" | "hook" | None — which detector fired
         "prUrls": [],              # PR links newly appended since last beat
         "tail": [],                # recent transcript messages, for the glasses client
@@ -2233,10 +2297,15 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
         # long as a question is actually blocking the tool call, so it's the
         # authoritative pending signal — prefer it over the transcript scan
         # (which can only see a question once it's already answered/denied).
-        hq, hopts = _hook_question(session_id)
+        hq = _hook_question(session_id)
         if hq:
-            report["question"] = hq
-            report["questionOptions"] = hopts
+            report["question"] = hq["question"]
+            report["questionOptions"] = hq["labels"]
+            report["questionOptionsRich"] = hq["options"]
+            report["questionHeader"] = hq["header"]
+            report["questionIndex"] = hq["index"]
+            report["questionTotal"] = hq["total"]
+            report["questionMulti"] = hq["multi"]
             report["questionSource"] = "hook"
         return report
 
@@ -2276,12 +2345,15 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
                 if block.get("name") == "AskUserQuestion" and report["lastRole"] == "assistant":
                     qs = (block.get("input") or {}).get("questions") or []
                     if qs and isinstance(qs[0], dict):
-                        report["question"] = str(qs[0].get("question") or "")[:300] or None
-                        opts = qs[0].get("options") or []
-                        report["questionOptions"] = [
-                            opt["label"][:80] for opt in opts[:4]
-                            if isinstance(opt, dict) and isinstance(opt.get("label"), str)
-                        ]
+                        q0 = qs[0]
+                        report["question"] = str(q0.get("question") or "")[:300] or None
+                        opts = q0.get("options") or []
+                        report["questionOptions"] = _question_labels(opts)
+                        report["questionOptionsRich"] = _question_options(opts)
+                        report["questionHeader"] = _question_header(q0.get("header"))
+                        report["questionIndex"] = 0
+                        report["questionTotal"] = len(qs)
+                        report["questionMulti"] = q0.get("multiSelect") is True
                         if report["question"]:
                             report["questionSource"] = "transcript"
 
@@ -4804,28 +4876,47 @@ class SessionManager:
                 continue  # a live bridge may still own it
             self._clear_question_files(sid)
 
-    def answer_question(self, sid, option_index, custom):
+    def answer_question(self, sid, option_index, custom, option_indices=None):
         """Answer a session's pending AskUserQuestion by dropping the answer file
         the ask.py bridge is polling for. option_index is 0-based into the
         question's options (or -1 for a free-text / "Other" answer carried in
-        custom). Only writes when a request file is actually pending, so a stray
-        answer for a session with no live question is a no-op. Written
-        atomically (temp + replace) so the blocked hook never reads a partial."""
+        custom); option_indices is the multiSelect equivalent (a list of picks).
+        Only writes when a request file is actually pending, so a stray answer
+        for a session with no live question is a no-op. Written atomically
+        (temp + replace) so the blocked hook never reads a partial."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
         req_path, ans_path = self._question_paths(sid)
         if not os.path.exists(req_path):
             return  # nothing waiting on this session
+        # A multiSelect answer carries a list of picks; a single-select one a
+        # lone index. Sanitize the list and prefer it when non-empty.
+        idxs = None
+        if isinstance(option_indices, list):
+            idxs = []
+            for v in option_indices:
+                try:
+                    n = int(v)
+                except (TypeError, ValueError):
+                    continue
+                if n >= 0 and n not in idxs:
+                    idxs.append(n)
         try:
             idx = int(option_index)
         except (TypeError, ValueError):
             idx = -1
-        answer = {"optionIndex": idx}
-        if isinstance(custom, str) and custom.strip():
+        has_text = isinstance(custom, str) and bool(custom.strip())
+        answer = {}
+        if idxs is not None and idxs:
+            answer["optionIndices"] = idxs
+            answer["optionIndex"] = idxs[0]  # compat for a single-answer reader
+        else:
+            answer["optionIndex"] = idx
+            if idx < 0 and not has_text:
+                return  # no option and no text — nothing to answer with
+        if has_text:
             answer["custom"] = custom[:INPUT_MAX_CHARS]
-        elif idx < 0:
-            return  # no option and no text — nothing to answer with
         try:
             tmp = f"{ans_path}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -5789,6 +5880,7 @@ class SessionManager:
                         cmd.get("sessionId"),
                         cmd.get("optionIndex"),
                         cmd.get("custom"),
+                        cmd.get("optionIndices"),
                     )
                 elif ctype == "history":
                     self._stage_history(cmd.get("sessionId"))

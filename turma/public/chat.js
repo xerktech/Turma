@@ -1087,11 +1087,43 @@
   }
 
   // ---- pending AskUserQuestion ---------------------------------------------
+  // Build one option card: label + optional description + a collapsible preview
+  // (the rendered mockup/code the TUI shows on the right). `rich` is the
+  // {label, description?, preview?} shape from `questionOptionsRich`; when only
+  // the legacy label strings are present it degrades to label-only.
+  function optionCardHtml(rich, i, multi) {
+    const label = esc(rich.label || "");
+    const head = multi
+      ? '<input type="checkbox" class="q-check" id="qopt-' + i + '" data-idx="' + i + '">' +
+        '<label class="q-opt-label" for="qopt-' + i + '">' + label + "</label>"
+      : '<span class="q-opt-label">' + label + "</span>" +
+        '<button class="q-opt-pick" data-idx="' + i + '">Choose</button>';
+    let body = "";
+    if (rich.description) body += '<div class="q-opt-desc">' + esc(rich.description) + "</div>";
+    if (rich.preview) {
+      // Previews are pre-formatted mockups/code — a monospace <pre> preserves
+      // their alignment faithfully where markdown reflow would mangle it.
+      body += '<details class="q-prev-wrap"><summary>Preview</summary>' +
+        '<pre class="q-prev">' + esc(rich.preview) + "</pre></details>";
+    }
+    return '<div class="q-opt-card" data-idx="' + i + '"><div class="q-opt-head">' +
+      head + "</div>" + body + "</div>";
+  }
+
   function updateQuestion(s) {
     const box = $("chatQuestion");
     if (!box) return;
-    const q = s && s.session && s.session.question;
-    const opts = (s && s.session && s.session.questionOptions) || [];
+    const sess2 = s && s.session;
+    const q = sess2 && sess2.question;
+    // Prefer the rich options ({label, description?, preview?}); fall back to the
+    // legacy label strings so an older agent still renders a pick list.
+    const rich = (sess2 && sess2.questionOptionsRich) || null;
+    const labels = (sess2 && sess2.questionOptions) || [];
+    const opts = (rich && rich.length) ? rich : labels.map((l) => ({ label: l }));
+    const multi = !!(sess2 && sess2.questionMulti);
+    const header = sess2 && sess2.questionHeader;
+    const total = sess2 && sess2.questionTotal;
+    const index = sess2 && sess2.questionIndex;
     // A stale heartbeat may still report the question we just answered; keep it
     // hidden until the agent actually clears it, then forget the suppression.
     if (q && q === answeredQuestion) { questionActive = false; box.hidden = true; box.innerHTML = ""; return; }
@@ -1099,18 +1131,41 @@
     questionActive = !!q;
     if (!q) { box.hidden = true; box.innerHTML = ""; return; }
     box.hidden = false;
-    box.innerHTML =
+    // Header chip + "n of N" progress, shown when a call bundles several
+    // questions so the operator knows more follow this one.
+    let meta = "";
+    if (header || (typeof total === "number" && total > 1)) {
+      meta = '<div class="q-meta">' +
+        (header ? '<span class="q-chip">' + esc(header) + "</span>" : "") +
+        ((typeof total === "number" && total > 1)
+          ? '<span class="q-progress">' + ((typeof index === "number" ? index : 0) + 1) +
+            " of " + total + "</span>" : "") + "</div>";
+    }
+    const submit = multi ? '<button class="q-submit">Submit selection</button>' : "";
+    box.innerHTML = meta +
       '<div class="q-text">' + esc(q) + "</div>" +
-      '<div class="q-opts">' + opts.map((o, i) =>
-        '<button class="q-opt" data-idx="' + i + '">' + esc(o) + "</button>").join("") + "</div>" +
+      '<div class="q-opts' + (multi ? " q-opts-multi" : "") + '">' +
+        opts.map((o, i) => optionCardHtml(o, i, multi)).join("") + "</div>" +
+      submit +
       '<div class="q-hint">Or type a custom answer below.</div>';
-    box.querySelectorAll(".q-opt").forEach((b) => b.addEventListener("click", () =>
-      answerQuestion(parseInt(b.getAttribute("data-idx"), 10), null)));
+    if (multi) {
+      const btn = box.querySelector(".q-submit");
+      if (btn) btn.addEventListener("click", () => {
+        const picks = Array.from(box.querySelectorAll(".q-check"))
+          .filter((c) => c.checked)
+          .map((c) => parseInt(c.getAttribute("data-idx"), 10));
+        if (picks.length) answerQuestion(-1, null, picks);
+      });
+    } else {
+      box.querySelectorAll(".q-opt-pick").forEach((b) => b.addEventListener("click", () =>
+        answerQuestion(parseInt(b.getAttribute("data-idx"), 10), null)));
+    }
   }
 
-  async function answerQuestion(optionIndex, custom) {
+  async function answerQuestion(optionIndex, custom, optionIndices) {
     if (!hostKey || !sessionId) return;
     const body = { optionIndex };
+    if (Array.isArray(optionIndices) && optionIndices.length) body.optionIndices = optionIndices;
     if (custom) body.custom = custom;
     // Hide the box immediately on click — the round-trip to the hub (and the
     // agent's next heartbeat) can take a moment, and leaving it up reads as if
@@ -1363,7 +1418,7 @@
     module.exports = {
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, prFooterChip,
       ticketFooterChip,
-      agentsHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
+      agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
       isBusy, updateComposeAction,
       __setLiveStatus: (st) => { liveStatus = st; },
       __stopPending: (t) => { stopPendingAt = t; },

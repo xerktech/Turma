@@ -75,8 +75,11 @@ def _emit_deny(reason: str) -> None:
 
 
 def _normalize_options(raw) -> list[dict]:
-    """Coerce a question's ``options`` into ``[{label, description?}]``. Bare
-    strings become ``{label}``; malformed entries are dropped."""
+    """Coerce a question's ``options`` into ``[{label, description?, preview?}]``.
+    Bare strings become ``{label}``; malformed entries are dropped. ``preview`` is
+    the option's rendered mockup/code sample — carried so the native chat can show
+    what each choice means, not just its label. It's capped generously here (the
+    hub re-caps for the heartbeat), the description tighter."""
     out: list[dict] = []
     if not isinstance(raw, list):
         return out
@@ -88,6 +91,9 @@ def _normalize_options(raw) -> list[dict]:
             desc = o.get("description")
             if isinstance(desc, str) and desc:
                 opt["description"] = desc[:400]
+            preview = o.get("preview")
+            if isinstance(preview, str) and preview:
+                opt["preview"] = preview[:2000]
             out.append(opt)
     return out
 
@@ -162,15 +168,33 @@ def _ask_one(req_path: str, ans_path: str, question: dict, index: int,
     if answer is None:
         return {"question": q_text, "optionIndex": -1, "label": None,
                 "custom": "__hook_timeout__"}
-    option_index = answer.get("optionIndex")
-    option_index = option_index if isinstance(option_index, int) else -1
     custom = answer.get("custom")
     custom = custom if isinstance(custom, str) and custom else None
-    label = None
-    if 0 <= option_index < len(options):
-        label = options[option_index].get("label")
-    return {"question": q_text, "optionIndex": option_index,
-            "label": label, "custom": custom}
+
+    # Resolve the chosen option index/indices. A multiSelect answer carries an
+    # `optionIndices` list; a single-select one carries `optionIndex`. Accept
+    # either shape regardless of the question type so a client that sends the
+    # "wrong" one still resolves — out-of-range picks are dropped.
+    raw_multi = answer.get("optionIndices")
+    idxs: list[int] = []
+    if isinstance(raw_multi, list):
+        for v in raw_multi:
+            if isinstance(v, int) and 0 <= v < len(options) and v not in idxs:
+                idxs.append(v)
+    else:
+        one = answer.get("optionIndex")
+        if isinstance(one, int) and 0 <= one < len(options):
+            idxs = [one]
+    labels = [options[i].get("label") for i in idxs]
+
+    if question.get("multiSelect") is True:
+        # Feed the model the full multi-pick shape; the single-select keys stay
+        # absent so it can tell "several were chosen" from "one was".
+        return {"question": q_text, "optionIndices": idxs,
+                "labels": labels, "custom": custom}
+    return {"question": q_text,
+            "optionIndex": idxs[0] if idxs else -1,
+            "label": labels[0] if labels else None, "custom": custom}
 
 
 def main() -> int:
