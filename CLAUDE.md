@@ -783,7 +783,8 @@ Cloudflare tunnel; port 8300 on the LAN.
     so a build with no `google-services.json` still runs).
 - Push is driven hub-side by `turma/push.js` (see the turma section).
 - Built with Gradle (wrapper generated in CI, not committed); PR-gated by
-  `.github/workflows/android-ci.yml` on the self-hosted runners inside a Docker Hub Android-SDK image.
+  `.github/workflows/android-ci.yml` on `ubuntu-latest`, against that runner's preinstalled JDK +
+  Android SDK with JDK 17 and Gradle pinned in-job to match `app/build.gradle.kts`.
 - Setup + FCM wiring in `android/README.md`.
 
 ## `.github/workflows/`
@@ -908,21 +909,44 @@ most CVEs are cleared. Genuinely non-actionable upstream base-image findings go 
     `ANDROID_EMULATOR_TAG`/`ANDROID_EMULATOR_ABI`) is built on demand via `workflow_dispatch` on
     `turma-agent-image.yml`.
 
-### Self-hosted runner constraints
+### Where jobs run
 
-**All workflows run on the home-lab self-hosted runners** (`runs-on: [self-hosted, linux]`).
-Constraints that shape the jobs:
+**Every workflow runs on GitHub-hosted `ubuntu-latest`.** The home-lab box is 3 runners on one
+t3.xlarge — a *concurrency cap of 3* at ~1.3 throttled vCPU each — against hosted's 20 concurrent
+jobs at 4 dedicated vCPU, so self-hosting mostly bought queue time (PR gates were measured waiting
+26 minutes to do 48 seconds of work).
 
-- Every job starts with a "Reset workspace ownership" step — Docker steps leave root-owned files on
-  the persistent runner.
-- No passwordless sudo, so CLI tools (hadolint, Trivy) are installed to `$HOME/.local/bin` +
-  `$GITHUB_PATH` rather than via their Docker/ghcr actions.
-- The runner can't authenticate to ghcr.io for pulls (Docker Hub pulls and authenticated ghcr
-  **pushes** work).
-- There's no GitHub Advanced Security, so there is no code-scanning API — findings live in the job log
-  and `--exit-code` is the gate (no SARIF upload).
-- `npm` isn't on the runner, so the Claude Code version lookup runs in a throwaway `node:24-alpine`
-  container.
+- The image builds moved too. Their layer cache is `type=gha` — **GitHub-side, so it follows the job
+  to a hosted runner**; the box's warm local docker cache was never what primed them. Adding
+  self-hosted back for "the layer cache" would be reasoning from a cache these jobs don't use.
+- Disk is the real constraint for the agent image, and it's handled in-job: the scan writes **one**
+  image copy (build straight to a docker-archive, `trivy --input`) instead of three, scans the slim
+  `tooling` tier, and both agent jobs delete the runner's ~25 GB of unused preinstalled toolchains up
+  front. That reclaim is only safe because those builds are hermetic — **don't copy it into
+  `android-ci.yml`, which builds against the runner's own Android SDK.**
+- Hosted bills **rounded UP per job**, so prefer fewer batched jobs over many trivial ones. Public
+  repos are free; private ones draw on the 2000 min/mo Free-plan pool.
+- If a job ever genuinely needs self-hosted again (a >14 GB build, or home-lab network reach), say
+  which in a comment on its `runs-on` — and bring back only the workarounds that job needs.
+
+These are the constraints that went away with the box, and the steps they justified are **deleted,
+not disabled** — reintroducing any of them is a regression:
+
+- "Reset workspace ownership" steps — the box's workspace persisted and docker steps left root-owned
+  files. A hosted runner is a fresh VM per job.
+- Per-job `DOCKER_CONFIG` scoping — the box ran 3 runners as one user, so a concurrent job's
+  `docker logout` wiped an in-flight job's ghcr.io credentials mid-push.
+- `docker image prune` / `docker builder prune` cleanup — the box's disk was shared, finite, and
+  outlived the job.
+- Throwaway `node:24-alpine` containers for `npm view` — hosted has node/npm on PATH.
+- The `mingc/android-build-box` container — the box couldn't pull ghcr.io and had no sudo, so a
+  Docker Hub image was how the Android jobs got a JDK + SDK. Hosted preinstalls both; see
+  `android-ci.yml`.
+
+Still true, and unrelated to where jobs run: there's no GitHub Advanced Security, so there is no
+code-scanning API — findings live in the job log and `--exit-code` is the gate (no SARIF upload).
+Trivy is still installed from its release tarball to `$HOME/.local/bin` (the trivy-action pins an
+internal step to a tag upstream deleted).
 
 ## Conventions
 

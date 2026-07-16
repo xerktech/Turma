@@ -6,12 +6,12 @@ name: scan-turma-agent-image
 # CLAUDE_CODE_VERSION is left at its Dockerfile default (latest) — the scan
 # cares about the assembled image, not the exact pinned tag.
 #
-# Runs on the home-lab self-hosted runners. Trivy is installed from its release
+# Runs on GitHub-hosted `ubuntu-latest`. Trivy is installed from its release
 # tarball (the trivy-action pins an internal setup-trivy step to a mutable tag
-# upstream has deleted, and the no-sudo runner install is the sibling repo's
-# proven pattern anyway). No SARIF upload: the repo has no GitHub Advanced
-# Security, so there is no code-scanning API to publish to — findings print to
-# the job log and --exit-code gates the PR.
+# upstream has deleted, and the tarball install is the sibling repo's proven
+# pattern anyway). No SARIF upload: the repo has no GitHub Advanced Security, so
+# there is no code-scanning API to publish to — findings print to the job log and
+# --exit-code gates the PR.
 on:
   pull_request:
     branches: [main]
@@ -29,45 +29,50 @@ permissions:
 
 jobs:
   scan:
-    # Self-hosted: builds the agent image to scan it. Even the slim tooling tier is
-    # ~4.1 GB (it carries the cloud CLIs — see agent/Dockerfile) and lands on disk
-    # several times over (snapshot + tar + Trivy scratch).
-    runs-on: [self-hosted, linux]
+    # Hosted. This is the job with the strongest claim on the self-hosted box, so
+    # it's worth being explicit about why it survives the move:
+    #   - the layer cache it builds from is `type=gha` (below), which is
+    #     GitHub-side and follows it here; the box's warm local cache was never
+    #     what primed this build.
+    #   - disk was the real constraint, and the structural fix for that already
+    #     landed: the build/scan handoff below writes ONE image copy instead of
+    #     three, and the tier split dropped it 8.1 GB -> 3.1 GB uncompressed. The
+    #     reclaim step below buys back more headroom than the box ever had free.
+    # Against that, it's a PR gate — the job whose queueing directly delays a
+    # merge, and the box is a 3-job concurrency cap.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # Image name recorded inside the build archive. Now only metadata (the
-      # daemon never loads it, and the archive itself is isolated in this job's
-      # runner.temp), but kept per-run so a scan's output still names the run it
-      # came from.
+      # Image name recorded inside the build archive. Only metadata: the daemon
+      # never loads it and the archive is isolated in this job's runner.temp. Kept
+      # per-run so a scan's output still names the run it came from.
       SCAN_TAG: local/turma-agent:pr-${{ github.run_id }}
     steps:
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
-
       - uses: actions/checkout@v7
 
-      # Headroom guard. The structural fix for this job's disk problem is the
-      # build/scan handoff below (one image copy instead of three); this step
-      # just clears stale cache so the remaining copies have room.
+      # Headroom guard, hosted edition. The structural fix for this job's disk
+      # problem is the build/scan handoff below (one image copy instead of
+      # three); this step just makes sure the remaining copies have room.
       #
-      # Pruning by AGE is deliberate. The cleanup note below rightly rejects an
-      # unfiltered `-a` prune — this repo's two scan jobs share one runner and
-      # `-a` yanks cache out from under the other job's in-flight build. An
-      # until= filter cannot do that: buildkit ages a cache record from when it
-      # was last USED, so a concurrent build's cache is 0 minutes old and no
-      # window reaches it.
+      # A hosted runner has ~14 GB free but ships ~25 GB of preinstalled
+      # toolchains, none of which this job touches — it builds everything it
+      # needs INSIDE the image, from the Dockerfile. The runner's own Android SDK
+      # (~9 GB) and .NET (~1.6 GB) are the big two. Deleting them up front is
+      # what turns "3.1 GB image, several copies at once, ~14 GB free" from tight
+      # into comfortable.
       #
-      # The window was 24h and reclaimed 0B on every observed run — on a runner
-      # building this image for several PRs an hour, no record is ever a day
-      # idle, so the guard never fired. 3h still cannot touch a live build (they
-      # last ~10 min) but does evict the previous hours' PR scans, which is what
-      # actually accumulates here.
-      - name: Reclaim disk before build
+      # This replaces an age-filtered `docker builder prune` that existed because
+      # the box's disk was SHARED and persistent — a concern that dies with the
+      # box, since this runner is a fresh VM thrown away at job end.
+      #
+      # NB: safe here precisely because the build is hermetic. Do NOT copy this
+      # into android-ci.yml, which builds against the runner's Android SDK.
+      - name: Free up disk space
         run: |
-          df -h / || true
-          docker image prune -f || true
-          docker builder prune -f --filter until=3h || true
-          df -h / || true
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
 
       - uses: docker/setup-buildx-action@v4
 
@@ -77,11 +82,14 @@ jobs:
       # both of which existed only to hand it from buildx to Trivy:
       #   1. load itself exports an OCI tarball and imports it into containerd's
       #      content store (a scan died in exactly this step: "importing to
-      #      docker … no space left on device", with 31G free);
+      #      docker … no space left on device", with 31G free on the old box);
       #   2. `trivy image <tag>` then exports the image straight back OUT of the
       #      daemon to its own tarball before it can read it (another scan died
       #      there: "docker-export-… no space left on device", with 37G free —
       #      the build itself had succeeded).
+      # Those failures predate the move to hosted runners, and are exactly why
+      # this job can now live on one: a runner with less disk than the box had
+      # free is fine when the job stops writing the image three times.
       # So the image landed on disk ~4x at once: buildkit snapshots + content
       # store + Trivy's re-export + Trivy's uncompressed layer scratch.
       #
@@ -173,9 +181,10 @@ jobs:
       #
       # TMPDIR → runner.temp: Trivy still extracts each uncompressed layer to a
       # scratch file before scanning, and even the `tooling` tier (node/npm/gh/
-      # ttyd/docker CLI/PowerShell) can blow out the runner container's small
-      # /tmp ("no space left on device"). runner.temp lives on the roomy _work
-      # volume and is cleaned per job.
+      # ttyd/docker CLI/PowerShell) can blow out a small /tmp ("no space left on
+      # device"). On the old box runner.temp was a roomier volume than /tmp; on a
+      # hosted runner both are the one root filesystem, so what buys the room now
+      # is the reclaim step at the top of this job.
       - name: Trivy image scan
         env:
           TMPDIR: ${{ runner.temp }}
@@ -199,19 +208,11 @@ jobs:
             --exit-code 1 \
             --no-progress
 
-      # The build archive is multi-GB. runner.temp is cleaned per job, but this
-      # runner is shared and the next job's build starts before that helps, so
-      # drop it the moment the scan is done rather than holding it to job end.
-      # `if: always()` because a FAILING scan must not leak it either.
-      #
-      # Deliberately NOT `docker builder prune`: this repo's two scan jobs
-      # (turma-agent + turma) run concurrently on one runner, and an `-a` cache
-      # prune here yanks build cache out from under the other job's in-flight
-      # build (buildkit aborts with "graceful_stop"). The age-filtered prune at
-      # the top of this job is the safe version of that. Never fails the job.
-      - name: Clean up scan image
+      # Report the disk this job actually used. The multi-GB archive and every
+      # cached layer die with the VM now, so there is nothing left to clean up —
+      # but this job's disk headroom is the thing most likely to bite as the
+      # image grows, and a `df` in the log is what tells the next person how
+      # close it ran. Never fails the job.
+      - name: Report disk use
         if: always()
-        run: |
-          rm -f "${RUNNER_TEMP}/agent-image.tar" || true
-          docker image prune -f || true
-          df -h || true
+        run: df -h / || true

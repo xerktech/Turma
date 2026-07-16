@@ -53,8 +53,9 @@ gradle wrapper --gradle-version 8.11.1   # one-time, needs a system Gradle
 ./gradlew assembleDebug                  # build the debug APK
 ```
 
-CI (`.github/workflows/android-ci.yml`) does exactly this inside a Docker Hub
-Android-SDK image on the self-hosted runners.
+CI (`.github/workflows/android-ci.yml`) does exactly this on a GitHub-hosted
+`ubuntu-latest` runner, using its preinstalled Android SDK with JDK 17 and
+Gradle pinned in-job.
 
 ## Push notifications (FCM) setup
 

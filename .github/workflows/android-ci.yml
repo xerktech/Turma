@@ -1,14 +1,23 @@
 name: android-ci
 
 # PR gate for the Android client: unit-test the pure core (reveal/transcript/
-# sessions/chat-items + serialization) and assemble a debug APK. Runs inside a
-# throwaway Docker Hub image that bundles the JDK + Android SDK (the self-hosted
-# runners can't pull ghcr.io and have no passwordless sudo), mirroring the
-# glasses-ci container pattern. Gradle is downloaded+pinned in-job (the image
-# doesn't put `gradle` on PATH), so the build is reproducible regardless of the
-# image's Gradle. A credential-less build is expected: no google-services.json
-# is present, so the Firebase plugin is skipped (see android/app/build.gradle.kts)
-# and push is inert — the app still builds.
+# sessions/chat-items + serialization) and assemble a debug APK.
+#
+# Runs on GitHub-hosted `ubuntu-latest`, using the JDK + Android SDK that runner
+# image preinstalls. It used to run on the self-hosted box inside the multi-GB
+# mingc/android-build-box container, which was the box's own constraints talking:
+# those runners can't pull ghcr.io and have no passwordless sudo, so a Docker Hub
+# image was how the job got a toolchain. A hosted runner already HAS one, and
+# pulling several GB every run to replace it would be strictly worse — so the
+# container goes with the box. Gradle is still downloaded+pinned in-job, so the
+# build version stays fixed by this file rather than by whatever the runner ships.
+#
+# The toolchain this pins (JDK 17, compileSdk/build-tools 35) matches what
+# android/app/build.gradle.kts declares; keep them in step.
+#
+# A credential-less build is expected: no google-services.json is present, so the
+# Firebase plugin is skipped (see android/app/build.gradle.kts) and push is inert
+# — the app still builds.
 
 on:
   pull_request:
@@ -20,8 +29,9 @@ on:
 
 # Was missing entirely, which made this the one workflow where pushing twice to
 # a PR left the superseded run alive — and it's the most expensive non-image PR
-# job in the repo, so each orphan held one of the box's three runners for its
-# full duration.
+# job in the repo, so each orphan used to hold one of the box's three runners for
+# its full duration. Still wanted on hosted: an orphan now burns billed minutes
+# instead of a runner slot.
 concurrency:
   group: android-ci-${{ github.ref }}
   cancel-in-progress: true
@@ -31,42 +41,36 @@ env:
 
 jobs:
   build:
-    # Self-hosted, and here that's earned rather than inherited: the job runs in
-    # mingc/android-build-box, a multi-GB image that stays warm in the box's
-    # docker cache. On a hosted runner it would be re-pulled every run.
-    #
-    # Worth revisiting: ubuntu-latest ships a JDK and Android SDK preinstalled,
-    # so dropping the container (setup-java + the preinstalled SDK) would move
-    # this to hosted AND delete the Gradle download and sdkmanager steps below.
-    # Left alone for now because it's a behavioural change to the toolchain, not
-    # a routing change.
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    container:
-      image: mingc/android-build-box:latest
     defaults:
       run:
         working-directory: android
     steps:
-      - name: Reset workspace ownership
-        working-directory: ${{ github.workspace }}
-        run: chown -R "$(id -u):$(id -g)" . || true
-
       - uses: actions/checkout@v7
 
-      # The image bundles the JDK + Android SDK but not a `gradle` on PATH.
-      # Download the pinned Gradle and expose it, so the build version is fixed
-      # by this file, not by whatever the image ships.
+      # JDK 17 to match sourceCompatibility/jvmTarget in app/build.gradle.kts.
+      # Pinned here rather than taken as whatever the runner defaults to, for the
+      # same reason Gradle is pinned below.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Pinned Gradle, so the build version is fixed by this file and not by the
+      # runner image. Unpacked into RUNNER_TEMP rather than the container's /opt:
+      # the job no longer runs as root, and RUNNER_TEMP is writable and per-job.
       - name: Install Gradle ${{ env.GRADLE_VERSION }}
         working-directory: ${{ github.workspace }}
         run: |
           set -eux
-          curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip
-          unzip -q -o /tmp/gradle.zip -d /opt
-          echo "/opt/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+          curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o "${RUNNER_TEMP}/gradle.zip"
+          unzip -q -o "${RUNNER_TEMP}/gradle.zip" -d "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
 
       # Ensure the compileSdk platform + build-tools this project needs are
-      # present (idempotent; the image usually has them, this guards a drift).
+      # present (idempotent; the runner image ships them, this guards a drift in
+      # what it preinstalls).
       - name: Ensure SDK packages
         run: yes | sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
 

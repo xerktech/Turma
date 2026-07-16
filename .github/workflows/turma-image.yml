@@ -2,7 +2,7 @@ name: build-turma-image
 
 # Build and push the turma dashboard image to GHCR whenever the
 # /turma build context (or this workflow) changes on main.
-# Runs on the home-lab self-hosted runners ([self-hosted, linux]).
+# Runs on GitHub-hosted `ubuntu-latest` — see the note on the job below.
 on:
   push:
     branches: [main]
@@ -20,33 +20,25 @@ env:
 
 jobs:
   build:
-    # Self-hosted: builds and pushes a container image, so the warm docker layer
-    # cache here is the point.
-    runs-on: [self-hosted, linux]
+    # Hosted. This job builds an image, but the thing it builds FROM is the
+    # `type=gha` cache below, not a warm local docker cache — that cache is
+    # GitHub-side and follows the job to a hosted runner unchanged. The image is
+    # a small node app, nowhere near a hosted runner's disk. So self-hosting
+    # bought this nothing but a slot in the box's 3-job queue.
+    #
+    # Moving here also deletes three steps that existed ONLY as workarounds for
+    # that shared box: a per-job DOCKER_CONFIG (3 runners shared one HOME, so a
+    # concurrent job's login-action logout wiped this job's ghcr.io credentials
+    # mid-push), a workspace-ownership reset (docker steps left root-owned files
+    # on the persistent workspace), and a dangling-image prune (the box's disk
+    # was shared and finite). A hosted runner is a fresh VM that is thrown away
+    # at job end, so none of them have anything to do. Don't reintroduce them.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       packages: write
     steps:
-      # Per-job docker config. The self-hosted box runs 3 runners as ONE user, so
-      # the default ~/.docker/config.json is shared by every concurrent job — and
-      # docker/login-action's post-cleanup `docker logout` (logout: true is its
-      # default) deletes the ghcr.io entry out of that shared file. Any other job
-      # finishing or being cancelled mid-build therefore strips this job's
-      # credentials, and the push falls back to an anonymous token -> 403.
-      # Scoping DOCKER_CONFIG to RUNNER_TEMP (fresh per job, wiped after) makes
-      # login/logout job-local. Keep this on any job here that logs in to GHCR.
-      #
-      # It's exported here rather than in a job-level `env:` because the `runner`
-      # context isn't populated until a runner is assigned, so `runner.temp` in
-      # `env:` is a schema error that makes GitHub reject the whole file. The
-      # RUNNER_TEMP variable is the same value, and is set in every step's shell.
-      - name: Scope docker config to this job
-        run: echo "DOCKER_CONFIG=${RUNNER_TEMP}/.docker" >> "$GITHUB_ENV"
-
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
-
       - uses: actions/checkout@v7
 
       - name: Log in to GHCR
@@ -86,15 +78,3 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.ver.outputs.version }}
-
-      # Keep the shared runner's disk at a steady state: sweep dangling layers
-      # after every run (success or failure). Pulled base images (node, busybox)
-      # stay for other jobs. Deliberately NOT `docker builder prune -a`: a
-      # concurrent scan job on the same runner would have its in-flight build
-      # aborted ("graceful_stop"); build cache is bounded by buildkit GC + the
-      # gha cache, so it isn't the disk leak. Never fails the job.
-      - name: Clean up dangling images
-        if: always()
-        run: |
-          docker image prune -f || true
-          df -h || true

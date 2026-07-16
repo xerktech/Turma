@@ -12,10 +12,11 @@ name: android-release
 # manage. Swap to a signed assembleRelease here if a Play-store-grade build is
 # ever needed.
 #
-# Same self-hosted-runner + container constraints as android-ci.yml: the runners
-# can't pull ghcr.io and have no passwordless sudo, so the build runs inside a
-# Docker Hub image that bundles the JDK + Android SDK; Gradle is downloaded and
-# pinned in-job (the image doesn't put `gradle` on PATH).
+# Same toolchain as android-ci.yml, and for the same reasons: GitHub-hosted
+# `ubuntu-latest` with its preinstalled JDK + Android SDK, JDK 17 pinned to match
+# app/build.gradle.kts, and Gradle downloaded+pinned in-job so the build version
+# is fixed by this file. Keep the two in step — this workflow ships what that one
+# gated.
 #
 # Versioning matches the repo: MAJOR.MINOR from the root VERSION file + this
 # run number as the patch. build.gradle.kts reads GITHUB_RUN_NUMBER for the
@@ -43,18 +44,15 @@ env:
 jobs:
   release:
     name: Build, sign (debug), release
-    # Self-hosted: same mingc/android-build-box container as android-ci.yml, which
-    # stays warm in this box's docker cache and would be re-pulled on a hosted VM.
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    container:
-      image: mingc/android-build-box:latest
     steps:
-      - name: Reset workspace ownership
-        working-directory: ${{ github.workspace }}
-        run: chown -R "$(id -u):$(id -g)" . || true
-
       - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
 
       # Full build version from the VERSION file + this run number as the patch,
       # and the release tag / asset name from it.
@@ -70,14 +68,14 @@ jobs:
       - name: Install Gradle ${{ env.GRADLE_VERSION }}
         run: |
           set -eux
-          curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip
-          unzip -q -o /tmp/gradle.zip -d /opt
-          echo "/opt/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+          curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o "${RUNNER_TEMP}/gradle.zip"
+          unzip -q -o "${RUNNER_TEMP}/gradle.zip" -d "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
 
       - name: Ensure SDK packages
         run: yes | sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
 
-      # GITHUB_RUN_NUMBER is present in the container, so build.gradle.kts stamps
+      # GITHUB_RUN_NUMBER is set on the runner, so build.gradle.kts stamps
       # versionName=$VERSION / versionCode=$run_number to match the tag.
       - name: Assemble debug APK
         working-directory: android
