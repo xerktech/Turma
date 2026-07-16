@@ -13,11 +13,19 @@ import { fileURLToPath } from "node:url";
 // controller tests keep passing while the real form is dead.
 const html = readFileSync(fileURLToPath(new URL("../index.html", import.meta.url)), "utf8");
 
-// The <input> tag for a given id, as raw text.
+// The <input> tag carrying a given id, as raw text. Plain string scanning
+// rather than a built-up `new RegExp(...)`: a non-literal regex trips
+// Semgrep's detect-non-literal-regexp rule, and a literal-only match is both
+// cheaper and one less thing to reason about.
 function inputTag(id: string): string {
-  const m = html.match(new RegExp(`<input[^>]*id="${id}"[^>]*>`));
-  if (!m) throw new Error(`no <input id="${id}"> in index.html`);
-  return m[0];
+  const needle = `id="${id}"`;
+  for (const chunk of html.split("<input")) {
+    const end = chunk.indexOf(">");
+    if (end === -1) continue;
+    const tag = "<input" + chunk.slice(0, end + 1);
+    if (tag.includes(needle)) return tag;
+  }
+  throw new Error(`no <input id="${id}"> in index.html`);
 }
 
 describe("login markup", () => {
