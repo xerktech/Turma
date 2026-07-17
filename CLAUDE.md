@@ -56,6 +56,40 @@ This replaced the old model of one fixed-repo container per session.
   so nothing free-form reaches the shell. The random worktree dir and `agent-<id>` tmux stay the
   canonical internal keys; a label is presentational only.
 
+### The session queue (XERK-14)
+
+- A spawn that can't run RIGHT NOW is **queued, not refused**. It lands as an ordinary registry record
+  with `status:"queued"` and no worktree/tmux/ttyd yet; `spawn()` splits into the record-build and
+  `_provision_session()` (worktree + tmux + ttyd + naming), and a queued session runs through the
+  SAME `_provision_session` when it's allowed to — nothing about a session that waited is second-class.
+- Three orthogonal reasons a spawn queues (`queuedReason`), each re-checked by the drainer before it
+  provisions: **capacity** (host at `MAX_SESSIONS`), **awaiting-clone** (its repo is being cloned to
+  this host on demand), **root-busy** (another root session holds the one root slot).
+- The queue/run decision is made BEFORE the record is appended to the registry, so the counts don't
+  include the session being added (a root would otherwise see itself as root-busy; a capacity check
+  would be off by one). The prompt/base-ref are stashed as `_pendingPrompt`/`_pendingBaseRef` so a
+  queued session (whose repo may not exist yet) carries them across the wait; `_provision_session`
+  consumes them.
+- `_drain_queue()` runs every heartbeat: oldest-first, **at most one per beat** (provisioning launches
+  claude against the one shared `~/.claude` login — the contention `resume_on_boot` staggers), head-of-
+  line skipped not blocking (a session still waiting on its clone doesn't hold up a capacity-only one).
+  A failed on-demand clone fails the session rather than waiting forever; a clone job lost to a
+  manager restart mid-flight is re-triggered from the stored `awaitCloneOwner`.
+- Capacity rides the heartbeat as **`capacity` = {maxSessions, running, queued, free, rootRunning}**
+  (`_capacity_payload`) — it never used to reach the wire, which is what left the hub unable to tell a
+  full host from an empty one and made a refused spawn look identical to a served one. `free` never
+  goes negative (the cap can be lowered under a host already over it).
+- Queued sessions are killable (Cancel) like any other — no worktree/tmux to tear down. resume-on-boot
+  skips them (they stay queued and the drainer picks them up); archival/usage/PR scans skip them (no
+  transcript to write). Surfaced on the heartbeat as `session.queuedReason`/`queuedAt`.
+- **The queue applies to every spawn path; only TICKET spawns split across hosts.** An explicit
+  "+ New session" is clicked on a specific host card, so it queues on THAT host — you named the
+  machine. See "Splitting ticket sessions across an org's agents" under the hub.
+- Tests: `TestSessionLifecycle` (`test_spawn_at_max_sessions_queues_instead_of_refusing`,
+  `test_drain_queue_*`, `test_capacity_payload_*`) and `TestSpawnTicket`
+  (`test_uncloned_repo_with_an_owner_clones_on_demand_and_queues`) in `agent/tests/test_hub_agent.py`;
+  the Queued-section cases in `turma/tests/sessions.test.js`.
+
 ### Repos-root sessions
 
 - Spawning against the repos-root pseudo-repo runs `claude` directly in `REPOS_ROOT` — spanning every
@@ -919,10 +953,8 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   `POST /api/jira/<siteKey>/<issueKey>/session` → a `spawnTicket` command (see the agent bullet).
 - **The hub's whole job here is ROUTING**, since it's the only party that sees the whole fleet. It
   sends just the issue key; the agent re-derives repo, ticket text and branch from its own state.
-- `findTicketHost` needs an ONLINE host that reports the org **and** has the ticket's repo cloned —
-  two different requirements, and `findJiraHost` only covers the first: with two hosts on one org, the
-  one holding the creds isn't necessarily the one holding the repo, and a spawn on a host without it
-  just logs a refusal the operator never sees.
+- `findTicketHost` picks that host by **splitting load across the org's agents** — see "Splitting
+  ticket sessions across an org's agents" below.
 - Online is **required**, not preferred (unlike the read-only ticket GET, which happily serves an
   offline host's cache): a spawn queued onto a sleeping host lands whenever it wakes, which is a
   surprise, not a feature.
@@ -932,14 +964,38 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   triaged repo yet" would send the operator hunting a triage problem they don't have.
 - Single-flight per ticket, like the `jiraIssue` fetch: a double-click must not start two sessions.
   A second session on a ticket is supported — that's what the `+` button and the -1/-2 branch are for.
-- The button's four states are deliberately distinct (`ticketStartHtml`): a triaged+cloned ticket gets
-  a live button; an uncloned repo gets a disabled one saying to clone it first; a "no repo" verdict and
-  an untriaged ticket get none at all. A failed start renders its reason beside a LIVE button (every
-  failure is fleet-state, so the operator needs both the reason and the retry).
+- The button's states are deliberately distinct (`ticketStartHtml`): a triaged ticket gets a live
+  button whether or not any host has the repo cloned (an uncloned repo reads **"☐ Start (clone first)"**
+  and clones on demand — see the splitting bullet), a "no repo" verdict and an untriaged ticket get
+  none at all. A failed start renders its reason beside a LIVE button (every failure is fleet-state, so
+  the operator needs both the reason and the retry).
 - In-flight state clears on **evidence**, not a timer: a session reporting the spawn's `cmdId`, or the
   command clearing from the host's queue — which is what covers a spawn the agent REFUSED, whose ack is
   the only signal a board that never sees a session would get.
 - Tests: the ticket-session cases in `turma/tests/server.test.js` and `board.test.js`.
+
+##### Splitting ticket sessions across an org's agents (XERK-14)
+
+- `findTicketHost` chooses among the org's **ONLINE** hosts: it **prefers one with the repo cloned**,
+  and — within that group, or across all of them when NONE has it — picks the **most available**
+  (`hostAvailability`), so N sessions on one org spread across its hosts instead of stacking on the
+  first match. A momentarily-full host is still a valid target: the session simply **queues** there
+  (see "The session queue"), so routing never fails for lack of a free slot.
+- `hostAvailability(a)` = the host's reported `capacity.free` **minus its `capacity.queued` and the
+  spawn/spawnTicket commands still sitting in its queue** since its last heartbeat. Subtracting the
+  in-flight commands is what makes rapid clicks split: without it, four tickets clicked between two
+  beats would all read the same stale `free` and pile onto one host. An agent predating the `capacity`
+  block reports no ceiling and scores below any host that does (but stays eligible for a mixed fleet).
+- **No host has the repo → clone on demand.** `findTicketHost` returns `{host, needsClone:true}` for
+  the most-available host; the agent's `spawn_ticket` then clones the repo (owner from its triage
+  ledger's `nameWithOwner`) and queues the session behind the clone. This replaced the old
+  `409 no online host has <repo> cloned` refusal and the board's disabled "clone it first" button.
+- The known **multi-host-per-org limits still apply**: the triage/branch state is per-host, so a
+  clone-on-demand routed to a host that didn't triage the ticket has no ledger entry to clone from —
+  fine on the one-host-per-org deployment (the org's host is the one that triaged AND spawns), noted
+  as a limit for the aspirational two-agents case this ticket is about.
+- Tests: the `most available one wins` / `pending lowers availability` / `clones on demand` cases in
+  `turma/tests/server.test.js`.
 
 #### Ticket ↔ session chips
 
@@ -1128,10 +1184,20 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
 - Tests: the `agentsHtml` cases in `turma/tests/chat.test.js` and the subagent-history endpoint cases
   in `turma/tests/server.test.js`.
 
+#### Queued sessions
+
+- A **"Queued" section** above Active lists sessions the agent hasn't provisioned yet
+  (`status:"queued"` — see "The session queue" under the agent). Its cards are static (no pane to
+  attach to), showing the wait reason (`queuedReasonText`) and a **Cancel** (arm-then-confirm kill).
+- A followed spawn (`?spawn=<cmdId>`) that lands in the queue words its stage **"Queued — <reason>"**
+  rather than "Starting…", and flips to the live session the moment it provisions. The dashboard's
+  session card mirrors this (a queued card offers Cancel and a State line explaining the wait).
+- Tests: the Queued-section cases in `turma/tests/sessions.test.js`.
+
 #### Ended sessions
 
-- The sidebar's third section (below Active/Idle), **collapsed by default** — it's history, and it
-  only grows. Replaced the old "Stopped" list, which showed only half the story.
+- The sidebar's third section (below Active/Idle/Queued), **collapsed by default** — it's history, and
+  it only grows. Replaced the old "Stopped" list, which showed only half the story.
 - It merges the three channels an over-but-resumable session arrives on, because the operator draws no
   distinction between them — all are "a session I'm done with, for now":
   - **killed** — dropped from the registry into the agent's closed history (`a.closedSessions`);

@@ -295,7 +295,9 @@
     const label = renamed || branch || s.summary || s.label || s.id
       || (s.ticket && s.ticket.key) || "session";
     const stopped = s.status !== "running";
-    const state = s.status === "error" ? "failed" : (stopped ? "stopped" : "running");
+    const state = s.status === "error" ? "failed"
+      : s.status === "queued" ? "queued"
+      : (stopped ? "stopped" : "running");
     const tip = [s.summary || s.label, branch && branch !== label ? "branch " + branch : "", state]
       .filter(Boolean).join(" · ");
     const cls = "kc-sess" + (s.status === "error" ? " kc-sess-err" : stopped ? " kc-sess-off" : "");
@@ -322,12 +324,18 @@
   //   - a spawn in flight  -> a busy marker. The session id doesn't exist until
   //                           the agent mints it a beat later, so this covers the
   //                           gap the POST can't.
-  //   - repo not cloned    -> disabled, saying so. The ticket HAS a repo, and
-  //                           "clone it first" is more useful than a missing button.
+  //   - a spawn in flight  -> a busy marker. The session id doesn't exist until
+  //                           the agent mints it a beat later, so this covers the
+  //                           gap the POST can't.
+  //   - repo not cloned     -> a LIVE start button that clones on demand. The hub
+  //                           routes to the most-available host in the org, which
+  //                           clones the repo and queues the session behind it, so
+  //                           "not cloned anywhere" is no longer a dead end — the
+  //                           tooltip just says it'll clone first.
   //   - ready              -> the start button.
   // A failed start renders its reason BESIDE a live button rather than replacing
-  // it: every failure here is a fleet-state one (no online host, repo not cloned
-  // there, not triaged yet), so the operator needs both the reason and the retry.
+  // it: every failure here is a fleet-state one (no online host, not triaged yet),
+  // so the operator needs both the reason and the retry.
   // Once a ticket has sessions the button stays, compacted to a "+": a second
   // session on one ticket is supported (it gets the -1/-2 branch), just not the
   // common case, so it stops competing with the chips for the card's width.
@@ -343,17 +351,18 @@
     const err = st.error
       ? `<span class="kc-start-err" title="${esc(st.error)}">⚠ ${esc(st.error)}</span>`
       : "";
-    if (!g.cloned) {
-      return chips + err + `<button class="kc-start" type="button" disabled
-        title="${esc(g.repo)} isn't cloned on the host reporting this org — clone it first">☐ Start session</button>`;
-    }
     const more = (sessions || []).length > 0;
     const tip = more
       ? `Start another session on ${t.key} — it gets its own branch`
-      : `Start a session on ${t.key} in ${g.repo}`;
-    return chips + err + `<button class="kc-start${more ? " kc-start-more" : ""}" type="button"
+      : g.cloned
+        ? `Start a session on ${t.key} in ${g.repo}`
+        : `Start a session on ${t.key} — ${g.repo} isn't cloned yet, so it clones first`;
+    // A not-yet-cloned repo gets a distinct label so the extra step is visible,
+    // but the button is live either way.
+    const label = more ? "+" : (g.cloned ? "☐ Start session" : "☐ Start (clone first)");
+    return chips + err + `<button class="kc-start${more ? " kc-start-more" : ""}${g.cloned ? "" : " kc-start-clone"}" type="button"
       data-start="${esc(t.key)}" title="${esc(tip)}"
-      aria-label="${esc(tip)}">${more ? "+" : "☐ Start session"}</button>`;
+      aria-label="${esc(tip)}">${label}</button>`;
   }
 
   function cardHtml(t, site, opts) {

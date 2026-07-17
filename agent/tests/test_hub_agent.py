@@ -2562,7 +2562,29 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertIsNone(sm.registry[0]["spawnCmdId"])
         self.assertIsNone(sm._session_payload(sm.registry[0], refresh=False)["spawnCmdId"])
 
-    def test_spawn_refused_at_max_sessions(self):
+    def test_spawn_at_max_sessions_queues_instead_of_refusing(self):
+        # A spawn that overruns the cap is no longer dropped on the floor — it
+        # lands as a `queued` record with no worktree/tmux, waiting for a slot.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        p = mock.patch.object(ha, "MAX_SESSIONS", 1)
+        p.start()
+        self.addCleanup(p.stop)
+        sm.registry = [{"id": "aaaaa", "status": "running", "ttydPort": 7700}]
+        self.run_ok_calls.clear()
+        sm.spawn("Turma")
+        self.assertEqual(len(sm.registry), 2)
+        q = sm.registry[1]
+        self.assertEqual(q["status"], "queued")
+        self.assertEqual(q["queuedReason"], "capacity")
+        self.assertIsNotNone(q["queuedAt"])
+        # No worktree was added for a queued session (it isn't provisioned yet).
+        self.assertFalse(any("worktree" in c and "add" in c for c in self.run_ok_calls))
+        # The queue markers ride the heartbeat so the card can explain the wait.
+        pay = sm._session_payload(q, refresh=False)
+        self.assertEqual(pay["queuedReason"], "capacity")
+
+    def test_drain_queue_provisions_when_a_slot_frees(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
         p = mock.patch.object(ha, "MAX_SESSIONS", 1)
@@ -2570,12 +2592,71 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.addCleanup(p.stop)
         sm.registry = [{"id": "aaaaa", "status": "running", "ttydPort": 7700}]
         sm.spawn("Turma")
-        self.assertEqual(len(sm.registry), 1)  # unchanged
+        q = sm.registry[1]
+        self.assertEqual(q["status"], "queued")
+        # Still full — draining does nothing.
+        sm._drain_queue()
+        self.assertEqual(q["status"], "queued")
+        # Free the slot; the next drain provisions the queued session in place.
+        sm.registry[0]["status"] = "stopped"
+        self.run_ok_calls.clear()
+        sm._drain_queue()
+        self.assertEqual(q["status"], "running")
+        self.assertIsNone(q.get("queuedReason"))
+        self.assertTrue(any("worktree" in c and "add" in c for c in self.run_ok_calls))
+
+    def test_drain_queue_is_one_per_beat(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        p = mock.patch.object(ha, "MAX_SESSIONS", 5)
+        p.start()
+        self.addCleanup(p.stop)
+        sm.spawn("Turma")  # runs (slot free)
+        # Two more that queue only because they await a clone that never comes;
+        # force them queued via a low cap instead.
+        p.stop()
+        p2 = mock.patch.object(ha, "MAX_SESSIONS", 1)
+        p2.start()
+        self.addCleanup(p2.stop)
+        sm.spawn("Turma")
+        sm.spawn("Turma")
+        queued = [s for s in sm.registry if s["status"] == "queued"]
+        self.assertEqual(len(queued), 2)
+        # Raise the cap so both COULD run, then drain: exactly one provisions.
+        p2.stop()
+        p3 = mock.patch.object(ha, "MAX_SESSIONS", 5)
+        p3.start()
+        self.addCleanup(p3.stop)
+        sm._drain_queue()
+        self.assertEqual(sum(1 for s in sm.registry if s["status"] == "running"), 2)
+        self.assertEqual(sum(1 for s in sm.registry if s["status"] == "queued"), 1)
 
     def test_spawn_refused_for_unknown_repo(self):
         sm = self.make_spawn_ready_manager([])
         sm.spawn("NoSuchRepo")
         self.assertEqual(sm.registry, [])
+
+    def test_capacity_payload_reports_the_ceiling_and_load(self):
+        # The hub can't split work across an org's hosts unless each reports its
+        # ceiling and current load; this is the fact ticket routing ranks on.
+        sm = self.make_spawn_ready_manager([])
+        p = mock.patch.object(ha, "MAX_SESSIONS", 3)
+        p.start()
+        self.addCleanup(p.stop)
+        sm.registry = [
+            {"id": "a", "status": "running"},
+            {"id": "b", "status": "running"},
+            {"id": "c", "status": "queued"},
+        ]
+        cap = sm._capacity_payload()
+        self.assertEqual(cap["maxSessions"], 3)
+        self.assertEqual(cap["running"], 2)
+        self.assertEqual(cap["queued"], 1)
+        self.assertEqual(cap["free"], 1)
+        self.assertFalse(cap["rootRunning"])
+        # free never goes negative even when the cap is lowered under a full host.
+        with mock.patch.object(ha, "MAX_SESSIONS", 1):
+            self.assertEqual(sm._capacity_payload()["free"], 0)
 
     def test_kill_drops_record_but_keeps_worktree(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
@@ -2979,12 +3060,14 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["model"], "opus")            # model still applies
         self.assertEqual(sess["permissionMode"], "acceptEdits")
 
-    def test_spawn_root_refused_when_root_already_running(self):
+    def test_second_root_session_queues_behind_the_first(self):
         sm = self._root_ready_manager()
         sm.spawn(ha.ROOT_REPO_NAME)
-        self.assertEqual(len(sm.registry), 1)
-        sm.spawn(ha.ROOT_REPO_NAME)  # a second concurrent root is refused
-        self.assertEqual(len(sm.registry), 1)
+        self.assertEqual(sm.registry[0]["status"], "running")
+        sm.spawn(ha.ROOT_REPO_NAME)  # only one root slot — the second waits
+        self.assertEqual(len(sm.registry), 2)
+        self.assertEqual(sm.registry[1]["status"], "queued")
+        self.assertEqual(sm.registry[1]["queuedReason"], "root-busy")
 
     def test_kill_root_keeps_repos_root_and_records_root(self):
         sm = self._root_ready_manager()
@@ -7036,13 +7119,38 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.registry, [])
         f.assert_not_called()
 
-    def test_refuses_a_repo_that_is_not_cloned_here(self):
-        # The ledger's `cloned` is as of triage time; scan_repos() is now.
-        sm = self.make_ticket_manager(repo="Elsewhere")
+    def test_refuses_an_uncloned_repo_with_no_owner_to_clone(self):
+        # Not cloned here AND the ledger recorded no owner/repo to clone from —
+        # there's nothing to clone, so refuse before spending a Jira fetch.
+        sm = self.make_ticket_manager(repo="Elsewhere")  # no nameWithOwner
         with mock.patch.object(ha, "fetch_jira_issue") as f:
             sm.spawn_ticket("PROJ-7")
         self.assertEqual(sm.registry, [])
         f.assert_not_called()
+
+    def test_uncloned_repo_with_an_owner_clones_on_demand_and_queues(self):
+        # The hub routes a ticket to the most-available host in the org even when
+        # NO host has the repo; that host clones it and queues the session behind
+        # the clone (provisioned by _drain_queue once the .git dir lands).
+        sm = self.make_ticket_manager(repo="Elsewhere")
+        sm.triage_ledger[ha._triage_key(self.SITE, "PROJ-7")]["nameWithOwner"] = \
+            "xerktech/Elsewhere"
+        started = []
+        sm.clone = lambda nwo: started.append(nwo)
+        with mock.patch.object(ha, "fetch_jira_issue",
+                               return_value={"summary": "s", "url": "u"}):
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(started, ["xerktech/Elsewhere"])  # clone kicked off
+        self.assertEqual(len(sm.registry), 1)
+        q = sm.registry[0]
+        self.assertEqual(q["status"], "queued")
+        self.assertEqual(q["queuedReason"], "awaiting-clone")
+        self.assertEqual(q["awaitClone"], "Elsewhere")
+        self.assertEqual(q["awaitCloneOwner"], "xerktech/Elsewhere")
+        # Its repoPath points at where the clone will land, and its branch is
+        # deferred (no repo yet to scan for a free name).
+        self.assertEqual(q["repoPath"], os.path.join(ha.REPOS_ROOT, "Elsewhere"))
+        self.assertIsNone(q["ticket"]["branch"])
 
     def test_refuses_anything_that_is_not_a_jira_key(self):
         sm = self.make_ticket_manager()

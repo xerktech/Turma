@@ -1029,11 +1029,14 @@ test("ticketStartHtml: an untriaged ticket gets no button at all", () => {
   assert.equal(ticketStartHtml(ticket("X-1", { repoGuess: { repo: null } }), [], null), "");
 });
 
-test("ticketStartHtml: an uncloned repo disables the button and says why", () => {
+test("ticketStartHtml: an uncloned repo gets a live 'clone first' start button", () => {
+  // Clone-on-demand: the hub routes to the most-available org host, which clones
+  // the repo and queues the session behind it — so this is no longer a dead end.
   const html = ticketStartHtml(ticket("X-1", guess({ cloned: false })), [], null);
-  assert.ok(html.includes("disabled"));
-  assert.ok(html.includes("isn't cloned"));
-  assert.ok(!html.includes("data-start"), "a disabled button must not be clickable");
+  assert.ok(!html.includes("disabled"), "the button is live now, not disabled");
+  assert.ok(html.includes(`data-start="X-1"`), "it's clickable and routes off data-start");
+  assert.ok(html.includes("clone first"), "the label flags the extra clone step");
+  assert.ok(html.includes("clones first"), "the tooltip explains it");
 });
 
 test("ticketStartHtml: an in-flight start shows busy, not a second button", () => {

@@ -161,6 +161,43 @@ test("running sessions split: working/waiting -> Active, idle -> Idle", () => {
   assert.ok(els.ended.innerHTML.includes("Dead Task"), "ended section still renders");
 });
 
+test("a queued session lands under Queued, not Ended, and offers Cancel", () => {
+  const { render, els } = loadPage();
+  const t0 = Date.now();
+  const { now, host: h } = host([
+    working("11111", "Live Task"),
+    { id: "q1234", status: "queued", repo: "repoX", summary: "Waiting Task",
+      queuedReason: "capacity", queuedAt: new Date(t0 - 5000).toISOString() },
+    { id: "q5678", status: "queued", repo: "repoX", summary: "Cloning Task",
+      queuedReason: "awaiting-clone", queuedAt: new Date(t0 - 2000).toISOString() },
+  ]);
+  render({ now, agents: [h] });
+
+  const q = els.queued.innerHTML;
+  assert.match(q, /Queued <span class="count">2<\/span>/);
+  assert.ok(q.includes("Waiting Task") && q.includes("waiting for a free session slot"));
+  assert.ok(q.includes("Cloning Task") && q.includes("cloning the repo first"));
+  assert.ok(q.includes("Cancel"), "a queued card offers Cancel");
+  // A queued session is NOT in the ended list, and not a live/attachable card.
+  assert.ok(!els.ended.innerHTML.includes("Waiting Task"),
+    "a queued session must not read as ended");
+  assert.ok(!els.active.innerHTML.includes("Waiting Task"));
+});
+
+test("cancelling a queued session arms then kills it", () => {
+  const { beat, posts, cardKill } = loadPage();
+  const { now, host: h } = host([
+    { id: "q1234", status: "queued", repo: "repoX", summary: "Waiting Task",
+      queuedReason: "capacity", queuedAt: new Date().toISOString() },
+  ]);
+  beat({ now, agents: [h] });
+  cardKill(click, "hostA", "q1234");   // first click arms
+  assert.deepEqual(posts, [], "arming fires no command");
+  cardKill(click, "hostA", "q1234");   // second click confirms
+  assert.equal(posts.length, 1);
+  assert.match(posts[0].url, /\/sessions\/q1234\/kill$/);
+});
+
 test("all running idle: Active shows empty-state pointing at Idle; Idle lists them", () => {
   const { render, els } = loadPage();
   const { now, host: h } = host([idle("66666", "Only Idle")]);

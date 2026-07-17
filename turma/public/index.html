@@ -684,6 +684,17 @@ function agentState(a, now) {
   return a.online ? "online" : "offline";
 }
 
+// Human text for why a queued session hasn't started — the agent's queuedReason
+// (capacity / awaiting-clone / root-busy), with a generic fallback for an agent
+// that reported a reason we don't recognize.
+function queuedReasonText(reason) {
+  return ({
+    "capacity": "queued — waiting for a free session slot",
+    "awaiting-clone": "queued — cloning the repo first",
+    "root-busy": "queued — waiting for the repos-root slot",
+  })[reason] || "queued — waiting to start";
+}
+
 function tile(label, value, hint) {
   return `<div class="tile"><div class="label">${esc(label)}</div>` +
          `<div class="value">${esc(value)}</div>` +
@@ -1119,6 +1130,11 @@ function sessCard(a, s, now) {
       // resumable. Delete (which removes the worktree) only appears on already-
       // stopped/errored cards below.
       `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? esc(killConfirm) : "Kill"}</button>`;
+  } else if (st === "queued") {
+    // Waiting for a slot / clone / the root slot. It has no worktree yet, so the
+    // only thing to do is cancel it — Kill drops the queued record.
+    actions =
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? "Confirm cancel" : "Cancel"}</button>`;
   } else {
     // stopped or error: offer Start (needs host online + worktree recoverable) + Delete.
     actions =
@@ -1154,7 +1170,9 @@ function sessCard(a, s, now) {
       <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
       ${killing
         ? `<dt>State</dt><dd><b class="sess-dying">shutting down…</b></dd>`
-        : live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>` : ""}
+        : live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>`
+        : st === "queued" ? `<dt>State</dt><dd><b class="sess-queued">${esc(queuedReasonText(s.queuedReason))}</b>${s.queuedAt ? " · " + esc(ago(now - Date.parse(s.queuedAt))) : ""}</dd>`
+        : ""}
       ${live && live.question ? `<dt>Question</dt><dd>${esc(live.question)}</dd>` : ""}
       ${st === "error" && s.errorMsg ? `<dt>Error</dt><dd class="errmsg">${esc(s.errorMsg)}</dd>` : ""}
       ${prs}
