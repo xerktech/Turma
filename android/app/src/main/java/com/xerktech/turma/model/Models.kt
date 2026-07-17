@@ -18,9 +18,17 @@ data class AgentsResponse(
 )
 
 @Serializable
+data class CodingAgent(val name: String = "", val version: String = "")
+
+@Serializable
 data class AgentInfo(
     val key: String = "",
     val device: String = "",
+    // The coding agent this host runs + this Turma agent build's version, both
+    // shown in the host header (web index.html codingAgent()/agentVersion).
+    val claudeVersion: String = "",
+    val agentVersion: String = "",
+    val codingAgent: CodingAgent? = null,
     val lastSeen: Long = 0,
     // ISO-8601 string on the wire (agent's now_iso()), NOT epoch — the hub, web
     // client, and glasses all treat it as a string. Typing it Long made
@@ -36,6 +44,22 @@ data class AgentInfo(
     val clones: List<CloneInfo> = emptyList(),
     val commands: List<CommandInfo> = emptyList(),
     val jira: JiraBlock? = null,
+    // Killed-but-resumable sessions (hub-agent _closed_payload) — the web's
+    // "Ended sessions" list.
+    val closedSessions: List<ClosedSessionInfo> = emptyList(),
+)
+
+@Serializable
+data class ClosedSessionInfo(
+    val id: String = "",
+    val repo: String = "",
+    val branch: String = "",
+    val root: Boolean = false,
+    val summary: String = "",
+    val label: String = "",
+    val createdAt: String = "",
+    val closedAt: String = "",
+    val ticket: String = "",
 )
 
 // ---- Jira board (the agent's `jira` heartbeat block; see hub-agent collect_jira) --
@@ -51,6 +75,18 @@ data class JiraBlock(
     val error: String? = null,
     val truncated: Boolean = false,
     val tickets: List<JiraTicket> = emptyList(),
+    // The repos the board's manual "Change" picker offers — exactly what the
+    // agent's set_jira_repo allowlists, so the two can't drift (hub-agent
+    // _triage_candidates → jira.repoOptions).
+    val repoOptions: List<RepoOption> = emptyList(),
+)
+
+@Serializable
+data class RepoOption(
+    val name: String = "",
+    val cloned: Boolean = false,
+    val nameWithOwner: String? = null,
+    val description: String = "",
 )
 
 @Serializable
@@ -79,6 +115,9 @@ data class RepoGuess(
     val nameWithOwner: String? = null,
     val reason: String = "",
     val at: String = "",
+    // The operator pinned this repo by hand (vs. the model's guess). A manual pin
+    // has no `reason` and preselects in the picker; see board.js repoFieldHtml.
+    val manual: Boolean = false,
 )
 
 /** On-demand issue detail (GET /api/jira/<siteKey>/<key>); kept lenient. */
@@ -196,8 +235,22 @@ data class LiveSignals(
     val bridgeAttached: Boolean = false,
     val question: String = "",
     val questionOptions: List<String> = emptyList(),
+    // Rich AskUserQuestion picker (hub-agent session_report): option cards with
+    // descriptions/previews, a header chip, n-of-N progress, and multiSelect.
+    val questionOptionsRich: List<QuestionOption> = emptyList(),
+    val questionHeader: String = "",
+    val questionIndex: Int? = null,
+    val questionTotal: Int? = null,
+    val questionMulti: Boolean = false,
     val newPrUrls: List<String> = emptyList(),
     val tail: List<TailEntry> = emptyList(),
+)
+
+@Serializable
+data class QuestionOption(
+    val label: String = "",
+    val description: String = "",
+    val preview: String = "",
 )
 
 @Serializable

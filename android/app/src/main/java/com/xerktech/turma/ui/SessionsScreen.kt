@@ -12,6 +12,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -31,6 +35,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.liveState
 import com.xerktech.turma.core.sessionBranch
 import com.xerktech.turma.core.sessionName
+import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.ClosedSessionInfo
 import com.xerktech.turma.model.SessionInfo
 import com.xerktech.turma.vm.FleetViewModel
 
@@ -72,6 +78,8 @@ fun SessionsScreen(
     var query by remember { mutableStateOf("") }
     val now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis()
     val rows = remember(fleet, query) { flattenSessions(fleet.agents, query) }
+    val ended = remember(fleet, query) { flattenClosed(fleet.agents, query) }
+    var endedOpen by remember { mutableStateOf(false) }
 
     Column(modifier.fillMaxSize()) {
         ScreenHeader("Sessions")
@@ -81,7 +89,7 @@ fun SessionsScreen(
             contentPadding = PaddingValues(10.dp, 4.dp, 10.dp, 12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            if (rows.isEmpty()) {
+            if (rows.isEmpty() && ended.isEmpty()) {
                 item {
                     Text(
                         if (fleet.loading) "Loading…" else "No sessions.",
@@ -92,6 +100,64 @@ fun SessionsScreen(
             items(rows, key = { it.host + "/" + it.session.id }) { r ->
                 SessionListCard(r, now) { onOpenChat(r.host, r.session.id) }
             }
+            // Ended sessions: killed but resumable — its own collapsible section.
+            if (ended.isNotEmpty()) {
+                item(key = "ended-header") {
+                    Row(
+                        Modifier.fillMaxWidth().clickable { endedOpen = !endedOpen }.padding(top = 6.dp, bottom = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Icon(
+                            if (endedOpen) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        SectionLabel("Ended sessions (${ended.size})")
+                    }
+                }
+                if (endedOpen) {
+                    items(ended, key = { "closed:" + it.host + "/" + it.closed.id }) { c ->
+                        ClosedSessionCard(c) { vm.resume(c.host, c.closed.id); onOpenChat(c.host, c.closed.id) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+data class FlatClosed(val host: String, val device: String, val closed: ClosedSessionInfo)
+
+fun flattenClosed(agents: List<AgentInfo>, query: String): List<FlatClosed> {
+    val q = query.trim().lowercase()
+    val all = agents.flatMap { a -> a.closedSessions.map { FlatClosed(a.key, a.device.ifBlank { a.key }, it) } }
+    return if (q.isEmpty()) all else all.filter {
+        (it.closed.summary + " " + it.closed.label + " " + it.closed.repo + " " + it.closed.branch + " " + it.device)
+            .lowercase().contains(q)
+    }
+}
+
+fun closedName(c: ClosedSessionInfo): String =
+    c.summary.ifBlank { c.label.ifBlank { c.branch.ifBlank { c.id.take(6) } } }
+
+@Composable
+private fun ClosedSessionCard(c: FlatClosed, onResume: () -> Unit) {
+    TurmaCard(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            StateDot(com.xerktech.turma.core.LiveState.STOPPED)
+            Column(Modifier.weight(1f)) {
+                Text(closedName(c.closed), fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    "${c.device} · ${c.closed.repo.ifBlank { "—" }}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                )
+            }
+            GhostButton("Resume", onResume)
         }
     }
 }

@@ -50,6 +50,11 @@ data class ChatUiState(
     val prefs: VerbosityPrefs get() = VerbosityPrefs.forPreset(verbosity)
     val question: String get() = session?.session?.question ?: ""
     val questionOptions: List<String> get() = session?.session?.questionOptions ?: emptyList()
+    val questionOptionsRich: List<com.xerktech.turma.model.QuestionOption> get() = session?.session?.questionOptionsRich ?: emptyList()
+    val questionHeader: String get() = session?.session?.questionHeader ?: ""
+    val questionMulti: Boolean get() = session?.session?.questionMulti ?: false
+    val questionTotal: Int? get() = session?.session?.questionTotal
+    val questionIndex: Int? get() = session?.session?.questionIndex
 }
 
 class ChatViewModel(
@@ -209,6 +214,15 @@ class ChatViewModel(
     fun answerOption(index: Int) {
         viewModelScope.launch {
             runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = index)) }
+            container.fleet.nudge()
+        }
+    }
+
+    /** Multi-select answer: submit the picked option indices together. */
+    fun answerMulti(picks: List<Int>) {
+        if (picks.isEmpty()) return
+        viewModelScope.launch {
+            runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = -1, optionIndices = picks)) }
             container.fleet.nudge()
         }
     }

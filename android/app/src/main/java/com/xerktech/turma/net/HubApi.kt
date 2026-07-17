@@ -120,6 +120,26 @@ interface HubApi {
     @POST("api/jira/refresh")
     suspend fun jiraRefresh(): OkResponse
 
+    // Start a session on a ticket: the hub picks the host + triaged repo and
+    // spawns with the ticket as context. 200 {ok, cmdId, host, repo}, or 4xx
+    // when the ticket has no triaged/cloned repo.
+    @POST("api/jira/{siteKey}/{issueKey}/session")
+    suspend fun startJiraSession(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+    ): Response<JiraSessionResponse>
+
+    // Override which repo a ticket belongs to (fans out to every host reporting
+    // the org). Body: {repo:"name"} to pin, {repo:null} for "no repo fits",
+    // {auto:true} to release the pin. Built as a JsonObject so an explicit null
+    // survives the shared decoder's explicitNulls=false. 202 {ok, hosts, ...}.
+    @POST("api/jira/{siteKey}/{issueKey}/repo")
+    suspend fun setJiraRepo(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): OkResponse
+
     @POST("api/devices")
     suspend fun registerDevice(@Body body: DeviceRequest): OkResponse
 
@@ -129,6 +149,15 @@ interface HubApi {
 
 @Serializable
 data class OkResponse(val ok: Boolean = false, val cmdId: String = "", val error: String = "")
+
+@Serializable
+data class JiraSessionResponse(
+    val ok: Boolean = false,
+    val cmdId: String = "",
+    val host: String = "",
+    val repo: String = "",
+    val error: String = "",
+)
 
 @Serializable
 data class SpawnRequest(
@@ -150,7 +179,11 @@ data class ModelRequest(val model: String)
 data class ModeRequest(val permissionMode: String)
 
 @Serializable
-data class AnswerRequest(val optionIndex: Int = -1, val custom: String? = null)
+data class AnswerRequest(
+    val optionIndex: Int = -1,
+    val custom: String? = null,
+    val optionIndices: List<Int>? = null,
+)
 
 @Serializable
 data class CloneRequest(val repo: String)

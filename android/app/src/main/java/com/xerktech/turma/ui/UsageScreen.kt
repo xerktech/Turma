@@ -72,9 +72,34 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
             if (rows.isEmpty()) item {
                 Text("No usage recorded yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+            // The descriptive footer the web moved from the dashboard to here.
+            item {
+                Text(
+                    USAGE_FOOTER,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 16.dp, bottom = 8.dp),
+                )
+            }
         }
     }
 }
+
+private const val USAGE_FOOTER =
+    "Token figures are parsed from the Claude transcripts on each host and count every session it " +
+        "has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed " +
+        "sessions. A new session gets a randomly-named worktree checked out in detached HEAD off the " +
+        "latest default branch — the app creates no branch; the running agent branches its own work when " +
+        "it's ready, and that live branch shows on the card. The ⌂ Repos root entry starts a session " +
+        "directly at the repos root (spanning every repo), with no worktree or branch, one per host at a " +
+        "time. \"Clone from GitHub\" pulls a repo into the repos root so it joins the list. \"+ New " +
+        "session\" spawns instantly with today's defaults; the composer adds an initial prompt, a label, " +
+        "and options (base branch, model, permission mode). Kill removes a session from the hub but keeps " +
+        "its worktree, conversation and usage history — the \"Resume\" picker re-attaches to it. Delete " +
+        "removes the worktree; committed branches survive, only uncommitted files are lost. \"Restart " +
+        "(clear context)\" relaunches with a fresh transcript; Start continues the previous conversation. " +
+        "\"Prune\" removes worktrees and branches merged into the default branch, leaving anything unmerged " +
+        "or dirty untouched."
 
 @Composable
 private fun Stat(label: String, tokens: Long) {

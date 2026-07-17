@@ -36,10 +36,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import android.widget.Toast
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -62,7 +64,10 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
     val refreshing by vm.refreshing.collectAsStateWithLifecycle()
     val sites = remember(fleet) { mergeSites(fleet.agents) }
     val allKeys = sites.map { it.siteKey }
-    var detail by remember { mutableStateOf<Pair<String, JiraTicket>?>(null) }
+    var detail by remember { mutableStateOf<Pair<BoardSite, JiraTicket>?>(null) }
+
+    val context = LocalContext.current
+    LaunchedEffect(Unit) { vm.messages.collect { Toast.makeText(context, it, Toast.LENGTH_SHORT).show() } }
 
     Column(modifier.fillMaxSize()) {
         ScreenHeader("Board") {
@@ -85,14 +90,14 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
             ) {
                 for ((cat, title) in BOARD_CATEGORIES) {
                     val cards = sites.flatMap { site -> site.tickets.filter { categoryOf(it) == cat }.map { site to it } }
-                    KanbanColumn(cat, title, cards, allKeys) { site, t -> detail = site.siteKey to t }
+                    KanbanColumn(cat, title, cards, allKeys) { site, t -> detail = site to t }
                 }
             }
         }
     }
 
-    detail?.let { (siteKey, ticket) ->
-        TicketDetailSheet(siteKey, ticket, vm, onDismiss = { detail = null })
+    detail?.let { (site, ticket) ->
+        TicketDetailSheet(site, ticket, vm, onDismiss = { detail = null })
     }
 }
 
@@ -144,9 +149,81 @@ private fun RepoChip(t: JiraTicket) {
     }
 }
 
+/**
+ * The Repo row of the detail sheet: the triaged repo + its rationale, a
+ * "Start session" action when it's cloned, and a "Change" picker that pins the
+ * repo by hand. Mirrors board.js repoFieldHtml + ticketStartHtml + repoPickerHtml.
+ */
+@Composable
+private fun RepoSection(site: BoardSite, t: JiraTicket, vm: BoardViewModel) {
+    var editing by remember(t.key) { mutableStateOf(false) }
+    val g = t.repoGuess
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        SectionLabel("Repo")
+        when {
+            g == null -> Text("Not triaged yet", style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            g.repo == null -> Text(
+                if (g.manual) "No repository — set by you" else "No repository fits this ticket",
+                style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            else -> {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Pill(g.repo!!, dashed = !g.cloned, mono = true)
+                    if (!g.cloned) Text("(not cloned)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (g.manual) Text("— set by you", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (g.reason.isNotBlank() && !g.manual) Text(g.reason, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            // Start is only offered on a triaged, cloned repo (the hub 409s otherwise).
+            if (g?.repo != null && g.cloned) {
+                GhostButton("▶ Start session", onClick = { vm.startSession(site.siteKey, t.key) })
+            }
+            GhostButton(if (editing) "Cancel" else "Change repo", onClick = { editing = !editing })
+        }
+        if (editing) {
+            RepoPicker(site, t) { repo, auto ->
+                vm.setRepo(site.siteKey, t.key, repo, auto)
+                editing = false
+            }
+        }
+    }
+}
+
+@Composable
+private fun RepoPicker(site: BoardSite, t: JiraTicket, onPick: (repo: String?, auto: Boolean) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    val g = t.repoGuess
+    val current = if (g?.manual == true) (g.repo ?: "No repository fits") else "Let the agent decide"
+    Box {
+        GhostButton("▾ $current", onClick = { open = true })
+        androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("Let the agent decide") },
+                onClick = { open = false; onPick(null, true) },
+            )
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("No repository fits") },
+                onClick = { open = false; onPick(null, false) },
+            )
+            for (o in site.repoOptions.filter { it.name.isNotBlank() }) {
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(o.name + if (!o.cloned) "  (not cloned)" else "", fontFamily = FontFamily.Monospace) },
+                    onClick = { open = false; onPick(o.name, false) },
+                )
+            }
+        }
+    }
+    if (site.repoOptions.none { it.name.isNotBlank() }) {
+        Text("No repos reported for this org", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun TicketDetailSheet(siteKey: String, t: JiraTicket, vm: BoardViewModel, onDismiss: () -> Unit) {
+private fun TicketDetailSheet(site: BoardSite, t: JiraTicket, vm: BoardViewModel, onDismiss: () -> Unit) {
+    val siteKey = site.siteKey
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val detail by produceState<com.xerktech.turma.model.JiraIssueDetail?>(initialValue = null, siteKey, t.key) {
         value = vm.fetchIssue(siteKey, t.key)
@@ -162,13 +239,7 @@ private fun TicketDetailSheet(siteKey: String, t: JiraTicket, vm: BoardViewModel
                 if (t.priority.isNotBlank()) Pill(t.priority)
             }
             Text(t.summary, style = MaterialTheme.typography.titleMedium)
-            t.repoGuess?.let { g ->
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    SectionLabel("Repo")
-                    RepoChip(t)
-                    if (g.reason.isNotBlank()) Text(g.reason, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
+            RepoSection(site, t, vm)
             val d = detail
             if (d == null) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {

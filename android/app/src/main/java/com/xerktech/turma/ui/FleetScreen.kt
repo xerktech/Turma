@@ -147,6 +147,16 @@ fun FleetScreen(
     }
 }
 
+/** The coding agent a host runs, for its header — mirrors index.html codingAgent(). */
+fun codingAgentLabel(a: AgentInfo): String {
+    val c = a.codingAgent
+    if (c != null && c.version.isNotBlank()) return "${c.name.ifBlank { "Claude Code" }} ${c.version}"
+    val raw = a.claudeVersion.trim()
+    if (raw.isEmpty()) return "–"
+    val m = Regex("^(\\S+)\\s+\\((.+)\\)$").find(raw)
+    return if (m != null) "${m.groupValues[2]} ${m.groupValues[1]}" else "Claude Code $raw"
+}
+
 @Composable
 private fun HostSection(
     agent: AgentInfo,
@@ -172,11 +182,15 @@ private fun HostSection(
                     if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, null,
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Text(
-                    agent.device.ifBlank { agent.key },
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.weight(1f),
-                )
+                Column(Modifier.weight(1f)) {
+                    Text(agent.device.ifBlank { agent.key }, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                    Text(
+                        "${codingAgentLabel(agent)} · Turma ${agent.agentVersion.ifBlank { "–" }}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                }
                 Pill(if (agent.online) "online" else "offline", color = if (agent.online) com.xerktech.turma.ui.theme.TurmaColors.good else null)
             }
             AnimatedVisibility(expanded) {
