@@ -59,7 +59,23 @@ data class ClosedSessionInfo(
     val label: String = "",
     val createdAt: String = "",
     val closedAt: String = "",
-    val ticket: String = "",
+    // The Jira ticket this session worked, snapshotted onto the closed record
+    // (hub-agent _closed_payload → {key, siteKey, url, summary, branch}); null
+    // when the session had no ticket. Was mistyped as a plain String, so decoding
+    // the WHOLE /api/agents payload threw for any host with a killed ticket-backed
+    // session — hiding every such host from the fleet (only the per-host SSE push,
+    // which decodes hosts one at a time, kept the ticket-free ones visible).
+    val ticket: TicketRef? = null,
+)
+
+/** A session's Jira ticket link (SessionInfo/ClosedSessionInfo `ticket`). */
+@Serializable
+data class TicketRef(
+    val key: String = "",
+    val siteKey: String = "",
+    val url: String = "",
+    val summary: String = "",
+    val branch: String? = null,
 )
 
 // ---- Jira board (the agent's `jira` heartbeat block; see hub-agent collect_jira) --
