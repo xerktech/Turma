@@ -1190,6 +1190,40 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
 - Tests: the compose-button cases in `turma/tests/chat.test.js` and the `termComposeAction` cases in
   `turma/tests/sessions.test.js`.
 
+#### Copying out of the terminal
+
+- A copy made in the terminal view reaches the viewer's **real system clipboard**. That took three
+  independent fixes: the text has to survive the app, tmux AND xterm.js, and each dropped it (XERK-7).
+- Selecting at all needs a **modifier**, because the Claude TUI holds mouse tracking (tmux's `mouse`
+  is off, so the app's request passes straight out) and xterm.js hands it every drag.
+  - That modifier is **Shift** everywhere except macOS, where xterm.js ignores Shift and honours
+    **Alt** — but only when `macOptionClickForcesSelection` is on, and it defaults off. So a Mac
+    operator could not select terminal text at all, hence could not copy any of it. `_launch_ttyd`
+    passes the option; the cost is Mac's Alt+drag column-select, the same trade every terminal makes.
+  - Once a selection EXISTS ttyd copies it itself (`document.execCommand` on `onSelectionChange`), so
+    that path needs nothing from us and is not what the ticket was about.
+- **Every other copy — the app's own and tmux copy-mode's — travels as OSC 52**, and all three links
+  in that chain were broken:
+  - tmux only emits OSC 52 if the OUTER terminfo advertises an `Ms` ("set clipboard") capability, and
+    neither xterm-256color nor tmux-256color carries one here, so tmux dropped every copy on the floor
+    instead of forwarding it. `agent/tmux.conf` declares `Ms` on the same "we launch the outer
+    terminal, so we know it's xterm.js" ground as the RGB override beside it.
+  - `set-clipboard`'s default `external` forwards **no** application OSC 52 at all (the man page's
+    "ignore attempts by applications" means ignore, not pass through) — so the app's own copy died
+    here even with `Ms`. `on` forwards it and keeps a tmux buffer, so one copy pastes both inside tmux
+    and outside the browser.
+  - xterm.js **parses** OSC 52 but ships no handler for it, so the sequence arrived in the tab and
+    nothing happened. ttyd exposes its instance as `window.term`, so the hub injects the missing
+    handler (`TERM_OSC52_JS`, beside the font + touch-scroll shims in `proxyTerm`).
+- The bridge is deliberately **write-only**: an OSC 52 READ request (`?`) is never answered, since
+  replying would hand any program running in the pane whatever the operator last copied. An empty
+  payload is dropped rather than written, so tmux copying an empty selection can't wipe the clipboard.
+- It splits the payload at the **first `;`** rather than matching a selection name: an app sends
+  `52;c;<b64>` but tmux sends an empty selection (`52;;<b64>`), and both must land.
+- Tests: the OSC 52 bridge cases in `turma/tests/server.test.js` (which run the injected string itself
+  against a fake `window.term`) and `test_launch_ttyd_lets_a_mac_force_a_selection` in
+  `agent/tests/test_hub_agent.py`.
+
 ### Durable archive
 
 - The hub hosts a **durable, searchable archive of ended sessions** (`turma/archive.js`): agents push

@@ -2480,6 +2480,25 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["ttydPid"], 4242)
         self.assertIs(sm.ttyd[sess["id"]].pid, 4242)
 
+    def test_launch_ttyd_lets_a_mac_force_a_selection(self):
+        # The Claude TUI holds mouse tracking, so xterm.js only makes a
+        # selection — the prerequisite for copying anything out — when a
+        # modifier forces one. On macOS that modifier is Alt AND ONLY with this
+        # option on, so without it a Mac operator cannot select at all (XERK-7).
+        sm = self.make_manager()
+        sess = self._running_sess()
+
+        class FakeProc:
+            pid = 4243
+            def poll(self_i):
+                return None
+
+        with mock.patch.object(ha, "_port_open", return_value=False), \
+             mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()) as popen:
+            sm._launch_ttyd(sess)
+        args = popen.call_args[0][0]
+        self.assertIn("macOptionClickForcesSelection=true", args)
+
     def test_kill_ttyd_reaps_adopted_orphan_by_pid(self):
         # An adopted ttyd isn't in self.ttyd; _kill_ttyd must still reap it via
         # the persisted pid so stop/delete don't leak the process and its port.

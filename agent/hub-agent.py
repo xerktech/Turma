@@ -4495,6 +4495,15 @@ class SessionManager:
             "-t", "fontSize=14",
             "-t", "rendererType=canvas",
             "-t", "disableLeaveAlert=true",
+            # A mouse-tracking app (the Claude TUI is one) takes the drag, so
+            # xterm.js only makes a SELECTION when a modifier forces one — the
+            # prerequisite for copying any text out at all. That modifier is
+            # Shift everywhere except macOS, where xterm.js ignores Shift and
+            # honours Alt instead, but only with this option on; it defaults
+            # off, so a Mac operator could not select terminal text at all
+            # (XERK-7). Costs Mac's Alt+drag column-select, which is what every
+            # terminal trades it for.
+            "-t", "macOptionClickForcesSelection=true",
             "-c", f"term:{TURMA_TOKEN or 'changeme'}",
             "tmux", "attach", "-t", sess["tmuxName"],
         ]

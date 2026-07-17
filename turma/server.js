@@ -856,6 +856,48 @@ const TERM_TOUCH_SCROLL =
   "addEventListener('touchend',function(){y=null;},{passive:false});" +
   "})();</script>";
 
+// Clipboard bridge injected into ttyd's page: the half of "copy out of the
+// terminal" that lives in the browser (XERK-7). A copy made inside the session
+// travels out as an OSC 52 escape, and xterm.js PARSES OSC 52 but ships no
+// handler for one — the sequence arrives and nothing happens — so a copy landed
+// in the tab and went no further, pasteable inside the terminal and nowhere
+// else. ttyd exposes its xterm instance as window.term, so registering the
+// handler it lacks is all the hub has to do. The agent's tmux.conf holds the
+// other half: tmux only emits OSC 52 when the outer terminfo advertises Ms.
+//
+// This is injected into <head>, so window.term won't exist for another beat or
+// two — hence the retry rather than a single read at parse time.
+const TERM_OSC52_JS =
+  "(function(){" +
+  "function wire(){" +
+  "var t=window.term;" +
+  "if(!t||!t.parser)return setTimeout(wire,50);" +
+  "t.parser.registerOscHandler(52,function(data){" +
+  // "<selection>;<payload>" — but tmux sends an EMPTY selection (";<payload>")
+  // where a bare app sends "c;<payload>", so split at the first ';' rather than
+  // matching a selection name we'd only have to enumerate.
+  "var i=data.indexOf(';');var b64=i<0?data:data.slice(i+1);" +
+  // "?" is a clipboard READ request, and this bridge is deliberately write-only:
+  // answering one would hand any program running in the pane the operator's
+  // whole clipboard. An empty payload is tmux copying an empty selection —
+  // dropped rather than written, so a stray one can't wipe the clipboard.
+  "if(b64==='?'||b64==='')return true;" +
+  "try{" +
+  "var bin=atob(b64);" +
+  // OSC 52 carries base64 of UTF-8 BYTES; atob yields one char per byte, so the
+  // bytes have to be decoded back or anything non-ASCII pastes as mojibake.
+  "var text=new TextDecoder().decode(Uint8Array.from(bin,function(c){" +
+  "return c.charCodeAt(0);}));" +
+  // Rejects if the document isn't focused or the permission is refused. Nothing
+  // to fall back to, and throwing here would land inside xterm.js's parser, so
+  // swallow it: the operator is left exactly where this fix found them.
+  "navigator.clipboard.writeText(text).catch(function(){});" +
+  "}catch(e){}" +
+  "return true;" +
+  "});}" +
+  "wire();})();";
+const TERM_OSC52_CLIPBOARD = "<script>" + TERM_OSC52_JS + "</script>";
+
 // ---- minimal WebSocket server framing (RFC 6455) ----------------------------
 // We only need enough to carry an opaque byte stream (the agent's ttyd TCP
 // wire) plus text control JSON, ping/pong keepalive, and close. Frames FROM the
@@ -1165,9 +1207,9 @@ async function proxyTerm(req, res, name, port) {
         upRes.on("data", (c) => chunks.push(c));
         upRes.on("end", () => {
           let html = Buffer.concat(chunks).toString("utf8");
-          // Insert the @font-face + touch-scroll shim before </head> (fall
-          // back to prepending).
-          const inject = TERM_FONT_STYLE + TERM_TOUCH_SCROLL;
+          // Insert the @font-face + touch-scroll shim + clipboard bridge before
+          // </head> (fall back to prepending).
+          const inject = TERM_FONT_STYLE + TERM_TOUCH_SCROLL + TERM_OSC52_CLIPBOARD;
           html = html.includes("</head>")
             ? html.replace("</head>", inject + "</head>")
             : inject + html;
@@ -2320,6 +2362,7 @@ if (process.env.TURMA_TEST) {
     issueSessionToken,
     sessionTokenValid,
     fmtDur,
+    TERM_OSC52_JS,
     pcmToWav,
     transcribePcm,
     issueWsToken,
