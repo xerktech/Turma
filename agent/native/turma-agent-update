@@ -32,7 +32,7 @@ PREFIX="$(dirname "$SELF_DIR")"
 
 REPO="${TURMA_REPO:-xerktech/turma}"
 LEGACY_TAG_PREFIX="agent-native-v"
-INTERVAL="${TURMA_UPDATE_INTERVAL:-21600}"   # 6h default for --loop
+INTERVAL="${TURMA_UPDATE_INTERVAL:-3600}"   # 1h default for --loop
 LOG="$HOME/.turma/update.log"
 LOCK="$HOME/.turma/update.lock"
 mkdir -p "$HOME/.turma" 2>/dev/null || true

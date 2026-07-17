@@ -121,7 +121,7 @@ The agent polls the GitHub Releases (via your `gh` login), and when a newer
 native build ships it downloads + checksum-verifies it, swaps the files, and
 restarts the manager. **Running sessions are not stopped** — the tmux/claude
 processes keep running; the web UI briefly disconnects and reconnects once the
-manager is back. Driven by a systemd timer (every 6h), or the
+manager is back. Driven by a systemd timer (hourly), or the
 `turma-agent-update --loop` poller on non-systemd hosts. Force a check with
 `turma-agent-update` (or `turma-agentctl update`).
 
