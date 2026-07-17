@@ -1064,13 +1064,14 @@ const KIND_ORDER = { waiting: 0, working: 1, idle: 2 };
 // place the shapes are told apart after this.
 //
 // The third channel is what makes the list DURABLE and complete. The first two
-// are read out of ~/.turma (sessions.json / closed.json), which on a container
-// host is the image's writable layer — an agent update recreates the container
-// and takes both with it, emptying this list. closed.json is capped at 5 per
-// repo besides, so it was never the whole history even on a host that kept it.
-// `resumable` is re-derived every slow beat from the transcripts under
-// ~/.claude/projects (a bind mount) plus each transcript's own recorded cwd, so
-// it survives that wipe and carries every prior session, not the newest few.
+// are read out of ~/.turma (sessions.json / closed.json), whose durability is the
+// host's to provide — a container that doesn't bind-mount it has it on the image's
+// writable layer, which an agent update recreates, emptying this list. And even
+// where it IS mounted, closed.json is capped at 5 per repo, so it was never the
+// whole history on any host. `resumable` is re-derived every slow beat from the
+// transcripts under ~/.claude/projects (a bind mount) plus each transcript's own
+// recorded cwd, so it survives that wipe and carries every prior session, not the
+// newest few.
 function endedEntry(a, s, kind) {
   const endedAt = kind === "closed" ? s.closedAt
     : kind === "resumable" ? s.endedTs
@@ -1150,6 +1151,17 @@ function collect(agents, now) {
 function findEnded(id) {
   const { ended } = collect(cache.agents || [], cache.now || Date.now());
   return ended.find(e => e.id === id) || null;
+}
+
+// The same list, found by CONVERSATION rather than by entry id — what the board's
+// ticket chips deep-link on (/sessions?ended=<transcriptId>). The transcript id is
+// the one handle all three ended channels share and the one this list already
+// dedupes on; an entry `id` is not, since a resumable row's is a synthesised
+// "t:<transcriptId>" while a killed one's is the session's own.
+function findEndedByTranscript(tid) {
+  if (!tid) return null;
+  const { ended } = collect(cache.agents || [], cache.now || Date.now());
+  return ended.find(e => e.s && e.s.transcriptId === tid) || null;
 }
 
 // A session's name: whatever the agent reports (auto-generated at spawn, or one
@@ -1516,6 +1528,19 @@ let viewPushed = false; // a history entry the back button will consume (mobile)
 // undone). Survives the async /api/agents load and any SSE-delivered arrival.
 const params = new URLSearchParams(location.search);
 let pendingSelect = params.get("session");
+// Deep link to an ENDED session's read-only view, keyed by its conversation:
+// /sessions?ended=<transcriptId>, which the board's ticket chips use for any
+// session that isn't running. Separate from ?session=, whose wait only ever
+// resolves a RUNNING session — pointing a killed session at that one parks the
+// stage on "Opening session…" indefinitely. Held until the ended list reports the
+// transcript (a killed session is in the very next heartbeat; one recovered by
+// the transcript scan can take a slow beat), then opened once.
+let pendingEnded = params.get("ended");
+const pendingEndedAt = Date.now();
+// Bounded, unlike the by-id wait: the board only ever chips a transcript it saw
+// in this same fleet payload, so failing to find one means the host dropped out
+// between the click and this load. Fall back to the ordinary empty stage.
+const ENDED_FOLLOW_MS = 30000;
 // Follow a session we just started, whose id we don't know yet. The agent mints
 // the id, so a spawn/resume POST can only answer with the queued command's
 // `cmdId`; the session it creates reports that back as `spawnCmdId` on a later
@@ -1537,6 +1562,21 @@ function followSpawn(cmdId) {
 // the ordinary by-id wait — a session is reported before its terminal tunnel is
 // up, so sessionHit() may still need a beat or two either way.
 function tryPendingSelect() {
+  if (pendingEnded) {
+    const e = findEndedByTranscript(pendingEnded);
+    if (e) {
+      const id = e.id;
+      pendingEnded = null;
+      stageWaiting(null);
+      openEndedSession(id);
+      return;
+    }
+    if (Date.now() - pendingEndedAt <= ENDED_FOLLOW_MS) {
+      stageWaiting("Opening session…");
+      return;
+    }
+    pendingEnded = null;   // gave up; fall through to the ordinary stage
+  }
   if (pendingSpawn) {
     if (Date.now() - pendingSpawnAt > SPAWN_FOLLOW_MS) pendingSpawn = null;
     else {
@@ -1621,6 +1661,7 @@ function selectSession(id) {
   // that lands mid-read can't yank the operator off the session they chose.
   pendingSpawn = null;
   pendingSelect = null;
+  pendingEnded = null;
   followedSpawn = false;
   // Already viewing this session in chat — clicking it again should be a no-op,
   // not tear down and rebuild the live tail (which reads as a page reload).
@@ -1887,6 +1928,7 @@ async function openEndedSession(id) {
   // An explicit pick wins over anything we were waiting to open.
   pendingSpawn = null;
   pendingSelect = null;
+  pendingEnded = null;
   followedSpawn = false;
   endedViewId = id;
   currentId = null;

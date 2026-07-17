@@ -764,13 +764,108 @@ test("ticketSessionIndex: sessions read oldest first (branch order)", () => {
     ["old", "new"]);
 });
 
-test("ticketSessionIndex: a killed session still shows on its ticket", () => {
-  // The record outlives the process, so the link does too — that's the point of
-  // hanging it on the session rather than on a hub-side store.
+test("ticketSessionIndex: a STOPPED session still shows on its ticket", () => {
+  // Its claude exited on its own, so the registry record (and the link hanging
+  // off it) is still right here in a.sessions. Contrast the killed case below,
+  // which this test was once named for but never exercised: a kill DROPS the
+  // record from the registry, so nothing in a.sessions could have covered it.
   const idx = ticketSessionIndex([agent("hostA", block(), {
     sessions: [tsess("s1", "X-1", { status: "stopped" })],
   })]);
   assert.equal(ticketSessionsOf(idx, "myorg.atlassian.net", "X-1").length, 1);
+});
+
+test("ticketSessionIndex: a KILLED session still shows on its ticket", () => {
+  // A kill drops the registry record and moves it to the closed history, so this
+  // is the only channel carrying the link — read it, or a ticket forgets its work
+  // the instant that work is killed.
+  const idx = ticketSessionIndex([agent("hostA", block(), {
+    sessions: [],
+    closedSessions: [tsess("s1", "X-1", { transcriptId: "tr1", closedAt: "2026-07-14T11:00:00Z" })],
+  })]);
+  const got = ticketSessionsOf(idx, "myorg.atlassian.net", "X-1");
+  assert.equal(got.length, 1);
+  assert.equal(got[0].id, "s1");
+  assert.equal(got[0].host, "hostA");
+});
+
+test("ticketSessionIndex: a session aged out of the closed history still shows", () => {
+  // closed.json keeps only CLOSED_PER_REPO per repo. Past that the durable
+  // transcript scan is the last channel reporting the session at all, and its
+  // ticket comes from the agent's transcript -> ticket ledger.
+  const idx = ticketSessionIndex([agent("hostA", block(), {
+    sessions: [],
+    repos: [{ name: "Turma", resumable: [
+      { transcriptId: "tr9", endedTs: "2026-07-13T09:00:00Z", summary: "Work Jira ticket X-1.",
+        ticket: { key: "X-1", siteKey: "myorg.atlassian.net", branch: "X-1" } },
+      { transcriptId: "tr8", endedTs: "2026-07-13T08:00:00Z", summary: "something else" },
+    ] }],
+  })]);
+  const got = ticketSessionsOf(idx, "myorg.atlassian.net", "X-1");
+  assert.equal(got.length, 1);
+  assert.equal(got[0].transcriptId, "tr9");
+});
+
+test("ticketSessionIndex: the closed record beats its own resumable scan entry", () => {
+  // A killed session is reported through BOTH channels once the slow scan catches
+  // up. Only the record knows its id, its createdAt and that it was renamed — so
+  // it must win, and the ticket must not chip twice.
+  const idx = ticketSessionIndex([agent("hostA", block(), {
+    sessions: [],
+    closedSessions: [tsess("s1", "X-1", { transcriptId: "tr1" })],
+    repos: [{ name: "Turma", resumable: [
+      { transcriptId: "tr1", endedTs: "2026-07-13T09:00:00Z",
+        ticket: { key: "X-1", siteKey: "myorg.atlassian.net", branch: "X-1" } },
+    ] }],
+  })]);
+  const got = ticketSessionsOf(idx, "myorg.atlassian.net", "X-1");
+  assert.equal(got.length, 1);
+  assert.equal(got[0].id, "s1");
+});
+
+test("ticketSessionIndex: a running session beats its scan entry on ANOTHER host's turn", () => {
+  // Resumable is sweept in its own pass over the whole fleet, after every
+  // registry-backed record is in `seen` — otherwise a record reported by a host
+  // listed later would lose to an earlier host's scan entry.
+  const idx = ticketSessionIndex([
+    agent("hostA", block(), {
+      sessions: [],
+      repos: [{ name: "Turma", resumable: [
+        { transcriptId: "tr1", endedTs: "2026-07-13T09:00:00Z",
+          ticket: { key: "X-1", siteKey: "myorg.atlassian.net", branch: "X-1" } },
+      ] }],
+    }),
+    agent("hostA", block(), { sessions: [tsess("s1", "X-1", { transcriptId: "tr1" })] }),
+  ]);
+  const got = ticketSessionsOf(idx, "myorg.atlassian.net", "X-1");
+  assert.equal(got.length, 1);
+  assert.equal(got[0].id, "s1");
+});
+
+test("ticketSessionIndex: the same transcript on two hosts is not deduped", () => {
+  // The shared ~/.claude login syncs transcripts between hosts, so an id alone is
+  // not unique across the fleet — two hosts reporting one really are two rows.
+  const idx = ticketSessionIndex([
+    agent("hostA", block(), { sessions: [tsess("s1", "X-1", { transcriptId: "tr1" })] }),
+    agent("hostB", block(), { sessions: [tsess("s2", "X-1", { transcriptId: "tr1" })] }),
+  ]);
+  assert.deepEqual(
+    ticketSessionsOf(idx, "myorg.atlassian.net", "X-1").map(s => s.host), ["hostA", "hostB"]);
+});
+
+test("ticketSessionIndex: a scan-recovered session sorts on when it last spoke", () => {
+  // It was never a record, so it has no createdAt — endedTs is the only timestamp
+  // its scan recovers, and without it it would sort to an arbitrary spot.
+  const idx = ticketSessionIndex([agent("hostA", block(), {
+    sessions: [tsess("new", "X-1", { createdAt: "2026-07-14T12:00:00Z" })],
+    repos: [{ name: "Turma", resumable: [
+      { transcriptId: "old", endedTs: "2026-07-13T09:00:00Z",
+        ticket: { key: "X-1", siteKey: "myorg.atlassian.net", branch: "X-1" } },
+    ] }],
+  })]);
+  assert.deepEqual(
+    ticketSessionsOf(idx, "myorg.atlassian.net", "X-1").map(s => s.id || s.transcriptId),
+    ["old", "new"]);
 });
 
 test("sessionChipHtml: links into the session and shows its live state", () => {
@@ -778,6 +873,42 @@ test("sessionChipHtml: links into the session and shows its live state", () => {
   assert.ok(html.includes(`href="/sessions?session=abc12"`));
   assert.ok(html.includes("running"));
   assert.ok(!html.includes("kc-sess-off"));
+});
+
+test("sessionChipHtml: anything not running opens the READ-ONLY view", () => {
+  // The Sessions page's ?session= wait only ever resolves a RUNNING session, so
+  // pointing a stopped/killed chip at it parks the stage on "Opening session…"
+  // forever. The conversation is what an ended session has to offer, and
+  // ?ended=<transcriptId> is the deep link that opens it.
+  for (const s of [
+    tsess("s1", "X-1", { status: "stopped", transcriptId: "tr1" }),   // registry, exited
+    tsess("s1", "X-1", { status: undefined, transcriptId: "tr1" }),   // killed / scan-recovered
+  ]) {
+    const html = sessionChipHtml(s);
+    assert.ok(html.includes(`href="/sessions?ended=tr1"`), html);
+    assert.ok(!html.includes("?session="), html);
+  }
+});
+
+test("sessionChipHtml: a session with no conversation is not a link", () => {
+  // Killed before its first turn: there is nothing to open, and an <a> to nowhere
+  // is worse than plain text saying so.
+  const html = sessionChipHtml(tsess("s1", "X-1", { status: "stopped" }));
+  assert.ok(!html.includes("<a"));
+  assert.ok(html.includes("no conversation"));
+  assert.ok(html.includes(">X-1<"));      // still labelled, still readable
+});
+
+test("sessionChipHtml: a scan-recovered session labels and links with no id at all", () => {
+  // It was never a registry record — no id, no git, no summaryManual. The ledger's
+  // reserved branch is its label and its transcript is its link.
+  const html = sessionChipHtml({
+    transcriptId: "tr9", endedTs: "2026-07-13T09:00:00Z",
+    ticket: { key: "X-1", siteKey: "myorg.atlassian.net", branch: "X-1" },
+  });
+  assert.ok(html.includes(`href="/sessions?ended=tr9"`));
+  assert.ok(html.includes(">X-1<"));
+  assert.ok(html.includes("kc-sess-off"));
 });
 
 test("sessionChipHtml: labels with the BRANCH, not the ticket-derived name", () => {
