@@ -307,6 +307,14 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     `prFooterChip` cases in `turma/tests/chat.test.js`.
 - Cached by URL in `pr_status_cache` and attached as `session.prs`; kept even after the session
   stops, and None until it opens a PR.
+- **The link set itself is durable across an agent restart** (XERK-15): a running session mirrors its
+  `session_pr_urls` onto its own registry record (`sess["prUrls"]`, saved as it grows in
+  `_session_payload`) and rehydrates the in-memory map from there on boot — the same durability a
+  killed session's PRs get off `closed.json`. Without it a restart blanked a running card's chips
+  (the map starts empty and the transcript scan primes to EOF, so it never replays old links) until
+  the session happened to open another PR. `pr_status_cache` itself stays re-derived (`gh pr view`),
+  so the chips reappear as bare links immediately and refill their state/CI on the next status poll.
+  Tests: `test_prs_survive_agent_restart` in `TestRefreshPrStatus`.
 - **Which PRs are "a session's"** is decided by `_scan_pr_line`, and the rule is deliberately narrow:
   a URL counts only when it comes back in a **`gh pr create` call's own `tool_result`** — the one
   event in a transcript that says this session OPENED that PR.

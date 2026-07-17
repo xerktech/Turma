@@ -5569,6 +5569,35 @@ class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
             sm.refresh_pr_status()
         pr.assert_called_once_with(url)
 
+    def test_prs_survive_agent_restart(self):
+        """XERK-15: a running session's opened-PR chips must survive an agent
+        restart. session_pr_urls is in-memory and the transcript scan primes to
+        EOF on boot (so it never replays old links), so the links have to be
+        mirrored onto the durable session record and rehydrated from it — the
+        same durability a killed session's PRs already get off closed.json."""
+        url = "https://github.com/o/r/pull/9"
+        sm = self.make_manager()
+        sess = {"id": "s1", "status": "running", "repo": "r", "repoPath": "/p",
+                "worktreePath": "/w", "branch": None, "rcName": "n"}
+        sm.registry = [sess]
+        with mock.patch.object(sm, "_session_git", return_value=(None, {})):
+            with mock.patch.object(ha, "session_report",
+                                   return_value={"prUrls": [url], **self._SIGNAL_STUB}):
+                sm._session_payload(sess)
+        # The link is now mirrored onto the record and persisted to disk.
+        self.assertEqual(sess["prUrls"], [url])
+        # A fresh manager (agent restart) reads the registry back and rehydrates
+        # the in-memory store, so the chip is on the card from the first beat.
+        sm2 = self.make_manager()
+        self.assertEqual(sm2.session_pr_urls["s1"], [url])
+        self.assertEqual([pr["url"] for pr in sm2._session_prs("s1")], [url])
+        # And the rehydrated link is re-pollable, so the full state/CI returns.
+        sm2.github = {"available": True}
+        with mock.patch.object(ha, "pr_status",
+                               return_value={"url": url, "state": "OPEN"}) as pr:
+            sm2.refresh_pr_status()
+        pr.assert_called_once_with(url)
+
 
 class TestNormalizeJiraSite(unittest.TestCase):
     """Every way an operator might write the site collapses to one bare
