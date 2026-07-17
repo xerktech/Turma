@@ -58,11 +58,14 @@ function makeEl(id) {
 // body. Off by default — a POST that never settles is what keeps the boot
 // refresh() inert for every other test, and only the paths that correlate a
 // reply (the cmdId a resumed transcript comes back under) need it.
-function loadPage({ search = "", sidebar = null, textareas = [], postReply = null } = {}) {
+function loadPage({ search = "", sidebar = null, textareas = [], postReply = null, narrow = false } = {}) {
   const els = {};
   const opened = [];
   const posts = [];
   const chat = { busy: false, stopped: 0 };
+  // Window-level listeners the page registers (e.g. popstate), so a test can
+  // drive the mobile back-button flow that `history.back()` triggers.
+  const winListeners = {};
   const document = {
     getElementById(id) { return (els[id] ||= makeEl(id)); },
     querySelector(sel) { return sel === ".sidebar" ? sidebar : null; },
@@ -89,7 +92,10 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     EventSource: class { addEventListener() {} close() {} static get CLOSED() { return 2; } },
     setInterval: () => 0, clearInterval: noop, setTimeout: () => 0, clearTimeout: noop,
     requestAnimationFrame: () => 0, cancelAnimationFrame: noop,
-    history: { replaceState: noop, pushState: noop },
+    // pushState/back mirror the browser closely enough to test the mobile stage:
+    // enterStage() pushes a state, and backToList()'s history.back() fires the
+    // page's popstate handler (which drops the showing-term view).
+    history: { replaceState: noop, pushState: noop, back() { (winListeners.popstate || []).forEach((fn) => fn()); } },
     URL: global.URL, URLSearchParams: global.URLSearchParams,
     TurmaChat: {
       open: (hostKey, id) => opened.push(id),
@@ -100,8 +106,8 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       isBusy: () => chat.busy, stop: () => { chat.stopped++; }, actionFailed: noop,
     },
     console, Date, Math, JSON, encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
-    addEventListener: noop, removeEventListener: noop,
-    matchMedia: () => ({ matches: false, addEventListener: noop }),
+    addEventListener(type, fn) { (winListeners[type] ||= []).push(fn); }, removeEventListener: noop,
+    matchMedia: () => ({ matches: narrow, addEventListener: noop }),
     scrollTo: noop, innerWidth: 1200, innerHeight: 800,
   };
   const names = Object.keys(stubs);
@@ -112,12 +118,12 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const fn = new Function(...names, "window",
     script + "\n;return { render, selectSession, followSpawn, toggleComposer,"
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
-      + " termComposeAction, openEndedSession, resumeEnded, openTranscript,"
+      + " termComposeAction, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
   api.beat = (data) => { api.setCache(data); api.render(data); };
-  return { ...api, els, opened, posts, chat };
+  return { ...api, els, opened, posts, chat, body: document.body };
 }
 // The card's ⋯/menu buttons pass their click event on; the shim has no events.
 const click = { stopPropagation() {} };
@@ -393,6 +399,37 @@ test("picking a session cancels a pending follow, so the spawn can't yank the st
   h.sessions = [...h.sessions, { ...working("99999", "Late Arrival"), spawnCmdId: "cmd-77" }];
   beat({ now, agents: [h] });
   assert.deepEqual(opened, ["11111"], "an explicit pick wins over the pending follow");
+});
+
+test("mobile: re-selecting a session after backing out re-reveals its stage (XERK-17)", () => {
+  const { beat, selectSession, backToList, opened, body } = loadPage({ narrow: true });
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+
+  selectSession("11111");
+  assert.deepEqual(opened, ["11111"]);
+  assert.ok(body.classList.contains("showing-term"), "the stage is revealed on select");
+
+  // "Back to Sessions" — the mobile flow only HIDES the stage; currentId/viewMode
+  // stay put so the live tail stays warm, and the sidebar card is tappable again.
+  backToList();
+  assert.ok(!body.classList.contains("showing-term"), "backing out hides the stage");
+
+  // Re-tapping the same card used to hit the desktop no-op guard and do nothing,
+  // stranding the session unopenable. It must now re-reveal the warm stage.
+  selectSession("11111");
+  assert.ok(body.classList.contains("showing-term"), "re-selecting re-reveals the stage");
+  assert.deepEqual(opened, ["11111"], "the warm chat is NOT torn down and rebuilt");
+});
+
+test("desktop: re-selecting the current session stays a no-op", () => {
+  const { beat, selectSession, opened } = loadPage(); // narrow:false — desktop
+  const { now, host: h } = host([working("11111", "Some Task")]);
+  beat({ now, agents: [h] });
+
+  selectSession("11111");
+  selectSession("11111");
+  assert.deepEqual(opened, ["11111"], "no rebuild when the stage is already visible");
 });
 
 // --- the terminal's Send/Stop compose button ---------------------------------
