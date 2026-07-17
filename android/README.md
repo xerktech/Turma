@@ -35,6 +35,9 @@ notifications** and **voice** for starting sessions and mid-session prompts.
   open session is `rememberSaveable`, so a foldable folding/unfolding reflows
   between the two forms without losing the conversation. Driven by
   `WindowWidthSizeClass` in `MainActivity` → `SessionsRoute`.
+- **In-app update** — checks the public GitHub releases for a newer APK and, on a
+  one-tap **Download & Install**, sideloads it via the system installer. A stopgap
+  until the app ships on Google Play (see "In-app update" below).
 
 ## Architecture
 
@@ -45,7 +48,9 @@ Mirrors the glasses client's pure-core / adapter-shell split:
   `Transcript` (grow-only merge), `Sessions` (working/idle/waiting), `ChatItems`
   (buildItems + verbosity). Unit tests in `src/test/`.
 - `net/` — `HubClient` (Retrofit + OkHttp + kotlinx.serialization),
-  `LiveTail`/`FleetRepository` (WebSocket + SSE), `Dictation` (mic → `/audio`).
+  `LiveTail`/`FleetRepository` (WebSocket + SSE), `Dictation` (mic → `/audio`),
+  `Updater` (in-app update — see below). The updater is pure/`core.Update` +
+  I/O/`net.Updater`, like everything else.
 - `vm/` — ViewModels. `ui/` — Jetpack Compose screens. `push/` — FCM.
 
 ## Build
@@ -63,6 +68,36 @@ gradle wrapper --gradle-version 8.11.1   # one-time, needs a system Gradle
 CI (`.github/workflows/android-ci.yml`) does exactly this on a GitHub-hosted
 `ubuntu-latest` runner, using its preinstalled Android SDK with JDK 17 and
 Gradle pinned in-job.
+
+## In-app update
+
+A stopgap self-updater until the app ships on Google Play (XERK-11). It checks
+the **public** `xerktech/turma` GitHub releases for a newer Android APK and, on a
+one-tap **Update**, downloads it and hands it to the system package installer.
+
+- **How the version is decided.** Every unified release is self-contained: a
+  component unchanged in a release still carries its own APK forward onto that
+  release under its ORIGINAL name (`turma-android-v<x.y.z>.apk` — see
+  `.github/scripts/manifest.js`). So the version in the asset FILENAME is the
+  component's real version, and the updater compares THAT against the installed
+  `versionName` — never the release TAG, which runs ahead of a carried component
+  (the same reasoning as the native agent updater). `core.Update` is the pure,
+  JVM-tested picker; it scans every recent release's assets and offers the
+  highest APK strictly newer than installed.
+- **Anonymous + isolated.** The repo is public, so the check is anonymous HTTPS
+  with no token or hub credential (like `agent/native/bootstrap.sh`). It uses its
+  own `OkHttpClient`, deliberately WITHOUT `HubClient`'s Basic-auth interceptor,
+  so the hub password never reaches github.com.
+- **Checking cadence.** On app start and each Dashboard visit, throttled to ~15
+  min. Quiet on failure (offline / rate-limit) — the banner only surfaces when
+  there's an actual update, and a "Later" tap hides that version for the session.
+- **Install.** `REQUEST_INSTALL_PACKAGES` + a `FileProvider` (`@xml/file_paths`,
+  authority `${applicationId}.updates`) expose the downloaded APK to the
+  installer over a `content://` URI. On API 26+ the OS gates this on "install
+  unknown apps" for Turma; when it isn't granted yet the updater routes the
+  operator to that settings screen and the banner reads **Install** to retry. The
+  OS verifies the APK signature on install — the real integrity gate for updating
+  an installed app — so no sha check is re-implemented here.
 
 ## Push notifications (FCM) setup
 

@@ -1501,6 +1501,33 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   - `push/` — the FCM service + `PushRegistrar` (registers the device via `POST /api/devices`; guarded
     so a build with no `google-services.json` still runs).
 - Push is driven hub-side by `turma/push.js` (see the turma section).
+
+### In-app update (XERK-11)
+
+- A stopgap self-updater until the app ships on Google Play: checks the **public** `xerktech/turma`
+  GitHub releases for a newer Android APK and, on a one-tap **Update**, downloads it and hands it to
+  the system package installer.
+- Split like the rest: `core.Update` is the pure, JVM-tested picker (`apkAssetVersion`,
+  `compareVersions`, `latestApkUpdate`); `net.Updater` is the I/O (fetch/download/install +
+  `State` StateFlow); `ui.UpdateBanner` + `vm.UpdateViewModel` render it on the Dashboard.
+- It compares the version in the **asset FILENAME** (`turma-android-v<x.y.z>.apk`) against the
+  installed `versionName`, never the release TAG — every release carries an unchanged component's APK
+  forward under its original name (`manifest.js`), so the filename is the component's real version and
+  the tag runs ahead of a carried one. Same reasoning as the native agent updater. It scans every
+  recent release's assets (not just the "latest" release) so a carried-forward APK can't hide a build.
+- **Anonymous + credential-isolated**: the repo is public, so the check is anonymous HTTPS with no
+  token or hub credential (like `agent/native/bootstrap.sh`), and the updater uses its OWN
+  `OkHttpClient` WITHOUT `HubClient`'s Basic-auth interceptor, so the hub password never reaches
+  github.com.
+- Checked on app start and each Dashboard visit, throttled ~15 min; **quiet on failure** (offline /
+  rate-limit) — the banner only surfaces on a real update, and "Later" hides that version for the
+  session (not persisted — "regular checking" means it resurfaces next launch).
+- Install uses `REQUEST_INSTALL_PACKAGES` + a `FileProvider` (`@xml/file_paths`, authority
+  `${applicationId}.updates`) over a `content://` URI. On API 26+ the OS gates on "install unknown
+  apps"; ungranted, the updater routes to that settings screen and the banner reads **Install** to
+  retry. The OS verifies the APK signature on install (the real integrity gate for updating an
+  installed app), so — unlike the native updater's file-swap — no sha is re-verified here.
+- Tests: `core/UpdateTest.kt` (the pure picker/compare cases).
 - Built with Gradle (wrapper generated in CI, not committed); PR-gated by
   `.github/workflows/android-ci.yml` on `ubuntu-latest`, against that runner's preinstalled JDK +
   Android SDK with JDK 17 and Gradle pinned in-job to match `app/build.gradle.kts`.
