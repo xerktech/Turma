@@ -476,6 +476,26 @@ test("Ended sessions is collapsed by default and hidden when there are none", ()
     "the ended list must start collapsed");
 });
 
+test("the Ended sessions heading IS the disclosure control", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([working("11111", "Live One")]);
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z")];
+  beat({ now, agents: [h] });
+
+  // The heading lives inside the <summary>, so clicking it toggles the section.
+  // A heading rendered as a sibling ABOVE the <details> looks identical but is
+  // dead to the click, which is what leaves the operator hunting for a second,
+  // smaller target below it.
+  assert.match(els.ended.innerHTML,
+    /<summary><h2>Ended sessions <span class="count">1<\/span><\/h2><\/summary>/,
+    "the <h2> must be the <summary>'s own content");
+  assert.ok(!/<\/h2>\s*<details/.test(els.ended.innerHTML),
+    "the heading must not sit outside the <details> as an inert sibling");
+  // The separate 'Show / hide ended sessions' line the heading replaced.
+  assert.ok(!/show\s*\/\s*hide/i.test(els.ended.innerHTML),
+    "no second toggle target below the heading");
+});
+
 test("resuming dispatches on how the session ended: killed -> resume, stopped -> start", () => {
   const { beat, resumeEnded, posts } = loadPage();
   const { now, host: h } = host([
