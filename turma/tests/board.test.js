@@ -14,6 +14,7 @@ const {
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
+  startSweepVerdict,
 } = require("../public/board.js");
 
 function ticket(key, over = {}) {
@@ -1105,4 +1106,54 @@ test("boardHtml: no session index or starts is fine (an ordinary render)", () =>
   const html = boardHtml(sites, "", {});
   assert.ok(html.includes("data-start"));
   assert.ok(!html.includes("kc-start-busy"));
+});
+
+// --- startSweepVerdict: when an optimistic start resolves ------------------
+const TMO = 60000;
+
+test("startSweepVerdict: a just-clicked start with no cmdId yet always holds", () => {
+  // The POST hasn't replied, so there's no cmdId to look for and nothing to
+  // time out against — its own fetch resolves it, never the sweep. This is the
+  // state the synchronous press-acknowledgement paints.
+  const p = { cmdId: null, host: "hostA", sawCmd: false, ageMs: 999999 };
+  assert.equal(startSweepVerdict(p, [], false, true, TMO), "hold");
+});
+
+test("startSweepVerdict: a stale cache that never saw the command must not clear it", () => {
+  // The regression: after the POST, the SSE-fallback cache hasn't refreshed past
+  // the click, so the command is absent — but that is "not seen yet", not
+  // "acked". Clearing here sweeps the ⏳ the instant it's set.
+  const p = { cmdId: "c1", host: "hostA", sawCmd: false, ageMs: 200 };
+  assert.equal(startSweepVerdict(p, [], false, true, TMO), "hold");
+  assert.equal(p.sawCmd, false, "never marked seen — the command was never present");
+});
+
+test("startSweepVerdict: the command present marks it seen and holds", () => {
+  const p = { cmdId: "c1", host: "hostA", sawCmd: false, ageMs: 200 };
+  assert.equal(startSweepVerdict(p, [], true, true, TMO), "hold");
+  assert.equal(p.sawCmd, true, "watched it land");
+});
+
+test("startSweepVerdict: a command we watched land, now drained, clears (agent ran/refused it)", () => {
+  const p = { cmdId: "c1", host: "hostA", sawCmd: true, ageMs: 5000 };
+  assert.equal(startSweepVerdict(p, [], false, true, TMO), "clear");
+});
+
+test("startSweepVerdict: a session reporting the cmdId clears it (it landed)", () => {
+  const p = { cmdId: "c1", host: "hostA", sawCmd: false, ageMs: 200 };
+  assert.equal(startSweepVerdict(p, [{ spawnCmdId: "c1" }], true, true, TMO), "clear");
+});
+
+test("startSweepVerdict: a host that dropped out of the fleet only ever times out", () => {
+  // Not knowing the host, we can't read the queue; holding-then-timing-out is
+  // the only honest verdict (never a false clear against a fleet we can't see).
+  const fresh = { cmdId: "c1", host: "gone", sawCmd: false, ageMs: 200 };
+  assert.equal(startSweepVerdict(fresh, [], false, false, TMO), "hold");
+  const old = { cmdId: "c1", host: "gone", sawCmd: false, ageMs: TMO + 1 };
+  assert.equal(startSweepVerdict(old, [], false, false, TMO), "error");
+});
+
+test("startSweepVerdict: a never-seen command past the timeout errors (backstop)", () => {
+  const p = { cmdId: "c1", host: "hostA", sawCmd: false, ageMs: TMO + 1 };
+  assert.equal(startSweepVerdict(p, [], false, true, TMO), "error");
 });

@@ -727,12 +727,40 @@
     return targeted.length > 0 && targeted.every(a => !!(a.jira && a.jira.error));
   }
 
+  // What should a start-in-flight become, given the current fleet? The board's
+  // start button is optimistic: the pending state is painted the instant it's
+  // pressed, before the POST is even sent, so the operator gets immediate
+  // acknowledgement and can move on. This decides when that optimism resolves.
+  //
+  // `p` is {cmdId, host, sawCmd, ageMs}; `sessions` are the ticket's sessions,
+  // `cmd` whether the host's queue still holds this cmdId right now, `known`
+  // whether the host is in the fleet payload at all.
+  //   - "hold"  keep showing ⏳ (also mutates p.sawCmd once the command appears)
+  //   - "clear" drop it: a session reported this cmdId (landed), or the command
+  //             we WATCHED land has since drained (the agent ran or refused it)
+  //   - "error" the backstop for a host that stopped beating mid-spawn
+  //
+  // The load-bearing subtlety is `sawCmd`: "command absent" only means "acked"
+  // once we've actually seen it PRESENT. A cache too stale to have seen it land
+  // (the SSE-fallback poll hasn't caught up to the click yet) reads as absent
+  // too, and treating that as acked sweeps the pending the instant it's set —
+  // the bug where the ⏳ never appeared at all. A cmdId-less pending (POST not
+  // back yet) always holds; its own fetch resolves it.
+  function startSweepVerdict(p, sessions, cmd, known, timeoutMs) {
+    if (!p || !p.cmdId) return "hold";
+    if ((sessions || []).some(s => s.spawnCmdId === p.cmdId)) return "clear";
+    if (!known) return (p.ageMs > timeoutMs) ? "error" : "hold";  // host gone: only time out
+    if (cmd) { p.sawCmd = true; return "hold"; }                  // command still queued
+    if (p.sawCmd) return "clear";                                 // watched it land, now drained
+    return (p.ageMs > timeoutMs) ? "error" : "hold";              // never saw it; wait it out
+  }
+
   const api = {
     CATEGORIES, mergeSites, categoryOf, ticketSort, orgColor, orgName, ageStr,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
-    newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
+    newestFetchedAt, jiraRefreshPending, jiraRefreshFailed, startSweepVerdict,
   };
   if (typeof window !== "undefined") window.TurmaBoard = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;

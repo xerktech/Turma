@@ -939,7 +939,29 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
 - In-flight state clears on **evidence**, not a timer: a session reporting the spawn's `cmdId`, or the
   command clearing from the host's queue — which is what covers a spawn the agent REFUSED, whose ack is
   the only signal a board that never sees a session would get.
-- Tests: the ticket-session cases in `turma/tests/server.test.js` and `board.test.js`.
+- The press is acknowledged **instantly and survives leaving the board**, which is what XERK-18 was
+  about — three separate defects behind one report ("click start, then click elsewhere, and the session
+  won't start; and nothing acknowledges the press for ~5s"):
+  - **The click was swallowed.** The board `innerHTML`-replaces every beat, so a press straddling a beat
+    had its button destroyed between mousedown and mouseup and the browser synthesized no `click` — the
+    press vanished, nothing queued. The start button now acts on **`pointerdown`** (fired on the press,
+    before any re-render can move the target), with the `click` handler kept only as the keyboard path (a
+    real `<button>` turns Enter/Space into a click no re-render can swallow). `startFrom` is the one entry
+    both go through; the pending guard makes a double-fire a no-op.
+  - **No acknowledgement for ~5s.** The `⏳ starting…` paint waited on the POST round-trip. `startSession`
+    now sets the pending state and repaints **synchronously, before the fetch** — the button is `⏳` the
+    instant it's pressed. `cmdId`/`host` fill in when the POST replies.
+  - **The optimistic paint was swept instantly against a stale cache.** `sweepStarts` read "command absent
+    from my cache" as "the host acked it", but on the SSE-fallback poll the cache hasn't yet seen the
+    just-queued command — so the first render after the click deleted the pending and the `⏳` never
+    showed. The verdict is now `B.startSweepVerdict` (pure, in `board.js`, unit-tested): a cmdId-less
+    pending always holds (its own fetch resolves it), and "command gone" only counts as acked once the
+    command was actually **seen present** (`sawCmd`) — a `saw`-then-gone rule mirroring the manual
+    refresh's.
+  - The POST uses **`keepalive: true`** so it outlives the page: navigating away (or the spawn handoff)
+    otherwise aborts the request in flight and the session never starts — the ticket's headline symptom.
+- Tests: the ticket-session cases in `turma/tests/server.test.js` and `board.test.js` (the latter's
+  `startSweepVerdict` cases cover the stale-cache and never-seen paths).
 
 #### Ticket ↔ session chips
 

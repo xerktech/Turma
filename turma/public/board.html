@@ -109,17 +109,26 @@ function render(data) {
 // session id a beat or two later. Between the POST and that beat there's a gap
 // with nothing to link to, which the `pending` state covers.
 //
-// Pending is cleared by EVIDENCE, not a timer: either a session reporting this
-// spawn's cmdId shows up (the card gains a real chip), or the command clears
-// from the host's queue — which is what covers a spawn the agent REFUSED, whose
-// ack is the only signal a board that never sees a session would ever get. The
-// timeout is just the backstop for a host that stops beating mid-spawn.
+// The press is acknowledged INSTANTLY — the pending state is set and painted
+// synchronously on pointerdown, before the POST is even sent, so the button
+// becomes "⏳ starting…" the moment it's pressed rather than after the ~5s
+// round trip. `cmdId`/`host` fill in when the POST replies; a pending with no
+// cmdId yet is the "clicked, not yet acknowledged by the hub" state, which
+// sweepStarts holds rather than mistaking for done.
+//
+// Pending is then cleared by EVIDENCE, not a timer: either a session reporting
+// this spawn's cmdId shows up (the card gains a real chip), or the command,
+// once we've actually SEEN it in the host's queue, clears from it — which is
+// what covers a spawn the agent REFUSED, whose ack is the only signal a board
+// that never sees a session would ever get. The timeout is just the backstop
+// for a host that stops beating mid-spawn.
 //
 // A failed POST parks the reason on the ticket instead of throwing a dialog, so
 // it renders on the card that caused it (same inline-.err convention as the
 // dashboard's clone/prune notes) and clears on the next attempt.
 const START_TIMEOUT_MS = 60000;
-const starts = new Map(); // "<siteKey>\x00<key>" -> {pending, cmdId, host, at} | {error}
+// "<siteKey>\x00<key>" -> {pending, cmdId, host, at, sawCmd} | {error}
+const starts = new Map();
 
 function startKey(siteKey, key) { return (siteKey || "") + "\x00" + key; }
 
@@ -128,35 +137,40 @@ function sweepStarts(agents, sessionIndex) {
   for (const [k, p] of [...starts]) {
     if (!p.pending) continue;              // an error sits until the next click
     const [siteKey, issueKey] = k.split("\x00");
-    const landed = B.ticketSessionsOf(sessionIndex, siteKey, issueKey)
-      .some(s => s.spawnCmdId === p.cmdId);
+    const sessions = B.ticketSessionsOf(sessionIndex, siteKey, issueKey);
     const host = (agents || []).find(a => a.key === p.host);
-    // No `host` means the agent dropped out of the fleet entirely — hold until
-    // the timeout rather than reading a fleet we can't see as "done".
-    const acked = host && !(host.commands || []).some(c => c && c.cmdId === p.cmdId);
-    if (landed || acked) starts.delete(k);
-    else if (now - p.at > START_TIMEOUT_MS) {
-      starts.set(k, { error: "the host didn't start it in time" });
+    const cmd = !!host && (host.commands || []).some(c => c && c.cmdId === p.cmdId);
+    p.ageMs = now - p.at;
+    switch (B.startSweepVerdict(p, sessions, cmd, !!host, START_TIMEOUT_MS)) {
+      case "clear": starts.delete(k); break;
+      case "error": starts.set(k, { error: "the host didn't start it in time" }); break;
+      // "hold": leave the pending as-is (verdict may have set p.sawCmd).
     }
   }
   return starts;
 }
 
-async function startSession(issueKey, siteKey, btn) {
+async function startSession(issueKey, siteKey) {
   const k = startKey(siteKey, issueKey);
   if (starts.get(k)?.pending) return;
-  starts.delete(k);                        // clear a previous failure's note
-  if (btn) btn.disabled = true;            // until the next render paints ⏳
+  // Paint the acknowledgement NOW, before the fetch — this overwrites any
+  // previous failure note too. cmdId/host arrive with the POST reply.
+  starts.set(k, { pending: true, cmdId: null, host: null, at: Date.now(), sawCmd: false });
+  if (cache) render(cache);
   const fail = (error) => { starts.set(k, { error }); if (cache) render(cache); };
   let r, body = {};
   try {
+    // keepalive lets the POST outlive the page: "click start, then go to the
+    // next thing" is the whole point of this flow, and without it navigating
+    // away (or the spawn handoff below) aborts the request in flight and the
+    // session never starts — the ticket's headline complaint.
     r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(issueKey)}/session`,
-                    { method: "POST" });
+                    { method: "POST", keepalive: true });
   } catch { return void fail("the hub is unreachable"); }
   if (r.status === 401) return void (location.href = "/login");
   try { body = await r.json(); } catch { /* non-JSON error body */ }
   if (!r.ok) return void fail(body.error || `HTTP ${r.status}`);
-  starts.set(k, { pending: true, cmdId: body.cmdId, host: body.host, at: Date.now() });
+  starts.set(k, { pending: true, cmdId: body.cmdId, host: body.host, at: Date.now(), sawCmd: false });
   if (cache) render(cache);
 }
 
@@ -352,13 +366,31 @@ async function openDetail(key, siteKey, fromEl) {
 // alone — kc-key is the deliberate way out to Jira, kc-sess into the session —
 // and kc-start does its own thing below instead of opening the panel.
 const CARD_OWN = ".kc-key, .kc-sess, .kc-start";
+
+// The start button acts on POINTERDOWN, not click, and this is load-bearing:
+// the board innerHTML-replaces on every heartbeat beat, so a press that
+// straddles a beat has its button destroyed between mousedown and mouseup and
+// the browser synthesizes NO click — the press vanished and nothing was queued
+// (the ticket's "click start and the session won't start"). pointerdown fires
+// on the press itself, before any re-render can move the target out from under
+// it, and startSession paints the acknowledgement synchronously. The keyboard
+// path stays on click below (a <button> turns Enter/Space into a click, which
+// no re-render can swallow the way it swallows a mouse gesture).
+function startFrom(el) {
+  const btn = el.closest(".kc-start[data-start]");
+  if (!btn || btn.disabled) return false;
+  const card = btn.closest(".kanban-card");
+  if (card) startSession(btn.dataset.start, card.dataset.site);
+  return true;
+}
+$board.addEventListener("pointerdown", (e) => {
+  if (e.button != null && e.button !== 0) return;   // primary button only
+  if (startFrom(e.target)) e.preventDefault();       // don't also focus/select
+});
 $board.addEventListener("click", (e) => {
-  const start = e.target.closest(".kc-start[data-start]");
-  if (start) {
-    const card = start.closest(".kanban-card");
-    if (card) startSession(start.dataset.start, card.dataset.site, start);
-    return;
-  }
+  // Keyboard activation (and a mouse fallback if pointerdown was missed); the
+  // pending guard in startSession makes a double-fire a no-op.
+  if (e.target.closest(".kc-start[data-start]")) { startFrom(e.target); return; }
   if (e.target.closest(CARD_OWN)) return;
   const card = e.target.closest(".kanban-card");
   if (card) openDetail(card.dataset.key, card.dataset.site, card);
