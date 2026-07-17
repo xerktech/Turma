@@ -1053,15 +1053,21 @@
   }
   // The Jira ticket this session was spawned to work (session.ticket, stamped by
   // the agent at spawn) — the reverse of the board's ticket -> session link, for
-  // the footer beside the PR chip. It links out to JIRA rather than back to the
-  // board: from inside the session, the useful thing is the live ticket, and the
-  // board card is one click away on the nav anyway. "" for an ordinary session.
+  // the footer beside the PR chip. "" for an ordinary session.
+  //
+  // It links to that ticket on Turma's OWN board (its detail panel deep-links
+  // open via /board?ticket=&site=), not out to Jira (XERK-16): the board is
+  // where this ticket's repo triage, its other sessions, and its controls live,
+  // so from inside a session that is the more useful hop — and the board card
+  // links on to the live Jira issue in turn. Same-tab, since it's an in-app nav.
   function ticketFooterChip(s) {
     const t = (s && s.ticket) || null;
     if (!t || !t.key) return "";
     const tip = [t.summary, t.branch ? "branch " + t.branch : ""].filter(Boolean).join(" · ");
+    const href = "/board?ticket=" + encodeURIComponent(t.key) +
+      (t.siteKey ? "&site=" + encodeURIComponent(t.siteKey) : "");
     return '<span class="cc-opt cc-ticket">' +
-      '<a class="jira-chip" href="' + esc(t.url || "#") + '" target="_blank" rel="noopener"' +
+      '<a class="jira-chip" href="' + esc(href) + '"' +
       ' title="' + esc(tip || t.key) + '">' + esc(t.key) + "</a></span>";
   }
   // fromPoll: a background heartbeat repaint — don't yank an open menu shut.

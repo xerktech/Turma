@@ -1052,8 +1052,15 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   documents).
 - The reverse link rides the session: the Sessions page's card meta shows the ticket key (a plain span
   — the card is a `<button>` and can't hold a link), and the chat footer carries a linked `jira-chip`
-  beside the PR chip (`ticketFooterChip`), out to Jira rather than back to the board — from inside a
-  session the useful thing is the live ticket.
+  beside the PR chip (`ticketFooterChip`).
+  - The chip links to that ticket on Turma's OWN board — `/board?ticket=<key>&site=<siteKey>`, which
+    the board deep-links open — not out to Jira (XERK-16). From inside a session the board is the more
+    useful hop: it's where the ticket's repo triage, its other sessions, and its controls live, and its
+    card links on to the live Jira issue in turn.
+  - The board's `consumeDeepLink` (in `board.html`) is one-shot: it waits for the ticket's org to
+    report, opens the detail panel on the first render that resolves the key, and strips the query
+    params so closing the panel or reloading doesn't reopen it. `site` is optional (any org carrying
+    the key wins without it).
 
 #### Ticket detail panel
 

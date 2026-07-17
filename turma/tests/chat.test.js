@@ -528,23 +528,28 @@ test("ticketFooterChip: '' for an ordinary session (not started from a ticket)",
   assert.equal(ticketFooterChip({ ticket: {} }), "");
 });
 
-test("ticketFooterChip: shows the key and links out to the live ticket", () => {
+test("ticketFooterChip: shows the key and links to the ticket on the turma board", () => {
   const html = ticketFooterChip({ ticket: {
-    key: "ENG-42", url: "https://myorg.atlassian.net/browse/ENG-42",
+    key: "ENG-42", siteKey: "myorg.atlassian.net",
+    url: "https://myorg.atlassian.net/browse/ENG-42",
     summary: "Fix the board", branch: "ENG-42-1",
   } });
   assert.match(html, /jira-chip/);
   assert.match(html, />ENG-42</);
-  assert.match(html, /href="https:\/\/myorg\.atlassian\.net\/browse\/ENG-42"/);
-  assert.match(html, /target="_blank"/);
+  // Deep-links the board's own ticket panel (XERK-16), not out to Jira.
+  assert.match(html, /href="\/board\?ticket=ENG-42&amp;site=myorg\.atlassian\.net"/);
+  assert.doesNotMatch(html, /atlassian\.net\/browse/);
+  assert.doesNotMatch(html, /target="_blank"/);
   // The summary and the branch it was told to use ride as the tooltip — the
   // chip itself only has room for the key.
   assert.match(html, /title="Fix the board · branch ENG-42-1"/);
 });
 
-test("ticketFooterChip: a ticket with no url still renders (never a broken chip)", () => {
+test("ticketFooterChip: a ticket with no siteKey still links to the board (never a broken chip)", () => {
   const html = ticketFooterChip({ ticket: { key: "ENG-1" } });
   assert.match(html, />ENG-1</);
+  assert.match(html, /href="\/board\?ticket=ENG-1"/);
+  assert.doesNotMatch(html, /site=/);
   assert.match(html, /title="ENG-1"/);
 });
 

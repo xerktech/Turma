@@ -54,6 +54,29 @@ function esc(s) { return B.esc(s); }
 // (and its org color) without re-merging.
 let lastSites = [], lastAllKeys = [];
 
+// Deep link: /board?ticket=<key>[&site=<siteKey>] opens that ticket's detail
+// panel — the session page's ticket chips link here rather than out to Jira
+// (XERK-16). One-shot: it waits for the ticket's org to report (a session can
+// outlive its host being briefly offline), opens on the first render that can
+// resolve it, and strips the params so closing the panel or reloading doesn't
+// reopen it. `site` is optional — without it any org carrying the key wins.
+let deepLink = (() => {
+  const p = new URLSearchParams(location.search);
+  const key = p.get("ticket");
+  return key ? { key, site: p.get("site") || "" } : null;
+})();
+
+function consumeDeepLink() {
+  if (!deepLink) return;
+  const { key, site } = deepLink;
+  const found = lastSites.find(s =>
+    (!site || s.siteKey === site) && s.tickets.some(t => t.key === key));
+  if (!found) return;                    // its org hasn't reported yet
+  deepLink = null;
+  history.replaceState(null, "", location.pathname);
+  openDetail(key, found.siteKey, null);
+}
+
 function render(data) {
   // Ahead of the empty-board early-return below, so a refresh still resolves on
   // a fleet whose blocks are all unavailable (hoisted; `pending` is live by the
@@ -62,6 +85,7 @@ function render(data) {
   const sites = B.mergeSites(data.agents || []);
   lastSites = sites; lastAllKeys = sites.map(s => s.siteKey);
   refreshOpenTicket();
+  consumeDeepLink();
   if (!sites.length) {
     $chips.replaceChildren();
     $board.innerHTML = `<div class="empty">No Jira tickets reported yet. Set <code>JIRA_SITE</code>, <code>JIRA_EMAIL</code>, and <code>JIRA_TOKEN</code> in an agent's environment to connect its org.</div>`;
