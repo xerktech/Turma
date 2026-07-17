@@ -571,6 +571,19 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     nothing to a running one, so a re-run left the old process serving the files it just replaced —
     a no-op on exactly the host that needed it (a first install that landed without node, or the
     documented way to update a checkout).
+  - **`have_sudo` asks** when it must, rather than probing `sudo -n` only: a `-n`-only probe makes an
+    ordinary password-sudo host look sudo-less, so under the README's `curl … | bash` quickstart every
+    apt prereq — node included — was skipped behind one warning while the install still "succeeded".
+    sudo prompts on `/dev/tty`, not stdin, so the pipe never stopped it asking; only the probe did.
+  - It is gated on `[ -t 2 ]` so an unattended run (CI, cron, a piped log) still fails fast rather
+    than hanging on a password nobody will type, and the answer is cached so a DECLINED prompt isn't
+    re-asked once per prerequisite.
+  - The README's quickstart primes it with `sudo -v` so the prompt lands up front. It must never
+    become `curl … | sudo bash`: the install belongs to the invoking user (their `$HOME`, their
+    systemd USER unit), and only the prereqs need root — which is the same reason `turma-agent` has
+    no privilege-drop machinery at all.
+  - Tests: `agent/tests/test_install_sudo.sh` (the piped-quickstart prompt, the unattended no-hang,
+    NOPASSWD, a declined password), wired into `code-scan.yml`.
 - `bootstrap.sh` — the README's `curl … | bash` front door: the way IN for a host with no checkout.
   Resolves the newest native tarball, verifies its sha256, unpacks to a temp dir, and `exec`s the
   `install.sh` inside it with every arg passed through (`bash -s -- --autostart`). Duplicates none of

@@ -42,7 +42,33 @@ done
 info() { echo "[install] $*"; }
 warn() { echo "[install] WARN: $*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
-have_sudo() { command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; }
+# Can we get root for the prerequisites? Prefer a credential we already hold —
+# NOPASSWD, or a live sudo timestamp (`sudo -n`) — and otherwise ASK, when there
+# is a terminal to ask on.
+#
+# The -n-only probe was a trap under the README's `curl … | bash` quickstart: an
+# ordinary password-sudo host looks sudo-less to it, so every apt prerequisite is
+# skipped with one warning and the install still "succeeds" — without node, which
+# is exactly how a host ends up with no reverse tunnel and every session reading
+# "terminal offline". The pipe was never what stopped sudo asking: it prompts on
+# /dev/tty, not stdin. Only this probe did.
+#
+# Gated on stderr being a terminal so an unattended run (CI, cron, a piped log)
+# still fails fast rather than hanging on a password nobody is there to type.
+# The answer is cached because a DECLINED prompt must not be re-asked once per
+# prerequisite (sudo's own timestamp already covers the granted case).
+SUDO_PROBE=""
+have_sudo() {
+  case "$SUDO_PROBE" in yes) return 0 ;; no) return 1 ;; esac
+  if ! command -v sudo >/dev/null 2>&1; then SUDO_PROBE=no; return 1; fi
+  if sudo -n true 2>/dev/null; then SUDO_PROBE=yes; return 0; fi
+  if [ -t 2 ] && [ -r /dev/tty ]; then
+    info "a prerequisite needs root — sudo will ask for your password."
+    info "(only the prereqs run as root; the agent itself installs as $USER)"
+    if sudo -v; then SUDO_PROBE=yes; return 0; fi
+  fi
+  SUDO_PROBE=no; return 1
+}
 
 node_major() { have node && node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/' || echo 0; }
 systemd_user_ok() { [ -d /run/systemd/system ] && systemctl --user show-environment >/dev/null 2>&1; }
@@ -54,7 +80,8 @@ if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
 ensure_apt_pkgs() {
   have apt-get || { warn "no apt-get — install manually: git tmux ripgrep ncurses-term python3 curl"; return 0; }
   if ! have_sudo && [ "$(id -u)" != 0 ]; then
-    warn "no passwordless sudo — skipping apt. Ensure installed: git tmux ripgrep ncurses-term python3 curl"
+    warn "no sudo — skipping apt. Ensure installed: git tmux ripgrep ncurses-term python3 curl"
+    warn "  then re-run this installer; it is idempotent."
     return 0
   fi
   info "apt: ensuring git tmux ripgrep ncurses-term python3 curl ca-certificates"
@@ -78,8 +105,17 @@ ensure_node() {
     rm -f "$ns"
     $SUDO apt-get install -y nodejs
   else
-    warn "node >= ${NODE_MAJOR_MIN} required and no sudo. Install it via nvm"
-    warn "  (see https://github.com/nvm-sh/nvm), then:  nvm install ${NODE_MAJOR_MIN}"
+    # Worth more than a one-line warning: node is what runs the reverse tunnel,
+    # so an install that lands without it leaves every session on this host
+    # reading "terminal offline" in the UI, while the host itself reads online.
+    # The agent now retries for node rather than needing a restart, so saying so
+    # here is what turns a mystery into a two-minute fix.
+    warn "node >= ${NODE_MAJOR_MIN} is MISSING and could not be installed (no sudo)."
+    warn "  Without it the reverse tunnel cannot run, so every session on this host"
+    warn "  will read 'terminal offline' in the UI. Install it, either:"
+    warn "    sudo apt-get install -y nodejs   (or re-run this installer with sudo available)"
+    warn "    nvm install ${NODE_MAJOR_MIN}          (see https://github.com/nvm-sh/nvm)"
+    warn "  The running agent picks it up on its own within seconds — no restart needed."
   fi
 }
 

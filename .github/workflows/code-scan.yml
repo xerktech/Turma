@@ -190,3 +190,10 @@ jobs:
       # the tunnel's poke signals. Pure shell + node/python3 stubs.
       - name: Native launcher tests (agent/native/turma-agent)
         run: ./agent/tests/test_turma_agent.sh
+      # install.sh's sudo probe gates every apt prerequisite, and a wrong "no"
+      # is silent: it skips node behind one warning while the install still
+      # reports success, leaving a host that reads online with every session
+      # reading "terminal offline". Covers the piped-quickstart prompt, the
+      # unattended no-hang, NOPASSWD, and a declined password. Shell + sudo stubs.
+      - name: Native installer sudo-probe tests (agent/native/install.sh)
+        run: ./agent/tests/test_install_sudo.sh
