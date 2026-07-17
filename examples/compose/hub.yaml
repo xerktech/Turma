@@ -29,20 +29,15 @@ services:
       # endpoint accepts only a logged-in operator, never an anonymous caller.
       # TURMA_TRIGGER_TOKEN: "${TURMA_TRIGGER_TOKEN:-}"
 
-      # Optional: ntfy alerts (host offline, question waiting, PR opened, ...).
-      # Unset NTFY_URL disables them.
-      # NTFY_URL: "${NTFY_URL:-}"
-      # NTFY_TOPIC: "${NTFY_TOPIC:-agents}"
-      # NTFY_USER: "${NTFY_USER:-}"
-      # NTFY_PASS: "${NTFY_PASS:-}"
-
       # Optional: Whisper STT for glasses/Android dictation, via any
       # OpenAI-compatible endpoint (e.g. a LiteLLM instance). Point this at the
       # /v1 base; the hub derives /audio/transcriptions from it.
       # LITELLM_URL: "${LITELLM_URL:-}"
       # LITELLM_API_KEY: "${LITELLM_API_KEY:-}"
 
-      # Optional: FCM push to the Android client. Inline service-account JSON.
+      # Optional: FCM push to the Android client — the only notification
+      # transport (host offline, question waiting, PR opened, turn finished).
+      # Unset disables all alerts. Inline service-account JSON.
       # FCM_SERVICE_ACCOUNT_JSON: "${FCM_SERVICE_ACCOUNT_JSON:-}"
 
       # Silences node:sqlite's ExperimentalWarning from the archive index.

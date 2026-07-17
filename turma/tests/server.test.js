@@ -4,8 +4,10 @@
 //
 // TURMA_TEST makes server.js export its internals instead of binding the
 // production port; the HTTP tests listen on an ephemeral port themselves.
-// notify()'s outbound ntfy POST is captured by stubbing globalThis.fetch, so
-// the alert tests observe exactly which notifications each beat fires.
+// notify() fans every alert out to registered devices via push.sendFcm; the
+// alert tests stub push.sendFcm to record exactly which notifications each beat
+// fires (server.js calls it as `push.sendFcm`, so replacing the property on the
+// shared module object intercepts every fan-out).
 
 "use strict";
 
@@ -25,7 +27,6 @@ process.env.TURMA_USER = "hubuser";
 process.env.TURMA_PASSWORD = "hubpass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.TURMA_TRIGGER_TOKEN = "triggertok"; // programmatic /api/trigger bearer
-process.env.NTFY_URL = "http://ntfy.test"; // enables notify(); fetch is stubbed
 // Control-channel liveness, wound right down so the beat/drop is testable in ms
 // rather than the 30s/90s the fleet runs. No other test opens a real
 // /agent/control socket, so nothing else feels these.
@@ -57,21 +58,34 @@ process.env.WHISPER_API_KEY = "whisperkey";
 process.env.WHISPER_LANGUAGE = "en";
 process.env.WHISPER_TIMEOUT_MS = "30000";
 
-// Capture ntfy pushes synchronously (notify() calls global fetch). Individual
-// tests below stub globalThis.fetch to exercise transcribePcm/the audio WS,
-// then must call restoreFetch() to put this capturing stub back.
-const notifications = [];
-function ntfyFetchStub(url, opts) {
-  notifications.push({ url, title: opts.headers.Title, body: opts.body, headers: opts.headers });
+// A benign default global fetch. notify() no longer touches it (it fans out via
+// push.sendFcm, stubbed below); only transcribePcm/the audio WS use it, and
+// those tests install their own stub, then call restoreFetch() to put this back.
+function defaultFetchStub() {
   return Promise.resolve({ ok: true });
 }
-globalThis.fetch = ntfyFetchStub;
+globalThis.fetch = defaultFetchStub;
 function restoreFetch() {
-  globalThis.fetch = ntfyFetchStub;
+  globalThis.fetch = defaultFetchStub;
 }
+
+// Capture notifications at the FCM fan-out boundary. server.js calls
+// `push.sendFcm(...)`, so replacing that property on the shared module object
+// records every alert synchronously (the recorder runs before the returned
+// promise resolves). Its {title, body, data} mirror what a real device would
+// receive.
+const push = require("../push.js");
+const notifications = [];
+push.sendFcm = (tokens, { title, body, data = {} } = {}) => {
+  notifications.push({ tokens, title, body, data });
+  return Promise.resolve({ sent: tokens.length, dead: [] });
+};
 const titles = () => notifications.map((n) => n.title);
 
 const hub = require("../server.js");
+// notify() no-ops when no device is registered; register one so the alert tests
+// see the fan-out. Real fan-out/pruning is exercised separately below.
+hub.registerDevice("capture-device", "android");
 const {
   server, agents, queueCommand, findSession,
   wsAccept, wsEncode, wsParser, channelDuplex,
@@ -481,7 +495,7 @@ test("alerts: restart loop needs 3 boots in 10m, then holds off 30m", () => {
   assert.deepEqual(titles(), []); // two boots: still quiet
   beat({ startedAt: "boot-3" }, t0 + 120 * 1000);
   assert.deepEqual(titles(), ["host1 restart loop"]);
-  assert.equal(notifications[0].headers.Priority, "urgent");
+  assert.equal(notifications[0].data.priority, "urgent");
   notifications.length = 0;
   beat({ startedAt: "boot-4" }, t0 + 180 * 1000); // inside the 30m holdoff
   assert.deepEqual(titles(), []);
@@ -515,7 +529,7 @@ test("alerts: PR created fires once per URL (persisted prSeen)", () => {
   notifications.length = 0;
   beat(withPrs([url]));
   assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
-  assert.equal(notifications[0].headers.Click, url);
+  assert.equal(notifications[0].data.click, url);
   notifications.length = 0;
   beat(withPrs([url])); // agent re-delivered it: still only once
   assert.deepEqual(titles(), []);
@@ -702,9 +716,9 @@ test("http: /api/devices register + unregister is user-authed", async () => {
 });
 
 test("notify(): FCM fan-out prunes dead tokens, keeps live ones", () => {
-  // With no FCM service account configured, push.sendFcm is a no-op, so notify
-  // fanning out must not throw and must not touch the registry. pruneDevices is
-  // exercised directly for the dead-token contract.
+  // pruneDevices is the registry side of the fan-out: sendFcm reports dead
+  // tokens (404 UNREGISTERED) and notify() prunes them. Exercised directly here
+  // for the dead-token contract, independent of any send.
   hub.registerDevice("live", "android");
   hub.registerDevice("stale", "android");
   hub.pruneDevices(["stale"]);
