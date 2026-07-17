@@ -963,9 +963,20 @@ Cloudflare tunnel; port 8300 on the LAN.
 - The panel's **Repo row carries a "Change" control** that swaps the row in place for a picker of the
   org's `jira.repoOptions` — cloned and un-cloned repos in separate `optgroup`s, plus "No repository
   fits" and "Let the agent decide". It's the same field the row was already reporting, and the
-  operator is answering the question it just asked. Saving `POST`s to
+  operator is answering the question it just asked. It `POST`s to
   `/api/jira/<siteKey>/<issueKey>/repo` (see the agent's "Manual repo override" bullet for the whole
   path).
+- **Choosing an option IS the save** — the dropdown is the setting, and every option on it is a
+  complete answer, so picking one commits it and closes the picker. There is no Save button: the
+  picker used to need one, and closing the panel (the ordinary way to leave a ticket) then discarded
+  the choice silently and snapped the row back to the model's guess, so a pin only ever landed for
+  someone who knew to press it. A control that reads as committing on pick has to commit on pick.
+- Re-picking the value already showing saves **nothing** (it isn't a change, and a fleet-wide command
+  restating the current answer is noise) but still closes the picker, which is what a pick means.
+  `repoPickerValue` is what the handler compares against, and it is the same function
+  `repoPickerHtml` preselects from — they must not drift, or a real change reads as a re-pick and gets
+  dropped, which is the bug this control just came out of. **Cancel** stays as the way out for someone
+  who opened the picker by mistake; clicking away does the same, since nothing changed.
 - The row is present even for an **untriaged** ticket, reading "Not triaged yet": the card draws no
   chip for one (absence isn't a verdict), but the panel is where an override is made, and a ticket
   nobody has classified is exactly the one worth pinning. It states which state it's in rather than

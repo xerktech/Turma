@@ -12,7 +12,7 @@ const {
   mergeSites, categoryOf, ticketSort, orgColor, orgName, ageStr, prioClass,
   cardHtml, boardHtml, detailHtml, textHtml, linkify,
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
-  repoChipHtml, repoFieldHtml, repoPickerHtml,
+  repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
 } = require("../public/board.js");
 
@@ -619,6 +619,53 @@ test("repoPickerHtml: an auto guess whose repo left the options doesn't get carr
   assert.ok(!html.includes("legacy-api"));
 });
 
+test("repoPickerHtml: choosing an option is the save — there is no Save button", () => {
+  // The regression: the picker used to need a separate Save, so selecting a repo
+  // and clicking away (the ordinary way to leave a ticket) discarded the choice
+  // silently and the row snapped back to the model's guess. The dropdown is the
+  // setting; picking IS answering. Cancel stays as the way out for someone who
+  // opened it by mistake.
+  const html = repoPickerHtml(ticket("X-1"), [{ name: "Turma", cloned: true }]);
+  assert.ok(!html.includes("data-repo-save"));
+  assert.ok(html.includes("data-repo-select"));
+  assert.ok(html.includes("data-repo-cancel"));
+});
+
+test("repoPickerValue: the picker's current answer, as the handler reads it", () => {
+  // The handler saves only what CHANGED against this, so it has to agree with
+  // what repoPickerHtml preselects — hence one function serving both.
+  assert.equal(repoPickerValue(ticket("X-1")), "__auto__");
+  // An auto guess is the model's answer; the operator's setting is still "auto",
+  // so re-picking "let the agent decide" must not fire a pin.
+  assert.equal(repoPickerValue(ticket("X-1", {
+    repoGuess: { repo: "Turma", cloned: true, manual: false },
+  })), "__auto__");
+  assert.equal(repoPickerValue(ticket("X-1", {
+    repoGuess: { repo: "Turma", cloned: true, manual: true },
+  })), "Turma");
+  assert.equal(repoPickerValue(ticket("X-1", {
+    repoGuess: { repo: null, manual: true },
+  })), "__none__");
+});
+
+test("repoPickerValue: agrees with what the picker preselects", () => {
+  // Drift here is what would make a re-pick of the shown value read as a change
+  // (a needless fleet command) — or a real change read as a re-pick, and get
+  // silently dropped, which is the very bug this control just came out of.
+  const opts = [{ name: "Turma", cloned: true }, { name: "Widget", cloned: false }];
+  for (const g of [null,
+                   { repo: "Turma", cloned: true, manual: false },
+                   { repo: "Turma", cloned: true, manual: true },
+                   { repo: "legacy-api", cloned: false, manual: true },  // left the options
+                   { repo: null, manual: true }]) {
+    const t = ticket("X-1", g ? { repoGuess: g } : {});
+    const html = repoPickerHtml(t, opts);
+    const selected = /<option value="([^"]*)" selected>/.exec(html);
+    assert.ok(selected, `nothing preselected for ${JSON.stringify(g)}`);
+    assert.equal(selected[1], repoPickerValue(t));
+  }
+});
+
 test("repoPickerHtml: a hostile repo name can't break out of the option", () => {
   const html = repoPickerHtml(ticket("X-1"), [
     { name: '"><script>alert(1)</script>', cloned: true },
@@ -656,7 +703,6 @@ test("detailHtml: editing swaps the Repo row for the picker in place", () => {
   });
   assert.ok(html.includes("<dt>Repo</dt>"));
   assert.ok(html.includes("data-repo-select"));
-  assert.ok(html.includes("data-repo-save"));
   assert.ok(!html.includes("data-repo-edit"));
 });
 
