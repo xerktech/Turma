@@ -1151,6 +1151,15 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   input + its paired tool_result output, error-styled) and collapsed thinking traces, the in-progress
   turn typing in via a typewriter reveal (ported from the glasses `live.ts`/`transcript.ts`/
   `reveal.ts`).
+  - The live turn is the tmux **pane scrape's "last ● bullet"**, which — unlike glasses' transcript
+    tail — is NOT a monotonic stream: mid-generation it SWAPS between unrelated blocks (prose → a
+    `Bash(…)`/`Read(…)` tool bullet → the next tool → the next prose). So `repaint` reveals the delta
+    only when the new capture **continues the exact slice already shown** (`liveTurn.startsWith`
+    revealed prefix) and **snaps** `reveal.shown` to the new length otherwise. A length-only clamp
+    (XERK-19's predecessor) caught only swaps to SHORTER text; a swap to longer or same-length-but-
+    different text kept re-typing from a stale offset — the "last line deletes and restreams over and
+    over" (XERK-19). This stands in for glasses `advanceReveal`'s entryId-change snap, which the pane
+    scrape has no id for. Tests: the swap/continuation cases in `turma/tests/chat-selection.test.js`.
 - Bubble prose is rendered by `renderProse` (`chat.js`), which lifts markdown out of the transcript's
   plain text: **fenced ` ``` ` blocks** become `<pre class="md-code">` (language chip from the info
   string), inline **` `code` ` spans** become `<code class="md-code-inline">` chips (`renderInline`),

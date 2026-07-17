@@ -128,6 +128,43 @@ test("the typewriter reveal idles while text is selected, then resumes", () => {
   assert.match(bubble.innerHTML, /^<span class="role">assistant<\/span>s/);
 });
 
+// XERK-19: the pane scrape's "last ● bullet" swaps between unrelated blocks as
+// tools run (prose -> Bash(…) -> Read(…) -> next prose). Each such swap must
+// snap the reveal to the new text — NOT keep typing from the previous block's
+// offset, which reads as the last line deleting and re-streaming over and over.
+test("a swap to different live-turn text snaps the reveal instead of re-typing", () => {
+  // A tool bullet, fully revealed.
+  chat.__setLiveTurn("");                       // reset shown to 0
+  chat.__setLiveTurnRaw("Bash(ls -la)");        // 12 chars
+  chat.__setRevealShown(12);                    // typed all the way out
+  chat.repaint();
+
+  // The scrape swaps to a LONGER, unrelated block (the next prose). The old
+  // length-only clamp only caught shrinks, so this one kept re-typing from 12.
+  chat.__setLiveTurnRaw("Now reading the configuration file in detail"); // 44
+  chat.repaint();
+  assert.equal(chat.__revealShown(), 44, "swap to longer text snaps, no re-stream");
+
+  // And a swap to a shorter, unrelated block snaps down too (not to 0).
+  chat.__setLiveTurnRaw("Read(app.js)");        // 12 chars
+  chat.repaint();
+  assert.equal(chat.__revealShown(), 12, "swap to shorter text snaps to its length");
+});
+
+// The flip side: when the SAME block genuinely grows (real streaming prose),
+// the reveal must keep its place and type only the delta, not snap.
+test("a genuine continuation of the live turn keeps typing the delta", () => {
+  chat.__setLiveTurn("");        // fresh turn: revealFull="", shown=0
+  chat.repaint();
+  chat.__setLiveTurnRaw("Hello wor");
+  chat.repaint();               // arms revealFull="Hello wor" (continuation of "")
+  chat.__setRevealShown(5);     // typewriter has revealed "Hello" so far
+
+  chat.__setLiveTurnRaw("Hello world, and here is a lot more prose");
+  chat.repaint();
+  assert.equal(chat.__revealShown(), 5, "continuation kept its place; the delta types in");
+});
+
 test("a selection outside the scroll doesn't hold the chat's paints", () => {
   chat.__setBuffer([entry("a", "hello")]);
   chat.repaint();
