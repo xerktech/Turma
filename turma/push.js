@@ -1,11 +1,10 @@
 // turma — mobile push (Firebase Cloud Messaging) fan-out for the alert bus.
 //
-// The hub already funnels every edge-triggered alert through server.js's
-// notify() (host offline/recovered, restart loop, question
-// waiting, PR created, turn finished). This module lets notify() ALSO deliver
-// those alerts to registered mobile devices (the Android client) via FCM, in
-// addition to the existing ntfy push — so the phone gets OS-level notifications
-// even when the app is backgrounded.
+// The hub funnels every edge-triggered alert through server.js's notify()
+// (host offline/recovered, restart loop, question waiting, PR created, turn
+// finished). This module delivers those alerts to registered mobile devices
+// (the Android client) via FCM — the app's sole notification transport, so the
+// phone gets OS-level notifications even when it's backgrounded.
 //
 // stdlib only — no npm dependencies (matches the repo's zero-dep stance). FCM's
 // HTTP v1 API needs an OAuth2 access token minted from a service-account key;
@@ -15,8 +14,8 @@
 // channel + deep-link even in the background.
 //
 // Config (inline env, DockerOps convention): FCM_SERVICE_ACCOUNT_JSON = the
-// service-account JSON, inline. Unset ⇒ this module is a no-op, exactly like
-// notify() when NTFY_URL is unset — "graceful when unconfigured".
+// service-account JSON, inline. Unset ⇒ this module is a no-op and notify()
+// pushes nothing — "graceful when unconfigured".
 
 "use strict";
 

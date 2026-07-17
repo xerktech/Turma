@@ -1429,18 +1429,25 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
 ### Notifications
 
 - Session commands are queued on the hub and drained via the heartbeat reply.
-- The hub pushes edge-triggered alerts to the self-hosted ntfy on topic `agents`: host
-  offline/recovered, restart loop, daily cost threshold (from the host-level `usage.today.cost` so
-  ended sessions still count, falling back to summing live sessions for older agents), per-session
-  turn finished / question waiting / PR created.
-- Every alert funnels through one `notify()` (`turma/server.js`).
-- Alongside ntfy it **also fans out to registered mobile devices via FCM** (`turma/push.js`: HTTP v1,
-  service-account JWT minted with `node:crypto`, no npm — enabled by `FCM_SERVICE_ACCOUNT_JSON`,
-  no-op when unset like ntfy), carrying `tags`/`priority`/`click`/`route:{host,sessionId}` as message
-  data so the Android client picks a notification channel and deep-links a tap.
+- The hub pushes edge-triggered alerts to the **Android client via FCM** — the sole notification
+  transport (XERK-10 removed the former self-hosted ntfy path): host offline/recovered, restart loop,
+  daily cost threshold (from the host-level `usage.today.cost` so ended sessions still count, falling
+  back to summing live sessions for older agents), per-session turn finished / question waiting / PR
+  created.
+- Every alert funnels through one `notify()` (`turma/server.js`), which fans out to every registered
+  device via `turma/push.js` (HTTP v1, service-account JWT minted with `node:crypto`, no npm — enabled
+  by `FCM_SERVICE_ACCOUNT_JSON`, a no-op that pushes nothing when unset), carrying
+  `tags`/`priority`/`click`/`route:{host,sessionId}` as message data so the client picks a
+  notification channel and deep-links a tap. `notify()` is a plain no-op when no device is registered
+  or FCM is unconfigured — there is no other sink.
 - Devices register via `POST /api/devices` (user-authed, persisted to `/data/devices.json`),
-  unregister via `DELETE /api/devices?token=`, and dead tokens are pruned on send.
-- Tests: `turma/tests/push.test.js`, plus the device-registry cases in `server.test.js`.
+  unregister via `DELETE /api/devices?token=`, and dead tokens (404 UNREGISTERED) are pruned on send.
+- The Android client owns the delivery half: `POST_NOTIFICATIONS` in the manifest, the Android-13+
+  runtime request in `MainActivity`, the notification channels + rendering in `push/Notifications.kt`
+  (channel chosen from `tags`, tap deep-linked from `host`/`sessionId`), and token
+  registration/rotation in `push/PushRegistrar.kt` — all guarded so a build without
+  `google-services.json` still runs. See the `android/` section.
+- Tests: `turma/tests/push.test.js`, plus the alert and device-registry cases in `server.test.js`.
 
 ### Auth and the glasses surface
 
@@ -1552,7 +1559,8 @@ GHCR image builds and PR gates — see Build & Deploy below.
 
 - `compose/turma-truenas.yaml` defines the `turma` service and a single per-host `agent-host`
   container: mounted at `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`, host mounts, the shared
-  `TURMA_TOKEN`/`TURMA_AGENT_TOKEN`, ntfy publisher creds, basic-auth.
+  `TURMA_TOKEN`/`TURMA_AGENT_TOKEN`, the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`),
+  basic-auth.
 - No pricing/cost env — usage is counted in tokens per model name, so there is no rate table to
   configure.
 - Because one container now hosts many concurrent Claude sessions, its `mem_limit`/`cpus`/
@@ -1683,8 +1691,8 @@ internal step to a tag upstream deleted).
 
 - All credentials are inline in environment variables (no Docker secrets mechanism) — this matches the
   DockerOps convention.
-- The live secrets (`TURMA_TOKEN`, `TURMA_AGENT_TOKEN`, basic-auth, ntfy) are set in DockerOps'
-  `compose/turma-truenas.yaml`, not in this repo.
+- The live secrets (`TURMA_TOKEN`, `TURMA_AGENT_TOKEN`, basic-auth, `FCM_SERVICE_ACCOUNT_JSON`) are
+  set in DockerOps' `compose/turma-truenas.yaml`, not in this repo.
 
 ### Run-as identity (host permission parity)
 

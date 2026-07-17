@@ -12,10 +12,11 @@
 //      (the tmux/Claude TUI). The hub then proxies the browser's /term traffic
 //      through that data channel. See the reverse-tunnel section below.
 //
-// It also pushes edge-triggered alerts to the self-hosted ntfy (grafana.yaml)
-// on the `agents` topic: container offline/recovered, crash loops, turn
-// finished / question waiting for input, and PR created.
-// Set NTFY_URL (plus NTFY_USER/NTFY_PASS) to enable; unset disables alerts.
+// It also pushes edge-triggered alerts to the Android client via Firebase Cloud
+// Messaging (turma/push.js): container offline/recovered, crash loops, turn
+// finished / question waiting for input, and PR created. Set
+// FCM_SERVICE_ACCOUNT_JSON to enable; unset disables push (the alert bus becomes
+// a no-op). Devices register their FCM token via POST /api/devices.
 //
 // stdlib only — no npm dependencies (the agent dials with Node's built-in
 // WebSocket; the hub hand-rolls the WebSocket *server* framing with `crypto`).
@@ -94,11 +95,6 @@ const SESSION_KEY =
 // token — one credential per agent container for heartbeat, tunnel, and ttyd.
 const TTYD_AUTH = "Basic " + Buffer.from(`term:${TURMA_AGENT_TOKEN || "changeme"}`).toString("base64");
 
-const NTFY_URL = (process.env.NTFY_URL || "").replace(/\/$/, "");
-const NTFY_TOPIC = process.env.NTFY_TOPIC || "agents";
-const NTFY_USER = process.env.NTFY_USER || "";
-const NTFY_PASS = process.env.NTFY_PASS || "";
-
 // ---- LiteLLM backend (OpenAI-compatible: Whisper STT) -----------------------
 // Whisper STT is served by a LiteLLM instance's `/v1` base: LITELLM_URL points
 // at it and Whisper hits `${LITELLM_URL}/audio/transcriptions` with LITELLM_API_KEY.
@@ -175,7 +171,7 @@ function prune() {
 
 // ---- mobile push device registry -------------------------------------------
 // FCM tokens the Android client has registered (POST /api/devices). notify()
-// fans every alert out to these in addition to ntfy. Persisted next to
+// fans every alert out to these. Persisted next to
 // STATE_FILE, same best-effort pattern (losing it just means devices re-register
 // on their next app launch). Each entry: {token, platform, addedAt, seenAt}.
 let devices = [];
@@ -663,31 +659,15 @@ function agentWsAuthorized(url, req) {
   return agentAuthorized(req);
 }
 
-// ---- ntfy push alerts -------------------------------------------------------
+// ---- push alerts (Firebase Cloud Messaging) ---------------------------------
+// The single alert bus. Every edge-triggered alert (host offline/recovered,
+// restart loop, question waiting, PR created, turn finished) funnels through
+// notify(), which fans it out to every registered mobile device via FCM. A
+// no-op when FCM is unconfigured or no device has registered, and best-effort:
+// a push failure only logs, never breaks the beat. tags/priority/click/route
+// ride as data so the app picks the notification channel and deep-links a tap to
+// the exact session or host.
 function notify(title, message, opts = {}) {
-  if (!NTFY_URL) return;
-  const headers = {
-    Title: title,
-    Tags: opts.tags || "robot",
-    Priority: opts.priority || "default",
-  };
-  if (opts.click) headers.Click = opts.click;
-  if (NTFY_USER)
-    headers.Authorization =
-      "Basic " + Buffer.from(`${NTFY_USER}:${NTFY_PASS}`).toString("base64");
-  fetch(`${NTFY_URL}/${NTFY_TOPIC}`, { method: "POST", body: message, headers })
-    .then((r) => {
-      if (!r.ok) console.error(`ntfy ${r.status} for "${title}"`);
-    })
-    .catch((e) => console.error(`ntfy failed: ${e.message}`));
-  pushFcm(title, message, opts);
-}
-
-// Fan an alert out to registered mobile devices via FCM. Independent of ntfy
-// (either can be configured without the other) and best-effort: a push failure
-// only logs. tags/priority/click/route ride as data so the app can pick the
-// notification channel and deep-link a tap to the exact session or host.
-function pushFcm(title, message, opts = {}) {
   const tokens = listDevices();
   if (!tokens.length) return; // no registered devices; also skips when FCM off
   const data = {
@@ -1452,7 +1432,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Mobile push device registry. The Android client registers its FCM token
-    // here so hub alerts (notify()) also fan out to it; it unregisters on
+    // here so hub alerts (notify()) fan out to it; it unregisters on
     // sign-out. User-authed like the rest of the browser API (the gate above
     // already enforced it). Unregister takes the token as a query param, not a
     // path segment, because FCM tokens can contain `/`.
@@ -2457,9 +2437,9 @@ if (process.env.TURMA_TEST) {
   server.listen(PORT, () => {
     console.log(`turma listening on :${PORT}`);
     console.log(
-      NTFY_URL
-        ? `ntfy alerts -> ${NTFY_URL}/${NTFY_TOPIC}`
-        : "ntfy alerts disabled (NTFY_URL not set)"
+      push.fcmEnabled()
+        ? "FCM push alerts -> Android devices"
+        : "FCM push alerts disabled (FCM_SERVICE_ACCOUNT_JSON not set)"
     );
     console.log(
       WHISPER_URL ? `whisper STT -> ${WHISPER_URL}` : "whisper STT disabled (LITELLM_URL/WHISPER_URL not set)"
