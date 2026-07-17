@@ -669,6 +669,25 @@ test("ended sessions survive an agent restart that empties ~/.turma", () => {
   assert.match(e, /ended \d+[smhd]/, "a recovered row carries its end time");
 });
 
+test("a resumable-only ended session keeps its PR chip (XERK-13)", () => {
+  // The point of the ticket: a session aged out of closed.json is reported only
+  // through the transcript scan, which now carries the PRs it opened from the
+  // agent's durable PR ledger — so its chip survives past its closed record.
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.sessions = [];
+  h.closedSessions = [];
+  withResumable(h, [resumable("t-pr", "Recovered With PR", "2026-07-15T09:00:00Z", {
+    prs: [{ url: "https://github.com/o/r/pull/7", number: 7, state: "MERGED", checks: "passing" }],
+  })]);
+  beat({ now, agents: [h] });
+
+  const e = els.ended.innerHTML;
+  assert.match(e, /Recovered With PR/, "the recovered session is listed");
+  assert.match(e, /pull\/7/, "and its PR link rides along");
+  assert.match(e, /#7/, "and the chip shows the PR number");
+});
+
 test("all three channels interleave into one list by when they ended", () => {
   const { beat, els } = loadPage();
   const { now, host: h } = host([

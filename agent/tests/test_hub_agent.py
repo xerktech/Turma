@@ -1678,6 +1678,8 @@ class ManagerMixin:
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
+            ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
+            ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", os.path.join(self.tmp, "worktrees")),
         ]:
@@ -2043,6 +2045,23 @@ class TestResumableReport(ManagerMixin, unittest.TestCase):
         self.assertEqual(by_tid["tkt1"]["ticket"]["branch"], "PROJ-7")
         # An ordinary session reports no ticket rather than an empty one.
         self.assertIsNone(by_tid["plain1"]["ticket"])
+
+    def test_carries_the_prs_a_transcript_opened(self):
+        """This scan is the only channel still reporting a session once its
+        closed record has aged out — so an ended session's PR chips (and their
+        last-known status) have to come from the durable PR ledger here (XERK-13),
+        exactly as the ticket does above."""
+        url = "https://github.com/o/r/pull/1"
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        self._write_at(wt, tid="pr1")
+        self._write_at(wt, tid="plain1")
+        sm = self.make_manager()
+        sm.pr_ledger = {"pr1": {"urls": [url], "at": "2026-01-01T00:00:00Z"}}
+        sm.pr_status_cache = {url: {"url": url, "state": "MERGED"}}
+        by_tid = {e["transcriptId"]: e for e in sm._resumable_report()["Turma"]}
+        self.assertEqual(by_tid["pr1"]["prs"], [{"url": url, "state": "MERGED"}])
+        # An ordinary session reports no PRs rather than an empty list.
+        self.assertIsNone(by_tid["plain1"]["prs"])
 
     def test_caps_per_repo(self):
         p = mock.patch.object(ha, "RESUMABLE_PER_REPO", 2)
@@ -5090,6 +5109,8 @@ class TestPruneRepo(unittest.TestCase):
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
+            ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
+            ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", self.wt_root),
             ("REPOS_ROOT", self.tmp),
@@ -5597,6 +5618,181 @@ class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
                                return_value={"url": url, "state": "OPEN"}) as pr:
             sm2.refresh_pr_status()
         pr.assert_called_once_with(url)
+
+
+class TestPrLedger(ManagerMixin, unittest.TestCase):
+    """The durable transcript -> PR-links ledger (XERK-13): what makes a
+    session's PR chips survive a manager restart and outlive its record —
+    killed, aged out of closed.json, or wiped with the in-memory scan."""
+
+    URL = "https://github.com/o/r/pull/1"
+    URL2 = "https://github.com/o/r/pull/2"
+
+    def _running(self, sm, sid="s1", tid="t1", urls=(URL,)):
+        sm.registry = [{"id": sid, "status": "running", "claudeSessionId": tid}]
+        sm.session_pr_urls[sid] = list(urls)
+        return sm
+
+    def test_remember_persists_and_reloads(self):
+        sm = self._running(self.make_manager())
+        self.assertTrue(sm._remember_prs(sm.registry[0]))
+        # A fresh manager reads the links back off disk — the whole point.
+        self.assertEqual(self.make_manager().pr_ledger["t1"]["urls"], [self.URL])
+
+    def test_ignores_a_session_with_no_pr_or_no_transcript(self):
+        sm = self.make_manager()
+        # No PR opened.
+        sm.registry = [{"id": "s1", "status": "running", "claudeSessionId": "t1"}]
+        self.assertFalse(sm._remember_prs(sm.registry[0]))
+        # A PR but no transcript to key on (not launched / pinned yet).
+        sm.session_pr_urls["s2"] = [self.URL]
+        self.assertFalse(sm._remember_prs({"id": "s2"}))
+        self.assertEqual(sm.pr_ledger, {})
+
+    def test_remember_is_idempotent(self):
+        """Called each beat a URL is present, so an unchanged entry must not
+        rewrite the file — and must not restamp `at`, the prune's sort key."""
+        sm = self._running(self.make_manager())
+        self.assertTrue(sm._remember_prs(sm.registry[0]))
+        at = sm.pr_ledger["t1"]["at"]
+        self.assertFalse(sm._remember_prs(sm.registry[0]))
+        self.assertEqual(sm.pr_ledger["t1"]["at"], at)
+
+    def test_a_new_url_merges_without_restamping(self):
+        sm = self._running(self.make_manager())
+        sm._remember_prs(sm.registry[0])
+        at = sm.pr_ledger["t1"]["at"]
+        sm.session_pr_urls["s1"].append(self.URL2)
+        self.assertTrue(sm._remember_prs(sm.registry[0]))
+        self.assertEqual(sm.pr_ledger["t1"]["urls"], [self.URL, self.URL2])
+        self.assertEqual(sm.pr_ledger["t1"]["at"], at)   # first-seen preserved
+
+    def test_ledger_backfills_a_live_session_the_xerk15_mirror_missed(self):
+        """The ledger fills the gap XERK-15's sess["prUrls"] mirror can't: a
+        registry record predating that mirror carries no prUrls to rehydrate
+        from, but its ledgered links (from a prior run) still name its PRs, so the
+        chip comes back on boot anyway (setdefault — XERK-15 wins when it has a
+        copy). The record here has no prUrls, exactly that pre-mirror shape."""
+        sm = self._running(self.make_manager())
+        sm._remember_prs(sm.registry[0])
+        write_json(ha.REGISTRY_PATH, sm.registry)   # persisted WITHOUT prUrls
+        sm2 = self.make_manager()
+        self.assertEqual(sm2.session_pr_urls["s1"], [self.URL])   # re-seeded
+        self.assertEqual([p["url"] for p in sm2._session_prs("s1")], [self.URL])
+
+    def test_backfills_from_closed_history(self):
+        """A closed record snapshots its own prUrls; adopt those so a ledger
+        added after the fact doesn't start empty on the sessions already ended."""
+        rec = {"id": "dead", "repo": "r", "transcriptId": "t-dead",
+               "prUrls": [self.URL]}
+        write_json(ha.CLOSED_PATH, [rec])
+        sm = self.make_manager()
+        self.assertEqual(sm.pr_ledger["t-dead"]["urls"], [self.URL])
+        # And it was persisted, not just held in memory.
+        self.assertEqual(self.make_manager().pr_ledger["t-dead"]["urls"], [self.URL])
+
+    def test_ledger_prs_shape(self):
+        sm = self.make_manager()
+        sm.pr_ledger["t1"] = {"urls": [self.URL], "at": "2026-01-01T00:00:00Z"}
+        # Bare {url} until the status lands (mirrors _session_prs/_closed_prs).
+        self.assertEqual(sm._ledger_prs("t1"), [{"url": self.URL}])
+        sm.pr_status_cache[self.URL] = {"url": self.URL, "state": "MERGED"}
+        self.assertEqual(sm._ledger_prs("t1"), [{"url": self.URL, "state": "MERGED"}])
+        # Nothing ledgered / opened -> None, so the payload key stays empty.
+        self.assertIsNone(sm._ledger_prs("nope"))
+        self.assertIsNone(sm._ledger_prs(None))
+
+    def test_refresh_persists_status_so_the_pill_survives_a_restart(self):
+        """A polled PR's status is persisted, so a fresh manager loads it back and
+        the chip keeps its state/CI pill rather than degrading to a bare link."""
+        sm = self._running(self.make_manager())
+        sm.github = {"available": True}
+        with mock.patch.object(
+                ha, "pr_status", return_value={"url": self.URL, "state": "OPEN"}):
+            sm.refresh_pr_status()
+        self.assertEqual(
+            self.make_manager().pr_status_cache[self.URL]["state"], "OPEN")
+
+    def test_a_ledgered_ended_pr_status_is_not_evicted(self):
+        """An ended session aged out of closed.json is reported only through the
+        resumable scan, which reads its links from the ledger — so its last-known
+        status has to survive the prune even with no live/closed record holding
+        it, or its ended card shows a bare link."""
+        stale = "https://github.com/o/r/pull/99"
+        sm = self.make_manager()
+        sm.registry = []
+        sm.closed = []
+        sm.pr_ledger["t1"] = {"urls": [self.URL], "at": "2026-01-01T00:00:00Z"}
+        sm.pr_status_cache = {self.URL: {"url": self.URL, "state": "MERGED"},
+                              stale: {"url": stale, "state": "CLOSED"}}
+        sm.github = {"available": True}
+        with mock.patch.object(ha, "pr_status") as pr:
+            sm.refresh_pr_status()
+        pr.assert_not_called()                                  # never re-polled
+        self.assertEqual(sm.pr_status_cache[self.URL]["state"], "MERGED")  # kept
+        self.assertNotIn(stale, sm.pr_status_cache)   # truly unreferenced: evicted
+
+    def test_kill_records_to_the_ledger(self):
+        sm = self._running(self.make_manager())
+        sm.registry[0].update({"repo": "r", "worktreePath": "/w"})
+        with mock.patch.object(sm, "_kill_tmux"), \
+                mock.patch.object(sm, "_kill_ttyd"), \
+                mock.patch.object(sm, "_session_transcript_id", return_value="t1"):
+            sm.kill("s1")
+        self.assertEqual(sm.pr_ledger["t1"]["urls"], [self.URL])
+        # Survives the kill dropping the in-memory set.
+        self.assertNotIn("s1", sm.session_pr_urls)
+
+    def test_end_to_end_scan_then_restart_keeps_the_chip(self):
+        """The whole path: the real transcript scan discovers an opened PR through
+        _session_payload, the ledger persists it, and a fresh manager (a restart,
+        with the scan primed to EOF and unable to re-find it) still reports it."""
+        sm = self.make_manager()
+        tid = "22222222-2222-4222-8222-222222222222"
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, tid + ".jsonl")
+        write_jsonl(path, [{"type": "user",
+                            "message": {"role": "user", "content": "hi"}}])
+        sess = {"id": "s1", "status": "running", "repo": "Turma", "repoPath": "/p",
+                "worktreePath": wt, "branch": None, "rcName": "n",
+                "claudeSessionId": tid}
+        sm.registry = [sess]
+        write_json(ha.REGISTRY_PATH, sm.registry)
+        with mock.patch.object(sm, "_session_git", return_value=(None, {})):
+            self.assertIsNone(sm._session_payload(sess)["prs"])   # beat 1 primes
+            # Now the session actually opens a PR — the two entries `gh pr create`
+            # leaves: the call, then its output (the new PR's URL).
+            write_jsonl(path, [
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "c1", "name": "Bash",
+                     "input": {"command": "gh pr create --fill"}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "c1",
+                     "content": self.URL}]}},
+            ])
+            p1 = sm._session_payload(sess)   # beat 2: scan scrapes the URL
+        self.assertEqual([pr["url"] for pr in p1["prs"]], [self.URL])
+        self.assertEqual(sm.pr_ledger[tid]["urls"], [self.URL])   # and it's durable
+
+        # Restart: a fresh manager reads the same registry + transcript. The scan
+        # primes to EOF and finds nothing new, but the chip comes back anyway.
+        sm2 = self.make_manager()
+        with mock.patch.object(sm2, "_session_git", return_value=(None, {})):
+            p2 = sm2._session_payload(sm2.registry[0])
+        self.assertEqual([pr["url"] for pr in p2["prs"]], [self.URL])
+
+    def test_prune_bounds_oldest_first(self):
+        p = mock.patch.object(ha, "PR_LEDGER_MAX", 2)
+        p.start()
+        self.addCleanup(p.stop)
+        sm = self.make_manager()
+        for i, at in enumerate(["2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z",
+                                "2026-03-01T00:00:00Z"]):
+            sm.pr_ledger[f"t{i}"] = {"urls": [f"u{i}"], "at": at}
+        sm._prune_pr_ledger()
+        self.assertEqual(set(sm.pr_ledger), {"t1", "t2"})   # oldest t0 fell off
 
 
 class TestNormalizeJiraSite(unittest.TestCase):

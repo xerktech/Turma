@@ -166,6 +166,27 @@ TICKET_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-sessions.json")
 # Bound on the above. Entries are small and only ticket-backed sessions make one,
 # so this is a runaway backstop rather than a working limit; the oldest fall off.
 TICKET_LEDGER_MAX = 500
+# Durable transcriptId -> {urls, at} ledger: the PR links each conversation
+# opened. The exact counterpart of TICKET_LEDGER_PATH above, and for the same
+# reason — the PR chips on a session's card (and in the hub's Ended-sessions
+# list) have to outlive the in-memory scan that first found the links.
+#
+# The set of PRs a session opened lived ONLY in the in-memory session_pr_urls,
+# rebuilt by an incremental transcript scan that primes to EOF on restart — so a
+# manager restart blanked a running session's chips (the `gh pr create` lines
+# are behind the primed offset and never re-read), and a session aged out of
+# closed.json lost its chips entirely (the resumable scan carries no PRs). Keying
+# here on the transcript id — the handle the resumable scan reports and the hub's
+# Ended list dedupes on — is what re-attaches links to a session across all of it.
+PR_LEDGER_PATH = os.path.join(REGISTRY_DIR, "pr-sessions.json")
+# Bound on the above, oldest-first — a runaway backstop, like the ticket ledger.
+PR_LEDGER_MAX = 500
+# Durable url -> compact `gh pr view` status ledger, so the chip keeps its
+# state/CI PILL (not just a bare link) across a restart. The in-memory
+# pr_status_cache seeds from this at boot; running sessions re-poll and refresh
+# it, but an ENDED session's PR is never re-polled, so its last-known status
+# would otherwise degrade to a bare link the moment the cache was lost.
+PR_STATUS_LEDGER_PATH = os.path.join(REGISTRY_DIR, "pr-status.json")
 # Where Claude Code keeps per-project transcript JSONLs (slug = cwd via
 # _project_slug below). Overridable so the test suite can point it at
 # fixtures; unset in production, so the default is the real path.
@@ -3702,7 +3723,9 @@ class SessionManager:
         # PR link -> compact status (state + CI checks), refreshed via `gh pr
         # view` on the PR_STATUS_REFRESH_EVERY cadence and attached to each
         # session's payload. Keyed by URL so several sessions can share one.
-        self.pr_status_cache = {}
+        # Seeded from the durable PR-status ledger so a chip keeps its state/CI
+        # pill across a restart (an ended session's PR is never re-polled).
+        self.pr_status_cache = self._load_pr_status_ledger()
         # Slow-changing git facts cached across beats (recomputed on the slow
         # USAGE_EVERY cadence, or on first sight): repo path -> repo_slow_facts,
         # session id -> {liveBranch, slow git_info, branch_sync work}.
@@ -3756,6 +3779,14 @@ class SessionManager:
         # records that still carry both, so it doesn't start empty.
         self.ticket_ledger = self._load_ticket_ledger()
         self._backfill_ticket_ledger()
+        # Durable transcript -> PR-links attribution (persisted). Keeps a
+        # session's PR chips answerable after the in-memory scan is lost (manager
+        # restart) and after the session record itself is gone (aged out of
+        # closed.json). Backfilled from the closed history, and re-seeds the live
+        # working set so a restart re-polls a running session's PRs rather than
+        # blanking them. See PR_LEDGER_PATH.
+        self.pr_ledger = self._load_pr_ledger()
+        self._backfill_pr_ledger()
         # Last SUCCESSFUL gh repo sweep, held so a failed one (which blanks the
         # github block to repos:[]) can't be mistaken for an empty org — see
         # _start_jira_triage.
@@ -4206,6 +4237,144 @@ class SessionManager:
             changed |= self._remember_ticket(sess, save=False)
         if changed:
             self._save_ticket_ledger()
+
+    def _load_pr_ledger(self):
+        try:
+            with open(PR_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_pr_ledger(self):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = PR_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.pr_ledger, f, indent=2)
+            os.replace(tmp, PR_LEDGER_PATH)
+        except OSError as e:
+            log(f"pr ledger save failed: {e}")
+
+    def _remember_prs(self, sess, save=True):
+        """Record a session's transcript -> PR-links attribution durably, so its
+        chips survive the in-memory scan being lost (a manager restart) and the
+        session record itself being gone (aged out of closed.json). Idempotent;
+        keyed by the transcript id, so a restart-clear-context's new conversation
+        gets its own entry rather than clobbering the old one.
+
+        The URLs are read from the live session_pr_urls (what the scan has found
+        so far); a session that has opened none, or has no transcript to key on,
+        is a no-op. Returns whether anything moved, so a bulk caller saves once.
+
+        The id is the PINNED one, falling back to a closed record's resolved
+        transcriptId — all a pre-pin record ever had (see _remember_closed)."""
+        tid = sess.get("claudeSessionId") or sess.get("transcriptId")
+        urls = self.session_pr_urls.get(sess.get("id")) or []
+        if not tid or not urls:
+            return False
+        prev = self.pr_ledger.get(tid)
+        merged = list((prev or {}).get("urls") or [])
+        moved = False
+        for u in urls:
+            if u not in merged:
+                merged.append(u)
+                moved = True
+        del merged[:-10]
+        if not moved and prev is not None:
+            return False    # nothing new; don't rewrite the file every beat
+        self.pr_ledger[tid] = {
+            "urls": merged,
+            # First-seen, not last-touched: the prune's sort key, so a session
+            # that keeps opening PRs doesn't push a genuinely older one off.
+            "at": (prev or {}).get("at") or now_iso(),
+        }
+        self._prune_pr_ledger()
+        if save:
+            self._save_pr_ledger()
+        return True
+
+    def _prune_pr_ledger(self):
+        """Bound the PR ledger, oldest first. Like the ticket ledger and unlike
+        the usage one, NOT pruned against the transcripts on disk: a transcript
+        archived off this host is still the answer to "which PRs did it open"."""
+        if len(self.pr_ledger) <= PR_LEDGER_MAX:
+            return
+        order = sorted(self.pr_ledger.items(),
+                       key=lambda kv: (kv[1] or {}).get("at") or "")
+        for tid, _ in order[:len(self.pr_ledger) - PR_LEDGER_MAX]:
+            self.pr_ledger.pop(tid, None)
+
+    def _backfill_pr_ledger(self):
+        """Seed the durable PR ledger from what's already on disk. Runs once at
+        construction, after the registry/closed history are loaded (and after
+        XERK-15's session_pr_urls rehydration, which this defers to below).
+
+        Two jobs, both the reconcile-from-what-we-have rule the other ledgers
+        follow:
+        - Fold in every closed record's own prUrls snapshot (keyed by
+          transcriptId), so a ledger added after the fact adopts the sessions
+          already ended — the ones whose chips it most needs to keep once their
+          closed record ages out of closed.json.
+        - Backfill session_pr_urls for any LIVE session the XERK-15 rehydration
+          missed — a registry record predating that mirror carries no
+          `sess["prUrls"]`, but its ledgered links (written on a prior run) still
+          name its PRs. setdefault, so XERK-15's copy stays authoritative when it
+          has one; this only fills a gap it left."""
+        changed = False
+        for rec in self.closed:
+            tid = rec.get("transcriptId") or rec.get("claudeSessionId")
+            urls = rec.get("prUrls") or []
+            if not tid or not urls:
+                continue
+            prev = self.pr_ledger.get(tid)
+            merged = list((prev or {}).get("urls") or [])
+            for u in urls:
+                if u not in merged:
+                    merged.append(u)
+            del merged[:-10]
+            if merged != ((prev or {}).get("urls") or []):
+                self.pr_ledger[tid] = {
+                    "urls": merged, "at": (prev or {}).get("at") or now_iso()}
+                changed = True
+        if changed:
+            self._prune_pr_ledger()
+            self._save_pr_ledger()
+        for sess in self.registry:
+            tid = sess.get("claudeSessionId")
+            entry = self.pr_ledger.get(tid) if tid else None
+            if entry and entry.get("urls"):
+                self.session_pr_urls.setdefault(sess["id"], list(entry["urls"]))
+
+    def _ledger_prs(self, tid):
+        """PR-status objects for a transcript's ledgered PR links, newest last —
+        the durable-side counterpart of _session_prs / _closed_prs, reading the
+        PR ledger by transcript id. This is the only channel that answers for a
+        session aged out of closed.json (the resumable scan). None when it opened
+        no PR, or predates the ledger."""
+        entry = self.pr_ledger.get(tid) if tid else None
+        urls = (entry or {}).get("urls")
+        if not urls:
+            return None
+        return [self.pr_status_cache.get(u) or {"url": u} for u in urls]
+
+    def _save_pr_status_ledger(self):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = PR_STATUS_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.pr_status_cache, f, indent=2)
+            os.replace(tmp, PR_STATUS_LEDGER_PATH)
+        except OSError as e:
+            log(f"pr status ledger save failed: {e}")
+
+    def _load_pr_status_ledger(self):
+        try:
+            with open(PR_STATUS_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
 
     def _remember_usage(self, sess):
         """Record a session's worktree -> repo attribution so its transcript's
@@ -4989,6 +5158,11 @@ class SessionManager:
         # manager restart exactly as the rest of the closed history does.
         rec["prUrls"] = list(self.session_pr_urls.get(sess["id"]) or [])
         rec["transcriptId"] = self._session_transcript_id(sess)
+        # Also persist to the durable PR ledger, keyed by the resolved transcript
+        # id, so the chips survive this record aging out of closed.json — the one
+        # channel left reporting the session then (the resumable scan) reads its
+        # PRs from there. _session_pr_urls is still populated (forget runs next).
+        self._remember_prs(rec)
         self.closed = [c for c in self.closed if c.get("id") != rec["id"]]
         self.closed.append(rec)
         # Trim per repo, newest first (the list is in close order).
@@ -5830,6 +6004,12 @@ class SessionManager:
                 # channel still reporting a session once its record has aged out
                 # of closed.json (see TICKET_LEDGER_PATH).
                 e["ticket"] = self.ticket_ledger.get(e["transcriptId"])
+                # The PRs this conversation opened, from the durable PR ledger —
+                # same story as the ticket above. This scan is the only channel
+                # still reporting a session once its closed record has aged out,
+                # so without the ledger its PR chips would be lost for good (a
+                # resumable row has no record to have snapshotted them onto).
+                e["prs"] = self._ledger_prs(e["transcriptId"])
                 e.pop("mtime", None)
         return by_repo
 
@@ -6035,13 +6215,27 @@ class SessionManager:
         # whose last-known status is what its card has always shown.
         for rec in self.closed:
             referenced.update(rec.get("prUrls") or [])
+        # Every ledgered PR too: an ended session aged out of closed.json is
+        # reported only through the resumable scan, which reads its links from
+        # the ledger — so its last-known status has to survive this sweep the
+        # same way a killed session's does, or its ended card shows a bare link.
+        for entry in self.pr_ledger.values():
+            referenced.update((entry or {}).get("urls") or [])
+        changed = False
         for url in list(self.pr_status_cache):
             if url not in referenced:
                 del self.pr_status_cache[url]
+                changed = True
         for url in wanted[:PR_STATUS_MAX]:
             st = pr_status(url)
             if st is not None:
                 self.pr_status_cache[url] = st
+                changed = True
+        # Persist the refreshed status so the pill survives a restart. An ended
+        # session's PR is never re-polled, so without this its state/CI degrades
+        # to a bare link the moment the in-memory cache is lost.
+        if changed:
+            self._save_pr_status_ledger()
 
     def _session_prs(self, sid):
         """The PR-status objects for a session's known PR links, newest last
@@ -6869,6 +7063,12 @@ class SessionManager:
                     if grew:
                         sess["prUrls"] = list(known)
                         self.save()
+                    # Also record to the durable transcriptId-keyed PR ledger.
+                    # sess["prUrls"] above (XERK-15) only survives while the
+                    # registry record does; the ledger is what carries the chips
+                    # into a session's ENDED life — reported then only by the
+                    # resumable scan, past closed.json's cap. (XERK-13)
+                    self._remember_prs(sess)
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
