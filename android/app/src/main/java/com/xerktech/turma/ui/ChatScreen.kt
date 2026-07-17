@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,11 +22,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.CheckBox
+import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -45,11 +47,13 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -130,14 +134,30 @@ fun ChatScreen(host: String, sessionId: String, onBack: () -> Unit, onTerminal: 
                     )
                 }
                 if (state.question.isNotBlank()) {
-                    QuestionSheet(state.question, state.questionOptions) { vm.answerOption(it) }
+                    val opts = state.questionOptionsRich.ifEmpty {
+                        state.questionOptions.map { com.xerktech.turma.model.QuestionOption(label = it) }
+                    }
+                    QuestionSheet(
+                        question = state.question,
+                        header = state.questionHeader,
+                        index = state.questionIndex,
+                        total = state.questionTotal,
+                        options = opts,
+                        multi = state.questionMulti,
+                        onAnswerSingle = { vm.answerOption(it) },
+                        onAnswerMulti = { vm.answerMulti(it) },
+                    )
                 }
                 ChatFooter(
                     session = state.session,
                     draft = state.draft,
                     mic = state.mic,
+                    // Working right now: prefer the live turn frames (fast), fall back
+                    // to the heartbeat's paneBusy. Drives the ◼ Stop button.
+                    busy = state.liveTurn.isNotBlank() || state.session?.session?.paneBusy == true,
                     onDraft = vm::setDraft,
                     onSend = vm::submitDraft,
+                    onStop = vm::stop,
                     onMicStart = vm::startDictation,
                     onMicStop = vm::stopDictation,
                     onModel = vm::setModel,
@@ -149,8 +169,8 @@ fun ChatScreen(host: String, sessionId: String, onBack: () -> Unit, onTerminal: 
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize().padding(pad),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(10.dp, 6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             if (state.hasMore) {
                 item { Text("· earlier history ·", Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
@@ -160,18 +180,72 @@ fun ChatScreen(host: String, sessionId: String, onBack: () -> Unit, onTerminal: 
     }
 }
 
-@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-private fun QuestionSheet(question: String, options: List<String>, onAnswer: (Int) -> Unit) {
-    Surface(color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.4f), modifier = Modifier.fillMaxWidth()) {
+private fun QuestionSheet(
+    question: String,
+    header: String,
+    index: Int?,
+    total: Int?,
+    options: List<com.xerktech.turma.model.QuestionOption>,
+    multi: Boolean,
+    onAnswerSingle: (Int) -> Unit,
+    onAnswerMulti: (List<Int>) -> Unit,
+) {
+    val picks = remember(question) { mutableStateListOf<Int>() }
+    Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("❓ $question", fontWeight = FontWeight.Medium)
-            androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                options.forEachIndexed { i, opt ->
-                    AssistChip(onClick = { onAnswer(i) }, label = { Text(opt) })
+            if (header.isNotBlank() || (total != null && total > 1)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (header.isNotBlank()) Pill(header, color = MaterialTheme.colorScheme.primary)
+                    if (total != null && total > 1) {
+                        Text("${(index ?: 0) + 1} of $total", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
             }
+            Text(question, fontWeight = FontWeight.Medium)
+            options.forEachIndexed { i, opt ->
+                val selected = picks.contains(i)
+                QuestionOptionCard(opt, multi, selected) {
+                    if (multi) { if (selected) picks.remove(i) else picks.add(i) } else onAnswerSingle(i)
+                }
+            }
+            if (multi) {
+                PrimaryButton("Submit selection", onClick = { onAnswerMulti(picks.toList()) }, enabled = picks.isNotEmpty())
+            }
             Text("…or type a custom answer below.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+private fun QuestionOptionCard(
+    opt: com.xerktech.turma.model.QuestionOption,
+    multi: Boolean,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val border = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+    Row(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .border(1.dp, border, RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick)
+            .padding(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        if (multi) {
+            Icon(
+                if (selected) Icons.Filled.CheckBox else Icons.Filled.CheckBoxOutlineBlank, null,
+                tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp),
+            )
+        }
+        Column(Modifier.weight(1f)) {
+            Text(opt.label, fontWeight = FontWeight.Medium, fontSize = 14.sp)
+            if (opt.description.isNotBlank()) {
+                Text(opt.description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
     }
 }
@@ -182,8 +256,10 @@ private fun ChatFooter(
     session: com.xerktech.turma.model.SessionInfo?,
     draft: String,
     mic: MicState,
+    busy: Boolean,
     onDraft: (String) -> Unit,
     onSend: () -> Unit,
+    onStop: () -> Unit,
     onMicStart: () -> Unit,
     onMicStop: () -> Unit,
     onModel: (String) -> Unit,
@@ -194,6 +270,7 @@ private fun ChatFooter(
         if (granted) onMicStart()
     }
     Column(Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        // Model / mode / PR sit ABOVE the input box.
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
             MenuChip("model: ${session?.model?.ifBlank { "default" } ?: "default"}", listOf("default", "opus", "sonnet", "haiku"), onModel)
             MenuChip("mode: ${session?.permissionMode?.ifBlank { "auto" } ?: "auto"}", listOf("auto", "acceptEdits", "plan", "bypassPermissions", "default"), onMode)
@@ -222,7 +299,17 @@ private fun ChatFooter(
                     MicState.FINALIZING -> CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                 }
             }
-            IconButton(onClick = onSend, enabled = draft.isNotBlank()) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
+            // The compose button IS the Stop button while a turn is in flight
+            // (web parity): interrupt it, else send the draft.
+            if (busy) {
+                IconButton(onClick = onStop) {
+                    Icon(Icons.Filled.Stop, "Stop", tint = com.xerktech.turma.ui.theme.TurmaColors.waiting)
+                }
+            } else {
+                IconButton(onClick = onSend, enabled = draft.isNotBlank()) {
+                    Icon(Icons.AutoMirrored.Filled.Send, "Send")
+                }
+            }
         }
     }
 }

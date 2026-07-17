@@ -37,9 +37,4 @@ class LoginViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun signOut() {
-        PushRegistrar.unregister(app, container)
-        container.config.clear()
-        _state.update { Ui() }
-    }
 }

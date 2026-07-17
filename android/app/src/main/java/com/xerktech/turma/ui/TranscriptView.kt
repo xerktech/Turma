@@ -45,8 +45,15 @@ private fun TranscriptBubble(b: ChatItem.Bubble) {
         Surface(
             color = if (isUser) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surfaceVariant,
             shape = RoundedCornerShape(12.dp),
-            modifier = Modifier.widthIn(max = 320.dp),
-        ) { Text(shown, Modifier.padding(12.dp, 8.dp)) }
+            modifier = Modifier.widthIn(max = 340.dp),
+        ) {
+            Text(
+                shown,
+                Modifier.padding(10.dp, 6.dp),
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+            )
+        }
     }
 }
 
@@ -54,8 +61,8 @@ private fun TranscriptBubble(b: ChatItem.Bubble) {
 private fun TranscriptThinking(text: String) {
     var open by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().clickable { open = !open }) {
-        Text("💭 thinking", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (open) Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 8.dp, top = 2.dp))
+        Text("💭 thinking", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (open) Text(text, fontSize = 12.sp, lineHeight = 16.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 8.dp, top = 2.dp))
     }
 }
 
@@ -69,13 +76,13 @@ private fun TranscriptTool(t: ChatItem.Tool) {
         ),
         modifier = Modifier.fillMaxWidth().clickable { open = !open },
     ) {
-        Column(Modifier.padding(10.dp)) {
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 7.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("🔧 ${t.name}", fontWeight = FontWeight.SemiBold, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                if (t.input.isNotBlank()) Text(t.input.take(48), style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("🔧 ${t.name}", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                if (t.input.isNotBlank()) Text(t.input.take(48), fontSize = 11.sp, fontFamily = FontFamily.Monospace, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             if (open && t.result.isNotBlank()) {
-                Text(t.result, Modifier.padding(top = 6.dp), style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+                Text(t.result, Modifier.padding(top = 5.dp), fontSize = 11.sp, lineHeight = 15.sp, fontFamily = FontFamily.Monospace)
             }
         }
     }

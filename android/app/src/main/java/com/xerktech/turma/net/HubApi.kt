@@ -4,6 +4,7 @@ import com.xerktech.turma.model.AgentsResponse
 import com.xerktech.turma.model.ArchiveListResponse
 import com.xerktech.turma.model.ArchiveTranscript
 import com.xerktech.turma.model.HistoryResponse
+import com.xerktech.turma.model.JiraIssueDetail
 import com.xerktech.turma.model.SearchResponse
 import com.xerktech.turma.model.WsTokenResponse
 import kotlinx.serialization.Serializable
@@ -40,6 +41,10 @@ interface HubApi {
 
     @DELETE("api/agents/{host}/sessions/{id}")
     suspend fun deleteSession(@Path("host") host: String, @Path("id") id: String): OkResponse
+
+    /** Interrupt the turn a running session has in flight (agent sends Escape). */
+    @POST("api/agents/{host}/sessions/{id}/interrupt")
+    suspend fun interruptSession(@Path("host") host: String, @Path("id") id: String): OkResponse
 
     @POST("api/agents/{host}/sessions/{id}/input")
     suspend fun sendInput(
@@ -105,6 +110,36 @@ interface HubApi {
     @GET("api/archive/{tid}")
     suspend fun archiveTranscript(@Path("tid") transcriptId: String): ArchiveTranscript
 
+    // 200 with the issue, or 202 {pending} while the host fetches it on demand.
+    @GET("api/jira/{siteKey}/{issueKey}")
+    suspend fun jiraIssue(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+    ): Response<JiraIssueDetail>
+
+    @POST("api/jira/refresh")
+    suspend fun jiraRefresh(): OkResponse
+
+    // Start a session on a ticket: the hub picks the host + triaged repo and
+    // spawns with the ticket as context. 200 {ok, cmdId, host, repo}, or 4xx
+    // when the ticket has no triaged/cloned repo.
+    @POST("api/jira/{siteKey}/{issueKey}/session")
+    suspend fun startJiraSession(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+    ): Response<JiraSessionResponse>
+
+    // Override which repo a ticket belongs to (fans out to every host reporting
+    // the org). Body: {repo:"name"} to pin, {repo:null} for "no repo fits",
+    // {auto:true} to release the pin. Built as a JsonObject so an explicit null
+    // survives the shared decoder's explicitNulls=false. 202 {ok, hosts, ...}.
+    @POST("api/jira/{siteKey}/{issueKey}/repo")
+    suspend fun setJiraRepo(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): OkResponse
+
     @POST("api/devices")
     suspend fun registerDevice(@Body body: DeviceRequest): OkResponse
 
@@ -114,6 +149,15 @@ interface HubApi {
 
 @Serializable
 data class OkResponse(val ok: Boolean = false, val cmdId: String = "", val error: String = "")
+
+@Serializable
+data class JiraSessionResponse(
+    val ok: Boolean = false,
+    val cmdId: String = "",
+    val host: String = "",
+    val repo: String = "",
+    val error: String = "",
+)
 
 @Serializable
 data class SpawnRequest(
@@ -135,7 +179,11 @@ data class ModelRequest(val model: String)
 data class ModeRequest(val permissionMode: String)
 
 @Serializable
-data class AnswerRequest(val optionIndex: Int = -1, val custom: String? = null)
+data class AnswerRequest(
+    val optionIndex: Int = -1,
+    val custom: String? = null,
+    val optionIndices: List<Int>? = null,
+)
 
 @Serializable
 data class CloneRequest(val repo: String)

@@ -735,8 +735,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 
 ## `turma/` — central dashboard
 
-The central dashboard for the per-host agent containers: https://turma.xerktech.com via the
-Cloudflare tunnel; port 8300 on the LAN.
+The central dashboard for the per-host agent containers: reached over the Cloudflare tunnel
+(the operator's public hub URL); port 8300 on the LAN.
 
 ### Shared site chrome (`turma/public/nav.js`)
 

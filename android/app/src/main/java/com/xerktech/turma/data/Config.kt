@@ -25,8 +25,20 @@ class Config private constructor(private val prefs: SharedPreferences) {
     ) {
         val configured: Boolean get() = hubUrl.isNotBlank() && password.isNotBlank()
 
-        /** Base URL guaranteed to end with a single '/', for Retrofit/WS building. */
-        val baseUrl: String get() = hubUrl.trim().trimEnd('/') + "/"
+        /**
+         * Base URL guaranteed to end with a single '/' and carry a scheme, for
+         * Retrofit/WS building. With no hub set yet it returns a harmless
+         * placeholder (never requested — the login screen saves a real URL before
+         * any call), so Retrofit can be constructed without a hub configured. A
+         * scheme-less host the operator typed (`myhub.com`) is promoted to https.
+         */
+        val baseUrl: String
+            get() {
+                var u = hubUrl.trim().trimEnd('/')
+                if (u.isBlank()) return "http://localhost/"
+                if (!u.startsWith("http://") && !u.startsWith("https://")) u = "https://$u"
+                return "$u/"
+            }
 
         val authHeader: String
             get() = "Basic " + Base64.encodeToString(
@@ -57,7 +69,8 @@ class Config private constructor(private val prefs: SharedPreferences) {
     val current: Settings get() = _state.value
 
     companion object {
-        const val DEFAULT_HUB_URL = "https://turma.xerktech.com"
+        // No baked-in hub; the operator enters it on the login screen.
+        const val DEFAULT_HUB_URL = ""
         private const val KEY_URL = "hub_url"
         private const val KEY_USER = "hub_user"
         private const val KEY_PASS = "hub_pass"

@@ -12,42 +12,69 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 
-private val Accent = Color(0xFF7AA2F7)
-private val AccentDark = Color(0xFF3D59A1)
-
-private val DarkColors = darkColorScheme(
-    primary = Accent,
-    onPrimary = Color(0xFF0B0E14),
-    secondary = Color(0xFF9ECE6A),
-    background = Color(0xFF0B0E14),
-    onBackground = Color(0xFFC0CAF5),
-    surface = Color(0xFF12161F),
-    onSurface = Color(0xFFC0CAF5),
-    surfaceVariant = Color(0xFF1A1F2B),
-    onSurfaceVariant = Color(0xFF9AA5CE),
-    error = Color(0xFFF7768E),
+private val LightScheme = lightColorScheme(
+    primary = AccentLight,
+    onPrimary = Color.White,
+    primaryContainer = Color(0xFFDCE9F9),
+    onPrimaryContainer = Color(0xFF0B3B6E),
+    secondary = AccentLight,
+    onSecondary = Color.White,
+    background = PageLight,
+    onBackground = InkLight,
+    surface = SurfaceLight,
+    onSurface = InkLight,
+    surfaceVariant = Color(0xFFF0EFEA),
+    onSurfaceVariant = Ink2Light,
+    surfaceContainerHighest = FieldLight,
+    outline = HairlineLight,
+    outlineVariant = HairlineLight,
+    error = Critical,
+    onError = Color.White,
+    scrim = Color(0x66000000),
 )
 
-private val LightColors = lightColorScheme(
+private val DarkScheme = darkColorScheme(
     primary = AccentDark,
-    background = Color(0xFFF5F6FA),
-    surface = Color(0xFFFFFFFF),
-    error = Color(0xFFC53B53),
+    onPrimary = Color(0xFF06121F),
+    primaryContainer = Color(0xFF16324F),
+    onPrimaryContainer = Color(0xFFCFE2FA),
+    secondary = AccentDark,
+    onSecondary = Color(0xFF06121F),
+    background = PageDark,
+    onBackground = InkDark,
+    surface = SurfaceDark,
+    onSurface = InkDark,
+    surfaceVariant = Color(0xFF232321),
+    onSurfaceVariant = Ink2Dark,
+    surfaceContainerHighest = FieldDark,
+    outline = HairlineDark,
+    outlineVariant = HairlineDark,
+    error = Color(0xFFE66767),
+    onError = Color(0xFF1A0606),
+    scrim = Color(0x99000000),
 )
 
-/** Turma status/PR/state colors shared across the UI. */
+/**
+ * Semantic status/PR/chart colors shared across the UI. These are theme-agnostic
+ * in the web tokens (good/warning/critical are never redefined for dark), so a
+ * plain object is safe — only the Material scheme above flips with the theme.
+ */
 object TurmaColors {
-    val working = Color(0xFF9ECE6A)
-    val idle = Color(0xFF7AA2F7)
-    val waiting = Color(0xFFE0AF68)
-    val stopped = Color(0xFF565F89)
-    val prOpen = Color(0xFF9ECE6A)
-    val prDraft = Color(0xFF565F89)
-    val prMerged = Color(0xFFBB9AF7)
-    val prClosed = Color(0xFFF7768E)
-    val checkPass = Color(0xFF9ECE6A)
-    val checkFail = Color(0xFFF7768E)
-    val checkPending = Color(0xFFE0AF68)
+    val working = Good
+    val idle = AccentDark
+    val waiting = Warning
+    val stopped = Muted
+    val good = Good
+    val warning = Warning
+    val critical = Critical
+    val prOpen = Good
+    val prDraft = Muted
+    val prMerged = Purple
+    val prClosed = Critical
+    val checkPass = Good
+    val checkFail = Critical
+    val checkPending = Warning
+    val series = ChartSeries
 }
 
 @Composable
@@ -55,15 +82,17 @@ fun TurmaTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
     content: @Composable () -> Unit,
 ) {
-    val colors = if (darkTheme) DarkColors else LightColors
+    val colors = if (darkTheme) DarkScheme else LightScheme
     val view = LocalView.current
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as? Activity)?.window ?: return@SideEffect
-            window.statusBarColor = colors.background.toArgb()
-            window.navigationBarColor = colors.background.toArgb()
-            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
+            window.statusBarColor = Color.Transparent.toArgb()
+            window.navigationBarColor = Color.Transparent.toArgb()
+            val insets = WindowCompat.getInsetsController(window, view)
+            insets.isAppearanceLightStatusBars = !darkTheme
+            insets.isAppearanceLightNavigationBars = !darkTheme
         }
     }
-    MaterialTheme(colorScheme = colors, content = content)
+    MaterialTheme(colorScheme = colors, typography = TurmaTypography, content = content)
 }
