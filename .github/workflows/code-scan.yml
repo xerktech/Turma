@@ -182,3 +182,18 @@ jobs:
       # refusal to install unverified bits. Pure shell + a curl stub.
       - name: Native bootstrap tests (agent/native/bootstrap.sh)
         run: ./agent/tests/test_bootstrap.sh
+      # The native launcher supervises the reverse tunnel, which every web
+      # terminal rides. Its failure mode is silent and permanent — the host still
+      # heartbeats, so it reads ONLINE while every session reads "terminal
+      # offline" — so nothing surfaces a regression here until an operator
+      # notices. Covers the respawn, the missing-node heal, and the manager pid
+      # the tunnel's poke signals. Pure shell + node/python3 stubs.
+      - name: Native launcher tests (agent/native/turma-agent)
+        run: ./agent/tests/test_turma_agent.sh
+      # install.sh's sudo probe gates every apt prerequisite, and a wrong "no"
+      # is silent: it skips node behind one warning while the install still
+      # reports success, leaving a host that reads online with every session
+      # reading "terminal offline". Covers the piped-quickstart prompt, the
+      # unattended no-hang, NOPASSWD, and a declined password. Shell + sudo stubs.
+      - name: Native installer sudo-probe tests (agent/native/install.sh)
+        run: ./agent/tests/test_install_sudo.sh

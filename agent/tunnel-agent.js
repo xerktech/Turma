@@ -788,16 +788,23 @@ function stopAllWatches() {
 
 // Nudge the session-manager process (hub-agent.py) to heartbeat immediately so
 // a just-queued hub command is delivered in that beat's reply rather than up
-// to a whole TURMA_INTERVAL later. entrypoint.sh `exec`s hub-agent.py as PID 1
-// and starts this tunnel as a child, so PID 1 is the manager; it installs a
-// SIGUSR1 handler that cuts its interval sleep short. Best-effort — a failed
-// signal (e.g. running outside that entrypoint) just falls back to the
-// scheduled beat.
+// to a whole TURMA_INTERVAL later. The manager installs a SIGUSR1 handler that
+// cuts its interval sleep short.
+//
+// Which pid that is depends on how the agent was launched, so the launcher
+// names it: turma-agent exports TURMA_MANAGER_PID (its own $$, which `exec`
+// makes the manager's). PID 1 is the fallback for the container, where
+// entrypoint.sh `exec`s hub-agent.py as PID 1 — but ONLY there. On a native
+// install PID 1 is systemd, and signalling it raised EPERM on every poke, so
+// every hub command silently waited out a full beat instead of landing in
+// about a round-trip. Still best-effort: a failed signal costs latency, never
+// correctness, since the scheduled beat delivers the command anyway.
 function pokeHeartbeat() {
+  const pid = Number(process.env.TURMA_MANAGER_PID) || 1;
   try {
-    process.kill(1, "SIGUSR1");
+    process.kill(pid, "SIGUSR1");
   } catch (err) {
-    log(`poke failed: ${(err && err.message) || err}`);
+    log(`poke failed (pid ${pid}): ${(err && err.message) || err}`);
   }
 }
 

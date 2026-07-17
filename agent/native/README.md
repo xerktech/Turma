@@ -30,7 +30,9 @@ no inbound exposure.
 | claude (`@anthropic-ai/claude-code`) | npm -g | no |
 | gh | apt | yes |
 
-Run with `--no-install-deps` to skip all of that and only lay down files.
+Most of that column says **yes**, so unless you have NOPASSWD sudo the installer
+has to ask for your password — see below. Run with `--no-install-deps` to skip
+all of it and only lay down files.
 
 ## Install
 
@@ -38,14 +40,31 @@ No checkout needed — `bootstrap.sh` fetches the latest native release,
 checksum-verifies it, and hands off to the `install.sh` inside it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/xerktech/turma/main/agent/native/bootstrap.sh | bash
+sudo -v && curl -fsSL https://raw.githubusercontent.com/xerktech/turma/main/agent/native/bootstrap.sh | bash
 ```
+
+The leading `sudo -v` authenticates you once, up front, so the apt prerequisites
+in the table above actually get installed. The installer will also prompt on its
+own if you skip it, but priming is better: you answer the password prompt while
+you are still looking at the terminal, rather than partway through the install.
+
+> **Don't** run it as `curl … | sudo bash`. The install itself must run as **you**
+> — it installs into your `$HOME` and wires your systemd **user** service. As root
+> it would land in `/root` and run as the wrong user. Only the prerequisites need
+> root, and the installer sudo's those individually.
+
+If you have neither sudo nor the prerequisites, the installer says exactly what
+is missing and carries on (it's idempotent — install the tool, re-run it). Watch
+for a **node** warning in particular: node runs the reverse tunnel, so without it
+the agent still comes up and reports online, but every session on the host reads
+*"terminal offline"* in the UI. The agent retries for node on its own, so
+installing it heals the terminals within seconds — no restart.
 
 Everything after `-s --` is passed straight through to `install.sh`, so the
 one-liner supports every option the checkout does:
 
 ```sh
-curl -fsSL .../bootstrap.sh | bash -s -- --autostart --prefix /opt/turma
+sudo -v && curl -fsSL .../bootstrap.sh | bash -s -- --autostart --prefix /opt/turma
 ```
 
 Or, from a repo checkout / an extracted release tarball:
