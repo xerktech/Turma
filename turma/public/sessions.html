@@ -1761,9 +1761,15 @@ function selectSession(id) {
   pendingSelect = null;
   pendingEnded = null;
   followedSpawn = false;
-  // Already viewing this session in chat — clicking it again should be a no-op,
-  // not tear down and rebuild the live tail (which reads as a page reload).
-  if (id === currentId && viewMode === "chat") return;
+  // Already viewing this session in chat — don't tear down and rebuild the live
+  // tail (which reads as a page reload). On DESKTOP the stage is always visible
+  // beside the list, so this is the intended do-nothing. On MOBILE, though,
+  // "backing out" only HIDES the stage — currentId/viewMode stay put so the tail
+  // stays warm, and the sidebar card is tappable again — so a re-tap must
+  // re-reveal that warm stage rather than no-op (or the session becomes
+  // unopenable once you've left it). enterStage() is idempotent and gated on
+  // isNarrow(), so it re-reveals on mobile and no-ops on desktop (XERK-17).
+  if (id === currentId && viewMode === "chat") { enterStage(); return; }
   currentId = id;
   viewMode = "chat";
   resetEndedBar();   // leaving any ended-session view (incl. one just resumed)
