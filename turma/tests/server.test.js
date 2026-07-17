@@ -26,6 +26,11 @@ process.env.TURMA_PASSWORD = "hubpass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.TURMA_TRIGGER_TOKEN = "triggertok"; // programmatic /api/trigger bearer
 process.env.NTFY_URL = "http://ntfy.test"; // enables notify(); fetch is stubbed
+// Control-channel liveness, wound right down so the beat/drop is testable in ms
+// rather than the 30s/90s the fleet runs. No other test opens a real
+// /agent/control socket, so nothing else feels these.
+process.env.CONTROL_PING_EVERY_MS = "50";
+process.env.CONTROL_DEAD_AFTER_MS = "400";
 process.env.STATE_FILE = path.join(
   os.tmpdir(),
   `turma-test-state-${process.pid}.json`
@@ -2817,4 +2822,92 @@ test("SSE /api/events: pushes a `removed` event when a host is deleted", async (
 
   req.destroy();
   res.destroy();
+});
+
+// ---- agent control channel: liveness ---------------------------------------
+// The hub half of the wedged-tunnel fix. The agent cannot see a protocol ping
+// (Node's built-in WebSocket handles 0x9 internally and exposes no ping event),
+// so the hub must also beat an app-level {ping} it CAN see — that frame is the
+// whole reason a restarted hub no longer strands every terminal. The 0x9 stays
+// for Cloudflare's idle timeout and for the pong that proves the agent is live.
+
+const CONTROL_PATH = "/agent/control?name=livehost&token=agenttok";
+
+// Wait for a frame matching `pred`, or resolve null. Frames arrive on a beat,
+// so this polls the array collectFrames fills rather than racing a single read.
+const waitFrame = (frames, pred, ms = 2000) =>
+  new Promise((resolve) => {
+    const t = setInterval(() => {
+      const hit = frames.find(pred);
+      if (hit) {
+        clearInterval(t);
+        clearTimeout(k);
+        resolve(hit);
+      }
+    }, 10);
+    const k = setTimeout(() => {
+      clearInterval(t);
+      resolve(null);
+    }, ms);
+  });
+
+const jsonFrame = (f) => {
+  if (f.op !== 0x1) return null;
+  try { return JSON.parse(f.payload.toString("utf8")); } catch { return null; }
+};
+
+test("control WS: hub beats an app-level {ping} the agent can actually see", async () => {
+  const { socket, statusLine, leftover } = await wsConnect(CONTROL_PATH);
+  try {
+    assert.match(statusLine, /101/);
+    const frames = collectFrames(socket, leftover);
+    // The app-level ping: a text frame, because the protocol ping below is
+    // invisible to the agent's WebSocket client.
+    const ping = await waitFrame(frames, (f) => jsonFrame(f) && jsonFrame(f).ping);
+    assert.ok(ping, "hub never sent an app-level {ping} — agents cannot detect a dead hub without it");
+    // And the protocol ping is still there (Cloudflare idle timeout + pong).
+    assert.ok(await waitFrame(frames, (f) => f.op === 0x9), "hub stopped sending the protocol ping");
+  } finally {
+    socket.destroy();
+  }
+});
+
+test("control WS: a channel that never pongs is dropped, so terminalOnline stops lying", async () => {
+  const { socket, leftover } = await wsConnect(CONTROL_PATH);
+  try {
+    collectFrames(socket, leftover);
+    // This raw socket answers nothing — a half-open channel to a host that died
+    // without a FIN. The hub must reap it rather than keep reporting the host's
+    // terminal as online while every Attach hangs.
+    const closed = await new Promise((resolve) => {
+      socket.on("close", () => resolve(true));
+      setTimeout(() => resolve(false), 3000);
+    });
+    assert.ok(closed, "hub kept a silent (half-open) control channel forever");
+  } finally {
+    socket.destroy();
+  }
+});
+
+test("control WS: a channel that pongs is kept past the dead-after window", async () => {
+  const { socket, leftover } = await wsConnect(CONTROL_PATH);
+  try {
+    // Mirror what a real agent's WebSocket does for free: auto-pong every ping.
+    // Client->server frames must be masked, so encode by hand.
+    const parse = wsParser((op) => {
+      if (op !== 0x9) return;
+      const mask = Buffer.from([1, 2, 3, 4]);
+      socket.write(Buffer.concat([Buffer.from([0x80 | 0xa, 0x80]), mask]));
+    });
+    if (leftover && leftover.length) parse(leftover);
+    socket.on("data", parse);
+    const closed = await new Promise((resolve) => {
+      socket.on("close", () => resolve(true));
+      // Well past CONTROL_DEAD_AFTER_MS: a ponging peer must survive.
+      setTimeout(() => resolve(false), 1500);
+    });
+    assert.ok(!closed, "hub dropped a live channel that was answering its pings");
+  } finally {
+    socket.destroy();
+  }
 });

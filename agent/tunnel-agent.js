@@ -811,6 +811,13 @@ function pokeHeartbeat() {
 // ws(s):// base derived from TURMA_URL's scheme.
 const WS_BASE = TURMA_URL.replace(/^http/, "ws").replace(/\/+$/, "");
 
+// How long the control channel may go completely silent before we treat the hub
+// as gone and reconnect. The hub beats every CONTROL_PING_EVERY_MS (30s), so
+// this is 3 missed beats — long enough that a slow link or a paused hub isn't
+// mistaken for a dead one.
+const CONTROL_IDLE_TIMEOUT_MS = Number(process.env.TURMA_CONTROL_IDLE_TIMEOUT_MS) || 90 * 1000;
+const CONTROL_WATCHDOG_EVERY_MS = Number(process.env.TURMA_CONTROL_WATCHDOG_EVERY_MS) || 15 * 1000;
+
 function log(msg) {
   console.log(`[tunnel-agent] ${msg}`);
 }
@@ -929,11 +936,54 @@ function connectControl() {
   const ws = new WebSocket(url);
   controlWs = ws;
 
+  // Liveness. A dead hub does not necessarily close this socket: when the hub
+  // is reached through Cloudflare, the edge holds our end open after the origin
+  // dies, so no 'close' ever fires and the reconnect below never runs. The
+  // channel then stays wedged forever — every session reads "terminal offline"
+  // while hub-agent.py's heartbeat (a separate HTTP POST) keeps the host green.
+  //
+  // We cannot see the hub's protocol ping: Node's built-in WebSocket answers it
+  // internally and exposes neither a ping event nor a ping method. So the hub
+  // also sends an app-level {ping} we CAN see, and silence is what we act on.
+  let lastMsgAt = Date.now();
+  let hubPings = false; // set once the hub proves it sends app-level pings
+  let watchdog = null;
+
+  // Reconnect at most once per socket, whether we got here from a real close or
+  // from the watchdog. Deliberately does NOT wait on ws.close(): closing a
+  // half-open socket waits for a peer close frame that is never coming, so the
+  // 'close' event we would be relying on may never arrive. We schedule the
+  // reconnect ourselves and let the doomed socket be reaped whenever it likes.
+  let retired = false;
+  const retire = (reason) => {
+    if (retired) return;
+    retired = true;
+    if (watchdog) clearInterval(watchdog);
+    // The channel the deltas ride is gone; stop every tail loop. The hub
+    // re-arms the watches once we reconnect, so no state is lost.
+    if (controlWs === ws) controlWs = null;
+    stopAllWatches();
+    const wait = backoff;
+    backoff = Math.min(backoff * 2, 30000);
+    log(`control channel ${reason}; reconnecting in ${Math.round(wait / 1000)}s`);
+    try { ws.close(); } catch {}
+    setTimeout(connectControl, wait);
+  };
+
   ws.addEventListener("open", () => {
     backoff = 1000;
+    lastMsgAt = Date.now();
     log(`control channel connected to ${WS_BASE} as ${NAME}`);
+    // Armed only once the hub has proven it pings (below), so a hub predating
+    // the app-level ping never trips this — it just keeps the old behaviour.
+    watchdog = setInterval(() => {
+      if (!hubPings || retired) return;
+      const idle = Date.now() - lastMsgAt;
+      if (idle > CONTROL_IDLE_TIMEOUT_MS) retire(`silent for ${Math.round(idle / 1000)}s (hub gone)`);
+    }, CONTROL_WATCHDOG_EVERY_MS);
   });
   ws.addEventListener("message", (ev) => {
+    lastMsgAt = Date.now(); // any frame proves the hub is still there
     let msg;
     try {
       msg = JSON.parse(typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString());
@@ -941,7 +991,11 @@ function connectControl() {
       return;
     }
     if (!msg) return;
-    if (msg.open) {
+    if (msg.ping) {
+      // The hub's liveness beat. Nothing to do but note that this hub sends
+      // them, which is what arms the watchdog above.
+      hubPings = true;
+    } else if (msg.open) {
       const port = Number(msg.port) || DEFAULT_TTYD_PORT;
       openDataChannel(String(msg.open), port);
     } else if (msg.watch) {
@@ -956,19 +1010,7 @@ function connectControl() {
       pokeHeartbeat();
     }
   });
-  const reconnect = () => {
-    const wait = backoff;
-    backoff = Math.min(backoff * 2, 30000);
-    setTimeout(connectControl, wait);
-  };
-  ws.addEventListener("close", () => {
-    // The channel the deltas ride is gone; stop every tail loop. The hub
-    // re-arms the watches once we reconnect, so no state is lost.
-    if (controlWs === ws) controlWs = null;
-    stopAllWatches();
-    log(`control channel closed; reconnecting in ${Math.round(backoff / 1000)}s`);
-    reconnect();
-  });
+  ws.addEventListener("close", () => retire("closed"));
   ws.addEventListener("error", (e) => {
     // 'close' fires after 'error'; let it drive the reconnect to avoid double.
     log(`control channel error: ${e.message || "connection failed"}`);

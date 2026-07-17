@@ -688,6 +688,40 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   `agent/tests/tunnel-agent.test.js`.
 - Tailing runs only while a client is watching, so idle sessions cost nothing.
 
+#### Control-channel liveness
+
+- **Both ends prove the channel rather than assume it**, because a heartbeat says nothing about it: the
+  heartbeat is a fresh HTTP POST while the tunnel is one long-lived socket, so they die independently.
+  A wedged tunnel therefore reads as a perfectly healthy host — `online` (green, heartbeating) with
+  `terminalOnline:false`, i.e. every session on it saying **"terminal offline"** and no attach possible.
+- The hub beats every `CONTROL_PING_EVERY_MS` (30s) and drops a channel silent for
+  `CONTROL_DEAD_AFTER_MS` (90s, 3 missed beats); the agent reconnects when nothing arrives for
+  `TURMA_CONTROL_IDLE_TIMEOUT_MS` (90s).
+- It sends **two pings, and needs both**:
+  - the **protocol ping** (`0x9`) beats Cloudflare's idle timeout, and is what every agent auto-pongs —
+    Node's built-in WebSocket answers it internally, so the returning `0xa` is liveness the hub gets
+    from OLD agents for free. That is how the hub reaps a half-open channel to a host that died without
+    a FIN, which it would otherwise report as `terminalOnline` while each Attach hung to
+    `openChannel`'s timeout.
+  - the **app-level `{ping}`** text frame is the same beat in a form the AGENT can see: that same
+    internal handling means a browser-style WebSocket exposes **no ping event and no ping method**, so
+    the protocol ping is invisible to it and it cannot send one either. This frame is the only liveness
+    signal its `onmessage` can observe. An agent predating it ignores the unknown key.
+- **A dead hub does not necessarily close the socket.** Reached through Cloudflare, the edge holds the
+  agent's end open after the origin dies, so no `close` fires and the reconnect never runs — the
+  channel wedges **forever** while the manager keeps the host green. This is what stranded the whole
+  fleet's terminals on a hub restart, and why silence (not a close event) is what the agent acts on.
+- The agent's watchdog is armed **only once the hub has proven it app-pings**, so a new agent against a
+  hub predating the ping keeps the old behaviour instead of reconnect-looping every idle timeout.
+- `retire()` is idempotent per-socket and **never waits on `ws.close()`**: closing a half-open socket
+  waits for a peer close frame that is never coming, so the `close` event it would rely on may never
+  fire. It schedules the reconnect itself and lets the doomed socket be reaped whenever.
+- Supervision does not cover this and cannot: the native tunnel supervisor only respawns on process
+  **exit**, and a wedged socket never exits.
+- Tests: the control-channel cases in `agent/tests/tunnel-agent.test.js` (which drive the real script
+  as a child process against a fake hub that goes silent — the bug is in the socket lifecycle, so a
+  mocked-WebSocket unit test would have passed all along) and in `turma/tests/server.test.js`.
+
 ### Live working footer and agent list
 
 - The same control channel also carries the session's **live working footer** scraped from the tmux
