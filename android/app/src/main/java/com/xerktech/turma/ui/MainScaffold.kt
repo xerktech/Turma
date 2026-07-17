@@ -47,7 +47,7 @@ fun MainScaffold(
 }
 
 @Composable
-private fun TurmaBottomNav(current: TopDest, onNavigate: (TopDest) -> Unit) {
+internal fun TurmaBottomNav(current: TopDest, onNavigate: (TopDest) -> Unit) {
     NavigationBar(
         containerColor = MaterialTheme.colorScheme.surface,
         tonalElevation = 0.dp,

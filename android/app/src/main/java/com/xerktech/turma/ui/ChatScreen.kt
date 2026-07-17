@@ -45,6 +45,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -75,15 +76,31 @@ import com.xerktech.turma.vm.MicState
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChatScreen(host: String, sessionId: String, onBack: () -> Unit, onTerminal: () -> Unit) {
+fun ChatScreen(
+    host: String,
+    sessionId: String,
+    onBack: () -> Unit,
+    onTerminal: () -> Unit,
+    showBack: Boolean = true,
+) {
     val context = LocalContext.current
     val app = context.applicationContext as TurmaApplication
-    val vm: ChatViewModel = viewModel(factory = ChatViewModel.factory(app, host, sessionId))
+    // Key the VM per (host, session): when the two-pane detail swaps to a
+    // different session this yields a fresh ChatViewModel rather than reusing the
+    // previous session's store entry.
+    val vm: ChatViewModel = viewModel(
+        key = "chat:$host:$sessionId",
+        factory = ChatViewModel.factory(app, host, sessionId),
+    )
     val state by vm.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
 
     LaunchedEffect(Unit) { vm.onEnter() }
     LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
+    // Stop this session's live tail/dictation the moment its chat leaves the
+    // composition (detail pane swapped, or navigated away) — the keyed VM object
+    // may linger in the store, but its sockets must not.
+    DisposableEffect(host, sessionId) { onDispose { vm.onLeave() } }
 
     val displayEntries = remember(state.entries, state.liveTurn) {
         if (state.liveTurn.isNotBlank())
@@ -115,7 +132,11 @@ fun ChatScreen(host: String, sessionId: String, onBack: () -> Unit, onTerminal: 
                         }
                     }
                 },
-                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+                navigationIcon = {
+                    if (showBack) {
+                        IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
+                    }
+                },
                 actions = {
                     VerbosityMenu(state.verbosity) { vm.setVerbosity(it) }
                     IconButton(onClick = onTerminal) { Icon(Icons.Filled.Terminal, "Terminal") }
