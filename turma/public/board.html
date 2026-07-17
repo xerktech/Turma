@@ -385,11 +385,27 @@ $panel.addEventListener("click", (e) => {
     openTicketState.editing = false;
     return paintDetail();
   }
-  if (e.target.closest("[data-repo-save]")) {
-    const sel = $panel.querySelector("[data-repo-select]");
-    if (sel) saveRepo(sel.value);
-    return;
+});
+// Choosing an option IS the save — the dropdown is the setting, so picking a repo
+// answers the question the row asked and there is nothing left to confirm.
+//
+// The regression this fixes: the picker used to need a separate Save, and closing
+// the panel — the ordinary way to leave a ticket — discarded the choice without a
+// word, snapping the row back to the model's guess. A control that looks like it
+// commits on pick must commit on pick.
+//
+// A re-pick of the value already showing saves nothing: it's not a change, and
+// firing a fleet-wide command to restate the current answer would be noise. It
+// still closes the picker, which is what a pick means.
+$panel.addEventListener("change", (e) => {
+  if (!openTicketState) return;
+  const sel = e.target.closest("[data-repo-select]");
+  if (!sel) return;
+  if (sel.value === B.repoPickerValue(openTicketState.ticket)) {
+    openTicketState.editing = false;
+    return paintDetail();
   }
+  saveRepo(sel.value);
 });
 $backdrop.addEventListener("click", (e) => { if (e.target === $backdrop) closeDetail(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && openTicketState) closeDetail(); });

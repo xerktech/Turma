@@ -480,6 +480,19 @@
     return bits.join(" ");
   }
 
+  // The picker's current answer, as one of the values its options carry. The
+  // handler reads this to know whether a selection actually CHANGED anything, so
+  // it must be derived exactly the way repoPickerHtml preselects — which is why
+  // both go through here rather than each deciding for itself.
+  //
+  // Only a MANUAL pin is an answer of the operator's. An auto guess of "Turma" is
+  // the model's answer, and their setting is still "let it decide".
+  function repoPickerValue(t) {
+    const g = (t && t.repoGuess) || null;
+    if (!g || !g.manual) return "__auto__";
+    return g.repo || "__none__";
+  }
+
   // The picker itself, shown in place of the row once "Change" is clicked. Its
   // options are the host's OWN candidate list (jira.repoOptions), which is the
   // same list set_jira_repo allowlists against — so every option here is one the
@@ -489,12 +502,15 @@
   // stray empty value: "no repo fits" and "let the model decide" are genuinely
   // different answers, and the agent treats them differently (a pin vs. dropping
   // the pin), so the UI must not blur them either.
+  //
+  // **Choosing an option IS the save** — there is no Save button. The dropdown is
+  // the setting, and it reads as one: an operator who picks a repo and clicks away
+  // has answered the question the row asked, and every one of these options is a
+  // complete answer on its own. It used to require a separate Save, which silently
+  // threw the choice away on a click-away and snapped the row back to the model's
+  // guess, so the pin only ever landed for someone who knew to press it.
   function repoPickerHtml(t, options) {
     const g = (t && t.repoGuess) || null;
-    // Only a MANUAL repo preselects. An auto guess of "Turma" is the model's
-    // answer, and the operator's current setting is "let it decide" — preselecting
-    // Turma would misreport that as a pin they'd made, and quietly turn a Save
-    // they meant as "leave it alone" into one.
     const pinned = !!(g && g.manual);
     const cur = pinned && g.repo ? g.repo : null;
     const opts = (options || []).filter(o => o && o.name);
@@ -503,8 +519,9 @@
     // back in as its own option, so it can stay `selected`.
     //
     // Without this the select has nothing selected and the browser falls back to
-    // its first option — "Let the agent decide" — which both misreports the
-    // current state and turns an untouched Save into a silent release of the pin.
+    // its first option — "Let the agent decide" — which misreports the current
+    // state, and (since the handler saves what changed against the preselection)
+    // would read a re-pick of the pin itself as a release of it.
     // `_apply_triage` deliberately keeps rendering such a repo (absence from the
     // list isn't evidence the pin is wrong), so this state is reachable by design
     // and the picker has to tell the same story the row does.
@@ -529,8 +546,10 @@
       ${group("Cloned", cloned)}
       ${group("Not cloned", uncloned)}
     </select>`;
+    // Cancel stays: it's the way out for someone who opened the picker by mistake
+    // and doesn't want to re-pick their existing answer to close it. Clicking away
+    // does the same — with nothing changed there is nothing to save.
     return `<div class="td-repo-edit">${sel}
-      <button type="button" class="td-edit" data-repo-save="1">Save</button>
       <button type="button" class="td-edit" data-repo-cancel="1">Cancel</button>
       ${opts.length || orphan ? "" : `<span class="td-dim">No repos reported for this org</span>`}
     </div>`;
@@ -711,7 +730,7 @@
   const api = {
     CATEGORIES, mergeSites, categoryOf, ticketSort, orgColor, orgName, ageStr,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
-    repoChipHtml, repoFieldHtml, repoPickerHtml,
+    repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   };
