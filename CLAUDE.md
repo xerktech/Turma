@@ -583,6 +583,32 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   config, defaults `CLAUDE_PROJECTS_ROOT=$HOME/.claude/projects` (the one env that decouples from the
   container's hardcoded `/root`) and `DEVICE_NAME=$(hostname)`, idles on missing claude creds,
   reconciles + supervises the tunnel, execs the manager.
+- The config is **validated before it is sourced**, and a bad one **idles** rather than exiting.
+  - The launcher `.`-sources the env file, so a non-assignment line does not fail — it RUNS. A
+    YAML-style `JIRA_SITE: "x"` becomes the command `JIRA_SITE:`, exits 127, and under `set -e` takes
+    the launcher down before it execs the manager.
+  - The two readers of that file **disagree** about such a line, which is what made this pathological:
+    systemd's `EnvironmentFile` parser only warns ("Ignoring invalid environment assignment"), while
+    our `.` dies. `Restart=always` then rebuilt the unit every `RestartSec` forever — spaced just wide
+    enough to stay under systemd's start-rate limit, so it never reached the `failed` state that would
+    have made it visible. Each pass reaped the tunnel, so every session read **"terminal offline"**
+    (same symptom as a missing node, different cause), with one `command not found` per interval in
+    the journal as the only evidence.
+  - So the check is anchored on the `=` directly after the name: `JIRA_TOKEN: "a=b"` carries an `=` in
+    its VALUE and slips past any looser test. `export` stays legal — not the documented format, but
+    sourcing has always taken it, and the guard must not fail a config that works today.
+  - **Idling, never `exit 1`.** A launcher that refuses to start is indistinguishable, to systemd, from
+    one worth restarting in five seconds — the exit IS the loop. Idling self-heals (fix the file,
+    restart) and states the fault once, where it will be read. `--preflight` is the one exception
+    (`install.sh --verify` must answer and leave), and it exits 1.
+  - Nothing is sourced in that state: a half-applied config points the manager at the wrong hub, or
+    none, which is worse than not running.
+  - The report carries **line numbers and key names, never values** — the file is `chmod 600` and holds
+    `TURMA_TOKEN`/`JIRA_TOKEN` while the banner goes to the journal, a different audience with
+    different permissions. A malformed secret is still a secret. (systemd's own warning does echo the
+    value; that is not a licence to leak it twice.)
+  - Tests: `agent/tests/test_turma_agent.sh` (invalid line idles + starts neither tunnel nor manager,
+    no value leak, `--preflight` exits without hanging, a valid config still loads).
 - The tunnel is **supervised** here, unlike in the container: it is re-exec'd as
   `turma-agent --tunnel-supervisor` (a respawn loop, not a bare background node), because a native
   install is the only place its runtime can be MISSING — node is an apt prereq, not a baked layer.

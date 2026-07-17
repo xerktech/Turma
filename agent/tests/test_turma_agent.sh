@@ -180,5 +180,98 @@ fi
 pkill -f "$WORK/stub-bin/python3" 2>/dev/null || true
 pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
 
+# --- Case 5: a non-assignment config line idles, and does NOT crash-loop -----
+# The launcher SOURCES the config, so a YAML-style line runs as a command and
+# exits 127. Under systemd's Restart=always that became a silent forever-loop
+# that reaped the tunnel on every pass — the host read ONLINE while every session
+# on it read "terminal offline". The fix is to refuse to start, not to die: these
+# cases pin the difference, which is the whole bug.
+echo "case: an invalid config line is reported and idled on"
+BADCFG="$WORK/bad.env"
+cat > "$BADCFG" <<'EOF'
+# a comment, and a blank line, are both fine
+
+TURMA_URL=https://hub.invalid
+JIRA_SITE: "xerktech.atlassian.net"
+JIRA_TOKEN: "ATATT3xFf-s3cret-whose-value-contains=an-equals-sign"
+EOF
+rm -f "$WORK/manager.log"
+TURMA_AGENT_ENV="$BADCFG" PATH="$WORK/stub-bin:$PATH" setsid \
+  "$PREFIX/bin/turma-agent" >"$WORK/bad.log" 2>&1 &
+BADPID=$!
+if wait_for logged "Invalid line" "$WORK/bad.log"; then
+  ok "named the file as the problem"
+else
+  fail "no invalid-config report: $(cat "$WORK/bad.log")"
+fi
+# Both offending lines, by number — including the one whose VALUE holds an `=`,
+# which is what a looser "does it contain =" check would wave through.
+if grep -q 'line 4: JIRA_SITE' "$WORK/bad.log" && grep -q 'line 5: JIRA_TOKEN' "$WORK/bad.log"; then
+  ok "named both bad lines with their line numbers"
+else
+  fail "did not report both bad lines: $(cat "$WORK/bad.log")"
+fi
+# This banner goes to the journal; the config is chmod 600 and holds tokens. A
+# malformed secret is still a secret, so the report carries names, never values.
+if grep -q 's3cret' "$WORK/bad.log"; then
+  fail "the invalid-config report leaked a token value into the journal"
+else
+  ok "reported the bad lines without echoing their values"
+fi
+sleep 1
+if kill -0 "$BADPID" 2>/dev/null; then
+  ok "idled instead of exiting — systemd has nothing to restart-loop"
+else
+  fail "launcher exited on a bad config; Restart=always would loop it forever"
+fi
+# Nothing may start against a config we refused to load: not the manager (it
+# would report to the wrong hub, or none), and not the tunnel — the thing the
+# crash loop was reaping every RestartSec in the first place.
+if pgrep -f "$PREFIX/bin/turma-agent --tunnel-supervisor" >/dev/null 2>&1; then
+  fail "a supervisor was started despite the config being rejected"
+else
+  ok "started no tunnel against a config it never loaded"
+fi
+if [ -f "$WORK/manager.log" ]; then
+  fail "the manager was started with a config that never loaded"
+else
+  ok "started no manager either"
+fi
+kill "$BADPID" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+
+# --- Case 6: --preflight reports the same fault but never hangs --------------
+# install.sh --verify calls this; it must answer and leave.
+echo "case: --preflight reports an invalid config and exits nonzero"
+rc=0
+TURMA_AGENT_ENV="$BADCFG" PATH="$WORK/stub-bin:$PATH" timeout 10 \
+  "$PREFIX/bin/turma-agent" --preflight >"$WORK/pre.log" 2>&1 || rc=$?
+if [ "$rc" = "1" ]; then
+  ok "exited 1 rather than idling"
+elif [ "$rc" = "124" ]; then
+  fail "--preflight hung on a bad config — install.sh --verify would never return"
+else
+  fail "expected exit 1, got $rc: $(cat "$WORK/pre.log")"
+fi
+
+# --- Case 7: a valid config still loads, `export` and all --------------------
+# The guard must not fail a config that works today: sourcing has always taken an
+# `export` prefix and shell expansion in values.
+echo "case: a valid config is unaffected"
+GOODCFG="$WORK/good.env"
+cat > "$GOODCFG" <<'EOF'
+TURMA_URL=https://hub.invalid
+export TURMA_TOKEN=t
+MAX_SESSIONS=6
+EOF
+rc=0
+TURMA_AGENT_ENV="$GOODCFG" PATH="$WORK/stub-bin:$PATH" timeout 10 \
+  "$PREFIX/bin/turma-agent" --preflight >"$WORK/pre2.log" 2>&1 || rc=$?
+if [ "$rc" = "0" ]; then
+  ok "a plain KEY=value config (with an export line) still passes"
+else
+  fail "valid config rejected (rc=$rc): $(cat "$WORK/pre2.log")"
+fi
+
 if [ "$FAILED" = 0 ]; then echo "all turma-agent launcher tests passed"; else echo "FAILURES"; fi
 exit "$FAILED"

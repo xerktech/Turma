@@ -22,11 +22,84 @@ PREFIX="$(dirname "$SELF_DIR")"             # $PREFIX
 # Load config. Same plain KEY=value format systemd's EnvironmentFile consumes;
 # `set -a` exports every assignment so it reaches hub-agent.py as an env var.
 CFG="${TURMA_AGENT_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/turma-agent/turma-agent.env}"
+
+# Every non-assignment line in the config, as `<line#>:<text>`. We SOURCE this
+# file, so such a line is not an inert typo — it RUNS. A YAML-style
+# `JIRA_SITE: "..."` becomes the command `JIRA_SITE:`, which exits 127 and, under
+# `set -e`, takes the launcher with it before it ever execs the manager.
+#
+# That is a uniquely bad way to fail, because the two readers of this file
+# DISAGREE about it: systemd's EnvironmentFile parser merely warns ("Ignoring
+# invalid environment assignment") and carries on, while our `.` dies. With
+# Restart=always the unit then rebuilds every RestartSec forever — a loop spaced
+# just wide enough to stay under systemd's start-rate limit, so it never trips
+# the "failed" state that would make it visible. Each pass reaps and respawns the
+# tunnel, so every session on the host reads "terminal offline", and the only
+# evidence is one `command not found` per interval in the journal.
+#
+# Anchoring on the `=` directly after the name is the point: `JIRA_TOKEN: "a=b"`
+# has an `=` in its VALUE and slips past any looser check. A `#` comment, a blank
+# line, and an `export` prefix all stay legal — `export` is not the documented
+# format, but sourcing has always accepted it and this must not fail a config
+# that works today. Line-based, so a quoted value spanning lines reads as
+# invalid; systemd rejects those too, which is why the format has never had them.
+config_errors() {  # <file>
+  grep -nvE '^[[:space:]]*(#|$)|^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' "$1" || true
+}
+
+CFG_BAD=""
 if [ -f "$CFG" ]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "$CFG"
-  set +a
+  CFG_BAD="$(config_errors "$CFG")"
+  if [ -z "$CFG_BAD" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$CFG"
+    set +a
+  fi
+fi
+
+# A bad config is reported ONCE and then idled on — the same posture as the
+# missing Claude login below, and for the same reason: idling is self-healing
+# (fix the file, restart the unit) and it states the problem where an operator
+# will actually read it. Never `exit 1` here. That is precisely what produced the
+# invisible crash loop; a launcher that refuses to start is indistinguishable, to
+# systemd, from one that is worth starting again in five seconds.
+#
+# Nothing is sourced in this state: a half-applied config would leave the manager
+# reporting to the wrong hub, or none, which is worse than not running.
+if [ -n "$CFG_BAD" ]; then
+  # Report the line NUMBER and the leading name only — never the line. This file
+  # is chmod 600 and holds TURMA_TOKEN and JIRA_TOKEN, while this banner goes to
+  # the journal, which is a different audience with different permissions. A
+  # malformed secret is still a secret. (systemd's own warning for these lines
+  # does echo the value, which is not a reason for us to leak it a second time.)
+  # The name is all an operator needs to find the line in their editor.
+  cfg_bad_report() {
+    echo "$CFG_BAD" | awk '{
+      line = $0; sub(/^[0-9]+:/, "", line); num = $0; sub(/:.*$/, "", num)
+      sub(/^[ \t]+/, "", line)
+      name = (match(line, /^[A-Za-z_][A-Za-z0-9_]*/)) ? substr(line, 1, RLENGTH) : "(unreadable)"
+      printf "   line %s: %s ...\n", num, name
+    }'
+  }
+  echo "=================================================================="
+  echo " Invalid line(s) in $CFG"
+  echo " (values hidden — this file holds tokens; only names are shown)"
+  echo
+  cfg_bad_report
+  echo
+  echo " Expected plain KEY=value, one per line (the format systemd's"
+  echo " EnvironmentFile takes). A line like  JIRA_SITE: \"x\"  is YAML, not"
+  echo " shell: it runs as a command, and the agent cannot start."
+  echo
+  echo " Nothing from this file was loaded. Fix the line(s) above, then:"
+  echo "   systemctl --user restart turma-agent"
+  echo "=================================================================="
+  # --preflight is install.sh --verify's reporting hook: it must answer and
+  # leave, never hang. Every other entry point (the run path, and the tunnel
+  # supervisor that inherits this config) idles.
+  if [ "${1:-}" = "--preflight" ]; then exit 1; fi
+  exec sleep infinity
 fi
 
 # Native-safe defaults, applied only when the config left a key blank/unset (the
