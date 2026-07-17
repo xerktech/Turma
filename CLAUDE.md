@@ -124,12 +124,20 @@ This replaced the old model of one fixed-repo container per session.
   can't evict the state its ended card shows; it is not re-polled, same rule as a stopped session).
 - The closed history is a **cache of what a kill knew, not the record that it happened**. It buys the
   PR links and the original session id (so `resume` hands it straight back), from the instant of the
-  kill rather than a slow beat later. It is not the history: `closed.json` lives in `~/.turma`, which
-  on a container host is the image's writable layer and does not survive an agent update, and it keeps
-  only `CLOSED_PER_REPO` per repo regardless. **Anything that must still be there afterwards belongs
-  on the durable side** — the transcripts under the `~/.claude` mount (which `_resumable_report()`
-  re-derives from, and which is what keeps a killed session in the hub's Ended list across a restart)
-  and the hub's own archive.
+  kill rather than a slow beat later. It is not the history: `closed.json` keeps only
+  `CLOSED_PER_REPO` per repo, so the 6th kill in a repo evicts the oldest however durably it is
+  stored. **Anything that must still be there afterwards belongs on the durable side** — the
+  transcripts under the `~/.claude` mount (which `_resumable_report()` re-derives from, and which is
+  what keeps a killed session in the hub's Ended list across a restart), the hub's own archive, and
+  the ledgers `~/.turma` keeps beside it.
+- **`~/.turma`'s durability is the HOST's to provide, and no code here may assume it.** A native
+  install puts it in the invoking user's `$HOME`; a container must bind-mount it or it is the image's
+  writable layer, which an agent update recreates. The deployed stack mounts it (DockerOps
+  `compose/turma-truenas.yaml` → `/mnt/data/Docker/Turma-agent`), and the examples under
+  `examples/compose/` declare their own volume — but that is a deployment promise, so every ledger in
+  there still reconciles from disk rather than trusting itself. It went unmounted on the real stack
+  for a long while, which silently reverted a board repo pin and a ticket's session list on every
+  Watchtower image update.
 - Each repo's **"Resume"** picker lists **every prior Claude session for the repo** whose origin cwd
   is resumable on this host — `repo.resumable` from `_resumable_report()`: killed/deleted/pruned
   Turma sessions, repo-dir "terminal"/dev runs on the host, and older ones aged out of
@@ -500,6 +508,24 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - The ticket is carried on the session record as `ticket` = `{key, siteKey, url, summary, branch}`,
   persisted, heartbeated, and surviving kill/resume. **That record IS the ticket ↔ session link** —
   there is no hub-side ticket store, and the board reverse-indexes the fleet payload it already polls.
+- The record only answers **while it exists**, so a durable `transcriptId → ticket` ledger
+  (`~/.turma/jira-sessions.json`, `TICKET_LEDGER_PATH`) answers afterwards. It is the exact
+  counterpart of the usage attribution ledger, for the same reason: a killed session's ticket rides its
+  closed record, but `closed.json` keeps only `CLOSED_PER_REPO` per repo, and past that the only
+  channel still reporting the session is the `resumable` scan — re-derived from the transcripts on
+  disk, which know nothing of Jira. Keying on the transcript id (what that scan reports, and what the
+  Ended list dedupes on) is what re-attaches the two.
+  - Written in `_launch_tmux` at the one line that names a session's conversation, so **every** launch
+    records it (`_remember_ticket`, idempotent, no-op without a ticket). A restart-clear-context adds
+    its NEW transcript beside the old rather than replacing it: both worked the ticket, and both stay
+    separately resumable.
+  - `_backfill_ticket_ledger()` adopts sessions predating it from the registry + closed history (the
+    two records carrying both a ticket and a transcript id), keying a pre-pin closed record on its
+    resolved `transcriptId` — so it doesn't start empty on the very update that makes it durable.
+  - Bounded by `TICKET_LEDGER_MAX` oldest-first on a first-seen `at`. Deliberately **not** pruned
+    against the transcripts on disk, unlike the usage ledger: a transcript archived off this host is
+    still the answer to "which session worked PROJ-123".
+  - Tests: `TestTicketLedger`, plus the end-to-end case in `TestSpawnTicket`.
 - A ticket-backed session is **named from its ticket** (`"PROJ-123 <summary>"`, via
   `clean_manual_summary`) instead of paying a `claude -p` to derive a worse name from a ticket-sized
   prompt.
@@ -775,6 +801,14 @@ Cloudflare tunnel; port 8300 on the LAN.
 - Both waits are one-shot, show a "Starting your session…" stage while the session comes up, expire
   after `SPAWN_FOLLOW_MS`, and are cancelled the moment the operator picks a session by hand, so a
   slow spawn can never yank the stage out from under them.
+- A third deep link, **`/sessions?ended=<transcriptId>`**, opens an ENDED session's read-only view —
+  what the board's ticket chips use for anything not running. It keys on the transcript id because
+  that is the one handle all three ended channels share (a resumable row's entry `id` is a synthesised
+  `t:<transcriptId>`, a killed one's is the session's own), resolving it through
+  `findEndedByTranscript` and handing off to `openEndedSession`. It is **bounded** (`ENDED_FOLLOW_MS`),
+  unlike the by-id wait: the board only ever chips a transcript it saw in the same fleet payload, so
+  not finding one means the host dropped out between the click and the load. It cannot be folded into
+  `?session=`, whose wait only ever resolves a **running** session.
 - Tests: the select-on-arrival cases in `turma/tests/sessions.test.js`, plus
   `TestSessionLifecycle`/`TestResumeTranscript`/`TestHandleCommands` in
   `agent/tests/test_hub_agent.py`.
@@ -850,8 +884,26 @@ Cloudflare tunnel; port 8300 on the LAN.
 #### Ticket ↔ session chips
 
 - A ticket's sessions show as chips on its card, from `ticketSessionIndex` — a reverse index of the
-  fleet payload's `session.ticket`, so **no hub-side ticket store exists to keep in sync**, and a
-  killed session still shows (the record outlives the process).
+  fleet payload's `session.ticket`, so **no hub-side ticket store exists to keep in sync**.
+- It reads the **same three channels the Sessions page's Ended list merges** (`a.sessions`,
+  `a.closedSessions`, each repo's `resumable`), because an operator asking "which session worked
+  PROJ-123" draws no distinction between them. Reading only `a.sessions` meant a ticket forgot its work
+  the instant that work was killed — the kill drops the registry record, and `_closed_payload` didn't
+  carry `ticket` at all. The resumable channel gets its ticket from the agent's ledger (above) and is
+  what covers a session aged out of `closed.json`.
+  - Deduped on `<host>::<transcriptId>` with the **registry-backed record winning** (only it knows the
+    session's id, `createdAt`, and that it was renamed); resumable is swept in its own pass over the
+    whole fleet, after every record is seen, so a record reported by a later host can't lose to an
+    earlier host's scan entry. Not deduped across hosts — the shared `~/.claude` login syncs
+    transcripts, so an id alone isn't fleet-unique and two hosts reporting one really are two rows.
+  - A **restart-clear-context session legitimately chips twice**: its pre-restart conversation is a
+    different transcript, still on disk and separately resumable. The Ended list shows the same.
+- **Where a chip links follows the run state, not the channel**: running → `?session=<id>` (the live
+  chat); anything else → `?ended=<transcriptId>` (the read-only view); no transcript at all → not a
+  link, since there is no conversation to open. The Sessions page's `?session=` wait only ever resolves
+  a **running** session (`sessionHit`) and never times out, so pointing a stopped/killed chip at it
+  parks the stage on "Opening session…" forever — a bug that predated the ended channels, since a
+  `stopped` registry session has never been openable live.
 - The chip is **labelled with the BRANCH**, not the session name: a ticket-spawned session is named
   from its ticket, so its name only repeats the key and summary already on the card, while the branch
   is the one thing that tells two sessions on one ticket apart. An operator's rename (`summaryManual`)
@@ -1016,12 +1068,13 @@ Cloudflare tunnel; port 8300 on the LAN.
   - **resumable** — a transcript from each repo's `resumable` scan, with no registry record of any
     kind behind it.
 - The third channel is what makes the list **durable**, and it is the point of the merge. The first
-  two are read out of `~/.turma`, which on a container host is the image's writable layer: an agent
-  update recreates the container and takes `sessions.json` and `closed.json` with it, so a list built
-  only from them empties on every update. `closed.json` is capped at `CLOSED_PER_REPO` besides, so it
-  was never the whole history even on a host that kept it. `resumable` is re-derived every slow beat
-  from the transcripts under `~/.claude/projects` (a bind mount) plus each transcript's own recorded
-  cwd, so it survives the wipe and carries every prior session, not the newest few.
+  two are read out of `~/.turma`, whose durability is the host's to provide (see the Kill/resume
+  bullet): a container that doesn't bind-mount it has `sessions.json` and `closed.json` on the image's
+  writable layer, so an agent update empties the list. Even where it IS mounted, `closed.json` is
+  capped at `CLOSED_PER_REPO`, so it was never the whole history on any host. `resumable` is
+  re-derived every slow beat from the transcripts under `~/.claude/projects` (a bind mount) plus each
+  transcript's own recorded cwd, so it survives the wipe and carries every prior session, not the
+  newest few.
 - The channels are **deduped on `<host>::<transcriptId>`**, and a registry-backed record always wins:
   a killed session is reported through both its closed record AND (once the slow scan catches up)
   `resumable`, and only the record knows the PRs it opened, when it was really killed, and that

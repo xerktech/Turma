@@ -114,10 +114,17 @@ QUESTIONS_DIR = os.path.join(REGISTRY_DIR, "questions")
 # session two things the transcript scan below can't recover — the PRs it opened
 # and its original session id, so `resume` can hand it straight back — and it
 # buys them from the moment of the kill, without waiting out a slow beat. It is
-# NOT the history: it lives in ~/.turma, which on a container host is the image's
-# writable layer and does not survive an agent update, and it holds only the
-# newest few per repo either way. Anything that has to still be there afterwards
-# belongs on the durable side (the transcripts, and the hub's archive).
+# NOT the history: it holds only the newest CLOSED_PER_REPO per repo, so the 6th
+# kill in a repo evicts the oldest however durably the file is stored. Anything
+# that has to still be there afterwards belongs on the durable side (the
+# transcripts, the hub's archive, and the ledgers this dir keeps beside it).
+#
+# It lives in ~/.turma, whose durability is the HOST's to provide: a native
+# install puts it in the invoking user's $HOME, and a container must bind-mount
+# it or it is the image's writable layer, which an agent update recreates. The
+# deployed stack mounts it (DockerOps compose/turma-truenas.yaml) — but that is a
+# deployment promise, not an invariant of this file, so nothing here may assume
+# it and every ledger beside it reconciles from disk rather than trusting itself.
 CLOSED_PATH = os.path.join(REGISTRY_DIR, "closed.json")
 # Only the newest N closed sessions per repo are kept/offered for resume —
 # bounds both the file and the heartbeat payload. Older kills don't fall out of
@@ -140,6 +147,25 @@ USAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "repo-usage.json")
 # Persisted so a triaged board survives a manager restart without re-running the
 # model over every ticket. See the "Jira -> repo triage" section.
 TRIAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-repos.json")
+# Durable transcriptId -> ticket ledger: which Jira ticket a conversation was
+# spawned to work. The exact counterpart of USAGE_LEDGER_PATH above, for the same
+# reason — the session record answers this only while it exists, and the board's
+# ticket chips have to outlive it.
+#
+# A killed session's ticket rides its closed record, but closed.json keeps only
+# CLOSED_PER_REPO per repo; past that the record is gone and the only channel
+# still reporting the session is the resumable scan, which is re-derived from the
+# transcripts on disk and so knows nothing of tickets. Keying here on the
+# transcript id — the handle that scan reports and the hub's Ended list dedupes
+# on — is what re-attaches the two.
+#
+# Written wherever a launch names its conversation (_launch_tmux), so a
+# restart-clear-context's NEW transcript is recorded alongside the old rather
+# than replacing it: both were that ticket's work.
+TICKET_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-sessions.json")
+# Bound on the above. Entries are small and only ticket-backed sessions make one,
+# so this is a runaway backstop rather than a working limit; the oldest fall off.
+TICKET_LEDGER_MAX = 500
 # Where Claude Code keeps per-project transcript JSONLs (slug = cwd via
 # _project_slug below). Overridable so the test suite can point it at
 # fixtures; unset in production, so the default is the real path.
@@ -3714,6 +3740,12 @@ class SessionManager:
         # against the one shared login. Both stay empty on unconfigured hosts.
         self.triage_ledger = self._load_triage_ledger()
         self.triage_job = None
+        # Durable transcript -> ticket attribution (persisted). Keeps the board's
+        # ticket chips answerable after the session record behind them is gone —
+        # killed, aged out of closed.json, or never in either. Backfilled from the
+        # records that still carry both, so it doesn't start empty.
+        self.ticket_ledger = self._load_ticket_ledger()
+        self._backfill_ticket_ledger()
         # Last SUCCESSFUL gh repo sweep, held so a failed one (which blanks the
         # github block to repos:[]) can't be mistaken for an empty org — see
         # _start_jira_triage.
@@ -4077,6 +4109,94 @@ class SessionManager:
         except OSError as e:
             log(f"usage ledger save failed: {e}")
 
+    # --- ticket attribution ledger -----------------------------------------
+
+    def _load_ticket_ledger(self):
+        try:
+            with open(TICKET_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_ticket_ledger(self):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = TICKET_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.ticket_ledger, f, indent=2)
+            os.replace(tmp, TICKET_LEDGER_PATH)
+        except OSError as e:
+            log(f"ticket ledger save failed: {e}")
+
+    def _remember_ticket(self, sess, save=True):
+        """Record a ticket-backed session's transcript -> ticket attribution, so
+        the board can still say which conversation worked a ticket once the
+        session record behind it is gone (see TICKET_LEDGER_PATH). Idempotent;
+        keyed by the transcript id, so a restart-clear-context adds its new
+        conversation rather than replacing the old one.
+
+        No-op for the ordinary session, which has no ticket, and for one not yet
+        launched, which has no transcript to key on. Returns whether anything
+        moved, so a bulk caller can save once.
+
+        The id is the PINNED one, falling back to the closed record's resolved
+        `transcriptId` — which is all a record written by an agent predating the
+        pin ever had (see _remember_closed)."""
+        tid = sess.get("claudeSessionId") or sess.get("transcriptId")
+        ticket = sess.get("ticket")
+        if not tid or not ticket or not ticket.get("key"):
+            return False
+        prev = self.ticket_ledger.get(tid)
+        entry = {
+            "key": ticket.get("key"),
+            "siteKey": ticket.get("siteKey"),
+            "url": ticket.get("url"),
+            "summary": ticket.get("summary"),
+            # The branch this session was TOLD to cut. The live git branch is the
+            # better label and the board prefers it, but it is only readable while
+            # the worktree exists — this is what a chip falls back to afterwards.
+            "branch": ticket.get("branch"),
+            "repo": sess.get("repo"),
+            # First-seen, not last-touched: this is the sort key _prune_ticket_ledger
+            # evicts on, and a resume must not make an old session look new and
+            # push a genuinely newer one off the end.
+            "at": (prev or {}).get("at") or now_iso(),
+        }
+        if prev == entry:
+            return False    # nothing moved; don't rewrite the file every launch
+        self.ticket_ledger[tid] = entry
+        self._prune_ticket_ledger()
+        if save:
+            self._save_ticket_ledger()
+        return True
+
+    def _prune_ticket_ledger(self):
+        """Bound the ticket ledger, oldest first. Unlike the usage ledger this is
+        NOT pruned against the transcripts on disk: a transcript can be archived
+        off this host and still be the answer to "which session worked PROJ-123",
+        and an entry is a few hundred bytes."""
+        if len(self.ticket_ledger) <= TICKET_LEDGER_MAX:
+            return
+        order = sorted(self.ticket_ledger.items(),
+                       key=lambda kv: (kv[1] or {}).get("at") or "")
+        for tid, _ in order[:len(self.ticket_ledger) - TICKET_LEDGER_MAX]:
+            self.ticket_ledger.pop(tid, None)
+
+    def _backfill_ticket_ledger(self):
+        """Adopt ticket-backed sessions that predate the ledger, from the two
+        records that already carry both a ticket and a transcript id: the live
+        registry and the closed history. Runs once at construction.
+
+        This is the same reconcile-from-what-we-have rule _reconcile_orphan_transcripts
+        applies to usage, and it is what stops the ledger starting empty on the
+        very update that makes it durable."""
+        changed = False
+        for sess in list(self.registry) + list(self.closed):
+            changed |= self._remember_ticket(sess, save=False)
+        if changed:
+            self._save_ticket_ledger()
+
     def _remember_usage(self, sess):
         """Record a session's worktree -> repo attribution so its transcript's
         token usage stays traceable to the repo forever (survives kill/delete).
@@ -4279,6 +4399,12 @@ class SessionManager:
             claude_sid = str(uuid.uuid4())
             parts.append(f"--session-id {claude_sid}")
         sess["claudeSessionId"] = claude_sid
+        # This session now knows which conversation it is, which is the one moment
+        # a ticket-backed one can be tied to its transcript. Every launch passes
+        # here (spawn, resume, restart-clear-context), so the ledger picks up a
+        # cleared session's new transcript too — both worked the ticket, and the
+        # board should chip both. No-op unless this session has a ticket.
+        self._remember_ticket(sess)
         parts.append(f"--remote-control '{sess['rcName']}'")
         model = sess.get("model")
         if model:
@@ -5510,6 +5636,13 @@ class SessionManager:
                     os.path.join(PROJECTS_ROOT, e["slug"], e["transcriptId"] + ".jsonl"))
                 e["endedTs"] = time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(e["mtime"]))
+                # Which Jira ticket this conversation was spawned to work, or None
+                # for the ordinary session. This scan is re-derived from the
+                # transcripts on disk, which know nothing of tickets, so it is the
+                # durable ledger that re-attaches the two — and this is the only
+                # channel still reporting a session once its record has aged out
+                # of closed.json (see TICKET_LEDGER_PATH).
+                e["ticket"] = self.ticket_ledger.get(e["transcriptId"])
                 e.pop("mtime", None)
         return by_repo
 
@@ -6623,8 +6756,21 @@ class SessionManager:
                 "rcName": c.get("rcName"),
                 "label": c.get("label"),
                 "summary": c.get("summary"),
+                # Whether that summary is an operator's own rename rather than a
+                # generated name. Carried for the same reason the live payload
+                # carries it: it decides how the board labels this session's chip,
+                # and the label must not change just because the session was
+                # killed.
+                "summaryManual": c.get("summaryManual"),
                 "createdAt": c.get("createdAt"),
                 "closedAt": c.get("closedAt"),
+                # The Jira ticket this session was spawned to work. _remember_closed
+                # has always snapshotted it onto the record, but it never reached
+                # the wire, so the board — which reverse-indexes session.ticket to
+                # chip a ticket with its sessions — lost the link the moment the
+                # session was killed, and could only ever answer "which session is
+                # working PROJ-123", never "which one worked it".
+                "ticket": c.get("ticket"),
                 # The conversation this session had, so the Ended-sessions view
                 # can open it read-only from the hub's archive. Absent on records
                 # written by an agent predating the snapshot (see _remember_closed).

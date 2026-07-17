@@ -194,25 +194,69 @@
   // The agent stamps the ticket onto the session record it spawns (session.ticket
   // = {key, siteKey, url, summary, branch}); this indexes the fleet payload the
   // board already polls to walk that link backwards, keyed "<siteKey>\x00<key>".
+  // Nothing is written to Jira — the link lives in Turma only, and there is no
+  // hub-side ticket store to keep in sync.
   //
-  // That's the whole link: there is no hub-side ticket store to keep in sync, and
-  // because the record outlives the process, a killed session still shows on its
-  // ticket. Nothing is written to Jira — the link lives in Turma only.
+  // It reads the same THREE channels the Sessions page's Ended list merges, for
+  // the same reason: an operator asking "which session worked PROJ-123" draws no
+  // distinction between them, and reading only the live registry meant a ticket
+  // forgot its work the instant that work was killed.
+  //   - a.sessions        live + stopped, registry-backed.
+  //   - a.closedSessions  killed. Carries `ticket` off the closed record.
+  //   - repo.resumable    the durable side: re-derived every slow beat from the
+  //                       transcripts on disk, so it survives an agent restart
+  //                       and outlives closed.json's CLOSED_PER_REPO cap. Its
+  //                       ticket comes from the agent's transcript -> ticket
+  //                       ledger, since a transcript knows nothing of Jira.
+  //
+  // Deduped on transcriptId with the registry-backed record winning — a killed
+  // session is reported through BOTH its closed record and (once the slow scan
+  // catches up) resumable, and only the record knows its id, its createdAt and
+  // that it was renamed.
+  //
+  // A session restarted with "clear context" legitimately contributes a second
+  // chip: its pre-restart conversation is a different transcript, still on disk
+  // and still separately resumable, and both really did work the ticket. That is
+  // the same thing the Ended list shows.
   function ticketSessionIndex(agents) {
     const idx = new Map();
+    const seen = new Set();          // "<host>\x00<transcriptId>" — dedupe key
+    const add = (s, a) => {
+      const t = s && s.ticket;
+      if (!t || !t.key) return;
+      const host = a.key || a.device;
+      const tid = s.transcriptId;
+      // Untranscripted records can't collide (nothing to key on) and are rare:
+      // a session killed before its first turn, or one an older agent wrote.
+      if (tid) {
+        const dk = host + "\x00" + tid;
+        if (seen.has(dk)) return;
+        seen.add(dk);
+      }
+      const k = (t.siteKey || "") + "\x00" + t.key;
+      if (!idx.has(k)) idx.set(k, []);
+      idx.get(k).push({ ...s, host });
+    };
     for (const a of agents || []) {
-      for (const s of a.sessions || []) {
-        const t = s && s.ticket;
-        if (!t || !t.key) continue;
-        const k = (t.siteKey || "") + "\x00" + t.key;
-        if (!idx.has(k)) idx.set(k, []);
-        idx.get(k).push({ ...s, host: a.key || a.device });
+      for (const s of a.sessions || []) add(s, a);
+      for (const c of a.closedSessions || []) add(c, a);
+    }
+    // Resumable last, and in its own pass over the whole fleet: it is the weakest
+    // channel, so every registry-backed record must already be in `seen` before
+    // it gets a look — otherwise a killed session reported by a host listed later
+    // would lose to its own scan entry and show up id-less.
+    for (const a of agents || []) {
+      for (const r of a.repos || []) {
+        for (const t of r.resumable || []) add(t, a);
       }
     }
     // Oldest first: the first session on a ticket is the one holding the bare
-    // PROJ-123 branch, so the chips read in the order the branches were cut.
+    // PROJ-123 branch, so the chips read in the order the branches were cut. A
+    // resumable entry has no createdAt — it was never a record — so it sorts on
+    // when its conversation last spoke, the only timestamp its scan recovers.
+    const at = (s) => String(s.createdAt || s.endedTs || "");
     for (const list of idx.values()) {
-      list.sort((x, y) => String(x.createdAt || "").localeCompare(String(y.createdAt || "")));
+      list.sort((x, y) => at(x).localeCompare(at(y)));
     }
     return idx;
   }
@@ -231,11 +275,25 @@
   // two sessions on one ticket apart. The live branch wins over the reserved one
   // — the reservation is what the agent was TOLD, git is what it did. An operator
   // who renames a session means that name, so it leads once it exists; a session
-  // that has neither yet falls back to its id.
+  // that has neither yet falls back to its id, and one recovered from the
+  // transcript scan (which never had an id) to its ticket key.
+  //
+  // WHERE IT LINKS follows the run state, not the channel it arrived on, because
+  // that is what the Sessions page can actually open:
+  //   - running -> ?session=<id>, the live chat view.
+  //   - anything else -> ?ended=<transcriptId>, the read-only view. Its deep-link
+  //     wait only ever resolves a RUNNING session, so pointing a stopped/killed
+  //     chip at ?session= parks the page on "Opening session…" forever. That bug
+  //     was reachable before this ever read the ended channels: a `stopped`
+  //     registry session is in a.sessions and has never been openable live.
+  //   - no transcript at all -> not a link. A session killed before its first
+  //     turn has no conversation to open, and an <a> to nothing is worse than
+  //     plain text saying so.
   function sessionChipHtml(s) {
     const branch = (s.git && s.git.branch) || (s.ticket && s.ticket.branch);
     const renamed = s.summaryManual ? s.summary : null;
-    const label = renamed || branch || s.summary || s.label || s.id;
+    const label = renamed || branch || s.summary || s.label || s.id
+      || (s.ticket && s.ticket.key) || "session";
     const stopped = s.status !== "running";
     const state = s.status === "error" ? "failed" : (stopped ? "stopped" : "running");
     const tip = [s.summary || s.label, branch && branch !== label ? "branch " + branch : "", state]
@@ -244,9 +302,15 @@
     // The label is its own element so it can ellipsise: .kc-sess is a flex
     // container, and text-overflow can't touch anonymous flex content — it would
     // hard-cut mid-letter. As a flex ITEM this span is blockified, so it can.
-    return `<a class="${cls}" href="/sessions?session=${encodeURIComponent(s.id)}"
-      title="${esc(tip || label)}"
-      ><span class="kc-sess-dot"></span><span class="kc-sess-name">${esc(label)}</span></a>`;
+    const body = `<span class="kc-sess-dot"></span><span class="kc-sess-name">${esc(label)}</span>`;
+    const href = !stopped && s.id
+      ? `/sessions?session=${encodeURIComponent(s.id)}`
+      : (s.transcriptId ? `/sessions?ended=${encodeURIComponent(s.transcriptId)}` : null);
+    if (!href) {
+      return `<span class="${cls}" title="${esc(tip ? tip + " · no conversation" : label)}"
+        >${body}</span>`;
+    }
+    return `<a class="${cls}" href="${href}" title="${esc(tip || label)}">${body}</a>`;
   }
 
   // The card's session control: its sessions, plus the button that starts one.

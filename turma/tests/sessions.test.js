@@ -530,13 +530,14 @@ test("an ended session's card carries Resume and its PR chips", () => {
 });
 
 // --- Ended sessions: the durable channel -------------------------------------
-// closed.json and sessions.json live in the agent's ~/.turma, which on a
-// container host is the image's writable layer — an agent update recreates the
-// container and both are gone, so a list built only from them empties on every
-// update. repo.resumable is re-derived from the transcripts under ~/.claude (a
-// bind mount), so it is what carries the list across a restart, and it isn't
-// capped at CLOSED_PER_REPO either. These cover the third channel, its dedupe
-// against the first two, and its own resume path.
+// closed.json and sessions.json live in the agent's ~/.turma, whose durability is
+// the host's to provide: a container that doesn't bind-mount it has them on the
+// image's writable layer, and an agent update recreates the container with both
+// gone. Even mounted, closed.json is capped at CLOSED_PER_REPO. repo.resumable is
+// re-derived from the transcripts under ~/.claude (a bind mount), so it is what
+// carries the list across a restart, and it isn't capped that way either. These
+// cover the third channel, its dedupe against the first two, and its own resume
+// path.
 
 // A prior session as the agent's transcript scan reports it: no session id and
 // no PR links, because there is no registry record left to have held them.
@@ -679,6 +680,82 @@ test("resumeEnded is a no-op for an offline host", () => {
   beat({ now, agents: [h] });
   resumeEnded(click, "33333");
   assert.deepEqual(posts, [], "no command can be queued on a host that can't take it");
+});
+
+// --- ?ended=<transcriptId>: the board's ticket chips deep-link here -----------
+// A chip for a session that isn't running can't use ?session=, whose wait only
+// ever resolves a RUNNING session and would park the stage on "Opening session…"
+// indefinitely. It keys on the transcript id because that is the one handle all
+// three ended channels share — a resumable row's entry id is a synthesised
+// "t:<id>", a killed one's is the session's own.
+
+// The transcript pane's title is only ever fetched from inside openEndedSession,
+// and the DOM shim materialises an element the first time the page asks for it —
+// so #trTitle's presence is what says an ended view was really opened. (The pane
+// itself is a module-level const, created at load and `hidden: false` by shim
+// default, so it can't stand in for this either way.)
+const openedEnded = (els) => els.trTitle !== undefined;
+
+test("?ended= opens a KILLED session's read-only view", () => {
+  const { beat, els } = loadPage({ search: "?ended=t-abc" });
+  const { now, host: h } = host([]);
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z",
+    { transcriptId: "t-abc" })];
+  beat({ now, agents: [h] });
+  assert.ok(openedEnded(els), "read-only view opened");
+  assert.equal(els.trTitle.textContent, "Killed");
+  assert.equal(els.transcriptPane.hidden, false);
+  assert.equal(els.chatPane.hidden, true);
+  assert.equal(els.termPane.hidden, true);
+});
+
+test("?ended= opens a session recovered by the transcript scan", () => {
+  // The channel with no registry record behind it at all — the one a ticket chip
+  // falls back to once closed.json has evicted the session.
+  const { beat, els } = loadPage({ search: "?ended=t-zzz" });
+  const { now, host: h } = host([]);
+  h.sessions = [];
+  h.closedSessions = [];
+  withResumable(h, [resumable("t-zzz", "Recovered", "2026-07-15T18:00:00Z")]);
+  beat({ now, agents: [h] });
+  assert.ok(openedEnded(els));
+  assert.equal(els.trTitle.textContent, "Recovered");
+  assert.equal(els.transcriptPane.hidden, false);
+});
+
+test("?ended= waits for the session to be reported rather than reading as empty", () => {
+  // A kill is in the very next heartbeat, but a scan-recovered session can take a
+  // slow beat — the stage must say it's working, not "No session attached".
+  const { beat, els } = loadPage({ search: "?ended=t-not-yet" });
+  const { now, host: h } = host([]);
+  beat({ now, agents: [h] });
+  assert.match(els.stageEmptyBig.innerHTML, /Opening session/);
+  assert.ok(!openedEnded(els), "nothing opened on the stage");
+});
+
+test("?ended= for an unknown transcript never opens the wrong session", () => {
+  const { beat, els } = loadPage({ search: "?ended=t-nope" });
+  const { now, host: h } = host([]);
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z",
+    { transcriptId: "t-abc" })];
+  beat({ now, agents: [h] });
+  assert.ok(!openedEnded(els), "the one ended session it CAN see is not a match");
+});
+
+test("an explicit pick beats a pending ?ended=", () => {
+  // Same rule the other two waits follow: an operator who clicks a session means
+  // it, and a deep link resolving a beat LATER must not yank them off it.
+  const { beat, selectSession, els, opened } = loadPage({ search: "?ended=t-abc" });
+  const { now, host: h } = host([running("live1", "Live Task")]);
+  beat({ now, agents: [h] });          // ?ended= still unresolved — nothing to open
+  selectSession("live1");              // ...so the operator picks one by hand
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z",
+    { transcriptId: "t-abc" })];       // and now the killed session lands
+  beat({ now, agents: [h] });
+
+  assert.deepEqual(opened, ["live1"]);
+  assert.equal(els.chatPane.hidden, false, "stayed on the session they chose");
+  assert.equal(els.transcriptPane.hidden, true);
 });
 
 test("opening an ended session shows PRs + Resume and never a terminal or compose box", () => {

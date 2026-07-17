@@ -43,6 +43,14 @@ def write_jsonl(path, lines):
             f.write("\n")
 
 
+def write_json(path, data):
+    """Seed one of the manager's own state files (sessions.json, closed.json, a
+    ledger) as it would find it on disk at construction."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
 def usage_entry(ts, msg_id, request_id, model, inp, out, cw=0, cr=0):
     return {
         "timestamp": ts,
@@ -1669,6 +1677,7 @@ class ManagerMixin:
             ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
+            ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", os.path.join(self.tmp, "worktrees")),
         ]:
@@ -1678,6 +1687,99 @@ class ManagerMixin:
 
     def make_manager(self):
         return ha.SessionManager()
+
+
+class TestTicketLedger(ManagerMixin, unittest.TestCase):
+    """The transcript -> ticket ledger: which conversation worked which Jira
+    ticket, recorded durably so the board's chips outlive the session record —
+    killed, aged out of closed.json, or wiped with ~/.turma."""
+
+    def _sess(self, sid="s1", tid="t1", key="PROJ-7", **over):
+        s = {"id": sid, "repo": "Turma", "claudeSessionId": tid,
+             "ticket": {"key": key, "siteKey": "x.atlassian.net",
+                        "url": f"https://x.atlassian.net/browse/{key}",
+                        "summary": "Fix the thing", "branch": key}}
+        s.update(over)
+        return s
+
+    def test_remember_persists_and_reloads(self):
+        sm = self.make_manager()
+        sm._remember_ticket(self._sess())
+        # A fresh manager reads it back off disk — the whole point of the file.
+        sm2 = self.make_manager()
+        self.assertEqual(sm2.ticket_ledger["t1"]["key"], "PROJ-7")
+        self.assertEqual(sm2.ticket_ledger["t1"]["branch"], "PROJ-7")
+        self.assertEqual(sm2.ticket_ledger["t1"]["repo"], "Turma")
+
+    def test_ignores_a_session_with_no_ticket_or_no_transcript(self):
+        sm = self.make_manager()
+        sm._remember_ticket({"id": "s1", "repo": "Turma", "claudeSessionId": "t1"})
+        sm._remember_ticket(self._sess(tid=None))          # not launched yet
+        sm._remember_ticket(self._sess(sid="s3", tid="t3", key=None))
+        self.assertEqual(sm.ticket_ledger, {})
+
+    def test_remember_is_idempotent(self):
+        """Every launch calls this, so an unchanged entry must not rewrite the
+        file — and must not restamp `at`, which is the prune's sort key."""
+        sm = self.make_manager()
+        self.assertTrue(sm._remember_ticket(self._sess()))
+        at = sm.ticket_ledger["t1"]["at"]
+        self.assertFalse(sm._remember_ticket(self._sess()))
+        self.assertEqual(sm.ticket_ledger["t1"]["at"], at)
+
+    def test_clear_context_records_both_conversations(self):
+        """A restart-clear-context relaunches the same session under a NEW
+        transcript. Both worked the ticket and both stay separately resumable, so
+        the old one is kept rather than replaced."""
+        sm = self.make_manager()
+        sess = self._sess()
+        sm._remember_ticket(sess)
+        sess["claudeSessionId"] = "t2"     # what _launch_tmux does on a restart
+        sm._remember_ticket(sess)
+        self.assertEqual(set(sm.ticket_ledger), {"t1", "t2"})
+        self.assertEqual(sm.ticket_ledger["t2"]["key"], "PROJ-7")
+
+    def test_backfills_from_registry_and_closed(self):
+        """Sessions that predate the ledger are adopted from the two records that
+        already carry both a ticket and a transcript id — so it doesn't start
+        empty on the very update that makes it durable."""
+        write_json(ha.REGISTRY_PATH, [self._sess(sid="live", tid="t-live")])
+        write_json(ha.CLOSED_PATH, [self._sess(sid="dead", tid="t-dead", key="PROJ-9")])
+        sm = self.make_manager()
+        self.assertEqual(sm.ticket_ledger["t-live"]["key"], "PROJ-7")
+        self.assertEqual(sm.ticket_ledger["t-dead"]["key"], "PROJ-9")
+        # And it was persisted, not just held in memory.
+        self.assertEqual(self.make_manager().ticket_ledger["t-dead"]["key"], "PROJ-9")
+
+    def test_backfill_keys_a_pre_pin_record_on_its_transcript_id(self):
+        """A closed record written before the session-id pin has no
+        claudeSessionId; its resolved transcriptId is the only handle it ever
+        had, so key on that rather than skipping it."""
+        rec = self._sess(sid="old", tid=None)
+        rec["transcriptId"] = "t-old"
+        write_json(ha.CLOSED_PATH, [rec])
+        self.assertEqual(self.make_manager().ticket_ledger["t-old"]["key"], "PROJ-7")
+
+    def test_survives_the_registry_and_closed_history_being_wiped(self):
+        """The reason this exists. ~/.turma outlives an agent update only if it's
+        mounted, but even then closed.json keeps just CLOSED_PER_REPO per repo —
+        so the ledger has to answer once both records are gone."""
+        sm = self.make_manager()
+        sm._remember_ticket(self._sess())
+        sm2 = self.make_manager()
+        sm2.registry, sm2.closed = [], []
+        self.assertEqual(sm2.ticket_ledger["t1"]["key"], "PROJ-7")
+
+    def test_prune_bounds_the_ledger_oldest_first(self):
+        p = mock.patch.object(ha, "TICKET_LEDGER_MAX", 2)
+        p.start()
+        self.addCleanup(p.stop)
+        sm = self.make_manager()
+        for i, at in enumerate(["2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z",
+                                "2026-03-01T00:00:00Z"]):
+            sm.ticket_ledger[f"t{i}"] = {"key": f"P-{i}", "at": at}
+        sm._prune_ticket_ledger()
+        self.assertEqual(set(sm.ticket_ledger), {"t1", "t2"})  # oldest t0 fell off
 
 
 class TestUsageLedger(ManagerMixin, unittest.TestCase):
@@ -1925,6 +2027,23 @@ class TestResumableReport(ManagerMixin, unittest.TestCase):
         rep = sm._resumable_report()
         self.assertNotIn("Turma", rep)  # its only transcript is on a live card
 
+    def test_carries_the_ticket_a_transcript_worked(self):
+        """The durable channel is re-derived from the transcripts on disk, which
+        know nothing of Jira — the ticket ledger is what re-attaches the two, and
+        this is the only channel still reporting a session once its record has
+        aged out of closed.json."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        self._write_at(wt, tid="tkt1")
+        self._write_at(wt, tid="plain1")
+        sm = self.make_manager()
+        sm.ticket_ledger = {"tkt1": {"key": "PROJ-7", "siteKey": "x.atlassian.net",
+                                     "branch": "PROJ-7", "repo": "Turma"}}
+        by_tid = {e["transcriptId"]: e for e in sm._resumable_report()["Turma"]}
+        self.assertEqual(by_tid["tkt1"]["ticket"]["key"], "PROJ-7")
+        self.assertEqual(by_tid["tkt1"]["ticket"]["branch"], "PROJ-7")
+        # An ordinary session reports no ticket rather than an empty one.
+        self.assertIsNone(by_tid["plain1"]["ticket"])
+
     def test_caps_per_repo(self):
         p = mock.patch.object(ha, "RESUMABLE_PER_REPO", 2)
         p.start()
@@ -1938,10 +2057,11 @@ class TestResumableReport(ManagerMixin, unittest.TestCase):
 
     def test_survives_a_wiped_registry_dir(self):
         """The report is what makes the hub's Ended list durable, so it must be
-        derivable from the bind-mounted transcripts ALONE. ~/.turma is the
-        container's writable layer: an agent update recreates the container and
-        takes sessions.json, closed.json and the usage ledger with it. What's
-        left is ~/.claude/projects and each transcript's own recorded cwd."""
+        derivable from the bind-mounted transcripts ALONE. ~/.turma's durability
+        is the host's to provide — a container that doesn't bind-mount it has
+        sessions.json, closed.json and the ledgers on the image's writable layer,
+        which an agent update recreates. What's left is ~/.claude/projects and
+        each transcript's own recorded cwd."""
         wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "gone1")
         self._write_at(wt, tid="t1", text="the work it was doing")
         sm = self.make_manager()
@@ -2560,6 +2680,25 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         entry = sm._closed_payload()[0]
         self.assertIsNone(entry["prs"])
         self.assertIsNone(entry["transcriptId"])
+        self.assertIsNone(entry["ticket"])
+
+    def test_closed_payload_reports_the_ticket_the_session_worked(self):
+        """_remember_closed has always snapshotted the ticket onto the record, but
+        it never reached the wire — so the board, which reverse-indexes
+        session.ticket, lost a ticket's session the moment it was killed and could
+        only ever say which session IS working a ticket, never which one DID.
+
+        summaryManual rides along for the same reason: it decides how the board
+        labels the chip, which must not change just because the session was
+        killed."""
+        ticket = {"key": "PROJ-7", "siteKey": "x.atlassian.net", "branch": "PROJ-7",
+                  "url": "https://x.atlassian.net/browse/PROJ-7", "summary": "Fix it"}
+        sm = self.make_manager()
+        sm.closed = [{"id": "s1", "repo": "r", "ticket": ticket,
+                      "summary": "My Own Name", "summaryManual": True}]
+        entry = sm._closed_payload()[0]
+        self.assertEqual(entry["ticket"], ticket)
+        self.assertTrue(entry["summaryManual"])
 
     def test_delete_removes_worktree_but_touches_no_branch(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
@@ -4848,6 +4987,7 @@ class TestPruneRepo(unittest.TestCase):
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
+            ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", self.wt_root),
             ("REPOS_ROOT", self.tmp),
@@ -6786,6 +6926,28 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         # ...and the link rides the heartbeat, which is what the board indexes.
         self.assertEqual(
             sm._session_payload(sess, refresh=False)["ticket"]["key"], "PROJ-7")
+
+    def test_the_link_outlives_the_session_it_was_spawned_for(self):
+        """The whole ask: which session was tasked with a ticket must survive.
+        Three channels, each covering the next one's blind spot — the live record,
+        the closed record it becomes when killed, and the durable ledger that is
+        all that's left once closed.json evicts it (CLOSED_PER_REPO per repo)."""
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        sess = sm.registry[0]
+        tid = sess["claudeSessionId"]
+        self.assertEqual(sm.ticket_ledger[tid]["key"], "PROJ-7")
+
+        sm.kill(sess["id"])
+        self.assertEqual(sm._closed_payload()[0]["ticket"]["key"], "PROJ-7")
+
+        # Now evict the closed record, as the 6th kill in this repo would. The
+        # ledger is the only thing left that knows, and it's on disk — so a fresh
+        # manager (an agent restart) still answers.
+        sm.closed = []
+        sm.save()
+        self.assertEqual(self.make_manager().ticket_ledger[tid]["key"], "PROJ-7")
 
     def test_the_ticket_text_is_the_initial_prompt(self):
         sm = self.make_ticket_manager()
