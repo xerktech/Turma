@@ -4,6 +4,7 @@ import com.xerktech.turma.model.AgentsResponse
 import com.xerktech.turma.model.ArchiveListResponse
 import com.xerktech.turma.model.ArchiveTranscript
 import com.xerktech.turma.model.HistoryResponse
+import com.xerktech.turma.model.JiraIssueDetail
 import com.xerktech.turma.model.SearchResponse
 import com.xerktech.turma.model.WsTokenResponse
 import kotlinx.serialization.Serializable
@@ -40,6 +41,10 @@ interface HubApi {
 
     @DELETE("api/agents/{host}/sessions/{id}")
     suspend fun deleteSession(@Path("host") host: String, @Path("id") id: String): OkResponse
+
+    /** Interrupt the turn a running session has in flight (agent sends Escape). */
+    @POST("api/agents/{host}/sessions/{id}/interrupt")
+    suspend fun interruptSession(@Path("host") host: String, @Path("id") id: String): OkResponse
 
     @POST("api/agents/{host}/sessions/{id}/input")
     suspend fun sendInput(
@@ -104,6 +109,16 @@ interface HubApi {
 
     @GET("api/archive/{tid}")
     suspend fun archiveTranscript(@Path("tid") transcriptId: String): ArchiveTranscript
+
+    // 200 with the issue, or 202 {pending} while the host fetches it on demand.
+    @GET("api/jira/{siteKey}/{issueKey}")
+    suspend fun jiraIssue(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+    ): Response<JiraIssueDetail>
+
+    @POST("api/jira/refresh")
+    suspend fun jiraRefresh(): OkResponse
 
     @POST("api/devices")
     suspend fun registerDevice(@Body body: DeviceRequest): OkResponse

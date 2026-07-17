@@ -32,13 +32,17 @@ class HubClient(private val config: Config) {
         .pingInterval(20, TimeUnit.SECONDS) // keep live-tail / audio sockets warm
         .build()
 
+    // MUST stay declared before `apiRef`: `apiRef`'s initializer calls build(),
+    // which reads contentType. A property initialized textually later is still
+    // null at that point, so ordering this after apiRef makes build() pass a
+    // null contentType and asConverterFactory throws on launch (crashes onCreate).
+    private val contentType = "application/json".toMediaType()
+
     @Volatile
     private var builtFor: String = ""
 
     @Volatile
     private var apiRef: HubApi = build(config.current.baseUrl)
-
-    private val contentType = "application/json".toMediaType()
 
     private fun build(baseUrl: String): HubApi {
         builtFor = baseUrl

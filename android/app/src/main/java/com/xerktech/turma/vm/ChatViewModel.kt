@@ -197,6 +197,15 @@ class ChatViewModel(
         }
     }
 
+    /** Interrupt the in-flight turn (web "◼ Stop" — POST .../interrupt). */
+    fun stop() {
+        viewModelScope.launch {
+            runCatching { client.api.interruptSession(host, sessionId) }
+            _messages.tryEmit("◼ stop sent")
+            container.fleet.nudge()
+        }
+    }
+
     fun answerOption(index: Int) {
         viewModelScope.launch {
             runCatching { client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = index)) }

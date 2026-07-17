@@ -136,8 +136,12 @@ fun ChatScreen(host: String, sessionId: String, onBack: () -> Unit, onTerminal: 
                     session = state.session,
                     draft = state.draft,
                     mic = state.mic,
+                    // Working right now: prefer the live turn frames (fast), fall back
+                    // to the heartbeat's paneBusy. Drives the ◼ Stop button.
+                    busy = state.liveTurn.isNotBlank() || state.session?.session?.paneBusy == true,
                     onDraft = vm::setDraft,
                     onSend = vm::submitDraft,
+                    onStop = vm::stop,
                     onMicStart = vm::startDictation,
                     onMicStop = vm::stopDictation,
                     onModel = vm::setModel,
@@ -149,8 +153,8 @@ fun ChatScreen(host: String, sessionId: String, onBack: () -> Unit, onTerminal: 
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize().padding(pad),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(10.dp, 6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             if (state.hasMore) {
                 item { Text("· earlier history ·", Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
@@ -182,8 +186,10 @@ private fun ChatFooter(
     session: com.xerktech.turma.model.SessionInfo?,
     draft: String,
     mic: MicState,
+    busy: Boolean,
     onDraft: (String) -> Unit,
     onSend: () -> Unit,
+    onStop: () -> Unit,
     onMicStart: () -> Unit,
     onMicStop: () -> Unit,
     onModel: (String) -> Unit,
@@ -194,6 +200,7 @@ private fun ChatFooter(
         if (granted) onMicStart()
     }
     Column(Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        // Model / mode / PR sit ABOVE the input box.
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
             MenuChip("model: ${session?.model?.ifBlank { "default" } ?: "default"}", listOf("default", "opus", "sonnet", "haiku"), onModel)
             MenuChip("mode: ${session?.permissionMode?.ifBlank { "auto" } ?: "auto"}", listOf("auto", "acceptEdits", "plan", "bypassPermissions", "default"), onMode)
@@ -222,7 +229,17 @@ private fun ChatFooter(
                     MicState.FINALIZING -> CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                 }
             }
-            IconButton(onClick = onSend, enabled = draft.isNotBlank()) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
+            // The compose button IS the Stop button while a turn is in flight
+            // (web parity): interrupt it, else send the draft.
+            if (busy) {
+                IconButton(onClick = onStop) {
+                    Icon(Icons.Filled.Stop, "Stop", tint = com.xerktech.turma.ui.theme.TurmaColors.waiting)
+                }
+            } else {
+                IconButton(onClick = onSend, enabled = draft.isNotBlank()) {
+                    Icon(Icons.AutoMirrored.Filled.Send, "Send")
+                }
+            }
         }
     }
 }

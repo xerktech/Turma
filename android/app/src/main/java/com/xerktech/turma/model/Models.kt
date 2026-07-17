@@ -22,7 +22,10 @@ data class AgentInfo(
     val key: String = "",
     val device: String = "",
     val lastSeen: Long = 0,
-    val startedAt: Long = 0,
+    // ISO-8601 string on the wire (agent's now_iso()), NOT epoch — the hub, web
+    // client, and glasses all treat it as a string. Typing it Long made
+    // kotlinx.serialization throw on the whole /api/agents payload.
+    val startedAt: String = "",
     val online: Boolean = false,
     val terminalOnline: Boolean = false,
     val repos: List<RepoInfo> = emptyList(),
@@ -32,13 +35,86 @@ data class AgentInfo(
     val github: GithubInfo? = null,
     val clones: List<CloneInfo> = emptyList(),
     val commands: List<CommandInfo> = emptyList(),
+    val jira: JiraBlock? = null,
+)
+
+// ---- Jira board (the agent's `jira` heartbeat block; see hub-agent collect_jira) --
+
+@Serializable
+data class JiraBlock(
+    val available: Boolean = false,
+    val configured: Boolean = false,
+    val site: String = "",
+    val siteKey: String = "",
+    val user: String = "",
+    val fetchedAt: String = "",
+    val error: String? = null,
+    val truncated: Boolean = false,
+    val tickets: List<JiraTicket> = emptyList(),
+)
+
+@Serializable
+data class JiraTicket(
+    val key: String = "",
+    val url: String = "",
+    val summary: String = "",
+    val status: String = "",
+    val statusCategory: String = "", // todo | inprogress | done
+    val priority: String = "",
+    val type: String = "",
+    val project: String = "",
+    val projectName: String = "",
+    val labels: List<String> = emptyList(),
+    val updated: String = "",
+    val created: String = "",
+    val dueDate: String? = null,
+    val parentKey: String? = null,
+    val repoGuess: RepoGuess? = null,
+)
+
+@Serializable
+data class RepoGuess(
+    val repo: String? = null,
+    val cloned: Boolean = false,
+    val nameWithOwner: String? = null,
+    val reason: String = "",
+    val at: String = "",
+)
+
+/** On-demand issue detail (GET /api/jira/<siteKey>/<key>); kept lenient. */
+@Serializable
+data class JiraIssueDetail(
+    val key: String = "",
+    val summary: String = "",
+    val status: String = "",
+    val statusCategory: String = "",
+    val priority: String = "",
+    val type: String = "",
+    val description: String = "",
+    val assignee: String = "",
+    val reporter: String = "",
+    val labels: List<String> = emptyList(),
+    val comments: List<JiraComment> = emptyList(),
+    val commentTotal: Int = 0,
+    val parentKey: String? = null,
+    val url: String = "",
+    val error: String? = null,
+    val stale: Boolean = false,
+)
+
+@Serializable
+data class JiraComment(
+    val author: String = "",
+    val body: String = "",
+    val created: String = "",
 )
 
 @Serializable
 data class RepoInfo(
     val name: String = "",
     val root: Boolean = false,
-    val lastActivity: Long = 0,
+    // ISO-8601 string (agent ranks repos by comparing these as strings), not epoch.
+    val lastActivity: String = "",
     val resumable: List<ResumableInfo> = emptyList(),
 )
 
@@ -48,7 +124,7 @@ data class ResumableInfo(
     val cwd: String = "",
     val summary: String = "",
     val label: String = "",
-    val ts: Long = 0,
+    val ts: String = "", // transcript entry's ISO-8601 timestamp, not epoch
     val source: String = "",
 )
 
@@ -56,7 +132,18 @@ data class ResumableInfo(
 data class GithubInfo(
     val ok: Boolean = false,
     val login: String = "",
-    val repos: List<String> = emptyList(),
+    // Wire sends objects ({nameWithOwner, name, isPrivate, ...}), not bare
+    // strings — the agent's collect_github()/_gh_clonable_repos().
+    val repos: List<GithubRepo> = emptyList(),
+)
+
+@Serializable
+data class GithubRepo(
+    val nameWithOwner: String = "",
+    val name: String = "",
+    val description: String = "",
+    val isPrivate: Boolean = false,
+    val updatedAt: String = "",
 )
 
 @Serializable
@@ -181,7 +268,7 @@ data class TailEntry(
     val uuid: String = "",
     val role: String = "",
     val text: String = "",
-    val ts: Long = 0,
+    val ts: String = "", // ISO-8601 timestamp from the transcript entry, not epoch
     val blocks: List<Block> = emptyList(),
 ) {
     val key: String get() = id.ifEmpty { uuid }
@@ -305,7 +392,7 @@ data class SearchMatch(
     val host: String = "",
     val summary: String = "",
     val role: String = "",
-    val ts: Long = 0,
+    val ts: String = "", // ISO-8601 timestamp, not epoch
     val uuid: String = "",
     val snippet: String = "",
 )
@@ -323,8 +410,8 @@ data class ArchiveSession(
     val repo: String = "",
     val worktree: String = "",
     val summary: String = "",
-    val createdAt: Long = 0,
-    val endedTs: Long = 0,
+    val createdAt: String = "", // ISO-8601 (archive.js stores TEXT), not epoch
+    val endedTs: String = "",
     val msgCount: Int = 0,
 )
 
@@ -334,7 +421,7 @@ data class ArchiveTranscript(
     val repo: String = "",
     val host: String = "",
     val summary: String = "",
-    val endedTs: Long = 0,
-    val createdAt: Long = 0,
+    val endedTs: String = "", // ISO-8601 (archive.js stores TEXT), not epoch
+    val createdAt: String = "",
     val entries: List<TailEntry> = emptyList(),
 )

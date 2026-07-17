@@ -171,7 +171,7 @@ private fun ActionRow(label: String, onClick: () -> Unit) {
 @Composable
 fun CloneBar(agent: com.xerktech.turma.model.AgentInfo, onClone: (String) -> Unit) {
     val gh = agent.github
-    Column(Modifier.fillMaxWidth().padding(16.dp, 4.dp)) {
+    Column(Modifier.fillMaxWidth().padding(10.dp, 2.dp)) {
         if (gh == null || !gh.ok) {
             Text("Cloning unavailable — this host reports no GitHub credentials.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -188,9 +188,11 @@ fun CloneBar(agent: com.xerktech.turma.model.AgentInfo, onClone: (String) -> Uni
                 }
             }
             if (gh.repos.isNotEmpty()) {
-                DropdownField("Or pick a repo", gh.repos.filter { it.substringAfterLast('/') !in present }, "select…") {
-                    onClone(it)
-                }
+                DropdownField(
+                    "Or pick a repo",
+                    gh.repos.map { it.nameWithOwner }.filter { it.substringAfterLast('/') !in present },
+                    "select…",
+                ) { onClone(it) }
             }
         }
     }
