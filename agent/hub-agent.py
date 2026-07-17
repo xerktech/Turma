@@ -3686,9 +3686,19 @@ class SessionManager:
         # pending_prs, which _clear_pending_prs empties after every delivered
         # heartbeat (it's a one-shot "new since last beat" delivery queue). This
         # is what _session_prs / refresh_pr_status key off, so a card's PR status
-        # survives past the beat the URL was first scraped. Deduped + capped,
-        # in-memory (a restart re-learns links as new PRs appear).
+        # survives past the beat the URL was first scraped. Deduped + capped.
         self.session_pr_urls = {}                # id -> [unique PR urls, capped]
+        # Rehydrated from the registry on boot: a running session mirrors its
+        # opened-PR links onto its own record (sess["prUrls"], saved as they grow
+        # in _session_payload), so the chips survive an AGENT restart the same way
+        # a killed session's do off its closed record. Without this the map
+        # started empty and the transcript scan primes its offsets to EOF (so it
+        # never replays the old links), which blanked a running card's PR chips on
+        # every restart until it happened to open another PR. (XERK-15)
+        for _sess in self.registry:
+            _urls = _sess.get("prUrls")
+            if _urls:
+                self.session_pr_urls[_sess["id"]] = list(_urls)
         # PR link -> compact status (state + CI checks), refreshed via `gh pr
         # view` on the PR_STATUS_REFRESH_EVERY cadence and attached to each
         # session's payload. Keyed by URL so several sessions can share one.
@@ -6844,13 +6854,21 @@ class SessionManager:
                 signals["newPrUrls"] = list(pend)
                 # Also remember them persistently: pending_prs is cleared on the
                 # next delivered beat, so the durable PR-status feature reads from
-                # session_pr_urls instead (deduped, newest-last, capped).
+                # session_pr_urls instead (deduped, newest-last, capped). Mirror
+                # the same list onto the session record and save when it grows, so
+                # the chips survive an agent restart (rehydrated in __init__) —
+                # not just across beats. (XERK-15)
                 if pend:
                     known = self.session_pr_urls.setdefault(sid, [])
+                    grew = False
                     for url in pend:
                         if url not in known:
                             known.append(url)
+                            grew = True
                     del known[:-10]
+                    if grew:
+                        sess["prUrls"] = list(known)
+                        self.save()
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
