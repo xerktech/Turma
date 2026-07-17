@@ -307,14 +307,33 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     `prFooterChip` cases in `turma/tests/chat.test.js`.
 - Cached by URL in `pr_status_cache` and attached as `session.prs`; kept even after the session
   stops, and None until it opens a PR.
-- **The link set itself is durable across an agent restart** (XERK-15): a running session mirrors its
+- **The link set is durable across an agent restart** (XERK-15): a running session mirrors its
   `session_pr_urls` onto its own registry record (`sess["prUrls"]`, saved as it grows in
   `_session_payload`) and rehydrates the in-memory map from there on boot — the same durability a
   killed session's PRs get off `closed.json`. Without it a restart blanked a running card's chips
   (the map starts empty and the transcript scan primes to EOF, so it never replays old links) until
-  the session happened to open another PR. `pr_status_cache` itself stays re-derived (`gh pr view`),
-  so the chips reappear as bare links immediately and refill their state/CI on the next status poll.
-  Tests: `test_prs_survive_agent_restart` in `TestRefreshPrStatus`.
+  the session happened to open another PR. Tests: `test_prs_survive_agent_restart` in
+  `TestRefreshPrStatus`.
+- **XERK-13 extends that durability to ENDED sessions and to the status pill**, keyed by transcript
+  id so it outlives the registry/closed record the XERK-15 mirror rides on. Two durable ledgers
+  beside the ticket one:
+  - `pr-sessions.json` (`PR_LEDGER_PATH`, `transcriptId -> {urls, at}`): written whenever the scan
+    finds a URL (`_remember_prs` from `_session_payload`, and on kill from `_remember_closed`) and
+    backfilled from closed history. Its consumer is the **resumable scan** — the ONLY channel still
+    reporting a session once its closed record ages out of `closed.json` past `CLOSED_PER_REPO`, and
+    it carries no PRs of its own — which now attaches `prs` from the ledger (`_ledger_prs`), exactly
+    as it attaches `ticket`. `resumableSession` in `sessions.html` carries them onto the Ended-list
+    row; a live closed record still wins the dedupe and shows its own re-polled status. On boot the
+    ledger also `setdefault`-backfills `session_pr_urls` for any live session the XERK-15 rehydration
+    missed (a pre-mirror registry record) — XERK-15's copy stays authoritative where it has one.
+  - `pr-status.json` (`PR_STATUS_LEDGER_PATH`, `url -> status`): `refresh_pr_status` persists the
+    status cache and `pr_status_cache` seeds from it at boot. XERK-15 left the cache re-derived (bare
+    link, then a status poll refills it) — fine for a RUNNING session, but an ended one is never
+    re-polled, so without this its chip degrades to a bare link on restart for good. Ledgered URLs
+    count as `referenced` in the refresh so an aged-out session's status isn't evicted.
+  - Tests: `TestPrLedger` in `agent/tests/test_hub_agent.py` (incl. a scan→restart end-to-end), the
+    `carries_the_prs` case in `TestResumableReport`, and the resumable-PR-chip case in
+    `turma/tests/sessions.test.js`.
 - **Which PRs are "a session's"** is decided by `_scan_pr_line`, and the rule is deliberately narrow:
   a URL counts only when it comes back in a **`gh pr create` call's own `tool_result`** — the one
   event in a transcript that says this session OPENED that PR.

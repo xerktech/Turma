@@ -1141,10 +1141,12 @@ function resumableSession(t) {
     summary: t.summary,
     worktreePath: t.cwd,
     endedTs: t.endedTs,   // the sort key — endedEntry reads it off this record
-    // No prs: PR links are snapshotted onto a closed record at kill time, and a
-    // transcript recovered by the scan has no record to have snapshotted them
-    // onto. The chips come back if its closed record is still around to win the
-    // dedupe below.
+    // The PRs this conversation opened, from the agent's durable PR ledger (see
+    // PR_LEDGER_PATH). This channel is the only one still reporting a session
+    // once its closed record has aged out, so this is what keeps an ended
+    // session's chips alive past that — the dedupe below still lets a live
+    // closed record win when one is around, carrying its own re-polled status.
+    prs: t.prs || null,
   };
 }
 function collect(agents, now) {
