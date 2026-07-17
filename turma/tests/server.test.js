@@ -10,6 +10,7 @@
 "use strict";
 
 const os = require("os");
+const vm = require("vm");
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
@@ -73,6 +74,7 @@ const {
   userAuthorized, agentAuthorized, agentWsAuthorized, triggerAuthorized, fmtDur,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
+  TERM_OSC52_JS,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -318,6 +320,103 @@ test("fmtDur buckets", () => {
   assert.equal(fmtDur(30 * 1000), "30s");
   assert.equal(fmtDur(120 * 1000), "2m");
   assert.equal(fmtDur(2 * 3600 * 1000), "2h");
+});
+
+// ---- OSC 52 clipboard bridge ---------------------------------------------------
+// TERM_OSC52_JS is a string injected into ttyd's page, so exercise it the way the
+// browser does: run it against a fake window.term and read what it hands the
+// clipboard. See the constant in server.js for why the bridge exists at all.
+
+const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
+
+function runOsc52({ withTerm = true, reject = false } = {}) {
+  const writes = [];
+  const timers = [];
+  let handler = null;
+  const term = {
+    parser: { registerOscHandler: (id, fn) => { if (id === 52) handler = fn; } },
+  };
+  const sandbox = {
+    window: { term: withTerm ? term : undefined },
+    navigator: {
+      clipboard: {
+        writeText: (t) => {
+          writes.push(t);
+          return reject ? Promise.reject(new Error("denied")) : Promise.resolve();
+        },
+      },
+    },
+    // Node's own atob, not a Buffer stand-in: both implement the same spec —
+    // one char per decoded BYTE, and a throw on invalid input, which
+    // Buffer.from(s, "base64") silently swallows instead.
+    atob,
+    TextDecoder,
+    setTimeout: (fn) => { timers.push(fn); return 0; },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(TERM_OSC52_JS, sandbox);
+  return {
+    writes,
+    sandbox,
+    term,
+    fire: (data) => handler(data),
+    handled: () => !!handler,
+    tick: () => timers.splice(0).forEach((f) => f()),
+  };
+}
+
+test("OSC 52 bridge copies both tmux's and an app's payload shape", () => {
+  const t = runOsc52();
+  // An app addresses the clipboard by name; tmux sends an EMPTY selection.
+  assert.equal(t.fire("c;" + b64("from-the-app")), true);
+  assert.equal(t.fire(";" + b64("from-tmux")), true);
+  assert.deepEqual(t.writes, ["from-the-app", "from-tmux"]);
+});
+
+test("OSC 52 bridge decodes UTF-8 rather than pasting mojibake", () => {
+  const t = runOsc52();
+  t.fire("c;" + b64("héllo → wörld ✓"));
+  assert.deepEqual(t.writes, ["héllo → wörld ✓"]);
+});
+
+test("OSC 52 bridge is write-only: a read request is never answered", () => {
+  const t = runOsc52();
+  // "?" asks the terminal to REPLY with the clipboard — answering would hand
+  // any program in the pane whatever the operator last copied.
+  assert.equal(t.fire("c;?"), true);
+  assert.deepEqual(t.writes, []);
+});
+
+test("OSC 52 bridge ignores an empty payload instead of wiping the clipboard", () => {
+  const t = runOsc52();
+  // tmux emits this when copy-mode copies an empty selection.
+  assert.equal(t.fire(";"), true);
+  assert.deepEqual(t.writes, []);
+});
+
+test("OSC 52 bridge waits for ttyd's terminal to exist", () => {
+  // Injected into <head>, so window.term won't exist for another beat or two.
+  const t = runOsc52({ withTerm: false });
+  assert.equal(t.handled(), false, "nothing to register on yet");
+  t.sandbox.window.term = t.term;   // ttyd's bundle boots
+  t.tick();
+  assert.equal(t.handled(), true);
+  t.fire("c;" + b64("late"));
+  assert.deepEqual(t.writes, ["late"]);
+});
+
+test("OSC 52 bridge swallows a refused clipboard write", async () => {
+  // Rejects when the document isn't focused or permission is denied; an
+  // unhandled rejection here would surface inside xterm.js's parser.
+  const t = runOsc52({ reject: true });
+  assert.equal(t.fire("c;" + b64("nope")), true);
+  await new Promise((r) => setImmediate(r));   // let the rejection settle
+});
+
+test("OSC 52 bridge survives a malformed payload", () => {
+  const t = runOsc52();
+  assert.equal(t.fire("c;!!!not-base64!!!"), true);
+  assert.deepEqual(t.writes, []);
 });
 
 test("sessionWorking: transcript freshness plus heartbeat staleness", () => {
