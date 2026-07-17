@@ -542,10 +542,35 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   bit (no setpriv/uid-gid/chown/docker-group/HOME forcing; runs as the invoking user). Sources the
   config, defaults `CLAUDE_PROJECTS_ROOT=$HOME/.claude/projects` (the one env that decouples from the
   container's hardcoded `/root`) and `DEVICE_NAME=$(hostname)`, idles on missing claude creds,
-  reconciles + backgrounds the tunnel, execs the manager.
+  reconciles + supervises the tunnel, execs the manager.
+- The tunnel is **supervised** here, unlike in the container: it is re-exec'd as
+  `turma-agent --tunnel-supervisor` (a respawn loop, not a bare background node), because a native
+  install is the only place its runtime can be MISSING — node is an apt prereq, not a baked layer.
+  - Fire-and-forget made that failure silent AND permanent: the manager kept heartbeating, so the
+    host read ONLINE while every session on it read **"terminal offline"** (the hub's
+    `terminalOnline` is just "is this host's control channel connected right now"), with one
+    `node: command not found` in the journal to say why. Nothing retried, because nothing watched.
+  - The node check lives INSIDE the loop, so installing node on a host that came up without it heals
+    the terminals within one `TUNNEL_RETRY_SEC` — no restart, and no operator who has to know one
+    was owed.
+  - The supervisor's pkill key is PREFIX-scoped like the `tunnel-agent.js` one, and the launcher
+    reaps the supervisor BEFORE the tunnel (the reverse order lets the old loop respawn the tunnel
+    that was just killed). `turma-agentctl stop` reaps it too — the tunnel-agent.js key doesn't
+    match it, and left alive it would respawn what the stop tore down.
+  - Tests: `agent/tests/test_turma_agent.sh` (respawn, missing-node heal, no duplicate supervisor).
+- The launcher exports **`TURMA_MANAGER_PID=$$`**, which `exec` makes the manager's own pid, so the
+  tunnel's poke (`pokeHeartbeat`, cutting a heartbeat sleep short so a queued command lands in about
+  a round-trip) signals the right process. It falls back to PID 1 — right ONLY in the container,
+  where entrypoint.sh `exec`s the manager as PID 1. Natively PID 1 is systemd, and poking it raised
+  EPERM on every command, silently costing each one a full beat. Tests: the `pokeHeartbeat` cases in
+  `agent/tests/tunnel-agent.test.js`.
 - `install.sh` — idempotent installer (`--verify`/`--uninstall`): auto-installs prereqs (apt + npm +
   pinned static ttyd), lays files into a prefix keeping `hub-agent.py` and `hooks/` siblings, writes a
   `chmod 600` config, wires the service, writes `$PREFIX/VERSION`.
+  - It `try-restart`s the service after wiring it: `enable --now` starts a STOPPED service but does
+    nothing to a running one, so a re-run left the old process serving the files it just replaced —
+    a no-op on exactly the host that needed it (a first install that landed without node, or the
+    documented way to update a checkout).
 - `bootstrap.sh` — the README's `curl … | bash` front door: the way IN for a host with no checkout.
   Resolves the newest native tarball, verifies its sha256, unpacks to a temp dir, and `exec`s the
   `install.sh` inside it with every arg passed through (`bash -s -- --autostart`). Duplicates none of

@@ -391,18 +391,36 @@ test("transcriptTail: with a cache, an unchanged file is not re-parsed", () => {
   ]);
 });
 
-test("pokeHeartbeat signals the session-manager process (PID 1) with SIGUSR1", () => {
-  // Stub process.kill so the test never actually signals anything — just
-  // capture what pokeHeartbeat would send.
+// Stub process.kill so these never actually signal anything — just capture what
+// pokeHeartbeat would send.
+function capturePoke(env) {
   const calls = [];
   const realKill = process.kill;
+  const realEnv = process.env.TURMA_MANAGER_PID;
   process.kill = (pid, sig) => calls.push([pid, sig]);
+  if (env === undefined) delete process.env.TURMA_MANAGER_PID;
+  else process.env.TURMA_MANAGER_PID = env;
   try {
     pokeHeartbeat();
   } finally {
     process.kill = realKill;
+    if (realEnv === undefined) delete process.env.TURMA_MANAGER_PID;
+    else process.env.TURMA_MANAGER_PID = realEnv;
   }
-  assert.deepEqual(calls, [[1, "SIGUSR1"]]);
+  return calls;
+}
+
+test("pokeHeartbeat signals the manager pid the launcher named", () => {
+  // The native launcher exports its own $$, which exec makes the manager's.
+  assert.deepEqual(capturePoke("4242"), [[4242, "SIGUSR1"]]);
+});
+
+test("pokeHeartbeat falls back to PID 1 (the container's exec'd manager)", () => {
+  assert.deepEqual(capturePoke(undefined), [[1, "SIGUSR1"]]);
+  // A garbage/empty value must not signal pid 0 — that is "every process in our
+  // group", not "no one".
+  assert.deepEqual(capturePoke(""), [[1, "SIGUSR1"]]);
+  assert.deepEqual(capturePoke("nonsense"), [[1, "SIGUSR1"]]);
 });
 
 test("pokeHeartbeat swallows a failing signal (best-effort)", () => {

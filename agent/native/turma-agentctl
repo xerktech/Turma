@@ -59,7 +59,11 @@ kill_manager() {
 stop() {
   kill_manager
   # Tear down the rest of the control plane (tunnel + update poller); leave the
-  # sessions (tmux/ttyd) running.
+  # sessions (tmux/ttyd) running. The tunnel's supervisor has to go first and by
+  # its own name: it is a `turma-agent --tunnel-supervisor` loop, so the
+  # tunnel-agent.js pkill below doesn't match it, and left alive it would just
+  # respawn the tunnel this stop is tearing down.
+  pkill -f "$PREFIX/bin/turma-agent --tunnel-supervisor" 2>/dev/null || true
   pkill -f "$PREFIX/tunnel-agent.js" 2>/dev/null || true
   upid="$([ -f "$UPDATE_PIDFILE" ] && cat "$UPDATE_PIDFILE" 2>/dev/null || true)"
   if _alive "$upid"; then kill "$upid" 2>/dev/null || true; fi

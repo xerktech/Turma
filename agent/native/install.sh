@@ -191,6 +191,14 @@ install_service() {
     systemctl --user daemon-reload
     systemctl --user enable --now turma-agent.service
     systemctl --user enable --now turma-agent-update.timer
+    # `enable --now` STARTS a stopped service but does nothing to a running one,
+    # so on a re-run the old process keeps running against the files we just
+    # replaced. That silently made re-running the installer — the natural fix for
+    # a first install that landed without node, and the documented way to update
+    # a checkout — a no-op on the very host that needed it. try-restart replaces
+    # a running manager (KillMode=process, so the live sessions are re-adopted,
+    # not killed) and stays quiet about a stopped one, which `--now` just started.
+    systemctl --user try-restart turma-agent.service
     # Keep the user manager alive across logout (so the agent survives with no
     # shell open). Best-effort; needs a one-time sudo.
     if have loginctl; then

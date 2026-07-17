@@ -36,8 +36,43 @@ export PATH="$PREFIX/bin:$PATH"
 export CLAUDE_PROJECTS_ROOT="${CLAUDE_PROJECTS_ROOT:-$HOME/.claude/projects}"
 export REPOS_ROOT="${REPOS_ROOT:-$HOME/git}"
 export DEVICE_NAME="${DEVICE_NAME:-$(hostname)}"
+TUNNEL_RETRY_SEC="${TUNNEL_RETRY_SEC:-10}"
 
 CREDS="$HOME/.claude/.credentials.json"
+
+# ---- reverse-tunnel supervisor ---------------------------------------------
+# Re-entry point: `turma-agent --tunnel-supervisor`, backgrounded by the run
+# path below. It is this script rather than a file of its own so that the
+# supervisor inherits the config we just sourced (TURMA_URL/TURMA_TOKEN and the
+# PATH above are what the tunnel needs), and so that its argv carries a precise,
+# greppable key — the run path and turma-agentctl both pkill on it. That key is
+# PREFIX-scoped, like the tunnel-agent.js one, so a --prefix install only ever
+# reaps its own.
+#
+# The tunnel is SUPERVISED here, unlike in the container, because a native
+# install is the only place its runtime can be missing: node is an apt
+# prerequisite installed at setup time, not a baked image layer. Fire-and-forget
+# made that failure both silent and permanent — the manager kept heartbeating,
+# so the host read ONLINE in the UI while every one of its sessions read
+# "terminal offline", with a lone `node: command not found` in the journal to
+# say why. Nothing retried, because nothing was watching.
+#
+# So the node check lives INSIDE the loop, not in front of it: installing node
+# on a host that came up without it heals the terminals within one retry, with
+# no restart and no operator who has to know a restart was owed.
+if [ "${1:-}" = "--tunnel-supervisor" ]; then
+  while :; do
+    if command -v node >/dev/null 2>&1; then
+      rc=0; node "$PREFIX/tunnel-agent.js" || rc=$?
+      echo "[turma-agent] tunnel exited (rc=$rc); web terminals are offline until it is back"
+    else
+      echo "[turma-agent] node not on PATH — the reverse tunnel cannot start, so every"
+      echo "[turma-agent] session on this host reads 'terminal offline'. Install node >=" \
+           "22 (the installer does this: agent/native/install.sh); it is picked up here."
+    fi
+    sleep "$TUNNEL_RETRY_SEC"
+  done
+fi
 
 # Log-only creds preflight, mirroring entrypoint.sh's checks but pointed at the
 # real $HOME. Never fatal here — the claude idling case is handled separately in
@@ -108,8 +143,22 @@ fi
 # matters because the systemd unit uses KillMode=process — on a manager restart
 # the old tunnel survives, and we want exactly one. Restarting the tunnel only
 # blips the web UI; it never touches tmux/claude.
+#
+# The supervisor goes first and the tunnel second: the reverse order would have
+# the old supervisor respawn the tunnel we just killed, and we would adopt it as
+# ours. setsid so the loop leads its own session — it must outlive this shell,
+# which `exec`s the manager below.
+pkill -f "$SELF_DIR/turma-agent --tunnel-supervisor" 2>/dev/null || true
 pkill -f "$PREFIX/tunnel-agent.js" 2>/dev/null || true
-node "$PREFIX/tunnel-agent.js" &
+
+# The pid the tunnel pokes to cut a heartbeat sleep short. `exec` preserves the
+# pid, so this shell's $$ IS the manager's pid a few lines down — which is the
+# only way to name it before it exists. The container gets this for free (its
+# manager is PID 1, the tunnel's fallback); here PID 1 is systemd, and poking it
+# just earned an EPERM every time, quietly costing every hub command up to a
+# whole beat of latency.
+export TURMA_MANAGER_PID="$$"
+setsid "$SELF_DIR/turma-agent" --tunnel-supervisor &
 
 echo "[turma-agent] starting session manager (REPOS_ROOT=$REPOS_ROOT DEVICE_NAME=$DEVICE_NAME)"
 exec python3 "$PREFIX/hub-agent.py"
