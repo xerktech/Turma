@@ -663,17 +663,25 @@
     // The in-progress assistant turn (streaming, text-only) as the trailing
     // bubble; its text is revealed by the typewriter loop.
     if (liveTurn) {
-      // The pane scrape's "last turn" text shrinks constantly mid-generation —
-      // a tool-use bullet (Bash(…), Read(…)) replaces the prose above it, the
-      // next tool replaces that one, content scrolls — each capture shorter than
-      // the fully-revealed previous one. CLAMP `shown` to the new length rather
-      // than resetting to 0: resetting re-types the shorter text from scratch,
-      // which reads as the last line streaming out and deleting over and over as
-      // tools run. Clamping snaps to the new text instead (mirrors the glasses
-      // reference reveal, glasses/src/reveal.ts advanceReveal). A genuinely new
-      // turn always arrives after an empty ("" -> reveal.shown=0, else-branch
-      // below) frame when generation ends, so it still types in from zero.
-      if (reveal.shown > liveTurn.length) reveal.shown = liveTurn.length;
+      // The pane scrape's "last ● bullet" is NOT a monotonically growing stream
+      // — mid-generation it SWAPS between unrelated blocks: assistant prose is
+      // replaced by a tool-use bullet (Bash(…), Read(…)), that by the next
+      // tool, then by the next prose block. The typewriter is built for text
+      // that only grows, so it must reveal the delta ONLY when the new capture
+      // genuinely continues what we were already showing, and SNAP otherwise.
+      //
+      // Decide by prefix: a genuine continuation starts with the exact slice
+      // already revealed. A swap doesn't, so snap `shown` to the new text — do
+      // NOT keep typing from the stale offset, which re-streams the tail of an
+      // unrelated block (the "last line deletes and restreams over and over"
+      // this ticket is about). This mirrors glasses/src/reveal.ts advanceReveal,
+      // whose entryId change snaps; the pane scrape has no such id, so the
+      // revealed prefix stands in for "same block". A genuinely new turn arrives
+      // after an empty ("" -> reveal.shown=0, else-branch below) frame when
+      // generation ends, so it still types in from zero. A prior clamp only
+      // covered the shrink case (swap to shorter text); a swap to LONGER or
+      // same-length-but-different text slipped through and kept re-typing.
+      if (!liveTurn.startsWith(revealFull.slice(0, reveal.shown))) reveal.shown = liveTurn.length;
       revealFull = liveTurn;
       const shownText = liveTurn.slice(0, Math.max(0, reveal.shown));
       html += '<div class="tr-msg assistant streaming" id="chatLiveBubble"><span class="role">assistant</span>' +
@@ -1446,6 +1454,11 @@
       __setNoExpand: (v) => { noExpand = v; },
       __setBuffer: (b) => { buffer = b; },
       __setLiveTurn: (t) => { liveTurn = t; reveal.shown = 0; },
+      // Set the live turn WITHOUT resetting the reveal — the real ws `turn`
+      // frame does exactly this (liveTurn = frame.text), and testing the
+      // swap-vs-continuation snap needs `shown` to carry across the change.
+      __setLiveTurnRaw: (t) => { liveTurn = t; },
+      __setRevealShown: (n) => { reveal.shown = n; },
       __resetPaint: () => { lastHtml = null; repaintDeferred = false; },
       __revealShown: () => reveal.shown,
     };
