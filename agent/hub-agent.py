@@ -4259,6 +4259,36 @@ class SessionManager:
     def _running_count(self):
         return sum(1 for s in self.registry if s.get("status") == "running")
 
+    def _queued_count(self):
+        return sum(1 for s in self.registry if s.get("status") == "queued")
+
+    def _capacity_payload(self):
+        """This host's session ceiling and what is against it.
+
+        MAX_SESSIONS never used to reach the wire at all, which left the hub
+        unable to tell a host with room from one at its limit — so it routed a
+        ticket to whichever host matched FIRST and a spawn that overran the cap
+        was refused with a log line nobody reads. This is what the hub ranks
+        hosts by; everything else in the queue depends on it being here.
+
+        Cheap enough to send every beat (three counts over the registry), and it
+        has to be: capacity is exactly the fact that goes stale fastest, and a
+        stale read is what makes the hub pile work onto a host that just
+        filled up."""
+        running = self._running_count()
+        return {
+            "maxSessions": MAX_SESSIONS,
+            "running": running,
+            "queued": self._queued_count(),
+            # Never negative: MAX_SESSIONS can be lowered under a host that is
+            # already over it, and "-2 free slots" is not something the hub
+            # should have to reason about.
+            "free": max(0, MAX_SESSIONS - running),
+            # A second, orthogonal ceiling — one root session per host — so the
+            # hub can see a root spawn is blocked without inferring it.
+            "rootRunning": self._root_running(),
+        }
+
     def _root_running(self):
         """True if a root session (cwd = REPOS_ROOT) is already live. Root
         sessions share one claude project slug + RC bridge pointer, so only one
@@ -4583,7 +4613,8 @@ class SessionManager:
     # --- lifecycle (executed container-side; see CONTRACT) ----------------
 
     def spawn(self, repo_name, *, prompt=None, label=None, base_ref=None,
-              model=None, permission_mode=None, ticket=None, cmd_id=None):
+              model=None, permission_mode=None, ticket=None, cmd_id=None,
+              await_clone=None, await_clone_owner=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
         The worktree is added in DETACHED HEAD forked off the latest default
@@ -4603,23 +4634,49 @@ class SessionManager:
         cmd_id is the hub's queued-command id. The session id is minted HERE, so
         the hub has no handle on the session it just asked for until a later
         beat; echoing the command id back on the record (reported as
-        `spawnCmdId`) is what lets the UI recognize its own spawn and open it."""
-        if self._running_count() >= MAX_SESSIONS:
-            log(f"spawn refused: at MAX_SESSIONS ({MAX_SESSIONS})")
-            return
+        `spawnCmdId`) is what lets the UI recognize its own spawn and open it.
+
+        A spawn that can't run RIGHT NOW is no longer refused: it lands as a
+        `queued` record and _drain_queue provisions it when a slot frees, the
+        clone finishes, or the root slot opens. `await_clone` (a repo name) is
+        the ticket-router's promise that this host is cloning that repo — it lets
+        the record exist before its repo does, so the session waits for the clone
+        instead of failing the unknown-repo check. See _drain_queue."""
         # A root session runs directly at REPOS_ROOT (no worktree/branch). The
         # base option doesn't apply; only one may run at a time.
         is_root = (repo_name == ROOT_REPO_NAME)
+        awaiting_clone = False
         if is_root:
-            if self._root_running():
-                log("spawn refused: a root session is already running")
-                return
             repo = {"name": ROOT_REPO_NAME, "path": REPOS_ROOT}
         else:
             repo = next((r for r in scan_repos() if r["name"] == repo_name), None)
             if not repo:
-                log(f"spawn refused: unknown repo {repo_name!r}")
-                return
+                if await_clone and repo_name == await_clone:
+                    # The repo is being cloned to THIS host on purpose — the
+                    # ticket router picked the most-available host in the org and
+                    # none had it. Let the record exist against where the clone
+                    # will land; _drain_queue waits for the .git dir to appear.
+                    repo = {"name": repo_name,
+                            "path": os.path.join(REPOS_ROOT, repo_name)}
+                    awaiting_clone = True
+                else:
+                    log(f"spawn refused: unknown repo {repo_name!r}")
+                    return
+        # Decide run-now vs queue HERE, before the record is appended, so the
+        # counts don't include the session we're about to add (a root session
+        # would otherwise see itself and always read root-busy; a capacity check
+        # would be off by one). Three orthogonal blocks, each re-checked by
+        # _drain_queue before it lets the session run:
+        #   root-busy — another root session already holds the one root slot;
+        #   capacity — the host is at MAX_SESSIONS;
+        #   awaiting-clone — the repo is being cloned to this host right now.
+        reason = None
+        if is_root and self._root_running():
+            reason = "root-busy"
+        elif self._running_count() >= MAX_SESSIONS:
+            reason = "capacity"
+        elif awaiting_clone:
+            reason = "awaiting-clone"
         sid = self._new_id()
         label = (label or "").strip() or None
         # Prefer a slugged label in the RC display name; fall back to the id.
@@ -4651,7 +4708,9 @@ class SessionManager:
             "model": None,                  # resolved --model value (None = omit)
             "permissionMode": "auto",
             "baseRef": None,                # base branch the worktree forked from
-            "status": "running",
+            # A queued record has no worktree/tmux/ttyd yet — _provision_session
+            # (via _drain_queue) makes it real when it's allowed to run.
+            "status": "queued" if reason else "running",
             "createdAt": now_iso(),
             "stoppedAt": None,
             "errorMsg": None,
@@ -4666,16 +4725,66 @@ class SessionManager:
             "spawnCmdId": cmd_id,
         }
         self.registry.append(sess)
+        # Validate every interpolated option BEFORE anything else, so a bad model
+        # or permission mode fails the spawn cleanly whether it runs now or waits
+        # in the queue. Model and permission mode apply to root too.
         try:
-            # Validate every interpolated option BEFORE touching git/tmux. Model
-            # and permission mode apply to root too; base/worktree don't.
             sess["model"] = resolve_model(model)
             sess["permissionMode"] = resolve_permission_mode(permission_mode)
+        except Exception as e:
+            self._set_error(sess, e)
+            return
+        # The base branch and prompt are provisioning inputs; stash them so a
+        # queued session (which resolves its base only once its repo exists, e.g.
+        # after an on-demand clone) carries them across the wait. Cleared by
+        # _provision_session.
+        sess["_pendingBaseRef"] = base_ref
+        sess["_pendingPrompt"] = prompt
+        if reason:
+            sess["queuedReason"] = reason
+            sess["queuedAt"] = now_iso()
+            # What _drain_queue waits on before provisioning (None once cloned /
+            # for a root or capacity wait), plus the owner/repo to re-clone from
+            # if the clone job is lost to a manager restart mid-clone.
+            if reason == "awaiting-clone":
+                sess["awaitClone"] = repo["name"]
+                sess["awaitCloneOwner"] = await_clone_owner
+            else:
+                sess["awaitClone"] = None
+            log(f"queued session {sid} for {repo['name']} ({reason}); "
+                f"{self._running_count()}/{MAX_SESSIONS} running, "
+                f"{self._queued_count()} queued"
+                + (f" ticket {ticket['key']}" if ticket else ""))
+            return
+        self._provision_session(sess)
+
+    def _provision_session(self, sess):
+        """Bring a session's record to life: add its worktree, launch claude +
+        ttyd, start naming it. This is the second half of a spawn — split out so
+        a session that had to WAIT (for a slot, a clone, or the root slot) starts
+        through exactly this code rather than a second, divergent path. Called by
+        spawn() when a slot is free and by _drain_queue() when one frees up."""
+        sid = sess["id"]
+        is_root = sess.get("root")
+        ticket = sess.get("ticket") or None
+        base_ref = sess.pop("_pendingBaseRef", None)
+        prompt = sess.pop("_pendingPrompt", None)
+        try:
             resolved_base = None
             if not is_root:
-                resolved_base = resolve_base_ref(repo["path"], base_ref)
+                # A ticket whose branch reservation was deferred (it queued before
+                # its repo was cloned, so there was no repo to scan for a free
+                # name) reserves it now, against the repo that now exists.
+                if ticket and not ticket.get("branch") and ticket.get("key"):
+                    ticket["branch"] = self._reserve_ticket_branch(
+                        sess["repoPath"], ticket["key"])
+                resolved_base = resolve_base_ref(sess["repoPath"], base_ref)
                 sess["baseRef"] = resolved_base
                 self._worktree_add(sess, base_ref=resolved_base)
+            sess["status"] = "running"
+            # Shed the queue markers — the record is a live session now.
+            for k in ("queuedReason", "queuedAt", "awaitClone", "awaitCloneOwner"):
+                sess.pop(k, None)
             self._launch_tmux(sess, prompt=(prompt or None))
             self._launch_ttyd(sess)
             # Record the worktree -> repo attribution so this session's token
@@ -4683,22 +4792,59 @@ class SessionManager:
             # gone — the basis of persistent host/repo usage.
             self._remember_usage(sess)
             # Name the session from its initial prompt, once, in the background
-            # (no-op when there's no prompt). Never blocks the spawn. Skipped
-            # entirely when the ticket already named it above.
-            if not ticket_summary:
+            # (no-op when there's no prompt). Never blocks the spawn. Skipped when
+            # the session already has a name (a ticket named it at spawn).
+            if not sess.get("summary"):
                 self._start_summary(sess, prompt)
             wt = os.path.basename(sess["worktreePath"])
-            log(f"spawned session {sid} for {repo['name']} on :{sess['ttydPort']} "
+            log(f"provisioned session {sid} for {sess['repo']} on :{sess['ttydPort']} "
                 + ("(root)" if is_root else
                    f"(detached worktree {wt}"
                    + (f", base {resolved_base}" if resolved_base else "")
                    + ")")
-                + (f" label {label!r}" if label else "")
+                + (f" label {sess.get('label')!r}" if sess.get("label") else "")
                 + (f" ticket {ticket['key']}"
                    + (f" -> branch {ticket['branch']}" if ticket.get("branch") else "")
                    if ticket else ""))
         except Exception as e:
             self._set_error(sess, e)
+
+    def _drain_queue(self):
+        """Provision queued sessions that can run now. Runs every heartbeat.
+
+        Oldest first, and at most ONE per beat: provisioning adds a worktree and
+        launches claude against the one shared ~/.claude login — exactly the
+        contention resume_on_boot staggers — so draining a backlog all at once
+        would hammer it. The next beat takes the next one; a poke shortens the
+        wait when a kill just freed a slot.
+
+        Head-of-line is skipped, not blocking: a session still waiting on its
+        clone doesn't hold up a capacity-only one behind it."""
+        if self._running_count() >= MAX_SESSIONS:
+            return  # no slot to drain into; nothing below can change that
+        for sess in self.registry:
+            if sess.get("status") != "queued":
+                continue
+            if sess.get("root"):
+                if self._root_running():
+                    continue  # the one root slot is still taken
+            elif sess.get("awaitClone"):
+                if not os.path.isdir(os.path.join(sess["repoPath"], ".git")):
+                    job = self.clones.get(sess["awaitClone"])
+                    if job and job.get("status") == "error":
+                        # The repo will never arrive — fail the session rather
+                        # than wait forever. (A terminal clone job lingers briefly
+                        # in self.clones; this catches it before it's pruned.)
+                        self._set_error(
+                            sess, f"clone of {sess['awaitClone']} failed: "
+                                  f"{job.get('error') or 'unknown error'}")
+                    elif not job and sess.get("awaitCloneOwner"):
+                        # No job at all: the clone was lost to a manager restart
+                        # mid-flight. Re-trigger it from the owner we stored.
+                        self.clone(sess["awaitCloneOwner"])
+                    continue
+            self._provision_session(sess)
+            return  # one per beat
 
     def _reserve_ticket_branch(self, repo_path, issue_key):
         """The branch name a new session on `issue_key` will be told to use.
@@ -4734,17 +4880,20 @@ class SessionManager:
         button.
 
         Everything is re-derived from LOCAL state rather than trusted from the
-        command: the hub only chooses which host (an online one reporting the org
-        with the repo cloned), and a board that is a beat or two stale must not be
-        able to spawn against the wrong repo. So the repo comes from this host's
-        own triage ledger and must still be in scan_repos(), and the ticket text
-        comes from a fresh fetch rather than the heartbeat's card fields.
+        command: the hub only chooses which host (an online one reporting the org,
+        preferring one with the repo already cloned but falling back to the
+        most-available one, which then clones on demand), and a board that is a
+        beat or two stale must not be able to spawn against the wrong repo. So the
+        repo comes from this host's own triage ledger, and the ticket text comes
+        from a fresh fetch rather than the heartbeat's card fields.
 
-        Refusals log and return, like spawn's own: there is no session record to
-        hang an error on yet, and each case is one the board's button is already
-        supposed to prevent (it only enables on a triaged, cloned repo). A fetch
-        that fails raises to handle_commands, which logs and acks — the board's
-        start button times out and says so rather than spinning forever."""
+        The repo NOT being cloned here is no longer a refusal: this host was
+        chosen precisely because it could clone it, so we start the clone and
+        queue the session behind it (see spawn's await_clone). Refusals that
+        remain log and return — a bad key, no creds, no triaged repo, or a repo
+        with no known owner to clone — each one the board's button already
+        prevents. A fetch that fails raises to handle_commands, which logs and
+        acks."""
         key = (issue_key or "").strip()
         if not JIRA_KEY_RE.match(key):
             log(f"spawnTicket refused: {key[:50]!r} is not a Jira issue key")
@@ -4761,25 +4910,44 @@ class SessionManager:
             log(f"spawnTicket refused: {key} has no triaged repo on this host")
             return
         repo_name = entry["repo"]
-        # The ledger's `cloned` is as of triage time; scan_repos() is now. spawn()
-        # would refuse an unknown repo anyway, but that refusal couldn't say why.
+        # The ledger's `cloned` is as of triage time; scan_repos() is now.
         repo = next((r for r in scan_repos() if r["name"] == repo_name), None)
+        await_clone = None
         if not repo:
-            log(f"spawnTicket refused: {key}'s repo {repo_name!r} is not cloned here")
-            return
+            # The repo isn't cloned here. The hub routed this ticket to us because
+            # we're the most-available host in the org and NO host had it — so
+            # clone it on demand and let the session queue behind the clone
+            # (_drain_queue provisions it, and reserves its branch, once the .git
+            # dir lands). The owner/repo comes from the triage ledger, which
+            # recorded it when it chose the repo; without one there is nothing to
+            # clone, so refuse before spending a Jira fetch.
+            nwo = entry.get("nameWithOwner")
+            if not nwo:
+                log(f"spawnTicket refused: {key}'s repo {repo_name!r} is not "
+                    "cloned here and no owner is known to clone it")
+                return
+            job = self.clones.get(repo_name)
+            if not job or job.get("status") == "error":
+                self.clone(nwo)
+            await_clone = repo_name
+        # Committed to spawning now — fetch the ticket text for the prompt, and
+        # (when the repo already exists) reserve the branch name against it.
         detail = fetch_jira_issue(key)
-        branch = self._reserve_ticket_branch(repo["path"], key)
+        branch = self._reserve_ticket_branch(repo["path"], key) if repo else None
         ticket = {
             "key": key,
             "siteKey": site_key,
             "url": detail.get("url") or f"https://{site_key}/browse/{key}",
             "summary": (detail.get("summary") or "")[:200],
-            # None when the name couldn't be reserved — the agent then names its
-            # own branch under the ordinary policy, which is worse but not broken.
+            # None when the name couldn't be reserved (or was deferred to the
+            # clone) — the agent then names its own branch under the ordinary
+            # policy, which is worse but not broken.
             "branch": branch,
         }
         self.spawn(repo_name, prompt=build_ticket_prompt(detail), ticket=ticket,
-                   cmd_id=cmd_id)
+                   cmd_id=cmd_id, await_clone=await_clone,
+                   await_clone_owner=(entry.get("nameWithOwner") if await_clone
+                                      else None))
 
     def _remember_closed(self, sess):
         """Record a killed session in the closed history so the hub can offer
@@ -6715,6 +6883,12 @@ class SessionManager:
             "permissionModes": perm_cycle_for(sess.get("launchPermissionMode")),
             "baseRef": sess.get("baseRef"),
             "status": sess.get("status"),
+            # Why a `queued` session is waiting (capacity / awaiting-clone /
+            # root-busy) and since when — so the card can say "waiting for a
+            # slot" rather than looking like a stuck spawn. Absent (None) for any
+            # session that isn't queued.
+            "queuedReason": sess.get("queuedReason"),
+            "queuedAt": sess.get("queuedAt"),
             "ttydPort": sess.get("ttydPort"),
             "createdAt": sess.get("createdAt"),
             "stoppedAt": sess.get("stoppedAt"),
@@ -6939,6 +7113,10 @@ class SessionManager:
                 log(f"pr status refresh failed: {e}")
         self._poll_clones()
         self._poll_prunes()
+        # Start any queued session that can now run — a freed slot, a finished
+        # on-demand clone, or the root slot opening. One per beat; see the method.
+        if not light:
+            self._drain_queue()
         # Drop AskUserQuestion rendezvous files left behind by a turn that died
         # outside our kill/restart cleanup, so a long-answered/abandoned question
         # can't keep showing as pending on the card.
@@ -6961,6 +7139,11 @@ class SessionManager:
             "memory": memory_usage(),
             "logTail": self._log_tail(beat, light),
             "reposRoot": REPOS_ROOT,
+            # Session ceiling + what's against it, so the hub can rank hosts by
+            # free slots (ticket routing) and show a queued session's wait. Cheap
+            # enough to send every beat, and it has to be: capacity is the fact
+            # that goes stale fastest.
+            "capacity": self._capacity_payload(),
             "repos": self._sorted_repo_entries(refresh),
             "sessions": [self._session_payload(s, refresh) for s in self.registry],
             "closedSessions": self._closed_payload(),

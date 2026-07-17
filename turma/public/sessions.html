@@ -58,6 +58,17 @@
   button.s-card:hover:not(:disabled) { border-color: var(--accent); }
   button.s-card:disabled { cursor: default; opacity: 0.6; }
   .s-card.cur { border-color: var(--accent); background: var(--accent-soft); }
+  /* A queued session card is a static <div>, not a selecting <button> (no pane to
+     attach to yet), so it needs the card's flex layout spelled out here. It gets
+     a dashed border + amber dot to read as "about to start", distinct from both a
+     live card and a muted ended one. */
+  .s-card.queued {
+    display: flex; align-items: flex-start; gap: 10px; width: 100%;
+    background: var(--surface); border: 1px dashed var(--border);
+    border-radius: var(--radius-md); padding: 10px 72px 10px 12px; color: var(--ink);
+  }
+  .s-card.queued .dot { background: var(--warning); box-shadow: none; }
+  .s-card-wrap > .s-dots { font-size: 11.5px; font-weight: 600; }
   .s-card .dot { margin-top: 4px; }
   .s-card .body { flex: 1; min-width: 0; }
   .s-card .title { font-weight: 600; font-size: 14px; line-height: 1.3; overflow-wrap: anywhere; }
@@ -627,6 +638,7 @@
       </div>
       <div id="searchResults"></div>
       <div id="spawn"></div>
+      <div id="queued"></div>
       <div id="active"></div>
       <div id="idle"></div>
       <div id="ended"></div>
@@ -705,6 +717,7 @@ const $active = document.getElementById("active");
 const $idle = document.getElementById("idle");
 const $ended = document.getElementById("ended");
 const $spawn = document.getElementById("spawn");
+const $queued = document.getElementById("queued");
 const $sidebar = document.querySelector(".sidebar");
 // The header slot nav.js mounts for this page's running/waiting counts.
 // See public/nav.js.
@@ -1134,7 +1147,7 @@ function resumableSession(t) {
   };
 }
 function collect(agents, now) {
-  const running = [], ended = [];
+  const running = [], queued = [], ended = [];
   // <host>::<transcriptId> of every session a registry-backed record covers.
   // A killed session is reported through BOTH channels by construction — its
   // closed record, and (once the slow scan catches up) its transcript in
@@ -1146,6 +1159,10 @@ function collect(agents, now) {
   for (const a of agents) {
     for (const s of (a.sessions || [])) {
       if (s.status === "running") running.push({ a, s, live: liveState(s, a, now) });
+      // A queued session is upcoming, not ended — it has a record but no worktree
+      // yet, and provisions when a slot frees / its clone lands (see the agent's
+      // _drain_queue). Its own section, above the live sessions.
+      else if (s.status === "queued") queued.push({ a, s });
       else ended.push(endedEntry(a, s, "stopped"));
       if (s.transcriptId) carded.add(key(a, s.transcriptId));
     }
@@ -1173,7 +1190,9 @@ function collect(agents, now) {
   // likely to want back. Ties (same-second kills, or two undated records) fall
   // back to the id so the order is at least stable across beats.
   ended.sort((x, y) => (y.endedMs - x.endedMs) || String(x.id).localeCompare(String(y.id)));
-  return { running, ended };
+  // Oldest-queued first — FIFO, the order the agent's _drain_queue will start them.
+  queued.sort((x, y) => String(x.s.queuedAt || "").localeCompare(String(y.s.queuedAt || "")));
+  return { running, queued, ended };
 }
 // The ended entry for a session id, whatever channel reported it.
 function findEnded(id) {
@@ -1232,7 +1251,7 @@ function render(data) {
   const { now, agents } = data;
   reconcilePending(agents);
 
-  const { running, ended } = collect(agents, now);
+  const { running, queued, ended } = collect(agents, now);
   const waiting = running.filter(x => x.live.kind === "waiting").length;
   $counts.textContent = running.length + " running" + (waiting ? " · " + waiting + " waiting on you" : "");
 
@@ -1261,6 +1280,14 @@ function render(data) {
           : `<div class="empty" style="padding:20px 0">No online hosts with repos.</div>`
       }</div>
     </details>`;
+
+  // Queued sessions: waiting for a slot, a clone, or the root slot. Above the
+  // live lists — they're the work about to start. Cancelable but not attachable
+  // (there's no pane yet).
+  $queued.innerHTML = queued.length
+    ? `<h2>Queued <span class="count">${queued.length}</span></h2>
+       <div class="s-list">${queued.map(x => queuedCard(x)).join("")}</div>`
+    : "";
 
   $active.innerHTML = `<h2>Active <span class="count">${active.length}</span></h2>` +
     (active.length
@@ -1304,6 +1331,44 @@ function render(data) {
   }
 
   tryPendingSelect(); // deep-linked ?session=<id> — open it once it's running
+}
+
+// Human text for why a queued session hasn't started yet.
+function queuedReasonText(reason) {
+  return ({
+    "capacity": "waiting for a free session slot",
+    "awaiting-clone": "cloning the repo first",
+    "root-busy": "waiting for the repos-root slot",
+  })[reason] || "waiting to start";
+}
+// The stage headline while a followed spawn is sitting in the queue.
+function queuedStageText(s) {
+  return "Queued — " + queuedReasonText(s.queuedReason);
+}
+
+// A queued session card: not attachable (no pane yet), so the whole thing is a
+// plain block rather than a selecting <button>. Cancel drops the queued record
+// (the same kill path, armed-then-confirmed via the ⋯ menu on live cards — here
+// a single inline arm/confirm keeps it simple).
+function queuedCard({ a, s }) {
+  const armed = killArmedId === s.id;
+  const ticket = s.ticket?.key ? ` · <span class="s-ticket">${esc(s.ticket.key)}</span>` : "";
+  const meta = `<span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}${ticket}`;
+  const since = s.queuedAt ? " · " + esc(ago(Date.now() - Date.parse(s.queuedAt))) : "";
+  return `<div class="s-card-wrap">
+    <div class="s-card queued">
+      <span class="dot queued"></span>
+      <span class="body">
+        <div class="title">${esc(sessTitle(s))}</div>
+        <div class="meta">${meta}</div>
+        <div class="state-row">
+          <div class="state">${esc(queuedReasonText(s.queuedReason))}${since}</div>
+        </div>
+      </span>
+    </div>
+    <button class="s-dots" title="Cancel queued session" aria-label="Cancel queued session"
+        onclick="cardKill(event,'${esc(a.key)}','${esc(s.id)}')">${armed ? "Confirm" : "Cancel"}</button>
+  </div>`;
 }
 
 function activeCard({ a, s, live }) {
@@ -1617,7 +1682,12 @@ function tryPendingSelect() {
   // to come up. Say which rather than sit on the "No session attached" copy,
   // which reads as if the spawn went nowhere.
   if (pendingSpawn || (pendingSelect && !sessionHit(pendingSelect))) {
-    stageWaiting(followedSpawn ? "Starting your session…" : "Opening session…");
+    // A followed spawn that landed in the queue (host full, or cloning its repo)
+    // says so rather than "Starting…", which reads as if it were already
+    // launching. It flips to the live session the moment it provisions.
+    const sel = pendingSelect ? findSession(pendingSelect) : null;
+    if (sel && sel.status === "queued") stageWaiting(queuedStageText(sel));
+    else stageWaiting(followedSpawn ? "Starting your session…" : "Opening session…");
     return;
   }
   if (!pendingSelect) { stageWaiting(null); return; }

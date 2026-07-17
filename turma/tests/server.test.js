@@ -1972,13 +1972,49 @@ test("http: the host must have the ticket's repo, not just the org's creds", asy
   assert.equal((agents.tsCreds.commands || []).length, 0);
 });
 
-test("http: no online host has the repo -> 409 saying so", async () => {
+test("http: no online host has the repo -> routes anyway and clones on demand", async () => {
+  // The old refusal is gone: the ticket routes to the most-available org host,
+  // which clones the repo and queues the session behind it (see spawn_ticket).
   await ticketBeat("ts5", "t5.atlassian.net", { repos: ["Other"] });
   const res = await request("POST", "/api/jira/t5.atlassian.net/ENG-5/session",
     { headers: userHeaders });
-  assert.equal(res.status, 409);
-  assert.match(res.body.error, /Turma/);
-  assert.equal((agents.ts5.commands || []).length, 0);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.host, "ts5");
+  assert.equal(res.body.needsClone, true);
+  assert.deepEqual(agents.ts5.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: among org hosts with the repo, the most available one wins", async () => {
+  // The splitting rule: N sessions on one org spread across its hosts instead of
+  // stacking on whichever registered first.
+  await ticketBeat("tsBusy", "tSplit.atlassian.net");
+  await ticketBeat("tsFree", "tSplit.atlassian.net");
+  agents.tsBusy.capacity = { maxSessions: 6, running: 5, queued: 0, free: 1 };
+  agents.tsFree.capacity = { maxSessions: 6, running: 1, queued: 0, free: 5 };
+  const res = await request("POST", "/api/jira/tSplit.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.body.host, "tsFree");
+  assert.equal((agents.tsBusy.commands || []).length, 0);
+});
+
+test("http: a spawn already queued to a host lowers its availability", async () => {
+  // Availability subtracts in-flight spawn commands, so two tickets clicked
+  // between beats split instead of both landing on the same host.
+  await ticketBeat("tsA", "tSplit2.atlassian.net", { key: "ENG-5" });
+  await ticketBeat("tsB", "tSplit2.atlassian.net", { key: "ENG-6" });
+  agents.tsA.capacity = { maxSessions: 6, running: 0, queued: 0, free: 6 };
+  agents.tsB.capacity = { maxSessions: 6, running: 0, queued: 0, free: 6 };
+  // First ticket: a tie, insertion order gives tsA.
+  const one = await request("POST", "/api/jira/tSplit2.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(one.body.host, "tsA");
+  // Second ticket before any beat reflects the first: tsA now has a pending
+  // spawn, so the second goes to tsB.
+  const two = await request("POST", "/api/jira/tSplit2.atlassian.net/ENG-6/session",
+    { headers: userHeaders });
+  assert.equal(two.body.host, "tsB");
 });
 
 test("http: an offline host is never queued a spawn — it 503s instead", async () => {

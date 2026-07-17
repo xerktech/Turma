@@ -421,30 +421,68 @@ function ticketRepo(siteKey, issueKey) {
   return best;
 }
 
-// Which HOST should run a ticket's session: an ONLINE host that both reports the
-// org and has the ticket's repo cloned. Those are two different requirements and
-// findJiraHost only covers the first — with two hosts on one org, the one holding
-// the creds is not necessarily the one holding the repo, and a spawn on a host
-// without the repo just logs a refusal the operator never sees.
+// How many more sessions a host can take RIGHT NOW, as the hub sees it — the
+// basis for splitting work across the agents of one org. Starts from the
+// agent-reported `capacity.free` (MAX_SESSIONS minus running) and subtracts what
+// the hub itself has already committed but the host hasn't reflected yet: its
+// queued sessions, and the spawn/spawnTicket commands sitting in its queue since
+// its last heartbeat. Without that subtraction, four tickets clicked between two
+// beats would all read the same stale `free` and pile onto one host.
+//
+// An agent predating the capacity block reports no ceiling, so its headroom is
+// unknowable; it scores below any capacity-reporting host (which, once a fleet
+// runs this build, is all of them) but stays eligible so a mixed fleet still
+// routes. Can go negative (more committed than free) — that's fine, it's a
+// sortable score, not a count.
+function pendingSpawnCount(a) {
+  return (a.commands || []).filter(
+    (c) => c && (c.type === "spawn" || c.type === "spawnTicket")).length;
+}
+function hostAvailability(a) {
+  const c = a.capacity;
+  if (!c || typeof c.free !== "number") {
+    // Unknown ceiling: rank only by what we've queued onto it, well below any
+    // host that reports real free slots.
+    return -1000 - pendingSpawnCount(a);
+  }
+  return c.free - (c.queued || 0) - pendingSpawnCount(a);
+}
+
+// Which HOST should run a ticket's session, splitting load across the org's
+// agents. Among the ONLINE hosts reporting the org:
+//   - prefer one that already has the repo cloned;
+//   - if NONE has it, fall back to any of them — the agent clones the repo on
+//     demand and queues the session behind the clone (see spawn_ticket);
+//   - within the chosen group, pick the MOST AVAILABLE (hostAvailability), so N
+//     sessions on one org spread across its hosts instead of stacking on the
+//     first match. A host that's momentarily full is still a valid target — the
+//     session simply queues there — so this never fails for lack of a free slot.
 //
 // Online is required rather than preferred (unlike the read-only GET above, which
-// happily serves an offline host's cache): a spawn queued onto a sleeping host
-// would land whenever it next wakes, which is a surprise, not a feature.
-// Returns {host} | {error, status}.
+// serves an offline host's cache): a spawn queued onto a sleeping host would land
+// whenever it next wakes, which is a surprise, not a feature.
+// Returns {host, needsClone} | {error, status}.
 function findTicketHost(siteKey, repo) {
   const now = Date.now();
-  let offline = false, wrongRepo = false;
+  let anyOrg = false, anyOnline = false;
+  const cloned = [], uncloned = [];
   for (const [key, a] of Object.entries(agents)) {
     if (!a.jira || a.jira.siteKey !== siteKey) continue;
-    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) { offline = true; continue; }
-    if (!(a.repos || []).some((r) => r && r.name === repo)) { wrongRepo = true; continue; }
-    return { host: key };
+    anyOrg = true;
+    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    anyOnline = true;
+    if ((a.repos || []).some((r) => r && r.name === repo)) cloned.push(key);
+    else uncloned.push(key);
   }
-  if (wrongRepo) {
-    return { status: 409, error: `no online host for that org has ${repo} cloned` };
+  if (!anyOrg) return { status: 404, error: "no host reports that Jira org" };
+  if (!anyOnline) {
+    return { status: 503, error: "every host reporting that Jira org is offline" };
   }
-  if (offline) return { status: 503, error: "every host reporting that Jira org is offline" };
-  return { status: 404, error: "no host reports that Jira org" };
+  const pool = cloned.length ? cloned : uncloned;
+  const needsClone = cloned.length === 0;
+  // Most available first; insertion order breaks ties (stable, deterministic).
+  pool.sort((x, y) => hostAvailability(agents[y]) - hostAvailability(agents[x]));
+  return { host: pool[0], needsClone };
 }
 
 // Which HOST owns a given sessionId, and that session's ttyd port. Sessions are
@@ -1962,7 +2000,7 @@ const server = http.createServer(async (req, res) => {
       if (!repo) {
         return json(res, 409, { error: "that ticket has no triaged repo yet" });
       }
-      const { host, error, status } = findTicketHost(siteKey, repo);
+      const { host, error, status, needsClone } = findTicketHost(siteKey, repo);
       if (!host) return json(res, status, { error });
       // Single-flight per ticket, like the jiraIssue fetch above: a double-click
       // (or a click while the first spawn is still riding the queue) must not
@@ -1971,7 +2009,9 @@ const server = http.createServer(async (req, res) => {
         .find((c) => c.type === "spawnTicket" && c.issueKey === issueKey);
       const cmdId = pending ? pending.cmdId
         : queueCommand(host, { type: "spawnTicket", issueKey });
-      return json(res, 200, { ok: true, cmdId, host, repo });
+      // needsClone tells the board the chosen host doesn't have the repo yet, so
+      // it will clone on demand and the session starts queued behind the clone.
+      return json(res, 200, { ok: true, cmdId, host, repo, needsClone });
     }
 
     // POST /api/jira/<siteKey>/<issueKey>/repo — the operator's own answer to
