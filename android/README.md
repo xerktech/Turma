@@ -28,6 +28,13 @@ notifications** and **voice** for starting sessions and mid-session prompts.
 - **Push** — FCM notifications for question waiting / turn finished / PR created /
   host offline / cost threshold, each on its own channel, deep-linking a tap to
   the exact session or host.
+- **Adaptive layout** — dashboard / board / usage simply expand to fill the
+  window; the Sessions screen becomes a web-style **list-detail two-pane** (cards
+  left, chat right) on an expanded width (≥840dp: tablets, unfolded foldables,
+  large landscape) and single-pane (list → full-screen chat) when narrow. The
+  open session is `rememberSaveable`, so a foldable folding/unfolding reflows
+  between the two forms without losing the conversation. Driven by
+  `WindowWidthSizeClass` in `MainActivity` → `SessionsRoute`.
 
 ## Architecture
 

@@ -1,33 +1,43 @@
 package com.xerktech.turma.ui
 
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -67,9 +77,86 @@ fun flattenSessions(
     return filtered.sortedBy { it.session.status != "running" }
 }
 
+/** Identity of the session currently open in the detail pane. */
+private fun selKey(host: String?, id: String?): String? =
+    if (!host.isNullOrEmpty() && !id.isNullOrEmpty()) "$host/$id" else null
+
+/**
+ * The adaptive Sessions screen. Selection is hoisted here and [rememberSaveable],
+ * so it survives the configuration change a foldable's fold/unfold triggers — the
+ * same session stays open as the layout reflows between the two forms:
+ *  - wide (tablet / unfolded): list-detail two-pane, like the web sessions page;
+ *  - narrow (phone / folded): the list, or a full-screen chat once a session is
+ *    picked (bottom-nav dropped, matching the web's full-screen terminal).
+ */
 @Composable
-fun SessionsScreen(
-    onOpenChat: (String, String) -> Unit,
+fun SessionsRoute(
+    wide: Boolean,
+    onNavigate: (TopDest) -> Unit,
+    onTerminal: (String, String) -> Unit,
+) {
+    var selHost by rememberSaveable { mutableStateOf<String?>(null) }
+    var selId by rememberSaveable { mutableStateOf<String?>(null) }
+    val select: (String, String) -> Unit = { h, s -> selHost = h; selId = s }
+    val clear: () -> Unit = { selHost = null; selId = null }
+    val hasSel = !selHost.isNullOrEmpty() && !selId.isNullOrEmpty()
+
+    val detail: @Composable () -> Unit = {
+        // key() so switching sessions rebuilds the chat subtree (fresh VM + reveal).
+        key(selHost, selId) {
+            ChatScreen(
+                host = selHost.orEmpty(),
+                sessionId = selId.orEmpty(),
+                onBack = clear,
+                onTerminal = { onTerminal(selHost.orEmpty(), selId.orEmpty()) },
+                showBack = !wide,
+            )
+        }
+    }
+
+    when {
+        // Narrow + a session picked: full-screen chat, no bottom nav (web parity).
+        !wide && hasSel -> detail()
+
+        // Wide: list on the left, chat (or an empty prompt) on the right.
+        wide -> MainScaffold(TopDest.SESSIONS, onNavigate) { m ->
+            Row(m.fillMaxSize()) {
+                SessionsListPane(
+                    selectedKey = selKey(selHost, selId),
+                    onSelect = select,
+                    modifier = Modifier.width(360.dp).fillMaxHeight(),
+                )
+                VerticalDivider()
+                Box(Modifier.weight(1f).fillMaxHeight()) {
+                    if (hasSel) detail() else DetailEmpty()
+                }
+            }
+        }
+
+        // Narrow, nothing picked: just the list.
+        else -> MainScaffold(TopDest.SESSIONS, onNavigate) { m ->
+            SessionsListPane(selectedKey = null, onSelect = select, modifier = m)
+        }
+    }
+}
+
+/** Placeholder shown in the wide detail pane before a session is picked. */
+@Composable
+private fun DetailEmpty() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text(
+            "Select a session to open its conversation.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(24.dp),
+        )
+    }
+}
+
+@Composable
+fun SessionsListPane(
+    selectedKey: String?,
+    onSelect: (String, String) -> Unit,
     modifier: Modifier = Modifier,
     vm: FleetViewModel = viewModel(),
 ) {
@@ -98,7 +185,9 @@ fun SessionsScreen(
                 }
             }
             items(rows, key = { it.host + "/" + it.session.id }) { r ->
-                SessionListCard(r, now) { onOpenChat(r.host, r.session.id) }
+                SessionListCard(r, now, selected = selectedKey == r.host + "/" + r.session.id) {
+                    onSelect(r.host, r.session.id)
+                }
             }
             // Ended sessions: killed but resumable — its own collapsible section.
             if (ended.isNotEmpty()) {
@@ -117,7 +206,7 @@ fun SessionsScreen(
                 }
                 if (endedOpen) {
                     items(ended, key = { "closed:" + it.host + "/" + it.closed.id }) { c ->
-                        ClosedSessionCard(c) { vm.resume(c.host, c.closed.id); onOpenChat(c.host, c.closed.id) }
+                        ClosedSessionCard(c) { vm.resume(c.host, c.closed.id); onSelect(c.host, c.closed.id) }
                     }
                 }
             }
@@ -164,8 +253,13 @@ private fun ClosedSessionCard(c: FlatClosed, onResume: () -> Unit) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SessionListCard(r: FlatSession, now: Long, onClick: () -> Unit) {
-    TurmaCard(Modifier.fillMaxWidth()) {
+private fun SessionListCard(r: FlatSession, now: Long, selected: Boolean, onClick: () -> Unit) {
+    val cardMod = Modifier.fillMaxWidth().then(
+        if (selected)
+            Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
+        else Modifier,
+    )
+    TurmaCard(cardMod) {
         Row(
             Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,

@@ -23,6 +23,7 @@ object Routes {
 @Composable
 fun TurmaApp(
     container: AppContainer,
+    wide: Boolean,
     pendingDeepLink: MainActivity.DeepLink?,
     onDeepLinkConsumed: () -> Unit,
 ) {
@@ -60,9 +61,14 @@ fun TurmaApp(
             }
         }
         composable(TopDest.SESSIONS.route) {
-            MainScaffold(TopDest.SESSIONS, goTab) { m ->
-                SessionsScreen(onOpenChat = { h, s -> nav.navigate(Routes.chat(h, s)) }, modifier = m)
-            }
+            // Sessions is the one adaptive screen: single-pane list (→ full-screen
+            // chat) when narrow, list-detail two-pane when wide. It owns its own
+            // scaffold/bottom-nav so it can drop the nav on a compact chat.
+            SessionsRoute(
+                wide = wide,
+                onNavigate = goTab,
+                onTerminal = { h, s -> nav.navigate(Routes.terminal(h, s)) },
+            )
         }
         composable(TopDest.BOARD.route) {
             MainScaffold(TopDest.BOARD, goTab) { m -> BoardScreen(modifier = m) }

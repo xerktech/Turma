@@ -78,6 +78,7 @@ class ChatViewModel(
     private var liveJob: Job? = null
     private var revealJob: Job? = null
     private var historyJob: Job? = null
+    private var fleetJob: Job? = null
     private var dictation: Dictation? = null
 
     fun onEnter() {
@@ -88,14 +89,18 @@ class ChatViewModel(
         loadHistory()
     }
 
+    // Symmetric with onEnter: cancels every launched job so a re-entry (the
+    // two-pane detail swapping back to a session whose VM lingered in the store)
+    // restarts cleanly rather than stacking a second collector on each job.
     fun onLeave() {
-        liveJob?.cancel(); revealJob?.cancel(); historyJob?.cancel()
+        liveJob?.cancel(); revealJob?.cancel(); historyJob?.cancel(); fleetJob?.cancel()
         cancelDictation()
     }
 
     // Session record + heartbeat tail seed + question state ride the fleet poll.
     private fun observeFleet() {
-        viewModelScope.launch {
+        fleetJob?.cancel()
+        fleetJob = viewModelScope.launch {
             container.fleet.state.collect { fleet ->
                 val session = fleet.agents.firstOrNull { it.key == host }
                     ?.sessions?.firstOrNull { it.id == sessionId }

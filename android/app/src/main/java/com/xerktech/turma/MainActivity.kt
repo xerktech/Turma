@@ -7,6 +7,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSizeClassApi
+import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
+import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -29,6 +32,7 @@ class MainActivity : ComponentActivity() {
     private val notifPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* best-effort */ }
 
+    @OptIn(ExperimentalMaterial3WindowSizeClassApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -38,8 +42,15 @@ class MainActivity : ComponentActivity() {
         val container = (application as TurmaApplication).container
         setContent {
             TurmaTheme {
+                // Expanded width (≥840dp: tablets, unfolded foldables, large
+                // landscape) drives the sessions list-detail two-pane; anything
+                // narrower stays single-pane. calculateWindowSizeClass re-reads
+                // the live window metrics, so folding/unfolding reflows the UI.
+                val wide = calculateWindowSizeClass(this).widthSizeClass ==
+                    WindowWidthSizeClass.Expanded
                 TurmaApp(
                     container = container,
+                    wide = wide,
                     pendingDeepLink = deepLink,
                     onDeepLinkConsumed = { deepLink = null },
                 )
