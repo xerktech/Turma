@@ -726,3 +726,120 @@ test("parsePaneLiveTurn: no agent-manager list -> status without agents key", ()
   const r = parsePaneLiveTurn(pane);
   assert.ok(r.status && !("agents" in r.status), "no expanded list -> no agents key");
 });
+
+// ---- control-channel liveness ----------------------------------------------
+// The regression these guard: a hub that dies without closing the socket (the
+// real case — Cloudflare holds our end open after the origin restarts) fires no
+// 'close', so the reconnect never runs and the channel wedges forever. Every
+// session then reads "terminal offline" while the host still heartbeats green.
+//
+// These drive the REAL script as a child process against a fake hub, because
+// the bug lives in the socket lifecycle, not in a pure helper: a unit test of a
+// mocked WebSocket would have happily passed all along.
+
+const http = require("http");
+const crypto = require("crypto");
+const { spawn } = require("child_process");
+
+const AGENT_JS = path.join(__dirname, "..", "tunnel-agent.js");
+
+function wsEncode(op, payload) {
+  const p = Buffer.from(payload);
+  return Buffer.concat([Buffer.from([0x80 | op, p.length]), p]);
+}
+
+// A hub that accepts control channels and records each one. `onConnect` decides
+// how that connection behaves (ping it, or stay mute).
+function fakeHub(onConnect) {
+  const sockets = [];
+  const srv = http.createServer();
+  srv.on("upgrade", (req, socket) => {
+    const key = req.headers["sec-websocket-key"];
+    const accept = crypto
+      .createHash("sha1")
+      .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+      .digest("base64");
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" +
+        `Connection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
+    );
+    socket.on("error", () => {});
+    sockets.push(socket);
+    onConnect(socket, sockets.length);
+  });
+  return new Promise((resolve) => {
+    srv.listen(0, "127.0.0.1", () => resolve({ srv, sockets, port: srv.address().port }));
+  });
+}
+
+function startAgent(port, extraEnv) {
+  const child = spawn(process.execPath, [AGENT_JS], {
+    env: {
+      ...process.env,
+      TURMA_URL: `http://127.0.0.1:${port}`,
+      TURMA_TOKEN: "x",
+      DEVICE_NAME: "testhost",
+      CLAUDE_PROJECTS_ROOT: PROJECTS_ROOT,
+      TURMA_CONTROL_IDLE_TIMEOUT_MS: "300",
+      TURMA_CONTROL_WATCHDOG_EVERY_MS: "50",
+      ...extraEnv,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout.on("data", () => {});
+  child.stderr.on("data", () => {});
+  return child;
+}
+
+const waitFor = (fn, ms) =>
+  new Promise((resolve) => {
+    const t = setInterval(() => {
+      if (fn()) {
+        clearInterval(t);
+        clearTimeout(k);
+        resolve(true);
+      }
+    }, 20);
+    const k = setTimeout(() => {
+      clearInterval(t);
+      resolve(false);
+    }, ms);
+  });
+
+// The bug, end to end: hub pings, then goes silent WITHOUT closing the socket.
+// The agent must notice the silence on its own and dial a fresh channel.
+test("control channel: a hub that goes silent without closing is reconnected", async () => {
+  const hub = await fakeHub((socket, n) => {
+    // Only the first connection gets a ping — enough to arm the watchdog — then
+    // that socket goes mute forever, exactly as a half-open channel does.
+    if (n === 1) socket.write(wsEncode(0x1, JSON.stringify({ ping: Date.now() })));
+  });
+  const child = startAgent(hub.port);
+  try {
+    assert.ok(await waitFor(() => hub.sockets.length >= 1, 5000), "agent never connected");
+    assert.ok(
+      await waitFor(() => hub.sockets.length >= 2, 5000),
+      "agent never reconnected after the hub went silent (the wedged-tunnel bug)"
+    );
+  } finally {
+    child.kill();
+    hub.srv.close();
+  }
+});
+
+// Compat: a hub predating the app-level ping sends nothing to observe. The
+// watchdog must stay disarmed there rather than tearing down a healthy channel
+// every idle timeout — a new agent must not reconnect-loop against an old hub.
+test("control channel: a hub that never app-pings is left alone (no reconnect loop)", async () => {
+  const hub = await fakeHub(() => {}); // never pings, never closes
+  const child = startAgent(hub.port);
+  try {
+    assert.ok(await waitFor(() => hub.sockets.length >= 1, 5000), "agent never connected");
+    // Well past several idle timeouts: still exactly one channel.
+    const looped = await waitFor(() => hub.sockets.length >= 2, 1200);
+    assert.ok(!looped, "agent reconnect-looped against a hub that does not app-ping");
+  } finally {
+    child.kill();
+    hub.srv.close();
+  }
+});

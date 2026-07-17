@@ -37,6 +37,12 @@ const PORT = parseInt(process.env.PORT || "8300", 10);
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
 const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
+// Control-channel liveness. A heartbeat is a fresh HTTP POST and so proves
+// nothing about the tunnel: the two die independently, and a host whose tunnel
+// is wedged still reports `online` while every Attach on it reads "terminal
+// offline". Both ends therefore prove the channel rather than assume it.
+const CONTROL_PING_EVERY_MS = Number(process.env.CONTROL_PING_EVERY_MS) || 30 * 1000;
+const CONTROL_DEAD_AFTER_MS = Number(process.env.CONTROL_DEAD_AFTER_MS) || 90 * 1000; // 3 missed beats
 const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
@@ -2048,7 +2054,36 @@ server.on("upgrade", async (req, socket, head) => {
       const target = watchTargetFor(name, sessionId);
       if (target) controlChannels[name].sendWatch(sessionId, target);
     }
-    const ping = setInterval(() => send(0x9, Buffer.alloc(0)), 30000); // beat CF idle timeout
+    // Liveness, in both directions — the channel is proven, never assumed.
+    //
+    // The protocol ping (0x9) beats Cloudflare's idle timeout and is what every
+    // agent auto-pongs (Node's built-in WebSocket answers it internally), so the
+    // returning 0xa is a liveness signal we get from OLD agents for free — it is
+    // how we spot a half-open channel to a host that died without a FIN, which we
+    // would otherwise keep reporting as `terminalOnline` while every Attach on it
+    // hung until openChannel's timeout.
+    //
+    // The app-level {ping} is the same beat in a frame the AGENT can see: that
+    // same internal handling means a browser-style WebSocket surfaces no ping
+    // event and offers no ping method, so a protocol ping is invisible to it and
+    // the agent has no way to notice we are gone. This text frame is the one
+    // liveness signal its onmessage can observe. Agents predating it ignore an
+    // unknown key and are unaffected.
+    let lastSeen = Date.now();
+    const ping = setInterval(() => {
+      const idle = Date.now() - lastSeen;
+      if (idle > CONTROL_DEAD_AFTER_MS) {
+        // Nothing (not even a pong) for 3 beats: the peer is gone and this
+        // socket is half-open. Destroy it so `terminalOnline` tells the truth
+        // and the agent's own reconnect isn't racing a channel we still hold.
+        console.log(`tunnel silent for ${Math.round(idle / 1000)}s; dropping: ${name}`);
+        try { socket.destroy(); } catch {}
+        cleanup();
+        return;
+      }
+      send(0x9, Buffer.alloc(0));
+      send(0x1, JSON.stringify({ ping: Date.now() }));
+    }, CONTROL_PING_EVERY_MS);
     // The agent pushes live deltas back on this same channel: committed
     // transcript entries as `{tail: sessionId, entries}`, and the in-progress
     // assistant turn scraped from the TUI as `{turn: sessionId, text, status}`
@@ -2057,6 +2092,9 @@ server.on("upgrade", async (req, socket, head) => {
     // status clears it once the turn completes and the committed tail owns it).
     // Everything else it sends we ignore.
     const parse = wsParser((op, payload) => {
+      // ANY frame proves the peer is alive — including the 0xa pong, which is
+      // the only thing an idle agent sends back and which we otherwise ignore.
+      lastSeen = Date.now();
       if (op === 0x8) return socket.end();
       if (op !== 0x1) return;
       let msg;
