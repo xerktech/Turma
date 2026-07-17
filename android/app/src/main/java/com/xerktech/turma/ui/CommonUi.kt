@@ -38,7 +38,23 @@ fun liveStateLabel(state: LiveState): String = when (state) {
     LiveState.STOPPED -> "stopped"
 }
 
-/** GitHub-style PR pill: state color + #number + a ✓/✗/● check mark. */
+/**
+ * The PR's merge-readiness verdict (ready/blocked/pending/""), which the agent
+ * derives from CI *and* mergeability together (_merge_ready in hub-agent.py) —
+ * green CI on a conflicting branch is not a PR that can land. An agent
+ * predating the field reports the CI half alone, so fall back to that rather
+ * than dropping the mark.
+ */
+fun prReady(pr: PrInfo): String = pr.ready.ifEmpty {
+    when (pr.checks.lowercase()) {
+        "passing" -> "ready"
+        "failing" -> "blocked"
+        "pending" -> "pending"
+        else -> ""
+    }
+}
+
+/** GitHub-style PR pill: state color + #number + a ✓/✗/● merge-readiness mark. */
 @Composable
 fun PrBadge(pr: PrInfo, modifier: Modifier = Modifier) {
     val stateColor = when (pr.state.uppercase()) {
@@ -48,9 +64,9 @@ fun PrBadge(pr: PrInfo, modifier: Modifier = Modifier) {
         "CLOSED" -> TurmaColors.prClosed
         else -> TurmaColors.stopped
     }
-    val check = when (pr.checks.lowercase()) {
-        "passing" -> "✓" to TurmaColors.checkPass
-        "failing" -> "✗" to TurmaColors.checkFail
+    val check = when (prReady(pr).lowercase()) {
+        "ready" -> "✓" to TurmaColors.checkPass
+        "blocked" -> "✗" to TurmaColors.checkFail
         "pending" -> "●" to TurmaColors.checkPending
         else -> "" to Color.Transparent
     }

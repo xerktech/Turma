@@ -5119,12 +5119,73 @@ class TestPrStatus(unittest.TestCase):
         out = ha._summarize_pr({"state": "MERGED", "isDraft": False, "statusCheckRollup": []})
         self.assertEqual(out["state"], "MERGED")
 
+    # ---- merge readiness: CI *and* mergeability, not CI alone ----
+
+    def _mergeable_pr(self, mergeable, rollup=None, state="OPEN"):
+        return ha._summarize_pr({
+            "state": state, "mergeable": mergeable,
+            "statusCheckRollup": rollup if rollup is not None
+            else [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        })
+
+    def test_ready_needs_green_ci_and_no_conflict(self):
+        out = self._mergeable_pr("MERGEABLE")
+        self.assertEqual(out["checks"], "passing")
+        self.assertEqual(out["mergeable"], "MERGEABLE")
+        self.assertEqual(out["ready"], "ready")
+
+    def test_conflict_blocks_despite_green_ci(self):
+        # The bug this exists for: green checks on a branch that merges nowhere
+        # used to read as a ✓.
+        out = self._mergeable_pr("CONFLICTING")
+        self.assertEqual(out["checks"], "passing")   # CI half unchanged...
+        self.assertEqual(out["ready"], "blocked")    # ...but the PR can't land
+
+    def test_conflict_blocks_even_while_ci_pends(self):
+        out = self._mergeable_pr("CONFLICTING", [{"status": "IN_PROGRESS"}])
+        self.assertEqual(out["checks"], "pending")
+        self.assertEqual(out["ready"], "blocked")
+
+    def test_unproven_mergeability_is_pending_not_ready(self):
+        # GitHub computes mergeability lazily; UNKNOWN is not a MERGEABLE.
+        self.assertEqual(self._mergeable_pr("UNKNOWN")["ready"], "pending")
+        self.assertEqual(self._mergeable_pr(None)["ready"], "pending")
+
+    def test_failing_ci_blocks_whatever_mergeability_says(self):
+        out = self._mergeable_pr("MERGEABLE",
+                                 [{"status": "COMPLETED", "conclusion": "FAILURE"}])
+        self.assertEqual(out["ready"], "blocked")
+
+    def test_no_checks_gets_no_verdict_unless_conflicting(self):
+        # Absent CI is not evidence of anything, so the card keeps its no-mark —
+        # but a conflict is evidence, and blocks on its own.
+        self.assertIsNone(self._mergeable_pr("MERGEABLE", [])["ready"])
+        self.assertIsNone(self._mergeable_pr("UNKNOWN", [])["ready"])
+        self.assertEqual(self._mergeable_pr("CONFLICTING", [])["ready"], "blocked")
+
+    def test_closed_pr_ignores_mergeability(self):
+        # A merged/closed PR merges nowhere by definition; its mark is CI alone,
+        # and gh reports these as UNKNOWN/CONFLICTING as it pleases.
+        self.assertEqual(self._mergeable_pr("UNKNOWN", state="MERGED")["ready"], "ready")
+        self.assertEqual(self._mergeable_pr("CONFLICTING", state="CLOSED")["ready"], "ready")
+
+    def test_draft_conflict_blocks(self):
+        # DRAFT is an OPEN sub-state — still a PR whose conflict matters.
+        out = ha._summarize_pr({
+            "state": "OPEN", "isDraft": True, "mergeable": "CONFLICTING",
+            "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        })
+        self.assertEqual(out["state"], "DRAFT")
+        self.assertEqual(out["ready"], "blocked")
+
     def test_pr_status_parses_gh(self):
         payload = json.dumps({"number": 7, "state": "OPEN", "url": "u",
-                              "statusCheckRollup": []})
-        with mock.patch.object(ha, "run", return_value=payload):
+                              "mergeable": "MERGEABLE", "statusCheckRollup": []})
+        with mock.patch.object(ha, "run", return_value=payload) as run:
             out = ha.pr_status("https://github.com/o/r/pull/7")
         self.assertEqual(out["number"], 7)
+        # The verdict is only as good as the field it needs being asked for.
+        self.assertIn("mergeable", run.call_args[0][0][-1])
 
     def test_pr_status_none_on_failure(self):
         with mock.patch.object(ha, "run", return_value=""):

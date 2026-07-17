@@ -1005,11 +1005,30 @@ function esc(s) {
   })[c]);
 }
 
-// GitHub-style PR status pill: state colour + #number + a CI-check mark. Kept in
-// sync with the copies in index.html and (as a compact chip) chat.js. Rendered
-// as a non-link <span> here because the session card is itself a <button> (a
-// nested <a> would be invalid and get hoisted out); the dashboard/footer copies
-// link to the PR.
+// The PR's merge-readiness verdict ('ready'/'blocked'/'pending'/""), derived
+// agent-side from CI *and* mergeability together (_merge_ready in
+// hub-agent.py) — green CI on a conflicting branch is not a PR that can land.
+// An agent predating the field reports the CI half alone, so fall back to that
+// rather than dropping the mark. Kept in sync with index.html and chat.js.
+function prReady(pr) {
+  return pr.ready || { passing: "ready", failing: "blocked", pending: "pending" }[pr.checks] || "";
+}
+// What that mark is saying, for its tooltip: the CI rollup, plus — for a PR
+// that could still land — whether GitHub says it merges.
+function prReadyTitle(pr) {
+  const state = String(pr.state || "").toUpperCase();
+  const parts = [];
+  if (pr.checks) parts.push("CI " + pr.checks);
+  if (pr.mergeable && (state === "OPEN" || state === "DRAFT"))
+    parts.push(pr.mergeable === "CONFLICTING" ? "merge conflict"
+      : pr.mergeable === "MERGEABLE" ? "no conflicts" : "mergeability unknown");
+  return parts.join(" · ");
+}
+// GitHub-style PR status pill: state colour + #number + a merge-readiness mark.
+// Kept in sync with the copies in index.html and (as a compact chip) chat.js.
+// Rendered as a non-link <span> here because the session card is itself a
+// <button> (a nested <a> would be invalid and get hoisted out); the
+// dashboard/footer copies link to the PR.
 function prBadgeHtml(pr) {
   if (!pr) return "";
   const url = pr.url || "";
@@ -1018,9 +1037,9 @@ function prBadgeHtml(pr) {
   const state = String(pr.state || "").toUpperCase();
   const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
   const label = state ? state[0] + state.slice(1).toLowerCase() : "";
-  const checks = pr.checks;
-  const mark = checks === "passing" ? "✓" : checks === "failing" ? "✗" : checks === "pending" ? "●" : "";
-  const chk = mark ? ` <span class="pr-checks ${checks}" title="CI ${esc(checks)}">${mark}</span>` : "";
+  const ready = prReady(pr);
+  const mark = ready === "ready" ? "✓" : ready === "blocked" ? "✗" : ready === "pending" ? "●" : "";
+  const chk = mark ? ` <span class="pr-ready ${ready}" title="${esc(prReadyTitle(pr))}">${mark}</span>` : "";
   return `<span class="pr-badge ${cls}" title="${esc(pr.title || url)}">`
     + `<span class="pr-dot"></span>${esc(num)}${label ? " " + esc(label) : ""}${chk}</span>`;
 }

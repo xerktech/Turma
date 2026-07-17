@@ -470,16 +470,18 @@ test("prFooterChip: '' when the session has no PRs", () => {
   assert.equal(prFooterChip({ prs: [] }), "");
 });
 
-test("prFooterChip: lists every PR, newest first, each linked with state + CI mark", () => {
+test("prFooterChip: lists every PR, newest first, each linked with state + readiness mark", () => {
   const html = prFooterChip({ prs: [
     { url: "https://github.com/o/r/pull/1", number: 1, state: "MERGED" },
-    { url: "https://github.com/o/r/pull/2", number: 2, state: "OPEN", checks: "passing", title: "Add flag" },
+    { url: "https://github.com/o/r/pull/2", number: 2, state: "OPEN", checks: "passing",
+      mergeable: "MERGEABLE", ready: "ready", title: "Add flag" },
   ] });
   assert.match(html, /pr-badge pr-open/);          // newest PR's state
   assert.match(html, /#2 Open/);                    // number + capitalized state
   assert.match(html, /pr-badge pr-merged/);        // older PR still shown
   assert.match(html, /#1 Merged/);
-  assert.match(html, /pr-checks passing/);          // CI rollup mark
+  assert.match(html, /pr-ready ready/);             // merge-readiness mark
+  assert.match(html, /title="CI passing · no conflicts"/);
   assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/1"/);
   assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/2"/);
   assert.match(html, /title="Add flag"/);
@@ -487,10 +489,32 @@ test("prFooterChip: lists every PR, newest first, each linked with state + CI ma
   assert.ok(html.indexOf("pull/2") < html.indexOf("pull/1"));
 });
 
-test("prFooterChip: derives #number from the URL when absent, no CI mark when unknown", () => {
+test("prFooterChip: derives #number from the URL when absent, no mark when unknown", () => {
   const html = prFooterChip({ prs: [{ url: "https://github.com/o/r/pull/42" }] });
   assert.match(html, /#42/);
-  assert.doesNotMatch(html, /pr-checks/);
+  assert.doesNotMatch(html, /pr-ready/);
+});
+
+// The mark answers "can this land", not "is CI green": a conflicting branch
+// merges nowhere however clean its checks are, so it reads ✗ and says why.
+test("prFooterChip: a merge conflict blocks the mark despite green CI", () => {
+  const html = prFooterChip({ prs: [{
+    url: "https://github.com/o/r/pull/7", number: 7, state: "OPEN",
+    checks: "passing", mergeable: "CONFLICTING", ready: "blocked",
+  }] });
+  assert.match(html, /pr-ready blocked/);
+  assert.match(html, /✗/);
+  assert.match(html, /title="CI passing · merge conflict"/);
+});
+
+// An agent predating `ready` reports the CI half alone — render that rather
+// than dropping the mark.
+test("prFooterChip: falls back to the CI rollup when the agent reports no verdict", () => {
+  const html = prFooterChip({ prs: [{
+    url: "https://github.com/o/r/pull/9", number: 9, state: "OPEN", checks: "failing",
+  }] });
+  assert.match(html, /pr-ready blocked/);
+  assert.match(html, /title="CI failing"/);   // nothing claimed about conflicts
 });
 
 // The Jira ticket this session was spawned to work — the reverse of the board's

@@ -999,7 +999,27 @@
       apply(b.getAttribute(attr));
     }));
   }
-  // One PR badge (state colour + #number + CI-check mark), linked to the PR.
+  // The PR's merge-readiness verdict ('ready'/'blocked'/'pending'/""), derived
+  // agent-side from CI *and* mergeability together (_merge_ready in
+  // hub-agent.py) — green CI on a conflicting branch is not a PR that can land.
+  // An agent predating the field reports the CI half alone, so fall back to
+  // that rather than dropping the mark. Kept in sync with index.html and
+  // sessions.html.
+  function prReady(pr) {
+    return pr.ready || { passing: "ready", failing: "blocked", pending: "pending" }[pr.checks] || "";
+  }
+  // What that mark is saying, for its tooltip: the CI rollup, plus — for a PR
+  // that could still land — whether GitHub says it merges.
+  function prReadyTitle(pr) {
+    const state = String(pr.state || "").toUpperCase();
+    const parts = [];
+    if (pr.checks) parts.push("CI " + pr.checks);
+    if (pr.mergeable && (state === "OPEN" || state === "DRAFT"))
+      parts.push(pr.mergeable === "CONFLICTING" ? "merge conflict"
+        : pr.mergeable === "MERGEABLE" ? "no conflicts" : "mergeability unknown");
+    return parts.join(" · ");
+  }
+  // One PR badge (state colour + #number + merge-readiness mark), linked to the PR.
   function prBadge(pr) {
     const url = pr.url || "";
     const m = url.match(/\/pull\/(\d+)/);
@@ -1007,9 +1027,9 @@
     const state = String(pr.state || "").toUpperCase();
     const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
     const label = state ? state[0] + state.slice(1).toLowerCase() : "";
-    const checks = pr.checks;
-    const mark = checks === "passing" ? "✓" : checks === "failing" ? "✗" : checks === "pending" ? "●" : "";
-    const chk = mark ? ' <span class="pr-checks ' + checks + '" title="CI ' + esc(checks) + '">' + mark + "</span>" : "";
+    const ready = prReady(pr);
+    const mark = ready === "ready" ? "✓" : ready === "blocked" ? "✗" : ready === "pending" ? "●" : "";
+    const chk = mark ? ' <span class="pr-ready ' + ready + '" title="' + esc(prReadyTitle(pr)) + '">' + mark + "</span>" : "";
     return '<a class="pr-badge ' + cls + '" href="' + esc(url) +
       '" target="_blank" rel="noopener" title="' + esc(pr.title || url) + '">' +
       '<span class="pr-dot"></span>' + esc(num) + (label ? " " + esc(label) : "") + chk + "</a>";
