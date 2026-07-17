@@ -77,6 +77,7 @@ fun FleetScreen(
             ScreenHeader("Dashboard") {
                 IconButton(onClick = { vm.refresh() }) { Icon(Icons.Filled.Refresh, "Refresh") }
             }
+            UpdateBanner()
             LazyColumn(
                 Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(8.dp, 2.dp, 8.dp, 10.dp),
