@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -921,5 +921,26 @@ test("compose button: the turn ending clears a pending Stop", () => {
   // The suppression is spent, so the NEXT turn shows Stop from its first frame.
   __setLiveStatus({ verb: "Thinking" });
   assert.equal(isBusy(), true);
+  clearDom();
+});
+
+test("compose button: a pending question keeps the button at Send (XERK-21)", () => {
+  const btns = fakeButtons();
+  __stopPending(0);
+  // The AskUserQuestion tool call blocks the pane, so the pane still reads busy —
+  // but the answer is typed into the compose box, so the button must stay Send.
+  __setLiveStatus({ verb: "Thinking" });
+  __setQuestionActive(true);
+  updateComposeAction();
+  assert.equal(isBusy(), false, "a live question overrides the busy pane read");
+  assert.equal(btns[0].textContent, "Send");
+  assert.equal(btns[0].classList.contains("stop"), false);
+  // Answering the question (questionActive clears) hands the button back to Stop
+  // while the pane is still working.
+  __setQuestionActive(false);
+  updateComposeAction();
+  assert.equal(isBusy(), true);
+  assert.equal(btns[0].textContent, "◼ Stop");
+  __setQuestionActive(false);
   clearDom();
 });
