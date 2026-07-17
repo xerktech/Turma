@@ -210,10 +210,12 @@ input:focus, textarea:focus, select:focus {
 .pr-badge.pr-closed { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent); background: color-mix(in srgb, var(--critical) 10%, transparent); }
 .pr-badge.pr-closed .pr-dot { background: var(--critical); }
 .pr-badge.pr-draft  { color: var(--muted); }
-.pr-badge .pr-checks { font-weight: 700; font-size: 11px; }
-.pr-badge .pr-checks.passing { color: var(--good); }
-.pr-badge .pr-checks.failing { color: var(--critical); }
-.pr-badge .pr-checks.pending { color: var(--warning); }
+/* The merge-readiness mark: CI *and* mergeability, not CI alone (see
+   _merge_ready in hub-agent.py) — hence "ready/blocked", not "passing/failing". */
+.pr-badge .pr-ready { font-weight: 700; font-size: 11px; }
+.pr-badge .pr-ready.ready { color: var(--good); }
+.pr-badge .pr-ready.blocked { color: var(--critical); }
+.pr-badge .pr-ready.pending { color: var(--warning); }
 .pr-list { display: flex; flex-wrap: wrap; gap: 6px; }
 
 /* ---- Status "lights" — glowing dots (the Lumen points-of-light motif) ---- */

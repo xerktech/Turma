@@ -1371,10 +1371,41 @@ def _check_class(entry):
     return None
 
 
+def _merge_ready(state, checks, mergeable):
+    """The card's single merge-readiness verdict: 'ready' | 'blocked' |
+    'pending' | None, from the CI rollup AND GitHub's mergeability.
+
+    Green CI is only half of "can this land": a PR whose branch conflicts with
+    its base merges nowhere, however clean its checks are, and a ✓ that says
+    otherwise is the one claim this mark must never make. So a conflict blocks
+    on its own, and a pass requires GitHub to have affirmatively said MERGEABLE.
+
+    Mergeability is computed lazily server-side, so a just-opened PR reports
+    UNKNOWN for a beat or two; that's 'pending' rather than 'ready' — unproven
+    is not proven, and the next refresh resolves it.
+
+    Conflicts are only a question for a PR that is still open: a MERGED or
+    CLOSED one merges nowhere by definition, and its mark reports CI alone, as
+    it always has. Likewise a PR with no checks at all keeps its no-mark unless
+    it CONFLICTS — absent CI is not evidence of anything, but a conflict is."""
+    if mergeable == "CONFLICTING" and state in ("OPEN", "DRAFT"):
+        return "blocked"
+    if checks == "failing":
+        return "blocked"
+    if checks == "pending":
+        return "pending"
+    if checks == "passing":
+        if state in ("OPEN", "DRAFT") and mergeable != "MERGEABLE":
+            return "pending"
+        return "ready"
+    return None
+
+
 def _summarize_pr(data):
     """Condense `gh pr view --json …` output to the compact status the hub cards
-    render: number, title, state (OPEN/DRAFT/MERGED/CLOSED), and a CI-check
-    rollup ('passing'/'failing'/'pending'/None) with per-bucket counts."""
+    render: number, title, state (OPEN/DRAFT/MERGED/CLOSED), a CI-check rollup
+    ('passing'/'failing'/'pending'/None) with per-bucket counts, GitHub's raw
+    mergeability, and the merge-readiness verdict the two combine into."""
     state = str(data.get("state") or "").upper()  # OPEN / MERGED / CLOSED
     draft = bool(data.get("isDraft"))
     counts = {"pass": 0, "fail": 0, "pending": 0}
@@ -1387,25 +1418,32 @@ def _summarize_pr(data):
     if total:
         checks = ("failing" if counts["fail"]
                   else "pending" if counts["pending"] else "passing")
+    # MERGEABLE / CONFLICTING / UNKNOWN. Reported raw beside the verdict so the
+    # card can say WHY it is blocked rather than only that it is.
+    mergeable = str(data.get("mergeable") or "").upper() or None
+    # DRAFT is really an OPEN sub-state in the API; surface it as its own state
+    # so the card can grey it out like GitHub does.
+    state = "DRAFT" if draft and state == "OPEN" else state
     return {
         "url": data.get("url"),
         "number": data.get("number"),
         "title": (data.get("title") or "")[:120],
-        # DRAFT is really an OPEN sub-state in the API; surface it as its own
-        # state so the card can grey it out like GitHub does.
-        "state": "DRAFT" if draft and state == "OPEN" else state,
+        "state": state,
         "checks": checks,
         "checkCounts": counts if total else None,
+        "mergeable": mergeable,
+        "ready": _merge_ready(state, checks, mergeable),
     }
 
 
 def pr_status(url):
-    """Fetch a PR's state + CI-check rollup via `gh pr view <url>`. Returns the
-    compact status dict, or None on any failure (gh accepts the full URL, so this
-    works from any cwd as long as the login can see the repo). Best-effort and
-    network-cheap — one gh call, capped by run()'s timeout."""
+    """Fetch a PR's state, CI-check rollup and mergeability via `gh pr view
+    <url>`. Returns the compact status dict, or None on any failure (gh accepts
+    the full URL, so this works from any cwd as long as the login can see the
+    repo). Best-effort and network-cheap — one gh call, capped by run()'s
+    timeout."""
     raw = run(["gh", "pr", "view", url, "--json",
-               "number,title,state,isDraft,url,statusCheckRollup"])
+               "number,title,state,isDraft,url,statusCheckRollup,mergeable"])
     if not raw:
         return None
     try:

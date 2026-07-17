@@ -119,7 +119,16 @@ data class PrInfo(
     val number: Int = 0,
     val state: String = "",
     val title: String = "",
+    /** The CI rollup alone: passing / failing / pending / "". */
     val checks: String = "",
+    /** GitHub's own mergeability: MERGEABLE / CONFLICTING / UNKNOWN / "". */
+    val mergeable: String = "",
+    /**
+     * Merge readiness — CI *and* mergeability together (_merge_ready in
+     * hub-agent.py): ready / blocked / pending / "". Empty from an agent
+     * predating the field, which reports [checks] alone.
+     */
+    val ready: String = "",
 )
 
 @Serializable

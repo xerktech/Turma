@@ -244,11 +244,25 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 
 #### PR status
 
-- The state (Open/Draft/Merged/Closed) + CI-check rollup (passing/failing/pending) of every PR a
-  session opened.
+- The state (Open/Draft/Merged/Closed), CI-check rollup (passing/failing/pending), and GitHub's own
+  mergeability (`mergeable`: MERGEABLE/CONFLICTING/UNKNOWN) of every PR a session opened.
 - Fetched via `gh pr view` (`pr_status`/`_summarize_pr`/`_check_class`) on the
   `PR_STATUS_REFRESH_EVERY` cadence — faster than the github block, so a card's merge/CI state stays
   live.
+- The card's **single ✓/✗/● mark is merge READINESS, not CI** (`ready`, from `_merge_ready`): green
+  CI is only half of "can this land", and a PR whose branch conflicts with its base merges nowhere
+  however clean its checks are. So a conflict blocks on its own, and a ✓ requires GitHub to have
+  affirmatively said MERGEABLE — mergeability is computed lazily server-side, so the UNKNOWN a
+  just-opened PR reports is `pending` (unproven ≠ proven) and resolves on the next refresh.
+  - Conflicts are only asked about while a PR could still land: a MERGED/CLOSED one reports CI alone.
+    A PR with **no checks at all** keeps its no-mark unless it CONFLICTS — absent CI is not evidence
+    of anything, but a conflict is, which is what keeps a no-CI repo from painting a false green.
+  - `checks`/`checkCounts` stay pure CI beside it (their name, their meaning), so the chip's tooltip
+    can say WHY it's blocked rather than only that it is. All four renderers (`index.html`,
+    `sessions.html`, `chat.js`, android's `PrBadge`) read `ready` and fall back to the CI half when an
+    agent predating the field reports none.
+  - Tests: `TestPrStatus` (the readiness cases) in `agent/tests/test_hub_agent.py`, plus the
+    `prFooterChip` cases in `turma/tests/chat.test.js`.
 - Cached by URL in `pr_status_cache` and attached as `session.prs`; kept even after the session
   stops, and None until it opens a PR.
 - **Which PRs are "a session's"** is decided by `_scan_pr_line`, and the rule is deliberately narrow:
@@ -704,9 +718,9 @@ Cloudflare tunnel; port 8300 on the LAN.
 - Working/idle/waiting-on-question state, the worktree name, and the agent's live branch (or
   "detached" until it branches).
 - Per-session token usage parsed from that worktree's `~/.claude/projects` transcripts.
-- Any **PR status** the session opened — a GitHub-style pill (state colour + `#number` + a ✓/✗/● CI
-  check mark) from the agent's `session.prs`; `prBadgeHtml` builds it, with shared `.pr-badge` CSS in
-  `app.css`.
+- Any **PR status** the session opened — a GitHub-style pill (state colour + `#number` + a ✓/✗/●
+  merge-readiness mark, CI *and* conflicts; see "PR status" under the agent) from the agent's
+  `session.prs`; `prBadgeHtml` builds it, with shared `.pr-badge` CSS in `app.css`.
 - Per-session **Attach / Restart (clear context) / Kill / Start / Delete**.
 
 ### Spawn/resume handoff
