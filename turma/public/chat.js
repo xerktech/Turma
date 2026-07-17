@@ -774,6 +774,13 @@
   // frames arrive, liveStatus stays null and the button stays Send — the safe
   // degradation, since a Stop that can't see the turn is worse than no Stop.
   function composeBusy() {
+    // A pending AskUserQuestion is answered THROUGH the compose box — a typed
+    // reply routes to /answer as a custom answer (see send()). So while a question
+    // is up the button must be Send, not Stop, even though the pane still reads
+    // busy (the AskUserQuestion tool call is blocking). Clicking Stop here would
+    // interrupt the turn and destroy the question, which is exactly the wrong
+    // thing when the operator only wanted to type a custom response (XERK-21).
+    if (questionActive) { stopPendingAt = 0; return false; }
     if (!liveStatus) { stopPendingAt = 0; return false; }
     // A clicked Stop only lands on the agent's next beat, so the pane keeps
     // reporting the turn for a second or two afterwards. Hand the button back to
@@ -1146,9 +1153,13 @@
     const index = sess2 && sess2.questionIndex;
     // A stale heartbeat may still report the question we just answered; keep it
     // hidden until the agent actually clears it, then forget the suppression.
-    if (q && q === answeredQuestion) { questionActive = false; box.hidden = true; box.innerHTML = ""; return; }
+    if (q && q === answeredQuestion) { questionActive = false; box.hidden = true; box.innerHTML = ""; updateComposeAction(); return; }
     answeredQuestion = null;
     questionActive = !!q;
+    // The compose button reads questionActive (a live question makes it Send, not
+    // Stop), so flip it the moment the question appears or clears rather than
+    // waiting for the next ~1s live frame to repaint it.
+    updateComposeAction();
     if (!q) { box.hidden = true; box.innerHTML = ""; return; }
     box.hidden = false;
     // Header chip + "n of N" progress, shown when a call bundles several
@@ -1194,6 +1205,7 @@
     answeredQuestion = (sess && sess.session && sess.session.question) || null;
     questionActive = false;
     const box = $("chatQuestion"); if (box) { box.hidden = true; box.innerHTML = ""; }
+    updateComposeAction(); // question gone -> the button follows the working turn again
     try {
       const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/answer", {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
@@ -1245,6 +1257,7 @@
         answeredQuestion = (sess && sess.session && sess.session.question) || null;
         questionActive = false;
         const box = $("chatQuestion"); if (box) { box.hidden = true; box.innerHTML = ""; }
+        updateComposeAction(); // question gone -> the button follows the working turn again
       } else {
         url = "/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/input";
         body = { text };
@@ -1442,6 +1455,7 @@
       isBusy, updateComposeAction,
       __setLiveStatus: (st) => { liveStatus = st; },
       __stopPending: (t) => { stopPendingAt = t; },
+      __setQuestionActive: (v) => { questionActive = v; },
       __setVerbosity: (v) => { verbosity = v; },
       __setNoExpand: (v) => { noExpand = v; },
       __setBuffer: (b) => { buffer = b; },

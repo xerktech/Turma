@@ -1307,6 +1307,12 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   the pane to stop reporting the turn — the interrupt only lands on the agent's next heartbeat, and
   the operator shouldn't have to watch a dead Stop to learn it worked. If the turn outlives the
   `STOP_SUPPRESS_MS` window the interrupt didn't take, and Stop legitimately comes back.
+- **A pending `AskUserQuestion` forces the button to Send, not Stop** (`composeBusy()` returns false
+  while `questionActive`, overriding the busy pane read the blocking tool call keeps up) — the answer
+  is typed THROUGH the compose box, routed to `/answer` as a custom answer (`send()`'s `wasAnswer`
+  path). Stop would interrupt the turn and destroy the question, which is exactly the wrong thing when
+  the operator only wanted to send a custom response (XERK-21). `updateQuestion` repaints the button
+  the instant a question appears or clears rather than waiting for the next live frame.
 - `chat.js` paints every `.compose-action` button on the page from that one read, so the terminal's
   button (its engine stays warm underneath the toggle) can't disagree with the chat's.
 - Tests: the compose-button cases in `turma/tests/chat.test.js` and the `termComposeAction` cases in
