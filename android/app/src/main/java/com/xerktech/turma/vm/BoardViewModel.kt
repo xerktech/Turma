@@ -14,6 +14,8 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 
+private const val ORG_KEY = "org"
+
 /** Board state: reuses the shared fleet stream; refresh fans a jira re-poll. */
 class BoardViewModel(app: Application) : AndroidViewModel(app) {
     private val container = (app as TurmaApplication).container
@@ -21,6 +23,17 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _refreshing = MutableStateFlow(false)
     val refreshing: StateFlow<Boolean> = _refreshing
+
+    // Selected org filter ("" = all orgs), persisted across visits like the web
+    // board's `turma-board-org` localStorage key (board.html).
+    private val prefs = app.getSharedPreferences("turma_board", 0)
+    private val _orgFilter = MutableStateFlow(prefs.getString(ORG_KEY, "") ?: "")
+    val orgFilter: StateFlow<String> = _orgFilter
+
+    fun setOrg(key: String) {
+        _orgFilter.value = key
+        prefs.edit().putString(ORG_KEY, key).apply()
+    }
 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val messages: SharedFlow<String> = _messages

@@ -1,6 +1,7 @@
 package com.xerktech.turma.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -18,6 +19,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
@@ -51,8 +53,10 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.BOARD_CATEGORIES
 import com.xerktech.turma.core.BoardSite
 import com.xerktech.turma.core.categoryOf
+import com.xerktech.turma.core.filterSites
 import com.xerktech.turma.core.mergeSites
 import com.xerktech.turma.core.orgColorIndex
+import com.xerktech.turma.core.orgName
 import com.xerktech.turma.model.JiraTicket
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.BoardViewModel
@@ -62,8 +66,11 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
     LaunchedEffect(Unit) { vm.start() }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val refreshing by vm.refreshing.collectAsStateWithLifecycle()
+    val orgFilter by vm.orgFilter.collectAsStateWithLifecycle()
     val sites = remember(fleet) { mergeSites(fleet.agents) }
+    // Org colors stay stable across filtering — keyed on every org, not the shown one.
     val allKeys = sites.map { it.siteKey }
+    val shown = remember(sites, orgFilter) { filterSites(sites, orgFilter) }
     var detail by remember { mutableStateOf<Pair<BoardSite, JiraTicket>?>(null) }
 
     val context = LocalContext.current
@@ -84,12 +91,16 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         } else {
+            // Pinned above the (horizontally-scrolling) columns: an "All orgs" chip
+            // plus one per org, labelled by org name, ticket-counted, and colored by
+            // the org's stable palette slot. Mirrors board.html's `#chips` row.
+            OrgFilterBar(sites, allKeys, orgFilter) { vm.setOrg(it) }
             Row(
                 Modifier.fillMaxSize().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 for ((cat, title) in BOARD_CATEGORIES) {
-                    val cards = sites.flatMap { site -> site.tickets.filter { categoryOf(it) == cat }.map { site to it } }
+                    val cards = shown.flatMap { site -> site.tickets.filter { categoryOf(it) == cat }.map { site to it } }
                     KanbanColumn(cat, title, cards, allKeys) { site, t -> detail = site to t }
                 }
             }
@@ -98,6 +109,80 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
 
     detail?.let { (site, ticket) ->
         TicketDetailSheet(site, ticket, vm, onDismiss = { detail = null })
+    }
+}
+
+/**
+ * The pinned org filter row: "All orgs" + one chip per org. Labelled by org
+ * name (the siteKey's `.atlassian.net` stripped), ticket-counted, colored by
+ * the org's stable palette slot, and flagged offline when no reporting host is
+ * online. Selecting one filters the board to that org's `siteKey`; the choice
+ * persists in the ViewModel. Mirrors board.html's `#chips` row.
+ */
+@Composable
+private fun OrgFilterBar(
+    sites: List<BoardSite>,
+    allKeys: List<String>,
+    orgFilter: String,
+    onPick: (String) -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        OrgChip("All orgs", null, null, offline = false, active = orgFilter.isBlank()) { onPick("") }
+        for (s in sites) {
+            OrgChip(
+                label = orgName(s.siteKey),
+                color = TurmaColors.series[orgColorIndex(s.siteKey, allKeys) % TurmaColors.series.size],
+                count = s.tickets.size,
+                offline = !s.online,
+                active = orgFilter == s.siteKey,
+            ) { onPick(s.siteKey) }
+        }
+    }
+}
+
+@Composable
+private fun OrgChip(
+    label: String,
+    color: Color?,
+    count: Int?,
+    offline: Boolean,
+    active: Boolean,
+    onClick: () -> Unit,
+) {
+    val accent = color ?: MaterialTheme.colorScheme.primary
+    val bg = if (active) accent.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surface
+    val stroke = if (active) accent else MaterialTheme.colorScheme.outline
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(bg)
+            .border(1.dp, stroke, RoundedCornerShape(999.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        if (color != null) Box(Modifier.size(8.dp).clip(CircleShape).background(color))
+        Text(
+            label,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+            color = if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (count != null) Text(
+            "$count",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (offline) Text(
+            "⚠",
+            style = MaterialTheme.typography.labelMedium,
+            color = TurmaColors.waiting,
+        )
     }
 }
 
