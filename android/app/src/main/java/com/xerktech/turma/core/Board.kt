@@ -74,8 +74,19 @@ fun agentPinOf(
 ): com.xerktech.turma.model.TicketAgentPin? =
     ticketAgents["$siteKey/$issueKey"]?.takeIf { it.host.isNotBlank() }
 
-/** Org display name: the siteKey with its `.atlassian.net` suffix stripped (board.js orgName). */
-fun orgName(siteKey: String): String = siteKey.replace(Regex("\\.atlassian\\.net$", RegexOption.IGNORE_CASE), "")
+/**
+ * Org display name (board.js orgName). Two siteKey shapes:
+ *   - Jira Cloud is a bare host ("myorg.atlassian.net"); strip `.atlassian.net`.
+ *   - Azure DevOps carries an org/collection PATH ("dev.azure.com/myorg"); the last
+ *     path segment is the readable org/collection identity.
+ */
+fun orgName(siteKey: String): String {
+    if (siteKey.contains('/')) {
+        val segs = siteKey.split('/').filter { it.isNotEmpty() }
+        return segs.lastOrNull() ?: siteKey
+    }
+    return siteKey.replace(Regex("\\.atlassian\\.net$", RegexOption.IGNORE_CASE), "")
+}
 
 /**
  * An org's auto-start opt-in for the org-chip switch (XERK-41), a pure port of

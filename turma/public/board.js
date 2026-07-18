@@ -159,17 +159,25 @@
       .sort((x, y) => x.siteKey.localeCompare(y.siteKey));
   }
 
-  // A siteKey is the Jira site's host ("myorg.atlassian.net"), but the org name
-  // is the only part of it a human reads, so every surface that shows a site to
-  // one shows this instead — the board's org chips and the dashboard's host
-  // rows. The full siteKey stays the identity everything is keyed and routed on;
-  // this is presentational only.
+  // A siteKey identifies a board's org, but the org name is the only part of it a
+  // human reads, so every surface that shows a site to one shows this instead —
+  // the board's org chips and the dashboard's host rows. The full siteKey stays
+  // the identity everything is keyed and routed on; this is presentational only.
   //
-  // Only the Jira Cloud suffix is stripped: on a site that isn't *.atlassian.net
-  // the whole host IS the org's name there, and trimming a suffix off it would
-  // invent one.
+  // Two siteKey shapes, two derivations:
+  //   - Jira Cloud is a bare host ("myorg.atlassian.net"); strip the `.atlassian.net`
+  //     suffix, leaving the org. A non-Atlassian bare host IS the org's name there.
+  //   - Azure DevOps carries an org/collection PATH ("dev.azure.com/myorg",
+  //     "tfs.co/DefaultCollection"); the last path segment is the org/collection,
+  //     which is the readable identity — the host alone would name every unrelated
+  //     org the same.
   function orgName(siteKey) {
-    return String(siteKey ?? "").replace(/\.atlassian\.net$/i, "");
+    let s = String(siteKey ?? "");
+    if (s.includes("/")) {
+      const segs = s.split("/").filter(Boolean);
+      return segs[segs.length - 1] || s;
+    }
+    return s.replace(/\.atlassian\.net$/i, "");
   }
 
   // An org's auto-start opt-in for the org-chip switch (XERK-41), resolved from
@@ -693,6 +701,10 @@
     // Prefer the fetched copy field-by-field: it's newer than the last board
     // poll, so an issue reprioritized since the beat reads correctly here.
     const v = (k) => (d[k] != null && d[k] !== "" ? d[k] : t[k]);
+    // Name the source in the "open the live copy" links from the ticket's own URL
+    // (Azure work items are `.../_workitems/edit/<id>`), so an Azure board reads
+    // "Open in Azure DevOps" rather than "Open in Jira".
+    const srcName = /\/_workitems\//i.test(String(v("url") || "")) ? "Azure DevOps" : "Jira";
     const now = o.now;
     const overdue = overdueOf({ dueDate: v("dueDate"), statusCategory: v("statusCategory") }, now);
 
@@ -744,13 +756,13 @@
     // section carries the loading or error state rather than an empty void.
     let body;
     if (o.error) {
-      body = `<div class="td-note td-err">Couldn't load the full ticket — ${esc(o.error)}. <a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">Open in Jira</a> instead.</div>`;
+      body = `<div class="td-note td-err">Couldn't load the full ticket — ${esc(o.error)}. <a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">Open in ${srcName}</a> instead.</div>`;
     } else if (!detail) {
       body = `<div class="td-note">Loading description and comments…</div>`;
     } else {
       const desc = d.description
         ? textHtml(d.description) +
-          (d.descriptionTruncated ? `<div class="td-note">Description truncated — <a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">read the rest in Jira</a>.</div>` : "")
+          (d.descriptionTruncated ? `<div class="td-note">Description truncated — <a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">read the rest in ${srcName}</a>.</div>` : "")
         : `<div class="td-none">No description.</div>`;
       const comments = d.comments || [];
       const dropped = Math.max(0, (d.commentTotal || comments.length) - comments.length);
@@ -766,7 +778,7 @@
         </section>
         <section class="td-section">
           <h3>Comments <span class="td-dim">${d.commentTotal || comments.length}</span></h3>
-          ${dropped ? `<div class="td-note">Showing the ${comments.length} newest — <a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">${dropped} older in Jira</a>.</div>` : ""}
+          ${dropped ? `<div class="td-note">Showing the ${comments.length} newest — <a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">${dropped} older in ${srcName}</a>.</div>` : ""}
           ${cHtml}
         </section>`;
     }
@@ -783,7 +795,7 @@
       <h2 class="td-summary">${esc(v("summary") || "")}</h2>
       <dl class="td-fields">${fields}</dl>
       ${body}
-      <div class="td-foot"><a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">Open in Jira ↗</a></div>`;
+      <div class="td-foot"><a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">Open in ${srcName} ↗</a></div>`;
   }
 
   // The three-column board for the selected sites (filter = a siteKey, or

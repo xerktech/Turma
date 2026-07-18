@@ -178,6 +178,10 @@ test("orgName: the org, not the Jira Cloud host", () => {
   // renders as no org suffix at all.
   assert.equal(orgName(null), "");
   assert.equal(orgName(undefined), "");
+  // Azure DevOps siteKeys carry an org/collection PATH; the last segment is the
+  // readable org (XERK-43) — the host alone would name every unrelated org alike.
+  assert.equal(orgName("dev.azure.com/myorg"), "myorg");
+  assert.equal(orgName("tfs.company.com/tfs/DefaultCollection"), "DefaultCollection");
 });
 
 test("autoStartState: the org-chip switch reflects hub toggle OR a legacy agent env", () => {

@@ -1901,7 +1901,7 @@ test("http: a body with neither repo nor auto is a 400, not a silent decline", a
 
 test("http: setting a repo rejects a bad issue key or repo name before routing", async () => {
   await jiraBeat("jr4", "r4.atlassian.net");
-  for (const bad of ["..%2F..%2Fsecret", "42", "ENG-"]) {
+  for (const bad of ["..%2F..%2Fsecret", "12ab", "ENG-"]) {
     const res = await setRepo("r4.atlassian.net", bad, { repo: "Turma" });
     assert.equal(res.status, 400, `${bad} should be rejected`);
   }
@@ -1954,11 +1954,22 @@ test("http: setting a ticket's repo requires the user login", async () => {
 
 test("http: ticket detail rejects a non-issue-key path segment before routing", async () => {
   await jiraBeat("jd5", "org5.atlassian.net");
-  for (const bad of ["..%2F..%2Fsecret", "ENG-42%3Fx%3D1", "42", "ENG-", "ENG%2042"]) {
+  for (const bad of ["..%2F..%2Fsecret", "ENG-42%3Fx%3D1", "12ab", "ENG-", "ENG%2042"]) {
     const res = await request("GET", `/api/jira/org5.atlassian.net/${bad}`, { headers: userHeaders });
     assert.equal(res.status, 400, `${bad} should be rejected`);
   }
   assert.equal((agents.jd5.commands || []).length, 0);
+});
+
+test("http: an Azure work-item id (numeric key, slash siteKey) routes like a Jira key (XERK-43)", async () => {
+  // Azure DevOps siteKeys carry an org path ("dev.azure.com/org7") and work-item
+  // ids are bare integers — both must route, not 400, through the same endpoints.
+  const site = "dev.azure.com/org7";
+  await jiraBeat("azd", site, { jira: { available: true, source: "azure", siteKey: site, user: "u", tickets: [] } });
+  const res = await request("GET", `/api/jira/${encodeURIComponent(site)}/1234`, { headers: userHeaders });
+  assert.equal(res.status, 202, "a numeric key is a valid Azure id, not a bad key");
+  assert.equal((agents.azd.commands || []).length, 1);
+  assert.equal(agents.azd.commands[0].issueKey, "1234");
 });
 
 test("http: ticket detail prefers an ONLINE host of the org; offline-only serves its cache", async () => {
@@ -2174,7 +2185,7 @@ test("http: the pin rides the /api/agents payload for the board to render", asyn
 test("http: pinning validates the key, body, and host before storing", async () => {
   await jiraBeat("taV", "taV.atlassian.net");
   await jiraBeat("taOther", "taOtherOrg.atlassian.net");
-  assert.equal((await setAgent("taV.atlassian.net", "42", { host: "taV" })).status, 400);
+  assert.equal((await setAgent("taV.atlassian.net", "12ab", { host: "taV" })).status, 400);
   assert.equal((await setAgent("taV.atlassian.net", "ENG-1", {})).status, 400);
   assert.equal((await setAgent("taV.atlassian.net", "ENG-1", { host: 42 })).status, 400);
   // A host of a DIFFERENT org is not on this org's picker; nor is a stranger.
@@ -2280,7 +2291,7 @@ test("http: the freshest reporting block decides the repo", async () => {
 
 test("http: a start rejects a non-issue-key path segment before routing", async () => {
   await ticketBeat("ts9", "t9.atlassian.net");
-  for (const bad of ["..%2F..%2Fsecret", "ENG-42%3Fx%3D1", "42", "ENG-", "ENG%2042"]) {
+  for (const bad of ["..%2F..%2Fsecret", "ENG-42%3Fx%3D1", "12ab", "ENG-", "ENG%2042"]) {
     const res = await request("POST", `/api/jira/t9.atlassian.net/${bad}/session`,
       { headers: userHeaders });
     assert.equal(res.status, 400, `${bad} should be rejected`);
