@@ -112,9 +112,9 @@ test("nav: every page mounts the shared chrome and hand-rolls none of it", () =>
 });
 
 // The header row is centred in the --wrap column on EVERY page, sessions.html
-// included. It once released --wrap there (its shell below is full-bleed), which
-// stretched the wordmark to x=20 and flung the tabs to the window edge — nothing
-// like the board/usage header it is supposed to match.
+// included. It once released --wrap there (to full-bleed its shell, since capped),
+// which stretched the wordmark to x=20 and flung the tabs to the window edge —
+// nothing like the board/usage header it is supposed to match.
 test("nav: no page releases --wrap and stretches the header to the window edges", () => {
   for (const f of PAGE_FILES) {
     const src = fs.readFileSync(path.join(PUBLIC, f), "utf8");

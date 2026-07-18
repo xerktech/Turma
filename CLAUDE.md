@@ -847,10 +847,14 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   stamp on dashboard/sessions, which was dropped as noise (the fleet polls constantly, so the stamp
   only ever said "seconds ago" while re-rendering every beat).
 - The header is full-bleed and `.site-header-in` caps its row at `--wrap` and centres it, so every
-  page's chrome lands in the same 1180px column as a `.wrap` page's content — including
-  `sessions.html`, whose shell below stays full-bleed while its header row does not. Letting that page
-  release `--wrap` instead stretched the wordmark and tabs to the window edges and looked nothing like
-  the others; the `.app-header` bar it used to override with is gone.
+  page's chrome lands in the same 1180px column as a `.wrap` page's content. On `sessions.html` the
+  two-pane `.sess-shell` below is capped at the same `--wrap` and centred too (XERK-28), so the whole
+  page reads like dashboard/board/usage — chrome and content in one centred column — rather than the
+  shell filling the window edge to edge while the header stayed capped. Its earlier full-bleed shell
+  was the odd page out; the cap is inert below `--wrap`, so the phone layout is unchanged. Letting the
+  page release `--wrap` on the HEADER instead (the older regression) stretched the wordmark and tabs to
+  the window edges and looked nothing like the others; the `.app-header` bar it used to override with
+  is gone.
 - Because that row is **centred**, the viewport it centres in must not depend on whether a page
   scrolls, so `app.css` reserves the scrollbar gutter globally (`html { scrollbar-gutter: stable }`).
   The dashboard always overflows and the other pages often don't, so without it the dashboard centred
