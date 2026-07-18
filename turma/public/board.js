@@ -8,6 +8,7 @@
   const CATEGORIES = [
     ["todo", "To Do"],
     ["inprogress", "In Progress"],
+    ["review", "In Review"],
     ["done", "Done"],
   ];
   const SLOTS = 8; // categorical palette --s1..--s8 (app.css)
@@ -18,12 +19,29 @@
     })[c]);
   }
 
+  // "In Review"/"Testing" statuses live in Jira's `indeterminate` category
+  // (which the agent maps to `inprogress`) — there is no fourth cross-org
+  // category for them. So the In Review column is carved out of `inprogress`
+  // by matching the org-specific status NAME rather than the category. Matched
+  // on word boundaries so "Attestation" or "Contest" can't leak in, but "In
+  // Review", "Code Review", "Testing", "In Test", "QA" all land here.
+  const REVIEW_STATUS_RE = /\b(review|reviewing|testing|test|qa)\b/i;
+
+  function isReviewStatus(t) {
+    return REVIEW_STATUS_RE.test(String((t && t.status) || ""));
+  }
+
   // Defensive: an unknown/missing statusCategory lands in To Do rather than
   // vanishing (the agent maps Jira's fixed new/indeterminate/done keys, but an
-  // older agent or a hand-fed payload might not).
+  // older agent or a hand-fed payload might not). An `inprogress` ticket whose
+  // status name reads as review/testing is pulled into the `review` column —
+  // only from inprogress, so a Done ("Testing complete") or To Do ticket keeps
+  // its category and can't be yanked backward/forward by its name alone.
   function categoryOf(t) {
     const c = t && t.statusCategory;
-    return c === "inprogress" || c === "done" ? c : "todo";
+    const base = c === "inprogress" || c === "done" ? c : "todo";
+    if (base === "inprogress" && isReviewStatus(t)) return "review";
+    return base;
   }
 
   function ticketSort(a, b) {
@@ -661,7 +679,7 @@
     const o = opts || {};
     const allKeys = o.allKeys || sites.map(s => s.siteKey);
     const shown = sites.filter(s => !filter || s.siteKey === filter);
-    const cards = { todo: [], inprogress: [], done: [] };
+    const cards = { todo: [], inprogress: [], review: [], done: [] };
     for (const site of shown) {
       const color = orgColor(site.siteKey, allKeys);
       for (const t of site.tickets) {
@@ -765,7 +783,7 @@
   }
 
   const api = {
-    CATEGORIES, mergeSites, categoryOf, ticketSort, orgColor, orgName, ageStr,
+    CATEGORIES, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgName, ageStr,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
