@@ -28,6 +28,8 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   an extra Hub-URL field.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
 - **In-app updater** (`ui/UpdateBanner.kt`) — a sideload stopgap until Play (XERK-11), no web analog.
+- **Chat verbosity defaults to Concise** (XERK-40), where the web defaults to Normal — a phone screen
+  fits far less, so tool cards/outputs are opt-in there. A per-session pick still persists as on web.
 
 ## Done (this pass — first installment)
 

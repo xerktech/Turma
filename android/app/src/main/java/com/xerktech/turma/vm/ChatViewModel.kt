@@ -40,7 +40,7 @@ data class ChatUiState(
     val liveTurn: String = "",
     val turnStatus: TurnStatus? = null,
     val reveal: RevealState = RevealState(),
-    val verbosity: Verbosity = Verbosity.NORMAL,
+    val verbosity: Verbosity = Verbosity.CONCISE,
     val connected: Boolean = false,
     val hasMore: Boolean = false,
     val loadingHistory: Boolean = false,
@@ -69,7 +69,7 @@ class ChatViewModel(
     private val prefs = app.getSharedPreferences("turma_verbosity", 0)
 
     private val _state = MutableStateFlow(
-        ChatUiState(verbosity = Verbosity.entries.getOrElse(prefs.getInt(sessionId, 1)) { Verbosity.NORMAL })
+        ChatUiState(verbosity = Verbosity.entries.getOrElse(prefs.getInt(sessionId, 0)) { Verbosity.CONCISE })
     )
     val state: StateFlow<ChatUiState> = _state
 
