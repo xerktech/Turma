@@ -19,7 +19,7 @@ CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/turma-agent"
 CFG="$CFG_DIR/turma-agent.env"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 TTYD_VERSION="1.7.7"          # matches agent/Dockerfile
-NODE_MAJOR_MIN=22            # tunnel-agent.js needs the global WebSocket
+NODE_MAJOR_MIN=24            # standardized on Node 24 (tunnel-agent.js needs the global WebSocket, Node 22+)
 
 DO=install
 INSTALL_DEPS=yes

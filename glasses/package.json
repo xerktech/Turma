@@ -21,7 +21,7 @@
   "devDependencies": {
     "@evenrealities/evenhub-cli": "^0.1.13",
     "@evenrealities/evenhub-simulator": "^0.7.3",
-    "@types/node": "^22.10.5",
+    "@types/node": "^24.0.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.0",
     "vitest": "^4.1.0"
