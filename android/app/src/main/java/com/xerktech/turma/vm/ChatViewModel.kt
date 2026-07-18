@@ -10,6 +10,7 @@ import com.xerktech.turma.core.RevealState
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.VerbosityPrefs
 import com.xerktech.turma.core.advanceReveal
+import com.xerktech.turma.core.liveRevealBase
 import com.xerktech.turma.core.mergeTail
 import com.xerktech.turma.core.prependHistory
 import com.xerktech.turma.model.SessionInfo
@@ -77,6 +78,9 @@ class ChatViewModel(
 
     private var liveJob: Job? = null
     private var revealJob: Job? = null
+    // The live text the current reveal offset indexes into, for the non-monotonic
+    // pane-scrape snap check (see liveRevealBase / startRevealLoop).
+    private var lastLiveText: String = ""
     private var historyJob: Job? = null
     private var fleetJob: Job? = null
     private var dictation: Dictation? = null
@@ -146,9 +150,17 @@ class ChatViewModel(
                 val s = _state.value
                 val (newestId, targetLen, live) = newestTarget(s)
                 if (newestId.isNotEmpty()) {
-                    val next = advanceReveal(s.reveal, newestId, targetLen, 80, live)
+                    // The live pane scrape isn't monotonic: when the new capture no
+                    // longer continues what we've revealed, snap the base so we don't
+                    // re-stream from a stale offset (XERK-19). Non-live entries are
+                    // monotonic and need no snap.
+                    val prev = if (live && newestId == s.reveal.entryId) {
+                        s.reveal.copy(shown = liveRevealBase(lastLiveText, s.reveal.shown, s.liveTurn))
+                    } else s.reveal
+                    val next = advanceReveal(prev, newestId, targetLen, 80, live)
                     if (next != s.reveal) _state.update { it.copy(reveal = next) }
                 }
+                lastLiveText = if (live) s.liveTurn else ""
                 delay(80)
             }
         }

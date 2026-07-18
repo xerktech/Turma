@@ -1674,6 +1674,38 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
     so a build with no `google-services.json` still runs).
 - Push is driven hub-side by `turma/push.js` (see the turma section).
 
+### Web UI ⇄ Android parity (XERK-30)
+
+- **The mobile web UI (`turma/public/`) is the source of truth for what the client does; the Android
+  app must match it.** The web is where a feature lands first (it's the fastest surface to change),
+  so the app is always the follower — never the other way round.
+- **A PR that changes user-facing behavior in `turma/public/` must carry the matching change to
+  `android/` in the same PR** (or, if genuinely out of scope, add a line to `android/PARITY.md` and
+  say so in the PR description — an unlisted, unmentioned divergence is the thing this rule exists to
+  stop). "User-facing" = a control, a screen, a state, a chip, an interaction, a layout that a person
+  sees or touches; pure server/agent plumbing with no client surface is exempt.
+- Concretely, when you touch one of these web files, check its Android counterpart:
+  - `index.html` → `ui/FleetScreen.kt` + `ui/FleetDialogs.kt` (dashboard/fleet tree, summary tiles)
+  - `sessions.html` + `chat.js` → `ui/SessionsScreen.kt` + `ui/ChatScreen.kt` + `vm/ChatViewModel.kt`
+    (+ `ui/ArchiveScreen.kt` for the full-history search the web puts in the Sessions sidebar)
+  - `board.js` + `board.html` → `ui/BoardScreen.kt` + `core/Board.kt` + `vm/BoardViewModel.kt`
+  - `usage.html` → `ui/UsageScreen.kt`
+  - `nav.js` → `ui/MainScaffold.kt` + `ui/TurmaApp.kt` (nav tabs, Sign out, shared header)
+- **Pure logic ports live in `core/` and are JVM-unit-tested against the web behavior** — the board
+  category carve-out (`core/Board.kt` ↔ `board.js` `categoryOf`), the typewriter reveal
+  (`core/Reveal.kt` ↔ `chat.js` `repaint`), the summary-tile reducers (`core/Fleet.kt` ↔ index.html
+  `fleetTokens`/`mergeModels`). Port the *logic* there so a test pins it to the web, and keep the
+  Compose screen a thin renderer. This is the same pure-core/adapter-shell split the section above
+  describes, applied specifically to keep parity checkable.
+- **Match features and structure, not pixels.** Compose is not CSS; the goal is that every control,
+  state and interaction the mobile web exposes is present and behaves the same, laid out in the
+  platform-idiomatic way (a Material dropdown for a `<select>`, an overflow menu for the ⋯ menu). A
+  justified platform difference (the app's native chat vs the web's ttyd terminal, the Hub-URL field
+  on login, voice dictation) is fine — record it in `android/PARITY.md` rather than leaving it to look
+  like an accidental gap.
+- `android/PARITY.md` is the **living gap tracker**: the web→Android feature map, what's done, and the
+  known-open items. Update it whenever you close a gap or knowingly open one.
+
 ### In-app update (XERK-11)
 
 - A stopgap self-updater until the app ships on Google Play: checks the **public** `xerktech/turma`

@@ -10,8 +10,8 @@ import org.junit.Test
 /** Parity with turma/public/board.js (mergeSites + categoryOf). */
 class BoardTest {
 
-    private fun ticket(key: String, cat: String = "todo") =
-        JiraTicket(key = key, statusCategory = cat)
+    private fun ticket(key: String, cat: String = "todo", status: String = "", updated: String = "") =
+        JiraTicket(key = key, statusCategory = cat, status = status, updated = updated)
 
     private fun agent(key: String, online: Boolean, jira: JiraBlock?) =
         AgentInfo(key = key, online = online, jira = jira)
@@ -21,6 +21,31 @@ class BoardTest {
         assertEquals("todo", categoryOf(ticket("A", "weird")))
         assertEquals("inprogress", categoryOf(ticket("A", "inprogress")))
         assertEquals("done", categoryOf(ticket("A", "done")))
+    }
+
+    @Test fun `in review is carved out of inprogress by status name`() {
+        // The four cross-org columns include In Review between In Progress and Done.
+        assertEquals(listOf("todo", "inprogress", "review", "done"), BOARD_CATEGORIES.map { it.first })
+        // Only an inprogress ticket whose status name reads as review/testing moves.
+        assertEquals("review", categoryOf(ticket("A", "inprogress", status = "In Review")))
+        assertEquals("review", categoryOf(ticket("A", "inprogress", status = "Code Review")))
+        assertEquals("review", categoryOf(ticket("A", "inprogress", status = "Testing")))
+        assertEquals("review", categoryOf(ticket("A", "inprogress", status = "QA")))
+        // A plain in-progress status stays put.
+        assertEquals("inprogress", categoryOf(ticket("A", "inprogress", status = "In Progress")))
+        // Word-boundary: "Attestation"/"Contest" must not leak in.
+        assertEquals("inprogress", categoryOf(ticket("A", "inprogress", status = "Attestation")))
+        assertEquals("inprogress", categoryOf(ticket("A", "inprogress", status = "Contest")))
+        // A Done or To Do ticket keeps its category whatever its name says.
+        assertEquals("done", categoryOf(ticket("A", "done", status = "Testing complete")))
+        assertEquals("todo", categoryOf(ticket("A", "todo", status = "Ready for review")))
+    }
+
+    @Test fun `ticketSort orders by updated descending`() {
+        val a = ticket("A", updated = "2026-07-16T01:00:00Z")
+        val b = ticket("B", updated = "2026-07-16T05:00:00Z")
+        val c = ticket("C", updated = "2026-07-16T03:00:00Z")
+        assertEquals(listOf("B", "C", "A"), ticketSort(listOf(a, b, c)).map { it.key })
     }
 
     @Test fun `two users on one site union their tickets, deduped by key`() {
