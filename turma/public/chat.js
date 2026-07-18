@@ -32,13 +32,65 @@
 
   // Live per-session selectors under the compose box. Values mirror the spawn
   // composer's allowlists (the agent re-validates); picking one changes the
-  // RUNNING session — model via `/model <name>`, mode via Shift+Tab cycling.
+  // RUNNING session — model via the /model picker's session-only path, mode via
+  // Shift+Tab cycling.
+  //
+  // MODEL_OPTS is the static FALLBACK menu, used only when the host hasn't
+  // probed its login's real model list yet (or predates the probe) — see
+  // modelOpts(), which builds the menu from the heartbeat's `models` block so
+  // it offers exactly what this login can actually run (XERK-33).
   const MODEL_OPTS = [
     { value: "default", label: "Default" },
     { value: "opus", label: "Opus" },
     { value: "sonnet", label: "Sonnet" },
     { value: "haiku", label: "Haiku" },
   ];
+  // The aliases the menu offers when available, in display order — the same
+  // curated set Claude Code's own /model picker shows. Aliases the picker has
+  // no row for (best / opusplan / the bracketed 1M variants) are deliberately
+  // not offered: the agent's session-only switch drives that picker, so a menu
+  // entry it can't reach would be a button that does nothing.
+  const MODEL_MENU_ALIASES = ["default", "opus", "fable", "sonnet", "haiku"];
+  // The host's real model menu: the curated aliases its probe reported
+  // available, labelled with what "Default" currently resolves to. `models` is
+  // the heartbeat's {available, defaultLabel} block; absent/empty (an agent
+  // predating the probe, or none has succeeded yet) falls back to the static
+  // list rather than an empty menu.
+  function modelOpts(models) {
+    const avail = models && Array.isArray(models.available) ? models.available : null;
+    if (!avail || !avail.length) return MODEL_OPTS;
+    const opts = MODEL_MENU_ALIASES
+      .filter((a) => a === "default" || avail.indexOf(a) !== -1)
+      .map((a) => ({
+        value: a,
+        label: a === "default" && models.defaultLabel
+          ? "Default (" + prettyModel(models.defaultLabel) + ")"
+          : a[0].toUpperCase() + a.slice(1),
+      }));
+    return opts.length > 1 ? opts : MODEL_OPTS;
+  }
+  // Human form of a model signal, which arrives in two shapes: a model id off a
+  // transcript's assistant entry ("claude-opus-4-8", "claude-haiku-4-5-20251001",
+  // "claude-fable-5[1m]") or an already-friendly display label from a /model
+  // confirmation ("Sonnet 5"). Ids are parsed — family word capitalized, digit
+  // runs joined into a dotted version, trailing date stamp dropped, "[1m]"
+  // rendered as a 1M suffix; anything else passes through untouched.
+  function prettyModel(v) {
+    if (!v) return "";
+    let s = String(v).trim();
+    if (!/^claude-/i.test(s)) return s;
+    const oneM = /\[1m\]$/i.test(s);
+    s = s.replace(/^claude-/i, "").replace(/\[1m\]$/i, "");
+    const parts = s.split("-").filter(Boolean);
+    const words = [], nums = [];
+    for (const p of parts) {
+      if (/^\d{8}$/.test(p)) continue; // date stamp, not a version
+      if (/^\d+$/.test(p)) nums.push(p);
+      else words.push(p[0].toUpperCase() + p.slice(1));
+    }
+    const name = words.join(" ") + (nums.length ? " " + nums.join(".") : "");
+    return (name || String(v)) + (oneM ? " 1M" : "");
+  }
   const MODE_OPTS = [
     { value: "auto", label: "auto" },
     { value: "acceptEdits", label: "acceptEdits" },
@@ -968,9 +1020,32 @@
     buildVerbositySeg($("chatVerbosity"), () => { saveVerbosity(); renderVerbosityControl(); repaint(); });
   }
   // ---- live agent-mode / model selectors (under the compose box) ------------
+  function availableModelOpts() {
+    return modelOpts(agent && agent.models);
+  }
   function currentModelValue() {
     const m = (sess && sess.model) ? String(sess.model).toLowerCase() : "default";
-    return MODEL_OPTS.some((o) => o.value === m) ? m : "default";
+    return availableModelOpts().some((o) => o.value === m) ? m : "default";
+  }
+  // A just-picked model switch, held until the agent confirms it (modelActual
+  // moves) or it times out. Without this the chip would flash BACK to the old
+  // actual model for the beat or two between the optimistic paint and the
+  // confirmation landing — which reads as the switch not taking.
+  let modelSwitchPending = null; // {value, prevActual, at}
+  const MODEL_SWITCH_SETTLE_MS = 30000;
+  // What the model chip SAYS: the model actually answering (per the agent's
+  // transcript read) over the picked alias, which in turn beats a bare
+  // "Default" — the chip's old text, which told the operator nothing (XERK-33).
+  function modelChipLabel() {
+    const actual = sess && sess.modelActual;
+    if (modelSwitchPending) {
+      const settled = actual !== modelSwitchPending.prevActual ||
+        Date.now() - modelSwitchPending.at > MODEL_SWITCH_SETTLE_MS;
+      if (!settled) return optLabel(availableModelOpts(), modelSwitchPending.value);
+      modelSwitchPending = null;
+    }
+    if (actual) return prettyModel(actual);
+    return optLabel(availableModelOpts(), currentModelValue());
   }
   function currentModeValue() {
     const m = (sess && sess.permissionMode) ? sess.permissionMode : "auto";
@@ -1084,6 +1159,9 @@
     if (fromPoll && host.querySelector(".cc-menu.open")) return;
     const mode = currentModeValue(), model = currentModelValue();
     const modeOpts = availableModeOpts();
+    const mOpts = availableModelOpts();
+    const mTitle = "Model for this session — switched live, session-only" +
+      (sess && sess.modelActual ? " (now: " + sess.modelActual + ")" : "");
     host.innerHTML =
       '<span class="cc-opt cc-mode">' +
         '<button class="cc-btn" id="ccModeBtn" title="Agent (permission) mode — switched live, best-effort">' +
@@ -1092,16 +1170,17 @@
         menuHtml(modeOpts, mode, "data-mode") + "</span></span>" +
       '<span class="cc-right">' + ticketFooterChip(sess) + prFooterChip(sess) +
         '<span class="cc-opt cc-model">' +
-          '<button class="cc-btn" id="ccModelBtn" title="Model for this session">' +
-          '<span class="cc-val">' + esc(optLabel(MODEL_OPTS, model)) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
+          '<button class="cc-btn" id="ccModelBtn" title="' + esc(mTitle) + '">' +
+          '<span class="cc-val">' + esc(modelChipLabel()) + '</span><span class="cc-caret">▾</span> 🧠</button>' +
           '<span class="cc-menu" id="ccModelMenu"><span class="cc-hint">Model</span>' +
-          menuHtml(MODEL_OPTS, model, "data-model") + "</span></span>" +
+          menuHtml(mOpts, model, "data-model") + "</span></span>" +
       "</span>";
     wireComposeMenu("ccModeBtn", "ccModeMenu", "data-mode", setSessionMode);
     wireComposeMenu("ccModelBtn", "ccModelMenu", "data-model", setSessionModel);
   }
   async function setSessionModel(value) {
     if (!hostKey || !sessionId || !sess || value === currentModelValue()) return;
+    modelSwitchPending = { value, prevActual: sess.modelActual || null, at: Date.now() };
     sess.model = value === "default" ? null : value; // optimistic; heartbeat confirms
     renderComposeOpts();
     try {
@@ -1404,6 +1483,7 @@
     hostKey = hk; sessionId = id; sess = s; agent = a;
     buffer = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
     stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send
+    modelSwitchPending = null;
     lastHtml = null; repaintDeferred = false; // this session's paint memo starts empty
     stickBottom = true; // land at the tail on open, past the seed→history race
     noExpand = false;
@@ -1431,15 +1511,19 @@
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
     buffer = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
-    stopPendingAt = 0; actionFailUntil = 0;
+    stopPendingAt = 0; actionFailUntil = 0; modelSwitchPending = null;
     lastHtml = null; repaintDeferred = false;
     updateLiveStatus(); // hide the pinned bar when the view closes
   }
 
   // Called from the page's render() on each heartbeat/SSE while chat is open.
-  function onPoll(s) {
+  // `a` is the session's host payload when the caller has a fresh one — it
+  // carries the probed `models` block the model menu is built from, which would
+  // otherwise stay frozen at whatever open() saw.
+  function onPoll(s, a) {
     if (!s) return;
     sess = s;
+    if (a) agent = a;
     setHeader(s, agent);
     updateQuestion(s);
     renderComposeOpts(true);
@@ -1464,7 +1548,7 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, prFooterChip,
-      ticketFooterChip,
+      ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
       isBusy, updateComposeAction,
       __setLiveStatus: (st) => { liveStatus = st; },
