@@ -2681,6 +2681,56 @@ def _pane_busy(tmux_name):
     return any(m in low for m in PANE_BUSY_MARKERS)
 
 
+# A single capture can read "idle" while the model is really still working:
+# Claude Code's TUI repaints its spinner (and the "esc to interrupt" hint that
+# rides it) several times a second by CLEARING the status line and rewriting it,
+# so a capture that lands in that sub-frame gap sees no marker even though the
+# turn hasn't ended. It's a momentary artifact — but paneBusy is sampled only
+# once per heartbeat (TURMA_INTERVAL, 20s by default), so a single missed frame
+# shows the session "idle" for a whole interval on EVERY status surface (the
+# fleet dots, the session cards, the glasses glyph, the Android list — all key
+# off this one field) AND fires a bogus "finished its turn" notification on the
+# hub's working->idle edge. That interval-long flip off and back is the "flaky
+# status icons" this guards against.
+#
+# The asymmetry is the whole idea: a redraw gap can fake IDLE while working, but
+# nothing fakes BUSY while idle (once a turn ends the marker is gone from the
+# grid for good). So a busy read is trusted instantly — status must light up
+# promptly — while an idle read is distrusted only on the busy->idle EDGE, where
+# we re-capture once after a short delay and believe idle only if it HOLDS. A
+# genuinely finished turn confirms in a frame; a redraw gap doesn't. A steady
+# idle session needs no confirmation and pays nothing.
+#
+# 0 disables (report the raw single read). The delay must clear one repaint
+# cycle — a couple hundred ms — without meaningfully taxing the beat, and it is
+# spent only on the transition, not every idle beat.
+PANE_IDLE_CONFIRM_SEC = float(os.environ.get("TURMA_PANE_IDLE_CONFIRM_SEC", "0.2"))
+
+
+def _stable_pane_busy(tmux_name, state):
+    """paneBusy with the busy->idle flicker suppressed, using per-session `state`
+    (persisted across beats) to remember the last stable reading. See
+    PANE_IDLE_CONFIRM_SEC for the mechanism and why it's asymmetric.
+
+    None (unknown — no pane, capture failed) is passed straight through and
+    leaves the remembered state untouched, so the transcript-mtime fallback still
+    decides and a transient capture failure can't be mistaken for "went idle"."""
+    raw = _pane_busy(tmux_name)
+    if raw is None:
+        return None
+    if raw:
+        state["paneBusyStable"] = True
+        return True
+    # raw is False. Only distrust it on the busy->idle edge.
+    if state.get("paneBusyStable") and PANE_IDLE_CONFIRM_SEC > 0:
+        time.sleep(PANE_IDLE_CONFIRM_SEC)
+        if _pane_busy(tmux_name):  # the marker was one frame away -> still working
+            state["paneBusyStable"] = True
+            return True
+    state["paneBusyStable"] = False
+    return False
+
+
 def _capture_pane(tmux_name):
     """The session pane's current text, or None when it can't be captured
     (tmux gone, timeout)."""
@@ -2720,7 +2770,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         "bridgeAttached": os.path.exists(os.path.join(proj, "bridge-pointer.json")),
         # Live "is it working right now" read straight off the session's TUI —
         # the primary working/idle signal; transcriptAgeSec is the fallback.
-        "paneBusy": _pane_busy(tmux_name),
+        # Flicker-suppressed via `state` (see _stable_pane_busy) so a single
+        # capture landing in a spinner-repaint gap can't flip every status icon
+        # to idle for a whole interval.
+        "paneBusy": _stable_pane_busy(tmux_name, state),
         "transcriptAgeSec": None,  # seconds since the newest transcript write
         "lastRole": None,          # "assistant"/"user"/... of the newest entry
         "lastHasToolUse": False,

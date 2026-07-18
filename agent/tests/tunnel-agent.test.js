@@ -601,6 +601,37 @@ test("parsePaneLiveTurn: completed turn (no 'esc to interrupt') -> not generatin
   assert.deepEqual(parsePaneLiveTurn(pane), { generating: false, text: "", status: null });
 });
 
+// liveTurnDecision holds a single busy->idle blip for one poll so a mid-repaint
+// capture can't flicker the pinned working bar off (the live counterpart of
+// hub-agent.py's _stable_pane_busy for the heartbeat's paneBusy).
+test("liveTurnDecision: busy is emitted instantly and clears any pending hold", () => {
+  const { liveTurnDecision } = require("../tunnel-agent.js");
+  // From idle...
+  assert.deepEqual(liveTurnDecision(false, false, true), { emit: true, gen: true, pending: false });
+  // ...and it also cancels a hold that was in flight (the blip recovered).
+  assert.deepEqual(liveTurnDecision(true, true, true), { emit: true, gen: true, pending: false });
+});
+
+test("liveTurnDecision: first idle frame after busy is held, not emitted", () => {
+  const { liveTurnDecision } = require("../tunnel-agent.js");
+  const d = liveTurnDecision(true, false, false);
+  assert.equal(d.emit, false);        // skip the frame, keep the last one on screen
+  assert.equal(d.gen, true);          // still consider it generating...
+  assert.equal(d.pending, true);      // ...pending one confirming poll
+});
+
+test("liveTurnDecision: a second idle frame confirms and clears", () => {
+  const { liveTurnDecision } = require("../tunnel-agent.js");
+  // Held last poll (pending), still idle -> genuinely ended, so emit the clear.
+  assert.deepEqual(liveTurnDecision(true, true, false), { emit: true, gen: false, pending: false });
+});
+
+test("liveTurnDecision: steady idle emits without holding", () => {
+  const { liveTurnDecision } = require("../tunnel-agent.js");
+  // Never was generating -> nothing to flicker off, so no hold.
+  assert.deepEqual(liveTurnDecision(false, false, false), { emit: true, gen: false, pending: false });
+});
+
 test("parsePaneLiveTurn: ignores the right-aligned effort indicator, empty pane", () => {
   const { parsePaneLiveTurn } = require("../tunnel-agent.js");
   assert.deepEqual(parsePaneLiveTurn(""), { generating: false, text: "", status: null });

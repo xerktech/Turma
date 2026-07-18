@@ -801,6 +801,29 @@ function parsePaneLiveTurn(pane) {
   return { generating: true, text, status };
 }
 
+// Suppress a single-frame busy->idle blip in the live turn scrape. Claude Code
+// repaints its spinner (and the "esc to interrupt" hint parsePaneLiveTurn keys
+// on) several times a second by clearing and rewriting the status line, so one
+// capture can read "not generating" mid-repaint while the model is still
+// working. Clearing the hub's pinned working bar (and the chat's Stop button) on
+// that blip makes it flicker off for a poll. So on the busy->idle EDGE we HOLD
+// one poll before clearing: if the very next poll is still generating it was a
+// redraw gap and nothing flickered; if it's still idle the turn really ended and
+// we clear (the committed transcript tail owns the finished message either way,
+// so the ~1s hold is invisible). Busy is never held — status must light up
+// promptly, and nothing fakes busy while idle. This mirrors _stable_pane_busy in
+// hub-agent.py, which guards the heartbeat's paneBusy the same way; the shorter
+// (1s) live cadence lets a poll-hold stand in for that one's re-capture.
+//
+// Pure so it's unit-testable: given the prior (gen, pending) hold state and this
+// poll's `generating`, returns whether to `emit` this frame plus the next hold
+// state. emit=false means skip the frame, leaving the last one on screen.
+function liveTurnDecision(prevGen, prevPending, generating) {
+  if (generating) return { emit: true, gen: true, pending: false };
+  if (prevGen && !prevPending) return { emit: false, gen: true, pending: true };
+  return { emit: true, gen: false, pending: false };
+}
+
 // Capture the session's tmux pane (agent-<id>) and extract the in-progress
 // assistant turn. Async (execFile, not execFileSync) so a slow/hung capture
 // can't block the control-WS event loop.
@@ -839,6 +862,10 @@ function pollWatcher(sessionId) {
   //    status-only change (the token counter ticking) still pushes an update.
   captureLiveTurn(sessionId, (live) => {
     if (!watchers.has(sessionId)) return; // stopped mid-capture
+    const d = liveTurnDecision(w.liveGen === true, w.livePending === true, live.generating);
+    w.liveGen = d.gen;
+    w.livePending = d.pending;
+    if (!d.emit) return; // holding a busy->idle blip for one poll; keep last frame
     const text = live.generating ? live.text : "";
     const status = live.generating ? (live.status || null) : null;
     // NUL separator: a byte that cannot occur in pane text. Written as an
@@ -870,6 +897,7 @@ function startWatch(sessionId, worktreePath, transcriptId) {
   }
   const w = { worktreePath, transcriptId: transcriptId || null,
     lastJson: null, lastTurn: "", timer: null,
+    liveGen: false, livePending: false, // busy->idle blip hold; see liveTurnDecision
     tailCache: { path: null, mtimeMs: 0, size: 0, result: [] } };
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
@@ -1127,5 +1155,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, parseAgentList, awaySummaryText, foldQueueOp, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, parseAgentList, awaySummaryText, foldQueueOp, BLOCK_CAPS_LIVE };
 }

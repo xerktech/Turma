@@ -1176,6 +1176,89 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
         self.assertIsNone(rep["paneBusy"])
 
 
+class TestStablePaneBusy(unittest.TestCase):
+    """_stable_pane_busy suppresses the busy->idle flicker a single mid-repaint
+    capture would otherwise cause: a busy read is instant, an idle read is
+    re-confirmed on the busy->idle edge, and None passes through untouched.
+    time.sleep is patched out so the confirm delay costs the tests nothing."""
+
+    def setUp(self):
+        self._sleep = mock.patch.object(ha.time, "sleep").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_busy_is_instant_and_marks_state(self):
+        # A busy read is trusted on the first capture — status lights up promptly
+        # — and there is no confirmation re-capture.
+        st = {}
+        with mock.patch.object(ha, "_pane_busy", return_value=True) as pb:
+            self.assertIs(ha._stable_pane_busy("agent-x", st), True)
+        pb.assert_called_once_with("agent-x")
+        self.assertIs(st["paneBusyStable"], True)
+        self._sleep.assert_not_called()
+
+    def test_steady_idle_is_not_re_confirmed(self):
+        # Never was busy this session -> nothing to flicker off, so a single idle
+        # read is believed with no second capture.
+        st = {}  # no paneBusyStable
+        with mock.patch.object(ha, "_pane_busy", return_value=False) as pb:
+            self.assertIs(ha._stable_pane_busy("agent-x", st), False)
+        pb.assert_called_once_with("agent-x")
+        self.assertIs(st["paneBusyStable"], False)
+        self._sleep.assert_not_called()
+
+    def test_single_idle_frame_while_busy_is_held(self):
+        # busy->idle edge: the first capture missed the marker (redraw gap) but
+        # the confirming re-capture sees it -> stays working, no flip.
+        st = {"paneBusyStable": True}
+        with mock.patch.object(ha, "_pane_busy", side_effect=[False, True]) as pb:
+            self.assertIs(ha._stable_pane_busy("agent-x", st), True)
+        self.assertEqual(pb.call_count, 2)  # confirmed with a second capture
+        self.assertIs(st["paneBusyStable"], True)
+        self._sleep.assert_called_once()
+
+    def test_genuine_idle_confirms_and_flips(self):
+        # busy->idle edge with the marker really gone: both captures agree,
+        # so it flips to idle (only one confirm delay was spent).
+        st = {"paneBusyStable": True}
+        with mock.patch.object(ha, "_pane_busy", side_effect=[False, False]) as pb:
+            self.assertIs(ha._stable_pane_busy("agent-x", st), False)
+        self.assertEqual(pb.call_count, 2)
+        self.assertIs(st["paneBusyStable"], False)
+
+    def test_unknown_passes_through_without_touching_state(self):
+        # A capture failure is not evidence the turn ended: return None (so the
+        # transcript fallback decides) and leave the remembered state alone.
+        st = {"paneBusyStable": True}
+        with mock.patch.object(ha, "_pane_busy", return_value=None) as pb:
+            self.assertIsNone(ha._stable_pane_busy("agent-x", st))
+        pb.assert_called_once_with("agent-x")
+        self.assertIs(st["paneBusyStable"], True)  # untouched
+        self._sleep.assert_not_called()
+
+    def test_confirm_disabled_via_env(self):
+        # PANE_IDLE_CONFIRM_SEC=0 restores the raw single-read behaviour.
+        st = {"paneBusyStable": True}
+        orig = ha.PANE_IDLE_CONFIRM_SEC
+        ha.PANE_IDLE_CONFIRM_SEC = 0.0
+        try:
+            with mock.patch.object(ha, "_pane_busy", side_effect=[False, True]) as pb:
+                self.assertIs(ha._stable_pane_busy("agent-x", st), False)
+            pb.assert_called_once_with("agent-x")  # no confirmation capture
+        finally:
+            ha.PANE_IDLE_CONFIRM_SEC = orig
+
+    def test_flicker_suppressed_across_beats_in_session_report(self):
+        # End-to-end through session_report: one shared state dict, a busy beat
+        # then a single idle-frame beat -> paneBusy stays True across the blip.
+        st = {}
+        with mock.patch.object(ha, "_pane_busy", return_value=True):
+            r1 = ha.session_report("/absent/worktree", st, "agent-x")
+        self.assertIs(r1["paneBusy"], True)
+        with mock.patch.object(ha, "_pane_busy", side_effect=[False, True]):
+            r2 = ha.session_report("/absent/worktree", st, "agent-x")
+        self.assertIs(r2["paneBusy"], True)
+
+
 class TestHookQuestion(unittest.TestCase):
     """_hook_question reads the ask.py bridge's request file directly."""
 
