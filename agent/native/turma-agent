@@ -122,7 +122,7 @@ CREDS="$HOME/.claude/.credentials.json"
 # PREFIX-scoped, like the tunnel-agent.js one, so a --prefix install only ever
 # reaps its own.
 #
-# The tunnel is SUPERVISED here, unlike in the container, because a native
+# The tunnel is SUPERVISED here with a node check, because a native
 # install is the only place its runtime can be missing: node is an apt
 # prerequisite installed at setup time, not a baked image layer. Fire-and-forget
 # made that failure both silent and permanent — the manager kept heartbeating,

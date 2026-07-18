@@ -152,12 +152,12 @@ curl -fsSL .../bootstrap.sh | bash -s -- --verify
 
 ## Known limitations (graceful degradation)
 
-- **No container self-inspect** — the heartbeat's container-log tail and the
-  restart `StartedAt` are empty (`docker inspect/logs` aren't there). Sessions
-  and per-session restart are unaffected, but the host card's Uptime reads "–"
-  and the hub's **restart-loop alert never fires for this host** (it keys on
-  `startedAt` changing): a crash-looping native manager restarts silently under
-  `Restart=always` with no push notification.
+- **No container self-inspect** — the heartbeat's container-log tail is empty
+  (`docker logs` isn't there). Sessions and per-session restart are unaffected.
+  `startedAt` falls back to the manager's own start time when `docker inspect`
+  can't answer, so the host card's Uptime reads as MANAGER uptime here (an
+  update restart resets it) and the hub's restart-loop alert still catches a
+  crash-looping native manager.
 - **`DEVICE_NAME` is explicit** — the container's docker/SMB auto-detection is
   gone; the launcher defaults it to `$(hostname)`.
 - **Lifetime** — the agent lives only while the WSL distro is running. Windows

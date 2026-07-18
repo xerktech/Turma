@@ -750,9 +750,11 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     value; that is not a licence to leak it twice.)
   - Tests: `agent/tests/test_turma_agent.sh` (invalid line idles + starts neither tunnel nor manager,
     no value leak, `--preflight` exits without hanging, a valid config still loads).
-- The tunnel is **supervised** here, unlike in the container: it is re-exec'd as
+- The tunnel is **supervised** here: it is re-exec'd as
   `turma-agent --tunnel-supervisor` (a respawn loop, not a bare background node), because a native
   install is the only place its runtime can be MISSING — node is an apt prereq, not a baked layer.
+  (The container gained its own, simpler respawn loop in `entrypoint.sh` with XERK-34 — no node
+  check, since node is a baked layer there; see the parity bullet below.)
   - Fire-and-forget made that failure silent AND permanent: the manager kept heartbeating, so the
     host read ONLINE while every session on it read **"terminal offline"** (the hub's
     `terminalOnline` is just "is this host's control channel connected right now"), with one
@@ -817,17 +819,20 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Container ⇄ native parity (the XERK-34 audit): the same `hub-agent.py`/`tunnel-agent.js`/`hooks/`
   run in both, so the session model, heartbeat, Jira/PR/usage/archive features are identical. The
   known deltas, beyond the tooling line above and the README's "Known limitations":
-  - **native**: `startedAt`/log-tail are empty (no docker), so the host card's Uptime reads "–" and
-    the hub's restart-loop alert never fires for a native host — a crash-looping native manager is
-    invisible to notifications. Fixable by heartbeating the manager's own start time as a fallback.
+  - Heartbeat `startedAt` is docker's StartedAt where docker can answer, else the manager's OWN
+    start time — never empty (`TestStartedAt`). The fallback is what keeps the hub's restart-loop
+    alert (keyed on `startedAt` CHANGING) and the card's Uptime working for native hosts, where a
+    crash-looping manager under `Restart=always` used to be invisible to notifications. The log
+    tail stays container-only (no native `docker logs`; nothing reads the journal).
   - **native**: the bundled tmux.conf only takes effect at `/etc/tmux.conf`/`~/.tmux.conf`; a host
     with its own conf loses truecolor and the OSC 52 copy chain (install.sh warns; hub-agent launches
     bare `tmux`, so `$PREFIX/tmux.conf` itself is never read, and agent sessions share the user's own
     tmux server/config).
-  - **container**: the tunnel is fire-and-forget (`entrypoint.sh` backgrounds it once) — a
-    tunnel-agent crash means "host online, every terminal offline" until a container restart, the
-    exact failure the NATIVE tunnel supervisor exists to heal. Socket-level failures self-heal via
-    the reconnect logic, so only a process death (uncaught exception) hits this.
+  - The tunnel is supervised on BOTH sides now: natively by `--tunnel-supervisor` (which also
+    handles a missing node), in the container by a respawn loop in `entrypoint.sh` (node is baked,
+    so it only guards process death — an uncaught exception used to strand every terminal as
+    "offline" under a green host until a container restart). Tested by the relaunch case in
+    `agent/tests/test_entrypoint.sh`.
 - Additive: nothing under `native/` edits the shared runtime files; the one enabling change is
   `resume_on_boot`'s adopt path (above), which is backward-compatible with the container.
 - The native tarball is one component of the unified `release.yml` (see Unified releases); the updater
