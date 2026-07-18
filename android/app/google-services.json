@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "56009754566",
+    "project_id": "turma-dc306",
+    "storage_bucket": "turma-dc306.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:56009754566:android:cef226af02424d3cc954c7",
+        "android_client_info": {
+          "package_name": "com.xerktech.turma"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCF79JtuAWm4xfDvswAJpL-AO-r5QtzztI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

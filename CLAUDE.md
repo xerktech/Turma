@@ -1681,9 +1681,13 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
 - Session commands are queued on the hub and drained via the heartbeat reply.
 - The hub pushes edge-triggered alerts to the **Android client via FCM** — the sole notification
   transport (XERK-10 removed the former self-hosted ntfy path): host offline/recovered, restart loop,
-  daily cost threshold (from the host-level `usage.today.cost` so ended sessions still count, falling
-  back to summing live sessions for older agents), per-session turn finished / question waiting / PR
-  created.
+  per-session turn finished / question waiting / PR created. (The old daily-cost-threshold alert went
+  with cost accounting — usage is token-only now.)
+- **`android/app/google-services.json` is committed** (XERK-37): the Firebase client config must be
+  IN the repo for the CI-built release APKs (the ones the in-app updater installs) to carry it —
+  gitignored, every released build had Firebase inert, no device ever registered, and push silently
+  did nothing in production. It holds only public identifiers (same reasoning as the committed
+  release keystore); the gradle apply stays conditional so a fork that removes it still builds.
 - Every alert funnels through one `notify()` (`turma/server.js`), which fans out to every registered
   device via `turma/push.js` (HTTP v1, service-account JWT minted with `node:crypto`, no npm — enabled
   by `FCM_SERVICE_ACCOUNT_JSON`, a no-op that pushes nothing when unset), carrying

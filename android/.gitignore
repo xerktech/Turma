@@ -14,9 +14,6 @@ gradle/wrapper/gradle-wrapper.jar
 gradlew
 gradlew.bat
 
-# Firebase config — per-project secret, dropped in by the operator (see README).
-google-services.json
-
 # Signing
 *.keystore
 *.jks
