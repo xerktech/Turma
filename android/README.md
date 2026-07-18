@@ -26,8 +26,8 @@ notifications** and **voice** for starting sessions and mid-session prompts.
 - **Search & archive** — full-text search of ended sessions and a read-only
   transcript viewer.
 - **Push** — FCM notifications for question waiting / turn finished / PR created /
-  host offline / cost threshold, each on its own channel, deep-linking a tap to
-  the exact session or host.
+  host offline/recovered / restart loop, each on its own channel, deep-linking a
+  tap to the exact session or host.
 - **Adaptive layout** — dashboard / board / usage simply expand to fill the
   window; the Sessions screen becomes a web-style **list-detail two-pane** (cards
   left, chat right) on an expanded width (≥840dp: tablets, unfolded foldables,
@@ -117,12 +117,22 @@ one-tap **Update**, downloads it and hands it to the system package installer.
 ## Push notifications (FCM) setup
 
 Push is optional — the app builds and runs without it (the Firebase plugin is
-skipped when no config is present). To enable:
+skipped when no config is present).
+
+**`android/app/google-services.json` is committed** (XERK-37) so the CI-built
+release APKs — the ones the in-app updater installs — actually carry the
+Firebase client config. It holds only public identifiers (project id, app id, an
+Android API key), not secrets, the same reasoning as the committed release
+keystore. While it was gitignored, every released APK was built without it, so
+push was silently inert in production. A fork pointing at its own Firebase
+project replaces the file with its own.
+
+To set up a new Firebase project:
 
 1. Create a Firebase project, add an Android app with applicationId
-   `com.xerktech.turma`, and download **`google-services.json`** into
-   `android/app/` (gitignored).
-2. On the **hub**, set `FCM_SERVICE_ACCOUNT_JSON` (the Firebase project's
+   `com.xerktech.turma`, and commit its **`google-services.json`** at
+   `android/app/`.
+2. On the **hub**, set `FCM_SERVICE_ACCOUNT_JSON` (the same Firebase project's
    service-account JSON, inline) in `compose/turma-truenas.yaml` (DockerOps).
    The hub's `turma/push.js` mints an OAuth token from it and fans every alert
    (`notify()`) out to registered devices.
