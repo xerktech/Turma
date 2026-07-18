@@ -379,13 +379,27 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
      names the repo, including the operator's own dev-machine sessions synced through the shared
      `~/.claude` login);
   4. else bucketed under `OTHER_REPO_NAME` (`(other)`), only when no `cwd` is recorded.
-- **Nothing is excluded** — every transcript on the box counts toward the host total.
+- **No real session is excluded** — every session transcript on the box counts toward the host total.
+- **The one carve-out is the manager's OWN internal `claude -p` helpers** (session naming + Jira
+  triage), which run with `cwd=REGISTRY_DIR` yet still write a transcript into the shared
+  `~/.claude/projects` — so the reconciler used to adopt the agent's own overhead as a phantom repo on
+  the usage page: `.turma` (from `/root/.turma`) in production, and a cluster of `hub-agent-mgr-*`
+  entries when a test/verify harness boots the manager against a `mkdtemp` `REGISTRY_DIR` (XERK-27).
+  `_is_internal_tool_slug` recognizes them — by the registry dir's own slug (no transcript read,
+  catches production) or, for a harness's foreign temp slug, by the `INTERNAL_TOOL_PROMPT_SIGS`
+  signature of the transcript's first prompt (path- and process-independent). Such a slug is
+  **tombstoned** in the ledger (`{internal:true}`), which `repo_usage_report` and `_archive_manifest`
+  skip, so it never re-evaluates and never surfaces on usage OR in the archive.
+  `_sanitize_internal_tool_entries` retires entries earlier builds already adopted; a real coding
+  session at a repo cwd is untouched, and a genuine ad-hoc run (e.g. an operator's `claude` in
+  `/root`) still counts as itself.
 - **This ledger is also the archive's input** (`_archive_manifest` enumerates ledger slugs), so
   reconciliation *intentionally* widens archival too: every ended session on the box, including
   synced dev-machine history, is shipped to and full-text-indexed in the hub's durable archive, not
   just Turma-managed ones. That coupling is deliberate (total history + search); decouple the two
   inputs only if archival scope should ever diverge from usage scope.
-- Tests: `agent/tests/test_hub_agent.py` (`TestReconcileOrphanTranscripts`).
+- Tests: `agent/tests/test_hub_agent.py` (`TestReconcileOrphanTranscripts`, including the
+  internal-tool tombstone/signature/sanitize cases).
 
 ### Jira block
 

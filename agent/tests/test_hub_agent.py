@@ -1943,6 +1943,93 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
         sm._reconcile_orphan_transcripts()
         self.assertFalse(sm.usage_ledger)
 
+    # --- The manager's OWN internal claude -p helpers are not repos (XERK-27) ---
+    # Session naming and Jira triage run headless with cwd=REGISTRY_DIR but still
+    # write a transcript into the shared ~/.claude/projects, which earlier builds
+    # adopted as phantom ".turma" / "hub-agent-mgr-*" repos on the usage page.
+
+    def _write_prompted(self, cwd_dir, prompt, tid="t"):
+        """A transcript whose first user turn is `prompt`, recorded from cwd_dir —
+        the shape the manager's own summary/triage claude -p leaves behind. Carries
+        usage so a test can also prove the tokens don't reach the host total."""
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd_dir))
+        os.makedirs(proj, exist_ok=True)
+        write_jsonl(os.path.join(proj, tid + ".jsonl"), [
+            {"type": "user", "cwd": cwd_dir,
+             "message": {"role": "user", "content": prompt}},
+            usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
+                        "claude-sonnet-4-20250514", 100_000, 0),
+        ])
+        return proj
+
+    def test_registry_dir_transcript_tombstoned_by_slug(self):
+        # cwd=REGISTRY_DIR -> the registry dir's own slug, matched WITHOUT reading
+        # the transcript (the production ".turma" leak). Tombstoned, not a repo.
+        proj = self._write_prompted(
+            ha.REGISTRY_DIR, ha.SUMMARY_INSTRUCTION + "Add a compose flag")
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertTrue(sm.usage_ledger[proj].get("internal"))
+        self.assertNotIn("repo", sm.usage_ledger[proj])
+        sm._refresh_repo_usage()          # nothing surfaces, no tokens counted
+        self.assertFalse(sm.repo_usage)
+        self.assertIsNone(sm.host_usage)
+
+    def test_triage_signature_tombstoned_under_foreign_slug(self):
+        # A verify/test harness boots the manager against a temp REGISTRY_DIR, so
+        # its triage claude -p lands under …-tmp-hub-agent-mgr-<rand>, NOT the
+        # running manager's registry slug. The prompt signature still catches it —
+        # otherwise it would have been named "hub-agent-mgr-abcd1234".
+        proj = self._write_prompted(
+            "/tmp/hub-agent-mgr-abcd1234",
+            ha.JIRA_TRIAGE_INSTRUCTION + "Candidate repositories:\n- Turma")
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertTrue(sm.usage_ledger[proj].get("internal"))
+        self.assertNotIn("repo", sm.usage_ledger[proj])
+
+    def test_sanitize_flips_existing_phantom_repo_entry(self):
+        # An older build already adopted the harness transcript as a real repo
+        # entry; the sanitize pass retires it to a tombstone so it drops off the
+        # usage page instead of lingering forever.
+        cwd = "/tmp/hub-agent-mgr-zzzz9999"
+        proj = self._write_prompted(cwd, ha.JIRA_TRIAGE_INSTRUCTION + "x")
+        sm = self.make_manager()
+        sm.usage_ledger = {proj: {"repo": "hub-agent-mgr-zzzz9999",
+                                  "remote": "", "slug": ha._project_slug(cwd)}}
+        sm._sanitize_internal_tool_entries()
+        self.assertTrue(sm.usage_ledger[proj].get("internal"))
+        sm._refresh_repo_usage()
+        self.assertFalse(any("hub-agent-mgr" in r["repo"]
+                             for r in sm.repo_usage))
+
+    def test_real_session_prompt_not_treated_as_internal(self):
+        # A genuine coding prompt from a repo cwd is still adopted as its repo —
+        # the carve-out is narrow and keyed on the manager's own prompt text.
+        proj = self._write_prompted(
+            "/home/me/personal/Widget", "Add a dark mode toggle to settings")
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertFalse(sm.usage_ledger[proj].get("internal"))
+        self.assertEqual(sm.usage_ledger[proj]["repo"], "Widget")
+
+    def test_archive_manifest_skips_internal_tool_transcript(self):
+        # The reconcile ledger is the archive's input too, so a tombstone keeps the
+        # helper transcripts out of the durable/searchable archive, not just usage.
+        self._write_prompted(ha.REGISTRY_DIR, ha.SUMMARY_INSTRUCTION + "x")
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertFalse(sm._archive_manifest())
+
+    def test_internal_signatures_track_the_live_prompts(self):
+        # The signatures must stay a prefix of the live instructions, or a reword
+        # would silently stop excluding the helper transcripts (XERK-27). Reading
+        # the transcript is the harness-proof path; this guards its input.
+        self.assertTrue(any(ha.JIRA_TRIAGE_INSTRUCTION.startswith(s)
+                            for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
+        self.assertTrue(any(ha.SUMMARY_INSTRUCTION.startswith(s)
+                            for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
+
 
 class TestTranscriptCwd(unittest.TestCase):
     """_transcript_cwd reads the real (un-slugified) cwd off a transcript's early

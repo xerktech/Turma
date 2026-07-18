@@ -1344,6 +1344,8 @@ def repo_usage_report(ledger, fold_slug):
     by_repo = {}  # repo name -> {"remote": str, "slugs": set()}
     for path, meta in (ledger or {}).items():
         meta = meta or {}
+        if meta.get("internal"):
+            continue  # the manager's own claude -p helper, not a repo (XERK-27)
         repo = meta.get("repo") or "?"
         slug = meta.get("slug") or _project_slug(path)
         g = by_repo.setdefault(repo, {"remote": "", "slugs": set()})
@@ -3595,6 +3597,35 @@ SUMMARY_INSTRUCTION = (
     '(e.g. "Adding Compose Flag", "Debugging Heartbeat Parser"). '
     "Reply with ONLY the name — no quotes, no punctuation, no preamble.\n\nTask:\n"
 )
+
+# The manager runs its OWN one-shot `claude -p` helpers — session naming
+# (SUMMARY_INSTRUCTION) and Jira repo triage (JIRA_TRIAGE_INSTRUCTION) — with
+# cwd=REGISTRY_DIR (see _start_summary / _start_jira_triage). Headless or not,
+# each still writes a transcript into the shared ~/.claude/projects, so the usage
+# reconciler would otherwise adopt the manager's own machinery as a phantom repo
+# on the usage page — the registry dir's basename (".turma" in production, or a
+# "hub-agent-mgr-*" temp dir when a test/verify harness boots the manager against
+# a mkdtemp REGISTRY_DIR). These are stable leading-text signatures of those two
+# prompts, matched against a transcript's first user turn so such a transcript is
+# recognized path- and process-independently (production AND any harness), and
+# even after a prompt reword leaves older transcripts still on disk. A test pins
+# them to the instructions above so a reword can't silently break the match. See
+# _looks_like_internal_tool_prompt / SessionManager._is_internal_tool_slug (XERK-27).
+INTERNAL_TOOL_PROMPT_SIGS = (
+    "You are triaging Jira tickets",
+    "In 2-4 words, give a Title Case name",
+)
+
+
+def _looks_like_internal_tool_prompt(text):
+    """True when `text` opens with one of the manager's own `claude -p` helper
+    prompts (session naming / Jira triage) — i.e. this transcript is the agent's
+    own tooling, not a coding session, and must not surface as a repo on the usage
+    page. See INTERNAL_TOOL_PROMPT_SIGS."""
+    if not text:
+        return False
+    head = text.lstrip()
+    return any(head.startswith(sig) for sig in INTERNAL_TOOL_PROMPT_SIGS)
 
 
 def clean_summary(raw):
@@ -6024,6 +6055,8 @@ class SessionManager:
         slug_attr = {}
         for wt, m in (self.usage_ledger or {}).items():
             m = m or {}
+            if m.get("internal"):
+                continue  # the manager's own claude -p helper, never archived (XERK-27)
             slug = m.get("slug") or _project_slug(wt)
             slug_attr[slug] = {
                 "repo": m.get("repo") or "?",
@@ -6898,6 +6931,63 @@ class SessionManager:
         name = re.split(r"[\\/]+", str(cwd).strip().rstrip("\\/"))[-1]
         return name or None
 
+    def _is_internal_tool_slug(self, slug):
+        """True when a PROJECTS_ROOT slug holds the manager's OWN internal
+        `claude -p` helper transcripts (session naming + Jira triage) rather than
+        a real coding session — see INTERNAL_TOOL_PROMPT_SIGS for why they leak
+        into ~/.claude/projects and must be kept off the usage page (XERK-27).
+
+        Those helpers run with cwd=REGISTRY_DIR, so in production every one lands
+        under the registry dir's own slug — matched here directly, with no
+        transcript read. A test/verify harness that boots the manager against a
+        temp REGISTRY_DIR writes the identical one-shots into the SHARED
+        ~/.claude/projects under a different slug (…-tmp-hub-agent-mgr-<rand>),
+        so fall back to the prompt signature of the newest transcript, which is
+        path- and process-independent. This is the one carve-out to the usage
+        ledger's 'every transcript on the box counts' rule: the agent's own
+        overhead is not a repo."""
+        if slug == _project_slug(REGISTRY_DIR):
+            return True
+        proj = os.path.join(PROJECTS_ROOT, slug)
+        try:
+            files = [f for f in os.listdir(proj) if f.endswith(".jsonl")]
+        except OSError:
+            return False
+        if not files:
+            return False
+        newest = max(files,
+                     key=lambda f: os.path.getmtime(os.path.join(proj, f)))
+        return _looks_like_internal_tool_prompt(
+            _first_user_text(os.path.join(proj, newest)))
+
+    def _sanitize_internal_tool_entries(self):
+        """Retire ledger entries that actually point at the manager's own internal
+        `claude -p` helper transcripts (see _is_internal_tool_slug). Earlier builds
+        adopted them as phantom repos on the usage page — ".turma", "hub-agent-mgr-*"
+        (XERK-27) — so flip any such surviving entry to an `internal` tombstone,
+        which repo_usage_report and _archive_manifest skip. Already-tombstoned
+        entries are passed over, so the signature read is paid at most once each
+        rather than every usage beat. Runs before _reconcile_orphan_transcripts,
+        which tombstones the same shape as it first encounters it."""
+        changed = False
+        for path, meta in list(self.usage_ledger.items()):
+            meta = meta or {}
+            if meta.get("internal"):
+                continue
+            slug = meta.get("slug") or _project_slug(path)
+            # Cheap outs before the per-entry transcript read: a recorded git
+            # remote or a worktree-shaped slug is a real session beyond doubt — the
+            # manager's cwd=REGISTRY_DIR helpers are neither — so only genuinely
+            # ambiguous (remote-less, non-worktree) entries pay the signature read,
+            # and it's paid at most once each (the survivor becomes a tombstone).
+            if meta.get("remote") or _repo_from_worktree_slug(slug):
+                continue
+            if self._is_internal_tool_slug(slug):
+                self.usage_ledger[path] = {"internal": True, "slug": slug}
+                changed = True
+        if changed:
+            self._save_ledger()
+
     def _reconcile_orphan_transcripts(self):
         """Adopt EVERY transcript sitting in PROJECTS_ROOT that no ledger entry
         covers, so persistent token usage reflects every session on disk — not
@@ -6905,8 +6995,11 @@ class SessionManager:
         _backfill_ledger sees. A session killed long ago (its card gone, its
         worktree maybe surviving) or one predating _remember_usage would
         otherwise silently drop out of the totals, since repo_usage_report only
-        folds slugs the ledger names. Nothing is excluded — an unattributable
-        transcript still counts under OTHER_REPO_NAME rather than being dropped.
+        folds slugs the ledger names. A REAL session is never excluded — an
+        unattributable one still counts under OTHER_REPO_NAME rather than being
+        dropped. The single carve-out is the manager's OWN internal `claude -p`
+        helper transcripts (_is_internal_tool_slug), which are its overhead, not a
+        repo; those are tombstoned so they never surface on the usage page (XERK-27).
 
         Attribution, most precise first:
           1. slug matches a worktree still on disk -> exact repo + git remote,
@@ -6940,6 +7033,17 @@ class SessionManager:
                 if not any(f.endswith(".jsonl") for f in os.listdir(proj)):
                     continue  # no transcript here — nothing to attribute
             except OSError:
+                continue
+            # The manager's own summary/triage `claude -p` is never worktree-shaped
+            # (its cwd is REGISTRY_DIR), so a worktree slug skips the signature read
+            # below and goes straight to attribution. A match is tombstoned — kept
+            # off usage + archive and, now in the ledger, never re-evaluated (it
+            # lands in `known` next beat).
+            if _repo_from_worktree_slug(slug) is None \
+                    and self._is_internal_tool_slug(slug):
+                self.usage_ledger[proj] = {"internal": True, "slug": slug}
+                known.add(slug)
+                added = True
                 continue
             if existing is None:
                 existing = self._existing_worktree_attrib()
@@ -6985,6 +7089,7 @@ class SessionManager:
         appended since the last beat) via _fold_slug, so it no longer re-reads
         every transcript from scratch."""
         self._backfill_ledger()
+        self._sanitize_internal_tool_entries()
         self._reconcile_orphan_transcripts()
         self._prune_ledger()
         try:
