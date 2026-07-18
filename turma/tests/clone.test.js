@@ -27,8 +27,7 @@ function loadCloneModule() {
     document: {
       getElementById: (id) => els.get(id) || null,
       querySelector: () => null,
-      // Back captureCloneScroll's `.clone-list` sweep with the fake registry.
-      querySelectorAll: (sel) => sel === ".clone-list" ? [...els.values()].filter((e) => e.__cloneList) : [],
+      querySelectorAll: () => [],
       addEventListener() {},
       get activeElement() { return null; },
       createElement: () => ({ style: {}, dataset: {}, classList: { add() {}, remove() {} }, setAttribute() {}, appendChild() {} }),
@@ -45,7 +44,7 @@ function loadCloneModule() {
   // Expose the pieces we test and give the test a way to observe post()/render()
   // and seed `cache`, then evaluate under the stubs.
   const exportTail = `
-    ;globalThis.__clone = { cloneBar, clonePick, clonePickCount, cloneRepo, cloneSearch, cloneText, updateCloneButton, cloneToggle, captureCloneScroll, restoreCloneScroll, cloneDraft, cloneOpen, hostId };
+    ;globalThis.__clone = { cloneBar, clonePick, clonePickCount, cloneRepo, cloneSearch, cloneText, updateCloneButton, cloneToggle, cloneDraft, cloneOpen, hostId };
     globalThis.__setRender = (f) => { render = f; };
     globalThis.__setPost = (f) => { post = f; };
     globalThis.__setCache = (c) => { cache = c; };
@@ -62,9 +61,7 @@ function loadCloneModule() {
   const posts = [];
   g.__setRender(() => {});                       // suppress DOM re-render side-effects
   g.__setPost((url, body) => { posts.push({ url, body }); return Promise.resolve(); });
-  // Register a fake .clone-list element so capture/restoreCloneScroll see it.
-  const addCloneList = (id, scrollTop) => { const e = { id, scrollTop, __cloneList: true }; els.set(id, e); return e; };
-  return { ...api, posts, els, addCloneList, setCache: g.__setCache };
+  return { ...api, posts, els, setCache: g.__setCache };
 }
 
 // The section is collapsed by default; picker-content tests expand it first.
@@ -192,23 +189,11 @@ test("cloneRepo: no selection and empty box is a no-op", () => {
   assert.equal(m.posts.length, 0);
 });
 
-test("capture/restoreCloneScroll: preserve the list's scroll across a re-render", () => {
-  const m = loadCloneModule();
-  // A list scrolled partway down before the poll's innerHTML swap.
-  m.addCloneList("clone-list-host1", 140);
-  const snap = m.captureCloneScroll();
-  assert.deepEqual(snap, [{ id: "clone-list-host1", top: 140 }]);
-  // The swap recreates the element at scrollTop 0; restore puts it back.
-  const fresh = m.addCloneList("clone-list-host1", 0);
-  m.restoreCloneScroll(snap);
-  assert.equal(fresh.scrollTop, 140, "scroll position reapplied after re-render");
-});
-
-test("captureCloneScroll: ignores lists sitting at the top (no snapshot needed)", () => {
-  const m = loadCloneModule();
-  m.addCloneList("clone-list-host1", 0);
-  assert.deepEqual(m.captureCloneScroll(), []);
-});
+// Preserving an open clone-list's scroll across the poll's innerHTML swap moved
+// out of index.html's bespoke captureCloneScroll into the shared
+// TurmaNav.preserveScroll (XERK-35) — index.html's render() now wraps the
+// #groups swap in it, and the id-anchored capture/restore contract (which is
+// exactly this .clone-list-across-re-render case) is pinned in nav.test.js.
 
 test("cloneBar: a host with no GitHub creds renders greyed out with no picker", () => {
   const m = loadCloneModule();

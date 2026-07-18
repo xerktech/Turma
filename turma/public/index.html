@@ -745,31 +745,15 @@ function render(data) {
 
   // One container per host, so each agent IS a host — render them as a flat
   // list of host cards keyed/titled by host name (no container-name layer).
-  // Preserve focus/caret in an open composer, and the clone list's scroll
-  // position, across the full innerHTML swap (a background poll re-render would
-  // otherwise reset a mid-scroll selection to the top).
+  // Preserve focus/caret in an open composer across the full innerHTML swap, and
+  // wrap the swap in preserveScroll so a background poll re-render can't reset
+  // the page scroll or a mid-selection scroll inside an open clone-repo list (a
+  // scrolled `.clone-list`, id-keyed, is captured by preserveScroll).
   const focus = captureComposerFocus();
-  const scrolls = captureCloneScroll();
-  $groups.innerHTML = `<div class="hosts">${agents.map(a => hostCard(a, now)).join("")}</div>`;
+  TurmaNav.preserveScroll($groups, () => {
+    $groups.innerHTML = `<div class="hosts">${agents.map(a => hostCard(a, now)).join("")}</div>`;
+  });
   restoreComposerFocus(focus);
-  restoreCloneScroll(scrolls);
-}
-
-// The clone repo picker is a scrollable list; the 5s poll's innerHTML swap
-// recreates it and would jump it back to the top mid-selection. Snapshot each
-// open list's scrollTop (keyed by its host id) and reapply it after the swap.
-function captureCloneScroll() {
-  const out = [];
-  for (const el of document.querySelectorAll(".clone-list")) {
-    if (el.id && el.scrollTop) out.push({ id: el.id, top: el.scrollTop });
-  }
-  return out;
-}
-function restoreCloneScroll(list) {
-  for (const s of (list || [])) {
-    const el = document.getElementById(s.id);
-    if (el) el.scrollTop = s.top;
-  }
 }
 
 function hostCard(a, now) {

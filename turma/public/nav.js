@@ -85,7 +85,61 @@
     if (bottom) bottom.innerHTML = bottomNavHtml(active);
   }
 
-  const api = { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, esc };
+  // Every page repaints by replacing a container's innerHTML on each heartbeat
+  // beat (SSE ~1s / poll) — which silently throws the user's scroll position
+  // back to the start every second: the page's own window scroll AND any inner
+  // overflow:auto region (the board's horizontal column strip, the fleet tree,
+  // a session list, a long transcript). It was most obvious mid-swipe on the
+  // phone board (XERK-35) but happens everywhere a beat repaints under a
+  // scrolled viewport. `preserveScroll` is the one wrapper every recurring
+  // repaint goes through so it can't recur: snapshot the scroll offsets, run the
+  // paint, put them back — synchronously, in the same frame, so nothing flickers.
+  //
+  // Scrolled descendants are matched across the swap by a stable key: the
+  // nearest `id` anchor if the element or an ancestor carries one (so a list the
+  // beat REORDERS — host cards by activity, sessions by state — still maps its
+  // scroll to the right row), else the STRUCTURAL child-index path from the
+  // container (fine for a fixed, ordered set like the board's four columns). Only
+  // elements actually scrolled off zero are captured, so a settled page costs one
+  // cheap walk. Window scroll is restored only if the paint moved it (replacing a
+  // tall container can briefly collapse document height and clamp to the top).
+  function scrollKey(container, el) {
+    const path = [];
+    for (let n = el; n && n !== container; n = n.parentNode) {
+      if (n.id) return { id: n.id, path: path.reverse() };
+      const parent = n.parentNode;
+      if (!parent) break;
+      path.push(Array.prototype.indexOf.call(parent.children, n));
+    }
+    return { id: null, path: path.reverse() };
+  }
+  function nodeAt(root, path) {
+    let n = root;
+    for (const i of path) n = n && n.children[i];
+    return n;
+  }
+  function nodeForKey(container, key) {
+    const base = key.id ? document.getElementById(key.id) : container;
+    return base && nodeAt(base, key.path);
+  }
+  function preserveScroll(container, paint) {
+    if (!container) { paint(); return; }
+    const winX = window.scrollX, winY = window.scrollY;
+    const saved = [];
+    for (const el of container.querySelectorAll("*")) {
+      if (el.scrollTop || el.scrollLeft) {
+        saved.push({ key: scrollKey(container, el), top: el.scrollTop, left: el.scrollLeft });
+      }
+    }
+    paint();
+    for (const s of saved) {
+      const el = nodeForKey(container, s.key);
+      if (el) { el.scrollTop = s.top; el.scrollLeft = s.left; }
+    }
+    if (window.scrollX !== winX || window.scrollY !== winY) window.scrollTo(winX, winY);
+  }
+
+  const api = { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, esc, preserveScroll };
   if (typeof window !== "undefined") {
     window.TurmaNav = api;
     mount(document);
