@@ -108,6 +108,16 @@ REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
 # question lives here as `<sessionId>.req.json`; the answer the glasses client
 # sends rides back as `<sessionId>.ans.json`. See _hook_question / answer_question.
 QUESTIONS_DIR = os.path.join(REGISTRY_DIR, "questions")
+# Peer-session context (XERK-12). Each running session gets a live view of the
+# OTHER sessions working in this org, written here as `<sessionId>.md` and
+# pointed at by that session's appended system prompt (PEER_SESSIONS_PROMPT), so
+# concurrent agents can steer clear of overlapping/redundant work and colliding
+# PRs. Rewritten every heartbeat, which is what makes it cover BOTH halves of the
+# ticket: a session that starts LATER shows up in its peers' files on the next
+# beat, and a session that ends drops out — something a spawn-time snapshot baked
+# into the prompt could never do. One host serves one org (the deployment), so a
+# host's running sessions ARE the org's; see the "same org" note on triage.
+PEERS_DIR = os.path.join(REGISTRY_DIR, "peers")
 # Killed-but-resumable session history (branch + transcript survive a kill).
 #
 # This is a CACHE of what a kill knew, not the record of it. It buys a killed
@@ -545,6 +555,67 @@ rather than deriving your own name from the ticket key.
 Everything above still applies: cut that branch from the REFRESHED remote default
 branch, not from this checkout.
 """
+
+# --- peer-session context (--append-system-prompt, XERK-12) --------------
+
+# Points a session at its live peer-context file (PEERS_DIR/<id>.md), which the
+# manager rewrites every heartbeat with what the OTHER sessions in this org are
+# working on. Rides the same --append-system-prompt as the branching policy, on
+# every launch including resume.
+#
+# It names a FILE rather than baking the peer list into the prompt on purpose:
+# the prompt is fixed at launch, but the file is refreshed, so re-reading it is
+# how a session learns about peers that started AFTER it — the half of the ticket
+# ("new sessions as they start") a spawn-time snapshot can't reach. And it's a
+# directive, not enforcement, for the same reason NEW_WORK_SYSTEM_PROMPT is: only
+# the agent knows when it's about to start a piece of work or open a PR, which are
+# the moments the peer list actually matters.
+PEER_SESSIONS_PROMPT = """
+You are one of several Claude Code agents Turma runs concurrently for this org,
+each in its own worktree. A live list of what the OTHER sessions are working on
+is kept — and continuously refreshed — at:
+  {path}
+Read that file before you start a new piece of work, decide what to build, or
+open a pull request, and again whenever you pick up something new. Because it is
+refreshed continuously, re-reading it is how you find out about sessions that
+started after you did. Use it to avoid duplicating a task another session already
+owns, and to avoid changes or a PR that would collide with a branch another
+session has in flight — especially one in the same repo. It is context, not a
+lock: if your work does overlap another session's, say so and coordinate rather
+than stopping. If the file is absent or empty, you are the only session active.
+"""
+
+
+def render_peer_context(peers):
+    """Render the markdown a session's peer-context file holds — the OTHER
+    sessions running in its org, in the order given (the caller sorts same-repo
+    first). Each peer is a dict with keys repo/root/summary/label/ticketKey/
+    branch/prUrls. Pure (no I/O) so it unit-tests cleanly; _refresh_peer_context
+    gathers the records and writes the files."""
+    header = (
+        "# Other Turma sessions running in this org\n\n"
+        "These are the other Claude Code sessions working concurrently on this "
+        "host right now. Skim them before you start new work or open a PR so you "
+        "don't duplicate a task or collide with a branch or PR already in flight "
+        "(a same-repo peer is the one most likely to conflict). This file is "
+        "refreshed continuously; re-read it whenever you begin something new.\n"
+    )
+    if not peers:
+        return (header + "\nNo other sessions are running right now — you are the "
+                "only agent active on this host.\n")
+    out = [header, f"\n{len(peers)} other session(s) running:\n"]
+    for p in peers:
+        title = p.get("summary") or p.get("label") or "(task not yet named)"
+        repo = ("the repos root (spans every repo)" if p.get("root")
+                else (p.get("repo") or "(unknown repo)"))
+        out.append(f"\n## {repo} — {title}")
+        if p.get("ticketKey"):
+            out.append(f"- Jira ticket: {p['ticketKey']}")
+        out.append(f"- Branch: {p.get('branch') or 'detached (not yet branched)'}")
+        prs = p.get("prUrls") or []
+        if prs:
+            out.append("- Open PRs: " + ", ".join(prs))
+    return "\n".join(out) + "\n"
 
 
 # --- agent safety guard (--settings wiring) ------------------------------
@@ -4681,6 +4752,13 @@ class SessionManager:
             policy += TICKET_BRANCH_PROMPT.format(
                 key=ticket.get("key") or "this session's ticket",
                 branch=ticket["branch"])
+        # Point the session at its live peer-context file (XERK-12) so it can
+        # avoid overlapping another org session's work / colliding with its
+        # branch or PR. Concatenated onto the same flag as a continuation of the
+        # session-policy the two above set; the file itself is written every beat
+        # by _refresh_peer_context.
+        policy += PEER_SESSIONS_PROMPT.format(
+            path=os.path.join(PEERS_DIR, f"{sess['id']}.md"))
         parts.append(f"--append-system-prompt {shlex.quote(policy)}")
         claude_cmd = " ".join(parts)
         if prompt:
@@ -7137,6 +7215,77 @@ class SessionManager:
             gi.update(cached["slow"])  # fold cached repoName/remote/lastCommit in
         return gi, cached["work"]
 
+    # --- peer-session context (XERK-12) ----------------------------------
+
+    def _peer_branch(self, sess):
+        """The branch to show a peer for a session: its LIVE git branch if it has
+        named one, else the branch reserved for its ticket (flagged not-yet-cut),
+        else None (still detached). Read from session_facts, which _session_git
+        warms every beat, so this costs no extra git call."""
+        live = (self.session_facts.get(sess["id"]) or {}).get("liveBranch")
+        if live:
+            return live
+        reserved = (sess.get("ticket") or {}).get("branch")
+        if reserved:
+            return f"detached (its reserved branch is {reserved})"
+        return None
+
+    def _peer_record(self, sess):
+        """The peer-context facts for one session: what it's working on, where,
+        and what it has open. PRs come from session_pr_urls (the same durable
+        list the cards read), branch from _peer_branch."""
+        return {
+            "id": sess["id"],
+            "repo": sess.get("repo"),
+            "root": sess.get("root", False),
+            "summary": sess.get("summary"),
+            "label": sess.get("label"),
+            "ticketKey": (sess.get("ticket") or {}).get("key"),
+            "branch": self._peer_branch(sess),
+            "prUrls": list(self.session_pr_urls.get(sess["id"], [])),
+        }
+
+    def _refresh_peer_context(self):
+        """(Re)write each running session's peer-context file (PEERS_DIR/<id>.md):
+        the OTHER running sessions in this org, so a concurrent agent can avoid
+        overlapping work and colliding PRs (XERK-12). Runs every heartbeat, which
+        is what makes the list live — a session that starts later appears in its
+        peers' files, and one that ends drops out (its file is removed below).
+        Same-repo peers are listed first, as the ones most likely to conflict.
+        Best-effort: a write failure is logged, never allowed to disrupt a beat."""
+        try:
+            os.makedirs(PEERS_DIR, exist_ok=True)
+        except OSError:
+            return
+        running = [s for s in self.registry if s.get("status") == "running"]
+        records = [self._peer_record(s) for s in running]
+        live_ids = set()
+        for s in running:
+            sid = s["id"]
+            live_ids.add(sid)
+            own_repo = s.get("repo")
+            peers = sorted(
+                (r for r in records if r["id"] != sid),
+                key=lambda r: (r.get("repo") != own_repo,
+                               r.get("repo") or "", r.get("summary") or ""))
+            path = os.path.join(PEERS_DIR, f"{sid}.md")
+            try:
+                tmp = path + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(render_peer_context(peers))
+                os.replace(tmp, path)
+            except OSError as e:
+                log(f"peer context write failed for {sid}: {e}")
+        # Drop files for sessions no longer running (killed / stopped / deleted),
+        # so a dead session's task can't linger in a peer's context. Self-healing
+        # here means no teardown path has to know about this dir.
+        try:
+            for name in os.listdir(PEERS_DIR):
+                if name.endswith(".md") and name[:-3] not in live_ids:
+                    os.remove(os.path.join(PEERS_DIR, name))
+        except OSError:
+            pass
+
     def _session_payload(self, sess, refresh=True):
         sid = sess["id"]
         running = sess.get("status") == "running"
@@ -7485,6 +7634,12 @@ class SessionManager:
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),
         }
+        # Refresh each running session's peer-context file (XERK-12) now that the
+        # `sessions` list above has warmed session_facts (so _peer_branch reads a
+        # current live branch). Runs on light beats too, so a just-provisioned
+        # session's file — and its peers' updated files — land on the immediate
+        # post-command beat rather than a full interval later.
+        self._refresh_peer_context()
         # Purely additive, and only present when something is staged — mirrors
         # how pending_prs stays out of a session's payload until there's
         # something to report.

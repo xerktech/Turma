@@ -1873,6 +1873,35 @@ internal step to a tag upstream deleted).
   touch.
 - Tests: the branching-policy cases in `agent/tests/test_hub_agent.py` (`TestSessionLifecycle`).
 
+### Peer-session context (XERK-12)
+
+- Concurrent sessions on one host can duplicate each other's work or open colliding PRs, so each
+  running session is given a **live view of what the OTHER sessions in its org are doing**.
+- One host serves one org (the deployment), so a host's running sessions ARE the org's — this is
+  wholly agent-side, no hub change, the same "same org = same host" rule the Jira triage relies on.
+- The manager writes a per-session file `~/.turma/peers/<id>.md` (`PEERS_DIR`) and points the session
+  at it via a fixed **`--append-system-prompt`** directive — `PEER_SESSIONS_PROMPT`, appended in
+  `_launch_tmux` after the branching policy — telling the agent to read it before starting new work,
+  choosing a task, or opening a PR, and again whenever it picks up something new.
+- Each file lists the OTHER running sessions (never itself), **same-repo peers first** (the ones most
+  likely to conflict), each with its task summary/label, repo (a root session flagged as spanning all
+  repos), live git branch (or its reserved ticket branch, or "detached"), Jira ticket key, and open
+  PR URLs. `render_peer_context` is the pure renderer; `_refresh_peer_context` gathers the records.
+- **It is a FILE, not a prompt snapshot, on purpose** — the prompt is fixed at launch, but the file is
+  rewritten every heartbeat (in `build_payload`, after the `sessions` list has warmed `session_facts`,
+  so the branch is current). Re-reading it is how a session learns about peers that started AFTER it —
+  the "new sessions as they start" half of the ticket a spawn-time snapshot could never cover — and a
+  session that ends drops out (its file is removed on the next beat; the cleanup self-heals, so no
+  teardown path has to know about the dir).
+- Branch/PR facts are read from the caches the payload already builds (`session_facts.liveBranch`,
+  `session_pr_urls`), so a refresh costs no extra git/`gh` call; writes are best-effort (logged, never
+  allowed to disrupt a beat).
+- A **directive, not enforcement**, for the same reason `NEW_WORK_SYSTEM_PROMPT` is: only the agent
+  knows when it's about to start work or open a PR. It says so — "context, not a lock: coordinate
+  rather than stop" — so overlap surfaces instead of silently racing.
+- Tests: `TestRenderPeerContext` and `TestRefreshPeerContext` in `agent/tests/test_hub_agent.py`, plus
+  the peer-directive case in `TestSessionLifecycle`.
+
 ### Session activity summaries
 
 - Each session gets a few-word "name" describing its task (e.g. "Adding Compose Flag"), shown

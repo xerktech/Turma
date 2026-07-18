@@ -1675,6 +1675,7 @@ class ManagerMixin:
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
+            ("PEERS_DIR", os.path.join(self.tmp, "peers")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
@@ -2992,6 +2993,10 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertNotIn("-b", wt)
         self.assertEqual(wt[-1], sess["worktreePath"])  # nothing after the path
         settings = os.path.join(ha.REGISTRY_DIR, "guard-settings.json")
+        # NEW_WORK_SYSTEM_PROMPT plus the peer-context directive (XERK-12), which
+        # names this session's own peer-context file, ride one --append flag.
+        policy = ha.NEW_WORK_SYSTEM_PROMPT + ha.PEER_SESSIONS_PROMPT.format(
+            path=os.path.join(ha.PEERS_DIR, f"{sess['id']}.md"))
         self.assertEqual(
             self._claude_cmd(),
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
@@ -2999,7 +3004,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"claude --session-id {sess['claudeSessionId']} "
             f"--remote-control '{sess['rcName']}' "
             f"--permission-mode auto --settings {shlex.quote(settings)} "
-            f"--append-system-prompt {shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT)}",
+            f"--append-system-prompt {shlex.quote(policy)}",
         )
         # The guard settings file was written and wires the Bash guard hook plus
         # the AskUserQuestion → glasses bridge, both as PreToolUse matchers.
@@ -3071,10 +3076,11 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("Turma")
         cmd = self._claude_cmd()
-        self.assertIn(
-            f"--append-system-prompt {shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT)}",
-            cmd,
-        )
+        # The branching policy rides --append-system-prompt (now concatenated
+        # with the peer-context directive as one shell-quoted token, so assert on
+        # its distinctive content rather than the whole quoted string).
+        self.assertIn("--append-system-prompt", cmd)
+        self.assertIn("Branching policy for this session", cmd)
 
     def test_new_work_policy_names_the_fetch_and_remote_ref(self):
         """The directive's load-bearing content: fetch, resolve origin/HEAD, and
@@ -3100,6 +3106,21 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sess = sm.registry[0]
         sm._launch_tmux(sess, resume=True)
         self.assertIn("--append-system-prompt", self._claude_cmd())
+
+    # --- peer-session context (XERK-12) -----------------------------------
+
+    def test_spawn_points_the_session_at_its_peer_context_file(self):
+        """Every session's appended prompt names its own live peer-context file,
+        so it can read what the other org sessions are doing (XERK-12)."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        cmd = self._claude_cmd()
+        self.assertIn(os.path.join(ha.PEERS_DIR, f"{sess['id']}.md"), cmd)
+        # The directive extends the branching policy rather than replacing it.
+        self.assertIn("Branching policy for this session", cmd)
+        self.assertIn("open a pull request", cmd)
 
     def test_spawn_rejects_missing_base_ref(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
@@ -3203,6 +3224,121 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         payload = sm._session_payload(sm.registry[0])
         self.assertTrue(payload["root"])
         self.assertIsNone(payload["branch"])
+
+
+class TestRenderPeerContext(unittest.TestCase):
+    """The pure markdown renderer for a session's peer-context file (XERK-12)."""
+
+    def test_empty_says_youre_the_only_one(self):
+        out = ha.render_peer_context([])
+        self.assertIn("only agent active", out)
+        self.assertNotIn("##", out)  # no per-peer section
+
+    def test_lists_each_peers_task_repo_branch_ticket_and_prs(self):
+        peers = [
+            {"id": "a", "repo": "Turma", "summary": "Fix login",
+             "ticketKey": "XERK-9", "branch": "XERK-9",
+             "prUrls": ["https://github.com/o/r/pull/3"]},
+            {"id": "b", "repo": "Other", "label": "Cleanup", "branch": None},
+        ]
+        out = ha.render_peer_context(peers)
+        self.assertIn("2 other session(s) running", out)
+        self.assertIn("## Turma — Fix login", out)
+        self.assertIn("Jira ticket: XERK-9", out)
+        self.assertIn("Branch: XERK-9", out)
+        self.assertIn("https://github.com/o/r/pull/3", out)
+        # Falls back to the label when unnamed, and says "detached" with no branch.
+        self.assertIn("## Other — Cleanup", out)
+        self.assertIn("detached (not yet branched)", out)
+
+    def test_root_peer_is_flagged_as_spanning_repos(self):
+        out = ha.render_peer_context([{"id": "r", "root": True, "summary": "x"}])
+        self.assertIn("spans every repo", out)
+
+
+class TestRefreshPeerContext(ManagerMixin, unittest.TestCase):
+    """Writing per-session peer files: each session sees the OTHERS, files stay
+    live as sessions start/stop (XERK-12)."""
+
+    def _sess(self, sid, **over):
+        s = {"id": sid, "repo": "Turma", "status": "running",
+             "summary": f"task {sid}", "worktreePath": os.path.join(self.tmp, sid)}
+        s.update(over)
+        return s
+
+    def _read(self, sid):
+        with open(os.path.join(ha.PEERS_DIR, f"{sid}.md")) as f:
+            return f.read()
+
+    def test_each_session_gets_a_file_of_the_others_excluding_itself(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess("aaa"), self._sess("bbb")]
+        sm._refresh_peer_context()
+        a, b = self._read("aaa"), self._read("bbb")
+        # A's file names B's task and not its own; B's the reverse.
+        self.assertIn("task bbb", a)
+        self.assertNotIn("task aaa", a)
+        self.assertIn("task aaa", b)
+        self.assertNotIn("task bbb", b)
+
+    def test_solo_session_file_says_it_is_alone(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess("solo")]
+        sm._refresh_peer_context()
+        self.assertIn("only agent active", self._read("solo"))
+
+    def test_only_running_sessions_are_peers(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess("run"), self._sess("q", status="queued"),
+                       self._sess("dead", status="stopped")]
+        sm._refresh_peer_context()
+        out = self._read("run")
+        self.assertIn("only agent active", out)  # the non-running two aren't peers
+        # A queued/stopped session gets no file of its own either.
+        self.assertFalse(os.path.exists(os.path.join(ha.PEERS_DIR, "q.md")))
+
+    def test_live_branch_and_ticket_are_reported(self):
+        sm = self.make_manager()
+        reader = self._sess("r1")
+        peer = self._sess("p1", ticket={"key": "XERK-5", "branch": "XERK-5"})
+        sm.registry = [reader, peer]
+        # p1 has named a live branch; the reader should see it, not the reserved one.
+        sm.session_facts["p1"] = {"liveBranch": "feature/x"}
+        sm.session_pr_urls["p1"] = ["https://github.com/o/r/pull/9"]
+        sm._refresh_peer_context()
+        out = self._read("r1")
+        self.assertIn("Branch: feature/x", out)
+        self.assertIn("Jira ticket: XERK-5", out)
+        self.assertIn("pull/9", out)
+
+    def test_reserved_branch_shown_until_the_session_cuts_one(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess("r1"),
+                       self._sess("p1", ticket={"key": "X-1", "branch": "X-1"})]
+        sm._refresh_peer_context()  # no liveBranch cached for p1
+        self.assertIn("reserved branch is X-1", self._read("r1"))
+
+    def test_stale_files_are_removed_when_a_session_stops(self):
+        sm = self.make_manager()
+        sm.registry = [self._sess("aaa"), self._sess("bbb")]
+        sm._refresh_peer_context()
+        self.assertTrue(os.path.exists(os.path.join(ha.PEERS_DIR, "bbb.md")))
+        # bbb ends; its file must not linger in aaa's world.
+        sm.registry = [self._sess("aaa")]
+        sm._refresh_peer_context()
+        self.assertFalse(os.path.exists(os.path.join(ha.PEERS_DIR, "bbb.md")))
+        self.assertIn("only agent active", self._read("aaa"))
+
+    def test_same_repo_peers_are_listed_first(self):
+        sm = self.make_manager()
+        sm.registry = [
+            self._sess("reader", repo="Turma"),
+            self._sess("far", repo="Zzz", summary="far task"),
+            self._sess("near", repo="Turma", summary="near task"),
+        ]
+        sm._refresh_peer_context()
+        out = self._read("reader")
+        self.assertLess(out.index("near task"), out.index("far task"))
 
 
 class TestSendInput(ManagerMixin, unittest.TestCase):
