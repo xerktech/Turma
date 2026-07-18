@@ -36,6 +36,9 @@ data class AgentInfo(
     val startedAt: String = "",
     val online: Boolean = false,
     val terminalOnline: Boolean = false,
+    // Set (non-null) during an ANNOUNCED update restart (XERK-29): the host is
+    // briefly silent on purpose, so this reads as "updating", not an outage.
+    val updating: UpdatingInfo? = null,
     val repos: List<RepoInfo> = emptyList(),
     val sessions: List<SessionInfo> = emptyList(),
     val usage: UsageInfo? = null,
@@ -47,6 +50,13 @@ data class AgentInfo(
     // Killed-but-resumable sessions (hub-agent _closed_payload) — the web's
     // "Ended sessions" list.
     val closedSessions: List<ClosedSessionInfo> = emptyList(),
+)
+
+/** An announced in-progress update restart (XERK-29); present only during the grace window. */
+@Serializable
+data class UpdatingInfo(
+    val version: String = "",
+    val until: Long = 0,
 )
 
 @Serializable

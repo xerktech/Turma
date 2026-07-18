@@ -24,6 +24,8 @@ import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -45,7 +47,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xerktech.turma.core.FleetSummary
 import com.xerktech.turma.core.LiveState
+import com.xerktech.turma.core.fleetSummary
 import com.xerktech.turma.core.liveState
 import com.xerktech.turma.core.sessionBranch
 import com.xerktech.turma.core.sessionName
@@ -83,6 +87,9 @@ fun FleetScreen(
                 contentPadding = PaddingValues(8.dp, 2.dp, 8.dp, 10.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
+                if (fleet.agents.isNotEmpty()) {
+                    item(key = "tiles") { FleetTiles(remember(fleet.agents) { fleetSummary(fleet.agents) }) }
+                }
                 if (fleet.agents.isEmpty()) {
                     item {
                         Text(
@@ -192,7 +199,16 @@ private fun HostSection(
                         maxLines = 1,
                     )
                 }
-                Pill(if (agent.online) "online" else "offline", color = if (agent.online) com.xerktech.turma.ui.theme.TurmaColors.good else null)
+                // An announced update restart reads as "updating" (warning), not
+                // the outage-looking "offline" (XERK-29).
+                when {
+                    agent.updating != null -> Pill(
+                        "updating" + agent.updating.version.takeIf { it.isNotBlank() }?.let { " → $it" }.orEmpty(),
+                        color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                    )
+                    agent.online -> Pill("online", color = com.xerktech.turma.ui.theme.TurmaColors.good)
+                    else -> Pill("offline", color = null)
+                }
             }
             AnimatedVisibility(expanded) {
                 Column(Modifier.fillMaxWidth().padding(bottom = 4.dp)) {
@@ -311,9 +327,65 @@ private fun SessionCard(session: SessionInfo, state: LiveState, onClick: () -> U
     }
 }
 
-/** Slim page header used on the top-level screens in place of the removed app bar. */
+/**
+ * The six fleet summary tiles at the top of the dashboard, a 2-up grid matching
+ * the web dashboard's `#tiles` (Hosts online / Running / Waiting on you / Tokens
+ * today / this week / all-time). Data is [fleetSummary], a pure port of the web
+ * reducers.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun FleetTiles(s: FleetSummary) {
+    FlowRow(
+        Modifier.fillMaxWidth().padding(vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+        maxItemsInEachRow = 2,
+    ) {
+        val tileMod = Modifier.weight(1f)
+        SummaryTile("Hosts online", "${s.hostsOnline} / ${s.hostsTotal}",
+            s.devices.joinToString(", ").ifBlank { "no devices yet" }, tileMod)
+        SummaryTile("Running sessions", s.running.toString(), "${s.totalSessions} total", tileMod)
+        SummaryTile("Waiting on you", s.waiting.toString(), "sessions with a question", tileMod)
+        SummaryTile("Tokens today", fmtTokens(s.tokensToday), "all sessions, incl. cache", tileMod)
+        SummaryTile("Tokens this week", fmtTokens(s.tokensWeek), "last 7 days (UTC)", tileMod)
+        SummaryTile("Tokens all-time", fmtTokens(s.tokensAllTime),
+            if (s.topModels == "–") "every session ever" else "mostly ${s.topModels}", tileMod)
+    }
+}
+
+@Composable
+private fun SummaryTile(label: String, value: String, hint: String, modifier: Modifier = Modifier) {
+    TurmaCard(modifier) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+            SectionLabel(label)
+            Text(
+                value,
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+            Text(
+                hint,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 1.dp),
+            )
+        }
+    }
+}
+
+/**
+ * Slim page header used on the top-level screens in place of the removed app bar.
+ * Always carries a ⋮ overflow with "Sign out" (via [LocalSignOut]) so it's
+ * reachable on every top-level page, matching the web's per-page nav Sign out.
+ */
 @Composable
 fun ScreenHeader(title: String, actions: @Composable () -> Unit = {}) {
+    val signOut = LocalSignOut.current
+    var menuOpen by remember { mutableStateOf(false) }
     Row(
         // Tight to the status bar: the Scaffold already insets past it, so only a
         // hair of top padding here keeps the title hugging the status bar.
@@ -323,5 +395,14 @@ fun ScreenHeader(title: String, actions: @Composable () -> Unit = {}) {
         Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.weight(1f))
         actions()
+        Box {
+            IconButton(onClick = { menuOpen = true }) { Icon(Icons.Filled.MoreVert, "More") }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Sign out") },
+                    onClick = { menuOpen = false; signOut() },
+                )
+            }
+        }
     }
 }

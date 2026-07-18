@@ -100,7 +100,10 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 for ((cat, title) in BOARD_CATEGORIES) {
-                    val cards = shown.flatMap { site -> site.tickets.filter { categoryOf(it) == cat }.map { site to it } }
+                    // Newest-updated first, matching board.js `ticketSort`.
+                    val cards = shown
+                        .flatMap { site -> site.tickets.filter { categoryOf(it) == cat }.map { site to it } }
+                        .sortedByDescending { it.second.updated }
                     KanbanColumn(cat, title, cards, allKeys) { site, t -> detail = site to t }
                 }
             }

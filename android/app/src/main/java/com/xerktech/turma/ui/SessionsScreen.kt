@@ -20,7 +20,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -94,6 +96,7 @@ fun SessionsRoute(
     wide: Boolean,
     onNavigate: (TopDest) -> Unit,
     onTerminal: (String, String) -> Unit,
+    onOpenArchive: () -> Unit = {},
 ) {
     var selHost by rememberSaveable { mutableStateOf<String?>(null) }
     var selId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -124,6 +127,7 @@ fun SessionsRoute(
                 SessionsListPane(
                     selectedKey = selKey(selHost, selId),
                     onSelect = select,
+                    onOpenArchive = onOpenArchive,
                     modifier = Modifier.width(360.dp).fillMaxHeight(),
                 )
                 VerticalDivider()
@@ -135,7 +139,7 @@ fun SessionsRoute(
 
         // Narrow, nothing picked: just the list.
         else -> MainScaffold(TopDest.SESSIONS, onNavigate) { m ->
-            SessionsListPane(selectedKey = null, onSelect = select, modifier = m)
+            SessionsListPane(selectedKey = null, onSelect = select, onOpenArchive = onOpenArchive, modifier = m)
         }
     }
 }
@@ -157,6 +161,7 @@ private fun DetailEmpty() {
 fun SessionsListPane(
     selectedKey: String?,
     onSelect: (String, String) -> Unit,
+    onOpenArchive: () -> Unit = {},
     modifier: Modifier = Modifier,
     vm: FleetViewModel = viewModel(),
 ) {
@@ -169,8 +174,12 @@ fun SessionsListPane(
     var endedOpen by remember { mutableStateOf(false) }
 
     Column(modifier.fillMaxSize()) {
-        ScreenHeader("Sessions")
-        TurmaField(query, { query = it }, "Search sessions", Modifier.fillMaxWidth().padding(10.dp, 2.dp))
+        ScreenHeader("Sessions") {
+            // Full-history archive + FTS search (offline hosts included) — the
+            // live box below only filters the sessions currently in the fleet.
+            IconButton(onClick = onOpenArchive) { Icon(Icons.Filled.Search, "Search all history") }
+        }
+        TurmaField(query, { query = it }, "Filter these sessions", Modifier.fillMaxWidth().padding(10.dp, 2.dp))
         LazyColumn(
             Modifier.fillMaxSize(),
             contentPadding = PaddingValues(10.dp, 4.dp, 10.dp, 12.dp),
