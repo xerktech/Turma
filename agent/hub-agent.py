@@ -104,6 +104,17 @@ WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".turma", "worktrees")
 # Persisted session registry (survives container restart).
 REGISTRY_DIR = os.path.expanduser("~/.turma")
 REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
+# Expected-restart signal (XERK-29). Before the manager goes down for a restart
+# it can't heartbeat through — an image update recreating the whole container,
+# or the native updater swapping files and `systemctl restart`ing us — it POSTs
+# the hub a one-shot "I'm updating" so the coming heartbeat gap renders as an
+# `updating` status instead of an unexpected-outage `offline`. The native
+# updater drops the target version here for our SIGTERM handler to read and
+# enrich the announcement with; a container update (Watchtower) leaves no file
+# and we announce a generic restart. Lives beside the other ~/.turma ledgers.
+UPDATING_FLAG_PATH = os.path.join(REGISTRY_DIR, "updating.json")
+UPDATING_ANNOUNCE_TIMEOUT_SEC = float(
+    os.environ.get("TURMA_UPDATING_ANNOUNCE_TIMEOUT_SEC", "4"))
 # Rendezvous dir for the AskUserQuestion bridge (agent/hooks/ask.py). A pending
 # question lives here as `<sessionId>.req.json`; the answer the glasses client
 # sends rides back as `<sessionId>.ans.json`. See _hook_question / answer_question.
@@ -3710,6 +3721,15 @@ class SessionManager:
         # AskUserQuestion bridge rendezvous dir (ask.py writes req files here).
         try:
             os.makedirs(QUESTIONS_DIR, exist_ok=True)
+        except OSError:
+            pass
+        # We've just (re)started, so any expected-restart hint the updater left
+        # for the PREVIOUS shutdown has served its purpose — clear it so a later
+        # SIGKILL (no handler) can't leak a stale version into a future announce
+        # (XERK-29). The hub already cleared the `updating` status the instant
+        # this boot's first heartbeat landed.
+        try:
+            os.unlink(UPDATING_FLAG_PATH)
         except OSError:
             pass
         self.registry = self._load_list(REGISTRY_PATH)  # persisted live sessions
@@ -7535,6 +7555,58 @@ class SessionManager:
             log(f"heartbeat failed: {e}")
             return None
 
+    def _read_updating_flag(self):
+        """Consume the native updater's hint file (reason + target version) if it
+        left one just before triggering our restart. Returns (reason, version),
+        both None when absent/garbled — a container update leaves no file, so a
+        missing one just means a generic restart with no known version."""
+        try:
+            with open(UPDATING_FLAG_PATH) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return None, None
+        if not isinstance(d, dict):
+            return None, None
+        return d.get("reason"), d.get("version")
+
+    def _announce_updating(self, reason="restart", version=None):
+        """Tell the hub we're going down for an EXPECTED restart, so it renders an
+        `updating` status rather than treating the coming heartbeat silence as an
+        unexpected outage (XERK-29). Fire-and-forget with a short timeout: we're
+        on the shutdown path and must never block the exit if the hub is slow or
+        unreachable. The hub drops the status the instant we heartbeat from the
+        far side, so no one has to clear it."""
+        if not TURMA_URL:
+            return
+        try:
+            body = {"reason": reason or "restart"}
+            if version:
+                body["version"] = version
+            headers = {"Content-Type": "application/json", "User-Agent": "hub-agent/1.0"}
+            if TURMA_TOKEN:
+                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+            url = (f"{TURMA_URL}/api/agents/"
+                   f"{urllib.parse.quote(self.device, safe='')}/updating")
+            req = urllib.request.Request(
+                url, data=json.dumps(body).encode(), headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=UPDATING_ANNOUNCE_TIMEOUT_SEC) as resp:
+                resp.read()
+            log(f"announced updating to hub (reason={reason or 'restart'}"
+                f"{', v' + version if version else ''})")
+        except Exception as e:
+            log(f"updating announce failed (continuing shutdown): {e}")
+
+    def _handle_shutdown(self, signum, frame):
+        """SIGTERM/SIGINT: we're being stopped for a restart we can't heartbeat
+        through — a container recreate on an image update, or the native updater's
+        `systemctl restart`. Announce it as EXPECTED (XERK-29), then exit so the
+        supervisor (systemd / Docker) brings us back. Sessions survive natively
+        (KillMode=process) and are re-adopted on boot; a container recreate takes
+        the whole stack down, which is exactly the outage this status explains."""
+        reason, version = self._read_updating_flag()
+        self._announce_updating(reason or "restart", version)
+        raise SystemExit(0)
+
     def run_forever(self):
         log(
             f"reporting to {TURMA_URL} as {self.device} (container {self.agent_id}); "
@@ -7546,6 +7618,12 @@ class SessionManager:
         # can poke; run_forever is the main thread, where signal handlers must
         # be set.
         signal.signal(signal.SIGUSR1, lambda *_: _poke.set())
+        # SIGTERM/SIGINT = the supervisor is restarting us (an update swapping
+        # files, or a container recreate). Announce it to the hub as an EXPECTED
+        # restart before we go silent (XERK-29), then exit for the supervisor to
+        # bring us back. Must be set on the main thread, like SIGUSR1 above.
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+        signal.signal(signal.SIGINT, self._handle_shutdown)
         self.resume_on_boot()
         beat = 0
         while True:

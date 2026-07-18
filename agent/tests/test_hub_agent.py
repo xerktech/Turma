@@ -7530,5 +7530,102 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         self.assertNotIn("touch", words)
 
 
+class TestUpdatingAnnounce(ManagerMixin, unittest.TestCase):
+    """XERK-29: before the manager restarts for an update it can't heartbeat
+    through, it tells the hub the downtime is EXPECTED so the host shows an
+    `updating` status instead of an unexpected-outage `offline`."""
+
+    def setUp(self):
+        super().setUp()
+        self.flag = os.path.join(self.tmp, "updating.json")
+        p = mock.patch.object(ha, "UPDATING_FLAG_PATH", self.flag)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _write_flag(self, **d):
+        with open(self.flag, "w") as f:
+            json.dump(d, f)
+
+    def test_read_flag_present_absent_and_garbled(self):
+        sm = self.make_manager()
+        # Absent (the container-update case: no updater wrote one).
+        self.assertEqual(sm._read_updating_flag(), (None, None))
+        # Present (the native updater left the target version).
+        self._write_flag(reason="update", version="9.9.9")
+        self.assertEqual(sm._read_updating_flag(), ("update", "9.9.9"))
+        # Garbled JSON degrades to "generic restart, no version".
+        with open(self.flag, "w") as f:
+            f.write("{not json")
+        self.assertEqual(sm._read_updating_flag(), (None, None))
+
+    def test_boot_clears_a_stale_flag(self):
+        # A SIGKILL (no handler ran) can leave the file behind; the next boot
+        # must not let it leak a stale version into a future announce.
+        self._write_flag(reason="update", version="1.2.3")
+        self.make_manager()
+        self.assertFalse(os.path.exists(self.flag))
+
+    def test_announce_noops_without_hub_url(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "TURMA_URL", ""), \
+             mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=AssertionError("must not POST")):
+            sm._announce_updating("update", "9.9.9")  # no raise = no POST
+
+    def test_announce_posts_signal_with_reason_and_version(self):
+        sm = self.make_manager()
+        seen = {}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b""
+
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["method"] = req.get_method()
+            seen["body"] = json.loads(req.data.decode())
+            seen["auth"] = req.get_header("Authorization")
+            return _Resp()
+
+        with mock.patch.object(ha, "TURMA_URL", "http://hub:8300"), \
+             mock.patch.object(ha, "TURMA_TOKEN", "tok"), \
+             mock.patch.object(ha.urllib.request, "urlopen", fake_urlopen):
+            sm._announce_updating("update", "9.9.9")
+
+        self.assertEqual(seen["method"], "POST")
+        self.assertEqual(
+            seen["url"], f"http://hub:8300/api/agents/{sm.device}/updating")
+        self.assertEqual(seen["body"], {"reason": "update", "version": "9.9.9"})
+        self.assertEqual(seen["auth"], "Bearer tok")
+
+    def test_announce_swallows_network_failure(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "TURMA_URL", "http://hub:8300"), \
+             mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=OSError("boom")):
+            sm._announce_updating("restart", None)  # best-effort, must not raise
+
+    def test_shutdown_handler_announces_from_flag_then_exits(self):
+        sm = self.make_manager()
+        self._write_flag(reason="update", version="9.9.9")
+        calls = []
+        with mock.patch.object(sm, "_announce_updating",
+                               side_effect=lambda *a: calls.append(a)):
+            with self.assertRaises(SystemExit):
+                sm._handle_shutdown(ha.signal.SIGTERM, None)
+        self.assertEqual(calls, [("update", "9.9.9")])
+
+    def test_shutdown_handler_defaults_to_generic_restart(self):
+        # The container case: Watchtower's SIGTERM, no flag on disk.
+        sm = self.make_manager()
+        calls = []
+        with mock.patch.object(sm, "_announce_updating",
+                               side_effect=lambda *a: calls.append(a)):
+            with self.assertRaises(SystemExit):
+                sm._handle_shutdown(ha.signal.SIGTERM, None)
+        self.assertEqual(calls, [("restart", None)])
+
+
 if __name__ == "__main__":
     unittest.main()

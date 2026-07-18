@@ -160,6 +160,14 @@ install_payload() {  # <tgz> <version>
   echo "$version" >"$PREFIX/VERSION"
   logmsg "installed $version; restarting manager (sessions preserved)"
 
+  # Leave the running manager a hint that its imminent SIGTERM is an EXPECTED
+  # update, not an outage: its shutdown handler reads this and announces an
+  # `updating` status to the hub so the host doesn't grey out as if it crashed
+  # (XERK-29). Best-effort — the file swap already succeeded either way. The new
+  # manager clears the file on boot.
+  printf '{"reason":"update","version":"%s"}\n' "$version" \
+    >"$HOME/.turma/updating.json" 2>/dev/null || true
+
   # Restart just the manager. KillMode=process / manager-only kill keeps
   # tmux/claude/ttyd alive; the new manager adopts them.
   if [ -d /run/systemd/system ] && systemctl --user show-environment >/dev/null 2>&1; then

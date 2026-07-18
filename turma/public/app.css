@@ -222,7 +222,8 @@ input:focus, textarea:focus, select:focus {
 .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .dot.online,  .dot.working { background: var(--good);     box-shadow: 0 0 8px color-mix(in srgb, var(--good) 75%, transparent); }
-.dot.waiting               { background: var(--warning);  box-shadow: 0 0 8px color-mix(in srgb, var(--warning) 75%, transparent); }
+.dot.waiting,
+.dot.updating              { background: var(--warning);  box-shadow: 0 0 8px color-mix(in srgb, var(--warning) 75%, transparent); }
 .dot.offline               { background: var(--critical);  box-shadow: 0 0 7px color-mix(in srgb, var(--critical) 55%, transparent); }
 .dot.idle                  { background: var(--muted); }
 
