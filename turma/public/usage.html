@@ -157,6 +157,12 @@ const HIDDEN_KEY = "turma-hidden-sessions";
 let hidden = new Set(JSON.parse(localStorage.getItem(HIDDEN_KEY) || "[]"));
 function saveHidden() { localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hidden])); }
 
+// The chart re-renders on every SSE beat (see scheduleRender), which rebuilds the
+// whole subtree — table view included. So the details' open state can't live in
+// the DOM alone (a fresh <details> defaults closed, snapping the table shut a
+// second after the operator opened it); it's held here and re-applied each render.
+let tableOpen = false;
+
 // View mode: "repos" (fleet-wide, unified across hosts) or "hosts". Persisted.
 const MODE_KEY = "turma-usage-mode";
 let mode = localStorage.getItem(MODE_KEY) === "hosts" ? "hosts" : "repos";
@@ -388,6 +394,11 @@ function paintSwatch(el, paint) {
 }
 
 function render(data) {
+  // A re-render replaces the chart subtree wholesale, which drops the page's
+  // scroll position (the content it was anchored to is momentarily gone). Capture
+  // it up front and restore it once the new subtree is in, so a background SSE
+  // beat can't yank the operator back to the top mid-read.
+  const scrollY = window.scrollY;
   const series = toSeries(data.agents || []);
   if (!series.length) {
     $chart.innerHTML = `<div class="empty">No usage reported yet (agents aggregate it within ~5 minutes of starting).</div>`;
@@ -423,6 +434,7 @@ function render(data) {
   buildChart(card, visible, dates, paintOf);
   $chart.append(card, tableView(visible, dates));
   $models.append(modelsCard(visible));
+  if (scrollY) scrollTo(0, scrollY);
 }
 
 // Legend = filter. Series items toggle one series; the group name toggles all
@@ -622,6 +634,8 @@ function tableView(list, dates) {
   const summary = document.createElement("summary");
   summary.textContent = "Table view";
   details.append(summary);
+  details.open = tableOpen;
+  details.addEventListener("toggle", () => { tableOpen = details.open; });
 
   if (!list.length) {
     const empty = document.createElement("div");
