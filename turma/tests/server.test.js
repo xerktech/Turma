@@ -94,6 +94,7 @@ const {
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
   TERM_OSC52_JS,
+  autoStartSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -2085,6 +2086,149 @@ test("http: starting a ticket session requires the user login", async () => {
   const res = await request("POST", "/api/jira/t10.atlassian.net/ENG-5/session");
   assert.equal(res.status, 401);
   assert.equal((agents.ts10.commands || []).length, 0);
+});
+
+// ---- auto-start To Do tickets (XERK-32) ---------------------------------------
+// A host opts its org in via JIRA_AUTO_START (heartbeated as jira.autoStart). The
+// hub then starts a session for every To Do ticket with a repo assigned that has
+// no session yet, routing each via the same splitting the manual Start button uses
+// — so an org's work spreads across ALL its agents, not just the flag-bearer.
+
+// A host reporting `site` with autoStart, `repos` cloned, and a ticket list. The
+// default ticket is a To Do ticket already triaged to Turma.
+const asBeat = (device, site, {
+  autoStart = true, repos = ["Turma"], capacity,
+  sessions = [], closedSessions = [],
+  tickets = [{ key: "ENG-5", summary: "Fix it", statusCategory: "todo",
+               repoGuess: { repo: "Turma", cloned: true } }],
+  fetchedAt = "2026-07-14T12:00:00Z",
+} = {}) =>
+  request("POST", "/api/heartbeat", {
+    body: {
+      device,
+      repos: repos.map((name) => ({ name, path: `/git/${name}` })),
+      sessions, closedSessions,
+      ...(capacity ? { capacity } : {}),
+      jira: { available: true, configured: true, siteKey: site, autoStart,
+              user: `${device}@x.com`, fetchedAt, tickets },
+    },
+    headers: agentHeaders,
+  });
+
+test("auto-start: a To Do ticket with a repo is queued once the org opts in", async () => {
+  autoStarted.clear();
+  await asBeat("asHost", "as1.atlassian.net");
+  autoStartSweep();
+  assert.deepEqual((agents.asHost.commands || []).map((c) => [c.type, c.issueKey]),
+    [["spawnTicket", "ENG-5"]]);
+});
+
+test("auto-start: does nothing while the flag is off (the default)", async () => {
+  autoStarted.clear();
+  await asBeat("asOff", "as2.atlassian.net", { autoStart: false });
+  autoStartSweep();
+  assert.equal((agents.asOff.commands || []).length, 0);
+});
+
+test("auto-start: only To Do tickets, and only ones with a repo assigned", async () => {
+  autoStarted.clear();
+  await asBeat("asFilter", "as3.atlassian.net", {
+    tickets: [
+      { key: "ENG-1", statusCategory: "inprogress",
+        repoGuess: { repo: "Turma", cloned: true } },        // not To Do
+      { key: "ENG-2", statusCategory: "todo", repoGuess: null }, // untriaged
+      { key: "ENG-3", statusCategory: "todo",
+        repoGuess: { repo: null, cloned: false } },           // "no repo fits"
+      { key: "ENG-4", statusCategory: "todo",
+        repoGuess: { repo: "Turma", cloned: true } },         // eligible
+    ],
+  });
+  autoStartSweep();
+  assert.deepEqual((agents.asFilter.commands || []).map((c) => c.issueKey), ["ENG-4"]);
+});
+
+test("auto-start: skips a ticket that already has a session (started manually or before)", async () => {
+  autoStarted.clear();
+  // The ticket already carries a live session and a killed one — either alone is
+  // enough to say "already started", so the hub must not open a second.
+  await asBeat("asDup", "as4.atlassian.net", {
+    sessions: [{ id: "s1", transcriptId: "t-live",
+                 ticket: { key: "ENG-5", siteKey: "as4.atlassian.net" } }],
+  });
+  autoStartSweep();
+  assert.equal((agents.asDup.commands || []).length, 0);
+
+  // Same for a ticket whose only session was killed (in closedSessions): a
+  // deliberate kill must not be resurrected by auto-start.
+  autoStarted.clear();
+  await asBeat("asDup2", "as5.atlassian.net", {
+    closedSessions: [{ id: "s2", transcriptId: "t-killed",
+                       ticket: { key: "ENG-5", siteKey: "as5.atlassian.net" } }],
+  });
+  autoStartSweep();
+  assert.equal((agents.asDup2.commands || []).length, 0);
+});
+
+test("auto-start: a resumable-only session (durable, survives restart) still counts as started", async () => {
+  autoStarted.clear();
+  await asBeat("asResume", "as6.atlassian.net", {
+    repos: ["Turma"],
+  });
+  // The durable channel: a transcript the resumable scan re-derived, with no
+  // registry record behind it. startedTicketKeys must read it too.
+  agents.asResume.repos[0].resumable = [
+    { transcriptId: "t-old", ticket: { key: "ENG-5", siteKey: "as6.atlassian.net" } },
+  ];
+  autoStartSweep();
+  assert.equal((agents.asResume.commands || []).length, 0);
+});
+
+test("auto-start: fires each ticket at most once, even if the spawn left no session", async () => {
+  autoStarted.clear();
+  await asBeat("asOnce", "as7.atlassian.net");
+  autoStartSweep();
+  assert.equal((agents.asOnce.commands || []).length, 1);
+  // Simulate the agent acking the command and NOT producing a session (a refused
+  // spawn): the in-flight and session guards both come up empty, so only the
+  // once-set stops a re-queue every sweep.
+  agents.asOnce.commands = [];
+  autoStartSweep();
+  assert.equal((agents.asOnce.commands || []).length, 0);
+});
+
+test("auto-start: an in-flight spawnTicket (e.g. a manual click) is not doubled", async () => {
+  autoStarted.clear();
+  await asBeat("asInflight", "as8.atlassian.net");
+  // A spawnTicket already queued by the /session route sits on the host.
+  queueCommand("asInflight", { type: "spawnTicket", issueKey: "ENG-5" });
+  autoStartSweep();
+  assert.equal((agents.asInflight.commands || []).filter(
+    (c) => c.type === "spawnTicket").length, 1);
+});
+
+test("auto-start: work still spreads across ALL the org's agents, flag or not", async () => {
+  // The two-agents case from the ticket: only one host opts in, but the session
+  // routes by availability across BOTH — landing on the more-available host even
+  // when that's the one with the flag OFF.
+  autoStarted.clear();
+  await asBeat("asFlagged", "as9.atlassian.net", {
+    autoStart: true, capacity: { maxSessions: 6, running: 5, queued: 0, free: 1 } });
+  await asBeat("asPlain", "as9.atlassian.net", {
+    autoStart: false, capacity: { maxSessions: 6, running: 1, queued: 0, free: 5 } });
+  autoStartSweep();
+  // Routed to the most-available host — the flag-OFF one — proving auto-start uses
+  // the same fleet-wide splitting as the manual button.
+  assert.deepEqual((agents.asPlain.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal((agents.asFlagged.commands || []).length, 0);
+});
+
+test("auto-start: an offline host's stale flag drives nothing", async () => {
+  autoStarted.clear();
+  await asBeat("asStale", "as10.atlassian.net");
+  agents.asStale.lastSeen = Date.now() - 10 * 60 * 1000; // offline
+  assert.equal(orgsWithAutoStart().has("as10.atlassian.net"), false);
+  autoStartSweep();
+  assert.equal((agents.asStale.commands || []).length, 0);
 });
 
 test("http: /api/agents does not serialize the jiraIssues cache (served only by /api/jira)", async () => {

@@ -6415,10 +6415,11 @@ class TestRefreshJira(ManagerMixin, unittest.TestCase):
             sm.build_payload(0, light=True)               # light beat -> no
             self.assertEqual(len(calls), 2)
         # The cached block rides every payload regardless, carrying the polled
-        # fields verbatim plus the picker's repo options.
+        # fields verbatim plus the hub-facing extras _jira_payload composes on top
+        # (the picker's repo options and the autoStart flag).
         self.assertIn("jira", payload)
         self.assertEqual({k: v for k, v in payload["jira"].items()
-                          if k != "repoOptions"}, sm.jira)
+                          if k not in ("repoOptions", "autoStart")}, sm.jira)
 
     def test_payload_skips_refresh_when_unconfigured(self):
         # The manager is built INSIDE the patch: the block's `configured` flag
@@ -7129,6 +7130,25 @@ class TestSetJiraRepo(ManagerMixin, unittest.TestCase):
             sm = self.make_manager()
             payload = sm.build_payload(1)
         self.assertNotIn("repoOptions", payload["jira"])
+
+    def test_auto_start_flag_is_off_by_default(self):
+        # The hub reads jira.autoStart to decide whether to auto-spawn this org's
+        # To Do tickets; it must default OFF (XERK-32).
+        sm = self._manager()
+        self.assertFalse(sm._jira_payload()["autoStart"])
+
+    def test_auto_start_flag_reflects_the_config(self):
+        # Settable ONLY from the agent's config, and honestly advertised when it is.
+        sm = self._manager()
+        with mock.patch.object(ha, "JIRA_AUTO_START", True):
+            self.assertTrue(sm._jira_payload()["autoStart"])
+
+    def test_an_unconfigured_host_advertises_no_auto_start(self):
+        # No org means nothing to auto-start; the flag doesn't ride at all.
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 JIRA_AUTO_START=True):
+            sm = self.make_manager()
+            self.assertNotIn("autoStart", sm.build_payload(1)["jira"])
 
     def test_the_command_reaches_set_jira_repo(self):
         sm = self._manager()

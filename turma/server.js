@@ -809,6 +809,111 @@ setInterval(() => {
   }
 }, 15 * 1000).unref();
 
+// ---- auto-start To Do tickets (XERK-32) ------------------------------------
+// Opt-in PER ORG via the agent's JIRA_AUTO_START config, advertised on the
+// heartbeat as jira.autoStart. When any ONLINE host of an org sets it, the hub
+// starts a session for every "To Do" ticket in that org that has a repo assigned
+// — by the model's triage or a manual pin — and doesn't already have one.
+//
+// The DECISION and the ROUTING live here, not on the agent, for the reason the
+// manual Start button already does (see the /session route): only the hub sees
+// the whole fleet, so only it can spread an org's sessions across ALL its agents
+// via findTicketHost rather than piling them on whichever host carries the flag.
+// So "one of two agents in an org has auto-start on" still fans work across both.
+//
+// The whole point is to never open a SECOND session for work already started —
+// by an operator's click, a prior auto-start, or anything else. Three guards, in
+// increasing strength:
+//   - autoStarted: fire each ticket at most once per hub lifetime. This is what
+//     stops a spawn the agent legitimately REFUSES (e.g. an uncloneable repo)
+//     from being re-queued every sweep — a refusal leaves no session to see.
+//   - startedTicketKeys(): the durable guard — a ticket carrying a session on ANY
+//     channel (live, killed, or the resumable scan that outlives a restart) is
+//     already handled, whether it was started manually or automatically.
+//   - an in-flight spawnTicket on some org host, for the window before that
+//     session first heartbeats back.
+const AUTO_START_EVERY_MS = 15 * 1000;
+const autoStarted = new Set(); // "<siteKey>\x00<issueKey>" already auto-started
+
+// siteKeys whose org has at least one ONLINE host opting in. Onlineness is
+// required (unlike a read-only GET): an offline host's stale flag must not drive
+// spawns, and findTicketHost needs a live host to route to anyway.
+function orgsWithAutoStart() {
+  const now = Date.now();
+  const on = new Set();
+  for (const a of Object.values(agents)) {
+    if (!a.jira || !a.jira.siteKey || !a.jira.autoStart) continue;
+    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    on.add(a.jira.siteKey);
+  }
+  return on;
+}
+
+// Every ticket that already has a session, on any channel — the durable
+// dedup key for auto-start. Mirrors board.js's ticketSessionIndex: a ticket is
+// "started" if any host's live/stopped registry (a.sessions), its killed history
+// (a.closedSessions), or a repo's resumable scan (a.repos[].resumable) carries a
+// session whose `ticket` names it. Keyed "<siteKey>\x00<key>" like the routing
+// helpers, so a lookup is a plain Set membership test.
+function startedTicketKeys() {
+  const keys = new Set();
+  const add = (s) => {
+    const t = s && s.ticket;
+    if (t && t.key) keys.add((t.siteKey || "") + "\x00" + t.key);
+  };
+  for (const a of Object.values(agents)) {
+    for (const s of a.sessions || []) add(s);
+    for (const c of a.closedSessions || []) add(c);
+    for (const r of a.repos || []) for (const t of r.resumable || []) add(t);
+  }
+  return keys;
+}
+
+function autoStartSweep() {
+  const orgs = orgsWithAutoStart();
+  if (!orgs.size) return;
+  const started = startedTicketKeys();
+  for (const siteKey of orgs) {
+    // The freshest reporting block owns the ticket list and its repo guesses, the
+    // same copy ticketRepo/mergeSites resolve against — so the hub auto-starts on
+    // what the board would show, not a lagging host's older view.
+    let block = null, bestAt = "";
+    for (const a of Object.values(agents)) {
+      if (!a.jira || a.jira.siteKey !== siteKey) continue;
+      const at = String(a.jira.fetchedAt || "");
+      if (!block || at > bestAt) { block = a.jira; bestAt = at; }
+    }
+    for (const t of (block && block.tickets) || []) {
+      if (!t || !t.key) continue;
+      if (t.statusCategory !== "todo") continue;      // only "To Do" tickets
+      const repo = ticketRepo(siteKey, t.key);         // a repo must be assigned
+      if (!repo) continue;
+      const k = siteKey + "\x00" + t.key;
+      if (autoStarted.has(k) || started.has(k)) continue;
+      // A spawnTicket already riding some org host's queue counts as started.
+      const inFlight = Object.values(agents).some((a) =>
+        a.jira && a.jira.siteKey === siteKey &&
+        (a.commands || []).some((c) => c.type === "spawnTicket" && c.issueKey === t.key));
+      if (inFlight) continue;
+      const { host } = findTicketHost(siteKey, repo);
+      // No online host to route to right now — leave it unrecorded so the next
+      // sweep retries once a host is back, exactly like the offline case.
+      if (!host) continue;
+      queueCommand(host, { type: "spawnTicket", issueKey: t.key });
+      autoStarted.add(k);
+    }
+  }
+}
+// Don't act on freshly-loaded (possibly stale) state right after a hub boot, the
+// same reason the offline sweep waits: let agents re-report first. (The online
+// gate in orgsWithAutoStart already no-ops until a host re-heartbeats, so this is
+// belt-and-suspenders — and kept out of autoStartSweep itself so it stays a pure,
+// directly-callable unit.)
+setInterval(() => {
+  if (Date.now() - BOOT_AT < BOOT_GRACE_MS) return;
+  autoStartSweep();
+}, AUTO_START_EVERY_MS).unref();
+
 const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
 const USAGE = fs.readFileSync(path.join(__dirname, "public", "usage.html"));
 const SESSIONS = fs.readFileSync(path.join(__dirname, "public", "sessions.html"));
@@ -2429,6 +2534,10 @@ if (process.env.TURMA_TEST) {
     unregisterDevice,
     listDevices,
     pruneDevices,
+    autoStartSweep,
+    startedTicketKeys,
+    orgsWithAutoStart,
+    autoStarted,
   };
 } else {
   if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");

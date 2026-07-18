@@ -1069,6 +1069,34 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
 - Tests: the `most available one wins` / `pending lowers availability` / `clones on demand` cases in
   `turma/tests/server.test.js`.
 
+##### Auto-starting To Do tickets (XERK-32)
+
+- An org can be **opted in** so the hub auto-starts a session for every **To Do** ticket the moment it
+  has a repo assigned — by the model's triage OR a manual pin. Off by default; enabled ONLY via the
+  agent's config env `JIRA_AUTO_START` (`hub-agent.py`), advertised on the heartbeat as
+  `jira.autoStart`. Nothing in the UI turns it on — a host never auto-spawns unless its operator set it.
+- **The decision and routing live on the HUB**, not the agent, for the same reason the manual Start
+  button does: only the hub sees the whole fleet, so only it can spread an org's sessions across ALL
+  its agents. `autoStartSweep()` (a 15s `setInterval`, boot-grace-gated like the offline sweep) walks
+  each org where **an ONLINE host reports `autoStart`**, and for each freshest-block To Do ticket with
+  a `repoGuess.repo`, routes a `spawnTicket` through the **same `findTicketHost`** the button uses. So
+  "one of two agents in an org has the flag on" still fans work across BOTH — the flag-bearer only
+  advertises intent; it need not be the host that runs the session.
+- The point is to never open a **second** session for work already started (by a click, a prior
+  auto-start, or anything else). Three guards, increasing in strength:
+  - `startedTicketKeys()` — the durable one: a ticket carrying a session on ANY channel
+    (`a.sessions`, `a.closedSessions`, or a repo's `resumable` scan, which outlives a restart) is
+    already handled, however it was started. A **killed** session counts — a deliberate kill is not
+    resurrected.
+  - an in-flight `spawnTicket` on some org host, for the window before that session first heartbeats.
+  - `autoStarted` — an in-memory once-per-hub-lifetime set, the only thing that stops a spawn the
+    agent legitimately **refuses** (leaving no session to see) from being re-queued every sweep. A
+    no-online-host result is left UNrecorded so it retries when a host returns.
+- Reuses the queue end to end: an auto-started session that can't run now just **queues** on its host
+  (see "The session queue"), exactly as a clicked one does. Nothing is written to Jira.
+- Tests: the `auto-start:` cases in `turma/tests/server.test.js`; the `autoStart` payload cases in
+  `TestSetJiraRepo` (`agent/tests/test_hub_agent.py`).
+
 #### Ticket ↔ session chips
 
 - A ticket's sessions show as chips on its card, from `ticketSessionIndex` — a reverse index of the

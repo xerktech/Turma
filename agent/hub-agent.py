@@ -2843,6 +2843,16 @@ try:
     JIRA_REFRESH_EVERY = int(os.environ.get("TURMA_JIRA_REFRESH_EVERY", "30"))
 except ValueError:
     JIRA_REFRESH_EVERY = 30   # beats between polls (30 × 20s beat ≈ 10 min)
+# Auto-start (XERK-32): when set, this host asks the hub to automatically start a
+# session for every "To Do" ticket in its org the moment that ticket has a repo
+# assigned (by the model or by a manual pin). OFF by default and settable ONLY
+# from the agent's config — a host never auto-spawns unless its operator opted in
+# here. The flag is purely advertised to the hub (heartbeated as jira.autoStart);
+# the hub owns the decision and the routing, because only it sees the whole fleet
+# and can spread the org's sessions across ALL its agents rather than piling them
+# on whichever one carries this flag. Read forgivingly (1/true/yes/on).
+JIRA_AUTO_START = os.environ.get("JIRA_AUTO_START", "").strip().lower() in (
+    "1", "true", "yes", "on")
 JIRA_TIMEOUT_SEC = 15
 JIRA_PAGE_SIZE = 100    # /search/jql hard-caps maxResults at 100
 JIRA_MAX_ACTIVE = 150   # not-Done tickets reported (bounds the heartbeat)
@@ -5829,7 +5839,9 @@ class SessionManager:
         opts = [{"name": c["name"], "cloned": bool(c.get("cloned")),
                  "nameWithOwner": c.get("nameWithOwner")}
                 for c in (self.triage_cands or [])]
-        return dict(self.jira, repoOptions=opts)
+        # autoStart (XERK-32): the hub reads this to decide whether to auto-spawn
+        # sessions for this org's freshly-triaged To Do tickets. See JIRA_AUTO_START.
+        return dict(self.jira, repoOptions=opts, autoStart=JIRA_AUTO_START)
 
     def _stage_jira_issue(self, key):
         """Handle a {type:"jiraIssue"} command: fetch that issue's full detail
