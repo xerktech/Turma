@@ -312,6 +312,19 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   - `true`/`false`/`null`-unknown; marker set overridable via `TURMA_PANE_BUSY_MARKERS`.
   - All three surfaces fall back to transcript freshness only when it's `null` — i.e. an older agent,
     or an uncapturable/gone pane.
+  - **Busy→idle flicker is suppressed at the source** (`_stable_pane_busy`, XERK-42): the TUI
+    repaints its spinner by clearing+rewriting the "esc to interrupt" line, so a single capture can
+    land in that sub-frame gap and read idle while the model is still working — and since paneBusy is
+    sampled once per `TURMA_INTERVAL` (20s) beat, that one miss shows the session idle for a whole
+    interval on EVERY status surface and fires a bogus "finished its turn" push. So a busy read is
+    trusted instantly (status lights up promptly; nothing fakes busy while idle) while an idle read
+    is re-confirmed once, after `TURMA_PANE_IDLE_CONFIRM_SEC` (0.2s, 0 disables), only on the
+    busy→idle EDGE — a genuinely ended turn confirms in a frame, a redraw gap doesn't. The last
+    stable read rides the per-session `sess_state`; `None` (capture failed) passes through untouched.
+    Stabilizing the SOURCE is why every component (fleet dots, cards, glasses glyph, Android list,
+    the hub's turn-finished alert) gets the fix with no client-render change. The live-footer scrape
+    guards its own copy of this with a one-poll hold (`liveTurnDecision` in `tunnel-agent.js`; see the
+    Live working footer bullet). Tests: `TestStablePaneBusy` in `agent/tests/test_hub_agent.py`.
 - **Transcript freshness** — now the fallback, not the primary signal.
 - **Pending questions** — a pending `AskUserQuestion` is surfaced by the `agent/hooks/ask.py`
   PreToolUse bridge (see the Safety guard note under Conventions), which drops a
@@ -891,6 +904,15 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - When Claude's agent-manager list is expanded below the input box, the footer also carries
   `status.agents[]` (`parseAgentList`: one `{sel,type,label}` row per live agent, i.e. `main` + each
   background subagent), so the hub pins the working indicator and lists the live agents.
+- A single-frame **busy→idle blip is held one poll** before the bar clears (`liveTurnDecision`,
+  XERK-42): the same spinner-repaint gap that flickers `paneBusy` can make one 1s capture read
+  "not generating" mid-turn, which would blink the pinned working bar (and the chat's Stop button)
+  off. When the previous poll was generating and this one isn't, the frame is skipped for one tick
+  (the last frame stays on screen); if the next poll is still idle the turn really ended and the bar
+  clears — the committed transcript tail owns the finished message either way, so the ~1s hold is
+  invisible. Busy is never held. This is the live counterpart of `_stable_pane_busy`'s re-capture
+  (the 1s cadence lets a poll-hold stand in for a delayed re-capture). Tests: the `liveTurnDecision`
+  cases in `agent/tests/tunnel-agent.test.js`.
 - **Clicking a subagent row opens that background agent's own transcript**: a
   `{type:"subagentHistory", sessionId, agentType, label}` command resolves the row to its
   `subagents/agent-<id>.jsonl` file via the main transcript's Task `tool_use` + that call's result
