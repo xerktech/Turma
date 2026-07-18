@@ -25,7 +25,7 @@ no inbound exposure.
 | Tool | How | Needs sudo |
 |---|---|---|
 | git, tmux, ripgrep, ncurses-term, python3, curl | apt | yes |
-| Node ≥ 22 (`tunnel-agent.js` needs the global `WebSocket`) | NodeSource, or keeps yours | yes |
+| Node ≥ 24 (`tunnel-agent.js` needs the global `WebSocket`, Node 22+) | NodeSource, or keeps yours | yes |
 | ttyd (pinned 1.7.7 static, or apt) | download/apt | download: no |
 | claude (`@anthropic-ai/claude-code`) | npm -g | no |
 | gh | apt | yes |
