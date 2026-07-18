@@ -30,6 +30,9 @@
     padding: 16px; display: flex; flex-direction: column; gap: 12px;
   }
   .host-card.offline { opacity: 0.62; }
+  /* An expected update in progress: legible, not greyed like an outage, with a
+     warm accent so it reads as transient rather than dead (XERK-29). */
+  .host-card.updating { opacity: 0.9; border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
   .host-card.collapsed { gap: 0; }
   .host-top { display: flex; align-items: center; gap: 10px; }
   /* The name + caret toggle the host card open/closed; keep the status chip out
@@ -681,6 +684,10 @@ function liveState(sess, host, now) {
 }
 
 function agentState(a, now) {
+  // An announced update in progress reads as "updating", not the outage-looking
+  // "offline" the silent-heartbeat gap would otherwise show (XERK-29). The hub
+  // only sets it while the host is actually silent, so it never masks a live one.
+  if (a.updating) return "updating";
   return a.online ? "online" : "offline";
 }
 
@@ -800,7 +807,7 @@ function hostCard(a, now) {
         ontoggle="logToggle('${esc(a.key)}', this.open)">
       <summary>Container log (tail)</summary><pre>${esc(a.logTail)}</pre>
     </details>` : ""}
-    ${a.online ? "" : `<div class="actions">
+    ${(a.online || a.updating) ? "" : `<div class="actions">
       <button onclick="removeHost('${esc(a.key)}')">Remove host</button>
     </div>`}`;
 
@@ -815,7 +822,15 @@ function hostCard(a, now) {
   // there when it says something.
   const org = window.TurmaBoard.orgName(a.jira && a.jira.siteKey);
 
-  return `<div class="host-card ${a.online ? "" : "offline"} ${collapsed ? "collapsed" : ""}">
+  // While updating, the card keeps its normal weight (not the greyed-out
+  // `offline` look the outage used to give it) and the header explains it's an
+  // expected, brief downtime rather than a crash (XERK-29).
+  const cardState = a.updating ? "updating" : (a.online ? "" : "offline");
+  const statusTitle = a.updating
+    ? `Agent is updating${a.updating.version ? " to " + a.updating.version : ""} — expected brief downtime, not an outage`
+    : "";
+
+  return `<div class="host-card ${cardState} ${collapsed ? "collapsed" : ""}">
     <div class="host-top">
       <button class="host-name" onclick="hostToggle('${esc(a.key)}')"
           aria-expanded="${collapsed ? "false" : "true"}" title="${collapsed ? "Expand" : "Collapse"} host">
@@ -823,7 +838,7 @@ function hostCard(a, now) {
         <h3>${esc(a.key)}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
       </button>
       ${collapsedMeta}
-      <span class="status"><span class="dot ${dot}"></span>${esc(state)}</span>
+      <span class="status"${statusTitle ? ` title="${esc(statusTitle)}"` : ""}><span class="dot ${dot}"></span>${esc(state)}</span>
     </div>${body}
   </div>`;
 }
@@ -1123,7 +1138,7 @@ function sessCard(a, s, now) {
     actions =
       (canAttach
         ? `<button class="primary btn-sm" onclick="location.href='/sessions?session=${encodeURIComponent(s.id)}'">Attach ▸</button>`
-        : `<button class="btn-sm" disabled title="Terminal tunnel offline">Attach</button>`) +
+        : `<button class="btn-sm" disabled title="${a.updating ? "Host is updating — terminal will return shortly" : "Terminal tunnel offline"}">Attach</button>`) +
       `<button class="btn-sm ${confirming.has(rKey) ? "confirm" : ""}" onclick="sessRestart('${key}','${id}')">${confirming.has(rKey) ? "Confirm restart" : "Restart"}</button>` +
       // Stop the session and drop it from the hub — but KEEP its worktree on
       // disk (uncommitted work survives) and its usage history, so it stays

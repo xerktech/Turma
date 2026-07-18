@@ -728,6 +728,61 @@ test("notify(): FCM fan-out prunes dead tokens, keeps live ones", () => {
   hub.unregisterDevice("live");
 });
 
+// ---- updating status (XERK-29) -----------------------------------------------
+
+test("http: /updating shows an expected restart as `updating`, not `offline`", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "upd-host" }, headers: agentHeaders });
+
+  // Agent-authed like the heartbeat: no creds is rejected.
+  assert.equal(
+    (await request("POST", "/api/agents/upd-host/updating", { body: { reason: "update" } })).status,
+    401,
+  );
+  // A host the hub has never seen has no record to hang the status on.
+  assert.equal(
+    (await request("POST", "/api/agents/ghost/updating", { body: {}, headers: agentHeaders })).status,
+    404,
+  );
+  // The announce lands.
+  const ok = await request("POST", "/api/agents/upd-host/updating",
+    { body: { reason: "update", version: "9.9.9" }, headers: agentHeaders });
+  assert.equal(ok.status, 200);
+
+  // /api/agents is memoized; the endpoints invalidate it, but a direct mutation
+  // of the record below does not, so drop the cache before each read.
+  const recOf = async () => {
+    hub.invalidateAgentsCache();
+    return (await request("GET", "/api/agents", { headers: userHeaders })).body.agents
+      .find((a) => a.key === "upd-host");
+  };
+
+  // While the host is still heartbeating it's plainly `online` — the status is
+  // only meaningful once it goes silent, so it's suppressed here.
+  let rec = await recOf();
+  assert.equal(rec.online, true);
+  assert.equal(rec.updating, null);
+
+  // Simulate the heartbeat gap the restart causes: silent, but within the grace
+  // window it surfaces as `updating` (carrying the reason/version), not offline.
+  agents["upd-host"].lastSeen = Date.now() - 2 * 60 * 1000;
+  rec = await recOf();
+  assert.equal(rec.online, false);
+  assert.ok(rec.updating, "updating surfaces while silent within grace");
+  assert.equal(rec.updating.reason, "update");
+  assert.equal(rec.updating.version, "9.9.9");
+
+  // Past the grace window a stuck update correctly falls through to offline.
+  agents["upd-host"].updating.until = Date.now() - 1;
+  rec = await recOf();
+  assert.equal(rec.online, false);
+  assert.equal(rec.updating, null);
+
+  // A heartbeat from the far side clears the flag outright (the record rebuild
+  // drops it), so a recovered host is never stuck showing `updating`.
+  await request("POST", "/api/heartbeat", { body: { device: "upd-host" }, headers: agentHeaders });
+  assert.equal(agents["upd-host"].updating, undefined);
+});
+
 // ---- archive: agent-push ingest + heartbeat cursors + search/browse/view -------
 
 test("http: archive ingest is agent-authed; search/browse/view are user-authed", async () => {

@@ -351,6 +351,34 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     by going back to scanning loose text.
 - Tests: `agent/tests/test_hub_agent.py` (`TestPrStatus`, `TestRefreshPrStatus`, `TestSessionReport`).
 
+### Expected-restart "updating" status (XERK-29)
+
+- An agent update takes the host down in a way a plain outage can't be told from: the container is
+  recreated (or the native manager restarted), heartbeats stop, and the dashboard greyed the host to
+  `offline` while its sessions read "terminal offline" — indistinguishable from a crash.
+- So the manager **announces an EXPECTED restart before it goes silent**: its SIGTERM/SIGINT handler
+  (`_handle_shutdown`) POSTs `POST /api/agents/<host>/updating` (`_announce_updating`, agent-token
+  authed, best-effort with a short timeout — it's the shutdown path and must not block the exit).
+- One signal covers both update paths, because both restart via a SIGTERM to the manager: a container
+  recreate on a Watchtower image update (SIGTERM to PID 1), and the native updater's
+  `systemctl restart` (SIGTERM to the manager, sessions kept alive by `KillMode=process`).
+- The native updater additionally leaves `~/.turma/updating.json` (`UPDATING_FLAG_PATH`, reason +
+  target version) just before it restarts; the SIGTERM handler reads it to enrich the announcement
+  with the version (`reason:"update"`). A container update leaves no file, so it announces a generic
+  `reason:"restart"`. The next boot clears any stale flag (a SIGKILL that skipped the handler).
+- Hub-side, the announce sets `a.updating = {at, until, reason, version}` with a `UPDATING_GRACE_MS`
+  (5 min) deadline. `serializeAgent` surfaces `updating` **only while the host is actually silent**
+  (`!online`) and **within the grace window** — a returned host is just `online` again (its heartbeat
+  rebuilds the record without the flag), and a stuck update falls through to `offline` past `until`.
+- The offline sweep suppresses the "host offline" alert while `updating` holds, so an expected restart
+  doesn't page; a genuinely stuck update still alerts once the window lapses.
+- The dashboard renders `updating` as a distinct amber state (`agentState`/`hostCard`): not the greyed
+  `offline` look, an "expected brief downtime" tooltip, and no "Remove host" affordance. The status is
+  purely a hub-render of the agent's signal; no client acts on it beyond display. Android/glasses
+  predate the field and keep showing `offline` — a cosmetic gap, not a regression.
+- Tests: `TestUpdatingAnnounce` in `agent/tests/test_hub_agent.py`, the updating-hint case in
+  `agent/tests/test_turma_agent_update.sh`, and the `/updating` case in `turma/tests/server.test.js`.
+
 ### Usage aggregates and the attribution ledger
 
 - The heartbeat carries **persistent usage aggregates independent of the live registry**: a per-repo
