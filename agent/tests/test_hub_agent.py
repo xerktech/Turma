@@ -1921,6 +1921,32 @@ class ManagerMixin:
         return ha.SessionManager()
 
 
+class TestStartedAt(ManagerMixin, unittest.TestCase):
+    """The heartbeat's startedAt: docker's StartedAt where it answers, else the
+    manager's own start — never empty. The hub's restart-loop alert keys on this
+    field CHANGING, so an agent that reports none (a native host, where `docker
+    inspect` isn't there) could crash-loop with no notification (XERK-34)."""
+
+    def test_falls_back_to_manager_start_when_docker_cannot_answer(self):
+        # ManagerMixin's fake_run returns "" for every command, docker included.
+        sm = self.make_manager()
+        self.assertTrue(sm.started_at)
+        # The fallback is a parseable UTC timestamp (what the hub Date.parse's).
+        time.strptime(sm.started_at, "%Y-%m-%dT%H:%M:%SZ")
+
+    def test_docker_answer_wins(self):
+        real_run = ha.run
+
+        def docker_aware_run(cmd, cwd=None):
+            if cmd[:2] == ["docker", "inspect"]:
+                return "2024-01-01T00:00:00.000000000Z"
+            return real_run(cmd, cwd)
+
+        with mock.patch.object(ha, "run", docker_aware_run):
+            sm = self.make_manager()
+        self.assertEqual(sm.started_at, "2024-01-01T00:00:00.000000000Z")
+
+
 class TestTicketLedger(ManagerMixin, unittest.TestCase):
     """The transcript -> ticket ledger: which conversation worked which Jira
     ticket, recorded durably so the board's chips outlive the session record —

@@ -4062,9 +4062,18 @@ class SessionManager:
         # meaningful (they're all just "agent"); the physical host name (device) is
         # what the hub keys on and displays.
         self.agent_id = run(["hostname"]) or "unknown"
+        # The container's own StartedAt where docker can answer, else THIS
+        # process's start — never empty. The fallback is what puts a native host
+        # on the hub's restart-loop radar (XERK-34): the alert keys on heartbeat
+        # `startedAt` CHANGING, so a host reporting none can crash-loop under
+        # systemd's Restart=always without a single notification, and its card's
+        # Uptime reads "–". The manager's start is the honest native equivalent
+        # of a container boot — with KillMode=process each crash restarts exactly
+        # this process — and in the container the manager IS PID 1, so the two
+        # times only differ by the entrypoint's preflight anyway.
         self.started_at = run(
             ["docker", "inspect", "--format", "{{.State.StartedAt}}", self.agent_id]
-        )
+        ) or now_iso()
         # Which coding agent this host runs, and its version. The raw string is
         # kept alongside the parsed {name, version} purely for hubs predating
         # `codingAgent` — the two update independently, so a new agent must not

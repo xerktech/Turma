@@ -48,7 +48,9 @@ echo "ROOTDIR_OWNER=$(stat -c '%u:%g' /root)"
 touch "$REPOS_ROOT/.probe" 2>/dev/null || true
 echo "NEWFILE_OWNER=$(stat -c '%u:%g' "$REPOS_ROOT/.probe" 2>/dev/null || echo none)"
 echo "LEFTOVER_ROOT_PATHS=$(find "$REPOS_ROOT" /root/.claude -uid 0 2>/dev/null | wc -l)"
-sleep 1
+# Configurable lifetime: the manager is PID 1, so how long IT lives is how long
+# the container lives — the tunnel-supervision case needs a few seconds.
+sleep "${STUB_MANAGER_SLEEP:-1}"
 STUB
 cp "$WORK/python3" "$WORK/hub-agent.py"
 echo 'console.log("TUNNEL uid=" + process.getuid() + " gid=" + process.getgid());' \
@@ -231,6 +233,28 @@ if echo "$out" | grep -q "\[entrypoint\] aws: credentials from the environment";
   echo "  ok: aws env creds recognised"
 else
   echo "  FAIL: aws — env creds not recognised"; FAILED=1
+fi
+
+# --- Case 10: the tunnel is supervised (XERK-34) -----------------------------
+# A tunnel PROCESS death must not outlive one retry interval. Fire-and-forget
+# left a crashed tunnel down until someone restarted the whole container, with
+# the heartbeat keeping the host green while every session read "terminal
+# offline" — the exact failure the native launcher's supervisor exists to heal.
+# The stub tunnel exits the moment it has printed, so a supervised entrypoint
+# relaunches it within TUNNEL_RETRY_SEC; count the launches.
+echo "== case: a dead tunnel-agent is relaunched"
+make_fixture "$WORK/fx10" 0 0
+out="$(run_case "$WORK/fx10" -e TUNNEL_RETRY_SEC=1 -e STUB_MANAGER_SLEEP=4)"
+starts="$(echo "$out" | grep -c "TUNNEL uid=")"
+if [ "$starts" -ge 2 ]; then
+  echo "  ok: tunnel relaunched after it exited ($starts starts)"
+else
+  echo "  FAIL: tunnel started $starts time(s) — a dead tunnel stays dead"; FAILED=1
+fi
+if echo "$out" | grep -q "tunnel-agent exited; restarting"; then
+  echo "  ok: the restart is logged"
+else
+  echo "  FAIL: no restart log line"; FAILED=1
 fi
 
 echo

@@ -14,9 +14,11 @@ no inbound exposure.
 
 - **Same** session model, heartbeat, worktrees, Jira/PR/usage features as the
   container.
-- **Not** installed: the cloud CLIs (aws/az/terraform) and PowerShell the image
-  bundles — a session that needs those should use the Docker image. `gh` is
-  installed (needed for auto-update on a private repo and for private git/PR).
+- **Not** installed: the cloud CLIs (aws/az/terraform), PowerShell, the docker
+  CLI, and the Android toolchain (JDK/Gradle/SDK) the image bundles — a session
+  that needs those should use the Docker image, or the host must provide them
+  itself. `gh` is installed (needed for auto-update on a private repo and for
+  private git/PR).
 
 ## Prerequisites (auto-installed)
 
@@ -150,17 +152,26 @@ curl -fsSL .../bootstrap.sh | bash -s -- --verify
 
 ## Known limitations (graceful degradation)
 
-- **No container self-inspect** — the heartbeat's container-log tail and the
-  restart `StartedAt` are empty (`docker inspect/logs` aren't there). Sessions
-  and per-session restart are unaffected.
+- **No container self-inspect** — the heartbeat's container-log tail is empty
+  (`docker logs` isn't there). Sessions and per-session restart are unaffected.
+  `startedAt` falls back to the manager's own start time when `docker inspect`
+  can't answer, so the host card's Uptime reads as MANAGER uptime here (an
+  update restart resets it) and the hub's restart-loop alert still catches a
+  crash-looping native manager.
 - **`DEVICE_NAME` is explicit** — the container's docker/SMB auto-detection is
   gone; the launcher defaults it to `$(hostname)`.
 - **Lifetime** — the agent lives only while the WSL distro is running. Windows
   may idle-stop the distro after the last shell exits despite lingering; there's
   no Docker-daemon-under-a-Windows-service to keep it up.
-- **tmux colors** — the web terminal's truecolor/passthrough needs the bundled
-  `tmux.conf` at `/etc/tmux.conf` or `~/.tmux.conf`. The installer won't clobber
-  an existing `~/.tmux.conf`; if colors look flat, add the two lines it prints.
+- **tmux colors AND clipboard** — the web terminal's truecolor/passthrough and
+  its copy-to-system-clipboard (the OSC 52 chain: the `Ms` override +
+  `set-clipboard on` + `allow-passthrough on`) all live in the bundled
+  `tmux.conf`, which only takes effect at `/etc/tmux.conf` or `~/.tmux.conf`.
+  The installer never clobbers an existing conf at either path — it warns when
+  the one in effect lacks the clipboard settings; merge the missing lines from
+  `$PREFIX/tmux.conf`, or colors flatten and every copy made in the terminal is
+  silently dropped. The agent's sessions also share the user's own tmux server
+  on a native host, so a personal tmux config applies to them.
 - **Manual `stop` leaves sessions running** — like the container's "kill keeps
   the worktree", stopping the service orphans the tmux/ttyd (a later `start`
   re-adopts). `--uninstall` prints how to sweep them.

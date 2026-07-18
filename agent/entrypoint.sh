@@ -266,7 +266,24 @@ fi
 # OUTBOUND WebSocket to TURMA_URL so the hub can reach this container's per-session
 # ttyds from any network/host. The hub tells it which port to bridge per data
 # channel (see agent/tunnel-agent.js + turma/server.js).
-run_as node /usr/local/bin/tunnel-agent.js &
+#
+# SUPERVISED, like the native launcher's --tunnel-supervisor and for the tail
+# end of the same reason (XERK-34): the tunnel dying while the manager lives is
+# the one failure that reads as a perfectly healthy host — the heartbeat (a
+# separate HTTP POST) keeps the card green while every session on it says
+# "terminal offline". Fire-and-forget made a tunnel PROCESS death (an uncaught
+# exception — socket-level failures self-heal via its own reconnect loop) stick
+# until someone restarted the whole container. No node check inside the loop,
+# unlike the native supervisor's: node is a baked image layer here, not an apt
+# prerequisite that can be missing.
+TUNNEL_RETRY_SEC="${TUNNEL_RETRY_SEC:-10}"
+(
+  while :; do
+    run_as node /usr/local/bin/tunnel-agent.js || true
+    echo "[entrypoint] tunnel-agent exited; restarting in ${TUNNEL_RETRY_SEC}s"
+    sleep "$TUNNEL_RETRY_SEC"
+  done
+) &
 
 # Session manager + heartbeat, in the FOREGROUND as the container's long-lived
 # process. It owns the persisted registry (~/.turma/sessions.json), scans
