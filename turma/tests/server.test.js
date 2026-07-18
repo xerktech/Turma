@@ -2089,7 +2089,8 @@ test("http: starting a ticket session requires the user login", async () => {
 });
 
 // ---- auto-start To Do tickets (XERK-32) ---------------------------------------
-// A host opts its org in via JIRA_AUTO_START (heartbeated as jira.autoStart). The
+// A host opts its org in via TICKET_AUTO_START (heartbeated top-level as
+// ticketAutoStart, board-agnostic and beside the jira block, not inside it). The
 // hub then starts a session for every To Do ticket with a repo assigned that has
 // no session yet, routing each via the same splitting the manual Start button uses
 // — so an org's work spreads across ALL its agents, not just the flag-bearer.
@@ -2108,8 +2109,10 @@ const asBeat = (device, site, {
       device,
       repos: repos.map((name) => ({ name, path: `/git/${name}` })),
       sessions, closedSessions,
+      // Board-agnostic and top-level, beside jira (not inside it).
+      ticketAutoStart: autoStart,
       ...(capacity ? { capacity } : {}),
-      jira: { available: true, configured: true, siteKey: site, autoStart,
+      jira: { available: true, configured: true, siteKey: site,
               user: `${device}@x.com`, fetchedAt, tickets },
     },
     headers: agentHeaders,

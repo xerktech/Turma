@@ -2843,15 +2843,19 @@ try:
     JIRA_REFRESH_EVERY = int(os.environ.get("TURMA_JIRA_REFRESH_EVERY", "30"))
 except ValueError:
     JIRA_REFRESH_EVERY = 30   # beats between polls (30 × 20s beat ≈ 10 min)
-# Auto-start (XERK-32): when set, this host asks the hub to automatically start a
-# session for every "To Do" ticket in its org the moment that ticket has a repo
-# assigned (by the model or by a manual pin). OFF by default and settable ONLY
-# from the agent's config — a host never auto-spawns unless its operator opted in
-# here. The flag is purely advertised to the hub (heartbeated as jira.autoStart);
-# the hub owns the decision and the routing, because only it sees the whole fleet
-# and can spread the org's sessions across ALL its agents rather than piling them
-# on whichever one carries this flag. Read forgivingly (1/true/yes/on).
-JIRA_AUTO_START = os.environ.get("JIRA_AUTO_START", "").strip().lower() in (
+# Ticket auto-start (XERK-32): when set, this host asks the hub to automatically
+# start a session for every "To Do" ticket on its board the moment that ticket has
+# a repo assigned (by the model or by a manual pin). OFF by default and settable
+# ONLY from the agent's config — a host never auto-spawns unless its operator opted
+# in here. Named TICKET_* rather than JIRA_* because the board is Jira today but the
+# concept isn't Jira-specific — other trackers may back it later, and this flag
+# should carry across unchanged. Advertised to the hub as the top-level, board-
+# agnostic `ticketAutoStart` (NOT inside the jira block, for the same reason); the
+# hub owns the decision and the routing, because only it sees the whole fleet and
+# can spread the org's sessions across ALL its agents rather than piling them on
+# whichever one carries this flag. An agent serves exactly one org (one board's
+# creds), so this per-agent flag IS the per-org switch. Read forgivingly.
+TICKET_AUTO_START = os.environ.get("TICKET_AUTO_START", "").strip().lower() in (
     "1", "true", "yes", "on")
 JIRA_TIMEOUT_SEC = 15
 JIRA_PAGE_SIZE = 100    # /search/jql hard-caps maxResults at 100
@@ -5839,9 +5843,7 @@ class SessionManager:
         opts = [{"name": c["name"], "cloned": bool(c.get("cloned")),
                  "nameWithOwner": c.get("nameWithOwner")}
                 for c in (self.triage_cands or [])]
-        # autoStart (XERK-32): the hub reads this to decide whether to auto-spawn
-        # sessions for this org's freshly-triaged To Do tickets. See JIRA_AUTO_START.
-        return dict(self.jira, repoOptions=opts, autoStart=JIRA_AUTO_START)
+        return dict(self.jira, repoOptions=opts)
 
     def _stage_jira_issue(self, key):
         """Handle a {type:"jiraIssue"} command: fetch that issue's full detail
@@ -7493,6 +7495,10 @@ class SessionManager:
             # Jira Cloud assigned tickets (user-scoped creds); the hub's /board
             # merges these across hosts by siteKey into one cross-org Kanban.
             "jira": self._jira_payload(),
+            # Ticket auto-start opt-in (XERK-32): top-level and board-agnostic on
+            # purpose — the hub reads it to decide whether to auto-spawn sessions
+            # for this org's To Do tickets. See TICKET_AUTO_START.
+            "ticketAutoStart": TICKET_AUTO_START,
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),

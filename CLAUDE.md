@@ -1073,8 +1073,16 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
 
 - An org can be **opted in** so the hub auto-starts a session for every **To Do** ticket the moment it
   has a repo assigned — by the model's triage OR a manual pin. Off by default; enabled ONLY via the
-  agent's config env `JIRA_AUTO_START` (`hub-agent.py`), advertised on the heartbeat as
-  `jira.autoStart`. Nothing in the UI turns it on — a host never auto-spawns unless its operator set it.
+  agent's config env `TICKET_AUTO_START` (`hub-agent.py`), advertised on the heartbeat as the
+  **top-level, board-agnostic `ticketAutoStart`** — named TICKET_* not JIRA_* and kept OUT of the
+  `jira` block on purpose, so a future non-Jira board carries it unchanged. Nothing in the UI turns it
+  on — a host never auto-spawns unless its operator set it.
+- It is a **per-org** setting, and per-org for free: an agent holds exactly one board's creds, so it
+  serves exactly one org, so a per-agent config flag IS that org's switch. Enable an org by setting
+  `TICKET_AUTO_START=1` on its agent; disable it by clearing that on the org's agent(s). Across an
+  org's hosts the rule is **OR** — `orgsWithAutoStart` enables the org if ANY online host reports the
+  flag — so on the aspirational multi-agent-per-org setup you disable by clearing all of them (fine on
+  the real one-host-per-org deployment, where there's a single switch).
 - **The decision and routing live on the HUB**, not the agent, for the same reason the manual Start
   button does: only the hub sees the whole fleet, so only it can spread an org's sessions across ALL
   its agents. `autoStartSweep()` (a 15s `setInterval`, boot-grace-gated like the offline sweep) walks

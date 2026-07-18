@@ -6415,11 +6415,10 @@ class TestRefreshJira(ManagerMixin, unittest.TestCase):
             sm.build_payload(0, light=True)               # light beat -> no
             self.assertEqual(len(calls), 2)
         # The cached block rides every payload regardless, carrying the polled
-        # fields verbatim plus the hub-facing extras _jira_payload composes on top
-        # (the picker's repo options and the autoStart flag).
+        # fields verbatim plus the picker's repo options.
         self.assertIn("jira", payload)
         self.assertEqual({k: v for k, v in payload["jira"].items()
-                          if k not in ("repoOptions", "autoStart")}, sm.jira)
+                          if k != "repoOptions"}, sm.jira)
 
     def test_payload_skips_refresh_when_unconfigured(self):
         # The manager is built INSIDE the patch: the block's `configured` flag
@@ -7131,24 +7130,27 @@ class TestSetJiraRepo(ManagerMixin, unittest.TestCase):
             payload = sm.build_payload(1)
         self.assertNotIn("repoOptions", payload["jira"])
 
-    def test_auto_start_flag_is_off_by_default(self):
-        # The hub reads jira.autoStart to decide whether to auto-spawn this org's
-        # To Do tickets; it must default OFF (XERK-32).
+    def test_ticket_auto_start_flag_is_off_by_default(self):
+        # The hub reads the top-level ticketAutoStart to decide whether to auto-spawn
+        # this org's To Do tickets; it must default OFF (XERK-32).
         sm = self._manager()
-        self.assertFalse(sm._jira_payload()["autoStart"])
+        with self._configured():
+            self.assertFalse(sm.build_payload(1)["ticketAutoStart"])
 
-    def test_auto_start_flag_reflects_the_config(self):
+    def test_ticket_auto_start_flag_reflects_the_config(self):
         # Settable ONLY from the agent's config, and honestly advertised when it is.
         sm = self._manager()
-        with mock.patch.object(ha, "JIRA_AUTO_START", True):
-            self.assertTrue(sm._jira_payload()["autoStart"])
+        with self._configured(), mock.patch.object(ha, "TICKET_AUTO_START", True):
+            self.assertTrue(sm.build_payload(1)["ticketAutoStart"])
 
-    def test_an_unconfigured_host_advertises_no_auto_start(self):
-        # No org means nothing to auto-start; the flag doesn't ride at all.
-        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
-                                 JIRA_AUTO_START=True):
-            sm = self.make_manager()
-            self.assertNotIn("autoStart", sm.build_payload(1)["jira"])
+    def test_ticket_auto_start_rides_top_level_not_the_jira_block(self):
+        # Board-agnostic on purpose: the flag lives beside `jira`, not inside it, so
+        # a future non-Jira board carries it unchanged.
+        sm = self._manager()
+        with self._configured(), mock.patch.object(ha, "TICKET_AUTO_START", True):
+            payload = sm.build_payload(1)
+        self.assertNotIn("autoStart", payload["jira"])
+        self.assertTrue(payload["ticketAutoStart"])
 
     def test_the_command_reaches_set_jira_repo(self):
         sm = self._manager()

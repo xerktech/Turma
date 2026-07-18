@@ -810,9 +810,10 @@ setInterval(() => {
 }, 15 * 1000).unref();
 
 // ---- auto-start To Do tickets (XERK-32) ------------------------------------
-// Opt-in PER ORG via the agent's JIRA_AUTO_START config, advertised on the
-// heartbeat as jira.autoStart. When any ONLINE host of an org sets it, the hub
-// starts a session for every "To Do" ticket in that org that has a repo assigned
+// Opt-in PER ORG via the agent's TICKET_AUTO_START config, advertised on the
+// heartbeat as the top-level, board-agnostic `ticketAutoStart` (an agent serves
+// one org, so its per-agent flag is that org's switch). When any ONLINE host of
+// an org sets it, the hub starts a session for every "To Do" ticket with a repo
 // — by the model's triage or a manual pin — and doesn't already have one.
 //
 // The DECISION and the ROUTING live here, not on the agent, for the reason the
@@ -842,7 +843,9 @@ function orgsWithAutoStart() {
   const now = Date.now();
   const on = new Set();
   for (const a of Object.values(agents)) {
-    if (!a.jira || !a.jira.siteKey || !a.jira.autoStart) continue;
+    // The flag rides top-level (board-agnostic); the org it applies to is still
+    // the host's board siteKey, so both must be present.
+    if (!a.ticketAutoStart || !a.jira || !a.jira.siteKey) continue;
     if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
     on.add(a.jira.siteKey);
   }
