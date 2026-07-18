@@ -812,7 +812,22 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   the manager (which re-adopts live sessions) — so an update never stops active sessions, the UI just
   reconnects. Falls back to the legacy `agent-native-v*` stream when no unified release exists. Driven
   by a systemd timer or a `--loop` poller. Tests: `agent/tests/test_turma_agent_update.sh`.
-- Not installed natively: cloud CLIs (aws/az/terraform) + PowerShell; the container is for those.
+- Not installed natively: cloud CLIs (aws/az/terraform) + PowerShell + docker CLI + the Android
+  toolchain; the container is for those.
+- Container ⇄ native parity (the XERK-34 audit): the same `hub-agent.py`/`tunnel-agent.js`/`hooks/`
+  run in both, so the session model, heartbeat, Jira/PR/usage/archive features are identical. The
+  known deltas, beyond the tooling line above and the README's "Known limitations":
+  - **native**: `startedAt`/log-tail are empty (no docker), so the host card's Uptime reads "–" and
+    the hub's restart-loop alert never fires for a native host — a crash-looping native manager is
+    invisible to notifications. Fixable by heartbeating the manager's own start time as a fallback.
+  - **native**: the bundled tmux.conf only takes effect at `/etc/tmux.conf`/`~/.tmux.conf`; a host
+    with its own conf loses truecolor and the OSC 52 copy chain (install.sh warns; hub-agent launches
+    bare `tmux`, so `$PREFIX/tmux.conf` itself is never read, and agent sessions share the user's own
+    tmux server/config).
+  - **container**: the tunnel is fire-and-forget (`entrypoint.sh` backgrounds it once) — a
+    tunnel-agent crash means "host online, every terminal offline" until a container restart, the
+    exact failure the NATIVE tunnel supervisor exists to heal. Socket-level failures self-heal via
+    the reconnect logic, so only a process death (uncaught exception) hits this.
 - Additive: nothing under `native/` edits the shared runtime files; the one enabling change is
   `resume_on_boot`'s adopt path (above), which is backward-compatible with the container.
 - The native tarball is one component of the unified `release.yml` (see Unified releases); the updater

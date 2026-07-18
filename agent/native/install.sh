@@ -194,19 +194,35 @@ install_config() {
   chmod 600 "$CFG" 2>/dev/null || true   # holds a bearer token
 }
 
+# A preserved (non-Turma) tmux.conf is the one silent parity gap vs the
+# container, which always ships ours at /etc/tmux.conf: without the bundled
+# settings the web terminal's truecolor flattens AND every copy made in it is
+# dropped (the OSC 52 chain — the Ms override + set-clipboard on — is what
+# forwards a copy to the viewer's clipboard; XERK-7). Colors failing are
+# visible; the clipboard failing is not, so say so rather than leaving it to be
+# discovered one lost copy at a time. Keyed on set-clipboard, the setting every
+# copy path needs; escapes in the Ms line make it a poor thing to transcribe
+# from a warn, so point at the bundled file to merge from instead.
+_tmux_conf_check() {  # <conf in effect>
+  grep -q "set-clipboard" "$1" 2>/dev/null && return 0
+  warn "$1 lacks the web terminal's settings (truecolor + copy-to-clipboard)."
+  warn "  Merge the lines from $PREFIX/tmux.conf into it, or copies made in the"
+  warn "  web terminal are silently dropped and colors flatten."
+}
+
 install_tmux_conf() {
   if [ -f /etc/tmux.conf ]; then
     info "tmux: using existing /etc/tmux.conf"
+    _tmux_conf_check /etc/tmux.conf
   elif have_sudo || [ "$(id -u)" = 0 ]; then
     $SUDO cp "$PREFIX/tmux.conf" /etc/tmux.conf
-    info "tmux: installed /etc/tmux.conf (truecolor passthrough for the web terminal)"
+    info "tmux: installed /etc/tmux.conf (truecolor + OSC 52 clipboard for the web terminal)"
   elif [ ! -f "$HOME/.tmux.conf" ]; then
     cp "$PREFIX/tmux.conf" "$HOME/.tmux.conf"
     info "tmux: installed ~/.tmux.conf"
   else
-    warn "$HOME/.tmux.conf exists; left as-is. If web-terminal colors look flat, add:"
-    warn "  set -g default-terminal 'tmux-256color'"
-    warn "  set -ga terminal-overrides ',*:RGB'"
+    warn "$HOME/.tmux.conf exists; left as-is."
+    _tmux_conf_check "$HOME/.tmux.conf"
   fi
 }
 
