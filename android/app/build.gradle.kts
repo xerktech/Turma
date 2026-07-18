@@ -64,6 +64,20 @@ android {
             signingConfig = signingConfigs.getByName("release")
         }
     }
+
+    lint {
+        // `assembleRelease` runs `lintVitalRelease` (a fatal-error gate that
+        // `assembleDebug` — all this project's CI ever built before XERK-26 —
+        // never ran), so switching the release pipeline to it surfaced one
+        // latent false positive: InvalidFragmentVersionForActivityResult on
+        // MainActivity's `registerForActivityResult`. That check assumes an
+        // androidx.fragment is on the classpath and wants it ≥1.3.0, but this
+        // app is Compose-only — MainActivity is a bare ComponentActivity and
+        // nothing depends on fragment — so there is no Fragment whose version
+        // could be wrong. Disable that one check; lintVital still gates the
+        // rest of the release build.
+        disable += "InvalidFragmentVersionForActivityResult"
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
