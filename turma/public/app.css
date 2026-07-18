@@ -395,8 +395,36 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 @media (max-width: 900px) {
   .kanban-cols { grid-template-columns: repeat(2, 1fr); }
 }
+/* On phones lay the status columns out as a horizontally-scrollable strip you
+   swipe through, and give each its own vertical scroll — rather than collapsing
+   them into one long stacked list (XERK-24). With four columns, fitting them all
+   across a ~390px screen would crush the cards, so instead each column keeps a
+   comfortable readable width and the row scrolls sideways with scroll-snap; a
+   peek of the next column signals that it swipes.
+   Each column's card list scrolls vertically, capped to roughly a viewport minus
+   the header/toolbar/bottom-nav chrome. The estimate is deliberately rough —
+   being a little off only trades a touch of page scroll for a touch of unused
+   height, never a broken layout — and the `min-height` floor keeps a list usable
+   in landscape, where a full 100dvh is short. The `vh` line is the fallback for
+   browsers without `dvh`. `align-items: start` (from the base rule) carries over
+   to the flex row, so shorter columns pin to the top instead of stretching. */
 @media (max-width: 560px) {
-  .kanban-cols { grid-template-columns: 1fr; }
+  .kanban-cols {
+    display: flex; gap: 10px; padding-bottom: 4px;
+    overflow-x: auto; overscroll-behavior-x: contain;
+    scroll-snap-type: x proximity;
+  }
+  .kanban-col {
+    flex: 0 0 82%; min-width: 0; scroll-snap-align: start;
+    display: flex; flex-direction: column;
+  }
+  .kanban-col .kc-head { padding: 2px 2px 6px; }
+  .kanban-col .kc-list {
+    overflow-y: auto; overscroll-behavior: contain; padding-right: 2px;
+    min-height: 96px;
+    max-height: calc(100vh - 210px);
+    max-height: calc(100dvh - 210px);
+  }
 }
 
 /* ---- Expanded ticket detail (board) ------------------------------------- */
