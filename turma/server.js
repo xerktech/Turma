@@ -38,6 +38,13 @@ const PORT = parseInt(process.env.PORT || "8300", 10);
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
 const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
+// An agent about to restart for an EXPECTED reason (an image update recreating
+// its container, or the native updater swapping files) POSTs /updating just
+// before it goes silent, so the coming heartbeat gap reads as `updating` rather
+// than an unexpected-outage `offline` (XERK-29). We hold that status for this
+// grace window; if the agent never comes back within it the update is stuck and
+// the host correctly falls through to offline (and alerts).
+const UPDATING_GRACE_MS = Number(process.env.UPDATING_GRACE_MS) || 5 * 60 * 1000;
 // Control-channel liveness. A heartbeat is a fresh HTTP POST and so proves
 // nothing about the tunnel: the two die independently, and a host whose tunnel
 // is wedged still reports `online` while every Attach on it reads "terminal
@@ -242,10 +249,16 @@ function invalidateAgentsCache() { agentsCache = null; }
 // lockstep.
 function serializeAgent(key, agent, now) {
   const { history, subagentHistory, jiraIssues, ...a } = agent;
+  const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   return {
     key,
     ...a,
-    online: now - (a.lastSeen || 0) < OFFLINE_AFTER_MS,
+    online,
+    // An expected restart in progress (XERK-29): only meaningful while the host
+    // is actually silent — a host that came back is just `online` again, and its
+    // heartbeat rebuild already dropped the stored flag — and only until the
+    // grace window lapses, past which a stuck update falls through to `offline`.
+    updating: !online && a.updating && now < a.updating.until ? a.updating : null,
     // Only true when this container's reverse tunnel is live right now.
     terminalOnline: !!controlChannels[key],
   };
@@ -794,7 +807,11 @@ setInterval(() => {
   if (now - BOOT_AT < BOOT_GRACE_MS) return;
   for (const [key, a] of Object.entries(agents)) {
     const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
-    if (online || a.alerts?.offlineAt) continue;
+    // An announced update in progress isn't an outage — hold the offline alert
+    // until its grace window lapses. If the update gets stuck the host crosses
+    // to genuinely-offline once `until` passes and this fires as normal (XERK-29).
+    const updating = a.updating && now < a.updating.until;
+    if (online || updating || a.alerts?.offlineAt) continue;
     a.alerts = a.alerts || {};
     a.alerts.offlineAt = now;
     const where = a.device ? ` on ${a.device}` : "";
@@ -1323,12 +1340,19 @@ const server = http.createServer(async (req, res) => {
       req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
       parts[3] === "archive" && parts.length === 5;
 
+    // The expected-restart signal is agent-pushed (bearer token) like the
+    // heartbeat: the agent fires it as it goes down, before it could ever hold
+    // a user login (XERK-29).
+    const isUpdatingSignal =
+      req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+      parts[3] === "updating" && parts.length === 4;
+
     // The programmatic trigger endpoint carries its own bearer-token auth (or a
     // user login), so it's gated by triggerAuthorized instead of the
     // browser-only userAuthorized gate below.
     const isTrigger = req.method === "POST" && url.pathname === "/api/trigger";
 
-    if (url.pathname === "/api/heartbeat" || isArchiveIngest) {
+    if (url.pathname === "/api/heartbeat" || isArchiveIngest || isUpdatingSignal) {
       if (!agentAuthorized(req)) return json(res, 401, { error: "unauthorized" });
     } else if (isTrigger) {
       if (!triggerAuthorized(req)) return json(res, 401, { error: "unauthorized" });
@@ -1568,6 +1592,34 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, archiveHave ? { commands, archiveHave } : { commands });
     }
 
+    // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart
+    // (an image update recreating its container, or the native self-updater) just
+    // before it stops heartbeating, so the coming silence renders as `updating`
+    // rather than an unexpected-outage `offline` (XERK-29). Agent-authed above,
+    // like the heartbeat/archive. Body: {reason, version}. The status auto-clears
+    // the instant the host heartbeats again (the beat rebuilds the record without
+    // it) or once the grace window lapses on a stuck update.
+    if (isUpdatingSignal) {
+      const key = decodeURIComponent(parts[2]);
+      const a = agents[key];
+      // Only a host we already know can be "updating" — an unknown key has no
+      // record to hang the status on and nothing to suppress an alert for.
+      if (!a) return json(res, 404, { error: "unknown host" });
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const now = Date.now();
+      a.updating = {
+        at: now,
+        until: now + UPDATING_GRACE_MS,
+        reason: typeof body.reason === "string" ? body.reason.slice(0, 40) : "restart",
+        version: typeof body.version === "string" ? body.version.slice(0, 40) : null,
+      };
+      scheduleSave();
+      // Refresh the memoized fleet payload (its `updating`/`online` flags just
+      // changed) and push the transition to open dashboards immediately.
+      publishAgent(key);
+      return json(res, 200, { ok: true });
+    }
+
     // POST /api/agents/<host>/archive/<transcriptId> — an agent pushing one delta
     // chunk of an inactive session's transcript into the durable hub archive.
     // Agent-authed above. Body: {startOffset, endOffset, size, entries, meta}.
@@ -1790,13 +1842,17 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/model -> switch a running
-      // session's model live (agent types `/model <name>`). Body: {model}, one
-      // of the composer's allowlisted aliases (default/opus/sonnet/haiku); the
-      // agent re-validates before it reaches the pane.
+      // session's model live, for that session only (the agent drives the
+      // /model picker's session-only path). Body: {model}, an alias from the
+      // host's probed `models.available` (or the static fallback set); the
+      // agent re-validates against its own allowlist before any key is pressed
+      // — this check only rejects the plainly malformed.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "model") {
         const body = JSON.parse((await readBody(req)) || "{}");
         const model = typeof body.model === "string" ? body.model : "";
         if (!model) return json(res, 400, { error: "model required" });
+        if (model.length > 60 || !/^[a-z0-9.[\]-]+$/i.test(model))
+          return json(res, 400, { error: "invalid model" });
         const cmdId = queueCommand(key, { type: "setModel", sessionId, model });
         return json(res, 200, { ok: true, cmdId });
       }
@@ -2408,6 +2464,7 @@ if (process.env.TURMA_TEST) {
   module.exports = {
     server,
     agents,
+    invalidateAgentsCache,
     queueCommand,
     findSession,
     wsAccept,

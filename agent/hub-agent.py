@@ -104,6 +104,17 @@ WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".turma", "worktrees")
 # Persisted session registry (survives container restart).
 REGISTRY_DIR = os.path.expanduser("~/.turma")
 REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
+# Expected-restart signal (XERK-29). Before the manager goes down for a restart
+# it can't heartbeat through — an image update recreating the whole container,
+# or the native updater swapping files and `systemctl restart`ing us — it POSTs
+# the hub a one-shot "I'm updating" so the coming heartbeat gap renders as an
+# `updating` status instead of an unexpected-outage `offline`. The native
+# updater drops the target version here for our SIGTERM handler to read and
+# enrich the announcement with; a container update (Watchtower) leaves no file
+# and we announce a generic restart. Lives beside the other ~/.turma ledgers.
+UPDATING_FLAG_PATH = os.path.join(REGISTRY_DIR, "updating.json")
+UPDATING_ANNOUNCE_TIMEOUT_SEC = float(
+    os.environ.get("TURMA_UPDATING_ANNOUNCE_TIMEOUT_SEC", "4"))
 # Rendezvous dir for the AskUserQuestion bridge (agent/hooks/ask.py). A pending
 # question lives here as `<sessionId>.req.json`; the answer the glasses client
 # sends rides back as `<sessionId>.ans.json`. See _hook_question / answer_question.
@@ -356,7 +367,20 @@ def slugify(s):
 
 # Model aliases the UI offers -> the value handed to `claude --model`. "default"
 # (or blank) means "don't pass --model at all" (claude's own default model).
-MODEL_ALIASES = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku"}
+# The static floor, not the whole story: the account's REAL alias list is probed
+# from the CLI itself on a slow cadence (see "available-models probe" below) and
+# resolve_model() accepts those probed aliases too, so a model the login gains
+# (e.g. fable) is offerable without a rebuild.
+MODEL_ALIASES = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku",
+                 "fable": "fable"}
+# A probed alias that may be interpolated into a launch command line: lowercase
+# word-ish, no brackets — `--model sonnet[1m]` unquoted is a shell glob, so the
+# bracketed aliases are valid to SWITCH to live (the picker path types nothing)
+# but are never accepted into a spawn's command string.
+SPAWN_MODEL_RE = re.compile(r"^[a-z0-9.-]{1,40}$")
+# A token from the CLI's own "Available: …" alias list (bracketed 1M variants
+# included).
+MODEL_ALIAS_TOKEN_RE = re.compile(r"^[a-z0-9.-]{1,40}(\[1m\])?$")
 # Permission modes the UI offers. "auto" is the default (claude's classifier-
 # gated hands-off mode); "bypassPermissions" disables prompts entirely; "default"
 # means "omit --permission-mode" (claude's own manual-review default).
@@ -440,14 +464,19 @@ def resolve_base_ref(repo_path, base_ref):
     return base_ref
 
 
-def resolve_model(model):
+def resolve_model(model, extra=()):
     """Map a UI model choice to a `claude --model` value, or None to omit the
-    flag. Fixed allowlist — never passes free-form text to claude."""
+    flag. Allowlist only — never passes free-form text to claude: the static
+    MODEL_ALIASES, plus `extra` (the aliases the CLI itself reported available,
+    from the models probe), each still charset-checked because they end up
+    interpolated into a launch command line."""
     model = (model or "").strip().lower()
     if not model or model == "default":
         return None
     if model in MODEL_ALIASES:
         return MODEL_ALIASES[model]
+    if model in extra and SPAWN_MODEL_RE.fullmatch(model):
+        return model
     raise ValueError(f"unknown model {model!r}")
 
 
@@ -1910,6 +1939,13 @@ def _scan_pr_line(raw, state, report):
         entry = json.loads(raw)
     except ValueError:
         return  # partial write, or the backlog cap's leading fragment
+    if isinstance(entry, dict):
+        _scan_pr_entry(entry, state, report)
+
+
+def _scan_pr_entry(entry, state, report):
+    """_scan_pr_line's fold, taking the already-parsed entry (the shared
+    per-line scan parses each line once for every scanner)."""
     msg = entry.get("message") if isinstance(entry, dict) else None
     content = msg.get("content") if isinstance(msg, dict) else None
     if not isinstance(content, list):
@@ -1931,6 +1967,57 @@ def _scan_pr_line(raw, state, report):
                 if url not in seen:
                     seen.add(url)
                     report["prUrls"].append(url)
+
+
+# The confirmation line Claude Code prints (and transcribes as local-command
+# stdout) when its model changes: "Set model to <X> for this session only" /
+# "…and saved as your default for new sessions". The captured label ("Sonnet 5")
+# is display text, not a model id. "Kept model as X" (a cancelled picker) is
+# deliberately not matched — nothing changed.
+SET_MODEL_STDOUT_RE = re.compile(
+    r"Set model to\s+(.+?)"
+    r"(?:\s+for this session only|\s+and saved as your default\b.*)?\s*$",
+    re.MULTILINE)
+
+
+def _scan_model_entry(entry, report):
+    """Fold one parsed transcript entry into the session's actual-model read.
+
+    Two signals, both chronological (the scan feeds lines in order, so the last
+    one seen wins): an assistant entry's `message.model` — the id of the model
+    that actually produced that turn — and the "Set model to X" local-command
+    stdout a live `/model` switch writes, which confirms a switch the instant it
+    lands rather than a whole turn later. The result is a model ID in the first
+    case and a display label in the second; the hub's prettifier renders both."""
+    if entry.get("type") == "assistant":
+        model = (entry.get("message") or {}).get("model")
+        # "<synthetic>" is Claude Code's stamp on entries it fabricates itself
+        # (e.g. error placeholders) — not a model that answered.
+        if isinstance(model, str) and model and not model.startswith("<"):
+            report["modelActual"] = model
+        return
+    if entry.get("type") == "system" and entry.get("subtype") == "local_command":
+        lc = _parse_local_command(entry.get("content") or "")  # `claude -p` shape
+    else:
+        lc = _entry_local_command(entry)  # the interactive-TUI (user turn) shape
+    if not lc or lc.get("kind") != "output" or not lc.get("text"):
+        return
+    m = SET_MODEL_STDOUT_RE.search(lc["text"])
+    if m:
+        report["modelActual"] = m.group(1).strip()
+
+
+def _scan_entry_line(raw, state, report):
+    """Fold one appended transcript line into every incremental per-beat scan
+    (PR attribution + actual model) with a single JSON parse."""
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return  # partial write, or the backlog cap's leading fragment
+    if not isinstance(entry, dict):
+        return
+    _scan_pr_entry(entry, state, report)
+    _scan_model_entry(entry, report)
 
 
 def _entry_blocks(entry, caps):
@@ -2223,6 +2310,33 @@ def _first_user_text(path, max_lines=500):
                 if not text:
                     continue  # tool_result-only turn, or empty after stripping
                 return text
+    except OSError:
+        return None
+    return None
+
+
+def _first_command_name(path, max_lines=50):
+    """The first slash-command invocation recorded at the top of a transcript
+    ("/model", …), or None. The complement of _first_user_text — which
+    deliberately skips command plumbing — for recognizing a transcript that IS
+    nothing but a command, like the manager's own models probe."""
+    try:
+        with open(path, errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                lc = _entry_local_command(entry)
+                if lc and lc.get("kind") == "command" and lc.get("name"):
+                    return lc["name"]
     except OSError:
         return None
     return None
@@ -2560,6 +2674,18 @@ def _pane_busy(tmux_name):
             gracefully rather than reporting a wrong state."""
     if not tmux_name or not PANE_BUSY_MARKERS:
         return None
+    cap = _capture_pane(tmux_name)
+    if cap is None:
+        return None
+    low = cap.lower()
+    return any(m in low for m in PANE_BUSY_MARKERS)
+
+
+def _capture_pane(tmux_name):
+    """The session pane's current text, or None when it can't be captured
+    (tmux gone, timeout)."""
+    if not tmux_name:
+        return None
     try:
         out = subprocess.run(
             ["tmux", "capture-pane", "-p", "-t", tmux_name],
@@ -2569,8 +2695,7 @@ def _pane_busy(tmux_name):
         return None
     if out.returncode != 0:
         return None
-    low = out.stdout.lower()
-    return any(m in low for m in PANE_BUSY_MARKERS)
+    return out.stdout
 
 
 def session_report(workdir, state, tmux_name=None, session_id=None,
@@ -2610,6 +2735,7 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         "questionMulti": False,    # multiSelect (pick several, then submit)
         "questionSource": None,    # "transcript" | "hook" | None — which detector fired
         "prUrls": [],              # PR links newly appended since last beat
+        "modelActual": None,       # newest actual-model signal appended this beat
         "tail": [],                # recent transcript messages, for the glasses client
     }
 
@@ -2694,10 +2820,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
                             report["questionSource"] = "transcript"
 
     # Incremental scan over the bytes appended to the active transcript, for the
-    # PRs this session OPENED (see _scan_pr_line for what counts). Only COMPLETE
-    # JSONL lines are consumed — the offset stops at the last newline, so an
-    # entry still being written is re-read whole next beat rather than parsed in
-    # half and lost.
+    # PRs this session OPENED (see _scan_pr_line for what counts) and the model
+    # actually answering (_scan_model_entry). Only COMPLETE JSONL lines are
+    # consumed — the offset stops at the last newline, so an entry still being
+    # written is re-read whole next beat rather than parsed in half and lost.
     try:
         size = os.stat(newest).st_size
         start = offsets.get(newest, 0)
@@ -2713,7 +2839,7 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
             end = raw.rfind(b"\n") + 1  # 0 when no line has completed yet
             for line in raw[:end].split(b"\n"):
                 if line.strip():
-                    _scan_pr_line(line, state, report)
+                    _scan_entry_line(line, state, report)
             consumed = start + end
         offsets[newest] = consumed
     except OSError:
@@ -3768,6 +3894,95 @@ def _looks_like_internal_tool_prompt(text):
     return any(head.startswith(sig) for sig in INTERNAL_TOOL_PROMPT_SIGS)
 
 
+# --- available-models probe + live model switching ------------------------------
+# The chat page's model menu used to be a hardcoded guess, and "Default" was all
+# it could say about the model a session was really running (XERK-33). Two reads
+# fix that, both from claude itself rather than a rate table baked here:
+#   - `claude -p "/model"` prints "Current model: <label>" and "Usage: /model
+#     <name>. Available: <aliases>…" — the login's REAL alias list and what
+#     "default" currently resolves to, probed on a slow cadence (below).
+#   - each session's transcript names the model that actually answered
+#     (_scan_model_entry), which the heartbeat carries as `modelActual`.
+# The probe is a detached one-shot like the summary/triage helpers (same shared
+# login, cwd=REGISTRY_DIR so its transcript is tombstoned as internal overhead —
+# see _is_internal_tool_slug, which also recognizes it by its command name in a
+# harness's foreign REGISTRY_DIR slug).
+MODEL_PROBE_PROMPT = "/model"
+MODELS_REFRESH_EVERY = int(os.environ.get("TURMA_MODELS_REFRESH_EVERY", "1080")
+                           or 1080)   # beats (~6h at the 20s interval)
+MODELS_RETRY_EVERY = 45               # beats (~15 min) until the first success
+MODELS_PROBE_TIMEOUT_SEC = int(
+    os.environ.get("TURMA_MODELS_PROBE_TIMEOUT_SEC", "90") or 90)
+# How long set_model waits for the /model picker to paint after opening it:
+# up to TRIES polls, WAIT_SEC apart. Runs on the command path of the heartbeat
+# loop, so the worst case (~3s) is bounded well under a spawn's git fetch.
+MODEL_PICKER_TRIES = 10
+MODEL_PICKER_WAIT_SEC = 0.3
+
+
+def parse_model_probe(text):
+    """Parse `claude -p "/model"` output into {"available": [aliases],
+    "defaultLabel": str|None}, or None when the Available list can't be read
+    (treat as a failed attempt, never as "no models"). Tokens that aren't
+    alias-shaped — the trailing "or a full model ID." — are dropped; "default"
+    is guaranteed onto the list since picking it is always legal."""
+    text = ANSI_RE.sub("", text or "")
+    m = re.search(r"Available:\s*(.+)", text)
+    if not m:
+        return None
+    avail = []
+    for tok in m.group(1).split(","):
+        tok = tok.strip().rstrip(".").strip()
+        if tok and MODEL_ALIAS_TOKEN_RE.fullmatch(tok) and tok not in avail:
+            avail.append(tok)
+    if not avail:
+        return None
+    if "default" not in avail:
+        avail.append("default")
+    dm = re.search(r"Current model:\s*(.+)", text)
+    label = dm.group(1).strip() if dm else None
+    return {"available": avail, "defaultLabel": label or None}
+
+
+def parse_model_picker(text):
+    """Parse a pane capture of Claude Code's /model picker into its option rows.
+
+    Returns (labels, current): the row labels top-to-bottom (description column
+    stripped — it sits 2+ spaces right of the label; the ✔ current-model mark
+    dropped) and the index the ❯ cursor is on, or ([], None) when the capture
+    holds no picker. Only the region from the last "Select model" heading down
+    is read, so numbered lines in the conversation above can't parse as rows."""
+    text = ANSI_RE.sub("", text or "")
+    pos = text.rfind("Select model")
+    if pos < 0:
+        return [], None
+    rows, cur = [], None
+    for line in text[pos:].splitlines():
+        m = re.match(r"^\s*(❯\s+)?(\d+)\.\s+(.+?)\s*$", line)
+        if not m:
+            continue
+        label = re.split(r"\s{2,}", m.group(3))[0].replace("✔", "").strip()
+        if not label:
+            continue
+        rows.append(label)
+        if m.group(1):
+            cur = len(rows) - 1
+    return rows, cur
+
+
+def _picker_index_for(rows, resolved):
+    """The picker row a resolved model alias (None = default) selects, or None
+    when the picker doesn't offer it. Rows lead with the alias as a word —
+    "Default (recommended)", "Opus", "Fable ✔" — so the match is on the first
+    word, case-folded."""
+    want = (resolved or "default").lower()
+    for i, label in enumerate(rows):
+        head = label.split()[0].lower() if label.split() else ""
+        if head == want:
+            return i
+    return None
+
+
 def clean_summary(raw):
     """Reduce raw `claude -p` output to a short display name, or None. Takes the
     first non-empty line, strips surrounding quotes/backticks and trailing
@@ -3850,6 +4065,15 @@ class SessionManager:
         # AskUserQuestion bridge rendezvous dir (ask.py writes req files here).
         try:
             os.makedirs(QUESTIONS_DIR, exist_ok=True)
+        except OSError:
+            pass
+        # We've just (re)started, so any expected-restart hint the updater left
+        # for the PREVIOUS shutdown has served its purpose — clear it so a later
+        # SIGKILL (no handler) can't leak a stale version into a future announce
+        # (XERK-29). The hub already cleared the `updating` status the instant
+        # this boot's first heartbeat landed.
+        try:
+            os.unlink(UPDATING_FLAG_PATH)
         except OSError:
             pass
         self.registry = self._load_list(REGISTRY_PATH)  # persisted live sessions
@@ -3938,6 +4162,16 @@ class SessionManager:
         # + its output file live here; the finished text lands on the session
         # record). Empty when no session has a prompt to summarize.
         self.summaries = {}
+        # The login's real model list, from the `claude -p "/model"` probe:
+        # {"available": [aliases], "defaultLabel": "Fable 5", "at": iso} once a
+        # probe has succeeded, None until then (the hub falls back to its static
+        # menu). In-memory only — a restart re-probes within a beat or two.
+        self.models_info = None
+        self.models_probe = None       # the in-flight probe job, or None
+        # Sessions whose modelActual has been seeded from their transcript tail
+        # this process — the seed is a one-shot bounded read per session, for
+        # records predating the field (the per-beat scan only sees new bytes).
+        self._model_seeded = set()
         # Cached Jira-ticket -> repo triage decisions (persisted), plus the single
         # in-flight triage subprocess. At most one runs at a time: a backlog
         # trickles out a batch per jira beat rather than forking N models at once
@@ -5079,7 +5313,7 @@ class SessionManager:
         # or permission mode fails the spawn cleanly whether it runs now or waits
         # in the queue. Model and permission mode apply to root too.
         try:
-            sess["model"] = resolve_model(model)
+            sess["model"] = resolve_model(model, self.models_available())
             sess["permissionMode"] = resolve_permission_mode(permission_mode)
         except Exception as e:
             self._set_error(sess, e)
@@ -5688,23 +5922,75 @@ class SessionManager:
             else f"cleared name of session {sid}")
 
     def set_model(self, sid, model):
-        """Switch a running session's model live by typing `/model <name>` into
-        its Claude TUI — the CLI applies it immediately (no picker). `default`
-        (or blank) resets to claude's own default model. Validation reuses
-        resolve_model, so only an allowlisted alias/`default` ever reaches the
-        pane, and the resolved value is stored back on the record so the
-        heartbeat/UI reflect the new model."""
+        """Switch a running session's model live — for THIS SESSION ONLY — by
+        driving Claude Code's /model picker: open it, arrow to the chosen row,
+        and press `s` ("use this session only").
+
+        It used to type `/model <name>`, which looks equivalent and isn't: the
+        argument form ALSO saves the pick as the login-wide default for new
+        sessions, and every session on the host shares that one login — so
+        switching one session's model silently changed what "Default" meant for
+        every future session on every host (XERK-33). The picker's `s` is the
+        only session-scoped switch the CLI exposes, so the picker is driven for
+        real: capture the pane, find the target row and the ❯ cursor, press the
+        arrows between them. A pane the picker never appears on, or a picker
+        with no row for the target (the bracketed 1M aliases have none), is
+        Escaped out of and logged — the record keeps the real model, and the
+        heartbeat corrects the UI's optimistic guess.
+
+        Two reliability fixes ride along: the input line is cleared (C-u)
+        first, so a half-typed operator prompt can't fuse with the command into
+        garbage; and a FRESH busy read gates the whole thing — typed into a
+        mid-turn pane the command would only be queued as a prompt, so it is
+        refused (log-only) rather than misfired. Unlike interrupt(), which
+        tolerates a stale idle read because Escape is harmless, this path types
+        into the pane, so it checks the pane NOW rather than trusting the
+        beat-old paneBusy."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
-        resolved = resolve_model(model)  # None for default, else alias; raises on junk
+        # None for default, else a validated alias (static or probed); raises on
+        # junk. The alias never reaches a command line here (the picker is
+        # arrow-driven), but the same allowlist keeps the two paths honest.
+        resolved = resolve_model(model, self.models_available())
         arg = resolved or "default"
         tmux_name = sess["tmuxName"]
-        run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", f"/model {arg}"])
+        if _pane_busy(tmux_name):
+            log(f"set model of {sid} -> {arg}: turn in flight, not typing into "
+                f"a busy pane; retry when idle")
+            return
+        run(["tmux", "send-keys", "-t", tmux_name, "C-u"])
+        run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", "/model"])
         run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+        rows, cur = [], None
+        for _ in range(MODEL_PICKER_TRIES):
+            time.sleep(MODEL_PICKER_WAIT_SEC)
+            rows, cur = parse_model_picker(_capture_pane(tmux_name) or "")
+            if rows:
+                break
+        if not rows or cur is None:
+            # No picker appeared (or no cursor to navigate from): back out.
+            # The pane was idle a moment ago, so Escape lands on the prompt (or
+            # closes a half-painted picker) and destroys nothing.
+            run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+            log(f"set model of {sid} -> {arg}: /model picker did not appear")
+            return
+        target = _picker_index_for(rows, resolved)
+        if target is None:
+            run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+            log(f"set model of {sid} -> {arg}: picker offers no such row "
+                f"({', '.join(rows)})")
+            return
+        key = "Down" if target > cur else "Up"
+        for _ in range(abs(target - cur)):
+            run(["tmux", "send-keys", "-t", tmux_name, key])
+        run(["tmux", "send-keys", "-t", tmux_name, "-l", "s"])
         sess["model"] = resolved
+        # The switch confirms in-transcript ("Set model to X for this session
+        # only"), which the per-beat scan folds into modelActual — the chip
+        # shows the model that's really answering, not this stored intent.
         self.save()
-        log(f"set model of {sid} -> {arg}")
+        log(f"set model of {sid} -> {arg} (session only)")
 
     def set_mode(self, sid, mode):
         """Switch a running session's permission mode live by injecting the number
@@ -6700,6 +6986,124 @@ class SessionManager:
                 log(f"summary for {sid} exited {rc}")
             self._finish_summary(sid, job, clean_summary(raw))
 
+    # --- available-models probe --------------------------------------------
+
+    def _start_models_probe(self):
+        """Kick off the `claude -p "/model"` probe (see parse_model_probe) as a
+        DETACHED subprocess reaped by _poll_models_probe — the same shape as the
+        summary/triage helpers: cwd=REGISTRY_DIR (its transcript is internal
+        overhead, tombstoned off the usage page), no --settings, argv list.
+        No-op while one is already in flight."""
+        if self.models_probe:
+            return
+        out_path = os.path.join(REGISTRY_DIR, "models-probe.out")
+        outf = None
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            outf = open(out_path, "w")
+            proc = subprocess.Popen(
+                ["claude", "-p", MODEL_PROBE_PROMPT],
+                stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+            )
+        except Exception as e:
+            log(f"models probe launch failed: {e}")
+            if outf is not None:
+                try:
+                    outf.close()
+                except Exception:
+                    pass
+            return
+        self.models_probe = {"proc": proc, "outf": outf, "outPath": out_path,
+                             "startedMono": time.time()}
+
+    def _poll_models_probe(self):
+        """Reap a finished models probe: parse its output into models_info, or
+        log and leave the previous read standing (an unparseable/failed run is a
+        property of the attempt — never downgrade a good list over it). Kills a
+        probe that overran its timeout, like _poll_summaries."""
+        job = self.models_probe
+        if not job:
+            return
+        proc = job.get("proc")
+        rc = proc.poll() if proc else 1
+        if rc is None:
+            if time.time() - job.get("startedMono", 0) > MODELS_PROBE_TIMEOUT_SEC:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                log("models probe timed out")
+                self._finish_models_probe(job, None)
+            return
+        raw = None
+        if rc == 0:
+            try:
+                with open(job.get("outPath") or "", errors="replace") as f:
+                    raw = f.read()
+            except OSError:
+                raw = None
+        else:
+            log(f"models probe exited {rc}")
+        self._finish_models_probe(job, raw)
+
+    def _finish_models_probe(self, job, raw):
+        try:
+            if job.get("outf"):
+                job["outf"].close()
+        except Exception:
+            pass
+        try:
+            os.unlink(job.get("outPath") or "")
+        except OSError:
+            pass
+        self.models_probe = None
+        parsed = parse_model_probe(raw) if raw else None
+        if parsed:
+            self.models_info = {**parsed, "at": now_iso()}
+            log(f"models probe: {', '.join(parsed['available'])}"
+                + (f" (default {parsed['defaultLabel']})"
+                   if parsed.get("defaultLabel") else ""))
+        elif raw is not None:
+            log("models probe output unparseable; keeping previous list")
+
+    def models_available(self):
+        """The probed alias list, or () before the first successful probe —
+        the `extra` allowlist resolve_model/set_model accept beyond the static
+        MODEL_ALIASES."""
+        return tuple((self.models_info or {}).get("available") or ())
+
+    def _seed_model_actual(self, sess):
+        """One-shot: the newest actual-model signal already IN a session's
+        transcript, for a record that predates the field (the per-beat scan
+        primes to EOF, so history never replays through it). Bounded to the
+        transcript's last 64 KiB — an assistant turn sits within that in any
+        conversation that has one."""
+        path = _session_transcript_path(sess)
+        if not path:
+            return None
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - (64 << 10)))
+                raw = f.read()
+        except OSError:
+            return None
+        tmp = {"modelActual": None}
+        # Skip the first fragment of a mid-entry start; fold the rest in order
+        # so the newest signal wins, exactly like the live scan.
+        lines = raw.split(b"\n")
+        for line in (lines[1:] if size > (64 << 10) else lines):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                _scan_model_entry(entry, tmp)
+        return tmp["modelActual"]
+
     # --- prune merged branches + safe worktrees ----------------------------
 
     def _repo_worktrees(self, repo_path):
@@ -7102,8 +7506,16 @@ class SessionManager:
             return False
         newest = max(files,
                      key=lambda f: os.path.getmtime(os.path.join(proj, f)))
-        return _looks_like_internal_tool_prompt(
-            _first_user_text(os.path.join(proj, newest)))
+        newest_path = os.path.join(proj, newest)
+        first = _first_user_text(newest_path)
+        if _looks_like_internal_tool_prompt(first):
+            return True
+        # The models probe's prompt IS a slash command ("/model"), which
+        # _first_user_text deliberately skips — so its transcript has no genuine
+        # user text at all. Recognize it by its first (and only) command; a real
+        # session that OPENS with /model goes on to carry genuine prompts, which
+        # makes `first` non-None and keeps it counted.
+        return first is None and _first_command_name(newest_path) == MODEL_PROBE_PROMPT
 
     def _sanitize_internal_tool_entries(self):
         """Retire ledger entries that actually point at the manager's own internal
@@ -7319,6 +7731,18 @@ class SessionManager:
                     # into a session's ENDED life — reported then only by the
                     # resumable scan, past closed.json's cap. (XERK-13)
                     self._remember_prs(sess)
+                # The model that actually answered (or a live /model switch's
+                # confirmation), persisted on the record so the chip survives
+                # beats and restarts. The per-beat scan only sees new bytes, so
+                # a record predating the field seeds once from the tail.
+                actual = signals.pop("modelActual", None)
+                if (not actual and not sess.get("modelActual")
+                        and sid not in self._model_seeded):
+                    actual = self._seed_model_actual(sess)
+                self._model_seeded.add(sid)
+                if actual and actual != sess.get("modelActual"):
+                    sess["modelActual"] = actual
+                    self.save()
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
@@ -7343,6 +7767,11 @@ class SessionManager:
             # the session. None for sessions predating the echo, or restored ones.
             "spawnCmdId": sess.get("spawnCmdId"),
             "model": sess.get("model"),
+            # The model REALLY answering, read from the transcript (a model id
+            # like "claude-opus-4-8", or a switch confirmation's display label
+            # like "Sonnet 5") — what the chat chip shows instead of "Default".
+            # None until the session's first assistant turn.
+            "modelActual": sess.get("modelActual"),
             "permissionMode": sess.get("permissionMode"),
             # The permission modes this session's live Shift+Tab cycle can reach
             # (base modes + whichever optional it was launched into) — the hub's
@@ -7594,6 +8023,13 @@ class SessionManager:
         # reap any finished naming subprocess.
         self._seed_summaries()
         self._poll_summaries()
+        # Probe the login's real model list on its own slow cadence (beat 0
+        # covers boot), retrying faster until the first success so the hub's
+        # model menu isn't a static guess for hours after a restart.
+        if not light and (beat % MODELS_REFRESH_EVERY == 0 or (
+                self.models_info is None and beat % MODELS_RETRY_EVERY == 0)):
+            self._start_models_probe()
+        self._poll_models_probe()
 
         payload = {
             # `device` (the physical host name) is the hub's identity key; agentId
@@ -7604,6 +8040,10 @@ class SessionManager:
             "agentVersion": self.agent_version,
             "codingAgent": self.coding_agent,
             "claudeVersion": self.claude_version,
+            # The login's real model list + what "default" currently resolves
+            # to, from the models probe. None until the first successful probe;
+            # the hub's model menu falls back to its static list then.
+            "models": self.models_info,
             "memory": memory_usage(),
             "logTail": self._log_tail(beat, light),
             "reposRoot": REPOS_ROOT,
@@ -7680,6 +8120,58 @@ class SessionManager:
             log(f"heartbeat failed: {e}")
             return None
 
+    def _read_updating_flag(self):
+        """Consume the native updater's hint file (reason + target version) if it
+        left one just before triggering our restart. Returns (reason, version),
+        both None when absent/garbled — a container update leaves no file, so a
+        missing one just means a generic restart with no known version."""
+        try:
+            with open(UPDATING_FLAG_PATH) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return None, None
+        if not isinstance(d, dict):
+            return None, None
+        return d.get("reason"), d.get("version")
+
+    def _announce_updating(self, reason="restart", version=None):
+        """Tell the hub we're going down for an EXPECTED restart, so it renders an
+        `updating` status rather than treating the coming heartbeat silence as an
+        unexpected outage (XERK-29). Fire-and-forget with a short timeout: we're
+        on the shutdown path and must never block the exit if the hub is slow or
+        unreachable. The hub drops the status the instant we heartbeat from the
+        far side, so no one has to clear it."""
+        if not TURMA_URL:
+            return
+        try:
+            body = {"reason": reason or "restart"}
+            if version:
+                body["version"] = version
+            headers = {"Content-Type": "application/json", "User-Agent": "hub-agent/1.0"}
+            if TURMA_TOKEN:
+                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+            url = (f"{TURMA_URL}/api/agents/"
+                   f"{urllib.parse.quote(self.device, safe='')}/updating")
+            req = urllib.request.Request(
+                url, data=json.dumps(body).encode(), headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=UPDATING_ANNOUNCE_TIMEOUT_SEC) as resp:
+                resp.read()
+            log(f"announced updating to hub (reason={reason or 'restart'}"
+                f"{', v' + version if version else ''})")
+        except Exception as e:
+            log(f"updating announce failed (continuing shutdown): {e}")
+
+    def _handle_shutdown(self, signum, frame):
+        """SIGTERM/SIGINT: we're being stopped for a restart we can't heartbeat
+        through — a container recreate on an image update, or the native updater's
+        `systemctl restart`. Announce it as EXPECTED (XERK-29), then exit so the
+        supervisor (systemd / Docker) brings us back. Sessions survive natively
+        (KillMode=process) and are re-adopted on boot; a container recreate takes
+        the whole stack down, which is exactly the outage this status explains."""
+        reason, version = self._read_updating_flag()
+        self._announce_updating(reason or "restart", version)
+        raise SystemExit(0)
+
     def run_forever(self):
         log(
             f"reporting to {TURMA_URL} as {self.device} (container {self.agent_id}); "
@@ -7691,6 +8183,12 @@ class SessionManager:
         # can poke; run_forever is the main thread, where signal handlers must
         # be set.
         signal.signal(signal.SIGUSR1, lambda *_: _poke.set())
+        # SIGTERM/SIGINT = the supervisor is restarting us (an update swapping
+        # files, or a container recreate). Announce it to the hub as an EXPECTED
+        # restart before we go silent (XERK-29), then exit for the supervisor to
+        # bring us back. Must be set on the main thread, like SIGUSR1 above.
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+        signal.signal(signal.SIGINT, self._handle_shutdown)
         self.resume_on_boot()
         beat = 0
         while True:

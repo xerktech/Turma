@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -650,6 +650,47 @@ test("filterModeOpts: the current mode is always kept even if not in the reachab
   const avail = ["default", "acceptEdits", "plan"];
   const vals = modeVals(filterModeOpts(MODE_OPTS, avail, "bypassPermissions"));
   assert.ok(vals.includes("bypassPermissions"));
+});
+
+// ---- modelOpts / prettyModel (the accurate model selector, XERK-33) ------
+const modelVals = (opts) => opts.map((o) => o.value);
+
+test("modelOpts: no models block -> the static fallback menu (older agent)", () => {
+  assert.deepEqual(modelOpts(undefined), MODEL_OPTS);
+  assert.deepEqual(modelOpts(null), MODEL_OPTS);
+  assert.deepEqual(modelOpts({ available: [] }), MODEL_OPTS);
+});
+
+test("modelOpts: the probed list curates the menu — fable in, absent aliases out", () => {
+  const models = { available: ["sonnet", "opus", "fable", "best", "opusplan", "default"] };
+  // haiku not probed -> not offered; best/opusplan have no picker row -> never offered.
+  assert.deepEqual(modelVals(modelOpts(models)), ["default", "opus", "fable", "sonnet"]);
+});
+
+test("modelOpts: the Default entry says what default actually is", () => {
+  const models = { available: ["sonnet", "default"], defaultLabel: "Fable 5" };
+  assert.equal(modelOpts(models)[0].label, "Default (Fable 5)");
+  // ...and stays plain when the probe carried no label.
+  assert.equal(modelOpts({ available: ["sonnet", "default"] })[0].label, "Default");
+});
+
+test("modelOpts: a probe listing nothing offerable falls back rather than emptying the menu", () => {
+  assert.deepEqual(modelOpts({ available: ["best", "opusplan"] }), MODEL_OPTS);
+});
+
+test("prettyModel: transcript model ids render human", () => {
+  assert.equal(prettyModel("claude-opus-4-8"), "Opus 4.8");
+  assert.equal(prettyModel("claude-fable-5"), "Fable 5");
+  assert.equal(prettyModel("claude-sonnet-5"), "Sonnet 5");
+  assert.equal(prettyModel("claude-haiku-4-5-20251001"), "Haiku 4.5"); // date dropped
+  assert.equal(prettyModel("claude-3-5-haiku-20241022"), "Haiku 3.5"); // legacy order
+  assert.equal(prettyModel("claude-fable-5[1m]"), "Fable 5 1M");
+});
+
+test("prettyModel: a switch confirmation's display label passes through", () => {
+  assert.equal(prettyModel("Sonnet 5"), "Sonnet 5");
+  assert.equal(prettyModel(""), "");
+  assert.equal(prettyModel(null), "");
 });
 
 // ---- renderProse (markdown tables in prose bubbles) ----------------------

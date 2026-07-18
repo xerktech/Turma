@@ -341,9 +341,23 @@ class TestSpawnOptionHelpers(unittest.TestCase):
         self.assertEqual(ha.resolve_model("opus"), "opus")
         self.assertEqual(ha.resolve_model("SONNET"), "sonnet")
         self.assertEqual(ha.resolve_model("haiku"), "haiku")
+        self.assertEqual(ha.resolve_model("fable"), "fable")
         for bad in ("gpt-4", "opus; rm", "claude-3"):
             with self.assertRaises(ValueError):
                 ha.resolve_model(bad)
+
+    def test_resolve_model_probed_extras(self):
+        # An alias the CLI itself reported available is accepted; anything not
+        # on either list still isn't, and the bracketed 1M variants never pass
+        # (they'd be interpolated into a launch command line, where the
+        # brackets are a shell glob).
+        extra = ("opusplan", "sonnet[1m]", "best")
+        self.assertEqual(ha.resolve_model("opusplan", extra), "opusplan")
+        self.assertEqual(ha.resolve_model("best", extra), "best")
+        with self.assertRaises(ValueError):
+            ha.resolve_model("sonnet[1m]", extra)
+        with self.assertRaises(ValueError):
+            ha.resolve_model("opusplan")  # not probed, not static
 
     def test_resolve_permission_mode(self):
         self.assertEqual(ha.resolve_permission_mode(""), "auto")
@@ -3588,16 +3602,42 @@ class TestInterrupt(ManagerMixin, unittest.TestCase):
             self.run_calls, [["tmux", "send-keys", "-t", "agent-abcde", "Escape"]])
 
 
-class TestSetModelMode(ManagerMixin, unittest.TestCase):
-    """Live model / permission-mode switches on a running session: model via a
-    typed `/model <name>`, mode via computed Shift+Tab (BTab) presses over the
-    session's launch-dependent cycle (perm_cycle_for). Both re-validate their
-    argument and persist the new value."""
+# A realistic /model picker pane capture: ❯ on the current model (Fable, row
+# index 2), descriptions two-plus spaces right of the label, ✔ on the current
+# row. What parse_model_picker and the set_model tests below drive against.
+MODEL_PICKER_PANE = """
+❯ /model
+   Select model
+   Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names, specify with --model.
 
-    def make_manager(self):
+     1. Default (recommended)  Opus 4.8 with 1M context · Best for everyday, complex tasks
+     2. Opus                   Opus 4.8 with 1M context · Best for everyday, complex tasks
+   ❯ 3. Fable ✔                Fable 5 · Most capable for your hardest and longest-running tasks
+     4. Sonnet                 Sonnet 5 · Efficient for routine tasks
+     5. Haiku                  Haiku 4.5 · Fastest for quick answers
+
+   Enter to set as default · s to use this session only · Esc to cancel
+"""
+
+
+class TestSetModelMode(ManagerMixin, unittest.TestCase):
+    """Live model / permission-mode switches on a running session: model by
+    driving the /model picker to the target row and pressing `s` (session-only —
+    the typed `/model <name>` form would also rewrite the shared login's saved
+    default), mode via computed Shift+Tab (BTab) presses over the session's
+    launch-dependent cycle (perm_cycle_for). Both re-validate their argument
+    and persist the new value."""
+
+    def make_manager(self, pane=MODEL_PICKER_PANE, busy=False):
         sm = super().make_manager()
         self.run_calls.clear()
         sm.save = mock.Mock()  # don't touch disk; just assert the record update
+        for name, value in [("_pane_busy", lambda t: busy),
+                            ("_capture_pane", lambda t: pane),
+                            ("MODEL_PICKER_WAIT_SEC", 0)]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
         return sm
 
     def _session(self, sm, sid="abcde", model=None, perm="auto", status="running",
@@ -3610,36 +3650,38 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sm.registry = [sess]
         return sess
 
-    def test_set_model_types_slash_model_and_persists(self):
+    def test_set_model_drives_picker_to_row_and_session_only(self):
         sm = self.make_manager()
         sess = self._session(sm, model=None)
         sm.set_model("abcde", "sonnet")
+        t = ["tmux", "send-keys", "-t", "agent-abcde"]
         self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--", "/model sonnet"],
-            ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
+            t + ["C-u"],                    # clear any half-typed input first
+            t + ["-l", "--", "/model"],
+            t + ["Enter"],
+            t + ["Down"],                   # ❯ on Fable (row 3) -> Sonnet (row 4)
+            t + ["-l", "s"],                # "use this session only"
         ])
         self.assertEqual(sess["model"], "sonnet")
         sm.save.assert_called_once()
 
-    def test_set_model_default_resets_and_stores_none(self):
+    def test_set_model_default_arrows_up_and_stores_none(self):
         sm = self.make_manager()
         sess = self._session(sm, model="opus")
         sm.set_model("abcde", "default")
-        self.assertEqual(self.run_calls[0][-1], "/model default")
+        keys = [c[-1] for c in self.run_calls]
+        self.assertEqual(keys, ["C-u", "/model", "Enter", "Up", "Up", "s"])
         self.assertIsNone(sess["model"])
 
-    def test_set_model_rejects_unknown_before_any_keystroke(self):
-        sm = self.make_manager()
-        self._session(sm, model=None)
-        with self.assertRaises(ValueError):
-            sm.set_model("abcde", "gpt-9")
-        self.assertEqual(self.run_calls, [])
-
-    def test_set_model_noop_for_non_running(self):
-        sm = self.make_manager()
-        self._session(sm, status="stopped")
+    def test_set_model_busy_pane_refuses_without_typing(self):
+        # Typed into a mid-turn pane the command would only be queued as a
+        # prompt, so a busy read refuses the switch and touches nothing.
+        sm = self.make_manager(busy=True)
+        sess = self._session(sm, model=None)
         sm.set_model("abcde", "sonnet")
         self.assertEqual(self.run_calls, [])
+        self.assertIsNone(sess["model"])
+        sm.save.assert_not_called()
 
     def test_set_mode_cycles_forward_the_minimal_presses(self):
         # An auto-launched session's cycle is [default, acceptEdits, plan, auto]
@@ -3739,6 +3781,303 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self._session(sm, perm="auto", status="stopped")
         sm.set_mode("abcde", "plan")
         self.assertEqual(self.run_calls, [])
+
+    def test_set_model_no_picker_escapes_and_keeps_model(self):
+        sm = self.make_manager(pane="❯ \n  ⏵⏵ auto mode on")
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self.run_calls[-1][-1], "Escape")
+        self.assertEqual(sess["model"], "opus")
+        sm.save.assert_not_called()
+
+    def test_set_model_row_not_offered_escapes(self):
+        # A probed alias with no picker row (the bracketed 1M variants) backs
+        # out rather than pressing keys at a row that isn't there.
+        sm = self.make_manager()
+        sm.models_info = {"available": ["sonnet", "opusplan", "default"]}
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "opusplan")
+        self.assertEqual(self.run_calls[-1][-1], "Escape")
+        self.assertIsNone(sess["model"])
+        sm.save.assert_not_called()
+
+    def test_set_model_rejects_unknown_before_any_keystroke(self):
+        sm = self.make_manager()
+        self._session(sm, model=None)
+        with self.assertRaises(ValueError):
+            sm.set_model("abcde", "gpt-9")
+        self.assertEqual(self.run_calls, [])
+
+    def test_set_model_noop_for_non_running(self):
+        sm = self.make_manager()
+        self._session(sm, status="stopped")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self.run_calls, [])
+
+
+# What `claude -p "/model"` really prints (v2.1.214): the current default's
+# label, then the usage line carrying the login's whole alias list.
+MODEL_PROBE_OUT = (
+    "Current model: Fable 5\n"
+    "Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, "
+    "sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.\n"
+)
+
+
+class TestParseModelProbe(unittest.TestCase):
+    def test_parses_aliases_and_default_label(self):
+        got = ha.parse_model_probe(MODEL_PROBE_OUT)
+        self.assertEqual(got["defaultLabel"], "Fable 5")
+        self.assertEqual(got["available"], [
+            "sonnet", "opus", "haiku", "fable", "best",
+            "sonnet[1m]", "opus[1m]", "fable[1m]", "opusplan", "default"])
+
+    def test_ansi_is_stripped(self):
+        got = ha.parse_model_probe(
+            "Current model: \x1b[1mFable 5\x1b[22m\n"
+            "Usage: /model <name>. Available: sonnet, default.")
+        self.assertEqual(got["defaultLabel"], "Fable 5")
+        self.assertEqual(got["available"], ["sonnet", "default"])
+
+    def test_no_available_line_is_a_failed_attempt_not_an_empty_list(self):
+        self.assertIsNone(ha.parse_model_probe("Current model: X"))
+        self.assertIsNone(ha.parse_model_probe(""))
+        self.assertIsNone(ha.parse_model_probe(None))
+
+    def test_default_is_guaranteed_and_missing_label_is_none(self):
+        got = ha.parse_model_probe("Usage: /model <name>. Available: sonnet, opus.")
+        self.assertIn("default", got["available"])
+        self.assertIsNone(got["defaultLabel"])
+
+
+class TestParseModelPicker(unittest.TestCase):
+    def test_rows_cursor_and_labels(self):
+        rows, cur = ha.parse_model_picker(MODEL_PICKER_PANE)
+        self.assertEqual(rows, ["Default (recommended)", "Opus", "Fable",
+                                "Sonnet", "Haiku"])
+        self.assertEqual(cur, 2)  # the ❯ sits on Fable
+
+    def test_capture_without_a_picker(self):
+        self.assertEqual(ha.parse_model_picker("❯ \n  1. not a picker"),
+                         ([], None))
+        self.assertEqual(ha.parse_model_picker(""), ([], None))
+        self.assertEqual(ha.parse_model_picker(None), ([], None))
+
+    def test_numbered_chat_lines_above_the_picker_are_not_rows(self):
+        rows, cur = ha.parse_model_picker(
+            "  1. buy groceries\n  2. do laundry\n" + MODEL_PICKER_PANE)
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(cur, 2)
+
+    def test_picker_index_for(self):
+        rows, _ = ha.parse_model_picker(MODEL_PICKER_PANE)
+        self.assertEqual(ha._picker_index_for(rows, None), 0)  # default
+        self.assertEqual(ha._picker_index_for(rows, "fable"), 2)
+        self.assertEqual(ha._picker_index_for(rows, "sonnet"), 3)
+        self.assertIsNone(ha._picker_index_for(rows, "opusplan"))
+
+
+class TestScanModelEntry(unittest.TestCase):
+    def _fold(self, entry):
+        rep = {"modelActual": None}
+        ha._scan_model_entry(entry, rep)
+        return rep["modelActual"]
+
+    def test_assistant_entry_names_the_model_that_answered(self):
+        self.assertEqual(
+            self._fold({"type": "assistant",
+                        "message": {"model": "claude-opus-4-8"}}),
+            "claude-opus-4-8")
+
+    def test_synthetic_is_not_a_model(self):
+        self.assertIsNone(self._fold(
+            {"type": "assistant", "message": {"model": "<synthetic>"}}))
+
+    def test_tui_switch_confirmation_with_ansi(self):
+        e = {"type": "user", "message": {"role": "user", "content":
+             "<local-command-stdout>Set model to \x1b[1mSonnet 5\x1b[22m and "
+             "saved as your default for new sessions</local-command-stdout>"}}
+        self.assertEqual(self._fold(e), "Sonnet 5")
+
+    def test_session_only_switch_confirmation(self):
+        e = {"type": "user", "message": {"content":
+             "<local-command-stdout>Set model to Haiku 4.5 for this session "
+             "only</local-command-stdout>"}}
+        self.assertEqual(self._fold(e), "Haiku 4.5")
+
+    def test_print_mode_system_shape(self):
+        e = {"type": "system", "subtype": "local_command", "content":
+             "<local-command-stdout>Set model to Sonnet 5 for this session "
+             "only</local-command-stdout>"}
+        self.assertEqual(self._fold(e), "Sonnet 5")
+
+    def test_kept_model_is_no_change(self):
+        e = {"type": "user", "message": {"content":
+             "<local-command-stdout>Kept model as Fable 5</local-command-stdout>"}}
+        self.assertIsNone(self._fold(e))
+
+
+class TestSessionReportModelActual(ProjectDirMixin, unittest.TestCase):
+    def test_incremental_scan_reports_newest_signal(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [{"type": "assistant",
+                            "message": {"model": "claude-old-1"}}])
+        state = {}
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertIsNone(rep["modelActual"])  # primed to EOF, no replay
+        write_jsonl(path, [
+            {"type": "assistant", "message": {"model": "claude-old-1"}},
+            {"type": "assistant", "message": {"model": "claude-opus-4-8"}},
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["modelActual"], "claude-opus-4-8")
+
+
+class TestModelsProbe(ManagerMixin, unittest.TestCase):
+    def _start(self, sm, rc):
+        fake = mock.Mock()
+        fake.poll.return_value = rc
+        with mock.patch.object(ha.subprocess, "Popen",
+                               return_value=fake) as pop:
+            sm._start_models_probe()
+        return fake, pop
+
+    def test_probe_reaps_into_models_info(self):
+        sm = self.make_manager()
+        fake, pop = self._start(sm, 0)
+        args, kwargs = pop.call_args
+        self.assertEqual(args[0], ["claude", "-p", "/model"])
+        self.assertEqual(kwargs["cwd"], ha.REGISTRY_DIR)  # internal-tool cwd
+        with open(sm.models_probe["outPath"], "w") as f:
+            f.write(MODEL_PROBE_OUT)
+        sm._poll_models_probe()
+        self.assertIsNone(sm.models_probe)
+        self.assertEqual(sm.models_info["defaultLabel"], "Fable 5")
+        self.assertIn("fable", sm.models_info["available"])
+        self.assertEqual(sm.models_available()[0], "sonnet")
+
+    def test_failed_probe_keeps_the_previous_list(self):
+        sm = self.make_manager()
+        sm.models_info = {"available": ["opus"], "defaultLabel": "X", "at": "t"}
+        self._start(sm, 1)
+        sm._poll_models_probe()
+        self.assertIsNone(sm.models_probe)
+        self.assertEqual(sm.models_info["available"], ["opus"])
+
+    def test_overrunning_probe_is_killed(self):
+        sm = self.make_manager()
+        fake, _ = self._start(sm, None)
+        sm.models_probe["startedMono"] = (
+            time.time() - ha.MODELS_PROBE_TIMEOUT_SEC - 1)
+        sm._poll_models_probe()
+        fake.kill.assert_called_once()
+        self.assertIsNone(sm.models_probe)
+        self.assertIsNone(sm.models_info)
+
+    def test_second_start_is_a_noop_while_one_is_in_flight(self):
+        sm = self.make_manager()
+        self._start(sm, None)
+        job = sm.models_probe
+        with mock.patch.object(ha.subprocess, "Popen") as pop:
+            sm._start_models_probe()
+            pop.assert_not_called()
+        self.assertIs(sm.models_probe, job)
+
+
+class TestSeedModelActual(ManagerMixin, unittest.TestCase):
+    SID = "11111111-1111-4111-8111-111111111111"
+
+    def _transcript(self, wt, entries):
+        d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, f"{self.SID}.jsonl"), entries)
+
+    def test_seeds_the_newest_signal_from_the_tail(self):
+        sm = self.make_manager()
+        wt = os.path.join(self.tmp, "wt")
+        self._transcript(wt, [
+            {"type": "assistant", "message": {"model": "claude-sonnet-5"}},
+            {"type": "user", "message": {"content":
+             "<local-command-stdout>Set model to Haiku 4.5 for this session "
+             "only</local-command-stdout>"}},
+        ])
+        sess = {"id": "s1", "worktreePath": wt, "claudeSessionId": self.SID}
+        self.assertEqual(sm._seed_model_actual(sess), "Haiku 4.5")
+
+    def test_no_transcript_seeds_nothing(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "worktreePath": os.path.join(self.tmp, "none"),
+                "claudeSessionId": self.SID}
+        self.assertIsNone(sm._seed_model_actual(sess))
+
+
+class TestInternalToolSlugModelProbe(ManagerMixin, unittest.TestCase):
+    """The models probe's transcript is nothing but the /model command — no
+    genuine user text for the prompt-signature match — so _is_internal_tool_slug
+    recognizes it by its first command instead (the harness-foreign-slug case;
+    in production its REGISTRY_DIR cwd already matches by slug)."""
+
+    CAVEAT = ("Caveat: The messages below were generated by the user while "
+              "running local commands. DO NOT respond to these messages or "
+              "otherwise consider them in your response unless the user "
+              "explicitly asks you to.")
+
+    def _slug(self, name, entries):
+        d = os.path.join(ha.PROJECTS_ROOT, name)
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, "t.jsonl"), entries)
+        return name
+
+    def _probe_entries(self):
+        return [
+            {"type": "user", "isMeta": True,
+             "message": {"role": "user",
+                         "content": f"<local-command-caveat>{self.CAVEAT}"
+                                    "</local-command-caveat>"}},
+            {"type": "user", "message": {"role": "user", "content":
+             "<command-name>/model</command-name><command-message>model"
+             "</command-message><command-args></command-args>"}},
+            {"type": "system", "subtype": "local_command", "content":
+             "<local-command-stdout>Current model: Fable 5</local-command-stdout>"},
+        ]
+
+    def test_model_probe_transcript_is_internal(self):
+        sm = self.make_manager()
+        slug = self._slug("-tmp-hub-agent-mgr-zzz", self._probe_entries())
+        self.assertTrue(sm._is_internal_tool_slug(slug))
+
+    def test_real_session_opening_with_model_still_counts(self):
+        sm = self.make_manager()
+        slug = self._slug("-w-repo", self._probe_entries() + [
+            {"type": "user",
+             "message": {"role": "user", "content": "now fix the login bug"}},
+        ])
+        self.assertFalse(sm._is_internal_tool_slug(slug))
+
+
+class TestModelActualPayload(ManagerMixin, unittest.TestCase):
+    def _sess(self):
+        return {"id": "abcde", "status": "running", "repo": "Turma",
+                "repoPath": "/w/Turma", "worktreePath": "/w/.turma/worktrees/x",
+                "branch": None, "rcName": "rc", "tmuxName": "agent-abcde",
+                "claudeSessionId": "22222222-2222-4222-8222-222222222222"}
+
+    def test_scan_signal_persists_on_the_record_and_payload(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        sm.registry = [sess]
+        signals = {"prUrls": [], "modelActual": "claude-opus-4-8", "tail": []}
+        with mock.patch.object(ha, "session_report", return_value=signals), \
+             mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            payload = sm._session_payload(sess, refresh=False)
+        self.assertEqual(payload["modelActual"], "claude-opus-4-8")
+        self.assertEqual(sess["modelActual"], "claude-opus-4-8")
+        # ...and it stays on the payload once the scan has nothing new.
+        signals2 = {"prUrls": [], "modelActual": None, "tail": []}
+        with mock.patch.object(ha, "session_report", return_value=signals2), \
+             mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            payload = sm._session_payload(sess, refresh=False)
+        self.assertEqual(payload["modelActual"], "claude-opus-4-8")
 
 
 class TestAnswerQuestion(ManagerMixin, unittest.TestCase):
@@ -7746,6 +8085,103 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         self.assertEqual(words[-1], ha.build_ticket_prompt(detail))
         # ...so nothing the ticket carried ever became a word of its own.
         self.assertNotIn("touch", words)
+
+
+class TestUpdatingAnnounce(ManagerMixin, unittest.TestCase):
+    """XERK-29: before the manager restarts for an update it can't heartbeat
+    through, it tells the hub the downtime is EXPECTED so the host shows an
+    `updating` status instead of an unexpected-outage `offline`."""
+
+    def setUp(self):
+        super().setUp()
+        self.flag = os.path.join(self.tmp, "updating.json")
+        p = mock.patch.object(ha, "UPDATING_FLAG_PATH", self.flag)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _write_flag(self, **d):
+        with open(self.flag, "w") as f:
+            json.dump(d, f)
+
+    def test_read_flag_present_absent_and_garbled(self):
+        sm = self.make_manager()
+        # Absent (the container-update case: no updater wrote one).
+        self.assertEqual(sm._read_updating_flag(), (None, None))
+        # Present (the native updater left the target version).
+        self._write_flag(reason="update", version="9.9.9")
+        self.assertEqual(sm._read_updating_flag(), ("update", "9.9.9"))
+        # Garbled JSON degrades to "generic restart, no version".
+        with open(self.flag, "w") as f:
+            f.write("{not json")
+        self.assertEqual(sm._read_updating_flag(), (None, None))
+
+    def test_boot_clears_a_stale_flag(self):
+        # A SIGKILL (no handler ran) can leave the file behind; the next boot
+        # must not let it leak a stale version into a future announce.
+        self._write_flag(reason="update", version="1.2.3")
+        self.make_manager()
+        self.assertFalse(os.path.exists(self.flag))
+
+    def test_announce_noops_without_hub_url(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "TURMA_URL", ""), \
+             mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=AssertionError("must not POST")):
+            sm._announce_updating("update", "9.9.9")  # no raise = no POST
+
+    def test_announce_posts_signal_with_reason_and_version(self):
+        sm = self.make_manager()
+        seen = {}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b""
+
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["method"] = req.get_method()
+            seen["body"] = json.loads(req.data.decode())
+            seen["auth"] = req.get_header("Authorization")
+            return _Resp()
+
+        with mock.patch.object(ha, "TURMA_URL", "http://hub:8300"), \
+             mock.patch.object(ha, "TURMA_TOKEN", "tok"), \
+             mock.patch.object(ha.urllib.request, "urlopen", fake_urlopen):
+            sm._announce_updating("update", "9.9.9")
+
+        self.assertEqual(seen["method"], "POST")
+        self.assertEqual(
+            seen["url"], f"http://hub:8300/api/agents/{sm.device}/updating")
+        self.assertEqual(seen["body"], {"reason": "update", "version": "9.9.9"})
+        self.assertEqual(seen["auth"], "Bearer tok")
+
+    def test_announce_swallows_network_failure(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "TURMA_URL", "http://hub:8300"), \
+             mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=OSError("boom")):
+            sm._announce_updating("restart", None)  # best-effort, must not raise
+
+    def test_shutdown_handler_announces_from_flag_then_exits(self):
+        sm = self.make_manager()
+        self._write_flag(reason="update", version="9.9.9")
+        calls = []
+        with mock.patch.object(sm, "_announce_updating",
+                               side_effect=lambda *a: calls.append(a)):
+            with self.assertRaises(SystemExit):
+                sm._handle_shutdown(ha.signal.SIGTERM, None)
+        self.assertEqual(calls, [("update", "9.9.9")])
+
+    def test_shutdown_handler_defaults_to_generic_restart(self):
+        # The container case: Watchtower's SIGTERM, no flag on disk.
+        sm = self.make_manager()
+        calls = []
+        with mock.patch.object(sm, "_announce_updating",
+                               side_effect=lambda *a: calls.append(a)):
+            with self.assertRaises(SystemExit):
+                sm._handle_shutdown(ha.signal.SIGTERM, None)
+        self.assertEqual(calls, [("restart", None)])
 
 
 if __name__ == "__main__":

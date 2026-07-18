@@ -1356,8 +1356,10 @@ function render(data) {
     const still = running.find(x => x.s.id === currentId && x.a.terminalOnline);
     if (!still) clearStage();
     else if ((viewMode === "chat" || viewMode === "terminal") && window.TurmaChat) {
-      // Refresh the chat header + pending-question region from the new heartbeat.
-      TurmaChat.onPoll(still.s);
+      // Refresh the chat header + pending-question region from the new
+      // heartbeat; the host payload rides along so the model menu tracks the
+      // agent's probed `models` block rather than open()'s snapshot.
+      TurmaChat.onPoll(still.s, still.a);
     }
   }
 

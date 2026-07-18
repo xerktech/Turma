@@ -202,5 +202,28 @@ got="$(run_case "0.3.5" "$d")"
 assert_eq "0.3.5" "$got" "up-to-date unified release is a no-op (stayed $got)" "reinstalled an up-to-date version, got $got"
 rm -rf "$d"
 
+# 7. A successful install leaves the running manager an EXPECTED-restart hint
+#    (~/.turma/updating.json) carrying the target version, so its SIGTERM handler
+#    announces `updating` to the hub instead of the restart looking like an
+#    outage (XERK-29). run_case discards the home dir, so drive it inline here.
+d="$(new_gh_dir)"
+add_unified_release "$d" "v0.3.5" "0.3.5" "v0.3.5"
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+echo "0.3.0" >"$prefix/VERSION"
+printf '#!/bin/sh\nexit 0\n' > "$bin/turma-agentctl"; chmod +x "$bin/turma-agentctl"
+install_fake_gh "$bin"
+FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  "$bin/turma-agent-update" >/dev/null 2>&1 || true
+flag="$root/home/.turma/updating.json"
+if [ -f "$flag" ] && grep -q '"version":"0.3.5"' "$flag" && grep -q '"reason":"update"' "$flag"; then
+  pass "install writes the updating hint (reason + target version)"
+else
+  fail "no/incorrect updating.json after install ($(cat "$flag" 2>/dev/null))"
+fi
+rm -rf "$root" "$d"
+
 if [ "$FAILED" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
 exit "$FAILED"
