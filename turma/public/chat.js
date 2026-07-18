@@ -827,32 +827,37 @@
     wireAgentDelegation(bar);
   }
 
-  // ---- the compose button: Send when idle, Stop while the agent works --------
-  // There's only ever one thing to do with the agent's turn — start it or end it
-  // — so one button at the bottom of the compose box does both, rather than a
-  // separate Stop parked in the header away from where the operator is typing.
+  // ---- the compose buttons: Send always sends; ◼ Stop appears mid-turn ------
+  // Send never morphs into Stop: a message sent while the agent works QUEUES
+  // (Claude Code runs it when the turn ends, and the chat shows it as a dimmed
+  // "queued" bubble), so the button that talks has to stay available mid-turn —
+  // on a phone it is the ONLY way to send, and morphing it into Stop made
+  // queueing impossible there. Stop is its own warning-coloured button beside
+  // Send, shown only while a turn is running (`composeBusy`), still in the
+  // compose row rather than parked in the header away from where the operator
+  // is typing.
   //
   // `liveStatus` is the busy read because it's the fastest one on the page: the
   // tunnel scrapes the pane's "esc to interrupt" hint every ~1s and pushes a
   // `turn` frame carrying the status (null the moment generating ends), where the
   // heartbeat's paneBusy is a beat or more behind. When the socket is down and no
-  // frames arrive, liveStatus stays null and the button stays Send — the safe
+  // frames arrive, liveStatus stays null and Stop stays hidden — the safe
   // degradation, since a Stop that can't see the turn is worse than no Stop.
   function composeBusy() {
     // A pending AskUserQuestion is answered THROUGH the compose box — a typed
     // reply routes to /answer as a custom answer (see send()). So while a question
-    // is up the button must be Send, not Stop, even though the pane still reads
-    // busy (the AskUserQuestion tool call is blocking). Clicking Stop here would
+    // is up Stop is hidden even though the pane still reads busy (the
+    // AskUserQuestion tool call is blocking): clicking Stop there would
     // interrupt the turn and destroy the question, which is exactly the wrong
     // thing when the operator only wanted to type a custom response (XERK-21).
     if (questionActive) { stopPendingAt = 0; return false; }
     if (!liveStatus) { stopPendingAt = 0; return false; }
     // A clicked Stop only lands on the agent's next beat, so the pane keeps
-    // reporting the turn for a second or two afterwards. Hand the button back to
-    // Send immediately anyway — the operator asked for the turn to end and
-    // shouldn't watch a dead Stop to find out it worked. If the turn is somehow
-    // still alive once the window lapses, the interrupt didn't take and Stop
-    // legitimately comes back.
+    // reporting the turn for a second or two afterwards. Hide Stop immediately
+    // anyway — the operator asked for the turn to end and shouldn't watch a
+    // dead Stop to find out it worked. If the turn is somehow still alive once
+    // the window lapses, the interrupt didn't take and Stop legitimately comes
+    // back.
     if (stopPendingAt) {
       if (Date.now() - stopPendingAt < STOP_SUPPRESS_MS) return false;
       stopPendingAt = 0;
@@ -861,27 +866,33 @@
   }
   function isBusy() { return composeBusy(); }
 
-  // Paint every compose button on the page (the chat's and — while the terminal
+  // Paint every compose bar on the page (the chat's and — while the terminal
   // toggle is showing, with this engine still warm underneath it — the
-  // terminal's) from the one busy read.
+  // terminal's) from the one busy read: Send keeps its label (only its tooltip
+  // says whether a send queues), and the ◼ Stop beside it shows only mid-turn.
   function updateComposeAction() {
     if (typeof document === "undefined") return;
     const busy = composeBusy();
     if (actionFailUntil && Date.now() < actionFailUntil) return; // let the failure text stand
     actionFailUntil = 0;
-    const btns = document.querySelectorAll(".compose-action");
-    for (const btn of btns) {
-      btn.classList.toggle("stop", busy);
-      btn.textContent = busy ? "◼ Stop" : "Send";
+    for (const btn of document.querySelectorAll(".compose-action")) {
+      btn.textContent = "Send";
       btn.title = busy
-        ? "Stop the agent's current turn (Esc) — the session keeps running"
+        ? "Send now — the message queues and runs when this turn ends"
         : "Send this message to the agent";
     }
+    for (const btn of document.querySelectorAll(".compose-stop")) {
+      btn.hidden = !busy;
+      btn.textContent = "◼ Stop";
+      btn.title = "Stop the agent's current turn (Esc) — the session keeps running";
+    }
   }
-  // Show a transient failure on the compose button, then repaint it normally.
-  function actionFailed(text) {
+  // Show a transient failure on a compose-bar button (`sel` picks which — the
+  // Send buttons by default, the Stop buttons for a failed interrupt), then
+  // repaint normally.
+  function actionFailed(text, sel) {
     actionFailUntil = Date.now() + ACTION_FAIL_MS;
-    const btns = document.querySelectorAll(".compose-action");
+    const btns = document.querySelectorAll(sel || ".compose-action");
     for (const btn of btns) btn.textContent = text;
     setTimeout(() => { actionFailUntil = 0; updateComposeAction(); }, ACTION_FAIL_MS);
   }
@@ -905,7 +916,7 @@
     } catch {
       stopPendingAt = 0; // the turn is still running — give Stop back right away
       updateComposeAction();
-      actionFailed("Stop failed");
+      actionFailed("Stop failed", ".compose-stop");
     }
   }
 
@@ -1507,12 +1518,15 @@
       isBusy, stop, actionFailed };
     // Global handlers referenced by the chat pane's inline HTML attributes.
     window.autoGrowChatInput = autoGrow;
-    // Enter always sends: a queued message is a normal thing to type mid-turn,
-    // and the key isn't the button — only the click target changes with the turn.
+    // Enter always sends, exactly like the button: a queued message is a
+    // normal thing to type mid-turn.
     window.chatInputKey = function (e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
     window.sendChatInput = send;
-    // The one compose button: Stop while the agent is generating, Send otherwise.
-    window.chatComposeAction = function () { if (composeBusy()) stop(); else send(); };
+    // Send always sends — mid-turn it queues (Claude Code holds the message
+    // until the turn ends, and the chat shows it as a "queued" bubble). The
+    // separate ◼ Stop button interrupts the turn.
+    window.chatComposeAction = function () { send(); };
+    window.chatComposeStop = function () { stop(); };
     window.chatJumpBottom = jumpToBottom;
   }
 

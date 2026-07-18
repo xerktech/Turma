@@ -909,59 +909,64 @@ test("optionCardHtml: escapes label, description and preview (no injection)", ()
 });
 
 
-// --- the compose button: Send when idle, Stop while the agent works -----------
+// --- the compose bar: Send always sends; ◼ Stop appears only mid-turn --------
 // The busy read is the live pane status (a `turn` frame every ~1s), not the
-// heartbeat, so the button flips within a second of the turn starting or ending.
+// heartbeat, so Stop appears/hides within a second of the turn starting or
+// ending. Send never morphs: a mid-turn send QUEUES (the chat renders the
+// "queued" bubble), so the button that talks must stay available while the
+// agent works — on a phone it is the only way to send.
 
 function fakeButtons(n = 2) {
-  const btns = [];
-  for (let i = 0; i < n; i++) {
-    btns.push({
-      textContent: "Send", title: "", _s: new Set(),
-      classList: { _s: new Set(), toggle(c, f) { f ? this._s.add(c) : this._s.delete(c); },
-        contains(c) { return this._s.has(c); } },
-    });
-  }
-  global.document = { querySelectorAll: (sel) => (sel === ".compose-action" ? btns : []) };
-  return btns;
+  const mk = () => ({
+    textContent: "Send", title: "", hidden: false, _s: new Set(),
+    classList: { _s: new Set(), toggle(c, f) { f ? this._s.add(c) : this._s.delete(c); },
+      contains(c) { return this._s.has(c); } },
+  });
+  const send = [], stop = [];
+  for (let i = 0; i < n; i++) { send.push(mk()); stop.push(mk()); }
+  global.document = { querySelectorAll: (sel) =>
+    (sel === ".compose-action" ? send : sel === ".compose-stop" ? stop : []) };
+  return { send, stop };
 }
 function clearDom() { delete global.document; }
 
-test("compose button: idle -> Send, generating -> Stop", () => {
-  const btns = fakeButtons();
+test("compose bar: idle -> Stop hidden; generating -> Stop shown, Send unchanged", () => {
+  const { send, stop } = fakeButtons();
   __stopPending(0);
 
   __setLiveStatus(null);
   updateComposeAction();
-  assert.equal(btns[0].textContent, "Send");
-  assert.equal(btns[0].classList.contains("stop"), false);
+  assert.equal(send[0].textContent, "Send");
+  assert.equal(stop[0].hidden, true);
   assert.equal(isBusy(), false);
 
   __setLiveStatus({ verb: "Thinking", up: "1.2k" });
   updateComposeAction();
   assert.equal(isBusy(), true);
-  // Every compose button on the page (chat's and the terminal toggle's) flips
-  // together — they read the one status.
-  for (const b of btns) {
+  // Every compose bar on the page (chat's and the terminal toggle's) flips
+  // together — they read the one status. Send stays Send: it queues mid-turn.
+  for (const b of send) assert.equal(b.textContent, "Send");
+  for (const b of stop) {
+    assert.equal(b.hidden, false);
     assert.equal(b.textContent, "◼ Stop");
-    assert.equal(b.classList.contains("stop"), true);
   }
   clearDom();
 });
 
-test("compose button: a clicked Stop hands the button back to Send immediately", () => {
-  const btns = fakeButtons();
+test("compose bar: a clicked Stop hides the button immediately", () => {
+  const { send, stop } = fakeButtons();
   // The turn is still being reported — the interrupt only lands on the agent's
   // next beat — but the operator already asked for it to end.
   __setLiveStatus({ verb: "Thinking" });
   __stopPending(Date.now());
   updateComposeAction();
   assert.equal(isBusy(), false, "no waiting on the pane to catch up");
-  assert.equal(btns[0].textContent, "Send");
+  assert.equal(stop[0].hidden, true);
+  assert.equal(send[0].textContent, "Send");
   clearDom();
 });
 
-test("compose button: a Stop that never landed gives Stop back", () => {
+test("compose bar: a Stop that never landed gives Stop back", () => {
   fakeButtons();
   __setLiveStatus({ verb: "Thinking" });
   __stopPending(Date.now() - 60000); // clicked long ago; the turn outlived it
@@ -969,7 +974,7 @@ test("compose button: a Stop that never landed gives Stop back", () => {
   clearDom();
 });
 
-test("compose button: the turn ending clears a pending Stop", () => {
+test("compose bar: the turn ending clears a pending Stop", () => {
   fakeButtons();
   __setLiveStatus(null);
   __stopPending(Date.now());
@@ -980,23 +985,24 @@ test("compose button: the turn ending clears a pending Stop", () => {
   clearDom();
 });
 
-test("compose button: a pending question keeps the button at Send (XERK-21)", () => {
-  const btns = fakeButtons();
+test("compose bar: a pending question hides Stop (XERK-21)", () => {
+  const { send, stop } = fakeButtons();
   __stopPending(0);
   // The AskUserQuestion tool call blocks the pane, so the pane still reads busy —
-  // but the answer is typed into the compose box, so the button must stay Send.
+  // but the answer is typed into the compose box, and an accidental Stop would
+  // destroy the question, so the Stop button must not be offered.
   __setLiveStatus({ verb: "Thinking" });
   __setQuestionActive(true);
   updateComposeAction();
   assert.equal(isBusy(), false, "a live question overrides the busy pane read");
-  assert.equal(btns[0].textContent, "Send");
-  assert.equal(btns[0].classList.contains("stop"), false);
-  // Answering the question (questionActive clears) hands the button back to Stop
-  // while the pane is still working.
+  assert.equal(send[0].textContent, "Send");
+  assert.equal(stop[0].hidden, true);
+  // Answering the question (questionActive clears) brings Stop back while the
+  // pane is still working.
   __setQuestionActive(false);
   updateComposeAction();
   assert.equal(isBusy(), true);
-  assert.equal(btns[0].textContent, "◼ Stop");
+  assert.equal(stop[0].hidden, false);
   __setQuestionActive(false);
   clearDom();
 });

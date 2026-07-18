@@ -573,15 +573,16 @@
   .chat-compose textarea { flex: 1; resize: none; font: inherit; font-size: 13.5px; line-height: 1.5;
     padding: 8px 11px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--page); color: var(--ink); }
 
-  /* The compose button IS the Stop button: while the agent is generating it turns
-     into a warning-coloured "◼ Stop" that interrupts the turn, and hands itself
-     back to Send the moment the turn ends (chat.js: updateComposeAction). One
-     button, at the one spot the operator is already looking at, always showing
-     the only thing there is to do with the turn. Warning- rather than
-     critical-coloured: Stop interrupts, it doesn't destroy (that's Kill).
-     Same width for both labels so the compose row doesn't jump on the swap. */
+  /* The split compose bar (chat.js: updateComposeAction).
+     Send never morphs: a message sent mid-turn QUEUES (rendered as a dimmed
+     "queued" bubble), so the button that talks stays available while the agent
+     works. Stop is its own button beside it, shown only during a turn.
+     Warning- rather than critical-coloured: Stop interrupts, it doesn't
+     destroy (that's Kill). */
   button.compose-action { min-width: 84px; }
-  button.primary.compose-action.stop { background: var(--warning); border-color: var(--warning); color: #1a1200; }
+  button.primary.compose-stop { background: var(--warning); border-color: var(--warning);
+    color: #1a1200; min-width: 84px; }
+  button.compose-stop[hidden] { display: none; }
 
   /* Live agent-mode (left) / model (right) selectors under the text box; the
      ticket chip and PR status chip (when present) ride just left of the model on
@@ -705,6 +706,7 @@
           <div class="chat-compose-row">
             <textarea id="chatInput" rows="1" placeholder="Message the agent"
               oninput="autoGrowChatInput()" onkeydown="chatInputKey(event)"></textarea>
+            <button class="primary compose-stop" id="chatStop" onclick="chatComposeStop()" hidden>◼ Stop</button>
             <button class="primary compose-action" id="chatSend" onclick="chatComposeAction()">Send</button>
           </div>
           <!-- Live per-session selectors: agent (permission) mode on the left,
@@ -729,6 +731,7 @@
         <div class="term-compose">
           <textarea id="termInput" rows="1" placeholder="Message the agent"
             oninput="autoGrowTermInput()" onkeydown="termInputKey(event)"></textarea>
+          <button class="primary compose-stop" id="termStop" onclick="termComposeStop()" hidden>◼ Stop</button>
           <button class="primary compose-action" id="termSend" onclick="termComposeAction()">Send</button>
         </div>
       </div>
@@ -1892,14 +1895,18 @@ function killCurrentTerminal() {
   if (viewPushed) { viewPushed = false; history.back(); }
   clearStage();
 }
-// The terminal's compose button, like the chat's, doubles as Stop while the
-// agent is generating. Both defer to the chat engine even here: it holds the
-// live pane status (the ~1s busy read) and paints every .compose-action button
-// on the page, and its tail stays warm underneath the terminal toggle — so the
-// two buttons can't disagree about whether the turn is still running.
+// The terminal's compose bar mirrors the chat's split: Send ALWAYS sends —
+// mid-turn it queues, which the chat renders as a dimmed "queued" bubble — and
+// the separate ◼ Stop beside it interrupts the turn. Both stop buttons defer
+// to the chat engine: it holds the live pane status (the ~1s busy read) and
+// paints every .compose-stop button on the page, and its tail stays warm
+// underneath the terminal toggle — so the two bars can't disagree about
+// whether the turn is still running.
 function termComposeAction() {
-  if (window.TurmaChat && TurmaChat.isBusy()) { TurmaChat.stop(); return; }
   sendTermInput();
+}
+function termComposeStop() {
+  if (window.TurmaChat) TurmaChat.stop();
 }
 // Same arm-then-confirm Kill, from the chat header.
 let chatKillArmed = false, chatKillTimer = null;

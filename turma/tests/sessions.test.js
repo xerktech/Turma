@@ -118,7 +118,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const fn = new Function(...names, "window",
     script + "\n;return { render, selectSession, followSpawn, toggleComposer,"
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
-      + " termComposeAction, openEndedSession, resumeEnded, openTranscript, backToList,"
+      + " termComposeAction, termComposeStop, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
@@ -432,25 +432,43 @@ test("desktop: re-selecting the current session stays a no-op", () => {
   assert.deepEqual(opened, ["11111"], "no rebuild when the stage is already visible");
 });
 
-// --- the terminal's Send/Stop compose button ---------------------------------
-// (The chat pane's own button is chat.js's — see chat.test.js.)
+// --- the terminal's split compose bar (Send + separate ◼ Stop) ---------------
+// (The chat pane's own buttons are chat.js's — see chat.test.js.)
 
-test("terminal compose: Stop delegates to the chat engine while the agent works", () => {
-  const { beat, selectSession, termComposeAction, posts, chat } = loadPage();
+test("terminal compose: Send sends even while the agent works (the send queues)", () => {
+  const { beat, selectSession, termComposeAction, els, posts, chat } = loadPage();
+  const { now, host: h } = host([working("11111", "Long Turn")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+
+  // Mid-turn, Send must NOT stop: the message queues (Claude Code holds it
+  // until the turn ends, and the chat shows it as a "queued" bubble).
+  chat.busy = true;
+  els.termInput = makeEl("termInput");
+  els.termInput.value = "also do the thing";
+  termComposeAction();
+  assert.equal(chat.stopped, 0, "sending mid-turn must not interrupt the turn");
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, "/api/agents/hostA/sessions/11111/input");
+  assert.equal(posts[0].body.text, "also do the thing");
+});
+
+test("terminal compose: the separate Stop button delegates to the chat engine", () => {
+  const { beat, selectSession, termComposeStop, posts, chat } = loadPage();
   const { now, host: h } = host([working("11111", "Long Turn")]);
   beat({ now, agents: [h] });
   selectSession("11111");
 
   chat.busy = true;
-  termComposeAction();
+  termComposeStop();
   // One click is the whole interaction — unlike Kill, nothing is destroyed, so
   // there's no arm-then-confirm step. The engine owns the interrupt POST so the
-  // two compose buttons can't disagree about the turn's state.
+  // two compose bars can't disagree about the turn's state.
   assert.equal(chat.stopped, 1, "the click stops the turn");
   assert.deepEqual(posts, [], "the page doesn't post the interrupt itself");
 });
 
-test("terminal compose: the same button sends the typed message when idle", () => {
+test("terminal compose: Send sends the typed message when idle", () => {
   const { beat, selectSession, termComposeAction, els, posts, chat } = loadPage();
   const { now, host: h } = host([idle("11111", "Waiting")]);
   beat({ now, agents: [h] });
