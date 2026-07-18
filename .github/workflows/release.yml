@@ -359,14 +359,19 @@ jobs:
         run: yes | sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
       # build.gradle.kts reads TURMA_VERSION / TURMA_VERSION_CODE (see the file);
       # the packed versionCode comes from the tested version.js, not run_number.
-      - name: Assemble debug APK
+      # Build the RELEASE variant, signed with the committed release keystore
+      # (see build.gradle.kts): the debug variant is signed with the runner's
+      # auto-generated debug key, which differs per ephemeral runner and made
+      # every release refuse to update in place (XERK-26). The release keystore
+      # is in the repo, so this needs no secrets.
+      - name: Assemble release APK
         working-directory: android
         env:
           TURMA_VERSION: ${{ needs.plan.outputs.version }}
           TURMA_VERSION_CODE: ${{ needs.plan.outputs.android_version_code }}
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+        run: gradle :app:assembleRelease --no-daemon --stacktrace
       - name: Name the asset
-        run: cp android/app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/turma-android-v${{ needs.plan.outputs.version }}.apk"
+        run: cp android/app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/turma-android-v${{ needs.plan.outputs.version }}.apk"
       - uses: actions/upload-artifact@v4
         with:
           name: asset-android

@@ -35,10 +35,33 @@ android {
         vectorDrawables { useSupportLibrary = true }
     }
 
+    // A FIXED, in-repo signing key — the fix for XERK-26. The APK is distributed
+    // by sideload (the in-app updater in core.Update / net.Updater pulls it from
+    // the public GitHub releases), and Android only lets a new APK update an
+    // installed one IN PLACE when the two carry the SAME signing certificate.
+    // Before this, release.yml shipped `assembleDebug`, signed with the debug
+    // keystore that each fresh ephemeral CI runner auto-generates — so every
+    // release had a DIFFERENT cert and refused to update, forcing an
+    // uninstall+reinstall each time. Committing one keystore and always signing
+    // with it makes the cert stable across builds and hosts, so updates install
+    // in place. The key is deliberately in the repo (which is public): its whole
+    // job is to be identical everywhere, and the app's own updater only installs
+    // official releases fetched over HTTPS. When the app eventually ships on
+    // Google Play, Play App Signing supersedes this.
+    signingConfigs {
+        create("release") {
+            storeFile = file("turma-release.keystore")
+            storePassword = "turma-release"
+            keyAlias = "turma"
+            keyPassword = "turma-release"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
     compileOptions {

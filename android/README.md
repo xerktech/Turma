@@ -98,6 +98,21 @@ one-tap **Update**, downloads it and hands it to the system package installer.
   operator to that settings screen and the banner reads **Install** to retry. The
   OS verifies the APK signature on install — the real integrity gate for updating
   an installed app — so no sha check is re-implemented here.
+- **Stable signing (XERK-26).** That signature check is also why every build must
+  carry the SAME signing certificate: Android only updates an installed app IN
+  PLACE when the new APK's cert matches the installed one, else it fails with
+  `INSTALL_FAILED_UPDATE_INCOMPATIBLE` and the app has to be uninstalled first.
+  The release build is therefore signed with a fixed keystore committed to the
+  repo (`app/turma-release.keystore`, wired in `app/build.gradle.kts`'s
+  `signingConfigs`), so every release — on any CI runner — shares one cert.
+  Before this, `release.yml` shipped `assembleDebug`, signed with the debug key
+  each ephemeral runner auto-generates fresh, so no two releases matched and each
+  update forced an uninstall+reinstall. The key is intentionally in a public repo
+  (its whole job is to be identical everywhere; the updater only installs official
+  HTTPS releases); Play App Signing supersedes it once the app ships on Play.
+  **Moving onto the first stable-key build still needs one final uninstall**,
+  because the currently-installed app carries an old random debug cert no stable
+  key can match; every update after that installs in place.
 
 ## Push notifications (FCM) setup
 
