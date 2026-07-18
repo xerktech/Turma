@@ -3864,12 +3864,13 @@ def board_configured():
 
 
 def collect_board():
-    """The heartbeat board block from whichever source is configured."""
+    """The heartbeat board block from whichever source is configured: Azure when
+    its creds are set, else Jira. collect_jira() itself returns the empty block
+    when Jira is unconfigured too, so it's the safe default (and refresh_jira only
+    runs at all behind a board_configured() gate)."""
     if azure_configured():
         return collect_azure()
-    if jira_configured():
-        return collect_jira()
-    return board_empty()
+    return collect_jira()
 
 
 def board_empty():
