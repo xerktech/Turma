@@ -1614,7 +1614,8 @@ test("http: heartbeat historyResults populate the cache; GET returns 200 while f
     body: {
       device: "hh2",
       historyResults: [
-        { sessionId: "s1", entries: [{ id: "1", role: "user", text: "hi" }], truncated: false },
+        { sessionId: "s1", entries: [{ id: "1", role: "user", text: "hi" }], truncated: false,
+          queued: ["still waiting"] },
       ],
     },
     headers: agentHeaders,
@@ -1624,6 +1625,9 @@ test("http: heartbeat historyResults populate the cache; GET returns 200 while f
   assert.equal(res.status, 200);
   assert.deepEqual(res.body.entries, [{ id: "1", role: "user", text: "hi" }]);
   assert.equal(res.body.truncated, false);
+  // Still-queued prompts ride the cache; an agent predating the field (the
+  // other historyResults cases above/below) normalises to [].
+  assert.deepEqual(res.body.queued, ["still waiting"]);
   assert.ok(res.body.fetchedAt);
 });
 
@@ -2880,15 +2884,25 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
   const relayed = await nextTextJson(liveFrames, 1);
   assert.equal(relayed.type, "tail");
   assert.deepEqual(relayed.entries, delta.entries);
+  // An agent predating the queued field: the hub normalises to [].
+  assert.deepEqual(relayed.queued, []);
+
+  // 3a. Still-queued prompts (typed mid-turn; foldQueueOp in tunnel-agent.js)
+  //     ride beside the entries and reach the live client.
+  ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+    { tail: "ls1", entries: delta.entries, queued: ["also do X"] }))));
+  const queuedFrame = await nextTextJson(liveFrames, 2);
+  assert.equal(queuedFrame.type, "tail");
+  assert.deepEqual(queuedFrame.queued, ["also do X"]);
 
   // 3b. A live `turn` delta (in-progress assistant text from the TUI) is fanned
   //     out too, including the empty-string clear on completion.
   ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({ turn: "ls1", text: "streaming…" }))));
-  const turn = await nextTextJson(liveFrames, 2);
+  const turn = await nextTextJson(liveFrames, 3);
   assert.equal(turn.type, "turn");
   assert.equal(turn.text, "streaming…");
   ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({ turn: "ls1", text: "" }))));
-  const cleared = await nextTextJson(liveFrames, 3);
+  const cleared = await nextTextJson(liveFrames, 4);
   assert.equal(cleared.type, "turn");
   assert.equal(cleared.text, "");
 
@@ -2981,17 +2995,28 @@ test("live WS: a watched session whose transcript MOVES is re-armed onto the new
 test("/api/agents: emits an ETag; unchanged If-None-Match -> 304; state change re-etags", async () => {
   await request("POST", "/api/heartbeat", { body: { device: "etag-host" }, headers: agentHeaders });
 
-  const first = await request("GET", "/api/agents", { headers: userHeaders });
-  assert.equal(first.status, 200);
+  // Earlier tests' torn-down control sockets surface as ASYNC close events
+  // ("tunnel gone: …" → publishAgent → invalidateAgentsCache) that can land
+  // between this test's two GETs; the rebuilt body embeds a fresh `now`, so a
+  // stray invalidation re-etags with no real state change and the 304 reads
+  // 200. Retry until two consecutive GETs agree — the world has settled — then
+  // assert the invariant: absent state changes, revalidation 304s.
+  let first, notMod;
+  for (let i = 0; i < 10; i++) {
+    first = await request("GET", "/api/agents", { headers: userHeaders });
+    assert.equal(first.status, 200);
+    notMod = await request("GET", "/api/agents", {
+      headers: { ...userHeaders, "if-none-match": first.headers.etag },
+    });
+    if (notMod.status === 304) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
   const etag = first.headers.etag;
   assert.ok(etag, "no ETag on /api/agents");
   // no-cache (not no-store) so the browser keeps the body + revalidates.
   assert.match(first.headers["cache-control"], /no-cache/);
 
   // Same ETag echoed back -> cheap 304, empty body.
-  const notMod = await request("GET", "/api/agents", {
-    headers: { ...userHeaders, "if-none-match": etag },
-  });
   assert.equal(notMod.status, 304);
   assert.equal(notMod.raw, "");
   assert.equal(notMod.headers.etag, etag);

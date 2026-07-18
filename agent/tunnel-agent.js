@@ -201,6 +201,14 @@ const COMMAND_NAME_RE = /<command-name>([\s\S]*?)<\/command-name>/;
 const COMMAND_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
 const COMMAND_STDOUT_RE = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/;
 const COMMAND_STDERR_RE = /<local-command-stderr>([\s\S]*?)<\/local-command-stderr>/;
+// The `!` prefix runs a shell command straight from the composer/TUI; Claude
+// Code records the command as <bash-input> and its output as
+// <bash-stdout>/<bash-stderr> user turns. Parsed into the same
+// command/output shapes (name "!") so the chat renders a chip + output card
+// instead of raw XML. Mirror of hub-agent.py BASH_*_RE.
+const BASH_INPUT_RE = /<bash-input>([\s\S]*?)<\/bash-input>/;
+const BASH_STDOUT_RE = /<bash-stdout>([\s\S]*?)<\/bash-stdout>/;
+const BASH_STDERR_RE = /<bash-stderr>([\s\S]*?)<\/bash-stderr>/;
 function parseLocalCommand(text) {
   if (!text) return null;
   if (LOCAL_COMMAND_CAVEAT_RE.test(text)) return { kind: "caveat" };
@@ -212,13 +220,25 @@ function parseLocalCommand(text) {
       return { kind: "command", name, args: argsM ? argsM[1].replace(ANSI_RE, "").trim() : "" };
     }
   }
-  // stderr wins over stdout when a turn carries both, so a failing command
-  // reads as an error rather than showing its (usually empty) stdout.
-  for (const [re, isError] of [[COMMAND_STDERR_RE, true], [COMMAND_STDOUT_RE, false]]) {
-    const m = re.exec(text);
-    if (m) return { kind: "output", text: m[1].replace(ANSI_RE, "").trim(), isError };
+  const bashM = BASH_INPUT_RE.exec(text);
+  if (bashM) {
+    const cmd = bashM[1].replace(ANSI_RE, "").trim();
+    if (cmd) return { kind: "command", name: "!", args: cmd };
   }
-  return null;
+  // stderr wins over stdout when a turn carries both — but ONLY when it
+  // carries text: a bash turn routinely ships both tags with one empty, and an
+  // empty stderr must not swallow the stdout beside it (or vice versa).
+  let first = null;
+  for (const [re, isError] of [[COMMAND_STDERR_RE, true], [BASH_STDERR_RE, true],
+    [COMMAND_STDOUT_RE, false], [BASH_STDOUT_RE, false]]) {
+    const m = re.exec(text);
+    if (m) {
+      const out = { kind: "output", text: m[1].replace(ANSI_RE, "").trim(), isError };
+      if (out.text) return out;
+      if (!first) first = out;
+    }
+  }
+  return first;
 }
 // Flatten a parsed local-command turn to text-feed form, or null to drop it —
 // mirror of hub-agent.py _lc_preview.
@@ -253,11 +273,32 @@ function entryFirstText(entry) {
   return "";
 }
 
+// Pressing Esc (or the hub's Stop) mid-turn writes a user-role "[Request
+// interrupted by user…]" marker entry — a statement about the turn, not
+// something the operator typed. Mirror of hub-agent.py INTERRUPT_RE.
+const INTERRUPT_RE = /^\s*\[Request interrupted by user[^\]\n]*\]\s*$/;
+
+// Claude Code's "while you were away" recap: a `system` entry (subtype
+// "away_summary") whose content the model wrote. Every other system subtype is
+// TUI bookkeeping and stays dropped; the trailing "(disable recaps in
+// /config)" hint is a TUI affordance and is stripped. Mirror of hub-agent.py
+// _away_summary_text.
+const AWAY_HINT_RE = /\s*\(disable recaps in \/config\)\s*$/;
+function awaySummaryText(entry) {
+  if (entry.type !== "system" || entry.subtype !== "away_summary") return null;
+  const text = String(entry.content || "").replace(ANSI_RE, "").replace(AWAY_HINT_RE, "").trim();
+  return text || null;
+}
+
 // Display role for an entry — mirror of hub-agent.py _entry_role. A compact
 // summary is written as a USER turn carrying text the model wrote about itself;
 // it reports as the assistant so the chat doesn't misattribute it to the human.
+// A system entry only ever survives the feeds as an away_summary recap, which
+// the model also wrote — same rule.
 function entryRole(entry) {
-  return entry.isCompactSummary ? "assistant" : entry.type;
+  if (entry.isCompactSummary) return "assistant";
+  if (entry.type === "system") return "assistant";
+  return entry.type;
 }
 
 // One text payload -> its text-feed form, or null to drop it. Mirror of
@@ -274,6 +315,8 @@ function flattenText(raw) {
 // type, no message, tool_result-only turn, empty after ANSI strip). Mirrors
 // hub-agent.py _entry_text.
 function entryText(entry) {
+  const away = awaySummaryText(entry);
+  if (away !== null) return away;
   const type = entry.type;
   if (type !== "user" && type !== "assistant") return null;
   const msg = entry.message;
@@ -336,6 +379,9 @@ function toolResultText(content) {
       if (block && typeof block === "object") {
         if (block.type === "text") parts.push(String(block.text || ""));
         else if (block.type === "image") parts.push("[image]");
+        // A ToolSearch result names the tools it loaded as tool_reference
+        // blocks; flattening them away left the call's output card empty.
+        else if (block.type === "tool_reference") parts.push(`\n[tool: ${block.tool_name || "tool"}]`);
       } else if (typeof block === "string") {
         parts.push(block);
       }
@@ -353,6 +399,15 @@ function toolResultText(content) {
 // truncated:true. Returns [] for a user/assistant message with no renderable
 // blocks. Line-for-line mirror of hub-agent.py _entry_blocks — keep in lockstep.
 function entryBlocks(entry, caps) {
+  // The "while you were away" recap becomes its own block (assistant-side
+  // card); all other system entries still drop. Mirror of _entry_blocks.
+  const away = awaySummaryText(entry);
+  if (away !== null) {
+    const [clipped, trunc] = clip(away, caps.text);
+    const block = { t: "away_summary", text: clipped };
+    if (trunc) block.truncated = true;
+    return [block];
+  }
   const type = entry.type;
   if (type !== "user" && type !== "assistant") return null;
   const msg = entry.message;
@@ -416,6 +471,11 @@ function entryBlocks(entry, caps) {
     if (tn) return addTaskNotification(tn);
     const lc = parseLocalCommand(raw);
     if (lc) return addLocalCommand(lc);
+    // An interrupt marker is a statement about the turn, not operator prose.
+    if (INTERRUPT_RE.test(raw)) {
+      blocks.push({ t: "interrupt", text: String(raw).replace(ANSI_RE, "").trim() });
+      return;
+    }
     addText(entry.isCompactSummary ? "compact_summary" : "text", raw, caps.text);
   };
   if (typeof content === "string") {
@@ -451,8 +511,47 @@ function entryBlocks(entry, caps) {
   return blocks;
 }
 
+// The prompt queue: a message typed mid-turn is enqueued, and Claude Code
+// records the queue's life as `queue-operation` transcript entries (enqueue
+// carries the text; dequeue pops the OLDEST into a real user turn; remove
+// withdraws one by content). Folded in file order so the chat can show a
+// still-queued prompt instead of it vanishing until the turn ends — when its
+// dequeue lands, the real user turn takes over, so there's no duplicate. A
+// window opening mid-sequence can see a dequeue whose enqueue was cut off;
+// popping an empty queue is a no-op, erring toward briefly hiding a queued
+// prompt rather than inventing a phantom one. Mirror of hub-agent.py
+// _fold_queue_op / QUEUED_*.
+const QUEUED_PROMPTS_MAX = 10;
+const QUEUED_PROMPT_CHARS = 4000;
+function foldQueueOp(entry, queue) {
+  const op = entry.operation;
+  const content = entry.content;
+  if (op === "enqueue") {
+    if (typeof content === "string" && content.trim()) queue.push(content.trim().slice(0, QUEUED_PROMPT_CHARS));
+  } else if (op === "dequeue") {
+    if (queue.length) queue.shift();
+  } else if (op === "remove") {
+    if (typeof content === "string") {
+      const c = content.trim().slice(0, QUEUED_PROMPT_CHARS);
+      const i = queue.indexOf(c);
+      if (i >= 0) queue.splice(i, 1);
+    }
+  }
+}
+
+// The queue entries worth SHOWING: capped, minus the tooling's own payloads —
+// a background task finishing mid-turn rides the same queue as a
+// `<task-notification>` XML wall, which must keep its FIFO slot (dequeues are
+// positional) but must not render as a queued operator bubble. Prefix-matched:
+// the enqueue copy is clipped, which can cut the closing tag a parse needs.
+// Mirror of hub-agent.py _queued_display.
+function queuedDisplay(queue) {
+  return queue.filter((q) => !q.startsWith("<task-notification>")).slice(-QUEUED_PROMPTS_MAX);
+}
+
 // Last TAIL_MSGS surviving messages of a worktree's newest transcript, oldest
-// first: [{id: uuid, role, text}]. [] when there's no transcript yet.
+// first, plus the still-queued prompts: {entries: [{id: uuid, role, text,
+// blocks}], queued: [text]}. Empty both when there's no transcript yet.
 //
 // Optional `cache` ({path, mtimeMs, size, result}, one per watched session)
 // skips the ~128 KB read+parse when the transcript is unchanged since the last
@@ -462,8 +561,8 @@ function entryBlocks(entry, caps) {
 function transcriptTail(worktreePath, cache, transcriptId) {
   const p = sessionTranscript(worktreePath, transcriptId);
   if (!p) {
-    if (cache) { cache.path = null; cache.result = []; }
-    return [];
+    if (cache) { cache.path = null; cache.result = { entries: [], queued: [] }; }
+    return { entries: [], queued: [] };
   }
   let st = null;
   try { st = fs.statSync(p); } catch {}
@@ -472,10 +571,12 @@ function transcriptTail(worktreePath, cache, transcriptId) {
     return cache.result; // unchanged since last poll -> reuse, no read+parse
   }
   const tail = [];
+  const queued = [];
   for (const raw of readTailLines(p, TAIL_READ_BYTES)) {
     let entry;
     try { entry = JSON.parse(raw); } catch { continue; }
     if (!entry || typeof entry !== "object") continue;
+    if (entry.type === "queue-operation") { foldQueueOp(entry, queued); continue; }
     const text = entryText(entry);
     const blocks = entryBlocks(entry, BLOCK_CAPS_LIVE);
     // Rich path widens inclusion: a tool_result-only turn (text === null) still
@@ -489,7 +590,7 @@ function transcriptTail(worktreePath, cache, transcriptId) {
       blocks: blocks || [],
     });
   }
-  const result = tail.slice(-TAIL_MSGS);
+  const result = { entries: tail.slice(-TAIL_MSGS), queued: queuedDisplay(queued) };
   if (cache) {
     cache.path = p;
     cache.mtimeMs = st ? st.mtimeMs : 0;
@@ -715,16 +816,19 @@ function captureLiveTurn(sessionId, cb) {
 function pollWatcher(sessionId) {
   const w = watchers.get(sessionId);
   if (!w) return;
-  // 1. Committed transcript tail (authoritative history). The per-session cache
-  //    skips the read+parse on ticks where the transcript file hasn't changed.
-  let entries = null;
-  try { entries = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId); }
-  catch { entries = null; }
-  if (entries && entries.length) {
-    const json = JSON.stringify(entries);
+  // 1. Committed transcript tail (authoritative history) plus the still-queued
+  //    prompts. The per-session cache skips the read+parse on ticks where the
+  //    transcript file hasn't changed. `queued` joins the dedup key because a
+  //    queue op is a transcript line that changes NO entry — without it, the
+  //    frame that reports "your prompt is queued" would never fire.
+  let tail = null;
+  try { tail = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId); }
+  catch { tail = null; }
+  if (tail && (tail.entries.length || tail.queued.length)) {
+    const json = JSON.stringify(tail);
     if (json !== w.lastJson) {
       w.lastJson = json;
-      sendControl({ tail: sessionId, entries });
+      sendControl({ tail: sessionId, entries: tail.entries, queued: tail.queued });
     }
   }
   // 2. Live in-progress assistant turn scraped from the TUI (real-time). Sent
@@ -1023,5 +1127,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, parseAgentList, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, parseAgentList, awaySummaryText, foldQueueOp, BLOCK_CAPS_LIVE };
 }

@@ -307,6 +307,12 @@
   let gen = 0;                      // bumped on every open/close; stale async work checks it
   let hostKey = null, sessionId = null, sess = null, agent = null;
   let buffer = [];                  // merged rich entries {id, role, text, blocks}
+  // Prompts typed mid-turn, still waiting in Claude Code's queue (the agent
+  // folds queue-operation transcript entries — see foldQueueOp in
+  // tunnel-agent.js). Rendered as pending user bubbles under the live turn;
+  // replaced wholesale by each tail frame / history load, so a consumed prompt
+  // drops out the moment its real user turn lands.
+  let queuedPrompts = [];
   let liveTurn = "";                // in-progress assistant text (pane scrape), "" when idle
   let liveStatus = null;            // {verb,up,down,elapsed} working indicator, null when idle
   let ws = null, backoffIdx = 0, wsRetryTimer = null;
@@ -380,8 +386,11 @@
       if (myGen !== gen) return;
       let frame;
       try { frame = JSON.parse(ev.data); } catch { return; }
-      if (frame && frame.type === "tail" && Array.isArray(frame.entries) && frame.entries.length) {
-        buffer = mergeTail(buffer, frame.entries);
+      if (frame && frame.type === "tail" && Array.isArray(frame.entries)) {
+        if (frame.entries.length) buffer = mergeTail(buffer, frame.entries);
+        // Every tail frame carries the CURRENT still-queued prompt list (an
+        // agent predating the field sends none — keep whatever we had).
+        if (Array.isArray(frame.queued)) queuedPrompts = frame.queued;
         repaint();
       } else if (frame && frame.type === "turn" && typeof frame.text === "string") {
         liveTurn = frame.text;
@@ -432,6 +441,7 @@
     // looser per-block caps). Seed order from it, then re-merge any newer live
     // entries already in the buffer on top.
     buffer = mergeTail(j.entries, buffer);
+    if (Array.isArray(j.queued)) queuedPrompts = j.queued;
     repaint();
   }
 
@@ -450,9 +460,18 @@
   // the text-only heartbeat seed is replaced by the rich live tail, and the live
   // tail (tight caps) is replaced by /history (looser caps). Grow-only, so a
   // truncated preview never clobbers a fuller copy.
+  //
+  // EVERY block payload field counts, not just text/input: a command block
+  // carries its content in name/args (a task_notification in summary/result),
+  // and leaving those out made the rich copy TIE its own flat text — and the
+  // `>=` tie-break then let a text-only seed clobber the blocks right back off
+  // the entry (a `!` chip regressing to a raw user bubble).
   function weight(e) {
     let w = (e.text || "").length;
-    for (const b of (e.blocks || [])) w += (b.text || "").length + (b.input || "").length;
+    for (const b of (e.blocks || [])) {
+      w += (b.text || "").length + (b.input || "").length + (b.name || "").length +
+        (b.args || "").length + (b.summary || "").length + (b.result || "").length;
+    }
     return w;
   }
   function mergeTail(existing, incoming) {
@@ -477,6 +496,7 @@
   //        | {kind:"action", id, name, input, inputTrunc, result:{text,isError,truncated}|null, entryId}
   //        | {kind:"command", id, name, args, argsTrunc, result:{text,isError,truncated}|null}
   //        | {kind:"compact", id, text, truncated}
+  //        | {kind:"interrupt", id, text} | {kind:"away", id, text, truncated}
   function buildItems(entries) {
     const resultsById = new Map();
     const toolUseIds = new Set();
@@ -558,6 +578,16 @@
         } else if (b.t === "compact_summary") {
           flush();
           items.push({ kind: "compact", id: eid, text: b.text || "", truncated: !!b.truncated });
+        } else if (b.t === "interrupt") {
+          // "[Request interrupted by user…]" — a statement about the turn, not
+          // something the operator typed; rendered as a centred status marker.
+          flush();
+          items.push({ kind: "interrupt", id: eid, text: b.text || "" });
+        } else if (b.t === "away_summary") {
+          // The model's "while you were away" recap — an assistant-side card,
+          // like the compact summary, not a bubble.
+          flush();
+          items.push({ kind: "away", id: eid, text: b.text || "", truncated: !!b.truncated });
         } else if (b.t === "task_notification") {
           // A background Task/agent finishing: render as an action card (like a
           // tool call) rather than a raw-XML user bubble. The summary is the
@@ -661,6 +691,24 @@
       '<div class="compact-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
   }
 
+  // "[Request interrupted by user…]" as a centred, muted status marker — the
+  // one thing the TUI's red ⎿ marker says that matters here is THAT the turn
+  // was cut, so the label is the marker text without its brackets.
+  function renderInterrupt(it) {
+    const label = String(it.text || "Request interrupted by user").replace(/^\[|\]$/g, "");
+    return '<div class="chat-interrupt" data-uuid="' + esc(it.id) + '">◼ ' + esc(label) + "</div>";
+  }
+
+  // The "while you were away" recap, collapsed like the compact-summary card.
+  // Never hidden by verbosity: it exists precisely for the operator who was
+  // not watching, and it's one line while closed.
+  function renderAwayCard(it) {
+    const key = "away:" + it.id;
+    return '<details class="away-card" data-dkey="' + esc(key) + '" data-uuid="' + esc(it.id) + '"' +
+      openAttr(key, false) + "><summary>☾ While you were away — recap</summary>" +
+      '<div class="away-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
+  }
+
   function itemsToHtml(items) {
     const out = [];
     let i = 0, g = 0;
@@ -670,6 +718,8 @@
       if (it.kind === "thinking") { out.push(renderThought(it)); i++; continue; }
       if (it.kind === "command") { out.push(renderCommandCard(it)); i++; continue; }
       if (it.kind === "compact") { out.push(renderCompactCard(it)); i++; continue; }
+      if (it.kind === "interrupt") { out.push(renderInterrupt(it)); i++; continue; }
+      if (it.kind === "away") { out.push(renderAwayCard(it)); i++; continue; }
       // action run
       let j = i;
       while (j < items.length && items[j].kind === "action") j++;
@@ -711,7 +761,7 @@
     const prevTop = scroll.scrollTop;
     const items = buildItems(buffer);
     let html = itemsToHtml(items);
-    if (!html && !liveTurn) html = '<div class="chat-empty">No messages yet. Say something below to get the agent going.</div>';
+    if (!html && !liveTurn && !queuedPrompts.length) html = '<div class="chat-empty">No messages yet. Say something below to get the agent going.</div>';
     // The in-progress assistant turn (streaming, text-only) as the trailing
     // bubble; its text is revealed by the typewriter loop.
     if (liveTurn) {
@@ -741,6 +791,13 @@
     } else {
       revealFull = "";
       reveal.shown = 0;
+    }
+    // Still-queued prompts (typed mid-turn) trail the live turn, where they'll
+    // actually run — the TUI shows the same list under its input box. Each is a
+    // dimmed user bubble labelled "queued"; the list is replaced wholesale by
+    // every tail frame, so a consumed prompt swaps for its real user turn.
+    for (const q of queuedPrompts) {
+      html += '<div class="tr-msg user queued"><span class="role">queued</span>' + esc(q) + "</div>";
     }
     // Most repaints are no-ops: the /history poll and the ~1s `turn` frame fire
     // whether or not anything changed, and re-writing identical HTML still
@@ -822,32 +879,37 @@
     wireAgentDelegation(bar);
   }
 
-  // ---- the compose button: Send when idle, Stop while the agent works --------
-  // There's only ever one thing to do with the agent's turn — start it or end it
-  // — so one button at the bottom of the compose box does both, rather than a
-  // separate Stop parked in the header away from where the operator is typing.
+  // ---- the compose buttons: Send always sends; ◼ Stop appears mid-turn ------
+  // Send never morphs into Stop: a message sent while the agent works QUEUES
+  // (Claude Code runs it when the turn ends, and the chat shows it as a dimmed
+  // "queued" bubble), so the button that talks has to stay available mid-turn —
+  // on a phone it is the ONLY way to send, and morphing it into Stop made
+  // queueing impossible there. Stop is its own warning-coloured button beside
+  // Send, shown only while a turn is running (`composeBusy`), still in the
+  // compose row rather than parked in the header away from where the operator
+  // is typing.
   //
   // `liveStatus` is the busy read because it's the fastest one on the page: the
   // tunnel scrapes the pane's "esc to interrupt" hint every ~1s and pushes a
   // `turn` frame carrying the status (null the moment generating ends), where the
   // heartbeat's paneBusy is a beat or more behind. When the socket is down and no
-  // frames arrive, liveStatus stays null and the button stays Send — the safe
+  // frames arrive, liveStatus stays null and Stop stays hidden — the safe
   // degradation, since a Stop that can't see the turn is worse than no Stop.
   function composeBusy() {
     // A pending AskUserQuestion is answered THROUGH the compose box — a typed
     // reply routes to /answer as a custom answer (see send()). So while a question
-    // is up the button must be Send, not Stop, even though the pane still reads
-    // busy (the AskUserQuestion tool call is blocking). Clicking Stop here would
+    // is up Stop is hidden even though the pane still reads busy (the
+    // AskUserQuestion tool call is blocking): clicking Stop there would
     // interrupt the turn and destroy the question, which is exactly the wrong
     // thing when the operator only wanted to type a custom response (XERK-21).
     if (questionActive) { stopPendingAt = 0; return false; }
     if (!liveStatus) { stopPendingAt = 0; return false; }
     // A clicked Stop only lands on the agent's next beat, so the pane keeps
-    // reporting the turn for a second or two afterwards. Hand the button back to
-    // Send immediately anyway — the operator asked for the turn to end and
-    // shouldn't watch a dead Stop to find out it worked. If the turn is somehow
-    // still alive once the window lapses, the interrupt didn't take and Stop
-    // legitimately comes back.
+    // reporting the turn for a second or two afterwards. Hide Stop immediately
+    // anyway — the operator asked for the turn to end and shouldn't watch a
+    // dead Stop to find out it worked. If the turn is somehow still alive once
+    // the window lapses, the interrupt didn't take and Stop legitimately comes
+    // back.
     if (stopPendingAt) {
       if (Date.now() - stopPendingAt < STOP_SUPPRESS_MS) return false;
       stopPendingAt = 0;
@@ -856,27 +918,33 @@
   }
   function isBusy() { return composeBusy(); }
 
-  // Paint every compose button on the page (the chat's and — while the terminal
+  // Paint every compose bar on the page (the chat's and — while the terminal
   // toggle is showing, with this engine still warm underneath it — the
-  // terminal's) from the one busy read.
+  // terminal's) from the one busy read: Send keeps its label (only its tooltip
+  // says whether a send queues), and the ◼ Stop beside it shows only mid-turn.
   function updateComposeAction() {
     if (typeof document === "undefined") return;
     const busy = composeBusy();
     if (actionFailUntil && Date.now() < actionFailUntil) return; // let the failure text stand
     actionFailUntil = 0;
-    const btns = document.querySelectorAll(".compose-action");
-    for (const btn of btns) {
-      btn.classList.toggle("stop", busy);
-      btn.textContent = busy ? "◼ Stop" : "Send";
+    for (const btn of document.querySelectorAll(".compose-action")) {
+      btn.textContent = "Send";
       btn.title = busy
-        ? "Stop the agent's current turn (Esc) — the session keeps running"
+        ? "Send now — the message queues and runs when this turn ends"
         : "Send this message to the agent";
     }
+    for (const btn of document.querySelectorAll(".compose-stop")) {
+      btn.hidden = !busy;
+      btn.textContent = "◼ Stop";
+      btn.title = "Stop the agent's current turn (Esc) — the session keeps running";
+    }
   }
-  // Show a transient failure on the compose button, then repaint it normally.
-  function actionFailed(text) {
+  // Show a transient failure on a compose-bar button (`sel` picks which — the
+  // Send buttons by default, the Stop buttons for a failed interrupt), then
+  // repaint normally.
+  function actionFailed(text, sel) {
     actionFailUntil = Date.now() + ACTION_FAIL_MS;
-    const btns = document.querySelectorAll(".compose-action");
+    const btns = document.querySelectorAll(sel || ".compose-action");
     for (const btn of btns) btn.textContent = text;
     setTimeout(() => { actionFailUntil = 0; updateComposeAction(); }, ACTION_FAIL_MS);
   }
@@ -900,7 +968,7 @@
     } catch {
       stopPendingAt = 0; // the turn is still running — give Stop back right away
       updateComposeAction();
-      actionFailed("Stop failed");
+      actionFailed("Stop failed", ".compose-stop");
     }
   }
 
@@ -1481,7 +1549,7 @@
     gen++;
     const myGen = gen;
     hostKey = hk; sessionId = id; sess = s; agent = a;
-    buffer = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
+    buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
     stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send
     modelSwitchPending = null;
     lastHtml = null; repaintDeferred = false; // this session's paint memo starts empty
@@ -1510,7 +1578,7 @@
     if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
-    buffer = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
+    buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
     stopPendingAt = 0; actionFailUntil = 0; modelSwitchPending = null;
     lastHtml = null; repaintDeferred = false;
     updateLiveStatus(); // hide the pinned bar when the view closes
@@ -1534,12 +1602,15 @@
       isBusy, stop, actionFailed };
     // Global handlers referenced by the chat pane's inline HTML attributes.
     window.autoGrowChatInput = autoGrow;
-    // Enter always sends: a queued message is a normal thing to type mid-turn,
-    // and the key isn't the button — only the click target changes with the turn.
+    // Enter always sends, exactly like the button: a queued message is a
+    // normal thing to type mid-turn.
     window.chatInputKey = function (e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
     window.sendChatInput = send;
-    // The one compose button: Stop while the agent is generating, Send otherwise.
-    window.chatComposeAction = function () { if (composeBusy()) stop(); else send(); };
+    // Send always sends — mid-turn it queues (Claude Code holds the message
+    // until the turn ends, and the chat shows it as a "queued" bubble). The
+    // separate ◼ Stop button interrupts the turn.
+    window.chatComposeAction = function () { send(); };
+    window.chatComposeStop = function () { stop(); };
     window.chatJumpBottom = jumpToBottom;
   }
 
@@ -1557,6 +1628,7 @@
       __setVerbosity: (v) => { verbosity = v; },
       __setNoExpand: (v) => { noExpand = v; },
       __setBuffer: (b) => { buffer = b; },
+      __setQueued: (q) => { queuedPrompts = q; },
       __setLiveTurn: (t) => { liveTurn = t; reveal.shown = 0; },
       // Set the live turn WITHOUT resetting the reveal — the real ws `turn`
       // frame does exactly this (liveTurn = frame.text), and testing the

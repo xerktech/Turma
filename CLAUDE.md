@@ -888,6 +888,30 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   contract).
 - Blocks PRESERVE the thinking text, tool_use inputs and tool_result outputs that `_entry_text`
   flattens away, so the hub's native chat UI can render + verbosity-filter each component.
+- Turns that are ABOUT the session rather than someone talking are classified, not rendered verbatim
+  (each backed by real transcript shapes found on the fleet):
+  - `[Request interrupted by user…]` marker turns (Esc / the hub's Stop) become `{t:"interrupt"}` —
+    a centred status marker in chat, not a user bubble; `_entry_text` keeps the raw bracket line.
+  - The `!` shell passthrough's `<bash-input>`/`<bash-stdout>`/`<bash-stderr>` turns parse into the
+    SAME command/command_output shapes the slash commands use (name `!`), via `_parse_local_command`.
+    Output tags routinely arrive together with one stream empty, so stderr only wins when non-empty.
+  - A `system`/`away_summary` entry (the "while you were away" recap) becomes `{t:"away_summary"}` —
+    an assistant-side collapsed card, with the "(disable recaps in /config)" TUI hint stripped; every
+    other system subtype is TUI bookkeeping and stays dropped (`_away_summary_text`).
+  - `tool_reference` blocks inside a tool_result (ToolSearch naming the tools it loaded) flatten to
+    `[tool: <name>]` lines instead of vanishing and leaving the result card empty.
+- **Still-queued prompts ride beside the entries, not inside them**: a message typed mid-turn only
+  becomes a user entry when Claude Code dequeues it, so the live tail and `/history` fold the
+  transcript's `queue-operation` entries FIFO (`_fold_queue_op` / `foldQueueOp`, enqueue → dequeue →
+  remove-by-content) and ship the survivors as `queued[]` beside `entries` — the chat renders them as
+  dimmed "queued" user bubbles under the live turn, exactly the list the TUI shows under its input
+  box, replaced wholesale each frame so a consumed prompt swaps for its real user turn with no
+  duplicate. A window opening mid-sequence errs toward hiding (an unmatched dequeue no-ops), never
+  toward inventing a phantom queued prompt. Older agents send no `queued` and the hub/chat treat it
+  as absent, not empty.
+- Tooling payloads ride the same queue — a background task finishing mid-turn enqueues its whole
+  `<task-notification>` XML — so display filtering happens at REPORT time (`_queued_display` /
+  `queuedDisplay`), never at fold time, which would desync the positional dequeues.
 - They ride the live tail (tight per-block caps) and on-demand `history`
   (`_entry_blocks(entry, BLOCK_CAPS_FULL)`, looser caps for "Show more").
 - They are the one place inclusion widens: a tool_result-only turn, dropped by `_entry_text`, is kept
@@ -1473,37 +1497,41 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
 - The menu's open/armed/typing state lives in page variables, not the DOM, because every beat
   re-renders the list.
 
-#### Stop button
+#### Send and Stop buttons
 
-- **The compose button IS the Stop button**, in both the chat and terminal views: while the attached
-  agent is generating it becomes a warning-coloured **◼ Stop**, and it's back to **Send** the moment
-  the turn ends. There is only ever one thing to do with the turn, and the button that does it sits
-  where the operator is already typing rather than in the header.
-- Stop interrupts the turn the session has in flight (`chatComposeAction`/`termComposeAction` →
-  `stop()` in `chat.js` → `POST /api/agents/<host>/sessions/<id>/interrupt` → an `interrupt` command →
-  the agent's Escape into the pane; see the agent bullet).
+- **Send always sends, and ◼ Stop is its own button**, in both the chat and terminal views. A message
+  sent mid-turn QUEUES (Claude Code holds it until the turn ends, and the chat renders it as a dimmed
+  "queued" bubble — see "Transcript entry blocks" under the agent), so the button that talks must stay
+  available while the agent works — on a phone it is the ONLY way to send, and the old design (one
+  button morphing into Stop mid-turn) made queueing impossible there. The warning-coloured Stop
+  appears beside Send only while a turn is running, still in the compose row rather than parked in the
+  header away from where the operator is typing.
+- Stop interrupts the turn the session has in flight (`chatComposeStop`/`termComposeStop` → `stop()`
+  in `chat.js` → `POST /api/agents/<host>/sessions/<id>/interrupt` → an `interrupt` command → the
+  agent's Escape into the pane; see the agent bullet).
 - Unlike Kill, Stop arms nothing and confirms nothing (it destroys no work — a turn stopped by mistake
   can just be re-asked) and leaves the session on the stage.
-- **Enter in the text box always sends**, whatever the button shows: queuing a message mid-turn is
-  normal, and only the click target changes with the turn.
-- The busy read is `chat.js`'s `liveStatus` — the ~1s pane scrape pushed as `turn` frames — NOT the
-  heartbeat's `paneBusy`, which is a beat or more behind a button the operator is watching. With the
-  live socket down no frames arrive, `liveStatus` stays null, and the button stays Send: a Stop that
-  can't see the turn is worse than no Stop.
-- A clicked Stop flips to Send **immediately** (`stopPendingAt`, `composeBusy()`), without waiting for
-  the pane to stop reporting the turn — the interrupt only lands on the agent's next heartbeat, and
-  the operator shouldn't have to watch a dead Stop to learn it worked. If the turn outlives the
-  `STOP_SUPPRESS_MS` window the interrupt didn't take, and Stop legitimately comes back.
-- **A pending `AskUserQuestion` forces the button to Send, not Stop** (`composeBusy()` returns false
-  while `questionActive`, overriding the busy pane read the blocking tool call keeps up) — the answer
-  is typed THROUGH the compose box, routed to `/answer` as a custom answer (`send()`'s `wasAnswer`
-  path). Stop would interrupt the turn and destroy the question, which is exactly the wrong thing when
-  the operator only wanted to send a custom response (XERK-21). `updateQuestion` repaints the button
+- **Enter in the text box always sends**, exactly like the button: queuing a message mid-turn is
+  normal. Only Send's tooltip changes with the turn (idle "send" vs busy "queues and runs when this
+  turn ends").
+- The busy read driving Stop's visibility is `chat.js`'s `liveStatus` — the ~1s pane scrape pushed as
+  `turn` frames — NOT the heartbeat's `paneBusy`, which is a beat or more behind a button the operator
+  is watching. With the live socket down no frames arrive, `liveStatus` stays null, and Stop stays
+  hidden: a Stop that can't see the turn is worse than no Stop.
+- A clicked Stop **hides immediately** (`stopPendingAt`, `composeBusy()`), without waiting for the
+  pane to stop reporting the turn — the interrupt only lands on the agent's next heartbeat, and the
+  operator shouldn't have to watch a dead Stop to learn it worked. If the turn outlives the
+  `STOP_SUPPRESS_MS` window the interrupt didn't take, and Stop legitimately comes back. A failed
+  interrupt POST paints "Stop failed" on the Stop button (`actionFailed`'s selector arg).
+- **A pending `AskUserQuestion` hides Stop** (`composeBusy()` returns false while `questionActive`,
+  overriding the busy pane read the blocking tool call keeps up) — the answer is typed THROUGH the
+  compose box, routed to `/answer` as a custom answer (`send()`'s `wasAnswer` path), and an accidental
+  Stop would interrupt the turn and destroy the question (XERK-21). `updateQuestion` repaints the bar
   the instant a question appears or clears rather than waiting for the next live frame.
-- `chat.js` paints every `.compose-action` button on the page from that one read, so the terminal's
-  button (its engine stays warm underneath the toggle) can't disagree with the chat's.
-- Tests: the compose-button cases in `turma/tests/chat.test.js` and the `termComposeAction` cases in
-  `turma/tests/sessions.test.js`.
+- `chat.js` paints every `.compose-action` and `.compose-stop` button on the page from that one read,
+  so the terminal's bar (its engine stays warm underneath the toggle) can't disagree with the chat's.
+- Tests: the compose-bar cases in `turma/tests/chat.test.js` and the
+  `termComposeAction`/`termComposeStop` cases in `turma/tests/sessions.test.js`.
 
 #### Copying out of the terminal
 

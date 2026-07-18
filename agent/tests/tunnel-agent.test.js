@@ -21,7 +21,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.TURMA_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, BLOCK_CAPS_LIVE } = require("../tunnel-agent.js");
+const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, BLOCK_CAPS_LIVE } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -211,6 +211,114 @@ test("entryBlocks: slash-command turns -> command / command_output blocks, cavea
   assert.equal(entryText({ type: "user", isMeta: true, message: { content: COMMAND_CAVEAT } }), null);
 });
 
+// Mirror of test_hub_agent.py TestBashPassthrough — keep in lockstep.
+test("parseLocalCommand: `!` bash passthrough turns -> command / output shapes", () => {
+  assert.deepEqual(parseLocalCommand("<bash-input> git status</bash-input>"),
+    { kind: "command", name: "!", args: "git status" });
+  assert.deepEqual(parseLocalCommand("<bash-stdout>2 files changed</bash-stdout>"),
+    { kind: "output", text: "2 files changed", isError: false });
+  assert.deepEqual(parseLocalCommand("<bash-stderr>fatal: not a repo</bash-stderr>"),
+    { kind: "output", text: "fatal: not a repo", isError: true });
+  // Both tags with one empty: the empty stream must not win by matching first.
+  assert.deepEqual(parseLocalCommand("<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>"),
+    { kind: "output", text: "ok", isError: false });
+  assert.deepEqual(parseLocalCommand("<bash-stdout></bash-stdout><bash-stderr>boom</bash-stderr>"),
+    { kind: "output", text: "boom", isError: true });
+  assert.equal(parseLocalCommand("talk about <bash-input> inline"), null);
+  // The blocks + text feeds treat it exactly like a slash command.
+  assert.deepEqual(
+    entryBlocks({ type: "user", message: { content: "<bash-input> ls -la</bash-input>" } }, BLOCK_CAPS_LIVE),
+    [{ t: "command", name: "!", args: "ls -la" }]);
+  assert.equal(entryText({ type: "user", message: { content: "<bash-input> ls</bash-input>" } }), "! ls");
+});
+
+// Mirror of test_hub_agent.py TestInterruptMarker — keep in lockstep.
+test("entryBlocks: an interrupt marker is a status block, not a user bubble", () => {
+  for (const text of ["[Request interrupted by user]", "[Request interrupted by user for tool use]"]) {
+    for (const content of [text, [{ type: "text", text }]]) {
+      assert.deepEqual(entryBlocks({ type: "user", message: { content } }, BLOCK_CAPS_LIVE),
+        [{ t: "interrupt", text }]);
+    }
+  }
+  // The text feed keeps the raw bracket line.
+  assert.equal(entryText({ type: "user", message: { content: "[Request interrupted by user]" } }),
+    "[Request interrupted by user]");
+  // Prose that merely mentions one stays prose.
+  const prose = "the log said [Request interrupted by user] at 3pm";
+  assert.deepEqual(entryBlocks({ type: "user", message: { content: prose } }, BLOCK_CAPS_LIVE),
+    [{ t: "text", text: prose }]);
+});
+
+// Mirror of test_hub_agent.py TestAwaySummary — keep in lockstep.
+test("entryBlocks/entryText/entryRole: the away recap surfaces; other system entries drop", () => {
+  const entry = { type: "system", subtype: "away_summary",
+    content: "Fixed the bug and opened a PR. (disable recaps in /config)" };
+  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS_LIVE),
+    [{ t: "away_summary", text: "Fixed the bug and opened a PR." }]);
+  assert.equal(entryText(entry), "Fixed the bug and opened a PR.");
+  assert.equal(entryRole(entry), "assistant");
+  assert.equal(awaySummaryText(entry), "Fixed the bug and opened a PR.");
+  for (const subtype of ["turn_duration", "bridge_status", "stop_hook_summary", undefined]) {
+    const other = { type: "system", subtype, content: "x" };
+    assert.equal(entryBlocks(other, BLOCK_CAPS_LIVE), null);
+    assert.equal(entryText(other), null);
+  }
+  // An empty recap (hint only) drops.
+  assert.equal(entryBlocks({ type: "system", subtype: "away_summary",
+    content: " (disable recaps in /config)" }, BLOCK_CAPS_LIVE), null);
+});
+
+// Mirror of test_hub_agent.py TestToolReferenceResult — keep in lockstep.
+test("entryBlocks: tool_reference blocks in a tool_result flatten to named lines", () => {
+  const entry = { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1",
+    content: [{ type: "text", text: "loaded:" }, { type: "tool_reference", tool_name: "WebFetch" }] }] } };
+  assert.deepEqual(entryBlocks(entry, BLOCK_CAPS_LIVE),
+    [{ t: "tool_result", text: "loaded:\n[tool: WebFetch]", forId: "t1" }]);
+});
+
+// Mirror of test_hub_agent.py TestQueuedPrompts — keep in lockstep.
+test("foldQueueOp: FIFO enqueue/dequeue/remove; unmatched ops are no-ops", () => {
+  const q = [];
+  foldQueueOp({ operation: "enqueue", content: "first" }, q);
+  foldQueueOp({ operation: "enqueue", content: "second" }, q);
+  foldQueueOp({ operation: "enqueue", content: "third" }, q);
+  foldQueueOp({ operation: "dequeue" }, q);
+  foldQueueOp({ operation: "remove", content: "third" }, q);
+  assert.deepEqual(q, ["second"]);
+  const empty = [];
+  foldQueueOp({ operation: "dequeue" }, empty);
+  foldQueueOp({ operation: "remove", content: "ghost" }, empty);
+  foldQueueOp({ operation: "enqueue", content: "  " }, empty);
+  assert.deepEqual(empty, []);
+});
+
+test("transcriptTail: still-queued prompts ride beside the entries", () => {
+  const wt = "/wt/queued";
+  writeTranscript(wt, "t.jsonl", [
+    { uuid: "u1", type: "user", message: { content: "start work" } },
+    { type: "queue-operation", operation: "enqueue", content: "also do X" },
+    { type: "queue-operation", operation: "enqueue", content: "and Y" },
+    { type: "queue-operation", operation: "dequeue" },
+    // the dequeued prompt lands as its real user turn — no duplicate
+    { uuid: "u2", type: "user", message: { content: "also do X" } },
+  ]);
+  const tail = transcriptTail(wt);
+  assert.deepEqual(tail.entries.map((e) => e.id), ["u1", "u2"]);
+  assert.deepEqual(tail.queued, ["and Y"]);
+});
+
+test("transcriptTail: a queued task-notification keeps its FIFO slot but never displays", () => {
+  const wt = "/wt/queued-tn";
+  writeTranscript(wt, "t.jsonl", [
+    { uuid: "u1", type: "user", message: { content: "start" } },
+    { type: "queue-operation", operation: "enqueue",
+      content: "<task-notification>\n<task-id>x</task-id>\n</task-notification>" },
+    { type: "queue-operation", operation: "enqueue", content: "real prompt" },
+    { type: "queue-operation", operation: "dequeue" }, // pops the notification
+  ]);
+  assert.deepEqual(transcriptTail(wt).queued, ["real prompt"]);
+});
+
 test("entryBlocks: command args omitted when empty; long output truncates", () => {
   assert.deepEqual(
     entryBlocks({ type: "user", message: { content: "<command-name>/clear</command-name>\n<command-args></command-args>" } }, BLOCK_CAPS_LIVE),
@@ -271,7 +379,7 @@ test("transcriptTail: a compact summary rides under the assistant role", () => {
     { uuid: "u1", type: "user", message: { content: "hi" } },
     { uuid: "u2", type: "user", isCompactSummary: true, message: { content: "the summary" } },
   ]);
-  const tail = transcriptTail("/w/compact");
+  const tail = transcriptTail("/w/compact").entries;
   assert.deepEqual(tail.map((e) => [e.id, e.role]), [["u1", "user"], ["u2", "assistant"]]);
   assert.deepEqual(tail[1].blocks, [{ t: "compact_summary", text: "the summary" }]);
 });
@@ -289,12 +397,12 @@ test("transcriptTail: oldest-first, rich blocks, tolerates broken lines", () => 
   // text stays the backward-compat flat string; blocks is the additive rich
   // feed. The tool_result-only turn (tr1) now surfaces via blocks (rich-path
   // widening) with text:"" — a3 (empty, no blocks) is still dropped.
-  assert.deepEqual(transcriptTail(wt), [
+  assert.deepEqual(transcriptTail(wt), { entries: [
     { id: "u1", role: "user", text: "hello there", blocks: [{ t: "text", text: "hello there" }] },
     { id: "a1", role: "assistant", text: "hi red done[Bash]", blocks: [{ t: "text", text: "hi red done" }, { t: "tool_use", name: "Bash", input: "" }] },
     { id: "tr1", role: "user", text: "", blocks: [{ t: "tool_result", text: "ignored" }] },
     { id: "a2", role: "assistant", text: "final answer", blocks: [{ t: "text", text: "final answer" }] },
-  ]);
+  ], queued: [] });
 });
 
 test("transcriptTail: picks the newest transcript, caps at 30 messages", () => {
@@ -308,7 +416,7 @@ test("transcriptTail: picks the newest transcript, caps at 30 messages", () => {
   fs.utimesSync(path.join(dir, "new.jsonl"), now, now);
   fs.utimesSync(path.join(dir, "old.jsonl"), now - 100, now - 100);
 
-  const tail = transcriptTail(wt);
+  const tail = transcriptTail(wt).entries;
   assert.equal(tail.length, 30); // TAIL_MSGS
   assert.equal(tail[0].id, "m10"); // last 30 of 40
   assert.equal(tail[29].id, "m39");
@@ -316,7 +424,7 @@ test("transcriptTail: picks the newest transcript, caps at 30 messages", () => {
 });
 
 test("transcriptTail: no transcript -> []", () => {
-  assert.deepEqual(transcriptTail("/wt/does-not-exist"), []);
+  assert.deepEqual(transcriptTail("/wt/does-not-exist"), { entries: [], queued: [] });
   assert.equal(newestTranscript("/wt/does-not-exist"), null);
 });
 
@@ -337,10 +445,10 @@ test("sessionTranscript: the named transcript wins over a newer neighbour", () =
   fs.utimesSync(path.join(dir, "sess-a.jsonl"), new Date(9000), new Date(9000));
 
   assert.equal(sessionTranscript(wt, "sess-b"), path.join(dir, "sess-b.jsonl"));
-  assert.deepEqual(transcriptTail(wt, null, "sess-b").map((e) => e.text), ["session B work"]);
+  assert.deepEqual(transcriptTail(wt, null, "sess-b").entries.map((e) => e.text), ["session B work"]);
   // Without an id — a hub predating the pin — newest-mtime is all there is.
   assert.equal(sessionTranscript(wt, null), path.join(dir, "sess-a.jsonl"));
-  assert.deepEqual(transcriptTail(wt, null).map((e) => e.text), ["session A work"]);
+  assert.deepEqual(transcriptTail(wt, null).entries.map((e) => e.text), ["session A work"]);
 });
 
 test("sessionTranscript: a named-but-absent transcript is empty, never a neighbour's", () => {
@@ -351,7 +459,7 @@ test("sessionTranscript: a named-but-absent transcript is empty, never a neighbo
     { uuid: "a1", type: "user", message: { content: "session A work" } },
   ]);
   assert.equal(sessionTranscript(wt, "sess-new"), null);
-  assert.deepEqual(transcriptTail(wt, null, "sess-new"), []);
+  assert.deepEqual(transcriptTail(wt, null, "sess-new"), { entries: [], queued: [] });
 });
 
 test("sessionTranscript: a traversing id names nothing", () => {
@@ -366,10 +474,10 @@ test("transcriptTail: with a cache, an unchanged file is not re-parsed", () => {
     { uuid: "u1", type: "user", message: { content: "one" } },
   ]);
   const p = path.join(dir, "t.jsonl");
-  const cache = { path: null, mtimeMs: 0, size: 0, result: [] };
+  const cache = { path: null, mtimeMs: 0, size: 0, result: { entries: [], queued: [] } };
 
   const first = transcriptTail(wt, cache);
-  assert.deepEqual(first, [{ id: "u1", role: "user", text: "one", blocks: [{ t: "text", text: "one" }] }]);
+  assert.deepEqual(first, { entries: [{ id: "u1", role: "user", text: "one", blocks: [{ t: "text", text: "one" }] }], queued: [] });
   assert.equal(cache.path, p); // primed
 
   // File untouched: the cache must skip the read+parse and hand back the EXACT
@@ -385,10 +493,10 @@ test("transcriptTail: with a cache, an unchanged file is not re-parsed", () => {
   const later = Date.now() / 1000 + 5;
   fs.utimesSync(p, later, later);
   const reparsed = transcriptTail(wt, cache);
-  assert.deepEqual(reparsed, [
+  assert.deepEqual(reparsed, { entries: [
     { id: "u1", role: "user", text: "one", blocks: [{ t: "text", text: "one" }] },
     { id: "a1", role: "assistant", text: "two", blocks: [{ t: "text", text: "two" }] },
-  ]);
+  ], queued: [] });
 });
 
 // Stub process.kill so these never actually signal anything — just capture what

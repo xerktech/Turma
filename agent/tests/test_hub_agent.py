@@ -1645,6 +1645,221 @@ class TestSkillBody(unittest.TestCase):
         self.assertIsNone(ha._entry_text(self._entry()))
 
 
+class TestBashPassthrough(unittest.TestCase):
+    """The `!` prefix's shell turns (<bash-input>, <bash-stdout>/<bash-stderr>)
+    are recorded as user-role XML — not the human talking. They parse into the
+    SAME command/output shapes the slash commands use (name "!"), so the chat
+    renders a chip + output card instead of raw XML prose. Kept in lockstep
+    with tunnel-agent.js parseLocalCommand (mirror cases in
+    tunnel-agent.test.js)."""
+
+    def test_parse_bash_input(self):
+        self.assertEqual(
+            ha._parse_local_command("<bash-input> git status</bash-input>"),
+            {"kind": "command", "name": "!", "args": "git status"})
+
+    def test_parse_bash_stdout_and_stderr(self):
+        self.assertEqual(
+            ha._parse_local_command("<bash-stdout>2 files changed</bash-stdout>"),
+            {"kind": "output", "text": "2 files changed", "isError": False})
+        self.assertEqual(
+            ha._parse_local_command("<bash-stderr>fatal: not a repo</bash-stderr>"),
+            {"kind": "output", "text": "fatal: not a repo", "isError": True})
+
+    def test_empty_stderr_does_not_swallow_stdout(self):
+        # A bash turn routinely ships BOTH tags with one empty — the empty
+        # stream must not win just by matching first.
+        self.assertEqual(
+            ha._parse_local_command(
+                "<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>"),
+            {"kind": "output", "text": "ok", "isError": False})
+        self.assertEqual(
+            ha._parse_local_command(
+                "<bash-stdout></bash-stdout><bash-stderr>boom</bash-stderr>"),
+            {"kind": "output", "text": "boom", "isError": True})
+
+    def test_blocks_emit_command_and_output(self):
+        self.assertEqual(
+            ha._entry_blocks({"type": "user", "message": {
+                "content": "<bash-input> ls -la</bash-input>"}}, ha.BLOCK_CAPS_LIVE),
+            [{"t": "command", "name": "!", "args": "ls -la"}])
+        self.assertEqual(
+            ha._entry_blocks({"type": "user", "message": {
+                "content": "<bash-stderr>boom</bash-stderr>"}}, ha.BLOCK_CAPS_LIVE),
+            [{"t": "command_output", "text": "boom", "isError": True}])
+
+    def test_text_feed_flattens_like_a_slash_command(self):
+        self.assertEqual(
+            ha._entry_text({"type": "user", "message": {
+                "content": "<bash-input> ls</bash-input>"}}),
+            "! ls")
+
+    def test_prose_quoting_a_bash_tag_stays_prose(self):
+        self.assertIsNone(ha._parse_local_command("talk about <bash-input> inline"))
+
+
+class TestInterruptMarker(unittest.TestCase):
+    """Esc / the hub's Stop mid-turn writes a user-role "[Request interrupted
+    by user…]" marker — a statement ABOUT the turn, not something the operator
+    typed, so the rich path classifies it as an `interrupt` block (the chat's
+    centred status marker) instead of a user text bubble. Mirror cases in
+    tunnel-agent.test.js."""
+
+    def test_marker_becomes_interrupt_block(self):
+        for text in ("[Request interrupted by user]",
+                     "[Request interrupted by user for tool use]"):
+            for content in (text, [{"type": "text", "text": text}]):
+                self.assertEqual(
+                    ha._entry_blocks({"type": "user", "message": {"content": content}},
+                                     ha.BLOCK_CAPS_LIVE),
+                    [{"t": "interrupt", "text": text}])
+
+    def test_text_feed_keeps_the_raw_line(self):
+        # Glasses/heartbeat/archive are one-dimensional text, where the bracket
+        # line already reads as the marker it is.
+        self.assertEqual(
+            ha._entry_text({"type": "user", "message": {
+                "content": "[Request interrupted by user]"}}),
+            "[Request interrupted by user]")
+
+    def test_prose_mentioning_an_interrupt_stays_prose(self):
+        text = "the log said [Request interrupted by user] at 3pm"
+        self.assertEqual(
+            ha._entry_blocks({"type": "user", "message": {"content": text}},
+                             ha.BLOCK_CAPS_LIVE),
+            [{"t": "text", "text": text}])
+
+
+class TestAwaySummary(unittest.TestCase):
+    """The "while you were away" recap is a `system` entry (subtype
+    away_summary) whose content the model wrote — the one system subtype worth
+    rendering. It surfaces as an assistant-side `away_summary` block/text with
+    the "(disable recaps in /config)" TUI hint stripped; every other system
+    subtype stays dropped. Mirror cases in tunnel-agent.test.js."""
+
+    ENTRY = {"type": "system", "subtype": "away_summary",
+             "content": "Fixed the bug and opened a PR. (disable recaps in /config)"}
+
+    def test_becomes_an_away_summary_block(self):
+        self.assertEqual(ha._entry_blocks(self.ENTRY, ha.BLOCK_CAPS_LIVE),
+                         [{"t": "away_summary", "text": "Fixed the bug and opened a PR."}])
+
+    def test_text_feed_and_role(self):
+        self.assertEqual(ha._entry_text(self.ENTRY), "Fixed the bug and opened a PR.")
+        self.assertEqual(ha._entry_role(self.ENTRY), "assistant")
+
+    def test_other_system_subtypes_stay_dropped(self):
+        for sub in ("turn_duration", "bridge_status", "stop_hook_summary", None):
+            entry = {"type": "system", "subtype": sub, "content": "x"}
+            self.assertIsNone(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE))
+            self.assertIsNone(ha._entry_text(entry))
+
+    def test_empty_recap_drops(self):
+        entry = {"type": "system", "subtype": "away_summary",
+                 "content": " (disable recaps in /config)"}
+        self.assertIsNone(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE))
+        self.assertIsNone(ha._entry_text(entry))
+
+    def test_long_recap_is_capped_and_truncated(self):
+        entry = {"type": "system", "subtype": "away_summary",
+                 "content": "z" * (ha.BLOCK_CAPS_LIVE["text"] + 100)}
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["text"])
+        self.assertTrue(block["truncated"])
+
+
+class TestToolReferenceResult(unittest.TestCase):
+    """A ToolSearch result names the tools it loaded as tool_reference blocks
+    inside its tool_result content; flattening them away left the call's
+    output card reading empty. Mirror cases in tunnel-agent.test.js."""
+
+    def test_tool_reference_flattens_to_a_named_line(self):
+        self.assertEqual(
+            ha._tool_result_text([{"type": "text", "text": "loaded:"},
+                                  {"type": "tool_reference", "tool_name": "WebFetch"},
+                                  {"type": "tool_reference", "tool_name": "Monitor"}]),
+            "loaded:\n[tool: WebFetch]\n[tool: Monitor]")
+
+    def test_nameless_reference_still_shows(self):
+        self.assertEqual(ha._tool_result_text([{"type": "tool_reference"}]),
+                         "\n[tool: tool]")
+
+
+class TestQueuedPrompts(ProjectDirMixin, unittest.TestCase):
+    """A message typed mid-turn only becomes a user entry when Claude Code
+    dequeues it; until then it lives in queue-operation transcript entries.
+    _fold_queue_op replays them FIFO so /history (and the JS live tail, mirror
+    in tunnel-agent.test.js) can report the still-queued prompts."""
+
+    def _fold(self, ops):
+        q = []
+        for op in ops:
+            ha._fold_queue_op(op, q)
+        return q
+
+    def test_enqueue_dequeue_remove_fifo(self):
+        q = self._fold([
+            {"operation": "enqueue", "content": "first"},
+            {"operation": "enqueue", "content": "second"},
+            {"operation": "enqueue", "content": "third"},
+            {"operation": "dequeue"},                      # pops "first"
+            {"operation": "remove", "content": "third"},   # withdrawn by hand
+        ])
+        self.assertEqual(q, ["second"])
+
+    def test_unmatched_dequeue_and_remove_are_noops(self):
+        # A read window can open mid-sequence: a dequeue whose enqueue was cut
+        # off must not invent or destroy anything.
+        self.assertEqual(self._fold([{"operation": "dequeue"},
+                                     {"operation": "remove", "content": "ghost"}]), [])
+
+    def test_blank_enqueue_is_ignored(self):
+        self.assertEqual(self._fold([{"operation": "enqueue", "content": "  "},
+                                     {"operation": "enqueue"}]), [])
+
+    def test_history_entries_reports_still_queued_prompts(self):
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [
+            {"uuid": "u1", "type": "user", "message": {"content": "start work"}},
+            {"type": "queue-operation", "operation": "enqueue", "content": "also do X"},
+            {"type": "queue-operation", "operation": "enqueue", "content": "and Y"},
+            {"type": "queue-operation", "operation": "dequeue"},
+            # the dequeued prompt lands as its real user turn — no duplicate
+            {"uuid": "u2", "type": "user", "message": {"content": "also do X"}},
+        ])
+        entries, capped, queued = ha._history_entries(path)
+        self.assertFalse(capped)
+        self.assertEqual([e["id"] for e in entries], ["u1", "u2"])
+        self.assertEqual(queued, ["and Y"])
+
+    def test_task_notifications_keep_their_slot_but_never_display(self):
+        # A background task finishing mid-turn rides the same queue as a
+        # <task-notification> XML wall. It must occupy its FIFO slot (dequeues
+        # are positional) yet never render as a queued operator bubble.
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [
+            {"type": "queue-operation", "operation": "enqueue",
+             "content": "<task-notification>\n<task-id>x</task-id>\n</task-notification>"},
+            {"type": "queue-operation", "operation": "enqueue", "content": "real prompt"},
+            {"type": "queue-operation", "operation": "dequeue"},  # pops the notification
+        ])
+        _, _, queued = ha._history_entries(path)
+        self.assertEqual(queued, ["real prompt"])
+        # And an undequeued notification is filtered at display, not from the FIFO.
+        self.assertEqual(ha._queued_display(
+            ["<task-notification>x</task-notification>", "real prompt"]),
+            ["real prompt"])
+
+    def test_queued_list_is_capped(self):
+        path = os.path.join(self.proj, "t.jsonl")
+        ops = [{"type": "queue-operation", "operation": "enqueue", "content": f"p{i}"}
+               for i in range(ha.QUEUED_PROMPTS_MAX + 5)]
+        write_jsonl(path, ops)
+        _, _, queued = ha._history_entries(path)
+        self.assertEqual(len(queued), ha.QUEUED_PROMPTS_MAX)
+        self.assertEqual(queued[-1], f"p{ha.QUEUED_PROMPTS_MAX + 4}")
+
+
 class TestHistoryEntriesRich(ProjectDirMixin, unittest.TestCase):
     def test_blocks_attached_and_tool_result_only_turn_surfaces(self):
         path = os.path.join(self.proj, "t.jsonl")
@@ -1657,8 +1872,9 @@ class TestHistoryEntriesRich(ProjectDirMixin, unittest.TestCase):
             {"uuid": "r1", "type": "user", "message": {"content": [
                 {"type": "tool_result", "tool_use_id": "t1", "content": "file.txt"}]}},
         ])
-        entries, capped = ha._history_entries(path)
+        entries, capped, queued = ha._history_entries(path)
         self.assertFalse(capped)
+        self.assertEqual(queued, [])
         self.assertEqual([e["id"] for e in entries], ["u1", "a1", "r1"])
         self.assertEqual(entries[2]["text"], "")
         self.assertEqual(entries[2]["blocks"], [{"t": "tool_result", "text": "file.txt", "forId": "t1"}])
@@ -4033,7 +4249,7 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
         sm.registry = []
         sm._stage_history("nope")
         self.assertEqual(sm.history_results, [
-            {"sessionId": "nope", "entries": [], "truncated": False},
+            {"sessionId": "nope", "entries": [], "truncated": False, "queued": []},
         ])
 
     def test_fixture_transcript_entries_ids_roles_order(self):
@@ -4055,6 +4271,7 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
                  "blocks": [{"t": "text", "text": "hello back"}]},
             ],
             "truncated": False,
+            "queued": [],
         }])
 
     def test_truncated_false_when_everything_fits(self):
@@ -4091,7 +4308,7 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
         open(os.path.join(proj, "t.jsonl"), "w").close()
         sm._stage_history(sess["id"])
         self.assertEqual(sm.history_results, [
-            {"sessionId": sess["id"], "entries": [], "truncated": False},
+            {"sessionId": sess["id"], "entries": [], "truncated": False, "queued": []},
         ])
 
     def test_missing_project_dir_stages_empty(self):
@@ -4099,7 +4316,7 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
         sess = self._running_session(sm, workdir="/absent/worktree")
         sm._stage_history(sess["id"])
         self.assertEqual(sm.history_results, [
-            {"sessionId": sess["id"], "entries": [], "truncated": False},
+            {"sessionId": sess["id"], "entries": [], "truncated": False, "queued": []},
         ])
 
     def test_keeps_full_message_beyond_tail_preview_cap(self):
@@ -4198,7 +4415,8 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
         self.assertTrue(did_work)
         extra_beat_payload = sm.build_payload(1)
         self.assertEqual(extra_beat_payload["historyResults"],
-                          [{"sessionId": "s1", "entries": [], "truncated": False}])
+                          [{"sessionId": "s1", "entries": [], "truncated": False,
+                            "queued": []}])
 
     def test_absent_when_nothing_staged(self):
         sm = self.make_manager()
