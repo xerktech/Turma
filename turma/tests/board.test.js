@@ -9,7 +9,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  mergeSites, categoryOf, ticketSort, orgColor, orgName, ageStr, prioClass,
+  mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgName, ageStr, prioClass,
   cardHtml, boardHtml, detailHtml, textHtml, linkify,
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
@@ -22,7 +22,7 @@ function ticket(key, over = {}) {
     key,
     url: `https://myorg.atlassian.net/browse/${key}`,
     summary: "do the thing",
-    status: "In Review",
+    status: "In Progress",
     statusCategory: "inprogress",
     priority: "High",
     type: "Bug",
@@ -115,11 +115,40 @@ test("mergeSites: skips agents with no jira block or no siteKey (unconfigured)",
 
 test("categoryOf: maps the three categories, defaults unknown to todo", () => {
   assert.equal(categoryOf({ statusCategory: "todo" }), "todo");
-  assert.equal(categoryOf({ statusCategory: "inprogress" }), "inprogress");
+  assert.equal(categoryOf({ statusCategory: "inprogress", status: "In Progress" }), "inprogress");
   assert.equal(categoryOf({ statusCategory: "done" }), "done");
   assert.equal(categoryOf({ statusCategory: "???" }), "todo");
   assert.equal(categoryOf({}), "todo");
   assert.equal(categoryOf(null), "todo");
+});
+
+test("categoryOf: review/testing statuses split out of inprogress into review", () => {
+  // These all live in Jira's `indeterminate` category (agent-mapped to
+  // inprogress); the column is carved out by the status NAME.
+  for (const name of ["In Review", "Review", "Code Review", "Reviewing",
+                      "Testing", "In Test", "Ready for Test", "QA"]) {
+    assert.equal(categoryOf({ statusCategory: "inprogress", status: name }),
+      "review", `"${name}" -> review`);
+  }
+});
+
+test("categoryOf: only inprogress splits — a done/todo review-named status is left", () => {
+  // "Testing complete"/"Test failed" etc. keep whatever category Jira assigned.
+  assert.equal(categoryOf({ statusCategory: "done", status: "Tested" }), "done");
+  assert.equal(categoryOf({ statusCategory: "todo", status: "Needs Review" }), "todo");
+  // Unknown category defaults to todo even with a review-ish name.
+  assert.equal(categoryOf({ statusCategory: "???", status: "In Review" }), "todo");
+});
+
+test("isReviewStatus: matches on word boundaries, no substring leaks", () => {
+  assert.ok(isReviewStatus({ status: "In Review" }));
+  assert.ok(isReviewStatus({ status: "Testing" }));
+  assert.ok(!isReviewStatus({ status: "In Progress" }));
+  assert.ok(!isReviewStatus({ status: "Attestation" }), "'test' inside a word doesn't match");
+  assert.ok(!isReviewStatus({ status: "Contested" }), "'test' inside a word doesn't match");
+  assert.ok(!isReviewStatus({ status: "" }));
+  assert.ok(!isReviewStatus({}));
+  assert.ok(!isReviewStatus(null));
 });
 
 test("ticketSort: newest updated first", () => {
@@ -190,19 +219,21 @@ test("cardHtml: done tickets are not overdue", () => {
   assert.ok(!cardHtml(t, { siteKey: "s" }, { now }).includes("overdue"));
 });
 
-test("boardHtml: three columns with counts, org filter scopes tickets", () => {
+test("boardHtml: four columns with counts, org filter scopes tickets", () => {
   const sites = mergeSites([
     agent("hostA", block({ tickets: [
-      ticket("T-1", { statusCategory: "todo" }),
-      ticket("T-2", { statusCategory: "inprogress" }),
-      ticket("T-3", { statusCategory: "done" }),
+      ticket("T-1", { status: "To Do", statusCategory: "todo" }),
+      ticket("T-2", { status: "In Progress", statusCategory: "inprogress" }),
+      ticket("T-3", { status: "In Review", statusCategory: "inprogress" }),
+      ticket("T-4", { status: "Done", statusCategory: "done" }),
     ] })),
     agent("hostB", block({ siteKey: "other.atlassian.net", user: "b@x.com",
-                           tickets: [ticket("O-1", { statusCategory: "todo" })] })),
+                           tickets: [ticket("O-1", { status: "To Do", statusCategory: "todo" })] })),
   ]);
   const all = boardHtml(sites, null, {});
   assert.ok(all.includes("T-1") && all.includes("O-1"));
-  assert.equal((all.match(/kanban-col[ "]/g) || []).length, 3);
+  assert.equal((all.match(/kanban-col[ "]/g) || []).length, 4);
+  assert.ok(all.includes("In Review"), "the In Review column heading renders");
   const one = boardHtml(sites, "other.atlassian.net", {});
   assert.ok(one.includes("O-1") && !one.includes("T-1"));
 });
@@ -255,7 +286,7 @@ test("cardHtml: the card is a clickable detail trigger carrying its issue+org", 
 test("detailHtml: before the fetch lands, renders the card's fields and a loading note", () => {
   const html = detailHtml(ticket("X-1"), null, { siteKey: "s" });
   assert.ok(html.includes("do the thing"), "summary shows immediately");
-  assert.ok(html.includes("In Review"));
+  assert.ok(html.includes("In Progress"));
   assert.ok(/Loading description and comments/.test(html));
   assert.ok(!html.includes("No description"), "absent detail is not an empty description");
 });

@@ -949,6 +949,11 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   wins per site+user; different users on one site union, deduped by issue key).
 - Columns are Jira's three universal status categories, and each card's pill shows the org's own
   status name.
+- A fourth **In Review** column (XERK-23) sits between In Progress and Done. Jira has no cross-org
+  category for review/testing (both are `indeterminate` → `inprogress`), so `categoryOf` carves it
+  out by matching the org-specific status NAME (`isReviewStatus`, word-boundary: review/testing/QA)
+  and only ever pulls FROM `inprogress` — a Done/To Do ticket keeps its category whatever its name.
+  Purely a board.js/CSS change; the agent still heartbeats the same three-category `statusCategory`.
 - The org filter chips are **labelled by `orgName(siteKey)`** — the site host minus its
   `.atlassian.net` suffix, since the org is the only part of it a human reads (the full host stays as
   the chip's tooltip). Presentational only: the chip still filters on, and the board stays keyed on,

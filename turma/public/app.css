@@ -277,7 +277,7 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .org-chip .chip-n { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .org-chip .chip-stale { color: var(--warning); font-size: 11px; }
 
-.kanban-cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; align-items: start; }
+.kanban-cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; align-items: start; }
 .kanban-col { min-width: 0; }
 .kanban-col .kc-head {
   font-weight: 600; font-size: 13px; color: var(--ink-2);
@@ -392,7 +392,10 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .kanban-card[role="button"]:focus-visible {
   outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring);
 }
-@media (max-width: 720px) {
+@media (max-width: 900px) {
+  .kanban-cols { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 560px) {
   .kanban-cols { grid-template-columns: 1fr; }
 }
 
