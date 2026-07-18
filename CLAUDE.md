@@ -822,6 +822,30 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   contract).
 - Blocks PRESERVE the thinking text, tool_use inputs and tool_result outputs that `_entry_text`
   flattens away, so the hub's native chat UI can render + verbosity-filter each component.
+- Turns that are ABOUT the session rather than someone talking are classified, not rendered verbatim
+  (each backed by real transcript shapes found on the fleet):
+  - `[Request interrupted by user…]` marker turns (Esc / the hub's Stop) become `{t:"interrupt"}` —
+    a centred status marker in chat, not a user bubble; `_entry_text` keeps the raw bracket line.
+  - The `!` shell passthrough's `<bash-input>`/`<bash-stdout>`/`<bash-stderr>` turns parse into the
+    SAME command/command_output shapes the slash commands use (name `!`), via `_parse_local_command`.
+    Output tags routinely arrive together with one stream empty, so stderr only wins when non-empty.
+  - A `system`/`away_summary` entry (the "while you were away" recap) becomes `{t:"away_summary"}` —
+    an assistant-side collapsed card, with the "(disable recaps in /config)" TUI hint stripped; every
+    other system subtype is TUI bookkeeping and stays dropped (`_away_summary_text`).
+  - `tool_reference` blocks inside a tool_result (ToolSearch naming the tools it loaded) flatten to
+    `[tool: <name>]` lines instead of vanishing and leaving the result card empty.
+- **Still-queued prompts ride beside the entries, not inside them**: a message typed mid-turn only
+  becomes a user entry when Claude Code dequeues it, so the live tail and `/history` fold the
+  transcript's `queue-operation` entries FIFO (`_fold_queue_op` / `foldQueueOp`, enqueue → dequeue →
+  remove-by-content) and ship the survivors as `queued[]` beside `entries` — the chat renders them as
+  dimmed "queued" user bubbles under the live turn, exactly the list the TUI shows under its input
+  box, replaced wholesale each frame so a consumed prompt swaps for its real user turn with no
+  duplicate. A window opening mid-sequence errs toward hiding (an unmatched dequeue no-ops), never
+  toward inventing a phantom queued prompt. Older agents send no `queued` and the hub/chat treat it
+  as absent, not empty.
+- Tooling payloads ride the same queue — a background task finishing mid-turn enqueues its whole
+  `<task-notification>` XML — so display filtering happens at REPORT time (`_queued_display` /
+  `queuedDisplay`), never at fold time, which would desync the positional dequeues.
 - They ride the live tail (tight per-block caps) and on-demand `history`
   (`_entry_blocks(entry, BLOCK_CAPS_FULL)`, looser caps for "Show more").
 - They are the one place inclusion widens: a tool_result-only turn, dropped by `_entry_text`, is kept

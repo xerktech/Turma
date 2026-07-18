@@ -502,6 +502,29 @@
     padding: 2px 0; text-align: left; }
   .compact-card .trunc:hover { text-decoration: underline; }
 
+  /* The model's "while you were away" recap — same collapsed, assistant-side
+     shape as the compaction summary (it's the model's writing about the
+     conversation, not conversation itself). */
+  .away-card { align-self: flex-start; max-width: 760px; width: 100%; color: var(--muted); font-size: 12.5px; }
+  .away-card > summary { list-style: none; cursor: pointer; user-select: none; color: var(--muted);
+    padding: 5px 0; border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); }
+  .away-card > summary::-webkit-details-marker { display: none; }
+  .away-card > summary:hover { color: var(--accent); }
+  .away-card .away-body { margin-top: 6px; padding: 9px 12px; border-left: 2px solid var(--border);
+    color: var(--ink-2); overflow-wrap: anywhere; }
+  .away-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0;
+    padding: 2px 0; text-align: left; }
+  .away-card .trunc:hover { text-decoration: underline; }
+
+  /* "[Request interrupted by user]" — a statement about the turn, not the
+     operator talking: a centred, muted marker rather than a user bubble. */
+  .chat-interrupt { align-self: center; color: var(--muted); font-size: 11.5px;
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 12px; }
+
+  /* A prompt typed mid-turn, still waiting in Claude Code's queue: a dimmed,
+     dashed user bubble labelled "queued" until its real user turn lands. */
+  .tr-msg.queued { opacity: 0.65; background: transparent; border: 1px dashed var(--border); }
+
   /* Collapsed thinking trace. */
   .thought { align-self: flex-start; max-width: 760px; color: var(--muted); font-size: 12.5px; }
   .thought > summary { list-style: none; cursor: pointer; user-select: none; color: var(--muted); }

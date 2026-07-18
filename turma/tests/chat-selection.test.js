@@ -67,6 +67,7 @@ test.beforeEach(() => {
   selectNothing();
   chat.__setLiveTurn("");
   chat.__setBuffer([]);
+  chat.__setQueued([]);
   chat.__resetPaint();
 });
 
@@ -192,4 +193,31 @@ test("the guards leave the committed transcript + live bubble intact", () => {
   chat.repaint();
   assert.match(scroll.innerHTML, /hi/, "committed messages still paint");
   assert.match(scroll.innerHTML, /chatLiveBubble/, "the in-progress turn still gets its bubble");
+});
+
+test("still-queued prompts trail the live turn as dimmed queued bubbles", () => {
+  chat.__setBuffer([entry("a", "start work")]);
+  chat.__setLiveTurn("working on it");
+  chat.__setQueued(["also do X", "and Y"]);
+  chat.repaint();
+  const html = scroll.innerHTML;
+  assert.match(html, /tr-msg user queued/);
+  assert.match(html, /also do X/);
+  assert.match(html, /and Y/);
+  // Queued bubbles come AFTER the live turn — they run once it finishes.
+  assert.ok(html.indexOf("chatLiveBubble") < html.indexOf("also do X"));
+  // A frame reporting the queue drained (its prompt became a real user turn)
+  // drops the bubbles.
+  chat.__setQueued([]);
+  chat.__setBuffer([entry("a", "start work"), entry("b", "also do X")]);
+  chat.repaint();
+  assert.doesNotMatch(scroll.innerHTML, /queued/);
+});
+
+test("queued prompts alone defeat the empty-state placeholder", () => {
+  chat.__setQueued(["waiting prompt"]);
+  chat.repaint();
+  assert.doesNotMatch(scroll.innerHTML, /No messages yet/);
+  assert.match(scroll.innerHTML, /waiting prompt/);
+  chat.__setQueued([]);
 });

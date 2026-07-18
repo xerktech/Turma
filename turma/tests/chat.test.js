@@ -130,6 +130,62 @@ test("buildItems: text-only entry with no blocks (older agent / seed) still bubb
   assert.deepEqual(items, [{ kind: "msg", role: "assistant", id: "a1", text: "legacy text", truncated: false }]);
 });
 
+test("mergeTail: a text-only seed can't clobber an equal-text command-block copy", () => {
+  // A command block keeps its content in name/args, which the old weight()
+  // ignored — so the rich copy TIED its own flattened text and the `>=`
+  // tie-break let the heartbeat's text-only seed strip the blocks back off.
+  const rich = [{ id: "b1", role: "user", text: "! git status",
+    blocks: [{ t: "command", name: "!", args: "git status" }] }];
+  const seed = [{ id: "b1", role: "user", text: "! git status" }];
+  const merged = mergeTail(rich, seed);
+  assert.deepEqual(merged[0].blocks, [{ t: "command", name: "!", args: "git status" }]);
+  // And the seed arriving first is still upgraded by the rich copy.
+  assert.deepEqual(mergeTail(seed, rich)[0].blocks,
+    [{ t: "command", name: "!", args: "git status" }]);
+});
+
+test("buildItems/render: an interrupt block -> a centred marker, not a user bubble", () => {
+  const entries = [{ id: "i1", role: "user",
+    blocks: [{ t: "interrupt", text: "[Request interrupted by user for tool use]" }] }];
+  const items = buildItems(entries);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "interrupt");
+  const html = withVerbosity("concise", () => itemsToHtml(items));
+  // Visible even in Concise (it says what happened to the turn), never a bubble.
+  assert.match(html, /class="chat-interrupt"/);
+  assert.match(html, /Request interrupted by user for tool use/);
+  assert.doesNotMatch(html, /\[Request/);        // brackets stripped for display
+  assert.doesNotMatch(html, /tr-msg user/);
+});
+
+test("buildItems/render: an away_summary block -> a collapsed assistant-side card", () => {
+  const entries = [{ id: "aw1", role: "assistant",
+    blocks: [{ t: "away_summary", text: "Fixed the bug and opened a PR." }] }];
+  const items = buildItems(entries);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "away");
+  const html = withVerbosity("concise", () => itemsToHtml(items));
+  assert.match(html, /class="away-card"/);
+  assert.match(html, /While you were away/);
+  assert.match(html, /Fixed the bug and opened a PR\./);
+  assert.doesNotMatch(html, /tr-msg/); // a card, not a bubble on either side
+});
+
+test("buildItems: a bash `!` passthrough pairs its output like a slash command", () => {
+  // <bash-input> and <bash-stdout> arrive as consecutive entries; the shared
+  // command/command_output shapes mean the existing pairing folds them into
+  // one chip + output card.
+  const items = buildItems([
+    { id: "b1", role: "user", blocks: [{ t: "command", name: "!", args: "git push" }] },
+    { id: "b2", role: "user", blocks: [{ t: "command_output", text: "pushed" }] },
+  ]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "command");
+  assert.equal(items[0].name, "!");
+  assert.equal(items[0].args, "git push");
+  assert.equal(items[0].result.text, "pushed");
+});
+
 test("buildItems: a task_notification block -> an action card, not a user bubble", () => {
   const items = buildItems([{
     id: "n1", role: "user", blocks: [{

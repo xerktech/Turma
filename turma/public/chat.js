@@ -255,6 +255,12 @@
   let gen = 0;                      // bumped on every open/close; stale async work checks it
   let hostKey = null, sessionId = null, sess = null, agent = null;
   let buffer = [];                  // merged rich entries {id, role, text, blocks}
+  // Prompts typed mid-turn, still waiting in Claude Code's queue (the agent
+  // folds queue-operation transcript entries — see foldQueueOp in
+  // tunnel-agent.js). Rendered as pending user bubbles under the live turn;
+  // replaced wholesale by each tail frame / history load, so a consumed prompt
+  // drops out the moment its real user turn lands.
+  let queuedPrompts = [];
   let liveTurn = "";                // in-progress assistant text (pane scrape), "" when idle
   let liveStatus = null;            // {verb,up,down,elapsed} working indicator, null when idle
   let ws = null, backoffIdx = 0, wsRetryTimer = null;
@@ -328,8 +334,11 @@
       if (myGen !== gen) return;
       let frame;
       try { frame = JSON.parse(ev.data); } catch { return; }
-      if (frame && frame.type === "tail" && Array.isArray(frame.entries) && frame.entries.length) {
-        buffer = mergeTail(buffer, frame.entries);
+      if (frame && frame.type === "tail" && Array.isArray(frame.entries)) {
+        if (frame.entries.length) buffer = mergeTail(buffer, frame.entries);
+        // Every tail frame carries the CURRENT still-queued prompt list (an
+        // agent predating the field sends none — keep whatever we had).
+        if (Array.isArray(frame.queued)) queuedPrompts = frame.queued;
         repaint();
       } else if (frame && frame.type === "turn" && typeof frame.text === "string") {
         liveTurn = frame.text;
@@ -380,6 +389,7 @@
     // looser per-block caps). Seed order from it, then re-merge any newer live
     // entries already in the buffer on top.
     buffer = mergeTail(j.entries, buffer);
+    if (Array.isArray(j.queued)) queuedPrompts = j.queued;
     repaint();
   }
 
@@ -398,9 +408,18 @@
   // the text-only heartbeat seed is replaced by the rich live tail, and the live
   // tail (tight caps) is replaced by /history (looser caps). Grow-only, so a
   // truncated preview never clobbers a fuller copy.
+  //
+  // EVERY block payload field counts, not just text/input: a command block
+  // carries its content in name/args (a task_notification in summary/result),
+  // and leaving those out made the rich copy TIE its own flat text — and the
+  // `>=` tie-break then let a text-only seed clobber the blocks right back off
+  // the entry (a `!` chip regressing to a raw user bubble).
   function weight(e) {
     let w = (e.text || "").length;
-    for (const b of (e.blocks || [])) w += (b.text || "").length + (b.input || "").length;
+    for (const b of (e.blocks || [])) {
+      w += (b.text || "").length + (b.input || "").length + (b.name || "").length +
+        (b.args || "").length + (b.summary || "").length + (b.result || "").length;
+    }
     return w;
   }
   function mergeTail(existing, incoming) {
@@ -425,6 +444,7 @@
   //        | {kind:"action", id, name, input, inputTrunc, result:{text,isError,truncated}|null, entryId}
   //        | {kind:"command", id, name, args, argsTrunc, result:{text,isError,truncated}|null}
   //        | {kind:"compact", id, text, truncated}
+  //        | {kind:"interrupt", id, text} | {kind:"away", id, text, truncated}
   function buildItems(entries) {
     const resultsById = new Map();
     const toolUseIds = new Set();
@@ -506,6 +526,16 @@
         } else if (b.t === "compact_summary") {
           flush();
           items.push({ kind: "compact", id: eid, text: b.text || "", truncated: !!b.truncated });
+        } else if (b.t === "interrupt") {
+          // "[Request interrupted by user…]" — a statement about the turn, not
+          // something the operator typed; rendered as a centred status marker.
+          flush();
+          items.push({ kind: "interrupt", id: eid, text: b.text || "" });
+        } else if (b.t === "away_summary") {
+          // The model's "while you were away" recap — an assistant-side card,
+          // like the compact summary, not a bubble.
+          flush();
+          items.push({ kind: "away", id: eid, text: b.text || "", truncated: !!b.truncated });
         } else if (b.t === "task_notification") {
           // A background Task/agent finishing: render as an action card (like a
           // tool call) rather than a raw-XML user bubble. The summary is the
@@ -609,6 +639,24 @@
       '<div class="compact-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
   }
 
+  // "[Request interrupted by user…]" as a centred, muted status marker — the
+  // one thing the TUI's red ⎿ marker says that matters here is THAT the turn
+  // was cut, so the label is the marker text without its brackets.
+  function renderInterrupt(it) {
+    const label = String(it.text || "Request interrupted by user").replace(/^\[|\]$/g, "");
+    return '<div class="chat-interrupt" data-uuid="' + esc(it.id) + '">◼ ' + esc(label) + "</div>";
+  }
+
+  // The "while you were away" recap, collapsed like the compact-summary card.
+  // Never hidden by verbosity: it exists precisely for the operator who was
+  // not watching, and it's one line while closed.
+  function renderAwayCard(it) {
+    const key = "away:" + it.id;
+    return '<details class="away-card" data-dkey="' + esc(key) + '" data-uuid="' + esc(it.id) + '"' +
+      openAttr(key, false) + "><summary>☾ While you were away — recap</summary>" +
+      '<div class="away-body">' + renderProse(it.text) + truncBtn(it.id, it.truncated) + "</div></details>";
+  }
+
   function itemsToHtml(items) {
     const out = [];
     let i = 0, g = 0;
@@ -618,6 +666,8 @@
       if (it.kind === "thinking") { out.push(renderThought(it)); i++; continue; }
       if (it.kind === "command") { out.push(renderCommandCard(it)); i++; continue; }
       if (it.kind === "compact") { out.push(renderCompactCard(it)); i++; continue; }
+      if (it.kind === "interrupt") { out.push(renderInterrupt(it)); i++; continue; }
+      if (it.kind === "away") { out.push(renderAwayCard(it)); i++; continue; }
       // action run
       let j = i;
       while (j < items.length && items[j].kind === "action") j++;
@@ -659,7 +709,7 @@
     const prevTop = scroll.scrollTop;
     const items = buildItems(buffer);
     let html = itemsToHtml(items);
-    if (!html && !liveTurn) html = '<div class="chat-empty">No messages yet. Say something below to get the agent going.</div>';
+    if (!html && !liveTurn && !queuedPrompts.length) html = '<div class="chat-empty">No messages yet. Say something below to get the agent going.</div>';
     // The in-progress assistant turn (streaming, text-only) as the trailing
     // bubble; its text is revealed by the typewriter loop.
     if (liveTurn) {
@@ -689,6 +739,13 @@
     } else {
       revealFull = "";
       reveal.shown = 0;
+    }
+    // Still-queued prompts (typed mid-turn) trail the live turn, where they'll
+    // actually run — the TUI shows the same list under its input box. Each is a
+    // dimmed user bubble labelled "queued"; the list is replaced wholesale by
+    // every tail frame, so a consumed prompt swaps for its real user turn.
+    for (const q of queuedPrompts) {
+      html += '<div class="tr-msg user queued"><span class="role">queued</span>' + esc(q) + "</div>";
     }
     // Most repaints are no-ops: the /history poll and the ~1s `turn` frame fire
     // whether or not anything changed, and re-writing identical HTML still
@@ -1402,7 +1459,7 @@
     gen++;
     const myGen = gen;
     hostKey = hk; sessionId = id; sess = s; agent = a;
-    buffer = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
+    buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
     stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send
     lastHtml = null; repaintDeferred = false; // this session's paint memo starts empty
     stickBottom = true; // land at the tail on open, past the seed→history race
@@ -1430,7 +1487,7 @@
     if (ws) { try { ws.onclose = null; ws.close(); } catch {} ws = null; }
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
-    buffer = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
+    buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
     stopPendingAt = 0; actionFailUntil = 0;
     lastHtml = null; repaintDeferred = false;
     updateLiveStatus(); // hide the pinned bar when the view closes
@@ -1473,6 +1530,7 @@
       __setVerbosity: (v) => { verbosity = v; },
       __setNoExpand: (v) => { noExpand = v; },
       __setBuffer: (b) => { buffer = b; },
+      __setQueued: (q) => { queuedPrompts = q; },
       __setLiveTurn: (t) => { liveTurn = t; reveal.shown = 0; },
       // Set the live turn WITHOUT resetting the reveal — the real ws `turn`
       // frame does exactly this (liveTurn = frame.text), and testing the

@@ -319,7 +319,8 @@ function ingestHistory(agent, historyResults) {
   const now = Date.now();
   for (const r of historyResults || []) {
     if (!r || !r.sessionId) continue;
-    agent.history[r.sessionId] = { entries: r.entries, truncated: r.truncated, fetchedAt: now };
+    agent.history[r.sessionId] = { entries: r.entries, truncated: r.truncated,
+      queued: Array.isArray(r.queued) ? r.queued : [], fetchedAt: now };
   }
   for (const [sessionId, h] of Object.entries(agent.history)) {
     if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.history[sessionId];
@@ -1856,6 +1857,7 @@ const server = http.createServer(async (req, res) => {
           return json(res, 200, {
             entries: cached.entries,
             truncated: cached.truncated,
+            queued: cached.queued || [],
             fetchedAt: cached.fetchedAt,
           });
         }
@@ -2162,7 +2164,10 @@ server.on("upgrade", async (req, socket, head) => {
       let msg;
       try { msg = JSON.parse(payload.toString("utf8")); } catch { return; }
       if (msg && msg.tail && Array.isArray(msg.entries)) {
-        liveFanout(name, msg.tail, { type: "tail", entries: msg.entries });
+        // `queued` = still-queued prompts typed mid-turn (foldQueueOp in
+        // tunnel-agent.js); absent from agents predating it.
+        liveFanout(name, msg.tail, { type: "tail", entries: msg.entries,
+          queued: Array.isArray(msg.queued) ? msg.queued : [] });
       } else if (msg && msg.turn && typeof msg.text === "string") {
         liveFanout(name, msg.turn, { type: "turn", text: msg.text, status: msg.status || null });
       }

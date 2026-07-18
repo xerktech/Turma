@@ -1611,15 +1611,28 @@ COMMAND_STDOUT_RE = re.compile(
 COMMAND_STDERR_RE = re.compile(
     r"<local-command-stderr>(.*?)</local-command-stderr>", re.DOTALL)
 
+# The `!` prefix runs a shell command straight from the composer/TUI, and
+# Claude Code records it as two more XML-ish user turns: the command
+# (<bash-input>) and its output (<bash-stdout>/<bash-stderr>). Not the human
+# talking either — parse them into the SAME command/output shapes the slash
+# commands produce (name "!", the exact prefix the operator typed), so the chat
+# renders a chip + output card instead of a raw-XML user bubble. Keep mirrored
+# with tunnel-agent.js parseLocalCommand.
+BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
+BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
+BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
+
 
 def _parse_local_command(text):
-    """Parse one of Claude Code's slash-command bookkeeping turns, or None when
-    `text` isn't one. Mirror of tunnel-agent.js parseLocalCommand(). Returns:
+    """Parse one of Claude Code's slash-command / `!`-shell bookkeeping turns,
+    or None when `text` isn't one. Mirror of tunnel-agent.js parseLocalCommand().
+    Returns:
       {"kind": "caveat"}                        -> drop the entry entirely
-      {"kind": "command", "name", "args"}       -> the /slash invocation
+      {"kind": "command", "name", "args"}       -> the /slash or ! invocation
       {"kind": "output", "text", "isError"}     -> the command's stdout/stderr
     stderr wins over stdout when a turn carries both, so a failing command reads
-    as an error rather than silently showing its (usually empty) stdout."""
+    as an error rather than silently showing its (usually empty) stdout — the
+    same rule for both the slash and the bash tags."""
     if not text:
         return None
     if LOCAL_COMMAND_CAVEAT_RE.fullmatch(text):
@@ -1634,15 +1647,29 @@ def _parse_local_command(text):
                 "name": name,
                 "args": ANSI_RE.sub("", args.group(1)).strip() if args else "",
             }
-    for regex, is_error in ((COMMAND_STDERR_RE, True), (COMMAND_STDOUT_RE, False)):
+    m = BASH_INPUT_RE.search(text)
+    if m:
+        cmd = ANSI_RE.sub("", m.group(1)).strip()
+        if cmd:
+            return {"kind": "command", "name": "!", "args": cmd}
+    first = None
+    for regex, is_error in ((COMMAND_STDERR_RE, True), (BASH_STDERR_RE, True),
+                            (COMMAND_STDOUT_RE, False), (BASH_STDOUT_RE, False)):
         m = regex.search(text)
         if m:
-            return {
+            out = {
                 "kind": "output",
                 "text": ANSI_RE.sub("", m.group(1)).strip(),
                 "isError": is_error,
             }
-    return None
+            # stderr wins over stdout ONLY when it carries text — a bash turn
+            # routinely ships both tags with one of them empty, and an empty
+            # stderr must not swallow the stdout beside it (or vice versa).
+            if out["text"]:
+                return out
+            if first is None:
+                first = out
+    return first
 
 
 def _lc_preview(lc):
@@ -1680,6 +1707,37 @@ def _entry_local_command(entry):
     return _parse_local_command(_entry_first_text(entry))
 
 
+# Pressing Esc (or the hub's Stop button) mid-turn writes a user-role
+# "[Request interrupted by user]" / "[Request interrupted by user for tool
+# use]" marker entry. That is a statement ABOUT the turn, not something the
+# operator typed, so _entry_blocks classifies it as an `interrupt` block the
+# chat renders as a muted status marker instead of a user bubble. The text
+# feed (_entry_text) keeps the raw bracket line: glasses/heartbeat/archive are
+# one-dimensional text, where it already reads as the marker it is. Keep
+# mirrored with tunnel-agent.js INTERRUPT_RE.
+INTERRUPT_RE = re.compile(r"^\s*\[Request interrupted by user[^\]\n]*\]\s*$")
+
+
+# Claude Code's "while you were away" recap: a `system` entry (subtype
+# "away_summary") whose content is prose the model wrote about what happened
+# since the operator left — the TUI paints it as a recap box, so the chat
+# should too rather than dropping it with the rest of the system bookkeeping
+# (turn_duration, bridge_status, …, which stay dropped). The trailing
+# "(disable recaps in /config)" hint is a TUI affordance the chat has no
+# equivalent of, so it is stripped.
+AWAY_HINT_RE = re.compile(r"\s*\(disable recaps in /config\)\s*$")
+
+
+def _away_summary_text(entry):
+    """The recap text of an away_summary system entry, or None when `entry`
+    isn't one (any other type/subtype, or empty content). Mirror of
+    tunnel-agent.js awaySummaryText."""
+    if entry.get("type") != "system" or entry.get("subtype") != "away_summary":
+        return None
+    text = AWAY_HINT_RE.sub("", ANSI_RE.sub("", str(entry.get("content") or ""))).strip()
+    return text or None
+
+
 def _entry_tool_source(entry):
     """The tool_use id this user turn was PRODUCED BY, or None.
 
@@ -1707,8 +1765,12 @@ def _entry_role(entry):
     """Display role for a transcript entry. Normally the entry type, but a
     compact summary is written as a USER turn carrying text the model wrote
     about itself — showing it on the human's side (as the raw transcript role
-    would) misattributes it, so it reports as the assistant."""
+    would) misattributes it, so it reports as the assistant. A system entry
+    only ever survives the feeds as an away_summary recap (see
+    _away_summary_text), which the model also wrote — same rule."""
     if entry.get("isCompactSummary"):
+        return "assistant"
+    if entry.get("type") == "system":
         return "assistant"
     return entry.get("type")
 
@@ -1730,7 +1792,11 @@ def _entry_text(entry):
     """Map one transcript entry to display text for the glasses tail feed, or
     None to drop it (wrong type, no message, tool_result-only turn, a skill body
     (_entry_tool_source), a slash-command caveat, or empty after stripping
-    ANSI)."""
+    ANSI). An away_summary system entry survives as its recap text (role
+    "assistant" via _entry_role); every other system subtype stays dropped."""
+    away = _away_summary_text(entry)
+    if away is not None:
+        return away
     if entry.get("type") not in ("user", "assistant"):
         return None
     # Tool-authored: a tool_result by another name, and this feed drops those.
@@ -1813,6 +1879,11 @@ def _tool_result_text(content):
                     parts.append(str(block.get("text") or ""))
                 elif block.get("type") == "image":
                     parts.append("[image]")
+                elif block.get("type") == "tool_reference":
+                    # A ToolSearch result names the tools it loaded as
+                    # tool_reference blocks; flattening them away left the
+                    # call's output card reading empty. Own line each.
+                    parts.append(f"\n[tool: {block.get('tool_name') or 'tool'}]")
             elif isinstance(block, str):
                 parts.append(block)
         return "".join(parts)
@@ -1877,6 +1948,8 @@ def _entry_blocks(entry, caps):
       {t:"compact_summary", text, truncated?}
       {t:"command",        name, args?, truncated?}
       {t:"command_output", text, isError?, truncated?}
+      {t:"interrupt",      text}
+      {t:"away_summary",   text, truncated?}
     A skill body — a user turn Claude Code wrote as the result of a `Skill` tool
     call (see _entry_tool_source) — becomes that call's {t:"tool_result"} block,
     so the chat folds it into the Skill action card it belongs to instead of
@@ -1887,8 +1960,20 @@ def _entry_blocks(entry, caps):
     bookkeeping turns get the same treatment via _parse_local_command: the
     invocation becomes a `command` block, its stdout/stderr a `command_output`
     block, and the boilerplate caveat is dropped (yielding []).
+    An "[Request interrupted by user…]" marker turn (INTERRUPT_RE) becomes an
+    `interrupt` block — a statement about the turn, rendered as a status
+    marker, not operator prose. An away_summary system entry (the "while you
+    were away" recap — see _away_summary_text) becomes an `away_summary` block;
+    all other system entries still drop.
     Returns [] for a user/assistant message with no renderable blocks. Keep this
     mirrored with tunnel-agent.js entryBlocks()."""
+    away = _away_summary_text(entry)
+    if away is not None:
+        clipped, trunc = _clip(away, caps["text"])
+        block = {"t": "away_summary", "text": clipped}
+        if trunc:
+            block["truncated"] = True
+        return [block]
     if entry.get("type") not in ("user", "assistant"):
         return None
     msg = entry.get("message")
@@ -1956,7 +2041,8 @@ def _entry_blocks(entry, caps):
 
     def add_payload(raw):
         """One text payload -> its block(s): a task-notification card, a
-        slash-command chip/output card, else plain text."""
+        slash-command / `!`-shell chip/output card, an interrupt marker, else
+        plain text."""
         tn = _parse_task_notification(raw)
         if tn:
             add_task_notification(tn)
@@ -1964,6 +2050,9 @@ def _entry_blocks(entry, caps):
         lc = _parse_local_command(raw)
         if lc:
             add_local_command(lc)
+            return
+        if INTERRUPT_RE.match(raw):
+            blocks.append({"t": "interrupt", "text": ANSI_RE.sub("", raw).strip()})
             return
         # A compact summary is prose the model wrote about the conversation so
         # far, injected as a user turn. It gets its own block so the chat can
@@ -2164,25 +2253,76 @@ def _transcript_cwd(path):
     return None
 
 
+# The prompt queue: a message typed mid-turn is enqueued, and Claude Code
+# records the queue's life as `queue-operation` transcript entries — enqueue
+# carries the text, dequeue pops the OLDEST into a real user turn, remove
+# withdraws one by content. The TUI shows the still-queued prompts below the
+# input box; the chat view reads them off these entries, folded in file order,
+# so a prompt sent mid-turn shows as "queued" instead of vanishing until the
+# turn ends (when its dequeue lands, the real user turn takes over — no
+# duplicate). A read window that opens mid-sequence can see a dequeue whose
+# enqueue was cut off; popping an empty queue is a no-op, which errs toward
+# briefly hiding a queued prompt rather than inventing a phantom one.
+QUEUED_PROMPTS_MAX = 10
+QUEUED_PROMPT_CHARS = 4000
+
+
+def _fold_queue_op(entry, queue):
+    """Fold one queue-operation entry into `queue` (still-queued prompt texts,
+    oldest first). Mirror of tunnel-agent.js foldQueueOp."""
+    op = entry.get("operation")
+    content = entry.get("content")
+    if op == "enqueue":
+        if isinstance(content, str) and content.strip():
+            queue.append(content.strip()[:QUEUED_PROMPT_CHARS])
+    elif op == "dequeue":
+        if queue:
+            queue.pop(0)
+    elif op == "remove":
+        if isinstance(content, str):
+            c = content.strip()[:QUEUED_PROMPT_CHARS]
+            if c in queue:
+                queue.remove(c)
+
+
+def _queued_display(queue):
+    """The queue entries worth SHOWING as queued prompts: capped, and minus the
+    tooling's own payloads. A background task finishing mid-turn rides the same
+    queue as a `<task-notification>` XML wall — rendering that as a queued
+    operator bubble is the exact misclassification the block parsers exist to
+    fix. It must still occupy its FIFO slot in `queue` (dequeues are
+    positional), so it is filtered here at report time, never at fold time.
+    Prefix-matched (not parsed): the enqueue copy is clipped to
+    QUEUED_PROMPT_CHARS, which can cut the closing tag a full parse needs.
+    Mirror of tunnel-agent.js queuedDisplay."""
+    return [q for q in queue
+            if not q.startswith("<task-notification>")][-QUEUED_PROMPTS_MAX:]
+
+
 def _history_entries(path):
     """On-demand `history` read of a transcript: bounded to the last 4 MiB
     (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
     ~128 KB, tolerant JSONL parse, entries mapped through _entry_text (no
-    duplicated entry->text logic). Returns (entries, byte_capped) — oldest
-    first; byte_capped is True when the file is bigger than the 4 MiB window,
-    i.e. older content was cut off before parsing even started."""
+    duplicated entry->text logic). Returns (entries, byte_capped, queued) —
+    entries oldest first; byte_capped is True when the file is bigger than the
+    4 MiB window, i.e. older content was cut off before parsing even started;
+    queued is the still-queued prompt texts (see _fold_queue_op)."""
     read_cap = 1 << 22
     try:
         byte_capped = os.path.getsize(path) > read_cap
     except OSError:
         byte_capped = False
     entries = []
+    queued = []
     for raw in _read_tail_lines(path, read_cap):
         try:
             entry = json.loads(raw)
         except ValueError:
             continue
         if not isinstance(entry, dict):
+            continue
+        if entry.get("type") == "queue-operation":
+            _fold_queue_op(entry, queued)
             continue
         text = _entry_text(entry)
         blocks = _entry_blocks(entry, BLOCK_CAPS_FULL)
@@ -2198,7 +2338,7 @@ def _history_entries(path):
             "text": (text or "")[:TAIL_MSG_CHARS_FULL],
             "blocks": blocks or [],
         })
-    return entries, byte_capped
+    return entries, byte_capped, _queued_display(queued)
 
 
 # The Task tool's result text carries the spawned agent's id ("agentId: <id>"),
@@ -5715,15 +5855,19 @@ class SessionManager:
         path = _session_transcript_path(sess) if sess else None
         if not path:
             self.history_results.append(
-                {"sessionId": sid, "entries": [], "truncated": False}
+                {"sessionId": sid, "entries": [], "truncated": False,
+                 "queued": []}
             )
             return
-        entries, byte_capped = _history_entries(path)
+        entries, byte_capped, queued = _history_entries(path)
         truncated = byte_capped or len(entries) > HISTORY_MAX_MSGS
         self.history_results.append({
             "sessionId": sid,
             "entries": entries[-HISTORY_MAX_MSGS:],
             "truncated": truncated,
+            # Still-queued prompts (typed mid-turn, not yet consumed) so the
+            # chat's /history fallback shows them like the live tail does.
+            "queued": queued,
         })
 
     def _stage_subagent_history(self, sid, agent_type, label):
@@ -5742,7 +5886,8 @@ class SessionManager:
         if not path:
             self.subagent_history_results.append(result)
             return
-        entries, byte_capped = _history_entries(path)
+        # Subagents take no operator input, so their queued list is dropped.
+        entries, byte_capped, _ = _history_entries(path)
         result["entries"] = entries[-HISTORY_MAX_MSGS:]
         result["truncated"] = byte_capped or len(entries) > HISTORY_MAX_MSGS
         self.subagent_history_results.append(result)
