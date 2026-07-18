@@ -59,4 +59,28 @@ class BoardTest {
         assertEquals(1, orgColorIndex("b.net", keys))
         assertEquals(2, orgColorIndex("c.net", keys))
     }
+
+    @Test fun `org name strips the atlassian net suffix`() {
+        assertEquals("xerktech", orgName("xerktech.atlassian.net"))
+        assertEquals("self-hosted.example.com", orgName("self-hosted.example.com"))
+    }
+
+    private fun site(key: String) = BoardSite(
+        siteKey = key, site = key, online = true, error = null, fetchedAt = "", tickets = emptyList(),
+    )
+
+    @Test fun `blank filter keeps every site`() {
+        val sites = listOf(site("a"), site("b"))
+        assertEquals(sites, filterSites(sites, ""))
+    }
+
+    @Test fun `a matching filter keeps only that org`() {
+        val sites = listOf(site("a"), site("b"))
+        assertEquals(listOf("b"), filterSites(sites, "b").map { it.siteKey })
+    }
+
+    @Test fun `a filter naming an org that stopped reporting falls back to all`() {
+        val sites = listOf(site("a"), site("b"))
+        assertEquals(sites, filterSites(sites, "gone"))
+    }
 }
