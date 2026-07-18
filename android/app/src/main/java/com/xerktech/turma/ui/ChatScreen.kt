@@ -176,8 +176,10 @@ fun ChatScreen(
                     draft = state.draft,
                     mic = state.mic,
                     // Working right now: prefer the live turn frames (fast), fall back
-                    // to the heartbeat's paneBusy. Drives the ◼ Stop button.
-                    busy = state.liveTurn.isNotBlank() || state.session?.session?.paneBusy == true,
+                    // to the heartbeat's paneBusy. Drives the separate ◼ Stop button —
+                    // suppressed while a question is pending (the draft answers it).
+                    busy = (state.liveTurn.isNotBlank() || state.session?.session?.paneBusy == true) &&
+                        state.question.isBlank(),
                     onDraft = vm::setDraft,
                     onSend = vm::submitDraft,
                     onStop = vm::stop,
@@ -350,16 +352,19 @@ private fun ChatFooter(
                     MicState.FINALIZING -> CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                 }
             }
-            // The compose button IS the Stop button while a turn is in flight
-            // (web parity): interrupt it, else send the draft.
+            // Split compose bar (XERK-33): Send ALWAYS sends — mid-turn the
+            // message just queues — and a separate warning-coloured Stop appears
+            // beside it while a turn is in flight. On a phone the button is the
+            // only way to send, so mid-turn queueing must not require stopping
+            // first. Stop is suppressed during a pending question (XERK-21): the
+            // draft then routes to the answer, and stopping would destroy it.
             if (busy) {
                 IconButton(onClick = onStop) {
-                    Icon(Icons.Filled.Stop, "Stop", tint = com.xerktech.turma.ui.theme.TurmaColors.waiting)
+                    Icon(Icons.Filled.Stop, "Stop turn", tint = com.xerktech.turma.ui.theme.TurmaColors.waiting)
                 }
-            } else {
-                IconButton(onClick = onSend, enabled = draft.isNotBlank()) {
-                    Icon(Icons.AutoMirrored.Filled.Send, "Send")
-                }
+            }
+            IconButton(onClick = onSend, enabled = draft.isNotBlank()) {
+                Icon(Icons.AutoMirrored.Filled.Send, if (busy) "Send (queues mid-turn)" else "Send")
             }
         }
     }

@@ -199,7 +199,16 @@ private fun HostSection(
                         maxLines = 1,
                     )
                 }
-                Pill(if (agent.online) "online" else "offline", color = if (agent.online) com.xerktech.turma.ui.theme.TurmaColors.good else null)
+                // An announced update restart reads as "updating" (warning), not
+                // the outage-looking "offline" (XERK-29).
+                when {
+                    agent.updating != null -> Pill(
+                        "updating" + agent.updating.version.takeIf { it.isNotBlank() }?.let { " → $it" }.orEmpty(),
+                        color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                    )
+                    agent.online -> Pill("online", color = com.xerktech.turma.ui.theme.TurmaColors.good)
+                    else -> Pill("offline", color = null)
+                }
             }
             AnimatedVisibility(expanded) {
                 Column(Modifier.fillMaxWidth().padding(bottom = 4.dp)) {

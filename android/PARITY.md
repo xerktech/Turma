@@ -47,6 +47,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   index.html's reducers). Tested in `FleetTest`.
 - **Question option preview.** The collapsible preview mockup the TUI shows (`chat.js` `q-prev-wrap`)
   now renders on each option card.
+- **Split compose bar (XERK-33).** Send now ALWAYS sends (mid-turn it queues); a separate
+  warning-coloured Stop appears beside it while a turn runs, suppressed during a pending question. Was
+  a single button that morphed into Stop — on a phone (no Enter key) that made mid-turn queueing
+  impossible. `ui/ChatScreen.kt`.
+- **Host "updating" status (XERK-29).** A host in an announced update restart shows an "updating →
+  <version>" pill instead of the outage-looking "offline". `model/Models.kt` + `ui/FleetScreen.kt`.
 
 ## Open (subsequent installments), by screen and priority
 
@@ -75,6 +81,23 @@ those are marked `[MODEL]`.
   optimistic model/mode update.
 - P2 New-session composer in the Sessions list (web can spawn from here).
 - P3 Deep links (`?session=`/`?ended=`), streaming caret, in-place terminal toggle.
+- P1 `[MODEL]` **Accurate model selector (XERK-33).** The footer model chip offers a hardcoded menu
+  and shows `model` ("default"); the web now heartbeats the login's REAL model list per host
+  (`agent.models`) and the model actually answering per session (`session.modelActual`), and switching
+  uses "this session only". Port: decode `models`/`modelActual`, populate the chip from the real list,
+  show the actual model.
+- P1 **Classify bookkeeping turns + queued prompts (#256, chat-view-classification).** The chat should
+  render, as the web now does: `[Request interrupted by user]` as a centred status marker; `!` shell
+  passthrough (`<bash-input>`/`<bash-stdout>`/`<bash-stderr>`) as command/command_output cards (name
+  "!", stderr wins only when non-empty); the `system/away_summary` recap as a collapsed assistant
+  card; and queued (not-yet-sent) prompts as dimmed bubbles. Logic belongs in `core/ChatItems.kt`
+  (JVM-tested against the web shapes) — the biggest new chat gap.
+- P3 **Terminal compose Stop.** XERK-33 also split the terminal compose bar; Android's
+  `ui/TerminalScreen.kt` bar still only sends (it's a separate WebView screen with no live busy read).
+
+### Usage
+- P2 **Table-view state persistence (XERK-31).** The web keeps the usage table open + the page put
+  across SSE re-renders. Moot until Android grows a usage table view (see the Usage P1 above).
 
 ### Board (`board.js` → `BoardScreen`/`core/Board`)
 - P0 `[MODEL]` Per-card Start button (4 states incl. clone-first) + session chips + optimistic sweep.
