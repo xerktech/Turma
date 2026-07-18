@@ -1841,13 +1841,17 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/model -> switch a running
-      // session's model live (agent types `/model <name>`). Body: {model}, one
-      // of the composer's allowlisted aliases (default/opus/sonnet/haiku); the
-      // agent re-validates before it reaches the pane.
+      // session's model live, for that session only (the agent drives the
+      // /model picker's session-only path). Body: {model}, an alias from the
+      // host's probed `models.available` (or the static fallback set); the
+      // agent re-validates against its own allowlist before any key is pressed
+      // — this check only rejects the plainly malformed.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "model") {
         const body = JSON.parse((await readBody(req)) || "{}");
         const model = typeof body.model === "string" ? body.model : "";
         if (!model) return json(res, 400, { error: "model required" });
+        if (model.length > 60 || !/^[a-z0-9.[\]-]+$/i.test(model))
+          return json(res, 400, { error: "invalid model" });
         const cmdId = queueCommand(key, { type: "setModel", sessionId, model });
         return json(res, 200, { ok: true, cmdId });
       }

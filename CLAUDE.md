@@ -228,6 +228,19 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     a beat stale by the time the operator clicks, while Escape into an idle pane is harmless.
   - Tests: `TestInterrupt`.
 - `setSummary` — rename a session; see "Session activity summaries" under Conventions.
+- `setModel` — switch a running session's model live, **for that session only** (XERK-33).
+  - `set_model` drives Claude Code's /model picker — clear the input line (C-u), open it, parse its
+    rows + ❯ cursor from a pane capture (`parse_model_picker`), arrow to the target, press `s`
+    ("use this session only") — instead of typing `/model <name>`: the argument form ALSO saves the
+    pick as the login-wide default for new sessions, and every session on a host shares that one
+    login, so switching one session silently changed what "Default" meant everywhere.
+  - Gated on a **fresh** pane-busy read (unlike `interrupt`, this types into the pane, and typed
+    mid-turn the command would only queue as a prompt); refused log-only when busy.
+  - Backs out with Escape when the picker doesn't appear or has no row for the target (the
+    bracketed `[1m]` aliases have none). Either way the transcript's own confirmation — not the
+    stored intent — is what the chip renders, via `modelActual` below.
+  - Validation is `resolve_model` against the static aliases plus the probed available list.
+  - Tests: `TestSetModelMode`, `TestParseModelPicker` in `agent/tests/test_hub_agent.py`.
 - `clone` — see "GitHub block and cloning" below.
 - `refreshJira` — the /board page's manual refresh: re-poll Jira now instead of waiting out the slow
   `JIRA_REFRESH_EVERY` cadence. Re-checks `jira_configured()`, so an unconfigured host stays at zero
@@ -266,6 +279,28 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     string the same way (`codingAgent()` in `index.html`), which is what stops it rendering as
     "Claude Code 2.1.211 (Claude Code)" under a label that already said Claude Code.
   - Tests: `TestCodingAgent`, `turma/tests/host-header.test.js`.
+- The **login's real model list** (`models` = `{available, defaultLabel, at}`, XERK-33), probed from
+  the CLI itself: `claude -p "/model"` prints "Current model: <label>" plus the account's whole
+  alias list, which `parse_model_probe` parses — so the hub's model menus offer what this login can
+  actually run, and "Default" can say what it resolves to, with no rate-table-style config to drift.
+  - The probe is a detached one-shot on the models cadence (`MODELS_REFRESH_EVERY`, beat 0 covering
+    boot; `MODELS_RETRY_EVERY` until the first success), same shape as the summary/triage helpers:
+    cwd=REGISTRY_DIR, no --settings, reaped by `_poll_models_probe` with a kill-on-timeout.
+  - A failed or unparseable probe **keeps the previous list** — an attempt's failure is never
+    evidence the login lost models. `None` until the first success; the hub falls back to its
+    static menu then (and for agents predating the field).
+  - `resolve_model(model, extra)` accepts the probed aliases beyond the static four, still
+    charset-checked (`SPAWN_MODEL_RE` — the bracketed `[1m]` variants never reach a launch command
+    line, where the brackets are a shell glob).
+  - `modelActual` on each session record is the probe's per-session counterpart: the incremental
+    transcript scan (`_scan_entry_line` — ONE json parse feeding both the PR scan and
+    `_scan_model_entry`) folds each assistant entry's `message.model` and the "Set model to X"
+    stdout a live /model switch writes, so the heartbeat names the model REALLY answering, id or
+    label, newest signal winning. Persisted; seeded once from the transcript tail for records
+    predating the field (`_seed_model_actual`).
+  - Tests: `TestParseModelProbe`, `TestModelsProbe`, `TestScanModelEntry`,
+    `TestSessionReportModelActual`, `TestSeedModelActual`, `TestModelActualPayload`, and the
+    model-probe cases in `TestInternalToolSlugModelProbe`.
 
 #### Live-session signals
 
@@ -408,14 +443,17 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
      `~/.claude` login);
   4. else bucketed under `OTHER_REPO_NAME` (`(other)`), only when no `cwd` is recorded.
 - **No real session is excluded** — every session transcript on the box counts toward the host total.
-- **The one carve-out is the manager's OWN internal `claude -p` helpers** (session naming + Jira
-  triage), which run with `cwd=REGISTRY_DIR` yet still write a transcript into the shared
+- **The one carve-out is the manager's OWN internal `claude -p` helpers** (session naming, Jira
+  triage, and the models probe), which run with `cwd=REGISTRY_DIR` yet still write a transcript into the shared
   `~/.claude/projects` — so the reconciler used to adopt the agent's own overhead as a phantom repo on
   the usage page: `.turma` (from `/root/.turma`) in production, and a cluster of `hub-agent-mgr-*`
   entries when a test/verify harness boots the manager against a `mkdtemp` `REGISTRY_DIR` (XERK-27).
   `_is_internal_tool_slug` recognizes them — by the registry dir's own slug (no transcript read,
   catches production) or, for a harness's foreign temp slug, by the `INTERNAL_TOOL_PROMPT_SIGS`
-  signature of the transcript's first prompt (path- and process-independent). Such a slug is
+  signature of the transcript's first prompt (path- and process-independent). The models probe's
+  prompt IS a slash command, which `_first_user_text` skips, so its transcript is recognized by its
+  first command instead (`_first_command_name` = `/model`, only when no genuine user text exists —
+  see the models-probe bullet). Such a slug is
   **tombstoned** in the ledger (`{internal:true}`), which `repo_usage_report` and `_archive_manifest`
   skip, so it never re-evaluates and never surfaces on usage OR in the archive.
   `_sanitize_internal_tool_entries` retires entries earlier builds already adopted; a real coding
@@ -1280,6 +1318,25 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
 - The compose footer's live agent-mode / model selectors are joined by a compact **PR status chip**
   (the session's latest PR, `prFooterChip` in `chat.js`, unit-tested in `chat.test.js`) when it has
   one.
+- The **model selector is accurate** (XERK-33) — it used to read "Default" and offer a hardcoded
+  guess of a menu, and its switch quietly rewrote the shared login's default (see `setModel` under
+  the agent's Commands):
+  - the chip leads with the session's heartbeated `modelActual` — the model really answering —
+    rendered human by `prettyModel` ("claude-opus-4-8" → "Opus 4.8"; a confirmation label like
+    "Sonnet 5" passes through), falling back to the picked alias, with the raw id in the tooltip;
+  - the menu is built by `modelOpts` from the host's probed `models` block — curated to the aliases
+    the /model picker can reach (a menu entry the agent's session-only switch can't perform would
+    be a button that does nothing), "Default (<label>)" saying what default resolves to, the static
+    four when a host hasn't probed;
+  - a just-picked switch holds its optimistic label until the agent confirms or
+    `MODEL_SWITCH_SETTLE_MS` passes (`modelSwitchPending`) — without it the chip flashes back to
+    the old model for the beat or two before the confirmation lands, which reads as a failed
+    switch;
+  - `onPoll` carries the fresh host payload so the menu tracks the probe, and the dashboard
+    composer offers the same probed list (`modelChoices` in `index.html`, remembered-pick kept like
+    the base-branch select).
+  - Tests: the `modelOpts`/`prettyModel` cases in `chat.test.js`, the malformed-model endpoint case
+    in `server.test.js`, and the agent tests under the models-probe bullet.
 - The raw ttyd terminal stays one **"Terminal ▸" toggle** away in the chat header for debugging (the
   old `#termPane` iframe, unchanged).
 - `GET /api/ws-token` (formerly only the glasses client) now also authenticates the web chat's `/live`

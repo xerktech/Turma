@@ -1407,6 +1407,21 @@ test("http: model endpoint queues a setModel command that rides the next heartbe
   ]);
 });
 
+test("http: model endpoint rejects a malformed model before it can queue", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hm1b" }, headers: agentHeaders });
+  for (const model of ["so nnet", "x;rm -rf", "a".repeat(61)]) {
+    const res = await request("POST", "/api/agents/hm1b/sessions/sess1/model", {
+      body: { model }, headers: userHeaders,
+    });
+    assert.equal(res.status, 400, model);
+  }
+  // The bracketed probe aliases are shaped fine — the agent decides if they're real.
+  const ok = await request("POST", "/api/agents/hm1b/sessions/sess1/model", {
+    body: { model: "sonnet[1m]" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+});
+
 test("http: mode endpoint queues a setMode command that rides the next heartbeat", async () => {
   await request("POST", "/api/heartbeat", { body: { device: "hm2" }, headers: agentHeaders });
   const res = await request("POST", "/api/agents/hm2/sessions/sess1/mode", {

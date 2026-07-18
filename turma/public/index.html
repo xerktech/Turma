@@ -1036,6 +1036,25 @@ function repoBlock(a, repo, sessList, now) {
   </details>`;
 }
 
+// The composer's model choices: the curated aliases the host's login actually
+// has (from the agent's probed `models` block — kept in sync with chat.js's
+// modelOpts, the same rule for the live chat menu), falling back to the static
+// four for a host that hasn't probed yet. A remembered pick that has left the
+// list is carried back in so the select can't silently misreport it.
+function modelChoices(a, remembered) {
+  const KNOWN = ["default", "opus", "fable", "sonnet", "haiku"];
+  const avail = a && a.models && Array.isArray(a.models.available) ? a.models.available : null;
+  const aliases = avail && avail.length
+    ? KNOWN.filter(m => m === "default" || avail.includes(m))
+    : ["default", "opus", "sonnet", "haiku"];
+  if (remembered && remembered !== "default" && !aliases.includes(remembered)) aliases.push(remembered);
+  const dflt = a && a.models && a.models.defaultLabel;
+  return aliases.map(m => ({
+    value: m,
+    label: m === "default" && dflt ? `Default (${dflt})` : m[0].toUpperCase() + m.slice(1),
+  }));
+}
+
 // The "New session" composer panel (#11 task, #13 label, #12 options). Task
 // first (autofocused, Cmd/Ctrl+Enter submits); options are a collapsed nested
 // disclosure that defaults to today's behavior. Field values that are text
@@ -1083,7 +1102,7 @@ function composer(a, repo, rk, spawning) {
         <div>
           <label>Model</label>
           <select id="${cid(rk, "model")}" onchange="onOptChange('${esc(rk)}','${rn}')">
-            ${opt("default", "Default", selModel)}${opt("opus", "Opus", selModel)}${opt("sonnet", "Sonnet", selModel)}${opt("haiku", "Haiku", selModel)}
+            ${modelChoices(a, selModel).map(m => opt(m.value, m.label, selModel)).join("")}
           </select>
         </div>
         <div>
