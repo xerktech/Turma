@@ -200,7 +200,7 @@
 
   .usage {
     border-top: 1px solid var(--hairline); padding-top: 8px;
-    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;
+    display: flex; align-items: baseline; gap: 8px;
   }
   .usage .u-label { color: var(--muted); font-size: 11px; }
   .usage .u-value { font-family: var(--font-display); font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -1180,12 +1180,9 @@ function sessCard(a, s, now) {
       <dt>Activity</dt><dd>${u?.lastActivity ? esc(ago(now - Date.parse(u.lastActivity))) : "–"}${u ? " · " + esc(shortModels(u.models)) : ""}</dd>
     </dl>
     <div class="usage">
-      <div><div class="u-label">Tokens today</div><div class="u-value">${fmtTokens(totalTokens(u?.today))}</div>
-           <div class="u-sub">${fmtTokens(u?.today?.output)} out</div></div>
-      <div><div class="u-label">This week</div><div class="u-value">${fmtTokens(totalTokens(u?.week))}</div>
-           <div class="u-sub">${fmtTokens(u?.week?.output)} out</div></div>
-      <div><div class="u-label">All-time</div><div class="u-value">${fmtTokens(totalTokens(u?.totals))}</div>
-           <div class="u-sub">${fmtTokens(u?.totals?.output)} out</div></div>
+      <div class="u-label">Tokens</div>
+      <div class="u-value" title="all tokens this session (input + output + cache), from the transcript — persists across kill/resume">${fmtTokens(totalTokens(u?.totals))}</div>
+      <div class="u-sub">${fmtTokens(u?.totals?.output)} out</div>
     </div>
     <div class="sess-actions">${actions}</div>
   </div>`;
