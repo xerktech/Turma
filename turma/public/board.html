@@ -222,6 +222,10 @@ function paintDetail() {
   const s = openTicketState;
   if (!s) return;
   const site = lastSites.find(x => x.siteKey === s.siteKey);
+  const agentPin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
+  // What the Agent row is showing, so refreshOpenTicket can repaint only when
+  // the pin actually moved (same story as the repoGuess `shown` fingerprint).
+  s.agentPinShown = agentPin ? agentPin.host : "";
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
     color: B.orgColor(s.siteKey, lastAllKeys),
     siteKey: s.siteKey,
@@ -232,9 +236,19 @@ function paintDetail() {
     editing: s.editing,
     repoError: s.repoError,
     repoOptions: (site && site.repoOptions) || [],
+    // The agent pin is hub-owned (no heartbeat round-trip), so its Change
+    // control needs no online gate — the hub is reachable if this page is.
+    agentPin,
+    agentEditing: s.agentEditing,
+    agentError: s.agentError,
+    hostOptions: (site && site.hostOptions) || [],
   });
   if (s.editing) {
     const sel = $panel.querySelector("[data-repo-select]");
+    if (sel) sel.focus();
+  }
+  if (s.agentEditing) {
+    const sel = $panel.querySelector("[data-agent-select]");
     if (sel) sel.focus();
   }
 }
@@ -276,9 +290,52 @@ function refreshOpenTicket() {
     s.repoPendingUntil = 0;
   }
   const shown = (g) => (g ? `${g.repo}|${!!g.cloned}|${!!g.manual}` : "");
-  const changed = shown(fresh.repoGuess) !== shown(s.ticket.repoGuess);
+  // The agent pin isn't a ticket field — it lives on cache.ticketAgents — so
+  // its "did what we render change" check compares against what paintDetail
+  // last drew rather than against the rebuilt ticket.
+  const pin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
+  const changed = shown(fresh.repoGuess) !== shown(s.ticket.repoGuess) ||
+    (pin ? pin.host : "") !== (s.agentPinShown || "");
   s.ticket = fresh;
-  if (changed && !s.editing) paintDetail();
+  // Neither picker may be swapped out from under an operator mid-edit.
+  if (changed && !s.editing && !s.agentEditing) paintDetail();
+}
+
+// The operator's own answer to which HOST the ticket's sessions spawn on
+// (XERK-38). No optimistic-settle machinery like saveRepo's: the pin is
+// hub-owned and the POST response is authoritative, so on success the local
+// copy of ticketAgents is just updated and repainted — the SSE broadcast keeps
+// every OTHER open board in step.
+async function saveAgent(value) {
+  const s = openTicketState;
+  if (!s) return;
+  const body = value === "__auto__" ? { auto: true } : { host: value };
+  s.agentEditing = false;
+  s.agentError = "";
+  let ok = false, err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/agent`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    ok = r.ok;
+    if (!ok) {
+      let d = {};
+      try { d = await r.json(); } catch { /* non-JSON error body */ }
+      err = d.error || `HTTP ${r.status}`;
+    }
+  } catch { err = "the hub is unreachable"; }
+  if (ok) {
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    const ta = cache.ticketAgents || (cache.ticketAgents = {});
+    const k = `${s.siteKey}/${s.key}`;
+    if (body.auto) delete ta[k];
+    else ta[k] = { host: body.host, at: Date.now() };
+  } else if (openTicketState === s) {
+    s.agentError = err;
+  }
+  if (openTicketState === s) paintDetail();
 }
 
 // The operator's own repo answer. Painted optimistically: the pin only becomes
@@ -448,6 +505,15 @@ $panel.addEventListener("click", (e) => {
     openTicketState.editing = false;
     return paintDetail();
   }
+  if (e.target.closest("[data-agent-edit]")) {
+    openTicketState.agentEditing = true;
+    openTicketState.agentError = "";  // a new attempt clears the old complaint
+    return paintDetail();
+  }
+  if (e.target.closest("[data-agent-cancel]")) {
+    openTicketState.agentEditing = false;
+    return paintDetail();
+  }
 });
 // Choosing an option IS the save — the dropdown is the setting, so picking a repo
 // answers the question the row asked and there is nothing left to confirm.
@@ -462,6 +528,18 @@ $panel.addEventListener("click", (e) => {
 // still closes the picker, which is what a pick means.
 $panel.addEventListener("change", (e) => {
   if (!openTicketState) return;
+  // The agent picker follows the repo picker's contract: a pick IS the save, a
+  // re-pick of the current answer saves nothing but still closes the picker.
+  const asel = e.target.closest("[data-agent-select]");
+  if (asel) {
+    const pin = B.agentPinOf(cache && cache.ticketAgents,
+      openTicketState.siteKey, openTicketState.key);
+    if (asel.value === B.agentPickerValue(pin)) {
+      openTicketState.agentEditing = false;
+      return paintDetail();
+    }
+    return void saveAgent(asel.value);
+  }
   const sel = e.target.closest("[data-repo-select]");
   if (!sel) return;
   if (sel.value === B.repoPickerValue(openTicketState.ticket)) {
@@ -569,6 +647,16 @@ function connectSSE() {
   es.addEventListener("removed", (e) => {
     try { const { key } = JSON.parse(e.data); if (cache) cache.agents = (cache.agents || []).filter(a => a.key !== key); }
     catch { return; }
+    scheduleRender();
+  });
+  // A ticket->agent pin changed (this browser's own save already painted; this
+  // is what keeps every OTHER open board in step). The event carries the whole
+  // map — it's tiny — so there's no patch bookkeeping.
+  es.addEventListener("ticketAgents", (e) => {
+    let ta;
+    try { ta = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.ticketAgents = ta;
     scheduleRender();
   });
   es.onerror = () => {

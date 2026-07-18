@@ -40,6 +40,10 @@ process.env.DEVICES_FILE = path.join(
   os.tmpdir(),
   `turma-test-devices-${process.pid}.json`
 );
+process.env.TICKET_AGENTS_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-ticket-agents-${process.pid}.json`
+);
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
 process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-archive-"));
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
@@ -2133,6 +2137,130 @@ test("http: an unknown org 404s", async () => {
   assert.equal(res.status, 404);
 });
 
+// POST /api/jira/<siteKey>/<issueKey>/agent — the operator's manual agent pin
+// (XERK-38): which HOST a ticket's sessions spawn on. Hub-owned (routing is the
+// hub's job) and durable (its own /data file), unlike the /repo override's
+// agent-ledger fan-out — so the save is an authoritative 200, not a 202.
+
+const setAgent = (site, key, body) =>
+  request("POST", `/api/jira/${site}/${key}/agent`, { body, headers: userHeaders });
+
+test("http: pinning a ticket's agent stores it; {auto:true} releases it", async () => {
+  await jiraBeat("taA", "taSite.atlassian.net");
+  await jiraBeat("taB", "taSite.atlassian.net");
+  const res = await setAgent("taSite.atlassian.net", "ENG-1", { host: "taB" });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.host, "taB");
+  assert.equal(hub.ticketAgents["taSite.atlassian.net/ENG-1"].host, "taB");
+
+  const rel = await setAgent("taSite.atlassian.net", "ENG-1", { auto: true });
+  assert.equal(rel.status, 200);
+  assert.equal(rel.body.host, null);
+  assert.ok(!("taSite.atlassian.net/ENG-1" in hub.ticketAgents));
+});
+
+test("http: the pin rides the /api/agents payload for the board to render", async () => {
+  await jiraBeat("taPay", "taPay.atlassian.net");
+  await setAgent("taPay.atlassian.net", "ENG-3", { host: "taPay" });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(res.body.ticketAgents["taPay.atlassian.net/ENG-3"].host, "taPay");
+});
+
+test("http: pinning validates the key, body, and host before storing", async () => {
+  await jiraBeat("taV", "taV.atlassian.net");
+  await jiraBeat("taOther", "taOtherOrg.atlassian.net");
+  assert.equal((await setAgent("taV.atlassian.net", "42", { host: "taV" })).status, 400);
+  assert.equal((await setAgent("taV.atlassian.net", "ENG-1", {})).status, 400);
+  assert.equal((await setAgent("taV.atlassian.net", "ENG-1", { host: 42 })).status, 400);
+  // A host of a DIFFERENT org is not on this org's picker; nor is a stranger.
+  assert.equal((await setAgent("taV.atlassian.net", "ENG-1", { host: "taOther" })).status, 400);
+  assert.equal((await setAgent("taV.atlassian.net", "ENG-1", { host: "ghost" })).status, 400);
+  // An org nobody reports at all.
+  assert.equal((await setAgent("nobody.atlassian.net", "ENG-1", { host: "taV" })).status, 404);
+  assert.ok(!("taV.atlassian.net/ENG-1" in hub.ticketAgents));
+});
+
+test("http: an offline org host can still be pinned — the pin is about future spawns", async () => {
+  await jiraBeat("taOffline", "taOff.atlassian.net");
+  agents.taOffline.lastSeen = Date.now() - 10 * 60 * 1000;
+  const res = await setAgent("taOff.atlassian.net", "ENG-1", { host: "taOffline" });
+  assert.equal(res.status, 200);
+  assert.equal(hub.ticketAgents["taOff.atlassian.net/ENG-1"].host, "taOffline");
+});
+
+test("http: pinning a ticket's agent requires the user login", async () => {
+  await jiraBeat("taAuth", "taAuth.atlassian.net");
+  const res = await request("POST", "/api/jira/taAuth.atlassian.net/ENG-1/agent",
+    { body: { host: "taAuth" } });
+  assert.equal(res.status, 401);
+  assert.ok(!("taAuth.atlassian.net/ENG-1" in hub.ticketAgents));
+});
+
+test("http: a pinned ticket spawns on its pinned agent, not the most available", async () => {
+  await ticketBeat("tpBusy", "tPin.atlassian.net");
+  await ticketBeat("tpFree", "tPin.atlassian.net");
+  agents.tpBusy.capacity = { maxSessions: 6, running: 5, queued: 0, free: 1 };
+  agents.tpFree.capacity = { maxSessions: 6, running: 1, queued: 0, free: 5 };
+  await setAgent("tPin.atlassian.net", "ENG-5", { host: "tpBusy" });
+  const res = await request("POST", "/api/jira/tPin.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.host, "tpBusy");
+  assert.equal((agents.tpFree.commands || []).length, 0);
+});
+
+test("http: a spawn refuses — never reroutes — when the pinned agent is offline", async () => {
+  // Routing elsewhere would contradict the one thing the pin asserts; the board
+  // renders the reason beside a live retry button, and the panel shows the pin.
+  await ticketBeat("tpOffA", "tPinOff.atlassian.net");
+  await ticketBeat("tpOffB", "tPinOff.atlassian.net");
+  await setAgent("tPinOff.atlassian.net", "ENG-5", { host: "tpOffB" });
+  agents.tpOffB.lastSeen = Date.now() - 10 * 60 * 1000;
+  const res = await request("POST", "/api/jira/tPinOff.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 503);
+  assert.match(res.body.error, /pinned/);
+  assert.equal((agents.tpOffA.commands || []).length, 0);
+  assert.equal((agents.tpOffB.commands || []).length, 0);
+});
+
+test("http: a pin to a host that left the fleet is a clear 409", async () => {
+  await ticketBeat("tpGoneA", "tPinGone.atlassian.net");
+  await ticketBeat("tpGoneB", "tPinGone.atlassian.net");
+  await setAgent("tPinGone.atlassian.net", "ENG-5", { host: "tpGoneB" });
+  delete agents.tpGoneB;   // pruned after a week offline, or renamed
+  const res = await request("POST", "/api/jira/tPinGone.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /pinned/);
+  assert.equal((agents.tpGoneA.commands || []).length, 0);
+});
+
+test("http: a pinned agent without the repo clones on demand, like any routed host", async () => {
+  await ticketBeat("tpHasRepo", "tPinClone.atlassian.net", { repos: ["Turma"] });
+  await ticketBeat("tpNoRepo", "tPinClone.atlassian.net", { repos: ["Other"] });
+  await setAgent("tPinClone.atlassian.net", "ENG-5", { host: "tpNoRepo" });
+  const res = await request("POST", "/api/jira/tPinClone.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.host, "tpNoRepo");
+  assert.equal(res.body.needsClone, true);
+});
+
+test("ticket-agent pins survive a hub restart (read back from their own file)", () => {
+  // "Persistent" is the point of the feature: the pin has its own durable file
+  // on /data rather than riding the best-effort state.json.
+  const file = path.join(os.tmpdir(), `turma-test-ta-persist-${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify({
+    "o.atlassian.net/ENG-1": { host: "h1", at: 123 } }));
+  try {
+    const mod = freshServerModule((env) => { env.TICKET_AGENTS_FILE = file; });
+    assert.equal(mod.ticketAgents["o.atlassian.net/ENG-1"].host, "h1");
+  } finally {
+    fs.unlinkSync(file);
+  }
+});
+
 test("http: the freshest reporting block decides the repo", async () => {
   // board.js merges on freshest-block-wins, so the hub must resolve against the
   // same copy the operator actually clicked.
@@ -2297,6 +2425,35 @@ test("auto-start: work still spreads across ALL the org's agents, flag or not", 
   // the same fleet-wide splitting as the manual button.
   assert.deepEqual((agents.asPlain.commands || []).map((c) => c.issueKey), ["ENG-5"]);
   assert.equal((agents.asFlagged.commands || []).length, 0);
+});
+
+test("auto-start: honors a ticket's pinned agent over availability", async () => {
+  autoStarted.clear();
+  await asBeat("asPinBusy", "asPin.atlassian.net",
+    { capacity: { maxSessions: 6, running: 5, queued: 0, free: 1 } });
+  await asBeat("asPinFree", "asPin.atlassian.net",
+    { capacity: { maxSessions: 6, running: 1, queued: 0, free: 5 } });
+  await setAgent("asPin.atlassian.net", "ENG-5", { host: "asPinBusy" });
+  autoStartSweep();
+  assert.deepEqual((agents.asPinBusy.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal((agents.asPinFree.commands || []).length, 0);
+});
+
+test("auto-start: a pinned agent that's offline retries later, never reroutes", async () => {
+  autoStarted.clear();
+  await asBeat("asPinOffA", "asPinOff.atlassian.net");
+  await asBeat("asPinOffB", "asPinOff.atlassian.net");
+  await setAgent("asPinOff.atlassian.net", "ENG-5", { host: "asPinOffB" });
+  agents.asPinOffB.lastSeen = Date.now() - 10 * 60 * 1000;
+  autoStartSweep();
+  // Not rerouted around the pin, and left UNrecorded so a later sweep retries.
+  assert.equal((agents.asPinOffA.commands || []).length, 0);
+  assert.equal((agents.asPinOffB.commands || []).length, 0);
+  assert.ok(!autoStarted.has("asPinOff.atlassian.net\x00ENG-5"));
+  // The pinned host comes back — the next sweep spawns there.
+  agents.asPinOffB.lastSeen = Date.now();
+  autoStartSweep();
+  assert.deepEqual((agents.asPinOffB.commands || []).map((c) => c.issueKey), ["ENG-5"]);
 });
 
 test("auto-start: an offline host's stale flag drives nothing", async () => {

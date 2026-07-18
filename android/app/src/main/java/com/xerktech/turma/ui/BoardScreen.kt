@@ -111,7 +111,10 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
     }
 
     detail?.let { (site, ticket) ->
-        TicketDetailSheet(site, ticket, vm, onDismiss = { detail = null })
+        // The Agent pin lives on the fleet payload (hub-owned), not the ticket,
+        // so it's resolved here where the fleet state is in scope.
+        val pin = com.xerktech.turma.core.agentPinOf(fleet.ticketAgents, site.siteKey, ticket.key)
+        TicketDetailSheet(site, ticket, pin, vm, onDismiss = { detail = null })
     }
 }
 
@@ -308,9 +311,82 @@ private fun RepoPicker(site: BoardSite, t: JiraTicket, onPick: (repo: String?, a
     }
 }
 
+/**
+ * The Agent row of the detail sheet (XERK-38): which HOST this ticket's
+ * sessions spawn on — the operator's rare multi-agent-org override of the
+ * hub's most-available routing. Mirrors board.js agentFieldHtml +
+ * agentPickerHtml: auto is the stated default, a pin says "set by you", and a
+ * pinned host that's offline or gone is said rather than hidden (the hub
+ * refuses to reroute around a dead pin).
+ */
+@Composable
+private fun AgentSection(
+    site: BoardSite,
+    t: JiraTicket,
+    pin: com.xerktech.turma.model.TicketAgentPin?,
+    vm: BoardViewModel,
+) {
+    val opt = pin?.let { p -> site.hostOptions.find { it.key == p.host } }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        SectionLabel("Agent")
+        if (pin == null) {
+            Text(
+                "Auto — most available agent",
+                style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Pill(opt?.name ?: pin.host, mono = true)
+                val note = when {
+                    opt == null -> "(no longer reports this org)"
+                    !opt.online -> "(offline)"
+                    else -> null
+                }
+                if (note != null) Text(note, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("— set by you", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        // Nothing to pick and nothing to release -> no picker (matches the web
+        // row going read-only).
+        if (site.hostOptions.isNotEmpty() || pin != null) {
+            AgentPicker(site, pin) { host -> vm.setTicketAgent(site.siteKey, t.key, host) }
+        }
+    }
+}
+
+/** A pick IS the save, same contract as [RepoPicker]; null = release to auto. */
+@Composable
+private fun AgentPicker(site: BoardSite, pin: com.xerktech.turma.model.TicketAgentPin?, onPick: (host: String?) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    val current = pin?.let { p -> site.hostOptions.find { it.key == p.host }?.name ?: p.host }
+        ?: "Auto — most available agent"
+    Box {
+        GhostButton("▾ $current", onClick = { open = true })
+        androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("Auto — most available agent") },
+                onClick = { open = false; onPick(null) },
+            )
+            for (h in site.hostOptions) {
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(h.name + if (!h.online) "  (offline)" else "", fontFamily = FontFamily.Monospace) },
+                    onClick = { open = false; onPick(h.key) },
+                )
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun TicketDetailSheet(site: BoardSite, t: JiraTicket, vm: BoardViewModel, onDismiss: () -> Unit) {
+private fun TicketDetailSheet(
+    site: BoardSite,
+    t: JiraTicket,
+    pin: com.xerktech.turma.model.TicketAgentPin?,
+    vm: BoardViewModel,
+    onDismiss: () -> Unit,
+) {
     val siteKey = site.siteKey
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val detail by produceState<com.xerktech.turma.model.JiraIssueDetail?>(initialValue = null, siteKey, t.key) {
@@ -328,6 +404,7 @@ private fun TicketDetailSheet(site: BoardSite, t: JiraTicket, vm: BoardViewModel
             }
             Text(t.summary, style = MaterialTheme.typography.titleMedium)
             RepoSection(site, t, vm)
+            AgentSection(site, t, pin, vm)
             val d = detail
             if (d == null) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {

@@ -13,6 +13,7 @@ const {
   cardHtml, boardHtml, detailHtml, textHtml, linkify,
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
+  agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
   startSweepVerdict,
 } = require("../public/board.js");
@@ -696,6 +697,115 @@ test("repoPickerValue: agrees with what the picker preselects", () => {
     assert.ok(selected, `nothing preselected for ${JSON.stringify(g)}`);
     assert.equal(selected[1], repoPickerValue(t));
   }
+});
+
+// ---- ticket -> agent pin (XERK-38): the detail panel's Agent row ------------
+
+test("mergeSites: collects the org's hosts as picker options, online first", () => {
+  const sites = mergeSites([
+    agent("hostB", block(), { online: false }),
+    agent("hostA", block()),
+  ]);
+  assert.deepEqual(sites[0].hostOptions, [
+    { key: "hostA", name: "hostA", online: true },
+    { key: "hostB", name: "hostB", online: false },
+  ]);
+});
+
+test("agentPinOf: reads the hub's siteKey/issueKey-keyed map", () => {
+  const ta = { "myorg.atlassian.net/X-1": { host: "hostA", at: 1 } };
+  assert.equal(agentPinOf(ta, "myorg.atlassian.net", "X-1").host, "hostA");
+  assert.equal(agentPinOf(ta, "myorg.atlassian.net", "X-2"), null);
+  assert.equal(agentPinOf(null, "myorg.atlassian.net", "X-1"), null);
+  // A malformed entry (no host) is no pin, not a crash.
+  assert.equal(agentPinOf({ "s/X-1": {} }, "s", "X-1"), null);
+});
+
+test("agentFieldHtml: auto routing is the stated default, a pin says set by you", () => {
+  const hosts = [{ key: "hostA", name: "hostA", online: true }];
+  const auto = agentFieldHtml(null, hosts, { editable: true });
+  assert.ok(auto.includes("Auto — most available agent"));
+  assert.ok(auto.includes("data-agent-edit"));
+  const pinned = agentFieldHtml({ host: "hostA" }, hosts, { editable: true });
+  assert.ok(pinned.includes("hostA"));
+  assert.ok(pinned.includes("set by you"));
+});
+
+test("agentFieldHtml: an offline or vanished pinned host is said, not hidden", () => {
+  // findTicketHost refuses rather than reroutes around a dead pin, so the row
+  // must say what the next spawn will hit instead of painting a healthy pin.
+  const offline = agentFieldHtml({ host: "hostA" },
+    [{ key: "hostA", name: "hostA", online: false }], {});
+  assert.ok(offline.includes("(offline)"));
+  const gone = agentFieldHtml({ host: "hostGone" },
+    [{ key: "hostA", name: "hostA", online: true }], {});
+  assert.ok(gone.includes("no longer reports this org"));
+});
+
+test("agentFieldHtml: a failed save is reported on the row", () => {
+  const html = agentFieldHtml(null, [], { error: "the hub is unreachable" });
+  assert.ok(html.includes("Couldn't save"));
+  assert.ok(html.includes("the hub is unreachable"));
+});
+
+test("agentPickerHtml: auto preselected without a pin, the pinned host with one", () => {
+  const hosts = [{ key: "hostA", name: "hostA", online: true },
+                 { key: "hostB", name: "hostB", online: false }];
+  const auto = agentPickerHtml(null, hosts);
+  assert.ok(/<option value="__auto__" selected>/.test(auto));
+  assert.ok(auto.includes('value="hostA"'));
+  assert.ok(auto.includes("hostB (offline)"));
+  // A pick IS the save — same contract as the repo picker, so no Save button.
+  assert.ok(!auto.includes("data-agent-save"));
+  assert.ok(auto.includes("data-agent-cancel"));
+  const pinned = agentPickerHtml({ host: "hostB" }, hosts);
+  assert.ok(/<option value="hostB" selected>/.test(pinned));
+  assert.ok(!/<option value="__auto__" selected>/.test(pinned));
+});
+
+test("agentPickerHtml: a pinned host that left the fleet stays selected", () => {
+  // Same trap the repo picker documents: with nothing selected the browser
+  // falls back to the first option — Auto — misreporting the pin, and turning a
+  // click-away into a silent release of it.
+  const html = agentPickerHtml({ host: "hostGone" },
+    [{ key: "hostA", name: "hostA", online: true }]);
+  assert.ok(/<option value="hostGone" selected>/.test(html));
+  assert.ok(html.includes('<optgroup label="Currently set">'));
+  assert.ok(!/<option value="__auto__" selected>/.test(html));
+});
+
+test("agentPickerValue: agrees with what the picker preselects", () => {
+  const hosts = [{ key: "hostA", name: "hostA", online: true }];
+  for (const pin of [null, { host: "hostA" }, { host: "hostGone" }]) {
+    const html = agentPickerHtml(pin, hosts);
+    const selected = /<option value="([^"]*)" selected>/.exec(html);
+    assert.ok(selected, `nothing preselected for ${JSON.stringify(pin)}`);
+    assert.equal(selected[1], agentPickerValue(pin));
+  }
+});
+
+test("detailHtml: the Agent row renders, and swaps for the picker when editing", () => {
+  const hosts = [{ key: "hostA", name: "hostA", online: true }];
+  const row = detailHtml(ticket("X-1"), null,
+    { siteKey: "s", agentPin: null, hostOptions: hosts });
+  assert.ok(row.includes("Agent"));
+  assert.ok(row.includes("Auto — most available agent"));
+  assert.ok(row.includes("data-agent-edit"));
+  const editing = detailHtml(ticket("X-1"), null,
+    { siteKey: "s", agentPin: null, hostOptions: hosts, agentEditing: true });
+  assert.ok(editing.includes("data-agent-select"));
+});
+
+test("detailHtml: no hosts and no pin leaves the Agent row read-only", () => {
+  // Nothing to pick and nothing to release — a Change button would open an
+  // empty picker.
+  const html = detailHtml(ticket("X-1"), null,
+    { siteKey: "s", agentPin: null, hostOptions: [] });
+  assert.ok(!html.includes("data-agent-edit"));
+  // But an existing pin must stay releasable even with the options blanked.
+  const pinned = detailHtml(ticket("X-1"), null,
+    { siteKey: "s", agentPin: { host: "hostGone" }, hostOptions: [] });
+  assert.ok(pinned.includes("data-agent-edit"));
 });
 
 test("repoPickerHtml: a hostile repo name can't break out of the option", () => {

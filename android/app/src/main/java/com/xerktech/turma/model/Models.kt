@@ -15,7 +15,15 @@ import kotlinx.serialization.json.JsonElement
 data class AgentsResponse(
     val now: Long = 0,
     val agents: List<AgentInfo> = emptyList(),
+    // Ticket -> pinned host (XERK-38), keyed "<siteKey>/<issueKey>": which
+    // agent a ticket's sessions spawn on, when the operator overrode the hub's
+    // most-available routing. Hub-owned and durable; absent on older hubs.
+    val ticketAgents: Map<String, TicketAgentPin> = emptyMap(),
 )
+
+/** One ticket->agent pin (the web board's Agent row; hub ticket-agents store). */
+@Serializable
+data class TicketAgentPin(val host: String = "", val at: Long = 0)
 
 @Serializable
 data class CodingAgent(val name: String = "", val version: String = "")

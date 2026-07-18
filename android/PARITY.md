@@ -104,6 +104,8 @@ those are marked `[MODEL]`.
 - P0 Ticket cards: type, age, status pill, priority pill, due/overdue.
 - P1 `[MODEL]` Detail sheet full field grid + "Open in Jira" + error state.
 - P1 Repo picker: cloned/not-cloned optgroups, "Currently set" orphan, `nameWithOwner`, save-error.
+- P1 Agent picker (XERK-38, shipped): inline save-error on the row (Android toasts like the repo
+  picker's; the web paints "Couldn't save" on the row itself).
 - P2 Mobile scroll-snapping columns with peek; deep-link (`?ticket=&site=`); refresh outcome/landing.
 - P3 Org-chip "offline · synced N ago"; card org-chip placement; empty-column + truncation notes.
 

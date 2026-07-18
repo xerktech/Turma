@@ -108,4 +108,30 @@ class BoardTest {
         val sites = listOf(site("a"), site("b"))
         assertEquals(sites, filterSites(sites, "gone"))
     }
+
+    // ---- ticket -> agent pin (XERK-38): parity with board.js hostOptions/agentPinOf
+
+    @Test fun `mergeSites collects the org's hosts as picker options, online first`() {
+        // Collected over EVERY reporting host, not the freshest-block winners —
+        // both hosts poll as the same user, so only one block survives the merge,
+        // yet the picker must offer both.
+        val a = agent("hostB", false, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T02:00:00Z"))
+        val b = agent("hostA", true, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T01:00:00Z"))
+        val sites = mergeSites(listOf(a, b))
+        assertEquals(
+            listOf(
+                HostOption("hostA", "hostA", true),
+                HostOption("hostB", "hostB", false),
+            ),
+            sites[0].hostOptions,
+        )
+    }
+
+    @Test fun `agentPinOf reads the hub's siteKey-issueKey-keyed map`() {
+        val ta = mapOf("org.atlassian.net/X-1" to com.xerktech.turma.model.TicketAgentPin(host = "hostA", at = 1))
+        assertEquals("hostA", agentPinOf(ta, "org.atlassian.net", "X-1")?.host)
+        assertEquals(null, agentPinOf(ta, "org.atlassian.net", "X-2"))
+        // A malformed entry (blank host) is no pin, not a crash.
+        assertEquals(null, agentPinOf(mapOf("s/X-1" to com.xerktech.turma.model.TicketAgentPin()), "s", "X-1"))
+    }
 }
