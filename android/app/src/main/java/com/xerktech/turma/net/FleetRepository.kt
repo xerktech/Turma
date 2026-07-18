@@ -34,6 +34,9 @@ data class FleetState(
     // board's Agent row reads it. Refreshed by the poll and the hub's
     // "ticketAgents" SSE event.
     val ticketAgents: Map<String, com.xerktech.turma.model.TicketAgentPin> = emptyMap(),
+    // Per-org auto-start opt-in (XERK-41), keyed by siteKey; the board's org-chip
+    // switch reads it. Refreshed by the poll and the "autoStartOrgs" SSE event.
+    val autoStartOrgs: Map<String, Boolean> = emptyMap(),
 )
 
 class FleetRepository(
@@ -81,6 +84,7 @@ class FleetRepository(
                 for (a in resp.agents) byKey[a.key] = a
             }
             ticketAgents = resp.ticketAgents
+            autoStartOrgs = resp.autoStartOrgs
             emit(resp.now, error = null)
         } catch (e: Exception) {
             emit(_state.value.now, error = e.message ?: "hub unreachable")
@@ -90,11 +94,15 @@ class FleetRepository(
     @Volatile
     private var ticketAgents: Map<String, com.xerktech.turma.model.TicketAgentPin> = emptyMap()
 
+    @Volatile
+    private var autoStartOrgs: Map<String, Boolean> = emptyMap()
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
             agents = list, now = now, loading = false, error = error,
             ticketAgents = ticketAgents,
+            autoStartOrgs = autoStartOrgs,
         )
     }
 
@@ -122,6 +130,11 @@ class FleetRepository(
                     "ticketAgents" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketAgentPin>>(data)
                     }.getOrNull()?.let { ticketAgents = it; emit(_state.value.now, null) }
+                    // An org's auto-start opt-in changed (XERK-41); the event
+                    // carries the whole (tiny) map, same as the web board.
+                    "autoStartOrgs" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, Boolean>>(data)
+                    }.getOrNull()?.let { autoStartOrgs = it; emit(_state.value.now, null) }
                 }
             }
 

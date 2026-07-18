@@ -19,6 +19,10 @@ data class AgentsResponse(
     // agent a ticket's sessions spawn on, when the operator overrode the hub's
     // most-available routing. Hub-owned and durable; absent on older hubs.
     val ticketAgents: Map<String, TicketAgentPin> = emptyMap(),
+    // Per-org auto-start opt-in (XERK-41), keyed by siteKey, value always true
+    // (presence = enabled). The hub-owned switch on each board org chip; unions
+    // with a legacy agent env (AgentInfo.ticketAutoStart). Absent on older hubs.
+    val autoStartOrgs: Map<String, Boolean> = emptyMap(),
 )
 
 /** One ticket->agent pin (the web board's Agent row; hub ticket-agents store). */
@@ -44,6 +48,11 @@ data class AgentInfo(
     val startedAt: String = "",
     val online: Boolean = false,
     val terminalOnline: Boolean = false,
+    // Legacy per-agent auto-start opt-in env (TICKET_AUTO_START, XERK-32). The
+    // hub's per-org toggle (AgentsResponse.autoStartOrgs, XERK-41) is the primary
+    // control now; this stays as a backward-compat OR — an ONLINE host reporting
+    // it forces its org on and locks the chip's switch. False/absent by default.
+    val ticketAutoStart: Boolean = false,
     // Set (non-null) during an ANNOUNCED update restart (XERK-29): the host is
     // briefly silent on purpose, so this reads as "updating", not an outage.
     val updating: UpdatingInfo? = null,

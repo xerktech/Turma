@@ -55,6 +55,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   impossible. `ui/ChatScreen.kt`.
 - **Host "updating" status (XERK-29).** A host in an announced update restart shows an "updating →
   <version>" pill instead of the outage-looking "offline". `model/Models.kt` + `ui/FleetScreen.kt`.
+- **Per-org auto-start switch (XERK-41).** Each board org chip carries an "auto" switch that flips the
+  hub-owned per-org auto-start opt-in (`POST /api/jira/<site>/autostart`); it reflects the effective
+  state (the hub toggle OR a legacy agent `TICKET_AUTO_START`, which shows on and locked). Ports
+  `board.js` `autoStartState` into `core/Board.kt` (tested in `BoardTest`); `model/Models.kt`,
+  `net/FleetRepository.kt` (payload + `autoStartOrgs` SSE), `net/HubApi.kt`, `vm/BoardViewModel.kt`,
+  `ui/BoardScreen.kt`.
 
 ## Open (subsequent installments), by screen and priority
 

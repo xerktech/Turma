@@ -134,4 +134,28 @@ class BoardTest {
         // A malformed entry (blank host) is no pin, not a crash.
         assertEquals(null, agentPinOf(mapOf("s/X-1" to com.xerktech.turma.model.TicketAgentPin()), "s", "X-1"))
     }
+
+    @Test fun `autoStartState reflects the hub toggle OR a legacy agent env`() {
+        val site = "acme.atlassian.net"
+        val block = JiraBlock(siteKey = site, user = "u", fetchedAt = "2026-07-16T01:00:00Z")
+        val envAgent = AgentInfo(key = "h", online = true, ticketAutoStart = true, jira = block)
+        val plainAgent = AgentInfo(key = "h", online = true, ticketAutoStart = false, jira = block)
+
+        // Off by default.
+        assertEquals(AutoStartState(false, false, false),
+            autoStartState(listOf(plainAgent), emptyMap(), site))
+        // The hub toggle alone turns it on, not locked.
+        assertEquals(AutoStartState(true, true, false),
+            autoStartState(listOf(plainAgent), mapOf(site to true), site))
+        // A legacy env on an ONLINE host forces it on and locks it.
+        assertEquals(AutoStartState(true, false, true),
+            autoStartState(listOf(envAgent), emptyMap(), site))
+        // An OFFLINE host's stale env flag drives nothing.
+        val offlineEnv = AgentInfo(key = "h", online = false, ticketAutoStart = true, jira = block)
+        assertEquals(AutoStartState(false, false, false),
+            autoStartState(listOf(offlineEnv), emptyMap(), site))
+        // Another org's env doesn't leak across siteKeys.
+        assertEquals(AutoStartState(false, false, false),
+            autoStartState(listOf(envAgent), emptyMap(), "other.atlassian.net"))
+    }
 }

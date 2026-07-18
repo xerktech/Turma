@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.model.JiraIssueDetail
+import com.xerktech.turma.net.AutoStartRequest
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -99,6 +100,21 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
             }
             val ok = runCatching { container.client.api.setTicketAgent(siteKey, issueKey, body) }.isSuccess
             _messages.tryEmit(if (ok) "✓ agent updated" else "✗ hub unreachable")
+            container.fleet.nudge()
+        }
+    }
+
+    /**
+     * Flip an org's auto-start opt-in (XERK-41). Hub-owned and durable — the POST
+     * is authoritative, and the fleet payload's autoStartOrgs (plus its SSE event)
+     * reflects it on the next poll.
+     */
+    fun setAutoStart(siteKey: String, enabled: Boolean) {
+        viewModelScope.launch {
+            val ok = runCatching {
+                container.client.api.setAutoStart(siteKey, AutoStartRequest(enabled))
+            }.isSuccess
+            _messages.tryEmit(if (ok) "✓ auto-start updated" else "✗ hub unreachable")
             container.fleet.nudge()
         }
     }

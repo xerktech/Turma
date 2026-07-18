@@ -41,6 +41,7 @@ import androidx.compose.runtime.setValue
 import android.widget.Toast
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -50,8 +51,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xerktech.turma.core.AutoStartState
 import com.xerktech.turma.core.BOARD_CATEGORIES
 import com.xerktech.turma.core.BoardSite
+import com.xerktech.turma.core.autoStartState
 import com.xerktech.turma.core.categoryOf
 import com.xerktech.turma.core.filterSites
 import com.xerktech.turma.core.mergeSites
@@ -94,7 +97,12 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
             // Pinned above the (horizontally-scrolling) columns: an "All orgs" chip
             // plus one per org, labelled by org name, ticket-counted, and colored by
             // the org's stable palette slot. Mirrors board.html's `#chips` row.
-            OrgFilterBar(sites, allKeys, orgFilter) { vm.setOrg(it) }
+            OrgFilterBar(
+                sites, allKeys, orgFilter,
+                autoOf = { autoStartState(fleet.agents, fleet.autoStartOrgs, it) },
+                onToggleAuto = { site, enabled -> vm.setAutoStart(site, enabled) },
+                onPick = { vm.setOrg(it) },
+            )
             Row(
                 Modifier.fillMaxSize().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -130,6 +138,8 @@ private fun OrgFilterBar(
     sites: List<BoardSite>,
     allKeys: List<String>,
     orgFilter: String,
+    autoOf: (String) -> AutoStartState,
+    onToggleAuto: (String, Boolean) -> Unit,
     onPick: (String) -> Unit,
 ) {
     Row(
@@ -139,14 +149,55 @@ private fun OrgFilterBar(
     ) {
         OrgChip("All orgs", null, null, offline = false, active = orgFilter.isBlank()) { onPick("") }
         for (s in sites) {
-            OrgChip(
-                label = orgName(s.siteKey),
-                color = TurmaColors.series[orgColorIndex(s.siteKey, allKeys) % TurmaColors.series.size],
-                count = s.tickets.size,
-                offline = !s.online,
-                active = orgFilter == s.siteKey,
-            ) { onPick(s.siteKey) }
+            // The org's filter chip + its auto-start switch travel together
+            // (XERK-41), mirroring board.html's .org-chip-wrap.
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OrgChip(
+                    label = orgName(s.siteKey),
+                    color = TurmaColors.series[orgColorIndex(s.siteKey, allKeys) % TurmaColors.series.size],
+                    count = s.tickets.size,
+                    offline = !s.online,
+                    active = orgFilter == s.siteKey,
+                ) { onPick(s.siteKey) }
+                val st = autoOf(s.siteKey)
+                AutoChip(st) { onToggleAuto(s.siteKey, !st.hubOn) }
+            }
         }
+    }
+}
+
+/**
+ * An org's auto-start switch (XERK-41): a compact pill beside its filter chip.
+ * On reflects the effective opt-in (hub toggle OR a legacy agent env); a tap
+ * writes the hub toggle. Forced on by an agent env, it's shown on and locked
+ * (dimmed, not clickable) — clear the env to control auto-start from here.
+ */
+@Composable
+private fun AutoChip(state: AutoStartState, onToggle: () -> Unit) {
+    val accent = MaterialTheme.colorScheme.primary
+    val on = state.on
+    val bg = if (on) accent.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surface
+    val stroke = if (on) accent else MaterialTheme.colorScheme.outline
+    val dot = if (on) accent else MaterialTheme.colorScheme.onSurfaceVariant
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(bg)
+            .border(1.dp, stroke, RoundedCornerShape(999.dp))
+            .then(if (state.envForced) Modifier.alpha(0.6f) else Modifier.clickable(onClick = onToggle))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Box(Modifier.size(7.dp).clip(CircleShape).background(dot))
+        Text(
+            "auto",
+            style = MaterialTheme.typography.labelMedium,
+            color = if (on) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

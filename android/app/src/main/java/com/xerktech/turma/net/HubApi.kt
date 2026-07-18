@@ -151,6 +151,14 @@ interface HubApi {
         @Body body: kotlinx.serialization.json.JsonObject,
     ): OkResponse
 
+    // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
+    // like the agent pin — an authoritative 200. Body: {enabled:true|false}.
+    @POST("api/jira/{siteKey}/autostart")
+    suspend fun setAutoStart(
+        @Path("siteKey") siteKey: String,
+        @Body body: AutoStartRequest,
+    ): OkResponse
+
     @POST("api/devices")
     suspend fun registerDevice(@Body body: DeviceRequest): OkResponse
 
@@ -188,6 +196,9 @@ data class ModelRequest(val model: String)
 
 @Serializable
 data class ModeRequest(val permissionMode: String)
+
+@Serializable
+data class AutoStartRequest(val enabled: Boolean)
 
 @Serializable
 data class AnswerRequest(
