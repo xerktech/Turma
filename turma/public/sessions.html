@@ -31,11 +31,13 @@
   }
 
   /* The shared .site-header (app.css) renders here unchanged — same centred
-     1180px row as every other page. The shell below it stays full-bleed; only
-     the header row is capped, so this page's chrome reads identically to
-     board/usage rather than stretching the wordmark and tabs to the edges. */
+     1180px row as every other page. The shell below is capped at the same
+     --wrap and centred (margin auto on the cross axis of the column body), so
+     the whole page — chrome AND content — lands in the same 1180px column as
+     dashboard/board/usage rather than filling the window edge to edge. Below
+     --wrap the cap is inert, so the phone layout (max-width:820px) is untouched. */
 
-  .sess-shell { flex: 1; display: flex; min-height: 0; }
+  .sess-shell { flex: 1; display: flex; min-height: 0; width: 100%; max-width: var(--wrap); margin: 0 auto; }
 
   /* ---- Left sidebar: new-session picker, active list, ended list ----------- */
   .sidebar {
