@@ -394,11 +394,14 @@ function paintSwatch(el, paint) {
 }
 
 function render(data) {
-  // A re-render replaces the chart subtree wholesale, which drops the page's
-  // scroll position (the content it was anchored to is momentarily gone). Capture
-  // it up front and restore it once the new subtree is in, so a background SSE
-  // beat can't yank the operator back to the top mid-read.
-  const scrollY = window.scrollY;
+  // The repaint replaces the #chart/#models subtrees wholesale every SSE beat,
+  // which would drop the page scroll (the content it was anchored to is briefly
+  // gone) AND any horizontal scroll inside an open day/model table
+  // (.table-scroll) — the same scroll-reset the rest of the app shares (XERK-35).
+  // preserveScroll restores page scroll and each scrolled table across the swap.
+  TurmaNav.preserveScroll(document.querySelector(".wrap"), () => renderInner(data));
+}
+function renderInner(data) {
   const series = toSeries(data.agents || []);
   if (!series.length) {
     $chart.innerHTML = `<div class="empty">No usage reported yet (agents aggregate it within ~5 minutes of starting).</div>`;
@@ -434,7 +437,6 @@ function render(data) {
   buildChart(card, visible, dates, paintOf);
   $chart.append(card, tableView(visible, dates));
   $models.append(modelsCard(visible));
-  if (scrollY) scrollTo(0, scrollY);
 }
 
 // Legend = filter. Series items toggle one series; the group name toggles all

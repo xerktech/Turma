@@ -122,8 +122,15 @@ function render(data) {
   }
 
   const sessionIndex = B.ticketSessionIndex(data.agents || []);
-  $board.innerHTML = B.boardHtml(sites, orgFilter, {
-    allKeys, sessionIndex, starts: sweepStarts(data.agents || [], sessionIndex),
+  // The board innerHTML-replaces every beat (SSE ~1s / 15s poll), which would
+  // otherwise reset the scroll each time — on phones the columns are a
+  // horizontally-scrollable strip (.kanban-cols) whose swipe kept snapping back
+  // to the first column a few seconds in (XERK-35), and each column list
+  // (.kc-list) scrolls vertically too. preserveScroll keeps both across the swap.
+  TurmaNav.preserveScroll($board, () => {
+    $board.innerHTML = B.boardHtml(sites, orgFilter, {
+      allKeys, sessionIndex, starts: sweepStarts(data.agents || [], sessionIndex),
+    });
   });
 }
 

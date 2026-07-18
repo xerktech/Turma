@@ -11,7 +11,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount } = require("../public/nav.js");
+const { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, preserveScroll } = require("../public/nav.js");
 
 const PUBLIC = path.join(__dirname, "..", "public");
 const PAGE_FILES = ["index.html", "sessions.html", "board.html", "usage.html"];
@@ -168,4 +168,88 @@ test("nav: each page declares its own sub-header text and its own tab", () => {
     subs.set(f, sub[1]);
   }
   assert.equal(new Set(subs.values()).size, PAGE_FILES.length, "two pages share a sub-header");
+});
+
+// --- preserveScroll: the one wrapper every recurring innerHTML repaint goes
+// through so a beat can't reset the scroll (XERK-35). No jsdom here, so we drive
+// it against a minimal fake DOM whose scrollTop/scrollLeft are plain properties
+// — enough to pin the capture-then-restore contract and the two ways a scrolled
+// node is matched across the swap (id anchor vs. structural child-index path).
+function fakeEl(id) {
+  return {
+    id: id || "", children: [], parentNode: null, scrollTop: 0, scrollLeft: 0,
+    append(...kids) { for (const k of kids) { k.parentNode = this; this.children.push(k); } },
+    querySelectorAll() {                     // only "*" is ever asked for
+      const out = [];
+      (function walk(n) { for (const c of n.children) { out.push(c); walk(c); } })(this);
+      return out;
+    },
+  };
+}
+function withFakeWindow(startY, run) {
+  const savedWin = global.window, savedDoc = global.document, byId = {};
+  let y = startY;
+  const scrolls = [];
+  global.window = {
+    get scrollX() { return 0; }, get scrollY() { return y; },
+    scrollTo(x, ny) { y = ny; scrolls.push(ny); },
+  };
+  global.document = { getElementById: (id) => byId[id] || null };
+  try { return run({ byId, setY: (v) => { y = v; }, getY: () => y, scrolls }); }
+  finally { global.window = savedWin; global.document = savedDoc; }
+}
+
+test("preserveScroll: null container still runs the paint once", () => {
+  let n = 0;
+  preserveScroll(null, () => { n++; });
+  assert.equal(n, 1);
+});
+
+test("preserveScroll: restores window scroll a paint clamped to the top", () => {
+  withFakeWindow(140, (ctx) => {
+    const container = fakeEl();
+    preserveScroll(container, () => { ctx.setY(0); });   // paint collapsed height
+    assert.equal(ctx.getY(), 140);
+    assert.deepEqual(ctx.scrolls, [140]);
+  });
+});
+
+test("preserveScroll: leaves window scroll alone when the paint didn't move it", () => {
+  withFakeWindow(90, (ctx) => {
+    preserveScroll(fakeEl(), () => { /* no scroll change */ });
+    assert.equal(ctx.scrolls.length, 0);                 // no needless scrollTo
+  });
+});
+
+test("preserveScroll: restores a scrolled descendant matched by structural path", () => {
+  withFakeWindow(0, () => {
+    const container = fakeEl();
+    const strip = fakeEl();                               // no id -> path-keyed
+    strip.scrollLeft = 200; strip.scrollTop = 30;
+    container.append(strip);
+    preserveScroll(container, () => {                     // rebuild: fresh, reset node
+      container.children = [];
+      container.append(fakeEl());                         // same structural slot
+    });
+    assert.equal(container.children[0].scrollLeft, 200);
+    assert.equal(container.children[0].scrollTop, 30);
+  });
+});
+
+test("preserveScroll: an id anchor follows a reordered list to the right row", () => {
+  withFakeWindow(0, (ctx) => {
+    const container = fakeEl();
+    const a = fakeEl("host-a"), b = fakeEl("host-b");
+    b.scrollTop = 75;                                     // the scrolled one is 2nd
+    container.append(a, b);
+    preserveScroll(container, () => {                     // rebuild with order SWAPPED
+      const a2 = fakeEl("host-a"), b2 = fakeEl("host-b");
+      ctx.byId["host-a"] = a2; ctx.byId["host-b"] = b2;
+      container.children = [];
+      container.append(b2, a2);                           // b now first
+    });
+    // Structural position moved, but the id anchor put scrollTop back on host-b.
+    assert.equal(ctx.byId["host-b"].scrollTop, 75);
+    assert.equal(ctx.byId["host-a"].scrollTop, 0);
+  });
 });

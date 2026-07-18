@@ -972,8 +972,29 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   every `.wrap` page's content sits 2px low.
 - It's mounted synchronously at the bottom of `<body>` — after both placeholders exist, before the
   page's own script reads the slots.
+- **`TurmaNav.preserveScroll(container, paint)` is the one wrapper every recurring innerHTML repaint
+  must go through** (XERK-35). Each page repaints by replacing a container's `innerHTML` on every
+  SSE/poll beat (~1s), which silently threw the user's scroll back to the start every second — the
+  page's own window scroll AND any inner `overflow:auto` region (the phone board's horizontal column
+  strip was the loudest case; the fleet tree, a clone-repo list, a usage table all did it too). It
+  snapshots the window scroll plus every scrolled descendant of `container`, runs `paint()`, then
+  restores them synchronously in the same frame. Scrolled nodes are re-matched across the swap by a
+  stable `id` anchor if one is in scope (so a list the beat REORDERS — host cards by activity — maps
+  its scroll to the right row), else by structural child-index path (fine for a fixed set like the
+  board's four columns); only nodes actually scrolled off zero are captured, so a settled page costs
+  one cheap walk.
+  - Callers: `board.html` render (`.kanban-cols`/`.kc-list`), `index.html` render (`#groups` fleet
+    tree + its `.clone-list`), `usage.html` render (`.wrap` → the `.table-scroll` tables + page
+    scroll). It SUBSUMED each page's older per-site snapshot code (the board's
+    `captureBoardScroll`, index's `captureCloneScroll`, usage's bare `window.scrollY` save).
+  - Two recurring repaints keep their OWN bespoke logic on purpose and must NOT be routed through it:
+    `chat.js`'s transcript `repaint` (stick-to-bottom vs. hold-place, plus a selection-guard), and
+    `sessions.html`'s sidebar (its `scrollTop` restore is ordered against a focus/caret restore that
+    can itself scroll the sidebar — `preserveScroll` has no focus half). New recurring repaints that
+    don't have such a special case should use `preserveScroll`.
 - Tests: `turma/tests/nav.test.js`, which asserts the invariants drift broke (one active tab, same
-  header DOM across pages) and that no page re-grows its own copy.
+  header DOM across pages), that no page re-grows its own copy, and the `preserveScroll`
+  capture/restore contract (window-scroll clamp recovery, structural-path and id-anchor matching).
 
 ### Fleet tree (host → repo → session)
 
