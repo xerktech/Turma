@@ -66,7 +66,10 @@
       if (!j || !j.siteKey) continue;
       const site = j.siteKey;
       let rep = reporters.get(site);
-      if (!rep) reporters.set(site, rep = { hosts: new Set(), online: false, repos: new Map() });
+      if (!rep) {
+        reporters.set(site, rep = {
+          hosts: new Set(), online: false, repos: new Map(), hostOpts: new Map() });
+      }
       rep.hosts.add(a.device || a.key || "?");
       if (a.online) rep.online = true;
       // The manual picker's repo choices, unioned over EVERY host reporting this
@@ -84,6 +87,16 @@
         const seen = rep.repos.get(o.name);
         if (!seen || (o.cloned && !seen.cloned)) rep.repos.set(o.name, o);
       }
+      // The agent-pin picker's host choices (XERK-38): every host reporting
+      // this org, online or not — a pin is a persistent choice about future
+      // spawns, so a momentarily-offline host is still a valid answer (the
+      // picker marks it; the spawn itself requires it online). Keyed on the
+      // hub's agent key, which is what the /agent endpoint validates against.
+      const hk = a.key || a.device;
+      if (hk) {
+        rep.hostOpts.set(hk, {
+          key: hk, name: a.device || hk, online: !!a.online });
+      }
       const key = site + "\x00" + (j.user || "");
       const prev = byUser.get(key);
       if (!prev || String(j.fetchedAt || "") > String(prev.block.fetchedAt || "")) {
@@ -99,7 +112,8 @@
       const site = block.siteKey;
       let entry = bySite.get(site);
       if (!entry) {
-        const rep = reporters.get(site) || { hosts: new Set(), online: false, repos: new Map() };
+        const rep = reporters.get(site) ||
+          { hosts: new Set(), online: false, repos: new Map(), hostOpts: new Map() };
         bySite.set(site, entry = {
           siteKey: site,
           users: [],
@@ -113,6 +127,10 @@
           // the picker's own order, so it doesn't inherit the scan's.
           repoOptions: [...rep.repos.values()].sort((x, y) =>
             (y.cloned ? 1 : 0) - (x.cloned ? 1 : 0) || x.name.localeCompare(y.name)),
+          // Online hosts first (the ones a pin would route to today), then by
+          // name — the agent picker's own order.
+          hostOptions: [...rep.hostOpts.values()].sort((x, y) =>
+            (y.online ? 1 : 0) - (x.online ? 1 : 0) || x.name.localeCompare(y.name)),
           _byKey: new Map(),
         });
       }
@@ -582,6 +600,75 @@
     </div>`;
   }
 
+  // The ticket's pinned host out of the hub's ticketAgents map (keyed
+  // "<siteKey>/<issueKey>"); null when the ticket routes automatically.
+  function agentPinOf(ticketAgents, siteKey, issueKey) {
+    const p = (ticketAgents || {})[`${siteKey}/${issueKey}`];
+    return p && p.host ? p : null;
+  }
+
+  // The Agent row of the detail panel (XERK-38): which HOST this ticket's
+  // sessions spawn on. Deliberately panel-only — the card gets no chip. Auto
+  // routing is the overwhelmingly common case, and unlike the repo guess there
+  // is no model answer worth surfacing at a glance: the row exists for the rare
+  // multi-agent-org override, so it lives where the other rare controls do.
+  function agentFieldHtml(pin, hostOptions, opts) {
+    const o = opts || {};
+    const bits = [];
+    if (!pin) {
+      bits.push(`<span class="td-dim">Auto — most available agent</span>`);
+    } else {
+      const opt = (hostOptions || []).find(h => h && h.key === pin.host);
+      bits.push(`<span class="kc-repo">${esc(opt ? opt.name : pin.host)}</span>`);
+      // A pinned host that stopped reporting the org (or went quiet) still IS
+      // the pin — findTicketHost refuses rather than reroutes — so the row says
+      // what that means for the next spawn instead of hiding it.
+      if (!opt) bits.push(`<span class="td-dim">(no longer reports this org)</span>`);
+      else if (!opt.online) bits.push(`<span class="td-dim">(offline)</span>`);
+      bits.push(`<span class="td-dim">— set by you</span>`);
+    }
+    if (o.editable) {
+      bits.push(`<button type="button" class="td-edit" data-agent-edit="1">Change</button>`);
+    }
+    if (o.error) bits.push(`<span class="td-err-inline">Couldn't save — ${esc(o.error)}</span>`);
+    return bits.join(" ");
+  }
+
+  // The picker's current answer — same contract as repoPickerValue: the change
+  // handler compares a pick against this to know whether anything changed, so
+  // it must derive exactly the way agentPickerHtml preselects.
+  function agentPickerValue(pin) {
+    return pin ? pin.host : "__auto__";
+  }
+
+  // The agent picker, swapped in for the row on "Change". Choosing an option IS
+  // the save, exactly like the repo picker above and for the same reason. The
+  // options are the org's reporting hosts (hostOptions from mergeSites) — the
+  // same fleet list the /agent endpoint allowlists against, so every option is
+  // one the hub will accept.
+  function agentPickerHtml(pin, hostOptions) {
+    const cur = pin ? pin.host : null;
+    const opts = (hostOptions || []).filter(h => h && h.key);
+    // A pinned host that has left the fleet list is carried back in so it can
+    // stay `selected` — otherwise the browser falls back to "Auto", misreporting
+    // the pin and turning a click-away into a silent release of it (the same
+    // trap repoPickerHtml documents).
+    const orphan = cur && !opts.some(h => h.key === cur)
+      ? { key: cur, name: cur, online: false, gone: true } : null;
+    const optHtml = (h) => `<option value="${esc(h.key)}"${
+      h.key === cur ? " selected" : ""}>${esc(h.name)}${
+      h.gone ? " (no longer reports this org)" : h.online ? "" : " (offline)"}</option>`;
+    const sel = `<select class="td-repo-select" data-agent-select="1">
+      <option value="__auto__"${pin ? "" : " selected"}>Auto — most available agent</option>
+      ${orphan ? `<optgroup label="Currently set">${optHtml(orphan)}</optgroup>` : ""}
+      ${opts.map(optHtml).join("")}
+    </select>`;
+    return `<div class="td-repo-edit">${sel}
+      <button type="button" class="td-edit" data-agent-cancel="1">Cancel</button>
+      ${opts.length || orphan ? "" : `<span class="td-dim">No agents reported for this org</span>`}
+    </div>`;
+  }
+
   // `t` is the card's ticket (always present); `detail` is the fetched issue
   // (null until it lands). opts: {color, now, siteKey, error, loading}.
   function detailHtml(t, detail, opts) {
@@ -610,6 +697,17 @@
       fieldRow("Repo", o.editing
         ? repoPickerHtml(t, o.repoOptions)
         : repoFieldHtml(t, { editable: !!o.canEdit, error: o.repoError })),
+      // Which host the ticket's sessions spawn on (XERK-38). The pin is
+      // hub-owned (o.agentPin, from the /api/agents payload's ticketAgents),
+      // not a ticket field, and the save is a plain hub POST — so unlike the
+      // Repo row it needs no online host to be editable; it just needs hosts
+      // to offer (or an existing pin to release).
+      fieldRow("Agent", o.agentEditing
+        ? agentPickerHtml(o.agentPin, o.hostOptions)
+        : agentFieldHtml(o.agentPin, o.hostOptions, {
+            editable: !!(o.agentPin || (o.hostOptions || []).length),
+            error: o.agentError,
+          })),
       fieldRow("Assignee", d.assignee ? esc(d.assignee) : ""),
       fieldRow("Reporter", d.reporter ? esc(d.reporter) : ""),
       fieldRow("Project", v("projectName")
@@ -786,6 +884,7 @@
     CATEGORIES, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgName, ageStr,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
+    agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed, startSweepVerdict,
   };

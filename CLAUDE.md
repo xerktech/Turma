@@ -1179,6 +1179,9 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
 
 ##### Splitting ticket sessions across an org's agents (XERK-14)
 
+- A ticket the operator pinned to a host (the detail panel's Agent row — see "Pinning the agent by
+  hand") skips all of the below: the pin is authoritative, and a dead pinned host refuses rather than
+  reroutes.
 - `findTicketHost` chooses among the org's **ONLINE** hosts: it **prefers one with the repo cloned**,
   and — within that group, or across all of them when NONE has it — picks the **most available**
   (`hostAvailability`), so N sessions on one org spread across its hosts instead of stacking on the
@@ -1344,6 +1347,40 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   offline org's ticket stays readable but not re-assignable.
 - The edit state lives in a page variable, not the DOM — the same rule the session card's ⋯ menu
   follows.
+
+##### Pinning the agent by hand (XERK-38)
+
+- Below the Repo row sits an **Agent row**: which HOST this ticket's sessions spawn on, defaulting to
+  "Auto — most available agent" (findTicketHost's ordinary pick). Its "Change" swaps in a picker of
+  the org's reporting hosts; **a pick IS the save**, same contract as the repo picker beside it.
+- Deliberately **panel-only** — the card gets no chip. Auto routing is the overwhelmingly common
+  case and there is no model guess worth surfacing at a glance; the row exists for the rare
+  multi-agent-org override, so it lives with the other rare controls.
+- **The pin is hub-owned, not an agent-ledger fan-out** like the repo override: it is a ROUTING
+  input, routing happens on the hub (the only party that sees the fleet), and it persists in the
+  hub's own `/data/ticket-agents.json` (`TICKET_AGENTS_FILE`, keyed `<siteKey>/<issueKey>`, bounded
+  by `TICKET_AGENTS_MAX` oldest-first) — durable across hub restarts, which is the ticket's whole
+  point, and NOT in the best-effort `state.json` whose loss is documented as harmless.
+- So `POST /api/jira/<siteKey>/<issueKey>/agent` (`{host}` to pin, `{auto:true}` to release) answers
+  an authoritative **200, not the /repo route's 202-on-queue**: nothing rides a heartbeat. The host
+  is allowlist-checked against the fleet's hosts reporting that org; an OFFLINE host is pinnable (a
+  pin is a persistent choice about future spawns), but a host of another org — or a stranger — is
+  not.
+- `findTicketHost` honors a pin over the availability ranking for **both** the board's Start button
+  and the auto-start sweep. A pinned host that's offline (or gone from the org) **refuses with the
+  pin in the error, never silently reroutes** — routing elsewhere would contradict the one thing the
+  pin asserts. The auto-start sweep treats that refusal like any no-host result: unrecorded, so it
+  retries once the pinned host returns.
+- The map rides the `/api/agents` payload as top-level `ticketAgents` (plus a `ticketAgents` SSE
+  event for open boards); the picker's options are `mergeSites`' per-site `hostOptions` — every host
+  reporting the org, online first, offline included and marked. A pinned host that left the fleet is
+  carried back into the picker "Currently set" so the browser can't misreport the pin as Auto (the
+  same trap the repo picker documents).
+- A pinned host without the repo still works: it clones on demand and queues behind the clone,
+  exactly like an auto-routed host (with the same per-host triage-ledger limits the splitting bullet
+  notes).
+- Tests: the ticket-agent-pin cases in `turma/tests/server.test.js` and `board.test.js`, plus the
+  hostOptions/agentPinOf cases in `android/app/src/test/.../BoardTest.kt`.
 
 #### Refresh button
 

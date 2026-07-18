@@ -85,6 +85,24 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Pin which HOST a ticket's sessions spawn on (XERK-38), or release the pin
+     * back to automatic routing (`host = null`). Hub-owned and durable — the
+     * POST is authoritative, and the fleet payload's ticketAgents reflects it
+     * on the next poll/SSE event.
+     */
+    fun setTicketAgent(siteKey: String, issueKey: String, host: String?) {
+        viewModelScope.launch {
+            val body = buildJsonObject {
+                if (host == null) put("auto", JsonPrimitive(true))
+                else put("host", JsonPrimitive(host))
+            }
+            val ok = runCatching { container.client.api.setTicketAgent(siteKey, issueKey, body) }.isSuccess
+            _messages.tryEmit(if (ok) "✓ agent updated" else "✗ hub unreachable")
+            container.fleet.nudge()
+        }
+    }
+
     /** Fetch full issue detail on demand; null while the host is still fetching. */
     suspend fun fetchIssue(siteKey: String, key: String): JiraIssueDetail? = try {
         val resp = container.client.api.jiraIssue(siteKey, key)

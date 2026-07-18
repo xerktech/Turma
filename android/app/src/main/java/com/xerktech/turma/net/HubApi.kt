@@ -140,6 +140,17 @@ interface HubApi {
         @Body body: kotlinx.serialization.json.JsonObject,
     ): OkResponse
 
+    // Pin which HOST a ticket's sessions spawn on (XERK-38), overriding the
+    // hub's most-available routing. Hub-owned and durable (no agent fan-out),
+    // so the save is an authoritative 200. Body: {host:"<agent key>"} to pin,
+    // {auto:true} to release.
+    @POST("api/jira/{siteKey}/{issueKey}/agent")
+    suspend fun setTicketAgent(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): OkResponse
+
     @POST("api/devices")
     suspend fun registerDevice(@Body body: DeviceRequest): OkResponse
 

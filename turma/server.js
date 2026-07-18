@@ -37,6 +37,16 @@ const push = require("./push.js");
 const PORT = parseInt(process.env.PORT || "8300", 10);
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
 const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
+// Ticket -> agent pins (XERK-38): which HOST a ticket's sessions spawn on,
+// chosen by the operator in the board's ticket detail panel. Unlike the repo
+// override (an agent-ledger fan-out — triage is agent state), the host choice
+// is a ROUTING input, and routing is the hub's job because only the hub sees
+// the whole fleet — so the pin lives here, on the same durable /data volume as
+// the archive, rather than riding any one agent's ~/.turma.
+const TICKET_AGENTS_FILE = process.env.TICKET_AGENTS_FILE || "/data/ticket-agents.json";
+// Tickets come and go while pins are only ever set by hand, so the map is
+// bounded rather than reconciled: past the cap the oldest pin is evicted.
+const TICKET_AGENTS_MAX = 500;
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -228,6 +238,59 @@ function listDevices() {
   return devices;
 }
 
+// ---- ticket -> agent pins (XERK-38) ----------------------------------------
+// The operator's own answer to which HOST a ticket's sessions spawn on,
+// overriding findTicketHost's most-available pick. Keyed "<siteKey>/<issueKey>"
+// (the agent-side ledgers key the same way); each entry {host, at}. Rarely
+// used, but "persistent" is the point of it: the choice must survive a hub
+// restart, which is why it has its own file on /data rather than riding the
+// best-effort state.json (whose loss is documented as harmless).
+let ticketAgents = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(TICKET_AGENTS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ticketAgents = parsed;
+} catch {
+  /* first boot or no volume mounted */
+}
+let taSaveTimer = null;
+function scheduleTicketAgentsSave() {
+  if (taSaveTimer) return;
+  taSaveTimer = setTimeout(() => {
+    taSaveTimer = null;
+    fs.mkdir(path.dirname(TICKET_AGENTS_FILE), { recursive: true }, () => {
+      fs.writeFile(TICKET_AGENTS_FILE, JSON.stringify(ticketAgents), (err) => {
+        if (err) console.error(`ticket-agents save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  taSaveTimer.unref();
+}
+function ticketAgentPin(siteKey, issueKey) {
+  const p = ticketAgents[`${siteKey}/${issueKey}`];
+  return p && typeof p.host === "string" && p.host ? p : null;
+}
+// Set or clear (host=null) a ticket's pinned host. The caller has already
+// validated the host against the fleet; this just owns the map's bookkeeping.
+function setTicketAgent(siteKey, issueKey, host) {
+  const k = `${siteKey}/${issueKey}`;
+  if (!host) delete ticketAgents[k];
+  else {
+    ticketAgents[k] = { host, at: Date.now() };
+    const keys = Object.keys(ticketAgents);
+    if (keys.length > TICKET_AGENTS_MAX) {
+      keys.sort((a, b) => (ticketAgents[a].at || 0) - (ticketAgents[b].at || 0));
+      for (const old of keys.slice(0, keys.length - TICKET_AGENTS_MAX)) {
+        delete ticketAgents[old];
+      }
+    }
+  }
+  scheduleTicketAgentsSave();
+  // The pin rides the /api/agents payload (and its own SSE event), so open
+  // boards must see the change without waiting out an ETag match.
+  invalidateAgentsCache();
+  sseBroadcast("ticketAgents", ticketAgents);
+}
+
 // ---- /api/agents payload cache + SSE fanout ---------------------------------
 // The dashboard fleet payload is polled by every browser but changes only on a
 // heartbeat ingest or a state mutation (a command queued, a host removed, a
@@ -270,7 +333,10 @@ function buildAgentsCache() {
   const now = Date.now();
   const list = Object.entries(agents).map(([key, a]) => serializeAgent(key, a, now));
   list.sort((x, y) => (x.device + x.key).localeCompare(y.device + y.key));
-  const body = JSON.stringify({ now, agents: list });
+  // ticketAgents (the ticket->host pins) rides the same payload: it's tiny,
+  // board-scoped, and hub-owned, so this is its one read channel (plus the
+  // "ticketAgents" SSE event for open boards).
+  const body = JSON.stringify({ now, agents: list, ticketAgents });
   const etag = '"' + crypto.createHash("sha1").update(body).digest("base64") + '"';
   agentsCache = { body, etag };
   return agentsCache;
@@ -471,8 +537,17 @@ function hostAvailability(a) {
 // Online is required rather than preferred (unlike the read-only GET above, which
 // serves an offline host's cache): a spawn queued onto a sleeping host would land
 // whenever it next wakes, which is a surprise, not a feature.
+//
+// A manual pin (ticketAgents, set from the ticket detail panel — XERK-38) is
+// authoritative when one exists for the issue: the operator named the machine,
+// so the availability ranking never overrides it. It is honored, not worked
+// around: a pinned host that's offline (or gone from the org) is an ERROR with
+// the pin in the message, never a silent fallback to another host — routing
+// elsewhere would contradict the one thing the pin asserts. The auto-start
+// sweep treats that error like any no-host result (retry next sweep,
+// unrecorded), so a pinned host that's briefly down just delays the spawn.
 // Returns {host, needsClone} | {error, status}.
-function findTicketHost(siteKey, repo) {
+function findTicketHost(siteKey, repo, issueKey) {
   const now = Date.now();
   let anyOrg = false, anyOnline = false;
   const cloned = [], uncloned = [];
@@ -485,6 +560,20 @@ function findTicketHost(siteKey, repo) {
     else uncloned.push(key);
   }
   if (!anyOrg) return { status: 404, error: "no host reports that Jira org" };
+  const pin = issueKey ? ticketAgentPin(siteKey, issueKey) : null;
+  if (pin) {
+    const a = agents[pin.host];
+    if (!a || !a.jira || a.jira.siteKey !== siteKey) {
+      return { status: 409, error:
+        `this ticket is pinned to agent "${pin.host}", which no longer reports that Jira org` };
+    }
+    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) {
+      return { status: 503, error:
+        `this ticket is pinned to agent "${pin.host}", which is offline` };
+    }
+    return { host: pin.host,
+      needsClone: !(a.repos || []).some((r) => r && r.name === repo) };
+  }
   if (!anyOnline) {
     return { status: 503, error: "every host reporting that Jira org is offline" };
   }
@@ -916,9 +1005,10 @@ function autoStartSweep() {
         a.jira && a.jira.siteKey === siteKey &&
         (a.commands || []).some((c) => c.type === "spawnTicket" && c.issueKey === t.key));
       if (inFlight) continue;
-      const { host } = findTicketHost(siteKey, repo);
-      // No online host to route to right now — leave it unrecorded so the next
-      // sweep retries once a host is back, exactly like the offline case.
+      const { host } = findTicketHost(siteKey, repo, t.key);
+      // No online host to route to right now (the org's hosts are down, or the
+      // ticket's pinned agent is) — leave it unrecorded so the next sweep
+      // retries once a host is back, exactly like the offline case.
       if (!host) continue;
       queueCommand(host, { type: "spawnTicket", issueKey: t.key });
       autoStarted.add(k);
@@ -2146,7 +2236,7 @@ const server = http.createServer(async (req, res) => {
       if (!repo) {
         return json(res, 409, { error: "that ticket has no triaged repo yet" });
       }
-      const { host, error, status, needsClone } = findTicketHost(siteKey, repo);
+      const { host, error, status, needsClone } = findTicketHost(siteKey, repo, issueKey);
       if (!host) return json(res, status, { error });
       // Single-flight per ticket, like the jiraIssue fetch above: a double-click
       // (or a click while the first spawn is still riding the queue) must not
@@ -2218,6 +2308,48 @@ const server = http.createServer(async (req, res) => {
         cmdId = queueCommand(k, { type: "setJiraRepo", siteKey, issueKey, repo, auto });
       }
       return json(res, 202, { ok: true, hosts, online, cmdId });
+    }
+
+    // POST /api/jira/<siteKey>/<issueKey>/agent — pin which HOST this ticket's
+    // sessions spawn on, overriding findTicketHost's most-available pick
+    // (XERK-38). Body: {host:"<agent key>"} to pin, {auto:true} to release back
+    // to automatic routing.
+    //
+    // Unlike the /repo override above this does NOT fan out to the agents: the
+    // pin is a routing input, routing happens here on the hub (the only party
+    // that sees the whole fleet), and the store is the hub's own durable
+    // ticket-agents file. So the save is authoritative the moment it returns —
+    // a 200, not the /repo route's 202-on-queue.
+    //
+    // The host must currently report the org, but need not be ONLINE: the pin
+    // is a persistent choice about future spawns, and pinning a host that's
+    // momentarily asleep is a valid answer (the spawn itself still requires it
+    // online, in findTicketHost). What it must not be is a name this org's
+    // picker never offered — hence the allowlist against the fleet.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "agent") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!/^[A-Za-z][A-Za-z0-9_]*-[0-9]+$/.test(issueKey)) {
+        return json(res, 400, { error: "not a Jira issue key" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const auto = body.auto === true;
+      if (!auto && !(typeof body.host === "string" && body.host)) {
+        return json(res, 400, { error: "body needs {host} or {auto:true}" });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      if (!auto) {
+        const a = agents[body.host];
+        if (!a || !a.jira || a.jira.siteKey !== siteKey) {
+          return json(res, 400, { error: "that agent does not report this Jira org" });
+        }
+      }
+      setTicketAgent(siteKey, issueKey, auto ? null : body.host);
+      return json(res, 200, { ok: true, host: auto ? null : body.host });
     }
 
     // Terminal proxy: /term/<sessionId>/… -> the ttyd of the host that owns
@@ -2603,6 +2735,8 @@ if (process.env.TURMA_TEST) {
     startedTicketKeys,
     orgsWithAutoStart,
     autoStarted,
+    ticketAgents,
+    findTicketHost,
   };
 } else {
   if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");
