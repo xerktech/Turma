@@ -1532,6 +1532,15 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   apps"; ungranted, the updater routes to that settings screen and the banner reads **Install** to
   retry. The OS verifies the APK signature on install (the real integrity gate for updating an
   installed app), so — unlike the native updater's file-swap — no sha is re-verified here.
+- **Stable signing key (XERK-26)**: that in-place update works ONLY when every build shares one signing
+  cert, so `release.yml` builds `assembleRelease` signed with a fixed keystore committed to the repo
+  (`android/app/turma-release.keystore`, wired in `app/build.gradle.kts`'s `signingConfigs`).
+  It shipped `assembleDebug` before — signed with the debug key each ephemeral CI runner generates
+  fresh, so no two releases matched and every update forced an uninstall+reinstall
+  (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`). The key is deliberately in the public repo (its job is to be
+  identical everywhere; the updater only installs official HTTPS releases); Play App Signing supersedes
+  it on Play. Moving onto the first stable-key build still needs one last uninstall — the old install's
+  random debug cert matches no stable key.
 - Tests: `core/UpdateTest.kt` (the pure picker/compare cases).
 - Built with Gradle (wrapper generated in CI, not committed); PR-gated by
   `.github/workflows/android-ci.yml` on `ubuntu-latest`, against that runner's preinstalled JDK +

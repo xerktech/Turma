@@ -21,6 +21,10 @@ google-services.json
 *.keystore
 *.jks
 keystore.properties
+# ...except the committed release keystore that gives every build a stable
+# signing cert so the app can update in place (XERK-26). It is intentionally
+# in the repo — see the signingConfigs note in app/build.gradle.kts.
+!/app/turma-release.keystore
 
 # Kotlin incremental compile cache
 .kotlin/
