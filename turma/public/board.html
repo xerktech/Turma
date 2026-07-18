@@ -77,6 +77,30 @@ function consumeDeepLink() {
   openDetail(key, found.siteKey, null);
 }
 
+// Flip an org's hub-side auto-start opt-in (XERK-41). Painted optimistically —
+// the hub map is authoritative the moment the POST returns and its SSE event
+// keeps every OTHER open board in step, but the local flip makes THIS board's
+// switch respond instantly. Rolls back if the POST fails.
+async function setAutoStart(siteKey, enabled) {
+  if (!cache) return;
+  const map = cache.autoStartOrgs || (cache.autoStartOrgs = {});
+  const had = !!map[siteKey];
+  if (enabled) map[siteKey] = true; else delete map[siteKey];
+  render(cache);
+  let ok = false;
+  try {
+    const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/autostart`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled }) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    ok = r.ok;
+  } catch { /* network error — fall through to rollback */ }
+  if (!ok) {
+    if (had) map[siteKey] = true; else delete map[siteKey];
+    if (cache) render(cache);
+  }
+}
+
 function render(data) {
   // Ahead of the empty-board early-return below, so a refresh still resolves on
   // a fleet whose blocks are all unavailable (hoisted; `pending` is live by the
@@ -111,6 +135,26 @@ function render(data) {
     b.addEventListener("click", () => setOrg(key));
     return b;
   };
+  // Each org's auto-start switch (XERK-41) sits beside its filter chip — a
+  // sibling button, never nested in the chip (a button inside a button is
+  // invalid HTML). It reflects the effective opt-in (hub toggle OR a legacy
+  // agent env), and a click writes the hub toggle. Forced-on by an agent env,
+  // it's shown on and disabled (clear the env to migrate to the hub control).
+  const mkAuto = (siteKey) => {
+    const st = B.autoStartState(data.agents || [], data.autoStartOrgs, siteKey);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "org-auto" + (st.on ? " on" : "") + (st.envForced ? " forced" : "");
+    b.setAttribute("aria-pressed", st.on ? "true" : "false");
+    b.disabled = st.envForced;
+    b.title = st.envForced
+      ? "Auto-start is forced on by this org's agent config (TICKET_AUTO_START) — clear it there to control auto-start from here"
+      : (st.on ? "Auto-start To Do tickets: ON — click to turn off"
+               : "Auto-start To Do tickets: OFF — click to turn on");
+    b.innerHTML = `<span class="org-auto-dot" aria-hidden="true"></span>auto`;
+    if (!st.envForced) b.addEventListener("click", () => setAutoStart(siteKey, !st.hubOn));
+    return b;
+  };
   $chips.append(mkChip("All orgs", ""));
   for (const s of sites) {
     let extra = ` <span class="chip-n">${s.tickets.length}</span>`;
@@ -118,7 +162,11 @@ function render(data) {
       const age = B.ageStr(s.lastFetched);
       extra += ` <span class="chip-stale" title="No host reporting this org is online — showing its last report">⚠ offline${age ? " · synced " + esc(age) + " ago" : ""}</span>`;
     }
-    $chips.append(mkChip(B.orgName(s.siteKey), s.siteKey, extra));
+    const wrap = document.createElement("span");
+    wrap.className = "org-chip-wrap";
+    wrap.append(mkChip(B.orgName(s.siteKey), s.siteKey, extra));
+    wrap.append(mkAuto(s.siteKey));
+    $chips.append(wrap);
   }
 
   const sessionIndex = B.ticketSessionIndex(data.agents || []);
@@ -657,6 +705,15 @@ function connectSSE() {
     try { ta = JSON.parse(e.data); } catch { return; }
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.ticketAgents = ta;
+    scheduleRender();
+  });
+  // An org's auto-start opt-in changed (XERK-41) — same tiny-whole-map pattern
+  // as ticketAgents; keeps every open board's switches in step.
+  es.addEventListener("autoStartOrgs", (e) => {
+    let m;
+    try { m = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.autoStartOrgs = m;
     scheduleRender();
   });
   es.onerror = () => {

@@ -3111,16 +3111,22 @@ except ValueError:
     JIRA_REFRESH_EVERY = 30   # beats between polls (30 × 20s beat ≈ 10 min)
 # Ticket auto-start (XERK-32): when set, this host asks the hub to automatically
 # start a session for every "To Do" ticket on its board the moment that ticket has
-# a repo assigned (by the model or by a manual pin). OFF by default and settable
-# ONLY from the agent's config — a host never auto-spawns unless its operator opted
-# in here. Named TICKET_* rather than JIRA_* because the board is Jira today but the
-# concept isn't Jira-specific — other trackers may back it later, and this flag
-# should carry across unchanged. Advertised to the hub as the top-level, board-
-# agnostic `ticketAutoStart` (NOT inside the jira block, for the same reason); the
-# hub owns the decision and the routing, because only it sees the whole fleet and
-# can spread the org's sessions across ALL its agents rather than piling them on
-# whichever one carries this flag. An agent serves exactly one org (one board's
-# creds), so this per-agent flag IS the per-org switch. Read forgivingly.
+# a repo assigned (by the model or by a manual pin). Named TICKET_* rather than
+# JIRA_* because the board is Jira today but the concept isn't Jira-specific —
+# other trackers may back it later, and this flag should carry across unchanged.
+# Advertised to the hub as the top-level, board-agnostic `ticketAutoStart` (NOT
+# inside the jira block, for the same reason); the hub owns the decision and the
+# routing, because only it sees the whole fleet and can spread the org's sessions
+# across ALL its agents rather than piling them on whichever one carries this flag.
+# An agent serves exactly one org (one board's creds), so this per-agent flag IS a
+# per-org switch. Read forgivingly.
+#
+# XERK-41 moved the PRIMARY control to the hub: the board's per-org auto-start
+# switch (a durable hub setting) is now how an operator turns this on and off
+# without redeploying an agent. This env stays as a backward-compat OR — an org
+# configured the old way keeps auto-starting — but new setups should leave it
+# unset and use the toggle. The hub unions the two sources (see the hub's
+# orgsWithAutoStart); a legacy env-on org shows on the board as forced-on.
 TICKET_AUTO_START = os.environ.get("TICKET_AUTO_START", "").strip().lower() in (
     "1", "true", "yes", "on")
 JIRA_TIMEOUT_SEC = 15

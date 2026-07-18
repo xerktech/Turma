@@ -47,6 +47,16 @@ const TICKET_AGENTS_FILE = process.env.TICKET_AGENTS_FILE || "/data/ticket-agent
 // Tickets come and go while pins are only ever set by hand, so the map is
 // bounded rather than reconciled: past the cap the oldest pin is evicted.
 const TICKET_AGENTS_MAX = 500;
+// Per-org auto-start opt-in (XERK-41): which Jira orgs auto-start a session for
+// every To Do ticket that has a repo. This replaced the agent's TICKET_AUTO_START
+// env as the PRIMARY control — it's now a hub setting the operator flips from the
+// board's org chip, so it can be turned on and off without redeploying an agent.
+// Hub-owned for the same reason the agent-pin above is: the decision and the
+// routing are the hub's job (only it sees the whole fleet). Durable on the /data
+// volume, not the best-effort state.json, because the opt-in must survive a hub
+// restart. The agent env still works as a legacy OR-fallback (see
+// orgsWithAutoStart) so an org configured the old way keeps auto-starting.
+const AUTOSTART_ORGS_FILE = process.env.AUTOSTART_ORGS_FILE || "/data/autostart-orgs.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -291,6 +301,46 @@ function setTicketAgent(siteKey, issueKey, host) {
   sseBroadcast("ticketAgents", ticketAgents);
 }
 
+// ---- per-org auto-start opt-in (XERK-41) -----------------------------------
+// The set of Jira orgs the operator has switched auto-start ON for, keyed by
+// siteKey with the value simply `true` (presence = enabled; disabling deletes
+// the key). Unlike the ticket->agent pins there's no eviction cap: orgs are
+// bounded by how many Jira sites the operator connects (a handful), not by the
+// churn of tickets. See AUTOSTART_ORGS_FILE for why it's durable and hub-owned.
+let autoStartOrgs = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(AUTOSTART_ORGS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) if (v) autoStartOrgs[k] = true;
+  }
+} catch {
+  /* first boot or no volume mounted */
+}
+let asSaveTimer = null;
+function scheduleAutoStartSave() {
+  if (asSaveTimer) return;
+  asSaveTimer = setTimeout(() => {
+    asSaveTimer = null;
+    fs.mkdir(path.dirname(AUTOSTART_ORGS_FILE), { recursive: true }, () => {
+      fs.writeFile(AUTOSTART_ORGS_FILE, JSON.stringify(autoStartOrgs), (err) => {
+        if (err) console.error(`autostart-orgs save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  asSaveTimer.unref();
+}
+// Flip an org's hub-side auto-start opt-in. The caller has already validated the
+// siteKey is one the fleet actually reports; this owns the map's bookkeeping.
+function setAutoStartOrg(siteKey, enabled) {
+  if (enabled) autoStartOrgs[siteKey] = true;
+  else delete autoStartOrgs[siteKey];
+  scheduleAutoStartSave();
+  // Rides the /api/agents payload (and its own SSE event), like the agent pins,
+  // so open boards reflect the toggle without waiting out an ETag match.
+  invalidateAgentsCache();
+  sseBroadcast("autoStartOrgs", autoStartOrgs);
+}
+
 // ---- /api/agents payload cache + SSE fanout ---------------------------------
 // The dashboard fleet payload is polled by every browser but changes only on a
 // heartbeat ingest or a state mutation (a command queued, a host removed, a
@@ -333,10 +383,11 @@ function buildAgentsCache() {
   const now = Date.now();
   const list = Object.entries(agents).map(([key, a]) => serializeAgent(key, a, now));
   list.sort((x, y) => (x.device + x.key).localeCompare(y.device + y.key));
-  // ticketAgents (the ticket->host pins) rides the same payload: it's tiny,
-  // board-scoped, and hub-owned, so this is its one read channel (plus the
-  // "ticketAgents" SSE event for open boards).
-  const body = JSON.stringify({ now, agents: list, ticketAgents });
+  // ticketAgents (the ticket->host pins) and autoStartOrgs (the per-org
+  // auto-start opt-in, XERK-41) ride the same payload: both are tiny,
+  // board-scoped, and hub-owned, so this is their one read channel (plus their
+  // own SSE events for open boards).
+  const body = JSON.stringify({ now, agents: list, ticketAgents, autoStartOrgs });
   const etag = '"' + crypto.createHash("sha1").update(body).digest("base64") + '"';
   agentsCache = { body, etag };
   return agentsCache;
@@ -943,12 +994,19 @@ setInterval(() => {
 const AUTO_START_EVERY_MS = 15 * 1000;
 const autoStarted = new Set(); // "<siteKey>\x00<issueKey>" already auto-started
 
-// siteKeys whose org has at least one ONLINE host opting in. Onlineness is
-// required (unlike a read-only GET): an offline host's stale flag must not drive
-// spawns, and findTicketHost needs a live host to route to anyway.
+// siteKeys whose org is opted in to auto-start, from EITHER source (XERK-41):
+//   - the hub-owned per-org toggle (autoStartOrgs), the primary control now;
+//   - the legacy agent env TICKET_AUTO_START, kept as a backward-compat OR so an
+//     org configured the old way keeps auto-starting until the operator moves it
+//     to the toggle. Onlineness is required for the env source (unlike a
+//     read-only GET): an offline host's stale flag must not drive spawns. The hub
+//     toggle has no such gate — it's the hub's own durable state, not a report —
+//     but the sweep still only acts on orgs with a live reporting block and
+//     routes through findTicketHost, which needs an online host anyway, so a
+//     toggled-on org with every host down simply no-ops.
 function orgsWithAutoStart() {
   const now = Date.now();
-  const on = new Set();
+  const on = new Set(Object.keys(autoStartOrgs).filter((k) => autoStartOrgs[k]));
   for (const a of Object.values(agents)) {
     // The flag rides top-level (board-agnostic); the org it applies to is still
     // the host's board siteKey, so both must be present.
@@ -2352,6 +2410,28 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, host: auto ? null : body.host });
     }
 
+    // POST /api/jira/<siteKey>/autostart — flip an org's auto-start opt-in
+    // (XERK-41). Body: {enabled:true|false}. Hub-owned durable state, so — like
+    // the /agent pin and unlike the /repo override — the save is authoritative
+    // the moment it returns (a 200, nothing rides a heartbeat). The org must be
+    // one the fleet actually reports, so a toggle can't invent a phantom org;
+    // the host need NOT be online (the opt-in is a persistent choice, and the
+    // sweep gates the actual spawn on a live host itself).
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "autostart") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      if (typeof body.enabled !== "boolean") {
+        return json(res, 400, { error: "body needs {enabled:true|false}" });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      setAutoStartOrg(siteKey, body.enabled);
+      return json(res, 200, { ok: true, enabled: body.enabled });
+    }
+
     // Terminal proxy: /term/<sessionId>/… -> the ttyd of the host that owns
     // that session, tunneled to its per-session ttydPort. User auth already
     // enforced by the gate above.
@@ -2735,6 +2815,8 @@ if (process.env.TURMA_TEST) {
     startedTicketKeys,
     orgsWithAutoStart,
     autoStarted,
+    autoStartOrgs,
+    setAutoStartOrg,
     ticketAgents,
     findTicketHost,
   };

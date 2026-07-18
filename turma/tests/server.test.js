@@ -44,6 +44,10 @@ process.env.TICKET_AGENTS_FILE = path.join(
   os.tmpdir(),
   `turma-test-ticket-agents-${process.pid}.json`
 );
+process.env.AUTOSTART_ORGS_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-autostart-orgs-${process.pid}.json`
+);
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
 process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-archive-"));
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
@@ -99,6 +103,7 @@ const {
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
   TERM_OSC52_JS,
   autoStartSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
+  autoStartOrgs, setAutoStartOrg,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -2463,6 +2468,67 @@ test("auto-start: an offline host's stale flag drives nothing", async () => {
   assert.equal(orgsWithAutoStart().has("as10.atlassian.net"), false);
   autoStartSweep();
   assert.equal((agents.asStale.commands || []).length, 0);
+});
+
+// ---- per-org auto-start opt-in from the hub (XERK-41) -------------------------
+
+test("auto-start: the hub-side org toggle opts an org in WITHOUT any agent env", async () => {
+  autoStarted.clear();
+  // A host with the legacy env OFF — the toggle alone must drive the sweep.
+  await asBeat("asHub", "ashub.atlassian.net", { autoStart: false });
+  assert.equal(orgsWithAutoStart().has("ashub.atlassian.net"), false);
+  setAutoStartOrg("ashub.atlassian.net", true);
+  assert.equal(orgsWithAutoStart().has("ashub.atlassian.net"), true);
+  autoStartSweep();
+  assert.deepEqual((agents.asHub.commands || []).map((c) => [c.type, c.issueKey]),
+    [["spawnTicket", "ENG-5"]]);
+  setAutoStartOrg("ashub.atlassian.net", false); // leave global state clean
+  assert.equal(orgsWithAutoStart().has("ashub.atlassian.net"), false);
+});
+
+test("POST /api/jira/<site>/autostart flips the opt-in and rides the payload", async () => {
+  await asBeat("asApi", "asapi.atlassian.net", { autoStart: false });
+
+  // Enable it.
+  let r = await request("POST", "/api/jira/asapi.atlassian.net/autostart",
+    { body: { enabled: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true, enabled: true });
+  assert.equal(autoStartOrgs["asapi.atlassian.net"], true);
+
+  // It rides the fleet payload as a top-level bool map.
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.autoStartOrgs["asapi.atlassian.net"], true);
+
+  // Disable it — the key is removed (presence = enabled).
+  r = await request("POST", "/api/jira/asapi.atlassian.net/autostart",
+    { body: { enabled: false }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal("asapi.atlassian.net" in autoStartOrgs, false);
+});
+
+test("POST /api/jira/<site>/autostart rejects a bad body and an unknown org", async () => {
+  await asBeat("asApi2", "asapi2.atlassian.net", { autoStart: false });
+  // Missing/!boolean enabled.
+  let r = await request("POST", "/api/jira/asapi2.atlassian.net/autostart",
+    { body: {}, headers: userHeaders });
+  assert.equal(r.status, 400);
+  r = await request("POST", "/api/jira/asapi2.atlassian.net/autostart",
+    { body: { enabled: "yes" }, headers: userHeaders });
+  assert.equal(r.status, 400);
+  // An org no host reports can't be toggled (no phantom entries).
+  r = await request("POST", "/api/jira/nobody.atlassian.net/autostart",
+    { body: { enabled: true }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal("nobody.atlassian.net" in autoStartOrgs, false);
+});
+
+test("POST /api/jira/<site>/autostart needs the user login", async () => {
+  await asBeat("asApi3", "asapi3.atlassian.net", { autoStart: false });
+  const r = await request("POST", "/api/jira/asapi3.atlassian.net/autostart",
+    { body: { enabled: true } });
+  assert.equal(r.status, 401);
+  assert.equal("asapi3.atlassian.net" in autoStartOrgs, false);
 });
 
 test("http: /api/agents does not serialize the jiraIssues cache (served only by /api/jira)", async () => {
