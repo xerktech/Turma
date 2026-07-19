@@ -3897,6 +3897,198 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(sess["pendingInputs"]), 1)
 
 
+class TestPrCommentEvents(unittest.TestCase):
+    """_pr_comment_events normalizes conversation comments, review bodies and
+    inline review-thread comments into one self-flagged event list (XERK-49)."""
+
+    URL = "https://github.com/o/r/pull/7"
+
+    def _fake_run(self, view, api):
+        def run(cmd, cwd=None):
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return json.dumps(view)
+            if cmd[:2] == ["gh", "api"]:
+                return json.dumps(api)
+            return ""
+        return run
+
+    def test_gathers_all_three_channels(self):
+        view = {
+            "comments": [
+                {"id": "c1", "author": {"login": "alice"}, "body": "please rename",
+                 "url": "u1"},
+            ],
+            "reviews": [
+                {"id": "r1", "author": {"login": "bob"}, "state": "CHANGES_REQUESTED",
+                 "body": "needs a test"},
+                {"id": "r2", "author": {"login": "bob"}, "state": "APPROVED",
+                 "body": ""},                      # bare approve — dropped
+            ],
+        }
+        api = [{"id": 99, "user": {"login": "carol"}, "body": "off by one",
+                "path": "x.py", "line": 12, "html_url": "u3"}]
+        with mock.patch.object(ha, "run", self._fake_run(view, api)):
+            events = ha._pr_comment_events(self.URL, "botlogin")
+        kinds = {e["kind"] for e in events}
+        self.assertEqual(len(events), 3)
+        self.assertIn("comment", kinds)
+        self.assertIn("review Changes Requested", kinds)
+        self.assertIn("inline", kinds)
+        inline = next(e for e in events if e["kind"] == "inline")
+        self.assertEqual(inline["loc"], "x.py:12")
+        self.assertEqual(inline["key"], "99")
+
+    def test_self_authored_is_flagged(self):
+        view = {
+            "comments": [
+                {"id": "c1", "author": {"login": "botlogin"}, "body": "opened this",
+                 "viewerDidAuthor": True},
+                {"id": "c2", "author": {"login": "alice"}, "body": "fix it"},
+            ],
+            "reviews": [],
+        }
+        with mock.patch.object(ha, "run", self._fake_run(view, [])):
+            events = ha._pr_comment_events(self.URL, "botlogin")
+        by_key = {e["key"]: e for e in events}
+        self.assertTrue(by_key["c1"]["is_self"])
+        self.assertFalse(by_key["c2"]["is_self"])
+
+    def test_login_compare_flags_self_without_viewer_field(self):
+        # Inline comments have no viewerDidAuthor; fall back to a login compare.
+        api = [{"id": 5, "user": {"login": "botlogin"}, "body": "mine"}]
+        view = {"comments": [], "reviews": []}
+        with mock.patch.object(ha, "run", self._fake_run(view, api)):
+            events = ha._pr_comment_events(self.URL, "botlogin")
+        self.assertTrue(events[0]["is_self"])
+
+    def test_fetch_failure_returns_none(self):
+        with mock.patch.object(ha, "run", lambda cmd, cwd=None: ""):
+            self.assertIsNone(ha._pr_comment_events(self.URL, "botlogin"))
+
+    def test_empty_pr_returns_empty_not_none(self):
+        view = {"comments": [], "reviews": []}
+        with mock.patch.object(ha, "run", self._fake_run(view, [])):
+            self.assertEqual(ha._pr_comment_events(self.URL, "botlogin"), [])
+
+
+class TestPrCommentMessage(unittest.TestCase):
+    """_pr_comment_message folds new comments into the single typed message."""
+
+    def test_names_pr_and_each_comment(self):
+        msg = ha._pr_comment_message(
+            "https://github.com/o/r/pull/7",
+            [{"author": "alice", "body": "rename the flag", "kind": "comment",
+              "loc": None},
+             {"author": "carol", "body": "off by one", "kind": "inline",
+              "loc": "x.py:12"}])
+        self.assertIn("#7", msg)
+        self.assertIn("this session", msg)
+        self.assertIn("@alice", msg)
+        self.assertIn("rename the flag", msg)
+        self.assertIn("inline on x.py:12", msg)
+
+    def test_body_is_capped(self):
+        msg = ha._pr_comment_message(
+            "https://github.com/o/r/pull/1",
+            [{"author": "a", "body": "x" * 5000, "kind": "comment", "loc": None}])
+        self.assertLessEqual(len(msg), ha.PR_COMMENTS_BODY_CAP + 200)
+
+
+class TestPollPrComments(ManagerMixin, unittest.TestCase):
+    """_poll_pr_comments types new PR review activity into the running session
+    that opened the PR, baselining history on first sight (XERK-49)."""
+
+    URL = "https://github.com/o/r/pull/7"
+
+    def make_manager(self):
+        sm = super().make_manager()
+        sm.github = {"available": True, "login": "botlogin", "repos": []}
+        self.run_calls.clear()
+        return sm
+
+    def _session(self, sm, base=None):
+        sess = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+                "worktreePath": os.path.join(self.tmp, "wt"), "summary": "work"}
+        if base is not None:
+            sess["prCommentBase"] = base
+        sm.registry = [sess]
+        sm.session_pr_urls = {"s1": [self.URL]}
+        return sess
+
+    def _typed(self):
+        return [c for c in self.run_calls
+                if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+
+    def _events(self, *events):
+        return mock.patch.object(ha, "_pr_comment_events",
+                                 return_value=list(events))
+
+    def _ev(self, key, author="alice", body="fix", is_self=False, kind="comment"):
+        return {"key": key, "author": author, "body": body, "kind": kind,
+                "loc": None, "is_self": is_self}
+
+    def test_first_sighting_baselines_silently(self):
+        sm = self.make_manager()
+        sess = self._session(sm)                    # no prior base -> first sight
+        with self._events(self._ev("c1"), self._ev("c2")):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])         # nothing delivered
+        self.assertEqual(set(sess["prCommentBase"][self.URL]), {"c1", "c2"})
+
+    def test_new_comment_is_delivered(self):
+        sm = self.make_manager()
+        sess = self._session(sm, base={self.URL: ["c1"]})
+        with self._events(self._ev("c1"), self._ev("c2", body="rename it")):
+            sm._poll_pr_comments()
+        typed = self._typed()
+        self.assertEqual(len(typed), 1)
+        self.assertIn("rename it", typed[0][-1])
+        self.assertEqual(set(sess["prCommentBase"][self.URL]), {"c1", "c2"})
+
+    def test_self_comment_is_not_delivered_but_is_seen(self):
+        sm = self.make_manager()
+        sess = self._session(sm, base={self.URL: ["c1"]})
+        with self._events(self._ev("c1"),
+                          self._ev("c2", author="botlogin", is_self=True)):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])
+        self.assertIn("c2", sess["prCommentBase"][self.URL])
+
+    def test_fetch_failure_keeps_baseline(self):
+        sm = self.make_manager()
+        sess = self._session(sm, base={self.URL: ["c1"]})
+        with mock.patch.object(ha, "_pr_comment_events", return_value=None):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])
+        self.assertEqual(sess["prCommentBase"][self.URL], ["c1"])
+
+    def test_skipped_without_gh_login(self):
+        sm = self.make_manager()
+        sm.github = {"available": False, "login": None, "repos": []}
+        self._session(sm, base={self.URL: ["c1"]})
+        with self._events(self._ev("c2")):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])
+
+    def test_stopped_session_is_skipped(self):
+        sm = self.make_manager()
+        sess = self._session(sm, base={self.URL: ["c1"]})
+        sess["status"] = "stopped"
+        with self._events(self._ev("c2")):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])
+
+    def test_seen_set_is_capped(self):
+        sm = self.make_manager()
+        big = [f"k{i}" for i in range(ha.PR_COMMENTS_SEEN_MAX + 10)]
+        sess = self._session(sm, base={self.URL: big})
+        with self._events(self._ev("knew", body="hi")):
+            sm._poll_pr_comments()
+        self.assertLessEqual(len(sess["prCommentBase"][self.URL]),
+                             ha.PR_COMMENTS_SEEN_MAX)
+        self.assertIn("knew", sess["prCommentBase"][self.URL])
+
+
 class TestInterrupt(ManagerMixin, unittest.TestCase):
     """Stop the turn a running session has in flight: a single Escape into its
     TUI, which cancels the generation/tool call and leaves the session running

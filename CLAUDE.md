@@ -422,6 +422,38 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     by going back to scanning loose text.
 - Tests: `agent/tests/test_hub_agent.py` (`TestPrStatus`, `TestRefreshPrStatus`, `TestSessionReport`).
 
+#### PR comment delivery (XERK-49)
+
+- **A reply asking for corrections on a session's PR is typed back into the session that opened it**, so
+  the agent continues the work in place — no operator relaying the comment. `_poll_pr_comments` runs on
+  the PR cadence (`PR_COMMENTS_REFRESH_EVERY`, its own env), for **running sessions only**, over their
+  OWN PRs (`session_pr_urls`, the same map the status pill reads).
+- Delivery goes through **`send_input`**, so it inherits the whole compose path for free: the
+  compaction-survival outbox (XERK-47) if the message lands mid-turn, and Claude Code's queue if a turn
+  is already in flight — exactly as if the operator had typed the correction by hand.
+- `_pr_comment_events(url, self_login)` gathers **three channels**, because "reply in a PR" means any of
+  them and a correction routinely arrives as an inline diff-line note: conversation comments and review
+  bodies from one `gh pr view --json comments,reviews`, plus inline review-thread comments from
+  `gh api repos/<o>/<r>/pulls/<n>/comments`. A bare approve (no body) carries no correction and is
+  dropped. Each event is normalized to `{key, author, body, kind, loc, is_self}`, keyed on GitHub's
+  stable id.
+- **Baseline-on-first-sight, then deliver only new + not-self.** A PR's whole current comment set is
+  recorded silently the first beat it's seen (`prCommentBase` on the session record, per-PR seen-key
+  set, capped `PR_COMMENTS_SEEN_MAX` newest-kept) — so the session never re-litigates history, and the
+  beat this deploys doesn't flood every open PR's backlog. After that only keys that are NEW *and* not
+  the agent's own writing are typed in (`is_self` via GitHub's `viewerDidAuthor` where present, else a
+  login compare against `github.login`); the session's own comments are still folded into the seen-set
+  so they're never mistaken for someone else's later.
+- Best-effort and bounded, the `pr_status` way: skipped without a gh login, capped at `PR_COMMENTS_MAX`
+  PRs per beat, wrapped on the heartbeat path, and a fetch failure (`_pr_comment_events` → None) leaves
+  that PR's baseline UNTOUCHED — a gh error is not evidence the comments vanished. Disable the whole
+  feature with `TURMA_PR_COMMENTS=0`.
+- Known limits: only the session that OPENED the PR receives it, and only while it's running (an ended
+  session's PR reply is not delivered — the ticket is about the active session); the raw ttyd terminal
+  bypasses `send_input`, but this poller calls it directly, so that's not a gap here.
+- Tests: `agent/tests/test_hub_agent.py` (`TestPrCommentEvents`, `TestPrCommentMessage`,
+  `TestPollPrComments`).
+
 ### Expected-restart "updating" status (XERK-29)
 
 - An agent update takes the host down in a way a plain outage can't be told from: the container is
