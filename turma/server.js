@@ -47,10 +47,12 @@ const TICKET_AGENTS_FILE = process.env.TICKET_AGENTS_FILE || "/data/ticket-agent
 // Tickets come and go while pins are only ever set by hand, so the map is
 // bounded rather than reconciled: past the cap the oldest pin is evicted.
 const TICKET_AGENTS_MAX = 500;
-// Per-org auto-start opt-in (XERK-41): which Jira orgs auto-start a session for
-// every To Do ticket that has a repo. This replaced the agent's TICKET_AUTO_START
-// env as the PRIMARY control — it's now a hub setting the operator flips from the
-// board's org chip, so it can be turned on and off without redeploying an agent.
+// Per-org auto opt-in (XERK-41): which Jira orgs let the board drive their whole
+// session lifecycle — auto-START a session for every To Do ticket that has a repo
+// (XERK-41), and auto-STOP a session when its ticket moves to Done (XERK-45; see
+// autoStopSweep). This replaced the agent's TICKET_AUTO_START env as the PRIMARY
+// control — it's now a hub setting the operator flips from the board's org chip,
+// so it can be turned on and off without redeploying an agent.
 // Hub-owned for the same reason the agent-pin above is: the decision and the
 // routing are the hub's job (only it sees the whole fleet). Durable on the /data
 // volume, not the best-effort state.json, because the opt-in must survive a hub
@@ -1081,14 +1083,85 @@ function autoStartSweep() {
     }
   }
 }
+// The lifecycle counterpart to autoStartSweep (XERK-45): when a ticket in an
+// opted-in org moves to Done, stop the session(s) working it. Same per-org
+// opt-in as auto-start (orgsWithAutoStart) — turning "auto" on for an org means
+// the board drives that org's WHOLE session lifecycle, both halves: start a To
+// Do ticket that has a repo, stop a Done one's session.
+//
+// A ticket only reaches Done by a HUMAN moving it (the board is pull-only — no
+// session writes to Jira), so it's a deliberate "this work is finished" signal,
+// even more intentional than the To Do state auto-start reacts to. So the hub
+// KILLS the session rather than merely interrupting it: a kill ends the session
+// cleanly — it moves to the Ended list with its worktree, conversation and PR
+// chips intact and still resumable, and frees the MAX_SESSIONS slot the
+// auto-started session took (symmetric with auto-start consuming one). An
+// interrupt would only cancel the in-flight turn and leave the session running
+// idle, still holding that slot with nothing to do.
+//
+// The DECISION and ROUTING live here for the same reason auto-start's do: only
+// the hub sees the whole fleet. The tickets (and which is Done) come from an
+// org's freshest jira block, but a session can live on ANY of the org's hosts,
+// so the sweep scans the whole fleet and routes each kill to the host that owns
+// the session — the kill command is keyed on the sessionId the agent minted.
+//
+// Guard: autoStopped fires the kill for a given session at most once per hub
+// lifetime. A kill drops the session's registry record within a beat or two, but
+// it's still reported in that window, so the set stops a duplicate kill riding
+// every 15s sweep until the record clears. It needs no durability — unlike
+// auto-start's dedup (which stops a REFUSED spawn re-queuing forever), a
+// re-issued kill of an already-dead session is a harmless no-op the agent
+// ignores, and a still-live session re-derives into the sweep on its own.
+const autoStopped = new Set(); // "<host>\x00<sessionId>" already auto-stopped
+
+function autoStopSweep() {
+  const orgs = orgsWithAutoStart();
+  if (!orgs.size) return;
+  // The set of now-Done tickets, per opted-in org, from the freshest reporting
+  // block — the same copy the board renders and autoStartSweep reads its To Dos
+  // from, so the hub stops on what the board shows, not a lagging host's view.
+  const doneKeys = new Set(); // "<siteKey>\x00<issueKey>"
+  for (const siteKey of orgs) {
+    let block = null, bestAt = "";
+    for (const a of Object.values(agents)) {
+      if (!a.jira || a.jira.siteKey !== siteKey) continue;
+      const at = String(a.jira.fetchedAt || "");
+      if (!block || at > bestAt) { block = a.jira; bestAt = at; }
+    }
+    for (const t of (block && block.tickets) || []) {
+      if (t && t.key && t.statusCategory === "done") {
+        doneKeys.add(siteKey + "\x00" + t.key);
+      }
+    }
+  }
+  if (!doneKeys.size) return;
+  for (const [host, a] of Object.entries(agents)) {
+    for (const s of a.sessions || []) {
+      // Only a LIVE session holds a slot and is worth stopping. A stopped/error
+      // session already ended; a killed one is gone from a.sessions entirely.
+      // A queued session (its ticket already Done before it ever ran) is killed
+      // too — that's its Cancel path, and running it would be pointless.
+      if (s.status !== "running" && s.status !== "queued") continue;
+      const t = s.ticket;
+      if (!t || !t.key) continue;
+      if (!doneKeys.has((t.siteKey || "") + "\x00" + t.key)) continue;
+      const dk = host + "\x00" + s.id;
+      if (autoStopped.has(dk)) continue;
+      queueCommand(host, { type: "kill", sessionId: s.id });
+      autoStopped.add(dk);
+    }
+  }
+}
+
 // Don't act on freshly-loaded (possibly stale) state right after a hub boot, the
 // same reason the offline sweep waits: let agents re-report first. (The online
 // gate in orgsWithAutoStart already no-ops until a host re-heartbeats, so this is
-// belt-and-suspenders — and kept out of autoStartSweep itself so it stays a pure,
-// directly-callable unit.)
+// belt-and-suspenders — and kept out of the sweeps themselves so they stay pure,
+// directly-callable units.)
 setInterval(() => {
   if (Date.now() - BOOT_AT < BOOT_GRACE_MS) return;
   autoStartSweep();
+  autoStopSweep();
 }, AUTO_START_EVERY_MS).unref();
 
 const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
@@ -2820,9 +2893,11 @@ if (process.env.TURMA_TEST) {
     listDevices,
     pruneDevices,
     autoStartSweep,
+    autoStopSweep,
     startedTicketKeys,
     orgsWithAutoStart,
     autoStarted,
+    autoStopped,
     autoStartOrgs,
     setAutoStartOrg,
     ticketAgents,

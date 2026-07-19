@@ -102,8 +102,8 @@ const {
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
   TERM_OSC52_JS,
-  autoStartSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
-  autoStartOrgs, setAutoStartOrg,
+  autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
+  autoStopped, autoStartOrgs, setAutoStartOrg,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -2540,6 +2540,90 @@ test("POST /api/jira/<site>/autostart needs the user login", async () => {
     { body: { enabled: true } });
   assert.equal(r.status, 401);
   assert.equal("asapi3.atlassian.net" in autoStartOrgs, false);
+});
+
+// ---- auto-stop a session when its ticket moves to Done (XERK-45) --------------
+// The lifecycle counterpart to auto-start: the SAME per-org "auto" opt-in that
+// starts a To Do ticket's session KILLS a session once its ticket reaches Done. A
+// human moving a ticket to Done is the "work finished" signal; the kill ends the
+// session cleanly (resumable, worktree/PRs kept) and frees its MAX_SESSIONS slot.
+
+// A Done ticket already being worked by a live session on the reporting host.
+const doneBeat = (device, site, {
+  status = "running", key = "ENG-9", ticketSite = site,
+  statusCategory = "done", extraSessions = [],
+} = {}) =>
+  asBeat(device, site, {
+    tickets: [{ key, summary: "Shipped", statusCategory,
+                repoGuess: { repo: "Turma", cloned: true } }],
+    sessions: [{ id: "sd1", status, ticket: { key, siteKey: ticketSite } },
+               ...extraSessions],
+  });
+
+test("auto-stop: a Done ticket's live session is killed once the org opts in", async () => {
+  autoStopped.clear();
+  await doneBeat("apHost", "ap1.atlassian.net");
+  autoStopSweep();
+  assert.deepEqual((agents.apHost.commands || []).map((c) => [c.type, c.sessionId]),
+    [["kill", "sd1"]]);
+});
+
+test("auto-stop: does nothing while the flag is off (the default)", async () => {
+  autoStopped.clear();
+  await asBeat("apOff", "ap2.atlassian.net", {
+    autoStart: false,
+    tickets: [{ key: "ENG-9", statusCategory: "done",
+                repoGuess: { repo: "Turma", cloned: true } }],
+    sessions: [{ id: "sd1", status: "running",
+                 ticket: { key: "ENG-9", siteKey: "ap2.atlassian.net" } }],
+  });
+  autoStopSweep();
+  assert.equal((agents.apOff.commands || []).length, 0);
+});
+
+test("auto-stop: only Done tickets — an active ticket's session keeps running", async () => {
+  autoStopped.clear();
+  await doneBeat("apActive", "ap3.atlassian.net", { statusCategory: "inprogress" });
+  autoStopSweep();
+  assert.equal((agents.apActive.commands || []).length, 0);
+});
+
+test("auto-stop: only LIVE sessions — a stopped/error one is not killed", async () => {
+  autoStopped.clear();
+  await doneBeat("apStop", "ap4.atlassian.net", {
+    status: "stopped",
+    extraSessions: [{ id: "sd-err", status: "error",
+                      ticket: { key: "ENG-9", siteKey: "ap4.atlassian.net" } }],
+  });
+  autoStopSweep();
+  assert.equal((agents.apStop.commands || []).length, 0);
+});
+
+test("auto-stop: a queued session for an already-Done ticket is cancelled", async () => {
+  autoStopped.clear();
+  await doneBeat("apQ", "ap5.atlassian.net", { status: "queued" });
+  autoStopSweep();
+  assert.deepEqual((agents.apQ.commands || []).map((c) => [c.type, c.sessionId]),
+    [["kill", "sd1"]]);
+});
+
+test("auto-stop: kills EVERY live session on the Done ticket (two branches / restart)", async () => {
+  autoStopped.clear();
+  await doneBeat("apMany", "ap6.atlassian.net", {
+    extraSessions: [{ id: "sd2", status: "running",
+                      ticket: { key: "ENG-9", siteKey: "ap6.atlassian.net" } }],
+  });
+  autoStopSweep();
+  assert.deepEqual((agents.apMany.commands || []).map((c) => c.sessionId).sort(),
+    ["sd1", "sd2"]);
+});
+
+test("auto-stop: fires each session at most once, across repeated sweeps", async () => {
+  autoStopped.clear();
+  await doneBeat("apOnce", "ap7.atlassian.net");
+  autoStopSweep();
+  autoStopSweep();
+  assert.equal((agents.apOnce.commands || []).filter((c) => c.type === "kill").length, 1);
 });
 
 test("http: /api/agents does not serialize the jiraIssues cache (served only by /api/jira)", async () => {

@@ -155,9 +155,9 @@ function render(data) {
     b.setAttribute("aria-pressed", st.on ? "true" : "false");
     b.disabled = st.envForced;
     b.title = st.envForced
-      ? "Auto-start is forced on by this org's agent config (TICKET_AUTO_START) — clear it there to control auto-start from here"
-      : (st.on ? "Auto-start To Do tickets: ON — click to turn off"
-               : "Auto-start To Do tickets: OFF — click to turn on");
+      ? "Auto is forced on by this org's agent config (TICKET_AUTO_START) — clear it there to control it from here"
+      : (st.on ? "Auto: start To Do tickets, stop Done sessions — ON, click to turn off"
+               : "Auto: start To Do tickets, stop Done sessions — OFF, click to turn on");
     b.innerHTML = `<span class="org-auto-dot" aria-hidden="true"></span>auto`;
     if (!st.envForced) b.addEventListener("click", () => setAutoStart(siteKey, !st.hubOn));
     wrap.append(b);
