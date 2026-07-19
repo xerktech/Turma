@@ -1518,13 +1518,25 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   `reveal.ts`).
   - The live turn is the tmux **pane scrape's "last ● bullet"**, which — unlike glasses' transcript
     tail — is NOT a monotonic stream: mid-generation it SWAPS between unrelated blocks (prose → a
-    `Bash(…)`/`Read(…)` tool bullet → the next tool → the next prose). So `repaint` reveals the delta
-    only when the new capture **continues the exact slice already shown** (`liveTurn.startsWith`
-    revealed prefix) and **snaps** `reveal.shown` to the new length otherwise. A length-only clamp
-    (XERK-19's predecessor) caught only swaps to SHORTER text; a swap to longer or same-length-but-
-    different text kept re-typing from a stale offset — the "last line deletes and restreams over and
-    over" (XERK-19). This stands in for glasses `advanceReveal`'s entryId-change snap, which the pane
-    scrape has no id for. Tests: the swap/continuation cases in `turma/tests/chat-selection.test.js`.
+    `Bash(…)`/`Read(…)` tool bullet → the next tool → the next prose). Left unmanaged this reads as
+    "the final line deletes and re-appears over and over" (XERK-19): the tool bullet swaps in (line
+    deletes) and prose swaps back (reappears).
+  - Every `turn` frame is therefore CLASSIFIED by `applyTurn` (in `chat.js`) before it reaches the
+    reveal — the streaming bubble is only for in-progress **prose**:
+    - an empty frame or a **tool-use bullet** (`isToolBullet`: an identifier immediately followed by
+      `(` — `Bash(…)`, `Read(…)`, `mcp__srv__tool(…)`) clears the bubble; that block is over and the
+      tool renders as a committed tool-card, not raw text here. A false positive only skips ONE
+      block's live preview (it still renders once committed) — a safe degradation — while a missed
+      tool bullet brings the flicker back, so the detector leans toward matching.
+    - the **same prose block** grown or re-captured keeps the LONGER text and never shrinks, so a
+      partial mid-frame re-capture can't re-type the tail from a stale offset (the char-level
+      flicker); `reveal.shown` holds and only the genuine delta types in.
+    - a **genuinely different prose block** retypes from 0, not the previous block's offset.
+  - This stands in for glasses `advanceReveal`'s entryId-change snap, which the pane scrape has no id
+    for. `repaint`'s prefix check (`liveTurn.startsWith` the revealed slice, else snap `reveal.shown`)
+    survives as a defensive clamp for any path that sets `liveTurn` directly. A length-only clamp
+    (XERK-19's first, incomplete pass) caught only swaps to SHORTER text and left the block-swap
+    flicker. Tests: the classifier/swap/continuation cases in `turma/tests/chat-selection.test.js`.
 - Bubble prose is rendered by `renderProse` (`chat.js`), which lifts markdown out of the transcript's
   plain text: **fenced ` ``` ` blocks** become `<pre class="md-code">` (language chip from the info
   string), inline **` `code` ` spans** become `<code class="md-code-inline">` chips (`renderInline`),
