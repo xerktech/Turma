@@ -1150,30 +1150,38 @@ class TestPaneBusy(unittest.TestCase):
 
 
 class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
-    """session_report surfaces the pane probe as report['paneBusy'] on every
-    return path (even before any transcript exists)."""
+    """session_report surfaces the (single-capture) pane probe as
+    report['paneBusy'] + report['modeActual'] on every return path (even
+    before any transcript exists)."""
 
-    def test_pane_busy_reported_with_transcript(self):
+    def test_pane_reads_reported_with_transcript(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, [{"type": "assistant",
                             "message": {"content": [{"type": "text", "text": "hi"}]}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=True) as pb:
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(True, "plan")) as ps:
             rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
         self.assertIs(rep["paneBusy"], True)
-        pb.assert_called_once_with("agent-abc")
+        self.assertEqual(rep["modeActual"], "plan")
+        # (tmux_name, state): state carries _stable_pane_busy's edge memory.
+        self.assertEqual(ps.call_args[0][0], "agent-abc")
+        self.assertIsInstance(ps.call_args[0][1], dict)
 
-    def test_pane_busy_reported_without_transcript(self):
-        # No transcript yet — paneBusy must still ride the early-return path.
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+    def test_pane_reads_reported_without_transcript(self):
+        # No transcript yet — the pane reads must still ride the early-return
+        # path.
+        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto")):
             rep = ha.session_report("/absent/worktree", {}, "agent-abc")
         self.assertIs(rep["paneBusy"], False)
+        self.assertEqual(rep["modeActual"], "auto")
 
-    def test_pane_busy_defaults_none_without_tmux(self):
+    def test_pane_reads_default_none_without_tmux(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, [{"type": "assistant",
                             "message": {"content": [{"type": "text", "text": "hi"}]}}])
         rep = ha.session_report(self.WORKDIR, {})  # no tmux_name
         self.assertIsNone(rep["paneBusy"])
+        self.assertIsNone(rep["modeActual"])
 
 
 class TestStablePaneBusy(unittest.TestCase):
@@ -4153,21 +4161,107 @@ MODEL_PICKER_PANE = """
 """
 
 
-class TestSetModelMode(ManagerMixin, unittest.TestCase):
-    """Live model / permission-mode switches on a running session: model by
-    driving the /model picker to the target row and pressing `s` (session-only —
-    the typed `/model <name>` form would also rewrite the shared login's saved
-    default), mode via computed Shift+Tab (BTab) presses over the session's
-    launch-dependent cycle (perm_cycle_for). Both re-validate their argument
-    and persist the new value."""
+class _PickerPane:
+    """A /model-picker pane simulator for set_model's closed loop: send-keys
+    move its ❯ cursor, `s` closes it and prints the confirmation — and it can
+    be told to drop arrow presses or never confirm, which is exactly the
+    flakiness the verified loop exists to survive."""
+    ROWS = ("Default (recommended)", "Opus", "Fable", "Sonnet", "Haiku")
 
-    def make_manager(self, pane=MODEL_PICKER_PANE, busy=False):
+    def __init__(self, cur=2, drop_arrows=0, confirm=True, opens=True):
+        self.cur = cur                  # ❯ starts on Fable, like the real pane
+        self.drop_arrows = drop_arrows  # swallow this many arrow presses
+        self.confirm = confirm          # print "Set model to…" after `s`
+        self.opens = opens              # whether /model paints a picker at all
+        self.open = False
+        self.confirmed = False
+
+    def key(self, key):
+        if key == "Enter" and not self.open:
+            self.open = self.opens
+        elif key in ("Down", "Up") and self.open:
+            if self.drop_arrows > 0:
+                self.drop_arrows -= 1
+                return
+            step = 1 if key == "Down" else -1
+            self.cur = min(len(self.ROWS) - 1, max(0, self.cur + step))
+        elif key == "s" and self.open:
+            self.open = False
+            self.confirmed = self.confirm
+        elif key == "Escape":
+            self.open = False
+
+    def capture(self):
+        if self.open:
+            lines = ["   Select model"]
+            for i, label in enumerate(self.ROWS):
+                mark = "❯ " if i == self.cur else "  "
+                lines.append(f"   {mark}{i + 1}. {label}    a description")
+            return "\n".join(lines)
+        if self.confirmed:
+            return "  ⎿  Set model to Sonnet 5 for this session only\n❯ "
+        return "❯ \n  ? for shortcuts"  # idle; deliberately no mode marker
+
+
+class _ModePane:
+    """A footer-mode pane simulator for set_mode's closed loop: BTab advances
+    through `cycle`, capture() shows the current mode's real footer marker."""
+    MARKERS = {
+        "default": "⏸ manual mode on",
+        "acceptEdits": "⏵⏵ accept edits on",
+        "plan": "⏸ plan mode on",
+        "auto": "⏵⏵ auto mode on",
+        "bypassPermissions": "⏵⏵ bypass permissions on",
+    }
+
+    def __init__(self, cycle, cur=0):
+        self.cycle = list(cycle)
+        self.i = cur
+
+    @property
+    def mode(self):
+        return self.cycle[self.i]
+
+    def key(self, key):
+        if key == "BTab":
+            self.i = (self.i + 1) % len(self.cycle)
+
+    def capture(self):
+        return f"❯ \n  {self.MARKERS[self.mode]} (shift+tab to cycle)"
+
+
+class TestSetModelMode(ManagerMixin, unittest.TestCase):
+    """Live model / permission-mode switches on a running session — both are
+    CLOSED LOOPS: model by driving the /model picker one verified arrow at a
+    time and pressing `s` (session-only; the typed `/model <name>` form would
+    also rewrite the shared login's saved default), mode by pressing Shift+Tab
+    and reading the footer marker back until the target shows. The real mode
+    cycle is account- AND model-dependent, so no precomputed press count is
+    trusted; the guessed-cycle math survives only as the fallback for a pane
+    whose marker can't be read."""
+
+    def make_manager(self, pane=None, busy=False):
         sm = super().make_manager()
         self.run_calls.clear()
         sm.save = mock.Mock()  # don't touch disk; just assert the record update
-        for name, value in [("_pane_busy", lambda t: busy),
-                            ("_capture_pane", lambda t: pane),
-                            ("MODEL_PICKER_WAIT_SEC", 0)]:
+        self.pane = _PickerPane() if pane is None else pane
+
+        def fake_run(cmd, cwd=None):
+            self.run_calls.append(cmd)
+            if cmd[:2] == ["tmux", "send-keys"] and hasattr(self.pane, "key"):
+                self.pane.key(cmd[-1])
+            return ""
+
+        def fake_capture(tmux_name):
+            return self.pane.capture() if hasattr(self.pane, "capture") else self.pane
+
+        for name, value in [("run", fake_run),
+                            ("_pane_busy", lambda t: busy),
+                            ("_capture_pane", fake_capture),
+                            ("MODEL_PICKER_WAIT_SEC", 0),
+                            ("MODEL_STEP_WAIT_SEC", 0),
+                            ("MODEL_CONFIRM_WAIT_SEC", 0),
+                            ("MODE_STEP_WAIT_SEC", 0)]:
             p = mock.patch.object(ha, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -4176,25 +4270,23 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
     def _session(self, sm, sid="abcde", model=None, perm="auto", status="running",
                  launch=None):
         # launch defaults to perm — a just-launched session's current mode is the
-        # mode it launched into, which fixes its live Shift+Tab cycle.
+        # mode it launched into, which fixes its blind-fallback cycle.
         sess = {"id": sid, "status": status, "tmuxName": f"agent-{sid}",
                 "model": model, "permissionMode": perm,
                 "launchPermissionMode": perm if launch is None else launch}
         sm.registry = [sess]
         return sess
 
+    def _keys(self):
+        return [c[-1] for c in self.run_calls]
+
+    # ---- set_model ---------------------------------------------------------
+
     def test_set_model_drives_picker_to_row_and_session_only(self):
         sm = self.make_manager()
         sess = self._session(sm, model=None)
         sm.set_model("abcde", "sonnet")
-        t = ["tmux", "send-keys", "-t", "agent-abcde"]
-        self.assertEqual(self.run_calls, [
-            t + ["C-u"],                    # clear any half-typed input first
-            t + ["-l", "--", "/model"],
-            t + ["Enter"],
-            t + ["Down"],                   # ❯ on Fable (row 3) -> Sonnet (row 4)
-            t + ["-l", "s"],                # "use this session only"
-        ])
+        self.assertEqual(self._keys(), ["C-u", "/model", "Enter", "Down", "s"])
         self.assertEqual(sess["model"], "sonnet")
         sm.save.assert_called_once()
 
@@ -4202,105 +4294,157 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = self._session(sm, model="opus")
         sm.set_model("abcde", "default")
-        keys = [c[-1] for c in self.run_calls]
-        self.assertEqual(keys, ["C-u", "/model", "Enter", "Up", "Up", "s"])
+        self.assertEqual(self._keys(), ["C-u", "/model", "Enter", "Up", "Up", "s"])
         self.assertIsNone(sess["model"])
 
-    def test_set_model_busy_pane_refuses_without_typing(self):
-        # Typed into a mid-turn pane the command would only be queued as a
-        # prompt, so a busy read refuses the switch and touches nothing.
+    def test_set_model_dropped_arrow_self_corrects(self):
+        # A dropped keypress used to leave the old press-burst one row short,
+        # and `s` then silently selected the WRONG model. The verified loop
+        # sees the unmoved ❯ and simply presses again.
+        sm = self.make_manager(pane=_PickerPane(drop_arrows=1))
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys(),
+                         ["C-u", "/model", "Enter", "Down", "Down", "s"])
+        self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_busy_pane_defers_instead_of_dropping(self):
+        # Typed into a mid-turn pane the command would only queue as a prompt.
+        # The pick is deferred (pendingModel), not silently dropped — the old
+        # log-only refusal is what made the button feel dead.
         sm = self.make_manager(busy=True)
         sess = self._session(sm, model=None)
         sm.set_model("abcde", "sonnet")
         self.assertEqual(self.run_calls, [])
+        self.assertEqual(sess["pendingModel"], "sonnet")
         self.assertIsNone(sess["model"])
-        sm.save.assert_not_called()
 
-    def test_set_mode_cycles_forward_the_minimal_presses(self):
-        # An auto-launched session's cycle is [default, acceptEdits, plan, auto]
-        # (bypassPermissions is NOT reachable). auto (idx 3) -> plan (idx 2) over
-        # that 4-mode cycle = (2-3) % 4 = 3 presses.
+    def test_apply_pending_switches_lands_the_deferred_pick(self):
+        sm = self.make_manager(busy=False)
+        sess = self._session(sm, model=None)
+        sess["pendingModel"] = "sonnet"
+        sm._apply_pending_switches()
+        self.assertNotIn("pendingModel", sess)
+        self.assertEqual(sess["model"], "sonnet")
+        self.assertIn("s", self._keys())
+
+    def test_apply_pending_switches_waits_out_a_busy_pane(self):
+        sm = self.make_manager(busy=True)
+        sess = self._session(sm, model=None)
+        sess["pendingModel"] = "sonnet"
+        sm._apply_pending_switches()
+        self.assertEqual(sess["pendingModel"], "sonnet")  # still waiting
+        self.assertEqual(self.run_calls, [])
+
+    def test_set_model_no_picker_escapes_and_keeps_model(self):
+        sm = self.make_manager(pane=_PickerPane(opens=False))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys()[-1], "Escape")
+        self.assertEqual(sess["model"], "opus")
+
+    def test_set_model_unconfirmed_selection_leaves_the_record(self):
+        # `s` was sent but the TUI never printed its confirmation: the record
+        # must not assert a switch nobody proved — the transcript scan's
+        # modelActual settles what the chip shows either way.
+        sm = self.make_manager(pane=_PickerPane(confirm=False))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys()[-1], "s")
+        self.assertEqual(sess["model"], "opus")
+
+    def test_set_model_row_not_offered_escapes(self):
+        # A probed alias with no picker row (the bracketed 1M variants) backs
+        # out rather than pressing keys at a row that isn't there.
         sm = self.make_manager()
+        sm.models_info = {"available": ["sonnet", "opusplan", "default"]}
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "opusplan")
+        self.assertEqual(self._keys()[-1], "Escape")
+        self.assertIsNone(sess["model"])
+
+    def test_set_model_rejects_unknown_before_any_keystroke(self):
+        sm = self.make_manager()
+        self._session(sm, model=None)
+        with self.assertRaises(ValueError):
+            sm.set_model("abcde", "gpt-9")
+        self.assertEqual(self.run_calls, [])
+
+    def test_set_model_noop_for_non_running(self):
+        sm = self.make_manager()
+        self._session(sm, status="stopped")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self.run_calls, [])
+
+    # ---- set_mode (closed loop) --------------------------------------------
+
+    def test_set_mode_presses_until_the_marker_reads_the_target(self):
+        pane = _ModePane(["default", "acceptEdits", "plan", "auto"], cur=3)
+        sm = self.make_manager(pane=pane)
         sess = self._session(sm, perm="auto")
         sm.set_mode("abcde", "plan")
-        self.assertEqual(self.run_calls,
-                         [["tmux", "send-keys", "-t", "agent-abcde", "BTab"]] * 3)
+        self.assertEqual(self._keys(), ["BTab"] * 3)
         self.assertEqual(sess["permissionMode"], "plan")
+        self.assertEqual(pane.mode, "plan")
         sm.save.assert_called_once()
 
-    def test_set_mode_within_base_takes_forward_step(self):
-        # Same auto-launch cycle, now sitting at acceptEdits (idx 1) after a prior
-        # cycle. acceptEdits -> plan (idx 2) = one forward press.
-        sm = self.make_manager()
-        self._session(sm, perm="acceptEdits", launch="auto")
-        sm.set_mode("abcde", "plan")
-        self.assertEqual(len(self.run_calls), 1)
-
-    def test_set_mode_plan_to_auto_wraps_forward(self):
-        # auto-launch cycle [default, acceptEdits, plan, auto]. plan (idx 2) ->
-        # auto (idx 3) = one forward press.
-        sm = self.make_manager()
-        sess = self._session(sm, perm="plan", launch="auto")
+    def test_set_mode_reaches_a_mode_the_guessed_cycle_says_is_absent(self):
+        # Observed live: a bypass-launched session's real cycle DOES contain
+        # auto (account-enabled), which perm_cycle_for guesses absent — the
+        # old computed-press path refused this switch outright. The closed
+        # loop doesn't consult the guess at all.
+        pane = _ModePane(["default", "acceptEdits", "plan", "auto",
+                          "bypassPermissions"], cur=4)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, perm="bypassPermissions")
         sm.set_mode("abcde", "auto")
-        self.assertEqual(len(self.run_calls), 1)
         self.assertEqual(sess["permissionMode"], "auto")
+        self.assertEqual(pane.mode, "auto")
 
-    def test_set_mode_bypass_unreachable_on_auto_launch_is_noop(self):
-        # The reported bug: an auto-launched session's cycle has no
-        # bypassPermissions, so selecting it must NOT blindly cycle to some other
-        # mode — it's a no-op and the record keeps the real mode.
-        sm = self.make_manager()
+    def test_set_mode_trusts_the_pane_over_a_stale_record(self):
+        # The operator cycled by hand in the live terminal: the record says
+        # auto but the pane shows plan. The loop starts from the PANE's truth,
+        # where the old path counted presses from the stale record and landed
+        # on the wrong mode.
+        pane = _ModePane(["default", "acceptEdits", "plan", "auto"], cur=2)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, perm="auto")  # stale
+        sm.set_mode("abcde", "acceptEdits")
+        self.assertEqual(self._keys(), ["BTab"] * 3)  # plan→auto→default→acceptEdits
+        self.assertEqual(sess["permissionMode"], "acceptEdits")
+
+    def test_set_mode_unreachable_target_wraps_and_keeps_the_truth(self):
+        pane = _ModePane(["default", "acceptEdits", "plan", "auto"], cur=0)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, perm="default")
+        sm.set_mode("abcde", "bypassPermissions")
+        self.assertEqual(self._keys(), ["BTab"] * 4)  # one full lap, then stop
+        self.assertEqual(sess["permissionMode"], "default")
+
+    def test_set_mode_already_there_presses_nothing(self):
+        pane = _ModePane(["default", "acceptEdits", "plan", "auto"], cur=2)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, perm="plan")
+        sm.set_mode("abcde", "plan")
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(sess["permissionMode"], "plan")
+
+    def test_set_mode_unreadable_pane_falls_back_to_computed_presses(self):
+        # No marker to read (a TUI wording this parser predates): the guessed
+        # cycle is still better than nothing. auto-launch cycle
+        # [default, acceptEdits, plan, auto]: auto -> plan = 3 presses.
+        sm = self.make_manager(pane="❯ \n  ? for shortcuts")
+        sess = self._session(sm, perm="auto")
+        sm.set_mode("abcde", "plan")
+        self.assertEqual(self._keys(), ["BTab"] * 3)
+        self.assertEqual(sess["permissionMode"], "plan")
+
+    def test_set_mode_blind_unreachable_is_a_noop(self):
+        sm = self.make_manager(pane="❯ \n  ? for shortcuts")
         sess = self._session(sm, perm="auto")
         sm.set_mode("abcde", "bypassPermissions")
         self.assertEqual(self.run_calls, [])
         self.assertEqual(sess["permissionMode"], "auto")
-        sm.save.assert_not_called()
-
-    def test_set_mode_reaches_bypass_when_launched_into_it(self):
-        # A bypassPermissions-launched session HAS it in cycle
-        # [default, acceptEdits, plan, bypassPermissions]; bypass (idx 3) -> plan
-        # (idx 2) = (2-3) % 4 = 3 presses.
-        sm = self.make_manager()
-        sess = self._session(sm, perm="bypassPermissions")
-        sm.set_mode("abcde", "plan")
-        self.assertEqual(len(self.run_calls), 3)
-        self.assertEqual(sess["permissionMode"], "plan")
-
-    def test_set_mode_auto_unreachable_on_bypass_launch_is_noop(self):
-        # Only the launched optional is guaranteed in-cycle: a bypass-launched
-        # session can't be assumed to reach auto, so it's a no-op skip.
-        sm = self.make_manager()
-        sess = self._session(sm, perm="bypassPermissions")
-        sm.set_mode("abcde", "auto")
-        self.assertEqual(self.run_calls, [])
-        self.assertEqual(sess["permissionMode"], "bypassPermissions")
-
-    def test_set_mode_auto_unreachable_on_default_launch_is_noop(self):
-        # A default-launched session (no --permission-mode) has the base cycle
-        # only; auto is not guaranteed reachable, so selecting it is a no-op.
-        sm = self.make_manager()
-        sess = self._session(sm, perm="default")
-        sm.set_mode("abcde", "auto")
-        self.assertEqual(self.run_calls, [])
-        self.assertEqual(sess["permissionMode"], "default")
-
-    def test_set_mode_missing_launch_field_assumes_auto(self):
-        # An older session persisted before launchPermissionMode existed: fall
-        # back to the auto cycle (Turma's launch default). auto -> plan = 3.
-        sm = self.make_manager()
-        sess = {"id": "abcde", "status": "running", "tmuxName": "agent-abcde",
-                "model": None, "permissionMode": "auto"}  # no launchPermissionMode
-        sm.registry = [sess]
-        sm.set_mode("abcde", "plan")
-        self.assertEqual(len(self.run_calls), 3)
-        self.assertEqual(sess["permissionMode"], "plan")
-
-    def test_set_mode_noop_when_already_target(self):
-        sm = self.make_manager()
-        self._session(sm, perm="plan")
-        sm.set_mode("abcde", "plan")
-        self.assertEqual(self.run_calls, [])
-        sm.save.assert_not_called()
 
     def test_set_mode_rejects_unknown(self):
         sm = self.make_manager()
@@ -4315,37 +4459,31 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sm.set_mode("abcde", "plan")
         self.assertEqual(self.run_calls, [])
 
-    def test_set_model_no_picker_escapes_and_keeps_model(self):
-        sm = self.make_manager(pane="❯ \n  ⏵⏵ auto mode on")
-        sess = self._session(sm, model="opus")
-        sm.set_model("abcde", "sonnet")
-        self.assertEqual(self.run_calls[-1][-1], "Escape")
-        self.assertEqual(sess["model"], "opus")
-        sm.save.assert_not_called()
 
-    def test_set_model_row_not_offered_escapes(self):
-        # A probed alias with no picker row (the bracketed 1M variants) backs
-        # out rather than pressing keys at a row that isn't there.
-        sm = self.make_manager()
-        sm.models_info = {"available": ["sonnet", "opusplan", "default"]}
-        sess = self._session(sm, model=None)
-        sm.set_model("abcde", "opusplan")
-        self.assertEqual(self.run_calls[-1][-1], "Escape")
-        self.assertIsNone(sess["model"])
-        sm.save.assert_not_called()
+class TestParsePaneMode(unittest.TestCase):
+    def test_all_five_markers(self):
+        for marker, mode in [
+            ("⏸ manual mode on · ? for shortcuts", "default"),
+            ("⏵⏵ accept edits on (shift+tab to cycle)", "acceptEdits"),
+            ("⏸ plan mode on (shift+tab to cycle)", "plan"),
+            ("⏵⏵ auto mode on (shift+tab to cycle)", "auto"),
+            ("⏵⏵ bypass permissions on (shift+tab to cycle)",
+             "bypassPermissions"),
+        ]:
+            self.assertEqual(ha.parse_pane_mode(f"❯ \n  {marker}"), mode, marker)
 
-    def test_set_model_rejects_unknown_before_any_keystroke(self):
-        sm = self.make_manager()
-        self._session(sm, model=None)
-        with self.assertRaises(ValueError):
-            sm.set_model("abcde", "gpt-9")
-        self.assertEqual(self.run_calls, [])
+    def test_conversation_text_without_the_glyph_is_not_a_marker(self):
+        self.assertIsNone(ha.parse_pane_mode("we turned plan mode on earlier\n❯ "))
 
-    def test_set_model_noop_for_non_running(self):
-        sm = self.make_manager()
-        self._session(sm, status="stopped")
-        sm.set_model("abcde", "sonnet")
-        self.assertEqual(self.run_calls, [])
+    def test_the_footers_marker_wins_over_a_quoted_one(self):
+        cap = ("…the TUI says ⏸ plan mode on while planning…\n"
+               "❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)")
+        self.assertEqual(ha.parse_pane_mode(cap), "auto")
+
+    def test_none_cases(self):
+        self.assertIsNone(ha.parse_pane_mode(""))
+        self.assertIsNone(ha.parse_pane_mode(None))
+        self.assertIsNone(ha.parse_pane_mode("❯ \n  ? for shortcuts"))
 
 
 # What `claude -p "/model"` really prints (v2.1.214): the current default's
@@ -4611,6 +4749,25 @@ class TestModelActualPayload(ManagerMixin, unittest.TestCase):
              mock.patch.object(sm, "_session_git", return_value=({}, {})):
             payload = sm._session_payload(sess, refresh=False)
         self.assertEqual(payload["modelActual"], "claude-opus-4-8")
+
+    def test_mode_reconciles_to_the_pane_and_pending_model_rides(self):
+        # The operator can cycle modes by hand in the live terminal, which no
+        # command ever reports: the pane's modeActual is the truth, so the
+        # stored permissionMode follows it. A deferred model pick rides the
+        # payload so the chip can show the switch as in-flight.
+        sm = self.make_manager()
+        sess = self._sess()
+        sess["permissionMode"] = "auto"
+        sess["pendingModel"] = "sonnet"
+        sm.registry = [sess]
+        signals = {"prUrls": [], "modelActual": None, "modeActual": "plan",
+                   "tail": []}
+        with mock.patch.object(ha, "session_report", return_value=signals), \
+             mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            payload = sm._session_payload(sess, refresh=False)
+        self.assertEqual(payload["permissionMode"], "plan")
+        self.assertEqual(sess["permissionMode"], "plan")
+        self.assertEqual(payload["pendingModel"], "sonnet")
 
 
 class TestAnswerQuestion(ManagerMixin, unittest.TestCase):

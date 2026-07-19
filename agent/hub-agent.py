@@ -2863,10 +2863,14 @@ def _pane_busy(tmux_name):
             captured (e.g. the tmux session is gone). Callers fall back to the
             transcript-mtime heuristic on None, so an old/crashed pane degrades
             gracefully rather than reporting a wrong state."""
-    if not tmux_name or not PANE_BUSY_MARKERS:
+    if not tmux_name:
         return None
-    cap = _capture_pane(tmux_name)
-    if cap is None:
+    return _busy_from_capture(_capture_pane(tmux_name))
+
+
+def _busy_from_capture(cap):
+    """The paneBusy read off an already-taken capture (None-capture = unknown)."""
+    if cap is None or not PANE_BUSY_MARKERS:
         return None
     low = cap.lower()
     return any(m in low for m in PANE_BUSY_MARKERS)
@@ -2921,6 +2925,50 @@ def _stable_pane_busy(tmux_name, state):
     state["paneBusyStable"] = False
     return False
 
+# The TUI names the ACTIVE permission mode on its footer at all times — even
+# mid-generation — as "⏸ manual mode on" / "⏵⏵ accept edits on" / "⏸ plan mode
+# on" / "⏵⏵ auto mode on" / "⏵⏵ bypass permissions on". Anchored on the leading
+# glyph so conversation text that merely SAYS "plan mode on" can't read as the
+# marker. This read is what makes set_mode a closed loop (press, read, repeat)
+# instead of a press-count computed against a guessed cycle: the real cycle is
+# account- AND model-dependent (auto joins it when the account enables it —
+# observed even on a bypass-launched session, where perm_cycle_for guesses it
+# absent — and drops out for models that can't do auto), so any precomputed
+# count lands on the wrong mode somewhere.
+PANE_MODE_RE = re.compile(
+    r"[⏸⏵]+\s+(bypass permissions|accept edits|plan mode|auto mode|manual mode) on")
+_PANE_MODE_NAMES = {
+    "bypass permissions": "bypassPermissions",
+    "accept edits": "acceptEdits",
+    "plan mode": "plan",
+    "auto mode": "auto",
+    "manual mode": "default",
+}
+
+
+def parse_pane_mode(cap):
+    """The permission mode the session's TUI is REALLY in, read off the footer
+    marker, or None when no marker is visible (pane gone, or a TUI wording this
+    parser predates). Scanned bottom-up: the footer owns the last lines, so a
+    marker quoted higher up in the conversation can't shadow the live one."""
+    if not cap:
+        return None
+    for line in reversed(cap.splitlines()):
+        m = PANE_MODE_RE.search(line)
+        if m:
+            return _PANE_MODE_NAMES[m.group(1)]
+    return None
+
+
+def _pane_status(tmux_name, state):
+    """(paneBusy, modeActual) for one beat: the busy half goes through
+    _stable_pane_busy's busy->idle flicker suppression (hence `state`), the
+    mode half reads the footer marker off its own capture."""
+    if not tmux_name:
+        return None, None
+    return (_stable_pane_busy(tmux_name, state),
+            parse_pane_mode(_capture_pane(tmux_name)))
+
 
 def _capture_pane(tmux_name):
     """The session pane's current text, or None when it can't be captured
@@ -2957,6 +3005,7 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
     proj = os.path.join(PROJECTS_ROOT, slug)
     primed = state.get("primed", False)
     offsets = state.setdefault("offsets", {})
+    pane_busy, mode_actual = _pane_status(tmux_name, state)
     report = {
         "bridgeAttached": os.path.exists(os.path.join(proj, "bridge-pointer.json")),
         # Live "is it working right now" read straight off the session's TUI —
@@ -2964,7 +3013,12 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # Flicker-suppressed via `state` (see _stable_pane_busy) so a single
         # capture landing in a spinner-repaint gap can't flip every status icon
         # to idle for a whole interval.
-        "paneBusy": _stable_pane_busy(tmux_name, state),
+        "paneBusy": pane_busy,
+        # The permission mode the TUI is REALLY in (footer marker), or None.
+        # The record reconciles to it each beat (_session_payload), so a mode
+        # the operator cycled by hand in the terminal doesn't leave the stored
+        # mode — and every switch computed from it — wrong forever.
+        "modeActual": mode_actual,
         "transcriptAgeSec": None,  # seconds since the newest transcript write
         "lastRole": None,          # "assistant"/"user"/... of the newest entry
         "lastHasToolUse": False,
@@ -4659,9 +4713,29 @@ MODELS_PROBE_TIMEOUT_SEC = int(
     os.environ.get("TURMA_MODELS_PROBE_TIMEOUT_SEC", "90") or 90)
 # How long set_model waits for the /model picker to paint after opening it:
 # up to TRIES polls, WAIT_SEC apart. Runs on the command path of the heartbeat
-# loop, so the worst case (~3s) is bounded well under a spawn's git fetch.
+# loop, so the worst case (a few seconds) is bounded well under a spawn's git
+# fetch.
 MODEL_PICKER_TRIES = 10
 MODEL_PICKER_WAIT_SEC = 0.3
+# The arrow loop: one press at a time, each verified by re-reading the ❯
+# before the next (MAX_STEPS bounds a cursor that never converges). STEP_*
+# pace the per-press readback; CONFIRM_* pace the wait for the "Set model to…"
+# confirmation after `s`.
+MODEL_PICKER_MAX_STEPS = 12
+MODEL_STEP_TRIES = 8
+MODEL_STEP_WAIT_SEC = 0.12
+MODEL_CONFIRM_TRIES = 10
+MODEL_CONFIRM_WAIT_SEC = 0.2
+# What the TUI prints once a picker selection lands (session-only or saved
+# default) or is dismissed on the current model. Either wording proves the
+# picker acted and closed.
+MODEL_CONFIRM_RE = re.compile(r"Set model to\s+.+|Kept model as\s+.+")
+# How set_mode's closed loop is bounded: more presses than any real cycle has
+# modes (a wrap back to the start stops it earlier), each press's readback
+# polled STEP_TRIES × STEP_WAIT.
+MODE_CYCLE_MAX_PRESSES = 6
+MODE_STEP_TRIES = 8
+MODE_STEP_WAIT_SEC = 0.15
 
 
 def parse_model_probe(text):
@@ -6820,9 +6894,15 @@ class SessionManager:
         arg = resolved or "default"
         tmux_name = sess["tmuxName"]
         if _pane_busy(tmux_name):
-            log(f"set model of {sid} -> {arg}: turn in flight, not typing into "
-                f"a busy pane; retry when idle")
+            # DEFER, don't drop: the click used to be refused log-only here,
+            # which read as the button doing nothing. The pending pick is
+            # persisted, heartbeated (so the chip can say it's switching), and
+            # applied by _apply_pending_switches on the first idle beat.
+            sess["pendingModel"] = arg
+            self.save()
+            log(f"set model of {sid} -> {arg}: turn in flight; deferred until idle")
             return
+        sess.pop("pendingModel", None)
         run(["tmux", "send-keys", "-t", tmux_name, "C-u"])
         run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", "/model"])
         run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
@@ -6838,41 +6918,170 @@ class SessionManager:
             # closes a half-painted picker) and destroys nothing.
             run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
             log(f"set model of {sid} -> {arg}: /model picker did not appear")
+            self.save()
             return
-        target = _picker_index_for(rows, resolved)
-        if target is None:
-            run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
-            log(f"set model of {sid} -> {arg}: picker offers no such row "
-                f"({', '.join(rows)})")
-            return
-        key = "Down" if target > cur else "Up"
-        for _ in range(abs(target - cur)):
-            run(["tmux", "send-keys", "-t", tmux_name, key])
+        # Arrow toward the target ONE press at a time, re-reading the ❯ before
+        # the next. The old burst of abs(target-cur) presses trusted every key
+        # to land exactly once — a dropped or doubled key put the cursor one
+        # row off and `s` then silently selected the WRONG model. Here a
+        # dropped key just means the next read still shows the gap (press
+        # again), and a doubled one flips the press direction; MAX_STEPS bounds
+        # a cursor that never converges.
+        steps = 0
+        while True:
+            target = _picker_index_for(rows, resolved)
+            if target is None:
+                run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+                log(f"set model of {sid} -> {arg}: picker offers no such row "
+                    f"({', '.join(rows)})")
+                self.save()
+                return
+            if cur == target:
+                break
+            if steps >= MODEL_PICKER_MAX_STEPS:
+                run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+                log(f"set model of {sid} -> {arg}: cursor never reached the row "
+                    f"(at {cur} after {steps} presses)")
+                self.save()
+                return
+            run(["tmux", "send-keys", "-t", tmux_name,
+                 "Down" if target > cur else "Up"])
+            steps += 1
+            rows, cur = self._await_picker_step(tmux_name, rows, cur)
+            if not rows or cur is None:
+                run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+                log(f"set model of {sid} -> {arg}: picker vanished mid-navigation")
+                self.save()
+                return
         run(["tmux", "send-keys", "-t", tmux_name, "-l", "s"])
-        sess["model"] = resolved
-        # The switch confirms in-transcript ("Set model to X for this session
-        # only"), which the per-beat scan folds into modelActual — the chip
-        # shows the model that's really answering, not this stored intent.
-        self.save()
-        log(f"set model of {sid} -> {arg} (session only)")
+        # The record updates only on the TUI's own confirmation — "Set model
+        # to X for this session only" (or "Kept model as X" when the row was
+        # already current). Unconfirmed, the record keeps the old value and the
+        # transcript scan's modelActual settles what the chip shows either way.
+        if self._await_model_confirmation(tmux_name):
+            sess["model"] = resolved
+            self.save()
+            log(f"set model of {sid} -> {arg} (session only, confirmed)")
+        else:
+            self.save()
+            log(f"set model of {sid} -> {arg}: selection sent but no "
+                f"confirmation read; record unchanged (modelActual will settle it)")
+
+    def _await_picker_step(self, tmux_name, rows, prev_cur):
+        """Poll the picker after an arrow press until the ❯ moves off prev_cur,
+        returning the fresh (rows, cur). On timeout returns the LAST read even
+        if unmoved — the caller's loop just presses again, bounded by
+        MAX_STEPS — and ([], None) when the picker is gone entirely."""
+        for _ in range(MODEL_STEP_TRIES):
+            time.sleep(MODEL_STEP_WAIT_SEC)
+            rows, cur = parse_model_picker(_capture_pane(tmux_name) or "")
+            if not rows:
+                return [], None
+            if cur is not None and cur != prev_cur:
+                return rows, cur
+        return rows, cur
+
+    def _await_model_confirmation(self, tmux_name):
+        """Whether the picker's selection visibly landed: poll for the TUI's
+        own "Set model to…"/"Kept model as…" line (MODEL_CONFIRM_RE)."""
+        for _ in range(MODEL_CONFIRM_TRIES):
+            time.sleep(MODEL_CONFIRM_WAIT_SEC)
+            cap = _capture_pane(tmux_name)
+            if cap and MODEL_CONFIRM_RE.search(cap):
+                return True
+        return False
+
+    def _apply_pending_switches(self):
+        """Apply model switches that arrived while their session's pane was
+        mid-turn (set_model defers them as sess['pendingModel']). Runs each
+        beat; set_model re-defers if a new turn has started, so a pick chases
+        the first idle moment instead of being dropped."""
+        for sess in list(self.registry):
+            pend = sess.get("pendingModel")
+            if not pend or sess.get("status") != "running":
+                continue
+            if _pane_busy(sess["tmuxName"]):
+                continue
+            sess.pop("pendingModel", None)
+            try:
+                self.set_model(sess["id"], pend)
+            except Exception as e:
+                log(f"deferred model switch for {sess['id']} failed: {e}")
+                self.save()
 
     def set_mode(self, sid, mode):
-        """Switch a running session's permission mode live by injecting the number
-        of Shift+Tab (BTab) presses that cycles it from its current mode to the
-        target. Claude Code exposes no set-mode-by-name command (only `/plan`), so
-        cycling is the only live path — but the cycle a session exposes is
-        launch-dependent (bypassPermissions/auto are in it only when launched into
-        them), so the presses are computed against THIS session's real cycle
-        (`perm_cycle_for(launchPermissionMode)`), which is what makes the switch
-        land on the chosen mode instead of drifting. A target the session's cycle
-        can't reach (e.g. bypassPermissions on an auto-launched session) is a no-op:
-        the record keeps the real mode, so the heartbeat corrects the UI's
-        optimistic guess. On success the target (validated) is stored so the UI
-        reflects it."""
+        """Switch a running session's permission mode live as a CLOSED LOOP:
+        press Shift+Tab (BTab), read the footer's mode marker back
+        (parse_pane_mode), repeat until the target reads back or the cycle
+        wraps to where it started.
+
+        It used to compute a press count against `perm_cycle_for`'s guessed
+        cycle — but the real cycle is account- AND model-dependent (auto joins
+        it when the account enables it, even on a bypass-launched session where
+        the guess says it's absent, and drops out for models that can't do
+        auto), and the record's idea of "current" goes stale the moment the
+        operator cycles by hand in the terminal. Every one of those made a
+        computed count land on the wrong mode. Reading the marker after each
+        press needs none of that knowledge: the loop stops ON the target, a
+        wrap back to the start proves the target isn't in this session's cycle
+        (a logged no-op), and what's STORED is always what was read, so the
+        record can't lie.
+
+        No busy gate, deliberately: BTab types nothing into the input line and
+        the TUI cycles modes mid-generation (verified live), with the marker
+        staying visible throughout. Falls back to the old computed presses only
+        when the marker can't be read at all (a TUI wording this parser
+        predates)."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
         target = resolve_permission_mode(mode)  # validated enum; raises on junk
+        tmux_name = sess["tmuxName"]
+        cur = parse_pane_mode(_capture_pane(tmux_name))
+        if cur is None:
+            self._set_mode_blind(sess, target)
+            return
+        start, presses = cur, 0
+        while cur != target and presses < MODE_CYCLE_MAX_PRESSES:
+            run(["tmux", "send-keys", "-t", tmux_name, "BTab"])
+            presses += 1
+            nxt = self._await_mode_step(tmux_name, cur)
+            if nxt is None:
+                log(f"set mode of {sid}: marker unreadable after {presses} "
+                    f"presses; keeping last read {cur!r}")
+                break
+            cur = nxt
+            if cur == start:
+                break  # full wrap: the target isn't in this session's cycle
+        sess["permissionMode"] = cur  # what was READ, not what was wanted
+        self.save()
+        if cur == target:
+            log(f"set mode of {sid} -> {target} ({presses} Shift+Tab, read back)")
+        else:
+            log(f"set mode of {sid}: {target} not reached (cycle read back "
+                f"{cur!r} after {presses} presses); record keeps the real mode")
+
+    def _await_mode_step(self, tmux_name, prev):
+        """Poll the pane after a BTab until its mode marker reads differently
+        from `prev` (the repaint landed), returning the new mode — or None when
+        it never reads back (pane gone / marker wording changed mid-flight).
+        A press that shows the SAME mode after the wait window reads as None
+        too: with every real cycle ≥3 modes, BTab can never map a mode to
+        itself, so an unmoved marker means the read is not to be trusted."""
+        for _ in range(MODE_STEP_TRIES):
+            time.sleep(MODE_STEP_WAIT_SEC)
+            nxt = parse_pane_mode(_capture_pane(tmux_name))
+            if nxt and nxt != prev:
+                return nxt
+        return None
+
+    def _set_mode_blind(self, sess, target):
+        """The pre-closed-loop fallback for a pane whose mode marker can't be
+        read: presses computed against perm_cycle_for's guessed cycle from the
+        record's stored mode. Kept only for TUIs whose footer wording this
+        build's parser doesn't know; wrong whenever the guess is (see
+        set_mode's docstring), which is why it is no longer the primary path."""
+        sid = sess["id"]
         current = sess.get("permissionMode") or "auto"
         if current == target:
             return
@@ -6887,7 +7096,7 @@ class SessionManager:
             run(["tmux", "send-keys", "-t", tmux_name, "BTab"])
         sess["permissionMode"] = target
         self.save()
-        log(f"set mode of {sid} -> {target} ({presses} Shift+Tab)")
+        log(f"set mode of {sid} -> {target} ({presses} Shift+Tab, blind)")
 
     def _question_paths(self, sid):
         """(req, ans) rendezvous file paths for a session's pending question."""
@@ -8671,6 +8880,14 @@ class SessionManager:
                 if actual and actual != sess.get("modelActual"):
                     sess["modelActual"] = actual
                     self.save()
+                # Reconcile the stored permission mode to the one the TUI's
+                # footer really shows (the operator can cycle by hand in the
+                # live terminal, which no command ever reports) — so the mode
+                # chip, and any restart's --permission-mode, follow the truth.
+                ma = signals.get("modeActual")
+                if ma and ma != sess.get("permissionMode"):
+                    sess["permissionMode"] = ma
+                    self.save()
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
@@ -8700,6 +8917,10 @@ class SessionManager:
             # like "Sonnet 5") — what the chat chip shows instead of "Default".
             # None until the session's first assistant turn.
             "modelActual": sess.get("modelActual"),
+            # A model pick that arrived mid-turn, waiting for the first idle
+            # beat (_apply_pending_switches). The chip shows it as in-flight
+            # rather than looking like a dropped click. Absent when none.
+            "pendingModel": sess.get("pendingModel"),
             "permissionMode": sess.get("permissionMode"),
             # The permission modes this session's live Shift+Tab cycle can reach
             # (base modes + whichever optional it was launched into) — the hub's
@@ -8972,6 +9193,12 @@ class SessionManager:
                 self.models_info is None and beat % MODELS_RETRY_EVERY == 0)):
             self._start_models_probe()
         self._poll_models_probe()
+        # Apply model switches deferred while their session was mid-turn.
+        if not light:
+            try:
+                self._apply_pending_switches()
+            except Exception as e:
+                log(f"pending switch drain failed: {e}")
 
         payload = {
             # `device` (the physical host name) is the hub's identity key; agentId

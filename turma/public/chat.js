@@ -1123,24 +1123,50 @@
     return availableModelOpts().some((o) => o.value === m) ? m : "default";
   }
   // A just-picked model switch, held until the agent confirms it (modelActual
-  // moves) or it times out. Without this the chip would flash BACK to the old
-  // actual model for the beat or two between the optimistic paint and the
-  // confirmation landing — which reads as the switch not taking.
+  // moves), the heartbeat starts carrying the agent's own pendingModel, or it
+  // times out. Without this the chip would flash BACK to the old actual model
+  // for the beat or two between the optimistic paint and the confirmation
+  // landing — which reads as the switch not taking.
   let modelSwitchPending = null; // {value, prevActual, at}
   const MODEL_SWITCH_SETTLE_MS = 30000;
-  // What the model chip SAYS: the model actually answering (per the agent's
-  // transcript read) over the picked alias, which in turn beats a bare
-  // "Default" — the chip's old text, which told the operator nothing (XERK-33).
+  // What the model chip SAYS: a switch still in flight (the agent's deferred
+  // pendingModel, or our own just-clicked memo) with an ellipsis, else the
+  // model actually answering (per the agent's transcript read) over the picked
+  // alias, which in turn beats a bare "Default" — the chip's old text, which
+  // told the operator nothing (XERK-33).
   function modelChipLabel() {
     const actual = sess && sess.modelActual;
+    const pending = sess && sess.pendingModel;
+    if (pending) {
+      // The agent itself says the pick is waiting for an idle beat — that
+      // outranks (and retires) the click-time memo.
+      modelSwitchPending = null;
+      return optLabel(availableModelOpts(), String(pending).toLowerCase()) + "…";
+    }
     if (modelSwitchPending) {
       const settled = actual !== modelSwitchPending.prevActual ||
         Date.now() - modelSwitchPending.at > MODEL_SWITCH_SETTLE_MS;
-      if (!settled) return optLabel(availableModelOpts(), modelSwitchPending.value);
+      if (!settled) return optLabel(availableModelOpts(), modelSwitchPending.value) + "…";
       modelSwitchPending = null;
     }
     if (actual) return prettyModel(actual);
     return optLabel(availableModelOpts(), currentModelValue());
+  }
+  // The mode switch's counterpart memo: hold the picked mode until the
+  // heartbeat's permissionMode agrees (the agent reconciles it from the TUI's
+  // own footer marker, so agreement means the switch really landed) or the
+  // settle window passes (an unreachable mode legitimately never lands, and
+  // the chip goes back to the truth).
+  let modeSwitchPending = null; // {value, at}
+  const MODE_SWITCH_SETTLE_MS = 30000;
+  function modeChipValue() {
+    if (modeSwitchPending) {
+      const settled = (sess && sess.permissionMode === modeSwitchPending.value) ||
+        Date.now() - modeSwitchPending.at > MODE_SWITCH_SETTLE_MS;
+      if (!settled) return modeSwitchPending.value;
+      modeSwitchPending = null;
+    }
+    return currentModeValue();
   }
   function currentModeValue() {
     const m = (sess && sess.permissionMode) ? sess.permissionMode : "auto";
@@ -1252,11 +1278,12 @@
     const host = $("chatComposeOpts");
     if (!host) return;
     if (fromPoll && host.querySelector(".cc-menu.open")) return;
-    const mode = currentModeValue(), model = currentModelValue();
+    const mode = modeChipValue(), model = currentModelValue();
     const modeOpts = availableModeOpts();
     const mOpts = availableModelOpts();
     const mTitle = "Model for this session — switched live, session-only" +
-      (sess && sess.modelActual ? " (now: " + sess.modelActual + ")" : "");
+      (sess && sess.pendingModel ? " (switching after the current turn)"
+        : sess && sess.modelActual ? " (now: " + sess.modelActual + ")" : "");
     host.innerHTML =
       '<span class="cc-opt cc-mode">' +
         '<button class="cc-btn" id="ccModeBtn" title="Agent (permission) mode — switched live, best-effort">' +
@@ -1286,7 +1313,12 @@
   }
   async function setSessionMode(value) {
     if (!hostKey || !sessionId || !sess || value === currentModeValue()) return;
-    sess.permissionMode = value; // optimistic; heartbeat confirms
+    // The memo alone paints the picked mode — deliberately NOT written onto
+    // sess.permissionMode: the memo settles when the HEARTBEAT's mode agrees,
+    // and an optimistic local write would satisfy that test instantly, letting
+    // the next stale beat flash the old mode back (the exact flicker the memo
+    // exists to stop).
+    modeSwitchPending = { value, at: Date.now() };
     renderComposeOpts();
     try {
       await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/mode", {
@@ -1578,7 +1610,7 @@
     hostKey = hk; sessionId = id; sess = s; agent = a;
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; reveal.shown = 0; revealFull = ""; backoffIdx = 0;
     stopPendingAt = 0; actionFailUntil = 0; // the compose button starts at Send
-    modelSwitchPending = null;
+    modelSwitchPending = null; modeSwitchPending = null;
     lastHtml = null; repaintDeferred = false; // this session's paint memo starts empty
     stickBottom = true; // land at the tail on open, past the seed→history race
     noExpand = false;
@@ -1606,7 +1638,7 @@
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
-    stopPendingAt = 0; actionFailUntil = 0; modelSwitchPending = null;
+    stopPendingAt = 0; actionFailUntil = 0; modelSwitchPending = null; modeSwitchPending = null;
     lastHtml = null; repaintDeferred = false;
     updateLiveStatus(); // hide the pinned bar when the view closes
   }
@@ -1654,6 +1686,11 @@
       __applyTurn: (t) => { applyTurn(t); },
       __setLiveStatus: (st) => { liveStatus = st; },
       __stopPending: (t) => { stopPendingAt = t; },
+      modelChipLabel, modeChipValue,
+      __setSess: (s) => { sess = s; },
+      __setAgent: (a) => { agent = a; },
+      __setModelSwitchPending: (p) => { modelSwitchPending = p; },
+      __setModeSwitchPending: (p) => { modeSwitchPending = p; },
       __setQuestionActive: (v) => { questionActive = v; },
       __setVerbosity: (v) => { verbosity = v; },
       __setNoExpand: (v) => { noExpand = v; },

@@ -257,13 +257,36 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     ("use this session only") — instead of typing `/model <name>`: the argument form ALSO saves the
     pick as the login-wide default for new sessions, and every session on a host shares that one
     login, so switching one session silently changed what "Default" meant everywhere.
+  - The arrows go **one press at a time, each verified by re-reading the ❯** before the next
+    (`_await_picker_step`): a burst of `abs(target-cur)` presses trusted every key to land exactly
+    once, and a dropped/doubled key put the cursor one row off — `s` then silently selected the
+    WRONG model. The record updates only on the TUI's own "Set model to…" confirmation
+    (`_await_model_confirmation`); unconfirmed, it keeps the old value and `modelActual` settles
+    what the chip shows.
   - Gated on a **fresh** pane-busy read (unlike `interrupt`, this types into the pane, and typed
-    mid-turn the command would only queue as a prompt); refused log-only when busy.
+    mid-turn the command would only queue as a prompt) — but a busy pane **defers, never drops**:
+    the pick lands as `sess["pendingModel"]` (persisted, heartbeated so the chip shows it
+    in-flight) and `_apply_pending_switches` applies it on the first idle beat, re-deferring if a
+    new turn started. The old log-only refusal is what made the button feel dead.
   - Backs out with Escape when the picker doesn't appear or has no row for the target (the
-    bracketed `[1m]` aliases have none). Either way the transcript's own confirmation — not the
-    stored intent — is what the chip renders, via `modelActual` below.
+    bracketed `[1m]` aliases have none).
   - Validation is `resolve_model` against the static aliases plus the probed available list.
-  - Tests: `TestSetModelMode`, `TestParseModelPicker` in `agent/tests/test_hub_agent.py`.
+  - Tests: `TestSetModelMode` (driven against the `_PickerPane` simulator, including the
+    dropped-key and defer cases), `TestParseModelPicker` in `agent/tests/test_hub_agent.py`.
+- `setMode` — switch a running session's permission mode live, as a **closed loop**: press
+  Shift+Tab, read the footer's mode marker back (`parse_pane_mode`), repeat until the target reads
+  back or the cycle wraps to its start (target not in THIS session's cycle — a logged no-op).
+  - It used to compute a press count against `perm_cycle_for`'s guessed cycle, but the REAL cycle
+    is account- AND model-dependent (auto joins it when the account enables it — observed even on a
+    bypass-launched session, where the guess says it's absent — and drops out for models that can't
+    do auto), and the record's "current" goes stale the moment the operator cycles by hand in the
+    terminal. Every one of those made a computed count land on the wrong mode. The blind math
+    survives only as `_set_mode_blind`, the fallback for a marker the parser can't read.
+  - **What is stored is always what was read**, so the record can't lie about the mode.
+  - No busy gate, deliberately: BTab types nothing into the input line and the TUI cycles modes
+    mid-generation (verified live), marker visible throughout.
+  - Tests: the set_mode closed-loop cases in `TestSetModelMode` (the `_ModePane` simulator),
+    `TestParsePaneMode`.
 - `clone` — see "GitHub block and cloning" below.
 - `refreshJira` — the /board page's manual refresh: re-poll Jira now instead of waiting out the slow
   `JIRA_REFRESH_EVERY` cadence. Re-checks `jira_configured()`, so an unconfigured host stays at zero
@@ -348,6 +371,16 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     the hub's turn-finished alert) gets the fix with no client-render change. The live-footer scrape
     guards its own copy of this with a one-poll hold (`liveTurnDecision` in `tunnel-agent.js`; see the
     Live working footer bullet). Tests: `TestStablePaneBusy` in `agent/tests/test_hub_agent.py`.
+- `modeActual` — the permission mode the TUI is REALLY in, read off the footer's mode marker
+  ("⏸ manual mode on" / "⏵⏵ accept edits on" / "⏸ plan mode on" / "⏵⏵ auto mode on" /
+  "⏵⏵ bypass permissions on"; glyph-anchored so quoted conversation text can't match —
+  `parse_pane_mode`, read beside the stable busy in `_pane_status`).
+  - `_session_payload` **reconciles the stored `permissionMode` to it** each beat: the operator can
+    cycle modes by hand in the live terminal, which no command ever reports, and the stale record
+    is what used to make the next computed switch land wrong. It also feeds `setMode`'s closed loop
+    (see Commands).
+  - Tests: `TestParsePaneMode`, the modeActual cases in `TestSessionReportPaneBusy` and
+    `TestModelActualPayload`.
 - **Transcript freshness** — now the fallback, not the primary signal.
 - **Pending questions** — a pending `AskUserQuestion` is surfaced by the `agent/hooks/ask.py`
   PreToolUse bridge (see the Safety guard note under Conventions), which drops a
@@ -1645,7 +1678,10 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   - a just-picked switch holds its optimistic label until the agent confirms or
     `MODEL_SWITCH_SETTLE_MS` passes (`modelSwitchPending`) — without it the chip flashes back to
     the old model for the beat or two before the confirmation lands, which reads as a failed
-    switch;
+    switch. A pick the agent DEFERRED (mid-turn — heartbeated as `session.pendingModel`) outranks
+    the memo and renders with an ellipsis ("Sonnet…") until it lands; the mode chip has the same
+    memo (`modeChipValue`/`modeSwitchPending`), retired when the heartbeat's `permissionMode`
+    agrees (the agent reconciles that from the pane, so agreement means the switch really landed);
   - `onPoll` carries the fresh host payload so the menu tracks the probe, and the dashboard
     composer offers the same probed list (`modelChoices` in `index.html`, remembered-pick kept like
     the base-branch select).
