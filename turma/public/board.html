@@ -14,7 +14,7 @@
 </head>
 <body>
 <header class="site-header" id="siteHeader" data-page="board"
-        data-sub="Jira board · assigned tickets across orgs"></header>
+        data-sub="Ticket board · assigned tickets across orgs"></header>
 <div class="wrap">
   <div class="board-bar">
     <div class="org-chips" id="chips"></div>
@@ -27,7 +27,7 @@
   <div class="td-backdrop" id="detailBackdrop" hidden>
     <div class="td-panel" id="detailPanel" role="dialog" aria-modal="true" aria-label="Ticket detail"></div>
   </div>
-  <div class="footer">Each host agent polls its org's Jira Cloud with user-scoped creds (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code> in the agent's env) for tickets assigned to that user — active work plus the last two weeks of Done — and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow Jira's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. Pull-only: nothing here writes to Jira.</div>
+  <div class="footer">Each host agent polls its org's tracker — Jira Cloud (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code>) or a self-hosted/cloud Azure DevOps board (<code>AZDO_URL</code> / <code>AZDO_TOKEN</code>) in the agent's env — for tickets assigned to that user, active work plus the last two weeks of Done, and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow the tracker's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. Pull-only: nothing here writes back to the tracker.</div>
 </div>
 
 <nav class="bottom-nav" id="bottomNav"></nav>
@@ -112,7 +112,7 @@ function render(data) {
   consumeDeepLink();
   if (!sites.length) {
     $chips.replaceChildren();
-    $board.innerHTML = `<div class="empty">No Jira tickets reported yet. Set <code>JIRA_SITE</code>, <code>JIRA_EMAIL</code>, and <code>JIRA_TOKEN</code> in an agent's environment to connect its org.</div>`;
+    $board.innerHTML = `<div class="empty">No tickets reported yet. Connect an org by setting <code>JIRA_SITE</code>/<code>JIRA_EMAIL</code>/<code>JIRA_TOKEN</code> (Jira) or <code>AZDO_URL</code>/<code>AZDO_TOKEN</code> (Azure DevOps) in an agent's environment.</div>`;
     return;
   }
   const allKeys = lastAllKeys;

@@ -6949,6 +6949,325 @@ class TestFetchJiraIssue(unittest.TestCase):
         self.assertEqual(d["url"], "https://myorg.atlassian.net/browse/ENG-42")
 
 
+# --- Azure DevOps (XERK-43) ----------------------------------------------------
+
+class TestNormalizeAzureSite(unittest.TestCase):
+    """Every way an operator writes AZDO_URL collapses to one siteKey that KEEPS
+    the org/collection path (unlike the Jira host-only key)."""
+
+    def test_cloud_and_server_variants(self):
+        cases = {
+            "https://dev.azure.com/MyOrg": "dev.azure.com/myorg",
+            "https://dev.azure.com/MyOrg/": "dev.azure.com/myorg",
+            "dev.azure.com/MyOrg": "dev.azure.com/myorg",
+            "https://user@dev.azure.com/MyOrg": "dev.azure.com/myorg",
+            "https://dev.azure.com/MyOrg/_apis/wit/wiql": "dev.azure.com/myorg",
+            "https://tfs.co:8080/tfs/DefaultCollection":
+                "tfs.co:8080/tfs/defaultcollection",
+            "https://tfs.co/DefaultCollection/_apis/wit/wiql":
+                "tfs.co/defaultcollection",
+        }
+        for raw, want in cases.items():
+            self.assertEqual(ha.normalize_azure_site(raw), want, raw)
+
+    def test_empty(self):
+        self.assertEqual(ha.normalize_azure_site(""), "")
+        self.assertEqual(ha.normalize_azure_site(None), "")
+
+
+class TestAzureBase(unittest.TestCase):
+    """AZDO_URL -> the scheme-qualified API/link base, trimmed of any pasted tail."""
+
+    def test_defaults_https_and_trims(self):
+        with mock.patch.object(ha, "AZDO_URL", "dev.azure.com/org"):
+            self.assertEqual(ha.azure_base(), "https://dev.azure.com/org")
+        # The REST/board tail is trimmed; any project segment before it is kept
+        # (AZDO_URL is documented as the org/collection base, not a deep link).
+        with mock.patch.object(ha, "AZDO_URL",
+                               "https://tfs.co/Collection/_workitems/edit/9/"):
+            self.assertEqual(ha.azure_base(), "https://tfs.co/Collection")
+        with mock.patch.object(ha, "AZDO_URL", ""):
+            self.assertEqual(ha.azure_base(), "")
+
+
+def _azure_wi(wid, state, wtype="Bug", project="Proj", title=None, **fields):
+    f = {
+        "System.Id": wid,
+        "System.Title": title if title is not None else f"WI {wid}",
+        "System.State": state,
+        "System.WorkItemType": wtype,
+        "System.TeamProject": project,
+        "System.ChangedDate": "2026-07-16T00:00:00Z",
+        "System.CreatedDate": "2026-07-01T00:00:00Z",
+    }
+    f.update(fields)
+    return {"id": wid, "fields": f}
+
+
+class TestShapeAzureItem(unittest.TestCase):
+    """A raw work item -> the SAME wire ticket shape Jira's _shape_issue makes."""
+
+    def test_full_item(self):
+        wi = _azure_wi(1234, "Active", wtype="User Story", project="Payments",
+                       title="Fix checkout",
+                       **{"Microsoft.VSTS.Common.Priority": 2,
+                          "System.Tags": "infra; urgent",
+                          "System.Parent": 900,
+                          "Microsoft.VSTS.Scheduling.DueDate": "2026-08-01T00:00:00Z"})
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}):
+            t = ha._shape_azure_item(wi, "dev.azure.com/org", "https://dev.azure.com/org")
+        self.assertEqual(t["key"], "1234")
+        self.assertEqual(t["url"],
+                         "https://dev.azure.com/org/Payments/_workitems/edit/1234")
+        self.assertEqual(t["summary"], "Fix checkout")
+        self.assertEqual(t["status"], "Active")
+        self.assertEqual(t["statusCategory"], "inprogress")
+        self.assertEqual(t["priority"], "P2")
+        self.assertEqual(t["type"], "User Story")
+        self.assertEqual(t["project"], "Payments")
+        self.assertEqual(t["projectName"], "Payments")
+        self.assertEqual(t["labels"], ["infra", "urgent"])
+        self.assertEqual(t["dueDate"], "2026-08-01T00:00:00Z")
+        self.assertEqual(t["parentKey"], "900")
+
+    def test_missing_optionals_degrade(self):
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}):
+            t = ha._shape_azure_item(_azure_wi(7, "New"), "s", "https://s")
+        self.assertIsNone(t["priority"])
+        self.assertIsNone(t["dueDate"])
+        self.assertIsNone(t["parentKey"])
+        self.assertEqual(t["labels"], [])
+        self.assertEqual(t["statusCategory"], "todo")
+
+    def test_url_without_project(self):
+        wi = _azure_wi(5, "Active", project=None)
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}):
+            t = ha._shape_azure_item(wi, "s", "https://s")
+        self.assertEqual(t["url"], "https://s/_workitems/edit/5")
+
+
+class TestAzureCategory(unittest.TestCase):
+    """Azure state -> board column: the per-type states API when reachable (custom
+    processes), else the static name map, else todo."""
+
+    def test_states_api_metastate_wins(self):
+        def fake_req(path, params, body=None):
+            self.assertTrue(path.endswith("/states"))
+            return {"value": [{"name": "Peer Review", "stateCategory": "InProgress"},
+                              {"name": "Shipped", "stateCategory": "Completed"}]}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", fake_req):
+            self.assertEqual(ha._azure_category("s", "P", "Bug", "Peer Review"),
+                             "inprogress")
+            self.assertEqual(ha._azure_category("s", "P", "Bug", "Shipped"), "done")
+
+    def test_name_map_fallback_when_api_fails(self):
+        def boom(*a, **k):
+            raise RuntimeError("403")
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", boom):
+            self.assertEqual(ha._azure_category("s", "P", "Bug", "Active"), "inprogress")
+            self.assertEqual(ha._azure_category("s", "P", "Bug", "Closed"), "done")
+            self.assertEqual(ha._azure_category("s", "P", "Bug", "New"), "todo")
+            # Genuinely unknown state -> todo, the safe default.
+            self.assertEqual(ha._azure_category("s", "P", "Bug", "Wibble"), "todo")
+
+    def test_state_map_is_cached_per_type(self):
+        calls = []
+
+        def fake_req(path, params, body=None):
+            calls.append(path)
+            return {"value": [{"name": "Active", "stateCategory": "InProgress"}]}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", fake_req):
+            ha._azure_category("s", "P", "Bug", "Active")
+            ha._azure_category("s", "P", "Bug", "Active")
+        self.assertEqual(len(calls), 1)   # second lookup hits the cache
+
+
+class TestCollectAzure(unittest.TestCase):
+    def _configured(self):
+        return mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/MyOrg",
+                                   AZDO_TOKEN="pat", AZDO_PROJECT="", AZDO_USER="")
+
+    def test_unconfigured_full_schema_no_http(self):
+        with mock.patch.object(ha, "AZDO_URL", ""), \
+             mock.patch.object(ha, "AZDO_TOKEN", ""), \
+             mock.patch.object(ha, "azure_req") as req:
+            block = ha.collect_azure()
+        req.assert_not_called()
+        self.assertFalse(block["configured"])
+        self.assertFalse(block["available"])
+        self.assertEqual(block["source"], "azure")
+        self.assertEqual(block["tickets"], [])
+
+    def _fake_req(self, items):
+        def req(path, params, body=None):
+            if path == "/_apis/wit/wiql":
+                self.assertIsNotNone(body)      # WIQL is a POST
+                self.assertIn("@Me", body["query"])
+                return {"workItems": [{"id": i["id"]} for i in items]}
+            if path == "/_apis/wit/workitems":
+                self.assertIn("errorPolicy", params)
+                want = set(params["ids"].split(","))
+                return {"value": [i for i in items if str(i["id"]) in want]}
+            if path.endswith("/states"):
+                return {"value": []}            # force the name-map path
+            raise AssertionError(path)
+        return req
+
+    def test_buckets_active_and_recent_done_like_jira(self):
+        items = [
+            _azure_wi(1, "Active"),
+            _azure_wi(2, "Closed", **{"System.ChangedDate": "2099-01-01T00:00:00Z"}),
+            _azure_wi(3, "Closed", **{"System.ChangedDate": "2000-01-01T00:00:00Z"}),
+            _azure_wi(4, "New"),
+        ]
+        with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", self._fake_req(items)):
+            block = ha.collect_azure()
+        self.assertTrue(block["available"])
+        self.assertEqual(block["source"], "azure")
+        self.assertEqual(block["siteKey"], "dev.azure.com/myorg")
+        self.assertEqual(block["user"], "myorg")   # AZDO_USER unset -> org segment
+        keys = [t["key"] for t in block["tickets"]]
+        self.assertIn("1", keys)          # active
+        self.assertIn("4", keys)          # active
+        self.assertIn("2", keys)          # recent done kept
+        self.assertNotIn("3", keys)       # done older than the window dropped
+
+    def test_project_scope_added_to_wiql(self):
+        seen = {}
+
+        def req(path, params, body=None):
+            if path == "/_apis/wit/wiql":
+                seen["q"] = body["query"]
+                return {"workItems": []}
+            return {"value": []}
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_PROJECT="My Proj", AZDO_USER=""), \
+             mock.patch.object(ha, "azure_req", req):
+            ha.collect_azure()
+        self.assertIn("[System.TeamProject] = 'My Proj'", seen["q"])
+
+    def test_truncated_when_capped(self):
+        items = [_azure_wi(i, "Active") for i in range(5)]
+        with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "AZDO_MAX_IDS", 2), \
+             mock.patch.object(ha, "azure_req", self._fake_req(items)):
+            block = ha.collect_azure()
+        self.assertTrue(block["truncated"])
+        self.assertEqual(len(block["tickets"]), 2)
+
+
+class TestAzureHtmlToText(unittest.TestCase):
+    def test_blocks_lists_links_entities(self):
+        html = ('<p>Hello <b>world</b></p><ul><li>one</li><li>two</li></ul>'
+                '<div>see <a href="http://x.io/p">here</a> &amp; there</div>')
+        out = ha.azure_html_to_text(html)
+        self.assertIn("Hello world", out)
+        self.assertIn("- one", out)
+        self.assertIn("- two", out)
+        self.assertIn("here (http://x.io/p)", out)
+        self.assertIn("& there", out)
+
+    def test_plain_string_passes_through(self):
+        self.assertEqual(ha.azure_html_to_text("just text"), "just text")
+
+    def test_empty_and_none(self):
+        self.assertEqual(ha.azure_html_to_text(""), "")
+        self.assertEqual(ha.azure_html_to_text(None), "")
+
+    def test_plain_truncates(self):
+        text, trunc = ha.azure_plain("<p>" + "x" * 50 + "</p>", 10)
+        self.assertTrue(trunc)
+        self.assertLessEqual(len(text), 10)
+
+
+class TestFetchAzureIssue(unittest.TestCase):
+    def test_detail_shape_with_comments(self):
+        def req(path, params, body=None):
+            if path == "/_apis/wit/workitems/42":
+                self.assertEqual(params.get("$expand"), "all")
+                return _azure_wi(42, "Active", title="Detail",
+                                 **{"System.Description": "<p>full <b>desc</b></p>",
+                                    "System.Reason": "Investigation complete",
+                                    "System.CreatedBy": {"displayName": "Ada"},
+                                    "System.AssignedTo": {"displayName": "Grace"}})
+            if path.endswith("/comments"):
+                self.assertIn("preview", params["api-version"])
+                return {"totalCount": 2, "comments": [
+                    {"id": 1, "text": "<p>older</p>", "createdDate": "2026-07-01T00:00:00Z",
+                     "createdBy": {"displayName": "Ada"}},
+                    {"id": 2, "text": "<p>newer</p>", "createdDate": "2026-07-05T00:00:00Z",
+                     "createdBy": {"displayName": "Grace"}},
+                ]}
+            raise AssertionError(path)
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                 AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            d = ha.fetch_azure_issue("42")
+        self.assertEqual(d["key"], "42")
+        self.assertIn("full desc", d["description"])
+        self.assertEqual(d["reporter"], "Ada")
+        self.assertEqual(d["assignee"], "Grace")
+        self.assertEqual(d["resolution"], "Investigation complete")
+        self.assertEqual(d["commentTotal"], 2)
+        self.assertEqual([c["body"] for c in d["comments"]], ["older", "newer"])
+
+    def test_comments_failure_degrades_to_none(self):
+        def req(path, params, body=None):
+            if path == "/_apis/wit/workitems/42":
+                return _azure_wi(42, "Active", **{"System.Description": "<p>x</p>"})
+            raise RuntimeError("comments 404")
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                 AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            d = ha.fetch_azure_issue("42")
+        self.assertEqual(d["comments"], [])
+        self.assertEqual(d["commentTotal"], 0)
+
+
+class TestBoardSourceDispatch(unittest.TestCase):
+    """The shims that pick the one configured source; azure wins if both set."""
+
+    def test_source_and_configured(self):
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="", AZDO_TOKEN=""):
+            self.assertIsNone(ha.board_source())
+            self.assertFalse(ha.board_configured())
+        with mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e",
+                                 JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN=""):
+            self.assertEqual(ha.board_source(), "jira")
+            self.assertTrue(ha.board_configured())
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"):
+            self.assertEqual(ha.board_source(), "azure")
+            self.assertEqual(ha.board_site_key(), "dev.azure.com/o")
+
+    def test_valid_issue_key_is_source_aware(self):
+        with mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e",
+                                 JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN=""):
+            self.assertTrue(ha.valid_issue_key("PROJ-7"))
+            self.assertFalse(ha.valid_issue_key("1234"))   # numeric isn't a Jira key
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"):
+            self.assertTrue(ha.valid_issue_key("1234"))
+            self.assertFalse(ha.valid_issue_key("PROJ-7"))  # keys aren't Azure ids
+
+    def test_ticket_branch_base(self):
+        with mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e",
+                                 JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN=""):
+            self.assertEqual(ha.ticket_branch_base("PROJ-7", {}), "PROJ-7")
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"):
+            self.assertEqual(ha.ticket_branch_base("1234", {"project": "My Proj"}),
+                             "My-Proj-1234")
+            self.assertEqual(ha.ticket_branch_base("1234", {}), "wi-1234")
+
+
 class TestStageJiraIssue(ManagerMixin, unittest.TestCase):
     """The {type:"jiraIssue"} command: every path stages a result (the board is
     waiting on this key) and none of them raises out of the heartbeat loop."""
@@ -6988,7 +7307,7 @@ class TestStageJiraIssue(ManagerMixin, unittest.TestCase):
         f.assert_not_called()
         self.assertEqual(len(sm.jira_issue_results), len(bad))
         for r in sm.jira_issue_results:
-            self.assertEqual(r["error"], "not a Jira issue key")
+            self.assertEqual(r["error"], "not a valid issue key")
 
     def test_unconfigured_host_says_so_without_fetching(self):
         sm = self.make_manager()
@@ -6996,7 +7315,7 @@ class TestStageJiraIssue(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha, "fetch_jira_issue") as f:
             sm._stage_jira_issue("ENG-42")
         f.assert_not_called()
-        self.assertIn("no Jira credentials", sm.jira_issue_results[0]["error"])
+        self.assertIn("no board credentials", sm.jira_issue_results[0]["error"])
 
     def test_command_routes_and_acks(self):
         sm = self.make_manager()
@@ -8216,6 +8535,40 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         self.assertEqual(words[-1], ha.build_ticket_prompt(detail))
         # ...so nothing the ticket carried ever became a word of its own.
         self.assertNotIn("touch", words)
+
+    def test_spawns_an_azure_work_item(self):
+        """An Azure host spawns a numeric-id work item through the SAME path,
+        with a project-prefixed branch and Azure-worded prompt (XERK-43)."""
+        site = "dev.azure.com/org"
+        repos = [{"name": "Turma", "path": os.path.join(self.tmp, "Turma")}]
+        sm = self.make_manager()
+        for name, value in [("scan_repos", lambda: repos),
+                            ("JIRA_SITE", ""), ("JIRA_EMAIL", ""), ("JIRA_TOKEN", ""),
+                            ("AZDO_URL", "https://dev.azure.com/org"),
+                            ("AZDO_TOKEN", "pat")]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        sm.triage_ledger[ha._triage_key(site, "1234")] = {
+            "decided": True, "repo": "Turma", "cloned": True, "reason": "x"}
+        sm._launch_ttyd = mock.Mock()
+        detail = {"key": "1234", "summary": "Fix checkout",
+                  "url": "https://dev.azure.com/org/Proj/_workitems/edit/1234",
+                  "project": "Proj", "projectName": "Proj",
+                  "description": "broken", "comments": []}
+        with mock.patch.object(ha, "fetch_azure_issue", lambda k: detail):
+            sm.spawn_ticket("1234", cmd_id="a1")
+        self.assertEqual(len(sm.registry), 1)
+        sess = sm.registry[0]
+        self.assertEqual(sess["repo"], "Turma")
+        self.assertEqual(sess["ticket"], {
+            "key": "1234", "siteKey": site, "url": detail["url"],
+            "summary": "Fix checkout", "branch": "Proj-1234",
+            "branchBase": "Proj-1234",
+        })
+        cmd = self._launches()[-1][-1]
+        self.assertIn("Work Azure DevOps work item #1234", cmd)
+        self.assertIn("Name the branch you create for it exactly: Proj-1234", cmd)
 
 
 class TestUpdatingAnnounce(ManagerMixin, unittest.TestCase):

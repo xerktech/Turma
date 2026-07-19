@@ -505,6 +505,46 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Tests: `agent/tests/test_hub_agent.py` (`TestAdfText`, `TestShapeIssueDetail`, `TestFetchJiraIssue`,
   `TestStageJiraIssue`).
 
+### Azure DevOps block (XERK-43) — the board's second source
+
+- **The board is source-agnostic; Azure DevOps is a drop-in second source that emits the SAME wire
+  contract as Jira.** With a PAT in the env (`AZDO_URL` + `AZDO_TOKEN`, optional
+  `AZDO_PROJECT`/`AZDO_USER`/`AZDO_API_VERSION`) the agent polls the work items assigned to that PAT's
+  owner and reports them in the very same `jira` heartbeat block, ticket shape and detail shape — so
+  the hub, `board.js`, `index.html`, and the Android/glasses clients render an Azure org exactly like a
+  Jira one with (almost) no changes on their side. `source:"jira"|"azure"` rides the block for the few
+  places that vary UI copy.
+- **An agent serves exactly ONE org**, so a host is a Jira host or an Azure host, never both.
+  `board_source()`/`board_configured()`/`collect_board()`/`fetch_board_issue()`/`board_site_key()`/
+  `valid_issue_key()` are the source-dispatch shims that replaced the bare `jira_configured()` gates;
+  everything downstream (triage, `spawn_ticket`, `set_jira_repo`, the heartbeat block, PR/session
+  machinery) is source-agnostic and reads `self.jira` unchanged.
+- **Self-hosted is the point.** `AZDO_URL` is any base — `https://tfs.company.com/DefaultCollection`
+  (Azure DevOps Server / TFS) or `https://dev.azure.com/org` (Services) — the same REST surface. PAT
+  auth is Basic with an empty username (`:PAT`). Read-only: only WIQL search + work-item GET.
+- **siteKey keeps the org/collection PATH** (`normalize_azure_site` → `dev.azure.com/myorg`), unlike
+  the Jira host-only key, because the host alone would merge every unrelated cloud org into one board.
+  It's percent-encoded into the `/api/jira/<siteKey>/...` routes (client `encodeURIComponent`, hub
+  `decodeURIComponent`), so a slash in the key is transparent. `board.js`/`Board.kt` `orgName` now
+  takes the last path segment for a slashed key (org display), else strips `.atlassian.net`.
+- **Work-item ids are bare integers**, so `AZDO_KEY_RE`/`valid_issue_key` and the hub's `isIssueKey`
+  accept `^[0-9]+$` alongside Jira's `PROJECT-123`. Ticket sessions get a human-scannable branch base
+  `<project>-<id>` (`ticket_branch_base`), not a bare number.
+- **State → column.** Azure's per-type state metadata (`stateCategory` metastate) is read from the
+  states API when reachable (`_azure_state_map`, cached per project+type — handles custom processes),
+  falling back to a static name map, then `todo` — mapping to the board's todo/inprogress/done exactly
+  as Jira's `statusCategory` does. The raw state name still rides as `status`, so the board's In Review
+  column (name-matched) catches Azure review states unchanged.
+- **HTML, not ADF.** `collect_azure` (WIQL → batch work-items GET) and `fetch_azure_issue` (work item
+  `$expand=all` + the comments endpoint) mirror `collect_jira`/`fetch_jira_issue`; the ADF flattener's
+  counterpart is `azure_html_to_text`/`azure_plain` (a stdlib `HTMLParser` pass). A comments-endpoint
+  failure degrades to no comments rather than losing the detail.
+- Tests: `agent/tests/test_hub_agent.py` (`TestNormalizeAzureSite`, `TestAzureBase`, `TestCollectAzure`,
+  `TestShapeAzureItem`, `TestAzureCategory`, `TestAzureHtmlToText`, `TestFetchAzureIssue`,
+  `TestBoardSourceDispatch`, plus the Azure cases in `TestSpawnTicket`); the numeric-issue-key cases in
+  `turma/tests/server.test.js`; the `orgName` Azure cases in `turma/tests/board.test.js` and
+  `android/.../BoardTest.kt`.
+
 ### Jira repo triage (`repoGuess`)
 
 - Each heartbeated ticket carries an optional **`repoGuess`** — which repo that ticket's work belongs

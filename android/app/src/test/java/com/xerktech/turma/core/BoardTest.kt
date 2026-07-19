@@ -90,6 +90,11 @@ class BoardTest {
         assertEquals("self-hosted.example.com", orgName("self-hosted.example.com"))
     }
 
+    @Test fun `org name takes the last path segment for azure devops`() {
+        assertEquals("myorg", orgName("dev.azure.com/myorg"))
+        assertEquals("defaultcollection", orgName("tfs.company.com/tfs/defaultcollection"))
+    }
+
     private fun site(key: String) = BoardSite(
         siteKey = key, site = key, online = true, error = null, fetchedAt = "", tickets = emptyList(),
     )

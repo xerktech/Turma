@@ -41,6 +41,7 @@ stdlib only — no pip installs in the image.
 
 import base64
 import datetime
+import html
 import json
 import os
 import re
@@ -58,6 +59,7 @@ import urllib.request
 import uuid
 import zlib
 from collections import deque
+from html.parser import HTMLParser
 
 # Set by a SIGUSR1 handler (installed in run_forever). tunnel-agent.js sends
 # SIGUSR1 when the hub pokes it over the control channel because a command was
@@ -3211,9 +3213,9 @@ JIRA_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
 # unconfigured one on every other field — both are available=False/siteKey=None
 # — so this is the only thing that lets the hub aim a manual refresh at the
 # configured-but-failing host that most needs the retry.
-JIRA_EMPTY = {"available": False, "configured": False, "site": None,
-              "siteKey": None, "user": None, "fetchedAt": None, "error": None,
-              "truncated": False, "tickets": []}
+JIRA_EMPTY = {"available": False, "configured": False, "source": "jira",
+              "site": None, "siteKey": None, "user": None, "fetchedAt": None,
+              "error": None, "truncated": False, "tickets": []}
 
 # fields.status.statusCategory.key is one of Jira's three fixed, cross-org
 # categories — the only workflow facet guaranteed to unify orgs with different
@@ -3341,6 +3343,7 @@ def collect_jira():
     return {
         "available": True,
         "configured": True,
+        "source": "jira",
         "site": site_key,
         "siteKey": site_key,
         "user": JIRA_EMAIL,
@@ -3486,6 +3489,474 @@ def fetch_jira_issue(key):
     return _shape_issue_detail(data, site_key)
 
 
+# --- Azure DevOps work-item polling --------------------------------------------
+# Optional second board source (XERK-43): with a PAT in the env (AZDO_URL +
+# AZDO_TOKEN) the agent polls the work items assigned to that PAT's owner and
+# reports them in the SAME heartbeat block, ticket shape and detail shape as Jira
+# — so the hub, the board, and every downstream client render an Azure DevOps
+# org exactly like a Jira one with zero changes on their side. An agent serves
+# exactly ONE org (one board's creds), so a host is either a Jira host or an
+# Azure host, never both; `board_source()` picks which collector runs.
+#
+# Self-hosted is the point (AZDO_URL is any base — `https://tfs.company.com/
+# DefaultCollection`), and Azure DevOps Services (`https://dev.azure.com/org`)
+# is the same REST surface, so both work off the one base URL. Read-only by
+# construction — the only endpoints called are WIQL search and work-item GET.
+AZDO_URL = os.environ.get("AZDO_URL", "").strip()
+AZDO_TOKEN = os.environ.get("AZDO_TOKEN", "").strip()
+# Optional: scope the poll to one project (else org-wide, every project the PAT
+# can see). Display-only creds for the board's `user` merge field; the poll uses
+# the PAT's own identity via WIQL's @Me, so no email/username is ever required.
+AZDO_PROJECT = os.environ.get("AZDO_PROJECT", "").strip()
+AZDO_USER = os.environ.get("AZDO_USER", "").strip()
+# Self-hosted servers trail cloud on api-version; 6.0 is supported by Azure
+# DevOps Server 2019+ and Services alike. Override for an older TFS (4.1/5.0).
+AZDO_API_VERSION = os.environ.get("AZDO_API_VERSION", "").strip() or "6.0"
+AZDO_MAX_IDS = 300      # most-recently-changed assigned items pulled before bucketing
+AZDO_BATCH = 200        # ids per work-items GET (the API's own hard cap)
+
+# Azure exposes a work item's cross-process "state category" (metastate) the same
+# way Jira exposes statusCategory — the one facet that unifies orgs with custom
+# state names. We read it from the work-item-type states API when reachable and
+# fall back to a name map for older/locked-down servers. Both collapse to the
+# board's three columns.
+_AZDO_META_CATEGORY = {
+    "proposed": "todo",
+    "inprogress": "inprogress",
+    "resolved": "inprogress",
+    "completed": "done",
+    "removed": "done",
+}
+_AZDO_STATE_CATEGORY = {
+    "new": "todo", "to do": "todo", "approved": "todo", "proposed": "todo",
+    "open": "todo", "backlog": "todo", "design": "todo",
+    "active": "inprogress", "committed": "inprogress", "in progress": "inprogress",
+    "doing": "inprogress", "resolved": "inprogress", "in review": "inprogress",
+    "code review": "inprogress", "testing": "inprogress", "ready": "inprogress",
+    "done": "done", "closed": "done", "completed": "done", "removed": "done",
+}
+# (siteKey, project, workItemType) -> {state_name_lower: column}. Populated
+# lazily from the states API, so a settled poll costs one cached lookup.
+_AZDO_STATE_CACHE = {}
+
+# Work item ids are bare integers, so the JIRA_KEY_RE grammar (PROJECT-123) would
+# reject every one. This is the allowlist gate before an id reaches a REST path.
+AZDO_KEY_RE = re.compile(r"^[0-9]+$")
+
+AZDO_EMPTY = {"available": False, "configured": False, "source": "azure",
+              "site": None, "siteKey": None, "user": None, "fetchedAt": None,
+              "error": None, "truncated": False, "tickets": []}
+
+
+def azure_configured():
+    return bool(AZDO_URL and AZDO_TOKEN)
+
+
+def azure_empty():
+    """The off/never-polled Azure block, stamped with whether creds are present —
+    the counterpart of jira_empty(), same full-schema contract."""
+    block = dict(AZDO_EMPTY)
+    block["configured"] = azure_configured()
+    return block
+
+
+def azure_base():
+    """AZDO_URL -> the API/link base: a scheme-qualified, trailing-slash-free
+    org/collection URL. A pasted deep link (`.../_workitems/...`, `.../_apis/...`)
+    is trimmed back to the collection root so links and REST paths rebuild cleanly."""
+    b = (AZDO_URL or "").strip()
+    if not b:
+        return ""
+    if not re.match(r"^[a-zA-Z][\w.+-]*://", b):
+        b = "https://" + b
+    b = b.rstrip("/")
+    # Trim anything from a pasted board/REST URL back to the collection root.
+    b = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", b, 1)[0]
+    return b.rstrip("/")
+
+
+def normalize_azure_site(url):
+    """An Azure DevOps base URL -> the cross-host `siteKey` the hub dedupes on:
+    the bare lowercase host (with port) plus the org/collection path, no scheme or
+    creds. `https://dev.azure.com/MyOrg/` -> `dev.azure.com/myorg`;
+    `https://tfs.co:8080/tfs/DefaultCollection` -> `tfs.co:8080/tfs/defaultcollection`.
+    Unlike the Jira siteKey this keeps the path — that org/collection segment IS
+    the org identity, and the host alone (`dev.azure.com`) would merge every
+    unrelated cloud org into one board."""
+    r = (url or "").strip()
+    r = re.sub(r"^[a-zA-Z][\w.+-]*://", "", r)   # scheme
+    r = re.sub(r"^[^/@]+@", "", r)               # credentials
+    r = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", r, 1)[0]
+    return r.strip("/").lower()
+
+
+def azure_req(path, params, body=None):
+    """One authenticated request against the configured Azure DevOps org. GET
+    when `body` is None, else a JSON POST. PAT auth is Basic with an empty
+    username (`:PAT`), which both Services and Server accept. Exceptions
+    propagate — collect_azure()'s caller turns them into the block's `error`."""
+    q = dict(params or {})
+    q.setdefault("api-version", AZDO_API_VERSION)
+    url = f"{azure_base()}{path}?{urllib.parse.urlencode(q)}"
+    auth = base64.b64encode(f":{AZDO_TOKEN}".encode()).decode()
+    headers = {
+        "Authorization": f"Basic {auth}",
+        "Accept": "application/json",
+        "User-Agent": "turma-agent/1.0",
+    }
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers,
+                                 method="POST" if body is not None else "GET")
+    with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _azure_state_map(site_key, project, wtype):
+    """{state_name_lower: column} for one (project, work-item-type), from the
+    states API, cached. {} when the call fails or is unavailable, so the caller
+    falls back to the static name map. Best-effort and total."""
+    ck = (site_key, project or "", wtype or "")
+    if ck in _AZDO_STATE_CACHE:
+        return _AZDO_STATE_CACHE[ck]
+    out = {}
+    if project and wtype:
+        try:
+            data = azure_req(
+                f"/{urllib.parse.quote(project)}/_apis/wit/workItemTypes/"
+                f"{urllib.parse.quote(wtype)}/states", {})
+            for s in data.get("value") or []:
+                name = str(s.get("name") or "").strip().lower()
+                cat = str(s.get("stateCategory") or "").strip().lower()
+                if name and cat in _AZDO_META_CATEGORY:
+                    out[name] = _AZDO_META_CATEGORY[cat]
+        except Exception as e:
+            log(f"azure states fetch failed for {project}/{wtype}: {e}")
+    _AZDO_STATE_CACHE[ck] = out
+    return out
+
+
+def _azure_category(site_key, project, wtype, state):
+    """An Azure work item's `System.State` -> the board's todo/inprogress/done.
+    Prefers the per-type state metadata (handles custom processes), then the
+    static name map, then `todo` — the same safe default as Jira's unknowns."""
+    name = str(state or "").strip().lower()
+    live = _azure_state_map(site_key, project, wtype)
+    if name in live:
+        return live[name]
+    return _AZDO_STATE_CATEGORY.get(name, "todo")
+
+
+def _azure_org_user():
+    """The board block's `user` (the merge/union axis): the operator's AZDO_USER
+    if given, else the org/collection segment of the site — a stable per-org
+    label, which is all mergeSites needs it to be."""
+    if AZDO_USER:
+        return AZDO_USER
+    seg = [s for s in normalize_azure_site(AZDO_URL).split("/") if s]
+    return seg[-1] if seg else normalize_azure_site(AZDO_URL)
+
+
+def _azure_item_url(base, project, wid):
+    proj = f"/{urllib.parse.quote(str(project))}" if project else ""
+    return f"{base}{proj}/_workitems/edit/{wid}"
+
+
+def _shape_azure_item(wi, site_key, base):
+    """One raw work item (from the batch GET) -> the compact wire ticket the
+    board renders — the SAME shape _shape_issue produces for Jira, so the board
+    can't tell them apart. Everything optional degrades to None/[]."""
+    f = wi.get("fields") or {}
+    wid = wi.get("id")
+    key = str(wid) if wid is not None else ""
+    project = f.get("System.TeamProject")
+    wtype = f.get("System.WorkItemType")
+    state = f.get("System.State")
+    prio = f.get("Microsoft.VSTS.Common.Priority")
+    tags = f.get("System.Tags")
+    labels = [t.strip() for t in str(tags).split(";") if t.strip()] if tags else []
+    parent = f.get("System.Parent")
+    return {
+        "key": key,
+        "url": _azure_item_url(base, project, key),
+        "summary": (f.get("System.Title") or "")[:200],
+        "status": state,                                         # org state (pill)
+        "statusCategory": _azure_category(site_key, project, wtype, state),
+        "priority": f"P{prio}" if isinstance(prio, int) else None,
+        "type": wtype,
+        "project": project,
+        "projectName": project,
+        "labels": labels[:5],
+        "updated": f.get("System.ChangedDate"),
+        "created": f.get("System.CreatedDate"),
+        "dueDate": f.get("Microsoft.VSTS.Scheduling.DueDate"),
+        "parentKey": str(parent) if parent is not None else None,
+    }
+
+
+_AZDO_LIST_FIELDS = [
+    "System.Id", "System.Title", "System.State", "System.WorkItemType",
+    "System.TeamProject", "System.ChangedDate", "System.CreatedDate",
+    "System.Tags", "Microsoft.VSTS.Common.Priority", "System.Parent",
+    "Microsoft.VSTS.Scheduling.DueDate",
+]
+
+
+def fetch_azure_items(ids, site_key, base):
+    """Batch-GET work items by id (chunked to the API's 200 cap), shaped. Missing
+    ids are omitted (errorPolicy) rather than failing the whole batch."""
+    out = []
+    for i in range(0, len(ids), AZDO_BATCH):
+        chunk = ids[i:i + AZDO_BATCH]
+        data = azure_req("/_apis/wit/workitems", {
+            "ids": ",".join(str(x) for x in chunk),
+            "fields": ",".join(_AZDO_LIST_FIELDS),
+            "errorPolicy": "omit",
+        })
+        for wi in data.get("value") or []:
+            if isinstance(wi, dict) and wi.get("id") is not None:
+                out.append(_shape_azure_item(wi, site_key, base))
+    return out
+
+
+def collect_azure():
+    """The heartbeat's board block, Azure edition: the PAT owner's assigned work
+    items, bucketed into the same active + recently-done windows as collect_jira
+    and returned in the identical block shape (source:"azure"). One WIQL search
+    for the ids, then batched detail GETs; @Me resolves the assignee, so no
+    username is needed."""
+    if not azure_configured():
+        return azure_empty()
+    site_key = normalize_azure_site(AZDO_URL)
+    base = azure_base()
+    where = ["[System.AssignedTo] = @Me"]
+    if AZDO_PROJECT:
+        where.append(f"[System.TeamProject] = '{AZDO_PROJECT.replace(chr(39), chr(39) * 2)}'")
+    wiql = ("SELECT [System.Id] FROM WorkItems WHERE " + " AND ".join(where) +
+            " ORDER BY [System.ChangedDate] DESC")
+    res = azure_req("/_apis/wit/wiql", {}, body={"query": wiql})
+    ids = [w.get("id") for w in (res.get("workItems") or []) if w.get("id") is not None]
+    truncated = len(ids) > AZDO_MAX_IDS
+    tickets = fetch_azure_items(ids[:AZDO_MAX_IDS], site_key, base)
+
+    # Same two-window model as Jira: all active work, plus a bounded tail of
+    # recently-changed done items so the Done column is populated without growing
+    # forever. WIQL already sorted by ChangedDate desc, so slicing preserves it.
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(days=JIRA_DONE_DAYS)).isoformat()
+    active = [t for t in tickets if t["statusCategory"] != "done"][:JIRA_MAX_ACTIVE]
+    done = [t for t in tickets if t["statusCategory"] == "done"
+            and str(t.get("updated") or "") >= cutoff][:JIRA_MAX_DONE]
+    if len(active) < len([t for t in tickets if t["statusCategory"] != "done"]):
+        truncated = True
+    return {
+        "available": True,
+        "configured": True,
+        "source": "azure",
+        "site": site_key,
+        "siteKey": site_key,
+        "user": _azure_org_user(),
+        "fetchedAt": now_iso(),
+        "error": None,
+        "truncated": truncated,
+        "tickets": active + done,
+    }
+
+
+# --- Azure DevOps work-item detail (on-demand) ---------------------------------
+# Azure returns description and comment bodies as HTML (not ADF, not markdown),
+# so the ADF flattener's counterpart here is a small HTML->text pass, keeping the
+# same (text, truncated) contract adf_plain has.
+
+class _HTMLTextExtractor(HTMLParser):
+    """Flattens HTML to plain text: block tags become newlines, <li> a bullet,
+    <a href> keeps its target, and entities are unescaped. Best-effort, total."""
+    _BLOCK = {"p", "div", "br", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
+              "ul", "ol", "table", "blockquote", "section", "pre"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._href = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "li":
+            self.parts.append("\n- ")
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+        elif tag == "a":
+            self._href = dict(attrs).get("href")
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href:
+            if self._href not in "".join(self.parts[-3:]):
+                self.parts.append(f" ({self._href})")
+            self._href = None
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def text(self):
+        return "".join(self.parts)
+
+
+def azure_html_to_text(raw):
+    """HTML (or a plain string) -> plain text. Never raises on malformed markup."""
+    if not raw:
+        return ""
+    if not isinstance(raw, str):
+        return str(raw)
+    try:
+        p = _HTMLTextExtractor()
+        p.feed(raw)
+        p.close()
+        return p.text()
+    except Exception:
+        # A last-ditch tag strip so unparseable markup still degrades to its text.
+        return html.unescape(re.sub(r"<[^>]+>", " ", raw))
+
+
+def azure_plain(raw, limit):
+    """azure_html_to_text normalized and clipped: (text, truncated) — the exact
+    contract adf_plain gives the Jira detail shape."""
+    text = re.sub(r"[ \t]+\n", "\n", azure_html_to_text(raw))
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) <= limit:
+        return text, False
+    return text[:limit].rstrip(), True
+
+
+def _shape_azure_detail(wi, comments_data, site_key, base):
+    """A GET work item ($expand=all) + its comments -> the same detail shape
+    _shape_issue_detail produces for Jira."""
+    detail = _shape_azure_item(wi, site_key, base)
+    f = wi.get("fields") or {}
+
+    def person(field):
+        v = f.get(field)
+        return v.get("displayName") if isinstance(v, dict) else (v or None)
+
+    desc, desc_trunc = azure_plain(f.get("System.Description"), JIRA_DESC_MAX_CHARS)
+    detail["description"] = desc
+    detail["descriptionTruncated"] = desc_trunc
+    detail["reporter"] = person("System.CreatedBy")
+    detail["assignee"] = person("System.AssignedTo")
+    detail["resolution"] = f.get("System.Reason") or None
+    tags = f.get("System.Tags")
+    detail["labels"] = ([t.strip() for t in str(tags).split(";") if t.strip()]
+                        [:JIRA_DETAIL_LABELS_MAX] if tags else [])
+    detail["parentSummary"] = None   # would need a second fetch; parentKey suffices
+
+    raw = (comments_data or {}).get("comments") or []
+    raw = [c for c in raw if isinstance(c, dict)]
+    raw.sort(key=lambda c: str(c.get("createdDate") or ""))   # oldest-first, like Jira
+    comments = []
+    for c in raw[-JIRA_COMMENT_MAX:]:
+        body, trunc = azure_plain(c.get("text"), JIRA_COMMENT_MAX_CHARS)
+        author = c.get("createdBy")
+        comments.append({
+            "id": c.get("id"),
+            "author": author.get("displayName") if isinstance(author, dict) else None,
+            "created": c.get("createdDate"),
+            "updated": c.get("modifiedDate"),
+            "body": body,
+            "truncated": trunc,
+        })
+    detail["comments"] = comments
+    total = (comments_data or {}).get("totalCount")
+    detail["commentTotal"] = total if isinstance(total, int) else len(comments)
+    detail["fetchedAt"] = now_iso()
+    return detail
+
+
+def fetch_azure_issue(key):
+    """One work item's full detail. Comments ride a separate endpoint (and a
+    preview api-version); a comments failure degrades to no comments rather than
+    losing the whole detail. Exceptions on the item itself propagate."""
+    site_key = normalize_azure_site(AZDO_URL)
+    base = azure_base()
+    wi = azure_req(f"/_apis/wit/workitems/{urllib.parse.quote(key)}",
+                   {"$expand": "all"})
+    project = (wi.get("fields") or {}).get("System.TeamProject")
+    comments_data = {}
+    if project:
+        try:
+            comments_data = azure_req(
+                f"/{urllib.parse.quote(project)}/_apis/wit/workItems/"
+                f"{urllib.parse.quote(key)}/comments",
+                {"api-version": f"{AZDO_API_VERSION}-preview.3"})
+        except Exception as e:
+            log(f"azure comments fetch failed for {key}: {e}")
+    return _shape_azure_detail(wi, comments_data, site_key, base)
+
+
+# --- Board source dispatch -----------------------------------------------------
+# The board is source-agnostic downstream: the hub, board.js and every client
+# read one `jira` block per agent and never branch on where its tickets came
+# from. These helpers pick the collector for the one source THIS host is
+# configured for, so a host is a Jira host or an Azure host but the wire contract
+# is identical. Azure takes precedence if both are somehow set (one org per host).
+
+def board_source():
+    """"azure" | "jira" | None — which ticket source this host polls."""
+    if azure_configured():
+        return "azure"
+    if jira_configured():
+        return "jira"
+    return None
+
+
+def board_configured():
+    """Whether ANY ticket source is configured (the gate that used to be
+    jira_configured() alone)."""
+    return jira_configured() or azure_configured()
+
+
+def collect_board():
+    """The heartbeat board block from whichever source is configured: Azure when
+    its creds are set, else Jira. collect_jira() itself returns the empty block
+    when Jira is unconfigured too, so it's the safe default (and refresh_jira only
+    runs at all behind a board_configured() gate)."""
+    if azure_configured():
+        return collect_azure()
+    return collect_jira()
+
+
+def board_empty():
+    """The off/never-polled block for the configured source (or a Jira-shaped
+    empty when nothing is configured — the historical default)."""
+    if azure_configured():
+        return azure_empty()
+    return jira_empty()
+
+
+def valid_issue_key(key):
+    """The allowlist gate for an issue key reaching a REST path, source-aware:
+    Jira's PROJECT-123 grammar, or Azure's bare integer work-item id."""
+    k = (key or "").strip()
+    if board_source() == "azure":
+        return bool(AZDO_KEY_RE.match(k))
+    return bool(JIRA_KEY_RE.match(k))
+
+
+def fetch_board_issue(key):
+    """One ticket's full detail from the configured source."""
+    if azure_configured():
+        return fetch_azure_issue(key)
+    return fetch_jira_issue(key)
+
+
+def board_site_key():
+    """This host's siteKey for the configured source (the ledger/routing key)."""
+    if azure_configured():
+        return normalize_azure_site(AZDO_URL)
+    return normalize_jira_site(JIRA_SITE)
+
+
 # --- Jira ticket sessions ------------------------------------------------------
 # Spawn a session to WORK a ticket: the board's per-card start button. Like the
 # triage above, this runs agent-side because this host is the only place the
@@ -3509,6 +3980,22 @@ def next_ticket_branch(issue_key, taken):
         if cand not in taken:
             return cand
     return None
+
+
+def ticket_branch_base(key, detail):
+    """The branch base a ticket session cuts from — kept human-scannable per the
+    branch-naming policy. A Jira key (PROJECT-123) already reads that way and is
+    used as-is. An Azure work-item id is a bare integer, so we prefix it with the
+    project for the same at-a-glance mapping (`MyProject-1234`), falling back to
+    `wi-<id>` when the project is unknown."""
+    if board_source() != "azure":
+        return key
+    project = (detail or {}).get("project") or (detail or {}).get("projectName")
+    if project:
+        slug = re.sub(r"-{2,}", "-", re.sub(r"[^A-Za-z0-9._]+", "-", str(project))).strip("-.")
+        if slug:
+            return f"{slug}-{key}"
+    return f"wi-{key}"
 
 
 def branch_names(repo_path):
@@ -3539,24 +4026,31 @@ def build_ticket_prompt(detail):
     """A fetched ticket -> the initial task prompt for its session: everything the
     agent would otherwise have to go and read, inlined.
 
-    The session has no Jira creds of its own (they live in the manager's env, not
+    The session has no board creds of its own (they live in the manager's env, not
     the worktree), so this text is all it will ever see of the ticket — hence the
     header saying plainly that it's a spawn-time snapshot and pointing at the URL
     for the live copy. Caps mirror the detail fetch's own (description and comment
-    bodies are already clipped agent-side by _shape_issue_detail)."""
+    bodies are already clipped agent-side by the shaping)."""
     d = detail or {}
     key = d.get("key") or ""
     summary = (d.get("summary") or "").strip()
-    head = f"Work Jira ticket {key}." if key else "Work the Jira ticket below."
+    # Name the source in the prompt so the session knows what it's working, and
+    # phrase an Azure work-item id as `#1234` the way that tracker does.
+    if board_source() == "azure":
+        source_name, noun, ref = "Azure DevOps", "work item", (f"#{key}" if key else "")
+    else:
+        source_name, noun, ref = "Jira", "ticket", key
+    head = f"Work {source_name} {noun} {ref}." if ref else f"Work the {source_name} {noun} below."
     out = [
-        head + " Its full text, as fetched from Jira when this session spawned,"
-        " follows. That is a snapshot — if something looks stale or contradictory,"
-        " the ticket's own URL below is the live copy.",
+        head + f" Its full text, as fetched from {source_name} when this session"
+        " spawned, follows. That is a snapshot — if something looks stale or"
+        " contradictory, the ticket's own URL below is the live copy.",
         "",
-        f"# {key}: {summary}".strip(": ") if (key or summary) else "# Ticket",
+        f"# {ref}: {summary}".strip(": ") if (ref or summary) else "# Ticket",
     ]
     project = d.get("projectName") or d.get("project")
-    if project and d.get("projectName") and d.get("project"):
+    if (project and d.get("projectName") and d.get("project")
+            and d["projectName"] != d["project"]):
         project = f"{d['projectName']} ({d['project']})"
     parent = d.get("parentKey")
     if parent and d.get("parentSummary"):
@@ -3582,7 +4076,7 @@ def build_ticket_prompt(detail):
     out += ["", "## Description", ""]
     out.append(desc or "_No description._")
     if d.get("descriptionTruncated"):
-        out.append("\n_(description truncated — the rest is in Jira)_")
+        out.append(f"\n_(description truncated — the rest is in {source_name})_")
 
     comments = [c for c in (d.get("comments") or []) if isinstance(c, dict)]
     shown = comments[-TICKET_PROMPT_COMMENTS:]
@@ -3594,7 +4088,7 @@ def build_ticket_prompt(detail):
     else:
         dropped = total - len(shown)
         if dropped > 0:
-            out.append(f"_Showing the {len(shown)} newest; {dropped} older are in Jira._\n")
+            out.append(f"_Showing the {len(shown)} newest; {dropped} older are in {source_name}._\n")
         for c in shown:
             who = c.get("author") or "Unknown"
             when = c.get("created") or ""
@@ -4236,7 +4730,7 @@ class SessionManager:
         # Jira Cloud assigned-ticket block (refreshed on its own slow cadence
         # or on a hub `refreshJira` command, reported every beat; stays the
         # empty shape on unconfigured hosts).
-        self.jira = jira_empty()
+        self.jira = board_empty()
         # Recent per-repo prune results (merged branches + safe worktrees swept),
         # keyed by repo name, lingered briefly so the UI can show the summary.
         self.prunes = {}
@@ -4386,11 +4880,12 @@ class SessionManager:
         return self.triage_cands
 
     def _start_jira_triage(self):
-        """Kick off one batch of Jira ticket -> repo triage as a DETACHED
+        """Kick off one batch of ticket -> repo triage as a DETACHED
         `claude -p` reaped by _poll_jira_triage. No-op when a job is already in
-        flight, when Jira is off, when there are no candidate repos, or when every
-        ticket already has a fresh decision — so a settled board costs nothing."""
-        if not jira_configured():
+        flight, when the board is off, when there are no candidate repos, or when
+        every ticket already has a fresh decision — so a settled board costs
+        nothing. Source-agnostic: it reads only the ticket text in self.jira."""
+        if not board_configured():
             return
         # Refreshed BEFORE the in-flight check: the board's picker reads this list
         # every beat, and freezing it for the length of a triage job would offer
@@ -5443,7 +5938,8 @@ class SessionManager:
                 # name) reserves it now, against the repo that now exists.
                 if ticket and not ticket.get("branch") and ticket.get("key"):
                     ticket["branch"] = self._reserve_ticket_branch(
-                        sess["repoPath"], ticket["key"])
+                        sess["repoPath"],
+                        ticket.get("branchBase") or ticket["key"])
                 resolved_base = resolve_base_ref(sess["repoPath"], base_ref)
                 sess["baseRef"] = resolved_base
                 self._worktree_add(sess, base_ref=resolved_base)
@@ -5512,8 +6008,10 @@ class SessionManager:
             self._provision_session(sess)
             return  # one per beat
 
-    def _reserve_ticket_branch(self, repo_path, issue_key):
-        """The branch name a new session on `issue_key` will be told to use.
+    def _reserve_ticket_branch(self, repo_path, branch_base):
+        """The branch name a new session will be told to use, cut from
+        `branch_base` (the ticket key for Jira, a project-prefixed id for Azure —
+        see ticket_branch_base).
 
         "Taken" is the union of two things, and it needs both:
           - what git knows — local heads plus remote branches, after a best-effort
@@ -5533,17 +6031,17 @@ class SessionManager:
             t = s.get("ticket") or {}
             if t.get("branch") and s.get("repoPath") == repo_path:
                 taken.add(t["branch"])
-        branch = next_ticket_branch(issue_key, taken)
-        # The key is already JIRA_KEY_RE-clean and so is a valid ref name, but this
-        # name reaches a command line via the system prompt and the record, so it
-        # gets the same allowlist gate as any other ref we hand out.
+        branch = next_ticket_branch(branch_base, taken)
+        # The base is already grammar-clean, but this name reaches a command line
+        # via the system prompt and the record, so it gets the same allowlist gate
+        # as any other ref we hand out.
         if branch and not valid_ref_name(branch):
             return None
         return branch
 
     def spawn_ticket(self, issue_key, cmd_id=None):
-        """Spawn a session to work a Jira ticket — the board's per-card start
-        button.
+        """Spawn a session to work a ticket (Jira or Azure DevOps) — the board's
+        per-card start button.
 
         Everything is re-derived from LOCAL state rather than trusted from the
         command: the hub only chooses which host (an online one reporting the org,
@@ -5561,16 +6059,16 @@ class SessionManager:
         prevents. A fetch that fails raises to handle_commands, which logs and
         acks."""
         key = (issue_key or "").strip()
-        if not JIRA_KEY_RE.match(key):
-            log(f"spawnTicket refused: {key[:50]!r} is not a Jira issue key")
+        if not valid_issue_key(key):
+            log(f"spawnTicket refused: {key[:50]!r} is not a valid issue key")
             return
         # Re-checked here (the hub already targets a host reporting this org) to
-        # keep "unset creds = zero Jira HTTP, ever" a property of the agent rather
+        # keep "unset creds = zero board HTTP, ever" a property of the agent rather
         # than of hub-side targeting — same stance as refreshJira.
-        if not jira_configured():
-            log(f"spawnTicket refused: no Jira credentials on this host ({key})")
+        if not board_configured():
+            log(f"spawnTicket refused: no board credentials on this host ({key})")
             return
-        site_key = normalize_jira_site(JIRA_SITE)
+        site_key = board_site_key()
         entry = self.triage_ledger.get(_triage_key(site_key, key))
         if not isinstance(entry, dict) or not entry.get("decided") or not entry.get("repo"):
             log(f"spawnTicket refused: {key} has no triaged repo on this host")
@@ -5598,8 +6096,9 @@ class SessionManager:
             await_clone = repo_name
         # Committed to spawning now — fetch the ticket text for the prompt, and
         # (when the repo already exists) reserve the branch name against it.
-        detail = fetch_jira_issue(key)
-        branch = self._reserve_ticket_branch(repo["path"], key) if repo else None
+        detail = fetch_board_issue(key)
+        branch_base = ticket_branch_base(key, detail)
+        branch = self._reserve_ticket_branch(repo["path"], branch_base) if repo else None
         ticket = {
             "key": key,
             "siteKey": site_key,
@@ -5610,6 +6109,11 @@ class SessionManager:
             # policy, which is worse but not broken.
             "branch": branch,
         }
+        # branchBase carries the human-scannable base across a deferred
+        # (post-clone) reservation. Omitted when it just equals the key (Jira),
+        # so a Jira ticket record is byte-for-byte what it always was.
+        if branch_base != key:
+            ticket["branchBase"] = branch_base
         self.spawn(repo_name, prompt=build_ticket_prompt(detail), ticket=ticket,
                    cmd_id=cmd_id, await_clone=await_clone,
                    await_clone_owner=(entry.get("nameWithOwner") if await_clone
@@ -6286,12 +6790,12 @@ class SessionManager:
         offer is one its picker never showed, so it is a bug or a stale client, and
         recording it would paint a chip for a repo that doesn't exist here."""
         k = (issue_key or "").strip()
-        if not JIRA_KEY_RE.match(k):
+        if not valid_issue_key(k):
             log(f"setJiraRepo: ignoring bad issue key {k[:50]!r}")
             return
         mine = self.jira.get("siteKey")
         if not mine:
-            log(f"setJiraRepo: no Jira org on this host, ignoring {k}")
+            log(f"setJiraRepo: no board org on this host, ignoring {k}")
             return
         # The hub routes by siteKey, so a mismatch means the command reached the
         # wrong host. Filing it under our own org would corrupt a ledger key that
@@ -6351,19 +6855,19 @@ class SessionManager:
         the board is waiting on this key, so it needs an answer either way, and
         a poison key must not take down the heartbeat loop."""
         k = (key or "").strip()
-        if not JIRA_KEY_RE.match(k):
+        if not valid_issue_key(k):
             self.jira_issue_results.append(
-                {"key": k[:50], "issue": None, "error": "not a Jira issue key"})
+                {"key": k[:50], "issue": None, "error": "not a valid issue key"})
             return
-        if not jira_configured():
+        if not board_configured():
             self.jira_issue_results.append(
-                {"key": k, "issue": None, "error": "no Jira credentials on this host"})
+                {"key": k, "issue": None, "error": "no board credentials on this host"})
             return
         try:
-            issue = fetch_jira_issue(k)
+            issue = fetch_board_issue(k)
             self.jira_issue_results.append({"key": k, "issue": issue, "error": None})
         except Exception as e:
-            log(f"jira issue fetch failed for {k}: {e}")
+            log(f"board issue fetch failed for {k}: {e}")
             self.jira_issue_results.append(
                 {"key": k, "issue": None, "error": str(e)[:200]})
 
@@ -6714,15 +7218,15 @@ class SessionManager:
             self.github = {"available": False, "login": None, "repos": []}
 
     def refresh_jira(self):
-        """Refresh the cached Jira assigned-tickets block. Fail-open the
-        pr_status way, not the github-block way: a fetch error KEEPS the prior
-        tickets/fetchedAt and only records the error string, so a transient
-        Jira hiccup degrades the board to stale-but-shown (with the error
-        surfaced) rather than blanking it until the next slow beat."""
+        """Refresh the cached assigned-tickets block from the configured source
+        (Jira or Azure DevOps). Fail-open the pr_status way, not the github-block
+        way: a fetch error KEEPS the prior tickets/fetchedAt and only records the
+        error string, so a transient hiccup degrades the board to stale-but-shown
+        (with the error surfaced) rather than blanking it until the next slow beat."""
         try:
-            self.jira = collect_jira()
+            self.jira = collect_board()
         except Exception as e:
-            log(f"jira refresh failed: {e}")
+            log(f"board refresh failed: {e}")
             prev = dict(self.jira)
             prev["error"] = str(e)[:200]
             self.jira = prev
@@ -7442,7 +7946,7 @@ class SessionManager:
                     # it costs the beat exactly what that poll already does, and
                     # handle_commands' immediate follow-up beat carries the
                     # fresh block straight back.
-                    if jira_configured():
+                    if board_configured():
                         self.refresh_jira()
                 else:
                     log(f"unknown command type {ctype!r} (cmdId {cid})")
@@ -8064,9 +8568,9 @@ class SessionManager:
         # gh calls); clone jobs are reaped every beat (cheap poll()s).
         if not light and beat % GITHUB_REFRESH_EVERY == 0:
             self.refresh_github()
-        # Jira assigned tickets on their own slow cadence; the configured()
-        # guard keeps unconfigured hosts at zero Jira HTTP calls forever.
-        if not light and beat % JIRA_REFRESH_EVERY == 0 and jira_configured():
+        # Assigned tickets (Jira or Azure DevOps) on their own slow cadence; the
+        # configured() guard keeps unconfigured hosts at zero board HTTP calls forever.
+        if not light and beat % JIRA_REFRESH_EVERY == 0 and board_configured():
             self.refresh_jira()
         # Ticket -> repo triage. Attempted every beat rather than on the slow jira
         # cadence: it's one batch in flight at a time, so a freshly-polled board

@@ -516,6 +516,14 @@ function ingestJiraIssues(agent, jiraIssueResults) {
   }
 }
 
+// An issue key is interpolated into an agent REST path, so it's allowlist-checked
+// before it reaches a URL — the same "nothing free-form" stance the agent takes.
+// Two grammars, because the board carries two ticket sources: Jira's PROJECT-123
+// keys and Azure DevOps' bare-integer work-item ids.
+function isIssueKey(k) {
+  return /^[A-Za-z][A-Za-z0-9_]*-[0-9]+$/.test(k) || /^[0-9]+$/.test(k);
+}
+
 // Which HOST should answer for a Jira org (siteKey): a host whose `jira` block
 // reports that site — preferring an ONLINE one, since an offline host's queued
 // command would sit undelivered until it returns. null when no host covers the
@@ -2228,8 +2236,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "jira" && parts.length === 4) {
       const siteKey = decodeURIComponent(parts[2]);
       const issueKey = decodeURIComponent(parts[3]);
-      if (!/^[A-Za-z][A-Za-z0-9_]*-[0-9]+$/.test(issueKey)) {
-        return json(res, 400, { error: "not a Jira issue key" });
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
       }
       // Fall back to an offline host's cache: its last fetch of this ticket is
       // still worth showing (the board already shows its stale tickets), even
@@ -2279,8 +2287,8 @@ const server = http.createServer(async (req, res) => {
         parts.length === 5 && parts[4] === "session") {
       const siteKey = decodeURIComponent(parts[2]);
       const issueKey = decodeURIComponent(parts[3]);
-      if (!/^[A-Za-z][A-Za-z0-9_]*-[0-9]+$/.test(issueKey)) {
-        return json(res, 400, { error: "not a Jira issue key" });
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
       }
       // Org first, then the repo: an org nobody reports has no ticket to be
       // untriaged, and answering "no triaged repo yet" for it would send the
@@ -2327,8 +2335,8 @@ const server = http.createServer(async (req, res) => {
         parts.length === 5 && parts[4] === "repo") {
       const siteKey = decodeURIComponent(parts[2]);
       const issueKey = decodeURIComponent(parts[3]);
-      if (!/^[A-Za-z][A-Za-z0-9_]*-[0-9]+$/.test(issueKey)) {
-        return json(res, 400, { error: "not a Jira issue key" });
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
       }
       const body = JSON.parse((await readBody(req)) || "{}");
       const auto = body.auto === true;
@@ -2388,8 +2396,8 @@ const server = http.createServer(async (req, res) => {
         parts.length === 5 && parts[4] === "agent") {
       const siteKey = decodeURIComponent(parts[2]);
       const issueKey = decodeURIComponent(parts[3]);
-      if (!/^[A-Za-z][A-Za-z0-9_]*-[0-9]+$/.test(issueKey)) {
-        return json(res, 400, { error: "not a Jira issue key" });
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
       }
       const body = JSON.parse((await readBody(req)) || "{}");
       const auto = body.auto === true;

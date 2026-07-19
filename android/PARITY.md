@@ -108,9 +108,16 @@ those are marked `[MODEL]`.
   across SSE re-renders. Moot until Android grows a usage table view (see the Usage P1 above).
 
 ### Board (`board.js` → `BoardScreen`/`core/Board`)
+- Azure DevOps org support (XERK-43) is at parity for free: the agent reports Azure work items in the
+  SAME `jira` heartbeat block, ticket shape and detail shape as Jira (with `source:"azure"`), so the
+  board renders them unchanged. The only client-side change was `orgName` — now takes the last path
+  segment of an Azure siteKey (`dev.azure.com/myorg` → `myorg`); ported to `core/Board.kt` and tested
+  in `BoardTest`. The detail sheet's "Open in Jira" label is source-aware on the web (derived from the
+  ticket URL); Android's equivalent label is not yet source-aware — see P1 below.
 - P0 `[MODEL]` Per-card Start button (4 states incl. clone-first) + session chips + optimistic sweep.
 - P0 Ticket cards: type, age, status pill, priority pill, due/overdue.
-- P1 `[MODEL]` Detail sheet full field grid + "Open in Jira" + error state.
+- P1 `[MODEL]` Detail sheet full field grid + "Open in Jira" + error state. (Web's link label is now
+  source-aware — "Open in Azure DevOps" for an Azure ticket, XERK-43; Android still says "Jira".)
 - P1 Repo picker: cloned/not-cloned optgroups, "Currently set" orphan, `nameWithOwner`, save-error.
 - P1 Agent picker (XERK-38, shipped): inline save-error on the row (Android toasts like the repo
   picker's; the web paints "Couldn't save" on the row itself).

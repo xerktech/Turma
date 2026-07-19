@@ -89,7 +89,7 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
         if (sites.isEmpty() || sites.all { it.tickets.isEmpty() }) {
             Text(
                 if (fleet.agents.any { it.jira?.configured == true }) "No tickets."
-                else "No Jira-configured hosts.",
+                else "No ticket-board-configured hosts.",
                 Modifier.padding(16.dp),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
