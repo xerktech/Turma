@@ -180,20 +180,11 @@
     return s.replace(/\.atlassian\.net$/i, "");
   }
 
-  // An org's auto-start opt-in for the org-chip switch (XERK-41), resolved from
-  // the two sources the hub's own orgsWithAutoStart unions:
-  //   - hubOn: the hub-owned per-org toggle (data.autoStartOrgs), the primary
-  //     control — what a click writes and reflects.
-  //   - envForced: a legacy agent still setting TICKET_AUTO_START (an ONLINE host
-  //     reporting ticketAutoStart). It forces the org on regardless of the hub
-  //     bit, so the switch shows on and LOCKED — you can't turn it off from the
-  //     hub while the agent config forces it (clear the env to migrate).
-  // `on` is the effective state (hub OR env), the honest thing to paint.
-  function autoStartState(agents, autoStartOrgs, siteKey) {
-    const hubOn = !!(autoStartOrgs && autoStartOrgs[siteKey]);
-    const envForced = (agents || []).some((a) =>
-      a && a.online && a.ticketAutoStart && a.jira && a.jira.siteKey === siteKey);
-    return { on: hubOn || envForced, hubOn, envForced };
+  // Whether an org is opted in to auto-start, for the org-chip switch (XERK-41).
+  // Hub-only: it's the hub-owned per-org toggle (data.autoStartOrgs) and nothing
+  // else — no agent-side flag — so a click freely turns it on and off.
+  function autoStartOn(autoStartOrgs, siteKey) {
+    return !!(autoStartOrgs && autoStartOrgs[siteKey]);
   }
 
   // Stable org color: position in the sorted key list -> --s1..--s8 (the same
@@ -909,7 +900,7 @@
   }
 
   const api = {
-    CATEGORIES, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgName, autoStartState, ageStr,
+    CATEGORIES, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgName, autoStartOn, ageStr,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,

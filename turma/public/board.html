@@ -143,23 +143,18 @@ function render(data) {
     wrap.append(main);
     return wrap;
   };
-  // The auto-start toggle segment, appended INSIDE the org's pill. Reflects the
-  // effective opt-in (hub toggle OR a legacy agent env); a click writes the hub
-  // toggle. Forced-on by an agent env, it's shown on and disabled (clear the env
-  // to migrate to the hub control).
+  // The auto-start toggle segment, appended INSIDE the org's pill. Hub-only
+  // (XERK-41): reflects the hub-owned per-org opt-in, and a click flips it.
   const addAuto = (wrap, siteKey) => {
-    const st = B.autoStartState(data.agents || [], data.autoStartOrgs, siteKey);
+    const on = B.autoStartOn(data.autoStartOrgs, siteKey);
     const b = document.createElement("button");
     b.type = "button";
-    b.className = "org-chip-auto" + (st.on ? " on" : "") + (st.envForced ? " forced" : "");
-    b.setAttribute("aria-pressed", st.on ? "true" : "false");
-    b.disabled = st.envForced;
-    b.title = st.envForced
-      ? "Auto is forced on by this org's agent config (TICKET_AUTO_START) — clear it there to control it from here"
-      : (st.on ? "Auto: start To Do tickets, stop Done sessions — ON, click to turn off"
-               : "Auto: start To Do tickets, stop Done sessions — OFF, click to turn on");
+    b.className = "org-chip-auto" + (on ? " on" : "");
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    b.title = on ? "Auto: start To Do tickets, stop Done sessions — ON, click to turn off"
+                 : "Auto: start To Do tickets, stop Done sessions — OFF, click to turn on";
     b.innerHTML = `<span class="org-auto-dot" aria-hidden="true"></span>auto`;
-    if (!st.envForced) b.addEventListener("click", () => setAutoStart(siteKey, !st.hubOn));
+    b.addEventListener("click", () => setAutoStart(siteKey, !on));
     wrap.append(b);
   };
   $chips.append(mkChip("All orgs", ""));

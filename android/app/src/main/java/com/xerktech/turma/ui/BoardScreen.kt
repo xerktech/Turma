@@ -43,7 +43,6 @@ import androidx.compose.runtime.setValue
 import android.widget.Toast
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -53,10 +52,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.xerktech.turma.core.AutoStartState
 import com.xerktech.turma.core.BOARD_CATEGORIES
 import com.xerktech.turma.core.BoardSite
-import com.xerktech.turma.core.autoStartState
+import com.xerktech.turma.core.autoStartOn
 import com.xerktech.turma.core.categoryOf
 import com.xerktech.turma.core.filterSites
 import com.xerktech.turma.core.mergeSites
@@ -101,7 +99,7 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
             // the org's stable palette slot. Mirrors board.html's `#chips` row.
             OrgFilterBar(
                 sites, allKeys, orgFilter,
-                autoOf = { autoStartState(fleet.agents, fleet.autoStartOrgs, it) },
+                autoOf = { autoStartOn(fleet.autoStartOrgs, it) },
                 onToggleAuto = { site, enabled -> vm.setAutoStart(site, enabled) },
                 onPick = { vm.setOrg(it) },
             )
@@ -140,7 +138,7 @@ private fun OrgFilterBar(
     sites: List<BoardSite>,
     allKeys: List<String>,
     orgFilter: String,
-    autoOf: (String) -> AutoStartState,
+    autoOf: (String) -> Boolean,
     onToggleAuto: (String, Boolean) -> Unit,
     onPick: (String) -> Unit,
 ) {
@@ -150,7 +148,7 @@ private fun OrgFilterBar(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         OrgChip("All orgs", null, null, offline = false, active = orgFilter.isBlank(),
-            auto = null, onToggleAuto = {}) { onPick("") }
+            autoOn = null, onToggleAuto = {}) { onPick("") }
         for (s in sites) {
             OrgChip(
                 label = orgName(s.siteKey),
@@ -159,7 +157,7 @@ private fun OrgFilterBar(
                 offline = !s.online,
                 active = orgFilter == s.siteKey,
                 // The auto-start toggle (XERK-41) is a segment INSIDE the chip.
-                auto = autoOf(s.siteKey),
+                autoOn = autoOf(s.siteKey),
                 onToggleAuto = { enabled -> onToggleAuto(s.siteKey, enabled) },
             ) { onPick(s.siteKey) }
         }
@@ -169,9 +167,8 @@ private fun OrgFilterBar(
 /**
  * One org chip as a single pill: a filter segment plus, for a real org, an
  * auto-start toggle segment (XERK-41) divided from it by an inner line — a port
- * of board.html's segmented `.org-chip`. The auto segment reflects the effective
- * opt-in (hub toggle OR a legacy agent env); a tap writes the hub toggle, and an
- * env-forced org shows it on and locked (dimmed, not clickable).
+ * of board.html's segmented `.org-chip`. The toggle reflects the hub-only per-org
+ * opt-in and a tap flips it (`autoOn = null` on the "All orgs" chip omits it).
  */
 @Composable
 private fun OrgChip(
@@ -180,7 +177,7 @@ private fun OrgChip(
     count: Int?,
     offline: Boolean,
     active: Boolean,
-    auto: AutoStartState?,
+    autoOn: Boolean?,
     onToggleAuto: (Boolean) -> Unit,
     onClick: () -> Unit,
 ) {
@@ -221,23 +218,22 @@ private fun OrgChip(
             )
         }
         // Auto-start toggle segment (real orgs only), divided by an inner line.
-        if (auto != null) {
+        if (autoOn != null) {
             Box(Modifier.width(1.dp).fillMaxHeight().background(MaterialTheme.colorScheme.outline))
-            val on = auto.on
             Row(
                 Modifier
-                    .background(if (on) accent.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surface)
-                    .then(if (auto.envForced) Modifier.alpha(0.6f) else Modifier.clickable { onToggleAuto(!auto.hubOn) })
+                    .background(if (autoOn) accent.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surface)
+                    .clickable { onToggleAuto(!autoOn) }
                     .padding(horizontal = 10.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(5.dp),
             ) {
                 Box(Modifier.size(7.dp).clip(CircleShape)
-                    .background(if (on) accent else MaterialTheme.colorScheme.onSurfaceVariant))
+                    .background(if (autoOn) accent else MaterialTheme.colorScheme.onSurfaceVariant))
                 Text(
                     "auto",
                     style = MaterialTheme.typography.labelMedium,
-                    color = if (on) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (autoOn) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }

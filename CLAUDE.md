@@ -1269,31 +1269,25 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
 
 - An org can be **opted in** so the hub auto-starts a session for every **To Do** ticket the moment it
   has a repo assigned — by the model's triage OR a manual pin. Off by default.
-- **The PRIMARY control is a hub setting the operator flips from the board (XERK-41)** — the "auto"
-  switch on each org chip. `POST /api/jira/<siteKey>/autostart` `{enabled}` → `setAutoStartOrg`, a
-  hub-owned, durable per-org opt-in stored in `autostart-orgs.json` (`AUTOSTART_ORGS_FILE` on `/data`,
-  keyed by siteKey, presence = enabled). It's hub-owned for the same reason the ticket→agent pins are:
-  the decision and routing are the hub's job. The map rides the fleet payload as top-level
-  `autoStartOrgs` (`{siteKey:true}`) plus an `autoStartOrgs` SSE event, so open boards reflect a toggle
-  live. This replaced the old requirement to redeploy an agent to change the opt-in.
-- The agent's config env **`TICKET_AUTO_START` (`hub-agent.py`) stays as a legacy OR-fallback** — an
-  org configured the old way keeps auto-starting. It's advertised on the heartbeat as the
-  **top-level, board-agnostic `ticketAutoStart`** (named TICKET_* not JIRA_*, kept OUT of the `jira`
-  block, so a future non-Jira board carries it unchanged). An **online** host reporting it forces its
-  org on, which the board shows as the switch **on and locked** (`autoStartState.envForced`) — clear
-  the env to control that org from the hub.
-- It is a **per-org** setting: an agent holds exactly one board's creds, so it serves exactly one org.
-  `orgsWithAutoStart` **unions** the two sources — every siteKey enabled in `autoStartOrgs`, plus any
-  siteKey an ONLINE host reports the env flag for. The env source needs onlineness (an offline host's
-  stale flag drives nothing); the hub toggle doesn't (it's durable hub state, and the sweep gates the
-  actual spawn on a live host via `findTicketHost` anyway).
+- **The opt-in is HUB-ONLY (XERK-41)** — the "auto" switch on each board org chip is the whole control;
+  there is no agent-side config for it. `POST /api/jira/<siteKey>/autostart` `{enabled}` →
+  `setAutoStartOrg`, a hub-owned, durable per-org opt-in stored in `autostart-orgs.json`
+  (`AUTOSTART_ORGS_FILE` on `/data`, keyed by siteKey, presence = enabled). It's hub-owned for the same
+  reason the ticket→agent pins are: the decision and routing are the hub's job. The map rides the fleet
+  payload as top-level `autoStartOrgs` (`{siteKey:true}`) plus an `autoStartOrgs` SSE event, so open
+  boards reflect a toggle live. This replaced the original design (an agent env `TICKET_AUTO_START`
+  heartbeated as `ticketAutoStart`), which was removed with XERK-41 — no agent flag, no env, so
+  turning an org on/off never needs an agent redeploy.
+- It is a **per-org** setting: `orgsWithAutoStart` is simply the set of siteKeys enabled in
+  `autoStartOrgs`. No onlineness gate on the opt-in itself (it's durable hub state, not a host report);
+  the sweep gates the actual spawn on a live host via `findTicketHost`, so a toggled-on org with every
+  host offline just no-ops until one returns.
 - **The decision and routing live on the HUB**, not the agent, for the same reason the manual Start
   button does: only the hub sees the whole fleet, so only it can spread an org's sessions across ALL
   its agents. `autoStartSweep()` (a 15s `setInterval`, boot-grace-gated like the offline sweep) walks
-  each org where **an ONLINE host reports `autoStart`**, and for each freshest-block To Do ticket with
-  a `repoGuess.repo`, routes a `spawnTicket` through the **same `findTicketHost`** the button uses. So
-  "one of two agents in an org has the flag on" still fans work across BOTH — the flag-bearer only
-  advertises intent; it need not be the host that runs the session.
+  each org in `orgsWithAutoStart`, and for each freshest-block To Do ticket with a `repoGuess.repo`,
+  routes a `spawnTicket` through the **same `findTicketHost`** the button uses — so an org's sessions
+  fan across all its agents by availability, wherever the ticket runs.
 - The point is to never open a **second** session for work already started (by a click, a prior
   auto-start, or anything else). Three guards, increasing in strength:
   - `startedTicketKeys()` — the durable one: a ticket carrying a session on ANY channel
@@ -1306,9 +1300,9 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
     no-online-host result is left UNrecorded so it retries when a host returns.
 - Reuses the queue end to end: an auto-started session that can't run now just **queues** on its host
   (see "The session queue"), exactly as a clicked one does. Nothing is written to Jira.
-- Tests: the `auto-start:` cases in `turma/tests/server.test.js` (incl. the hub-toggle sweep and the
-  `/autostart` endpoint), the `autoStartState` cases in `turma/tests/board.test.js` and android's
-  `BoardTest.kt`, and the `autoStart` payload cases in `TestSetJiraRepo`
+- Tests: the `auto-start:` cases in `turma/tests/server.test.js` (the hub-toggle sweep and the
+  `/autostart` endpoint), the `autoStartOn` cases in `turma/tests/board.test.js` and android's
+  `BoardTest.kt`, and `test_no_agent_side_auto_start_flag` in `TestSetJiraRepo`
   (`agent/tests/test_hub_agent.py`).
 
 ##### Auto-stopping Done tickets (XERK-45)

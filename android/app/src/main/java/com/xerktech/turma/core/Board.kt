@@ -89,26 +89,13 @@ fun orgName(siteKey: String): String {
 }
 
 /**
- * An org's auto-start opt-in for the org-chip switch (XERK-41), a pure port of
- * board.js `autoStartState`. Resolves the two sources the hub unions:
- *   - [hubOn]: the hub-owned per-org toggle (`AgentsResponse.autoStartOrgs`), the
- *     primary control — what a tap writes and reflects.
- *   - [envForced]: a legacy agent still setting TICKET_AUTO_START (an ONLINE host
- *     reporting `ticketAutoStart`). It forces the org on regardless of the hub
- *     bit, so the switch shows on and LOCKED (clear the env to migrate).
- * [on] is the effective state (hub OR env) — the honest thing to render.
+ * Whether an org is opted in to auto-start, for the org-chip switch (XERK-41), a
+ * pure port of board.js `autoStartOn`. Hub-only: it reads the hub-owned per-org
+ * toggle (`AgentsResponse.autoStartOrgs`) and nothing else — there is no
+ * agent-side flag — so a tap freely turns it on and off.
  */
-data class AutoStartState(val on: Boolean, val hubOn: Boolean, val envForced: Boolean)
-
-fun autoStartState(
-    agents: List<AgentInfo>,
-    autoStartOrgs: Map<String, Boolean>,
-    siteKey: String,
-): AutoStartState {
-    val hubOn = autoStartOrgs[siteKey] == true
-    val envForced = agents.any { it.online && it.ticketAutoStart && it.jira?.siteKey == siteKey }
-    return AutoStartState(on = hubOn || envForced, hubOn = hubOn, envForced = envForced)
-}
+fun autoStartOn(autoStartOrgs: Map<String, Boolean>, siteKey: String): Boolean =
+    autoStartOrgs[siteKey] == true
 
 fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
     // Step 1: within each (siteKey, user) group keep only the freshest block.
