@@ -1427,6 +1427,17 @@ PR_CALLS_MAX = 20
 PR_STATUS_REFRESH_EVERY = int(os.environ.get("TURMA_PR_REFRESH_EVERY", "3"))
 PR_STATUS_MAX = 20
 
+# PR-comment delivery (XERK-49): poll the PRs running sessions opened for new
+# review activity and TYPE it into the authoring session, so a reply asking for
+# corrections continues the work in the session that made the PR — no operator
+# in the loop. Same cadence and per-beat cap as the status poll (one gh call per
+# PR, or two when the inline-review-thread fetch runs). Disable with =0.
+PR_COMMENTS_DELIVER = os.environ.get("TURMA_PR_COMMENTS", "1") != "0"
+PR_COMMENTS_REFRESH_EVERY = int(os.environ.get("TURMA_PR_COMMENTS_EVERY", "3"))
+PR_COMMENTS_MAX = 20               # PRs polled per beat, like PR_STATUS_MAX
+PR_COMMENTS_SEEN_MAX = 500         # per-PR seen-key ceiling (newest kept)
+PR_COMMENTS_BODY_CAP = 1200        # per-comment body chars folded into the message
+
 
 def _check_class(entry):
     """Map one `statusCheckRollup` entry to 'pass' | 'fail' | 'pending' | None.
@@ -1531,6 +1542,126 @@ def pr_status(url):
     except ValueError:
         return None
     return _summarize_pr(data)
+
+
+PR_URL_PARTS_RE = re.compile(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)")
+
+
+def _pr_comment_events(url, self_login):
+    """Every human-visible comment on a PR, normalized to the fields the
+    delivery poller needs (XERK-49). Three channels, because "reply in a PR"
+    means any of them and a correction routinely arrives as an inline note on a
+    diff line:
+
+      - conversation comments (`gh pr view --json comments`),
+      - review summaries with a body (`--json reviews` — a bare approve carries
+        no correction text and is skipped),
+      - inline review-thread comments on specific lines
+        (`gh api repos/<o>/<r>/pulls/<n>/comments`).
+
+    Each event is `{key, author, body, kind, loc, is_self}`. `key` is the item's
+    stable GitHub id (its url as a fallback) — what the seen-set dedupes on.
+    `is_self` marks a comment the agent's own login wrote (via GitHub's
+    `viewerDidAuthor` where present, else a login compare), so the poller can
+    baseline it as seen yet never react to the session's own words.
+
+    Returns the event list (possibly empty — a real PR with no comments), or
+    None on a hard fetch failure so the caller leaves the baseline untouched
+    rather than treating "gh errored" as "every prior comment vanished"."""
+    raw = run(["gh", "pr", "view", url, "--json", "comments,reviews"])
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+
+    def _login(obj):
+        return str(((obj or {}).get("author") or {}).get("login") or "")
+
+    def _is_self(obj, login):
+        if obj.get("viewerDidAuthor"):
+            return True
+        return bool(self_login) and login == self_login
+
+    events = []
+    for c in data.get("comments") or []:
+        if not isinstance(c, dict):
+            continue
+        body = str(c.get("body") or "").strip()
+        if not body:
+            continue
+        login = _login(c)
+        events.append({
+            "key": str(c.get("id") or c.get("url") or ""),
+            "author": login, "body": body, "kind": "comment", "loc": None,
+            "is_self": _is_self(c, login),
+        })
+    for r in data.get("reviews") or []:
+        if not isinstance(r, dict):
+            continue
+        body = str(r.get("body") or "").strip()
+        if not body:                       # a bare approve/comment carries no text
+            continue
+        login = _login(r)
+        state = str(r.get("state") or "").replace("_", " ").title()
+        events.append({
+            "key": str(r.get("id") or r.get("url") or ""),
+            "author": login, "body": body,
+            "kind": f"review {state}".strip(), "loc": None,
+            "is_self": _is_self(r, login),
+        })
+    # Inline review-thread comments aren't in `gh pr view`; fetch them straight
+    # from the API. Best-effort — a failure just leaves inline notes uncovered
+    # this beat rather than losing the conversation ones already gathered.
+    m = PR_URL_PARTS_RE.search(url or "")
+    if m:
+        owner, repo, num = m.group(1), m.group(2), m.group(3)
+        raw2 = run(["gh", "api", f"repos/{owner}/{repo}/pulls/{num}/comments",
+                    "--paginate"])
+        if raw2:
+            try:
+                inline = json.loads(raw2)
+            except ValueError:
+                inline = None
+            for c in inline or []:
+                if not isinstance(c, dict):
+                    continue
+                body = str(c.get("body") or "").strip()
+                if not body:
+                    continue
+                login = str((c.get("user") or {}).get("login") or "")
+                loc = c.get("path") or None
+                if loc and c.get("line"):
+                    loc = f"{loc}:{c['line']}"
+                events.append({
+                    "key": str(c.get("id") or c.get("html_url") or ""),
+                    "author": login, "body": body, "kind": "inline", "loc": loc,
+                    "is_self": bool(self_login) and login == self_login,
+                })
+    return [e for e in events if e["key"]]
+
+
+def _pr_comment_message(url, events):
+    """Fold new PR comments into the single free-text message typed into the
+    session (XERK-49). send_input collapses newlines to spaces, so this is built
+    flat: a header naming the PR and telling the agent to act on it in THIS
+    session, then each comment as `@author (kind, loc): body`, bodies capped so
+    one long comment can't crowd out the rest before INPUT_MAX_CHARS truncates."""
+    if not events:
+        return ""
+    m = PR_URL_PARTS_RE.search(url or "")
+    num = f"#{m.group(3)}" if m else ""
+    parts = [f"New review activity on the PR {num} you opened ({url}). "
+             f"Address it and update the PR — continue in this session:"]
+    for e in events:
+        who = f"@{e['author']}" if e.get("author") else "someone"
+        tag = e.get("kind") or "comment"
+        if e.get("loc"):
+            tag = f"{tag} on {e['loc']}"
+        body = " ".join(str(e.get("body") or "").split())[:PR_COMMENTS_BODY_CAP]
+        parts.append(f"[{who} — {tag}] {body}")
+    return "  ".join(parts)
 
 
 LOG_TAIL_LINES = 50
@@ -7444,6 +7575,70 @@ class SessionManager:
             return None
         return [self.pr_status_cache.get(u) or {"url": u} for u in urls]
 
+    def _poll_pr_comments(self):
+        """Deliver new PR review activity into the RUNNING session that opened
+        the PR (XERK-49): a reply asking for corrections is typed into that
+        session so the agent continues the work, with no operator relaying it.
+
+        Only running sessions, only their OWN PRs (`session_pr_urls`, the same
+        map the status pill reads). Delivery goes through send_input, so it
+        inherits the whole compose path — the compaction-survival outbox
+        (XERK-47) if the message lands mid-turn, and the queue if a turn is in
+        flight — exactly like an operator typing the correction by hand.
+
+        Each PR carries a per-session `prCommentBase` seen-key set. The FIRST
+        time a PR is seen its whole current comment set is baselined silently:
+        the session shouldn't re-litigate history (or, on the beat this feature
+        deploys, every existing comment on every open PR). After that, only keys
+        that are NEW *and* not the agent's own writing are delivered. The
+        session's own comments are still folded into the seen-set so they are
+        never mistaken for someone else's on a later beat.
+
+        Best-effort and bounded: skipped without a gh login, capped at
+        PR_COMMENTS_MAX PRs per beat, and a fetch failure leaves that PR's
+        baseline untouched (a gh error is not evidence the comments vanished)."""
+        if not PR_COMMENTS_DELIVER or not self.github.get("available"):
+            return
+        self_login = self.github.get("login") or ""
+        polled = 0
+        for sess in self.registry:
+            if sess.get("status") != "running":
+                continue
+            urls = self.session_pr_urls.get(sess["id"]) or []
+            if not urls:
+                continue
+            base = sess.get("prCommentBase")
+            if not isinstance(base, dict):
+                base = {}
+            changed = False
+            for url in urls:
+                if polled >= PR_COMMENTS_MAX:
+                    break
+                polled += 1
+                events = _pr_comment_events(url, self_login)
+                if events is None:
+                    continue                       # fetch failed — keep baseline
+                seen = set(base.get(url) or [])
+                first = url not in base
+                fresh = [e for e in events
+                         if e["key"] not in seen and not e["is_self"]]
+                # Fold EVERY current key (self-authored included) into the seen
+                # set — a first sighting baselines them all; later beats only add
+                # the newcomers. Cap newest-kept so a chatty PR can't grow it
+                # without bound.
+                keys = [e["key"] for e in events]
+                merged = list(seen) + [k for k in keys if k not in seen]
+                base[url] = merged[-PR_COMMENTS_SEEN_MAX:]
+                changed = True
+                if first or not fresh:
+                    continue
+                msg = _pr_comment_message(url, fresh)
+                if msg:
+                    self.send_input(sess["id"], msg)
+            if changed:
+                sess["prCommentBase"] = base
+                self.save()
+
     def clone(self, repo_spec):
         """Clone a GitHub repo into REPOS_ROOT so it joins the scanned repo list.
 
@@ -8741,6 +8936,16 @@ class SessionManager:
                 self.refresh_pr_status()
             except Exception as e:
                 log(f"pr status refresh failed: {e}")
+        # New review activity on a session's PR is typed back into that session
+        # so a reply asking for corrections continues the work (XERK-49). Own
+        # cadence + per-beat cap; wrapped, because a PR comment is never worth
+        # taking the host's sessions down for.
+        if not light and PR_COMMENTS_DELIVER and (
+                beat % PR_COMMENTS_REFRESH_EVERY == 0):
+            try:
+                self._poll_pr_comments()
+            except Exception as e:
+                log(f"pr comment poll failed: {e}")
         self._poll_clones()
         self._poll_prunes()
         # Start any queued session that can now run — a freed slot, a finished
