@@ -220,6 +220,29 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   above. `_resumable_report()` heartbeats each repo's resumable list.
   - Tests: `TestResumableReport`, `TestResumeTranscript`, `TestTranscriptCwd`.
 - `input` / `history` / `answerQuestion` — for the glasses client.
+  - `input`/`send_input` types the message into the session's tmux pane, and **guarantees it survives
+    a compaction** (XERK-47). A message the operator sends is queued by Claude Code when a turn is in
+    flight; an auto-compaction (context ~95%) can drop that queued message — or one typed as it began —
+    instead of consuming it, so it never becomes a user turn and silently vanishes. `send_input`
+    records every sent message on the session record's `pendingInputs` outbox, and `_poll_pending_inputs`
+    (every beat, a no-op unless a session has an outbox) gives it an at-least-once guarantee:
+    - a compaction is detected authoritatively from the transcript's own `compact_boundary` **system
+      entry** (written when a compaction completes; `compactMetadata.trigger` = auto/manual) counted by
+      `_pending_scan`, NOT by scraping the pane for an undocumented "Compacting…" string;
+    - a message is **reaped on delivery** — once it appears as a genuine user turn (`_pending_scan`'s
+      `delivered`), or **left in flight** while it's still in the folded live queue (`queued`);
+    - it is **re-sent** only when a NEW compaction has happened since it was sent (`compactBase` count
+      rose) AND it's neither delivered nor queued AND the pane has settled to idle (`_pane_busy` False,
+      not None) — the pane-idle + not-queued gate is what makes the resend **duplicate-safe** (if the
+      queue survived the compaction the message is still queued, so it waits rather than double-sending);
+    - bounded: `PENDING_INPUT_MAX_ATTEMPTS` resends (each needing a fresh compaction), one resend per
+      beat, and an entry that never lands and never sees a compaction ages out at `PENDING_INPUT_TTL_SEC`.
+    - `delivered` matches by text with no timestamp/offset filter, biased AGAINST a resend: re-sending
+      the exact text of an older turn reads as already-delivered (a missed resend, never a duplicate).
+    - The outbox is internal (not on the heartbeat payload) and is cleared on restart-clear-context (a
+      pre-restart message is contextually gone with the old conversation). The raw ttyd terminal bypasses
+      `send_input`, so a message typed straight into it isn't covered — the compose-box/glasses path is.
+    - Tests: `TestPendingScan`, `TestPollPendingInputs`, and the outbox cases in `TestSendInput`.
 - `interrupt` — stop the turn a running session has in flight.
   - `interrupt()` sends a single Escape to its tmux pane, exactly the key an operator at the live
     terminal would press, so claude cancels the current generation/tool call and drops back to its
