@@ -9,7 +9,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgName, autoStartOn, ageStr, prioClass,
+  mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgName, autoStartOn, ageStr, prioClass,
   cardHtml, boardHtml, detailHtml, textHtml, linkify,
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
@@ -158,23 +158,59 @@ test("ticketSort: newest updated first", () => {
   assert.deepEqual(list.sort(ticketSort).map((t) => t.key), ["B", "A"]);
 });
 
-test("orgColor: persistent per-key, independent of the fleet's other orgs (XERK-48)", () => {
-  // The color is a hash of the key ITSELF, so a given org keeps its slot no
-  // matter which other orgs come or go — the bug this replaced keyed on the
-  // key's index in the set, which reshuffled every hue when a host was added.
-  const c = orgColor("a.atlassian.net");
-  assert.match(c, /^var\(--s[1-8]\)$/, "one of the 8 palette slots");
-  assert.equal(orgColor("a.atlassian.net"), c, "same key -> same slot, always");
-  // Adding/removing sibling orgs can't move it: orgColor doesn't see them.
-  assert.equal(orgColor("a.atlassian.net"), c, "stable as the fleet changes");
-  // Distinct keys map independently (no shared state / list position).
-  assert.equal(orgColor("b.atlassian.net"), orgColor("b.atlassian.net"));
-  // Locked to the exact slots the djb2 hash produces, so the Android port
-  // (core/Board.kt orgColorIndex, slot-1) paints each org the identical color.
-  assert.equal(orgColor("a.net"), "var(--s4)");
-  assert.equal(orgColor("b.net"), "var(--s5)");
-  assert.equal(orgColor("a.atlassian.net"), "var(--s2)");
-  assert.equal(orgColor("xerktech.atlassian.net"), "var(--s7)");
+test("orgColorMap: every org gets a UNIQUE color, no overlap (XERK-48)", () => {
+  // A collision-free set: each org's djb2-preferred slot differs, so each keeps
+  // it. All four colors distinct.
+  const four = ["alpha.atlassian.net", "beta.atlassian.net", "gamma.atlassian.net", "delta.atlassian.net"];
+  const m = orgColorMap(four);
+  const vals = [...m.values()];
+  assert.equal(new Set(vals).size, vals.length, "no two orgs share a color");
+  // Locked to the exact slots, so the Android port (core/Board.kt, slot-1)
+  // paints each org the identical color.
+  assert.equal(m.get("alpha.atlassian.net"), "var(--s7)");
+  assert.equal(m.get("beta.atlassian.net"), "var(--s5)");
+  assert.equal(m.get("gamma.atlassian.net"), "var(--s4)");
+  assert.equal(m.get("delta.atlassian.net"), "var(--s3)");
+});
+
+test("orgColorMap: colliding preferred slots still resolve to distinct colors", () => {
+  // "a.net" and "gamma.atlassian.net" both prefer slot 3 (var --s4); the probe
+  // gives the second one the next free slot rather than doubling up.
+  const m = orgColorMap(["gamma.atlassian.net", "a.net"]);
+  assert.notEqual(m.get("a.net"), m.get("gamma.atlassian.net"), "collision resolved, not shared");
+  assert.equal(m.get("a.net"), "var(--s4)");
+  assert.equal(m.get("gamma.atlassian.net"), "var(--s5)");
+});
+
+test("orgColorMap: order-independent, and only colliding orgs move on a fleet change (XERK-48)", () => {
+  const four = ["alpha.atlassian.net", "beta.atlassian.net", "gamma.atlassian.net", "delta.atlassian.net"];
+  const a = orgColorMap(four);
+  const b = orgColorMap([...four].reverse());
+  for (const k of four) assert.equal(a.get(k), b.get(k), "same set, any order -> same colors");
+  // Adding a non-colliding org ("c.net" prefers a free slot) leaves the rest put
+  // — the whole point of the fix vs. the old index-in-sorted-set reshuffle.
+  const withC = orgColorMap([...four, "c.net"]);
+  for (const k of four) assert.equal(withC.get(k), a.get(k), "existing orgs keep their color when a non-colliding org joins");
+  assert.equal(withC.get("c.net"), "var(--s6)");
+  // And removing one doesn't disturb the survivors here either.
+  const withoutAlpha = orgColorMap(four.filter((k) => k !== "alpha.atlassian.net"));
+  for (const k of four) if (k !== "alpha.atlassian.net") assert.equal(withoutAlpha.get(k), a.get(k), "survivors unchanged on removal");
+});
+
+test("orgColorMap: more orgs than palette colors degrades without throwing", () => {
+  const many = Array.from({ length: 12 }, (_, i) => `s${i}.atlassian.net`);
+  const m = orgColorMap(many);
+  assert.equal(m.size, 12);
+  for (const v of m.values()) assert.match(v, /^var\(--s[1-8]\)$/, "always a valid palette slot");
+  // The first 8 (by assignment) are unique; the rest reuse — unavoidable with 8 colors.
+  assert.equal(new Set([...m.values()]).size, 8, "uses all 8, overflow reuses");
+});
+
+test("orgColor: single-org helper falls back to the preferred slot without a set", () => {
+  assert.match(orgColor("alpha.atlassian.net"), /^var\(--s[1-8]\)$/);
+  // Given the set, it agrees with orgColorMap.
+  const four = ["alpha.atlassian.net", "beta.atlassian.net", "gamma.atlassian.net", "delta.atlassian.net"];
+  assert.equal(orgColor("gamma.atlassian.net", four), orgColorMap(four).get("gamma.atlassian.net"));
 });
 
 test("orgName: the org, not the Jira Cloud host", () => {

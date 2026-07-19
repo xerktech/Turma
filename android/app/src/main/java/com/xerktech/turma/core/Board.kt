@@ -148,19 +148,48 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
     return out.sortedBy { it.siteKey }
 }
 
-/**
- * Persistent org color slot for a siteKey: a hash of the KEY ITSELF into one of
- * the 8 palette slots (0..7 -> ChartSeries), matching board.js `orgColor`. Keying
- * on the key rather than its index in the current org set is what makes the color
- * hold when a host (hence an org) is added or removed (XERK-48); the old
- * index-in-sorted-set rule reshuffled every org's hue on any fleet change. Same
- * djb2 hash and modulo as the web, so a given org gets the identical color on both.
- */
-fun orgColorIndex(siteKey: String): Int {
+/** djb2 hash of a siteKey -> its preferred palette slot (0..7). */
+private fun orgSlotPref(siteKey: String): Int {
     var h = 5381L
     for (c in siteKey) h = (h * 33L + c.code.toLong()) and 0xFFFFFFFFL
     return (h % 8L).toInt()
 }
+
+/**
+ * Assign every org a UNIQUE color slot (0..7 -> ChartSeries), no two sharing —
+ * a port of board.js `orgColorMap` (XERK-48). Uniqueness couples the orgs, so
+ * it takes the whole set: each org takes its djb2-preferred slot if free, else
+ * linear-probes to the next free one, keys processed in sorted order so the
+ * result is deterministic and order-independent. Unique up to 8 orgs (the
+ * palette's size); a larger fleet can't be collision-free, so overflow orgs fall
+ * back to their preferred (then possibly shared) slot. Persistent where it can
+ * be — an org keeps its color as the fleet changes unless its preferred slot
+ * actually collides, and even then only the colliding orgs move.
+ */
+fun orgColorMap(allKeys: List<String>): Map<String, Int> {
+    val keys = allKeys.filter { it.isNotEmpty() }.distinct().sorted()
+    val used = BooleanArray(8)
+    val map = LinkedHashMap<String, Int>()
+    for (k in keys) {
+        val pref = orgSlotPref(k)
+        var slot = -1
+        for (step in 0 until 8) {
+            val cand = (pref + step) % 8
+            if (!used[cand]) { slot = cand; break }
+        }
+        if (slot < 0) slot = pref else used[slot] = true
+        map[k] = slot
+    }
+    return map
+}
+
+/**
+ * The palette slot a single org paints, given every org it shares the board with
+ * (uniqueness couples them). Mirrors board.js `orgColor`; a key absent from the
+ * set falls back to its own preferred slot.
+ */
+fun orgColorIndex(siteKey: String, allKeys: List<String>): Int =
+    orgColorMap(allKeys)[siteKey] ?: orgSlotPref(siteKey)
 
 /**
  * The board's org filter, a port of board.js `boardHtml`'s `shown`: a blank

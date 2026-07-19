@@ -58,7 +58,7 @@ import com.xerktech.turma.core.autoStartOn
 import com.xerktech.turma.core.categoryOf
 import com.xerktech.turma.core.filterSites
 import com.xerktech.turma.core.mergeSites
-import com.xerktech.turma.core.orgColorIndex
+import com.xerktech.turma.core.orgColorMap
 import com.xerktech.turma.core.orgName
 import com.xerktech.turma.model.JiraTicket
 import com.xerktech.turma.ui.theme.TurmaColors
@@ -71,6 +71,9 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
     val refreshing by vm.refreshing.collectAsStateWithLifecycle()
     val orgFilter by vm.orgFilter.collectAsStateWithLifecycle()
     val sites = remember(fleet) { mergeSites(fleet.agents) }
+    // One assignment of unique per-org colors over the whole org set, shared by
+    // the chips and the columns so an org is one color everywhere (XERK-48).
+    val colorMap = remember(sites) { orgColorMap(sites.map { it.siteKey }) }
     val shown = remember(sites, orgFilter) { filterSites(sites, orgFilter) }
     var detail by remember { mutableStateOf<Pair<BoardSite, JiraTicket>?>(null) }
 
@@ -96,7 +99,7 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
             // plus one per org, labelled by org name, ticket-counted, and colored by
             // the org's stable palette slot. Mirrors board.html's `#chips` row.
             OrgFilterBar(
-                sites, orgFilter,
+                sites, colorMap, orgFilter,
                 autoOf = { autoStartOn(fleet.autoStartOrgs, it) },
                 onToggleAuto = { site, enabled -> vm.setAutoStart(site, enabled) },
                 onPick = { vm.setOrg(it) },
@@ -110,7 +113,7 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
                     val cards = shown
                         .flatMap { site -> site.tickets.filter { categoryOf(it) == cat }.map { site to it } }
                         .sortedByDescending { it.second.updated }
-                    KanbanColumn(cat, title, cards) { site, t -> detail = site to t }
+                    KanbanColumn(cat, title, cards, colorMap) { site, t -> detail = site to t }
                 }
             }
         }
@@ -134,6 +137,7 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
 @Composable
 private fun OrgFilterBar(
     sites: List<BoardSite>,
+    colorMap: Map<String, Int>,
     orgFilter: String,
     autoOf: (String) -> Boolean,
     onToggleAuto: (String, Boolean) -> Unit,
@@ -149,7 +153,7 @@ private fun OrgFilterBar(
         for (s in sites) {
             OrgChip(
                 label = orgName(s.siteKey),
-                color = TurmaColors.series[orgColorIndex(s.siteKey) % TurmaColors.series.size],
+                color = TurmaColors.series[(colorMap[s.siteKey] ?: 0) % TurmaColors.series.size],
                 count = s.tickets.size,
                 offline = !s.online,
                 active = orgFilter == s.siteKey,
@@ -242,6 +246,7 @@ private fun KanbanColumn(
     cat: String,
     title: String,
     cards: List<Pair<BoardSite, JiraTicket>>,
+    colorMap: Map<String, Int>,
     onOpen: (BoardSite, JiraTicket) -> Unit,
 ) {
     Column(Modifier.width(300.dp).fillMaxSize()) {
@@ -252,7 +257,7 @@ private fun KanbanColumn(
         }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             items(cards, key = { it.second.key }) { (site, t) ->
-                TicketCard(t, TurmaColors.series[orgColorIndex(site.siteKey) % TurmaColors.series.size]) { onOpen(site, t) }
+                TicketCard(t, TurmaColors.series[(colorMap[site.siteKey] ?: 0) % TurmaColors.series.size]) { onOpen(site, t) }
             }
         }
     }
