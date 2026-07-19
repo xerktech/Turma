@@ -1311,6 +1311,38 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   `BoardTest.kt`, and the `autoStart` payload cases in `TestSetJiraRepo`
   (`agent/tests/test_hub_agent.py`).
 
+##### Auto-stopping Done tickets (XERK-45)
+
+- The lifecycle **counterpart** to auto-start: the SAME per-org "auto" opt-in that starts a To Do
+  ticket's session **kills** a session once its ticket reaches **Done**. Turning "auto" on for an org
+  now means the board drives that org's whole session lifecycle — both halves — which is why the org
+  chip's tooltip reads "start To Do tickets, stop Done sessions" rather than naming only the start.
+- A ticket only reaches Done by a **human** moving it (the board is pull-only — no session writes to
+  Jira), so it's a deliberate "this work is finished" signal, even more intentional than the To Do
+  state auto-start reacts to.
+- The hub **KILLS** the session, not interrupts it: a kill ends it cleanly — it moves to the Ended
+  list with its worktree, conversation and PR chips intact and still resumable, and frees the
+  `MAX_SESSIONS` slot the auto-started session took (symmetric with auto-start consuming one). An
+  interrupt would only cancel the in-flight turn and leave the session running idle, still holding the
+  slot with nothing to do.
+- The DECISION and ROUTING live on the HUB for the same reason auto-start's do: only it sees the whole
+  fleet. `autoStopSweep()` (same 15s `setInterval`, boot-grace-gated, beside `autoStartSweep`) reads
+  each opted-in org's **Done** tickets from its freshest jira block (the copy the board renders), then
+  scans the WHOLE fleet for sessions whose `ticket` names one — a session can live on ANY of the org's
+  hosts, so it routes each `{type:"kill", sessionId}` to the host that owns the session.
+- Only **live** sessions are stopped (`status` `running`/`queued`): a `stopped`/`error` session
+  already ended, a killed one is gone from `a.sessions`, and a `queued` session for an already-Done
+  ticket is cancelled (its Cancel path) rather than run pointlessly. Every live session on the ticket
+  is killed — a two-branch (`-1`/`-2`) or restart-clear-context ticket has more than one.
+- Guard: `autoStopped`, an in-memory `<host>\x00<sessionId>` once-per-hub-lifetime set. A kill drops
+  the record within a beat or two but it's still reported in that window, so the set stops a duplicate
+  kill riding every sweep. It needs no durability — unlike `autoStarted` (which stops a *refused*
+  spawn re-queuing forever), a re-issued kill of an already-dead session is a harmless agent-side
+  no-op, and a still-live session re-derives into the sweep on its own.
+- The Android client shows the identical "auto" toggle and behaviour; the reworded text is a
+  desktop-only hover tooltip (Compose has no equivalent), so there's no parity gap.
+- Tests: the `auto-stop:` cases in `turma/tests/server.test.js`.
+
 #### Ticket ↔ session chips
 
 - A ticket's sessions show as chips on its card, from `ticketSessionIndex` — a reverse index of the
