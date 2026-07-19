@@ -18,6 +18,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Search
@@ -78,6 +79,26 @@ fun flattenSessions(
     }
     return filtered.sortedBy { it.session.status != "running" }
 }
+
+/** An online host and the repos a new session can be spawned in on it. */
+data class SpawnHost(val key: String, val device: String, val repos: List<com.xerktech.turma.model.RepoInfo>)
+
+/**
+ * The spawn picker's source list — mirrors the web sessions sidebar's "New
+ * session" section (each ONLINE host, its repos as spawn buttons). The repos-root
+ * pseudo-repo is dropped while that host already runs a root session (only one is
+ * allowed per host), matching the dashboard's hidden "+ New session" there. A host
+ * left with no spawnable repo is omitted.
+ */
+fun spawnTargets(agents: List<AgentInfo>): List<SpawnHost> =
+    agents.filter { it.online }
+        .map { a ->
+            val repos = a.repos.filter { repo ->
+                !repo.root || a.sessions.none { it.root && it.status == "running" }
+            }
+            SpawnHost(a.key, a.device.ifBlank { a.key }, repos)
+        }
+        .filter { it.repos.isNotEmpty() }
 
 /** Identity of the session currently open in the detail pane. */
 private fun selKey(host: String?, id: String?): String? =
@@ -172,9 +193,13 @@ fun SessionsListPane(
     val rows = remember(fleet, query) { flattenSessions(fleet.agents, query) }
     val ended = remember(fleet, query) { flattenClosed(fleet.agents, query) }
     var endedOpen by remember { mutableStateOf(false) }
+    // New-session picker: pick an online host + repo, then the spawn composer.
+    var pickerOpen by remember { mutableStateOf(false) }
+    var spawnFor by remember { mutableStateOf<Triple<String, String, Boolean>?>(null) }
 
     Column(modifier.fillMaxSize()) {
         ScreenHeader("Sessions") {
+            IconButton(onClick = { pickerOpen = true }) { Icon(Icons.Filled.Add, "New session") }
             // Full-history archive + FTS search (offline hosts included) — the
             // live box below only filters the sessions currently in the fleet.
             IconButton(onClick = onOpenArchive) { Icon(Icons.Filled.Search, "Search all history") }
@@ -220,6 +245,23 @@ fun SessionsListPane(
                 }
             }
         }
+    }
+
+    if (pickerOpen) {
+        NewSessionPickerDialog(
+            targets = remember(fleet) { spawnTargets(fleet.agents) },
+            onDismiss = { pickerOpen = false },
+            onPick = { host, repo, isRoot -> pickerOpen = false; spawnFor = Triple(host, repo, isRoot) },
+        )
+    }
+    spawnFor?.let { (host, repo, isRoot) ->
+        SpawnDialog(
+            host = host, repo = repo, isRoot = isRoot,
+            onDismiss = { spawnFor = null },
+            onSpawn = { prompt, label, baseRef, model, mode ->
+                vm.spawn(host, repo, prompt, label, baseRef, model, mode); spawnFor = null
+            },
+        )
     }
 }
 

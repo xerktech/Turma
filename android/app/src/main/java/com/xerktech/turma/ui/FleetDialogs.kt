@@ -100,6 +100,49 @@ fun DropdownField(label: String, options: List<String>, selected: String, onSele
     }
 }
 
+/**
+ * The "New session" picker for the Sessions page (web sessions.html #spawn): pick
+ * an ONLINE host and one of its repos, which then opens [SpawnDialog] for that
+ * target. The dashboard spawns per-repo in place; the Sessions page has no repo
+ * tree, so this two-step picker stands in for it.
+ */
+@Composable
+fun NewSessionPickerDialog(
+    targets: List<SpawnHost>,
+    onDismiss: () -> Unit,
+    onPick: (host: String, repo: String, isRoot: Boolean) -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New session") },
+        text = {
+            if (targets.isEmpty()) {
+                Text("No online host with a repo to spawn in.")
+            } else {
+                Column(
+                    Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    targets.forEach { h ->
+                        SectionLabel(h.device, Modifier.padding(top = 8.dp, bottom = 2.dp))
+                        h.repos.forEach { repo ->
+                            Text(
+                                if (repo.root) "⌂ Repos root" else repo.name,
+                                Modifier.fillMaxWidth()
+                                    .clickable { onPick(h.key, repo.name, repo.root) }
+                                    .padding(vertical = 10.dp),
+                            )
+                            HorizontalDivider()
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
 @Composable
 fun ResumeDialog(repo: RepoInfo, onDismiss: () -> Unit, onPick: (transcriptId: String, cwd: String) -> Unit) {
     AlertDialog(

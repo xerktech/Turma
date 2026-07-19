@@ -142,6 +142,9 @@ fun ChatScreen(
                 actions = {
                     VerbosityMenu(state.verbosity) { vm.setVerbosity(it) }
                     IconButton(onClick = onTerminal) { Icon(Icons.Filled.Terminal, "Terminal") }
+                    // Kill the session you're in (web chatKill): arm/confirm, then
+                    // leave the view — the card drops on the agent's next beat.
+                    KillAction(onKill = { vm.kill(); onBack() })
                 },
             )
         },

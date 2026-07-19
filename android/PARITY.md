@@ -55,6 +55,13 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   impossible. `ui/ChatScreen.kt`.
 - **Host "updating" status (XERK-29).** A host in an announced update restart shows an "updating →
   <version>" pill instead of the outage-looking "offline". `model/Models.kt` + `ui/FleetScreen.kt`.
+- **Kill from the chat/terminal header + New session from the Sessions page (XERK-44).** A shared
+  arm/confirm `KillAction` (`ui/CommonUi.kt`) sits in both the `ChatScreen` and `TerminalScreen` top
+  bars (web `chatKill`/`termKill`): first tap arms "Confirm kill", a second within 3.5s kills the
+  session you're in and leaves the view. The Sessions header gains a "+" that opens a two-step
+  `NewSessionPickerDialog` (online host → repo, the pure `spawnTargets` port of the web's `#spawn`
+  sidebar) feeding the existing `SpawnDialog`. `vm/ChatViewModel.kt` `kill()`;
+  `spawnTargets` tested in `SessionsFlattenTest`.
 - **Per-org auto-start switch (XERK-41).** Each board org chip carries an "auto" toggle segment INSIDE
   the pill (a divided chip, mirroring board.html's segmented `.org-chip`) that flips the hub-owned
   per-org auto-start opt-in (`POST /api/jira/<site>/autostart`); it reflects the effective state (the
@@ -82,13 +89,15 @@ those are marked `[MODEL]`.
 - P0 Jump-to-latest pill + stick-bottom scroll (stop auto-scroll fighting the reader).
 - P0 Ended sessions: read-only transcript view (archive fetch) with PR chips + Resume, not just a
   live-relaunch; include stopped + `repo.resumable` channels; exclude non-running from the live list.
-- P0 Per-card ⋯ menu: Rename (inline) + arm/confirm Kill; Kill in the chat header.
+- P0 Per-card ⋯ menu: Rename (inline) + arm/confirm Kill. (Kill in the chat/terminal header is done —
+  XERK-44; the per-list-card ⋯ menu with Rename is still open.)
 - P1 Sidebar sections: Queued / Active / Idle / Ended split with state line + question preview.
 - P1 Verbosity NORMAL: tool card collapsed (output on expand) to match web; persist per-card open.
 - P2 Live status bar: token counters + elapsed + spinner + hint lines + subagent list.
 - P2 `[MODEL]` Compose bar: all PR chips + Jira ticket chip; filter modes to `permissionModes`;
   optimistic model/mode update.
-- P2 New-session composer in the Sessions list (web can spawn from here).
+- ~~P2 New-session composer in the Sessions list (web can spawn from here).~~ Done (XERK-44): a "+"
+  in the Sessions header → host/repo picker → `SpawnDialog`.
 - P3 Deep links (`?session=`/`?ended=`), streaming caret, in-place terminal toggle.
 - P1 `[MODEL]` **Accurate model selector (XERK-33).** The footer model chip offers a hardcoded menu
   and shows `model` ("default"); the web now heartbeats the login's REAL model list per host
