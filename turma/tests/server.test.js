@@ -2307,52 +2307,61 @@ test("http: starting a ticket session requires the user login", async () => {
 });
 
 // ---- auto-start To Do tickets (XERK-32) ---------------------------------------
-// A host opts its org in via TICKET_AUTO_START (heartbeated top-level as
-// ticketAutoStart, board-agnostic and beside the jira block, not inside it). The
-// hub then starts a session for every To Do ticket with a repo assigned that has
-// no session yet, routing each via the same splitting the manual Start button uses
-// — so an org's work spreads across ALL its agents, not just the flag-bearer.
+// An org opts in via the HUB's per-org auto-start toggle (XERK-41 made this
+// hub-only — no agent flag). The hub then starts a session for every To Do ticket
+// with a repo assigned that has no session yet, routing each via the same
+// splitting the manual Start button uses — so an org's work spreads across ALL its
+// agents.
 
-// A host reporting `site` with autoStart, `repos` cloned, and a ticket list. The
-// default ticket is a To Do ticket already triaged to Turma.
-const asBeat = (device, site, {
+// A host reporting `site`, `repos` cloned, and a ticket list. The default ticket
+// is a To Do ticket already triaged to Turma. `autoStart:true` (the default)
+// also flips the org's HUB toggle on, since the opt-in is hub-only now.
+const asBeat = async (device, site, {
   autoStart = true, repos = ["Turma"], capacity,
   sessions = [], closedSessions = [],
   tickets = [{ key: "ENG-5", summary: "Fix it", statusCategory: "todo",
                repoGuess: { repo: "Turma", cloned: true } }],
   fetchedAt = "2026-07-14T12:00:00Z",
-} = {}) =>
-  request("POST", "/api/heartbeat", {
+} = {}) => {
+  const r = await request("POST", "/api/heartbeat", {
     body: {
       device,
       repos: repos.map((name) => ({ name, path: `/git/${name}` })),
       sessions, closedSessions,
-      // Board-agnostic and top-level, beside jira (not inside it).
-      ticketAutoStart: autoStart,
       ...(capacity ? { capacity } : {}),
       jira: { available: true, configured: true, siteKey: site,
               user: `${device}@x.com`, fetchedAt, tickets },
     },
     headers: agentHeaders,
   });
+  if (autoStart) setAutoStartOrg(site, true);
+  return r;
+};
+
+// Clear both the per-sweep once-guard and the hub opt-in map so each sweep test
+// starts from a clean slate (no org left opted in by a prior test).
+const resetAutoStart = () => {
+  autoStarted.clear();
+  for (const k of Object.keys(autoStartOrgs)) delete autoStartOrgs[k];
+};
 
 test("auto-start: a To Do ticket with a repo is queued once the org opts in", async () => {
-  autoStarted.clear();
+  resetAutoStart();
   await asBeat("asHost", "as1.atlassian.net");
   autoStartSweep();
   assert.deepEqual((agents.asHost.commands || []).map((c) => [c.type, c.issueKey]),
     [["spawnTicket", "ENG-5"]]);
 });
 
-test("auto-start: does nothing while the flag is off (the default)", async () => {
-  autoStarted.clear();
+test("auto-start: does nothing until the org is opted in (off by default)", async () => {
+  resetAutoStart();
   await asBeat("asOff", "as2.atlassian.net", { autoStart: false });
   autoStartSweep();
   assert.equal((agents.asOff.commands || []).length, 0);
 });
 
 test("auto-start: only To Do tickets, and only ones with a repo assigned", async () => {
-  autoStarted.clear();
+  resetAutoStart();
   await asBeat("asFilter", "as3.atlassian.net", {
     tickets: [
       { key: "ENG-1", statusCategory: "inprogress",
@@ -2369,7 +2378,7 @@ test("auto-start: only To Do tickets, and only ones with a repo assigned", async
 });
 
 test("auto-start: skips a ticket that already has a session (started manually or before)", async () => {
-  autoStarted.clear();
+  resetAutoStart();
   // The ticket already carries a live session and a killed one — either alone is
   // enough to say "already started", so the hub must not open a second.
   await asBeat("asDup", "as4.atlassian.net", {
@@ -2391,7 +2400,7 @@ test("auto-start: skips a ticket that already has a session (started manually or
 });
 
 test("auto-start: a resumable-only session (durable, survives restart) still counts as started", async () => {
-  autoStarted.clear();
+  resetAutoStart();
   await asBeat("asResume", "as6.atlassian.net", {
     repos: ["Turma"],
   });
@@ -2405,7 +2414,7 @@ test("auto-start: a resumable-only session (durable, survives restart) still cou
 });
 
 test("auto-start: fires each ticket at most once, even if the spawn left no session", async () => {
-  autoStarted.clear();
+  resetAutoStart();
   await asBeat("asOnce", "as7.atlassian.net");
   autoStartSweep();
   assert.equal((agents.asOnce.commands || []).length, 1);
@@ -2418,7 +2427,7 @@ test("auto-start: fires each ticket at most once, even if the spawn left no sess
 });
 
 test("auto-start: an in-flight spawnTicket (e.g. a manual click) is not doubled", async () => {
-  autoStarted.clear();
+  resetAutoStart();
   await asBeat("asInflight", "as8.atlassian.net");
   // A spawnTicket already queued by the /session route sits on the host.
   queueCommand("asInflight", { type: "spawnTicket", issueKey: "ENG-5" });
@@ -2427,24 +2436,23 @@ test("auto-start: an in-flight spawnTicket (e.g. a manual click) is not doubled"
     (c) => c.type === "spawnTicket").length, 1);
 });
 
-test("auto-start: work still spreads across ALL the org's agents, flag or not", async () => {
-  // The two-agents case from the ticket: only one host opts in, but the session
-  // routes by availability across BOTH — landing on the more-available host even
-  // when that's the one with the flag OFF.
-  autoStarted.clear();
-  await asBeat("asFlagged", "as9.atlassian.net", {
-    autoStart: true, capacity: { maxSessions: 6, running: 5, queued: 0, free: 1 } });
-  await asBeat("asPlain", "as9.atlassian.net", {
+test("auto-start: work spreads across ALL the org's agents (routes by availability)", async () => {
+  // The two-agents case: the ORG is opted in (hub-only), and the session routes
+  // by availability across BOTH its hosts — landing on the more-available one.
+  resetAutoStart();
+  await asBeat("asBusy", "as9.atlassian.net", {
+    capacity: { maxSessions: 6, running: 5, queued: 0, free: 1 } });   // opts as9 in
+  await asBeat("asFree", "as9.atlassian.net", {
     autoStart: false, capacity: { maxSessions: 6, running: 1, queued: 0, free: 5 } });
   autoStartSweep();
-  // Routed to the most-available host — the flag-OFF one — proving auto-start uses
-  // the same fleet-wide splitting as the manual button.
-  assert.deepEqual((agents.asPlain.commands || []).map((c) => c.issueKey), ["ENG-5"]);
-  assert.equal((agents.asFlagged.commands || []).length, 0);
+  // Routed to the most-available host, proving auto-start uses the same
+  // fleet-wide splitting as the manual button.
+  assert.deepEqual((agents.asFree.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal((agents.asBusy.commands || []).length, 0);
 });
 
 test("auto-start: honors a ticket's pinned agent over availability", async () => {
-  autoStarted.clear();
+  resetAutoStart();
   await asBeat("asPinBusy", "asPin.atlassian.net",
     { capacity: { maxSessions: 6, running: 5, queued: 0, free: 1 } });
   await asBeat("asPinFree", "asPin.atlassian.net",
@@ -2456,7 +2464,7 @@ test("auto-start: honors a ticket's pinned agent over availability", async () =>
 });
 
 test("auto-start: a pinned agent that's offline retries later, never reroutes", async () => {
-  autoStarted.clear();
+  resetAutoStart();
   await asBeat("asPinOffA", "asPinOff.atlassian.net");
   await asBeat("asPinOffB", "asPinOff.atlassian.net");
   await setAgent("asPinOff.atlassian.net", "ENG-5", { host: "asPinOffB" });
@@ -2472,29 +2480,37 @@ test("auto-start: a pinned agent that's offline retries later, never reroutes", 
   assert.deepEqual((agents.asPinOffB.commands || []).map((c) => c.issueKey), ["ENG-5"]);
 });
 
-test("auto-start: an offline host's stale flag drives nothing", async () => {
-  autoStarted.clear();
-  await asBeat("asStale", "as10.atlassian.net");
+test("auto-start: an org with every host offline queues nothing until one returns", async () => {
+  resetAutoStart();
+  await asBeat("asStale", "as10.atlassian.net");        // opts the org in
   agents.asStale.lastSeen = Date.now() - 10 * 60 * 1000; // offline
-  assert.equal(orgsWithAutoStart().has("as10.atlassian.net"), false);
+  // The opt-in is durable hub state, so the org stays "on"...
+  assert.equal(orgsWithAutoStart().has("as10.atlassian.net"), true);
+  // ...but with no online host to route to, the sweep queues nothing.
   autoStartSweep();
   assert.equal((agents.asStale.commands || []).length, 0);
+  // The host returns — the next sweep spawns there.
+  agents.asStale.lastSeen = Date.now();
+  autoStartSweep();
+  assert.deepEqual((agents.asStale.commands || []).map((c) => c.issueKey), ["ENG-5"]);
 });
 
 // ---- per-org auto-start opt-in from the hub (XERK-41) -------------------------
 
-test("auto-start: the hub-side org toggle opts an org in WITHOUT any agent env", async () => {
-  autoStarted.clear();
-  // A host with the legacy env OFF — the toggle alone must drive the sweep.
+test("auto-start: the hub-side org toggle is the ONLY opt-in", async () => {
+  resetAutoStart();
+  // A reporting host is not enough — the org is off until the hub toggle is set.
   await asBeat("asHub", "ashub.atlassian.net", { autoStart: false });
   assert.equal(orgsWithAutoStart().has("ashub.atlassian.net"), false);
+  autoStartSweep();
+  assert.equal((agents.asHub.commands || []).length, 0);
+  // The toggle drives the sweep.
   setAutoStartOrg("ashub.atlassian.net", true);
   assert.equal(orgsWithAutoStart().has("ashub.atlassian.net"), true);
   autoStartSweep();
   assert.deepEqual((agents.asHub.commands || []).map((c) => [c.type, c.issueKey]),
     [["spawnTicket", "ENG-5"]]);
   setAutoStartOrg("ashub.atlassian.net", false); // leave global state clean
-  assert.equal(orgsWithAutoStart().has("ashub.atlassian.net"), false);
 });
 
 test("POST /api/jira/<site>/autostart flips the opt-in and rides the payload", async () => {

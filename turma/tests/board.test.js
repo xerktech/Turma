@@ -9,7 +9,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgName, autoStartState, ageStr, prioClass,
+  mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgName, autoStartOn, ageStr, prioClass,
   cardHtml, boardHtml, detailHtml, textHtml, linkify,
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
@@ -184,36 +184,15 @@ test("orgName: the org, not the Jira Cloud host", () => {
   assert.equal(orgName("tfs.company.com/tfs/DefaultCollection"), "DefaultCollection");
 });
 
-test("autoStartState: the org-chip switch reflects hub toggle OR a legacy agent env", () => {
+test("autoStartOn: the org-chip switch reads the hub-only per-org opt-in", () => {
   const site = "acme.atlassian.net";
-  const envAgent = { online: true, ticketAutoStart: true, jira: { siteKey: site } };
-  const plainAgent = { online: true, ticketAutoStart: false, jira: { siteKey: site } };
-
-  // Off by default: no hub toggle, no env.
-  assert.deepEqual(autoStartState([plainAgent], {}, site),
-    { on: false, hubOn: false, envForced: false });
-
-  // The hub toggle alone turns it on and is not locked.
-  assert.deepEqual(autoStartState([plainAgent], { [site]: true }, site),
-    { on: true, hubOn: true, envForced: false });
-
-  // A legacy env on an ONLINE host forces it on and locks it (can't clear from
-  // the hub), even with the hub toggle off.
-  assert.deepEqual(autoStartState([envAgent], {}, site),
-    { on: true, hubOn: false, envForced: true });
-
-  // An OFFLINE host's stale env flag drives nothing — matches orgsWithAutoStart.
-  const offlineEnv = { online: false, ticketAutoStart: true, jira: { siteKey: site } };
-  assert.deepEqual(autoStartState([offlineEnv], {}, site),
-    { on: false, hubOn: false, envForced: false });
-
-  // Another org's env doesn't leak across siteKeys.
-  assert.deepEqual(autoStartState([envAgent], {}, "other.atlassian.net"),
-    { on: false, hubOn: false, envForced: false });
-
-  // Tolerates missing inputs.
-  assert.deepEqual(autoStartState(undefined, undefined, site),
-    { on: false, hubOn: false, envForced: false });
+  // Off unless the hub toggle names the org.
+  assert.equal(autoStartOn({}, site), false);
+  assert.equal(autoStartOn({ [site]: true }, site), true);
+  // Another org's entry doesn't leak across siteKeys.
+  assert.equal(autoStartOn({ [site]: true }, "other.atlassian.net"), false);
+  // Tolerates missing inputs (older payloads with no autoStartOrgs).
+  assert.equal(autoStartOn(undefined, site), false);
 });
 
 test("ageStr: human ages from ISO timestamps (Jira's +0000 offset included)", () => {

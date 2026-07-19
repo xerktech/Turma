@@ -8115,27 +8115,15 @@ class TestSetJiraRepo(ManagerMixin, unittest.TestCase):
             payload = sm.build_payload(1)
         self.assertNotIn("repoOptions", payload["jira"])
 
-    def test_ticket_auto_start_flag_is_off_by_default(self):
-        # The hub reads the top-level ticketAutoStart to decide whether to auto-spawn
-        # this org's To Do tickets; it must default OFF (XERK-32).
+    def test_no_agent_side_auto_start_flag(self):
+        # Auto-start opt-in is HUB-ONLY (XERK-41): the agent carries no
+        # TICKET_AUTO_START env and reports no ticketAutoStart flag.
+        self.assertFalse(hasattr(ha, "TICKET_AUTO_START"))
         sm = self._manager()
         with self._configured():
-            self.assertFalse(sm.build_payload(1)["ticketAutoStart"])
-
-    def test_ticket_auto_start_flag_reflects_the_config(self):
-        # Settable ONLY from the agent's config, and honestly advertised when it is.
-        sm = self._manager()
-        with self._configured(), mock.patch.object(ha, "TICKET_AUTO_START", True):
-            self.assertTrue(sm.build_payload(1)["ticketAutoStart"])
-
-    def test_ticket_auto_start_rides_top_level_not_the_jira_block(self):
-        # Board-agnostic on purpose: the flag lives beside `jira`, not inside it, so
-        # a future non-Jira board carries it unchanged.
-        sm = self._manager()
-        with self._configured(), mock.patch.object(ha, "TICKET_AUTO_START", True):
             payload = sm.build_payload(1)
+        self.assertNotIn("ticketAutoStart", payload)
         self.assertNotIn("autoStart", payload["jira"])
-        self.assertTrue(payload["ticketAutoStart"])
 
     def test_the_command_reaches_set_jira_repo(self):
         sm = self._manager()

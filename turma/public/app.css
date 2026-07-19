@@ -296,7 +296,6 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .org-chip-auto .org-auto-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
 .org-chip-auto.on { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .org-chip-auto.on .org-auto-dot { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
-.org-chip-auto.forced, .org-chip-auto:disabled { cursor: default; opacity: .75; }
 
 .kanban-cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; align-items: start; }
 .kanban-col { min-width: 0; }

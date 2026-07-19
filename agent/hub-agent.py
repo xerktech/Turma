@@ -3164,26 +3164,14 @@ try:
     JIRA_REFRESH_EVERY = int(os.environ.get("TURMA_JIRA_REFRESH_EVERY", "30"))
 except ValueError:
     JIRA_REFRESH_EVERY = 30   # beats between polls (30 × 20s beat ≈ 10 min)
-# Ticket auto-start (XERK-32): when set, this host asks the hub to automatically
-# start a session for every "To Do" ticket on its board the moment that ticket has
-# a repo assigned (by the model or by a manual pin). Named TICKET_* rather than
-# JIRA_* because the board is Jira today but the concept isn't Jira-specific —
-# other trackers may back it later, and this flag should carry across unchanged.
-# Advertised to the hub as the top-level, board-agnostic `ticketAutoStart` (NOT
-# inside the jira block, for the same reason); the hub owns the decision and the
-# routing, because only it sees the whole fleet and can spread the org's sessions
-# across ALL its agents rather than piling them on whichever one carries this flag.
-# An agent serves exactly one org (one board's creds), so this per-agent flag IS a
-# per-org switch. Read forgivingly.
-#
-# XERK-41 moved the PRIMARY control to the hub: the board's per-org auto-start
-# switch (a durable hub setting) is now how an operator turns this on and off
-# without redeploying an agent. This env stays as a backward-compat OR — an org
-# configured the old way keeps auto-starting — but new setups should leave it
-# unset and use the toggle. The hub unions the two sources (see the hub's
-# orgsWithAutoStart); a legacy env-on org shows on the board as forced-on.
-TICKET_AUTO_START = os.environ.get("TICKET_AUTO_START", "").strip().lower() in (
-    "1", "true", "yes", "on")
+# Ticket auto-start (XERK-32) is opt-in PER ORG so the hub starts a session for
+# every "To Do" ticket the moment it has a repo assigned (by the model's triage or
+# a manual pin). The opt-in is HUB-ONLY (XERK-41): the operator flips it from the
+# board's per-org auto-start switch (a durable hub setting — see the hub's
+# autostart-orgs store), so there is no agent-side config for it and this host
+# reports no auto-start flag. The hub owns the decision and the routing anyway,
+# because only it sees the whole fleet and can spread the org's sessions across
+# ALL its agents.
 JIRA_TIMEOUT_SEC = 15
 JIRA_PAGE_SIZE = 100    # /search/jql hard-caps maxResults at 100
 JIRA_MAX_ACTIVE = 150   # not-Done tickets reported (bounds the heartbeat)
@@ -8652,10 +8640,6 @@ class SessionManager:
             # Jira Cloud assigned tickets (user-scoped creds); the hub's /board
             # merges these across hosts by siteKey into one cross-org Kanban.
             "jira": self._jira_payload(),
-            # Ticket auto-start opt-in (XERK-32): top-level and board-agnostic on
-            # purpose — the hub reads it to decide whether to auto-spawn sessions
-            # for this org's To Do tickets. See TICKET_AUTO_START.
-            "ticketAutoStart": TICKET_AUTO_START,
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),

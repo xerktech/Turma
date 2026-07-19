@@ -50,14 +50,13 @@ const TICKET_AGENTS_MAX = 500;
 // Per-org auto opt-in (XERK-41): which Jira orgs let the board drive their whole
 // session lifecycle — auto-START a session for every To Do ticket that has a repo
 // (XERK-41), and auto-STOP a session when its ticket moves to Done (XERK-45; see
-// autoStopSweep). This replaced the agent's TICKET_AUTO_START env as the PRIMARY
-// control — it's now a hub setting the operator flips from the board's org chip,
-// so it can be turned on and off without redeploying an agent.
-// Hub-owned for the same reason the agent-pin above is: the decision and the
-// routing are the hub's job (only it sees the whole fleet). Durable on the /data
-// volume, not the best-effort state.json, because the opt-in must survive a hub
-// restart. The agent env still works as a legacy OR-fallback (see
-// orgsWithAutoStart) so an org configured the old way keeps auto-starting.
+// autoStopSweep). This is the SOLE control — it's a hub setting the operator flips
+// from the board's org chip, so it can be turned on and off without redeploying an
+// agent, and there is no agent-side flag (the original agent env TICKET_AUTO_START
+// was removed). Hub-owned for the same reason the agent-pin above is: the decision
+// and the routing are the hub's job (only it sees the whole fleet). Durable on the
+// /data volume, not the best-effort state.json, because the opt-in must survive a
+// hub restart.
 const AUTOSTART_ORGS_FILE = process.env.AUTOSTART_ORGS_FILE || "/data/autostart-orgs.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
@@ -978,17 +977,15 @@ setInterval(() => {
 }, 15 * 1000).unref();
 
 // ---- auto-start To Do tickets (XERK-32) ------------------------------------
-// Opt-in PER ORG via the agent's TICKET_AUTO_START config, advertised on the
-// heartbeat as the top-level, board-agnostic `ticketAutoStart` (an agent serves
-// one org, so its per-agent flag is that org's switch). When any ONLINE host of
-// an org sets it, the hub starts a session for every "To Do" ticket with a repo
-// — by the model's triage or a manual pin — and doesn't already have one.
+// Opt-in PER ORG via the hub's own per-org toggle (autoStartOrgs, XERK-41 —
+// hub-only, no agent flag). When an org is toggled on, the hub starts a session
+// for every "To Do" ticket that has a repo — by the model's triage or a manual
+// pin — and doesn't already have one.
 //
 // The DECISION and the ROUTING live here, not on the agent, for the reason the
 // manual Start button already does (see the /session route): only the hub sees
 // the whole fleet, so only it can spread an org's sessions across ALL its agents
-// via findTicketHost rather than piling them on whichever host carries the flag.
-// So "one of two agents in an org has auto-start on" still fans work across both.
+// via findTicketHost rather than piling them on one host.
 //
 // The whole point is to never open a SECOND session for work already started —
 // by an operator's click, a prior auto-start, or anything else. Three guards, in
@@ -1004,27 +1001,14 @@ setInterval(() => {
 const AUTO_START_EVERY_MS = 15 * 1000;
 const autoStarted = new Set(); // "<siteKey>\x00<issueKey>" already auto-started
 
-// siteKeys whose org is opted in to auto-start, from EITHER source (XERK-41):
-//   - the hub-owned per-org toggle (autoStartOrgs), the primary control now;
-//   - the legacy agent env TICKET_AUTO_START, kept as a backward-compat OR so an
-//     org configured the old way keeps auto-starting until the operator moves it
-//     to the toggle. Onlineness is required for the env source (unlike a
-//     read-only GET): an offline host's stale flag must not drive spawns. The hub
-//     toggle has no such gate — it's the hub's own durable state, not a report —
-//     but the sweep still only acts on orgs with a live reporting block and
-//     routes through findTicketHost, which needs an online host anyway, so a
-//     toggled-on org with every host down simply no-ops.
+// siteKeys whose org is opted in to auto-start (XERK-41). The opt-in is HUB-ONLY:
+// it's the hub's own durable per-org toggle (autoStartOrgs), set from the board —
+// there is no agent-side flag. No onlineness gate here (it's hub state, not a host
+// report); the sweep still only acts on orgs with a live reporting block and routes
+// through findTicketHost, which needs an online host anyway, so a toggled-on org
+// with every host down simply no-ops.
 function orgsWithAutoStart() {
-  const now = Date.now();
-  const on = new Set(Object.keys(autoStartOrgs).filter((k) => autoStartOrgs[k]));
-  for (const a of Object.values(agents)) {
-    // The flag rides top-level (board-agnostic); the org it applies to is still
-    // the host's board siteKey, so both must be present.
-    if (!a.ticketAutoStart || !a.jira || !a.jira.siteKey) continue;
-    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
-    on.add(a.jira.siteKey);
-  }
-  return on;
+  return new Set(Object.keys(autoStartOrgs).filter((k) => autoStartOrgs[k]));
 }
 
 // Every ticket that already has a session, on any channel — the durable
@@ -1154,10 +1138,11 @@ function autoStopSweep() {
 }
 
 // Don't act on freshly-loaded (possibly stale) state right after a hub boot, the
-// same reason the offline sweep waits: let agents re-report first. (The online
-// gate in orgsWithAutoStart already no-ops until a host re-heartbeats, so this is
-// belt-and-suspenders — and kept out of the sweeps themselves so they stay pure,
-// directly-callable units.)
+// same reason the offline sweep waits: let agents re-report first. (The opt-in map
+// loads from disk at boot, but the sweeps only act on orgs with a live reporting
+// block and route through findTicketHost, so they no-op until a host re-heartbeats
+// anyway — this is belt-and-suspenders, kept out of the sweeps themselves so they
+// stay pure, directly-callable units.)
 setInterval(() => {
   if (Date.now() - BOOT_AT < BOOT_GRACE_MS) return;
   autoStartSweep();
