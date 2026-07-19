@@ -1,8 +1,10 @@
 package com.xerktech.turma.ui
 
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.RepoInfo
 import com.xerktech.turma.model.SessionInfo
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SessionsFlattenTest {
@@ -39,5 +41,48 @@ class SessionsFlattenTest {
         assertEquals(listOf("b"), flattenSessions(agents, "dockerops").map { it.session.id })
         assertEquals(2, flattenSessions(agents, "maxai").size) // device match
         assertEquals(0, flattenSessions(agents, "nomatch").size)
+    }
+
+    // ---- spawnTargets (the New-session picker's source list) -----------------
+
+    private fun agentWithRepos(
+        key: String, device: String, online: Boolean,
+        repos: List<RepoInfo>, sessions: List<SessionInfo> = emptyList(),
+    ) = AgentInfo(key = key, device = device, online = online, repos = repos, sessions = sessions)
+
+    @Test fun `spawnTargets lists only online hosts with repos, device-labelled`() {
+        val agents = listOf(
+            agentWithRepos("h1", "MAXAI", true, listOf(RepoInfo(name = "turma"), RepoInfo(name = "docker"))),
+            agentWithRepos("h2", "OFF", false, listOf(RepoInfo(name = "turma"))), // offline → dropped
+            agentWithRepos("h3", "", true, emptyList()), // no repos → dropped
+        )
+        val targets = spawnTargets(agents)
+        assertEquals(1, targets.size)
+        assertEquals("h1", targets[0].key)
+        assertEquals("MAXAI", targets[0].device)
+        assertEquals(listOf("turma", "docker"), targets[0].repos.map { it.name })
+    }
+
+    @Test fun `spawnTargets blank device falls back to host key`() {
+        val targets = spawnTargets(listOf(agentWithRepos("host-key", "", true, listOf(RepoInfo(name = "r")))))
+        assertEquals("host-key", targets[0].device)
+    }
+
+    @Test fun `spawnTargets drops the repos-root while a root session runs`() {
+        val root = RepoInfo(name = "(root)", root = true)
+        val turma = RepoInfo(name = "turma")
+        // Root busy: the pseudo-repo is hidden (only one root session per host).
+        val busy = agentWithRepos(
+            "h1", "MAXAI", true, listOf(root, turma),
+            sessions = listOf(SessionInfo(id = "s", status = "running", root = true)),
+        )
+        assertEquals(listOf("turma"), spawnTargets(listOf(busy))[0].repos.map { it.name })
+
+        // Root free (only a stopped root session): the pseudo-repo is offered.
+        val free = agentWithRepos(
+            "h1", "MAXAI", true, listOf(root, turma),
+            sessions = listOf(SessionInfo(id = "s", status = "stopped", root = true)),
+        )
+        assertTrue(spawnTargets(listOf(free))[0].repos.any { it.root })
     }
 }

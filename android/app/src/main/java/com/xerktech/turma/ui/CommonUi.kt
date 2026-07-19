@@ -19,7 +19,13 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -101,6 +107,26 @@ fun GhostButton(text: String, onClick: () -> Unit, modifier: Modifier = Modifier
         fontWeight = FontWeight.Medium,
     )
 }
+
+/**
+ * Arm-then-confirm "Kill" for a chat/terminal top bar (web sessions.html
+ * chatKill/termKill). The first tap arms — the label becomes "Confirm kill" in
+ * the error colour for [ARM_MS] — and only a second tap within that window calls
+ * [onKill], so a mis-tap can't destroy a session. The arm auto-disarms on
+ * timeout, matching the web's 3.5s.
+ */
+@Composable
+fun KillAction(onKill: () -> Unit, modifier: Modifier = Modifier) {
+    var armed by remember { mutableStateOf(false) }
+    LaunchedEffect(armed) { if (armed) { kotlinx.coroutines.delay(ARM_MS); armed = false } }
+    TextButton(
+        onClick = { if (armed) { armed = false; onKill() } else armed = true },
+        modifier = modifier,
+        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+    ) { Text(if (armed) "Confirm kill" else "Kill") }
+}
+
+private const val ARM_MS = 3500L
 
 // ---- fields ----------------------------------------------------------------
 

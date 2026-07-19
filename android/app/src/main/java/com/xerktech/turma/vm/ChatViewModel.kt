@@ -219,6 +219,19 @@ class ChatViewModel(
         }
     }
 
+    /**
+     * Kill this session (web chat/terminal header "Kill" — POST .../kill). Fire-
+     * and-forget like the web's post-then-history.back(): the UI leaves the view
+     * immediately, the kill lands on the agent's next beat and drops the card.
+     */
+    fun kill() {
+        viewModelScope.launch {
+            runCatching { client.api.sessionAction(host, sessionId, "kill") }
+            _messages.tryEmit("✓ kill queued")
+            container.fleet.nudge()
+        }
+    }
+
     /** Interrupt the in-flight turn (web "◼ Stop" — POST .../interrupt). */
     fun stop() {
         viewModelScope.launch {

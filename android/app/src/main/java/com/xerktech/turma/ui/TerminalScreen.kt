@@ -83,7 +83,18 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
             TopAppBar(
                 title = { Text("Terminal") },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
-                actions = { IconButton(onClick = { reload++ }) { Icon(Icons.Filled.Refresh, "Reload") } },
+                actions = {
+                    IconButton(onClick = { reload++ }) { Icon(Icons.Filled.Refresh, "Reload") }
+                    // Kill the session you're in (web termKill): arm/confirm, then
+                    // leave the terminal — the session drops on the next beat.
+                    KillAction(onKill = {
+                        scope.launch {
+                            runCatching { container.client.api.sessionAction(host, sessionId, "kill") }
+                            container.fleet.nudge()
+                        }
+                        onBack()
+                    })
+                },
             )
         },
     ) { pad ->
