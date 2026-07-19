@@ -12,6 +12,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -306,7 +308,7 @@ private fun QuestionOptionCard(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun ChatFooter(
     session: com.xerktech.turma.model.SessionInfo?,
@@ -326,11 +328,13 @@ private fun ChatFooter(
         if (granted) onMicStart()
     }
     Column(Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        // Model / mode / PR sit ABOVE the input box.
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+        // Model / mode / PR sit ABOVE the input box. Every PR the session opened
+        // shows (newest first — the freshest link leads), matching the web footer
+        // chip (chat.js prFooterChip); FlowRow wraps them on a narrow phone.
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             MenuChip("model: ${session?.model?.ifBlank { "default" } ?: "default"}", listOf("default", "opus", "sonnet", "haiku"), onModel)
             MenuChip("mode: ${session?.permissionMode?.ifBlank { "auto" } ?: "auto"}", listOf("auto", "acceptEdits", "plan", "bypassPermissions", "default"), onMode)
-            session?.prs?.firstOrNull()?.let { PrBadge(it) }
+            session?.prs?.asReversed()?.forEach { PrBadge(it) }
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
