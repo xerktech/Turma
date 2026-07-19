@@ -3664,6 +3664,238 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         sm.send_input(sess["id"], "   \t\n  ")
         self.assertEqual(self.run_calls, [])
 
+    def test_records_the_message_on_the_outbox(self):
+        # Every sent message is recorded so _poll_pending_inputs can guarantee it
+        # across a compaction (XERK-47): text as typed (newlines flattened),
+        # attempts=1 (the initial send).
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sm.send_input(sess["id"], "run the tests")
+        pend = sess["pendingInputs"]
+        self.assertEqual(len(pend), 1)
+        self.assertEqual(pend[0]["text"], "run the tests")
+        self.assertEqual(pend[0]["attempts"], 1)
+        self.assertIn("at", pend[0])
+
+    def test_outbox_is_bounded(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        for i in range(ha.PENDING_INPUT_MAX + 5):
+            sm.send_input(sess["id"], f"msg {i}")
+        self.assertEqual(len(sess["pendingInputs"]), ha.PENDING_INPUT_MAX)
+        # The OLDEST are dropped, newest kept.
+        self.assertEqual(sess["pendingInputs"][-1]["text"],
+                         f"msg {ha.PENDING_INPUT_MAX + 4}")
+
+
+class TestPendingScan(ProjectDirMixin, unittest.TestCase):
+    """_pending_scan folds a transcript into (delivered user turns, still-queued
+    prompts, compaction count) in one pass — the facts the resend guarantee
+    keys on (XERK-47)."""
+
+    def _write(self, lines):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.WORKDIR))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, "t.jsonl")
+        with open(path, "w") as f:
+            for e in lines:
+                f.write(json.dumps(e) + "\n")
+        return path
+
+    def test_delivered_queued_and_compactions(self):
+        path = self._write([
+            {"type": "user", "message": {"role": "user", "content": "hello"}},
+            {"type": "queue-operation", "operation": "enqueue", "content": "later msg"},
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}},
+            {"type": "user", "message": {"role": "user", "content": "second"}},
+        ])
+        delivered, queued, compactions = ha._pending_scan(path)
+        self.assertIn("hello", delivered)
+        self.assertIn("second", delivered)
+        self.assertEqual(queued, ["later msg"])
+        self.assertEqual(compactions, 1)
+
+    def test_compact_summary_and_meta_turns_are_not_delivered(self):
+        # A compact summary is written as a user turn but is the model's own prose
+        # (isCompactSummary); a system-sourced turn (a task-notification) isn't a
+        # human message. Neither counts as a delivered operator message.
+        path = self._write([
+            {"type": "user", "isCompactSummary": True,
+             "message": {"role": "user", "content": "summary prose"}},
+            {"type": "user", "isMeta": True,
+             "message": {"role": "user", "content": "meta"}},
+            {"type": "user", "promptSource": "system",
+             "message": {"role": "user", "content": "injected"}},
+            {"type": "user", "message": {"role": "user", "content": "real one"}},
+        ])
+        delivered, _queued, _c = ha._pending_scan(path)
+        self.assertEqual(delivered, ["real one"])
+
+    def test_dequeue_empties_the_queue(self):
+        path = self._write([
+            {"type": "queue-operation", "operation": "enqueue", "content": "q"},
+            {"type": "queue-operation", "operation": "dequeue"},
+        ])
+        _d, queued, _c = ha._pending_scan(path)
+        self.assertEqual(queued, [])
+
+
+class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
+    """_poll_pending_inputs confirms sent messages landed and re-sends any a
+    compaction dropped (XERK-47)."""
+
+    SID = "11111111-1111-4111-8111-111111111111"
+
+    def make_manager(self):
+        sm = super().make_manager()
+        self.run_calls.clear()
+        return sm
+
+    def _session(self, sm, pending, worktree=None):
+        wt = worktree or os.path.join(self.tmp, "wt")
+        os.makedirs(wt, exist_ok=True)
+        sess = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+                "worktreePath": wt, "claudeSessionId": self.SID,
+                "pendingInputs": pending}
+        sm.registry = [sess]
+        return sess, wt
+
+    def _write_transcript(self, wt, lines):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, f"{self.SID}.jsonl"), "w") as f:
+            for e in lines:
+                f.write(json.dumps(e) + "\n")
+
+    def test_delivered_message_is_reaped(self):
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "do it", "at": time.time(),
+                                       "attempts": 1}])
+        self._write_transcript(wt, [
+            {"type": "user", "message": {"role": "user", "content": "do it"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        self.assertNotIn("pendingInputs", sess)
+        self.assertEqual(self.run_calls, [])  # no resend
+
+    def test_still_queued_message_is_kept_not_resent(self):
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "later", "at": time.time(),
+                                       "attempts": 1}])
+        self._write_transcript(wt, [
+            {"type": "queue-operation", "operation": "enqueue", "content": "later"}])
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        self.assertEqual(len(sess["pendingInputs"]), 1)
+        self.assertEqual(self.run_calls, [])
+
+    def test_compaction_dropped_message_is_resent_when_idle(self):
+        sm = self.make_manager()
+        # compactBase 0: a compaction (count 1) has happened since it was sent.
+        sess, wt = self._session(sm, [{"text": "hi there", "at": time.time(),
+                                       "attempts": 1, "compactBase": 0}])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        self.assertEqual(self.run_calls, [
+            ["tmux", "send-keys", "-t", "agent-s1", "-l", "--", "hi there"],
+            ["tmux", "send-keys", "-t", "agent-s1", "Enter"],
+        ])
+        it = sess["pendingInputs"][0]
+        self.assertEqual(it["attempts"], 2)
+        self.assertEqual(it["compactBase"], 1)  # only a NEWER compaction re-loses it
+
+    def test_no_resend_while_pane_is_busy(self):
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
+                                       "attempts": 1, "compactBase": 0}])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=True):
+            sm._poll_pending_inputs()
+        self.assertEqual(self.run_calls, [])            # deferred
+        self.assertEqual(len(sess["pendingInputs"]), 1)  # still tracked
+
+    def test_no_resend_without_a_new_compaction(self):
+        sm = self.make_manager()
+        # compactBase already 1 and the transcript holds one compaction: no NEW
+        # compaction, so a not-yet-delivered message just waits (in-flight).
+        sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
+                                       "attempts": 1, "compactBase": 1}])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(len(sess["pendingInputs"]), 1)
+
+    def test_resend_budget_is_bounded(self):
+        sm = self.make_manager()
+        sess, wt = self._session(
+            sm, [{"text": "hi", "at": time.time(),
+                  "attempts": ha.PENDING_INPUT_MAX_ATTEMPTS, "compactBase": 0}])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        self.assertEqual(self.run_calls, [])       # budget spent, no resend
+        self.assertNotIn("pendingInputs", sess)     # given up, reaped
+
+    def test_only_one_resend_per_beat(self):
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [
+            {"text": "one", "at": time.time(), "attempts": 1, "compactBase": 0},
+            {"text": "two", "at": time.time(), "attempts": 1, "compactBase": 0},
+        ])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        # Exactly one message re-typed this beat (type + Enter); the other waits.
+        typed = [c for c in self.run_calls if c[:2] == ["tmux", "send-keys"]
+                 and "-l" in c]
+        self.assertEqual(len(typed), 1)
+        self.assertEqual(len(sess["pendingInputs"]), 2)
+
+    def test_expired_unconfirmed_message_is_dropped(self):
+        sm = self.make_manager()
+        sess, wt = self._session(
+            sm, [{"text": "stale", "at": time.time() - ha.PENDING_INPUT_TTL_SEC - 1,
+                  "attempts": 1, "compactBase": 0}])
+        self._write_transcript(wt, [])  # never landed, no compaction
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        self.assertEqual(self.run_calls, [])
+        self.assertNotIn("pendingInputs", sess)
+
+    def test_stopped_session_drops_its_outbox(self):
+        sm = self.make_manager()
+        sess, _wt = self._session(sm, [{"text": "x", "at": time.time(),
+                                        "attempts": 1}])
+        sess["status"] = "stopped"
+        sm._poll_pending_inputs()
+        self.assertNotIn("pendingInputs", sess)
+
+    def test_unknown_pane_state_does_not_resend(self):
+        # _pane_busy None (uncapturable) is not "idle" — never resend on it.
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
+                                       "attempts": 1, "compactBase": 0}])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=None):
+            sm._poll_pending_inputs()
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(len(sess["pendingInputs"]), 1)
+
 
 class TestInterrupt(ManagerMixin, unittest.TestCase):
     """Stop the turn a running session has in flight: a single Escape into its

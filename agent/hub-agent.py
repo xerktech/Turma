@@ -2415,6 +2415,64 @@ def _queued_display(queue):
             if not q.startswith("<task-notification>")][-QUEUED_PROMPTS_MAX:]
 
 
+# A conversation that auto-compacts (context near-full, ~95%) rewrites its own
+# history, and a message the operator sent that was still QUEUED — or was typed
+# straight into the pane as compaction began — can be dropped by it instead of
+# consumed: it never becomes a real user turn and never reaches the model, so
+# the operator's message silently vanishes (XERK-47). send_input records every
+# sent message on the session record and _poll_pending_inputs gives it an
+# at-least-once guarantee across a compaction: it reaps the record on delivery,
+# and on a FRESH compaction that ate the message re-types it once the pane has
+# settled. A compaction is detected authoritatively from the transcript's own
+# `compact_boundary` system entry (written when a compaction completes), not by
+# scraping the pane for an undocumented "Compacting…" string.
+PENDING_INPUT_MAX = 20                # cap the per-session outbox
+PENDING_INPUT_MAX_ATTEMPTS = int(os.environ.get("SESSION_INPUT_RESEND_MAX", "3"))
+# Drop an outbox entry that never lands and never sees a compaction (some
+# non-compaction loss, e.g. a tmux hiccup) so the record can't leak forever.
+PENDING_INPUT_TTL_SEC = float(os.environ.get("SESSION_INPUT_PENDING_TTL_SEC", "900"))
+
+
+def _pending_scan(path):
+    """Read a session's transcript tail for the three facts the resend-across-
+    compaction guarantee needs (XERK-47), in one pass:
+
+      - delivered:  stripped texts of genuine user turns (a queued message the
+                    model consumed becomes one) — a sent message present here has
+                    LANDED and its outbox record is reaped;
+      - queued:     the still-queued prompt texts (folded, see _fold_queue_op) —
+                    IN-FLIGHT, neither delivered nor lost, so it is left to land;
+      - compactions: how many `compact_boundary` system entries the transcript
+                    holds — a rise since a message was sent means a compaction
+                    happened that could have dropped it.
+
+    Same 4 MiB tail window _history_entries reads. Delivered is matched by text
+    with no timestamp/offset filter, which is deliberately biased AGAINST a
+    resend: the only cost is that a message re-sending the EXACT text of an older
+    turn is treated as already delivered and not resent (a missed resend, never a
+    duplicate) — and a duplicate is the worse failure to show the operator."""
+    delivered, queued, compactions = [], [], 0
+    for raw in _read_tail_lines(path, 1 << 22):
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        etype = entry.get("type")
+        if etype == "queue-operation":
+            _fold_queue_op(entry, queued)
+        elif etype == "system" and entry.get("subtype") == "compact_boundary":
+            compactions += 1
+        elif (etype == "user" and not entry.get("isMeta")
+              and not entry.get("isCompactSummary")
+              and entry.get("promptSource") != "system"):
+            text = _entry_text(entry)
+            if text:
+                delivered.append(text.strip())
+    return delivered, _queued_display(queued), compactions
+
+
 def _history_entries(path):
     """On-demand `history` read of a transcript: bounded to the last 4 MiB
     (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
@@ -6394,6 +6452,9 @@ class SessionManager:
             self._kill_tmux(sess)          # ends the current claude
             self.sess_state.pop(sid, None)  # fresh freshness/PR tracking
             self._clear_question_files(sid)  # drop any question the old claude was blocked on
+            # A message queued for the pre-restart conversation is contextually
+            # gone with it — never re-inject it into the fresh one (XERK-47).
+            sess.pop("pendingInputs", None)
             self._launch_tmux(sess)         # drops bridge-pointer + new claude
             self._launch_ttyd(sess)         # (re)ensure ttyd if it had died
             sess["errorMsg"] = None
@@ -6463,6 +6524,104 @@ class SessionManager:
         tmux_name = sess["tmuxName"]
         run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
         run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+        # Record it on the session's outbox so _poll_pending_inputs can confirm it
+        # landed and re-send it if a compaction drops it (XERK-47). `attempts:1`
+        # counts this first type; a resend needs a fresh compaction to fire again.
+        pend = sess.setdefault("pendingInputs", [])
+        pend.append({"text": text, "at": time.time(), "attempts": 1})
+        del pend[:-PENDING_INPUT_MAX]
+        self.save()
+
+    def _poll_pending_inputs(self):
+        """Confirm each session's recently-sent messages landed and re-send any a
+        compaction dropped (XERK-47). See _pending_scan and the send_input outbox.
+
+        Runs every beat but short-circuits on a session with an empty outbox, so a
+        settled fleet pays one dict lookup per session. For a session that has an
+        outbox: read its transcript once, then for each queued message —
+          - drop it once it appears as a genuine user turn (delivered);
+          - leave it while it is still in the live queue (in-flight, will land);
+          - once a NEW compaction has happened since it was sent AND the pane has
+            settled to idle (so anything the compaction was going to keep has
+            already been consumed — this is what makes the resend duplicate-safe),
+            re-type it, up to PENDING_INPUT_MAX_ATTEMPTS, one resend per beat;
+          - drop it if it ages past PENDING_INPUT_TTL_SEC never having landed
+            (lost to something other than a compaction — out of this fix's scope).
+        """
+        now = time.time()
+        for sess in self.registry:
+            pend = sess.get("pendingInputs")
+            if not pend:
+                continue
+            if sess.get("status") != "running":
+                # Nothing to type into, and the record is meaningless once the
+                # session ends — drop it.
+                sess.pop("pendingInputs", None)
+                self.save()
+                continue
+            path = _session_transcript_path(sess)
+            if not path or not os.path.exists(path):
+                continue
+            delivered, queued, compactions = _pending_scan(path)
+            tmux_name = sess.get("tmuxName")
+            # Only judge a message "lost" once the pane is settled: True=busy,
+            # False=idle, None=unknown (uncapturable) — treat anything but a
+            # confirmed idle as "wait", so a transient capture failure or an
+            # in-progress turn never triggers a resend.
+            idle = _pane_busy(tmux_name) is False
+            keep, changed, resent = [], False, False
+            for item in pend:
+                text = (item.get("text") or "")
+                stripped = text.strip()
+                if "compactBase" not in item:
+                    # Baseline the compaction count the FIRST time we see this
+                    # message, and persist it now: a resend fires only when the
+                    # count rises above this, so a restart that lost an unsaved
+                    # baseline (re-taken post-compaction) would miss the resend.
+                    item["compactBase"] = compactions
+                    changed = True
+                base = item["compactBase"]
+                if stripped in delivered:
+                    changed = True          # landed — reap it
+                    continue
+                if stripped in queued:
+                    keep.append(item)       # in-flight — leave it
+                    continue
+                if compactions > base and idle:
+                    # A compaction fired since this was sent and the pane is idle,
+                    # yet it is neither a delivered turn nor still queued: the
+                    # compaction ate it. Re-send (bounded), one per beat.
+                    if item.get("attempts", 1) >= PENDING_INPUT_MAX_ATTEMPTS:
+                        changed = True
+                        log(f"gave up re-sending a compaction-dropped message "
+                            f"in session {sess['id']}")
+                        continue
+                    if resent:
+                        keep.append(item)   # already re-sent one this beat
+                        continue
+                    run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
+                    run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+                    item["attempts"] = item.get("attempts", 1) + 1
+                    item["compactBase"] = compactions  # only a NEWER compaction re-loses it
+                    item["at"] = now
+                    resent = changed = True
+                    keep.append(item)
+                    log(f"re-sent a message dropped by compaction in "
+                        f"session {sess['id']}")
+                    continue
+                if now - item.get("at", now) > PENDING_INPUT_TTL_SEC:
+                    changed = True          # never landed, no compaction — give up
+                    log(f"pending message expired unconfirmed in "
+                        f"session {sess['id']}")
+                    continue
+                keep.append(item)           # still in-flight (busy, or awaiting a beat)
+            if changed:
+                trimmed = keep[-PENDING_INPUT_MAX:]
+                if trimmed:
+                    sess["pendingInputs"] = trimmed
+                else:
+                    sess.pop("pendingInputs", None)
+                self.save()
 
     def interrupt(self, sid):
         """Stop a running session's in-flight turn without ending the session:
@@ -8609,6 +8768,10 @@ class SessionManager:
         # reap any finished naming subprocess.
         self._seed_summaries()
         self._poll_summaries()
+        # Confirm recently-sent messages landed, and re-send any a compaction
+        # dropped (XERK-47). Cheap on a settled fleet — it short-circuits on any
+        # session with an empty outbox.
+        self._poll_pending_inputs()
         # Probe the login's real model list on its own slow cadence (beat 0
         # covers boot), retrying faster until the first success so the hub's
         # model menu isn't a static guess for hours after a restart.
