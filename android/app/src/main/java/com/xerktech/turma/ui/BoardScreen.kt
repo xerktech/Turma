@@ -7,8 +7,10 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -147,60 +149,30 @@ private fun OrgFilterBar(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        OrgChip("All orgs", null, null, offline = false, active = orgFilter.isBlank()) { onPick("") }
+        OrgChip("All orgs", null, null, offline = false, active = orgFilter.isBlank(),
+            auto = null, onToggleAuto = {}) { onPick("") }
         for (s in sites) {
-            // The org's filter chip + its auto-start switch travel together
-            // (XERK-41), mirroring board.html's .org-chip-wrap.
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                OrgChip(
-                    label = orgName(s.siteKey),
-                    color = TurmaColors.series[orgColorIndex(s.siteKey, allKeys) % TurmaColors.series.size],
-                    count = s.tickets.size,
-                    offline = !s.online,
-                    active = orgFilter == s.siteKey,
-                ) { onPick(s.siteKey) }
-                val st = autoOf(s.siteKey)
-                AutoChip(st) { onToggleAuto(s.siteKey, !st.hubOn) }
-            }
+            OrgChip(
+                label = orgName(s.siteKey),
+                color = TurmaColors.series[orgColorIndex(s.siteKey, allKeys) % TurmaColors.series.size],
+                count = s.tickets.size,
+                offline = !s.online,
+                active = orgFilter == s.siteKey,
+                // The auto-start toggle (XERK-41) is a segment INSIDE the chip.
+                auto = autoOf(s.siteKey),
+                onToggleAuto = { enabled -> onToggleAuto(s.siteKey, enabled) },
+            ) { onPick(s.siteKey) }
         }
     }
 }
 
 /**
- * An org's auto-start switch (XERK-41): a compact pill beside its filter chip.
- * On reflects the effective opt-in (hub toggle OR a legacy agent env); a tap
- * writes the hub toggle. Forced on by an agent env, it's shown on and locked
- * (dimmed, not clickable) — clear the env to control auto-start from here.
+ * One org chip as a single pill: a filter segment plus, for a real org, an
+ * auto-start toggle segment (XERK-41) divided from it by an inner line — a port
+ * of board.html's segmented `.org-chip`. The auto segment reflects the effective
+ * opt-in (hub toggle OR a legacy agent env); a tap writes the hub toggle, and an
+ * env-forced org shows it on and locked (dimmed, not clickable).
  */
-@Composable
-private fun AutoChip(state: AutoStartState, onToggle: () -> Unit) {
-    val accent = MaterialTheme.colorScheme.primary
-    val on = state.on
-    val bg = if (on) accent.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surface
-    val stroke = if (on) accent else MaterialTheme.colorScheme.outline
-    val dot = if (on) accent else MaterialTheme.colorScheme.onSurfaceVariant
-    Row(
-        Modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(bg)
-            .border(1.dp, stroke, RoundedCornerShape(999.dp))
-            .then(if (state.envForced) Modifier.alpha(0.6f) else Modifier.clickable(onClick = onToggle))
-            .padding(horizontal = 10.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(5.dp),
-    ) {
-        Box(Modifier.size(7.dp).clip(CircleShape).background(dot))
-        Text(
-            "auto",
-            style = MaterialTheme.typography.labelMedium,
-            color = if (on) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
-}
-
 @Composable
 private fun OrgChip(
     label: String,
@@ -208,38 +180,67 @@ private fun OrgChip(
     count: Int?,
     offline: Boolean,
     active: Boolean,
+    auto: AutoStartState?,
+    onToggleAuto: (Boolean) -> Unit,
     onClick: () -> Unit,
 ) {
     val accent = color ?: MaterialTheme.colorScheme.primary
-    val bg = if (active) accent.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surface
     val stroke = if (active) accent else MaterialTheme.colorScheme.outline
     Row(
         Modifier
+            .height(IntrinsicSize.Min)
             .clip(RoundedCornerShape(999.dp))
-            .background(bg)
-            .border(1.dp, stroke, RoundedCornerShape(999.dp))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 6.dp),
+            .border(1.dp, stroke, RoundedCornerShape(999.dp)),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        if (color != null) Box(Modifier.size(8.dp).clip(CircleShape).background(color))
-        Text(
-            label,
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
-            color = if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        if (count != null) Text(
-            "$count",
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        if (offline) Text(
-            "⚠",
-            style = MaterialTheme.typography.labelMedium,
-            color = TurmaColors.waiting,
-        )
+        // Filter segment.
+        Row(
+            Modifier
+                .background(if (active) accent.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surface)
+                .clickable(onClick = onClick)
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            if (color != null) Box(Modifier.size(8.dp).clip(CircleShape).background(color))
+            Text(
+                label,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                color = if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (count != null) Text(
+                "$count",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (offline) Text(
+                "⚠",
+                style = MaterialTheme.typography.labelMedium,
+                color = TurmaColors.waiting,
+            )
+        }
+        // Auto-start toggle segment (real orgs only), divided by an inner line.
+        if (auto != null) {
+            Box(Modifier.width(1.dp).fillMaxHeight().background(MaterialTheme.colorScheme.outline))
+            val on = auto.on
+            Row(
+                Modifier
+                    .background(if (on) accent.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surface)
+                    .then(if (auto.envForced) Modifier.alpha(0.6f) else Modifier.clickable { onToggleAuto(!auto.hubOn) })
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                Box(Modifier.size(7.dp).clip(CircleShape)
+                    .background(if (on) accent else MaterialTheme.colorScheme.onSurfaceVariant))
+                Text(
+                    "auto",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (on) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 

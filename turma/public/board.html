@@ -124,27 +124,34 @@ function render(data) {
   // A chip is LABELLED with the org name but still filters on the full siteKey,
   // which stays the identity the board is keyed on; the site host rides along as
   // the chip's tooltip for anyone who wants to see which Jira it actually is.
+  // Each chip is ONE pill: a container holding the filter segment (.org-chip-main)
+  // and, for a real org, the auto-start toggle segment (.org-chip-auto, XERK-41).
+  // The segments are separate buttons because a button can't nest a button, but
+  // they render as a single divided pill.
   const mkChip = (label, key, extra) => {
-    const b = document.createElement("button");
-    b.className = "org-chip" + (orgFilter === key ? " active" : "");
-    b.innerHTML = extra ? esc(label) + extra : esc(label);
+    const wrap = document.createElement("span");
+    wrap.className = "org-chip" + (orgFilter === key ? " active" : "");
+    const main = document.createElement("button");
+    main.type = "button";
+    main.className = "org-chip-main" + (key ? " has-dot" : "");
+    main.innerHTML = extra ? esc(label) + extra : esc(label);
     if (key) {
-      b.style.setProperty("--org", B.orgColor(key, allKeys));
-      b.title = key;
+      wrap.style.setProperty("--org", B.orgColor(key, allKeys));
+      main.title = key;
     }
-    b.addEventListener("click", () => setOrg(key));
-    return b;
+    main.addEventListener("click", () => setOrg(key));
+    wrap.append(main);
+    return wrap;
   };
-  // Each org's auto-start switch (XERK-41) sits beside its filter chip — a
-  // sibling button, never nested in the chip (a button inside a button is
-  // invalid HTML). It reflects the effective opt-in (hub toggle OR a legacy
-  // agent env), and a click writes the hub toggle. Forced-on by an agent env,
-  // it's shown on and disabled (clear the env to migrate to the hub control).
-  const mkAuto = (siteKey) => {
+  // The auto-start toggle segment, appended INSIDE the org's pill. Reflects the
+  // effective opt-in (hub toggle OR a legacy agent env); a click writes the hub
+  // toggle. Forced-on by an agent env, it's shown on and disabled (clear the env
+  // to migrate to the hub control).
+  const addAuto = (wrap, siteKey) => {
     const st = B.autoStartState(data.agents || [], data.autoStartOrgs, siteKey);
     const b = document.createElement("button");
     b.type = "button";
-    b.className = "org-auto" + (st.on ? " on" : "") + (st.envForced ? " forced" : "");
+    b.className = "org-chip-auto" + (st.on ? " on" : "") + (st.envForced ? " forced" : "");
     b.setAttribute("aria-pressed", st.on ? "true" : "false");
     b.disabled = st.envForced;
     b.title = st.envForced
@@ -153,7 +160,7 @@ function render(data) {
                : "Auto-start To Do tickets: OFF — click to turn on");
     b.innerHTML = `<span class="org-auto-dot" aria-hidden="true"></span>auto`;
     if (!st.envForced) b.addEventListener("click", () => setAutoStart(siteKey, !st.hubOn));
-    return b;
+    wrap.append(b);
   };
   $chips.append(mkChip("All orgs", ""));
   for (const s of sites) {
@@ -162,11 +169,9 @@ function render(data) {
       const age = B.ageStr(s.lastFetched);
       extra += ` <span class="chip-stale" title="No host reporting this org is online — showing its last report">⚠ offline${age ? " · synced " + esc(age) + " ago" : ""}</span>`;
     }
-    const wrap = document.createElement("span");
-    wrap.className = "org-chip-wrap";
-    wrap.append(mkChip(B.orgName(s.siteKey), s.siteKey, extra));
-    wrap.append(mkAuto(s.siteKey));
-    $chips.append(wrap);
+    const chip = mkChip(B.orgName(s.siteKey), s.siteKey, extra);
+    addAuto(chip, s.siteKey);
+    $chips.append(chip);
   }
 
   const sessionIndex = B.ticketSessionIndex(data.agents || []);

@@ -264,36 +264,39 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 }
 
 .org-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 14px; }
+/* Each org chip is ONE pill (border + radius); the filter button and the
+   auto-start toggle (XERK-41) are two segments INSIDE it. A button can't nest a
+   button, so the pill is a plain container and each segment is its own button. */
 .org-chip {
-  font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
-  color: var(--ink-2); background: var(--surface);
+  display: inline-flex; align-items: stretch; overflow: hidden;
+  background: var(--surface);
   border: 1px solid var(--border); border-radius: 999px;
-  display: inline-flex; align-items: center; gap: 7px;
   --org: var(--muted);
 }
-.org-chip::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--org); flex: none; }
-/* Hide the dot on the "All orgs" chip only — it's the bare direct child; the
-   real org chips are now nested in .org-chip-wrap (each a :first-child of its
-   own wrap), so this must scope to the direct child rather than any first-child. */
-.org-chips > .org-chip:first-child::before { display: none; }
-.org-chip:hover { color: var(--ink); }
-.org-chip.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
-.org-chip .chip-n { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-.org-chip .chip-stale { color: var(--warning); font-size: 11px; }
-
-/* An org's filter chip + its auto-start switch travel together (XERK-41). */
-.org-chip-wrap { display: inline-flex; align-items: center; gap: 4px; }
-.org-auto {
-  font: inherit; font-size: 11px; padding: 4px 9px; cursor: pointer;
-  color: var(--muted); background: var(--surface);
-  border: 1px solid var(--border); border-radius: 999px;
+.org-chip.active { border-color: var(--accent); }
+/* The filter segment — the whole chip minus the auto toggle. */
+.org-chip-main {
+  font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
+  color: var(--ink-2); background: transparent; border: none;
+  display: inline-flex; align-items: center; gap: 7px;
+}
+.org-chip-main.has-dot::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--org); flex: none; }
+.org-chip-main:hover { color: var(--ink); }
+.org-chip.active .org-chip-main { color: var(--accent); font-weight: 600; }
+.org-chip-main .chip-n { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.org-chip-main .chip-stale { color: var(--warning); font-size: 11px; }
+/* The auto-start toggle segment, divided from the filter by an inner border. */
+.org-chip-auto {
+  font: inherit; font-size: 11px; padding: 5px 10px; cursor: pointer;
+  color: var(--muted); background: transparent;
+  border: none; border-left: 1px solid var(--border);
   display: inline-flex; align-items: center; gap: 5px;
 }
-.org-auto:hover:not(:disabled) { color: var(--ink); }
-.org-auto .org-auto-dot { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
-.org-auto.on { color: var(--accent); border-color: var(--accent); }
-.org-auto.on .org-auto-dot { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
-.org-auto.forced, .org-auto:disabled { cursor: default; opacity: .75; }
+.org-chip-auto:hover:not(:disabled) { color: var(--ink); }
+.org-chip-auto .org-auto-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+.org-chip-auto.on { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.org-chip-auto.on .org-auto-dot { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
+.org-chip-auto.forced, .org-chip-auto:disabled { cursor: default; opacity: .75; }
 
 .kanban-cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; align-items: start; }
 .kanban-col { min-width: 0; }
