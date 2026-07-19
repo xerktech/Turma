@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -691,6 +691,55 @@ test("prettyModel: a switch confirmation's display label passes through", () => 
   assert.equal(prettyModel("Sonnet 5"), "Sonnet 5");
   assert.equal(prettyModel(""), "");
   assert.equal(prettyModel(null), "");
+});
+
+// ---- modelChipLabel / modeChipValue (switch-in-flight display) -----------
+function resetChipState() {
+  __setSess(null); __setAgent(null);
+  __setModelSwitchPending(null); __setModeSwitchPending(null);
+}
+
+test("modelChipLabel: the agent's deferred pendingModel outranks everything and reads in-flight", () => {
+  __setSess({ pendingModel: "sonnet", modelActual: "claude-opus-4-8", model: null });
+  assert.equal(modelChipLabel(), "Sonnet…");
+  resetChipState();
+});
+
+test("modelChipLabel: actual model beats the picked alias beats Default", () => {
+  __setSess({ modelActual: "claude-opus-4-8", model: "sonnet" });
+  assert.equal(modelChipLabel(), "Opus 4.8");
+  __setSess({ model: "sonnet" });
+  assert.equal(modelChipLabel(), "Sonnet");
+  __setSess({});
+  assert.equal(modelChipLabel(), "Default");
+  resetChipState();
+});
+
+test("modelChipLabel: the click memo holds until the actual model moves", () => {
+  __setSess({ modelActual: "claude-opus-4-8", model: "sonnet" });
+  __setModelSwitchPending({ value: "sonnet", prevActual: "claude-opus-4-8", at: Date.now() });
+  assert.equal(modelChipLabel(), "Sonnet…"); // a stale heartbeat can't flash the old model back
+  __setSess({ modelActual: "Sonnet 5", model: "sonnet" });
+  assert.equal(modelChipLabel(), "Sonnet 5"); // confirmation arrived; memo retires
+  resetChipState();
+});
+
+test("modeChipValue: holds the picked mode until the heartbeat agrees", () => {
+  __setSess({ permissionMode: "auto" });
+  __setModeSwitchPending({ value: "plan", at: Date.now() });
+  assert.equal(modeChipValue(), "plan"); // agent hasn't applied it yet
+  __setSess({ permissionMode: "plan" });
+  assert.equal(modeChipValue(), "plan"); // agreement retires the memo...
+  __setSess({ permissionMode: "auto" });
+  assert.equal(modeChipValue(), "auto"); // ...so later changes show through
+  resetChipState();
+});
+
+test("modeChipValue: an expired memo stops overriding the truth", () => {
+  __setSess({ permissionMode: "auto" });
+  __setModeSwitchPending({ value: "bypassPermissions", at: Date.now() - 60000 });
+  assert.equal(modeChipValue(), "auto"); // unreachable mode never landed; chip goes honest
+  resetChipState();
 });
 
 // ---- renderProse (markdown tables in prose bubbles) ----------------------
