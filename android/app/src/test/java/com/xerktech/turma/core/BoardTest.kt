@@ -78,11 +78,19 @@ class BoardTest {
         assertTrue(mergeSites(listOf(none, blank)).isEmpty())
     }
 
-    @Test fun `org color index is stable and sorted`() {
-        val keys = listOf("b.net", "a.net", "c.net")
-        assertEquals(0, orgColorIndex("a.net", keys))
-        assertEquals(1, orgColorIndex("b.net", keys))
-        assertEquals(2, orgColorIndex("c.net", keys))
+    @Test fun `org color index is persistent per-key and matches the web hash (XERK-48)`() {
+        // Slot is a hash of the key alone, so it's deterministic and never moves
+        // when other orgs come or go (the bug this replaced keyed on list index).
+        for (k in listOf("a.net", "b.net", "xerktech.atlassian.net")) {
+            assertEquals(orgColorIndex(k), orgColorIndex(k))
+            assertTrue(orgColorIndex(k) in 0..7)
+        }
+        // Locked to the exact slots board.js `orgColor` (djb2 % 8) produces, so an
+        // org gets the identical color on web and Android.
+        assertEquals(3, orgColorIndex("a.net"))
+        assertEquals(4, orgColorIndex("b.net"))
+        assertEquals(1, orgColorIndex("a.atlassian.net"))
+        assertEquals(6, orgColorIndex("xerktech.atlassian.net"))
     }
 
     @Test fun `org name strips the atlassian net suffix`() {

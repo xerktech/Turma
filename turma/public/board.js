@@ -187,12 +187,19 @@
     return !!(autoStartOrgs && autoStartOrgs[siteKey]);
   }
 
-  // Stable org color: position in the sorted key list -> --s1..--s8 (the same
-  // palette trick the history chart uses), so a site keeps its hue as long as
-  // the set of sites is stable, regardless of filter or ordering.
-  function orgColor(siteKey, allKeys) {
-    const i = [...new Set(allKeys)].sort().indexOf(siteKey);
-    return `var(--s${(Math.max(i, 0) % SLOTS) + 1})`;
+  // Stable org color: hash the siteKey itself into a --s1..--s8 palette slot
+  // (the categorical palette in app.css). Deriving the slot from the KEY —
+  // rather than the key's position in the current set of orgs, as this once did
+  // — is what makes the color PERSISTENT: it no longer moves when a host (hence
+  // an org) is added to or removed from the fleet, which used to reshuffle every
+  // org's hue (XERK-48). The trade is that two distinct orgs can hash to the same
+  // slot (it's a hash, not a distinct-per-org assignment) — a cosmetic collision,
+  // accepted so a given org keeps one color for good. djb2 over the key's chars.
+  function orgColor(siteKey) {
+    const s = String(siteKey || "");
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+    return `var(--s${(h % SLOTS) + 1})`;
   }
 
   function ageStr(iso, now) {
@@ -790,15 +797,15 @@
   }
 
   // The three-column board for the selected sites (filter = a siteKey, or
-  // null/"" for all). Sites are the mergeSites() output; allKeys keeps org
-  // colors stable across filtering.
+  // null/"" for all). Sites are the mergeSites() output; each org's color is a
+  // stable hash of its own siteKey (orgColor), so it holds across filtering and
+  // fleet changes without threading the whole key set through here.
   function boardHtml(sites, filter, opts) {
     const o = opts || {};
-    const allKeys = o.allKeys || sites.map(s => s.siteKey);
     const shown = sites.filter(s => !filter || s.siteKey === filter);
     const cards = { todo: [], inprogress: [], review: [], done: [] };
     for (const site of shown) {
-      const color = orgColor(site.siteKey, allKeys);
+      const color = orgColor(site.siteKey);
       for (const t of site.tickets) {
         cards[categoryOf(t)].push({ t, site, color });
       }

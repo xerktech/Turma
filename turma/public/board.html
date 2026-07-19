@@ -136,7 +136,7 @@ function render(data) {
     main.className = "org-chip-main" + (key ? " has-dot" : "");
     main.innerHTML = extra ? esc(label) + extra : esc(label);
     if (key) {
-      wrap.style.setProperty("--org", B.orgColor(key, allKeys));
+      wrap.style.setProperty("--org", B.orgColor(key));
       main.title = key;
     }
     main.addEventListener("click", () => setOrg(key));
@@ -177,7 +177,7 @@ function render(data) {
   // (.kc-list) scrolls vertically too. preserveScroll keeps both across the swap.
   TurmaNav.preserveScroll($board, () => {
     $board.innerHTML = B.boardHtml(sites, orgFilter, {
-      allKeys, sessionIndex, starts: sweepStarts(data.agents || [], sessionIndex),
+      sessionIndex, starts: sweepStarts(data.agents || [], sessionIndex),
     });
   });
 }
@@ -275,7 +275,7 @@ function paintDetail() {
   // the pin actually moved (same story as the repoGuess `shown` fingerprint).
   s.agentPinShown = agentPin ? agentPin.host : "";
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
-    color: B.orgColor(s.siteKey, lastAllKeys),
+    color: B.orgColor(s.siteKey),
     siteKey: s.siteKey,
     error: s.error,
     // The override rides the heartbeat, so it needs a live host to reach; an

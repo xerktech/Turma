@@ -1192,6 +1192,13 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   `.atlassian.net` suffix, since the org is the only part of it a human reads (the full host stays as
   the chip's tooltip). Presentational only: the chip still filters on, and the board stays keyed on,
   the whole `siteKey`. A non-`atlassian.net` site keeps its whole host, which is its name there.
+- Each org's **color** is a stable hash of its own `siteKey` into a `--s1..--s8` palette slot
+  (`orgColor`, a djb2 hash % 8), so it is **persistent** — it never moves when a host (hence an org)
+  is added to or removed from the fleet (XERK-48). It previously keyed on the siteKey's index in the
+  sorted set of all orgs, which reshuffled every hue on any fleet change. The trade is that two orgs
+  can collide on a slot (a hash, not a distinct-per-org assignment). The Android port
+  (`core/Board.kt` `orgColorIndex` → `ChartSeries`) uses the identical hash, so an org is the same
+  color on both, pinned by locked test vectors on each side.
 - Pull-only: nothing on this page writes to Jira.
 - Tests: `turma/tests/board.test.js`, plus the ticket-detail and jira-refresh endpoint cases in
   `server.test.js`.

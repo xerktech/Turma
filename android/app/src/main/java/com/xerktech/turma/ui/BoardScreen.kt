@@ -71,8 +71,6 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
     val refreshing by vm.refreshing.collectAsStateWithLifecycle()
     val orgFilter by vm.orgFilter.collectAsStateWithLifecycle()
     val sites = remember(fleet) { mergeSites(fleet.agents) }
-    // Org colors stay stable across filtering — keyed on every org, not the shown one.
-    val allKeys = sites.map { it.siteKey }
     val shown = remember(sites, orgFilter) { filterSites(sites, orgFilter) }
     var detail by remember { mutableStateOf<Pair<BoardSite, JiraTicket>?>(null) }
 
@@ -98,7 +96,7 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
             // plus one per org, labelled by org name, ticket-counted, and colored by
             // the org's stable palette slot. Mirrors board.html's `#chips` row.
             OrgFilterBar(
-                sites, allKeys, orgFilter,
+                sites, orgFilter,
                 autoOf = { autoStartOn(fleet.autoStartOrgs, it) },
                 onToggleAuto = { site, enabled -> vm.setAutoStart(site, enabled) },
                 onPick = { vm.setOrg(it) },
@@ -112,7 +110,7 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
                     val cards = shown
                         .flatMap { site -> site.tickets.filter { categoryOf(it) == cat }.map { site to it } }
                         .sortedByDescending { it.second.updated }
-                    KanbanColumn(cat, title, cards, allKeys) { site, t -> detail = site to t }
+                    KanbanColumn(cat, title, cards) { site, t -> detail = site to t }
                 }
             }
         }
@@ -136,7 +134,6 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
 @Composable
 private fun OrgFilterBar(
     sites: List<BoardSite>,
-    allKeys: List<String>,
     orgFilter: String,
     autoOf: (String) -> Boolean,
     onToggleAuto: (String, Boolean) -> Unit,
@@ -152,7 +149,7 @@ private fun OrgFilterBar(
         for (s in sites) {
             OrgChip(
                 label = orgName(s.siteKey),
-                color = TurmaColors.series[orgColorIndex(s.siteKey, allKeys) % TurmaColors.series.size],
+                color = TurmaColors.series[orgColorIndex(s.siteKey) % TurmaColors.series.size],
                 count = s.tickets.size,
                 offline = !s.online,
                 active = orgFilter == s.siteKey,
@@ -245,7 +242,6 @@ private fun KanbanColumn(
     cat: String,
     title: String,
     cards: List<Pair<BoardSite, JiraTicket>>,
-    allKeys: List<String>,
     onOpen: (BoardSite, JiraTicket) -> Unit,
 ) {
     Column(Modifier.width(300.dp).fillMaxSize()) {
@@ -256,7 +252,7 @@ private fun KanbanColumn(
         }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             items(cards, key = { it.second.key }) { (site, t) ->
-                TicketCard(t, TurmaColors.series[orgColorIndex(site.siteKey, allKeys) % TurmaColors.series.size]) { onOpen(site, t) }
+                TicketCard(t, TurmaColors.series[orgColorIndex(site.siteKey) % TurmaColors.series.size]) { onOpen(site, t) }
             }
         }
     }

@@ -158,13 +158,23 @@ test("ticketSort: newest updated first", () => {
   assert.deepEqual(list.sort(ticketSort).map((t) => t.key), ["B", "A"]);
 });
 
-test("orgColor: stable slot regardless of list order, wraps past 8", () => {
-  const keys = ["b.net", "a.net", "c.net"];
-  assert.equal(orgColor("a.net", keys), "var(--s1)");
-  assert.equal(orgColor("b.net", keys), "var(--s2)");
-  assert.equal(orgColor("b.net", [...keys].reverse()), "var(--s2)", "order-independent");
-  const many = Array.from({ length: 9 }, (_, i) => `s${i}.net`);
-  assert.equal(orgColor("s8.net", many), "var(--s1)", "9th key wraps to slot 1");
+test("orgColor: persistent per-key, independent of the fleet's other orgs (XERK-48)", () => {
+  // The color is a hash of the key ITSELF, so a given org keeps its slot no
+  // matter which other orgs come or go — the bug this replaced keyed on the
+  // key's index in the set, which reshuffled every hue when a host was added.
+  const c = orgColor("a.atlassian.net");
+  assert.match(c, /^var\(--s[1-8]\)$/, "one of the 8 palette slots");
+  assert.equal(orgColor("a.atlassian.net"), c, "same key -> same slot, always");
+  // Adding/removing sibling orgs can't move it: orgColor doesn't see them.
+  assert.equal(orgColor("a.atlassian.net"), c, "stable as the fleet changes");
+  // Distinct keys map independently (no shared state / list position).
+  assert.equal(orgColor("b.atlassian.net"), orgColor("b.atlassian.net"));
+  // Locked to the exact slots the djb2 hash produces, so the Android port
+  // (core/Board.kt orgColorIndex, slot-1) paints each org the identical color.
+  assert.equal(orgColor("a.net"), "var(--s4)");
+  assert.equal(orgColor("b.net"), "var(--s5)");
+  assert.equal(orgColor("a.atlassian.net"), "var(--s2)");
+  assert.equal(orgColor("xerktech.atlassian.net"), "var(--s7)");
 });
 
 test("orgName: the org, not the Jira Cloud host", () => {

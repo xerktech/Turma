@@ -148,10 +148,18 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
     return out.sortedBy { it.siteKey }
 }
 
-/** Stable org color index for a siteKey among all known keys. */
-fun orgColorIndex(siteKey: String, allKeys: List<String>): Int {
-    val sorted = allKeys.distinct().sorted()
-    return sorted.indexOf(siteKey).coerceAtLeast(0)
+/**
+ * Persistent org color slot for a siteKey: a hash of the KEY ITSELF into one of
+ * the 8 palette slots (0..7 -> ChartSeries), matching board.js `orgColor`. Keying
+ * on the key rather than its index in the current org set is what makes the color
+ * hold when a host (hence an org) is added or removed (XERK-48); the old
+ * index-in-sorted-set rule reshuffled every org's hue on any fleet change. Same
+ * djb2 hash and modulo as the web, so a given org gets the identical color on both.
+ */
+fun orgColorIndex(siteKey: String): Int {
+    var h = 5381L
+    for (c in siteKey) h = (h * 33L + c.code.toLong()) and 0xFFFFFFFFL
+    return (h % 8L).toInt()
 }
 
 /**
