@@ -94,8 +94,8 @@ those are marked `[MODEL]`.
 - P1 Sidebar sections: Queued / Active / Idle / Ended split with state line + question preview.
 - P1 Verbosity NORMAL: tool card collapsed (output on expand) to match web; persist per-card open.
 - P2 Live status bar: token counters + elapsed + spinner + hint lines + subagent list.
-- P2 `[MODEL]` Compose bar: all PR chips + Jira ticket chip; filter modes to `permissionModes`;
-  optimistic model/mode update.
+- P2 `[MODEL]` Compose bar: Jira ticket chip; filter modes to `permissionModes`;
+  optimistic model/mode update. (All PR chips: done — XERK-46.)
 - ~~P2 New-session composer in the Sessions list (web can spawn from here).~~ Done (XERK-44): a "+"
   in the Sessions header → host/repo picker → `SpawnDialog`.
 - P3 Deep links (`?session=`/`?ended=`), streaming caret, in-place terminal toggle.
