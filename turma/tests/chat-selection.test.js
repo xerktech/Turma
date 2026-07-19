@@ -165,6 +165,61 @@ test("a genuine continuation of the live turn keeps typing the delta", () => {
   assert.equal(chat.__revealShown(), 5, "continuation kept its place; the delta types in");
 });
 
+// XERK-19 (the real fix): the `turn` frame is classified by applyTurn before it
+// ever reaches the reveal, so the pane's block-swap can't drive the bubble.
+test("a tool-use bullet clears the streaming bubble instead of showing as text", () => {
+  // Prose is streaming and partly revealed.
+  chat.__applyTurn("Let me check the config");
+  chat.__setRevealShown(10);
+  assert.equal(chat.__liveTurn(), "Let me check the config");
+
+  // The pane's last ● bullet swaps to a tool call — the block is done, and the
+  // tool renders as a committed card, not raw text here. The bubble clears; it
+  // does NOT flash "Bash(…)" (the "line deletes and re-appears" symptom).
+  chat.__applyTurn("Bash(git status)");
+  assert.equal(chat.__liveTurn(), "", "tool bullet clears the live bubble");
+
+  // The same for an MCP tool and an empty (turn-ended) frame.
+  chat.__applyTurn("mcp__github__create_pr(title=fix)");
+  assert.equal(chat.__liveTurn(), "");
+  chat.__applyTurn("Reading the whole file now");
+  assert.equal(chat.__liveTurn(), "Reading the whole file now");
+  chat.__applyTurn("");
+  assert.equal(chat.__liveTurn(), "");
+});
+
+test("the same prose block grows, but a shorter re-capture never shrinks it", () => {
+  chat.__applyTurn("Here's the plan");           // 15
+  chat.__setRevealShown(15);                      // fully typed out
+  chat.__applyTurn("Here's the plan, step one");  // 25 — same block, grew
+  assert.equal(chat.__liveTurn(), "Here's the plan, step one", "grows to the longer capture");
+  assert.equal(chat.__revealShown(), 15, "kept its place; only the delta types");
+
+  // A partial re-capture of the same block (the TUI redrew mid-frame) must be
+  // ignored — shrinking then re-growing is the char-level flicker.
+  chat.__applyTurn("Here's the");
+  assert.equal(chat.__liveTurn(), "Here's the plan, step one", "held the longer text");
+  assert.equal(chat.__revealShown(), 15, "reveal offset untouched");
+});
+
+test("a genuinely different prose block retypes from zero", () => {
+  chat.__applyTurn("First block of prose");
+  chat.__setRevealShown(21);
+  chat.__applyTurn("An unrelated second block");   // shares no prefix
+  assert.equal(chat.__liveTurn(), "An unrelated second block");
+  assert.equal(chat.__revealShown(), 0, "new block types in from the start, not a stale offset");
+});
+
+test("isToolBullet matches tool calls, not prose", () => {
+  assert.equal(chat.isToolBullet("Bash(ls -la)"), true);
+  assert.equal(chat.isToolBullet("Read(app.js)"), true);
+  assert.equal(chat.isToolBullet("mcp__srv__do(x=1)"), true);
+  assert.equal(chat.isToolBullet("Update(foo.py) ⎿ 3 lines"), true);
+  assert.equal(chat.isToolBullet("Let me look at the file."), false);
+  assert.equal(chat.isToolBullet("Here is a summary of what I did"), false);
+  assert.equal(chat.isToolBullet(""), false);
+});
+
 test("a selection outside the scroll doesn't hold the chat's paints", () => {
   chat.__setBuffer([entry("a", "hello")]);
   chat.repaint();

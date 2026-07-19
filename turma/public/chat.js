@@ -332,7 +332,7 @@
         buffer = mergeTail(buffer, frame.entries);
         repaint();
       } else if (frame && frame.type === "turn" && typeof frame.text === "string") {
-        liveTurn = frame.text;
+        applyTurn(frame.text);
         // The working indicator (spinner verb + live token up/down counters) is
         // pinned below the scroll, not woven into the streamed text — so it stops
         // flickering in and out of the message as the TUI spinner animates.
@@ -663,24 +663,12 @@
     // The in-progress assistant turn (streaming, text-only) as the trailing
     // bubble; its text is revealed by the typewriter loop.
     if (liveTurn) {
-      // The pane scrape's "last ● bullet" is NOT a monotonically growing stream
-      // — mid-generation it SWAPS between unrelated blocks: assistant prose is
-      // replaced by a tool-use bullet (Bash(…), Read(…)), that by the next
-      // tool, then by the next prose block. The typewriter is built for text
-      // that only grows, so it must reveal the delta ONLY when the new capture
-      // genuinely continues what we were already showing, and SNAP otherwise.
-      //
-      // Decide by prefix: a genuine continuation starts with the exact slice
-      // already revealed. A swap doesn't, so snap `shown` to the new text — do
-      // NOT keep typing from the stale offset, which re-streams the tail of an
-      // unrelated block (the "last line deletes and restreams over and over"
-      // this ticket is about). This mirrors glasses/src/reveal.ts advanceReveal,
-      // whose entryId change snaps; the pane scrape has no such id, so the
-      // revealed prefix stands in for "same block". A genuinely new turn arrives
-      // after an empty ("" -> reveal.shown=0, else-branch below) frame when
-      // generation ends, so it still types in from zero. A prior clamp only
-      // covered the shrink case (swap to shorter text); a swap to LONGER or
-      // same-length-but-different text slipped through and kept re-typing.
+      // liveTurn is already classified by applyTurn (block swaps / tool bullets /
+      // shrinks handled there — see XERK-19), so by here it only grows within a
+      // block or was reset to shown=0 for a new one. This prefix check is a
+      // defensive clamp for any other path that sets liveTurn directly: if the
+      // new text doesn't continue the revealed slice, snap `shown` to it rather
+      // than typewriting the tail of an unrelated block from a stale offset.
       if (!liveTurn.startsWith(revealFull.slice(0, reveal.shown))) reveal.shown = liveTurn.length;
       revealFull = liveTurn;
       const shownText = liveTurn.slice(0, Math.max(0, reveal.shown));
@@ -881,6 +869,45 @@
 
   // Repaint from outside (e.g. returning from the terminal toggle).
   function repaintPublic() { renderVerbosityControl(); renderComposeOpts(); repaint(); }
+
+  // A tool-use bullet as it renders in the pane's ● block after reflow:
+  // an identifier (Bash, Read, Update, Task, mcp__server__tool, …) immediately
+  // followed by "(" — e.g. "Bash(git status)", "Read(app.js)". Prose almost
+  // never opens "Word(" with no space, and a false positive only skips ONE
+  // block's live typing preview (it still renders in full once the transcript
+  // commits it) — a safe degradation — while a missed tool bullet brings the
+  // flicker back, so the test deliberately leans toward matching.
+  function isToolBullet(t) { return /^[\w-]+\(/.test(t); }
+
+  // Fold a pane-scrape `turn` frame into the streaming bubble. The pane's
+  // "last ● bullet" is NOT a growing stream: within one generating turn it
+  // SWAPS between blocks — assistant prose, then a tool-use bullet (Bash(…),
+  // Read(…)), then the next prose. Feeding every swap straight to the bubble is
+  // what makes "the final line delete and re-appear over and over" (XERK-19):
+  // the tool bullet swaps in (the line deletes) and prose swaps back (it
+  // reappears). So classify the frame instead of trusting it verbatim:
+  //  - empty, or a tool-use bullet -> the streaming block is over (or is a tool
+  //    that renders as a committed card, not raw text here). Clear the bubble;
+  //    the committed transcript owns what just finished.
+  //  - the SAME prose block, grown or re-captured shorter -> keep the LONGER
+  //    text and never shrink. A shorter partial re-capture of the same block is
+  //    what re-typed the tail from a stale offset; holding it keeps the reveal's
+  //    place so only genuine new characters type in.
+  //  - a genuinely different prose block -> retype it from 0, not from the
+  //    previous block's offset.
+  // This stands in for glasses/src/reveal.ts advanceReveal's entryId-change
+  // snap; the pane scrape has no id, so the revealed prose stands in for it.
+  function applyTurn(text) {
+    const t = typeof text === "string" ? text : "";
+    if (!t || isToolBullet(t)) { liveTurn = ""; return; }
+    if (t.startsWith(liveTurn) || liveTurn.startsWith(t)) {
+      // Same block: grow to the longer capture, ignore a shorter re-capture.
+      if (t.length >= liveTurn.length) liveTurn = t;
+      return;
+    }
+    liveTurn = t;
+    reveal.shown = 0;
+  }
 
   // ---- typewriter reveal loop (live turn only) ------------------------------
   function startReveal() {
@@ -1447,7 +1474,10 @@
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, prFooterChip,
       ticketFooterChip,
       agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
-      isBusy, updateComposeAction,
+      isBusy, updateComposeAction, isToolBullet,
+      // Drive the real `turn`-frame classifier (see applyTurn): the ws onmessage
+      // hands it frame.text verbatim, so the flicker tests exercise it directly.
+      __applyTurn: (t) => { applyTurn(t); },
       __setLiveStatus: (st) => { liveStatus = st; },
       __stopPending: (t) => { stopPendingAt = t; },
       __setVerbosity: (v) => { verbosity = v; },
@@ -1461,6 +1491,7 @@
       __setRevealShown: (n) => { reveal.shown = n; },
       __resetPaint: () => { lastHtml = null; repaintDeferred = false; },
       __revealShown: () => reveal.shown,
+      __liveTurn: () => liveTurn,
     };
   }
 })();
