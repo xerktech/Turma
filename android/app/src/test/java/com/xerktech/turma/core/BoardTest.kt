@@ -78,11 +78,58 @@ class BoardTest {
         assertTrue(mergeSites(listOf(none, blank)).isEmpty())
     }
 
-    @Test fun `org color index is stable and sorted`() {
-        val keys = listOf("b.net", "a.net", "c.net")
-        assertEquals(0, orgColorIndex("a.net", keys))
-        assertEquals(1, orgColorIndex("b.net", keys))
-        assertEquals(2, orgColorIndex("c.net", keys))
+    @Test fun `org colors are unique and match the web assignment (XERK-48)`() {
+        // A collision-free set: every org keeps its preferred slot, all distinct.
+        // Locked to the exact slots board.js `orgColorMap` produces (slot = --sN-1),
+        // so an org paints the identical color on web and Android.
+        val four = listOf(
+            "alpha.atlassian.net", "beta.atlassian.net", "gamma.atlassian.net", "delta.atlassian.net",
+        )
+        val m = orgColorMap(four)
+        assertEquals(4, m.values.toSet().size)  // no two orgs share a color
+        assertEquals(6, m["alpha.atlassian.net"])  // --s7
+        assertEquals(4, m["beta.atlassian.net"])   // --s5
+        assertEquals(3, m["gamma.atlassian.net"])  // --s4
+        assertEquals(2, m["delta.atlassian.net"])  // --s3
+    }
+
+    @Test fun `colliding preferred slots resolve to distinct colors`() {
+        // "a.net" and "gamma.atlassian.net" both prefer slot 3; the probe gives
+        // the second the next free slot rather than overlapping.
+        val m = orgColorMap(listOf("gamma.atlassian.net", "a.net"))
+        assertTrue(m["a.net"] != m["gamma.atlassian.net"])
+        assertEquals(3, m["a.net"])       // --s4
+        assertEquals(4, m["gamma.atlassian.net"])  // --s5
+    }
+
+    @Test fun `org colors are order-independent and stable for non-colliding fleet changes`() {
+        val four = listOf(
+            "alpha.atlassian.net", "beta.atlassian.net", "gamma.atlassian.net", "delta.atlassian.net",
+        )
+        val a = orgColorMap(four)
+        assertEquals(a, orgColorMap(four.reversed()))
+        // Adding a non-colliding org leaves the rest put; removing one likewise.
+        val withC = orgColorMap(four + "c.net")
+        for (k in four) assertEquals(a[k], withC[k])
+        assertEquals(5, withC["c.net"])  // --s6
+        val withoutAlpha = orgColorMap(four.filter { it != "alpha.atlassian.net" })
+        for (k in four) if (k != "alpha.atlassian.net") assertEquals(a[k], withoutAlpha[k])
+    }
+
+    @Test fun `more orgs than colors degrades to reuse without throwing`() {
+        val many = (0 until 12).map { "s$it.atlassian.net" }
+        val m = orgColorMap(many)
+        assertEquals(12, m.size)
+        for (v in m.values) assertTrue(v in 0..7)
+        assertEquals(8, m.values.toSet().size)  // uses all 8, overflow reuses
+    }
+
+    @Test fun `orgColorIndex agrees with the map and falls back without a set`() {
+        val four = listOf(
+            "alpha.atlassian.net", "beta.atlassian.net", "gamma.atlassian.net", "delta.atlassian.net",
+        )
+        assertEquals(orgColorMap(four)["gamma.atlassian.net"], orgColorIndex("gamma.atlassian.net", four))
+        assertTrue(orgColorIndex("x.atlassian.net", emptyList()) in 0..7)
     }
 
     @Test fun `org name strips the atlassian net suffix`() {

@@ -187,12 +187,56 @@
     return !!(autoStartOrgs && autoStartOrgs[siteKey]);
   }
 
-  // Stable org color: position in the sorted key list -> --s1..--s8 (the same
-  // palette trick the history chart uses), so a site keeps its hue as long as
-  // the set of sites is stable, regardless of filter or ordering.
+  // djb2 hash of a siteKey -> its PREFERRED palette slot (0..SLOTS-1).
+  function orgSlotPref(siteKey) {
+    const s = String(siteKey || "");
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+    return h % SLOTS;
+  }
+
+  // Assign every org a UNIQUE palette slot — no two orgs ever share a color
+  // (XERK-48). Uniqueness couples the orgs (a slot one takes is one another
+  // can't), so unlike a pure per-key hash this needs the whole set. Each org
+  // takes its djb2-preferred slot if free, else linear-probes to the next free
+  // one; keys are processed in sorted order so the result is deterministic and
+  // order-independent. This keeps two properties that matter:
+  //   - UNIQUE up to SLOTS orgs (the palette has only 8 colors; a fleet with
+  //     more than that can't be collision-free, so the overflow orgs fall back
+  //     to their preferred — then possibly shared — slot rather than erroring);
+  //   - PERSISTENT where it can be: an org keeps its color as hosts/orgs come and
+  //     go unless its preferred slot actually collides, and even then only the
+  //     colliding orgs move — never, as the old index-in-sorted-set rule did,
+  //     every org on any fleet change.
+  // Returns a Map siteKey -> "var(--sN)".
+  function orgColorMap(allKeys) {
+    const keys = [...new Set(allKeys)].filter(Boolean).sort();
+    const used = new Array(SLOTS).fill(false);
+    const map = new Map();
+    for (const k of keys) {
+      const pref = orgSlotPref(k);
+      let slot = -1;
+      for (let step = 0; step < SLOTS; step++) {
+        const cand = (pref + step) % SLOTS;
+        if (!used[cand]) { slot = cand; break; }
+      }
+      if (slot < 0) slot = pref;   // more orgs than colors: reuse is unavoidable
+      else used[slot] = true;
+      map.set(k, `var(--s${slot + 1})`);
+    }
+    return map;
+  }
+
+  // The palette slot a single org paints, given every org it shares the board
+  // with (uniqueness couples them, so the full set is needed). Called with no
+  // set — or with one the key isn't in — it falls back to the org's own
+  // preferred slot.
   function orgColor(siteKey, allKeys) {
-    const i = [...new Set(allKeys)].sort().indexOf(siteKey);
-    return `var(--s${(Math.max(i, 0) % SLOTS) + 1})`;
+    if (allKeys) {
+      const c = orgColorMap(allKeys).get(siteKey);
+      if (c) return c;
+    }
+    return `var(--s${orgSlotPref(siteKey) + 1})`;
   }
 
   function ageStr(iso, now) {
@@ -790,15 +834,17 @@
   }
 
   // The three-column board for the selected sites (filter = a siteKey, or
-  // null/"" for all). Sites are the mergeSites() output; allKeys keeps org
-  // colors stable across filtering.
+  // null/"" for all). Sites are the mergeSites() output; org colors come from
+  // orgColorMap over the FULL org set (opts.allKeys) — computed once here, not
+  // per site — so each org's unique color is the same whether or not it's the
+  // filtered-to one.
   function boardHtml(sites, filter, opts) {
     const o = opts || {};
-    const allKeys = o.allKeys || sites.map(s => s.siteKey);
+    const colorMap = orgColorMap(o.allKeys || sites.map(s => s.siteKey));
     const shown = sites.filter(s => !filter || s.siteKey === filter);
     const cards = { todo: [], inprogress: [], review: [], done: [] };
     for (const site of shown) {
-      const color = orgColor(site.siteKey, allKeys);
+      const color = colorMap.get(site.siteKey) || orgColor(site.siteKey);
       for (const t of site.tickets) {
         cards[categoryOf(t)].push({ t, site, color });
       }
@@ -900,7 +946,7 @@
   }
 
   const api = {
-    CATEGORIES, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgName, autoStartOn, ageStr,
+    CATEGORIES, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgName, autoStartOn, ageStr,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,

@@ -1192,6 +1192,17 @@ The central dashboard for the per-host agent containers: reached over the Cloudf
   `.atlassian.net` suffix, since the org is the only part of it a human reads (the full host stays as
   the chip's tooltip). Presentational only: the chip still filters on, and the board stays keyed on,
   the whole `siteKey`. A non-`atlassian.net` site keeps its whole host, which is its name there.
+- Each org gets a **UNIQUE color** — no two orgs share a `--s1..--s8` palette slot (`orgColorMap`,
+  XERK-48). Uniqueness couples the orgs (a slot one takes is one another can't), so it's computed over
+  the whole org set, not as a pure per-key hash: each org takes its djb2-preferred slot if free, else
+  linear-probes to the next free one, keys processed in sorted order (deterministic, order-
+  independent). It is **persistent where it can be** — an org keeps its color as hosts/orgs come and go
+  unless its preferred slot actually collides, and even then only the *colliding* orgs move (the old
+  rule keyed on the siteKey's index in the sorted set, so it reshuffled *every* hue on any fleet
+  change). Unique up to 8 orgs; a fleet with more than the palette's 8 colors can't be collision-free,
+  so overflow orgs fall back to their preferred (then possibly shared) slot rather than erroring. The
+  Android port (`core/Board.kt` `orgColorMap` → `ChartSeries`) uses the identical assignment, so an
+  org is the same color on both, pinned by locked test vectors on each side.
 - Pull-only: nothing on this page writes to Jira.
 - Tests: `turma/tests/board.test.js`, plus the ticket-detail and jira-refresh endpoint cases in
   `server.test.js`.

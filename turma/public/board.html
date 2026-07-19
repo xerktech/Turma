@@ -117,8 +117,11 @@ function render(data) {
   }
   const allKeys = lastAllKeys;
   if (orgFilter && !allKeys.includes(orgFilter)) orgFilter = "";
+  // One assignment of unique per-org colors over the whole org set, shared by the
+  // chips and the board columns so an org is one color everywhere (XERK-48).
+  const colorMap = B.orgColorMap(allKeys);
 
-  // Chips: All + one per org, colored by the org's stable palette slot, with
+  // Chips: All + one per org, colored by the org's unique palette slot, with
   // a staleness note when none of the org's reporting hosts is online.
   $chips.replaceChildren();
   // A chip is LABELLED with the org name but still filters on the full siteKey,
@@ -136,7 +139,7 @@ function render(data) {
     main.className = "org-chip-main" + (key ? " has-dot" : "");
     main.innerHTML = extra ? esc(label) + extra : esc(label);
     if (key) {
-      wrap.style.setProperty("--org", B.orgColor(key, allKeys));
+      wrap.style.setProperty("--org", colorMap.get(key) || B.orgColor(key));
       main.title = key;
     }
     main.addEventListener("click", () => setOrg(key));
