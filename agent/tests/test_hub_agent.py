@@ -9,6 +9,7 @@ faked at its two chokepoints, run()/run_ok(), plus Popen for ttyd — no
 docker/tmux/git needed.
 """
 
+import base64
 import datetime
 import importlib.util
 import io
@@ -7569,6 +7570,41 @@ class TestAzureBase(unittest.TestCase):
             self.assertEqual(ha.azure_base(), "https://tfs.co/Collection")
         with mock.patch.object(ha, "AZDO_URL", ""):
             self.assertEqual(ha.azure_base(), "")
+
+
+class TestAzureGitAuthConfig(unittest.TestCase):
+    """XERK-54: reuse the board's PAT to authenticate plain git against a
+    non-GitHub Azure DevOps org, via a URL-scoped http.extraHeader."""
+
+    def test_wires_url_scoped_basic_header(self):
+        with mock.patch.multiple(ha, AZDO_URL="https://tfs.co/DefaultCollection",
+                                 AZDO_TOKEN="pat123"):
+            key, value = ha.azure_git_auth_config()
+            # Scoped to the collection base, so no other host sees the header.
+            self.assertEqual(key, "http.https://tfs.co/DefaultCollection.extraHeader")
+            # Basic with an empty username, exactly like azure_req().
+            expect = base64.b64encode(b":pat123").decode()
+            self.assertEqual(value, f"Authorization: Basic {expect}")
+
+    def test_dev_azure_services_and_pasted_tail(self):
+        # A bare host and a pasted deep link both collapse to the base via
+        # azure_base(), so the header scope is the org/collection.
+        with mock.patch.multiple(ha, AZDO_URL="dev.azure.com/MyOrg", AZDO_TOKEN="p"):
+            self.assertEqual(ha.azure_git_auth_config()[0],
+                             "http.https://dev.azure.com/MyOrg.extraHeader")
+        with mock.patch.multiple(
+                ha, AZDO_URL="https://tfs.co/Col/_git/repo", AZDO_TOKEN="p"):
+            self.assertEqual(ha.azure_git_auth_config()[0],
+                             "http.https://tfs.co/Col.extraHeader")
+
+    def test_none_when_unconfigured(self):
+        with mock.patch.multiple(ha, AZDO_URL="", AZDO_TOKEN=""):
+            self.assertIsNone(ha.azure_git_auth_config())
+        # A URL without a token (or vice versa) is not enough to wire anything.
+        with mock.patch.multiple(ha, AZDO_URL="https://tfs.co/Col", AZDO_TOKEN=""):
+            self.assertIsNone(ha.azure_git_auth_config())
+        with mock.patch.multiple(ha, AZDO_URL="", AZDO_TOKEN="p"):
+            self.assertIsNone(ha.azure_git_auth_config())
 
 
 def _azure_wi(wid, state, wtype="Bug", project="Proj", title=None, **fields):

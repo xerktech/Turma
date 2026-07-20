@@ -196,6 +196,19 @@ else
   echo "[entrypoint] git: no cached non-GitHub creds (/root/.git-credentials) — github.com still works via gh"
 fi
 
+# --- Azure DevOps git auth (XERK-54) ---------------------------------------
+# When the board is pointed at an Azure DevOps org (AZDO_URL + AZDO_TOKEN), the
+# agent already holds a PAT — so reuse it for plain git instead of mounting the
+# host's creds. hub-agent.py wires a URL-scoped http.extraHeader (--system, hence
+# run as root here, BEFORE the privilege drop) so clone/fetch/push against the
+# ADO host authenticate with no mount and no credential helper — the counterpart
+# of github.com going through gh. extraHeader (not proactiveAuth) because the
+# image's git predates proactiveAuth; see azure_git_auth_config(). Non-fatal and
+# secret-safe: it logs the host, never the token.
+if [ -n "${AZDO_URL:-}" ] && [ -n "${AZDO_TOKEN:-}" ]; then
+  python3 /usr/local/bin/hub-agent.py --wire-azure-git || true
+fi
+
 # --- Cloud CLI creds preflight (agent-agnostic) ----------------------------
 # terraform, az and aws are installed in every image, but their credentials are
 # the HOST's, reused through bind mounts exactly like claude (/root/.claude) and

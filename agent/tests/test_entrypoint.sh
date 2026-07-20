@@ -43,6 +43,9 @@ cp "$AGENT_DIR/entrypoint.sh" "$WORK/entrypoint.sh"
 cat > "$WORK/python3" <<'STUB'
 #!/bin/sh
 if [ "$2" = "--print-device" ]; then echo "DEVICE_NAME=testbox"; exit 0; fi
+# Stand-in for hub-agent.py --wire-azure-git: the entrypoint only calls it when
+# AZDO_URL+AZDO_TOKEN are set, so echoing a marker proves the plumbing fired.
+if [ "$2" = "--wire-azure-git" ]; then echo "WIRE_AZURE_GIT called"; exit 0; fi
 echo "MANAGER uid=$(id -u) gid=$(id -g) home=$HOME"
 echo "ROOTDIR_OWNER=$(stat -c '%u:%g' /root)"
 touch "$REPOS_ROOT/.probe" 2>/dev/null || true
@@ -261,6 +264,29 @@ else
   echo "  FAIL: git — absent creds not reported"; FAILED=1
 fi
 expect "manager still starts" "0" "$(field "$out" uid)"
+
+# --- Case 9d: Azure DevOps git auth is wired when configured (XERK-54) -------
+# A non-GitHub ADO org already gives the agent a PAT (AZDO_TOKEN) for the board;
+# the entrypoint reuses it to wire plain git. Only fires when both AZDO vars are
+# set, and is non-fatal to boot either way.
+echo "== case: AZDO_URL+AZDO_TOKEN wires git auth"
+make_fixture "$WORK/fx9d" 0 0
+out="$(run_case "$WORK/fx9d" -e AZDO_URL=https://tfs.example.com/Col -e AZDO_TOKEN=pat)"
+if echo "$out" | grep -q "WIRE_AZURE_GIT called"; then
+  echo "  ok: git-auth wiring invoked"
+else
+  echo "  FAIL: AZDO configured but git-auth wiring not invoked"; FAILED=1
+fi
+expect "manager still starts" "0" "$(field "$out" uid)"
+
+echo "== case: no AZDO creds means no git-auth wiring"
+make_fixture "$WORK/fx9e" 0 0
+out="$(run_case "$WORK/fx9e")"
+if echo "$out" | grep -q "WIRE_AZURE_GIT called"; then
+  echo "  FAIL: git-auth wiring invoked with no AZDO creds"; FAILED=1
+else
+  echo "  ok: git-auth wiring skipped without AZDO creds"
+fi
 
 # --- Case 10: the tunnel is supervised (XERK-34) -----------------------------
 # A tunnel PROCESS death must not outlive one retry interval. Fire-and-forget
