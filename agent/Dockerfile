@@ -293,10 +293,21 @@ ARG CLAUDE_CODE_VERSION=latest
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
  && npm cache clean --force
 
-# Wire git to authenticate via gh, system-wide (so it applies regardless of the
-# per-repo /mnt/data .git/config that carries the commit identity). gh reads the
-# token from the read-only-mounted /root/.config/gh.
-RUN git config --system credential.helper '!gh auth git-credential'
+# Wire git to authenticate, system-wide (so it applies regardless of the per-repo
+# /mnt/data .git/config that carries the commit identity). Two helpers, tried in
+# order for every host:
+#   1. gh — serves github.com (and GH Enterprise hosts gh knows), minting a fresh
+#      token from the read-only-mounted /root/.config/gh.
+#   2. store — serves EVERYONE ELSE (GitLab, Bitbucket, Azure DevOps, self-hosted
+#      git) from the host's own credential cache, an OPTIONAL bind mount at
+#      /root/.git-credentials. For an org that doesn't use GitHub, this is the
+#      whole point: gh declines the host, git falls through to store, and the
+#      cached credential clones/fetches/pushes. Absent mount = empty helper = a
+#      no-op, so a GitHub-only host is unaffected.
+# gh is FIRST so github.com always gets a fresh gh token even if the store file
+# also happens to carry a (staler) github.com line.
+RUN git config --system credential.helper '!gh auth git-credential' \
+ && git config --system --add credential.helper 'store --file=/root/.git-credentials'
 
 LABEL org.opencontainers.image.source="https://github.com/xerktech/DockerOps" \
       org.opencontainers.image.description="Headless Claude Code host multiplexer (worktree-backed Remote Control sessions) for the Turma"
@@ -344,6 +355,9 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/hub-agent.py \
 #   /root/.aws          aws CLI   — config + credentials (or AWS_* env creds)
 #   /root/.azure        az CLI    — azureProfile.json + the MSAL token cache
 #   /root/.terraform.d  terraform — credentials.tfrc.json, for Terraform Cloud
+#   /root/.git-credentials  git   — the host's cached git creds (the file the
+#                   `store` helper reads) for NON-GitHub hosts; github.com goes
+#                   through gh instead. Mount the host's ~/.git-credentials here.
 #   JIRA_SITE / JIRA_EMAIL / JIRA_TOKEN   optional Jira Cloud polling for the hub's
 #                   /board Kanban: the org's *.atlassian.net site + a user-scoped
 #                   API token (Basic auth, read-only — only issue search is ever
