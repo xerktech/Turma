@@ -27,7 +27,7 @@
   <div class="td-backdrop" id="detailBackdrop" hidden>
     <div class="td-panel" id="detailPanel" role="dialog" aria-modal="true" aria-label="Ticket detail"></div>
   </div>
-  <div class="footer">Each host agent polls its org's tracker — Jira Cloud (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code>) or a self-hosted/cloud Azure DevOps board (<code>AZDO_URL</code> / <code>AZDO_TOKEN</code>) in the agent's env — for tickets assigned to that user, active work plus the last two weeks of Done, and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow the tracker's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. Pull-only: nothing here writes back to the tracker.</div>
+  <div class="footer">Each host agent polls its org's tracker — Jira Cloud (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code>) or a self-hosted/cloud Azure DevOps board (<code>AZDO_URL</code> / <code>AZDO_TOKEN</code>) in the agent's env — for tickets assigned to that user, active work plus the last two weeks of Done, and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow the tracker's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. An org chip is labelled from its site unless the agent sets <code>BOARD_ORG_NAME</code>. Pull-only: nothing here writes back to the tracker.</div>
 </div>
 
 <nav class="bottom-nav" id="bottomNav"></nav>
@@ -167,7 +167,7 @@ function render(data) {
       const age = B.ageStr(s.lastFetched);
       extra += ` <span class="chip-stale" title="No host reporting this org is online — showing its last report">⚠ offline${age ? " · synced " + esc(age) + " ago" : ""}</span>`;
     }
-    const chip = mkChip(B.orgName(s.siteKey), s.siteKey, extra);
+    const chip = mkChip(B.orgName(s.siteKey, s.orgName), s.siteKey, extra);
     addAuto(chip, s.siteKey);
     $chips.append(chip);
   }

@@ -112,6 +112,9 @@ data class JiraBlock(
     val fetchedAt: String = "",
     val error: String? = null,
     val truncated: Boolean = false,
+    // The operator's org-label override (agent BOARD_ORG_NAME); "" falls back to
+    // the siteKey-derived name. Presentational only — see core.orgName.
+    val orgName: String = "",
     val tickets: List<JiraTicket> = emptyList(),
     // The repos the board's manual "Change" picker offers — exactly what the
     // agent's set_jira_repo allowlists, so the two can't drift (hub-agent

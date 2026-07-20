@@ -152,7 +152,7 @@ private fun OrgFilterBar(
             autoOn = null, onToggleAuto = {}) { onPick("") }
         for (s in sites) {
             OrgChip(
-                label = orgName(s.siteKey),
+                label = orgName(s.siteKey, s.orgName),
                 color = TurmaColors.series[(colorMap[s.siteKey] ?: 0) % TurmaColors.series.size],
                 count = s.tickets.size,
                 offline = !s.online,

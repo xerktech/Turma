@@ -116,6 +116,11 @@
           { hosts: new Set(), online: false, repos: new Map(), hostOpts: new Map() };
         bySite.set(site, entry = {
           siteKey: site,
+          // The operator's org-label override, off the FRESHEST block (this
+          // entry is created by the first winner) — the same rule the other
+          // single-valued fields follow. An org's hosts are configured alike,
+          // so there is nothing to union.
+          orgName: block.orgName || "",
           users: [],
           hosts: [...rep.hosts].sort(),
           online: rep.online,
@@ -171,7 +176,15 @@
   //     "tfs.co/DefaultCollection"); the last path segment is the org/collection,
   //     which is the readable identity — the host alone would name every unrelated
   //     org the same.
-  function orgName(siteKey) {
+  //
+  // `override` is the agent's own BOARD_ORG_NAME (block/site `orgName`), which
+  // wins outright when set: a self-hosted Azure collection derives to its
+  // COLLECTION name ("tfs.co/tfs/DefaultCollection" -> "defaultcollection"), a
+  // deployment detail rather than the org. It renames only the LABEL — the
+  // siteKey everything is keyed and routed on is untouched.
+  function orgName(siteKey, override) {
+    const o = String(override ?? "").trim();
+    if (o) return o;
     let s = String(siteKey ?? "");
     if (s.includes("/")) {
       const segs = s.split("/").filter(Boolean);
