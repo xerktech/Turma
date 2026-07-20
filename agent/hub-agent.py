@@ -3810,6 +3810,30 @@ def azure_base():
     return b.rstrip("/")
 
 
+def azure_git_auth_config():
+    """The `git config` that lets plain git (clone/fetch/push) authenticate
+    against the configured Azure DevOps org, or None when ADO isn't configured.
+
+    Returns (key, value) for `git config --system`:
+      http.<base>.extraHeader = Authorization: Basic <base64(":<PAT>")>
+    URL-scoped to the ADO base, so no other host ever receives the header. The
+    PAT is the same AZDO_TOKEN the board already uses; Basic with an empty
+    username matches azure_req().
+
+    Why extraHeader and not a credential helper: self-hosted TFS / Azure DevOps
+    Server often does not issue a Basic challenge git can act on, so a helper is
+    never invoked at all (which is why such hosts set `http.proactiveAuth=basic`).
+    The image's git is too old for proactiveAuth (Debian bookworm ships git 2.39;
+    it landed in 2.46), whereas extraHeader (git 2.4+) forces the header
+    proactively on every request and works on the shipped git. This is the
+    non-GitHub counterpart to github.com going through `gh auth git-credential`."""
+    base = azure_base()
+    if not (base and AZDO_TOKEN):
+        return None
+    token = base64.b64encode(f":{AZDO_TOKEN}".encode()).decode()
+    return (f"http.{base}.extraHeader", f"Authorization: Basic {token}")
+
+
 def normalize_azure_site(url):
     """An Azure DevOps base URL -> the cross-host `siteKey` the hub dedupes on:
     the bare lowercase host (with port) plus the org/collection path, no scheme or
@@ -9404,6 +9428,25 @@ if __name__ == "__main__":
     # module-level boot logs that also land on stdout.
     if "--print-device" in sys.argv:
         print("DEVICE_NAME=" + device_name())
+        sys.exit(0)
+    if "--wire-azure-git" in sys.argv:
+        # entrypoint.sh calls this once at boot (as root, before the privilege
+        # drop, since it writes --system git config) so plain git can push to a
+        # non-GitHub Azure DevOps org using the PAT the board already has.
+        # Non-fatal and secret-safe: it logs the host, never the token, and any
+        # failure just leaves git unwired.
+        cfg = azure_git_auth_config()
+        if cfg:
+            key, value = cfg
+            try:
+                subprocess.run(["git", "config", "--system", key, value],
+                               check=True)
+                site = normalize_azure_site(AZDO_URL) or azure_base()
+                print(f"[entrypoint] git: Azure DevOps auth wired for {site} "
+                      "(http.extraHeader)")
+            except Exception as e:  # pragma: no cover - best effort
+                print(f"[entrypoint] git: Azure DevOps auth NOT wired ({e})",
+                      file=sys.stderr)
         sys.exit(0)
     try:
         main()

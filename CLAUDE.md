@@ -663,6 +663,18 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   using `credential.helper store` works with no change.** Tests: the git-creds cases in
   `agent/tests/test_entrypoint.sh`, `test_denies_non_github_git_credential_writes` in
   `test_guard_settings.py`.
+- **Azure DevOps git auth (XERK-54)** — an ADO org already gives the agent a PAT for the board
+  (`AZDO_TOKEN` + `AZDO_URL`), so plain git reuses it instead of any mount: at boot `entrypoint.sh`
+  runs `hub-agent.py --wire-azure-git`, which sets a URL-scoped `http.<azure_base>.extraHeader =
+  Authorization: Basic <base64(":<PAT>")>` (`azure_git_auth_config()`), scoped to the ADO base so no
+  other host receives it. Uses **`extraHeader`, not a credential helper / `http.proactiveAuth`**:
+  self-hosted TFS/Server often issues no Basic challenge a helper can act on (why such hosts set
+  `proactiveAuth=basic`), and the image's git (Debian bookworm, 2.39) predates `proactiveAuth` (2.46) —
+  `extraHeader` (git 2.4+) forces the header proactively and works on the shipped git. Written
+  `--system` as root before the privilege drop; non-fatal, logs the host never the token. The
+  container-only counterpart of github.com going through gh (native relies on the host's own git
+  config). Tests: `TestAzureGitAuthConfig` in `test_hub_agent.py`, the AZDO cases in
+  `test_entrypoint.sh`.
 
 ### `entrypoint.sh`
 
