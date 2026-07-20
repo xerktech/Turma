@@ -180,6 +180,22 @@ if command -v gh >/dev/null 2>&1; then
   fi
 fi
 
+# --- Non-GitHub git creds preflight (agent-agnostic) -----------------------
+# github.com authenticates through gh (above); every OTHER git host (GitLab,
+# Bitbucket, Azure DevOps, self-hosted) authenticates through the `store` helper
+# wired in the Dockerfile, which reads the host's own cached git credentials from
+# an OPTIONAL bind mount at /root/.git-credentials. For an org that doesn't use
+# GitHub this is how private clone/fetch/push works at all.
+# Non-fatal and presence-only, exactly like the cloud creds below: a host that
+# mounts none is supported (it just has no non-GitHub git auth). The file is a
+# sound marker on its own — nothing in this image creates it by merely running
+# (unlike ~/.azure), so its existence means the host really seeded it.
+if [ -s /root/.git-credentials ]; then
+  echo "[entrypoint] git: non-GitHub creds mounted at /root/.git-credentials"
+else
+  echo "[entrypoint] git: no cached non-GitHub creds (/root/.git-credentials) — github.com still works via gh"
+fi
+
 # --- Cloud CLI creds preflight (agent-agnostic) ----------------------------
 # terraform, az and aws are installed in every image, but their credentials are
 # the HOST's, reused through bind mounts exactly like claude (/root/.claude) and

@@ -651,6 +651,18 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - A `clone` command `git clone`s a validated `owner/repo` (allowlist-checked before it reaches git) into
   `REPOS_ROOT` as a **detached subprocess** (reaped across later beats), after which the new repo joins
   the scan. Private-repo auth rides the system git credential helper (`gh auth git-credential`).
+- **Non-GitHub git creds (XERK-54)** — the image wires a SECOND system credential helper after gh:
+  `store --file=/root/.git-credentials`, tried in order for every host. gh serves github.com (fresh
+  token); every other host (GitLab, Bitbucket, Azure DevOps, self-hosted) falls through to `store`,
+  which reads the host's own cached git credentials from an **optional** bind mount at
+  `/root/.git-credentials`. gh is first so github.com always gets a fresh token even if the store file
+  also carries a (staler) github.com line; an unmounted file is an empty helper = a no-op, so a
+  GitHub-only host is unaffected. The `entrypoint.sh` preflight reports the mount (non-fatal, presence
+  only, like the cloud creds). The guard denies writing it (`~/.git-credentials`), a store shared by
+  every session like `~/.aws`. **Native inherits the host's git config untouched, so a host already
+  using `credential.helper store` works with no change.** Tests: the git-creds cases in
+  `agent/tests/test_entrypoint.sh`, `test_denies_non_github_git_credential_writes` in
+  `test_guard_settings.py`.
 
 ### `entrypoint.sh`
 

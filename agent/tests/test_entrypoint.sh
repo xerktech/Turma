@@ -235,6 +235,33 @@ else
   echo "  FAIL: aws — env creds not recognised"; FAILED=1
 fi
 
+# --- Case 9b: non-GitHub git creds are reported (XERK-54) --------------------
+# For an org that doesn't use GitHub, git authenticates through the `store`
+# helper reading a host-mounted /root/.git-credentials. The preflight reports
+# the mount when present and, like the cloud creds, is non-fatal when absent.
+echo "== case: a mounted /root/.git-credentials is reported"
+make_fixture "$WORK/fx9b" 0 0
+# A benign non-empty stand-in — the preflight only checks the file is non-empty,
+# never its contents, so no credential-shaped text is committed here.
+printf '# host git credential cache\n' > "$WORK/fx9b/git-credentials"
+out="$(run_case "$WORK/fx9b" -v "$WORK/fx9b/git-credentials:/root/.git-credentials")"
+if echo "$out" | grep -q "\[entrypoint\] git: non-GitHub creds mounted at /root/.git-credentials"; then
+  echo "  ok: mounted git creds reported"
+else
+  echo "  FAIL: git — /root/.git-credentials mounted but not reported"; FAILED=1
+fi
+expect "manager still starts" "0" "$(field "$out" uid)"
+
+echo "== case: no /root/.git-credentials is ignored, not fatal"
+make_fixture "$WORK/fx9c" 0 0
+out="$(run_case "$WORK/fx9c")"
+if echo "$out" | grep -q "\[entrypoint\] git: no cached non-GitHub creds"; then
+  echo "  ok: absent git creds reported as ignored"
+else
+  echo "  FAIL: git — absent creds not reported"; FAILED=1
+fi
+expect "manager still starts" "0" "$(field "$out" uid)"
+
 # --- Case 10: the tunnel is supervised (XERK-34) -----------------------------
 # A tunnel PROCESS death must not outlive one retry interval. Fire-and-forget
 # left a crashed tunnel down until someone restarted the whole container, with

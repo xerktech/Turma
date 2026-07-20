@@ -47,6 +47,13 @@ class TestGuardSettings(unittest.TestCase):
         ):
             self.assertIn(rule, deny)
 
+    def test_denies_non_github_git_credential_writes(self):
+        # The `store` helper's cached non-GitHub git creds are shared by every
+        # session, so the agent must not edit that file either.
+        deny = ha.build_guard_settings()["permissions"]["deny"]
+        self.assertIn("Edit(~/.git-credentials)", deny)
+        self.assertIn("Write(~/.git-credentials)", deny)
+
     def test_guard_script_path_points_at_bundled_hook(self):
         path = ha.guard_script_path()
         self.assertTrue(path.endswith(os.path.join("hooks", "guard.py")))

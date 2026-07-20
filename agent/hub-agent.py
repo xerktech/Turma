@@ -596,6 +596,10 @@ _GUARD_DENY_PATH_RULES = [
     "Write(~/.claude/**)",
     "Edit(~/.config/gcloud/**)",
     "Write(~/.config/gcloud/**)",
+    # The host's cached non-GitHub git creds (the `store` helper's file), shared
+    # by every session on the box exactly like ~/.aws.
+    "Edit(~/.git-credentials)",
+    "Write(~/.git-credentials)",
 ]
 
 # Operator-supplied extra permissions. Claude Code does NOT read a *user-level*
