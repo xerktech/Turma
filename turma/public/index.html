@@ -804,7 +804,8 @@ function hostCard(a, now) {
   // The org whose Jira this host polls, alongside its name — a host with no Jira
   // creds reports no siteKey and just shows its name, so the suffix is only ever
   // there when it says something.
-  const org = window.TurmaBoard.orgName(a.jira && a.jira.siteKey);
+  const org = window.TurmaBoard.orgName(a.jira && a.jira.siteKey,
+                                        a.jira && a.jira.orgName);
 
   // While updating, the card keeps its normal weight (not the greyed-out
   // `offline` look the outage used to give it) and the header explains it's an

@@ -7849,6 +7849,39 @@ class TestBoardSourceDispatch(unittest.TestCase):
             self.assertEqual(ha.ticket_branch_base("1234", {}), "wi-1234")
 
 
+class TestBoardOrgName(unittest.TestCase):
+    """BOARD_ORG_NAME: the operator's presentational override for the board's org
+    label, source-agnostic and applied in collect_board()."""
+
+    def test_clean_org_name(self):
+        self.assertEqual(ha.clean_org_name("Acme"), "Acme")
+        self.assertEqual(ha.clean_org_name("  Acme   Corp \n junk"), "Acme Corp")
+        # Blank in, blank out — the clients then derive from the siteKey.
+        for blank in ("", "   ", "\n", None):
+            self.assertEqual(ha.clean_org_name(blank), "")
+        self.assertEqual(len(ha.clean_org_name("x" * 200)), ha.ORG_NAME_MAX_CHARS)
+
+    def test_collect_board_stamps_the_override(self):
+        with mock.patch.object(ha, "collect_jira", lambda: {"siteKey": "s", "tickets": []}), \
+             mock.patch.object(ha, "azure_configured", lambda: False):
+            with mock.patch.object(ha, "BOARD_ORG_NAME", "Acme"):
+                self.assertEqual(ha.collect_board()["orgName"], "Acme")
+            # Unset rides as None, which every client reads as "derive it".
+            with mock.patch.object(ha, "BOARD_ORG_NAME", ""):
+                self.assertIsNone(ha.collect_board()["orgName"])
+
+    def test_it_never_touches_the_site_key(self):
+        """The siteKey is what the hub keys, merges and routes on (and what the
+        hub's ticket-agent/auto-start ledgers are stored under), so the label
+        override must leave it exactly as the collector reported it."""
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="https://tfs.co/tfs/DefaultCollection",
+                                 AZDO_TOKEN="p", BOARD_ORG_NAME="Acme"), \
+             mock.patch.object(ha, "collect_azure",
+                               lambda: {"siteKey": ha.normalize_azure_site(ha.AZDO_URL)}):
+            self.assertEqual(ha.collect_board()["siteKey"], "tfs.co/tfs/defaultcollection")
+
+
 class TestStageJiraIssue(ManagerMixin, unittest.TestCase):
     """The {type:"jiraIssue"} command: every path stages a result (the board is
     waiting on this key) and none of them raises out of the heartbeat loop."""

@@ -142,6 +142,29 @@ class BoardTest {
         assertEquals("defaultcollection", orgName("tfs.company.com/tfs/defaultcollection"))
     }
 
+    @Test fun `the operator's org name override wins over the derived name`() {
+        // Locked to board.js orgName: a self-hosted collection otherwise derives
+        // to a deployment detail rather than the org.
+        assertEquals("Acme", orgName("tfs.company.com/tfs/defaultcollection", "Acme"))
+        assertEquals("Acme Corp", orgName("myorg.atlassian.net", "Acme Corp"))
+        assertEquals("Padded", orgName("dev.azure.com/myorg", "  Padded  "))
+        // Blank falls back rather than blanking the chip (an agent predating the
+        // field, or BOARD_ORG_NAME unset, reports "").
+        assertEquals("myorg", orgName("dev.azure.com/myorg", ""))
+        assertEquals("myorg", orgName("dev.azure.com/myorg", "   "))
+        assertEquals("myorg", orgName("dev.azure.com/myorg"))
+    }
+
+    @Test fun `merge sites carries the org name override off the freshest block`() {
+        fun at(t: String, org: String) = AgentInfo(
+            key = "h$t", device = "h$t", online = true,
+            jira = JiraBlock(siteKey = "tfs.co/tfs/coll", user = "u", fetchedAt = t,
+                orgName = org, tickets = emptyList()),
+        )
+        assertEquals("New", mergeSites(listOf(at("2026-01-01", "Old"), at("2026-02-01", "New")))[0].orgName)
+        assertEquals("", mergeSites(listOf(at("2026-01-01", "")))[0].orgName)
+    }
+
     private fun site(key: String) = BoardSite(
         siteKey = key, site = key, online = true, error = null, fetchedAt = "", tickets = emptyList(),
     )

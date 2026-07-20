@@ -4136,6 +4136,32 @@ def fetch_azure_issue(key):
 # configured for, so a host is a Jira host or an Azure host but the wire contract
 # is identical. Azure takes precedence if both are somehow set (one org per host).
 
+# The board chip's org label is DERIVED from the siteKey by every client
+# (board.js `orgName`), which reads well for Jira Cloud ("myorg.atlassian.net" ->
+# "myorg") and for Azure DevOps Services ("dev.azure.com/myorg" -> "myorg"), but
+# not for a self-hosted collection: "tfs.company.com/tfs/DefaultCollection" is
+# named after its COLLECTION ("defaultcollection"), which is a deployment detail,
+# not the org. So the operator can override the label from the agent's env.
+#
+# Presentational ONLY, and deliberately not part of the siteKey: the siteKey is
+# what the hub keys, merges and routes on, and what /api/jira/<siteKey>/... paths
+# and the hub's own ticket-agent/auto-start ledgers are stored under. Renaming it
+# would orphan every one of those; renaming the LABEL costs nothing.
+ORG_NAME_MAX_CHARS = 40
+
+
+def clean_org_name(raw):
+    """BOARD_ORG_NAME as the board may render it: first line, whitespace
+    collapsed, capped. "" for anything blank, so an unset or whitespace-only
+    override falls straight back to the client's derived name."""
+    text = str(raw or "").strip()
+    first = text.splitlines()[0] if text else ""
+    return re.sub(r"\s+", " ", first).strip()[:ORG_NAME_MAX_CHARS]
+
+
+BOARD_ORG_NAME = clean_org_name(os.environ.get("BOARD_ORG_NAME", ""))
+
+
 def board_source():
     """"azure" | "jira" | None — which ticket source this host polls."""
     if azure_configured():
@@ -4155,10 +4181,14 @@ def collect_board():
     """The heartbeat board block from whichever source is configured: Azure when
     its creds are set, else Jira. collect_jira() itself returns the empty block
     when Jira is unconfigured too, so it's the safe default (and refresh_jira only
-    runs at all behind a board_configured() gate)."""
-    if azure_configured():
-        return collect_azure()
-    return collect_jira()
+    runs at all behind a board_configured() gate).
+
+    The operator's `orgName` override rides here rather than in either collector
+    because it is presentational and source-agnostic — the siteKey a board is
+    keyed, merged and routed on is untouched."""
+    block = collect_azure() if azure_configured() else collect_jira()
+    block["orgName"] = BOARD_ORG_NAME or None
+    return block
 
 
 def board_empty():

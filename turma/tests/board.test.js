@@ -230,6 +230,32 @@ test("orgName: the org, not the Jira Cloud host", () => {
   assert.equal(orgName("tfs.company.com/tfs/DefaultCollection"), "DefaultCollection");
 });
 
+test("orgName: the operator's override wins over the derived name", () => {
+  // Why the override exists: a self-hosted collection derives to a deployment
+  // detail, not the org.
+  assert.equal(orgName("tfs.company.com/tfs/defaultcollection", "Acme"), "Acme");
+  assert.equal(orgName("myorg.atlassian.net", "Acme Corp"), "Acme Corp");
+  assert.equal(orgName("dev.azure.com/myorg", "  Padded  "), "Padded");
+  // Blank/absent overrides fall back rather than blanking the chip — the agent
+  // sends null when BOARD_ORG_NAME is unset.
+  assert.equal(orgName("dev.azure.com/myorg", null), "myorg");
+  assert.equal(orgName("dev.azure.com/myorg", ""), "myorg");
+  assert.equal(orgName("dev.azure.com/myorg", "   "), "myorg");
+  assert.equal(orgName("dev.azure.com/myorg"), "myorg", "still one-arg callable");
+});
+
+test("mergeSites: carries the org-label override off the freshest block", () => {
+  const at = (t, orgName) => ({
+    device: "h" + t, online: true,
+    jira: { siteKey: "tfs.co/tfs/coll", user: "u", fetchedAt: t, orgName, tickets: [] },
+  });
+  // Freshest wins, the same rule the other single-valued fields follow.
+  assert.equal(mergeSites([at("2026-01-01", "Old"), at("2026-02-01", "New")])[0].orgName,
+               "New");
+  // An agent predating the field reports none: "" leaves the label derived.
+  assert.equal(mergeSites([at("2026-01-01", undefined)])[0].orgName, "");
+});
+
 test("autoStartOn: the org-chip switch reads the hub-only per-org opt-in", () => {
   const site = "acme.atlassian.net";
   // Off unless the hub toggle names the org.

@@ -965,6 +965,15 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `inprogress`. Purely a board.js/CSS change.
 - The org filter chips are **labelled by `orgName(siteKey)`** — the site host minus `.atlassian.net` (the
   full host stays as tooltip). Presentational only; the board stays keyed on the whole `siteKey`.
+- The agent's **`BOARD_ORG_NAME`** overrides that label outright (`orgName(siteKey, override)`, stamped
+  onto the block by `collect_board` so it is source-agnostic, carried by `mergeSites` off the freshest
+  block). A self-hosted Azure collection otherwise derives to its COLLECTION
+  (`tfs.co/tfs/DefaultCollection` → "defaultcollection"), a deployment detail rather than the org.
+  Deliberately **not** part of the `siteKey`, which is what the hub keys/merges/routes on and what the
+  `/api/jira/<siteKey>/…` paths and the ticket-agent/auto-start ledgers are stored under — so the label
+  is safe to change later, and renaming the siteKey would orphan all of those. Also read by the
+  dashboard's host rows. Tests: `TestBoardOrgName`, the `orgName`/`mergeSites` override cases in
+  `turma/tests/board.test.js` and `android/.../BoardTest.kt`.
 - Each org gets a **UNIQUE color** — no two share a `--s1..--s8` palette slot (`orgColorMap`, XERK-48).
   Uniqueness couples the orgs, so it's computed over the whole org set: each takes its djb2-preferred slot
   if free, else linear-probes to the next free one, keys processed in sorted order (deterministic). It is

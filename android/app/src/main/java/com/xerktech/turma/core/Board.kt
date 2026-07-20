@@ -47,6 +47,9 @@ fun ticketSort(tickets: List<JiraTicket>): List<JiraTicket> =
 data class BoardSite(
     val siteKey: String,
     val site: String,
+    // The freshest block's org-label override (board.js mergeSites `orgName`);
+    // "" means the label derives from the siteKey.
+    val orgName: String = "",
     val online: Boolean,
     val error: String?,
     val fetchedAt: String,
@@ -79,8 +82,15 @@ fun agentPinOf(
  *   - Jira Cloud is a bare host ("myorg.atlassian.net"); strip `.atlassian.net`.
  *   - Azure DevOps carries an org/collection PATH ("dev.azure.com/myorg"); the last
  *     path segment is the readable org/collection identity.
+ *
+ * `override` is the agent's own BOARD_ORG_NAME (block/site `orgName`) and wins
+ * outright when set: a self-hosted Azure collection derives to its COLLECTION
+ * name, a deployment detail rather than the org. Label only — the siteKey
+ * everything is keyed and routed on is untouched.
  */
-fun orgName(siteKey: String): String {
+fun orgName(siteKey: String, override: String = ""): String {
+    val o = override.trim()
+    if (o.isNotEmpty()) return o
     if (siteKey.contains('/')) {
         val segs = siteKey.split('/').filter { it.isNotEmpty() }
         return segs.lastOrNull() ?: siteKey
@@ -133,6 +143,7 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
             BoardSite(
                 siteKey = site,
                 site = newest.site.ifBlank { site },
+                orgName = newest.orgName,
                 online = reporterOnline[site] ?: false,
                 error = sorted.firstNotNullOfOrNull { it.j.error },
                 fetchedAt = newest.fetchedAt,
