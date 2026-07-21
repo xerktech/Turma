@@ -18,6 +18,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 | `board.html` + `board.js`     | `ui/BoardScreen.kt`, `core/Board.kt`, `vm/BoardViewModel.kt`       |
 | `usage.html`                  | `ui/UsageScreen.kt`                                                |
 | `nav.js` (header/bottom-nav)  | `ui/MainScaffold.kt`, `ui/TurmaApp.kt`                             |
+| `org.js` (header org filter)  | `ui/OrgControl.kt`, `vm/OrgViewModel.kt`, `data/OrgFilter.kt`      |
 | `login.html`                  | `ui/LoginScreen.kt`                                                |
 
 ## Deliberate differences (parity by intent, not omission)
@@ -62,11 +63,26 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `NewSessionPickerDialog` (online host → repo, the pure `spawnTargets` port of the web's `#spawn`
   sidebar) feeding the existing `SpawnDialog`. `vm/ChatViewModel.kt` `kill()`;
   `spawnTargets` tested in `SessionsFlattenTest`.
-- **Per-org auto-start switch (XERK-41).** Each board org chip carries an "auto" toggle segment INSIDE
-  the pill (a divided chip, mirroring board.html's segmented `.org-chip`) that flips the hub-only
-  per-org auto-start opt-in (`POST /api/jira/<site>/autostart`). Ports `board.js` `autoStartOn` into
-  `core/Board.kt` (tested in `BoardTest`); `model/Models.kt`, `net/FleetRepository.kt` (payload +
-  `autoStartOrgs` SSE), `net/HubApi.kt`, `vm/BoardViewModel.kt`, `ui/BoardScreen.kt`.
+- **Per-org auto-start switch (XERK-41).** Flips the hub-only per-org auto-start opt-in
+  (`POST /api/jira/<site>/autostart`). Ports `board.js` `autoStartOn` into `core/Board.kt` (tested in
+  `BoardTest`); `model/Models.kt`, `net/FleetRepository.kt` (payload + `autoStartOrgs` SSE),
+  `net/HubApi.kt`. It rode the board's org chips until XERK-62 moved it onto the header control's
+  org rows, following the web.
+- **Fleet-wide org filter (XERK-62).** The board's org chip strip is gone; one org control lives in
+  the shared `ScreenHeader` and so is on all four top-level screens, scoping each of them from the one
+  persisted pick — Dashboard hosts + tiles, Sessions lists + new-session host picker, Board tickets,
+  Usage series (both groupings). A host polls exactly one org, so scoping the agent list scopes
+  everything built from it; a host with NO tracker block belongs to no org and shows only under "All
+  orgs". A pick for an org nobody reports any more doesn't apply but is KEPT, so it resumes when that
+  host comes back, and each screen's empty state distinguishes "nothing reported" from "the filter
+  narrowed this to nothing" and points at the header. Ports `turma/public/org.js`: `siteKeyOf` /
+  `filterAgents` / `effectiveOrg` / `scopedAgents` / `storedOrg` / `ageStr` in `core/Board.kt` (tested
+  in `BoardTest`), the pick hoisted to `data/OrgFilter.kt` + `AppContainer` (migrating the old
+  board-only preference forward, as the web migrates `turma-board-org` → `turma-org`), the control in
+  `ui/OrgControl.kt` + `vm/OrgViewModel.kt`, call sites in `ui/FleetScreen.kt`, `ui/SessionsScreen.kt`,
+  `ui/BoardScreen.kt`, `ui/UsageScreen.kt`. Platform form: a Material dropdown of rows (dot, org name,
+  ticket count, offline/synced note, `Switch` for auto-start) rather than the web's button + popover of
+  divided pills.
 
 ## Open (subsequent installments), by screen and priority
 
@@ -130,7 +146,11 @@ those are marked `[MODEL]`.
 - P1 Agent picker (XERK-38, shipped): inline save-error on the row (Android toasts like the repo
   picker's; the web paints "Couldn't save" on the row itself).
 - P2 Mobile scroll-snapping columns with peek; deep-link (`?ticket=&site=`); refresh outcome/landing.
-- P3 Org-chip "offline · synced N ago"; card org-chip placement; empty-column + truncation notes.
+- P3 Card org-chip placement; empty-column + truncation notes. (The org chips themselves are gone —
+  XERK-62 — and their "offline · synced N ago" note now rides the header control's org rows.)
+- P3 Org control: no cross-tab sync (the web follows a `storage` event when a second tab re-scopes;
+  a phone has one instance) and no "Currently set" carry-back for a stored-but-unreported org — the
+  pick is kept and resumes, it just isn't listed while nothing reports it, same as the web.
 
 ### Usage (`usage.html` → `UsageScreen`)
 - P0 `[MODEL surface]` 30-day stacked daily chart (per-day buckets exist server-side but are dropped

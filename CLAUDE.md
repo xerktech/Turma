@@ -878,6 +878,9 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - Page-specific content goes in the two slots the page fills — `#hdrSub` (static descriptor) and
   `#hdrMeta` (dynamic). An unfilled slot collapses (`.site-header .sub:empty`). The row **ends at the
   tabs**: no right-hand slot (one carried an "updated <time>" stamp, dropped as noise).
+- A third slot, **`#hdrOrg`, is filled by nobody** — `org.js` mounts the fleet-wide org filter into it
+  (see "The org filter"). It sits after the spacer, before the tabs, and collapses when no host reports
+  a tracker org.
 - The header is full-bleed and `.site-header-in` caps its row at `--wrap` and centres it, so every page's
   chrome lands in the same 1180px column as a `.wrap` page's content. On `sessions.html` the two-pane
   `.sess-shell` below is capped at the same `--wrap` and centred too (XERK-28), so the whole page reads
@@ -905,6 +908,39 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
     (its `scrollTop` restore is ordered against a focus/caret restore that can itself scroll). New
     recurring repaints without such a special case should use `preserveScroll`.
 - Tests: `turma/tests/nav.test.js`.
+
+### The org filter (`turma/public/org.js`, XERK-62)
+
+- **One org-scoping control, in the header, obeyed by all four pages.** A host polls exactly ONE org
+  (agent-side rule), so an org **partitions the fleet** — the same pick that filters tickets filters
+  hosts, sessions and usage. It was a chip strip on the board alone, which is why "which org am I
+  looking at" was a question only the Kanban could answer.
+- The value is a **full `siteKey`** (what the hub keys and routes on), never the display org name;
+  `""` is every org. Persisted as `turma-org` (migrated once from the board's `turma-board-org`, so an
+  existing filter carries over) and re-read on the `storage` event, so two open tabs agree.
+- Each page: `TurmaOrg.update(data)` each beat, `TurmaOrg.filter(data.agents)` to scope what it builds,
+  `TurmaOrg.subscribe(...)` to repaint on a change, `TurmaOrg.sse(es)` to take the hub's `autoStartOrgs`
+  broadcast off the page's existing socket rather than opening a second one.
+- Scoping is applied to the **agent list**, once, and everything downstream follows. Deliberately NOT
+  applied to `findSession`/`sessionHit` (they read `cache` directly) — an open session must not be torn
+  off the stage because its org left the sidebar — nor to pending-command reconciliation, which runs
+  against the WHOLE fleet or a command fired before a re-scope hangs forever.
+- A host with **no tracker block belongs to no org**: it shows under "All orgs" and under none of the
+  named ones. That is the truth about it, not a bug to fold away.
+- **A pick for an org nobody reports doesn't apply, but is kept** (`effectiveKey`): otherwise an org
+  whose last host was removed leaves every page filtered to nothing with no chip left to clear it — the
+  one way an operator could lock themselves out of the fleet. Keeping it means it resumes when that host
+  returns. Empty states say which case they're in and point at the header.
+- The per-org **auto-start switch (XERK-41) rides the menu's org rows** — `org.js` owns its optimistic
+  flip, POST and rollback.
+- Repaints are **skipped when the markup is unchanged**, so the beat can't churn the DOM under an open
+  menu. Clicks are delegated, and a handled click is flagged **on the event** — the repaint detaches the
+  clicked node, so the click-away handler's `slot.contains(e.target)` is false and the menu closed
+  itself on the click that opened it.
+- It reads board.js's org vocabulary, so **every page loads `board.js`**, ordered board.js → nav.js →
+  org.js (the vocabulary first, then the `#hdrOrg` slot org.js mounts into).
+- Tests: `turma/tests/org.test.js`; Android's port is `data/OrgFilter.kt` + `ui/OrgControl.kt` +
+  `core/Board.kt`'s `siteKeyOf`/`filterAgents`/`effectiveOrg`/`scopedAgents`, tested in `BoardTest.kt`.
 
 ### Fleet tree (host → repo → session)
 
@@ -975,8 +1011,10 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   for review/testing (both `indeterminate` → `inprogress`), so `categoryOf` carves it out by matching the
   org-specific status NAME (`isReviewStatus`, word-boundary: review/testing/QA) and only ever pulls FROM
   `inprogress`. Purely a board.js/CSS change.
-- The org filter chips are **labelled by `orgName(siteKey)`** — the site host minus `.atlassian.net` (the
-  full host stays as tooltip). Presentational only; the board stays keyed on the whole `siteKey`.
+- The board is scoped by the **header's org filter**, not a strip of its own — see "The org filter". It
+  reads `TurmaOrg.get()` each render and passes it to `boardHtml` as before.
+- An org is **labelled by `orgName(siteKey)`** — the site host minus `.atlassian.net` (the full host
+  stays as tooltip). Presentational only; everything stays keyed on the whole `siteKey`.
 - The agent's **`BOARD_ORG_NAME`** overrides that label outright (`orgName(siteKey, override)`, stamped
   onto the block by `collect_board` so it is source-agnostic, carried by `mergeSites` off the freshest
   block). A self-hosted Azure collection otherwise derives to its COLLECTION
@@ -1066,7 +1104,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 - An org can be **opted in** so the hub auto-starts a session for every **To Do** ticket the moment it has
   a repo assigned (by triage OR a manual pin). Off by default.
-- **The opt-in is HUB-ONLY (XERK-41)** — the "auto" switch on each board org chip is the whole control.
+- **The opt-in is HUB-ONLY (XERK-41)** — the "auto" switch on each org row of the header's org menu is
+  the whole control (it rode the board's org chips until XERK-62 moved it there).
   `POST /api/jira/<siteKey>/autostart` `{enabled}` → `setAutoStartOrg`, a hub-owned durable per-org opt-in
   stored in `autostart-orgs.json` (`AUTOSTART_ORGS_FILE` on `/data`, keyed by siteKey, presence =
   enabled). It rides the fleet payload as top-level `autoStartOrgs` (`{siteKey:true}`) plus an
@@ -1094,7 +1133,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 ##### Auto-stopping Done tickets (XERK-45)
 
 - The lifecycle **counterpart** to auto-start: the SAME per-org "auto" opt-in **kills** a session once its
-  ticket reaches **Done** (the org chip's tooltip reads "start To Do tickets, stop Done sessions"). A
+  ticket reaches **Done** (the switch's tooltip reads "start To Do tickets, stop Done sessions"). A
   ticket only reaches Done by a **human** moving it (the board is pull-only), so it's a deliberate
   "finished" signal.
 - The hub **KILLS**, not interrupts: a kill ends it cleanly (moves to Ended with worktree/conversation/PR
@@ -1533,6 +1572,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   - `board.js` + `board.html` → `ui/BoardScreen.kt` + `core/Board.kt` + `vm/BoardViewModel.kt`
   - `usage.html` → `ui/UsageScreen.kt`
   - `nav.js` → `ui/MainScaffold.kt` + `ui/TurmaApp.kt`
+  - `org.js` → `ui/OrgControl.kt` + `vm/OrgViewModel.kt` + `data/OrgFilter.kt`
 - **Pure logic ports live in `core/` and are JVM-unit-tested against the web behavior** — the board
   category carve-out (`core/Board.kt` ↔ `board.js` `categoryOf`), the typewriter reveal (`core/Reveal.kt`
   ↔ `chat.js` `repaint`), the summary-tile reducers (`core/Fleet.kt` ↔ index.html

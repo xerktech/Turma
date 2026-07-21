@@ -257,12 +257,13 @@
 </div>
 
 <nav class="bottom-nav" id="bottomNav"></nav>
-<script src="/nav.js"></script>
-
 <!-- For TurmaBoard.orgName: the host rows name each host's Jira org, and that
      siteKey -> org-name rule is the board's, so the dashboard borrows it rather
-     than growing a second copy to drift from. -->
+     than growing a second copy to drift from. org.js reads the same vocabulary
+     for the header's org filter, and needs nav.js's #hdrOrg slot to exist. -->
 <script src="/board.js"></script>
+<script src="/nav.js"></script>
+<script src="/org.js"></script>
 
 <script>
 const $tiles = document.getElementById("tiles");
@@ -709,8 +710,16 @@ function tile(label, value, hint) {
 }
 
 function render(data) {
-  const { now, agents } = data;
-  reconcilePending(agents);
+  const { now } = data;
+  // Pending commands are reconciled against the WHOLE fleet, not the scoped
+  // view: a spawn fired before the operator narrowed to another org must still
+  // be retired when its host reports, or it hangs "starting…" forever.
+  reconcilePending(data.agents || []);
+  // Everything below is the fleet as scoped by the header's org filter
+  // (XERK-62). A host polls exactly one org, so scoping the agent list scopes
+  // the tiles, the host cards, their repos and their sessions in one move.
+  TurmaOrg.update(data);
+  const agents = TurmaOrg.filter(data.agents || []);
 
   // Aggregate across every session on every host.
   const sess = agents.flatMap(a => (a.sessions || []).map(s => ({ s, host: a })));
@@ -738,8 +747,13 @@ function render(data) {
          models === "–" ? "every session ever" : "mostly " + models);
 
   if (!agents.length) {
-    $groups.innerHTML = `<div class="empty">No hosts have reported yet.<br>
-      Containers running the agent image heartbeat here automatically.</div>`;
+    // Distinguish an empty fleet from one the org filter has narrowed to
+    // nothing — otherwise a scoped-out dashboard reads as "no agents at all".
+    $groups.innerHTML = (data.agents || []).length
+      ? `<div class="empty">No hosts report this org.<br>
+         Pick another org (or “All orgs”) in the header to see the rest of the fleet.</div>`
+      : `<div class="empty">No hosts have reported yet.<br>
+         Containers running the agent image heartbeat here automatically.</div>`;
     return;
   }
 
@@ -1424,6 +1438,10 @@ function connectSSE() {
     catch { return; }
     bgRender();
   });
+  // The header's per-org auto-start switches (XERK-41) ride the same socket —
+  // org.js takes its own event off this page's EventSource rather than opening
+  // a second one.
+  TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;
     // The browser auto-retries an open stream; only re-create one it gave up on.
@@ -1449,6 +1467,10 @@ function fastPoll() {
   }, 500);
 }
 
+// The org scope lives in the header and applies to every page (XERK-62);
+// a change there repaints this one straight away rather than waiting for
+// the next beat.
+TurmaOrg.subscribe(() => render(cache));
 refresh();
 connectSSE();
 // Fallback poll: slower now that SSE carries live updates, and skipped entirely

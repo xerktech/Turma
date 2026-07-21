@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.liveState
+import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.core.sessionBranch
 import com.xerktech.turma.core.sessionName
 import com.xerktech.turma.model.AgentInfo
@@ -188,10 +189,15 @@ fun SessionsListPane(
 ) {
     LaunchedEffect(Unit) { vm.start() }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
+    val org by vm.orgFilter.collectAsStateWithLifecycle()
     var query by remember { mutableStateOf("") }
     val now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis()
-    val rows = remember(fleet, query) { flattenSessions(fleet.agents, query) }
-    val ended = remember(fleet, query) { flattenClosed(fleet.agents, query) }
+    // Scoped by the header's org control (XERK-62) before anything is built from
+    // it, so the lists AND the new-session host picker narrow together — a host
+    // polls exactly one org, so scoping the agent list scopes all three.
+    val agents = remember(fleet.agents, org) { scopedAgents(fleet.agents, org) }
+    val rows = remember(agents, query) { flattenSessions(agents, query) }
+    val ended = remember(agents, query) { flattenClosed(agents, query) }
     var endedOpen by remember { mutableStateOf(false) }
     // New-session picker: pick an online host + repo, then the spawn composer.
     var pickerOpen by remember { mutableStateOf(false) }
@@ -213,7 +219,15 @@ fun SessionsListPane(
             if (rows.isEmpty() && ended.isEmpty()) {
                 item {
                     Text(
-                        if (fleet.loading) "Loading…" else "No sessions.",
+                        when {
+                            // Say which of the two it is: a fleet with no sessions
+                            // reads very differently from one the org filter
+                            // narrowed to nothing, and only one has a way out.
+                            fleet.agents.isNotEmpty() && agents.isEmpty() ->
+                                "No hosts report this org. Pick another org (or “All orgs”) in the header."
+                            fleet.loading -> "Loading…"
+                            else -> "No sessions."
+                        },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -249,7 +263,7 @@ fun SessionsListPane(
 
     if (pickerOpen) {
         NewSessionPickerDialog(
-            targets = remember(fleet) { spawnTargets(fleet.agents) },
+            targets = remember(agents) { spawnTargets(agents) },
             onDismiss = { pickerOpen = false },
             onPick = { host, repo, isRoot -> pickerOpen = false; spawnFor = Triple(host, repo, isRoot) },
         )

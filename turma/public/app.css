@@ -127,6 +127,66 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 .site-header .sub:empty { display: none; }
 .site-header .spacer { flex: 1; }
 
+/* ---- Org filter (#hdrOrg, built by org.js) -------------------------------
+   The one org-scoping control, in the chrome because every page obeys it
+   (XERK-62) — it replaced the board-only chip strip. Collapses to nothing when
+   no host reports a tracker org, like the .sub slots above. */
+.site-header .org-slot:empty { display: none; }
+.org-filter { position: relative; display: inline-flex; }
+.org-btn {
+  font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
+  color: var(--ink-2); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 999px;
+  display: inline-flex; align-items: center; gap: 7px;
+  --org: var(--muted);
+}
+.org-btn:hover { color: var(--ink); }
+.org-btn.scoped { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.org-btn .org-dot { display: none; }
+.org-btn.scoped .org-dot { display: block; width: 9px; height: 9px; border-radius: 50%; background: var(--org); flex: none; }
+.org-btn .org-chev { color: var(--muted); font-size: 10px; }
+/* The menu. Right-aligned under the button (on desktop the button sits at the
+   right edge of the header row, so a left-aligned panel would hang off-screen).
+   The phone override below flips that — see the media query. */
+.org-menu {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 50;
+  min-width: 220px; max-width: calc(100vw - 24px); max-height: 60vh; overflow-y: auto;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow-md);
+  padding: 4px; display: flex; flex-direction: column; gap: 2px;
+}
+/* One row per org: the scope pick, and the org's auto-start switch (XERK-41) —
+   the two segments the board's chips carried, laid out as a list row. A button
+   can't nest a button, so the row is a plain container. */
+.org-row {
+  display: flex; align-items: stretch; border-radius: 999px; overflow: hidden;
+  --org: var(--muted);
+}
+.org-row:hover { background: color-mix(in srgb, var(--ink) 6%, transparent); }
+.org-row.active { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.org-row-main {
+  font: inherit; font-size: 12.5px; padding: 6px 10px; cursor: pointer;
+  color: var(--ink-2); background: transparent; border: none; text-align: left;
+  display: inline-flex; align-items: center; gap: 7px; flex: 1; min-width: 0;
+}
+.org-row-main .org-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--org); flex: none; }
+.org-row-main .org-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.org-row-main:hover { color: var(--ink); }
+.org-row.active .org-row-main { color: var(--accent); font-weight: 600; }
+.org-row-main .chip-n { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.org-row-main .chip-stale { color: var(--warning); font-size: 11px; }
+/* The auto-start toggle segment, divided from the pick by an inner border. */
+.org-chip-auto {
+  font: inherit; font-size: 11px; padding: 5px 10px; cursor: pointer;
+  color: var(--muted); background: transparent;
+  border: none; border-left: 1px solid var(--border); border-radius: 0;
+  display: inline-flex; align-items: center; gap: 5px; flex: none;
+}
+.org-chip-auto:hover:not(:disabled) { color: var(--ink); }
+.org-chip-auto .org-auto-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+.org-chip-auto.on { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.org-chip-auto.on .org-auto-dot { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
+
 /* Global focus: keyboard users get a clear accent ring; mouse clicks don't. */
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
@@ -242,11 +302,9 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 }
 
 /* ---- Jira board (/board) -------------------------------------------------- */
-/* Board toolbar: org chips run wide, the refresh button stays pinned right.
-   `align-items: flex-start` keeps the button from stretching when the chips
-   wrap to a second row. */
-.board-bar { display: flex; align-items: flex-start; gap: 10px; margin: 2px 0 14px; }
-.board-bar .org-chips { flex: 1; min-width: 0; margin: 0; }
+/* Board toolbar: just the refresh button now, pinned right — the org chips it
+   used to run alongside became the header's org filter (XERK-62). */
+.board-bar { display: flex; align-items: flex-start; justify-content: flex-end; gap: 10px; margin: 2px 0 14px; }
 .board-refresh {
   font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
   color: var(--ink-2); background: var(--surface);
@@ -262,40 +320,6 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 @media (prefers-reduced-motion: reduce) {
   .board-refresh.busy svg { animation: none; }
 }
-
-.org-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 14px; }
-/* Each org chip is ONE pill (border + radius); the filter button and the
-   auto-start toggle (XERK-41) are two segments INSIDE it. A button can't nest a
-   button, so the pill is a plain container and each segment is its own button. */
-.org-chip {
-  display: inline-flex; align-items: stretch; overflow: hidden;
-  background: var(--surface);
-  border: 1px solid var(--border); border-radius: 999px;
-  --org: var(--muted);
-}
-.org-chip.active { border-color: var(--accent); }
-/* The filter segment — the whole chip minus the auto toggle. */
-.org-chip-main {
-  font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
-  color: var(--ink-2); background: transparent; border: none;
-  display: inline-flex; align-items: center; gap: 7px;
-}
-.org-chip-main.has-dot::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--org); flex: none; }
-.org-chip-main:hover { color: var(--ink); }
-.org-chip.active .org-chip-main { color: var(--accent); font-weight: 600; }
-.org-chip-main .chip-n { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-.org-chip-main .chip-stale { color: var(--warning); font-size: 11px; }
-/* The auto-start toggle segment, divided from the filter by an inner border. */
-.org-chip-auto {
-  font: inherit; font-size: 11px; padding: 5px 10px; cursor: pointer;
-  color: var(--muted); background: transparent;
-  border: none; border-left: 1px solid var(--border);
-  display: inline-flex; align-items: center; gap: 5px;
-}
-.org-chip-auto:hover:not(:disabled) { color: var(--ink); }
-.org-chip-auto .org-auto-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
-.org-chip-auto.on { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
-.org-chip-auto.on .org-auto-dot { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
 
 .kanban-cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; align-items: start; }
 .kanban-col { min-width: 0; }
@@ -578,6 +602,10 @@ body.td-open { overflow: hidden; }
   .site-header { margin-bottom: 16px; }
   .site-header-in { padding: 16px 12px 0; gap: 8px 12px; }
   .nav-tabs { display: none; }
+  /* With the tabs gone the org button no longer sits at the right edge — it
+     wraps to the start of its own row, so a right-aligned panel hangs off the
+     LEFT of the screen. Anchor it to the button's left edge instead. */
+  .org-menu { right: auto; left: 0; }
   .bottom-nav {
     display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
     background: color-mix(in srgb, var(--surface) 88%, transparent);

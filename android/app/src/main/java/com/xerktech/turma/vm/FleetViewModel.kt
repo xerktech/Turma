@@ -26,6 +26,9 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
     private val container = (app as TurmaApplication).container
     val fleet: StateFlow<com.xerktech.turma.net.FleetState> get() = container.fleet.state
 
+    /** The header's org scope (XERK-62), shared by every screen. */
+    val orgFilter: StateFlow<String> get() = container.org.stored
+
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val messages: SharedFlow<String> = _messages
 

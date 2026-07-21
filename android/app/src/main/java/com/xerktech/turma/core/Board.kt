@@ -203,6 +203,77 @@ fun orgColorIndex(siteKey: String, allKeys: List<String>): Int =
     orgColorMap(allKeys)[siteKey] ?: orgSlotPref(siteKey)
 
 /**
+ * Relative age of an ISO timestamp ("now"/"5m"/"3h"/"2d"/"1w"), a port of
+ * board.js `ageStr`. Blank for a missing/unparseable stamp, so a caller can
+ * append it or not without a null dance.
+ */
+fun ageStr(iso: String, nowMs: Long = System.currentTimeMillis()): String {
+    if (iso.isBlank()) return ""
+    val t = runCatching { java.time.Instant.parse(iso).toEpochMilli() }.getOrNull() ?: return ""
+    val s = ((nowMs - t) / 1000).coerceAtLeast(0)
+    return when {
+        s < 60 -> "now"
+        s < 3600 -> "${s / 60}m"
+        s < 86400 -> "${s / 3600}h"
+        s < 86400 * 7 -> "${s / 86400}d"
+        else -> "${s / (86400 * 7)}w"
+    }
+}
+
+// ---- the fleet-wide org filter (XERK-62), a port of turma/public/org.js ------
+//
+// The org pick used to scope the board alone; it now lives in the shared header
+// and scopes every screen. Since a host polls exactly ONE org (an agent-side
+// rule), an org IS a partition of the fleet — so the same pick that filters
+// tickets filters hosts, sessions and usage, by filtering the agent list once.
+// The value is a full siteKey (what the hub keys and routes on), never the
+// display org name; "" means every org.
+
+/**
+ * The org a host belongs to. A host with no tracker creds reports no jira block
+ * and belongs to no org — so it shows under "All orgs" and under none of the
+ * named ones, which is the truth about it.
+ */
+fun siteKeyOf(agent: AgentInfo): String = agent.jira?.siteKey.orEmpty()
+
+/**
+ * The fleet, scoped to one org. Deliberately NOT [filterSites]'s fallback
+ * ("an unknown filter shows everything") — that rule is about a site list, and
+ * here the caller has already resolved the key through [effectiveOrg], which is
+ * where a stale pick self-heals.
+ */
+fun filterAgents(agents: List<AgentInfo>, key: String): List<AgentInfo> =
+    if (key.isBlank()) agents else agents.filter { siteKeyOf(it) == key }
+
+/**
+ * The stored pick as it APPLIES right now. It only counts while some host still
+ * reports that org — an org whose last agent was removed must not leave every
+ * screen filtered down to nothing with no way back. The stored value is KEPT by
+ * the caller (a host that comes back resumes its filter); it just doesn't apply
+ * while nothing reports it.
+ */
+fun effectiveOrg(key: String, sites: List<BoardSite>): String =
+    if (key.isNotBlank() && sites.any { it.siteKey == key }) key else ""
+
+/**
+ * The one call site every screen uses: the beat's fleet scoped to the stored
+ * pick, self-heal included. Keeps the self-heal in one tested place rather than
+ * once per screen.
+ */
+fun scopedAgents(agents: List<AgentInfo>, stored: String): List<AgentInfo> =
+    filterAgents(agents, effectiveOrg(stored, mergeSites(agents)))
+
+/**
+ * The org pick to persist on first read, migrating the board-only preference
+ * (`turma_board`/`org`) into the fleet-wide one — an operator's existing board
+ * filter carries into the new global control rather than silently resetting to
+ * "all orgs" on upgrade. Mirrors org.js's `turma-board-org` → `turma-org`
+ * migration; null means "nothing stored either way".
+ */
+fun storedOrg(current: String?, legacy: String?): String? =
+    current ?: legacy?.takeIf { it.isNotBlank() }
+
+/**
  * The board's org filter, a port of board.js `boardHtml`'s `shown`: a blank
  * filter (the "All orgs" chip) keeps every site; otherwise only the site whose
  * `siteKey` matches. A filter naming an org no longer reporting collapses to

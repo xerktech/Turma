@@ -2,6 +2,7 @@ package com.xerktech.turma
 
 import android.content.Context
 import com.xerktech.turma.data.Config
+import com.xerktech.turma.data.OrgFilter
 import com.xerktech.turma.net.Dictation
 import com.xerktech.turma.net.FleetRepository
 import com.xerktech.turma.net.HubClient
@@ -21,6 +22,13 @@ class AppContainer(context: Context) {
     val client = HubClient(config)
     val fleet = FleetRepository(client, config, appScope)
     val liveTail = LiveTail(client, config)
+
+    /**
+     * The org scope (XERK-62). Held here rather than in a ViewModel because it is
+     * ONE value shared by every screen — the header control sets it, the fleet,
+     * sessions, board and usage screens all read it.
+     */
+    val org = OrgFilter(context.applicationContext)
 
     /** In-app self-updater (XERK-11); [installedVersion] read once from the package manager. */
     val updater = Updater(context.applicationContext, appScope, installedVersion(context))
