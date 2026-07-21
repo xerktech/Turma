@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -196,16 +197,21 @@ fun ChatScreen(
             }
         },
     ) { pad ->
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.fillMaxSize().padding(pad),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(10.dp, 6.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            if (state.hasMore) {
-                item { Text("· earlier history ·", Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
+        // Wrap the transcript so its text is selectable + copyable, matching the
+        // web chat, which relies on native browser selection to copy session text
+        // (XERK-64). Long-press selects; tap still toggles tool/thinking cards.
+        SelectionContainer(Modifier.fillMaxSize().padding(pad)) {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(10.dp, 6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                if (state.hasMore) {
+                    item { Text("· earlier history ·", Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
+                }
+                items(items.size) { i -> ChatItemView(items[i]) }
             }
-            items(items.size) { i -> ChatItemView(items[i]) }
         }
     }
 }
