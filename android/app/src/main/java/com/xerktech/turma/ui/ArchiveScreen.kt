@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.CircularProgressIndicator
@@ -46,11 +47,14 @@ fun ArchiveScreen(onBack: () -> Unit, vm: ArchiveViewModel = viewModel()) {
                 navigationIcon = { IconButton(onClick = { vm.closeTranscript() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
             )
         }) { pad ->
-            LazyColumn(
-                Modifier.fillMaxSize().padding(pad),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) { items(items.size) { i -> ChatItemView(items[i]) } }
+            // Ended/archived transcript text is selectable + copyable too (XERK-64).
+            SelectionContainer(Modifier.fillMaxSize().padding(pad)) {
+                LazyColumn(
+                    Modifier.fillMaxSize(),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) { items(items.size) { i -> ChatItemView(items[i]) } }
+            }
         }
         return
     }

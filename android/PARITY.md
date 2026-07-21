@@ -83,6 +83,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `ui/BoardScreen.kt`, `ui/UsageScreen.kt`. Platform form: a Material dropdown of rows (dot, org name,
   ticket count, offline/synced note, `Switch` for auto-start) rather than the web's button + popover of
   divided pills.
+- **Selectable/copyable transcript text (XERK-64).** The web chat relies on native browser text
+  selection to copy session text (and defers repaints to keep a live selection intact). Compose `Text`
+  isn't selectable by default, so the transcript `LazyColumn` in `ui/ChatScreen.kt` and the
+  archived/ended transcript viewer in `ui/ArchiveScreen.kt` are now wrapped in a `SelectionContainer`:
+  long-press selects, the system copy toolbar copies, and taps still toggle the tool/thinking cards.
 
 ## Open (subsequent installments), by screen and priority
 
