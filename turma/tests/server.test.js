@@ -2413,17 +2413,76 @@ test("auto-start: a resumable-only session (durable, survives restart) still cou
   assert.equal((agents.asResume.commands || []).length, 0);
 });
 
-test("auto-start: fires each ticket at most once, even if the spawn left no session", async () => {
+// XERK-61: a spawnTicket the agent acked but that produced no session is a
+// FAILED attempt, not a completed one — the agent acks a refusal and a mid-spawn
+// exception exactly like a success. So the sweep retries it, bounded and backed
+// off, instead of dropping the ticket for the hub's lifetime.
+test("auto-start: an acked spawn that left no session is retried, not dropped", async () => {
   resetAutoStart();
-  await asBeat("asOnce", "as7.atlassian.net");
+  await asBeat("asRetry", "as7.atlassian.net");
   autoStartSweep();
-  assert.equal((agents.asOnce.commands || []).length, 1);
-  // Simulate the agent acking the command and NOT producing a session (a refused
-  // spawn): the in-flight and session guards both come up empty, so only the
-  // once-set stops a re-queue every sweep.
-  agents.asOnce.commands = [];
+  assert.equal((agents.asRetry.commands || []).length, 1);
+
+  // The agent took the command and produced nothing (a refusal, or a Jira fetch
+  // that blew up). Immediately after, the backoff holds the retry off.
+  agents.asRetry.commands = [];
   autoStartSweep();
-  assert.equal((agents.asOnce.commands || []).length, 0);
+  assert.equal((agents.asRetry.commands || []).length, 0,
+    "the retry waits out its backoff rather than re-queuing every 15s");
+
+  // Once the backoff has elapsed, the ticket is tried again.
+  autoStarted.get("as7.atlassian.net\x00ENG-5").nextAt = 0;
+  autoStartSweep();
+  assert.deepEqual((agents.asRetry.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal(autoStarted.get("as7.atlassian.net\x00ENG-5").attempts, 2);
+});
+
+test("auto-start: retries are bounded — a ticket that never starts is given up on", async () => {
+  resetAutoStart();
+  await asBeat("asBudget", "as7b.atlassian.net");
+  const k = "as7b.atlassian.net\x00ENG-5";
+  // Burn the whole budget: every attempt is acked and leaves no session.
+  for (let i = 0; i < 12; i++) {
+    agents.asBudget.commands = [];
+    const e = autoStarted.get(k);
+    if (e) e.nextAt = 0;
+    autoStartSweep();
+  }
+  assert.equal(autoStarted.get(k).attempts, 4, "capped at AUTO_START_MAX_ATTEMPTS");
+  agents.asBudget.commands = [];
+  autoStarted.get(k).nextAt = 0;
+  autoStartSweep();
+  assert.equal((agents.asBudget.commands || []).length, 0,
+    "an impossible ticket stops retrying instead of re-queuing forever");
+});
+
+test("auto-start: a session appearing ends the retries and forgets the attempts", async () => {
+  resetAutoStart();
+  await asBeat("asWon", "as7c.atlassian.net");
+  autoStartSweep();
+  const k = "as7c.atlassian.net\x00ENG-5";
+  assert.equal(autoStarted.get(k).attempts, 1);
+  // The spawn worked: the session (queued or running) reports its ticket back.
+  agents.asWon.commands = [];
+  agents.asWon.sessions = [{ id: "s1", status: "queued", transcriptId: "t1",
+    ticket: { key: "ENG-5", siteKey: "as7c.atlassian.net" } }];
+  autoStartSweep();
+  assert.equal((agents.asWon.commands || []).length, 0);
+  assert.ok(!autoStarted.has(k), "the attempt record is dropped, not left to grow");
+});
+
+test("auto-start: an offline org spends no attempt (the failure isn't the ticket's)", async () => {
+  resetAutoStart();
+  await asBeat("asDown", "as7d.atlassian.net");
+  agents.asDown.lastSeen = Date.now() - 10 * 60 * 1000;  // offline
+  autoStartSweep();
+  assert.equal((agents.asDown.commands || []).length, 0);
+  assert.ok(!autoStarted.has("as7d.atlassian.net\x00ENG-5"));
+  // The host returns: the ticket starts on the very next sweep, with its full
+  // budget intact rather than sitting out a backoff it never earned.
+  agents.asDown.lastSeen = Date.now();
+  autoStartSweep();
+  assert.deepEqual((agents.asDown.commands || []).map((c) => c.issueKey), ["ENG-5"]);
 });
 
 test("auto-start: an in-flight spawnTicket (e.g. a manual click) is not doubled", async () => {
