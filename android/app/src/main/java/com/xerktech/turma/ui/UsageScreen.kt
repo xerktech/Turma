@@ -29,6 +29,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.vm.UsageViewModel
 
 /** Compact token count: 1.2M / 3.4k / 850. Mirrors the web UI's fmtTokens. */
@@ -43,7 +44,14 @@ fun fmtTokens(n: Long): String = when {
 fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel()) {
     LaunchedEffect(Unit) { vm.start() }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
-    val ui = remember(fleet) { UsageViewModel.compute(fleet) }
+    val org by vm.orgFilter.collectAsStateWithLifecycle()
+    // Scoped by the header's org control (XERK-62) before the totals are built,
+    // so both groupings stay consistent: "By host" drops the other orgs' hosts,
+    // and "By repo" charts only what the scoped org's hosts spent — a repo two
+    // orgs share reads as that org's share of it, which is the point of scoping.
+    val ui = remember(fleet, org) {
+        UsageViewModel.compute(fleet.copy(agents = scopedAgents(fleet.agents, org)))
+    }
     var tab by remember { mutableIntStateOf(0) }
 
     Column(modifier.fillMaxSize()) {
@@ -70,7 +78,14 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
                 UsageRow(name, today, total, total.toDouble() / maxTotal)
             }
             if (rows.isEmpty()) item {
-                Text("No usage recorded yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    // An org whose hosts reported nothing yet vs a fleet that has:
+                    // only the first has a way out, and it's the header control.
+                    if (fleet.agents.isNotEmpty() && org.isNotBlank())
+                        "No usage reported for this org. Pick another org (or “All orgs”) in the header."
+                    else "No usage recorded yet.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             // The descriptive footer the web moved from the dashboard to here.
             item {

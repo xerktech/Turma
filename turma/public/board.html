@@ -17,7 +17,6 @@
         data-sub="Ticket board · assigned tickets across orgs"></header>
 <div class="wrap">
   <div class="board-bar">
-    <div class="org-chips" id="chips"></div>
     <button id="refresh" class="board-refresh" title="Re-poll Jira on every connected host now">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
       <span id="refreshLabel">Refresh</span>
@@ -27,26 +26,25 @@
   <div class="td-backdrop" id="detailBackdrop" hidden>
     <div class="td-panel" id="detailPanel" role="dialog" aria-modal="true" aria-label="Ticket detail"></div>
   </div>
-  <div class="footer">Each host agent polls its org's tracker — Jira Cloud (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code>) or a self-hosted/cloud Azure DevOps board (<code>AZDO_URL</code> / <code>AZDO_TOKEN</code>) in the agent's env — for tickets assigned to that user, active work plus the last two weeks of Done, and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow the tracker's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. An org chip is labelled from its site unless the agent sets <code>BOARD_ORG_NAME</code>. Pull-only: nothing here writes back to the tracker.</div>
+  <div class="footer">Each host agent polls its org's tracker — Jira Cloud (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code>) or a self-hosted/cloud Azure DevOps board (<code>AZDO_URL</code> / <code>AZDO_TOKEN</code>) in the agent's env — for tickets assigned to that user, active work plus the last two weeks of Done, and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow the tracker's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. The header's org filter scopes this board — and every other page — to one org; each org is labelled from its site unless the agent sets <code>BOARD_ORG_NAME</code>. Pull-only: nothing here writes back to the tracker.</div>
 </div>
 
 <nav class="bottom-nav" id="bottomNav"></nav>
-<script src="/nav.js"></script>
-
+<!-- board.js first: it owns the org vocabulary (mergeSites/orgName/orgColorMap)
+     that org.js's header control reads, and nav.js must have built the #hdrOrg
+     slot before org.js mounts into it. -->
 <script src="/board.js"></script>
+<script src="/nav.js"></script>
+<script src="/org.js"></script>
+
 <script>
 const B = window.TurmaBoard;
-const $chips = document.getElementById("chips");
 const $board = document.getElementById("board");
 
-// Selected org filter persists across visits ("" = all orgs).
-const ORG_KEY = "turma-board-org";
-let orgFilter = localStorage.getItem(ORG_KEY) || "";
-function setOrg(k) {
-  orgFilter = k;
-  localStorage.setItem(ORG_KEY, k);
-  if (cache) render(cache);
-}
+// The org scope is no longer this page's to own — it lives in the header and
+// applies to every page (XERK-62). The board just reads it each render and
+// re-renders when the operator changes it.
+window.TurmaOrg.subscribe(() => { if (cache) render(cache); });
 
 function esc(s) { return B.esc(s); }
 
@@ -77,29 +75,9 @@ function consumeDeepLink() {
   openDetail(key, found.siteKey, null);
 }
 
-// Flip an org's hub-side auto-start opt-in (XERK-41). Painted optimistically —
-// the hub map is authoritative the moment the POST returns and its SSE event
-// keeps every OTHER open board in step, but the local flip makes THIS board's
-// switch respond instantly. Rolls back if the POST fails.
-async function setAutoStart(siteKey, enabled) {
-  if (!cache) return;
-  const map = cache.autoStartOrgs || (cache.autoStartOrgs = {});
-  const had = !!map[siteKey];
-  if (enabled) map[siteKey] = true; else delete map[siteKey];
-  render(cache);
-  let ok = false;
-  try {
-    const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/autostart`,
-      { method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ enabled }) });
-    if (r.status === 401) { location.href = "/login"; return; }
-    ok = r.ok;
-  } catch { /* network error — fall through to rollback */ }
-  if (!ok) {
-    if (had) map[siteKey] = true; else delete map[siteKey];
-    if (cache) render(cache);
-  }
-}
+// The per-org auto-start switch (XERK-41) moved with the org chips into the
+// header menu — see org.js's setAutoStart, which owns the optimistic flip, the
+// POST and the rollback for every page.
 
 function render(data) {
   // Ahead of the empty-board early-return below, so a refresh still resolves on
@@ -110,67 +88,17 @@ function render(data) {
   lastSites = sites; lastAllKeys = sites.map(s => s.siteKey);
   refreshOpenTicket();
   consumeDeepLink();
+  // The header's org control is fed the same beat every page feeds it, so its
+  // menu (org list, ticket counts, staleness, auto switches) tracks the fleet.
+  TurmaOrg.update(data);
   if (!sites.length) {
-    $chips.replaceChildren();
     $board.innerHTML = `<div class="empty">No tickets reported yet. Connect an org by setting <code>JIRA_SITE</code>/<code>JIRA_EMAIL</code>/<code>JIRA_TOKEN</code> (Jira) or <code>AZDO_URL</code>/<code>AZDO_TOKEN</code> (Azure DevOps) in an agent's environment.</div>`;
     return;
   }
   const allKeys = lastAllKeys;
-  if (orgFilter && !allKeys.includes(orgFilter)) orgFilter = "";
-  // One assignment of unique per-org colors over the whole org set, shared by the
-  // chips and the board columns so an org is one color everywhere (XERK-48).
-  const colorMap = B.orgColorMap(allKeys);
-
-  // Chips: All + one per org, colored by the org's unique palette slot, with
-  // a staleness note when none of the org's reporting hosts is online.
-  $chips.replaceChildren();
-  // A chip is LABELLED with the org name but still filters on the full siteKey,
-  // which stays the identity the board is keyed on; the site host rides along as
-  // the chip's tooltip for anyone who wants to see which Jira it actually is.
-  // Each chip is ONE pill: a container holding the filter segment (.org-chip-main)
-  // and, for a real org, the auto-start toggle segment (.org-chip-auto, XERK-41).
-  // The segments are separate buttons because a button can't nest a button, but
-  // they render as a single divided pill.
-  const mkChip = (label, key, extra) => {
-    const wrap = document.createElement("span");
-    wrap.className = "org-chip" + (orgFilter === key ? " active" : "");
-    const main = document.createElement("button");
-    main.type = "button";
-    main.className = "org-chip-main" + (key ? " has-dot" : "");
-    main.innerHTML = extra ? esc(label) + extra : esc(label);
-    if (key) {
-      wrap.style.setProperty("--org", colorMap.get(key) || B.orgColor(key));
-      main.title = key;
-    }
-    main.addEventListener("click", () => setOrg(key));
-    wrap.append(main);
-    return wrap;
-  };
-  // The auto-start toggle segment, appended INSIDE the org's pill. Hub-only
-  // (XERK-41): reflects the hub-owned per-org opt-in, and a click flips it.
-  const addAuto = (wrap, siteKey) => {
-    const on = B.autoStartOn(data.autoStartOrgs, siteKey);
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = "org-chip-auto" + (on ? " on" : "");
-    b.setAttribute("aria-pressed", on ? "true" : "false");
-    b.title = on ? "Auto: start To Do tickets, stop Done sessions — ON, click to turn off"
-                 : "Auto: start To Do tickets, stop Done sessions — OFF, click to turn on";
-    b.innerHTML = `<span class="org-auto-dot" aria-hidden="true"></span>auto`;
-    b.addEventListener("click", () => setAutoStart(siteKey, !on));
-    wrap.append(b);
-  };
-  $chips.append(mkChip("All orgs", ""));
-  for (const s of sites) {
-    let extra = ` <span class="chip-n">${s.tickets.length}</span>`;
-    if (!s.online) {
-      const age = B.ageStr(s.lastFetched);
-      extra += ` <span class="chip-stale" title="No host reporting this org is online — showing its last report">⚠ offline${age ? " · synced " + esc(age) + " ago" : ""}</span>`;
-    }
-    const chip = mkChip(B.orgName(s.siteKey, s.orgName), s.siteKey, extra);
-    addAuto(chip, s.siteKey);
-    $chips.append(chip);
-  }
+  // The scope the header control is on. It's a siteKey (or "" for every org),
+  // already self-healed against orgs nobody reports.
+  const orgFilter = TurmaOrg.get();
 
   const sessionIndex = B.ticketSessionIndex(data.agents || []);
   // The board innerHTML-replaces every beat (SSE ~1s / 15s poll), which would
@@ -711,14 +639,10 @@ function connectSSE() {
     scheduleRender();
   });
   // An org's auto-start opt-in changed (XERK-41) — same tiny-whole-map pattern
-  // as ticketAgents; keeps every open board's switches in step.
-  es.addEventListener("autoStartOrgs", (e) => {
-    let m;
-    try { m = JSON.parse(e.data); } catch { return; }
-    if (!cache) cache = { now: Date.now(), agents: [] };
-    cache.autoStartOrgs = m;
-    scheduleRender();
-  });
+  // as ticketAgents; keeps every open page's switches in step. The switches live
+  // in the header menu now, so org.js takes that event off this page's socket
+  // rather than opening a second one.
+  TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;
     if (es.readyState === EventSource.CLOSED) {

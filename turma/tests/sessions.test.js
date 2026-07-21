@@ -108,6 +108,10 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     console, Date, Math, JSON, encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
     addEventListener(type, fn) { (winListeners[type] ||= []).push(fn); }, removeEventListener: noop,
     matchMedia: () => ({ matches: narrow, addEventListener: noop }),
+    // The header's org filter (org.js). Stubbed as the identity scope ("all
+    // orgs") so these tests see every fabricated host; `setOrg` lets an
+    // org-scoping test narrow it.
+    TurmaOrg: { _k: "", get() { return this._k; }, filter(a) { return this._k ? (a || []).filter((x) => (x.jira && x.jira.siteKey) === this._k) : (a || []); }, update: noop, subscribe: noop, sse: noop },
     scrollTo: noop, innerWidth: 1200, innerHeight: 800,
   };
   const names = Object.keys(stubs);

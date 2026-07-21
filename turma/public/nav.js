@@ -10,6 +10,12 @@
 // unfilled slot collapses (`.sub:empty` in app.css), so pages using fewer slots
 // still ship the same DOM.
 //
+// A third slot, #hdrOrg, is the exception that proves the rule: no page fills
+// it. It is filled by org.js with the one org-scoping control every page obeys
+// (XERK-62), which is why it lives in the chrome rather than in any page's
+// markup. It sits after the spacer so it right-aligns beside the tabs, and it
+// collapses when the fleet reports no tracker org at all.
+//
 // Loaded by every page in the browser (window.TurmaNav) and require()d directly
 // by tests/nav.test.js, the same dual-export pattern as chat.js / board.js.
 // Mounting is synchronous on load so the header paints with the page and the
@@ -63,6 +69,7 @@
     <span class="sub" id="hdrSub">${esc(sub ?? "")}</span>
     <span class="sub" id="hdrMeta"></span>
     <span class="spacer"></span>
+    <span class="org-slot" id="hdrOrg"></span>
     ${tabsHtml(active)}
   </div>`;
   }
@@ -140,9 +147,9 @@
   }
 
   const api = { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, esc, preserveScroll };
-  if (typeof window !== "undefined") {
-    window.TurmaNav = api;
-    mount(document);
-  }
+  if (typeof window !== "undefined") window.TurmaNav = api;
+  // Guarded on `document`, not `window`: a test can put a stand-in on a fake
+  // global `window` before requiring this and still drive mount() itself.
+  if (typeof document !== "undefined") mount(document);
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })();

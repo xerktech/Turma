@@ -51,6 +51,7 @@ import com.xerktech.turma.core.FleetSummary
 import com.xerktech.turma.core.LiveState
 import com.xerktech.turma.core.fleetSummary
 import com.xerktech.turma.core.liveState
+import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.core.sessionBranch
 import com.xerktech.turma.core.sessionName
 import com.xerktech.turma.model.AgentInfo
@@ -65,6 +66,11 @@ fun FleetScreen(
     vm: FleetViewModel = viewModel(),
 ) {
     val fleet by vm.fleet.collectAsStateWithLifecycle()
+    val org by vm.orgFilter.collectAsStateWithLifecycle()
+    // Everything below is the fleet as scoped by the header's org control
+    // (XERK-62). A host polls exactly one org, so scoping the agent list scopes
+    // the tiles, the host cards, their repos and their sessions in one move.
+    val agents = remember(fleet.agents, org) { scopedAgents(fleet.agents, org) }
     val snackbar = remember { SnackbarHostState() }
 
     LaunchedEffect(Unit) { vm.start() }
@@ -87,18 +93,26 @@ fun FleetScreen(
                 contentPadding = PaddingValues(8.dp, 2.dp, 8.dp, 10.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                if (fleet.agents.isNotEmpty()) {
-                    item(key = "tiles") { FleetTiles(remember(fleet.agents) { fleetSummary(fleet.agents) }) }
+                if (agents.isNotEmpty()) {
+                    item(key = "tiles") { FleetTiles(remember(agents) { fleetSummary(agents) }) }
                 }
-                if (fleet.agents.isEmpty()) {
+                if (agents.isEmpty()) {
                     item {
                         Text(
-                            if (fleet.loading) "Loading fleet…" else (fleet.error ?: "No hosts reporting."),
+                            // Distinguish an empty fleet from one the org filter
+                            // narrowed to nothing — otherwise a scoped-out
+                            // dashboard reads as "no agents at all".
+                            when {
+                                fleet.agents.isNotEmpty() ->
+                                    "No hosts report this org. Pick another org (or “All orgs”) in the header."
+                                fleet.loading -> "Loading fleet…"
+                                else -> fleet.error ?: "No hosts reporting."
+                            },
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
-                items(fleet.agents, key = { it.key }) { agent ->
+                items(agents, key = { it.key }) { agent ->
                     HostSection(
                         agent = agent,
                         now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis(),
@@ -380,7 +394,8 @@ private fun SummaryTile(label: String, value: String, hint: String, modifier: Mo
 /**
  * Slim page header used on the top-level screens in place of the removed app bar.
  * Always carries a ⋮ overflow with "Sign out" (via [LocalSignOut]) so it's
- * reachable on every top-level page, matching the web's per-page nav Sign out.
+ * reachable on every top-level page, matching the web's per-page nav Sign out,
+ * and the org filter (XERK-62) for the same reason — one scope, on every screen.
  */
 @Composable
 fun ScreenHeader(title: String, actions: @Composable () -> Unit = {}) {
@@ -394,6 +409,7 @@ fun ScreenHeader(title: String, actions: @Composable () -> Unit = {}) {
     ) {
         Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.weight(1f))
+        OrgFilterAction()
         actions()
         Box {
             IconButton(onClick = { menuOpen = true }) { Icon(Icons.Filled.MoreVert, "More") }

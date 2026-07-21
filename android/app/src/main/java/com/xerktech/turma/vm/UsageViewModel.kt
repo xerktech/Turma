@@ -17,6 +17,10 @@ import com.xerktech.turma.net.FleetState
 class UsageViewModel(app: Application) : AndroidViewModel(app) {
     private val container = (app as TurmaApplication).container
     val fleet get() = container.fleet.state
+
+    /** The header's org scope (XERK-62), shared by every screen. */
+    val orgFilter get() = container.org.stored
+
     fun start() = container.fleet.start()
 
     data class RepoTotal(

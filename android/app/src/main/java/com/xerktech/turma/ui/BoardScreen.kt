@@ -1,16 +1,13 @@
 package com.xerktech.turma.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -54,12 +51,10 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.BOARD_CATEGORIES
 import com.xerktech.turma.core.BoardSite
-import com.xerktech.turma.core.autoStartOn
 import com.xerktech.turma.core.categoryOf
 import com.xerktech.turma.core.filterSites
 import com.xerktech.turma.core.mergeSites
 import com.xerktech.turma.core.orgColorMap
-import com.xerktech.turma.core.orgName
 import com.xerktech.turma.model.JiraTicket
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.BoardViewModel
@@ -72,8 +67,11 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
     val orgFilter by vm.orgFilter.collectAsStateWithLifecycle()
     val sites = remember(fleet) { mergeSites(fleet.agents) }
     // One assignment of unique per-org colors over the whole org set, shared by
-    // the chips and the columns so an org is one color everywhere (XERK-48).
+    // the header control and the columns so an org is one color everywhere
+    // (XERK-48).
     val colorMap = remember(sites) { orgColorMap(sites.map { it.siteKey }) }
+    // The scope is the header control's (XERK-62); filterSites self-heals a pick
+    // no org still reports, exactly as `effectiveOrg` does for the other screens.
     val shown = remember(sites, orgFilter) { filterSites(sites, orgFilter) }
     var detail by remember { mutableStateOf<Pair<BoardSite, JiraTicket>?>(null) }
 
@@ -87,23 +85,20 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
                 else Icon(Icons.Filled.Refresh, "Refresh")
             }
         }
-        if (sites.isEmpty() || sites.all { it.tickets.isEmpty() }) {
+        if (sites.isEmpty() || shown.all { it.tickets.isEmpty() }) {
             Text(
-                if (fleet.agents.any { it.jira?.configured == true }) "No tickets."
-                else "No ticket-board-configured hosts.",
+                when {
+                    // The scoped org reporting nothing is a different story from a
+                    // fleet with no tickets at all, and the way out is the header.
+                    sites.isNotEmpty() && shown.size < sites.size ->
+                        "No tickets for this org. Pick another org (or “All orgs”) in the header."
+                    fleet.agents.any { it.jira?.configured == true } -> "No tickets."
+                    else -> "No ticket-board-configured hosts."
+                },
                 Modifier.padding(16.dp),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         } else {
-            // Pinned above the (horizontally-scrolling) columns: an "All orgs" chip
-            // plus one per org, labelled by org name, ticket-counted, and colored by
-            // the org's stable palette slot. Mirrors board.html's `#chips` row.
-            OrgFilterBar(
-                sites, colorMap, orgFilter,
-                autoOf = { autoStartOn(fleet.autoStartOrgs, it) },
-                onToggleAuto = { site, enabled -> vm.setAutoStart(site, enabled) },
-                onPick = { vm.setOrg(it) },
-            )
             Row(
                 Modifier.fillMaxSize().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -124,120 +119,6 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
         // so it's resolved here where the fleet state is in scope.
         val pin = com.xerktech.turma.core.agentPinOf(fleet.ticketAgents, site.siteKey, ticket.key)
         TicketDetailSheet(site, ticket, pin, vm, onDismiss = { detail = null })
-    }
-}
-
-/**
- * The pinned org filter row: "All orgs" + one chip per org. Labelled by org
- * name (the siteKey's `.atlassian.net` stripped), ticket-counted, colored by
- * the org's stable palette slot, and flagged offline when no reporting host is
- * online. Selecting one filters the board to that org's `siteKey`; the choice
- * persists in the ViewModel. Mirrors board.html's `#chips` row.
- */
-@Composable
-private fun OrgFilterBar(
-    sites: List<BoardSite>,
-    colorMap: Map<String, Int>,
-    orgFilter: String,
-    autoOf: (String) -> Boolean,
-    onToggleAuto: (String, Boolean) -> Unit,
-    onPick: (String) -> Unit,
-) {
-    Row(
-        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        OrgChip("All orgs", null, null, offline = false, active = orgFilter.isBlank(),
-            autoOn = null, onToggleAuto = {}) { onPick("") }
-        for (s in sites) {
-            OrgChip(
-                label = orgName(s.siteKey, s.orgName),
-                color = TurmaColors.series[(colorMap[s.siteKey] ?: 0) % TurmaColors.series.size],
-                count = s.tickets.size,
-                offline = !s.online,
-                active = orgFilter == s.siteKey,
-                // The auto-start toggle (XERK-41) is a segment INSIDE the chip.
-                autoOn = autoOf(s.siteKey),
-                onToggleAuto = { enabled -> onToggleAuto(s.siteKey, enabled) },
-            ) { onPick(s.siteKey) }
-        }
-    }
-}
-
-/**
- * One org chip as a single pill: a filter segment plus, for a real org, an
- * auto-start toggle segment (XERK-41) divided from it by an inner line — a port
- * of board.html's segmented `.org-chip`. The toggle reflects the hub-only per-org
- * opt-in and a tap flips it (`autoOn = null` on the "All orgs" chip omits it).
- */
-@Composable
-private fun OrgChip(
-    label: String,
-    color: Color?,
-    count: Int?,
-    offline: Boolean,
-    active: Boolean,
-    autoOn: Boolean?,
-    onToggleAuto: (Boolean) -> Unit,
-    onClick: () -> Unit,
-) {
-    val accent = color ?: MaterialTheme.colorScheme.primary
-    val stroke = if (active) accent else MaterialTheme.colorScheme.outline
-    Row(
-        Modifier
-            .height(IntrinsicSize.Min)
-            .clip(RoundedCornerShape(999.dp))
-            .border(1.dp, stroke, RoundedCornerShape(999.dp)),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        // Filter segment.
-        Row(
-            Modifier
-                .background(if (active) accent.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surface)
-                .clickable(onClick = onClick)
-                .padding(horizontal = 12.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            if (color != null) Box(Modifier.size(8.dp).clip(CircleShape).background(color))
-            Text(
-                label,
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
-                color = if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (count != null) Text(
-                "$count",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (offline) Text(
-                "⚠",
-                style = MaterialTheme.typography.labelMedium,
-                color = TurmaColors.waiting,
-            )
-        }
-        // Auto-start toggle segment (real orgs only), divided by an inner line.
-        if (autoOn != null) {
-            Box(Modifier.width(1.dp).fillMaxHeight().background(MaterialTheme.colorScheme.outline))
-            Row(
-                Modifier
-                    .background(if (autoOn) accent.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surface)
-                    .clickable { onToggleAuto(!autoOn) }
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(5.dp),
-            ) {
-                Box(Modifier.size(7.dp).clip(CircleShape)
-                    .background(if (autoOn) accent else MaterialTheme.colorScheme.onSurfaceVariant))
-                Text(
-                    "auto",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (autoOn) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
     }
 }
 

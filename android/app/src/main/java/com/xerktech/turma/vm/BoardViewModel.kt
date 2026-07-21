@@ -5,7 +5,6 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.model.JiraIssueDetail
-import com.xerktech.turma.net.AutoStartRequest
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -15,8 +14,6 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 
-private const val ORG_KEY = "org"
-
 /** Board state: reuses the shared fleet stream; refresh fans a jira re-poll. */
 class BoardViewModel(app: Application) : AndroidViewModel(app) {
     private val container = (app as TurmaApplication).container
@@ -25,16 +22,9 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
     private val _refreshing = MutableStateFlow(false)
     val refreshing: StateFlow<Boolean> = _refreshing
 
-    // Selected org filter ("" = all orgs), persisted across visits like the web
-    // board's `turma-board-org` localStorage key (board.html).
-    private val prefs = app.getSharedPreferences("turma_board", 0)
-    private val _orgFilter = MutableStateFlow(prefs.getString(ORG_KEY, "") ?: "")
-    val orgFilter: StateFlow<String> = _orgFilter
-
-    fun setOrg(key: String) {
-        _orgFilter.value = key
-        prefs.edit().putString(ORG_KEY, key).apply()
-    }
+    // The org scope ("" = all orgs) is the header control's now (XERK-62), held
+    // by the container so the board reads the same pick every other screen does.
+    val orgFilter: StateFlow<String> get() = container.org.stored
 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val messages: SharedFlow<String> = _messages
@@ -100,21 +90,6 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
             }
             val ok = runCatching { container.client.api.setTicketAgent(siteKey, issueKey, body) }.isSuccess
             _messages.tryEmit(if (ok) "✓ agent updated" else "✗ hub unreachable")
-            container.fleet.nudge()
-        }
-    }
-
-    /**
-     * Flip an org's auto-start opt-in (XERK-41). Hub-owned and durable — the POST
-     * is authoritative, and the fleet payload's autoStartOrgs (plus its SSE event)
-     * reflects it on the next poll.
-     */
-    fun setAutoStart(siteKey: String, enabled: Boolean) {
-        viewModelScope.launch {
-            val ok = runCatching {
-                container.client.api.setAutoStart(siteKey, AutoStartRequest(enabled))
-            }.isSuccess
-            _messages.tryEmit(if (ok) "✓ auto-start updated" else "✗ hub unreachable")
             container.fleet.nudge()
         }
     }

@@ -210,6 +210,69 @@ class BoardTest {
         assertEquals(null, agentPinOf(mapOf("s/X-1" to com.xerktech.turma.model.TicketAgentPin()), "s", "X-1"))
     }
 
+    // ---- the fleet-wide org filter (XERK-62): parity with org.js
+
+    @Test fun `siteKeyOf is the host's org, blank for a host with no tracker`() {
+        assertEquals("acme.atlassian.net", siteKeyOf(agent("h1", true, JiraBlock(siteKey = "acme.atlassian.net"))))
+        assertEquals("", siteKeyOf(agent("h2", true, null)))
+    }
+
+    @Test fun `filterAgents scopes the fleet to one org`() {
+        val a = agent("h1", true, JiraBlock(siteKey = "acme"))
+        val b = agent("h2", true, JiraBlock(siteKey = "beta"))
+        // A host with no tracker belongs to no org: under "All orgs" and under
+        // none of the named ones.
+        val c = agent("h3", true, null)
+        val all = listOf(a, b, c)
+        assertEquals(all, filterAgents(all, ""))
+        assertEquals(listOf("h1"), filterAgents(all, "acme").map { it.key })
+        assertEquals(listOf("h3"), filterAgents(all, "").filter { siteKeyOf(it).isEmpty() }.map { it.key })
+        // Unlike filterSites, an unknown key here filters to nothing — the caller
+        // resolves it through effectiveOrg first.
+        assertTrue(filterAgents(all, "gone").isEmpty())
+    }
+
+    @Test fun `effectiveOrg self-heals a pick no host reports any more`() {
+        val sites = listOf(site("acme"), site("beta"))
+        assertEquals("acme", effectiveOrg("acme", sites))
+        assertEquals("", effectiveOrg("gone", sites))
+        assertEquals("", effectiveOrg("", sites))
+        // Nothing reporting at all can't strand every screen on an empty fleet.
+        assertEquals("", effectiveOrg("acme", emptyList()))
+    }
+
+    @Test fun `scopedAgents applies the pick only while its org reports`() {
+        val a = agent("h1", true, JiraBlock(siteKey = "acme", user = "u", fetchedAt = "2026-07-16T01:00:00Z"))
+        val b = agent("h2", true, JiraBlock(siteKey = "beta", user = "u", fetchedAt = "2026-07-16T01:00:00Z"))
+        assertEquals(listOf("h1"), scopedAgents(listOf(a, b), "acme").map { it.key })
+        // The stored pick is kept by the caller; it just doesn't scope anything
+        // while nothing reports that org — the whole fleet shows instead.
+        assertEquals(listOf("h1", "h2"), scopedAgents(listOf(a, b), "gone").map { it.key })
+    }
+
+    @Test fun `storedOrg migrates the board-only pick forward exactly once`() {
+        // Nothing stored either way.
+        assertEquals(null, storedOrg(null, null))
+        // Only the legacy board key: adopt it.
+        assertEquals("acme", storedOrg(null, "acme"))
+        // A blank legacy value is nothing to migrate.
+        assertEquals(null, storedOrg(null, ""))
+        // Once the new key exists it wins, including a deliberate "all orgs".
+        assertEquals("", storedOrg("", "acme"))
+        assertEquals("beta", storedOrg("beta", "acme"))
+    }
+
+    @Test fun `ageStr reports how stale an offline org's last report is`() {
+        val now = java.time.Instant.parse("2026-07-16T12:00:00Z").toEpochMilli()
+        assertEquals("", ageStr("", now))
+        assertEquals("", ageStr("not-a-date", now))
+        assertEquals("now", ageStr("2026-07-16T11:59:30Z", now))
+        assertEquals("5m", ageStr("2026-07-16T11:55:00Z", now))
+        assertEquals("3h", ageStr("2026-07-16T09:00:00Z", now))
+        assertEquals("2d", ageStr("2026-07-14T12:00:00Z", now))
+        assertEquals("1w", ageStr("2026-07-08T12:00:00Z", now))
+    }
+
     @Test fun `autoStartOn reads the hub-only per-org opt-in`() {
         val site = "acme.atlassian.net"
         // Off unless the hub toggle names the org.

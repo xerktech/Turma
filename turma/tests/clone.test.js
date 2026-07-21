@@ -38,6 +38,10 @@ function loadCloneModule() {
     setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
     location: { pathname: "/", href: "" },
     matchMedia: () => ({ matches: false, addEventListener() {} }),
+    // The header's org filter (org.js) — a real dependency of the page now that
+    // every list is scoped by it. Stubbed as the identity scope ("all orgs"), so
+    // these tests see the whole fabricated fleet.
+    TurmaOrg: { get: () => "", filter: (a) => a || [], update() {}, subscribe() {}, sse() {} },
   };
   g.window = g; g.globalThis = g;
 
@@ -51,11 +55,11 @@ function loadCloneModule() {
   `;
   const fn = new Function(
     "localStorage", "document", "window", "EventSource", "fetch",
-    "setInterval", "clearInterval", "setTimeout", "clearTimeout", "location", "matchMedia", "globalThis",
+    "setInterval", "clearInterval", "setTimeout", "clearTimeout", "location", "matchMedia", "TurmaOrg", "globalThis",
     src + exportTail
   );
   fn(g.localStorage, g.document, g.window, g.EventSource, g.fetch,
-     g.setInterval, g.clearInterval, g.setTimeout, g.clearTimeout, g.location, g.matchMedia, g);
+     g.setInterval, g.clearInterval, g.setTimeout, g.clearTimeout, g.location, g.matchMedia, g.TurmaOrg, g);
 
   const api = g.__clone;
   const posts = [];

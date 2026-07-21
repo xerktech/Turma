@@ -739,7 +739,12 @@
   </div>
 
 <nav class="bottom-nav" id="bottomNav"></nav>
+<!-- board.js owns the org vocabulary (mergeSites/orgName/orgColorMap) the
+     header's org filter reads; nav.js must build the #hdrOrg slot before
+     org.js mounts into it. -->
+<script src="/board.js"></script>
 <script src="/nav.js"></script>
+<script src="/org.js"></script>
 
 <script>
 const $active = document.getElementById("active");
@@ -1279,8 +1284,17 @@ function sessMeta(s) {
 }
 
 function render(data) {
-  const { now, agents } = data;
-  reconcilePending(agents);
+  const { now } = data;
+  // Against the WHOLE fleet: a command fired before the operator narrowed to
+  // another org still has to be retired when its host reports.
+  reconcilePending(data.agents || []);
+  // The sidebar lists — and the "+ New session" host picker — are scoped to the
+  // header's org filter (XERK-62); a host polls exactly one org, so scoping the
+  // agent list scopes every list built from it. Deliberately NOT applied to
+  // findSession/sessionHit, which read `cache` directly: an open session must
+  // not be torn off the stage because its org was filtered out of the sidebar.
+  TurmaOrg.update(data);
+  const agents = TurmaOrg.filter(data.agents || []);
 
   const { running, queued, ended } = collect(agents, now);
   const waiting = running.filter(x => x.live.kind === "waiting").length;
@@ -2328,6 +2342,10 @@ function connectSSE() {
     catch { return; }
     render(cache);
   });
+  // The header's per-org auto-start switches (XERK-41) ride the same socket —
+  // org.js takes its own event off this page's EventSource rather than opening
+  // a second one.
+  TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;
     if (es.readyState === EventSource.CLOSED) {
@@ -2350,6 +2368,10 @@ function fastPoll() {
   }, 500);
 }
 
+// The org scope lives in the header and applies to every page (XERK-62);
+// a change there repaints this one straight away rather than waiting for
+// the next beat.
+TurmaOrg.subscribe(() => render(cache));
 refresh();
 connectSSE();
 // Fallback poll: slower now that SSE carries live updates, skipped while healthy.

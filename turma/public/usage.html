@@ -134,7 +134,12 @@
 </div>
 
 <nav class="bottom-nav" id="bottomNav"></nav>
+<!-- board.js owns the org vocabulary (mergeSites/orgName/orgColorMap) the
+     header's org filter reads; nav.js must build the #hdrOrg slot before
+     org.js mounts into it. -->
+<script src="/board.js"></script>
 <script src="/nav.js"></script>
+<script src="/org.js"></script>
 
 <script>
 const $chart = document.getElementById("chart");
@@ -402,9 +407,17 @@ function render(data) {
   TurmaNav.preserveScroll(document.querySelector(".wrap"), () => renderInner(data));
 }
 function renderInner(data) {
-  const series = toSeries(data.agents || []);
+  // Scoped to the header's org filter (XERK-62) before either series builder
+  // runs, so both modes stay consistent: "By host" drops the other orgs' hosts,
+  // and "By repo" charts only what the scoped org's hosts spent — a repo two
+  // orgs share reads as that org's share of it, which is the point of scoping.
+  TurmaOrg.update(data);
+  const agents = TurmaOrg.filter(data.agents || []);
+  const series = toSeries(agents);
   if (!series.length) {
-    $chart.innerHTML = `<div class="empty">No usage reported yet (agents aggregate it within ~5 minutes of starting).</div>`;
+    $chart.innerHTML = (data.agents || []).length
+      ? `<div class="empty">No usage reported for this org. Pick another org (or “All orgs”) in the header.</div>`
+      : `<div class="empty">No usage reported yet (agents aggregate it within ~5 minutes of starting).</div>`;
     return;
   }
 
@@ -770,6 +783,10 @@ function connectSSE() {
     catch { return; }
     scheduleRender();
   });
+  // The header's per-org auto-start switches (XERK-41) ride the same socket —
+  // org.js takes its own event off this page's EventSource rather than opening
+  // a second one.
+  TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;
     if (es.readyState === EventSource.CLOSED) {
@@ -779,6 +796,10 @@ function connectSSE() {
   };
 }
 
+// The org scope lives in the header and applies to every page (XERK-62);
+// a change there repaints this one straight away rather than waiting for
+// the next beat.
+TurmaOrg.subscribe(() => { if (cache) render(cache); });
 refresh();
 connectSSE();
 setInterval(() => { if (!sseOk) refresh(); }, 30000);
