@@ -990,16 +990,47 @@ setInterval(() => {
 // The whole point is to never open a SECOND session for work already started —
 // by an operator's click, a prior auto-start, or anything else. Three guards, in
 // increasing strength:
-//   - autoStarted: fire each ticket at most once per hub lifetime. This is what
-//     stops a spawn the agent legitimately REFUSES (e.g. an uncloneable repo)
-//     from being re-queued every sweep — a refusal leaves no session to see.
+//   - autoStarted: a per-ticket ATTEMPT record, bounded and backed off (see
+//     below). This is what stops a spawn the agent legitimately REFUSES (e.g. an
+//     uncloneable repo) from being re-queued every 15s forever — a refusal leaves
+//     no session to see.
 //   - startedTicketKeys(): the durable guard — a ticket carrying a session on ANY
 //     channel (live, killed, or the resumable scan that outlives a restart) is
 //     already handled, whether it was started manually or automatically.
 //   - an in-flight spawnTicket on some org host, for the window before that
 //     session first heartbeats back.
 const AUTO_START_EVERY_MS = 15 * 1000;
-const autoStarted = new Set(); // "<siteKey>\x00<issueKey>" already auto-started
+
+// Auto-start is BOUNDED RETRY, not one-shot (XERK-61). Queuing a spawnTicket is
+// not evidence that a session started: the agent acks every command it takes,
+// including ones it refuses outright (no triaged repo on THAT host, no owner to
+// clone with) and ones that simply blow up mid-spawn (a Jira fetch that times
+// out, a git failure) — handle_commands logs and acks those exactly like a
+// success, and nothing reports the outcome back. Treating "queued once" as
+// "started" therefore made a TRANSIENT failure permanent for the hub's lifetime,
+// which is what "sometimes it starts and sometimes it doesn't, with every
+// condition met" looks like from the board.
+//
+// So each ticket gets a small budget of attempts spaced by a growing backoff,
+// and the retry gate is EVIDENCE, in the same order the sweep already checks it:
+// a session for the ticket (on any channel) ends the attempts for good, an
+// in-flight command means we're still waiting, and only a ticket that is still
+// session-less with nothing in flight past its backoff is tried again. The
+// budget is what keeps a genuinely impossible ticket (a repo that cannot be
+// cloned) from retrying forever; exhausting it logs once and gives up.
+const AUTO_START_MAX_ATTEMPTS = 4;
+const AUTO_START_RETRY_MS = 60 * 1000;      // after attempt 1; doubles each time
+const AUTO_START_RETRY_MAX_MS = 10 * 60 * 1000;
+// "<siteKey>\x00<issueKey>" -> { attempts, nextAt }. Entries are dropped the
+// moment the ticket is seen to have a session, so this stays as small as the set
+// of tickets currently failing to start.
+const autoStarted = new Map();
+
+// When to try again after `attempts` failed attempts: 1min, 2min, 4min, capped.
+function autoStartRetryAt(now, attempts) {
+  return now + Math.min(AUTO_START_RETRY_MS * 2 ** (attempts - 1),
+    AUTO_START_RETRY_MAX_MS);
+}
 
 // siteKeys whose org is opted in to auto-start (XERK-41). The opt-in is HUB-ONLY:
 // it's the hub's own durable per-org toggle (autoStartOrgs), set from the board —
@@ -1034,6 +1065,7 @@ function startedTicketKeys() {
 function autoStartSweep() {
   const orgs = orgsWithAutoStart();
   if (!orgs.size) return;
+  const now = Date.now();
   const started = startedTicketKeys();
   for (const siteKey of orgs) {
     // The freshest reporting block owns the ticket list and its repo guesses, the
@@ -1051,19 +1083,42 @@ function autoStartSweep() {
       const repo = ticketRepo(siteKey, t.key);         // a repo must be assigned
       if (!repo) continue;
       const k = siteKey + "\x00" + t.key;
-      if (autoStarted.has(k) || started.has(k)) continue;
-      // A spawnTicket already riding some org host's queue counts as started.
+      // A session exists on some channel — the work is under way (or was, and
+      // was deliberately killed). Done with this ticket for good; drop any
+      // attempt record so the map only ever holds tickets still failing.
+      if (started.has(k)) { autoStarted.delete(k); continue; }
+      // A spawnTicket already riding some org host's queue: the agent hasn't
+      // taken it yet, so there is nothing to conclude about it either way.
       const inFlight = Object.values(agents).some((a) =>
         a.jira && a.jira.siteKey === siteKey &&
         (a.commands || []).some((c) => c.type === "spawnTicket" && c.issueKey === t.key));
       if (inFlight) continue;
+      // Nothing in flight and still no session: the last attempt (if any) was
+      // taken and produced nothing. Retry it, within the budget and its backoff.
+      const prior = autoStarted.get(k);
+      if (prior) {
+        if (prior.attempts >= AUTO_START_MAX_ATTEMPTS) continue;
+        if (now < prior.nextAt) continue;
+      }
       const { host } = findTicketHost(siteKey, repo, t.key);
       // No online host to route to right now (the org's hosts are down, or the
-      // ticket's pinned agent is) — leave it unrecorded so the next sweep
-      // retries once a host is back, exactly like the offline case.
+      // ticket's pinned agent is) — spend no attempt, so the next sweep retries
+      // immediately once a host is back rather than sitting out a backoff for a
+      // failure that was never the ticket's fault.
       if (!host) continue;
       queueCommand(host, { type: "spawnTicket", issueKey: t.key });
-      autoStarted.add(k);
+      const attempts = (prior ? prior.attempts : 0) + 1;
+      autoStarted.set(k, { attempts, nextAt: autoStartRetryAt(now, attempts) });
+      if (attempts > 1) {
+        console.log(`auto-start: retrying ${t.key} on ${host} `
+          + `(attempt ${attempts}/${AUTO_START_MAX_ATTEMPTS}) — the previous `
+          + "spawnTicket was acked but left no session");
+      }
+      if (attempts >= AUTO_START_MAX_ATTEMPTS) {
+        console.log(`auto-start: ${t.key} has used its last attempt; if this one `
+          + "leaves no session the hub will stop trying (start it by hand from "
+          + "the board to retry)");
+      }
     }
   }
 }

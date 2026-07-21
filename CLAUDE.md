@@ -1122,9 +1122,21 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
     `a.closedSessions`, or a repo's `resumable` scan) is already handled, however started. A **killed**
     session counts (a deliberate kill is not resurrected).
   - an in-flight `spawnTicket` on some org host, for the window before that session first heartbeats.
-  - `autoStarted` — an in-memory once-per-hub-lifetime set, the only thing that stops a spawn the agent
-    legitimately **refuses** (leaving no session to see) from being re-queued every sweep. A
-    no-online-host result is left UNrecorded so it retries when a host returns.
+  - `autoStarted` — an in-memory per-ticket ATTEMPT record, the only thing that stops a spawn the agent
+    legitimately **refuses** (leaving no session to see) from being re-queued every sweep.
+- **A queued `spawnTicket` is an ATTEMPT, not a start** (XERK-61), so auto-start is **bounded retry**:
+  `AUTO_START_MAX_ATTEMPTS` (4) tries spaced by a doubling `AUTO_START_RETRY_MS` (1/2/4 min, capped at
+  `AUTO_START_RETRY_MAX_MS`), tracked in `autoStarted` as `{attempts, nextAt}` keyed like the rest.
+  - The agent **acks a refusal and a mid-spawn exception exactly like a success** (`handle_commands` logs
+    and acks; no outcome rides back), so recording "queued once" as done made a TRANSIENT failure (a timed-out
+    Jira fetch, a repo not yet triaged on *that* host) permanent for the hub's lifetime.
+  - The retry gate is **evidence, in the sweep's existing order**: a session on any channel ends the attempts
+    for good and drops the record (so the map holds only tickets currently failing); an in-flight command
+    means the agent hasn't taken it yet, so nothing is concluded; only a still-session-less ticket with
+    nothing in flight, past its backoff, is retried. A queued/awaiting-clone session reports its `ticket`
+    from the first beat, so a slow spawn is never mistaken for a failed one.
+  - A **no-online-host** result spends NO attempt (that failure isn't the ticket's), so it keeps its full
+    budget for when a host returns. An exhausted budget logs once and stops.
 - Reuses the queue end to end. Nothing is written to Jira.
 - Tests: the `auto-start:` cases in `turma/tests/server.test.js`, the `autoStartOn` cases in
   `turma/tests/board.test.js` and android's `BoardTest.kt`, and `test_no_agent_side_auto_start_flag` in
