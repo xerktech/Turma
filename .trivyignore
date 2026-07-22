@@ -27,6 +27,17 @@ CVE-2026-39822 exp:2026-10-10
 CVE-2026-27145 exp:2026-10-10
 CVE-2026-42504 exp:2026-10-10
 
+# GHSA-hrxh-6v49-42gf — HIGH gRPC-Go xDS RBAC / HTTP/2 vulnerability (fixed in
+# grpc-go 1.82.1). Embedded in TWO bundled third-party Go binaries — gh 2.96.0
+# (grpc v1.81.1) and terraform 1.15.8 (grpc v1.80.0) — not first-party code and
+# not independently patchable, since grpc is compiled into each binary. Both are
+# already the newest upstream releases (see the Go-toolchain entries above), so
+# GH_VERSION / TERRAFORM_VERSION have nothing to bump to; the next upstream
+# release built against grpc 1.82.1+ clears it. The vulnerable path is a gRPC
+# xDS/RBAC server, which neither the gh nor terraform CLI runs here. Expiry
+# forces the revisit.
+GHSA-hrxh-6v49-42gf exp:2026-10-10
+
 # GHSA-537c-gmf6-5ccf — the cryptography wheel bundles a vulnerable OpenSSL.
 # From azure-cli's OWN vendored python (/opt/az, cryptography 46.0.7; fixed in
 # 48.0.1), not anything this repo installs — az ships and pins that tree itself,
