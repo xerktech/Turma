@@ -602,10 +602,15 @@ body.td-open { overflow: hidden; }
   .site-header { margin-bottom: 16px; }
   .site-header-in { padding: 16px 12px 0; gap: 8px 12px; }
   .nav-tabs { display: none; }
-  /* With the tabs gone the org button no longer sits at the right edge — it
-     wraps to the start of its own row, so a right-aligned panel hangs off the
-     LEFT of the screen. Anchor it to the button's left edge instead. */
-  .org-menu { right: auto; left: 0; }
+  /* The header's flex spacer keeps the org button at the right edge of its row,
+     but it wraps to the LEFT of a new row when the header content is wide — so
+     anchoring the popover to either edge of the button risks it hanging off
+     screen (a right-growing panel off a right-edge button forces a sideways
+     scroll to reach the auto toggles). Drop it below the whole header instead,
+     spanning the viewport, so it's always fully in view wherever the button sat. */
+  .org-filter { position: static; }
+  .site-header-in { position: relative; }
+  .org-menu { left: 12px; right: 12px; top: calc(100% + 4px); max-width: none; }
   .bottom-nav {
     display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
     background: color-mix(in srgb, var(--surface) 88%, transparent);
