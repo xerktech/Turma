@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -125,6 +126,11 @@ fun ChatScreen(
     }
 
     Scaffold(
+        // Lift the whole screen above the soft keyboard (XERK-76): the app is
+        // edge-to-edge, so without this the IME simply overlays the compose box
+        // and you can't see what you're typing. imePadding consumes the inset,
+        // so the bottomBar (footer + question sheet) lands right on the keyboard.
+        modifier = Modifier.imePadding(),
         topBar = {
             TopAppBar(
                 title = {

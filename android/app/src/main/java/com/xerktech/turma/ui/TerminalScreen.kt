@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -78,6 +79,9 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
     }
 
     Scaffold(
+        // Keep the input bar above the soft keyboard (XERK-76) — edge-to-edge
+        // means the IME otherwise overlays it. Same fix as the chat screen.
+        modifier = Modifier.imePadding(),
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
