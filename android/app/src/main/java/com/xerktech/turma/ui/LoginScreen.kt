@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -58,8 +59,10 @@ fun LoginScreen(onSignedIn: () -> Unit, vm: LoginViewModel = viewModel()) {
     var pass by rememberSaveable { mutableStateOf("") }
 
     Box(
+        // imePadding (XERK-76): shrink the scroll area above the soft keyboard so
+        // the focused field scrolls into view instead of being covered by it.
         Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
-            .verticalScroll(rememberScrollState()).padding(24.dp),
+            .imePadding().verticalScroll(rememberScrollState()).padding(24.dp),
         contentAlignment = Alignment.Center,
     ) {
         Surface(
