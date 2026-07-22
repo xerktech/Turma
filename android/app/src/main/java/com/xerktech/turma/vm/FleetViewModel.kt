@@ -12,6 +12,7 @@ import com.xerktech.turma.net.ModelRequest
 import com.xerktech.turma.net.OkResponse
 import com.xerktech.turma.net.ResumeRequest
 import com.xerktech.turma.net.SpawnRequest
+import com.xerktech.turma.net.SummaryRequest
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -83,6 +84,10 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setMode(host: String, id: String, mode: String) =
         run("mode change queued") { container.client.api.setMode(host, id, ModeRequest(mode)) }
+
+    /** Rename a session (web sessions.html ⋯ → Rename). A blank name clears it. */
+    fun setSummary(host: String, id: String, summary: String) =
+        run("rename queued") { container.client.api.setSummary(host, id, SummaryRequest(summary)) }
 
     fun sendInput(host: String, id: String, text: String) =
         run("sent") { container.client.api.sendInput(host, id, InputRequest(text)) }

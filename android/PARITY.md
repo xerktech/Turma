@@ -142,8 +142,11 @@ those are marked `[MODEL]`.
 - P0 Ended sessions: STILL to do — include the stopped + `repo.resumable` channels (Android reads only
   `a.closedSessions`, the killed channel) and exclude non-running sessions from the live list. The
   read-only review itself is done (XERK-70, below).
-- P0 Per-card ⋯ menu: Rename (inline) + arm/confirm Kill. (Kill in the chat/terminal header is done —
-  XERK-44; the per-list-card ⋯ menu with Rename is still open.)
+- ~~P0 Per-card ⋯ menu: Rename (inline) + arm/confirm Kill.~~ Done (XERK-71): each live session card
+  carries a `MoreVert` menu (`SessionCardMenu`) — Rename swaps the card for an inline seeded field
+  (`SessionRenameCard`, painted optimistically until the agent reports the name back or a TTL passes),
+  Kill arms "Confirm kill" then confirms. `vm/FleetViewModel.kt` `setSummary`; `net/HubApi.kt`
+  `setSummary`/`SummaryRequest`.
 - P1 Sidebar sections: Active / Idle split done (XERK-73) — `rankRunning` ranks running sessions
   attention-first / freshest-first into Active (waiting+working) and Idle, plus a Stopped group for
   non-running registry records. Still open: a dedicated Queued section, and a state line + question
