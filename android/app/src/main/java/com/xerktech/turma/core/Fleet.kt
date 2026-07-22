@@ -19,6 +19,9 @@ data class FleetSummary(
     val devices: List<String>,
     val running: Int,
     val totalSessions: Int,
+    // Session ceiling for the scoped fleet: the SUM of each host's per-agent
+    // MAX_SESSIONS (XERK-72), null when no scoped host reports a capacity block.
+    val maxSessions: Int?,
     val waiting: Int,
     val tokensToday: Long,
     val tokensWeek: Long,
@@ -64,12 +67,17 @@ fun fleetTopModels(agents: List<AgentInfo>): String {
 
 fun fleetSummary(agents: List<AgentInfo>): FleetSummary {
     val sessions = agents.flatMap { it.sessions }
+    // MAX_SESSIONS is per-agent, so the scoped fleet's ceiling is the sum across
+    // hosts that report a capacity block; null when none do (pre-capacity fleet),
+    // so the tile shows the running count alone rather than a misleading "/ 0".
+    val capHosts = agents.mapNotNull { it.capacity }
     return FleetSummary(
         hostsOnline = agents.count { it.online },
         hostsTotal = agents.size,
         devices = agents.map { it.device }.filter { it.isNotBlank() }.distinct(),
         running = sessions.count { it.status == "running" },
         totalSessions = sessions.size,
+        maxSessions = if (capHosts.isEmpty()) null else capHosts.sumOf { it.maxSessions },
         waiting = sessions.count { it.status == "running" && !it.session?.question.isNullOrBlank() },
         tokensToday = fleetTokens(agents, UsageWindow.TODAY),
         tokensWeek = fleetTokens(agents, UsageWindow.WEEK),

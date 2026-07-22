@@ -62,6 +62,21 @@ data class AgentInfo(
     // Killed-but-resumable sessions (hub-agent _closed_payload) — the web's
     // "Ended sessions" list.
     val closedSessions: List<ClosedSessionInfo> = emptyList(),
+    // This host's session ceiling and what is against it (hub-agent
+    // _capacity_payload). `maxSessions` is a PER-AGENT cap, summed across an org's
+    // hosts for the dashboard's session-count tile (XERK-72). Null on a
+    // pre-capacity agent.
+    val capacity: Capacity? = null,
+)
+
+/** A host's session ceiling and live counts (hub-agent `_capacity_payload`). */
+@Serializable
+data class Capacity(
+    val maxSessions: Int = 0,
+    val running: Int = 0,
+    val queued: Int = 0,
+    val free: Int = 0,
+    val rootRunning: Boolean = false,
 )
 
 /** An announced in-progress update restart (XERK-29); present only during the grace window. */

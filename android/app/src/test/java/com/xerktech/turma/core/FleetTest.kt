@@ -1,6 +1,7 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.Capacity
 import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.ModelUsage
 import com.xerktech.turma.model.SessionInfo
@@ -20,7 +21,9 @@ class FleetTest {
         device: String = key,
         usage: UsageInfo? = null,
         sessions: List<SessionInfo> = emptyList(),
-    ) = AgentInfo(key = key, device = device, online = online, sessions = sessions, usage = usage)
+        capacity: Capacity? = null,
+    ) = AgentInfo(key = key, device = device, online = online, sessions = sessions, usage = usage,
+        capacity = capacity)
 
     private fun session(status: String, question: String = "", usage: UsageInfo? = null) =
         SessionInfo(id = status, status = status, usage = usage, session = LiveSignals(question = question))
@@ -71,5 +74,21 @@ class FleetTest {
         assertEquals(2, s.running)
         assertEquals(3, s.totalSessions)
         assertEquals(1, s.waiting) // only the running one with a question
+    }
+
+    @Test fun `max sessions sums the per-agent cap across the org's hosts`() {
+        val a = agent("h1", capacity = Capacity(maxSessions = 4))
+        val b = agent("h2", capacity = Capacity(maxSessions = 6))
+        assertEquals(10, fleetSummary(listOf(a, b)).maxSessions)
+    }
+
+    @Test fun `max sessions is null when no host reports a capacity block`() {
+        assertEquals(null, fleetSummary(listOf(agent("old"))).maxSessions)
+    }
+
+    @Test fun `max sessions sums only the hosts that report a capacity block`() {
+        val a = agent("h1", capacity = Capacity(maxSessions = 4))
+        val b = agent("old") // pre-capacity agent, no ceiling reported
+        assertEquals(4, fleetSummary(listOf(a, b)).maxSessions)
     }
 }
