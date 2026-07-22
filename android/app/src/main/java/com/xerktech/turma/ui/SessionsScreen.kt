@@ -18,18 +18,24 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -46,6 +52,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xerktech.turma.core.Verbosity
+import com.xerktech.turma.core.VerbosityPrefs
+import com.xerktech.turma.core.buildItems
 import com.xerktech.turma.core.liveState
 import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.core.sessionBranch
@@ -53,6 +62,7 @@ import com.xerktech.turma.core.sessionName
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.ClosedSessionInfo
 import com.xerktech.turma.model.SessionInfo
+import com.xerktech.turma.vm.ArchiveViewModel
 import com.xerktech.turma.vm.FleetViewModel
 
 /** One session flattened together with the host that owns it — the row unit. */
@@ -123,20 +133,45 @@ fun SessionsRoute(
 ) {
     var selHost by rememberSaveable { mutableStateOf<String?>(null) }
     var selId by rememberSaveable { mutableStateOf<String?>(null) }
-    val select: (String, String) -> Unit = { h, s -> selHost = h; selId = s }
-    val clear: () -> Unit = { selHost = null; selId = null }
-    val hasSel = !selHost.isNullOrEmpty() && !selId.isNullOrEmpty()
+    // An ENDED session opened for read-only review (XERK-70): its transcript id
+    // (the archive handle) + the closed record's id (for Resume). Distinct from
+    // the live selection above — the two are mutually exclusive, so picking one
+    // clears the other.
+    var endHost by rememberSaveable { mutableStateOf<String?>(null) }
+    var endTid by rememberSaveable { mutableStateOf<String?>(null) }
+    var endId by rememberSaveable { mutableStateOf<String?>(null) }
+    val select: (String, String) -> Unit = { h, s ->
+        endHost = null; endTid = null; endId = null; selHost = h; selId = s
+    }
+    val selectEnded: (String, String, String) -> Unit = { h, tid, id ->
+        selHost = null; selId = null; endHost = h; endTid = tid; endId = id
+    }
+    val clear: () -> Unit = { selHost = null; selId = null; endHost = null; endTid = null; endId = null }
+    val hasLive = !selHost.isNullOrEmpty() && !selId.isNullOrEmpty()
+    val hasEnded = !endHost.isNullOrEmpty() && !endId.isNullOrEmpty()
+    val hasSel = hasLive || hasEnded
 
     val detail: @Composable () -> Unit = {
-        // key() so switching sessions rebuilds the chat subtree (fresh VM + reveal).
-        key(selHost, selId) {
-            ChatScreen(
-                host = selHost.orEmpty(),
-                sessionId = selId.orEmpty(),
-                onBack = clear,
-                onTerminal = { onTerminal(selHost.orEmpty(), selId.orEmpty()) },
-                showBack = !wide,
-            )
+        // key() so switching sessions rebuilds the detail subtree (fresh VM + reveal).
+        key(selHost, selId, endHost, endId) {
+            if (hasEnded) {
+                EndedSessionView(
+                    host = endHost.orEmpty(),
+                    transcriptId = endTid.orEmpty(),
+                    closedId = endId.orEmpty(),
+                    onBack = clear,
+                    onResumed = select,
+                    showBack = !wide,
+                )
+            } else {
+                ChatScreen(
+                    host = selHost.orEmpty(),
+                    sessionId = selId.orEmpty(),
+                    onBack = clear,
+                    onTerminal = { onTerminal(selHost.orEmpty(), selId.orEmpty()) },
+                    showBack = !wide,
+                )
+            }
         }
     }
 
@@ -154,8 +189,9 @@ fun SessionsRoute(
         wide -> MainScaffold(TopDest.SESSIONS, onNavigate) { m ->
             Row(m.fillMaxSize()) {
                 SessionsListPane(
-                    selectedKey = selKey(selHost, selId),
+                    selectedKey = selKey(selHost, selId) ?: selKey(endHost, endId),
                     onSelect = select,
+                    onSelectEnded = selectEnded,
                     onOpenArchive = onOpenArchive,
                     modifier = Modifier.width(360.dp).fillMaxHeight(),
                 )
@@ -168,7 +204,10 @@ fun SessionsRoute(
 
         // Narrow, nothing picked: just the list.
         else -> MainScaffold(TopDest.SESSIONS, onNavigate) { m ->
-            SessionsListPane(selectedKey = null, onSelect = select, onOpenArchive = onOpenArchive, modifier = m)
+            SessionsListPane(
+                selectedKey = null, onSelect = select, onSelectEnded = selectEnded,
+                onOpenArchive = onOpenArchive, modifier = m,
+            )
         }
     }
 }
@@ -190,6 +229,7 @@ private fun DetailEmpty() {
 fun SessionsListPane(
     selectedKey: String?,
     onSelect: (String, String) -> Unit,
+    onSelectEnded: (String, String, String) -> Unit = { _, _, _ -> },
     onOpenArchive: () -> Unit = {},
     modifier: Modifier = Modifier,
     vm: FleetViewModel = viewModel(),
@@ -261,7 +301,14 @@ fun SessionsListPane(
                 }
                 if (endedOpen) {
                     items(ended, key = { "closed:" + it.host + "/" + it.closed.id }) { c ->
-                        ClosedSessionCard(c) { vm.resume(c.host, c.closed.id); onSelect(c.host, c.closed.id) }
+                        ClosedSessionCard(
+                            c,
+                            selected = selectedKey == c.host + "/" + c.closed.id,
+                            // Tap the card body to review the chat read-only; the
+                            // Resume button re-launches it live (XERK-70).
+                            onOpen = { onSelectEnded(c.host, c.closed.transcriptId, c.closed.id) },
+                            onResume = { vm.resume(c.host, c.closed.id); onSelect(c.host, c.closed.id) },
+                        )
                     }
                 }
             }
@@ -300,16 +347,24 @@ fun flattenClosed(agents: List<AgentInfo>, query: String): List<FlatClosed> {
 fun closedName(c: ClosedSessionInfo): String =
     c.summary.ifBlank { c.label.ifBlank { c.branch.ifBlank { c.id.take(6) } } }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ClosedSessionCard(c: FlatClosed, onResume: () -> Unit) {
-    TurmaCard(Modifier.fillMaxWidth()) {
+private fun ClosedSessionCard(c: FlatClosed, selected: Boolean, onOpen: () -> Unit, onResume: () -> Unit) {
+    val cardMod = Modifier.fillMaxWidth().then(
+        if (selected)
+            Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
+        else Modifier,
+    )
+    TurmaCard(cardMod) {
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+            // Tapping the card body opens the read-only chat review; Resume stays a
+            // separate action (XERK-70), the same split the web ended row has.
+            Modifier.fillMaxWidth().clickable(onClick = onOpen).padding(horizontal = 10.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             StateDot(com.xerktech.turma.core.LiveState.STOPPED)
-            Column(Modifier.weight(1f)) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(closedName(c.closed), fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(
                     "${c.device} · ${c.closed.repo.ifBlank { "—" }}",
@@ -317,6 +372,14 @@ private fun ClosedSessionCard(c: FlatClosed, onResume: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                 )
+                if (c.closed.prs.isNotEmpty()) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        c.closed.prs.forEach { PrBadge(it) }
+                    }
+                }
             }
             GhostButton("Resume", onResume)
         }
@@ -362,5 +425,113 @@ private fun SessionListCard(r: FlatSession, now: Long, selected: Boolean, onClic
                 }
             }
         }
+    }
+}
+
+/**
+ * The read-only review of an ENDED session's conversation (XERK-70), the web
+ * ended-session stage's counterpart (`#transcriptPane` in sessions.html): the
+ * archived transcript rendered through the SAME `buildItems`/`ChatItemView`
+ * engine the live chat uses, with a PR-chip + Resume bar and a verbosity control
+ * — but deliberately NO compose box and no terminal (there is no live pty).
+ *
+ * The transcript is fetched from the hub's durable archive by transcript id, so
+ * it opens even when the session's host is offline; Resume is gated on the host
+ * being online. A record with no `transcriptId` (an agent predating the snapshot)
+ * shows "no conversation recorded" and stays Resume-only.
+ */
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+private fun EndedSessionView(
+    host: String,
+    transcriptId: String,
+    closedId: String,
+    onBack: () -> Unit,
+    onResumed: (String, String) -> Unit,
+    showBack: Boolean,
+    fleetVm: FleetViewModel = viewModel(),
+    archiveVm: ArchiveViewModel = viewModel(),
+) {
+    val fleet by fleetVm.fleet.collectAsStateWithLifecycle()
+    val arch by archiveVm.state.collectAsStateWithLifecycle()
+    val agent = fleet.agents.firstOrNull { it.key == host }
+    val closed = agent?.closedSessions?.firstOrNull { it.id == closedId }
+    val online = agent?.online == true
+    var verbosity by remember { mutableStateOf(Verbosity.VERBOSE) }
+
+    // Keep the fleet polling in the narrow full-screen case, where the list pane
+    // (which normally does this) isn't composed — the closed lookup + online gate
+    // read the live snapshot. start() no-ops if already polling.
+    LaunchedEffect(Unit) { fleetVm.start() }
+    // Load once per transcript; drop it on the way out so a later re-open reloads.
+    LaunchedEffect(transcriptId) { if (transcriptId.isNotBlank()) archiveVm.openTranscript(transcriptId) }
+    DisposableEffect(transcriptId) { onDispose { archiveVm.closeTranscript() } }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(closed?.let { closedName(it) } ?: "Ended session", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            "${agent?.device?.ifBlank { host } ?: host} · ${closed?.repo?.ifBlank { "—" } ?: "—"}",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 1,
+                        )
+                    }
+                },
+                navigationIcon = {
+                    if (showBack) IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
+                },
+                actions = {
+                    VerbosityMenu(verbosity) { verbosity = it }
+                    GhostButton("Resume", { fleetVm.resume(host, closedId); onResumed(host, closedId) }, enabled = online)
+                },
+            )
+        },
+    ) { pad ->
+        Column(Modifier.fillMaxSize().padding(pad)) {
+            // PR chips (each links out to GitHub) on the stage bar, like the web.
+            closed?.prs?.takeIf { it.isNotEmpty() }?.let { prs ->
+                FlowRow(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) { prs.forEach { PrBadge(it) } }
+            }
+            // Guard on the loaded transcript's OWN id so a stale one from the
+            // previously-open ended session never flashes before this one loads.
+            val ready = arch.open?.takeIf { it.transcriptId == transcriptId }
+            when {
+                transcriptId.isBlank() -> EndedMessage("No conversation was recorded for this session.")
+                ready != null -> {
+                    val items = buildItems(ready.entries, VerbosityPrefs.forPreset(verbosity))
+                    SelectionContainer(Modifier.fillMaxSize()) {
+                        LazyColumn(
+                            Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) { items(items.size) { i -> ChatItemView(items[i]) } }
+                    }
+                }
+                arch.openLoading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                else -> EndedMessage(
+                    "This conversation hasn't reached the hub's archive yet — it syncs within a few minutes. Resume still works.",
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun EndedMessage(text: String) {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text(
+            text,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(24.dp),
+        )
     }
 }

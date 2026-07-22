@@ -83,6 +83,19 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `ui/BoardScreen.kt`, `ui/UsageScreen.kt`. Platform form: a Material dropdown of rows (dot, org name,
   ticket count, offline/synced note, `Switch` for auto-start) rather than the web's button + popover of
   divided pills.
+- **Ended-session read-only chat review (XERK-70).** Tapping an ended-session card body (not just its
+  Resume button) now opens the conversation read-only, the web ended-session stage's counterpart
+  (`#transcriptPane` in `sessions.html` → `openEndedSession`). `EndedSessionView` in
+  `ui/SessionsScreen.kt` fetches the archived transcript by id (`GET /api/archive/<transcriptId>`, the
+  existing `ArchiveViewModel.openTranscript`) and renders it through the same `buildItems`/`ChatItemView`
+  engine the live chat uses — with a PR-chip + Resume bar and a verbosity control, but deliberately no
+  compose box and no terminal (no live pty). Resume is gated on the host being online; PR chips link out
+  to GitHub. It slots into the adaptive `SessionsRoute` beside the live `ChatScreen` (wide two-pane +
+  narrow full-screen, Back clears it). Needed two `ClosedSessionInfo` fields the agent already emits but
+  Android didn't decode — `transcriptId` and `prs` (`model/Models.kt`); a record lacking `transcriptId`
+  (older agent) stays Resume-only and says "no conversation recorded". Decode covered by `AgentDecodeTest`.
+  Still open under the P0 above: the stopped + `repo.resumable` ended channels and excluding non-running
+  from the live list.
 - **Selectable/copyable transcript text (XERK-64).** The web chat relies on native browser text
   selection to copy session text (and defers repaints to keep a live selection intact). Compose `Text`
   isn't selectable by default, so the transcript `LazyColumn` in `ui/ChatScreen.kt` and the
@@ -106,8 +119,9 @@ those are marked `[MODEL]`.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)
 - P0 Jump-to-latest pill + stick-bottom scroll (stop auto-scroll fighting the reader).
-- P0 Ended sessions: read-only transcript view (archive fetch) with PR chips + Resume, not just a
-  live-relaunch; include stopped + `repo.resumable` channels; exclude non-running from the live list.
+- P0 Ended sessions: STILL to do — include the stopped + `repo.resumable` channels (Android reads only
+  `a.closedSessions`, the killed channel) and exclude non-running sessions from the live list. The
+  read-only review itself is done (XERK-70, below).
 - P0 Per-card ⋯ menu: Rename (inline) + arm/confirm Kill. (Kill in the chat/terminal header is done —
   XERK-44; the per-list-card ⋯ menu with Rename is still open.)
 - P1 Sidebar sections: Queued / Active / Idle / Ended split with state line + question preview.

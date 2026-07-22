@@ -60,4 +60,39 @@ class AgentDecodeTest {
         assertEquals(1, resp.agents.size)
         assertNull(resp.agents[0].closedSessions[0].ticket)
     }
+
+    // The ended-session read-only review (XERK-70) opens by transcriptId and chips
+    // the session's PRs; both ride _closed_payload and must decode onto the record.
+    @Test fun `a closed session carries its transcriptId and PRs`() {
+        val body = """
+            { "now": 1, "agents": [ {
+              "key": "h", "device": "h", "online": true,
+              "closedSessions": [ {
+                "id": "s", "repo": "r", "transcriptId": "tid-abc",
+                "prs": [ { "url": "https://gh/x/pull/7", "number": 7, "state": "MERGED", "ready": "ready" } ]
+              } ]
+            } ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val closed = resp.agents[0].closedSessions[0]
+        assertEquals("tid-abc", closed.transcriptId)
+        assertEquals(1, closed.prs.size)
+        assertEquals(7, closed.prs[0].number)
+        assertEquals("MERGED", closed.prs[0].state)
+    }
+
+    // Records from an agent predating the snapshot omit both — they must default,
+    // not throw (which would drop the whole fleet poll).
+    @Test fun `a closed session without transcriptId or prs still decodes`() {
+        val body = """
+            { "now": 1, "agents": [ {
+              "key": "h", "device": "h", "online": true,
+              "closedSessions": [ { "id": "s", "repo": "r" } ]
+            } ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val closed = resp.agents[0].closedSessions[0]
+        assertEquals("", closed.transcriptId)
+        assertEquals(0, closed.prs.size)
+    }
 }
