@@ -140,22 +140,38 @@ fun SessionsRoute(
     var endHost by rememberSaveable { mutableStateOf<String?>(null) }
     var endTid by rememberSaveable { mutableStateOf<String?>(null) }
     var endId by rememberSaveable { mutableStateOf<String?>(null) }
+    // A live subagent's transcript drilled into from the open session's status bar
+    // (web openSubagentView): scoped to the live selection above, so Back returns to
+    // that session's chat. Cleared whenever a different session/ended row is picked.
+    var subType by rememberSaveable { mutableStateOf<String?>(null) }
+    var subLabel by rememberSaveable { mutableStateOf<String?>(null) }
     val select: (String, String) -> Unit = { h, s ->
-        endHost = null; endTid = null; endId = null; selHost = h; selId = s
+        endHost = null; endTid = null; endId = null; subType = null; subLabel = null; selHost = h; selId = s
     }
     val selectEnded: (String, String, String) -> Unit = { h, tid, id ->
-        selHost = null; selId = null; endHost = h; endTid = tid; endId = id
+        selHost = null; selId = null; subType = null; subLabel = null; endHost = h; endTid = tid; endId = id
     }
-    val clear: () -> Unit = { selHost = null; selId = null; endHost = null; endTid = null; endId = null }
+    val clearSub: () -> Unit = { subType = null; subLabel = null }
+    val clear: () -> Unit = {
+        selHost = null; selId = null; endHost = null; endTid = null; endId = null; subType = null; subLabel = null
+    }
     val hasLive = !selHost.isNullOrEmpty() && !selId.isNullOrEmpty()
     val hasEnded = !endHost.isNullOrEmpty() && !endId.isNullOrEmpty()
+    val hasSub = subType != null && hasLive
     val hasSel = hasLive || hasEnded
 
     val detail: @Composable () -> Unit = {
         // key() so switching sessions rebuilds the detail subtree (fresh VM + reveal).
-        key(selHost, selId, endHost, endId) {
-            if (hasEnded) {
-                EndedSessionView(
+        key(selHost, selId, endHost, endId, subType, subLabel) {
+            when {
+                hasSub -> SubagentView(
+                    host = selHost.orEmpty(),
+                    sessionId = selId.orEmpty(),
+                    type = subType.orEmpty(),
+                    label = subLabel.orEmpty(),
+                    onBack = clearSub,
+                )
+                hasEnded -> EndedSessionView(
                     host = endHost.orEmpty(),
                     transcriptId = endTid.orEmpty(),
                     closedId = endId.orEmpty(),
@@ -163,13 +179,13 @@ fun SessionsRoute(
                     onResumed = select,
                     showBack = !wide,
                 )
-            } else {
-                ChatScreen(
+                else -> ChatScreen(
                     host = selHost.orEmpty(),
                     sessionId = selId.orEmpty(),
                     onBack = clear,
                     onTerminal = { onTerminal(selHost.orEmpty(), selId.orEmpty()) },
                     showBack = !wide,
+                    onOpenSubagent = { t, l -> subType = t; subLabel = l },
                 )
             }
         }
@@ -179,7 +195,7 @@ fun SessionsRoute(
     // Android back button would otherwise pop the whole Sessions tab. Intercept it
     // to clear the selection — Back returns to the list, like the top-bar arrow
     // (XERK-66). Scoped to the narrow case, where the arrow (showBack) also shows.
-    BackHandler(enabled = !wide && hasSel) { clear() }
+    BackHandler(enabled = !wide && hasSel) { if (hasSub) clearSub() else clear() }
 
     when {
         // Narrow + a session picked: full-screen chat, no bottom nav (web parity).
@@ -519,6 +535,68 @@ private fun EndedSessionView(
                 else -> EndedMessage(
                     "This conversation hasn't reached the hub's archive yet — it syncs within a few minutes. Resume still works.",
                 )
+            }
+        }
+    }
+}
+
+/**
+ * Read-only view of one live background agent's transcript (web `openSubagentView`
+ * in sessions.html), reached by tapping a subagent row in the live chat's status
+ * bar. Always drilled into FROM an open session, so Back returns to that chat (the
+ * web's `subagentReturn`). Renders through the same `buildItems`/`ChatItemView`
+ * engine and verbosity control as the ended-session review; no compose box.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SubagentView(
+    host: String,
+    sessionId: String,
+    type: String,
+    label: String,
+    onBack: () -> Unit,
+    vm: com.xerktech.turma.vm.SubagentViewModel = viewModel(),
+) {
+    val ui by vm.state.collectAsStateWithLifecycle()
+    var verbosity by remember { mutableStateOf(Verbosity.VERBOSE) }
+    LaunchedEffect(host, sessionId, type, label) { vm.open(host, sessionId, type, label) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(type.ifBlank { "Agent" }, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            label.ifBlank { "background agent" },
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Session") }
+                },
+                actions = { VerbosityMenu(verbosity) { verbosity = it } },
+            )
+        },
+    ) { pad ->
+        Box(Modifier.fillMaxSize().padding(pad)) {
+            when {
+                ui.entries.isNotEmpty() -> {
+                    val items = buildItems(ui.entries, VerbosityPrefs.forPreset(verbosity))
+                    SelectionContainer(Modifier.fillMaxSize()) {
+                        LazyColumn(
+                            Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) { items(items.size) { i -> ChatItemView(items[i]) } }
+                    }
+                }
+                ui.loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                else -> EndedMessage("Agent transcript unavailable.")
             }
         }
     }

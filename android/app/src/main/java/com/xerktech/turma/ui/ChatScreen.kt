@@ -64,6 +64,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -87,6 +88,7 @@ fun ChatScreen(
     onBack: () -> Unit,
     onTerminal: () -> Unit,
     showBack: Boolean = true,
+    onOpenSubagent: (String, String) -> Unit = { _, _ -> },
 ) {
     val context = LocalContext.current
     val app = context.applicationContext as TurmaApplication
@@ -154,14 +156,12 @@ fun ChatScreen(
         snackbarHost = { SnackbarHost(snackbar) },
         bottomBar = {
             Column {
-                state.turnStatus?.takeIf { state.liveTurn.isNotBlank() }?.let { st ->
-                    Text(
-                        "${st.verb.ifBlank { "working" }}… ${st.hint}".trim(),
-                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
+                // The live working-status bar (web chat.js updateLiveStatus): spinner
+                // + gerund verb + ↑/↓ token counters + elapsed, Claude Code's rotating
+                // tip / active-task hint lines, and the live agent-manager list. Shown
+                // whenever a status frame is present (i.e. while generating) — the
+                // agent list can be non-empty even when the live text is blank.
+                state.turnStatus?.let { st -> LiveStatusBar(st, onOpenSubagent) }
                 if (state.question.isNotBlank()) {
                     val opts = state.questionOptionsRich.ifEmpty {
                         state.questionOptions.map { com.xerktech.turma.model.QuestionOption(label = it) }
@@ -211,6 +211,121 @@ fun ChatScreen(
                     item { Text("· earlier history ·", Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
                 }
                 items(items.size) { i -> ChatItemView(items[i]) }
+            }
+        }
+    }
+}
+
+/**
+ * The pinned live working-status bar — the Android port of the web chat's
+ * `#chatStatus` (chat.js `updateLiveStatus` + `agentsHtml`). Mirrors the terminal's
+ * bottom status region while a turn is generating:
+ *  - a spinner + the gerund verb ("Cogitating…"), with elapsed + ↑/↓ token
+ *    counters pushed to the right (all display strings scraped off the pane);
+ *  - Claude Code's rotating tip / active-task footer as de-emphasized hint lines
+ *    (an active-task checklist arrives newline-joined — one row per to-do item);
+ *  - the live agent-manager list when expanded: "main" as a plain marker, each
+ *    background subagent a tappable row that opens its transcript read-only.
+ */
+@Composable
+private fun LiveStatusBar(
+    status: com.xerktech.turma.model.TurnStatus,
+    onOpenSubagent: (String, String) -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 2.dp,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 7.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                CircularProgressIndicator(Modifier.size(11.dp), strokeWidth = 2.dp)
+                Text(
+                    "${status.verb.ifBlank { "Working" }}…",
+                    fontWeight = FontWeight.SemiBold,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                // Elapsed + token counters, right-aligned and monospace (web .toks).
+                Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(Modifier.weight(1f))
+                    if (status.elapsed.isNotBlank()) TokChip(status.elapsed, MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (status.up.isNotBlank()) TokChip("↑ ${status.up}", MaterialTheme.colorScheme.primary)
+                    if (status.down.isNotBlank()) TokChip("↓ ${status.down}", MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            // One hint/tip row per line — each clipped to a single line (web .cc-hint)
+            // so a long tip or a to-do checklist never crowds the composer.
+            status.hint.split("\n").filter { it.isNotBlank() }.forEach { line ->
+                Text(
+                    line,
+                    Modifier.padding(start = 21.dp).fillMaxWidth(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (status.agents.isNotEmpty()) AgentsList(status.agents, onOpenSubagent)
+        }
+    }
+}
+
+@Composable
+private fun TokChip(text: String, color: Color) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelSmall,
+        fontFamily = FontFamily.Monospace,
+        color = color,
+        maxLines = 1,
+    )
+}
+
+/**
+ * The live agent list scraped from the pane (web `agentsHtml`). "main" (the parent
+ * conversation, already on screen) is a plain marker; every other row is a button
+ * that opens that background agent's transcript. `sel` marks the focused agent.
+ */
+@Composable
+private fun AgentsList(
+    agents: List<com.xerktech.turma.model.AgentRow>,
+    onOpenSubagent: (String, String) -> Unit,
+) {
+    Column(Modifier.padding(start = 21.dp, top = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            "AGENTS",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        agents.forEach { a ->
+            val isMain = a.type == "main" && a.label.isBlank()
+            val rowMod = Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(5.dp))
+                .then(if (isMain) Modifier else Modifier.clickable { onOpenSubagent(a.type, a.label) })
+                .padding(horizontal = 4.dp, vertical = 2.dp)
+            Row(rowMod, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                // Filled accent dot for the focused agent (sel), hollow otherwise.
+                Box(
+                    Modifier.size(8.dp).clip(androidx.compose.foundation.shape.CircleShape)
+                        .then(
+                            if (a.sel) Modifier.background(MaterialTheme.colorScheme.primary)
+                            else Modifier.border(1.5.dp, MaterialTheme.colorScheme.onSurfaceVariant, androidx.compose.foundation.shape.CircleShape),
+                        ),
+                )
+                Text(a.type, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelMedium)
+                if (a.label.isNotBlank()) {
+                    Text(
+                        a.label,
+                        Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
         }
     }

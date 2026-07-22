@@ -72,6 +72,22 @@ class HubClient(private val config: Config) {
     /** GET history, mapping the hub's 202-pending into a typed result. */
     suspend fun history(host: String, sessionId: String): HistoryResult {
         val resp = api.history(host, sessionId)
+        return mapHistory(resp)
+    }
+
+    /**
+     * GET one background agent's transcript by (type, label) — the same 202-pending
+     * shape as [history] (the agent fetches on demand; a cache miss 202s until the
+     * next heartbeat delivers it, so the caller polls).
+     */
+    suspend fun subagentHistory(
+        host: String,
+        sessionId: String,
+        type: String,
+        label: String,
+    ): HistoryResult = mapHistory(api.subagentHistory(host, sessionId, type, label))
+
+    private fun mapHistory(resp: retrofit2.Response<com.xerktech.turma.model.HistoryResponse>): HistoryResult {
         val body = resp.body()
         return if (resp.code() == 202 || body == null || body.pending) {
             HistoryResult.Pending(body?.cmdId ?: "")
