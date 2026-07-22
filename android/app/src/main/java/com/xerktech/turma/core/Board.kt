@@ -1,6 +1,8 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.JiraIssueDetail
+import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.JiraTicket
 
 /**
@@ -283,4 +285,30 @@ fun storedOrg(current: String?, legacy: String?): String? =
 fun filterSites(sites: List<BoardSite>, filter: String): List<BoardSite> {
     if (filter.isBlank() || sites.none { it.siteKey == filter }) return sites
     return sites.filter { it.siteKey == filter }
+}
+
+/**
+ * One GET /api/jira/<siteKey>/<key> attempt's outcome — a pure port of
+ * board.html `fetchDetail`'s per-response branch. [Pending] means the host is
+ * still fetching (HTTP 202 / `{pending}`) so poll again; [Done] is terminal and
+ * carries either the resolved issue or an error-bearing [JiraIssueDetail] to
+ * render (never null, so the detail sheet always exits its "Loading details…"
+ * spinner).
+ *
+ * The issue is nested under `issue` in the envelope; decoding the top-level body
+ * straight into [JiraIssueDetail] silently blanks every field, which is why the
+ * on-demand 200 rendered an empty sheet before XERK-83.
+ */
+sealed interface IssueFetch {
+    object Pending : IssueFetch
+    data class Done(val detail: JiraIssueDetail) : IssueFetch
+}
+
+fun classifyIssueResponse(code: Int, body: JiraIssueEnvelope?): IssueFetch = when {
+    code == 202 || body?.pending == true -> IssueFetch.Pending
+    body?.issue != null -> IssueFetch.Done(body.issue.copy(stale = body.stale))
+    body?.error != null -> IssueFetch.Done(JiraIssueDetail(error = body.error))
+    // A non-2xx (4xx/5xx) parses no body; surface the code rather than spin.
+    body == null -> IssueFetch.Done(JiraIssueDetail(error = "HTTP $code"))
+    else -> IssueFetch.Done(JiraIssueDetail(error = "the host reported no issue"))
 }

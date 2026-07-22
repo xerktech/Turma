@@ -4,7 +4,10 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.IssueFetch
+import com.xerktech.turma.core.classifyIssueResponse
 import com.xerktech.turma.model.JiraIssueDetail
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -94,11 +97,32 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Fetch full issue detail on demand; null while the host is still fetching. */
-    suspend fun fetchIssue(siteKey: String, key: String): JiraIssueDetail? = try {
-        val resp = container.client.api.jiraIssue(siteKey, key)
-        if (resp.code() == 202) null else resp.body()
-    } catch (_: Exception) {
-        null
+    /**
+     * Fetch one ticket's full detail on demand, polling while the host fetches it
+     * (HTTP 202) with backoff up to a deadline — a port of board.html
+     * `fetchDetail`. The hub queues the fetch and 202s on a cache miss, so a
+     * single shot (the old behaviour) always caught the pending state and spun
+     * the detail sheet forever (XERK-83). Never returns null: a terminal failure
+     * comes back as an error-bearing detail so the sheet stops loading.
+     */
+    suspend fun fetchIssue(siteKey: String, key: String): JiraIssueDetail {
+        val deadline = System.currentTimeMillis() + 45_000  // host beats ~20s: 2 shots
+        var delayMs = 600L
+        while (System.currentTimeMillis() < deadline) {
+            val outcome = try {
+                val resp = container.client.api.jiraIssue(siteKey, key)
+                classifyIssueResponse(resp.code(), resp.body())
+            } catch (_: Exception) {
+                return JiraIssueDetail(error = "the hub is unreachable")
+            }
+            when (outcome) {
+                is IssueFetch.Done -> return outcome.detail
+                IssueFetch.Pending -> {
+                    delay(delayMs)
+                    delayMs = (delayMs * 3 / 2).coerceAtMost(3_000L)
+                }
+            }
+        }
+        return JiraIssueDetail(error = "the host didn't answer in time")
     }
 }

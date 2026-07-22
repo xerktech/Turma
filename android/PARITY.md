@@ -47,6 +47,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Board "In Review" column.** `core/Board.kt` now carries the 4th category and the review/testing
   status-name carve-out from `inprogress` (was 3 columns → review tickets mis-bucketed). Columns sort
   newest-`updated` first. Ports `board.js` `categoryOf`/`ticketSort`. Tested in `BoardTest`.
+- **On-demand ticket detail loads (XERK-83).** The detail sheet fetched once and returned null on the
+  hub's 202-while-fetching, so a first click spun "Loading details…" forever; it also decoded the
+  `{issue, fetchedAt}` envelope's top level straight into `JiraIssueDetail`, blanking every field on a
+  200. Now `BoardViewModel.fetchIssue` polls with backoff to a 45s deadline and unwraps the nested
+  `issue` (`JiraIssueEnvelope`), surfacing a terminal failure as an error message — a port of
+  board.html `fetchDetail`. `core/Board.kt` `classifyIssueResponse`/`IssueFetch` tested in `BoardTest`.
 - **Typewriter reveal snap on live-turn block swaps.** `core/Reveal.kt` `liveRevealBase` +
   `ChatViewModel` — the non-monotonic pane scrape no longer re-streams the last line from a stale
   offset (the web `chat.js` `startsWith` check, XERK-19). Tested in `RevealTest`.

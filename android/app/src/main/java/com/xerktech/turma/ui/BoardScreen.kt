@@ -341,6 +341,12 @@ private fun TicketDetailSheet(
                     CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                     Text("Loading details…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
+            } else if (!d.error.isNullOrBlank()) {
+                Text(
+                    "Couldn't load details: ${d.error}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
             } else {
                 if (d.description.isNotBlank()) {
                     SectionLabel("Description")
