@@ -46,4 +46,44 @@ class SessionsTest {
         assertEquals("mylabel", sessionName(SessionInfo(label = "mylabel", worktreePath = "/a/wt-9")))
         assertEquals("wt-9", sessionName(SessionInfo(worktreePath = "/a/wt-9")))
     }
+
+    // ---- workLine (web index.html workLine/unpushedCommits, XERK-78) ---------
+
+    private fun sessWork(
+        pushed: Boolean? = null, aheadOfBase: Int? = null, aheadOfRemote: Int? = null,
+        baseRef: String? = null, dirty: Int = 0,
+    ) = SessionInfo(
+        work = com.xerktech.turma.model.WorkInfo(
+            baseRef = baseRef, aheadOfBase = aheadOfBase, pushed = pushed, aheadOfRemote = aheadOfRemote,
+        ),
+        git = GitState(dirtyFiles = dirty),
+    )
+
+    @Test fun `workLine is null when nothing is known`() {
+        assertEquals(null, workLine(SessionInfo()))
+        assertEquals(null, workLine(sessWork()))
+    }
+
+    @Test fun `unpushed commits or dirty files read as risk`() {
+        val risky = workLine(sessWork(pushed = false, aheadOfBase = 3, baseRef = "main", dirty = 2))!!
+        assertEquals("3 commits ahead of main · not pushed · 2 dirty files", risky.text)
+        assertEquals(true, risky.risk)
+        // Singulars singular.
+        val one = workLine(sessWork(pushed = false, aheadOfBase = 1, dirty = 1))!!
+        assertEquals("1 commit ahead · not pushed · 1 dirty file", one.text)
+    }
+
+    @Test fun `pushed and clean reads safe`() {
+        val safe = workLine(sessWork(pushed = true, aheadOfBase = 2, aheadOfRemote = 0, baseRef = "main"))!!
+        assertEquals("2 commits ahead of main · pushed", safe.text)
+        assertEquals(false, safe.risk)
+        // Pushed with unknown sync says so rather than claiming either way.
+        val unknown = workLine(sessWork(pushed = true, aheadOfBase = 2, aheadOfRemote = null))!!
+        assertEquals("2 commits ahead · pushed · sync unknown", unknown.text)
+        assertEquals(false, unknown.risk)
+        // Pushed but with commits origin doesn't have yet: risk again.
+        val behind = workLine(sessWork(pushed = true, aheadOfBase = 5, aheadOfRemote = 2))!!
+        assertEquals("5 commits ahead · 2 unpushed", behind.text)
+        assertEquals(true, behind.risk)
+    }
 }

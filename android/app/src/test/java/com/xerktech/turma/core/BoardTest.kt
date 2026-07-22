@@ -318,4 +318,140 @@ class BoardTest {
         assertTrue(out is IssueFetch.Done)
         assertEquals("HTTP 503", (out as IssueFetch.Done).detail.error)
     }
+
+    // ---- card fields (web board.js prioClass / overdueOf), XERK-78 -----------
+
+    @Test fun `prioClass emphasizes highest-high and mutes low-lowest`() {
+        assertEquals(PrioEmphasis.HIGH, prioClass("Highest"))
+        assertEquals(PrioEmphasis.HIGH, prioClass("high"))
+        assertEquals(PrioEmphasis.LOW, prioClass("Low"))
+        assertEquals(PrioEmphasis.LOW, prioClass("lowest"))
+        assertEquals(PrioEmphasis.NONE, prioClass("Medium"))
+        assertEquals(PrioEmphasis.NONE, prioClass(""))
+    }
+
+    @Test fun `overdueOf needs a past due date on a not-done ticket`() {
+        val now = java.time.Instant.parse("2026-07-22T12:00:00Z").toEpochMilli()
+        fun t(due: String?, cat: String = "todo") =
+            JiraTicket(key = "A", statusCategory = cat, dueDate = due)
+        assertTrue(overdueOf(t("2026-07-21"), now))
+        assertTrue(!overdueOf(t("2026-07-22"), now))   // due today is not overdue
+        assertTrue(!overdueOf(t("2026-07-23"), now))
+        assertTrue(!overdueOf(t(null), now))
+        // A Done ticket is never overdue however old its date.
+        assertTrue(!overdueOf(t("2020-01-01", cat = "done"), now))
+    }
+
+    // ---- ticket -> session chips (web board.js ticketSessionIndex), XERK-78 --
+
+    private fun tref(key: String, site: String = "org.atlassian.net", branch: String? = null) =
+        com.xerktech.turma.model.TicketRef(key = key, siteKey = site, branch = branch)
+
+    @Test fun `ticketSessionIndex merges the three channels, record winning`() {
+        val t = tref("X-1")
+        val live = com.xerktech.turma.model.SessionInfo(
+            id = "aa1", status = "running", ticket = t, transcriptId = "tid-live",
+            createdAt = "2026-07-20T10:00:00Z",
+        )
+        val closed = com.xerktech.turma.model.ClosedSessionInfo(
+            id = "bb2", ticket = t, transcriptId = "tid-closed", createdAt = "2026-07-19T10:00:00Z",
+        )
+        // The killed session's own transcript also shows up in the resumable
+        // scan; the closed record must win the dedupe.
+        val scanDupe = com.xerktech.turma.model.ResumableInfo(
+            transcriptId = "tid-closed", ticket = t, endedTs = "2026-07-19T11:00:00Z",
+        )
+        // Plus one the registry has forgotten entirely.
+        val scanOnly = com.xerktech.turma.model.ResumableInfo(
+            transcriptId = "tid-old", ticket = t, endedTs = "2026-07-18T09:00:00Z", summary = "old work",
+        )
+        val agent = AgentInfo(
+            key = "host1", online = true,
+            sessions = listOf(live),
+            closedSessions = listOf(closed),
+            repos = listOf(com.xerktech.turma.model.RepoInfo(name = "r", resumable = listOf(scanDupe, scanOnly))),
+        )
+        val idx = ticketSessionIndex(listOf(agent))
+        val sessions = ticketSessionsOf(idx, "org.atlassian.net", "X-1")
+        // Three chips: live + closed + the scan-only orphan — oldest first, and
+        // the resumable entry sorts on its endedTs (the only stamp it has).
+        assertEquals(listOf("tid-old", "tid-closed", "tid-live"), sessions.map { it.transcriptId })
+        assertEquals("bb2", sessions[1].id)          // the record's id survived the dedupe
+        assertEquals("", sessions[0].id)             // the orphan never had one
+    }
+
+    @Test fun `chip label prefers rename, then branch, and state maps status`() {
+        val s = TicketSession(
+            host = "h", id = "aa1", transcriptId = "t", status = "running",
+            gitBranch = "X-1-2", ticketBranch = "X-1", summary = "X-1 fix the thing",
+            summaryManual = false, label = "", ticketKey = "X-1", siteKey = "s",
+        )
+        // The live branch beats the reserved one and the generated summary.
+        assertEquals("X-1-2", ticketSessionLabel(s))
+        // A rename leads once it exists.
+        assertEquals("my name", ticketSessionLabel(s.copy(summaryManual = true, summary = "my name")))
+        // No branches at all: summary, then label, then id, then the key.
+        assertEquals("X-1 fix the thing", ticketSessionLabel(s.copy(gitBranch = "", ticketBranch = "")))
+        assertEquals("aa1", ticketSessionLabel(s.copy(gitBranch = "", ticketBranch = "", summary = "", label = "")))
+        assertEquals("running", ticketSessionState(s))
+        assertEquals("queued", ticketSessionState(s.copy(status = "queued")))
+        assertEquals("failed", ticketSessionState(s.copy(status = "error")))
+        assertEquals("stopped", ticketSessionState(s.copy(status = "stopped")))
+    }
+
+    // ---- the start control + sweep (web ticketStartHtml / startSweepVerdict) -
+
+    private fun guessed(cloned: Boolean) = JiraTicket(
+        key = "X-1",
+        repoGuess = com.xerktech.turma.model.RepoGuess(repo = "turma", cloned = cloned),
+    )
+
+    @Test fun `start control has the web's four states`() {
+        // No triaged repo -> no control at all.
+        assertEquals(null, ticketStartControl(JiraTicket(key = "X-1"), 0, null))
+        assertEquals(
+            null,
+            ticketStartControl(
+                JiraTicket(key = "X-1", repoGuess = com.xerktech.turma.model.RepoGuess(repo = null)), 0, null,
+            ),
+        )
+        // Pending -> the busy marker.
+        assertEquals(StartControl.Busy, ticketStartControl(guessed(true), 0, StartState(pending = true)))
+        // Ready -> a live button; an uncloned repo is a live start too (clone
+        // on demand), just labelled; sessions compact it to "+".
+        assertEquals(StartControl.Button(clone = false, more = false, error = null), ticketStartControl(guessed(true), 0, null))
+        assertEquals(StartControl.Button(clone = true, more = false, error = null), ticketStartControl(guessed(false), 0, null))
+        assertEquals(StartControl.Button(clone = false, more = true, error = null), ticketStartControl(guessed(true), 2, null))
+        // A failed attempt keeps a LIVE button with the reason beside it.
+        assertEquals(
+            StartControl.Button(clone = false, more = false, error = "boom"),
+            ticketStartControl(guessed(true), 0, StartState(error = "boom")),
+        )
+    }
+
+    private fun sess(spawnCmdId: String) = TicketSession(
+        host = "h", id = "s1", transcriptId = "t1", status = "running",
+        gitBranch = "", ticketBranch = "", summary = "", summaryManual = false,
+        label = "", ticketKey = "X-1", siteKey = "s", spawnCmdId = spawnCmdId,
+    )
+
+    @Test fun `sweep verdict follows the web's evidence rules`() {
+        val p = StartState(pending = true, cmdId = "c1", host = "h", at = 0)
+        // A cmdId-less pending (POST not back yet) always holds.
+        assertEquals(SweepVerdict.HOLD, startSweepVerdict(StartState(pending = true), emptyList(), false, true, 0, 100).first)
+        // A session reporting this cmdId clears it.
+        assertEquals(SweepVerdict.CLEAR, startSweepVerdict(p, listOf(sess("c1")), false, true, 0, 100).first)
+        // Host gone from the fleet: only the timeout resolves it.
+        assertEquals(SweepVerdict.HOLD, startSweepVerdict(p, emptyList(), false, false, 50, 100).first)
+        assertEquals(SweepVerdict.ERROR, startSweepVerdict(p, emptyList(), false, false, 150, 100).first)
+        // Command present in the host queue: hold, and REMEMBER we saw it.
+        val (v, seen) = startSweepVerdict(p, emptyList(), true, true, 0, 100)
+        assertEquals(SweepVerdict.HOLD, v)
+        assertTrue(seen.sawCmd)
+        // Once seen, its absence means the agent took (or refused) it: clear.
+        assertEquals(SweepVerdict.CLEAR, startSweepVerdict(seen, emptyList(), false, true, 0, 100).first)
+        // Never seen + absent: a stale cache, not an ack — wait, then time out.
+        assertEquals(SweepVerdict.HOLD, startSweepVerdict(p, emptyList(), false, true, 50, 100).first)
+        assertEquals(SweepVerdict.ERROR, startSweepVerdict(p, emptyList(), false, true, 150, 100).first)
+    }
 }

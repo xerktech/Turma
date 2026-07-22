@@ -110,8 +110,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   narrow full-screen, Back clears it). Needed two `ClosedSessionInfo` fields the agent already emits but
   Android didn't decode — `transcriptId` and `prs` (`model/Models.kt`); a record lacking `transcriptId`
   (older agent) stays Resume-only and says "no conversation recorded". Decode covered by `AgentDecodeTest`.
-  Still open under the P0 above: the stopped + `repo.resumable` ended channels and excluding non-running
-  from the live list.
+  (The stopped + `repo.resumable` ended channels and the live-list exclusion landed later — XERK-78.)
 - **Selectable/copyable transcript text (XERK-64).** The web chat relies on native browser text
   selection to copy session text (and defers repaints to keep a live selection intact). Compose `Text`
   isn't selectable by default, so the transcript `LazyColumn` in `ui/ChatScreen.kt` and the
@@ -133,15 +132,65 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `vm/SubagentViewModel.kt`, `ui/ChatScreen.kt`, `ui/SessionsScreen.kt`; decode locked
   in `AgentDecodeTest`.
 
+## Done (XERK-78 installment — the P0 sweep)
+
+- **Board per-card Start button + ticket↔session chips + optimistic sweep.** Each ticket card now
+  carries the web's 4-state start control (`ticketStartControl` in `core/Board.kt` ← board.js
+  `ticketStartHtml`): no button without a triaged repo, "⏳ starting…" while a spawn is in flight,
+  "☐ Start session" / "☐ Start (clone first)" (an uncloned repo is a LIVE start — the hub clones on
+  demand, XERK-14; the detail sheet's stale cloned-only gate is gone), compacting to "+" once the
+  ticket has sessions, a failed start's reason parked beside a live retry button. Session chips
+  (`ticketSessionIndex`/`ticketSessionLabel`/`ticketSessionState` ← board.js) read the same three
+  channels the Ended list merges, deduped on host+transcriptId (record wins), branch-first label;
+  a running chip opens the live chat, anything else the read-only ended review (new `ended/` route).
+  The pending paint is synchronous-before-POST and resolves on EVIDENCE via the `startSweepVerdict`
+  port (`BoardViewModel.starts` swept each fleet beat, incl. the `sawCmd` staleness rule). Tested in
+  `BoardTest`.
+- **Board ticket card fields.** Type + age (`ageStr`) on the top row; status pill, priority pill with
+  high/low tinting (`prioClass`), due/overdue chip (`overdueOf`) on the meta row. Tested in `BoardTest`.
+- **Sessions ended list: all three channels (`collectSessions` ← sessions.html `collect`).** Android
+  read only `a.closedSessions`; it now merges stopped (non-running registry records, which also LEAVE
+  the live list), killed, and each repo's `resumable` scan (the durable channel), deduped on
+  `<host>::<transcriptId>` with the record winning, sorted newest-ended first (`endedTs`, XERK-73).
+  Resume dispatches per channel: killed → `resume`, stopped → `start`, resumable → `resumeTranscript`
+  at its origin cwd. `EndedSessionView` now keys on the transcript id alone (web
+  `findEndedByTranscript`) and resolves the entry — and its Resume — from the fleet each beat.
+  `ResumableInfo` was re-shaped to the real wire (`endedTs`/`repo`/`root`/`ticket`/`prs`; the old
+  `ts`/`source` fields decoded nothing). Tested in `SessionsFlattenTest` + `AgentDecodeTest`.
+- **Sessions queued section.** `status:"queued"` records get their own FIFO section above Active
+  (was: mis-bucketed under "Stopped" with live-card actions): reason (`queuedReasonText`) + queued-since,
+  inline arm/confirm Cancel, no attach (no pane yet).
+- **Chat stick-to-bottom + jump-to-latest pill.** Auto-scroll follows the tail only while the reader
+  is AT the tail (was: unconditional scroll-to-end on every new item, fighting the reader); scrolling
+  up unpins, a "↓ Jump to latest" pill re-pins, and the reveal growing the last bubble keeps the tail
+  in view while pinned (web chat.js `stickBottom`/`#chatJump`).
+- **Dashboard session card detail.** Status badge (queued/error + the optimistic "stopping"), id,
+  worktree/branch (or "repos root (no worktree)"), work-risk line (`core/Sessions.kt workLine` ←
+  index.html, tested in `SessionsTest`), RC name, state/queued-reason + since, question preview,
+  error message, created/stopped/activity + model list, all-time tokens + output (was: today only).
+- **Dashboard queued/stopping + Cancel + optimistic pending.** A queued card's only action is an
+  arm/confirm Cancel; the actions dialog branches on queued and arms/confirms Kill/Restart/Delete
+  (delete warns on dirty files). Every session action paints its busy state synchronously before the
+  POST and clears on the completion signal it actually has (`FleetViewModel.reconcilePending` ←
+  index.html, tested in `FleetPendingTest`): kill/delete → session gone, start → running, resume →
+  reappears, restart → `restartCount` bump, TTL backstop.
+- **Usage 30-day stacked daily chart + persisted legend toggles.** `UsageInfo.days` now decodes (it
+  was silently dropped at the model layer, so no client code could ever chart it);
+  `UsageViewModel.compute` merges per-day buckets per repo (across hosts) and per host
+  (`dateWindow`/`niceMax` ports tested in `UsageViewModelTest`). The screen draws one stacked bar per
+  UTC day for the selected grouping, with a legend that is the filter — per-series + group toggles,
+  persisted (the web's `turma-hidden-sessions`), rescoping chart and rows; paint is assigned by stable
+  order so toggling never repaints survivors. The grouping tab pick persists too (`turma-usage-mode`).
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
 those are marked `[MODEL]`.
 
 ### Dashboard (`index.html` → `FleetScreen`/`FleetDialogs`)
-- P0 `[MODEL]` Session card detail: status badge (incl. `queued`/`stopping`), id, worktree/branch,
-  work-risk line, RC name, queued reason, error, created/activity, token totals + output.
-- P0 `[MODEL]` `queued`/`stopping` states + Cancel button + optimistic pending feedback on actions.
+- ~~P0 Session card detail~~ / ~~P0 queued/stopping + Cancel + optimistic pending~~ — done (XERK-78,
+  see Done above). Still open from that pass: the spawn "ghost card" (a pending spawn shows only as
+  the composer's toast today) — P2.
 - P1 `[MODEL]` Host meta (memory, uptime/last-seen, repos-root, session counts), container-log toggle.
 - P1 Host collapse persistence; Jira org label beside hostname; Remove-host for offline hosts.
 - P1 Clone bar: collapse + search + multi-select + `🔒` private marker + clone-job status rows.
@@ -149,19 +198,17 @@ those are marked `[MODEL]`.
 - P1 Composer base-branch dropdown + per-repo option persistence.
 
 ### Sessions + Chat (`sessions.html` + `chat.js` → `SessionsScreen`/`ChatScreen`)
-- P0 Jump-to-latest pill + stick-bottom scroll (stop auto-scroll fighting the reader).
-- P0 Ended sessions: STILL to do — include the stopped + `repo.resumable` channels (Android reads only
-  `a.closedSessions`, the killed channel) and exclude non-running sessions from the live list. The
-  read-only review itself is done (XERK-70, below).
+- ~~P0 Jump-to-latest pill + stick-bottom scroll.~~ Done (XERK-78, see Done above).
+- ~~P0 Ended sessions: stopped + `repo.resumable` channels + live-list exclusion.~~ Done (XERK-78,
+  see Done above; the read-only review itself was XERK-70).
 - ~~P0 Per-card ⋯ menu: Rename (inline) + arm/confirm Kill.~~ Done (XERK-71): each live session card
   carries a `MoreVert` menu (`SessionCardMenu`) — Rename swaps the card for an inline seeded field
   (`SessionRenameCard`, painted optimistically until the agent reports the name back or a TTL passes),
   Kill arms "Confirm kill" then confirms. `vm/FleetViewModel.kt` `setSummary`; `net/HubApi.kt`
   `setSummary`/`SummaryRequest`.
-- P1 Sidebar sections: Active / Idle split done (XERK-73) — `rankRunning` ranks running sessions
-  attention-first / freshest-first into Active (waiting+working) and Idle, plus a Stopped group for
-  non-running registry records. Still open: a dedicated Queued section, and a state line + question
-  preview on each card.
+- P1 Sidebar sections: Active / Idle split done (XERK-73, `rankRunning`); the dedicated Queued
+  section done (XERK-78; the old Stopped group folded into Ended). Still open: a state line + question
+  preview on each live card (the dashboard card has both; the sessions-list card shows only the dot).
 - P1 Verbosity NORMAL: tool card collapsed (output on expand) to match web; persist per-card open.
 - ~~P2 Live status bar: token counters + elapsed + spinner + hint lines + subagent list.~~
   Done (XERK-75) — see "Done" below.
@@ -195,8 +242,9 @@ those are marked `[MODEL]`.
   segment of an Azure siteKey (`dev.azure.com/myorg` → `myorg`); ported to `core/Board.kt` and tested
   in `BoardTest`. The detail sheet's "Open in Jira" label is source-aware on the web (derived from the
   ticket URL); Android's equivalent label is not yet source-aware — see P1 below.
-- P0 `[MODEL]` Per-card Start button (4 states incl. clone-first) + session chips + optimistic sweep.
-- P0 Ticket cards: type, age, status pill, priority pill, due/overdue.
+- ~~P0 Per-card Start button (4 states incl. clone-first) + session chips + optimistic sweep.~~
+  ~~P0 Ticket cards: type, age, status pill, priority pill, due/overdue.~~ Both done (XERK-78, see
+  Done above).
 - P1 `[MODEL]` Detail sheet full field grid + "Open in Jira" + error state. (Web's link label is now
   source-aware — "Open in Azure DevOps" for an Azure ticket, XERK-43; Android still says "Jira".)
 - P1 Repo picker: cloned/not-cloned optgroups, "Currently set" orphan, `nameWithOwner`, save-error.
@@ -210,12 +258,11 @@ those are marked `[MODEL]`.
   pick is kept and resumes, it just isn't listed while nothing reports it, same as the web.
 
 ### Usage (`usage.html` → `UsageScreen`)
-- P0 `[MODEL surface]` 30-day stacked daily chart (per-day buckets exist server-side but are dropped
-  in `UsageViewModel.compute`).
-- P0 Legend with per-series + per-group toggles, persisted, rescoping chart/table/models.
+- ~~P0 30-day stacked daily chart.~~ ~~P0 Legend with per-series + per-group toggles, persisted,
+  rescoping.~~ Both done (XERK-78, see Done above); series colors are the categorical palette now.
 - P1 Move "By model" out of the grouping tabs into a standalone "Tokens by model" card (Today / Last
   7 days / All-time). Add a collapsible table view with in/out split.
-- P2 Per-day tooltip; categorical per-series colors.
+- P2 Per-day tooltip; the web's texture channel for series 9+ (Android reuses hues past 8).
 
 ### Nav / Login
 - P1 Login: distinguish 401 (bad credentials) from unreachable-host, matching the web's messages.

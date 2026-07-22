@@ -29,9 +29,22 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val today: Long,
         val week: Long,
         val total: Long,
-    )
+        /** "YYYY-MM-DD" (UTC) -> that day's total tokens, summed across hosts. */
+        val days: Map<String, Long> = emptyMap(),
+    ) {
+        /** Legend/persistence key, the web's skey ("repo::<remoteKey>"). */
+        val skey: String get() = "repo::$remoteKey"
+    }
 
-    data class HostTotal(val host: String, val today: Long, val week: Long, val total: Long)
+    data class HostTotal(
+        val host: String,
+        val today: Long,
+        val week: Long,
+        val total: Long,
+        val days: Map<String, Long> = emptyMap(),
+    ) {
+        val skey: String get() = "host::$host"
+    }
 
     /** One model's fleet-wide token counts. */
     data class ModelTotal(val model: String, val today: Long, val week: Long, val total: Long)
@@ -50,6 +63,11 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
          * Pure — a companion fun rather than a method so the JVM unit tests can
          * exercise it without standing up an Application for the ViewModel.
          */
+        /** Merge one usage block's per-day buckets into an accumulator. */
+        private fun addDays(acc: MutableMap<String, Long>, u: UsageInfo) {
+            for ((d, b) in u.days) acc[d] = (acc[d] ?: 0) + b.total
+        }
+
         fun compute(fleet: FleetState): UsageUi {
             val repoAcc = LinkedHashMap<String, RepoTotal>()
             val modelAcc = LinkedHashMap<String, ModelTotal>()
@@ -68,7 +86,10 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 val hostToday = window { it.today }
                 val hostWeek = window { it.week }
                 val hostTotal = window { it.totals }
-                hosts.add(HostTotal(a.key, hostToday, hostWeek, hostTotal))
+                val hostDays = LinkedHashMap<String, Long>()
+                a.usage?.let { addDays(hostDays, it) }
+                    ?: a.repoUsage.forEach { addDays(hostDays, it.usage) }
+                hosts.add(HostTotal(a.key, hostToday, hostWeek, hostTotal, hostDays))
                 today += hostToday
                 week += hostWeek
                 total += hostTotal
@@ -76,12 +97,15 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 for (ru in a.repoUsage) {
                     val key = ru.remoteKey.ifBlank { ru.repo }
                     val prev = repoAcc[key]
+                    val days = LinkedHashMap(prev?.days ?: emptyMap())
+                    addDays(days, ru.usage)
                     repoAcc[key] = RepoTotal(
                         repo = prev?.repo?.ifBlank { ru.repo } ?: ru.repo,
                         remoteKey = key,
                         today = (prev?.today ?: 0) + ru.usage.today.total,
                         week = (prev?.week ?: 0) + ru.usage.week.total,
                         total = (prev?.total ?: 0) + ru.usage.totals.total,
+                        days = days,
                     )
                 }
 
@@ -105,6 +129,30 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 week = week,
                 total = total,
             )
+        }
+
+        /** How many days the stacked daily chart shows (web usage.html DAYS_SHOWN). */
+        const val DAYS_SHOWN = 30
+
+        /**
+         * The chart's date axis: [DAYS_SHOWN] consecutive UTC days ending at the
+         * newest day any series reports (web usage.html `dateWindow`). Empty when
+         * no series carries per-day data (older agents).
+         */
+        fun dateWindow(seriesDays: List<Map<String, Long>>): List<String> {
+            val newest = seriesDays.flatMap { it.keys }.maxOrNull() ?: return emptyList()
+            val end = runCatching { java.time.LocalDate.parse(newest) }.getOrNull() ?: return emptyList()
+            return (DAYS_SHOWN - 1 downTo 0).map { end.minusDays(it.toLong()).toString() }
+        }
+
+        /** Round a max value up to a "nice" axis ceiling (web `niceMax`). */
+        fun niceMax(v: Long): Long {
+            if (v <= 0) return 1
+            val pow = Math.pow(10.0, Math.floor(Math.log10(v.toDouble())))
+            for (m in doubleArrayOf(1.0, 2.0, 2.5, 5.0, 10.0)) {
+                if (v <= m * pow) return Math.ceil(m * pow).toLong()
+            }
+            return (10 * pow).toLong()
         }
     }
 }

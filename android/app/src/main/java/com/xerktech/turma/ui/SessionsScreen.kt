@@ -95,6 +95,151 @@ fun flattenSessions(
     return filtered.sortedBy { it.session.status != "running" }
 }
 
+// ---- the ended-sessions merge (web sessions.html collect(), XERK-78) ---------
+//
+// A session is "ended" if it is over but still resumable, and that covers three
+// records the agent reports through DIFFERENT channels — killed (its closed
+// record), stopped (a non-running registry record), and resumable (the durable
+// per-repo transcript scan). The operator draws no distinction, so they land in
+// one list, deduped on <host>::<transcriptId> with the registry-backed record
+// winning (only it knows the session's id, PRs and rename), sorted most
+// recently ended first. `kind` is what Resume dispatches on: closed → resume
+// (same id), stopped → start, resumable → resumeTranscript at its origin cwd.
+
+/** Which channel reported an ended session — decides its Resume dispatch. */
+enum class EndedKind { STOPPED, CLOSED, RESUMABLE }
+
+data class EndedSession(
+    val host: String,
+    val device: String,
+    val online: Boolean,
+    val kind: EndedKind,
+    /** Session id for a registry-backed record; "t:<transcriptId>" for a
+     *  resumable row (it never had one — the transcript is its only identity). */
+    val id: String,
+    val transcriptId: String,
+    val repo: String,
+    val name: String,
+    val status: String = "",
+    val errorMsg: String = "",
+    /** ISO ended stamp (closedAt / stoppedAt / endedTs); "" when unrecorded. */
+    val endedAt: String = "",
+    /** Sort key parsed from [endedAt]; 0 (oldest) for an undated record. */
+    val endedMs: Long = 0,
+    val prs: List<com.xerktech.turma.model.PrInfo> = emptyList(),
+    /** The origin cwd a resumable row relaunches at (resumeTranscript body). */
+    val cwd: String = "",
+)
+
+/** The sidebar's three lists in one pass — running, queued (FIFO), ended. */
+data class SessionLists(
+    val running: List<FlatSession>,
+    val queued: List<FlatSession>,
+    val ended: List<EndedSession>,
+)
+
+private fun parseIso(s: String): Long =
+    if (s.isBlank()) 0 else runCatching { java.time.Instant.parse(s).toEpochMilli() }.getOrDefault(0)
+
+fun collectSessions(agents: List<AgentInfo>, query: String): SessionLists {
+    val q = query.trim().lowercase()
+    fun matches(vararg fields: String) =
+        q.isEmpty() || fields.joinToString(" ").lowercase().contains(q)
+
+    val running = ArrayList<FlatSession>()
+    val queued = ArrayList<FlatSession>()
+    val ended = ArrayList<EndedSession>()
+    // <host>::<transcriptId> of every session a registry-backed record covers —
+    // a killed session is reported through BOTH its closed record and (once the
+    // slow scan catches up) `resumable`, and the two must collapse to one row.
+    val carded = HashSet<String>()
+    fun key(host: String, tid: String) = "$host::$tid"
+
+    for (a in agents) {
+        val host = a.key
+        val device = a.device.ifBlank { a.key }
+        for (s in a.sessions) {
+            if (s.transcriptId.isNotBlank()) carded.add(key(host, s.transcriptId))
+            val flat = FlatSession(host, device, a.online, a.lastSeen, s)
+            val nameMatch = matches(sessionName(s), s.repo, sessionBranch(s), device)
+            when (s.status) {
+                "running" -> if (nameMatch) running.add(flat)
+                // Upcoming, not ended: a record with no worktree yet, provisioned
+                // when a slot frees / its clone lands (the agent's _drain_queue).
+                "queued" -> if (nameMatch) queued.add(flat)
+                else -> if (nameMatch) ended.add(
+                    EndedSession(
+                        host = host, device = device, online = a.online,
+                        kind = EndedKind.STOPPED, id = s.id,
+                        transcriptId = s.transcriptId, repo = s.repo,
+                        name = sessionName(s), status = s.status, errorMsg = s.errorMsg,
+                        endedAt = s.stoppedAt, endedMs = parseIso(s.stoppedAt),
+                        prs = s.prs,
+                    ),
+                )
+            }
+        }
+        for (c in a.closedSessions) {
+            if (c.transcriptId.isNotBlank()) carded.add(key(host, c.transcriptId))
+            if (!matches(closedName(c), c.repo, c.branch, device)) continue
+            ended.add(
+                EndedSession(
+                    host = host, device = device, online = a.online,
+                    kind = EndedKind.CLOSED, id = c.id,
+                    transcriptId = c.transcriptId, repo = c.repo,
+                    name = closedName(c),
+                    endedAt = c.closedAt, endedMs = parseIso(c.closedAt),
+                    prs = c.prs,
+                ),
+            )
+        }
+    }
+    // Second pass, so a resumable row is only ever a fallback for a session no
+    // record above already speaks for.
+    for (a in agents) {
+        for (r in a.repos) for (t in r.resumable) {
+            if (t.transcriptId.isBlank() || !carded.add(key(a.key, t.transcriptId))) continue
+            val name = t.summary.ifBlank { t.transcriptId.take(8) }
+            if (!matches(name, t.repo, a.device.ifBlank { a.key })) continue
+            ended.add(
+                EndedSession(
+                    host = a.key, device = a.device.ifBlank { a.key }, online = a.online,
+                    kind = EndedKind.RESUMABLE, id = "t:" + t.transcriptId,
+                    transcriptId = t.transcriptId, repo = t.repo,
+                    name = name,
+                    endedAt = t.endedTs, endedMs = parseIso(t.endedTs),
+                    prs = t.prs,
+                    cwd = t.cwd,
+                ),
+            )
+        }
+    }
+    // Most recently ended first; ties (and undated records) fall back to the id
+    // so the order is at least stable across beats. Queued oldest-first — FIFO,
+    // the order the agent's _drain_queue will start them.
+    ended.sortWith(compareByDescending<EndedSession> { it.endedMs }.thenBy { it.id })
+    queued.sortBy { it.session.queuedAt }
+    return SessionLists(running, queued, ended)
+}
+
+/** Human text for why a queued session hasn't started yet (web queuedReasonText). */
+fun queuedReasonText(reason: String): String = when (reason) {
+    "capacity" -> "waiting for a free session slot"
+    "awaiting-clone" -> "cloning the repo first"
+    "root-busy" -> "waiting for the repos-root slot"
+    else -> "waiting to start"
+}
+
+/** The row's state word: killed/stopped/failed/ended (web endedRow `state`). */
+fun endedStateText(e: EndedSession): String = when {
+    e.kind == EndedKind.CLOSED -> "killed"
+    // A resumable row is a bare transcript: nothing recorded WHY it ended, only
+    // that it did, so it says the one thing that's true of all of them.
+    e.kind == EndedKind.RESUMABLE -> "ended"
+    e.status == "error" -> "failed"
+    else -> "stopped"
+}
+
 /** One running session tagged with its live state — the row unit for the ranked
  *  Active/Idle lists. */
 data class RankedSession(val flat: FlatSession, val state: com.xerktech.turma.core.LiveState)
@@ -170,36 +315,36 @@ fun SessionsRoute(
 ) {
     var selHost by rememberSaveable { mutableStateOf<String?>(null) }
     var selId by rememberSaveable { mutableStateOf<String?>(null) }
-    // An ENDED session opened for read-only review (XERK-70): its transcript id
-    // (the archive handle) + the closed record's id (for Resume). Distinct from
-    // the live selection above — the two are mutually exclusive, so picking one
-    // clears the other.
+    // An ENDED session opened for read-only review (XERK-70): keyed on its
+    // transcript id, the one handle all three ended channels share (the view
+    // itself re-resolves the entry — and its Resume dispatch — from the fleet).
+    // Distinct from the live selection above — the two are mutually exclusive,
+    // so picking one clears the other.
     var endHost by rememberSaveable { mutableStateOf<String?>(null) }
     var endTid by rememberSaveable { mutableStateOf<String?>(null) }
-    var endId by rememberSaveable { mutableStateOf<String?>(null) }
     // A live subagent's transcript drilled into from the open session's status bar
     // (web openSubagentView): scoped to the live selection above, so Back returns to
     // that session's chat. Cleared whenever a different session/ended row is picked.
     var subType by rememberSaveable { mutableStateOf<String?>(null) }
     var subLabel by rememberSaveable { mutableStateOf<String?>(null) }
     val select: (String, String) -> Unit = { h, s ->
-        endHost = null; endTid = null; endId = null; subType = null; subLabel = null; selHost = h; selId = s
+        endHost = null; endTid = null; subType = null; subLabel = null; selHost = h; selId = s
     }
-    val selectEnded: (String, String, String) -> Unit = { h, tid, id ->
-        selHost = null; selId = null; subType = null; subLabel = null; endHost = h; endTid = tid; endId = id
+    val selectEnded: (String, String) -> Unit = { h, tid ->
+        selHost = null; selId = null; subType = null; subLabel = null; endHost = h; endTid = tid
     }
     val clearSub: () -> Unit = { subType = null; subLabel = null }
     val clear: () -> Unit = {
-        selHost = null; selId = null; endHost = null; endTid = null; endId = null; subType = null; subLabel = null
+        selHost = null; selId = null; endHost = null; endTid = null; subType = null; subLabel = null
     }
     val hasLive = !selHost.isNullOrEmpty() && !selId.isNullOrEmpty()
-    val hasEnded = !endHost.isNullOrEmpty() && !endId.isNullOrEmpty()
+    val hasEnded = !endHost.isNullOrEmpty() && !endTid.isNullOrEmpty()
     val hasSub = subType != null && hasLive
     val hasSel = hasLive || hasEnded
 
     val detail: @Composable () -> Unit = {
         // key() so switching sessions rebuilds the detail subtree (fresh VM + reveal).
-        key(selHost, selId, endHost, endId, subType, subLabel) {
+        key(selHost, selId, endHost, endTid, subType, subLabel) {
             when {
                 hasSub -> SubagentView(
                     host = selHost.orEmpty(),
@@ -211,7 +356,6 @@ fun SessionsRoute(
                 hasEnded -> EndedSessionView(
                     host = endHost.orEmpty(),
                     transcriptId = endTid.orEmpty(),
-                    closedId = endId.orEmpty(),
                     onBack = clear,
                     onResumed = select,
                     showBack = !wide,
@@ -242,7 +386,7 @@ fun SessionsRoute(
         wide -> MainScaffold(TopDest.SESSIONS, onNavigate) { m ->
             Row(m.fillMaxSize()) {
                 SessionsListPane(
-                    selectedKey = selKey(selHost, selId) ?: selKey(endHost, endId),
+                    selectedKey = selKey(selHost, selId) ?: selKey(endHost, endTid),
                     onSelect = select,
                     onSelectEnded = selectEnded,
                     onOpenArchive = onOpenArchive,
@@ -282,7 +426,7 @@ private fun DetailEmpty() {
 fun SessionsListPane(
     selectedKey: String?,
     onSelect: (String, String) -> Unit,
-    onSelectEnded: (String, String, String) -> Unit = { _, _, _ -> },
+    onSelectEnded: (String, String) -> Unit = { _, _ -> },
     onOpenArchive: () -> Unit = {},
     modifier: Modifier = Modifier,
     vm: FleetViewModel = viewModel(),
@@ -296,13 +440,16 @@ fun SessionsListPane(
     // it, so the lists AND the new-session host picker narrow together — a host
     // polls exactly one org, so scoping the agent list scopes all three.
     val agents = remember(fleet.agents, org) { scopedAgents(fleet.agents, org) }
-    val rows = remember(agents, query) { flattenSessions(agents, query) }
+    // Running / queued / ended in one pass (web sessions.html collect()): the
+    // live lists carry only running sessions; queued get their own section; a
+    // non-running registry record lands in Ended with the killed + resumable
+    // channels, deduped on <host>::<transcriptId>.
+    val lists = remember(agents, query) { collectSessions(agents, query) }
     // The live sessions split into the web's Active (waiting/working) and Idle
-    // sections, each ranked attention-first / freshest-first (XERK-73). Stopped
-    // records (claude exited on its own) are neither — they trail below.
-    val (active, idle) = remember(rows, now) { rankRunning(rows, now) }
-    val stopped = remember(rows) { rows.filter { it.session.status != "running" } }
-    val ended = remember(agents, query) { flattenClosed(agents, query) }
+    // sections, each ranked attention-first / freshest-first (XERK-73).
+    val (active, idle) = remember(lists, now) { rankRunning(lists.running, now) }
+    val queued = lists.queued
+    val ended = lists.ended
     var endedOpen by remember { mutableStateOf(false) }
     // New-session picker: pick an online host + repo, then the spawn composer.
     var pickerOpen by remember { mutableStateOf(false) }
@@ -321,7 +468,8 @@ fun SessionsListPane(
             contentPadding = PaddingValues(10.dp, 4.dp, 10.dp, 12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            if (rows.isEmpty() && ended.isEmpty()) {
+            val anyRows = lists.running.isNotEmpty() || queued.isNotEmpty()
+            if (!anyRows && ended.isEmpty()) {
                 item {
                     Text(
                         when {
@@ -337,10 +485,19 @@ fun SessionsListPane(
                     )
                 }
             }
+            // Queued sessions: waiting for a slot, a clone, or the root slot.
+            // Above the live lists — they're the work about to start. Cancelable
+            // but not attachable (there's no pane yet).
+            if (queued.isNotEmpty()) {
+                item(key = "queued-header") { SectionLabel("Queued (${queued.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
+                items(queued, key = { "q:" + it.host + "/" + it.session.id }) { r ->
+                    QueuedSessionCard(r, now, onCancel = { vm.kill(r.host, r.session.id) })
+                }
+            }
             // Active: sessions wanting attention (waiting on you, or working). The
             // header shows even when empty, so "nothing active right now" reads as
             // a state rather than a missing section — matching the web sidebar.
-            if (rows.isNotEmpty() || ended.isNotEmpty()) {
+            if (anyRows || ended.isNotEmpty()) {
                 item(key = "active-header") { SectionLabel("Active (${active.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
                 if (active.isEmpty()) {
                     item(key = "active-empty") {
@@ -375,21 +532,9 @@ fun SessionsListPane(
                     )
                 }
             }
-            // Stopped: still in the registry but not running (claude exited on its
-            // own). Startable in place; shown only when present.
-            if (stopped.isNotEmpty()) {
-                item(key = "stopped-header") { SectionLabel("Stopped (${stopped.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
-                items(stopped, key = { "s:" + it.host + "/" + it.session.id }) { r ->
-                    SessionListCard(
-                        r, now,
-                        selected = selectedKey == r.host + "/" + r.session.id,
-                        onKill = { vm.kill(r.host, r.session.id) },
-                        onRename = { name -> vm.setSummary(r.host, r.session.id, name) },
-                        onClick = { onSelect(r.host, r.session.id) },
-                    )
-                }
-            }
-            // Ended sessions: killed but resumable — its own collapsible section.
+            // Ended sessions: over but resumable, whatever channel reported them
+            // (stopped / killed / the durable transcript scan) — its own
+            // collapsible section, most recently ended first.
             if (ended.isNotEmpty()) {
                 item(key = "ended-header") {
                     Row(
@@ -405,14 +550,14 @@ fun SessionsListPane(
                     }
                 }
                 if (endedOpen) {
-                    items(ended, key = { "closed:" + it.host + "/" + it.closed.id }) { c ->
-                        ClosedSessionCard(
-                            c,
-                            selected = selectedKey == c.host + "/" + c.closed.id,
+                    items(ended, key = { "ended:" + it.host + "/" + it.id }) { e ->
+                        EndedSessionRow(
+                            e, now,
+                            selected = selectedKey == e.host + "/" + e.transcriptId,
                             // Tap the card body to review the chat read-only; the
                             // Resume button re-launches it live (XERK-70).
-                            onOpen = { onSelectEnded(c.host, c.closed.transcriptId, c.closed.id) },
-                            onResume = { vm.resume(c.host, c.closed.id); onSelect(c.host, c.closed.id) },
+                            onOpen = { onSelectEnded(e.host, e.transcriptId) },
+                            onResume = { resumeEnded(vm, e); if (e.kind != EndedKind.RESUMABLE) onSelect(e.host, e.id) },
                         )
                     }
                 }
@@ -438,23 +583,69 @@ fun SessionsListPane(
     }
 }
 
-data class FlatClosed(val host: String, val device: String, val closed: ClosedSessionInfo)
-
-fun flattenClosed(agents: List<AgentInfo>, query: String): List<FlatClosed> {
-    val q = query.trim().lowercase()
-    val all = agents.flatMap { a -> a.closedSessions.map { FlatClosed(a.key, a.device.ifBlank { a.key }, it) } }
-    return if (q.isEmpty()) all else all.filter {
-        (it.closed.summary + " " + it.closed.label + " " + it.closed.repo + " " + it.closed.branch + " " + it.device)
-            .lowercase().contains(q)
-    }
-}
-
 fun closedName(c: ClosedSessionInfo): String =
     c.summary.ifBlank { c.label.ifBlank { c.branch.ifBlank { c.id.take(6) } } }
 
+/**
+ * Bring an ended session back, dispatching on which channel reported it (web
+ * resumeEnded): a KILLED session was dropped from the registry and comes back
+ * via `resume` (same id); a merely stopped one still has its record and just
+ * needs `start`; one recovered by the transcript scan has no record at all, so
+ * `resumeTranscript` relaunches it at its own origin cwd under a NEW id.
+ */
+fun resumeEnded(vm: FleetViewModel, e: EndedSession) = when (e.kind) {
+    EndedKind.CLOSED -> vm.resume(e.host, e.id)
+    EndedKind.STOPPED -> vm.start(e.host, e.id)
+    EndedKind.RESUMABLE -> vm.resumeTranscript(e.host, e.transcriptId, e.cwd)
+}
+
+/**
+ * A queued session card (web queuedCard): not attachable (no pane yet), so the
+ * body is inert — it shows the wait reason + how long it's been queued, and the
+ * one action is an inline arm/confirm Cancel (the same kill path; a queued
+ * record has no worktree to tear down).
+ */
+@Composable
+private fun QueuedSessionCard(r: FlatSession, now: Long, onCancel: () -> Unit) {
+    var armed by remember { mutableStateOf(false) }
+    LaunchedEffect(armed) { if (armed) { kotlinx.coroutines.delay(KILL_ARM_MS); armed = false } }
+    TurmaCard(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 10.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            StateDot(com.xerktech.turma.core.LiveState.WAITING)
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(sessionName(r.session), fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                val ticket = r.session.ticket?.key?.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty()
+                Text(
+                    "${r.session.id} · ${r.session.repo.ifBlank { "?" }} · ${r.device}$ticket",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                )
+                val since = r.session.queuedAt.takeIf { it.isNotBlank() }
+                    ?.let { " · " + com.xerktech.turma.core.ageStr(it, now) }.orEmpty()
+                Text(
+                    queuedReasonText(r.session.queuedReason) + since,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                    maxLines = 1,
+                )
+            }
+            GhostButton(
+                if (armed) "Confirm" else "Cancel",
+                onClick = { if (armed) { armed = false; onCancel() } else armed = true },
+            )
+        }
+    }
+}
+
+/** One ended session's row, whatever channel reported it (web endedRow). */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ClosedSessionCard(c: FlatClosed, selected: Boolean, onOpen: () -> Unit, onResume: () -> Unit) {
+private fun EndedSessionRow(e: EndedSession, now: Long, selected: Boolean, onOpen: () -> Unit, onResume: () -> Unit) {
     val cardMod = Modifier.fillMaxWidth().then(
         if (selected)
             Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
@@ -470,23 +661,44 @@ private fun ClosedSessionCard(c: FlatClosed, selected: Boolean, onOpen: () -> Un
         ) {
             StateDot(com.xerktech.turma.core.LiveState.STOPPED)
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(closedName(c.closed), fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(e.name, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                // A resumable row is keyed on a 36-char transcript UUID; shorten it
+                // to the same visual weight as a session id (web endedRowId).
+                val rowId = if (e.kind == EndedKind.RESUMABLE) e.transcriptId.take(8) else e.id
                 Text(
-                    "${c.device} · ${c.closed.repo.ifBlank { "—" }}",
+                    "$rowId · ${e.repo.ifBlank { "—" }} · ${e.device}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                 )
-                if (c.closed.prs.isNotEmpty()) {
+                val when_ = e.endedAt.takeIf { it.isNotBlank() }
+                    ?.let { com.xerktech.turma.core.ageStr(it, now) }.orEmpty()
+                Text(
+                    endedStateText(e) + if (when_.isNotBlank()) " $when_" else "",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                )
+                if (e.status == "error" && e.errorMsg.isNotBlank()) {
+                    Text(
+                        e.errorMsg,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        maxLines = 2,
+                    )
+                }
+                if (e.prs.isNotEmpty()) {
                     FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
-                        c.closed.prs.forEach { PrBadge(it) }
+                        e.prs.forEach { PrBadge(it) }
                     }
                 }
             }
-            GhostButton("Resume", onResume)
+            // Resume needs the host online (it rides the heartbeat as a command);
+            // reading the conversation does not, so the card stays clickable.
+            GhostButton("Resume", onResume, enabled = e.online)
         }
     }
 }
@@ -580,17 +792,18 @@ private fun SessionListCard(
  * engine the live chat uses, with a PR-chip + Resume bar and a verbosity control
  * — but deliberately NO compose box and no terminal (there is no live pty).
  *
- * The transcript is fetched from the hub's durable archive by transcript id, so
- * it opens even when the session's host is offline; Resume is gated on the host
- * being online. A record with no `transcriptId` (an agent predating the snapshot)
- * shows "no conversation recorded" and stays Resume-only.
+ * Keyed on the TRANSCRIPT id — the one handle all three ended channels share
+ * (web findEndedByTranscript) — and re-resolves the entry from the fleet each
+ * beat, so Resume dispatches on however the session ended (killed → resume,
+ * stopped → start, resumable → resumeTranscript). The transcript is fetched
+ * from the hub's durable archive, so it opens even when the session's host is
+ * offline; Resume is gated on the host being online.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun EndedSessionView(
+internal fun EndedSessionView(
     host: String,
     transcriptId: String,
-    closedId: String,
     onBack: () -> Unit,
     onResumed: (String, String) -> Unit,
     showBack: Boolean,
@@ -600,7 +813,13 @@ private fun EndedSessionView(
     val fleet by fleetVm.fleet.collectAsStateWithLifecycle()
     val arch by archiveVm.state.collectAsStateWithLifecycle()
     val agent = fleet.agents.firstOrNull { it.key == host }
-    val closed = agent?.closedSessions?.firstOrNull { it.id == closedId }
+    // The ended entry this transcript belongs to, whatever channel reports it
+    // right now. It can legitimately be missing (the session was resumed and is
+    // running again, or the fleet moved on) — the archived conversation still
+    // renders; only Resume needs the entry.
+    val entry = remember(fleet.agents, host, transcriptId) {
+        collectSessions(fleet.agents, "").ended.firstOrNull { it.host == host && it.transcriptId == transcriptId }
+    }
     val online = agent?.online == true
     var verbosity by remember { mutableStateOf(Verbosity.VERBOSE) }
 
@@ -617,9 +836,9 @@ private fun EndedSessionView(
             TopAppBar(
                 title = {
                     Column {
-                        Text(closed?.let { closedName(it) } ?: "Ended session", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(entry?.name ?: "Ended session", maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
-                            "${agent?.device?.ifBlank { host } ?: host} · ${closed?.repo?.ifBlank { "—" } ?: "—"}",
+                            "${agent?.device?.ifBlank { host } ?: host} · ${entry?.repo?.ifBlank { "—" } ?: "—"}",
                             style = MaterialTheme.typography.bodySmall,
                             fontFamily = FontFamily.Monospace,
                             maxLines = 1,
@@ -631,14 +850,25 @@ private fun EndedSessionView(
                 },
                 actions = {
                     VerbosityMenu(verbosity) { verbosity = it }
-                    GhostButton("Resume", { fleetVm.resume(host, closedId); onResumed(host, closedId) }, enabled = online)
+                    entry?.let { e ->
+                        GhostButton(
+                            "Resume",
+                            {
+                                resumeEnded(fleetVm, e)
+                                // A resumable row comes back under a NEW id only the
+                                // agent knows, so there is no session to select yet.
+                                if (e.kind != EndedKind.RESUMABLE) onResumed(host, e.id) else onBack()
+                            },
+                            enabled = online,
+                        )
+                    }
                 },
             )
         },
     ) { pad ->
         Column(Modifier.fillMaxSize().padding(pad)) {
             // PR chips (each links out to GitHub) on the stage bar, like the web.
-            closed?.prs?.takeIf { it.isNotEmpty() }?.let { prs ->
+            entry?.prs?.takeIf { it.isNotEmpty() }?.let { prs ->
                 FlowRow(
                     Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),

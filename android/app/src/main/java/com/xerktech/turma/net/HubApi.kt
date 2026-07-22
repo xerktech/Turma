@@ -193,6 +193,9 @@ data class JiraSessionResponse(
     val cmdId: String = "",
     val host: String = "",
     val repo: String = "",
+    // True when no host had the repo cloned: the chosen host clones it on
+    // demand and the session queues behind the clone (XERK-14).
+    val needsClone: Boolean = false,
     val error: String = "",
 )
 

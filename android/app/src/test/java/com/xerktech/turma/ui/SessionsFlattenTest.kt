@@ -132,4 +132,91 @@ class SessionsFlattenTest {
         )
         assertTrue(spawnTargets(listOf(free))[0].repos.any { it.root })
     }
+
+    // ---- collectSessions (the web collect(): queued + 3-channel ended) -------
+
+    @Test fun `collectSessions routes running, queued and stopped to their lists`() {
+        val a = AgentInfo(
+            key = "h1", device = "BOX", online = true,
+            sessions = listOf(
+                SessionInfo(id = "run", status = "running"),
+                SessionInfo(id = "q2", status = "queued", queuedReason = "capacity", queuedAt = "2026-07-22T10:01:00Z"),
+                SessionInfo(id = "q1", status = "queued", queuedReason = "root-busy", queuedAt = "2026-07-22T10:00:00Z"),
+                SessionInfo(id = "dead", status = "stopped", stoppedAt = "2026-07-22T09:00:00Z", transcriptId = "tid-dead"),
+            ),
+        )
+        val lists = collectSessions(listOf(a), "")
+        assertEquals(listOf("run"), lists.running.map { it.session.id })
+        // Queued is FIFO by queuedAt — the order the agent's drainer starts them.
+        assertEquals(listOf("q1", "q2"), lists.queued.map { it.session.id })
+        // The stopped record left the live list and became an ended row.
+        assertEquals(listOf("dead"), lists.ended.map { it.id })
+        assertEquals(EndedKind.STOPPED, lists.ended[0].kind)
+    }
+
+    @Test fun `collectSessions merges three channels, deduped, newest ended first`() {
+        val a = AgentInfo(
+            key = "h1", device = "BOX", online = true,
+            sessions = listOf(
+                SessionInfo(id = "stop1", status = "stopped", stoppedAt = "2026-07-22T08:00:00Z", transcriptId = "tid-stop"),
+            ),
+            closedSessions = listOf(
+                com.xerktech.turma.model.ClosedSessionInfo(
+                    id = "kill1", transcriptId = "tid-kill", closedAt = "2026-07-22T10:00:00Z", summary = "killed one",
+                ),
+            ),
+            repos = listOf(
+                RepoInfo(
+                    name = "r",
+                    resumable = listOf(
+                        // The killed session's own transcript — must dedupe away.
+                        com.xerktech.turma.model.ResumableInfo(transcriptId = "tid-kill", endedTs = "2026-07-22T10:05:00Z"),
+                        // A transcript no record speaks for — the durable channel.
+                        com.xerktech.turma.model.ResumableInfo(
+                            transcriptId = "tid-old", endedTs = "2026-07-22T09:00:00Z",
+                            summary = "old work", cwd = "/repos/.turma/worktrees/x",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val lists = collectSessions(listOf(a), "")
+        // Newest ended first: killed (10:00) > resumable (09:00) > stopped (08:00).
+        assertEquals(listOf("kill1", "t:tid-old", "stop1"), lists.ended.map { it.id })
+        assertEquals(
+            listOf(EndedKind.CLOSED, EndedKind.RESUMABLE, EndedKind.STOPPED),
+            lists.ended.map { it.kind },
+        )
+        // The resumable row carries what resumeTranscript needs.
+        assertEquals("/repos/.turma/worktrees/x", lists.ended[1].cwd)
+        // And the duplicate transcript produced no fourth row.
+        assertEquals(1, lists.ended.count { it.transcriptId == "tid-kill" })
+    }
+
+    @Test fun `an undated ended record sorts oldest, not NaN-somewhere`() {
+        val a = AgentInfo(
+            key = "h1", device = "BOX", online = true,
+            closedSessions = listOf(
+                com.xerktech.turma.model.ClosedSessionInfo(id = "undated", transcriptId = "t1"),
+                com.xerktech.turma.model.ClosedSessionInfo(id = "dated", transcriptId = "t2", closedAt = "2026-07-22T10:00:00Z"),
+            ),
+        )
+        assertEquals(listOf("dated", "undated"), collectSessions(listOf(a), "").ended.map { it.id })
+    }
+
+    @Test fun `queuedReasonText and endedStateText read like the web`() {
+        assertEquals("waiting for a free session slot", queuedReasonText("capacity"))
+        assertEquals("cloning the repo first", queuedReasonText("awaiting-clone"))
+        assertEquals("waiting for the repos-root slot", queuedReasonText("root-busy"))
+        assertEquals("waiting to start", queuedReasonText("something-new"))
+
+        fun e(kind: EndedKind, status: String = "") = EndedSession(
+            host = "h", device = "d", online = true, kind = kind, id = "i",
+            transcriptId = "t", repo = "r", name = "n", status = status,
+        )
+        assertEquals("killed", endedStateText(e(EndedKind.CLOSED)))
+        assertEquals("ended", endedStateText(e(EndedKind.RESUMABLE)))
+        assertEquals("failed", endedStateText(e(EndedKind.STOPPED, status = "error")))
+        assertEquals("stopped", endedStateText(e(EndedKind.STOPPED, status = "stopped")))
+    }
 }
