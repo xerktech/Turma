@@ -10,6 +10,7 @@ import com.xerktech.turma.core.RevealState
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.VerbosityPrefs
 import com.xerktech.turma.core.advanceReveal
+import com.xerktech.turma.core.entryTruncated
 import com.xerktech.turma.core.liveRevealBase
 import com.xerktech.turma.core.mergeTail
 import com.xerktech.turma.core.prependHistory
@@ -83,6 +84,12 @@ class ChatViewModel(
     private var lastLiveText: String = ""
     private var historyJob: Job? = null
     private var fleetJob: Job? = null
+    private var pollJob: Job? = null
+    private var refreshJob: Job? = null
+    // Entry keys whose cap-truncated live-tail blocks already triggered a
+    // /history upgrade fetch — one fetch per entry, so a block still truncated
+    // at the FULL caps can't refetch forever.
+    private val upgradedKeys = HashSet<String>()
     private var dictation: Dictation? = null
 
     fun onEnter() {
@@ -91,6 +98,7 @@ class ChatViewModel(
         startLive()
         startRevealLoop()
         loadHistory()
+        startPollFallback()
     }
 
     // Symmetric with onEnter: cancels every launched job so a re-entry (the
@@ -98,6 +106,7 @@ class ChatViewModel(
     // restarts cleanly rather than stacking a second collector on each job.
     fun onLeave() {
         liveJob?.cancel(); revealJob?.cancel(); historyJob?.cancel(); fleetJob?.cancel()
+        pollJob?.cancel(); refreshJob?.cancel()
         cancelDictation()
     }
 
@@ -128,8 +137,11 @@ class ChatViewModel(
         liveJob = viewModelScope.launch {
             container.liveTail.stream(host, sessionId).collect { ev ->
                 when (ev) {
-                    is LiveEvent.Tail -> _state.update {
-                        it.copy(entries = mergeTail(it.entries, ev.entries), liveTurn = "")
+                    is LiveEvent.Tail -> {
+                        _state.update {
+                            it.copy(entries = mergeTail(it.entries, ev.entries), liveTurn = "")
+                        }
+                        maybeUpgradeTruncated(ev.entries)
                     }
                     is LiveEvent.Turn -> _state.update {
                         // Empty text = turn committed; the tail owns it now.
@@ -198,6 +210,54 @@ class ChatViewModel(
                     else _state.update { it.copy(loadingHistory = false) }
                 }
                 null -> _state.update { it.copy(loadingHistory = false) }
+            }
+        }
+    }
+
+    // /history fallback poll — the web chat's POLL_MS loop (and what LiveTail's
+    // doc promises the caller does): while the live socket is down, the buffer
+    // otherwise only grows via the heartbeat's 500-char text-only previews, so
+    // messages appear cut off mid-sentence and stay that way (XERK-77). A phone
+    // backgrounds its sockets far more than a desktop tab, so this path is the
+    // common one, not the exception.
+    private fun startPollFallback() {
+        pollJob?.cancel()
+        pollJob = viewModelScope.launch {
+            while (isActive) {
+                delay(POLL_MS)
+                if (!_state.value.connected) refreshHistory()
+            }
+        }
+    }
+
+    /**
+     * The live tail clips blocks to the tight LIVE caps (4000-char text), so a
+     * long assistant message arrives flagged truncated. The web offers a manual
+     * "Show more…" that refetches /history (FULL caps); here the upgrade is
+     * automatic — once per entry key, so an entry still truncated at the FULL
+     * caps can't loop.
+     */
+    private fun maybeUpgradeTruncated(incoming: List<TailEntry>) {
+        val need = incoming.asSequence()
+            .filter { entryTruncated(it) }
+            .map { it.key }
+            .filter { it.isNotEmpty() && it !in upgradedKeys }
+            .toList()
+        if (need.isEmpty()) return
+        upgradedKeys.addAll(need)
+        refreshHistory()
+    }
+
+    /** Silent /history re-fetch + merge (no spinner, no 202 retry loop). */
+    private fun refreshHistory() {
+        if (refreshJob?.isActive == true) return
+        refreshJob = viewModelScope.launch {
+            val r = runCatching { client.history(host, sessionId) }.getOrNull()
+            if (r is HubClient.HistoryResult.Ready) {
+                _state.update {
+                    val (merged, more) = prependHistory(it.entries, r.entries, r.truncated)
+                    it.copy(entries = merged, hasMore = more)
+                }
             }
         }
     }
@@ -318,6 +378,8 @@ class ChatViewModel(
 
     companion object {
         const val LIVE_TURN_ID = "__live_turn__"
+        /** /history fallback cadence while the live WS is down (web chat POLL_MS). */
+        const val POLL_MS = 6000L
 
         fun factory(app: Application, host: String, sessionId: String): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {

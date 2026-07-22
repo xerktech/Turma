@@ -36,6 +36,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   these to a single "+" that opens the `SpawnDialog` (prompt/label/base/model/mode); the separate
   quick-spawn (was the ⚙/Tune icon) is gone. A phone header has room for one action, and the composer
   covers the bare case by leaving every field blank.
+- **Auto history-upgrade instead of the "Show more…" button** (XERK-77). The web chat marks a
+  cap-truncated block with a manual "Show more…" that refetches `/history` (looser caps). Android
+  refetches `/history` automatically when a truncated block arrives on the live tail (once per entry,
+  `ChatViewModel.maybeUpgradeTruncated`) — a tap-target that small earns its keep less on a phone than
+  just showing the full text. Both clients also poll `/history` while the live socket is down.
 
 ## Done (this pass — first installment)
 
