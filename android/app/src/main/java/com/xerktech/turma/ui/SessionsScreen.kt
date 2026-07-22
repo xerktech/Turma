@@ -24,8 +24,11 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -350,18 +353,26 @@ fun SessionsListPane(
                     }
                 }
                 items(active, key = { "a:" + it.flat.host + "/" + it.flat.session.id }) { r ->
-                    SessionListCard(r.flat, now, selected = selectedKey == r.flat.host + "/" + r.flat.session.id) {
-                        onSelect(r.flat.host, r.flat.session.id)
-                    }
+                    SessionListCard(
+                        r.flat, now,
+                        selected = selectedKey == r.flat.host + "/" + r.flat.session.id,
+                        onKill = { vm.kill(r.flat.host, r.flat.session.id) },
+                        onRename = { name -> vm.setSummary(r.flat.host, r.flat.session.id, name) },
+                        onClick = { onSelect(r.flat.host, r.flat.session.id) },
+                    )
                 }
             }
             // Idle: live and attachable, just quiet — shown only when non-empty.
             if (idle.isNotEmpty()) {
                 item(key = "idle-header") { SectionLabel("Idle (${idle.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
                 items(idle, key = { "i:" + it.flat.host + "/" + it.flat.session.id }) { r ->
-                    SessionListCard(r.flat, now, selected = selectedKey == r.flat.host + "/" + r.flat.session.id) {
-                        onSelect(r.flat.host, r.flat.session.id)
-                    }
+                    SessionListCard(
+                        r.flat, now,
+                        selected = selectedKey == r.flat.host + "/" + r.flat.session.id,
+                        onKill = { vm.kill(r.flat.host, r.flat.session.id) },
+                        onRename = { name -> vm.setSummary(r.flat.host, r.flat.session.id, name) },
+                        onClick = { onSelect(r.flat.host, r.flat.session.id) },
+                    )
                 }
             }
             // Stopped: still in the registry but not running (claude exited on its
@@ -369,9 +380,13 @@ fun SessionsListPane(
             if (stopped.isNotEmpty()) {
                 item(key = "stopped-header") { SectionLabel("Stopped (${stopped.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
                 items(stopped, key = { "s:" + it.host + "/" + it.session.id }) { r ->
-                    SessionListCard(r, now, selected = selectedKey == r.host + "/" + r.session.id) {
-                        onSelect(r.host, r.session.id)
-                    }
+                    SessionListCard(
+                        r, now,
+                        selected = selectedKey == r.host + "/" + r.session.id,
+                        onKill = { vm.kill(r.host, r.session.id) },
+                        onRename = { name -> vm.setSummary(r.host, r.session.id, name) },
+                        onClick = { onSelect(r.host, r.session.id) },
+                    )
                 }
             }
             // Ended sessions: killed but resumable — its own collapsible section.
@@ -478,21 +493,59 @@ private fun ClosedSessionCard(c: FlatClosed, selected: Boolean, onOpen: () -> Un
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SessionListCard(r: FlatSession, now: Long, selected: Boolean, onClick: () -> Unit) {
+private fun SessionListCard(
+    r: FlatSession,
+    now: Long,
+    selected: Boolean,
+    onKill: () -> Unit,
+    onRename: (String) -> Unit,
+    onClick: () -> Unit,
+) {
     val cardMod = Modifier.fillMaxWidth().then(
         if (selected)
             Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
         else Modifier,
     )
+    // Rename swaps the card for an inline field (web sessions.html ⋯ → Rename).
+    var renaming by remember { mutableStateOf(false) }
+    // Painted until the agent reports the new name back on its next heartbeat, or a
+    // TTL passes — a rename that never lands (dead host, lost command) must not pin
+    // a name the session doesn't have (web renameOptimistic).
+    var optimistic by remember { mutableStateOf<String?>(null) }
+    val liveName = sessionName(r.session)
+    LaunchedEffect(optimistic, liveName) {
+        val want = optimistic ?: return@LaunchedEffect
+        if (liveName == want) { optimistic = null; return@LaunchedEffect }
+        kotlinx.coroutines.delay(RENAME_OPTIMISTIC_MS)
+        if (optimistic == want) optimistic = null
+    }
+
+    if (renaming) {
+        SessionRenameCard(
+            cardMod,
+            initial = optimistic ?: liveName,
+            onCancel = { renaming = false },
+            onSubmit = { name ->
+                renaming = false
+                optimistic = name  // pin exactly what was asked for (blank clears)
+                onRename(name)
+            },
+        )
+        return
+    }
+
     TurmaCard(cardMod) {
         Row(
-            Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 8.dp),
+            Modifier.fillMaxWidth().clickable(onClick = onClick).padding(start = 10.dp, top = 8.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             StateDot(liveState(r.session, r.hostLastSeen, now))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(sessionName(r.session), fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    optimistic?.ifBlank { null } ?: liveName,
+                    fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(r.device, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
                     Text(
@@ -514,6 +567,8 @@ private fun SessionListCard(r: FlatSession, now: Long, selected: Boolean, onClic
                     }
                 }
             }
+            // Per-card overflow menu (web sessions.html ⋯): Rename + arm/confirm Kill.
+            SessionCardMenu(onRename = { renaming = true }, onKill = onKill)
         }
     }
 }
@@ -687,3 +742,59 @@ private fun EndedMessage(text: String) {
         )
     }
 }
+
+/** Rename-mode form the card swaps to: seeded field + Cancel/Save. */
+@Composable
+private fun SessionRenameCard(
+    modifier: Modifier,
+    initial: String,
+    onCancel: () -> Unit,
+    onSubmit: (String) -> Unit,
+) {
+    var draft by remember { mutableStateOf(initial) }
+    TurmaCard(modifier) {
+        Column(Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            TurmaField(draft, { draft = it }, "Session name", Modifier.fillMaxWidth())
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Box(Modifier.weight(1f))
+                GhostButton("Cancel", onCancel)
+                GhostButton("Save", onClick = { onSubmit(draft.trim()) })
+            }
+        }
+    }
+}
+
+/**
+ * The card's ⋯ menu. Rename opens the inline field; Kill arms then confirms
+ * (web killArmedId): the first tap turns the item into a red "Confirm kill" for
+ * [KILL_ARM_MS], and only a second tap within that window kills the session, so a
+ * mis-tap can't destroy it. Closing the menu disarms.
+ */
+@Composable
+private fun SessionCardMenu(onRename: () -> Unit, onKill: () -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    var armed by remember { mutableStateOf(false) }
+    LaunchedEffect(armed) { if (armed) { kotlinx.coroutines.delay(KILL_ARM_MS); armed = false } }
+    Box {
+        IconButton(onClick = { open = true }) { Icon(Icons.Filled.MoreVert, "Session actions") }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false; armed = false }) {
+            DropdownMenuItem(
+                text = { Text("Rename…") },
+                onClick = { open = false; armed = false; onRename() },
+            )
+            DropdownMenuItem(
+                text = {
+                    Text(
+                        if (armed) "Confirm kill" else "Kill",
+                        color = MaterialTheme.colorScheme.error,
+                        fontWeight = if (armed) FontWeight.SemiBold else FontWeight.Normal,
+                    )
+                },
+                onClick = { if (armed) { armed = false; open = false; onKill() } else armed = true },
+            )
+        }
+    }
+}
+
+private const val KILL_ARM_MS = 3500L
+private const val RENAME_OPTIMISTIC_MS = 10_000L

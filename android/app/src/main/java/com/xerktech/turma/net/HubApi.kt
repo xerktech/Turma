@@ -67,6 +67,13 @@ interface HubApi {
         @Body body: ModeRequest,
     ): OkResponse
 
+    @POST("api/agents/{host}/sessions/{id}/summary")
+    suspend fun setSummary(
+        @Path("host") host: String,
+        @Path("id") id: String,
+        @Body body: SummaryRequest,
+    ): OkResponse
+
     @POST("api/agents/{host}/sessions/{id}/answer")
     suspend fun answerQuestion(
         @Path("host") host: String,
@@ -206,6 +213,10 @@ data class ModelRequest(val model: String)
 
 @Serializable
 data class ModeRequest(val permissionMode: String)
+
+/** Rename a session — a blank [summary] clears the name back to the fallback. */
+@Serializable
+data class SummaryRequest(val summary: String)
 
 @Serializable
 data class AutoStartRequest(val enabled: Boolean)
