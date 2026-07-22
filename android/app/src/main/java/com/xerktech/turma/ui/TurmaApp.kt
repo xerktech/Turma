@@ -7,6 +7,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -60,7 +61,17 @@ fun TurmaApp(
     LaunchedEffect(pendingDeepLink, settings.configured) {
         val dl = pendingDeepLink ?: return@LaunchedEffect
         if (settings.configured && !dl.host.isNullOrEmpty() && !dl.sessionId.isNullOrEmpty()) {
-            nav.navigate(Routes.chat(dl.host, dl.sessionId))
+            // Root the jumped-to session on the Sessions list rather than stacking
+            // it atop whatever chat was open (XERK-66): pop everything above the
+            // dashboard root, put a fresh Sessions list under the chat, then open
+            // it. So Back (arrow OR the Android button) from a notification-opened
+            // session always lands on the list, and repeated taps never accumulate
+            // a chain of chats to walk back through.
+            nav.navigate(TopDest.SESSIONS.route) {
+                popUpTo(nav.graph.findStartDestination().id) { inclusive = false }
+                launchSingleTop = true
+            }
+            nav.navigate(Routes.chat(dl.host, dl.sessionId)) { launchSingleTop = true }
         }
         onDeepLinkConsumed()
     }

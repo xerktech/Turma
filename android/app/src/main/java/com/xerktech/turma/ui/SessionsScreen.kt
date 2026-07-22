@@ -1,5 +1,6 @@
 package com.xerktech.turma.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -138,6 +139,12 @@ fun SessionsRoute(
             )
         }
     }
+
+    // Narrow full-screen chat is selection state, not a nav destination, so the
+    // Android back button would otherwise pop the whole Sessions tab. Intercept it
+    // to clear the selection — Back returns to the list, like the top-bar arrow
+    // (XERK-66). Scoped to the narrow case, where the arrow (showBack) also shows.
+    BackHandler(enabled = !wide && hasSel) { clear() }
 
     when {
         // Narrow + a session picked: full-screen chat, no bottom nav (web parity).
