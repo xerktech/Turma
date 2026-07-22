@@ -31,6 +31,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **In-app updater** (`ui/UpdateBanner.kt`) — a sideload stopgap until Play (XERK-11), no web analog.
 - **Chat verbosity defaults to Concise** (XERK-40), where the web defaults to Normal — a phone screen
   fits far less, so tool cards/outputs are opt-in there. A per-session pick still persists as on web.
+- **One "+" per repo, opening the composer** (XERK-69). The web dashboard has two spawn controls per
+  repo — a "+ New session" quick bare-spawn and a ▾ caret to the option composer. Android collapses
+  these to a single "+" that opens the `SpawnDialog` (prompt/label/base/model/mode); the separate
+  quick-spawn (was the ⚙/Tune icon) is gone. A phone header has room for one action, and the composer
+  covers the bare case by leaving every field blank.
 
 ## Done (this pass — first installment)
 

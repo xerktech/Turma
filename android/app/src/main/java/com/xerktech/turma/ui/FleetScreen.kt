@@ -23,7 +23,6 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -118,7 +117,6 @@ fun FleetScreen(
                         now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis(),
                         expanded = expandedHosts[agent.key] ?: true,
                         onToggle = { expandedHosts[agent.key] = !(expandedHosts[agent.key] ?: true) },
-                        onQuickSpawn = { host, repo -> vm.spawn(host, repo) },
                         onComposeSpawn = { host, repo, isRoot -> spawnFor = Triple(host, repo, isRoot) },
                         onResume = { host, repo -> resumeFor = host to repo },
                         onPrune = { host, repo -> pruneFor = host to repo },
@@ -185,7 +183,6 @@ private fun HostSection(
     now: Long,
     expanded: Boolean,
     onToggle: () -> Unit,
-    onQuickSpawn: (String, String) -> Unit,
     onComposeSpawn: (String, String, Boolean) -> Unit,
     onResume: (String, RepoInfo) -> Unit,
     onPrune: (String, String) -> Unit,
@@ -231,7 +228,6 @@ private fun HostSection(
                         val sessions = agent.sessions.filter { if (repo.root) it.root else (!it.root && it.repo == repo.name) }
                         RepoSection(
                             repo = repo, sessions = sessions, now = now, hostLastSeen = agent.lastSeen,
-                            onQuickSpawn = { onQuickSpawn(agent.key, repo.name) },
                             onComposeSpawn = { onComposeSpawn(agent.key, repo.name, repo.root) },
                             onResume = { onResume(agent.key, repo) },
                             onPrune = { onPrune(agent.key, repo.name) },
@@ -251,7 +247,6 @@ private fun RepoSection(
     sessions: List<SessionInfo>,
     now: Long,
     hostLastSeen: Long,
-    onQuickSpawn: () -> Unit,
     onComposeSpawn: () -> Unit,
     onResume: () -> Unit,
     onPrune: () -> Unit,
@@ -271,8 +266,7 @@ private fun RepoSection(
             )
             val rootBusy = repo.root && sessions.any { it.status == "running" }
             if (!rootBusy) {
-                IconButton(onClick = onQuickSpawn, modifier = Modifier.size(32.dp)) { Icon(Icons.Filled.Add, "New session", Modifier.size(18.dp)) }
-                IconButton(onClick = onComposeSpawn, modifier = Modifier.size(32.dp)) { Icon(Icons.Filled.Tune, "New session with options", Modifier.size(18.dp)) }
+                IconButton(onClick = onComposeSpawn, modifier = Modifier.size(32.dp)) { Icon(Icons.Filled.Add, "New session", Modifier.size(18.dp)) }
             }
             if (repo.resumable.isNotEmpty()) GhostButton("Resume", onResume)
             if (!repo.root) GhostButton("Prune", onPrune)
