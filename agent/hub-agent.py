@@ -1698,6 +1698,26 @@ def _last_entry(path):
     return None
 
 
+def _last_activity_ts(path):
+    """ISO timestamp of the newest transcript entry that carries one — the true
+    'last new message' time (XERK-73). This is the accurate sort key for the
+    ended list, immune to the file-mtime drift the `resumable` scan otherwise
+    inherits: a week-old conversation copied onto this host (a synced ~/.claude,
+    a backup restore) gets mtime=now and sorts to the top though nothing was
+    said, but its entries keep their original UTC timestamps. Scans the tail
+    newest-first and returns the first entry's `timestamp`; None when no tail
+    entry has one (an older/odd transcript), leaving the caller its mtime
+    fallback."""
+    for raw in reversed(_read_tail_lines(path, 1 << 17)):  # ~128 KB
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue  # partial write at the tail, or the seek-point fragment
+        if isinstance(entry, dict) and entry.get("timestamp"):
+            return entry["timestamp"]
+    return None
+
+
 def _tail_entries(path):
     """Parsed dict entries from roughly the last 128 KB of a transcript JSONL,
     in file order. Tolerant JSONL parse: lines that fail json.loads or don't
@@ -7582,13 +7602,21 @@ class SessionManager:
                 })
         sess_meta = self._session_meta_by_slug()
         for repo, lst in by_repo.items():
+            # Cap by mtime (a cheap stat, already in hand) so the accurate
+            # last-message read below is paid only for the survivors. mtime can
+            # be inflated by a file copy, but that only ever KEEPS a transcript
+            # that a truthful key would have dropped — never the reverse — so the
+            # cap stays a safe superset; the hub sorts the survivors by endedTs.
             lst.sort(key=lambda e: e["mtime"], reverse=True)
             del lst[RESUMABLE_PER_REPO:]
             for e in lst:
+                path = os.path.join(PROJECTS_ROOT, e["slug"], e["transcriptId"] + ".jsonl")
                 sm = sess_meta.get(e["slug"], {})
-                e["summary"] = sm.get("summary") or _first_user_text(
-                    os.path.join(PROJECTS_ROOT, e["slug"], e["transcriptId"] + ".jsonl"))
-                e["endedTs"] = time.strftime(
+                e["summary"] = sm.get("summary") or _first_user_text(path)
+                # The last new message's own timestamp, not the file mtime — see
+                # _last_activity_ts. Falls back to mtime only when the transcript
+                # carries no timestamped entry.
+                e["endedTs"] = _last_activity_ts(path) or time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(e["mtime"]))
                 # Which Jira ticket this conversation was spawned to work, or None
                 # for the ordinary session. This scan is re-derived from the
@@ -7651,14 +7679,21 @@ class SessionManager:
                     "worktree": attr["worktree"],
                     "size": st.st_size,
                     "mtime": st.st_mtime,
-                    "endedTs": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime)),
+                    "path": path,
                     "createdAt": sm.get("createdAt"),
                     "summary": sm.get("summary"),
                 })
         out.sort(key=lambda m: m["mtime"], reverse=True)
         out = out[:ARCHIVE_MANIFEST_MAX]
         for m in out:
-            m.pop("mtime", None)  # internal sort key; not part of the payload
+            # The last new message's own timestamp, not the file mtime (XERK-73) —
+            # the archive orders and dates its rows by this, so a synced/restored
+            # transcript with an inflated mtime must not read as recently ended.
+            # Paid only for the capped survivors. Falls back to mtime.
+            m["endedTs"] = _last_activity_ts(m["path"]) or time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(m["mtime"]))
+            m.pop("mtime", None)   # internal sort key; not part of the payload
+            m.pop("path", None)
         return out
 
     def _archive_deltas(self, archive_have):

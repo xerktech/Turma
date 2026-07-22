@@ -1394,6 +1394,12 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - Sorted **most recently ended first** (`endedMs`, from `closedAt`/`stoppedAt`/`endedTs` — note
   `resumableSession()` must copy `endedTs` onto the record, where `endedEntry` reads the key). An undated
   record (older agent) sorts oldest.
+- The resumable channel's **`endedTs` is the last message's own transcript timestamp**
+  (`_last_activity_ts`), NOT the file mtime (XERK-73). mtime is inflated to copy-time by a synced
+  `~/.claude` or a backup restore, so a week-old conversation sorted to the top of Ended though nothing
+  was said; the entries keep their real UTC timestamps, which is the accurate sort/display key.
+  `_archive_manifest` dates its rows the same way. Both fall back to mtime for a transcript with no
+  timestamped entry. Tests: `TestLastActivityTs`, the `endedTs` cases in `TestResumableReport`.
 - A **running** session is never also listed as ended: the agent re-cuts the cached scan against its live
   registry every beat (`_sorted_repo_entries`), and the page dedupes resumable rows against every reported
   session's `transcriptId` (why `_session_payload` reports it for running sessions too).

@@ -144,7 +144,10 @@ those are marked `[MODEL]`.
   read-only review itself is done (XERK-70, below).
 - P0 Per-card ⋯ menu: Rename (inline) + arm/confirm Kill. (Kill in the chat/terminal header is done —
   XERK-44; the per-list-card ⋯ menu with Rename is still open.)
-- P1 Sidebar sections: Queued / Active / Idle / Ended split with state line + question preview.
+- P1 Sidebar sections: Active / Idle split done (XERK-73) — `rankRunning` ranks running sessions
+  attention-first / freshest-first into Active (waiting+working) and Idle, plus a Stopped group for
+  non-running registry records. Still open: a dedicated Queued section, and a state line + question
+  preview on each card.
 - P1 Verbosity NORMAL: tool card collapsed (output on expand) to match web; persist per-card open.
 - ~~P2 Live status bar: token counters + elapsed + spinner + hint lines + subagent list.~~
   Done (XERK-75) — see "Done" below.
