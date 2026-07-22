@@ -2,6 +2,7 @@ package com.xerktech.turma.ui
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -37,22 +38,31 @@ fun ChatItemView(item: ChatItem) {
     }
 }
 
+// The bubble keeps a max width so a long turn doesn't run edge to edge, but the
+// leftover gutter (available width − BASE_BUBBLE_MAX) is halved (XERK-74): the cap
+// is (available + BASE_BUBBLE_MAX)/2, so the empty space shrinks by half at any
+// screen width. Short turns still hug their text; only the cap moves.
+private val BASE_BUBBLE_MAX = 340.dp
+
 @Composable
 private fun TranscriptBubble(b: ChatItem.Bubble) {
     val isUser = b.role == "user"
     val shown = if (b.revealLen in 0 until b.text.length) b.text.take(b.revealLen) else b.text
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start) {
-        Surface(
-            color = if (isUser) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surfaceVariant,
-            shape = RoundedCornerShape(12.dp),
-            modifier = Modifier.widthIn(max = 340.dp),
-        ) {
-            Text(
-                shown,
-                Modifier.padding(10.dp, 6.dp),
-                fontSize = 13.sp,
-                lineHeight = 18.sp,
-            )
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val cap = (maxWidth + BASE_BUBBLE_MAX) / 2
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start) {
+            Surface(
+                color = if (isUser) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.widthIn(max = cap),
+            ) {
+                Text(
+                    shown,
+                    Modifier.padding(10.dp, 6.dp),
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp,
+                )
+            }
         }
     }
 }
