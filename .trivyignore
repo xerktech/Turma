@@ -34,3 +34,18 @@ CVE-2026-42504 exp:2026-10-10
 # package Microsoft publishes for bookworm. Revisit on the expiry: a later
 # azure-cli vendoring cryptography 48+ clears it with a pin bump.
 GHSA-537c-gmf6-5ccf exp:2026-10-10
+
+# CVE-2026-47302 / -47304 / -50525 / -50527 / -50648 — HIGH .NET
+# (System.Security.Cryptography.Xml 10.0.6) DoS / security-feature-bypass CVEs,
+# all fixed in dotnet 10.0.10 / 9.0.18 / 8.0.4. From azure-cli's OWN vendored
+# .NET runtime, not anything this repo installs — az bundles and pins that tree
+# itself, so the only lever is AZURE_CLI_VERSION, and 2.88.0 is already the
+# newest package Microsoft publishes for bookworm (same story as GHSA-537c
+# above). Not first-party code; the blast radius is the `az` CLI a session runs
+# by hand. Revisit on the expiry: a later azure-cli bundling patched .NET clears
+# them with a pin bump.
+CVE-2026-47302 exp:2026-10-10
+CVE-2026-47304 exp:2026-10-10
+CVE-2026-50525 exp:2026-10-10
+CVE-2026-50527 exp:2026-10-10
+CVE-2026-50648 exp:2026-10-10
