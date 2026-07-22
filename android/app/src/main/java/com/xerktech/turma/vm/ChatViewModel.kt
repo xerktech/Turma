@@ -135,7 +135,15 @@ class ChatViewModel(
                         // Empty text = turn committed; the tail owns it now.
                         it.copy(liveTurn = ev.text, turnStatus = ev.status)
                     }
-                    is LiveEvent.Connected -> _state.update { it.copy(connected = ev.up) }
+                    // Clear the live status when the tail drops: a phone backgrounds
+                    // sockets far more than a desktop tab, and a "Working…" spinner
+                    // stuck on forever after the tail dies is worse than none (the
+                    // same reasoning the web's Stop button uses — a status it can no
+                    // longer see should not be shown). It repopulates on reconnect.
+                    is LiveEvent.Connected -> _state.update {
+                        if (ev.up) it.copy(connected = true)
+                        else it.copy(connected = false, turnStatus = null)
+                    }
                 }
             }
         }

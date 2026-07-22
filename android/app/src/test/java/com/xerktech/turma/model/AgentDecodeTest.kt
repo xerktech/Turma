@@ -95,4 +95,40 @@ class AgentDecodeTest {
         assertEquals("", closed.transcriptId)
         assertEquals(0, closed.prs.size)
     }
+
+    // The live-status frame (XERK-75): tunnel-agent.js scrapes up/down/elapsed as
+    // DISPLAY STRINGS ("1.2k", "12s") and attaches an optional agents[] list. These
+    // were typed Long, so decodeFromString<TailFrame> threw on every real status
+    // frame — and LiveTail swallows that, dropping the whole turn. Lock the shapes.
+    @Test fun `a turn status frame with string tokens and an agent list decodes`() {
+        val body = """
+            {
+              "type": "turn", "text": "hello",
+              "status": {
+                "verb": "Cogitating", "up": "1.2k", "down": "340", "elapsed": "12s",
+                "hint": "Tip: press esc\n☐ write the test",
+                "agents": [
+                  { "sel": true, "type": "main" },
+                  { "sel": false, "type": "Explore", "label": "look at chat.js" }
+                ]
+              }
+            }
+        """.trimIndent()
+        val frame = TurmaJson.decodeFromString<TailFrame>(body)
+        val st = frame.status!!
+        assertEquals("Cogitating", st.verb)
+        assertEquals("1.2k", st.up)
+        assertEquals("340", st.down)
+        assertEquals("12s", st.elapsed)
+        assertEquals(2, st.agents.size)
+        assertEquals("main", st.agents[0].type)
+        assertEquals(true, st.agents[0].sel)
+        assertEquals("look at chat.js", st.agents[1].label)
+    }
+
+    // An idle frame carries no status (null) and no agents — must default cleanly.
+    @Test fun `a turn frame with no status decodes to null`() {
+        val frame = TurmaJson.decodeFromString<TailFrame>("""{ "type": "turn", "text": "" }""")
+        assertNull(frame.status)
+    }
 }

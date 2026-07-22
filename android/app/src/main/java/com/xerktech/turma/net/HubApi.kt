@@ -78,6 +78,16 @@ interface HubApi {
     @GET("api/agents/{host}/sessions/{id}/history")
     suspend fun history(@Path("host") host: String, @Path("id") id: String): Response<HistoryResponse>
 
+    // One live background agent's transcript (same fresh-cache / queue-and-202
+    // shape as history). type+label identify the pane agent-list row.
+    @GET("api/agents/{host}/sessions/{id}/subagents/history")
+    suspend fun subagentHistory(
+        @Path("host") host: String,
+        @Path("id") id: String,
+        @Query("type") type: String,
+        @Query("label") label: String,
+    ): Response<HistoryResponse>
+
     @POST("api/agents/{host}/clone")
     suspend fun clone(@Path("host") host: String, @Body body: CloneRequest): OkResponse
 

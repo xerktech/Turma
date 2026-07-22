@@ -450,10 +450,28 @@ data class TailFrame(
 @Serializable
 data class TurnStatus(
     val verb: String = "",
-    val up: Long = 0,
-    val down: Long = 0,
-    val elapsed: Long = 0,
+    // Token counters and elapsed are DISPLAY STRINGS on the wire ("1.2k", "340",
+    // "12s", or "" when absent) — parsePaneStatus in tunnel-agent.js scrapes them
+    // straight off the TUI, it does not emit numbers. Typing them as Long made
+    // decodeFromString<TailFrame> throw on every real status frame (coerceInputValues
+    // won't turn "1.2k"/"" into a Long), and LiveTail swallows that exception and
+    // drops the WHOLE turn frame — so the status footer never rendered.
+    val up: String = "",
+    val down: String = "",
+    val elapsed: String = "",
     val hint: String = "",
+    // The live agent-manager list scraped from the pane (parseAgentList in
+    // tunnel-agent.js): "main" plus each background subagent. Present only when the
+    // TUI's agent list is expanded below the input box; absent otherwise.
+    val agents: List<AgentRow> = emptyList(),
+)
+
+/** One row of the pane's live agent list: {sel,type,label} (tunnel-agent.js). */
+@Serializable
+data class AgentRow(
+    val sel: Boolean = false,
+    val type: String = "",
+    val label: String = "",
 )
 
 @Serializable

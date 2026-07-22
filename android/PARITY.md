@@ -107,6 +107,21 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   archived/ended transcript viewer in `ui/ArchiveScreen.kt` are now wrapped in a `SelectionContainer`:
   long-press selects, the system copy toolbar copies, and taps still toggle the tool/thinking cards.
 
+- **Live working-status bar (XERK-75).** The chat footer now renders the full web
+  `#chatStatus` (chat.js `updateLiveStatus`/`agentsHtml`): a spinner + gerund verb,
+  right-aligned elapsed + ↑/↓ token counters, Claude Code's rotating tip / active-task
+  hint lines (one clipped row each), and the live agent-manager list — "main" a plain
+  marker, each background subagent a tappable row that opens its transcript read-only
+  (new `GET .../subagents/history` endpoint, `SubagentViewModel` + `SubagentView`,
+  reusing the ended-review `buildItems`/`ChatItemView` engine; Back returns to the
+  parent chat, the web's `subagentReturn`). Was a single verb+hint line that, in
+  practice, never showed: `TurnStatus.up/down/elapsed` were typed `Long` but the wire
+  sends display strings ("1.2k"/"12s"/""), so `decodeFromString<TailFrame>` threw and
+  `LiveTail` dropped the whole turn frame — fixed to `String`, plus a new `agents[]`
+  field. `model/Models.kt`, `net/HubApi.kt`, `net/HubClient.kt`, `vm/ChatViewModel.kt`,
+  `vm/SubagentViewModel.kt`, `ui/ChatScreen.kt`, `ui/SessionsScreen.kt`; decode locked
+  in `AgentDecodeTest`.
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
@@ -131,7 +146,8 @@ those are marked `[MODEL]`.
   XERK-44; the per-list-card ⋯ menu with Rename is still open.)
 - P1 Sidebar sections: Queued / Active / Idle / Ended split with state line + question preview.
 - P1 Verbosity NORMAL: tool card collapsed (output on expand) to match web; persist per-card open.
-- P2 Live status bar: token counters + elapsed + spinner + hint lines + subagent list.
+- ~~P2 Live status bar: token counters + elapsed + spinner + hint lines + subagent list.~~
+  Done (XERK-75) — see "Done" below.
 - P2 `[MODEL]` Compose bar: Jira ticket chip; filter modes to `permissionModes`;
   optimistic model/mode update. (All PR chips: done — XERK-46.)
 - ~~P2 New-session composer in the Sessions list (web can spawn from here).~~ Done (XERK-44): a "+"
