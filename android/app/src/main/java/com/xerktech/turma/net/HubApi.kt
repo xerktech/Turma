@@ -4,7 +4,7 @@ import com.xerktech.turma.model.AgentsResponse
 import com.xerktech.turma.model.ArchiveListResponse
 import com.xerktech.turma.model.ArchiveTranscript
 import com.xerktech.turma.model.HistoryResponse
-import com.xerktech.turma.model.JiraIssueDetail
+import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.SearchResponse
 import com.xerktech.turma.model.WsTokenResponse
 import kotlinx.serialization.Serializable
@@ -127,12 +127,13 @@ interface HubApi {
     @GET("api/archive/{tid}")
     suspend fun archiveTranscript(@Path("tid") transcriptId: String): ArchiveTranscript
 
-    // 200 with the issue, or 202 {pending} while the host fetches it on demand.
+    // 200 {issue|error, fetchedAt, stale?}, or 202 {pending} while the host
+    // fetches it on demand. The issue is nested under `issue` in the envelope.
     @GET("api/jira/{siteKey}/{issueKey}")
     suspend fun jiraIssue(
         @Path("siteKey") siteKey: String,
         @Path("issueKey") issueKey: String,
-    ): Response<JiraIssueDetail>
+    ): Response<JiraIssueEnvelope>
 
     @POST("api/jira/refresh")
     suspend fun jiraRefresh(): OkResponse

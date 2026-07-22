@@ -205,6 +205,21 @@ data class JiraIssueDetail(
     val stale: Boolean = false,
 )
 
+/**
+ * The GET /api/jira/<siteKey>/<key> response envelope: the hub wraps the issue
+ * under `issue` (plus `fetchedAt`/`stale`), or returns `{error}`, or 202
+ * `{pending}` while the owning host fetches it on demand. Decoding the top-level
+ * body straight into [JiraIssueDetail] silently loses every field (the issue is
+ * nested), so the envelope is unwrapped explicitly — see BoardViewModel.fetchIssue.
+ */
+@Serializable
+data class JiraIssueEnvelope(
+    val issue: JiraIssueDetail? = null,
+    val error: String? = null,
+    val stale: Boolean = false,
+    val pending: Boolean = false,
+)
+
 @Serializable
 data class JiraComment(
     val author: String = "",

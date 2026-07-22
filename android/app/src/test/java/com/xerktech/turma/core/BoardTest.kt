@@ -2,6 +2,8 @@ package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.JiraBlock
+import com.xerktech.turma.model.JiraIssueDetail
+import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.JiraTicket
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -280,5 +282,40 @@ class BoardTest {
         assertEquals(true, autoStartOn(mapOf(site to true), site))
         // Another org's entry doesn't leak across siteKeys.
         assertEquals(false, autoStartOn(mapOf(site to true), "other.atlassian.net"))
+    }
+
+    // XERK-83: the on-demand issue detail response envelope.
+    @Test fun `a 202 pending response asks to poll again`() {
+        assertEquals(IssueFetch.Pending, classifyIssueResponse(202, null))
+        // The hub also flags pending in a 200 body (older shape); honour it too.
+        assertEquals(IssueFetch.Pending, classifyIssueResponse(200, JiraIssueEnvelope(pending = true)))
+    }
+
+    @Test fun `a 200 unwraps the nested issue, not the top-level body`() {
+        // The issue lives under `issue`; decoding the body itself blanks every
+        // field, which was the empty-sheet half of the bug.
+        val env = JiraIssueEnvelope(
+            issue = JiraIssueDetail(key = "X-1", description = "hi", stale = false),
+            stale = true,
+        )
+        val out = classifyIssueResponse(200, env)
+        assertTrue(out is IssueFetch.Done)
+        val d = (out as IssueFetch.Done).detail
+        assertEquals("X-1", d.key)
+        assertEquals("hi", d.description)
+        // The envelope's stale flag rides onto the detail.
+        assertEquals(true, d.stale)
+    }
+
+    @Test fun `a cached error becomes an error-bearing detail, never a spin`() {
+        val out = classifyIssueResponse(200, JiraIssueEnvelope(error = "boom"))
+        assertTrue(out is IssueFetch.Done)
+        assertEquals("boom", (out as IssueFetch.Done).detail.error)
+    }
+
+    @Test fun `a non-2xx with no parsed body surfaces the code`() {
+        val out = classifyIssueResponse(503, null)
+        assertTrue(out is IssueFetch.Done)
+        assertEquals("HTTP 503", (out as IssueFetch.Done).detail.error)
     }
 }
