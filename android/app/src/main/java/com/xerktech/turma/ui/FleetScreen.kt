@@ -353,7 +353,9 @@ private fun FleetTiles(s: FleetSummary) {
         val tileMod = Modifier.weight(1f)
         SummaryTile("Hosts online", "${s.hostsOnline} / ${s.hostsTotal}",
             s.devices.joinToString(", ").ifBlank { "no devices yet" }, tileMod)
-        SummaryTile("Running sessions", s.running.toString(), "${s.totalSessions} total", tileMod)
+        SummaryTile("Running sessions",
+            if (s.maxSessions != null) "${s.running} / ${s.maxSessions}" else s.running.toString(),
+            "${s.totalSessions} total", tileMod)
         SummaryTile("Waiting on you", s.waiting.toString(), "sessions with a question", tileMod)
         SummaryTile("Tokens today", fmtTokens(s.tokensToday), "all sessions, incl. cache", tileMod)
         SummaryTile("Tokens this week", fmtTokens(s.tokensWeek), "last 7 days (UTC)", tileMod)

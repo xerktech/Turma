@@ -735,11 +735,19 @@ function render(data) {
     ? (totalTokens(a.usage[w]) || 0)
     : (a.sessions || []).reduce((n, s) => n + (totalTokens(s.usage?.[w]) || 0), 0)), 0);
   const models = shortModels(mergeModels(agents.map(a => a.usage?.models)));
+  // MAX_SESSIONS is a PER-AGENT ceiling (agent capacity.maxSessions), so the cap
+  // for the current selection is the SUM across the scoped hosts — an org with
+  // several agents can run more than one host's worth. Only hosts that report the
+  // capacity block count; if none do (a pre-capacity fleet) the ceiling is unknown
+  // and we show the running count alone rather than a misleading "/ 0".
+  const capHosts = agents.filter(a => a.capacity && typeof a.capacity.maxSessions === "number");
+  const maxSessions = capHosts.reduce((t, a) => t + a.capacity.maxSessions, 0);
+  const runningValue = capHosts.length ? `${running.length} / ${maxSessions}` : String(running.length);
 
   $tiles.innerHTML =
     tile("Hosts online", `${online.length} / ${agents.length}`,
          [...new Set(agents.map(a => a.device))].join(", ") || "no devices yet") +
-    tile("Running sessions", String(running.length), sess.length + " total") +
+    tile("Running sessions", runningValue, sess.length + " total") +
     tile("Waiting on you", String(waiting.length), "sessions with a question") +
     tile("Tokens today", fmtTokens(fleetTokens("today")), "all sessions, incl. cache") +
     tile("Tokens this week", fmtTokens(fleetTokens("week")), "last 7 days (UTC)") +
