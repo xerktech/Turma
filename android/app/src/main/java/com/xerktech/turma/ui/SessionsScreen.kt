@@ -82,6 +82,40 @@ fun flattenSessions(
     return filtered.sortedBy { it.session.status != "running" }
 }
 
+/** One running session tagged with its live state — the row unit for the ranked
+ *  Active/Idle lists. */
+data class RankedSession(val flat: FlatSession, val state: com.xerktech.turma.core.LiveState)
+
+/** Attention rank for the running lists — waiting, then working, then idle,
+ *  matching the web sidebar's KIND_ORDER. */
+private val KIND_RANK = mapOf(
+    com.xerktech.turma.core.LiveState.WAITING to 0,
+    com.xerktech.turma.core.LiveState.WORKING to 1,
+    com.xerktech.turma.core.LiveState.IDLE to 2,
+)
+
+/**
+ * The running sessions split into the web sessions sidebar's two live groups —
+ * Active (attention-worthy: waiting + working) and Idle — each ranked as the web's
+ * `collect()` does: attention-first by [KIND_RANK], then freshest activity first.
+ * Freshest-first is ascending transcript age; a session with no transcript yet
+ * (null age) sorts first, exactly as the web's `?? -1` fallback. Returns
+ * (active, idle). Only status=="running" sessions are ranked here; stopped/queued
+ * records are handled separately by the caller.
+ */
+fun rankRunning(rows: List<FlatSession>, now: Long): Pair<List<RankedSession>, List<RankedSession>> {
+    val running = rows.asSequence()
+        .filter { it.session.status == "running" }
+        .map { RankedSession(it, liveState(it.session, it.hostLastSeen, now)) }
+        .sortedWith(
+            compareBy<RankedSession> { KIND_RANK[it.state] ?: 3 }
+                .thenBy { it.flat.session.session?.transcriptAgeSec ?: -1.0 },
+        )
+        .toList()
+    return running.filter { it.state != com.xerktech.turma.core.LiveState.IDLE } to
+        running.filter { it.state == com.xerktech.turma.core.LiveState.IDLE }
+}
+
 /** An online host and the repos a new session can be spawned in on it. */
 data class SpawnHost(val key: String, val device: String, val repos: List<com.xerktech.turma.model.RepoInfo>)
 
@@ -204,6 +238,11 @@ fun SessionsListPane(
     // polls exactly one org, so scoping the agent list scopes all three.
     val agents = remember(fleet.agents, org) { scopedAgents(fleet.agents, org) }
     val rows = remember(agents, query) { flattenSessions(agents, query) }
+    // The live sessions split into the web's Active (waiting/working) and Idle
+    // sections, each ranked attention-first / freshest-first (XERK-73). Stopped
+    // records (claude exited on its own) are neither — they trail below.
+    val (active, idle) = remember(rows, now) { rankRunning(rows, now) }
+    val stopped = remember(rows) { rows.filter { it.session.status != "running" } }
     val ended = remember(agents, query) { flattenClosed(agents, query) }
     var endedOpen by remember { mutableStateOf(false) }
     // New-session picker: pick an online host + repo, then the spawn composer.
@@ -239,9 +278,44 @@ fun SessionsListPane(
                     )
                 }
             }
-            items(rows, key = { it.host + "/" + it.session.id }) { r ->
-                SessionListCard(r, now, selected = selectedKey == r.host + "/" + r.session.id) {
-                    onSelect(r.host, r.session.id)
+            // Active: sessions wanting attention (waiting on you, or working). The
+            // header shows even when empty, so "nothing active right now" reads as
+            // a state rather than a missing section — matching the web sidebar.
+            if (rows.isNotEmpty() || ended.isNotEmpty()) {
+                item(key = "active-header") { SectionLabel("Active (${active.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
+                if (active.isEmpty()) {
+                    item(key = "active-empty") {
+                        Text(
+                            if (idle.isNotEmpty()) "No active sessions. See Idle below." else "No active sessions.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(vertical = 4.dp),
+                        )
+                    }
+                }
+                items(active, key = { "a:" + it.flat.host + "/" + it.flat.session.id }) { r ->
+                    SessionListCard(r.flat, now, selected = selectedKey == r.flat.host + "/" + r.flat.session.id) {
+                        onSelect(r.flat.host, r.flat.session.id)
+                    }
+                }
+            }
+            // Idle: live and attachable, just quiet — shown only when non-empty.
+            if (idle.isNotEmpty()) {
+                item(key = "idle-header") { SectionLabel("Idle (${idle.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
+                items(idle, key = { "i:" + it.flat.host + "/" + it.flat.session.id }) { r ->
+                    SessionListCard(r.flat, now, selected = selectedKey == r.flat.host + "/" + r.flat.session.id) {
+                        onSelect(r.flat.host, r.flat.session.id)
+                    }
+                }
+            }
+            // Stopped: still in the registry but not running (claude exited on its
+            // own). Startable in place; shown only when present.
+            if (stopped.isNotEmpty()) {
+                item(key = "stopped-header") { SectionLabel("Stopped (${stopped.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
+                items(stopped, key = { "s:" + it.host + "/" + it.session.id }) { r ->
+                    SessionListCard(r, now, selected = selectedKey == r.host + "/" + r.session.id) {
+                        onSelect(r.host, r.session.id)
+                    }
                 }
             }
             // Ended sessions: killed but resumable — its own collapsible section.

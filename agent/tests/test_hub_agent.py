@@ -752,6 +752,37 @@ class TestLastEntry(ProjectDirMixin, unittest.TestCase):
         self.assertIsNone(ha._last_entry(os.path.join(self.proj, "nope.jsonl")))
 
 
+class TestLastActivityTs(ProjectDirMixin, unittest.TestCase):
+    """XERK-73: the last new message's own timestamp, the accurate ended-list sort
+    key that the file mtime is not."""
+
+    def test_newest_timestamped_entry_wins(self):
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [
+            {"type": "user", "timestamp": "2026-07-01T00:00:00.000Z"},
+            {"type": "assistant", "timestamp": "2026-07-01T00:05:00.000Z"},
+        ])
+        self.assertEqual(ha._last_activity_ts(path), "2026-07-01T00:05:00.000Z")
+
+    def test_skips_a_trailing_untimestamped_entry(self):
+        """A summary/system tail entry without a timestamp doesn't blank the key —
+        the scan keeps walking back to the last real message."""
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [
+            {"type": "assistant", "timestamp": "2026-07-01T00:05:00.000Z"},
+            {"type": "summary", "summary": "recap"},   # no timestamp
+        ])
+        self.assertEqual(ha._last_activity_ts(path), "2026-07-01T00:05:00.000Z")
+
+    def test_none_without_any_timestamp(self):
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [{"type": "assistant", "n": 1}])
+        self.assertIsNone(ha._last_activity_ts(path))
+
+    def test_missing_file(self):
+        self.assertIsNone(ha._last_activity_ts(os.path.join(self.proj, "nope.jsonl")))
+
+
 class TestSessionReport(ProjectDirMixin, unittest.TestCase):
     PR1 = "https://github.com/xerktech/Turma/pull/34"
     PR2 = "https://github.com/xerktech/DockerOps/pull/7"
@@ -2534,6 +2565,40 @@ class TestResumableReport(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         self.assertEqual(sm._resumable_report()["Turma"][0]["slug"],
                          ha._project_slug(wt))
+
+    def test_endedTs_is_the_last_message_timestamp_not_the_mtime(self):
+        """XERK-73: the ended list sorts on endedTs, so it must be the last new
+        message's own timestamp — NOT the file mtime, which a synced ~/.claude or
+        a backup restore inflates to copy-time (a week-old chat sorting to the top
+        of Ended though nothing was said). The transcript's entries keep their
+        real timestamps, so those are the truth."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "w1")
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, "t1.jsonl")
+        write_jsonl(path, [
+            {"type": "user", "cwd": wt, "timestamp": "2026-07-01T00:00:00.000Z",
+             "message": {"role": "user", "content": "hi"}},
+            {"type": "assistant", "cwd": wt, "timestamp": "2026-07-01T00:05:00.000Z",
+             "message": {"role": "assistant", "content": "done"}},
+        ])
+        # The file was touched recently (a fresh copy), but that is a lie.
+        recent = time.time()
+        os.utime(path, (recent, recent))
+        sm = self.make_manager()
+        e = sm._resumable_report()["Turma"][0]
+        self.assertEqual(e["endedTs"], "2026-07-01T00:05:00.000Z")
+
+    def test_endedTs_falls_back_to_mtime_without_a_timestamped_entry(self):
+        """A transcript whose tail carries no timestamp (an older/odd shape) keeps
+        the mtime fallback rather than losing its endedTs entirely."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "w1")
+        self._write_at(wt, tid="t1")   # _write_at writes no timestamp
+        path = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt), "t1.jsonl")
+        os.utime(path, (1_600_000_000, 1_600_000_000))   # 2020-09-13T12:26:40Z
+        sm = self.make_manager()
+        e = sm._resumable_report()["Turma"][0]
+        self.assertEqual(e["endedTs"], "2020-09-13T12:26:40Z")
 
     def test_report_re_cuts_a_stale_scan_against_the_live_registry(self):
         """The scan is cached across the slow beats between refreshes, so on its
@@ -6539,7 +6604,10 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         self.assertEqual(m["remoteKey"], "github.com/xerk/turma")
         self.assertEqual(m["summary"], "My Task")
         self.assertGreater(m["size"], 0)
+        # endedTs is the last message's own timestamp, not the file mtime (XERK-73).
+        self.assertEqual(m["endedTs"], "2026-07-01T10:00:00Z")
         self.assertNotIn("mtime", m)  # internal sort key stripped
+        self.assertNotIn("path", m)   # internal read path stripped
 
     def test_manifest_excludes_running_session_slug(self):
         sm = self.make_manager()

@@ -1,6 +1,8 @@
 package com.xerktech.turma.ui
 
+import com.xerktech.turma.core.LiveState
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.RepoInfo
 import com.xerktech.turma.model.SessionInfo
 import org.junit.Assert.assertEquals
@@ -41,6 +43,51 @@ class SessionsFlattenTest {
         assertEquals(listOf("b"), flattenSessions(agents, "dockerops").map { it.session.id })
         assertEquals(2, flattenSessions(agents, "maxai").size) // device match
         assertEquals(0, flattenSessions(agents, "nomatch").size)
+    }
+
+    // ---- rankRunning (the Active / Idle sections, XERK-73) -------------------
+
+    private fun flat(
+        id: String, status: String = "running",
+        question: String = "", paneBusy: Boolean? = null, ageSec: Double? = null,
+    ) = FlatSession(
+        host = "h", device = "BOX", online = true, hostLastSeen = 1_000L,
+        session = SessionInfo(
+            id = id, status = status,
+            session = LiveSignals(paneBusy = paneBusy, question = question, transcriptAgeSec = ageSec),
+        ),
+    )
+
+    @Test fun `rankRunning splits active (waiting+working) from idle, dropping non-running`() {
+        val (active, idle) = rankRunning(
+            listOf(
+                flat("idleOne", paneBusy = false),
+                flat("workOne", paneBusy = true),
+                flat("waitOne", question = "pick one"),
+                flat("stoppedOne", status = "stopped"),
+            ),
+            now = 1_000L,
+        )
+        // Active is waiting before working (attention-first, web KIND_ORDER).
+        assertEquals(listOf("waitOne", "workOne"), active.map { it.flat.session.id })
+        assertEquals(listOf(LiveState.WAITING, LiveState.WORKING), active.map { it.state })
+        assertEquals(listOf("idleOne"), idle.map { it.flat.session.id })
+        // The stopped session is in neither list.
+        assertTrue(active.none { it.flat.session.id == "stoppedOne" })
+    }
+
+    @Test fun `rankRunning orders freshest-first within a kind, null age first`() {
+        val (active, _) = rankRunning(
+            listOf(
+                flat("stale", paneBusy = true, ageSec = 90.0),
+                flat("fresh", paneBusy = true, ageSec = 3.0),
+                flat("brandNew", paneBusy = true, ageSec = null), // no transcript yet
+            ),
+            now = 1_000L,
+        )
+        // Same kind (all working): smallest age first, and a null age (never
+        // written) sorts ahead of any aged one — exactly the web's `?? -1`.
+        assertEquals(listOf("brandNew", "fresh", "stale"), active.map { it.flat.session.id })
     }
 
     // ---- spawnTargets (the New-session picker's source list) -----------------
