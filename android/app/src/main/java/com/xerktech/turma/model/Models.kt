@@ -103,6 +103,14 @@ data class ClosedSessionInfo(
     // session — hiding every such host from the fleet (only the per-host SSE push,
     // which decodes hosts one at a time, kept the ticket-free ones visible).
     val ticket: TicketRef? = null,
+    // The conversation this session had, so the Ended-sessions view can open it
+    // read-only from the hub's archive (GET /api/archive/<transcriptId>). Blank on
+    // records written by an agent predating the snapshot (_closed_payload); the
+    // card then falls back to Resume-only (no click-to-review).
+    val transcriptId: String = "",
+    // PR-status objects this session opened, same shape/type as SessionInfo.prs —
+    // rendered as chips on the ended card and the read-only review's stage bar.
+    val prs: List<PrInfo> = emptyList(),
 )
 
 /** A session's Jira ticket link (SessionInfo/ClosedSessionInfo `ticket`). */

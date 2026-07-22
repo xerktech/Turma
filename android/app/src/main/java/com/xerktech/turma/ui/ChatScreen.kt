@@ -384,7 +384,7 @@ private fun ChatFooter(
 }
 
 @Composable
-private fun VerbosityMenu(current: Verbosity, onSelect: (Verbosity) -> Unit) {
+internal fun VerbosityMenu(current: Verbosity, onSelect: (Verbosity) -> Unit) {
     var open by remember { mutableStateOf(false) }
     IconButton(onClick = { open = true }) { Icon(Icons.Filled.Tune, "Verbosity") }
     DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
