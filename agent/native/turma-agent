@@ -104,8 +104,16 @@ fi
 
 # Native-safe defaults, applied only when the config left a key blank/unset (the
 # `:-` treats an empty value as unset, which is why the template ships these
-# blank). PATH gets $PREFIX/bin so a bundled static ttyd is found.
-export PATH="$PREFIX/bin:$PATH"
+# blank). PATH gets $PREFIX/bin so a bundled static ttyd is found, plus
+# $HOME/.local/bin — the prefix install.sh blesses for claude (`npm config set
+# prefix ~/.local`). A login shell carries that dir already, but a systemd
+# --user unit inherits the user manager's default PATH (which ends at
+# /snap/bin), so relying on inheritance left claude unreachable at runtime:
+# the unit stayed active (running) while the models probe and every
+# hub-requested session died on exec with "No such file or directory:
+# 'claude'". The launcher owns guaranteeing a correct runtime PATH, so the
+# blessed install dir belongs here, not in per-host systemd drop-ins.
+export PATH="$PREFIX/bin:$HOME/.local/bin:$PATH"
 export CLAUDE_PROJECTS_ROOT="${CLAUDE_PROJECTS_ROOT:-$HOME/.claude/projects}"
 export REPOS_ROOT="${REPOS_ROOT:-$HOME/git}"
 export DEVICE_NAME="${DEVICE_NAME:-$(hostname)}"
@@ -209,6 +217,19 @@ if [ ! -f "$CREDS" ]; then
   echo " Idling until credentials exist..."
   echo "=================================================================="
   exec sleep infinity
+fi
+
+# claude is what every session exec's, so its absence must be LOUD: without
+# this, the unit stays active (running) while the models probe and every
+# hub-requested session dies seconds after launch — and install.sh's own
+# `have claude` check passes in the caller's login shell, masking exactly this
+# service-PATH failure. Log-only, not idle: $HOME/.local/bin is on PATH above,
+# so installing claude there heals the next launch with no restart.
+if ! command -v claude >/dev/null 2>&1; then
+  echo "[turma-agent] WARNING: claude not on PATH — every session launch will fail"
+  echo "[turma-agent] until it is installed. Install to the blessed prefix:"
+  echo "[turma-agent]   npm config set prefix ~/.local && npm install -g @anthropic-ai/claude-code"
+  echo "[turma-agent] It is picked up here with no restart needed."
 fi
 
 # Reconcile the reverse tunnel: kill any prior instance first, so each (re)start
