@@ -97,8 +97,11 @@ Whisper endpoint is derived as `${LITELLM_URL}/audio/transcriptions`:
   URL above).
 - `WHISPER_API_KEY` — override the STT bearer token (optional; defaults to
   `LITELLM_API_KEY`).
-- `WHISPER_MODEL` — model name passed to the Whisper server (optional).
-- `WHISPER_LANGUAGE` — default `en`.
+- `WHISPER_MODEL` — model name passed to the Whisper server (optional). This is
+  also the LiteLLM alias the gateway routes on (e.g. `voxtral`, `parakeet`).
+- `WHISPER_LANGUAGE` — language hint sent with the audio; default `en`. Set it to
+  an **empty string** to omit the hint entirely, letting a multilingual model
+  (e.g. Parakeet) auto-detect the language.
 - `WHISPER_TIMEOUT_MS` — default `30000`.
 
 Set these in DockerOps' compose file alongside the hub's existing env
