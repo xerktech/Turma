@@ -23,6 +23,9 @@ object Routes {
     const val ARCHIVE = "archive"
     fun chat(host: String, session: String) = "chat/${enc(host)}/${enc(session)}"
     fun terminal(host: String, session: String) = "terminal/${enc(host)}/${enc(session)}"
+    /** Read-only review of an ended session by transcript id — what a board
+     *  ticket chip opens for anything not running (web /sessions?ended=<tid>). */
+    fun ended(host: String, transcriptId: String) = "ended/${enc(host)}/${enc(transcriptId)}"
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
 }
 
@@ -109,7 +112,15 @@ fun TurmaApp(
             )
         }
         composable(TopDest.BOARD.route) {
-            MainScaffold(TopDest.BOARD, goTab) { m -> BoardScreen(modifier = m) }
+            MainScaffold(TopDest.BOARD, goTab) { m ->
+                BoardScreen(
+                    modifier = m,
+                    // Ticket session chips: running → live chat, ended → the
+                    // read-only review (web board.js sessionChipHtml hrefs).
+                    onOpenChat = { h, s -> nav.navigate(Routes.chat(h, s)) },
+                    onOpenEnded = { h, tid -> nav.navigate(Routes.ended(h, tid)) },
+                )
+            }
         }
         composable(TopDest.USAGE.route) {
             MainScaffold(TopDest.USAGE, goTab) { m -> UsageScreen(modifier = m) }
@@ -146,6 +157,28 @@ fun TurmaApp(
         // search action on the Sessions header (see SessionsRoute onOpenArchive).
         composable(Routes.ARCHIVE) {
             ArchiveScreen(onBack = { nav.popBackStack() })
+        }
+        // An ended session's read-only review, reached from a board ticket chip
+        // (the Sessions pane composes EndedSessionView inline instead).
+        composable(
+            "ended/{host}/{tid}",
+            arguments = listOf(
+                navArgument("host") { type = NavType.StringType },
+                navArgument("tid") { type = NavType.StringType },
+            ),
+        ) { entry ->
+            val host = entry.arguments?.getString("host").orEmpty()
+            val tid = entry.arguments?.getString("tid").orEmpty()
+            EndedSessionView(
+                host = host,
+                transcriptId = tid,
+                onBack = { nav.popBackStack() },
+                onResumed = { h, s ->
+                    nav.popBackStack()
+                    nav.navigate(Routes.chat(h, s))
+                },
+                showBack = true,
+            )
         }
     }
     }

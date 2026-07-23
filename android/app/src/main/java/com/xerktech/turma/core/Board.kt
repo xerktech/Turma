@@ -222,6 +222,230 @@ fun ageStr(iso: String, nowMs: Long = System.currentTimeMillis()): String {
     }
 }
 
+/**
+ * Priority emphasis for the card's priority pill, a port of board.js
+ * `prioClass`: highest/high read as urgent, low/lowest as muted, anything else
+ * (or blank) neutral.
+ */
+enum class PrioEmphasis { HIGH, LOW, NONE }
+
+fun prioClass(priority: String): PrioEmphasis = when (priority.trim().lowercase()) {
+    "highest", "high" -> PrioEmphasis.HIGH
+    "low", "lowest" -> PrioEmphasis.LOW
+    else -> PrioEmphasis.NONE
+}
+
+/**
+ * Whether a ticket's due date has passed, a port of board.js `overdueOf`: a
+ * dueDate set, the ticket not Done, and the date (a "YYYY-MM-DD" string, so a
+ * plain string compare) before today's UTC date.
+ */
+fun overdueOf(t: JiraTicket, nowMs: Long = System.currentTimeMillis()): Boolean {
+    val due = t.dueDate ?: return false
+    if (due.isBlank() || categoryOf(t) == "done") return false
+    val today = java.time.Instant.ofEpochMilli(nowMs).toString().substring(0, 10)
+    return due < today
+}
+
+// ---- ticket -> session link (board.js ticketSessionIndex, XERK-78) -----------
+//
+// The agent stamps the ticket onto the session record it spawns
+// (session.ticket); this indexes the fleet payload the board already polls to
+// walk that link backwards. It reads the same THREE channels the Sessions
+// page's Ended list merges — a.sessions (live + stopped), a.closedSessions
+// (killed), and repo.resumable (the durable transcript scan) — deduped on
+// <host>\u0000<transcriptId> with the registry-backed record winning, because a
+// killed session is reported through BOTH its closed record and (once the slow
+// scan catches up) resumable, and only the record knows its id and rename.
+
+/** One of a ticket's sessions, shaped channel-agnostically for its card chip. */
+data class TicketSession(
+    val host: String,
+    /** The session's own id; "" for a resumable row (the registry never knew it). */
+    val id: String,
+    val transcriptId: String,
+    /** running | queued | error | stopped (resumable rows read as stopped). */
+    val status: String,
+    /** The live git branch, "" when unknown. */
+    val gitBranch: String,
+    /** The branch name the ticket spawn reserved, "" when none. */
+    val ticketBranch: String,
+    val summary: String,
+    val summaryManual: Boolean,
+    val label: String,
+    val ticketKey: String,
+    val siteKey: String,
+    val spawnCmdId: String = "",
+    /** Sort key: createdAt for a record, endedTs for a resumable row. */
+    val at: String = "",
+)
+
+/** The chip's run-state dot, board.js sessionChipHtml's `state`. */
+fun ticketSessionState(s: TicketSession): String = when {
+    s.status == "error" -> "failed"
+    s.status == "queued" -> "queued"
+    s.status != "running" -> "stopped"
+    else -> "running"
+}
+
+/**
+ * The chip's label — the BRANCH, not the session name (a ticket-spawned
+ * session's name just repeats the key + summary already on the card, while the
+ * branch's -1/-2 tells two sessions apart). An operator's rename leads once it
+ * exists; the live branch beats the reserved one. Port of board.js
+ * sessionChipHtml's precedence.
+ */
+fun ticketSessionLabel(s: TicketSession): String {
+    val renamed = if (s.summaryManual) s.summary else ""
+    val branch = s.gitBranch.ifBlank { s.ticketBranch }
+    return renamed.ifBlank { branch }.ifBlank { s.summary }.ifBlank { s.label }
+        .ifBlank { s.id }.ifBlank { s.ticketKey }.ifBlank { "session" }
+}
+
+private fun ticketIndexKey(siteKey: String, issueKey: String) = siteKey + "\u0000" + issueKey
+
+/**
+ * Index every session that worked a ticket, keyed "<siteKey>\u0000<issueKey>",
+ * each list oldest-first (the first session holds the bare PROJ-123 branch, so
+ * chips read in branch-cut order; a resumable row sorts on when its
+ * conversation last spoke — the only timestamp its scan recovers).
+ */
+fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>> {
+    val idx = LinkedHashMap<String, MutableList<TicketSession>>()
+    val seen = HashSet<String>()
+    fun add(host: String, s: TicketSession) {
+        // Untranscripted records can't collide (nothing to key on) and are rare:
+        // a session killed before its first turn, or one an older agent wrote.
+        if (s.transcriptId.isNotBlank() && !seen.add(host + "\u0000" + s.transcriptId)) return
+        if (s.ticketKey.isBlank()) return
+        idx.getOrPut(ticketIndexKey(s.siteKey, s.ticketKey)) { mutableListOf() }.add(s)
+    }
+    for (a in agents) {
+        val host = a.key.ifBlank { a.device }
+        for (s in a.sessions) {
+            val t = s.ticket ?: continue
+            add(host, TicketSession(
+                host = host, id = s.id, transcriptId = s.transcriptId,
+                status = s.status, gitBranch = s.git?.branch.orEmpty(),
+                ticketBranch = t.branch.orEmpty(), summary = s.summary,
+                summaryManual = false, label = s.label, ticketKey = t.key,
+                siteKey = t.siteKey, spawnCmdId = s.spawnCmdId, at = s.createdAt,
+            ))
+        }
+        for (c in a.closedSessions) {
+            val t = c.ticket ?: continue
+            add(host, TicketSession(
+                host = host, id = c.id, transcriptId = c.transcriptId,
+                status = "stopped", gitBranch = c.branch,
+                ticketBranch = t.branch.orEmpty(), summary = c.summary,
+                summaryManual = c.summaryManual, label = c.label, ticketKey = t.key,
+                siteKey = t.siteKey, at = c.createdAt,
+            ))
+        }
+    }
+    // Resumable last, in its own pass over the whole fleet: it is the weakest
+    // channel, so every registry-backed record must already be in `seen` before
+    // it gets a look — else a killed session reported by a host listed later
+    // would lose to its own scan entry and show up id-less.
+    for (a in agents) {
+        val host = a.key.ifBlank { a.device }
+        for (r in a.repos) for (t in r.resumable) {
+            val tk = t.ticket ?: continue
+            add(host, TicketSession(
+                host = host, id = "", transcriptId = t.transcriptId,
+                status = "stopped", gitBranch = "",
+                ticketBranch = tk.branch.orEmpty(), summary = t.summary,
+                summaryManual = false, label = "", ticketKey = tk.key,
+                siteKey = tk.siteKey, at = t.endedTs,
+            ))
+        }
+    }
+    for (list in idx.values) list.sortBy { it.at }
+    return idx
+}
+
+fun ticketSessionsOf(
+    idx: Map<String, List<TicketSession>>,
+    siteKey: String,
+    issueKey: String,
+): List<TicketSession> = idx[ticketIndexKey(siteKey, issueKey)] ?: emptyList()
+
+// ---- the card's start control (board.js ticketStartHtml + startSweepVerdict) --
+
+/**
+ * One ticket's in-flight start, the board's optimistic pending painted the
+ * instant the button is pressed (before the POST). `sawCmd` records that the
+ * command was SEEN in the host's queue — "command absent" only means "acked"
+ * after that (see [startSweepVerdict]). A failure parks [error] on the ticket
+ * until the next attempt.
+ */
+data class StartState(
+    val pending: Boolean = false,
+    val cmdId: String? = null,
+    val host: String? = null,
+    val at: Long = 0,
+    val sawCmd: Boolean = false,
+    val error: String? = null,
+)
+
+/** What the card's start control should render — board.js ticketStartHtml. */
+sealed interface StartControl {
+    /** A spawn is in flight: the "⏳ starting…" busy marker. */
+    object Busy : StartControl
+    /**
+     * A live start button. [clone] marks the repo as not cloned anywhere (the
+     * host clones on demand first); [more] compacts the label to "+" once the
+     * ticket already has sessions; [error] is a failed attempt's reason,
+     * rendered BESIDE the still-live button.
+     */
+    data class Button(val clone: Boolean, val more: Boolean, val error: String?) : StartControl
+}
+
+/**
+ * The start control's state for one ticket, or null for no control at all (no
+ * triaged repo: nothing to start against, and the repo chip already says why).
+ * An uncloned repo still gets a LIVE button — the hub clones on demand and
+ * queues the session behind the clone (XERK-14).
+ */
+fun ticketStartControl(t: JiraTicket, sessionCount: Int, start: StartState?): StartControl? {
+    val g = t.repoGuess
+    if (g?.repo == null) return null
+    if (start?.pending == true) return StartControl.Busy
+    return StartControl.Button(
+        clone = !g.cloned,
+        more = sessionCount > 0,
+        error = start?.error,
+    )
+}
+
+enum class SweepVerdict { HOLD, CLEAR, ERROR }
+
+/**
+ * What a start-in-flight should become, given the current fleet — a pure port
+ * of board.js `startSweepVerdict`. The load-bearing subtlety is `sawCmd`:
+ * "command absent" only means "acked" once the command was actually seen
+ * PRESENT — a cache too stale to have seen it land reads as absent too, and
+ * treating that as acked would sweep the pending the instant it was set.
+ * A cmdId-less pending (POST not back yet) always holds; its own request
+ * resolves it. Returns the verdict plus the state to keep on HOLD (which is
+ * where a newly-seen command sets `sawCmd`).
+ */
+fun startSweepVerdict(
+    p: StartState,
+    sessions: List<TicketSession>,
+    cmdPresent: Boolean,
+    hostKnown: Boolean,
+    ageMs: Long,
+    timeoutMs: Long,
+): Pair<SweepVerdict, StartState> {
+    val cmdId = p.cmdId ?: return SweepVerdict.HOLD to p
+    if (sessions.any { it.spawnCmdId == cmdId }) return SweepVerdict.CLEAR to p
+    if (!hostKnown) return (if (ageMs > timeoutMs) SweepVerdict.ERROR else SweepVerdict.HOLD) to p
+    if (cmdPresent) return SweepVerdict.HOLD to p.copy(sawCmd = true) // command still queued
+    if (p.sawCmd) return SweepVerdict.CLEAR to p                      // watched it land, now drained
+    return (if (ageMs > timeoutMs) SweepVerdict.ERROR else SweepVerdict.HOLD) to p
+}
+
 // ---- the fleet-wide org filter (XERK-62), a port of turma/public/org.js ------
 //
 // The org pick used to scope the board alone; it now lives in the shared header

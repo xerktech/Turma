@@ -70,6 +70,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.launch
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.core.ChatItem
@@ -121,9 +122,32 @@ fun ChatScreen(
     }
 
     val listState = rememberLazyListState()
-    LaunchedEffect(items.size) {
-        if (items.isNotEmpty()) listState.animateScrollToItem(items.size - 1)
+    // Stick-to-bottom (web chat.js `stickBottom` + the #chatJump pill): the
+    // transcript follows the tail only while the reader is AT the tail —
+    // scrolling up unpins, so a growing live turn stops yanking the view back
+    // down, and the "Jump to latest" pill below re-pins. Re-pinned the moment
+    // the reader returns to the bottom, like the web's scroll listener.
+    var stickBottom by remember { mutableStateOf(true) }
+    // Plain ref, not state: marks OUR programmatic scroll so the observer below
+    // doesn't read the auto-scroll itself as the reader scrolling away.
+    val autoScrolling = remember { arrayOf(false) }
+    LaunchedEffect(listState) {
+        androidx.compose.runtime.snapshotFlow {
+            listState.isScrollInProgress to listState.canScrollForward
+        }.collect { (scrolling, canFwd) ->
+            if (!autoScrolling[0] && (scrolling || !canFwd)) stickBottom = !canFwd
+        }
     }
+    // Keyed on `items` (not just its size) so the typewriter reveal growing the
+    // last bubble keeps the tail in view too, exactly as the web pins on every
+    // repaint tick.
+    LaunchedEffect(items) {
+        if (stickBottom && items.isNotEmpty()) {
+            autoScrolling[0] = true
+            try { listState.scrollToItem(items.size - 1) } finally { autoScrolling[0] = false }
+        }
+    }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
 
     Scaffold(
         // Lift the whole screen above the soft keyboard (XERK-76): the app is
@@ -203,20 +227,48 @@ fun ChatScreen(
             }
         },
     ) { pad ->
-        // Wrap the transcript so its text is selectable + copyable, matching the
-        // web chat, which relies on native browser selection to copy session text
-        // (XERK-64). Long-press selects; tap still toggles tool/thinking cards.
-        SelectionContainer(Modifier.fillMaxSize().padding(pad)) {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(10.dp, 6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                if (state.hasMore) {
-                    item { Text("· earlier history ·", Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
+        Box(Modifier.fillMaxSize().padding(pad)) {
+            // Wrap the transcript so its text is selectable + copyable, matching the
+            // web chat, which relies on native browser selection to copy session text
+            // (XERK-64). Long-press selects; tap still toggles tool/thinking cards.
+            SelectionContainer(Modifier.fillMaxSize()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(10.dp, 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    if (state.hasMore) {
+                        item { Text("· earlier history ·", Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
+                    }
+                    items(items.size) { i -> ChatItemView(items[i]) }
                 }
-                items(items.size) { i -> ChatItemView(items[i]) }
+            }
+            // The "jump to latest" pill (web #chatJump): shown only while the
+            // reader is scrolled up; tapping it snaps to the tail and re-pins.
+            if (!stickBottom) {
+                Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    shape = RoundedCornerShape(16.dp),
+                    tonalElevation = 4.dp,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 10.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .clickable {
+                            stickBottom = true
+                            scope.launch {
+                                if (items.isNotEmpty()) listState.scrollToItem(items.size - 1)
+                            }
+                        },
+                ) {
+                    Text(
+                        "↓ Jump to latest",
+                        Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                }
             }
         }
     }

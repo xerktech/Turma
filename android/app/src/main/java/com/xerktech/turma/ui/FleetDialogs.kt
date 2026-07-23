@@ -155,7 +155,7 @@ fun ResumeDialog(repo: RepoInfo, onDismiss: () -> Unit, onPick: (transcriptId: S
                     Column(
                         Modifier.fillMaxWidth().clickable { onPick(r.transcriptId, r.cwd) }.padding(vertical = 8.dp),
                     ) {
-                        Text(r.summary.ifBlank { r.label.ifBlank { r.transcriptId } })
+                        Text(r.summary.ifBlank { r.transcriptId })
                         Text(
                             r.cwd, style = MaterialTheme.typography.bodySmall,
                             fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -182,19 +182,34 @@ fun SessionActionsDialog(
     onDelete: () -> Unit,
 ) {
     val running = session.status == "running"
+    val queued = session.status == "queued"
+    // Destructive actions arm on the first tap and fire on the second (the web
+    // card's two-click confirm); delete warns when uncommitted work would go.
+    val dirty = session.git?.dirtyFiles ?: 0
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(com.xerktech.turma.core.sessionName(session)) },
         text = {
             Column {
-                ActionRow("Open chat", onOpen)
-                if (running) {
-                    ActionRow("Restart (clear context)", onRestart)
-                    ActionRow("Kill", onKill)
-                } else {
-                    ActionRow("Start", onStart)
-                    ActionRow("Resume", onResume)
-                    ActionRow("Delete", onDelete)
+                when {
+                    // A queued session has no worktree/pane yet — the only
+                    // action is cancelling it (the same kill path).
+                    queued -> ConfirmActionRow("Cancel queued session", "Confirm cancel", onKill)
+                    running -> {
+                        ActionRow("Open chat", onOpen)
+                        ConfirmActionRow("Restart (clear context)", "Confirm restart", onRestart)
+                        ConfirmActionRow("Kill", "Confirm kill", onKill)
+                    }
+                    else -> {
+                        ActionRow("Open chat", onOpen)
+                        ActionRow("Start", onStart)
+                        ActionRow("Resume", onResume)
+                        ConfirmActionRow(
+                            "Delete",
+                            if (dirty > 0) "Confirm delete — uncommitted changes will be lost" else "Confirm delete",
+                            onDelete,
+                        )
+                    }
                 }
             }
         },
@@ -208,6 +223,22 @@ private fun ActionRow(label: String, onClick: () -> Unit) {
     Text(
         label,
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 12.dp),
+    )
+}
+
+/** Two-tap arm/confirm row for a destructive action; auto-disarms after 3.5s. */
+@Composable
+private fun ConfirmActionRow(label: String, confirmLabel: String, onConfirm: () -> Unit) {
+    var armed by remember { mutableStateOf(false) }
+    androidx.compose.runtime.LaunchedEffect(armed) {
+        if (armed) { kotlinx.coroutines.delay(3500); armed = false }
+    }
+    Text(
+        if (armed) confirmLabel else label,
+        Modifier.fillMaxWidth()
+            .clickable { if (armed) { armed = false; onConfirm() } else armed = true }
+            .padding(vertical = 12.dp),
+        color = if (armed) MaterialTheme.colorScheme.error else androidx.compose.ui.graphics.Color.Unspecified,
     )
 }
 

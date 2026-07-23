@@ -66,6 +66,7 @@ fun FleetScreen(
 ) {
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val org by vm.orgFilter.collectAsStateWithLifecycle()
+    val pending by vm.pending.collectAsStateWithLifecycle()
     // Everything below is the fleet as scoped by the header's org control
     // (XERK-62). A host polls exactly one org, so scoping the agent list scopes
     // the tiles, the host cards, their repos and their sessions in one move.
@@ -116,6 +117,7 @@ fun FleetScreen(
                         agent = agent,
                         now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis(),
                         expanded = expandedHosts[agent.key] ?: true,
+                        pending = pending,
                         onToggle = { expandedHosts[agent.key] = !(expandedHosts[agent.key] ?: true) },
                         onComposeSpawn = { host, repo, isRoot -> spawnFor = Triple(host, repo, isRoot) },
                         onResume = { host, repo -> resumeFor = host to repo },
@@ -123,6 +125,7 @@ fun FleetScreen(
                         onClone = { host, repo -> vm.clone(host, repo) },
                         onOpenSession = onOpenChat,
                         onSessionActions = { host, s -> actionsFor = host to s },
+                        onCancelQueued = { host, s -> vm.kill(host, s.id) },
                     )
                 }
             }
@@ -182,6 +185,7 @@ private fun HostSection(
     agent: AgentInfo,
     now: Long,
     expanded: Boolean,
+    pending: Map<String, FleetViewModel.SessPending>,
     onToggle: () -> Unit,
     onComposeSpawn: (String, String, Boolean) -> Unit,
     onResume: (String, RepoInfo) -> Unit,
@@ -189,6 +193,7 @@ private fun HostSection(
     onClone: (String, String) -> Unit,
     onOpenSession: (String, String) -> Unit,
     onSessionActions: (String, SessionInfo) -> Unit,
+    onCancelQueued: (String, SessionInfo) -> Unit,
 ) {
     TurmaCard(Modifier.fillMaxWidth()) {
         Column(Modifier.fillMaxWidth()) {
@@ -228,11 +233,13 @@ private fun HostSection(
                         val sessions = agent.sessions.filter { if (repo.root) it.root else (!it.root && it.repo == repo.name) }
                         RepoSection(
                             repo = repo, sessions = sessions, now = now, hostLastSeen = agent.lastSeen,
+                            hostKey = agent.key, pending = pending,
                             onComposeSpawn = { onComposeSpawn(agent.key, repo.name, repo.root) },
                             onResume = { onResume(agent.key, repo) },
                             onPrune = { onPrune(agent.key, repo.name) },
                             onOpenSession = { s -> onOpenSession(agent.key, s.id) },
                             onSessionActions = { s -> onSessionActions(agent.key, s) },
+                            onCancelQueued = { s -> onCancelQueued(agent.key, s) },
                         )
                     }
                 }
@@ -247,11 +254,14 @@ private fun RepoSection(
     sessions: List<SessionInfo>,
     now: Long,
     hostLastSeen: Long,
+    hostKey: String,
+    pending: Map<String, FleetViewModel.SessPending>,
     onComposeSpawn: () -> Unit,
     onResume: () -> Unit,
     onPrune: () -> Unit,
     onOpenSession: (SessionInfo) -> Unit,
     onSessionActions: (SessionInfo) -> Unit,
+    onCancelQueued: (SessionInfo) -> Unit,
 ) {
     Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
         Row(
@@ -276,49 +286,168 @@ private fun RepoSection(
                 SessionCard(
                     session = s,
                     state = liveState(s, hostLastSeen, now),
+                    now = now,
+                    pendingKind = FleetViewModel.sessPending(pending, hostKey, s.id),
                     onClick = { onOpenSession(s) },
                     onActions = { onSessionActions(s) },
+                    onCancelQueued = { onCancelQueued(s) },
                 )
             }
         }
     }
 }
 
+/** Trim "claude-opus-4-8-20250801" → "opus-4-8" (web index.html shortModels). */
+private fun shortModels(models: List<com.xerktech.turma.model.ModelUsage>): String =
+    if (models.isEmpty()) "–"
+    else models.take(2).joinToString(", ") {
+        it.model.removePrefix("claude-").replace(Regex("-\\d{8}$"), "")
+    }
+
+/**
+ * A session card with the web dashboard card's detail set (index.html
+ * `sessCard`, XERK-78): status badge (incl. queued + the optimistic "stopping"),
+ * id, worktree/branch (or "repos root"), the work-risk line, state/queued-reason
+ * row, question preview, error, created/activity, and all-time tokens + output.
+ * A queued card's one action is Cancel; an in-flight action shows as a busy
+ * marker until the fleet reflects it (FleetViewModel.pending).
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SessionCard(session: SessionInfo, state: LiveState, onClick: () -> Unit, onActions: () -> Unit) {
+private fun SessionCard(
+    session: SessionInfo,
+    state: LiveState,
+    now: Long,
+    pendingKind: String?,
+    onClick: () -> Unit,
+    onActions: () -> Unit,
+    onCancelQueued: () -> Unit,
+) {
+    val st = session.status.ifBlank { "stopped" }
+    val killing = pendingKind == "kill"
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
     TurmaCard(Modifier.fillMaxWidth()) {
         Row(
             Modifier.fillMaxWidth().clickable(onClick = onClick).padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            StateDot(state)
-            // Name on one ellipsized line; branch/state/tokens wrap in a FlowRow;
-            // any PR pill(s) sit on their OWN line below the info — never squeezing
+            StateDot(if (st == "queued") LiveState.WAITING else state)
+            // Name on one ellipsized line; the detail rows wrap in FlowRows; any
+            // PR pill(s) sit on their OWN line below the info — never squeezing
             // the name into a many-line, oversized card.
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(
-                    sessionName(session),
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        sessionName(session),
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    // Status badge; a confirmed kill flips it to "stopping" before
+                    // the command even reaches the agent (web `killing`).
+                    when {
+                        killing -> Pill("stopping", color = com.xerktech.turma.ui.theme.TurmaColors.waiting)
+                        st == "running" -> {}
+                        st == "queued" -> Pill("queued", color = com.xerktech.turma.ui.theme.TurmaColors.waiting)
+                        st == "error" -> Pill("error", color = MaterialTheme.colorScheme.error)
+                        else -> Pill(st)
+                    }
+                }
+                // id · worktree (or repos root) · branch — the card's identity row.
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
+                    Text(session.id, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = muted, maxLines = 1)
+                    if (session.root) {
+                        Text("· repos root (no worktree)", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                    } else {
+                        val wt = session.worktreePath.substringAfterLast('/').ifBlank { "–" }
+                        Text("· $wt", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            "· ${sessionBranch(session)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = muted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                // The claude.ai/code Remote Control name this session registered.
+                if (session.rcName.isNotBlank()) {
                     Text(
-                        sessionBranch(session),
+                        "RC ${session.rcName}",
                         style = MaterialTheme.typography.bodySmall,
                         fontFamily = FontFamily.Monospace,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = muted,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Text("· ${liveStateLabel(state)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
-                    session.usage?.today?.total?.takeIf { it > 0 }?.let {
-                        Text("· ${fmtTokens(it)} today", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                }
+                // Work-risk line: unpushed commits / dirty files read as risk.
+                com.xerktech.turma.core.workLine(session)?.let { w ->
+                    Text(
+                        w.text,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (w.risk) com.xerktech.turma.ui.theme.TurmaColors.waiting else muted,
+                        maxLines = 2,
+                    )
+                }
+                // State row: shutting down / live state / queued reason + since.
+                when {
+                    killing -> Text("shutting down…", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                    st == "running" -> Text(liveStateLabel(state), style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                    st == "queued" -> {
+                        val since = session.queuedAt.takeIf { it.isNotBlank() }
+                            ?.let { " · " + com.xerktech.turma.core.ageStr(it, now) }.orEmpty()
+                        Text(
+                            "queued — " + queuedReasonText(session.queuedReason) + since,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                            maxLines = 1,
+                        )
+                    }
+                }
+                // Pending question preview (web Question row).
+                session.session?.question?.takeIf { it.isNotBlank() }?.let { q ->
+                    Text(
+                        "“$q”",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                if (st == "error" && session.errorMsg.isNotBlank()) {
+                    Text(session.errorMsg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, maxLines = 2)
+                }
+                // Created / stopped · activity + models · all-time tokens + out.
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    session.createdAt.takeIf { it.isNotBlank() }?.let {
+                        Text("created ${com.xerktech.turma.core.ageStr(it, now)}", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                    }
+                    session.stoppedAt.takeIf { it.isNotBlank() }?.let {
+                        Text("· stopped ${com.xerktech.turma.core.ageStr(it, now)}", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                    }
+                    session.usage?.let { u ->
+                        u.lastActivity.takeIf { it.isNotBlank() }?.let {
+                            Text("· active ${com.xerktech.turma.core.ageStr(it, now)}", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                        }
+                        u.totals.total.takeIf { it > 0 }?.let {
+                            Text(
+                                "· ${fmtTokens(it)} (${fmtTokens(u.totals.output)} out) · ${shortModels(u.models)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = muted,
+                                maxLines = 1,
+                            )
+                        }
                     }
                 }
                 if (session.prs.isNotEmpty()) {
@@ -330,7 +459,34 @@ private fun SessionCard(session: SessionInfo, state: LiveState, onClick: () -> U
                     }
                 }
             }
-            IconButton(onClick = onActions) { Icon(Icons.Filled.MoreVert, "Actions", modifier = Modifier.size(20.dp)) }
+            when {
+                // A command is in flight — one busy marker, controls disabled
+                // until the polled state reflects it (web sessPending labels).
+                pendingKind != null -> Text(
+                    when (pendingKind) {
+                        "kill" -> "Killing…"
+                        "start" -> "Starting…"
+                        "restart" -> "Restarting…"
+                        "resume" -> "Resuming…"
+                        "delete" -> "Deleting…"
+                        else -> "Working…"
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = muted,
+                    modifier = Modifier.padding(end = 6.dp),
+                )
+                // A queued session has no worktree yet: the only action is
+                // Cancel (an arm/confirm kill dropping the queued record).
+                st == "queued" -> {
+                    var armed by remember(session.id) { mutableStateOf(false) }
+                    LaunchedEffect(armed) { if (armed) { kotlinx.coroutines.delay(3500); armed = false } }
+                    GhostButton(
+                        if (armed) "Confirm" else "Cancel",
+                        onClick = { if (armed) { armed = false; onCancelQueued() } else armed = true },
+                    )
+                }
+                else -> IconButton(onClick = onActions) { Icon(Icons.Filled.MoreVert, "Actions", modifier = Modifier.size(20.dp)) }
+            }
         }
     }
 }

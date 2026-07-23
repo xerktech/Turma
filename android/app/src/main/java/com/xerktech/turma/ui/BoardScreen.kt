@@ -1,6 +1,7 @@
 package com.xerktech.turma.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -51,21 +53,44 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.BOARD_CATEGORIES
 import com.xerktech.turma.core.BoardSite
+import com.xerktech.turma.core.PrioEmphasis
+import com.xerktech.turma.core.StartControl
+import com.xerktech.turma.core.StartState
+import com.xerktech.turma.core.TicketSession
+import com.xerktech.turma.core.ageStr
 import com.xerktech.turma.core.categoryOf
 import com.xerktech.turma.core.filterSites
 import com.xerktech.turma.core.mergeSites
 import com.xerktech.turma.core.orgColorMap
+import com.xerktech.turma.core.overdueOf
+import com.xerktech.turma.core.prioClass
+import com.xerktech.turma.core.ticketSessionIndex
+import com.xerktech.turma.core.ticketSessionLabel
+import com.xerktech.turma.core.ticketSessionState
+import com.xerktech.turma.core.ticketSessionsOf
+import com.xerktech.turma.core.ticketStartControl
 import com.xerktech.turma.model.JiraTicket
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.BoardViewModel
 
 @Composable
-fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel()) {
+fun BoardScreen(
+    modifier: Modifier = Modifier,
+    vm: BoardViewModel = viewModel(),
+    // Where a session chip opens: a running session in its live chat, anything
+    // else in the read-only ended review (web board.js sessionChipHtml hrefs).
+    onOpenChat: (host: String, sessionId: String) -> Unit = { _, _ -> },
+    onOpenEnded: (host: String, transcriptId: String) -> Unit = { _, _ -> },
+) {
     LaunchedEffect(Unit) { vm.start() }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val refreshing by vm.refreshing.collectAsStateWithLifecycle()
     val orgFilter by vm.orgFilter.collectAsStateWithLifecycle()
+    val starts by vm.starts.collectAsStateWithLifecycle()
     val sites = remember(fleet) { mergeSites(fleet.agents) }
+    // Ticket -> sessions reverse index over the whole fleet payload (XERK-78).
+    val sessionIndex = remember(fleet) { ticketSessionIndex(fleet.agents) }
+    val now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis()
     // One assignment of unique per-org colors over the whole org set, shared by
     // the header control and the columns so an org is one color everywhere
     // (XERK-48).
@@ -108,7 +133,17 @@ fun BoardScreen(modifier: Modifier = Modifier, vm: BoardViewModel = viewModel())
                     val cards = shown
                         .flatMap { site -> site.tickets.filter { categoryOf(it) == cat }.map { site to it } }
                         .sortedByDescending { it.second.updated }
-                    KanbanColumn(cat, title, cards, colorMap) { site, t -> detail = site to t }
+                    KanbanColumn(
+                        cat, title, cards, colorMap, now,
+                        sessionIndex = sessionIndex,
+                        starts = starts,
+                        onStart = { site, t -> vm.startSession(site.siteKey, t.key) },
+                        onOpenSession = { s ->
+                            if (s.status == "running" && s.id.isNotBlank()) onOpenChat(s.host, s.id)
+                            else if (s.transcriptId.isNotBlank()) onOpenEnded(s.host, s.transcriptId)
+                        },
+                        onOpen = { site, t -> detail = site to t },
+                    )
                 }
             }
         }
@@ -128,6 +163,11 @@ private fun KanbanColumn(
     title: String,
     cards: List<Pair<BoardSite, JiraTicket>>,
     colorMap: Map<String, Int>,
+    now: Long,
+    sessionIndex: Map<String, List<TicketSession>>,
+    starts: Map<String, StartState>,
+    onStart: (BoardSite, JiraTicket) -> Unit,
+    onOpenSession: (TicketSession) -> Unit,
     onOpen: (BoardSite, JiraTicket) -> Unit,
 ) {
     Column(Modifier.width(300.dp).fillMaxSize()) {
@@ -138,24 +178,151 @@ private fun KanbanColumn(
         }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             items(cards, key = { it.second.key }) { (site, t) ->
-                TicketCard(t, TurmaColors.series[(colorMap[site.siteKey] ?: 0) % TurmaColors.series.size]) { onOpen(site, t) }
+                TicketCard(
+                    t,
+                    TurmaColors.series[(colorMap[site.siteKey] ?: 0) % TurmaColors.series.size],
+                    now = now,
+                    sessions = ticketSessionsOf(sessionIndex, site.siteKey, t.key),
+                    start = starts[com.xerktech.turma.vm.BoardViewModel.startKey(site.siteKey, t.key)],
+                    onStart = { onStart(site, t) },
+                    onOpenSession = onOpenSession,
+                ) { onOpen(site, t) }
             }
         }
     }
 }
 
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-private fun TicketCard(t: JiraTicket, orgColor: Color, onClick: () -> Unit) {
+private fun TicketCard(
+    t: JiraTicket,
+    orgColor: Color,
+    now: Long,
+    sessions: List<TicketSession>,
+    start: StartState?,
+    onStart: () -> Unit,
+    onOpenSession: (TicketSession) -> Unit,
+    onClick: () -> Unit,
+) {
     TurmaCard(Modifier.fillMaxWidth()) {
         Column(Modifier.clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            // Top row (web .kc-top): org dot + project, issue type, age … key.
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Box(Modifier.size(9.dp).clip(CircleShape).background(orgColor))
                 Text(t.project, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (t.type.isNotBlank()) {
+                    Text(t.type, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Text(ageStr(t.updated, now), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.weight(1f))
                 Text(t.key, style = MaterialTheme.typography.labelMedium, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Text(t.summary, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, maxLines = 4)
-            RepoChip(t)
+            // Meta row (web .kc-meta): status + priority pills, due/overdue,
+            // repo chip, session chips + start control.
+            androidx.compose.foundation.layout.FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                if (t.status.isNotBlank()) Pill(t.status)
+                if (t.priority.isNotBlank()) {
+                    Pill(
+                        t.priority,
+                        color = when (prioClass(t.priority)) {
+                            PrioEmphasis.HIGH -> MaterialTheme.colorScheme.error
+                            PrioEmphasis.LOW -> MaterialTheme.colorScheme.onSurfaceVariant
+                            PrioEmphasis.NONE -> null
+                        },
+                    )
+                }
+                t.dueDate?.takeIf { it.isNotBlank() }?.let { due ->
+                    Pill("due $due", color = if (overdueOf(t, now)) MaterialTheme.colorScheme.error else null)
+                }
+                RepoChip(t)
+                sessions.forEach { s -> TicketSessionChip(s, onClick = { onOpenSession(s) }) }
+                TicketStartControl(t, sessions, start, onStart)
+            }
+        }
+    }
+}
+
+/**
+ * One of a ticket's sessions, as a chip linking into it (board.js
+ * `sessionChipHtml`): a run-state dot + the branch-first label. Tapping a
+ * running chip opens the live chat, anything else the read-only ended review; a
+ * chip with no transcript (killed before its first turn) isn't tappable.
+ */
+@Composable
+private fun TicketSessionChip(s: TicketSession, onClick: () -> Unit) {
+    val state = ticketSessionState(s)
+    val dot = when (state) {
+        "running" -> TurmaColors.working
+        "queued" -> TurmaColors.waiting
+        "failed" -> MaterialTheme.colorScheme.error
+        else -> TurmaColors.stopped
+    }
+    val tappable = (s.status == "running" && s.id.isNotBlank()) || s.transcriptId.isNotBlank()
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(7.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(7.dp))
+            .then(if (tappable) Modifier.clickable(onClick = onClick) else Modifier)
+            .padding(horizontal = 7.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Box(Modifier.size(7.dp).clip(CircleShape).background(dot))
+        Text(
+            ticketSessionLabel(s),
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+            modifier = Modifier.widthIn(max = 140.dp),
+            color = if (state == "running") MaterialTheme.colorScheme.onSurface
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/**
+ * The card's start control (board.js `ticketStartHtml`): nothing without a
+ * triaged repo, "⏳ starting…" while a spawn is in flight, else a live button —
+ * "Start session" / "Start (clone first)" for an uncloned repo (the hub clones
+ * on demand, XERK-14), compacted to "+" once the ticket already has sessions.
+ * A failed start renders its reason BESIDE the still-live button.
+ */
+@Composable
+private fun TicketStartControl(
+    t: JiraTicket,
+    sessions: List<TicketSession>,
+    start: StartState?,
+    onStart: () -> Unit,
+) {
+    when (val c = ticketStartControl(t, sessions.size, start)) {
+        null -> {}
+        is StartControl.Busy -> Text(
+            "⏳ starting…",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        is StartControl.Button -> {
+            c.error?.let {
+                Text(
+                    "⚠ $it",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            GhostButton(
+                when {
+                    c.more -> "+"
+                    c.clone -> "☐ Start (clone first)"
+                    else -> "☐ Start session"
+                },
+                onClick = onStart,
+            )
         }
     }
 }
@@ -197,9 +364,14 @@ private fun RepoSection(site: BoardSite, t: JiraTicket, vm: BoardViewModel) {
             }
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            // Start is only offered on a triaged, cloned repo (the hub 409s otherwise).
-            if (g?.repo != null && g.cloned) {
-                GhostButton("▶ Start session", onClick = { vm.startSession(site.siteKey, t.key) })
+            // Start is offered on any triaged repo — an uncloned one is a live
+            // start too: the hub routes to the most-available host, which clones
+            // on demand and queues the session behind the clone (XERK-14).
+            if (g?.repo != null) {
+                GhostButton(
+                    if (g.cloned) "▶ Start session" else "▶ Start (clone first)",
+                    onClick = { vm.startSession(site.siteKey, t.key) },
+                )
             }
             GhostButton(if (editing) "Cancel" else "Change repo", onClick = { editing = !editing })
         }

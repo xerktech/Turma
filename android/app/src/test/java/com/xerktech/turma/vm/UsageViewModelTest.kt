@@ -15,7 +15,7 @@ class UsageViewModelTest {
     private fun bucket(total: Long) = UsageBucket(input = total)
 
     private fun usage(today: Long, week: Long, all: Long, models: List<ModelUsage> = emptyList()) =
-        UsageInfo(bucket(today), bucket(week), bucket(all), models)
+        UsageInfo(today = bucket(today), week = bucket(week), totals = bucket(all), models = models)
 
     @Test fun `bucket total sums every token field, cache included`() {
         val b = UsageBucket(input = 1, output = 2, cacheWrite = 4, cacheRead = 8)
@@ -99,5 +99,57 @@ class UsageViewModelTest {
         assertEquals(0L, ui.total)
         assertEquals(emptyList<UsageViewModel.RepoTotal>(), ui.byRepo)
         assertEquals(emptyList<UsageViewModel.ModelTotal>(), ui.byModel)
+    }
+
+    // ---- per-day buckets for the stacked daily chart (XERK-78) ---------------
+
+    private fun usageDays(vararg days: Pair<String, Long>) =
+        UsageInfo(days = days.toMap().mapValues { bucket(it.value) })
+
+    @Test fun `per-day buckets merge across hosts for a unified repo`() {
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "h1", repoUsage = listOf(
+                RepoUsage("Turma", "github.com/x/turma", usageDays("2026-07-20" to 10, "2026-07-21" to 5)),
+            )),
+            AgentInfo(key = "h2", repoUsage = listOf(
+                RepoUsage("Turma", "github.com/x/turma", usageDays("2026-07-21" to 7)),
+            )),
+        ))
+        val turma = UsageViewModel.compute(fleet).byRepo.single()
+        assertEquals(mapOf("2026-07-20" to 10L, "2026-07-21" to 12L), turma.days)
+        assertEquals("repo::github.com/x/turma", turma.skey)
+    }
+
+    @Test fun `host days prefer the host block, else sum the repos`() {
+        val withBlock = AgentInfo(key = "h1", usage = usageDays("2026-07-20" to 3), repoUsage = listOf(
+            RepoUsage("A", "k/a", usageDays("2026-07-20" to 999)),
+        ))
+        val without = AgentInfo(key = "h2", repoUsage = listOf(
+            RepoUsage("A", "k/a", usageDays("2026-07-20" to 1)),
+            RepoUsage("B", "k/b", usageDays("2026-07-20" to 2)),
+        ))
+        val ui = UsageViewModel.compute(FleetState(agents = listOf(withBlock, without)))
+        assertEquals(mapOf("2026-07-20" to 3L), ui.byHost.first { it.host == "h1" }.days)
+        assertEquals(mapOf("2026-07-20" to 3L), ui.byHost.first { it.host == "h2" }.days)
+    }
+
+    @Test fun `dateWindow ends at the newest reported day, 30 days wide`() {
+        val dates = UsageViewModel.dateWindow(listOf(
+            mapOf("2026-07-01" to 1L),
+            mapOf("2026-07-10" to 2L, "2026-06-01" to 1L),
+        ))
+        assertEquals(UsageViewModel.DAYS_SHOWN, dates.size)
+        assertEquals("2026-07-10", dates.last())
+        assertEquals("2026-06-11", dates.first())
+        // No per-day data at all (older agents): no window, chart shows a note.
+        assertEquals(emptyList<String>(), UsageViewModel.dateWindow(listOf(emptyMap())))
+    }
+
+    @Test fun `niceMax rounds up to a tidy axis ceiling`() {
+        assertEquals(1L, UsageViewModel.niceMax(0))
+        assertEquals(100L, UsageViewModel.niceMax(81))
+        assertEquals(250L, UsageViewModel.niceMax(201))
+        assertEquals(500L, UsageViewModel.niceMax(400))
+        assertEquals(1000L, UsageViewModel.niceMax(999))
     }
 }

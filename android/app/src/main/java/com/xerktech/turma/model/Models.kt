@@ -93,6 +93,10 @@ data class ClosedSessionInfo(
     val branch: String = "",
     val root: Boolean = false,
     val summary: String = "",
+    // Whether [summary] is an operator's own rename rather than a generated
+    // name — it decides the board chip's label precedence (a human's name wins
+    // over the branch), and must not change just because the session was killed.
+    val summaryManual: Boolean = false,
     val label: String = "",
     val createdAt: String = "",
     val closedAt: String = "",
@@ -236,14 +240,30 @@ data class RepoInfo(
     val resumable: List<ResumableInfo> = emptyList(),
 )
 
+/**
+ * One transcript from the agent's per-repo resumable scan (`_resumable_report`),
+ * the DURABLE ended-sessions channel: re-derived every slow beat from the
+ * transcripts on disk, so it outlives the registry, closed.json's cap, and an
+ * agent wipe. Wire shape: {transcriptId, cwd, repo, root, origin, slug, summary,
+ * endedTs, ticket, prs}. (It previously declared `ts`/`source` fields that are
+ * not on the wire and decoded nothing.)
+ */
 @Serializable
 data class ResumableInfo(
     val transcriptId: String = "",
     val cwd: String = "",
+    val repo: String = "",
+    val root: Boolean = false,
     val summary: String = "",
-    val label: String = "",
-    val ts: String = "", // transcript entry's ISO-8601 timestamp, not epoch
-    val source: String = "",
+    // The last message's own transcript timestamp (ISO-8601) — the ended list's
+    // sort key (XERK-73); falls back agent-side to file mtime.
+    val endedTs: String = "",
+    // The Jira ticket this conversation worked, from the agent's durable
+    // transcript→ticket ledger; null for an ordinary session.
+    val ticket: TicketRef? = null,
+    // The PRs this conversation opened, from the agent's durable PR ledger —
+    // the only channel still carrying them once the closed record aged out.
+    val prs: List<PrInfo> = emptyList(),
 )
 
 @Serializable
@@ -296,12 +316,51 @@ data class SessionInfo(
     val usage: UsageInfo? = null,
     val prs: List<PrInfo> = emptyList(),
     val session: LiveSignals? = null,
+    // The Jira ticket this session was spawned to work (hub-agent
+    // _session_payload `ticket`); the board reverse-indexes it into per-ticket
+    // session chips. Null for an ordinary session.
+    val ticket: TicketRef? = null,
+    // The hub command that created this session (spawn / spawnTicket /
+    // resumeTranscript) — what the board's start sweep matches its optimistic
+    // pending against. "" for sessions predating the echo.
+    val spawnCmdId: String = "",
+    // The conversation this session is having — the id the Ended list dedupes
+    // on and the ended read-only view opens by. "" from an older agent.
+    val transcriptId: String = "",
+    val createdAt: String = "",
+    val stoppedAt: String = "",
+    val errorMsg: String = "",
+    // Why a `queued` session is waiting (capacity / awaiting-clone / root-busy)
+    // and since when; "" for any session that isn't queued.
+    val queuedReason: String = "",
+    val queuedAt: String = "",
+    // Bumps on a "Restart (clear context)" — the completion signal the
+    // dashboard's optimistic restart pending clears on.
+    val restartCount: Int = 0,
+    // The live branch's relation to its base/origin — the work-risk line.
+    val work: WorkInfo? = null,
 )
 
 @Serializable
 data class GitState(
     val repoName: String = "",
     val branch: String = "",
+    // Uncommitted-change count from `git status --porcelain` in the worktree.
+    val dirtyFiles: Int = 0,
+)
+
+/**
+ * "Is this work safe yet?" facts for a session's branch (hub-agent
+ * branch_sync_info): commits past the base branch, whether the branch was ever
+ * pushed, and commits not yet on origin. Every field degrades to null (branch
+ * not born yet, no origin, unfetchable counts) rather than lying with a zero.
+ */
+@Serializable
+data class WorkInfo(
+    val baseRef: String? = null,
+    val aheadOfBase: Int? = null,
+    val pushed: Boolean? = null,
+    val aheadOfRemote: Int? = null,
 )
 
 /** The live TUI probe on a running session (`session.session`); null when stopped. */
@@ -356,6 +415,14 @@ data class UsageInfo(
     /** Rolling 7 UTC days ending today, pre-sliced agent-side. */
     val week: UsageBucket = UsageBucket(),
     val totals: UsageBucket = UsageBucket(),
+    /**
+     * Per-day buckets, "YYYY-MM-DD" (UTC) -> bucket, the last ~60 days
+     * (hub-agent HISTORY_DAYS) — what the usage page's 30-day stacked daily
+     * chart is built from. Empty from an agent predating the field.
+     */
+    val days: Map<String, UsageBucket> = emptyMap(),
+    /** ISO timestamp of the newest transcript entry counted into this block. */
+    val lastActivity: String = "",
     /** Per-model token counts, biggest consumer first. */
     val models: List<ModelUsage> = emptyList(),
 )

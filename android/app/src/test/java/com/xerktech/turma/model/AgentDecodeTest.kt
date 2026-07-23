@@ -131,4 +131,84 @@ class AgentDecodeTest {
         val frame = TurmaJson.decodeFromString<TailFrame>("""{ "type": "turn", "text": "" }""")
         assertNull(frame.status)
     }
+
+    // ---- the XERK-78 session-detail fields (hub-agent _session_payload) ------
+
+    @Test fun `a live session's detail fields decode, nulls coercing to defaults`() {
+        val body = """
+            { "now": 1, "agents": [ {
+              "key": "h", "device": "h", "online": true,
+              "sessions": [ {
+                "id": "s1", "status": "queued", "repo": "turma",
+                "ticket": { "key": "XERK-9", "siteKey": "x.atlassian.net", "branch": "XERK-9" },
+                "spawnCmdId": "cmd-1", "transcriptId": "tid-1",
+                "createdAt": "2026-07-22T10:00:00Z", "stoppedAt": null, "errorMsg": null,
+                "queuedReason": "capacity", "queuedAt": "2026-07-22T10:00:01Z",
+                "restartCount": 2,
+                "work": { "baseRef": "main", "aheadOfBase": 3, "pushed": false, "aheadOfRemote": null },
+                "git": { "repoName": "turma", "branch": "XERK-9", "dirtyFiles": 4 }
+              } ]
+            } ] }
+        """.trimIndent()
+        val s = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0].sessions[0]
+        assertEquals("XERK-9", s.ticket!!.key)
+        assertEquals("cmd-1", s.spawnCmdId)
+        assertEquals("tid-1", s.transcriptId)
+        assertEquals("capacity", s.queuedReason)
+        assertEquals("2026-07-22T10:00:01Z", s.queuedAt)
+        assertEquals(2, s.restartCount)
+        // The wire's explicit nulls coerce to the blank defaults, not a throw.
+        assertEquals("", s.stoppedAt)
+        assertEquals("", s.errorMsg)
+        assertEquals(3, s.work!!.aheadOfBase)
+        assertEquals(false, s.work!!.pushed)
+        assertNull(s.work!!.aheadOfRemote)
+        assertEquals(4, s.git!!.dirtyFiles)
+    }
+
+    // The resumable scan's real wire shape ({transcriptId, cwd, repo, root,
+    // endedTs, ticket, prs}) — the ended list's durable channel.
+    @Test fun `a resumable transcript decodes its endedTs, ticket and PRs`() {
+        val body = """
+            { "now": 1, "agents": [ {
+              "key": "h", "device": "h", "online": true,
+              "repos": [ { "name": "turma", "resumable": [ {
+                "transcriptId": "tid-9", "cwd": "/repos/.turma/worktrees/x",
+                "repo": "turma", "root": false, "summary": "old work",
+                "endedTs": "2026-07-20T09:00:00Z",
+                "ticket": { "key": "XERK-5", "siteKey": "x.atlassian.net" },
+                "prs": [ { "url": "https://gh/x/pull/3", "number": 3, "state": "OPEN" } ]
+              } ] } ]
+            } ] }
+        """.trimIndent()
+        val r = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0].repos[0].resumable[0]
+        assertEquals("tid-9", r.transcriptId)
+        assertEquals("2026-07-20T09:00:00Z", r.endedTs)
+        assertEquals("XERK-5", r.ticket!!.key)
+        assertEquals(3, r.prs[0].number)
+        assertEquals("/repos/.turma/worktrees/x", r.cwd)
+    }
+
+    // The usage block's per-day buckets (the 30-day chart's source) and
+    // lastActivity — absent on an older agent, defaulting cleanly.
+    @Test fun `usage days and lastActivity decode, and default when absent`() {
+        val body = """
+            { "now": 1, "agents": [ {
+              "key": "h", "device": "h", "online": true,
+              "usage": {
+                "totals": { "input": 1, "output": 2, "cacheWrite": 0, "cacheRead": 0 },
+                "days": { "2026-07-21": { "input": 5, "output": 1, "cacheWrite": 0, "cacheRead": 0 } },
+                "lastActivity": "2026-07-21T23:00:00Z"
+              }
+            } ] }
+        """.trimIndent()
+        val u = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0].usage!!
+        assertEquals(6L, u.days["2026-07-21"]!!.total)
+        assertEquals("2026-07-21T23:00:00Z", u.lastActivity)
+        val bare = TurmaJson.decodeFromString<AgentsResponse>(
+            """{ "now": 1, "agents": [ { "key": "h", "usage": { } } ] }""",
+        ).agents[0].usage!!
+        assertEquals(0, bare.days.size)
+        assertEquals("", bare.lastActivity)
+    }
 }
