@@ -20,10 +20,12 @@
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.Turma">
 
-        <!-- nosemgrep: java.android.security.exported_activity.exported_activity (the single launcher activity must be exported; it holds no privileged control plane) -->
         <!-- adjustResize so the IME insets are reported to Compose (imePadding)
              on pre-API-30 devices too — without it the keyboard overlays the
              chat/terminal compose boxes instead of pushing them up (XERK-76). -->
+        <!-- The suppression below must sit DIRECTLY above <activity> — semgrep only
+             honors nosemgrep on the finding's own line or the line before it. -->
+        <!-- nosemgrep: java.android.security.exported_activity.exported_activity (the single launcher activity must be exported; it holds no privileged control plane) -->
         <activity
             android:name=".MainActivity"
             android:exported="true"

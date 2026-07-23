@@ -56,10 +56,12 @@ STUB
 chmod +x "$WORK/stub-bin/node"
 
 # Stands in for the session manager. Reports the pid the launcher named against
-# its own — \`exec\` means they must be the same process.
+# its own — \`exec\` means they must be the same process — and where claude
+# resolves on the PATH the manager inherited (what every session launch uses).
 cat > "$WORK/stub-bin/python3" <<STUB
 #!/bin/sh
 echo "named=\${TURMA_MANAGER_PID:-unset} actual=\$\$" > "$WORK/manager.log"
+echo "claude=\$(command -v claude || echo missing)" >> "$WORK/manager.log"
 sleep 30
 STUB
 chmod +x "$WORK/stub-bin/python3"
@@ -272,6 +274,66 @@ if [ "$rc" = "0" ]; then
 else
   fail "valid config rejected (rc=$rc): $(cat "$WORK/pre2.log")"
 fi
+
+# --- Case 8: the service PATH reaches claude at ~/.local/bin -----------------
+# The XERK-94 shape: a systemd --user unit inherits the manager's default PATH
+# (no ~/.local/bin), so claude at the install prefix install.sh blesses was
+# unreachable — the unit stayed active while every session died on exec. The
+# launcher must put $HOME/.local/bin on PATH itself, host-agnostically.
+echo "case: launcher puts \$HOME/.local/bin on the runtime PATH"
+# A curated PATH shaped like the systemd user manager's default: the tools the
+# launcher itself needs, our stubs, and NO claude — the host's own claude (or
+# the test shell's inherited ~/.local/bin) must not satisfy the lookup under test.
+mkdir -p "$WORK/svc-bin"
+for t in bash env dirname sleep hostname pkill setsid grep sed awk; do
+  ln -sf "$(command -v "$t")" "$WORK/svc-bin/$t"
+done
+cp "$WORK/stub-bin/node" "$WORK/stub-bin/python3" "$WORK/svc-bin/"
+# claude where install.sh recommends installing it (npm config set prefix ~/.local).
+mkdir -p "$WORK/home/.local/bin"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/home/.local/bin/claude"
+chmod +x "$WORK/home/.local/bin/claude"
+rm -f "$WORK/manager.log"
+PATH="$WORK/svc-bin" setsid "$PREFIX/bin/turma-agent" >"$WORK/run3.log" 2>&1 &
+if wait_for file_has_content "$WORK/manager.log" && \
+   wait_for logged "claude=" "$WORK/manager.log"; then
+  resolved="$(sed -n 's/^claude=//p' "$WORK/manager.log")"
+  if [ "$resolved" = "$WORK/home/.local/bin/claude" ]; then
+    ok "manager resolves claude at ~/.local/bin despite a bare service PATH"
+  else
+    fail "claude resolved to '$resolved' — sessions would die with ENOENT: 'claude'"
+  fi
+else
+  fail "manager never started under the curated PATH: $(cat "$WORK/run3.log")"
+fi
+if grep -q "claude not on PATH" "$WORK/run3.log"; then
+  fail "warned about a claude it can actually reach"
+else
+  ok "no spurious warning when claude is reachable"
+fi
+pkill -f "$WORK/svc-bin/python3" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
+
+# --- Case 9: a genuinely missing claude is warned about, loudly --------------
+# install.sh's `have claude` passes in the caller's login shell even when the
+# service PATH won't find it, so the launcher itself must say when sessions
+# cannot run. Log-only: the manager still starts (the dir is on PATH, so an
+# install later heals with no restart), but the journal names the fault.
+echo "case: missing claude is a loud warning, not a silent failure"
+rm -f "$WORK/home/.local/bin/claude" "$WORK/manager.log"
+PATH="$WORK/svc-bin" setsid "$PREFIX/bin/turma-agent" >"$WORK/run4.log" 2>&1 &
+if wait_for logged "claude not on PATH" "$WORK/run4.log"; then
+  ok "said sessions will fail and how to fix it"
+else
+  fail "no claude warning — the failure would be silent again: $(cat "$WORK/run4.log")"
+fi
+if wait_for file_has_content "$WORK/manager.log"; then
+  ok "manager still started (log-only, self-heals when claude appears)"
+else
+  fail "launcher refused to start over a missing claude"
+fi
+pkill -f "$WORK/svc-bin/python3" 2>/dev/null || true
+pkill -f "$PREFIX/bin/turma-agent" 2>/dev/null || true
 
 if [ "$FAILED" = 0 ]; then echo "all turma-agent launcher tests passed"; else echo "FAILURES"; fi
 exit "$FAILED"

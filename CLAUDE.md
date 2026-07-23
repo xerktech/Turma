@@ -690,6 +690,12 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   (runs as the invoking user). Sources the config, defaults `CLAUDE_PROJECTS_ROOT=$HOME/.claude/projects`
   (the one env decoupling from the container's hardcoded `/root`) and `DEVICE_NAME=$(hostname)`, idles on
   missing claude creds, reconciles + supervises the tunnel, execs the manager.
+- The launcher puts **`$HOME/.local/bin` on PATH itself** (XERK-94): a systemd --user unit doesn't
+  inherit the login shell's PATH, so claude at the prefix install.sh blesses (`npm config set prefix
+  ~/.local`) was unreachable — the unit stayed active while the models probe and every session died
+  on exec. A missing claude is a **loud, log-only** warning at start (the dir is on PATH, so a later
+  install heals with no restart); install-time `have claude` checks pass in the login shell and
+  cannot catch this. Tests: the PATH/warning cases in `agent/tests/test_turma_agent.sh`.
 - The config is **validated before it is sourced**, and a bad one **idles** rather than exiting:
   - The launcher `.`-sources the env file, so a non-assignment line RUNS. A YAML-style `JIRA_SITE: "x"`
     becomes the command `JIRA_SITE:`, exits 127, and under `set -e` takes the launcher down. systemd's
