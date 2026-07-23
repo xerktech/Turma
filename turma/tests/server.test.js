@@ -2831,6 +2831,33 @@ test("transcribePcm: language is passed through when present", async () => {
   restoreFetch();
 });
 
+test("transcribePcm: WHISPER_LANGUAGE default sends the language hint", async () => {
+  let form;
+  globalThis.fetch = async (_url, opts) => {
+    form = opts.body;
+    return { ok: true, json: async () => ({ text: "hi" }) };
+  };
+  await transcribePcm(Buffer.from([1]));
+  assert.equal(form.get("language"), "en");
+  restoreFetch();
+});
+
+test("transcribePcm: empty WHISPER_LANGUAGE omits the hint (auto-detect)", async () => {
+  // A multilingual model (Parakeet) auto-detects when no language is pinned. An
+  // explicit empty WHISPER_LANGUAGE must OMIT the field — `??` lets "" through,
+  // where `||` would fall back to the "en" default and force English.
+  let form;
+  globalThis.fetch = async (_url, opts) => {
+    form = opts.body;
+    return { ok: true, json: async () => ({ text: "hola", language: "es" }) };
+  };
+  const auto = freshServerModule((env) => { env.WHISPER_LANGUAGE = ""; });
+  const result = await auto.transcribePcm(Buffer.from([1]));
+  assert.equal(form.has("language"), false);
+  assert.deepEqual(result, { text: "hola", language: "es" });
+  restoreFetch();
+});
+
 test("transcribePcm: non-OK response -> unavailable, status in reason", async () => {
   globalThis.fetch = async () => ({ ok: false, status: 503 });
   const result = await transcribePcm(Buffer.from([1]));
