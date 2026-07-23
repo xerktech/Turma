@@ -4,8 +4,15 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
     <!-- Themed-icon (Android 13+) layer: the lit T only, single-color so the
-         system can tint it. Matches the foreground's lit units. -->
+         system can tint it. Matches the foreground's lit units, including its
+         ~15% zoom-out about the mark's centre (54, 50.06). -->
+    <group
+        android:scaleX="0.85"
+        android:scaleY="0.85"
+        android:pivotX="54"
+        android:pivotY="50.06">
     <path
         android:fillColor="#FFFFFF"
         android:pathData="M29.93,26 h7.26 a3.93,3.93 0 0 1 3.93,3.93 v7.26 a3.93,3.93 0 0 1 -3.93,3.93 h-7.26 a3.93,3.93 0 0 1 -3.93,-3.93 v-7.26 a3.93,3.93 0 0 1 3.93,-3.93 z M50.36,26 h7.26 a3.93,3.93 0 0 1 3.93,3.93 v7.26 a3.93,3.93 0 0 1 -3.93,3.93 h-7.26 a3.93,3.93 0 0 1 -3.93,-3.93 v-7.26 a3.93,3.93 0 0 1 3.93,-3.93 z M70.79,26 h7.26 a3.93,3.93 0 0 1 3.93,3.93 v7.26 a3.93,3.93 0 0 1 -3.93,3.93 h-7.26 a3.93,3.93 0 0 1 -3.93,-3.93 v-7.26 a3.93,3.93 0 0 1 3.93,-3.93 z M50.36,46.43 h7.26 a3.93,3.93 0 0 1 3.93,3.93 v7.26 a3.93,3.93 0 0 1 -3.93,3.93 h-7.26 a3.93,3.93 0 0 1 -3.93,-3.93 v-7.26 a3.93,3.93 0 0 1 3.93,-3.93 z M50.36,66.86 h7.26 a3.93,3.93 0 0 1 3.93,3.93 v7.26 a3.93,3.93 0 0 1 -3.93,3.93 h-7.26 a3.93,3.93 0 0 1 -3.93,-3.93 v-7.26 a3.93,3.93 0 0 1 3.93,-3.93 z" />
+    </group>
 </vector>
