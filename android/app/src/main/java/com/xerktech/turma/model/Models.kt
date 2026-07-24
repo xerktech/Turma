@@ -32,6 +32,20 @@ data class TicketAgentPin(val host: String = "", val at: Long = 0)
 @Serializable
 data class CodingAgent(val name: String = "", val version: String = "")
 
+/**
+ * Health of the host's shared Claude subscription login (hub-agent
+ * claude_auth_status, XERK-98). `needsLogin` is the urgent state (lapsed or
+ * missing — sessions can't authenticate); `expiringSoon` is the proactive one.
+ * `refreshExpiresAt` is the refresh-token expiry in epoch ms.
+ */
+@Serializable
+data class ClaudeAuth(
+    val present: Boolean = false,
+    val needsLogin: Boolean = false,
+    val expiringSoon: Boolean = false,
+    val refreshExpiresAt: Long? = null,
+)
+
 @Serializable
 data class AgentInfo(
     val key: String = "",
@@ -41,6 +55,8 @@ data class AgentInfo(
     val claudeVersion: String = "",
     val agentVersion: String = "",
     val codingAgent: CodingAgent? = null,
+    // Shared Claude login health (XERK-98); null on an older agent.
+    val claudeAuth: ClaudeAuth? = null,
     val lastSeen: Long = 0,
     // ISO-8601 string on the wire (agent's now_iso()), NOT epoch — the hub, web
     // client, and glasses all treat it as a string. Typing it Long made

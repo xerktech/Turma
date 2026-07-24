@@ -909,6 +909,50 @@ function heartbeatAlerts(key, prev, next) {
     }
   }
 
+  // Claude login health (XERK-98): the agent reports the shared subscription
+  // login's refresh-token expiry. `needsLogin` (lapsed/missing) is the urgent
+  // edge — the host keeps heartbeating but its sessions and headless probes
+  // can't authenticate until someone runs `claude /login` there. `expiringSoon`
+  // is the proactive nudge before that happens. Both edge-trigger once and
+  // clear on recovery, mirroring the offline/online pair. Guarded so an older
+  // agent that reports no block fires nothing.
+  const ca = next.claudeAuth;
+  if (ca) {
+    if (ca.needsLogin) {
+      if (!alerts.claudeLoginAt) {
+        alerts.claudeLoginAt = now;
+        notify(`Claude login required${where}`, `Run 'claude /login' on ${key} — sessions can't authenticate until then.`, {
+          tags: "key",
+          priority: "high",
+          route: { host: key },
+        });
+      }
+      // The hard state supersedes the soft one, so a lapsed login never also
+      // carries a stale "expiring soon" marker to re-fire on recovery.
+      delete alerts.claudeExpiringAt;
+    } else {
+      if (alerts.claudeLoginAt) {
+        delete alerts.claudeLoginAt;
+        notify(`Claude login restored${where}`, `${key} is authenticated again.`, {
+          tags: "green_circle",
+          route: { host: key },
+        });
+      }
+      if (ca.expiringSoon) {
+        if (!alerts.claudeExpiringAt) {
+          alerts.claudeExpiringAt = now;
+          const when = ca.refreshExpiresAt ? ` (expires ${fmtDur(ca.refreshExpiresAt - now)} from now)` : "";
+          notify(`Claude login expiring${where}`, `Re-login soon on ${key}${when} — run 'claude /login'.`, {
+            tags: "key",
+            route: { host: key },
+          });
+        }
+      } else {
+        delete alerts.claudeExpiringAt;
+      }
+    }
+  }
+
   // Per-session events from each session's transcript probe. Bookkeeping is
   // nested per sessionId so questions/PRs/turns don't cross-fire between the
   // several Claude sessions a host runs at once.

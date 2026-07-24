@@ -204,6 +204,20 @@ PR_STATUS_LEDGER_PATH = os.path.join(REGISTRY_DIR, "pr-status.json")
 # _project_slug below). Overridable so the test suite can point it at
 # fixtures; unset in production, so the default is the real path.
 PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", "/root/.claude/projects")
+# The subscription login every session and headless probe on this host shares.
+# Its refresh-token expiry is the "re-login required" signal the hub alerts on
+# (XERK-98). Derived from PROJECTS_ROOT's parent so the CLAUDE_PROJECTS_ROOT
+# override (native install) and the test suite move both together; overridable
+# on its own too.
+CLAUDE_CREDS_PATH = os.environ.get(
+    "CLAUDE_CREDS_PATH",
+    os.path.join(os.path.dirname(PROJECTS_ROOT), ".credentials.json"),
+)
+# Nudge the operator this long before the refresh token lapses, so a "re-login
+# soon" warning lands before sessions actually start failing. Env override in
+# seconds; 0 disables the early warning (the hard needsLogin edge still fires).
+CLAUDE_AUTH_WARN_MS = int(
+    os.environ.get("TURMA_CLAUDE_AUTH_WARN_SEC", str(3 * 24 * 3600)) or 0) * 1000
 
 # Archive sync: ship INACTIVE-session transcripts to the hub's durable, searchable
 # store (see turma/archive.js). The agent enumerates ended transcripts, and pushes
@@ -1049,6 +1063,60 @@ def memory_usage():
         except OSError:
             continue
     return None
+
+
+def claude_auth_status(path=None, now_ms=None):
+    """The shared subscription login's health, for the heartbeat (XERK-98).
+
+    Claude Code stores an OAuth pair in ~/.claude/.credentials.json under
+    `claudeAiOauth`. Two expiries live there and they mean different things:
+
+      * `expiresAt` is the ACCESS token — short-lived (hours) and silently
+        refreshed on every run, so it is NOT a re-login signal on its own.
+      * `refreshTokenExpiresAt` is the REFRESH token — it only lapses when
+        claude has not refreshed inside its ~30-day window, i.e. the login has
+        gone stale on an idle or logged-out host. THAT is when a human must run
+        `claude /login`, so it is what `needsLogin`/`expiringSoon` key off.
+
+    A missing file, unreadable JSON, or a login with no access token reads as
+    not-logged-in (`present:false`, `needsLogin:true`). A present login whose
+    refresh expiry is unknown (an older credential shape) is reported healthy —
+    without a timestamp to stand on we never cry wolf. All times are epoch ms,
+    matching the file's own format and the hub's Date.now().
+    """
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    status = {
+        "present": False,
+        "needsLogin": True,
+        "expiringSoon": False,
+        "expiresAt": None,
+        "refreshExpiresAt": None,
+        "subscriptionType": None,
+        "at": now_ms,
+    }
+    try:
+        with open(path or CLAUDE_CREDS_PATH) as f:
+            oauth = (json.load(f) or {}).get("claudeAiOauth") or {}
+    except (OSError, ValueError):
+        return status  # missing/unreadable => not logged in
+    if not oauth.get("accessToken"):
+        return status  # a file without a token is not a login
+    status["present"] = True
+    status["subscriptionType"] = oauth.get("subscriptionType")
+    access = oauth.get("expiresAt")
+    refresh = oauth.get("refreshTokenExpiresAt")
+    status["expiresAt"] = access if isinstance(access, (int, float)) else None
+    status["refreshExpiresAt"] = refresh if isinstance(refresh, (int, float)) else None
+    if isinstance(refresh, (int, float)):
+        if refresh <= now_ms:
+            status["needsLogin"] = True        # refresh token lapsed: must re-login
+        else:
+            status["needsLogin"] = False
+            status["expiringSoon"] = bool(
+                CLAUDE_AUTH_WARN_MS and refresh - now_ms <= CLAUDE_AUTH_WARN_MS)
+    else:
+        status["needsLogin"] = False           # present, expiry unknown: assume ok
+    return status
 
 
 HISTORY_DAYS = 60  # per-day breakdown reported to the hub (bounds payload size)
@@ -9302,6 +9370,11 @@ class SessionManager:
             "agentVersion": self.agent_version,
             "codingAgent": self.coding_agent,
             "claudeVersion": self.claude_version,
+            # Health of the shared subscription login: present/needsLogin/
+            # expiringSoon + the refresh-token expiry the hub alerts on when the
+            # login lapses (XERK-98). Read fresh each beat — it's a tiny JSON
+            # read and this is the fact that decides whether sessions can run.
+            "claudeAuth": claude_auth_status(),
             # The login's real model list + what "default" currently resolves
             # to, from the models probe. None until the first successful probe;
             # the hub's model menu falls back to its static list then.

@@ -42,7 +42,9 @@ object Notifications {
         tags.contains("question") -> CH_QUESTION
         tags.contains("checkered_flag") -> CH_TURN
         tags.contains("rocket") -> CH_PR
-        tags.contains("circle") || tags.contains("rotating_light") || tags.contains("moneybag") -> CH_HOST
+        // "key" is the Claude-login alert (XERK-98); "circle" also catches the
+        // green_circle "login restored" notification. Both are host-level.
+        tags.contains("circle") || tags.contains("rotating_light") || tags.contains("moneybag") || tags.contains("key") -> CH_HOST
         else -> CH_ALERTS
     }
 
