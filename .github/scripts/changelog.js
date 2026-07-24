@@ -28,7 +28,7 @@ const COMPONENT_LABEL = {
   turma: "Hub (image)",
   "agent-image": "Agent (image)",
   "agent-native": "Agent (native)",
-  glasses: "Glasses",
+  glasses: "Glasses (Even Hub)",
   android: "Android",
 };
 const TABLE_ORDER = ["turma", "agent-image", "agent-native", "glasses", "android"];
@@ -121,6 +121,7 @@ function renderComponentTable(manifest) {
     let artifact = "";
     if (c.kind === "image") artifact = "`" + c.ref + "`";
     else if (c.kind === "asset") artifact = "`" + c.asset + "`" + (c.version_code ? ` (code ${c.version_code})` : "");
+    else if (c.kind === "evenhub") artifact = "`" + c.package_id + "` (Even Hub portal)";
     rows.push(`| ${COMPONENT_LABEL[key]} | ${c.version} | ${status} | ${artifact} |`);
   }
   return rows.join("\n");
@@ -132,7 +133,8 @@ const INSTALL_DETAILS = [
   "- **Images** (`Hub`, `Agent`): deployed on the home lab by Watchtower from `:latest`.",
   "  Pin a specific build with the `ghcr.io/...` ref in the table above.",
   "- **Agent (native)**: WSL/Linux hosts self-update from this stream; see `agent/native/README.md`.",
-  "- **Glasses** (`.ehpk`): download below and sideload via the Even Hub app.",
+  "- **Glasses**: published to the Even Hub developer portal (no release asset);",
+  "  promote the build there, then update the app from the Even phone app.",
   "- **Android** (`.apk`): download below and install (enable \"install unknown apps\"). Debug-signed.",
   "",
   "Carried components are unchanged since the version shown; their artifact name reflects the",

@@ -70,14 +70,14 @@ test("renderComponentTable reads rebuilt/carried status straight from the manife
       turma: { version: "0.3.1", kind: "image", ref: "ghcr.io/x/turma:0.3.1", built: true },
       "agent-image": { version: "0.3.0", kind: "image", ref: "ghcr.io/x/turma-agent:0.3.0", built: false },
       "agent-native": { version: "0.3.1", kind: "asset", asset: "n.tar.gz", built: true },
-      glasses: { version: "0.3.0", kind: "asset", asset: "turma-hud-v0.3.0.ehpk", built: false },
+      glasses: { version: "0.3.0", kind: "evenhub", package_id: "com.xerktech.turma", built: false },
       android: { version: "0.3.1", kind: "asset", asset: "a.apk", version_code: 30001, built: true },
     },
   };
   const table = CL.renderComponentTable(manifest);
   assert.match(table, /Hub \(image\) \| 0\.3\.1 \| rebuilt/);
   assert.match(table, /Agent \(image\) \| 0\.3\.0 \| carried/);
-  assert.match(table, /Glasses \| 0\.3\.0 \| carried \| `turma-hud-v0\.3\.0\.ehpk`/);
+  assert.match(table, /Glasses \(Even Hub\) \| 0\.3\.0 \| carried \| `com\.xerktech\.turma` \(Even Hub portal\)/);
   assert.match(table, /code 30001/);
 });
 

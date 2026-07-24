@@ -144,7 +144,7 @@ npm run mock-hub                                  # terminal 1 — fake hub on :
 echo 'VITE_HUB_URL=http://localhost:8301' > .env.local
 npm run dev                                       # terminal 2 — :5173
 npm test && npm run typecheck                     # vitest + tsc
-npm run build && npm run pack                     # dist/ → ../turma-hud.ehpk
+npm run build && npm run pack                     # dist/ → ../turma.ehpk
 npx evenhub qr                                    # sideload to the glasses
 ```
 
