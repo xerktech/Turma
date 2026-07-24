@@ -190,6 +190,16 @@ jobs:
       # the tunnel's poke signals. Pure shell + node/python3 stubs.
       - name: Native launcher tests (agent/native/turma-agent)
         run: ./agent/tests/test_turma_agent.sh
+      # turma-agentctl is the non-systemd process controller for WSL-without-
+      # logind hosts — the exact hosts where XDG_RUNTIME_DIR is set but points at
+      # a /run/user/<uid> logind never created. Its failure was silent: a broken
+      # runtime dir made stop/restart unable to read the pid they kill, so they
+      # left the old manager running and spawned a second (two managers double-
+      # heartbeating the hub). Covers the fallback to ~/.turma, the pidfile
+      # round-trip, and that a usable runtime dir is still honoured. Shell + sleep
+      # stubs.
+      - name: Native controller tests (agent/native/turma-agentctl)
+        run: ./agent/tests/test_turma_agentctl.sh
       # install.sh's sudo probe gates every apt prerequisite, and a wrong "no"
       # is silent: it skips node behind one warning while the install still
       # reports success, leaving a host that reads online with every session

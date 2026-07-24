@@ -19,7 +19,19 @@ set -eu
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"   # $PREFIX/bin
 PREFIX="$(dirname "$SELF_DIR")"
 
-RUNDIR="${XDG_RUNTIME_DIR:-$HOME/.turma}"
+# Prefer XDG_RUNTIME_DIR for the pidfiles, but only if it is actually USABLE.
+# `${VAR:-default}` falls back only when the var is unset/empty — not when it is
+# set to a directory that doesn't exist and can't be created, which is exactly
+# the state on the WSL-without-logind hosts this script exists for: logind is
+# what creates /run/user/<uid>, so without it XDG_RUNTIME_DIR points at a path a
+# non-root user can't mkdir under. Left unhandled, every pidfile write fails —
+# `start` errors out, and worse, `stop`/`restart` can't read the pid they need
+# to kill, so they silently leave the old manager running and spin up a second
+# one. Fall back to the durable ~/.turma whenever the runtime dir isn't writable.
+RUNDIR="${XDG_RUNTIME_DIR:-}"
+if [ -z "$RUNDIR" ] || ! mkdir -p "$RUNDIR" 2>/dev/null || [ ! -w "$RUNDIR" ]; then
+  RUNDIR="$HOME/.turma"
+fi
 PIDFILE="$RUNDIR/turma-agent.pid"
 UPDATE_PIDFILE="$RUNDIR/turma-agent-update.pid"
 LOG="$HOME/.turma/agent.log"
