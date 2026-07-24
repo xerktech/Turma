@@ -2487,23 +2487,33 @@ test("auto-start: an acked spawn that left no session is retried, not dropped", 
   assert.equal(autoStarted.get("as7.atlassian.net\x00ENG-5").attempts, 2);
 });
 
-test("auto-start: retries are bounded — a ticket that never starts is given up on", async () => {
+test("auto-start: retries never give up — a ticket keeps being tried, backing off to a steady ceiling", async () => {
+  // XERK-109: the earlier bounded-budget behaviour blacklisted a ticket for the
+  // hub's lifetime once it had flaked a handful of times, so a transiently-blocked
+  // ticket never started even after its condition cleared and every visible
+  // condition was met. The cap is gone; retries only slow down, they never stop.
   resetAutoStart();
   await asBeat("asBudget", "as7b.atlassian.net");
   const k = "as7b.atlassian.net\x00ENG-5";
-  // Burn the whole budget: every attempt is acked and leaves no session.
-  for (let i = 0; i < 12; i++) {
+  // Every attempt is acked and leaves no session. Far more rounds than the old
+  // budget would have allowed — the attempt counter settles at the backoff
+  // ceiling instead of climbing without bound.
+  for (let i = 0; i < 20; i++) {
     agents.asBudget.commands = [];
     const e = autoStarted.get(k);
-    if (e) e.nextAt = 0;
+    if (e) e.nextAt = 0;      // pretend the backoff has elapsed
     autoStartSweep();
+    assert.deepEqual((agents.asBudget.commands || []).map((c) => c.issueKey),
+      ["ENG-5"], "the ticket is retried on every eligible sweep, never abandoned");
   }
-  assert.equal(autoStarted.get(k).attempts, 4, "capped at AUTO_START_MAX_ATTEMPTS");
+  assert.equal(autoStarted.get(k).attempts, 5,
+    "the counter settles at the backoff ceiling (AUTO_START_BACKOFF_STEPS)");
+  // The steady-state retry is spaced by the max backoff, so a still-stuck ticket
+  // re-queues at most once per ceiling interval rather than every sweep.
   agents.asBudget.commands = [];
-  autoStarted.get(k).nextAt = 0;
-  autoStartSweep();
+  autoStartSweep();  // nextAt is now ~10min out, so this sweep must NOT re-queue
   assert.equal((agents.asBudget.commands || []).length, 0,
-    "an impossible ticket stops retrying instead of re-queuing forever");
+    "within the ceiling backoff the retry holds off");
 });
 
 test("auto-start: a session appearing ends the retries and forgets the attempts", async () => {
@@ -2519,6 +2529,30 @@ test("auto-start: a session appearing ends the retries and forgets the attempts"
   autoStartSweep();
   assert.equal((agents.asWon.commands || []).length, 0);
   assert.ok(!autoStarted.has(k), "the attempt record is dropped, not left to grow");
+});
+
+test("auto-start: a ticket that flaked past the old budget still self-heals once the block clears (XERK-109)", async () => {
+  resetAutoStart();
+  await asBeat("asHeal", "as7e.atlassian.net");
+  const k = "as7e.atlassian.net\x00ENG-5";
+  // Flake far more times than the old 4-attempt budget would have tolerated —
+  // the hub used to have permanently given up by now.
+  for (let i = 0; i < 8; i++) {
+    agents.asHeal.commands = [];
+    const e = autoStarted.get(k);
+    if (e) e.nextAt = 0;
+    autoStartSweep();
+  }
+  assert.ok((agents.asHeal.commands || []).some((c) => c.issueKey === "ENG-5"),
+    "still retrying after the old budget would have blacklisted it");
+  // Now the transient condition clears and the spawn finally takes: the session
+  // reports its ticket, and auto-start settles for good.
+  agents.asHeal.commands = [];
+  agents.asHeal.sessions = [{ id: "s1", status: "running", transcriptId: "t1",
+    ticket: { key: "ENG-5", siteKey: "as7e.atlassian.net" } }];
+  autoStartSweep();
+  assert.equal((agents.asHeal.commands || []).length, 0);
+  assert.ok(!autoStarted.has(k), "the attempt record is dropped once it starts");
 });
 
 test("auto-start: an offline org spends no attempt (the failure isn't the ticket's)", async () => {

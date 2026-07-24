@@ -1176,19 +1176,26 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   - an in-flight `spawnTicket` on some org host, for the window before that session first heartbeats.
   - `autoStarted` — an in-memory per-ticket ATTEMPT record, the only thing that stops a spawn the agent
     legitimately **refuses** (leaving no session to see) from being re-queued every sweep.
-- **A queued `spawnTicket` is an ATTEMPT, not a start** (XERK-61), so auto-start is **bounded retry**:
-  `AUTO_START_MAX_ATTEMPTS` (4) tries spaced by a doubling `AUTO_START_RETRY_MS` (1/2/4 min, capped at
-  `AUTO_START_RETRY_MAX_MS`), tracked in `autoStarted` as `{attempts, nextAt}` keyed like the rest.
+- **A queued `spawnTicket` is an ATTEMPT, not a start** (XERK-61), so auto-start **retries on a growing
+  backoff and never gives up** (XERK-109): a doubling `AUTO_START_RETRY_MS` (1/2/4/8 min) that HOLDS at
+  `AUTO_START_RETRY_MAX_MS` (10 min) once `AUTO_START_BACKOFF_STEPS` (5) is reached, tracked in
+  `autoStarted` as `{attempts, nextAt}` keyed like the rest (`attempts` capped at the ceiling so it can't
+  climb forever).
   - The agent **acks a refusal and a mid-spawn exception exactly like a success** (`handle_commands` logs
-    and acks; no outcome rides back), so recording "queued once" as done made a TRANSIENT failure (a timed-out
-    Jira fetch, a repo not yet triaged on *that* host) permanent for the hub's lifetime.
+    and acks; no outcome rides back), so a TRANSIENT failure (a timed-out Jira fetch, a repo not yet triaged
+    on *that* host, the shared login momentarily down) leaves no session. **Never re-introduce an attempt
+    CAP**: any hard give-up blacklists such a ticket for the hub's lifetime even after its condition clears,
+    which is the "conditions appear met but it never starts" bug (XERK-109).
   - The retry gate is **evidence, in the sweep's existing order**: a session on any channel ends the attempts
     for good and drops the record (so the map holds only tickets currently failing); an in-flight command
     means the agent hasn't taken it yet, so nothing is concluded; only a still-session-less ticket with
     nothing in flight, past its backoff, is retried. A queued/awaiting-clone session reports its `ticket`
     from the first beat, so a slow spawn is never mistaken for a failed one.
-  - A **no-online-host** result spends NO attempt (that failure isn't the ticket's), so it keeps its full
-    budget for when a host returns. An exhausted budget logs once and stops.
+  - So a **transiently-blocked** ticket self-heals on the first sweep after its block clears, while a
+    **genuinely-stuck** one (a repo that can never be cloned) re-queues at most once per ceiling interval —
+    cheap, because the agent refuses an impossible spawn before it ever fetches Jira.
+  - A **no-online-host** result spends NO attempt (that failure isn't the ticket's), so it retries
+    immediately once a host returns rather than sitting out a backoff it never earned.
 - Reuses the queue end to end. Nothing is written to Jira.
 - Tests: the `auto-start:` cases in `turma/tests/server.test.js`, the `autoStartOn` cases in
   `turma/tests/board.test.js` and android's `BoardTest.kt`, and `test_no_agent_side_auto_start_flag` in
