@@ -48,6 +48,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import struct
@@ -6918,16 +6919,32 @@ class SessionManager:
         return buf.getvalue()
 
     def _unpack_transcript(self, blob, dest_dir):
-        """Extract a _pack_transcript bundle into dest_dir, rejecting any member
-        with an absolute path or a `..` segment (a bundle crosses a host
-        boundary, so it is never trusted to stay inside dest_dir)."""
+        """Extract a _pack_transcript bundle into dest_dir. A bundle crosses a
+        host boundary, so it is never trusted: each member is written by hand to
+        a path re-checked to stay inside dest_dir (no tar.extract/extractall,
+        which would honour an absolute path, a `..`, or a symlink), and only
+        regular files and directories are unpacked."""
+        root = os.path.realpath(dest_dir)
         buf = io.BytesIO(blob)
         with tarfile.open(fileobj=buf, mode="r:gz") as tar:
             for m in tar.getmembers():
                 parts = m.name.split("/")
                 if m.name.startswith("/") or os.path.isabs(m.name) or ".." in parts:
                     raise ValueError(f"unsafe tar member {m.name!r}")
-            tar.extractall(dest_dir)
+                out = os.path.join(dest_dir, m.name)
+                if os.path.realpath(out) != root and \
+                        not os.path.realpath(out).startswith(root + os.sep):
+                    raise ValueError(f"tar member escapes dest {m.name!r}")
+                if m.isdir():
+                    os.makedirs(out, exist_ok=True)
+                elif m.isreg():
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                    src = tar.extractfile(m)
+                    if src is None:
+                        continue
+                    with src, open(out, "wb") as f:
+                        shutil.copyfileobj(src, f)
+                # anything else (symlink/device/fifo) is silently skipped
 
     def _migration_upload(self, migration_id, blob):
         """POST a transcript bundle to the hub's migration relay (octet-stream,
