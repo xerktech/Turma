@@ -3,3 +3,7 @@ __pycache__/
 
 # Local compose secrets — never commit
 .env
+
+# Packed glasses app — built by `glasses` npm run pack, published to the Even
+# Hub portal (not committed, not a release asset).
+/turma.ehpk

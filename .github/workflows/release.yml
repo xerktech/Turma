@@ -289,6 +289,13 @@ jobs:
 
   # ------------------------------------------------------- build: glasses -----
   # GitHub-hosted: an npm build + pack, no docker cache to keep warm.
+  # Packs AND publishes: the .ehpk ships straight to the Even Hub developer
+  # portal from this job (the portal — not the GitHub release — is its
+  # distribution channel), so a portal failure fails the build and blocks the
+  # release like any other build failure. The upload happens before the tag
+  # exists; the publish script skips versions the portal already has, so a
+  # release run that fails downstream and retries at the same version is safe.
+  # Promotion in the portal remains manual.
   build-glasses:
     needs: [plan, bump]
     if: >-
@@ -309,7 +316,7 @@ jobs:
       # sideloaded installs on app.json's "version", so it MUST increase per
       # build. Only app.json is touched (evenhub pack reads the version there;
       # rewriting package.json would desync package-lock.json and break npm ci).
-      # The pack script writes ../turma-hud.ehpk (repo root).
+      # The pack script writes ../turma.ehpk (repo root).
       - name: Stamp version, install, build, pack
         working-directory: glasses
         env:
@@ -320,12 +327,40 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
           npm run pack
-      - name: Name the asset
-        run: cp "$GITHUB_WORKSPACE/turma-hud.ehpk" "$GITHUB_WORKSPACE/turma-hud-v${{ needs.plan.outputs.version }}.ehpk"
+      - name: Publish .ehpk to the Even Hub dev portal
+        working-directory: glasses
+        env:
+          EVENHUB_EMAIL: ${{ secrets.EVENHUB_EMAIL }}
+          EVENHUB_PASSWORD: ${{ secrets.EVENHUB_PASSWORD }}
+          PACKAGE_ID: ${{ vars.EVENHUB_PACKAGE_ID }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          DRY_RUN: ${{ needs.plan.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          FLAGS=()
+          if [ "$DRY_RUN" = "true" ]; then
+            FLAGS+=(--dry-run)
+          elif [ -z "$EVENHUB_EMAIL" ] || [ -z "$EVENHUB_PASSWORD" ]; then
+            echo "::error::EVENHUB_EMAIL / EVENHUB_PASSWORD repository secrets are not set — the portal upload cannot authenticate. See RELEASING.md." >&2
+            exit 1
+          fi
+          # The committed app.json package_id is the default; the repo variable
+          # EVENHUB_PACKAGE_ID overrides it when the portal listing uses a
+          # different id.
+          if [ -n "$PACKAGE_ID" ]; then FLAGS+=(--package-id "$PACKAGE_ID"); fi
+          node scripts/evenhub-publish.mjs \
+            --skip-build \
+            --artifact ../turma.ehpk \
+            --changelog "Turma ${TAG} — https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" \
+            "${FLAGS[@]}"
+      # No release asset for the .ehpk — the portal is its channel. Keep the
+      # packed file inspectable on dry-run rehearsals only (named so the publish
+      # job's asset-* download can't pick it up).
       - uses: actions/upload-artifact@v4
+        if: needs.plan.outputs.dry_run == 'true'
         with:
-          name: asset-glasses
-          path: turma-hud-v${{ needs.plan.outputs.version }}.ehpk
+          name: glasses-ehpk-dry-run
+          path: turma.ehpk
           if-no-files-found: error
 
   # ------------------------------------------------------- build: android -----
@@ -451,8 +486,13 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
-      # Collect whatever the build jobs produced into dist/ (flattened).
+      # Collect the built release assets into dist/ (flattened). The Android
+      # .apk and native tarball are the only asset-* producers now (the .ehpk
+      # ships to the Even Hub portal from build-glasses), so only download when
+      # one of them actually built — a zero-match pattern must not be able to
+      # fail a hub/agent-image/glasses-only release.
       - uses: actions/download-artifact@v4
+        if: needs.plan.outputs.build_android == 'true' || needs.plan.outputs.build_agent_native == 'true'
         with:
           pattern: asset-*
           path: dist

@@ -16,6 +16,18 @@ const changelog = require("./changelog.js");
 const { collectEntries } = require("./collect.js");
 const git = require("./git.js");
 
+// The portal package id the manifest's glasses entry references: the same
+// EVENHUB_PACKAGE_ID override build-glasses publishes under, else the committed
+// glasses/app.json, else the module default.
+function resolveGlassesPackageId() {
+  if (process.env.EVENHUB_PACKAGE_ID) return process.env.EVENHUB_PACKAGE_ID;
+  try {
+    return JSON.parse(fs.readFileSync(path.join(process.cwd(), "glasses", "app.json"), "utf8")).package_id;
+  } catch {
+    return manifestMod.DEFAULT_GLASSES_PACKAGE_ID;
+  }
+}
+
 function main() {
   const version = process.env.VERSION_FULL;
   const tag = process.env.TAG;
@@ -35,6 +47,7 @@ function main() {
     changed,
     prevManifest,
     androidVersionCode,
+    glassesPackageId: resolveGlassesPackageId(),
   });
 
   const entries = collectEntries(prevTag ? `${prevTag}..HEAD` : "");

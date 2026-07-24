@@ -13,15 +13,20 @@
 //     retag a carried image to the new version — :0.3.9 pointing at 0.3.4 bits
 //     is the same lie as renaming a carried asset.
 //   - Assets: physically copied onto the new release under their ORIGINAL name
-//     (turma-hud-v0.3.4.ehpk on the v0.3.9 release), so every release page is
+//     (turma-android-v0.3.4.apk on the v0.3.9 release), so every release page is
 //     self-contained. Renaming to the new version would make a file whose
-//     in-package version (app.json / versionCode) contradicts its name — which
-//     Even Hub and Android act on.
+//     in-package version (versionCode) contradicts its name — which Android
+//     acts on.
+//   - Even Hub (the glasses component): the .ehpk is NOT a release asset — its
+//     distribution channel is the Even Hub developer portal, uploaded by
+//     build-glasses at pack time. Nothing to do on carry: the portal already
+//     holds the carried version; the manifest just references it.
 
 "use strict";
 
 const SCHEMA = 1;
 const DEFAULT_OWNER = "xerktech";
+const DEFAULT_GLASSES_PACKAGE_ID = "com.xerktech.turma";
 
 // Fresh descriptor for a component built at `version` on release `tag`.
 function freshComponent(component, version, tag, opts) {
@@ -36,7 +41,12 @@ function freshComponent(component, version, tag, opts) {
       return { version, kind: "asset", asset, sha256_asset: `${asset}.sha256`, release_tag: tag, built: true };
     }
     case "glasses":
-      return { version, kind: "asset", asset: `turma-hud-v${version}.ehpk`, release_tag: tag, built: true };
+      return {
+        version,
+        kind: "evenhub",
+        package_id: (opts && opts.glassesPackageId) || DEFAULT_GLASSES_PACKAGE_ID,
+        built: true,
+      };
     case "android":
       return {
         version,
@@ -71,6 +81,19 @@ function buildManifest(opts) {
       // never emit a manifest with a hole.
       throw new Error(`component ${component} is unchanged but absent from the previous manifest; rebuild it`);
     }
+    // Pre-portal manifests shipped the .ehpk as a release asset; the Even Hub
+    // portal is its channel now, so a carried glasses entry is normalized to
+    // the evenhub kind instead of copying a stale asset forward (the portal
+    // already holds that version — it uploads on every rebuild).
+    if (component === "glasses" && prev.kind === "asset") {
+      components[component] = {
+        version: prev.version,
+        kind: "evenhub",
+        package_id: (opts && opts.glassesPackageId) || DEFAULT_GLASSES_PACKAGE_ID,
+        built: false,
+      };
+      continue;
+    }
     const carried = Object.assign({}, prev, { built: false });
     if (carried.kind === "asset") carried.release_tag = tag;
     components[component] = carried;
@@ -98,4 +121,4 @@ function carryPlan(manifest, prevManifest) {
   return actions;
 }
 
-module.exports = { SCHEMA, DEFAULT_OWNER, freshComponent, buildManifest, carryPlan };
+module.exports = { SCHEMA, DEFAULT_OWNER, DEFAULT_GLASSES_PACKAGE_ID, freshComponent, buildManifest, carryPlan };

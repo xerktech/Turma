@@ -126,7 +126,7 @@ Before `npm run pack`, edit `app.json`'s `permissions[].whitelist` (the
 layer, so a stale entry means the packaged app simply can't reach your hub.
 
 ```sh
-npm run pack   # builds dist/ and packages it + app.json into ../turma-hud.ehpk
+npm run pack   # builds dist/ and packages it + app.json into ../turma.ehpk
 npx evenhub qr # sideload: generates a QR code the Even app scans to install
 ```
 
@@ -159,11 +159,29 @@ command, so the built `.ehpk` is uploaded through the web portal.
 
    ```sh
    npm run build   # tsc + vite → dist/
-   npm run pack    # evenhub pack app.json dist -o ../turma-hud.ehpk
+   npm run pack    # evenhub pack app.json dist -o ../turma.ehpk
    ```
 
-4. **Upload the `.ehpk` in the developer portal** and create/update the app
-   entry. This is the step the CLI does not cover.
+4. **Upload the `.ehpk` to the developer portal.** `evenhub` itself has no
+   `publish`/`submit` command, so `scripts/evenhub-publish.mjs` drives the
+   portal's own draft + create-version API (the two calls the portal web UI
+   makes by hand) — dependency-free, authenticated by a stored `evenhub login`
+   credential or `EVENHUB_EMAIL` / `EVENHUB_PASSWORD`:
+
+   ```sh
+   npm run publish:hub -- --changelog 'Private build'   # packs then uploads
+   ```
+
+   The release pipeline runs this automatically: every release that rebuilds the
+   glasses component packs and uploads its `.ehpk` to the portal from the
+   `build-glasses` job in `.github/workflows/release.yml` — the portal, not the
+   GitHub release, is the app's distribution channel — authenticated by the
+   `EVENHUB_EMAIL` / `EVENHUB_PASSWORD` repository secrets (see `RELEASING.md`).
+   Publishing skips versions the portal already has, so retried release runs are
+   safe. `EVENHUB_BASE_URL` overrides the portal host (default
+   `https://hub.evenrealities.com`). The portal API is unofficial —
+   reverse-engineered from the CLI and portal traffic — so treat breakage after
+   an Even Hub update as expected.
 5. **Manual review.** Every submission goes through a manual review against Even
    Hub's [App Submission & QA checklist](https://hub.evenrealities.com/docs/reference/app-submission);
    anything that fails is returned with a rejection note. The recommended
@@ -182,7 +200,7 @@ portal:
 - **Public** — after passing review, listed in the Even Hub store for anyone to
   install (shown under "Public" plugins).
 
-**For Turma HUD specifically, the private/beta lane is the realistic one.**
+**For Turma specifically, the private/beta lane is the realistic one.**
 The app is single-user and self-hosted: it sits behind HTTP Basic auth, and the
 `app.json` `network` whitelist is pinned to one host. A public installer has no
 reachable hub and no credentials, so a public store listing wouldn't be usable.
