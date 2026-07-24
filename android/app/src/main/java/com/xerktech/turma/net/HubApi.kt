@@ -46,6 +46,14 @@ interface HubApi {
     @POST("api/agents/{host}/sessions/{id}/interrupt")
     suspend fun interruptSession(@Path("host") host: String, @Path("id") id: String): OkResponse
 
+    /** Move a running session to another agent in the same org (XERK-101). */
+    @POST("api/agents/{host}/sessions/{id}/migrate")
+    suspend fun migrateSession(
+        @Path("host") host: String,
+        @Path("id") id: String,
+        @Body body: MigrateRequest,
+    ): OkResponse
+
     @POST("api/agents/{host}/sessions/{id}/input")
     suspend fun sendInput(
         @Path("host") host: String,
@@ -231,6 +239,10 @@ data class AnswerRequest(
     val custom: String? = null,
     val optionIndices: List<Int>? = null,
 )
+
+/** The target agent a session should move to (XERK-101). */
+@Serializable
+data class MigrateRequest(val host: String)
 
 @Serializable
 data class CloneRequest(val repo: String)

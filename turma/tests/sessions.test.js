@@ -122,6 +122,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   const fn = new Function(...names, "window",
     script + "\n;return { render, selectSession, followSpawn, toggleComposer,"
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
+      + " openMove, moveTo, closeMove,"
       + " termComposeAction, termComposeStop, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
@@ -263,6 +264,77 @@ test("menu Kill arms first and only fires on the confirming click", () => {
   assert.equal(posts.length, 1);
   assert.equal(posts[0].url, "/api/agents/hostA/sessions/11111/kill");
   assert.ok(!els.active.innerHTML.includes("s-menu"), "the menu closes on the kill");
+});
+
+// --- move a session to another agent (XERK-101) ------------------------------
+
+// hostA runs session 11111 on repoX; the extra hosts share the same org.
+function moveFleet(extraHosts = []) {
+  const now = Date.now();
+  const jira = { siteKey: "org.atlassian.net" };
+  const a = {
+    key: "hostA", device: "hostA", online: true, terminalOnline: true,
+    lastSeen: now, jira, repos: [{ name: "repoX" }],
+    sessions: [working("11111", "Log Task")],
+  };
+  return { now, agents: [a, ...extraHosts] };
+}
+const otherHost = (key, { org = "org.atlassian.net", online = true, repos = ["repoX"] } = {}) => ({
+  key, device: key, online, terminalOnline: online, lastSeen: Date.now(),
+  jira: { siteKey: org }, repos: repos.map((name) => ({ name })), sessions: [],
+});
+
+test("the ⋯ menu offers Move only when an eligible same-org host has the repo", () => {
+  const { beat, toggleCardMenu, els } = loadPage();
+  // No other host yet -> no Move item.
+  beat(moveFleet());
+  toggleCardMenu(click, "11111");
+  assert.ok(!els.active.innerHTML.includes("Move to another agent"),
+    "no eligible target -> no Move item");
+
+  // A same-org host with the repo appears; the still-open menu re-renders with
+  // the Move item (menuOpenId persists across the beat).
+  beat(moveFleet([otherHost("hostB")]));
+  assert.ok(els.active.innerHTML.includes("Move to another agent…"));
+});
+
+test("Move excludes offline, other-org, and repo-less hosts", () => {
+  const { beat, toggleCardMenu, openMove, els } = loadPage();
+  beat(moveFleet([
+    otherHost("hostB"),                               // eligible
+    otherHost("hostOff", { online: false }),          // offline
+    otherHost("hostOrg", { org: "other.atlassian.net" }), // different org
+    otherHost("hostNoRepo", { repos: ["nope"] }),     // lacks the repo
+  ]));
+  toggleCardMenu(click, "11111");
+  openMove(click, "11111");
+  const menu = els.active.innerHTML;
+  assert.ok(menu.includes("hostB"), "the one eligible host is offered");
+  assert.ok(!menu.includes("hostOff") && !menu.includes("hostOrg") && !menu.includes("hostNoRepo"),
+    "offline / other-org / repo-less hosts are excluded");
+});
+
+test("picking a target posts the migrate command to the source host", () => {
+  const { beat, toggleCardMenu, openMove, moveTo, posts } = loadPage({ postReply: { migrationId: "mig1" } });
+  beat(moveFleet([otherHost("hostB")]));
+  toggleCardMenu(click, "11111");
+  openMove(click, "11111");
+  moveTo(click, "hostA", "11111", "hostB");
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, "/api/agents/hostA/sessions/11111/migrate");
+  assert.deepEqual(posts[0].body, { host: "hostB" });
+});
+
+test("a source card shows a 'Moving to …' hint while its migration is in flight", () => {
+  const { beat, els } = loadPage();
+  const data = moveFleet([otherHost("hostB")]);
+  data.migrations = [{
+    id: "mig1", srcHost: "hostA", srcSessionId: "11111", targetHost: "hostB",
+    phase: "exporting", importCmdId: null,
+  }];
+  beat(data);
+  assert.ok(els.active.innerHTML.includes("Moving to hostB…"),
+    "the in-flight move is surfaced on the source card");
 });
 
 test("rename swaps the card for a field seeded with the current name, and saves it", () => {

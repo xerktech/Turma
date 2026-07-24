@@ -2833,6 +2833,159 @@ class TestResumeTranscript(ManagerMixin, unittest.TestCase):
         sm._launch_tmux.assert_not_called()
 
 
+class TestMigrateSession(ManagerMixin, unittest.TestCase):
+    """Moving a session to another agent (XERK-101): the source packs its raw
+    transcript and ships it through the hub; the target unpacks it under the
+    origin cwd's slug and resumes the same conversation, carrying the moved
+    session's identity."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
+        p.start()
+        self.addCleanup(p.stop)
+        self.repo = {"name": "Turma", "path": os.path.join(ha.REPOS_ROOT, "Turma")}
+        os.makedirs(self.repo["path"], exist_ok=True)
+        p2 = mock.patch.object(ha, "scan_repos", lambda: [self.repo])
+        p2.start()
+        self.addCleanup(p2.stop)
+
+    def _write_transcript(self, cwd, tid, *, tail="\n", subagents=False):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, tid + ".jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "user", "cwd": cwd,
+                                "message": {"role": "user", "content": "hi"}}) + "\n")
+            f.write(tail)  # a trailing partial (no newline) or a clean "\n"
+        if subagents:
+            sub = ha._subagents_dir(path)
+            os.makedirs(sub, exist_ok=True)
+            with open(os.path.join(sub, "agent-x.jsonl"), "w") as f:
+                f.write('{"sub":1}\n')
+        return path
+
+    def _manager(self):
+        sm = self.make_manager()
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        sm.device = "hostA"
+        return sm
+
+    def test_pack_unpack_round_trip_truncates_partial_tail(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        # A half-written final line (no newline) must not travel — the target
+        # would choke resuming a partial-JSON tail.
+        path = self._write_transcript(wt, "trans1", tail='{"partial', subagents=True)
+        sm = self._manager()
+        blob = sm._pack_transcript(path)
+        dest = os.path.join(self.tmp, "dest")
+        os.makedirs(dest)
+        sm._unpack_transcript(blob, dest)
+        out = os.path.join(dest, "trans1.jsonl")
+        self.assertTrue(os.path.isfile(out))
+        with open(out) as f:
+            body = f.read()
+        self.assertNotIn("partial", body)          # truncated at the last newline
+        self.assertTrue(body.endswith("\n"))
+        # The subagents dir travels alongside, laid out for the slug dir.
+        self.assertTrue(os.path.isfile(
+            os.path.join(dest, "trans1", "subagents", "agent-x.jsonl")))
+
+    def test_unpack_rejects_a_traversing_member(self):
+        sm = self._manager()
+        buf = io.BytesIO()
+        with __import__("tarfile").open(fileobj=buf, mode="w:gz") as tar:
+            data = b"x"
+            ti = __import__("tarfile").TarInfo(name="../escape.jsonl")
+            ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+        with self.assertRaises(ValueError):
+            sm._unpack_transcript(buf.getvalue(), os.path.join(self.tmp, "d2"))
+
+    def test_export_packs_and_uploads(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "sess1")
+        self._write_transcript(wt, "transE")
+        sm = self._manager()
+        sm.registry = [{"id": "sess1", "worktreePath": wt, "status": "running",
+                        "repo": "Turma", "claudeSessionId": "transE"}]
+        sent = {}
+        sm._migration_upload = lambda mid, blob: sent.update(mid=mid, blob=blob)
+        sm.export_session("sess1", "mig123")
+        self.assertEqual(sent["mid"], "mig123")
+        # What it uploaded really is the packed transcript.
+        dest = os.path.join(self.tmp, "dl")
+        os.makedirs(dest)
+        sm._unpack_transcript(sent["blob"], dest)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "transE.jsonl")))
+
+    def test_export_no_transcript_uploads_nothing(self):
+        sm = self._manager()
+        sm.registry = [{"id": "s", "worktreePath": "/nope", "status": "running",
+                        "repo": "Turma", "claudeSessionId": "gone"}]
+        called = []
+        sm._migration_upload = lambda *a: called.append(a)
+        sm.export_session("s", "mig1")
+        self.assertEqual(called, [])
+
+    def test_import_unpacks_and_resumes_with_identity(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "orig")  # not on disk here
+        # Pack a transcript on a "source", then import it on this "target".
+        src_path = self._write_transcript(wt, "transI")
+        src = self._manager()
+        blob = src._pack_transcript(src_path)
+        # Wipe the target's copy so import is what puts it on disk.
+        shutil.rmtree(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt)))
+
+        sm = self._manager()
+        sm._worktree_add = mock.Mock()
+        sm._migration_download = lambda mid: blob
+        cmd = {
+            "type": "importSession", "cmdId": "c9", "migrationId": "mig9",
+            "transcriptId": "transI", "cwd": wt, "repo": "Turma",
+            "model": "opus", "permissionMode": "plan", "summary": "Fix the logs",
+            "ticket": {"key": "ENG-9", "branch": "ENG-9"},
+            "migratedFrom": {"host": "hostA", "sessionId": "orig"},
+        }
+        with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
+            sm.import_session(cmd)
+        # The transcript landed at the origin cwd's slug so claude --resume finds it.
+        self.assertTrue(os.path.isfile(os.path.join(
+            ha.PROJECTS_ROOT, ha._project_slug(wt), "transI.jsonl")))
+        self.assertEqual(len(sm.registry), 1)
+        sess = sm.registry[0]
+        self.assertEqual(sess["worktreePath"], wt)
+        self.assertEqual(sess["repo"], "Turma")
+        self.assertEqual(sess["spawnCmdId"], "c9")
+        self.assertEqual(sess["model"], "opus")
+        self.assertEqual(sess["permissionMode"], "plan")
+        self.assertEqual(sess["summary"], "Fix the logs")
+        self.assertEqual(sess["ticket"]["key"], "ENG-9")
+        self.assertEqual(sess["migratedFrom"]["host"], "hostA")
+        # The moved conversation is resumed (its id pinned), and the missing
+        # worktree re-created at the exact origin path.
+        self.assertEqual(sm._launch_tmux.call_args.kwargs["resume_id"], "transI")
+        sm._worktree_add.assert_called_once()
+
+    def test_import_download_failure_creates_no_session(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "orig2")
+        sm = self._manager()
+        sm._migration_download = lambda mid: None
+        sm.import_session({"migrationId": "m", "transcriptId": "t",
+                           "cwd": wt, "repo": "Turma"})
+        self.assertEqual(sm.registry, [])
+        sm._launch_tmux.assert_not_called()
+
+    def test_import_rejects_a_foreign_cwd(self):
+        sm = self._manager()
+        got = []
+        sm._migration_download = lambda mid: got.append(mid)
+        sm.import_session({"migrationId": "m", "transcriptId": "t",
+                           "cwd": "/home/me/elsewhere", "repo": "Turma"})
+        self.assertEqual(sm.registry, [])
+        self.assertEqual(got, [])   # bailed before spending a download
+
+
 class TestRegistryPersistence(ManagerMixin, unittest.TestCase):
     def test_save_load_round_trip(self):
         sm = self.make_manager()

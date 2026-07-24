@@ -86,4 +86,38 @@ class SessionsTest {
         assertEquals("5 commits ahead · 2 unpushed", behind.text)
         assertEquals(true, behind.risk)
     }
+
+    // --- eligibleMoveTargets (XERK-101) --------------------------------------
+
+    private fun agent(
+        key: String,
+        online: Boolean = true,
+        org: String = "org.a",
+        repos: List<String> = listOf("repoX"),
+        sessions: List<SessionInfo> = emptyList(),
+    ) = com.xerktech.turma.model.AgentInfo(
+        key = key, device = key, online = online,
+        jira = com.xerktech.turma.model.JiraBlock(siteKey = org),
+        repos = repos.map { com.xerktech.turma.model.RepoInfo(name = it) },
+        sessions = sessions,
+    )
+
+    @Test fun `move targets are online same-org hosts with the repo, minus the source`() {
+        val sess = SessionInfo(id = "s1", status = "running", repo = "repoX")
+        val agents = listOf(
+            agent("src", sessions = listOf(sess)),
+            agent("ok"),                              // eligible
+            agent("off", online = false),             // offline
+            agent("otherOrg", org = "org.b"),         // different org
+            agent("noRepo", repos = listOf("other")), // lacks the repo
+        )
+        val targets = eligibleMoveTargets(agents, "src", sess).map { it.key }
+        assertEquals(listOf("ok"), targets)
+    }
+
+    @Test fun `no eligible targets when the org has only the source host`() {
+        val sess = SessionInfo(id = "s1", status = "running", repo = "repoX")
+        val agents = listOf(agent("src", sessions = listOf(sess)))
+        assertEquals(emptyList<String>(), eligibleMoveTargets(agents, "src", sess).map { it.key })
+    }
 }

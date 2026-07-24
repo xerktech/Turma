@@ -162,6 +162,34 @@ Replaced the old model of one fixed-repo container per session.
 - **Delete** (on a stopped session) also removes the worktree. Since the app owns no branch, any branch
   the agent committed survives; only uncommitted worktree files are lost.
 
+### Migrating a session to another agent (XERK-101)
+
+- **Move a running session to another agent in the SAME org** (e.g. onto the host holding the container
+  whose logs the conversation needs). The conversation moves; committed work rides git; uncommitted/
+  unpushed work stays on the source (KILLED, so resumable there as a fallback).
+- The hub can't touch a worktree and agents are outbound-only, so a migration is composed hub-side from
+  agent commands + a hub-brokered relay of the one thing `claude --resume` needs and the archive lacks —
+  the **RAW transcript bytes** (the archive keeps a rendered projection, not resumable bytes):
+  `exportSession` packs the transcript (`+ subagents/`, truncated to its last complete line) and POSTs
+  the gzip-tar to `POST /api/agents/<host>/migrations/<id>/blob`; the blob landing queues
+  `importSession` on the target (recording `importCmdId`), which downloads + unpacks it under the origin
+  cwd's slug and resumes via the shared `_resume_at_cwd` (worktree re-created off the repo's default
+  branch, carrying the moved session's ticket/name/model/mode); the target reporting up (its
+  `spawnCmdId` == `importCmdId`) makes `advanceMigrations` KILL the source and finish. The Sessions page
+  follows via `migrations` (its `importCmdId` feeds the normal `followSpawn`); a "Moving to <host>…"
+  hint covers the export step.
+- `_resume_at_cwd` (shared by `resume_transcript` and `import_session`) works cross-host only because
+  `REPOS_ROOT` is the same mount path on every host, so the re-created worktree's slug matches the
+  transcript. The tar extract guards against `..`/absolute members (crosses a host boundary — untrusted).
+  Blob relay is agent-authed; `POST .../sessions/<id>/migrate {host}` validates same-org + online +
+  repo-cloned + running/non-root/has-conversation, single-flight per session. Migration state is
+  in-memory (blob included); a hub restart mid-move aborts it, leaving the source session intact. **The
+  target must already have the repo cloned** (v1; UI offers only such hosts) — clone-on-demand and
+  copying dirty worktree files are follow-ups.
+- Tests: `TestMigrateSession` (agent), the `migrate:` cases in `server.test.js`, the Move cases in
+  `sessions.test.js`, `eligibleMoveTargets` in android `SessionsTest`. Android: ⋯-menu Move picker, no
+  stage-follow (`android/PARITY.md`).
+
 ## Repository Structure
 
 Top level: `agent/`, `turma/`, `glasses/`, `android/`, `.github/workflows/`. Each is detailed below.

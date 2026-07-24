@@ -7,6 +7,7 @@ import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.net.AnswerRequest
 import com.xerktech.turma.net.CloneRequest
 import com.xerktech.turma.net.InputRequest
+import com.xerktech.turma.net.MigrateRequest
 import com.xerktech.turma.net.ModeRequest
 import com.xerktech.turma.net.ModelRequest
 import com.xerktech.turma.net.OkResponse
@@ -119,6 +120,11 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
         mark(host, id, "delete")
         run("delete queued") { container.client.api.deleteSession(host, id) }
     }
+
+    /** Move a running session to another agent in the same org (XERK-101). The
+     *  moved session reappears on its new host in the list once it's up. */
+    fun migrate(host: String, id: String, targetHost: String) =
+        run("move queued") { container.client.api.migrateSession(host, id, MigrateRequest(targetHost)) }
 
     fun clone(host: String, repo: String) = run("clone queued") { container.client.api.clone(host, CloneRequest(repo)) }
     fun prune(host: String, repo: String) = run("prune queued") { container.client.api.prune(host, repo) }
