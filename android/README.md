@@ -114,6 +114,16 @@ one-tap **Update**, downloads it and hands it to the system package installer.
   because the currently-installed app carries an old random debug cert no stable
   key can match; every update after that installs in place.
 
+## Publishing to Google Play
+
+The app currently ships only by sideload (GitHub releases + the in-app updater
+above). To put it on the Play Store instead, see **[`PUBLISHING.md`](PUBLISHING.md)**
+— a step-by-step walkthrough covering the three repo changes a Play build needs
+(an App Bundle instead of an APK, dropping the self-updater and its
+`REQUEST_INSTALL_PACKAGES` permission via a product flavor, and a private upload
+key separate from the committed sideload keystore) and the full Play Console flow
+(account, app signing, store listing / data safety, testing tracks → production).
+
 ## Push notifications (FCM) setup
 
 Push is optional — the app builds and runs without it (the Firebase plugin is
