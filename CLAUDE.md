@@ -751,6 +751,12 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Service: a systemd **user** unit with `KillMode=process` (a restart signals only the manager, leaving
   tmux/claude/ttyd/tunnel alive), plus a nohup `turma-agentctl` fallback for WSL without systemd. Both
   preserve running sessions via the adopt-on-boot path.
+  - `turma-agentctl` keys its pidfiles on `XDG_RUNTIME_DIR` but falls back to `~/.turma` unless that dir
+    exists and is **writable** — a plain `${XDG_RUNTIME_DIR:-…}` doesn't, and on a WSL-without-logind host
+    (the one it's FOR) the var is set to a `/run/user/<uid>` logind never created, so every pidfile write
+    failed: `start` errored and `stop`/`restart` couldn't read the pid to kill, silently orphaning the old
+    manager and spawning a second (two managers double-heartbeating). Tests:
+    `agent/tests/test_turma_agentctl.sh`.
 - `turma-agent-update` — self-updater: reads the unified release stream via `gh`, comparing the release
   `manifest.json`'s **agent-native component version** (never the tag), verifies the sha256, swaps files,
   restarts the manager (re-adopting live sessions). Falls back to the legacy `agent-native-v*` stream.
