@@ -1211,32 +1211,44 @@ setInterval(() => {
 //     session first heartbeats back.
 const AUTO_START_EVERY_MS = 15 * 1000;
 
-// Auto-start is BOUNDED RETRY, not one-shot (XERK-61). Queuing a spawnTicket is
-// not evidence that a session started: the agent acks every command it takes,
+// Auto-start RETRIES until it succeeds, backing off but NEVER giving up (XERK-61
+// added the retry; XERK-109 removed the give-up). Queuing a spawnTicket is not
+// evidence that a session started: the agent acks every command it takes,
 // including ones it refuses outright (no triaged repo on THAT host, no owner to
 // clone with) and ones that simply blow up mid-spawn (a Jira fetch that times
 // out, a git failure) — handle_commands logs and acks those exactly like a
 // success, and nothing reports the outcome back. Treating "queued once" as
-// "started" therefore made a TRANSIENT failure permanent for the hub's lifetime,
-// which is what "sometimes it starts and sometimes it doesn't, with every
-// condition met" looks like from the board.
+// "started" made such a failure permanent, which is what "sometimes it starts and
+// sometimes it doesn't, with every condition met" looks like from the board.
 //
-// So each ticket gets a small budget of attempts spaced by a growing backoff,
-// and the retry gate is EVIDENCE, in the same order the sweep already checks it:
-// a session for the ticket (on any channel) ends the attempts for good, an
-// in-flight command means we're still waiting, and only a ticket that is still
-// session-less with nothing in flight past its backoff is tried again. The
-// budget is what keeps a genuinely impossible ticket (a repo that cannot be
-// cloned) from retrying forever; exhausting it logs once and gives up.
-const AUTO_START_MAX_ATTEMPTS = 4;
+// XERK-61's first fix retried a failed attempt on a growing backoff, but it CAPPED
+// the retries and gave up after a handful — so a ticket that flaked a few times for
+// a purely transient reason (Jira briefly down, the shared login momentarily
+// unavailable, a git hiccup) stayed blacklisted for the hub's lifetime even once
+// the condition cleared and every visible condition was met. That is the XERK-109
+// report. So the cap is gone: the backoff climbs to a ceiling and HOLDS there, and
+// the sweep keeps trying indefinitely. A genuinely-stuck ticket therefore re-queues
+// at most once per ceiling interval (cheap — the agent refuses an impossible spawn
+// before it ever fetches Jira), while a transiently-blocked one self-heals on the
+// first sweep after its condition returns.
+//
+// The retry gate is EVIDENCE, in the same order the sweep already checks it: a
+// session for the ticket (on any channel) ends the attempts for good and drops the
+// record, an in-flight command means we're still waiting, and only a ticket still
+// session-less with nothing in flight past its backoff is tried again.
 const AUTO_START_RETRY_MS = 60 * 1000;      // after attempt 1; doubles each time
-const AUTO_START_RETRY_MAX_MS = 10 * 60 * 1000;
+const AUTO_START_RETRY_MAX_MS = 10 * 60 * 1000;   // backoff ceiling; retries never stop
+// Doublings before the backoff reaches its ceiling (1→2→4→8→10min). The attempt
+// counter is capped here so it settles into a steady once-per-ceiling retry rather
+// than climbing without bound on a ticket that never manages to start.
+const AUTO_START_BACKOFF_STEPS = 5;
 // "<siteKey>\x00<issueKey>" -> { attempts, nextAt }. Entries are dropped the
 // moment the ticket is seen to have a session, so this stays as small as the set
 // of tickets currently failing to start.
 const autoStarted = new Map();
 
-// When to try again after `attempts` failed attempts: 1min, 2min, 4min, capped.
+// When to try again after `attempts` failed attempts: 1min, 2min, 4min, 8min, then
+// held at AUTO_START_RETRY_MAX_MS (10min) for good.
 function autoStartRetryAt(now, attempts) {
   return now + Math.min(AUTO_START_RETRY_MS * 2 ** (attempts - 1),
     AUTO_START_RETRY_MAX_MS);
@@ -1304,12 +1316,11 @@ function autoStartSweep() {
         (a.commands || []).some((c) => c.type === "spawnTicket" && c.issueKey === t.key));
       if (inFlight) continue;
       // Nothing in flight and still no session: the last attempt (if any) was
-      // taken and produced nothing. Retry it, within the budget and its backoff.
+      // taken and produced nothing. Retry it once its backoff has elapsed — the
+      // backoff is the ONLY gate now, so a ticket blocked by a transient failure
+      // recovers on its own the moment the block clears (XERK-109).
       const prior = autoStarted.get(k);
-      if (prior) {
-        if (prior.attempts >= AUTO_START_MAX_ATTEMPTS) continue;
-        if (now < prior.nextAt) continue;
-      }
+      if (prior && now < prior.nextAt) continue;
       const { host } = findTicketHost(siteKey, repo, t.key);
       // No online host to route to right now (the org's hosts are down, or the
       // ticket's pinned agent is) — spend no attempt, so the next sweep retries
@@ -1317,17 +1328,15 @@ function autoStartSweep() {
       // failure that was never the ticket's fault.
       if (!host) continue;
       queueCommand(host, { type: "spawnTicket", issueKey: t.key });
-      const attempts = (prior ? prior.attempts : 0) + 1;
+      // Grow the backoff toward its ceiling; the counter is capped there so it
+      // settles into a steady once-per-ceiling retry instead of climbing forever.
+      const attempts = Math.min((prior ? prior.attempts : 0) + 1,
+        AUTO_START_BACKOFF_STEPS);
       autoStarted.set(k, { attempts, nextAt: autoStartRetryAt(now, attempts) });
       if (attempts > 1) {
-        console.log(`auto-start: retrying ${t.key} on ${host} `
-          + `(attempt ${attempts}/${AUTO_START_MAX_ATTEMPTS}) — the previous `
-          + "spawnTicket was acked but left no session");
-      }
-      if (attempts >= AUTO_START_MAX_ATTEMPTS) {
-        console.log(`auto-start: ${t.key} has used its last attempt; if this one `
-          + "leaves no session the hub will stop trying (start it by hand from "
-          + "the board to retry)");
+        console.log(`auto-start: retrying ${t.key} on ${host} — the previous `
+          + "spawnTicket was acked but left no session (backing off, but the hub "
+          + "keeps trying so it recovers once the block clears)");
       }
     }
   }
