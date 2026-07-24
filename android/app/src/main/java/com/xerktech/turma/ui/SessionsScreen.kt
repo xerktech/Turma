@@ -58,6 +58,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.VerbosityPrefs
 import com.xerktech.turma.core.buildItems
+import com.xerktech.turma.core.eligibleMoveTargets
 import com.xerktech.turma.core.liveState
 import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.core.sessionBranch
@@ -513,8 +514,10 @@ fun SessionsListPane(
                     SessionListCard(
                         r.flat, now,
                         selected = selectedKey == r.flat.host + "/" + r.flat.session.id,
+                        moveTargets = eligibleMoveTargets(fleet.agents, r.flat.host, r.flat.session),
                         onKill = { vm.kill(r.flat.host, r.flat.session.id) },
                         onRename = { name -> vm.setSummary(r.flat.host, r.flat.session.id, name) },
+                        onMove = { target -> vm.migrate(r.flat.host, r.flat.session.id, target) },
                         onClick = { onSelect(r.flat.host, r.flat.session.id) },
                     )
                 }
@@ -526,8 +529,10 @@ fun SessionsListPane(
                     SessionListCard(
                         r.flat, now,
                         selected = selectedKey == r.flat.host + "/" + r.flat.session.id,
+                        moveTargets = eligibleMoveTargets(fleet.agents, r.flat.host, r.flat.session),
                         onKill = { vm.kill(r.flat.host, r.flat.session.id) },
                         onRename = { name -> vm.setSummary(r.flat.host, r.flat.session.id, name) },
+                        onMove = { target -> vm.migrate(r.flat.host, r.flat.session.id, target) },
                         onClick = { onSelect(r.flat.host, r.flat.session.id) },
                     )
                 }
@@ -709,8 +714,10 @@ private fun SessionListCard(
     r: FlatSession,
     now: Long,
     selected: Boolean,
+    moveTargets: List<com.xerktech.turma.model.AgentInfo>,
     onKill: () -> Unit,
     onRename: (String) -> Unit,
+    onMove: (String) -> Unit,
     onClick: () -> Unit,
 ) {
     val cardMod = Modifier.fillMaxWidth().then(
@@ -779,8 +786,14 @@ private fun SessionListCard(
                     }
                 }
             }
-            // Per-card overflow menu (web sessions.html ⋯): Rename + arm/confirm Kill.
-            SessionCardMenu(onRename = { renaming = true }, onKill = onKill)
+            // Per-card overflow menu (web sessions.html ⋯): Rename + Move + arm/confirm Kill.
+            SessionCardMenu(
+                canMove = r.session.status == "running" && !r.session.root && moveTargets.isNotEmpty(),
+                moveTargets = moveTargets,
+                onRename = { renaming = true },
+                onMove = onMove,
+                onKill = onKill,
+            )
         }
     }
 }
@@ -1001,17 +1014,47 @@ private fun SessionRenameCard(
  * mis-tap can't destroy it. Closing the menu disarms.
  */
 @Composable
-private fun SessionCardMenu(onRename: () -> Unit, onKill: () -> Unit) {
+private fun SessionCardMenu(
+    canMove: Boolean,
+    moveTargets: List<com.xerktech.turma.model.AgentInfo>,
+    onRename: () -> Unit,
+    onMove: (String) -> Unit,
+    onKill: () -> Unit,
+) {
     var open by remember { mutableStateOf(false) }
     var armed by remember { mutableStateOf(false) }
+    // Second level: the target-host picker for a move (web moveMenu).
+    var moving by remember { mutableStateOf(false) }
     LaunchedEffect(armed) { if (armed) { kotlinx.coroutines.delay(KILL_ARM_MS); armed = false } }
+    fun dismiss() { open = false; armed = false; moving = false }
     Box {
         IconButton(onClick = { open = true }) { Icon(Icons.Filled.MoreVert, "Session actions") }
-        DropdownMenu(expanded = open, onDismissRequest = { open = false; armed = false }) {
+        DropdownMenu(expanded = open, onDismissRequest = { dismiss() }) {
+            if (moving) {
+                DropdownMenuItem(
+                    enabled = false,
+                    text = { Text("Move to…", style = MaterialTheme.typography.labelSmall) },
+                    onClick = {},
+                )
+                moveTargets.forEach { t ->
+                    DropdownMenuItem(
+                        text = { Text(t.device.ifBlank { t.key }) },
+                        onClick = { dismiss(); onMove(t.key) },
+                    )
+                }
+                DropdownMenuItem(text = { Text("Cancel") }, onClick = { moving = false })
+                return@DropdownMenu
+            }
             DropdownMenuItem(
                 text = { Text("Rename…") },
                 onClick = { open = false; armed = false; onRename() },
             )
+            if (canMove) {
+                DropdownMenuItem(
+                    text = { Text("Move to another agent…") },
+                    onClick = { armed = false; moving = true },
+                )
+            }
             DropdownMenuItem(
                 text = {
                     Text(

@@ -58,6 +58,13 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   offset (the web `chat.js` `startsWith` check, XERK-19). Tested in `RevealTest`.
 - **Sign out.** A ⋮ overflow on the shared `ScreenHeader` (every top-level screen) that unregisters
   push, clears credentials, and returns to Login — the web has Sign out in its nav on every page.
+- **Move a session to another agent (XERK-101).** The session card ⋯ menu gains "Move to another
+  agent…" opening a target-host picker (online, same-org hosts that have the repo), which posts the
+  `/migrate` command — a port of web sessions.html `moveMenu`/`moveTo`. `core.eligibleMoveTargets`
+  mirrors the web target filter (tested in `SessionsTest`). One deliberate difference: the web stage
+  auto-follows the moved session onto its new host (`advanceMigrationFollow`); Android just lets it
+  reappear in the session list on its new host (no stage to follow on a phone), so the "Moving…" card
+  hint and the follow are web-only.
 - **Full-history archive search reachable.** `ui/ArchiveScreen.kt` was fully built but orphaned; it's
   now a route reached from a search action on the Sessions header (the web puts this search in the
   Sessions sidebar). The live Sessions box is relabeled "Filter these sessions" to distinguish it.

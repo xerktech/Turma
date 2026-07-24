@@ -104,6 +104,7 @@ const {
   TERM_OSC52_JS,
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStartOrgs, setAutoStartOrg,
+  migrations, advanceMigrations,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -3671,4 +3672,182 @@ test("control WS: a channel that pongs is kept past the dead-after window", asyn
   } finally {
     socket.destroy();
   }
+});
+
+// ---- session migration across hosts (XERK-101) --------------------------------
+// Move a running session from one agent to another in the same org. The hub
+// orchestrates: exportSession on the source, a raw-transcript relay through the
+// hub, importSession on the target, then a kill of the source once it's up.
+
+// Seed a host reporting a running, worktree-backed session `s1` on `repo`, in
+// org `site`. Fields are exactly what the /migrate endpoint validates.
+const migHost = (device, site, {
+  session = "s1", repo = "Turma", repos = ["Turma"], status = "running",
+  root = false, claudeSessionId = "trans-" + device, extraSessions = [],
+} = {}) =>
+  request("POST", "/api/heartbeat", {
+    body: {
+      device,
+      repos: repos.map((name) => ({ name, path: `/git/${name}` })),
+      jira: { available: true, configured: true, siteKey: site, user: `${device}@x.com`, tickets: [] },
+      sessions: [
+        {
+          id: session, status, root, repo, claudeSessionId,
+          worktreePath: `/git/.turma/worktrees/${repo}/${session}`,
+          model: "opus", permissionMode: "auto", summary: "Fix the logs",
+          ticket: { key: "ENG-9", siteKey: site, url: "u", summary: "Fix the logs", branch: "ENG-9" },
+        },
+        ...extraSessions,
+      ],
+    },
+    headers: agentHeaders,
+  });
+
+// A raw-body request (the JSON `request` helper can't carry an octet-stream).
+function requestRaw(method, pathName, { body, headers } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(baseUrl + pathName, { method, headers }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const buf = Buffer.concat(chunks);
+        let parsed = null;
+        try { parsed = JSON.parse(buf.toString()); } catch {}
+        resolve({ status: res.statusCode, body: parsed, buf, headers: res.headers });
+      });
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+const migrate = (host, session, body) =>
+  request("POST", `/api/agents/${host}/sessions/${session}/migrate`,
+    { body, headers: userHeaders });
+
+test("migrate: rejects a bad source, target, or org mismatch", async () => {
+  await migHost("mSrc", "m1.atlassian.net");
+  await migHost("mTgt", "m1.atlassian.net");
+  await migHost("mOther", "m2.atlassian.net"); // a different org
+
+  // unknown session
+  assert.equal((await migrate("mSrc", "nope", { host: "mTgt" })).status, 404);
+  // no target / same host
+  assert.equal((await migrate("mSrc", "s1", { host: "" })).status, 400);
+  assert.equal((await migrate("mSrc", "s1", { host: "mSrc" })).status, 400);
+  // unknown target
+  assert.equal((await migrate("mSrc", "s1", { host: "ghost" })).status, 404);
+  // different org
+  assert.equal((await migrate("mSrc", "s1", { host: "mOther" })).status, 409);
+});
+
+test("migrate: rejects a root session and one with no conversation yet", async () => {
+  await migHost("mRoot", "mr.atlassian.net", { root: true });
+  await migHost("mRootTgt", "mr.atlassian.net");
+  assert.equal((await migrate("mRoot", "s1", { host: "mRootTgt" })).status, 409);
+
+  await migHost("mFresh", "mf.atlassian.net", { claudeSessionId: null });
+  await migHost("mFreshTgt", "mf.atlassian.net");
+  assert.equal((await migrate("mFresh", "s1", { host: "mFreshTgt" })).status, 409);
+});
+
+test("migrate: rejects a target that lacks the repo cloned", async () => {
+  await migHost("mHas", "mrepo.atlassian.net", { repos: ["Turma"] });
+  await migHost("mLacks", "mrepo.atlassian.net", { repos: ["Other"] });
+  const r = await migrate("mHas", "s1", { host: "mLacks" });
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /clone it there first/);
+});
+
+test("migrate: full move — export, relay, import, then kill the source", async () => {
+  await migHost("mgA", "mg.atlassian.net");
+  await migHost("mgB", "mg.atlassian.net");
+
+  // 1. Start the move: exportSession queued on the source, migration exporting.
+  const r = await migrate("mgA", "s1", { host: "mgB" });
+  assert.equal(r.status, 200);
+  const mid = r.body.migrationId;
+  assert.ok(mid);
+  assert.deepEqual(agents.mgA.commands, [
+    { type: "exportSession", sessionId: "s1", migrationId: mid, cmdId: agents.mgA.commands[0].cmdId },
+  ]);
+  assert.equal(migrations.get(mid).phase, "exporting");
+
+  // 2. The source uploads the raw transcript bundle -> importSession on target.
+  const blob = Buffer.from("PRETEND-GZIP-TAR-BYTES");
+  const up = await requestRaw("POST", `/api/agents/mgA/migrations/${mid}/blob`,
+    { body: blob, headers: { authorization: "Bearer agenttok", "content-type": "application/octet-stream" } });
+  assert.equal(up.status, 200);
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "importing");
+  const imp = agents.mgB.commands.find((c) => c.type === "importSession");
+  assert.ok(imp);
+  assert.equal(imp.migrationId, mid);
+  assert.equal(imp.transcriptId, "trans-mgA");
+  assert.equal(imp.cwd, "/git/.turma/worktrees/Turma/s1");
+  assert.equal(imp.repo, "Turma");
+  assert.equal(imp.model, "opus");
+  assert.equal(imp.ticket.key, "ENG-9");
+  assert.equal(imp.migratedFrom.host, "mgA");
+  assert.equal(m.importCmdId, imp.cmdId);
+
+  // 3. The target agent pulls the bundle back (byte-identical).
+  const dl = await requestRaw("GET", `/api/agents/mgB/migrations/${mid}/blob`,
+    { headers: { authorization: "Bearer agenttok" } });
+  assert.equal(dl.status, 200);
+  assert.equal(dl.headers["content-type"], "application/octet-stream");
+  assert.ok(blob.equals(dl.buf));
+
+  // 4. The target session comes up (spawnCmdId === importCmdId) -> the hub kills
+  //    the source and finishes the migration on that heartbeat.
+  await migHost("mgB", "mg.atlassian.net", {
+    extraSessions: [{ id: "new1", status: "running", root: false, repo: "Turma",
+      claudeSessionId: "trans-mgA", worktreePath: "/git/.turma/worktrees/Turma/s1",
+      spawnCmdId: m.importCmdId }],
+  });
+  const after = migrations.get(mid);
+  assert.equal(after.phase, "done");
+  assert.equal(after.targetSessionId, "new1");
+  assert.ok(agents.mgA.commands.some((c) => c.type === "kill" && c.sessionId === "s1"),
+    "source session should be killed once the target is up");
+  // The blob is freed on handoff.
+  assert.equal(after.blob, null);
+});
+
+test("migrate: a second move of the same session is single-flighted", async () => {
+  await migHost("sfA", "sf.atlassian.net");
+  await migHost("sfB", "sf.atlassian.net");
+  const first = await migrate("sfA", "s1", { host: "sfB" });
+  assert.equal(first.status, 200);
+  const second = await migrate("sfA", "s1", { host: "sfB" });
+  assert.equal(second.status, 409);
+  assert.match(second.body.error, /already being moved/);
+});
+
+test("migrate: a stalled move times out and frees its blob", async () => {
+  await migHost("toA", "to.atlassian.net");
+  await migHost("toB", "to.atlassian.net");
+  const r = await migrate("toA", "s1", { host: "toB" });
+  const m = migrations.get(r.body.migrationId);
+  m.startedAt = Date.now() - 10 * 60 * 1000; // well past MIGRATE_TIMEOUT_MS
+  advanceMigrations();
+  assert.equal(m.phase, "failed");
+  assert.match(m.error, /timed out/);
+  assert.equal(m.blob, null);
+});
+
+test("migrate: the blob relay rejects an unauthenticated caller", async () => {
+  await migHost("auA", "au.atlassian.net");
+  await migHost("auB", "au.atlassian.net");
+  const r = await migrate("auA", "s1", { host: "auB" });
+  const mid = r.body.migrationId;
+  // No credentials, and a bad bearer token, are both refused (like the
+  // heartbeat, the user login also works — but nothing unauthenticated does).
+  const anon = await requestRaw("POST", `/api/agents/auA/migrations/${mid}/blob`,
+    { body: Buffer.from("x") });
+  assert.equal(anon.status, 401);
+  const badTok = await requestRaw("POST", `/api/agents/auA/migrations/${mid}/blob`,
+    { body: Buffer.from("x"), headers: { authorization: "Bearer nope" } });
+  assert.equal(badTok.status, 401);
 });

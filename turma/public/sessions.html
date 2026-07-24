@@ -121,6 +121,25 @@
   .s-menu button:hover { background: var(--accent-soft); }
   .s-menu button.danger { color: var(--critical); font-weight: 600; }
   .s-menu button.danger.armed { background: var(--critical); color: #fff; }
+  .s-menu-head {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+    color: var(--muted); padding: 6px 9px 3px;
+  }
+  .s-menu-empty { font-size: 12px; color: var(--muted); padding: 6px 9px; }
+  /* "Moving to <host>…" hint on a source card while its migration is in flight. */
+  .s-moving {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11.5px; color: var(--accent); margin-top: 4px;
+  }
+  /* A transient bottom-centre notice (a failed move, today). */
+  .toast {
+    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+    z-index: 50; max-width: min(92vw, 480px);
+    background: var(--critical); color: #fff; font-size: 13px;
+    padding: 10px 16px; border-radius: var(--radius-md); box-shadow: var(--shadow-md);
+    opacity: 0; pointer-events: none; transition: opacity .2s;
+  }
+  .toast.show { opacity: 1; }
 
   /* Inline rename field, opened from the menu; replaces the card while editing. */
   .s-rename {
@@ -796,6 +815,81 @@ const KILL_ARM_MS = 3500;
 // DOM id of a card's rename field (see captureFieldFocus for the "ren-" prefix).
 function renFieldId(id) { return "ren-" + String(id).replace(/[^A-Za-z0-9]/g, "_"); }
 
+// ---- move a session to another agent (XERK-101) -----------------------------
+// - moveOpenId: session id whose ⋯ menu is showing the target-host picker
+// - pendingMigration: the migrationId we're following; once its importCmdId is
+//   known we hand off to the normal followSpawn wait so the stage follows the
+//   session onto its new host (the target mints a NEW id, like a resume).
+let moveOpenId = null;
+let pendingMigration = null;
+let pendingMigrationFollowed = false;
+
+function siteKeyOfAgent(a) { return (a && a.jira && a.jira.siteKey) || ""; }
+// The online hosts a running session could move to: same org, a different host,
+// with the session's repo already cloned (the hub requires it — the target
+// resumes off that repo's default branch).
+function eligibleMoveTargets(a, s) {
+  const org = siteKeyOfAgent(a);
+  return (cache.agents || []).filter(x =>
+    x.key !== a.key && x.online && siteKeyOfAgent(x) === org &&
+    (x.repos || []).some(r => r && r.name === s.repo));
+}
+// Is this session mid-move? (Shown as a "moving…" hint on its card so the
+// operator sees the export/relay step before the stage follows it over.)
+function migrationFor(host, id) {
+  return (cache.migrations || []).find(m =>
+    m.srcHost === host && m.srcSessionId === id &&
+    (m.phase === "exporting" || m.phase === "importing")) || null;
+}
+function openMove(ev, id) { ev.stopPropagation(); moveOpenId = id; render(cache); }
+function closeMove(ev) { if (ev) ev.stopPropagation(); moveOpenId = null; render(cache); }
+async function moveTo(ev, srcHost, id, targetHost) {
+  ev.stopPropagation();
+  moveOpenId = null;
+  menuOpenId = null;
+  render(cache);
+  const out = await post(`/api/agents/${enc(srcHost)}/sessions/${enc(id)}/migrate`,
+    { host: targetHost });
+  if (out && out.migrationId) {
+    pendingMigration = out.migrationId;
+    pendingMigrationFollowed = false;
+  } else {
+    toast(out && out.error ? "Move failed: " + out.error : "Move failed");
+  }
+}
+// Advance a followed migration each render: hand off to followSpawn the moment
+// the target's importSession command id is known, and surface a failure.
+function advanceMigrationFollow() {
+  if (!pendingMigration) return;
+  const m = (cache.migrations || []).find(x => x.id === pendingMigration);
+  if (!m) { pendingMigration = null; pendingMigrationFollowed = false; return; }
+  if (m.phase === "failed") {
+    pendingMigration = null; pendingMigrationFollowed = false;
+    toast("Move failed: " + (m.error || "migration failed"));
+    return;
+  }
+  if (m.importCmdId && !pendingMigrationFollowed) {
+    pendingMigrationFollowed = true;
+    followSpawn(m.importCmdId); // the target session comes up under this cmdId
+  }
+  if (m.phase === "done") pendingMigration = null;
+}
+// A tiny non-blocking toast (migration is the only caller today).
+let toastTimer = null;
+function toast(msg) {
+  let el = document.getElementById("toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "toast";
+    el.className = "toast";
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.classList.add("show");
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 6000);
+}
+
 function toggleCardMenu(ev, id) {
   ev.stopPropagation();  // the card behind the ⋯ must not take the click
   menuOpenId = menuOpenId === id ? null : id;
@@ -804,8 +898,9 @@ function toggleCardMenu(ev, id) {
 }
 // Any click outside an open menu dismisses it (the menu itself stops the event).
 function closeCardMenu() {
-  if (menuOpenId === null) return;
+  if (menuOpenId === null && moveOpenId === null) return;
   menuOpenId = null;
+  moveOpenId = null;
   disarmCardKill();
   render(cache);
 }
@@ -1377,6 +1472,7 @@ function render(data) {
     }
   }
 
+  advanceMigrationFollow(); // hand a followed move off to the spawn wait below
   tryPendingSelect(); // deep-linked ?session=<id> — open it once it's running
 }
 
@@ -1427,6 +1523,10 @@ function activeCard({ a, s, live }) {
   // legally hold one — the chat footer's chip is where the ticket is clickable.
   const ticket = s.ticket?.key ? ` · <span class="s-ticket">${esc(s.ticket.key)}</span>` : "";
   const meta = `<span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}${ticket}`;
+  // A move in progress: show where it's going until the stage follows it over.
+  const mig = migrationFor(a.key, s.id);
+  const moving = mig
+    ? `<div class="s-moving"><span class="spin"></span> Moving to ${esc(mig.targetHost)}…</div>` : "";
   return `<div class="s-card-wrap">
     <button class="s-card ${cur ? "cur" : ""}" ${attachable ? "" : "disabled"}
         onclick="selectSession('${esc(s.id)}')"
@@ -1440,6 +1540,7 @@ function activeCard({ a, s, live }) {
           ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
         </div>
         ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
+        ${moving}
       </span>
     </button>
     <button class="s-dots ${menuOpenId === s.id ? "open" : ""}" title="Session actions"
@@ -1454,13 +1555,28 @@ function activeCard({ a, s, live }) {
 // offline too — the card is un-attachable then, but renaming is local to the
 // registry and a kill still rides the heartbeat.
 function cardMenu(a, s) {
+  if (moveOpenId === s.id) return moveMenu(a, s);
   const armed = killArmedId === s.id;
+  const targets = eligibleMoveTargets(a, s);
   return `<div class="s-menu" onclick="event.stopPropagation()">
     <button onclick="startRename(event,'${esc(s.id)}')">Rename…</button>
+    ${targets.length ? `<button onclick="openMove(event,'${esc(s.id)}')">Move to another agent…</button>` : ""}
     <button class="danger ${armed ? "armed" : ""}"
         onclick="cardKill(event,'${esc(a.key)}','${esc(s.id)}')">
       ${armed ? "Confirm kill" : "Kill session"}
     </button>
+  </div>`;
+}
+// The ⋯ menu showing the target-host picker for a move. Each online same-org
+// host that has the repo is a one-click destination (see eligibleMoveTargets).
+function moveMenu(a, s) {
+  const targets = eligibleMoveTargets(a, s);
+  return `<div class="s-menu" onclick="event.stopPropagation()">
+    <div class="s-menu-head">Move to…</div>
+    ${targets.length
+      ? targets.map(t => `<button onclick="moveTo(event,'${esc(a.key)}','${esc(s.id)}','${esc(t.key)}')">${esc(t.device || t.key)}</button>`).join("")
+      : `<div class="s-menu-empty">No eligible agent.</div>`}
+    <button onclick="closeMove(event)">Cancel</button>
   </div>`;
 }
 

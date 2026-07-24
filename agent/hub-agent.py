@@ -42,16 +42,19 @@ stdlib only — no pip installs in the image.
 import base64
 import datetime
 import html
+import io
 import json
 import os
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.parse
@@ -227,6 +230,12 @@ CLAUDE_AUTH_WARN_MS = int(
 ARCHIVE_MANIFEST_MAX = int(os.environ.get("ARCHIVE_MANIFEST_MAX", "200"))
 ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read+POST per delta
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
+# The compressed transcript bundle a session migration ships through the hub
+# (source host -> hub -> target host). A single gzipped POST, capped so a
+# pathologically long conversation fails loudly rather than OOM-ing the hub's
+# in-memory relay. Transcripts are JSON and compress ~10x, so this covers very
+# large sessions; the guard is a backstop, not an expected limit (XERK-101).
+MIGRATION_BLOB_MAX = int(os.environ.get("TURMA_MIGRATION_BLOB_MAX", str(1 << 26)))  # 64 MiB
 
 
 def _project_slug(path):
@@ -241,6 +250,10 @@ def _project_slug(path):
 # interpolate into the tmux command line (--session-id / --resume). Never let
 # anything through that isn't a plain uuid-ish word.
 VALID_CLAUDE_SID_RE = re.compile(r"[A-Za-z0-9-]+")
+# A migration id, minted hub-side (crypto random hex) and echoed into the blob
+# relay URL — validated the same strict way as a transcript id since it also
+# reaches a URL path.
+VALID_MIGRATION_ID_RE = re.compile(r"[A-Za-z0-9-]+")
 # Glasses-client transcript tail: how many surviving messages to report per
 # beat, and how many chars of each to keep (payload-size bounds).
 TAIL_MSGS = int(os.environ.get("SESSION_TAIL_MSGS", "30"))
@@ -6708,20 +6721,36 @@ class SessionManager:
             return
         path = os.path.join(proj, transcript_id + ".jsonl")
         cwd = _transcript_cwd(path) or cwd_hint
+        self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id)
+
+    def _resume_at_cwd(self, transcript_id, cwd, *, cmd_id=None, extra=None):
+        """Launch `claude --resume <transcript_id>` cwd'd at `cwd`, the shared
+        core of resume_transcript (host-local resume-any) and import_session
+        (a session migrated in from another agent). The transcript file must
+        already be present under PROJECTS_ROOT/<slug(cwd)>/ — resume_transcript
+        located it there, import_session unpacked it there. Only a cwd under
+        REPOS_ROOT is resumable, and the origin worktree is re-created at the
+        EXACT path if missing so its slug matches the transcript and claude
+        resolves the id (see resume_transcript's docstring).
+
+        `extra` carries fields a plain resume-any has no source for but a
+        migration does — the session's ticket, name, model and mode — so the
+        moved session lands looking like its old self rather than an anonymous
+        resume. Returns the new session record, or None if it couldn't launch."""
         # Only a cwd under REPOS_ROOT is resumable here — never let a free-form
         # path reach git/tmux.
         cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
         if not cls:
-            log(f"resumeTranscript: cwd {cwd!r} not resumable on this host")
-            return
+            log(f"resume: cwd {cwd!r} not resumable on this host")
+            return None
         repo, _origin, is_root = cls
         cwd = os.path.normpath(cwd)
         if self._running_count() >= MAX_SESSIONS:
-            log(f"resumeTranscript refused: at MAX_SESSIONS ({MAX_SESSIONS})")
-            return
+            log(f"resume refused: at MAX_SESSIONS ({MAX_SESSIONS})")
+            return None
         if is_root and self._root_running():
-            log("resumeTranscript refused: a root session is already running")
-            return
+            log("resume refused: a root session is already running")
+            return None
         # One live session per cwd: two claudes in the same dir share a project
         # slug + RC bridge pointer and would collide (the same reason root is
         # single). A worktree resume gets its own dir, so this only bites a repo-
@@ -6729,12 +6758,13 @@ class SessionManager:
         if any(s.get("status") == "running"
                and os.path.normpath(s.get("worktreePath") or "") == cwd
                for s in self.registry):
-            log(f"resumeTranscript refused: a session is already running in {cwd}")
-            return
+            log(f"resume refused: a session is already running in {cwd}")
+            return None
         repo_path = REPOS_ROOT if is_root else os.path.join(REPOS_ROOT, repo)
         if not is_root and not os.path.isdir(repo_path):
-            log(f"resumeTranscript: repo {repo!r} is gone; cannot resume")
-            return
+            log(f"resume: repo {repo!r} is gone; cannot resume")
+            return None
+        extra = extra or {}
         sid = self._new_id()
         sess = {
             "id": sid,
@@ -6746,13 +6776,19 @@ class SessionManager:
             # The transcript being resumed IS this session's conversation;
             # _launch_tmux pins it from resume_id.
             "claudeSessionId": None,
-            "label": None,
-            "summary": None,       # seeded from the transcript on later beats
+            "label": extra.get("label"),
+            # A migration carries the moved session's name/ticket/model/mode; a
+            # plain resume-any has none of these and seeds the name from the
+            # transcript on later beats.
+            "summary": extra.get("summary"),
+            "summaryManual": extra.get("summaryManual"),
+            "ticket": extra.get("ticket"),
+            "migratedFrom": extra.get("migratedFrom"),
             "rcName": f"{slugify(self.device)}-{slugify(repo)}-{sid}",
             "tmuxName": f"agent-{sid}",
             "ttydPort": self._alloc_port(),
-            "model": None,
-            "permissionMode": "auto",
+            "model": extra.get("model"),
+            "permissionMode": extra.get("permissionMode") or "auto",
             "baseRef": None,
             "status": "running",
             "createdAt": now_iso(),
@@ -6762,9 +6798,11 @@ class SessionManager:
         }
         self.registry.append(sess)
         try:
-            # A deleted/pruned Turma worktree: re-add a detached one at the exact
-            # origin path so its slug matches the transcript and claude resolves
-            # the id. Repo-dir / repos-root cwds always exist, so this is skipped.
+            # A deleted/pruned Turma worktree (or a migrated session, whose
+            # worktree only ever existed on the source host): re-add a detached
+            # one at the exact origin path so its slug matches the transcript and
+            # claude resolves the id. Repo-dir / repos-root cwds always exist, so
+            # this is skipped.
             if not is_root and not os.path.isdir(cwd):
                 sess["baseRef"] = resolve_base_ref(repo_path, None)
                 self._worktree_add(sess, base_ref=sess["baseRef"])
@@ -6773,8 +6811,177 @@ class SessionManager:
             self._launch_ttyd(sess)
             log(f"resumed transcript {transcript_id} for {repo} in {cwd} "
                 f"on :{sess['ttydPort']}")
+            return sess
         except Exception as e:
             self._set_error(sess, e)
+            return None
+
+    # --- session migration across hosts (XERK-101) ------------------------
+
+    def export_session(self, session_id, migration_id):
+        """Source half of a migration: snapshot this running session's raw
+        transcript (the ONLY copy that `claude --resume` can replay — the hub's
+        archive keeps a rendered projection, not resumable bytes) and ship it to
+        the hub's migration relay, which hands it to the chosen target agent.
+
+        The snapshot is truncated to the last complete line so a turn caught
+        mid-write can't hand the target a half-JSON tail. The source session
+        keeps running until the hub confirms the target is up and queues its
+        kill, so any turn that lands after this snapshot survives on the source
+        (killed = resumable), never lost."""
+        if not migration_id or not VALID_MIGRATION_ID_RE.fullmatch(migration_id):
+            log(f"exportSession: bad migration id {migration_id!r}")
+            return
+        sess = self._find(session_id)
+        if not sess:
+            log(f"exportSession: no such session {session_id}")
+            return
+        path = _session_transcript_path(sess)
+        if not path or not os.path.isfile(path):
+            log(f"exportSession: session {session_id} has no transcript to move")
+            return
+        try:
+            blob = self._pack_transcript(path)
+        except Exception as e:
+            log(f"exportSession: pack failed for {session_id}: {e}")
+            return
+        if len(blob) > MIGRATION_BLOB_MAX:
+            log(f"exportSession: transcript bundle {len(blob)} bytes exceeds "
+                f"{MIGRATION_BLOB_MAX}; migration aborted")
+            return
+        self._migration_upload(migration_id, blob)
+
+    def import_session(self, cmd):
+        """Target half of a migration: pull the transcript bundle the source
+        shipped, unpack it under this host's PROJECTS_ROOT at the origin cwd's
+        slug, then resume it here carrying the moved session's identity. A NEW
+        Turma id/rcName/port is minted like a resume; the transcript id (hence
+        the conversation) is preserved, so the target continues in place."""
+        migration_id = cmd.get("migrationId")
+        transcript_id = cmd.get("transcriptId")
+        cwd = cmd.get("cwd")
+        if not migration_id or not VALID_MIGRATION_ID_RE.fullmatch(migration_id):
+            log(f"importSession: bad migration id {migration_id!r}")
+            return
+        if not transcript_id or not VALID_CLAUDE_SID_RE.fullmatch(transcript_id):
+            log(f"importSession: bad transcript id {transcript_id!r}")
+            return
+        # Classify the cwd BEFORE spending a download — a foreign path or a
+        # missing repo can't be resumed here, and the hub already vetted the org
+        # + repo, so this only trips on a genuinely inconsistent target.
+        cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
+        if not cls:
+            log(f"importSession: cwd {cwd!r} not resumable on this host")
+            return
+        blob = self._migration_download(migration_id)
+        if blob is None:
+            log(f"importSession: could not fetch bundle for {migration_id}")
+            return
+        slug_dir = os.path.join(PROJECTS_ROOT,
+                                _project_slug(os.path.normpath(cwd)))
+        try:
+            os.makedirs(slug_dir, exist_ok=True)
+            self._unpack_transcript(blob, slug_dir)
+        except Exception as e:
+            log(f"importSession: unpack failed for {migration_id}: {e}")
+            return
+        extra = {
+            "ticket": cmd.get("ticket"),
+            "summary": cmd.get("summary"),
+            "summaryManual": cmd.get("summaryManual"),
+            "label": cmd.get("label"),
+            "model": cmd.get("model"),
+            "permissionMode": cmd.get("permissionMode"),
+            "migratedFrom": cmd.get("migratedFrom"),
+        }
+        self._resume_at_cwd(transcript_id, cwd,
+                            cmd_id=cmd.get("cmdId"), extra=extra)
+
+    def _pack_transcript(self, path):
+        """Bundle a transcript file (+ its subagents/ dir, if any) into gzipped
+        tar bytes, laid out relative to the project-slug dir so the target
+        unpacks straight into PROJECTS_ROOT/<slug>/: `<id>.jsonl` and, when
+        present, `<id>/subagents/...`. The main file is truncated to its last
+        complete line."""
+        tid = os.path.basename(path)[:-len(".jsonl")]
+        with open(path, "rb") as f:
+            raw = f.read()
+        nl = raw.rfind(b"\n")
+        complete = raw[:nl + 1] if nl >= 0 else raw
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            ti = tarfile.TarInfo(name=os.path.basename(path))
+            ti.size = len(complete)
+            tar.addfile(ti, io.BytesIO(complete))
+            sub = _subagents_dir(path)
+            if os.path.isdir(sub):
+                tar.add(sub, arcname=os.path.join(tid, "subagents"))
+        return buf.getvalue()
+
+    def _unpack_transcript(self, blob, dest_dir):
+        """Extract a _pack_transcript bundle into dest_dir. A bundle crosses a
+        host boundary, so it is never trusted: each member is written by hand to
+        a path re-checked to stay inside dest_dir (no tar.extract/extractall,
+        which would honour an absolute path, a `..`, or a symlink), and only
+        regular files and directories are unpacked."""
+        root = os.path.realpath(dest_dir)
+        buf = io.BytesIO(blob)
+        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            for m in tar.getmembers():
+                parts = m.name.split("/")
+                if m.name.startswith("/") or os.path.isabs(m.name) or ".." in parts:
+                    raise ValueError(f"unsafe tar member {m.name!r}")
+                out = os.path.join(dest_dir, m.name)
+                if os.path.realpath(out) != root and \
+                        not os.path.realpath(out).startswith(root + os.sep):
+                    raise ValueError(f"tar member escapes dest {m.name!r}")
+                if m.isdir():
+                    os.makedirs(out, exist_ok=True)
+                elif m.isreg():
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                    src = tar.extractfile(m)
+                    if src is None:
+                        continue
+                    with src, open(out, "wb") as f:
+                        shutil.copyfileobj(src, f)
+                # anything else (symlink/device/fifo) is silently skipped
+
+    def _migration_upload(self, migration_id, blob):
+        """POST a transcript bundle to the hub's migration relay (octet-stream,
+        agent-authed). Best-effort: a failure leaves the migration to time out
+        hub-side rather than raising into the command loop."""
+        try:
+            headers = {"Content-Type": "application/octet-stream",
+                       "User-Agent": "hub-agent/1.0"}
+            if TURMA_TOKEN:
+                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+            url = (f"{TURMA_URL}/api/agents/"
+                   f"{urllib.parse.quote(self.device, safe='')}"
+                   f"/migrations/{urllib.parse.quote(migration_id, safe='')}/blob")
+            req = urllib.request.Request(url, data=blob, headers=headers,
+                                         method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp.read()
+            log(f"migration {migration_id}: uploaded {len(blob)} bytes")
+        except Exception as e:
+            log(f"migration upload failed for {migration_id}: {e}")
+
+    def _migration_download(self, migration_id):
+        """GET a transcript bundle from the hub's migration relay. Returns the
+        raw bytes, or None on any failure."""
+        try:
+            headers = {"User-Agent": "hub-agent/1.0"}
+            if TURMA_TOKEN:
+                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+            url = (f"{TURMA_URL}/api/agents/"
+                   f"{urllib.parse.quote(self.device, safe='')}"
+                   f"/migrations/{urllib.parse.quote(migration_id, safe='')}/blob")
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except Exception as e:
+            log(f"migration download failed for {migration_id}: {e}")
+            return None
 
     def restart(self, sid):
         """Clear context: kill claude/tmux in place, drop the bridge pointer, and
@@ -8615,6 +8822,11 @@ class SessionManager:
                 elif ctype == "resumeTranscript":
                     self.resume_transcript(
                         cmd.get("transcriptId"), cmd.get("cwd"), cmd_id=cid)
+                elif ctype == "exportSession":
+                    self.export_session(
+                        cmd.get("sessionId"), cmd.get("migrationId"))
+                elif ctype == "importSession":
+                    self.import_session(cmd)
                 elif ctype == "delete":
                     self.delete(cmd.get("sessionId"))
                 elif ctype == "input":

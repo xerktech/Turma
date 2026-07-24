@@ -347,6 +347,47 @@ function setAutoStartOrg(siteKey, enabled) {
   sseBroadcast("autoStartOrgs", autoStartOrgs);
 }
 
+// ---- session migration across hosts (XERK-101) -----------------------------
+// Move a running session from one agent to another in the same org (e.g. to the
+// host that has the container whose logs the conversation needs). The hub can't
+// touch a worktree, and agents are outbound-only, so a migration is composed
+// from agent commands + a hub-brokered relay of the one thing `claude --resume`
+// needs and the archive doesn't keep — the RAW transcript bytes:
+//   1. exportSession -> source host packs its transcript and POSTs it here;
+//   2. the blob lands -> importSession queued on the target, which pulls it,
+//      unpacks it, recreates the worktree off the repo's default branch, and
+//      resumes the same conversation there;
+//   3. target session comes up -> the source session is KILLED (kept, so its
+//      worktree/uncommitted work stays resumable on the origin as a fallback).
+// State is in-memory and short-lived (the blob rides in the record); a hub
+// restart mid-migration aborts it, leaving the source session intact.
+const migrations = new Map(); // migrationId -> record (see startMigration)
+const MIGRATE_TIMEOUT_MS = Number(process.env.MIGRATE_TIMEOUT_MS) || 5 * 60 * 1000;
+const MIGRATE_DONE_KEEP_MS = 30 * 1000; // keep a done/failed record briefly so UI can observe
+const MIGRATIONS_MAX = 40; // backstop against unbounded growth
+// Upload cap for the relay: a hair above the agent's own 64 MiB pack limit so a
+// legitimate at-cap bundle isn't rejected for framing overhead.
+const MIGRATE_BLOB_MAX = (1 << 26) + (1 << 20); // 65 MiB
+
+// The wire shape (blob stripped) the /api/agents payload and SSE carry, so the
+// UI can follow a migration to its new host and surface a failure.
+function serializeMigration(m) {
+  return {
+    id: m.id, srcHost: m.srcHost, srcSessionId: m.srcSessionId,
+    targetHost: m.targetHost, siteKey: m.siteKey, repo: m.repo,
+    transcriptId: m.transcriptId, phase: m.phase, error: m.error || null,
+    importCmdId: m.importCmdId || null, targetSessionId: m.targetSessionId || null,
+    at: m.at,
+  };
+}
+function migrationList() {
+  return Array.from(migrations.values()).map(serializeMigration);
+}
+function publishMigrations() {
+  invalidateAgentsCache();
+  sseBroadcast("migrations", migrationList());
+}
+
 // ---- /api/agents payload cache + SSE fanout ---------------------------------
 // The dashboard fleet payload is polled by every browser but changes only on a
 // heartbeat ingest or a state mutation (a command queued, a host removed, a
@@ -393,7 +434,12 @@ function buildAgentsCache() {
   // auto-start opt-in, XERK-41) ride the same payload: both are tiny,
   // board-scoped, and hub-owned, so this is their one read channel (plus their
   // own SSE events for open boards).
-  const body = JSON.stringify({ now, agents: list, ticketAgents, autoStartOrgs });
+  const body = JSON.stringify({
+    now, agents: list, ticketAgents, autoStartOrgs,
+    // In-flight (and just-settled) session migrations, so the Sessions page can
+    // follow a moved session onto its new host and surface a failure (XERK-101).
+    migrations: migrationList(),
+  });
   const etag = '"' + crypto.createHash("sha1").update(body).digest("base64") + '"';
   agentsCache = { body, etag };
   return agentsCache;
@@ -444,6 +490,100 @@ function queueCommand(key, cmd) {
     }
   }
   return cmdId;
+}
+
+// An agent's org, or "" if it reports none — the one predicate that partitions
+// the fleet (see org.js siteKeyOf). A migration may only cross hosts that share
+// this, so two hosts of one Jira org can trade sessions but no session ever
+// leaves its org (or leaks between an org host and an org-less one).
+function siteKeyOf(a) {
+  return (a && a.jira && a.jira.siteKey) || "";
+}
+
+// Begin a migration: queue exportSession on the source and record the pending
+// move. The caller validated the source session + target host; this owns the
+// bookkeeping. Returns the migration record.
+function startMigration(srcHost, s, targetHost) {
+  // Bound the map: drop the oldest settled record if we're at the cap (an
+  // in-flight one is never evicted — that would strand a live handoff).
+  if (migrations.size >= MIGRATIONS_MAX) {
+    let oldest = null;
+    for (const m of migrations.values()) {
+      if (m.phase === "done" || m.phase === "failed") {
+        if (!oldest || m.at < oldest.at) oldest = m;
+      }
+    }
+    if (oldest) migrations.delete(oldest.id);
+  }
+  const id = crypto.randomBytes(8).toString("hex");
+  const m = {
+    id, srcHost, srcSessionId: s.id, targetHost,
+    siteKey: siteKeyOf(agents[srcHost]), repo: s.repo,
+    transcriptId: s.claudeSessionId,
+    // Metadata the moved session should keep — the hub has it all from the
+    // heartbeat, so the source only ships the raw transcript.
+    meta: {
+      model: s.model || null,
+      permissionMode: s.permissionMode || null,
+      summary: s.summary || null,
+      summaryManual: s.summaryManual || null,
+      label: s.label || null,
+      ticket: s.ticket || null,
+    },
+    phase: "exporting", // exporting -> importing -> done | failed
+    blob: null, importCmdId: null, targetSessionId: null,
+    error: null, startedAt: Date.now(), at: Date.now(),
+  };
+  migrations.set(id, m);
+  queueCommand(srcHost, { type: "exportSession", sessionId: s.id, migrationId: id });
+  publishMigrations();
+  return m;
+}
+
+// Drive every in-flight migration one step (called from the target's heartbeat
+// for a fast handoff, and from the sweep interval for timeouts/cleanup). Pure
+// bookkeeping over `migrations` + the fleet — safe to call often.
+function advanceMigrations() {
+  const now = Date.now();
+  for (const m of migrations.values()) {
+    // The target session reported itself up (its spawnCmdId is the importCmdId
+    // the hub minted): hand off — kill the source (kept, resumable) and finish.
+    if (m.phase === "importing" && m.importCmdId) {
+      const a = agents[m.targetHost];
+      const up = a && (a.sessions || []).find(
+        (s) => s.spawnCmdId === m.importCmdId && s.status === "running");
+      if (up) {
+        m.targetSessionId = up.id;
+        m.phase = "done";
+        m.error = null;
+        m.blob = null;
+        m.at = now;
+        if (agents[m.srcHost]) {
+          queueCommand(m.srcHost, { type: "kill", sessionId: m.srcSessionId });
+        }
+        publishMigrations();
+        continue;
+      }
+    }
+    // A move that never completed: fail it so the UI stops waiting. The source
+    // session was never killed, so nothing is lost — the operator retries.
+    if ((m.phase === "exporting" || m.phase === "importing") &&
+        now - m.startedAt > MIGRATE_TIMEOUT_MS) {
+      m.phase = "failed";
+      m.error = "migration timed out";
+      m.blob = null;
+      m.at = now;
+      publishMigrations();
+      continue;
+    }
+    // Retire a settled record after a short grace so open UIs can observe the
+    // terminal state before it disappears.
+    if ((m.phase === "done" || m.phase === "failed") &&
+        now - m.at > MIGRATE_DONE_KEEP_MS) {
+      migrations.delete(m.id);
+      publishMigrations();
+    }
+  }
 }
 
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
@@ -672,6 +812,27 @@ function readBody(req) {
       }
     });
     req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
+
+// Collect a request body as raw bytes (for the binary migration relay, which
+// readBody's 1 MiB string cap would truncate). Rejects past `cap` so a huge or
+// runaway upload can't exhaust the hub's memory.
+function readRawBody(req, cap) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let len = 0;
+    req.on("data", (c) => {
+      len += c.length;
+      if (len > cap) {
+        reject(new Error("body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
 }
@@ -1253,6 +1414,14 @@ setInterval(() => {
   autoStopSweep();
 }, AUTO_START_EVERY_MS).unref();
 
+// Migration timeouts + settled-record cleanup (the fast handoff runs on the
+// target's heartbeat; this is the fallback that fails a stuck move and retires a
+// done one). Runs regardless of boot grace — a migration is only ever created
+// after boot, by an explicit operator action.
+setInterval(() => {
+  if (migrations.size) advanceMigrations();
+}, 10 * 1000).unref();
+
 const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
 const USAGE = fs.readFileSync(path.join(__dirname, "public", "usage.html"));
 const SESSIONS = fs.readFileSync(path.join(__dirname, "public", "sessions.html"));
@@ -1779,7 +1948,17 @@ const server = http.createServer(async (req, res) => {
     // browser-only userAuthorized gate below.
     const isTrigger = req.method === "POST" && url.pathname === "/api/trigger";
 
-    if (url.pathname === "/api/heartbeat" || isArchiveIngest || isUpdatingSignal) {
+    // The migration transcript relay is agent-pushed/pulled (bearer token) like
+    // the heartbeat/archive — a source agent POSTs the bundle, the target agent
+    // GETs it (XERK-101). The user-triggered /migrate endpoint that starts it
+    // all rides the normal user login below.
+    const isMigrationBlob =
+      (req.method === "POST" || req.method === "GET") &&
+      parts[0] === "api" && parts[1] === "agents" &&
+      parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6;
+
+    if (url.pathname === "/api/heartbeat" || isArchiveIngest || isUpdatingSignal ||
+        isMigrationBlob) {
       if (!agentAuthorized(req)) return json(res, 401, { error: "unauthorized" });
     } else if (isTrigger) {
       if (!triggerAuthorized(req)) return json(res, 401, { error: "unauthorized" });
@@ -2012,6 +2191,10 @@ const server = http.createServer(async (req, res) => {
       ingestJiraIssues(next, jiraIssueResults);
       heartbeatAlerts(key, prev, next);
       rearmMovedWatches(key, prev, next);
+      // A migration finishes the instant its target session heartbeats in — do
+      // the handoff (kill source, mark done) now rather than waiting out the
+      // sweep interval (XERK-101). Cheap: a no-op unless a migration is live.
+      if (migrations.size) advanceMigrations();
       scheduleSave();
       // A fresh beat landed — refresh the memoized fleet payload and push the
       // updated record to open dashboards so the UI reflects it near-instantly.
@@ -2066,6 +2249,74 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         return json(res, 500, { error: e.message });
       }
+    }
+
+    // POST /api/agents/<host>/migrations/<id>/blob — the SOURCE agent uploading
+    // a migrated session's raw transcript bundle. Agent-authed above. Body is
+    // the raw gzipped tar; storing it advances the migration to `importing` and
+    // queues importSession on the target (XERK-101).
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
+      const id = decodeURIComponent(parts[4]);
+      const m = migrations.get(id);
+      if (!m) return json(res, 404, { error: "unknown migration" });
+      if (m.phase !== "exporting")
+        return json(res, 409, { error: "migration not awaiting a bundle" });
+      let blob;
+      try {
+        blob = await readRawBody(req, MIGRATE_BLOB_MAX);
+      } catch (e) {
+        m.phase = "failed"; m.error = "transcript bundle too large"; m.at = Date.now();
+        publishMigrations();
+        return json(res, 413, { error: e.message });
+      }
+      if (!blob.length) return json(res, 400, { error: "empty bundle" });
+      m.blob = blob;
+      m.phase = "importing";
+      m.at = Date.now();
+      // Hand the target everything it needs to resume the moved session as its
+      // old self: the transcript id + origin cwd (so `claude --resume` resolves)
+      // plus the carried-over identity. Its spawnCmdId is this importCmdId, which
+      // is how advanceMigrations recognizes the target session coming up.
+      const src = agents[m.srcHost];
+      const s = src && (src.sessions || []).find((x) => x.id === m.srcSessionId);
+      const cwd = s && s.worktreePath;
+      if (!cwd) {
+        m.phase = "failed"; m.error = "source session gone"; m.blob = null; m.at = Date.now();
+        publishMigrations();
+        return json(res, 409, { error: "source session gone" });
+      }
+      m.importCmdId = queueCommand(m.targetHost, {
+        type: "importSession",
+        migrationId: id,
+        transcriptId: m.transcriptId,
+        cwd,
+        repo: m.repo,
+        model: m.meta.model,
+        permissionMode: m.meta.permissionMode,
+        summary: m.meta.summary,
+        summaryManual: m.meta.summaryManual,
+        label: m.meta.label,
+        ticket: m.meta.ticket,
+        migratedFrom: { host: m.srcHost, sessionId: m.srcSessionId, at: Date.now() },
+      });
+      publishMigrations();
+      return json(res, 200, { ok: true });
+    }
+
+    // GET /api/agents/<host>/migrations/<id>/blob — the TARGET agent pulling the
+    // bundle to unpack + resume. Agent-authed above.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
+      const id = decodeURIComponent(parts[4]);
+      const m = migrations.get(id);
+      if (!m || !m.blob) return json(res, 404, { error: "no bundle" });
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": m.blob.length,
+        "Cache-Control": "no-store",
+      });
+      return res.end(m.blob);
     }
 
     // GET /api/search?q=&repo=&host=&limit= — instant hub-local full-text search
@@ -2257,6 +2508,47 @@ const server = http.createServer(async (req, res) => {
       if (req.method === "POST" && parts.length === 6 && parts[5] === "interrupt") {
         const cmdId = queueCommand(key, { type: "interrupt", sessionId });
         return json(res, 200, { ok: true, cmdId });
+      }
+      // POST /api/agents/<srcHost>/sessions/<id>/migrate -> move a running
+      // session to another agent in the SAME org (XERK-101). Body: {host}, the
+      // target. The hub orchestrates: exportSession on the source, the blob
+      // relay, importSession on the target, then a kill of the source once the
+      // target is up. Returns {migrationId}; the UI follows the move via the
+      // `migrations` payload (its importCmdId feeds the normal followSpawn).
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "migrate") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const target = typeof body.host === "string" ? body.host : "";
+        const src = agents[key];
+        const s = (src.sessions || []).find((x) => x.id === sessionId);
+        if (!s) return json(res, 404, { error: "unknown session" });
+        if (s.status !== "running")
+          return json(res, 409, { error: "only a running session can be moved" });
+        if (s.root)
+          return json(res, 409, { error: "a repos-root session has no worktree to move" });
+        if (!s.claudeSessionId)
+          return json(res, 409, { error: "this session has no conversation to move yet" });
+        if (!target || target === key)
+          return json(res, 400, { error: "a different target host is required" });
+        const tgt = agents[target];
+        if (!tgt) return json(res, 404, { error: "unknown target host" });
+        if (siteKeyOf(src) !== siteKeyOf(tgt))
+          return json(res, 409, { error: "the target agent is in a different org" });
+        if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
+          return json(res, 503, { error: "the target agent is offline" });
+        if (!(tgt.repos || []).some((r) => r && r.name === s.repo))
+          return json(res, 409, {
+            error: `the target agent doesn't have "${s.repo}" cloned — clone it there first`,
+          });
+        // Single-flight: don't start a second move of the same session while one
+        // is already exporting/importing (a double-click must not fan out).
+        for (const m of migrations.values()) {
+          if (m.srcHost === key && m.srcSessionId === sessionId &&
+              (m.phase === "exporting" || m.phase === "importing")) {
+            return json(res, 409, { error: "this session is already being moved" });
+          }
+        }
+        const m = startMigration(key, s, target);
+        return json(res, 200, { ok: true, migrationId: m.id });
       }
       // POST /api/agents/<host>/sessions/<id>/input -> forward free-text input
       // to a running session (typing a message into the session). Body: {text}.
@@ -2992,6 +3284,9 @@ if (process.env.TURMA_TEST) {
     setAutoStartOrg,
     ticketAgents,
     findTicketHost,
+    migrations,
+    advanceMigrations,
+    siteKeyOf,
   };
 } else {
   if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");

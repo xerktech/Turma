@@ -96,3 +96,21 @@ fun flattenSessions(agents: List<AgentInfo>): List<FlatSession> =
 /** Locate the host that owns a sessionId (for deep-link routing). */
 fun findHost(agents: List<AgentInfo>, sessionId: String): String? =
     agents.firstOrNull { a -> a.sessions.any { it.id == sessionId } }?.key
+
+/**
+ * The hosts a running session at [srcHost] could move to (XERK-101): online,
+ * in the same org, a different host, with the session's repo already cloned —
+ * the exact predicate the hub enforces and web `eligibleMoveTargets` renders.
+ */
+fun eligibleMoveTargets(
+    agents: List<AgentInfo>,
+    srcHost: String,
+    session: SessionInfo,
+): List<AgentInfo> {
+    val src = agents.firstOrNull { it.key == srcHost } ?: return emptyList()
+    val org = siteKeyOf(src)
+    return agents.filter { t ->
+        t.key != srcHost && t.online && siteKeyOf(t) == org &&
+            t.repos.any { it.name == session.repo }
+    }
+}
