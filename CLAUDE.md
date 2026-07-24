@@ -291,6 +291,18 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     once from the transcript tail for older records (`_seed_model_actual`).
   - Tests: `TestParseModelProbe`, `TestModelsProbe`, `TestScanModelEntry`, `TestSessionReportModelActual`,
     `TestSeedModelActual`, `TestModelActualPayload`, `TestInternalToolSlugModelProbe`.
+- The **shared Claude login's health** (`claudeAuth`, XERK-98) — `claude_auth_status()` reads
+  `~/.claude/.credentials.json` (`CLAUDE_CREDS_PATH`) every beat so the hub can alert when re-login is
+  required. `{present, needsLogin, expiringSoon, expiresAt, refreshExpiresAt, subscriptionType, at}`,
+  epoch ms. The **REFRESH token** (`refreshTokenExpiresAt`) is the signal, NOT the access token (short-lived
+  + silently refreshed): it only lapses when claude hasn't refreshed inside its ~30-day window — an
+  idle/logged-out host, exactly when a human must `claude /login`. `needsLogin` = missing/unreadable file,
+  no `claudeAiOauth`/access token, or a past refresh expiry; `expiringSoon` = refresh token within
+  `CLAUDE_AUTH_WARN_MS` (3d; `TURMA_CLAUDE_AUTH_WARN_SEC`). A present login with unknown refresh expiry reads
+  healthy (never cry wolf without a timestamp). A wholly MISSING login idles at the boot preflight and can't
+  heartbeat, so it surfaces as the offline alert instead. Consumed by `heartbeatAlerts` (see Notifications);
+  host-header chip via `claudeAuthBadge` (`index.html`) / `🔑` pill (`FleetScreen.kt`). Tests:
+  `TestClaudeAuthStatus`.
 
 #### Live-session signals
 
@@ -1516,7 +1528,13 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - Session commands are queued on the hub and drained via the heartbeat reply.
 - The hub pushes edge-triggered alerts to the **Android client via FCM** — the sole notification transport
   (XERK-10 removed the ntfy path): host offline/recovered, restart loop, per-session turn finished /
-  question waiting / PR created.
+  question waiting / PR created, and Claude login required/expiring/restored.
+- **Claude login alerts** (XERK-98) fire in `heartbeatAlerts` off the agent's `claudeAuth` block. Two
+  edge-triggered states, deduped under `next.alerts` and cleared on recovery like the offline/online pair:
+  `needsLogin` → urgent `key`-tagged "Claude login required", `expiringSoon` → default-priority "Claude
+  login expiring". The hard state supersedes the soft (`claudeExpiringAt` dropped when `needsLogin`), so a
+  lapse-then-recover fires only "restored", never a stale "expiring". `key` routes to Android `CH_HOST`.
+  Tests: the `claude login` cases in `server.test.js`.
 - **`android/app/google-services.json` is committed** (XERK-37): the Firebase client config must be IN the
   repo for the CI-built release APKs to carry it — gitignored, every released build had Firebase inert and
   push did nothing. It holds only public identifiers (same as the committed release keystore); the gradle

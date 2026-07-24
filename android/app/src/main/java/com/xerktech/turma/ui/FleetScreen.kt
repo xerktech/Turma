@@ -215,6 +215,17 @@ private fun HostSection(
                         maxLines = 1,
                     )
                 }
+                // Claude subscription-login health (XERK-98): a red "login" pill
+                // when the shared login has lapsed (sessions can't authenticate)
+                // and an amber "expiring" one when it's about to. Shown only when
+                // it needs action — mirrors index.html's claudeAuthBadge.
+                agent.claudeAuth?.let { ca ->
+                    when {
+                        ca.needsLogin -> Pill("🔑 login", color = com.xerktech.turma.ui.theme.TurmaColors.critical)
+                        ca.expiringSoon -> Pill("🔑 expiring", color = com.xerktech.turma.ui.theme.TurmaColors.warning)
+                        else -> {}
+                    }
+                }
                 // An announced update restart reads as "updating" (warning), not
                 // the outage-looking "offline" (XERK-29).
                 when {

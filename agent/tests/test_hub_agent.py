@@ -208,6 +208,97 @@ class TestCodingAgent(unittest.TestCase):
         self.assertIsNone(self._run(""))
 
 
+class TestClaudeAuthStatus(unittest.TestCase):
+    """The shared subscription login's health, heartbeated so the hub can alert
+    when re-login is required (XERK-98). The REFRESH-token expiry is the signal;
+    the short-lived access token is not."""
+
+    NOW = 1_700_000_000_000  # fixed "now" in epoch ms for deterministic windows
+
+    def _status(self, oauth, warn_ms=None):
+        """Run claude_auth_status against a temp credentials file holding
+        `oauth` under claudeAiOauth (None writes no such key)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".credentials.json")
+            body = {} if oauth is None else {"claudeAiOauth": oauth}
+            with open(path, "w") as f:
+                json.dump(body, f)
+            warn = ha.CLAUDE_AUTH_WARN_MS if warn_ms is None else warn_ms
+            with mock.patch.object(ha, "CLAUDE_AUTH_WARN_MS", warn):
+                return ha.claude_auth_status(path=path, now_ms=self.NOW)
+
+    def test_missing_file_reads_as_not_logged_in(self):
+        st = ha.claude_auth_status(path="/no/such/creds.json", now_ms=self.NOW)
+        self.assertFalse(st["present"])
+        self.assertTrue(st["needsLogin"])
+        self.assertFalse(st["expiringSoon"])
+
+    def test_file_without_oauth_block_is_not_a_login(self):
+        st = self._status(None)
+        self.assertFalse(st["present"])
+        self.assertTrue(st["needsLogin"])
+
+    def test_oauth_without_access_token_is_not_a_login(self):
+        st = self._status({"refreshTokenExpiresAt": self.NOW + 10**9})
+        self.assertFalse(st["present"])
+        self.assertTrue(st["needsLogin"])
+
+    def test_healthy_login_needs_nothing(self):
+        st = self._status({
+            "accessToken": "a",
+            "refreshTokenExpiresAt": self.NOW + 30 * 24 * 3600 * 1000,
+            "subscriptionType": "max",
+        })
+        self.assertTrue(st["present"])
+        self.assertFalse(st["needsLogin"])
+        self.assertFalse(st["expiringSoon"])
+        self.assertEqual(st["subscriptionType"], "max")
+
+    def test_lapsed_refresh_token_needs_login(self):
+        # A refresh token in the past means claude hasn't refreshed in its
+        # window — the operator must run `claude /login`.
+        st = self._status({"accessToken": "a", "refreshTokenExpiresAt": self.NOW - 1})
+        self.assertTrue(st["present"])
+        self.assertTrue(st["needsLogin"])
+        self.assertFalse(st["expiringSoon"])
+
+    def test_refresh_token_inside_warn_window_is_expiring_soon(self):
+        warn = 3 * 24 * 3600 * 1000
+        st = self._status(
+            {"accessToken": "a", "refreshTokenExpiresAt": self.NOW + warn // 2},
+            warn_ms=warn,
+        )
+        self.assertFalse(st["needsLogin"])
+        self.assertTrue(st["expiringSoon"])
+
+    def test_expired_access_token_alone_does_not_need_login(self):
+        # The access token is auto-refreshed; only the refresh token matters.
+        st = self._status({
+            "accessToken": "a",
+            "expiresAt": self.NOW - 3600 * 1000,           # access expired
+            "refreshTokenExpiresAt": self.NOW + 30 * 24 * 3600 * 1000,
+        })
+        self.assertFalse(st["needsLogin"])
+        self.assertFalse(st["expiringSoon"])
+
+    def test_present_login_with_unknown_expiry_is_assumed_ok(self):
+        # An older credential shape with no refresh expiry: never cry wolf.
+        st = self._status({"accessToken": "a"})
+        self.assertTrue(st["present"])
+        self.assertFalse(st["needsLogin"])
+        self.assertFalse(st["expiringSoon"])
+        self.assertIsNone(st["refreshExpiresAt"])
+
+    def test_unreadable_json_reads_as_not_logged_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".credentials.json")
+            with open(path, "w") as f:
+                f.write("{ not json")
+            st = ha.claude_auth_status(path=path, now_ms=self.NOW)
+        self.assertFalse(st["present"])
+        self.assertTrue(st["needsLogin"])
+
+
 class TestAgentVersion(unittest.TestCase):
     """This build's own version, as heartbeated for the hub's host header:
     baked env (container image) -> VERSION beside hub-agent.py (native install)

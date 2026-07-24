@@ -496,6 +496,55 @@ test("alerts: offline recovery fires once and clears the marker", () => {
   assert.deepEqual(titles(), []);
 });
 
+test("alerts: claude login-required fires once, restores once (XERK-98)", () => {
+  const beat = makeHost();
+  const now = Date.now();
+  notifications.length = 0;
+  // Lapsed login: the urgent edge fires once, high priority, routed to host.
+  beat({ device: "truenas", claudeAuth: { needsLogin: true } }, now);
+  assert.deepEqual(titles(), ["Claude login required on truenas"]);
+  assert.equal(notifications[0].data.priority, "high");
+  assert.equal(notifications[0].data.host, "host1"); // routed by agent key, like every host alert
+  notifications.length = 0;
+  beat({ device: "truenas", claudeAuth: { needsLogin: true } }, now + 20000); // still lapsed: quiet
+  assert.deepEqual(titles(), []);
+  // Operator logs in: the restore fires once and re-arms the edge.
+  beat({ device: "truenas", claudeAuth: { needsLogin: false } }, now + 40000);
+  assert.deepEqual(titles(), ["Claude login restored on truenas"]);
+  notifications.length = 0;
+  beat({ device: "truenas", claudeAuth: { needsLogin: false } }, now + 60000);
+  assert.deepEqual(titles(), []);
+  beat({ device: "truenas", claudeAuth: { needsLogin: true } }, now + 80000); // lapses again: fires again
+  assert.deepEqual(titles(), ["Claude login required on truenas"]);
+});
+
+test("alerts: claude login-expiring warns once, superseded by needsLogin (XERK-98)", () => {
+  const beat = makeHost();
+  const now = Date.now();
+  notifications.length = 0;
+  const soon = { needsLogin: false, expiringSoon: true, refreshExpiresAt: now + 2 * 24 * 3600 * 1000 };
+  beat({ device: "truenas", claudeAuth: soon }, now);
+  assert.deepEqual(titles(), ["Claude login expiring on truenas"]);
+  assert.equal(notifications[0].data.priority, "default");
+  notifications.length = 0;
+  beat({ device: "truenas", claudeAuth: soon }, now + 20000); // still expiring: quiet
+  assert.deepEqual(titles(), []);
+  // It fully lapses — the hard edge fires, and recovering from THAT must not
+  // re-fire a stale "expiring" warning.
+  beat({ device: "truenas", claudeAuth: { needsLogin: true } }, now + 40000);
+  assert.deepEqual(titles(), ["Claude login required on truenas"]);
+  notifications.length = 0;
+  beat({ device: "truenas", claudeAuth: { needsLogin: false, expiringSoon: false } }, now + 60000);
+  assert.deepEqual(titles(), ["Claude login restored on truenas"]); // restore only, no expiring re-fire
+});
+
+test("alerts: no claude-login alert when the agent reports no block (older agent)", () => {
+  const beat = makeHost();
+  notifications.length = 0;
+  beat({ device: "truenas" }); // no claudeAuth key at all
+  assert.deepEqual(titles(), []);
+});
+
 test("alerts: restart loop needs 3 boots in 10m, then holds off 30m", () => {
   const beat = makeHost();
   const t0 = Date.now();
