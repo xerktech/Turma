@@ -601,6 +601,73 @@ test("parsePaneLiveTurn: completed turn (no 'esc to interrupt') -> not generatin
   assert.deepEqual(parsePaneLiveTurn(pane), { generating: false, text: "", status: null });
 });
 
+// XERK-130: a pane once viewed from a narrow client (a phone) stays ~54
+// columns wide, and at that width the TUI ellipsizes the footer's
+// "· esc to interrupt" to "· esc to inte…" — the full-string gate read every
+// such working session as "not generating", so the live working bar (and the
+// heartbeat's paneBusy, fixed in hub-agent.py the same way) never showed.
+// Fixtures are verbatim captures from live sessions.
+const NARROW_RULE = "─".repeat(54);
+
+test("parsePaneLiveTurn: a narrow pane's truncated interrupt hint still reads generating", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const pane = [
+    "❯ write a haiku about turtles",
+    "● Cat",
+    "  Sunbeam on the floor,",
+    NARROW_RULE,
+    "❯ ",
+    NARROW_RULE,
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to inte…",
+  ].join("\n");
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.generating, true);
+  assert.equal(r.text, "Cat Sunbeam on the floor,");
+});
+
+test("parsePaneLiveTurn: the column-0 spinner line alone reads generating (hint fully elided)", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  // Scrunched further, or scrolled: no "esc to i…" remnant survives, but the
+  // spinner line is on screen. "still thinking" has no token counter.
+  const pane = [
+    "· Perusing… (54m 38s · still thinking)",
+    "  ⎿  Tip: Use /clear to start fresh when switching",
+    NARROW_RULE,
+    "❯ ",
+    NARROW_RULE,
+    "  ⏵⏵ bypass permissions on",
+  ].join("\n");
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.generating, true);
+  assert.equal(r.status.verb, "Perusing");
+});
+
+test("parsePaneLiveTurn: truncated-hint anchor tolerates varying footer segments", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  // A "· PR #98" chip can sit between the mode marker and the hint, and
+  // "(shift+tab to cycle)" comes and goes.
+  assert.equal(parsePaneLiveTurn("  ⏵⏵ auto mode on · PR #98 · esc to inte…").generating, true);
+  assert.equal(parsePaneLiveTurn("  ⏵⏵ bypass permissions on · esc to i…").generating, true);
+  // An IDLE footer can be width-cut too; its remnant never starts with "e".
+  assert.equal(parsePaneLiveTurn("  ⏵⏵ auto mode on · PR #98 · ← for ag…").generating, false);
+});
+
+test("parsePaneLiveTurn: an idle narrow pane (completed-turn line, no hint) stays not generating", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  // "✻ Brewed for 9s" is a spinner GLYPH at column 0 but no gerund ellipsis —
+  // it stays on the idle screen and must not fake busy forever.
+  const pane = [
+    "  the cat sleeps through it.",
+    "",
+    "✻ Brewed for 9s",
+    NARROW_RULE,
+    "❯ ",
+    NARROW_RULE,
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+  ].join("\n");
+  assert.deepEqual(parsePaneLiveTurn(pane), { generating: false, text: "", status: null });
+});
+
 // liveTurnDecision holds a single busy->idle blip for one poll so a mid-repaint
 // capture can't flicker the pinned working bar off (the live counterpart of
 // hub-agent.py's _stable_pane_busy for the heartbeat's paneBusy).

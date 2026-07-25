@@ -340,6 +340,14 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   transcript-mtime.
   - `true`/`false`/`null`-unknown; marker set overridable via `TURMA_PANE_BUSY_MARKERS`. All surfaces
     fall back to transcript freshness only when `null` (older agent, or uncapturable pane).
+  - **Busy is read from three shapes, not the full hint alone** (XERK-130): tmux keeps a pane at its
+    smallest-ever client width (a phone leaves ~54 cols), where the TUI ellipsizes the footer hint to
+    "esc to inte…" and every working session read idle. `_busy_from_capture` also accepts the mode
+    line's truncated remnant (`PANE_BUSY_TRUNC_RE`, glyph-anchored — middle segments like "· PR #98"
+    vary) and the column-0 spinner line (`PANE_SPINNER_RE`, requiring the gerund's ellipsis so the
+    completed-turn line an idle pane keeps, "✻ Brewed for 9s", can't fake busy). Mirrored in
+    `tunnel-agent.js`'s `paneShowsBusy` gate for the live working bar. Tests: the narrow-pane cases in
+    `TestPaneBusy` and in `agent/tests/tunnel-agent.test.js`.
   - **Busy→idle flicker is suppressed at the source** (`_stable_pane_busy`, XERK-42): the TUI repaints
     its spinner by clearing+rewriting the "esc to interrupt" line, so a single capture can land in that
     sub-frame gap and read idle mid-turn — which, sampled once per `TURMA_INTERVAL` (20s) beat, shows the

@@ -1271,6 +1271,67 @@ class TestPaneBusy(unittest.TestCase):
         finally:
             ha.PANE_BUSY_MARKERS = markers
 
+    # XERK-130: a pane once viewed from a narrow client (a phone) stays ~54
+    # columns wide, and at that width the TUI ellipsizes the footer's
+    # "· esc to interrupt" to "· esc to inte…" — the plain substring match read
+    # every such working session as idle for its whole turn. Fixtures below are
+    # verbatim captures from live sessions.
+
+    def test_true_when_hint_truncated_by_a_narrow_pane(self):
+        pane = ("  Cat\n  Sunbeam on the floor,\n\n"
+                + "─" * 54 + "\n❯ \n" + "─" * 54 + "\n"
+                "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to inte…\n")
+        with mock.patch.object(ha.subprocess, "run", self._capture(stdout=pane)):
+            self.assertIs(ha._pane_busy("agent-x"), True)
+
+    def test_true_when_hint_truncated_with_varying_middle_segments(self):
+        # The footer's middle segments vary — "(shift+tab to cycle)" comes and
+        # goes, a "· PR #98" chip can sit between the mode and the hint — so
+        # the anchor is the mode glyph + the ellipsized "e…" tail segment.
+        for footer in ("  ⏵⏵ bypass permissions on · esc to i…",
+                       "  ⏵⏵ auto mode on · PR #98 · esc to inte…"):
+            with mock.patch.object(ha.subprocess, "run",
+                                   self._capture(stdout=footer + "\n")):
+                self.assertIs(ha._pane_busy("agent-x"), True, footer)
+
+    def test_false_when_the_idle_suffix_is_what_got_truncated(self):
+        # An IDLE footer can be width-cut too ("· ← for agents" -> "· ← for
+        # ag…"); the remnant doesn't start with "e", so it must stay idle.
+        pane = "  ⏵⏵ bypass permissions on · PR #98 · ← for ag…\n"
+        with mock.patch.object(ha.subprocess, "run", self._capture(stdout=pane)):
+            self.assertIs(ha._pane_busy("agent-x"), False)
+
+    def test_true_from_the_spinner_line_alone(self):
+        # A narrow pane running a tool: the hint is fully elided but the
+        # column-0 spinner line is visible above the input box.
+        for spinner in ("✢ Determining… (12m 19s · ↓ 44.2k tokens)",
+                        "· Perusing… (54m 38s · still thinking)",
+                        "✻ Hashing… (2m 58s · ↓ 5.7k tokens)"):
+            pane = spinner + "\n  ⎿  Tip: Use /btw to ask a quick side question\n"
+            with mock.patch.object(ha.subprocess, "run",
+                                   self._capture(stdout=pane)):
+                self.assertIs(ha._pane_busy("agent-x"), True, spinner)
+
+    def test_false_on_an_idle_narrow_pane(self):
+        # Idle keeps a completed-turn line ("✻ Brewed for 9s" — spinner glyph,
+        # NO ellipsis) on screen, and the footer suffix is "· ← for agents":
+        # neither may read as busy or a finished session pins busy forever.
+        pane = ("  the cat sleeps through it.\n\n✻ Brewed for 9s\n"
+                + "─" * 54 + "\n❯ \n" + "─" * 54 + "\n"
+                "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n")
+        with mock.patch.object(ha.subprocess, "run", self._capture(stdout=pane)):
+            self.assertIs(ha._pane_busy("agent-x"), False)
+
+    def test_false_when_a_spinner_line_is_quoted_in_tool_output(self):
+        # A session debugging Turma echoes captured panes into its own
+        # conversation; the echoed copy is INDENTED (tool results always are),
+        # so the column-0 anchor keeps it from faking busy on an idle pane.
+        pane = ("  ⎿  $ tmux capture-pane -p -t agent-y\n"
+                "     ✻ Hashing… (2m 58s · ↓ 5.7k tokens)\n"
+                "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n")
+        with mock.patch.object(ha.subprocess, "run", self._capture(stdout=pane)):
+            self.assertIs(ha._pane_busy("agent-x"), False)
+
 
 class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
     """session_report surfaces the (single-capture) pane probe as

@@ -2958,6 +2958,43 @@ PANE_BUSY_MARKERS = tuple(
     if m.strip()
 )
 
+# The hint alone is not enough on a NARROW pane (XERK-130). tmux sizes the
+# window to its smallest-ever attached client, so a session once viewed from a
+# phone renders ~54 columns wide — and at that width the TUI ellipsizes the
+# footer's ") · esc to interrupt" suffix to ") · esc to inte…", which the plain
+# substring match reads as idle. Every working session on a narrowed pane
+# reported idle for its whole turn, which is the "active sessions are marked
+# idle" defect. Two extra shapes, each verified against live panes, recover it:
+#
+# - PANE_BUSY_TRUNC_RE — the mode footer line with any width-truncation of the
+#   hint: a line carrying the mode marker's ⏸/⏵ glyph whose LAST "·"-separated
+#   segment is a PREFIX of "esc to interrupt" (character class, so every cut
+#   point matches) ending in the TUI's own "…" ellipsis. Anchored on the glyph
+#   rather than fixed wording because the middle segments vary — "(shift+tab
+#   to cycle)" comes and goes, a "· PR #98" chip can sit between the mode and
+#   the hint — while the hint is always the segment being cut. The idle
+#   footer's "· ← for agents" suffix cannot match (it never starts with "e").
+#   This is the ONLY visible signal while text streams on a narrow pane (no
+#   spinner line is painted then) and while the operator has scrolled the
+#   conversation up (the spinner is off-screen).
+#
+# - PANE_SPINNER_RE — the column-0 working spinner line itself, e.g.
+#   "✢ Determining… (12m 19s · ↓ 44.2k tokens)" or "· Perusing… (54m 38s ·
+#   still thinking)": a single spinner glyph (glyph-agnostic — the frames vary
+#   by version — but never the assistant-turn "●" bullet or the "❯" prompt),
+#   one capitalized gerund, then the TUI's ellipsis and "(" detail. The
+#   ellipsis is load-bearing: the completed-turn line left on an IDLE pane
+#   ("✻ Brewed for 9s") has none, and prose can't sit at column 0 (assistant
+#   text is bulleted then indented).
+#
+# Both fail toward idle (today's behaviour) if the TUI wording shifts, and both
+# are disabled with the markers (empty TURMA_PANE_BUSY_MARKERS = feature off).
+PANE_BUSY_TRUNC_RE = re.compile(
+    r"[⏸⏵][^\n]*·\s*e[sc to interup]*…\s*$",
+    re.IGNORECASE | re.MULTILINE)
+PANE_SPINNER_RE = re.compile(
+    r"^[^\sA-Za-z0-9●❯]\s+[A-Z][a-z]+(?:…|\.\.\.)(?:\s*\(|\s*$)")
+
 
 def _pane_busy(tmux_name):
     """Whether the session's live TUI shows the model actively working.
@@ -2974,11 +3011,20 @@ def _pane_busy(tmux_name):
 
 
 def _busy_from_capture(cap):
-    """The paneBusy read off an already-taken capture (None-capture = unknown)."""
+    """The paneBusy read off an already-taken capture (None-capture = unknown).
+
+    Busy is any of: a configured marker ("esc to interrupt" on a pane wide
+    enough to show it whole), the width-truncated remnant of that hint on the
+    mode footer line, or the column-0 working-spinner line — see the regexes'
+    comment for why all three are needed (XERK-130)."""
     if cap is None or not PANE_BUSY_MARKERS:
         return None
     low = cap.lower()
-    return any(m in low for m in PANE_BUSY_MARKERS)
+    if any(m in low for m in PANE_BUSY_MARKERS):
+        return True
+    if PANE_BUSY_TRUNC_RE.search(cap):
+        return True
+    return any(PANE_SPINNER_RE.match(line) for line in cap.splitlines())
 
 
 # A single capture can read "idle" while the model is really still working:

@@ -721,9 +721,39 @@ function parsePaneStatus(l) {
   return { verb: verb ? verb[1] : "", up: u, down: d, elapsed: elapsed ? elapsed[1] + "s" : "" };
 }
 
+// "Is a turn running" read off the whole capture — the same three shapes
+// hub-agent.py's _busy_from_capture keys on (XERK-130), because the full
+// "esc to interrupt" hint alone misses a NARROW pane: tmux sizes the window to
+// its smallest-ever attached client (a phone leaves ~54 columns), and at that
+// width the TUI ellipsizes the footer hint to "· esc to inte…", so every
+// working session on such a pane read "not generating" and the live working
+// bar never appeared. Busy is any of:
+//  - the full hint (wide pane), as before;
+//  - the width-truncated hint on the mode footer line — a line carrying the
+//    mode marker's ⏸/⏵ glyph whose LAST "·"-separated segment is a PREFIX of
+//    "esc to interrupt" (character class, so every cut point matches) ending
+//    in the TUI's own "…". Glyph-anchored because the middle segments vary
+//    ("(shift+tab to cycle)" comes and goes, a "· PR #98" chip can sit before
+//    the hint); the idle footer's "· ← for agents" suffix can't match (it
+//    never starts with "e"). The only visible signal while text streams on a
+//    narrow pane (no spinner line then) or the conversation is scrolled up
+//    (spinner off-screen);
+//  - the column-0 spinner line ("✢ Determining… (12m 19s · ↓ 44.2k tokens)",
+//    "· Perusing… (54m 38s · still thinking)"): glyph-agnostic but never the
+//    assistant "●" bullet or "❯" prompt, one capitalized gerund, then the
+//    ellipsis — which the completed-turn line an IDLE pane keeps on screen
+//    ("✻ Brewed for 9s") lacks, so it can't fake busy.
+const PANE_BUSY_TRUNC_RE = /[⏸⏵][^\n]*·\s*e[sc to interup]*…\s*$/im;
+const PANE_SPINNER_RE = /^[^\sA-Za-z0-9●❯]\s+[A-Z][a-z]+(?:…|\.\.\.)(?:\s*\(|\s*$)/;
+function paneShowsBusy(raw) {
+  if (/esc to interrupt/i.test(raw)) return true;
+  if (PANE_BUSY_TRUNC_RE.test(raw)) return true;
+  return raw.split("\n").some((l) => PANE_SPINNER_RE.test(l));
+}
+
 function parsePaneLiveTurn(pane) {
   const raw = String(pane || "").replace(/\r/g, "");
-  if (!/esc to interrupt/i.test(raw)) return { generating: false, text: "", status: null };
+  if (!paneShowsBusy(raw)) return { generating: false, text: "", status: null };
   const lines = raw.split("\n");
   const isRule = (l) => /^─{20,}$/.test(l.trim());
   // Drop the whole bottom input box (its top border ─, the ❯ prompt line(s),
