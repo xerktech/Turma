@@ -127,7 +127,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
       + " termComposeAction, termComposeStop, openEndedSession, resumeEnded, openTranscript, backToList,"
-      + " chatToTerminal, terminalToChat,"
+      + " chatToTerminal, terminalToChat, sessMeta,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
@@ -1096,4 +1096,18 @@ test("a scrolled sidebar stays put across a re-render", () => {
   beat({ now, agents: [h] });
 
   assert.equal(sidebar.scrollTop, 240, "render must restore the offset the swap clamped away");
+});
+
+// The session header's meta line (XERK-121): host is prefixed by each header's
+// caller, so sessMeta returns "repo · branch" — matching the Android chat header
+// (core/Sessions.kt sessionHeaderMeta).
+test("sessMeta shows the repo and branch, dropping blanks", () => {
+  const { sessMeta } = loadPage();
+  assert.equal(sessMeta({ repo: "Turma", git: { branch: "XERK-121" } }), "Turma · XERK-121");
+  // A not-yet-branched (or transcript-recovered without git) session: branch
+  // reads "detached" only when a git block is present.
+  assert.equal(sessMeta({ repo: "Turma", git: { branch: "HEAD" } }), "Turma · detached");
+  assert.equal(sessMeta({ repo: "Turma" }), "Turma");
+  // Repos-root sessions have no repo/branch of their own.
+  assert.equal(sessMeta({ root: true, repo: "" }), "repos root");
 });

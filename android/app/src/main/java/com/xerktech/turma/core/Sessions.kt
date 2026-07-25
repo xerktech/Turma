@@ -44,6 +44,17 @@ fun sessionBranch(session: SessionInfo): String {
 }
 
 /**
+ * The session header's subtitle line (XERK-121): the host the agent runs on, the
+ * repo, and the live branch — e.g. "truenas · Turma · XERK-121". Blank parts are
+ * dropped, so a repos-root session (no repo) still reads cleanly. Mirrors the web
+ * session header (turma sessions.html `sessMeta`, prefixed with the host).
+ */
+fun sessionHeaderMeta(host: String, session: SessionInfo): String =
+    listOf(host, session.repo, sessionBranch(session))
+        .filter { it.isNotBlank() }
+        .joinToString(" · ")
+
+/**
  * Work-safety facts for a session (web index.html `unpushedCommits`): how many
  * commits aren't on origin yet — relative to origin/<branch> when it was ever
  * pushed, else everything past the base branch. Null = unknown (first beat,

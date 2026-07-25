@@ -76,7 +76,7 @@ import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.core.ChatItem
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.buildItems
-import com.xerktech.turma.core.sessionBranch
+import com.xerktech.turma.core.sessionHeaderMeta
 import com.xerktech.turma.core.sessionName
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.vm.ChatViewModel
@@ -161,10 +161,14 @@ fun ChatScreen(
                     Column {
                         Text(state.session?.let { sessionName(it) } ?: "Session", maxLines = 1)
                         state.session?.let {
+                            // Host · repo · branch (XERK-121), + a live indicator.
+                            val hostLabel = state.hostLabel.ifBlank { host }
                             Text(
-                                sessionBranch(it) + if (state.connected) " · live" else "",
+                                sessionHeaderMeta(hostLabel, it) + if (state.connected) " · live" else "",
                                 style = MaterialTheme.typography.bodySmall,
                                 fontFamily = FontFamily.Monospace,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                             )
                         }
                     }

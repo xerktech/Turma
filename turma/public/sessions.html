@@ -1364,18 +1364,20 @@ function sessTitle(s) {
   return wt || s.id;
 }
 
-// Worktree dir name + the live branch the agent named for its work ("detached"
-// until it branches). The app itself creates no branch, so s.branch is unused.
+// Repo + the live branch the agent named for its work ("detached" until it
+// branches) — the session header's meta line (XERK-121), matching the Android
+// chat header (core/Sessions.kt sessionHeaderMeta). Prefixed with the host by
+// each header's caller, so the whole line reads "host · repo · branch". The app
+// itself creates no branch, so s.branch is unused.
 function sessMeta(s) {
   if (s.root) return "repos root";
-  const wt = String(s.worktreePath || "").split("/").filter(Boolean).pop();
   // "detached" is a READING of the agent's git report, not the absence of one.
   // A session recovered from the transcript scan has no git block at all — we
   // don't know what it was on — so it says nothing rather than asserting a
   // detached HEAD it was never told about.
   const b = s.git && s.git.branch;
   const branch = s.git ? ((b && b !== "HEAD") ? b : "detached") : null;
-  return [wt, branch].filter(Boolean).join(" · ");
+  return [s.repo, branch].filter(Boolean).join(" · ");
 }
 
 function render(data) {
