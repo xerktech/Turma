@@ -80,6 +80,22 @@ class ChatViewModel(
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val messages: SharedFlow<String> = _messages
 
+    /**
+     * The compose draft is the container's, not this ViewModel's (XERK-122): the
+     * terminal screen has a second box over the same session, and the text has to
+     * survive walking between them. This VM mirrors it into [ChatUiState.draft]
+     * for the renderer and writes every change back through it — the flow, not
+     * the state copy, is the source of truth.
+     */
+    private val draft = container.drafts.of(host, sessionId)
+
+    init {
+        // Collected on viewModelScope (not the onEnter/onLeave jobs): the mirror
+        // must survive a detail-pane swap, or a re-entry would paint an empty box
+        // until the next keystroke.
+        viewModelScope.launch { draft.collect { text -> _state.update { it.copy(draft = text) } } }
+    }
+
     private var liveJob: Job? = null
     private var revealJob: Job? = null
     // The live text the current reveal offset indexes into, for the non-monotonic
@@ -267,7 +283,7 @@ class ChatViewModel(
         }
     }
 
-    fun setDraft(text: String) = _state.update { it.copy(draft = text) }
+    fun setDraft(text: String) { draft.value = text }
 
     fun setVerbosity(v: Verbosity) {
         prefs.edit().putInt(sessionId, v.ordinal).apply()
@@ -276,9 +292,9 @@ class ChatViewModel(
 
     /** Send the draft: routes to answer(custom) when a question is pending. */
     fun submitDraft() {
-        val text = _state.value.draft.trim()
+        val text = draft.value.trim()
         if (text.isEmpty()) return
-        _state.update { it.copy(draft = "") }
+        draft.value = ""
         viewModelScope.launch {
             val ok = runCatching {
                 if (_state.value.question.isNotBlank()) {
@@ -363,10 +379,12 @@ class ChatViewModel(
             val result = runCatching { d.stopAndFinalize() }.getOrNull()
             dictation = null
             val text = (result as? Dictation.Result.Text)?.text
-            _state.update {
-                val merged = if (!text.isNullOrBlank()) listOf(it.draft, text).filter { s -> s.isNotBlank() }.joinToString(" ") else it.draft
-                it.copy(mic = MicState.IDLE, draft = merged)
+            // Dictation appends to whatever is already typed, so it goes through
+            // the shared draft too (the mirror repaints the box).
+            if (!text.isNullOrBlank()) {
+                draft.value = listOf(draft.value, text).filter { s -> s.isNotBlank() }.joinToString(" ")
             }
+            _state.update { it.copy(mic = MicState.IDLE) }
             if (text.isNullOrBlank()) _messages.tryEmit("✗ nothing transcribed")
         }
     }

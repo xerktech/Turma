@@ -44,6 +44,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.net.InputRequest
 import kotlinx.coroutines.Dispatchers
@@ -200,31 +201,42 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
                 }
             }
         }
-        TerminalInputBar(onSend = { text ->
-            scope.launch { runCatching { container.client.api.sendInput(host, sessionId, InputRequest(text)) } }
-        })
+        // The compose box shares the chat screen's draft for this session
+        // (XERK-122) — stepping in here to read the pane and back must not eat a
+        // half-typed message, the same contract the web's view toggle keeps.
+        val draft = remember(host, sessionId) { container.drafts.of(host, sessionId) }
+        val text by draft.collectAsStateWithLifecycle()
+        TerminalInputBar(
+            text = text,
+            onText = { draft.value = it },
+            onSend = {
+                val body = draft.value
+                draft.value = ""
+                scope.launch { runCatching { container.client.api.sendInput(host, sessionId, InputRequest(body)) } }
+            },
+        )
       }
     }
 }
 
 /** A compose input on the terminal page — types the text into the session (same
- *  `input` endpoint the chat uses), so you needn't tap into the ttyd WebView. */
+ *  `input` endpoint the chat uses), so you needn't tap into the ttyd WebView.
+ *  Stateless: the draft it edits is the session's shared one (see DraftStore). */
 @Composable
-private fun TerminalInputBar(onSend: (String) -> Unit) {
-    var text by remember { mutableStateOf("") }
+private fun TerminalInputBar(text: String, onText: (String) -> Unit, onSend: () -> Unit) {
     Row(
         Modifier.fillMaxWidth().padding(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         OutlinedTextField(
             value = text,
-            onValueChange = { text = it },
+            onValueChange = onText,
             placeholder = { Text("Type into the terminal…") },
             modifier = Modifier.weight(1f),
             maxLines = 4,
         )
         IconButton(
-            onClick = { if (text.isNotBlank()) { onSend(text); text = "" } },
+            onClick = { if (text.isNotBlank()) onSend() },
             enabled = text.isNotBlank(),
         ) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
     }
