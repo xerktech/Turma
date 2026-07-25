@@ -2,6 +2,7 @@ package com.xerktech.turma
 
 import android.content.Context
 import com.xerktech.turma.data.Config
+import com.xerktech.turma.data.DraftStore
 import com.xerktech.turma.data.OrgFilter
 import com.xerktech.turma.net.Dictation
 import com.xerktech.turma.net.FleetRepository
@@ -29,6 +30,14 @@ class AppContainer(context: Context) {
      * sessions, board and usage screens all read it.
      */
     val org = OrgFilter(context.applicationContext)
+
+    /**
+     * Per-session compose drafts (XERK-122). Here for the same reason as [org]:
+     * the chat screen and the terminal screen each have a compose box over the
+     * SAME session, and the half-typed message has to survive walking between
+     * them — so it can't live in either screen's own state.
+     */
+    val drafts = DraftStore()
 
     /** In-app self-updater (XERK-11); [installedVersion] read once from the package manager. */
     val updater = Updater(context.applicationContext, appScope, installedVersion(context))

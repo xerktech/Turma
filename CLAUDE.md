@@ -1515,6 +1515,19 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   terminal's bar can't disagree with the chat's. Tests: the compose-bar cases in `chat.test.js` and the
   `termComposeAction`/`termComposeStop` cases in `sessions.test.js`.
 
+#### The compose draft survives the view toggle (XERK-122)
+
+- The chat and terminal panes have a compose box each, but a session has ONE draft: each toggle **moves**
+  the text across (`carryDraft`), clearing the source, so a half-typed message survives a look at the raw
+  pane and the two boxes can never disagree about what's still pending.
+- It is carried **after** the pane swap, not before — `focus()` on a still-`hidden` textarea is a silent
+  no-op, leaving the operator to tap the box before they can keep typing.
+- Focus follows only a NON-EMPTY draft, so toggling with an empty box doesn't pop a phone's soft keyboard.
+- Android has no in-place toggle (the terminal is its own screen), so the draft lives outside both screens
+  in the container's `data/DraftStore.kt`, keyed per (host, session); `ChatViewModel` mirrors it into
+  `ChatUiState.draft` and writes every change — incl. dictation and send-clears — back through it.
+- Tests: the draft-carry cases in `turma/tests/sessions.test.js`, `android/.../data/DraftStoreTest.kt`.
+
 #### Copying out of the terminal
 
 - A copy made in the terminal view reaches the viewer's **real system clipboard** — three independent

@@ -1944,15 +1944,46 @@ function selectSession(id) {
   enterStage();
   render(cache); // refresh the .cur highlight
 }
+// The chat and terminal panes each have their own compose box, but a half-typed
+// message is ONE draft: toggling views to check something in the terminal (or
+// coming back) must not eat it (XERK-122). Each toggle MOVES the text across —
+// the source is cleared, so the two boxes can never disagree about what's still
+// pending, and whichever box you can see holds the whole draft.
+// Focus follows only a non-empty draft: focusing an empty box would pop the soft
+// keyboard on a phone for someone who just wanted to look at the terminal.
+function carryDraft(fromId, toId) {
+  const src = document.getElementById(fromId), dst = document.getElementById(toId);
+  if (!src || !dst) return;
+  const text = src.value;
+  src.value = "";
+  dst.value = text;
+  growCompose(fromId); growCompose(toId);
+  if (!text.trim()) return;
+  dst.focus();
+  // Caret at the end, so the next keystroke continues the sentence.
+  try { dst.selectionStart = dst.selectionEnd = dst.value.length; } catch {}
+}
+// The two boxes auto-grow through different owners: the terminal's is local, the
+// chat's belongs to the chat engine (chat.js publishes autoGrowChatInput).
+function growCompose(id) {
+  if (id === "termInput") autoGrowTermInput();
+  else if (typeof window.autoGrowChatInput === "function") window.autoGrowChatInput();
+}
 // Swap the chat view for the raw ttyd terminal (debugging), keeping the chat's
 // live tail warm underneath so returning is instant.
 function chatToTerminal() {
   if (!currentId) return;
   const hit = sessionHit(currentId);
+  // setFrame() clears the terminal's box (it's opening a session's terminal), so
+  // the draft has to be carried across after it, not before.
   setFrame(currentId, hit ? hit.s : null, hit ? hit.a : null);
   viewMode = "terminal";
   $chatPane.hidden = true;
   $termPane.hidden = false;
+  // LAST, once the pane is actually shown: focus() on a still-`hidden` textarea
+  // is a silent no-op, which lands the draft in a box the operator then has to
+  // tap before they can keep typing.
+  carryDraft("chatInput", "termInput");
 }
 function terminalToChat() {
   if (!currentId) return;
@@ -1961,6 +1992,7 @@ function terminalToChat() {
   $termPane.hidden = true;
   $chatPane.hidden = false;
   disarmTermKill();
+  carryDraft("termInput", "chatInput"); // after the swap — see chatToTerminal()
   if (window.TurmaChat) TurmaChat.repaint();
 }
 // Push one mobile history entry the back button consumes, and reveal the stage.

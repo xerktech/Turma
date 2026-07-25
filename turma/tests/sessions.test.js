@@ -31,7 +31,10 @@ function makeEl(id) {
     addEventListener() {}, removeEventListener() {},
     appendChild(c) { this.children.push(c); return c; },
     querySelector() { return null; }, querySelectorAll() { return []; },
-    closest() { return null; }, focus() {}, blur() {}, select() {}, setAttribute() {}, getAttribute() { return null; },
+    // `focused` records the last focus() call, which is how the draft-carry
+    // tests observe that the box you can now see is the one taking keystrokes.
+    closest() { return null; }, focus() { this.focused = true; }, blur() { this.focused = false; },
+    select() {}, setAttribute() {}, getAttribute() { return null; },
     getBoundingClientRect() { return { top: 0, bottom: 0, height: 0 }; },
     scrollIntoView() {}, remove() {},
   };
@@ -99,7 +102,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     URL: global.URL, URLSearchParams: global.URLSearchParams,
     TurmaChat: {
       open: (hostKey, id) => opened.push(id),
-      onPoll: noop, close: noop, closeStatic: noop, renderStatic: noop,
+      onPoll: noop, close: noop, closeStatic: noop, renderStatic: noop, repaint: noop,
       // The chat engine owns the live busy read and the interrupt; the terminal's
       // compose button just defers to it. `busy` is what a test flips to model a
       // turn being in flight, and `stopped` records the delegation.
@@ -124,6 +127,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
       + " termComposeAction, termComposeStop, openEndedSession, resumeEnded, openTranscript, backToList,"
+      + " chatToTerminal, terminalToChat,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
@@ -558,6 +562,44 @@ test("terminal compose: Send sends the typed message when idle", () => {
   assert.equal(posts.length, 1);
   assert.equal(posts[0].url, "/api/agents/hostA/sessions/11111/input");
   assert.equal(posts[0].body.text, "do the thing");
+});
+
+// --- the draft survives a chat <-> terminal toggle (XERK-122) ----------------
+
+test("toggling to the terminal carries the half-typed chat draft, and back again", () => {
+  const { beat, selectSession, chatToTerminal, terminalToChat, els } = loadPage();
+  const { now, host: h } = host([working("11111", "Long Turn")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+
+  els.chatInput = makeEl("chatInput");
+  els.termInput = makeEl("termInput");
+  els.chatInput.value = "check the logs and then";
+  chatToTerminal();
+  assert.equal(els.termInput.value, "check the logs and then", "the draft follows the view");
+  assert.equal(els.chatInput.value, "", "the source box is cleared, so only one box holds it");
+  assert.ok(els.termInput.focused, "a carried draft takes focus, ready to keep typing");
+
+  // Keep typing in the terminal's box, then go back — the whole draft returns.
+  els.termInput.value = "check the logs and then restart it";
+  terminalToChat();
+  assert.equal(els.chatInput.value, "check the logs and then restart it");
+  assert.equal(els.termInput.value, "");
+  assert.ok(els.chatInput.focused);
+});
+
+test("an empty compose box doesn't grab focus on a toggle (no soft keyboard on a phone)", () => {
+  const { beat, selectSession, chatToTerminal, els } = loadPage();
+  const { now, host: h } = host([working("11111", "Long Turn")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+
+  els.chatInput = makeEl("chatInput");
+  els.termInput = makeEl("termInput");
+  els.chatInput.value = "   ";
+  chatToTerminal();
+  assert.equal(els.termInput.value, "   ", "whitespace still moves — it's the operator's text");
+  assert.ok(!els.termInput.focused, "but nothing worth continuing means no focus steal");
 });
 
 test("?session=<id>: waits for a session that isn't running yet, then opens it", () => {
