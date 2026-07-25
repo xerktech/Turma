@@ -46,9 +46,8 @@ fun sessionBranch(session: SessionInfo): String {
 /**
  * The session header's subtitle line (XERK-121): the host the agent runs on, the
  * repo, and the live branch — e.g. "truenas · Turma · XERK-121". Blank parts are
- * dropped, so a repos-root session (no repo) still reads cleanly. The web session
- * header shows host · worktree · branch; Android shows the repo instead of the
- * worktree name (a random dir keyed on the session id) — see PARITY.md.
+ * dropped, so a repos-root session (no repo) still reads cleanly. Mirrors the web
+ * session header (turma sessions.html `sessMeta`, prefixed with the host).
  */
 fun sessionHeaderMeta(host: String, session: SessionInfo): String =
     listOf(host, session.repo, sessionBranch(session))
