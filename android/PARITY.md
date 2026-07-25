@@ -46,10 +46,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 
 - **Repo on the Sessions-tab session card (XERK-125).** The live card's meta row read
   `host · branch`, so the one fact telling several open sessions apart — which repo each works — was
-  missing (the web card, and Android's own queued/ended rows, all lead with it). It now reads
-  `repo · host · branch`, via `core/Sessions.kt` `sessionRepoLabel` (a repos-root session says "repos
-  root" rather than the agent's `(root)` sentinel, and drops the branch it has no worktree for, as the
-  Dashboard card does). Tested in `SessionsTest`.
+  missing (the web card, and Android's own queued/ended rows, all carry it). It now reads
+  `host · repo · branch` — the same three facts in the same order as the session header this card
+  opens (`sessionHeaderMeta`) — with the repo from `core/Sessions.kt` `sessionRepoLabel`: a repos-root
+  session says "repos root" rather than the agent's `(root)` sentinel, and drops the branch it has no
+  worktree for, as the Dashboard card does. Tested in `SessionsTest`.
 - **Board "In Review" column.** `core/Board.kt` now carries the 4th category and the review/testing
   status-name carve-out from `inprogress` (was 3 columns → review tickets mis-bucketed). Columns sort
   newest-`updated` first. Ports `board.js` `categoryOf`/`ticketSort`. Tested in `BoardTest`.

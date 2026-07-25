@@ -766,33 +766,34 @@ private fun SessionListCard(
                     optimistic?.ifBlank { null } ?: liveName,
                     fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
-                // repo · host · branch — the card's identity row. The repo leads it
-                // (XERK-125): several sessions on one host are told apart by which
-                // repo they work, and that is the order the queued/ended rows and the
-                // web card use. A FlowRow so a long repo or branch wraps rather than
-                // ellipsising the parts after it away on a narrow phone.
+                // host · repo · branch — the card's identity row (XERK-125), the same
+                // three facts in the same order as the session header this card opens
+                // (core/Sessions.kt sessionHeaderMeta). The repo is the addition: it
+                // is what tells several sessions on one host apart.
+                // A FlowRow so a long repo or branch wraps rather than ellipsising the
+                // parts after it away on a narrow phone.
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     Text(
-                        sessionRepoLabel(r.session),
+                        r.device,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        "· ${r.device}",
+                        "· ${sessionRepoLabel(r.session)}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
                     // A repos-root session has no worktree, so it has no branch to
-                    // name — the row would otherwise read "repos root · … · detached"
-                    // and assert a HEAD it was never given (Dashboard card does the
-                    // same).
+                    // name — the row would otherwise read "… · repos root · detached"
+                    // and assert a HEAD it was never given (the Dashboard card does
+                    // the same).
                     if (!r.session.root) {
                         Text(
                             "· ${sessionBranch(r.session)}",
