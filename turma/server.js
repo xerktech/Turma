@@ -47,6 +47,14 @@ const TICKET_AGENTS_FILE = process.env.TICKET_AGENTS_FILE || "/data/ticket-agent
 // Tickets come and go while pins are only ever set by hand, so the map is
 // bounded rather than reconciled: past the cap the oldest pin is evicted.
 const TICKET_AGENTS_MAX = 500;
+// Ticket -> model pins (XERK-123): which MODEL a ticket's session runs, chosen
+// by the operator in the board's ticket detail panel. Like the agent pin (and
+// unlike the repo override) this is hub-owned durable state on /data: the model
+// is carried on the spawnTicket command the hub already routes, so the hub is
+// the one party that has to remember it. The alias ("opus"/"sonnet"/…) the agent
+// resolves at spawn, never a raw model id.
+const TICKET_MODELS_FILE = process.env.TICKET_MODELS_FILE || "/data/ticket-models.json";
+const TICKET_MODELS_MAX = 500;
 // Per-org auto opt-in (XERK-41): which Jira orgs let the board drive their whole
 // session lifecycle — auto-START a session for every To Do ticket that has a repo
 // (XERK-41), and auto-STOP a session when its ticket moves to Done (XERK-45; see
@@ -307,6 +315,80 @@ function setTicketAgent(siteKey, issueKey, host) {
   sseBroadcast("ticketAgents", ticketAgents);
 }
 
+// ---- ticket -> model pins (XERK-123) ---------------------------------------
+// The operator's own answer to which MODEL a ticket's session runs, overriding
+// the login's default. Keyed "<siteKey>/<issueKey>" like the agent pin; each
+// entry {model, at} where `model` is a plain alias. Hub-owned and durable for
+// the same reason the agent pin is: the model is delivered on the spawnTicket
+// command the hub routes, so the hub must remember the choice across a restart.
+let ticketModels = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(TICKET_MODELS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ticketModels = parsed;
+} catch {
+  /* first boot or no volume mounted */
+}
+let tmSaveTimer = null;
+function scheduleTicketModelsSave() {
+  if (tmSaveTimer) return;
+  tmSaveTimer = setTimeout(() => {
+    tmSaveTimer = null;
+    fs.mkdir(path.dirname(TICKET_MODELS_FILE), { recursive: true }, () => {
+      fs.writeFile(TICKET_MODELS_FILE, JSON.stringify(ticketModels), (err) => {
+        if (err) console.error(`ticket-models save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  tmSaveTimer.unref();
+}
+function ticketModelPin(siteKey, issueKey) {
+  const p = ticketModels[`${siteKey}/${issueKey}`];
+  return p && typeof p.model === "string" && p.model ? p : null;
+}
+// Set or clear (model=null) a ticket's pinned model. The caller has already
+// validated the alias against the org's offered models; this just owns the
+// map's bookkeeping and eviction.
+function setTicketModel(siteKey, issueKey, model) {
+  const k = `${siteKey}/${issueKey}`;
+  if (!model) delete ticketModels[k];
+  else {
+    ticketModels[k] = { model, at: Date.now() };
+    const keys = Object.keys(ticketModels);
+    if (keys.length > TICKET_MODELS_MAX) {
+      keys.sort((a, b) => (ticketModels[a].at || 0) - (ticketModels[b].at || 0));
+      for (const old of keys.slice(0, keys.length - TICKET_MODELS_MAX)) {
+        delete ticketModels[old];
+      }
+    }
+  }
+  scheduleTicketModelsSave();
+  invalidateAgentsCache();
+  sseBroadcast("ticketModels", ticketModels);
+}
+
+// The set of model aliases a ticket may be pinned to for an org: the aliases the
+// org's hosts actually probed available, unioned across every reporting host,
+// dropped to the non-bracketed ones (a bracketed "[1m]" alias is a live-switch
+// affordance the agent's resolve_model rejects for a spawn command line), plus
+// the static family aliases every login can name. "default" is always legal (it
+// releases the pin, so it never reaches this allowlist). Empty aliases beyond the
+// static set only when no host has probed yet.
+const STATIC_MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"];
+function orgModelAliases(siteKey) {
+  const set = new Set(STATIC_MODEL_ALIASES);
+  for (const a of Object.values(agents)) {
+    if (!a || !a.jira || a.jira.siteKey !== siteKey) continue;
+    const avail = a.models && Array.isArray(a.models.available) ? a.models.available : [];
+    for (const m of avail) {
+      if (typeof m === "string" && m && m !== "default" &&
+          /^[a-z0-9.-]{1,40}$/.test(m)) {
+        set.add(m);
+      }
+    }
+  }
+  return set;
+}
+
 // ---- per-org auto-start opt-in (XERK-41) -----------------------------------
 // The set of Jira orgs the operator has switched auto-start ON for, keyed by
 // siteKey with the value simply `true` (presence = enabled; disabling deletes
@@ -435,7 +517,7 @@ function buildAgentsCache() {
   // board-scoped, and hub-owned, so this is their one read channel (plus their
   // own SSE events for open boards).
   const body = JSON.stringify({
-    now, agents: list, ticketAgents, autoStartOrgs,
+    now, agents: list, ticketAgents, ticketModels, autoStartOrgs,
     // In-flight (and just-settled) session migrations, so the Sessions page can
     // follow a moved session onto its new host and surface a failure (XERK-101).
     migrations: migrationList(),
@@ -1327,7 +1409,9 @@ function autoStartSweep() {
       // immediately once a host is back rather than sitting out a backoff for a
       // failure that was never the ticket's fault.
       if (!host) continue;
-      queueCommand(host, { type: "spawnTicket", issueKey: t.key });
+      const mpin = ticketModelPin(siteKey, t.key);   // XERK-123, see /session
+      queueCommand(host, { type: "spawnTicket", issueKey: t.key,
+        ...(mpin ? { model: mpin.model } : {}) });
       // Grow the backoff toward its ceiling; the counter is capped there so it
       // settles into a steady once-per-ceiling retry instead of climbing forever.
       const attempts = Math.min((prior ? prior.attempts : 0) + 1,
@@ -2773,8 +2857,14 @@ const server = http.createServer(async (req, res) => {
       // start two sessions on one ticket.
       const pending = (agents[host].commands || [])
         .find((c) => c.type === "spawnTicket" && c.issueKey === issueKey);
+      // The operator's model pin (XERK-123) rides the command the hub already
+      // routes — the agent has no per-ticket ledger of its own to read it from.
+      // Omitted when unpinned, so a ticket with no model choice spawns exactly as
+      // it always did (the agent's default model).
+      const mpin = ticketModelPin(siteKey, issueKey);
       const cmdId = pending ? pending.cmdId
-        : queueCommand(host, { type: "spawnTicket", issueKey });
+        : queueCommand(host, { type: "spawnTicket", issueKey,
+            ...(mpin ? { model: mpin.model } : {}) });
       // needsClone tells the board the chosen host doesn't have the repo yet, so
       // it will clone on demand and the session starts queued behind the clone.
       return json(res, 200, { ok: true, cmdId, host, repo, needsClone });
@@ -2880,6 +2970,43 @@ const server = http.createServer(async (req, res) => {
       }
       setTicketAgent(siteKey, issueKey, auto ? null : body.host);
       return json(res, 200, { ok: true, host: auto ? null : body.host });
+    }
+
+    // POST /api/jira/<siteKey>/<issueKey>/model — pin which MODEL this ticket's
+    // session runs with (XERK-123). Body: {model:"<alias>"} to pin, {auto:true}
+    // (or {model:"default"}) to release back to the login's default model.
+    //
+    // Hub-owned durable state exactly like the /agent pin: the model is carried
+    // on the spawnTicket command the hub routes, so this is authoritative the
+    // moment it returns (a 200, not a queued 202). The alias must be one the
+    // org's hosts actually offer — the same allowlist the composer's model menu
+    // is built from — so the pin can't name a model no session could run; the
+    // agent still re-validates it host-side (resolve_model) before launch.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "model") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const raw = typeof body.model === "string" ? body.model.trim().toLowerCase() : "";
+      // "default" is the release value in model's clothing — treat it as {auto},
+      // so the picker's "Default" option and an explicit {auto:true} land the same
+      // "drop the pin" outcome rather than storing a "default" alias to resolve.
+      const auto = body.auto === true || raw === "default" || raw === "";
+      if (!auto && typeof body.model !== "string") {
+        return json(res, 400, { error: "body needs {model} or {auto:true}" });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      if (!auto && !orgModelAliases(siteKey).has(raw)) {
+        return json(res, 400, { error: "that model is not offered by this org" });
+      }
+      setTicketModel(siteKey, issueKey, auto ? null : raw);
+      return json(res, 200, { ok: true, model: auto ? null : raw });
     }
 
     // POST /api/jira/<siteKey>/autostart — flip an org's auto-start opt-in
@@ -3292,6 +3419,10 @@ if (process.env.TURMA_TEST) {
     autoStartOrgs,
     setAutoStartOrg,
     ticketAgents,
+    ticketModels,
+    ticketModelPin,
+    setTicketModel,
+    orgModelAliases,
     findTicketHost,
     migrations,
     advanceMigrations,

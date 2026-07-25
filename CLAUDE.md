@@ -1328,6 +1328,35 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - Tests: the ticket-agent-pin cases in `turma/tests/server.test.js` and `board.test.js`, the
   hostOptions/agentPinOf cases in `android/app/src/test/.../BoardTest.kt`.
 
+##### Pinning the model by hand (XERK-123)
+
+- A **Model row** sits below the Agent row: which MODEL this ticket's session runs, defaulting to
+  "Default — the agent's default model" (the login's default). Its "Change" swaps in a picker of
+  "Default" + the org's offered aliases; **a pick IS the save**, same contract as the repo/agent pickers.
+  Panel-only — the card gets no chip, since the default is the common case (mirrors the Agent row).
+- **Hub-owned durable state like the agent pin**, NOT an agent-ledger fan-out: the model is delivered on
+  the `spawnTicket` command the hub already routes (`ticketModelPin` → the command's `model`), so the hub
+  is the one party that has to remember the choice. Stored in `/data/ticket-models.json`
+  (`TICKET_MODELS_FILE`, keyed `<siteKey>/<issueKey>`, `{model, at}`, bounded `TICKET_MODELS_MAX`
+  oldest-first). `POST /api/jira/<siteKey>/<issueKey>/model` answers an authoritative **200** (`{model}`
+  to pin, `{auto:true}` or `{model:"default"}` to release), rides `/api/agents` as top-level
+  `ticketModels` (+ a `ticketModels` SSE event).
+- The alias must be one the org **actually offers** (`orgModelAliases`: the union of the org's hosts'
+  probed `models.available`, non-bracketed, + the static family aliases — the same set the composer's
+  menu is built from). The **agent still re-validates** it host-side (`spawn`'s `resolve_model`) before
+  launch, so a model a host can't run fails as an error card; an unpinned ticket omits `model` and spawns
+  exactly as before (the default). The picker offers the curated menu (`modelChoices`/`prettyModel`);
+  a pinned alias off the current probe is carried back so it stays selected (repo/agent-picker orphan
+  handling). Un-probed org falls back to the static family aliases, never an empty menu.
+- The pin also feeds the **auto-start sweep**: an auto-started To Do ticket carries its pinned model too.
+- **Known limit (multi-host-per-org only, so it doesn't bite the one-host deployment):** the picker
+  offers the union of the org's hosts' probed models, so it can offer an alias one host lacks — that host
+  fails the spawn as an error card. Same shape as the repo/agent pins' multi-host caveats.
+- Tests: the `/model` endpoint + spawnTicket-carries-model cases in `turma/tests/server.test.js`, the
+  `modelPinOf`/`modelPickerHtml`/`modelChoices` cases in `board.test.js`, the model-pin cases in
+  `TestSpawnTicket` (`agent/tests/test_hub_agent.py`), and the `modelPinOf`/`modelChoices` cases in
+  `android/app/src/test/.../BoardTest.kt`.
+
 #### Refresh button
 
 - `POST /api/jira/refresh` fans a `refreshJira` out to every Jira-configured host, deduped so a mashed

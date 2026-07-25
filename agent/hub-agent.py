@@ -6449,9 +6449,16 @@ class SessionManager:
             return None
         return branch
 
-    def spawn_ticket(self, issue_key, cmd_id=None):
+    def spawn_ticket(self, issue_key, cmd_id=None, model=None):
         """Spawn a session to work a ticket (Jira or Azure DevOps) — the board's
         per-card start button.
+
+        `model` is the operator's per-ticket model pin (XERK-123), an alias the
+        hub carries on the command because the model choice is hub-owned durable
+        state with no agent-side ledger to read it from. None (unpinned) spawns
+        with the login's default model, exactly as before. It is validated the
+        same way a composer spawn's model is — resolve_model in spawn() — so a
+        model this host can't run fails as an error card rather than silently.
 
         Everything is re-derived from LOCAL state rather than trusted from the
         command: the hub only chooses which host (an online one reporting the org,
@@ -6525,7 +6532,7 @@ class SessionManager:
         if branch_base != key:
             ticket["branchBase"] = branch_base
         self.spawn(repo_name, prompt=build_ticket_prompt(detail), ticket=ticket,
-                   cmd_id=cmd_id, await_clone=await_clone,
+                   model=model, cmd_id=cmd_id, await_clone=await_clone,
                    await_clone_owner=(entry.get("nameWithOwner") if await_clone
                                       else None))
 
@@ -8810,7 +8817,8 @@ class SessionManager:
                         cmd_id=cid,
                     )
                 elif ctype == "spawnTicket":
-                    self.spawn_ticket(cmd.get("issueKey"), cmd_id=cid)
+                    self.spawn_ticket(cmd.get("issueKey"), cmd_id=cid,
+                                      model=cmd.get("model"))
                 elif ctype == "kill":
                     self.kill(cmd.get("sessionId"))
                 elif ctype == "start":

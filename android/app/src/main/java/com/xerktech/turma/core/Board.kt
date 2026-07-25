@@ -62,10 +62,67 @@ data class BoardSite(
     // every host reporting this org, online first — offline included, since a
     // pin is a persistent choice about future spawns.
     val hostOptions: List<HostOption> = emptyList(),
+    // The org's probed model list + what "Default" resolves to (board.js
+    // `models`, XERK-123): the ticket model picker's options, unioned across the
+    // org's hosts, freshest default label winning.
+    val models: BoardModels = BoardModels(),
 )
 
 /** One org host the agent picker can pin a ticket to (board.js hostOpts entry). */
 data class HostOption(val key: String, val name: String, val online: Boolean)
+
+/** The org's model options for the ticket model picker (board.js BoardSite.models). */
+data class BoardModels(val available: List<String> = emptyList(), val defaultLabel: String = "")
+
+/**
+ * The ticket's pinned model out of the hub's ticketModels map, keyed
+ * "<siteKey>/<issueKey>" — a port of board.js `modelPinOf`. Null means the
+ * ticket runs the login's default model.
+ */
+fun modelPinOf(
+    ticketModels: Map<String, com.xerktech.turma.model.TicketModelPin>,
+    siteKey: String,
+    issueKey: String,
+): com.xerktech.turma.model.TicketModelPin? =
+    ticketModels["$siteKey/$issueKey"]?.takeIf { it.model.isNotBlank() }
+
+/**
+ * The curated aliases the model picker offers besides "Default", filtered to what
+ * the org probed — a port of board.js `modelChoices`. The bracketed "[1m]" alias
+ * is never offered (it's a live-switch affordance the spawn command rejects); an
+ * org with no probe yet falls back to the static family set.
+ */
+val MODEL_MENU_ALIASES = listOf("opus", "fable", "sonnet", "haiku")
+fun modelChoices(models: BoardModels): List<String> {
+    val avail = models.available
+    if (avail.isEmpty()) return MODEL_MENU_ALIASES
+    return MODEL_MENU_ALIASES.filter { it in avail }
+}
+
+/**
+ * Human form of a model signal — a port of board.js `prettyModel`. An alias
+ * ("opus") capitalizes; a raw claude-* id is parsed (family word, dotted
+ * version, trailing datestamp dropped, "[1m]" -> " 1M").
+ */
+fun prettyModel(v: String): String {
+    var s = v.trim()
+    if (s.isEmpty()) return ""
+    if (!s.startsWith("claude-", ignoreCase = true)) {
+        return s.replaceFirstChar { it.uppercase() }
+    }
+    val oneM = Regex("\\[1m\\]$", RegexOption.IGNORE_CASE).containsMatchIn(s)
+    s = s.replaceFirst(Regex("^claude-", RegexOption.IGNORE_CASE), "")
+        .replaceFirst(Regex("\\[1m\\]$", RegexOption.IGNORE_CASE), "")
+    val words = ArrayList<String>()
+    val nums = ArrayList<String>()
+    for (p in s.split("-").filter { it.isNotEmpty() }) {
+        if (Regex("^\\d{8}$").matches(p)) continue          // datestamp, not a version
+        if (Regex("^\\d+$").matches(p)) nums.add(p)
+        else words.add(p.replaceFirstChar { it.uppercase() })
+    }
+    val name = words.joinToString(" ") + (if (nums.isNotEmpty()) " " + nums.joinToString(".") else "")
+    return (name.ifBlank { v }) + (if (oneM) " 1M" else "")
+}
 
 /**
  * The ticket's pinned host out of the hub's ticketAgents map, keyed
@@ -118,6 +175,10 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
     // (not the freshest-block winners): the agent picker must offer the whole
     // org, exactly like the web board's hostOpts collection (XERK-38).
     val hostOpts = LinkedHashMap<String, LinkedHashMap<String, HostOption>>()
+    // The org's model options (XERK-123): a union of probed aliases + the freshest
+    // probe's default label. Collected over EVERY reporting host, like hostOpts.
+    val modelAvail = LinkedHashMap<String, LinkedHashSet<String>>()
+    val modelDefault = LinkedHashMap<String, Pair<String, String>>()  // site -> (at, defaultLabel)
     for (a in agents) {
         val j = a.jira ?: continue
         if (j.siteKey.isBlank()) continue
@@ -126,6 +187,12 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
         if (hk.isNotBlank()) {
             hostOpts.getOrPut(j.siteKey) { LinkedHashMap() }[hk] =
                 HostOption(hk, a.device.ifBlank { hk }, a.online)
+        }
+        a.models?.let { mb ->
+            val set = modelAvail.getOrPut(j.siteKey) { LinkedHashSet() }
+            for (m in mb.available) if (m.isNotBlank() && m != "default") set.add(m)
+            val cur = modelDefault[j.siteKey]
+            if (cur == null || mb.at >= cur.first) modelDefault[j.siteKey] = mb.at to mb.defaultLabel
         }
         val k = j.siteKey + "\u0000" + j.user
         val prev = byUser[k]
@@ -155,6 +222,10 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
                 // name — the picker's own order (board.js hostOptions sort).
                 hostOptions = (hostOpts[site]?.values ?: emptyList())
                     .sortedWith(compareByDescending<HostOption> { it.online }.thenBy { it.name }),
+                models = BoardModels(
+                    available = (modelAvail[site]?.toList() ?: emptyList()).sorted(),
+                    defaultLabel = modelDefault[site]?.second ?: "",
+                ),
             ),
         )
     }

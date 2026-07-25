@@ -150,10 +150,11 @@ fun BoardScreen(
     }
 
     detail?.let { (site, ticket) ->
-        // The Agent pin lives on the fleet payload (hub-owned), not the ticket,
-        // so it's resolved here where the fleet state is in scope.
+        // The Agent/Model pins live on the fleet payload (hub-owned), not the
+        // ticket, so they're resolved here where the fleet state is in scope.
         val pin = com.xerktech.turma.core.agentPinOf(fleet.ticketAgents, site.siteKey, ticket.key)
-        TicketDetailSheet(site, ticket, pin, vm, onDismiss = { detail = null })
+        val modelPin = com.xerktech.turma.core.modelPinOf(fleet.ticketModels, site.siteKey, ticket.key)
+        TicketDetailSheet(site, ticket, pin, modelPin, vm, onDismiss = { detail = null })
     }
 }
 
@@ -457,6 +458,69 @@ private fun AgentSection(
     }
 }
 
+/**
+ * The Model row of the detail sheet (XERK-123): which MODEL this ticket's session
+ * runs — the operator's override of the login's default. Mirrors board.js
+ * modelFieldHtml + modelPickerHtml: Default is the stated default (naming what it
+ * resolves to when probed), a pin says "set by you".
+ */
+@Composable
+private fun ModelSection(
+    site: BoardSite,
+    t: JiraTicket,
+    pin: com.xerktech.turma.model.TicketModelPin?,
+    vm: BoardViewModel,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        SectionLabel("Model")
+        if (pin == null) {
+            val def = site.models.defaultLabel.takeIf { it.isNotBlank() }
+                ?.let { " (${com.xerktech.turma.core.prettyModel(it)})" } ?: ""
+            Text(
+                "Default$def — the agent's default model",
+                style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Pill(com.xerktech.turma.core.prettyModel(pin.model), mono = true)
+                Text("— set by you", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        // The picker is always available (the static family aliases are always
+        // offerable), matching the web row's always-editable Model field.
+        ModelPicker(site, pin) { model -> vm.setTicketModel(site.siteKey, t.key, model) }
+    }
+}
+
+/** A pick IS the save; null = release to the default model. */
+@Composable
+private fun ModelPicker(site: BoardSite, pin: com.xerktech.turma.model.TicketModelPin?, onPick: (model: String?) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    // A pinned alias off the probed list is carried back so it can stay current,
+    // the same orphan handling the web picker does.
+    val choices = com.xerktech.turma.core.modelChoices(site.models).toMutableList()
+    pin?.model?.takeIf { it.isNotBlank() && it !in choices }?.let { choices.add(0, it) }
+    val current = pin?.let { com.xerktech.turma.core.prettyModel(it.model) } ?: "Default"
+    Box {
+        GhostButton("▾ $current", onClick = { open = true })
+        androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            val def = site.models.defaultLabel.takeIf { it.isNotBlank() }
+                ?.let { " (${com.xerktech.turma.core.prettyModel(it)})" } ?: ""
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("Default$def") },
+                onClick = { open = false; onPick(null) },
+            )
+            for (m in choices) {
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(com.xerktech.turma.core.prettyModel(m)) },
+                    onClick = { open = false; onPick(m) },
+                )
+            }
+        }
+    }
+}
+
 /** A pick IS the save, same contract as [RepoPicker]; null = release to auto. */
 @Composable
 private fun AgentPicker(site: BoardSite, pin: com.xerktech.turma.model.TicketAgentPin?, onPick: (host: String?) -> Unit) {
@@ -486,6 +550,7 @@ private fun TicketDetailSheet(
     site: BoardSite,
     t: JiraTicket,
     pin: com.xerktech.turma.model.TicketAgentPin?,
+    modelPin: com.xerktech.turma.model.TicketModelPin?,
     vm: BoardViewModel,
     onDismiss: () -> Unit,
 ) {
@@ -507,6 +572,7 @@ private fun TicketDetailSheet(
             Text(t.summary, style = MaterialTheme.typography.titleMedium)
             RepoSection(site, t, vm)
             AgentSection(site, t, pin, vm)
+            ModelSection(site, t, modelPin, vm)
             val d = detail
             if (d == null) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
