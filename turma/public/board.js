@@ -68,10 +68,24 @@
       let rep = reporters.get(site);
       if (!rep) {
         reporters.set(site, rep = {
-          hosts: new Set(), online: false, repos: new Map(), hostOpts: new Map() });
+          hosts: new Set(), online: false, repos: new Map(), hostOpts: new Map(),
+          modelAvail: new Set(), modelAt: "", modelDefaultLabel: "" });
       }
       rep.hosts.add(a.device || a.key || "?");
       if (a.online) rep.online = true;
+      // The per-ticket model picker's choices (XERK-123): the aliases this org's
+      // hosts probed available, unioned over EVERY reporting host (same reason as
+      // the repo/host options — the freshest-block winners loop below sees only
+      // one host per user). `default`'s human label is taken from the FRESHEST
+      // probe (by its `at`), since that's what "Default" resolves to right now.
+      const mb = a.models;
+      if (mb && Array.isArray(mb.available)) {
+        for (const m of mb.available) if (m && m !== "default") rep.modelAvail.add(m);
+        if (String(mb.at || "") >= String(rep.modelAt || "")) {
+          rep.modelAt = mb.at || rep.modelAt;
+          rep.modelDefaultLabel = mb.defaultLabel || "";
+        }
+      }
       // The manual picker's repo choices, unioned over EVERY host reporting this
       // org — collected here, alongside the hosts, rather than in the winners
       // loop below. The blocks that survive `byUser` are one per (site, user),
@@ -136,6 +150,14 @@
           // name — the agent picker's own order.
           hostOptions: [...rep.hostOpts.values()].sort((x, y) =>
             (y.online ? 1 : 0) - (x.online ? 1 : 0) || x.name.localeCompare(y.name)),
+          // The org's probed model list + what "Default" resolves to (XERK-123),
+          // for the ticket model picker. `available` is the union across hosts;
+          // empty when no host has probed yet (the picker falls back to the static
+          // family aliases then, exactly as the composer's menu does).
+          models: {
+            available: [...rep.modelAvail].sort(),
+            defaultLabel: rep.modelDefaultLabel || "",
+          },
           _byKey: new Map(),
         });
       }
@@ -741,6 +763,100 @@
     </div>`;
   }
 
+  // ---- per-ticket model pin (XERK-123) --------------------------------------
+  // The curated aliases the model picker offers besides "Default", filtered to
+  // what the org actually probed — the same set the composer's model menu shows
+  // (chat.js MODEL_MENU_ALIASES), minus "default" (which the picker spells out as
+  // its own release option). A "[1m]" bracketed alias is never offered: the pin
+  // is interpolated into a spawn command line, which the agent's resolve_model
+  // rejects for those. An org with no probe yet falls back to the static family
+  // set rather than an empty menu.
+  const MODEL_MENU_ALIASES = ["opus", "fable", "sonnet", "haiku"];
+  function modelChoices(models) {
+    const avail = models && Array.isArray(models.available) ? models.available : null;
+    if (!avail || !avail.length) return MODEL_MENU_ALIASES.slice();
+    return MODEL_MENU_ALIASES.filter((a) => avail.indexOf(a) !== -1);
+  }
+  // Human form of a model signal — an alias ("opus") capitalizes; a raw claude-*
+  // id is parsed the way the chat footer's prettyModel does (family word, dotted
+  // version, trailing datestamp dropped, "[1m]" → " 1M").
+  function prettyModel(v) {
+    if (!v) return "";
+    let s = String(v).trim();
+    if (!/^claude-/i.test(s)) return s ? s[0].toUpperCase() + s.slice(1) : s;
+    const oneM = /\[1m\]$/i.test(s);
+    s = s.replace(/^claude-/i, "").replace(/\[1m\]$/i, "");
+    const parts = s.split("-").filter(Boolean);
+    const words = [], nums = [];
+    for (const p of parts) {
+      if (/^\d{8}$/.test(p)) continue;
+      if (/^\d+$/.test(p)) nums.push(p);
+      else words.push(p[0].toUpperCase() + p.slice(1));
+    }
+    const name = words.join(" ") + (nums.length ? " " + nums.join(".") : "");
+    return (name || String(v)) + (oneM ? " 1M" : "");
+  }
+
+  // The ticket's pinned model out of the hub's ticketModels map (keyed
+  // "<siteKey>/<issueKey>"); null when the ticket runs the default model.
+  function modelPinOf(ticketModels, siteKey, issueKey) {
+    const p = (ticketModels || {})[`${siteKey}/${issueKey}`];
+    return p && p.model ? p : null;
+  }
+
+  // The Model row of the detail panel (XERK-123): which model this ticket's
+  // session runs. Panel-only like the Agent row — the default is the common case
+  // and there's no per-card chip worth the space. "Default" names what it
+  // resolves to when the org has probed, so the operator sees what "leave it
+  // alone" means.
+  function modelFieldHtml(pin, models, opts) {
+    const o = opts || {};
+    const bits = [];
+    if (!pin) {
+      const def = models && models.defaultLabel
+        ? ` (${esc(prettyModel(models.defaultLabel))})` : "";
+      bits.push(`<span class="td-dim">Default${def} — the agent's default model</span>`);
+    } else {
+      bits.push(`<span class="kc-repo">${esc(prettyModel(pin.model))}</span>`);
+      bits.push(`<span class="td-dim">— set by you</span>`);
+    }
+    if (o.editable) {
+      bits.push(`<button type="button" class="td-edit" data-model-edit="1">Change</button>`);
+    }
+    if (o.error) bits.push(`<span class="td-err-inline">Couldn't save — ${esc(o.error)}</span>`);
+    return bits.join(" ");
+  }
+
+  // The picker's current answer — same contract as repoPickerValue/agentPickerValue:
+  // the change handler compares a pick against this to know whether anything
+  // changed, so it must derive exactly the way modelPickerHtml preselects.
+  function modelPickerValue(pin) {
+    return pin ? pin.model : "__default__";
+  }
+
+  // The model picker, swapped in for the row on "Change". Choosing an option IS
+  // the save, exactly like the repo/agent pickers. "Default" is the release
+  // (drops the pin); every other option pins that alias.
+  function modelPickerHtml(pin, models) {
+    const cur = pin ? pin.model : null;
+    const list = modelChoices(models);
+    // A pinned alias that has fallen out of the org's current choices (a probe
+    // that no longer lists it) is carried back in so it stays `selected` — the
+    // same orphan handling the repo/agent pickers do.
+    if (cur && !list.includes(cur)) list.unshift(cur);
+    const def = models && models.defaultLabel
+      ? ` (${esc(prettyModel(models.defaultLabel))})` : "";
+    const optHtml = (a) => `<option value="${esc(a)}"${
+      a === cur ? " selected" : ""}>${esc(prettyModel(a))}</option>`;
+    const sel = `<select class="td-repo-select" data-model-select="1">
+      <option value="__default__"${pin ? "" : " selected"}>Default${def}</option>
+      ${list.map(optHtml).join("")}
+    </select>`;
+    return `<div class="td-repo-edit">${sel}
+      <button type="button" class="td-edit" data-model-cancel="1">Cancel</button>
+    </div>`;
+  }
+
   // `t` is the card's ticket (always present); `detail` is the fetched issue
   // (null until it lands). opts: {color, now, siteKey, error, loading}.
   function detailHtml(t, detail, opts) {
@@ -783,6 +899,16 @@
         : agentFieldHtml(o.agentPin, o.hostOptions, {
             editable: !!(o.agentPin || (o.hostOptions || []).length),
             error: o.agentError,
+          })),
+      // Which MODEL this ticket's session runs (XERK-123). Hub-owned like the
+      // agent pin (o.modelPin, from the /api/agents payload's ticketModels), so
+      // it needs no online host to be editable — the model options are the org's
+      // probed list (o.models), always at least the static family aliases.
+      fieldRow("Model", o.modelEditing
+        ? modelPickerHtml(o.modelPin, o.models)
+        : modelFieldHtml(o.modelPin, o.models, {
+            editable: true,
+            error: o.modelError,
           })),
       fieldRow("Assignee", d.assignee ? esc(d.assignee) : ""),
       fieldRow("Reporter", d.reporter ? esc(d.reporter) : ""),
@@ -963,6 +1089,7 @@
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
+    modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed, startSweepVerdict,
   };

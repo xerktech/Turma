@@ -212,6 +212,46 @@ class BoardTest {
         assertEquals(null, agentPinOf(mapOf("s/X-1" to com.xerktech.turma.model.TicketAgentPin()), "s", "X-1"))
     }
 
+    // ---- ticket -> model pin (XERK-123): parity with board.js models/modelPinOf
+
+    @Test fun `mergeSites unions the org's probed models with the freshest default`() {
+        val a = agent("hostA", true, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T01:00:00Z"))
+            .copy(models = com.xerktech.turma.model.ModelsInfo(
+                available = listOf("opus", "sonnet", "default"), defaultLabel = "Sonnet 5",
+                at = "2026-07-16T11:00:00Z"))
+        val b = agent("hostB", true, JiraBlock(siteKey = "org", user = "u", fetchedAt = "2026-07-16T02:00:00Z"))
+            .copy(models = com.xerktech.turma.model.ModelsInfo(
+                available = listOf("haiku", "opus[1m]"), defaultLabel = "Haiku 4.5",
+                at = "2026-07-16T12:00:00Z"))
+        val site = mergeSites(listOf(a, b)).single()
+        // Union across hosts, sorted, "default" dropped; the bracketed alias stays
+        // in the raw list (modelChoices filters it).
+        assertEquals(listOf("haiku", "opus", "opus[1m]", "sonnet"), site.models.available)
+        // Default off the FRESHEST probe (hostB).
+        assertEquals("Haiku 4.5", site.models.defaultLabel)
+    }
+
+    @Test fun `modelPinOf reads the hub's siteKey-issueKey-keyed map`() {
+        val tm = mapOf("org.atlassian.net/X-1" to com.xerktech.turma.model.TicketModelPin(model = "opus", at = 1))
+        assertEquals("opus", modelPinOf(tm, "org.atlassian.net", "X-1")?.model)
+        assertEquals(null, modelPinOf(tm, "org.atlassian.net", "X-2"))
+        assertEquals(null, modelPinOf(mapOf("s/X-1" to com.xerktech.turma.model.TicketModelPin()), "s", "X-1"))
+    }
+
+    @Test fun `modelChoices filters the menu to the probe, static fallback when empty`() {
+        assertEquals(listOf("opus", "haiku"), modelChoices(BoardModels(available = listOf("opus", "haiku"))))
+        assertEquals(listOf("opus", "fable", "sonnet", "haiku"), modelChoices(BoardModels()))
+        // The bracketed live-switch-only alias is never a pin option.
+        assertEquals(listOf("sonnet"), modelChoices(BoardModels(available = listOf("opus[1m]", "sonnet"))))
+    }
+
+    @Test fun `prettyModel capitalizes aliases and parses claude ids`() {
+        assertEquals("Opus", prettyModel("opus"))
+        assertEquals("Opus 4.8", prettyModel("claude-opus-4-8"))
+        assertEquals("Fable 5 1M", prettyModel("claude-fable-5[1m]"))
+        assertEquals("", prettyModel(""))
+    }
+
     // ---- the fleet-wide org filter (XERK-62): parity with org.js
 
     @Test fun `siteKeyOf is the host's org, blank for a host with no tracker`() {

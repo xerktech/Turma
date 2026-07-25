@@ -14,6 +14,7 @@ const {
   newestFetchedAt, jiraRefreshPending, jiraRefreshFailed,
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
   agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
+  modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
   startSweepVerdict,
 } = require("../public/board.js");
@@ -893,6 +894,105 @@ test("detailHtml: no hosts and no pin leaves the Agent row read-only", () => {
   const pinned = detailHtml(ticket("X-1"), null,
     { siteKey: "s", agentPin: { host: "hostGone" }, hostOptions: [] });
   assert.ok(pinned.includes("data-agent-edit"));
+});
+
+// ---- ticket -> model pin (XERK-123): the detail panel's Model row -----------
+
+test("mergeSites: unions the org's probed model aliases + freshest default", () => {
+  const sites = mergeSites([
+    agent("hostA", block(), { models: {
+      available: ["opus", "sonnet", "default"], defaultLabel: "Sonnet 5",
+      at: "2026-07-14T11:00:00Z" } }),
+    agent("hostB", block(), { models: {
+      available: ["haiku", "opus[1m]"], defaultLabel: "Haiku 4.5",
+      at: "2026-07-14T12:00:00Z" } }),
+  ]);
+  // Union across hosts, sorted, "default" dropped (it's the release option), the
+  // bracketed alias kept in the raw list (the picker filters it out).
+  assert.deepEqual(sites[0].models.available, ["haiku", "opus", "opus[1m]", "sonnet"]);
+  // Default label off the FRESHEST probe (hostB, later `at`).
+  assert.equal(sites[0].models.defaultLabel, "Haiku 4.5");
+});
+
+test("modelPinOf: reads the hub's siteKey/issueKey-keyed map", () => {
+  const tm = { "myorg.atlassian.net/X-1": { model: "opus", at: 1 } };
+  assert.equal(modelPinOf(tm, "myorg.atlassian.net", "X-1").model, "opus");
+  assert.equal(modelPinOf(tm, "myorg.atlassian.net", "X-2"), null);
+  assert.equal(modelPinOf(null, "myorg.atlassian.net", "X-1"), null);
+  assert.equal(modelPinOf({ "s/X-1": {} }, "s", "X-1"), null);   // no model = no pin
+});
+
+test("modelChoices: probed list filters the menu; empty probe falls back to static", () => {
+  assert.deepEqual(modelChoices({ available: ["opus", "haiku"] }), ["opus", "haiku"]);
+  // No probe yet — the static family aliases, never an empty menu.
+  assert.deepEqual(modelChoices(null), ["opus", "fable", "sonnet", "haiku"]);
+  assert.deepEqual(modelChoices({ available: [] }), ["opus", "fable", "sonnet", "haiku"]);
+  // The bracketed live-switch-only alias is never offered as a pin.
+  assert.deepEqual(modelChoices({ available: ["opus[1m]", "sonnet"] }), ["sonnet"]);
+});
+
+test("prettyModel: aliases capitalize, claude ids parse, 1M kept", () => {
+  assert.equal(prettyModel("opus"), "Opus");
+  assert.equal(prettyModel("claude-opus-4-8"), "Opus 4.8");
+  assert.equal(prettyModel("claude-fable-5[1m]"), "Fable 5 1M");
+  assert.equal(prettyModel(""), "");
+});
+
+test("modelFieldHtml: default is the stated default, a pin says set by you", () => {
+  const models = { available: ["opus"], defaultLabel: "Sonnet 5" };
+  const def = modelFieldHtml(null, models, { editable: true });
+  assert.ok(def.includes("Default (Sonnet 5)"));
+  assert.ok(def.includes("data-model-edit"));
+  const pinned = modelFieldHtml({ model: "opus" }, models, { editable: true });
+  assert.ok(pinned.includes("Opus"));
+  assert.ok(pinned.includes("set by you"));
+});
+
+test("modelFieldHtml: a failed save is reported on the row", () => {
+  const html = modelFieldHtml(null, null, { editable: true, error: "the hub is unreachable" });
+  assert.ok(html.includes("Couldn't save"));
+  assert.ok(html.includes("the hub is unreachable"));
+});
+
+test("modelPickerHtml: default preselected without a pin, the pinned alias with one", () => {
+  const models = { available: ["opus", "sonnet", "haiku"], defaultLabel: "Sonnet 5" };
+  const def = modelPickerHtml(null, models);
+  assert.ok(/<option value="__default__" selected>Default \(Sonnet 5\)/.test(def));
+  assert.ok(def.includes('value="opus"'));
+  assert.ok(!def.includes("data-model-save"));   // a pick IS the save
+  assert.ok(def.includes("data-model-cancel"));
+  const pinned = modelPickerHtml({ model: "opus" }, models);
+  assert.ok(/<option value="opus" selected>/.test(pinned));
+  assert.ok(!/<option value="__default__" selected>/.test(pinned));
+});
+
+test("modelPickerHtml: a pinned alias off the probed list stays selected", () => {
+  // The org's probe no longer lists "opus" (only sonnet), but the pin persists —
+  // carried back so the browser doesn't fall back to Default and silently release.
+  const html = modelPickerHtml({ model: "opus" }, { available: ["sonnet"] });
+  assert.ok(/<option value="opus" selected>/.test(html));
+  assert.ok(!/<option value="__default__" selected>/.test(html));
+});
+
+test("modelPickerValue: agrees with what the picker preselects", () => {
+  const models = { available: ["opus"], defaultLabel: "Sonnet 5" };
+  for (const pin of [null, { model: "opus" }, { model: "fable" }]) {
+    const html = modelPickerHtml(pin, models);
+    const selected = /<option value="([^"]*)" selected>/.exec(html);
+    assert.ok(selected, `nothing preselected for ${JSON.stringify(pin)}`);
+    assert.equal(selected[1], modelPickerValue(pin));
+  }
+});
+
+test("detailHtml: the Model row renders, and swaps for the picker when editing", () => {
+  const models = { available: ["opus"], defaultLabel: "Sonnet 5" };
+  const row = detailHtml(ticket("X-1"), null, { siteKey: "s", modelPin: null, models });
+  assert.ok(row.includes("Model"));
+  assert.ok(row.includes("the agent's default model"));
+  assert.ok(row.includes("data-model-edit"));
+  const editing = detailHtml(ticket("X-1"), null,
+    { siteKey: "s", modelPin: null, models, modelEditing: true });
+  assert.ok(editing.includes("data-model-select"));
 });
 
 test("repoPickerHtml: a hostile repo name can't break out of the option", () => {

@@ -23,11 +23,32 @@ data class AgentsResponse(
     // (presence = enabled). The hub-owned switch on each board org chip; hub-only
     // (no agent flag). Absent on older hubs.
     val autoStartOrgs: Map<String, Boolean> = emptyMap(),
+    // Ticket -> pinned MODEL (XERK-123), keyed "<siteKey>/<issueKey>": which model
+    // a ticket's session runs, when the operator overrode the login's default.
+    // Hub-owned and durable like ticketAgents; absent on older hubs.
+    val ticketModels: Map<String, TicketModelPin> = emptyMap(),
 )
 
 /** One ticket->agent pin (the web board's Agent row; hub ticket-agents store). */
 @Serializable
 data class TicketAgentPin(val host: String = "", val at: Long = 0)
+
+/** One ticket->model pin (the web board's Model row; hub ticket-models store). */
+@Serializable
+data class TicketModelPin(val model: String = "", val at: Long = 0)
+
+/**
+ * The host login's real model list, probed from the CLI (hub-agent models
+ * block, XERK-33): the aliases this login can run + what "Default" resolves to.
+ * Null on an agent predating the probe (the ticket model picker falls back to
+ * the static family aliases then).
+ */
+@Serializable
+data class ModelsInfo(
+    val available: List<String> = emptyList(),
+    val defaultLabel: String = "",
+    val at: String = "",
+)
 
 @Serializable
 data class CodingAgent(val name: String = "", val version: String = "")
@@ -69,6 +90,9 @@ data class AgentInfo(
     val updating: UpdatingInfo? = null,
     val repos: List<RepoInfo> = emptyList(),
     val sessions: List<SessionInfo> = emptyList(),
+    // The login's probed model list (XERK-33), for the ticket model picker's
+    // options; null on an agent predating the probe.
+    val models: ModelsInfo? = null,
     val usage: UsageInfo? = null,
     val repoUsage: List<RepoUsage> = emptyList(),
     val github: GithubInfo? = null,

@@ -177,6 +177,16 @@ interface HubApi {
         @Body body: kotlinx.serialization.json.JsonObject,
     ): OkResponse
 
+    // Pin which MODEL a ticket's session runs (XERK-123), or release it back to
+    // the login's default. Hub-owned and durable like the agent pin, so an
+    // authoritative 200. Body: {model:"<alias>"} to pin, {auto:true} to release.
+    @POST("api/jira/{siteKey}/{issueKey}/model")
+    suspend fun setTicketModel(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): OkResponse
+
     // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
     // like the agent pin — an authoritative 200. Body: {enabled:true|false}.
     @POST("api/jira/{siteKey}/autostart")

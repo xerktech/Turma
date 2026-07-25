@@ -202,9 +202,11 @@ function paintDetail() {
   if (!s) return;
   const site = lastSites.find(x => x.siteKey === s.siteKey);
   const agentPin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
-  // What the Agent row is showing, so refreshOpenTicket can repaint only when
-  // the pin actually moved (same story as the repoGuess `shown` fingerprint).
+  const modelPin = B.modelPinOf(cache && cache.ticketModels, s.siteKey, s.key);
+  // What the Agent/Model rows are showing, so refreshOpenTicket can repaint only
+  // when a pin actually moved (same story as the repoGuess `shown` fingerprint).
   s.agentPinShown = agentPin ? agentPin.host : "";
+  s.modelPinShown = modelPin ? modelPin.model : "";
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
     color: B.orgColor(s.siteKey, lastAllKeys),
     siteKey: s.siteKey,
@@ -221,6 +223,12 @@ function paintDetail() {
     agentEditing: s.agentEditing,
     agentError: s.agentError,
     hostOptions: (site && site.hostOptions) || [],
+    // The model pin is hub-owned too (XERK-123); its options are the org's
+    // probed model list off the merged site block.
+    modelPin,
+    modelEditing: s.modelEditing,
+    modelError: s.modelError,
+    models: (site && site.models) || null,
   });
   if (s.editing) {
     const sel = $panel.querySelector("[data-repo-select]");
@@ -228,6 +236,10 @@ function paintDetail() {
   }
   if (s.agentEditing) {
     const sel = $panel.querySelector("[data-agent-select]");
+    if (sel) sel.focus();
+  }
+  if (s.modelEditing) {
+    const sel = $panel.querySelector("[data-model-select]");
     if (sel) sel.focus();
   }
 }
@@ -273,11 +285,13 @@ function refreshOpenTicket() {
   // its "did what we render change" check compares against what paintDetail
   // last drew rather than against the rebuilt ticket.
   const pin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
+  const mpin = B.modelPinOf(cache && cache.ticketModels, s.siteKey, s.key);
   const changed = shown(fresh.repoGuess) !== shown(s.ticket.repoGuess) ||
-    (pin ? pin.host : "") !== (s.agentPinShown || "");
+    (pin ? pin.host : "") !== (s.agentPinShown || "") ||
+    (mpin ? mpin.model : "") !== (s.modelPinShown || "");
   s.ticket = fresh;
-  // Neither picker may be swapped out from under an operator mid-edit.
-  if (changed && !s.editing && !s.agentEditing) paintDetail();
+  // No picker may be swapped out from under an operator mid-edit.
+  if (changed && !s.editing && !s.agentEditing && !s.modelEditing) paintDetail();
 }
 
 // The operator's own answer to which HOST the ticket's sessions spawn on
@@ -313,6 +327,43 @@ async function saveAgent(value) {
     else ta[k] = { host: body.host, at: Date.now() };
   } else if (openTicketState === s) {
     s.agentError = err;
+  }
+  if (openTicketState === s) paintDetail();
+}
+
+// The operator's own answer to which MODEL the ticket's session runs (XERK-123).
+// Same posture as saveAgent: the pin is hub-owned and the POST response is
+// authoritative, so on success the local ticketModels copy is updated and
+// repainted — the SSE broadcast keeps every OTHER open board in step. No
+// optimistic-settle machinery (that's saveRepo's, for the heartbeat round-trip).
+async function saveModel(value) {
+  const s = openTicketState;
+  if (!s) return;
+  const body = value === "__default__" ? { auto: true } : { model: value };
+  s.modelEditing = false;
+  s.modelError = "";
+  let ok = false, err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/model`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    ok = r.ok;
+    if (!ok) {
+      let d = {};
+      try { d = await r.json(); } catch { /* non-JSON error body */ }
+      err = d.error || `HTTP ${r.status}`;
+    }
+  } catch { err = "the hub is unreachable"; }
+  if (ok) {
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    const tm = cache.ticketModels || (cache.ticketModels = {});
+    const k = `${s.siteKey}/${s.key}`;
+    if (body.auto) delete tm[k];
+    else tm[k] = { model: body.model, at: Date.now() };
+  } else if (openTicketState === s) {
+    s.modelError = err;
   }
   if (openTicketState === s) paintDetail();
 }
@@ -493,6 +544,15 @@ $panel.addEventListener("click", (e) => {
     openTicketState.agentEditing = false;
     return paintDetail();
   }
+  if (e.target.closest("[data-model-edit]")) {
+    openTicketState.modelEditing = true;
+    openTicketState.modelError = "";  // a new attempt clears the old complaint
+    return paintDetail();
+  }
+  if (e.target.closest("[data-model-cancel]")) {
+    openTicketState.modelEditing = false;
+    return paintDetail();
+  }
 });
 // Choosing an option IS the save — the dropdown is the setting, so picking a repo
 // answers the question the row asked and there is nothing left to confirm.
@@ -518,6 +578,17 @@ $panel.addEventListener("change", (e) => {
       return paintDetail();
     }
     return void saveAgent(asel.value);
+  }
+  // The model picker follows the same contract (XERK-123).
+  const msel = e.target.closest("[data-model-select]");
+  if (msel) {
+    const pin = B.modelPinOf(cache && cache.ticketModels,
+      openTicketState.siteKey, openTicketState.key);
+    if (msel.value === B.modelPickerValue(pin)) {
+      openTicketState.modelEditing = false;
+      return paintDetail();
+    }
+    return void saveModel(msel.value);
   }
   const sel = e.target.closest("[data-repo-select]");
   if (!sel) return;
@@ -636,6 +707,14 @@ function connectSSE() {
     try { ta = JSON.parse(e.data); } catch { return; }
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.ticketAgents = ta;
+    scheduleRender();
+  });
+  // A ticket->model pin changed (XERK-123) — same tiny-whole-map pattern.
+  es.addEventListener("ticketModels", (e) => {
+    let tm;
+    try { tm = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.ticketModels = tm;
     scheduleRender();
   });
   // An org's auto-start opt-in changed (XERK-41) — same tiny-whole-map pattern

@@ -9459,7 +9459,33 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.spawn_ticket = mock.Mock()
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "cmdId": "c9"}])
-        sm.spawn_ticket.assert_called_once_with("PROJ-7", cmd_id="c9")
+        sm.spawn_ticket.assert_called_once_with("PROJ-7", cmd_id="c9", model=None)
+
+    def test_handle_commands_carries_the_model_pin(self):
+        # The hub's per-ticket model pin (XERK-123) rides the command; the agent
+        # forwards it to spawn_ticket, which validates it like any spawn model.
+        sm = self.make_ticket_manager()
+        sm.spawn_ticket = mock.Mock()
+        sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
+                             "model": "opus", "cmdId": "c9"}])
+        sm.spawn_ticket.assert_called_once_with("PROJ-7", cmd_id="c9", model="opus")
+
+    def test_a_model_pin_lands_on_the_session_and_command_line(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", model="opus")
+        sess = sm.registry[0]
+        self.assertEqual(sess["model"], "opus")     # resolve_model(opus) -> opus
+        cmd = self._launches()[-1][-1]
+        self.assertIn("--model opus", cmd)
+
+    def test_no_model_pin_spawns_with_the_default_model(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        sess = sm.registry[0]
+        self.assertIsNone(sess["model"])            # omit --model = login default
+        self.assertNotIn("--model", self._launches()[-1][-1])
 
     def test_hostile_ticket_text_cannot_break_out_of_the_command_line(self):
         # Ticket text is the one genuinely untrusted input here: unlike an

@@ -37,6 +37,9 @@ data class FleetState(
     // Per-org auto-start opt-in (XERK-41), keyed by siteKey; the board's org-chip
     // switch reads it. Refreshed by the poll and the "autoStartOrgs" SSE event.
     val autoStartOrgs: Map<String, Boolean> = emptyMap(),
+    // Ticket -> pinned model (XERK-123), from the same payload; the board's Model
+    // row reads it. Refreshed by the poll and the "ticketModels" SSE event.
+    val ticketModels: Map<String, com.xerktech.turma.model.TicketModelPin> = emptyMap(),
 )
 
 class FleetRepository(
@@ -85,6 +88,7 @@ class FleetRepository(
             }
             ticketAgents = resp.ticketAgents
             autoStartOrgs = resp.autoStartOrgs
+            ticketModels = resp.ticketModels
             emit(resp.now, error = null)
         } catch (e: Exception) {
             emit(_state.value.now, error = e.message ?: "hub unreachable")
@@ -97,12 +101,16 @@ class FleetRepository(
     @Volatile
     private var autoStartOrgs: Map<String, Boolean> = emptyMap()
 
+    @Volatile
+    private var ticketModels: Map<String, com.xerktech.turma.model.TicketModelPin> = emptyMap()
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
             agents = list, now = now, loading = false, error = error,
             ticketAgents = ticketAgents,
             autoStartOrgs = autoStartOrgs,
+            ticketModels = ticketModels,
         )
     }
 
@@ -135,6 +143,10 @@ class FleetRepository(
                     "autoStartOrgs" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, Boolean>>(data)
                     }.getOrNull()?.let { autoStartOrgs = it; emit(_state.value.now, null) }
+                    // A ticket->model pin changed (XERK-123); whole tiny map.
+                    "ticketModels" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketModelPin>>(data)
+                    }.getOrNull()?.let { ticketModels = it; emit(_state.value.now, null) }
                 }
             }
 

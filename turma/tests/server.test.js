@@ -48,6 +48,10 @@ process.env.AUTOSTART_ORGS_FILE = path.join(
   os.tmpdir(),
   `turma-test-autostart-orgs-${process.pid}.json`
 );
+process.env.TICKET_MODELS_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-ticket-models-${process.pid}.json`
+);
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
 process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-archive-"));
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
@@ -2322,6 +2326,112 @@ test("ticket-agent pins survive a hub restart (read back from their own file)", 
   try {
     const mod = freshServerModule((env) => { env.TICKET_AGENTS_FILE = file; });
     assert.equal(mod.ticketAgents["o.atlassian.net/ENG-1"].host, "h1");
+  } finally {
+    fs.unlinkSync(file);
+  }
+});
+
+// POST /api/jira/<siteKey>/<issueKey>/model — the operator's per-ticket model
+// pin (XERK-123). Hub-owned durable state like the /agent pin; the model rides
+// the spawnTicket command the hub already routes.
+
+const setModel = (site, key, body) =>
+  request("POST", `/api/jira/${site}/${key}/model`, { body, headers: userHeaders });
+
+// A jira host that ALSO probed a model list, so orgModelAliases has more than the
+// static family aliases to offer.
+const modelBeat = (device, siteKey, available) =>
+  request("POST", "/api/heartbeat", {
+    body: { device, jira: { available: true, siteKey, user: `${device}@x.com`, tickets: [] },
+      models: { available, defaultLabel: "Sonnet 5", at: "2026-07-14T12:00:00Z" } },
+    headers: agentHeaders,
+  });
+
+test("http: pinning a ticket's model stores it; {auto:true} releases it", async () => {
+  await jiraBeat("tmA", "tmSite.atlassian.net");
+  const res = await setModel("tmSite.atlassian.net", "ENG-1", { model: "opus" });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.model, "opus");
+  assert.equal(hub.ticketModels["tmSite.atlassian.net/ENG-1"].model, "opus");
+
+  const rel = await setModel("tmSite.atlassian.net", "ENG-1", { auto: true });
+  assert.equal(rel.status, 200);
+  assert.equal(rel.body.model, null);
+  assert.ok(!("tmSite.atlassian.net/ENG-1" in hub.ticketModels));
+});
+
+test("http: {model:\"default\"} releases the pin, same as {auto:true}", async () => {
+  await jiraBeat("tmDef", "tmDef.atlassian.net");
+  await setModel("tmDef.atlassian.net", "ENG-1", { model: "opus" });
+  const rel = await setModel("tmDef.atlassian.net", "ENG-1", { model: "default" });
+  assert.equal(rel.status, 200);
+  assert.equal(rel.body.model, null);
+  assert.ok(!("tmDef.atlassian.net/ENG-1" in hub.ticketModels));
+});
+
+test("http: the model pin rides the /api/agents payload for the board to render", async () => {
+  await jiraBeat("tmPay", "tmPay.atlassian.net");
+  await setModel("tmPay.atlassian.net", "ENG-3", { model: "haiku" });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(res.body.ticketModels["tmPay.atlassian.net/ENG-3"].model, "haiku");
+});
+
+test("http: a model pin only accepts an alias the org offers", async () => {
+  await jiraBeat("tmV", "tmV.atlassian.net");
+  // A static family alias is always offerable.
+  assert.equal((await setModel("tmV.atlassian.net", "ENG-1", { model: "sonnet" })).status, 200);
+  // A model no host probed (and not a static alias) is refused.
+  assert.equal((await setModel("tmV.atlassian.net", "ENG-1", { model: "gpt-4" })).status, 400);
+  // A bracketed live-switch alias is never a spawn model, even if probed.
+  await modelBeat("tmVProbe", "tmVProbe.atlassian.net", ["opus[1m]"]);
+  assert.equal((await setModel("tmVProbe.atlassian.net", "ENG-1", { model: "opus[1m]" })).status, 400);
+  // A malformed body, and an org nobody reports.
+  assert.equal((await setModel("tmV.atlassian.net", "12ab", { model: "opus" })).status, 400);
+  assert.equal((await setModel("nobody.atlassian.net", "ENG-1", { model: "opus" })).status, 404);
+});
+
+test("http: a probed non-static alias becomes offerable once a host reports it", async () => {
+  await modelBeat("tmProbe", "tmProbe.atlassian.net", ["fable", "opus", "default"]);
+  const res = await setModel("tmProbe.atlassian.net", "ENG-1", { model: "fable" });
+  assert.equal(res.status, 200);
+  assert.equal(hub.ticketModels["tmProbe.atlassian.net/ENG-1"].model, "fable");
+});
+
+test("http: pinning a ticket's model requires the user login", async () => {
+  await jiraBeat("tmAuth", "tmAuth.atlassian.net");
+  const res = await request("POST", "/api/jira/tmAuth.atlassian.net/ENG-1/model",
+    { body: { model: "opus" } });
+  assert.equal(res.status, 401);
+  assert.ok(!("tmAuth.atlassian.net/ENG-1" in hub.ticketModels));
+});
+
+test("http: a model-pinned ticket carries the model on its spawnTicket command", async () => {
+  await ticketBeat("tmSpawn", "tmSpawn.atlassian.net");
+  await setModel("tmSpawn.atlassian.net", "ENG-5", { model: "opus" });
+  const res = await request("POST", "/api/jira/tmSpawn.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(agents.tmSpawn.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", model: "opus", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: an unpinned ticket spawns with no model on the command (unchanged)", async () => {
+  await ticketBeat("tmNone", "tmNone.atlassian.net");
+  const res = await request("POST", "/api/jira/tmNone.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.deepEqual(agents.tmNone.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("ticket-model pins survive a hub restart (read back from their own file)", () => {
+  const file = path.join(os.tmpdir(), `turma-test-tm-persist-${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify({
+    "o.atlassian.net/ENG-1": { model: "opus", at: 123 } }));
+  try {
+    const mod = freshServerModule((env) => { env.TICKET_MODELS_FILE = file; });
+    assert.equal(mod.ticketModels["o.atlassian.net/ENG-1"].model, "opus");
   } finally {
     fs.unlinkSync(file);
   }
