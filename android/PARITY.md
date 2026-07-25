@@ -195,6 +195,22 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   persisted (the web's `turma-hidden-sessions`), rescoping chart and rows; paint is assigned by stable
   order so toggling never repaints survivors. The grouping tab pick persists too (`turma-usage-mode`).
 
+## Done (XERK-126 — the clone bar)
+
+- **Repo cloning worked on web but was dead on Android.** `GithubInfo` decoded the availability flag
+  as `ok`; the agent's `collect_github()` has always named it **`available`** and sends no `ok` key,
+  so it defaulted to false on EVERY host and the bar rendered its "no GitHub credentials" note —
+  the one thing the operator saw. Renamed to the wire key; a pinned real-payload decode test guards it.
+- **The rest of the bar caught up with `cloneBar`/`cloneBody`** (the old P1 line): collapsible header
+  naming the gh login, search box, multi-select list with the `🔒` private marker and an "already here"
+  row for repos the host has, free-text `owner/repo`, a "Clone N" button firing one POST per spec, and
+  the agent's clone-job rows (cloning / ✓ cloned / ⚠ failed + reason) — which stay visible while the
+  panel is collapsed, since they are the answer to "did my clone work". Offline hosts browse but
+  can't fire. Pure reducers in `core/Clone.kt` (`cloneCandidates`/`cloneSpecs`/`cloneRepoName`/
+  `cloneJobRow`), tested in `CloneTest`.
+- Still open here: the web's optimistic clone row (a spec fired but not yet echoed by the agent) —
+  Android shows a "clone queued" snackbar instead, and the real job row lands a beat later. P2.
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
@@ -206,7 +222,8 @@ those are marked `[MODEL]`.
   the composer's toast today) — P2.
 - P1 `[MODEL]` Host meta (memory, uptime/last-seen, repos-root, session counts), container-log toggle.
 - P1 Host collapse persistence; Jira org label beside hostname; Remove-host for offline hosts.
-- P1 Clone bar: collapse + search + multi-select + `🔒` private marker + clone-job status rows.
+- ~~P1 Clone bar: collapse + search + multi-select + `🔒` private marker + clone-job status rows.~~
+  Done (XERK-126, see Done below).
 - P1 `[MODEL]` Repo blocks: branch/dirty meta, remote link, orphan repos, prune-note, empty state.
 - P1 Composer base-branch dropdown + per-repo option persistence.
 

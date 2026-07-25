@@ -688,6 +688,9 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - The agent heartbeats a `github` block: whether it has a usable `gh` login and, if so, that login's
   clonable repos (refreshed slow; the authenticated user's own repos, their orgs, and any extra
   `GH_CLONE_OWNERS`), plus any in-flight/recent `clones`.
+- The availability flag is **`available`** and the hub passes the block through untouched, so every
+  client gates its clone UI on that exact key — decoding it as anything else defaults to false on
+  every host and reads as "no GitHub credentials" (XERK-126). Tests: `android/.../core/CloneTest.kt`.
 - A `clone` command `git clone`s a validated `owner/repo` (allowlist-checked before it reaches git) into
   `REPOS_ROOT` as a **detached subprocess** (reaped across later beats), after which the new repo joins
   the scan. Private-repo auth rides the system git credential helper (`gh auth git-credential`).
