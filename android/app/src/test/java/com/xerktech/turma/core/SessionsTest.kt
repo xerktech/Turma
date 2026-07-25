@@ -47,6 +47,16 @@ class SessionsTest {
         assertEquals("wt-9", sessionName(SessionInfo(worktreePath = "/a/wt-9")))
     }
 
+    @Test fun `card repo label names the repo, or says repos root in words`() {
+        assertEquals("Turma", sessionRepoLabel(SessionInfo(repo = "Turma")))
+        // A repos-root session: by the flag, and by the agent's "(root)" sentinel
+        // (a closed/resumable record can carry the name without the flag).
+        assertEquals("repos root", sessionRepoLabel(SessionInfo(repo = "(root)", root = true)))
+        assertEquals("repos root", sessionRepoLabel(SessionInfo(repo = "(root)")))
+        // Nothing reported at all — never blank, so the row can't lose a separator.
+        assertEquals("?", sessionRepoLabel(SessionInfo(repo = "")))
+    }
+
     @Test fun `header meta joins host repo and branch, dropping blanks`() {
         assertEquals(
             "truenas · Turma · XERK-121",

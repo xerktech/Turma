@@ -44,6 +44,28 @@ fun sessionBranch(session: SessionInfo): String {
 }
 
 /**
+ * The repo a session works, as the Sessions-tab card names it (XERK-125) — with
+ * several sessions open at once it is what tells them apart, so it leads the
+ * card's meta line the way it does on the web card (sessions.html `activeCard`)
+ * and on the queued/ended rows.
+ *
+ * A repos-root session has no repo: it spans the whole git root, and the agent
+ * reports the `(root)` pseudo-repo sentinel for it. That says nothing to a
+ * reader, so it reads in words instead, as the Dashboard card already does
+ * ("repos root (no worktree)" in FleetScreen) and as the web session header does
+ * (`sessMeta`). A record with no repo at all (an older agent, a partial closed
+ * record) reads "?" like the queued and ended rows.
+ */
+fun sessionRepoLabel(session: SessionInfo): String = when {
+    session.root || session.repo == ROOT_REPO_NAME -> "repos root"
+    session.repo.isNotBlank() -> session.repo
+    else -> "?"
+}
+
+/** The agent's pseudo-repo name for a repos-root session (hub-agent.py ROOT_REPO_NAME). */
+const val ROOT_REPO_NAME = "(root)"
+
+/**
  * The session header's subtitle line (XERK-121): the host the agent runs on, the
  * repo, and the live branch — e.g. "truenas · Turma · XERK-121". Blank parts are
  * dropped, so a repos-root session (no repo) still reads cleanly. Mirrors the web
