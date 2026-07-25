@@ -766,38 +766,38 @@ private fun SessionListCard(
                     optimistic?.ifBlank { null } ?: liveName,
                     fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
-                // repo · host · branch — the card's identity row. The repo leads it
-                // (XERK-125): several sessions on one host are told apart by which
-                // repo they work, and that is the order the queued/ended rows and the
-                // web card use. A FlowRow so a long repo or branch wraps rather than
-                // ellipsising the parts after it away on a narrow phone.
+                // host · repo · ticket — the card's identity row (XERK-125). The repo
+                // is what tells several sessions on one host apart, and the ticket is
+                // what the work is FOR; the branch this row used to carry says the
+                // same thing more cryptically and is still on the session header
+                // (core/Sessions.kt sessionHeaderMeta) one tap away.
+                // A FlowRow so a long repo wraps rather than ellipsising the parts
+                // after it away on a narrow phone.
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     Text(
-                        sessionRepoLabel(r.session),
+                        r.device,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        "· ${r.device}",
+                        "· ${sessionRepoLabel(r.session)}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    // A repos-root session has no worktree, so it has no branch to
-                    // name — the row would otherwise read "repos root · … · detached"
-                    // and assert a HEAD it was never given (Dashboard card does the
-                    // same).
-                    if (!r.session.root) {
+                    // Only a board-started session works a ticket, so the key is
+                    // dropped rather than placeholdered when there is none (the
+                    // queued card and the web card do the same).
+                    r.session.ticket?.key?.takeIf { it.isNotBlank() }?.let { key ->
                         Text(
-                            "· ${sessionBranch(r.session)}",
+                            "· $key",
                             style = MaterialTheme.typography.bodySmall,
-                            fontFamily = FontFamily.Monospace,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,

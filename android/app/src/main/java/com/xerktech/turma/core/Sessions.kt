@@ -45,9 +45,9 @@ fun sessionBranch(session: SessionInfo): String {
 
 /**
  * The repo a session works, as the Sessions-tab card names it (XERK-125) — with
- * several sessions open at once it is what tells them apart, so it leads the
- * card's meta line the way it does on the web card (sessions.html `activeCard`)
- * and on the queued/ended rows.
+ * several sessions open at once it is what tells them apart, so it sits on the
+ * card's meta line (`host · repo · ticket`) as it does on the web card
+ * (sessions.html `activeCard`) and on the queued/ended rows.
  *
  * A repos-root session has no repo: it spans the whole git root, and the agent
  * reports the `(root)` pseudo-repo sentinel for it. That says nothing to a
