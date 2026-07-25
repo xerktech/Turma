@@ -308,7 +308,10 @@ data class ResumableInfo(
 
 @Serializable
 data class GithubInfo(
-    val ok: Boolean = false,
+    // The agent's collect_github() names this key `available` — decoding it as
+    // anything else silently defaults to false on every host, which reads as
+    // "no GitHub credentials" and kills the clone bar outright (XERK-126).
+    val available: Boolean = false,
     val login: String = "",
     // Wire sends objects ({nameWithOwner, name, isPrivate, ...}), not bare
     // strings — the agent's collect_github()/_gh_clonable_repos().
@@ -324,10 +327,18 @@ data class GithubRepo(
     val updatedAt: String = "",
 )
 
+/**
+ * One clone job the agent reported (its `_clones_payload`): `repo` is the
+ * owner/repo spec as asked for, `name` the bare repo dir it lands in, and
+ * `status` one of cloning/done/error, `error` carrying the reason for the last.
+ */
 @Serializable
 data class CloneInfo(
     val repo: String = "",
+    val name: String = "",
     val status: String = "",
+    val error: String = "",
+    val startedAt: String = "",
 )
 
 @Serializable
