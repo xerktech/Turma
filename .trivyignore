@@ -60,3 +60,15 @@ CVE-2026-47304 exp:2026-10-10
 CVE-2026-50525 exp:2026-10-10
 CVE-2026-50527 exp:2026-10-10
 CVE-2026-50648 exp:2026-10-10
+
+# CVE-2026-14257 — HIGH ReDoS/DoS in brace-expansion through 5.0.7 (fixed in
+# 5.0.8). Present ONLY in the npm bundled inside the node base image
+# (/usr/local/lib/node_modules/npm/node_modules/brace-expansion), a transitive
+# dep of npm itself. NPM_VERSION already pins npm ahead of the base image to
+# clear such findings, but even the latest npm (12.0.1) still vendors
+# brace-expansion 5.0.7 — there is nothing to bump to yet. Not first-party: the
+# hub runs zero npm deps (node-core only) and never invokes npm at runtime, so
+# the vulnerable regex is unreachable in this image. Revisit on the expiry: the
+# first npm release vendoring brace-expansion 5.0.8+ clears it with an
+# NPM_VERSION bump.
+CVE-2026-14257 exp:2026-10-25
