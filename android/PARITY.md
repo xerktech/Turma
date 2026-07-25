@@ -36,6 +36,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   these to a single "+" that opens the `SpawnDialog` (prompt/label/base/model/mode); the separate
   quick-spawn (was the ⚙/Tune icon) is gone. A phone header has room for one action, and the composer
   covers the bare case by leaving every field blank.
+- **Chat header shows the repo, not the worktree** (XERK-121). The web session header's meta line is
+  `host · worktree · branch` (`chat.js setHeader` + `sessions.html sessMeta`); Android shows
+  `host · repo · branch` (`core/Sessions.kt sessionHeaderMeta`) — the worktree name is a random dir
+  keyed on the session id, whereas the repo names what the session is working on, which a phone header
+  has room for exactly once. Both surface the host; the session name is the title above the line.
 - **Auto history-upgrade instead of the "Show more…" button** (XERK-77). The web chat marks a
   cap-truncated block with a manual "Show more…" that refetches `/history` (looser caps). Android
   refetches `/history` automatically when a truncated block arrives on the live tail (once per entry,

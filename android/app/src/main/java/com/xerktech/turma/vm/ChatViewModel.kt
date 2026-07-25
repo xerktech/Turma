@@ -48,6 +48,9 @@ data class ChatUiState(
     val mic: MicState = MicState.IDLE,
     val draft: String = "",
     val session: SessionInfo? = null,
+    // The host this session's agent runs on, shown in the header (XERK-121):
+    // the agent's device name, falling back to its registration key.
+    val hostLabel: String = "",
 ) {
     val prefs: VerbosityPrefs get() = VerbosityPrefs.forPreset(verbosity)
     val question: String get() = session?.session?.question ?: ""
@@ -115,9 +118,10 @@ class ChatViewModel(
         fleetJob?.cancel()
         fleetJob = viewModelScope.launch {
             container.fleet.state.collect { fleet ->
-                val session = fleet.agents.firstOrNull { it.key == host }
-                    ?.sessions?.firstOrNull { it.id == sessionId }
-                _state.update { it.copy(session = session) }
+                val agent = fleet.agents.firstOrNull { it.key == host }
+                val session = agent?.sessions?.firstOrNull { it.id == sessionId }
+                val label = agent?.device?.ifBlank { host } ?: host
+                _state.update { it.copy(session = session, hostLabel = label) }
                 session?.session?.tail?.takeIf { it.isNotEmpty() }?.let { seed ->
                     _state.update { it.copy(entries = mergeTail(it.entries, seed)) }
                 }
@@ -126,10 +130,11 @@ class ChatViewModel(
     }
 
     private fun seedFromFleet() {
-        val session = container.fleet.state.value.agents.firstOrNull { it.key == host }
-            ?.sessions?.firstOrNull { it.id == sessionId }
+        val agent = container.fleet.state.value.agents.firstOrNull { it.key == host }
+        val session = agent?.sessions?.firstOrNull { it.id == sessionId }
+        val label = agent?.device?.ifBlank { host } ?: host
         val seed = session?.session?.tail ?: emptyList()
-        _state.update { it.copy(session = session, entries = mergeTail(it.entries, seed)) }
+        _state.update { it.copy(session = session, hostLabel = label, entries = mergeTail(it.entries, seed)) }
     }
 
     private fun startLive() {

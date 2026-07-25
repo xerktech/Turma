@@ -47,6 +47,19 @@ class SessionsTest {
         assertEquals("wt-9", sessionName(SessionInfo(worktreePath = "/a/wt-9")))
     }
 
+    @Test fun `header meta joins host repo and branch, dropping blanks`() {
+        assertEquals(
+            "truenas · Turma · XERK-121",
+            sessionHeaderMeta("truenas", SessionInfo(repo = "Turma", git = GitState(branch = "XERK-121"))),
+        )
+        // No repo (repos-root) or no branch (detached) still reads cleanly.
+        assertEquals("truenas · detached", sessionHeaderMeta("truenas", SessionInfo(repo = "")))
+        assertEquals(
+            "truenas · Turma · detached",
+            sessionHeaderMeta("truenas", SessionInfo(repo = "Turma", git = GitState(branch = "HEAD"))),
+        )
+    }
+
     // ---- workLine (web index.html workLine/unpushedCommits, XERK-78) ---------
 
     private fun sessWork(
