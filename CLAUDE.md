@@ -882,7 +882,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   `{type:"subagentHistory", sessionId, agentType, label}` command resolves the row to its
   `subagents/agent-<id>.jsonl` via the main transcript's Task `tool_use` + its result text
   (`agentId: <id>`) — `_resolve_subagent`/`_stage_subagent_history`, matching type + description (exact,
-  else a prefix). The result rides the next beat as `subagentHistoryResults`.
+  else a prefix; a trailing pane-ellipsis "…" is stripped first — a narrow window cuts long cells with
+  it, and it is not part of the real value, XERK-130). The result rides the next beat as `subagentHistoryResults`.
 - Tests: `TestResolveSubagent`, `TestStageSubagentHistory`, the `parseAgentList` cases in
   `agent/tests/tunnel-agent.test.js`.
 

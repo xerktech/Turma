@@ -2764,6 +2764,18 @@ def _subagents_dir(main_path):
     return os.path.join(stem, "subagents")
 
 
+def _strip_pane_ellipsis(cell):
+    """(text, truncated) for a cell scraped off a pane row: the TUI ellipsizes
+    a long cell with its own "…" on a narrow window, and that ellipsis is not
+    part of the real value — a prefix match against it can never succeed
+    (XERK-130). "..." is accepted alongside for safety."""
+    if cell.endswith("…"):
+        return cell[:-1].rstrip(), True
+    if cell.endswith("..."):
+        return cell[:-3].rstrip(), True
+    return cell, False
+
+
 def _resolve_subagent(main_path, agent_type, label):
     """Map a pane agent-list row (its `type` + short `label`/description) to the
     background agent's transcript file, via the main transcript's Task calls.
@@ -2773,11 +2785,13 @@ def _resolve_subagent(main_path, agent_type, label):
     (subagents/agent-<id>.jsonl). We read the main transcript, index Task calls
     by tool_use id, resolve each id's agentId from its result, then pick the
     NEWEST call whose type+description match the clicked row (exact, else a
-    prefix match so a pane-truncated label still resolves). Returns the subagent
+    prefix match so a pane-truncated label still resolves — the TUI ellipsizes
+    a long cell with "…" on a narrow window, so a trailing ellipsis is stripped
+    first and marks the cell as a prefix, XERK-130). Returns the subagent
     transcript path, or None when nothing matches / the file is absent — a miss
     must not raise (the caller stages an empty result)."""
-    want_type = (agent_type or "").strip()
-    want_label = (label or "").strip()
+    want_type, type_trunc = _strip_pane_ellipsis((agent_type or "").strip())
+    want_label, _ = _strip_pane_ellipsis((label or "").strip())
     if not want_type:
         return None
     tasks = []          # [(tool_use_id, description)] for the wanted type, in order
@@ -2796,7 +2810,9 @@ def _resolve_subagent(main_path, agent_type, label):
                 continue
             if block.get("type") == "tool_use" and block.get("name") == "Task":
                 inp = block.get("input") or {}
-                if str(inp.get("subagent_type") or "").strip() == want_type:
+                have_type = str(inp.get("subagent_type") or "").strip()
+                if have_type == want_type or (type_trunc and
+                                              have_type.startswith(want_type)):
                     tasks.append((block.get("id"),
                                   str(inp.get("description") or "").strip()))
             elif block.get("type") == "tool_result":

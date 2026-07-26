@@ -5889,6 +5889,30 @@ class TestResolveSubagent(unittest.TestCase):
         # A pane-truncated label (a prefix) still resolves.
         self.assertEqual(ha._resolve_subagent(main, "Explore", "Find the parser"), sub)
 
+    def test_resolves_ellipsized_label_and_type(self):
+        # XERK-130: on a narrow pane the TUI cuts a long cell with its own "…"
+        # ellipsis, which is not part of the real value — it must be stripped
+        # or the prefix match can never succeed.
+        main, sub = self._main_with_task(
+            "abc123", "general-purpose", "Search for pane busy detection code")
+        self.assertEqual(
+            ha._resolve_subagent(main, "general-purpose",
+                                 "Search for pane busy dete…"), sub)
+        # The type column can be cut too on an extreme width.
+        self.assertEqual(
+            ha._resolve_subagent(main, "general-pur…",
+                                 "Search for pane busy detection code"), sub)
+        # "..." accepted alongside for safety.
+        self.assertEqual(
+            ha._resolve_subagent(main, "general-purpose",
+                                 "Search for pane busy dete..."), sub)
+
+    def test_ellipsis_stripping_does_not_break_a_genuine_match(self):
+        # A description whose real text ends in "…" still resolves when the
+        # pane shows it whole (the stripped remnant is a prefix of the real one).
+        main, sub = self._main_with_task("abc123", "Explore", "Keep digging…")
+        self.assertEqual(ha._resolve_subagent(main, "Explore", "Keep digging…"), sub)
+
     def test_newest_matching_task_wins(self):
         main = os.path.join(self.tmp, "main.jsonl")
         subdir = os.path.join(self.tmp, "main", "subagents")
