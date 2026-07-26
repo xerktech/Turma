@@ -3827,7 +3827,7 @@ test("control WS: a channel that pongs is kept past the dead-after window", asyn
 // org `site`. Fields are exactly what the /migrate endpoint validates.
 const migHost = (device, site, {
   session = "s1", repo = "Turma", repos = ["Turma"], status = "running",
-  root = false, claudeSessionId = "trans-" + device, extraSessions = [],
+  root = false, transcriptId = "trans-" + device, extraSessions = [],
 } = {}) =>
   request("POST", "/api/heartbeat", {
     body: {
@@ -3836,7 +3836,7 @@ const migHost = (device, site, {
       jira: { available: true, configured: true, siteKey: site, user: `${device}@x.com`, tickets: [] },
       sessions: [
         {
-          id: session, status, root, repo, claudeSessionId,
+          id: session, status, root, repo, transcriptId,
           worktreePath: `/git/.turma/worktrees/${repo}/${session}`,
           model: "opus", permissionMode: "auto", summary: "Fix the logs",
           ticket: { key: "ENG-9", siteKey: site, url: "u", summary: "Fix the logs", branch: "ENG-9" },
@@ -3891,7 +3891,7 @@ test("migrate: rejects a root session and one with no conversation yet", async (
   await migHost("mRootTgt", "mr.atlassian.net");
   assert.equal((await migrate("mRoot", "s1", { host: "mRootTgt" })).status, 409);
 
-  await migHost("mFresh", "mf.atlassian.net", { claudeSessionId: null });
+  await migHost("mFresh", "mf.atlassian.net", { transcriptId: null });
   await migHost("mFreshTgt", "mf.atlassian.net");
   assert.equal((await migrate("mFresh", "s1", { host: "mFreshTgt" })).status, 409);
 });
@@ -3947,7 +3947,7 @@ test("migrate: full move — export, relay, import, then kill the source", async
   //    the source and finishes the migration on that heartbeat.
   await migHost("mgB", "mg.atlassian.net", {
     extraSessions: [{ id: "new1", status: "running", root: false, repo: "Turma",
-      claudeSessionId: "trans-mgA", worktreePath: "/git/.turma/worktrees/Turma/s1",
+      transcriptId: "trans-mgA", worktreePath: "/git/.turma/worktrees/Turma/s1",
       spawnCmdId: m.importCmdId }],
   });
   const after = migrations.get(mid);
