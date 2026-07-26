@@ -601,7 +601,10 @@ function startMigration(srcHost, s, targetHost) {
   const m = {
     id, srcHost, srcSessionId: s.id, targetHost,
     siteKey: siteKeyOf(agents[srcHost]), repo: s.repo,
-    transcriptId: s.claudeSessionId,
+    // The agent reports a session's pinned conversation id as `transcriptId`
+    // (it never sends a `claudeSessionId` field) — that is the id
+    // `claude --resume` needs on the target.
+    transcriptId: s.transcriptId,
     // Metadata the moved session should keep — the hub has it all from the
     // heartbeat, so the source only ships the raw transcript.
     meta: {
@@ -2618,7 +2621,7 @@ const server = http.createServer(async (req, res) => {
           return json(res, 409, { error: "only a running session can be moved" });
         if (s.root)
           return json(res, 409, { error: "a repos-root session has no worktree to move" });
-        if (!s.claudeSessionId)
+        if (!s.transcriptId)
           return json(res, 409, { error: "this session has no conversation to move yet" });
         if (!target || target === key)
           return json(res, 400, { error: "a different target host is required" });
