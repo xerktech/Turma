@@ -54,6 +54,26 @@ pass: `Edit` ~2.4k calls, a `description` arg on ~6.9k, `pr-link` ~1.1k entries,
 a bare string ~11.6k times but a list ~170 times. A shape you never saw is a
 shape you'd have "handled" by guessing.
 
+**Count DISTINCT values too, not just occurrences, and look at what surrounds
+them.** An entry type is not automatically an event. `pr-link` ran 1163 entries
+across the corpus but only 195 distinct (transcript, URL) pairs — 6× — because
+Claude Code re-stamps a session's PR links in the metadata preamble it writes at
+the top of every user turn, beside `last-prompt`/`ai-title`/`mode`/
+`permission-mode`. Reading it as "a PR was opened here" rendered the same PR six
+times in the chat. Two cheap checks catch this class before you design:
+
+```python
+Counter(e["type"] for e in entries)                        # occurrences
+len({(fn, e.get("prUrl")) for e in entries})               # distinct facts
+Counter(prev_type_of(i) for i in indexes_of(type))         # is it in a preamble?
+```
+
+A ratio far above 1.0, or a near-constant predecessor type, means the entry is
+**state re-recorded on a schedule**, not something that happened at that spot.
+Render those once — and take the FIRST sighting, after checking it lands where
+the underlying event did (for `pr-link`, within ~6 entries of its `gh pr
+create`).
+
 ## 2. Old-vs-new differential — the no-regression proof
 
 Load **both** versions of the module and run every corpus entry through each:

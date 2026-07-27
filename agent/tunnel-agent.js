@@ -349,9 +349,14 @@ function entryText(entry) {
 // The entry's own uuid, or a synthesized stable id for the entry types Claude
 // Code writes WITHOUT one (pr-link): the chat's tail merge dedups on id and
 // drops id-less entries. Mirror of hub-agent.py _entry_id.
+//
+// A pr-link keys on its URL ALONE, deliberately excluding the timestamp: Claude
+// Code re-stamps a session's PR links in the metadata preamble it writes at the
+// top of every user turn, so one PR yields ~6 entries differing only in
+// `timestamp`. Sharing an id collapses them to the first — where the PR landed.
 function entryId(entry) {
   if (entry.uuid) return entry.uuid;
-  if (entry.type === "pr-link") return `pr-link:${entry.prUrl || ""}:${entry.timestamp || ""}`;
+  if (entry.type === "pr-link") return `pr-link:${entry.prUrl || ""}`;
   return undefined;
 }
 

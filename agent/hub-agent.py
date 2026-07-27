@@ -2032,12 +2032,20 @@ def _entry_id(entry):
     """The entry's own uuid, or a synthesized stable id for the entry types
     Claude Code writes WITHOUT one (pr-link): the client's tail merge dedups on
     id and drops id-less entries, so without this a pr_link block never reaches
-    the chat. Mirror of tunnel-agent.js entryId()."""
+    the chat. Mirror of tunnel-agent.js entryId().
+
+    A pr-link keys on its URL ALONE, deliberately excluding the timestamp: Claude
+    Code re-stamps a session's PR links in the metadata preamble it writes at the
+    top of every user turn (beside last-prompt/ai-title/mode/permission-mode), so
+    one PR yields ~6 entries differing only in `timestamp`. They are re-records of
+    one fact, not separate events, and sharing an id is what lets the tail merge
+    collapse them to the FIRST — which lands within a few entries of the `gh pr
+    create` that opened it, i.e. where the PR really landed in the conversation."""
     eid = entry.get("uuid")
     if eid:
         return eid
     if entry.get("type") == "pr-link":
-        return "pr-link:%s:%s" % (entry.get("prUrl") or "", entry.get("timestamp") or "")
+        return "pr-link:%s" % (entry.get("prUrl") or "",)
     return None
 
 

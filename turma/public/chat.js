@@ -517,6 +517,8 @@
       if (b.t === "tool_result" && b.forId) resultsById.set(b.forId, b);
     }
     const items = [];
+    // PR URLs already marked, so a re-stamped pr-link renders once (see below).
+    const prSeen = new Set();
     // A slash command's output arrives as its OWN transcript entry, right after
     // the invocation — there's no id to pair them by (unlike tool_use/
     // tool_result), so fold an output into the command card still open from the
@@ -627,11 +629,22 @@
           });
         } else if (b.t === "pr_link") {
           // Claude Code's own record of a PR this session opened — an inline
-          // marker where in the conversation it landed. The transcript often
-          // logs the same PR twice back-to-back; consecutive duplicates fold.
+          // marker where in the conversation it landed.
+          //
+          // ONE marker per URL, at its FIRST occurrence. Claude Code re-stamps a
+          // session's PR links in the metadata preamble at the top of every user
+          // turn, so a long session logs the same PR ~6 times, spread across the
+          // whole conversation (measured over the corpus: 1163 entries for 195
+          // distinct PRs). Folding only CONSECUTIVE repeats left the rest to
+          // render as a marker apiece. The first occurrence is the real one — it
+          // lands within a few entries of the `gh pr create` that opened it.
+          //
+          // Deduping here rather than relying on the id-keyed tail merge is what
+          // covers the archive/ended-session view, which calls buildItems on
+          // stored entries with no merge step at all.
           flush();
-          const prev = items[items.length - 1];
-          if (!(prev && prev.kind === "pr" && prev.url === b.url)) {
+          if (!prSeen.has(b.url)) {
+            prSeen.add(b.url);
             items.push({ kind: "pr", id: eid, url: b.url || "", number: b.number, repo: b.repo || "" });
           }
         }
