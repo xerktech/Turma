@@ -178,9 +178,15 @@ Replaced the old model of one fixed-repo container per session.
   `spawnCmdId` == `importCmdId`) makes `advanceMigrations` KILL the source and finish. The Sessions page
   follows via `migrations` (its `importCmdId` feeds the normal `followSpawn`); a "Moving to <host>…"
   hint covers the export step.
-- `_resume_at_cwd` (shared by `resume_transcript` and `import_session`) works cross-host only because
-  `REPOS_ROOT` is the same mount path on every host, so the re-created worktree's slug matches the
-  transcript. The tar extract guards against `..`/absolute members (crosses a host boundary — untrusted).
+- `_resume_at_cwd` is shared by `resume_transcript` and `import_session`. Hosts may mount `REPOS_ROOT` at
+  DIFFERENT paths (a WSL-native agent at `/home/<user>/git`, a container at `/mnt/data/Docker/git`), so
+  `import_session` first `_localize_migrated_cwd`s the source's absolute worktree path onto THIS host's
+  `REPOS_ROOT` (the `.turma/worktrees/<repo>/<dir>` tail is mount-independent; a migration is always a
+  worktree session, so it always has one). Both the unpack slug and the re-created worktree then use that
+  local cwd, so the slug matches the transcript. Without the remap, every cross-mount move wedged in
+  `importing` forever — the target rejected the foreign path as not-resumable. History entries keep the
+  source's absolute paths (harmless — `claude --resume` resolves by the local slug, not the recorded cwd).
+  The tar extract guards against `..`/absolute members (crosses a host boundary — untrusted).
   Blob relay is agent-authed; `POST .../sessions/<id>/migrate {host}` validates same-org + online +
   repo-cloned + running/non-root/has-conversation, single-flight per session. Migration state is
   in-memory (blob included); a hub restart mid-move aborts it, leaving the source session intact. **The
