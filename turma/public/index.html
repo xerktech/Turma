@@ -696,6 +696,13 @@ function liveState(sess, host, now) {
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   if (s.question)
     return { label: "waiting for your answer", cls: "sess-wait", question: s.question, busy: true };
+  // A blocking TUI dialog (tool permission / plan approval) is the same thing
+  // for the operator, and MUST be checked before the working read: while one is
+  // up the pane shows no interrupt hint, so paneBusy reads false and the
+  // session would otherwise be labelled plain "idle" while it waits on a human.
+  if (s.panePrompt && s.panePrompt.prompt)
+    return { label: "waiting for your answer", cls: "sess-wait",
+             question: s.panePrompt.prompt, busy: true };
   const working = s.paneBusy != null
     ? (host.online && s.paneBusy)
     : (host.online && age < 90 * 1000);

@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -268,6 +268,50 @@ test("buildItems/render: pr_link blocks -> one linked marker, consecutive duplic
   assert.match(html, /chat-pr-mark/);
   assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/230"/);
   assert.match(html, /Opened PR #230 — o\/r/);
+});
+
+test("panePromptHtml: renders the TUI dialog with its context and numbered picks", () => {
+  const html = panePromptHtml({
+    prompt: "Do you want to proceed?",
+    detail: "Bash command\ntouch /tmp/marker",
+    options: [
+      { number: 1, label: "Yes", selected: true },
+      { number: 2, label: "Yes, and always allow access to tmp/", selected: false },
+      { number: 3, label: "No", selected: false },
+    ],
+  });
+  assert.match(html, /Do you want to proceed\?/);
+  assert.match(html, /q-pane-detail">Bash command\ntouch \/tmp\/marker</);
+  // Answered by the number the dialog itself shows — that's the key typed.
+  assert.match(html, /data-num="1"[^>]*>1\. Choose</);
+  assert.match(html, /data-num="3"[^>]*>3\. Choose</);
+  // The TUI's own cursor position is carried through as the marked pick.
+  assert.match(html, /q-opt-pick sel" data-num="1"/);
+  assert.doesNotMatch(html, /q-opt-pick sel" data-num="2"/);
+});
+
+test("panePromptHtml: escapes dialog text (it is scraped terminal output)", () => {
+  const html = panePromptHtml({
+    prompt: "Run <script>alert(1)</script>?",
+    detail: "rm -rf <x> && echo 'y'",
+    options: [{ number: 1, label: "<b>Yes</b>", selected: true },
+              { number: 2, label: "No", selected: false }],
+  });
+  assert.doesNotMatch(html, /<script>/);
+  assert.doesNotMatch(html, /<b>Yes<\/b>/);
+  assert.match(html, /&lt;script&gt;/);
+});
+
+test("compose bar: a blocking TUI dialog hides Stop, like a pending question", () => {
+  // Same reasoning as XERK-21: the dialog is answered with its own buttons, and
+  // a Stop there would cancel the decision rather than a running turn.
+  __setLiveStatus({ verb: "Working" });
+  __stopPending(0);
+  __setQuestionActive(false);
+  __setPanePromptActive(true);
+  assert.equal(isBusy(), false);
+  __setPanePromptActive(false);
+  assert.equal(isBusy(), true);
 });
 
 test("render: task_notification card carries the task class + glyph, hidden by 'concise'", () => {

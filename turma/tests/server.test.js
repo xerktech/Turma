@@ -1614,6 +1614,34 @@ test("http: answer endpoint carries free-text custom and defaults optionIndex to
   ]);
 });
 
+test("http: pane-prompt endpoint queues answerPanePrompt with the displayed number", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "pp1" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/pp1/sessions/sess1/pane-prompt", {
+    body: { optionNumber: 2 }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "pp1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "answerPanePrompt", sessionId: "sess1", optionNumber: 2, cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: pane-prompt endpoint rejects a number no dialog key could carry", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "pp2" }, headers: agentHeaders });
+  // The answer is delivered by typing the digit, so 0, 10+ and non-integers
+  // are not answerable and are refused before they reach the queue.
+  for (const optionNumber of [0, 10, -1, 1.5, "2", null]) {
+    const res = await request("POST", "/api/agents/pp2/sessions/sess1/pane-prompt", {
+      body: { optionNumber }, headers: userHeaders,
+    });
+    assert.equal(res.status, 400);
+  }
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "pp2" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, []);
+});
+
 test("http: answer endpoint rejects an empty answer and over-long custom", async () => {
   await request("POST", "/api/heartbeat", { body: { device: "ha3" }, headers: agentHeaders });
 

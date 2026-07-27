@@ -268,6 +268,13 @@ those are marked `[MODEL]`.
   #N", linked, consecutive duplicates folded — synthesized ids, `entryId`). Android decodes these to
   `UnknownBlock`/ignored keys today (safe degrade); port the fields onto `model/Models.kt`'s
   `ToolUseBlock` + new marker blocks, build items in `core/ChatItems.kt`, render in `ChatScreen`.
+- P1 **Blocking TUI dialogs (`session.panePrompt`).** The agent now reports the tool-permission /
+  plan-approval dialog scraped off the pane, and the web renders it in the pending-question box with
+  numbered picks that `POST .../sessions/<id>/pane-prompt {optionNumber}`; both web `liveState`s also
+  treat it as "waiting for your answer" so the card isn't labelled idle while it blocks. Android
+  decodes the field away today, so such a session still reads idle with no way to answer. Port:
+  `panePrompt` onto the session model, the waiting state in `core/Sessions.kt`, and the picker in
+  `ChatScreen`/`ChatViewModel` beside the existing question sheet.
 - P3 **Terminal compose Stop.** XERK-33 also split the terminal compose bar; Android's
   `ui/TerminalScreen.kt` bar still only sends (it's a separate WebView screen with no live busy read).
 

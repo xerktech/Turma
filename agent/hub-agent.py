@@ -3227,14 +3227,139 @@ def parse_pane_mode(cap):
     return None
 
 
+# Claude Code blocks a turn on a CHOICE DIALOG the transcript never records: a
+# tool-permission request ("Bash command … Do you want to proceed?") or a plan
+# approval ("Claude has written up a plan … Would you like to proceed?"). It is
+# a TUI affordance, like the AskUserQuestion picker the ask.py bridge
+# intercepts — but this one has no hook to intercept it, so nothing about it
+# reaches the transcript, the tail, or the chat.
+#
+# Worse, while a dialog is up the pane shows NEITHER the "esc to interrupt"
+# hint NOR the mode footer (the composer is replaced by the dialog), so
+# `paneBusy` reads False and every status surface calls the session IDLE. It is
+# in fact blocked on a human, and the only way to see that — or to answer — was
+# to open the raw terminal. So we read the dialog off the pane, the same way
+# `parse_pane_mode` reads the mode marker.
+#
+# Shapes verified against live panes (Claude Code 2.1.220), a permission
+# dialog and a plan approval:
+#
+#     Bash command                    │   Claude has written up a plan and is
+#                                     │   ready to execute. Would you like to
+#       touch /tmp/marker             │   proceed?
+#       Create marker file in /tmp    │
+#                                     │   ❯ 1. Yes, and use auto mode
+#     Do you want to proceed?         │     2. Yes, manually approve edits
+#     ❯ 1. Yes                        │     3. No, refine with Ultraplan …
+#       2. Yes, and always allow …    │     4. Tell Claude what to change
+#       3. No                         │
+#
+# The wordings differ, so nothing keys on them. What both share, and what an
+# ordinary numbered list in conversation text does not, is all four of:
+#   1. a contiguous run of >= 2 options numbered 1..N in order;
+#   2. exactly one carrying the TUI's "❯" selection cursor;
+#   3. a question line (ends in "?") directly above the run;
+#   4. NO mode footer below it — the footer marker rides the composer, which a
+#      dialog replaces, so its absence is what says "this is a live dialog"
+#      rather than transcript text that happens to look like one.
+PANE_PROMPT_OPTION_RE = re.compile(r"^\s*(❯\s+)?(\d+)\.\s+(\S.*?)\s*$")
+# A box/rule line the TUI draws between sections. The dialog's context is the
+# nearest block ABOVE the question fenced by these, which is why they are
+# skipped before the block and end it after: a permission dialog's block sits
+# directly above the question ("Bash command" + the command + its description),
+# while a plan's body sits one rule further up (the approval sentence has its
+# own rule under it), and one walk has to find both.
+PANE_PROMPT_RULE_RE = re.compile(r"^[\s─╌━▔▁═_│╭╮╰╯┌┐└┘├┤┬┴┼-]+$")
+# How much context above the question to carry (the tool's command + its
+# description, or the plan's body): enough to decide on, bounded for the beat.
+PANE_PROMPT_DETAIL_LINES = 14
+PANE_PROMPT_DETAIL_CHARS = 800
+PANE_PROMPT_MAX_OPTIONS = 9   # answered by typing the digit; 10+ isn't one key
+
+
+def parse_pane_prompt(cap):
+    """The blocking choice dialog the session's TUI is showing, or None.
+
+    Returns {prompt, options: [{number, label, selected}], detail} — `detail`
+    being the context lines above the question (the command being asked about,
+    or the plan). See the comment above for the four conditions a run of lines
+    must meet, and why an idle/working pane can't produce a false positive.
+
+    Scanned bottom-up: the dialog owns the bottom of the pane, so an earlier
+    dialog still scrolled on screen can't shadow the live one."""
+    if not cap:
+        return None
+    lines = cap.splitlines()
+    # A mode footer anywhere below means the composer is live -> no dialog.
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i]
+        m = PANE_PROMPT_OPTION_RE.match(line)
+        if not m or m.group(2) == "0":
+            if PANE_MODE_RE.search(line):
+                return None          # composer footer: nothing is blocking
+            continue
+        # Walk up while the numbers keep descending to 1.
+        end = i
+        start = i
+        want = int(m.group(2))
+        while start >= 0:
+            om = PANE_PROMPT_OPTION_RE.match(lines[start])
+            if not om or int(om.group(2)) != want:
+                break
+            start -= 1
+            want -= 1
+        if want != 0 or end - start < 2:
+            continue                 # not 1..N, or fewer than two options
+        start += 1
+        opts = []
+        for line_no in range(start, end + 1):
+            om = PANE_PROMPT_OPTION_RE.match(lines[line_no])
+            opts.append({"number": int(om.group(2)),
+                         "label": om.group(3)[:200],
+                         "selected": bool(om.group(1))})
+        if sum(1 for o in opts if o["selected"]) != 1:
+            continue                 # no cursor (or several): not a live picker
+        if len(opts) > PANE_PROMPT_MAX_OPTIONS:
+            continue
+        # The question sits directly above, skipping blanks.
+        q = start - 1
+        while q >= 0 and not lines[q].strip():
+            q -= 1
+        if q < 0 or not lines[q].strip().endswith("?"):
+            continue
+        prompt = lines[q].strip()
+        # Walk up for the fenced block above the question: skip blanks and rules
+        # until real text starts, then stop at the rule that closes it.
+        detail = []
+        for line in reversed(lines[:q]):
+            text = line.strip()
+            if not text:
+                continue         # a blank never closes the block (the TUI puts
+                                 # one between a dialog's title and its body)
+            if PANE_PROMPT_RULE_RE.match(line):
+                if detail:
+                    break        # the rule fencing the block we just collected
+                continue         # still above/between rules — keep looking
+            detail.append(text)
+            if len(detail) >= PANE_PROMPT_DETAIL_LINES:
+                break
+        detail.reverse()
+        out = {"prompt": prompt[:300], "options": opts}
+        if detail:
+            out["detail"] = "\n".join(detail)[:PANE_PROMPT_DETAIL_CHARS]
+        return out
+    return None
+
+
 def _pane_status(tmux_name, state):
-    """(paneBusy, modeActual) for one beat: the busy half goes through
-    _stable_pane_busy's busy->idle flicker suppression (hence `state`), the
-    mode half reads the footer marker off its own capture."""
+    """(paneBusy, modeActual, panePrompt) for one beat: the busy half goes
+    through _stable_pane_busy's busy->idle flicker suppression (hence `state`),
+    the mode and blocking-dialog halves read one shared capture."""
     if not tmux_name:
-        return None, None
-    return (_stable_pane_busy(tmux_name, state),
-            parse_pane_mode(_capture_pane(tmux_name)))
+        return None, None, None
+    busy = _stable_pane_busy(tmux_name, state)
+    cap = _capture_pane(tmux_name)
+    return busy, parse_pane_mode(cap), parse_pane_prompt(cap)
 
 
 def _capture_pane(tmux_name):
@@ -3272,7 +3397,7 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
     proj = os.path.join(PROJECTS_ROOT, slug)
     primed = state.get("primed", False)
     offsets = state.setdefault("offsets", {})
-    pane_busy, mode_actual = _pane_status(tmux_name, state)
+    pane_busy, mode_actual, pane_prompt = _pane_status(tmux_name, state)
     report = {
         "bridgeAttached": os.path.exists(os.path.join(proj, "bridge-pointer.json")),
         # Live "is it working right now" read straight off the session's TUI —
@@ -3286,6 +3411,11 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # the operator cycled by hand in the terminal doesn't leave the stored
         # mode — and every switch computed from it — wrong forever.
         "modeActual": mode_actual,
+        # The blocking choice dialog the TUI is showing (tool permission / plan
+        # approval), or None. Nothing about it reaches the transcript, and it
+        # suppresses the busy hint — so without this read the session looks idle
+        # while it waits on a human. See parse_pane_prompt.
+        "panePrompt": pane_prompt,
         "transcriptAgeSec": None,  # seconds since the newest transcript write
         "lastRole": None,          # "assistant"/"user"/... of the newest entry
         "lastHasToolUse": False,
@@ -7357,6 +7487,36 @@ class SessionManager:
         run(["tmux", "send-keys", "-t", sess["tmuxName"], "Escape"])
         log(f"interrupted session {sid}")
 
+    def answer_pane_prompt(self, sid, number):
+        """Answer the blocking choice dialog a session's TUI is showing (a tool
+        permission request or a plan approval — see parse_pane_prompt) by typing
+        its option digit, exactly the key an operator at the live terminal would
+        press. This is what makes the dialog answerable from the chat page
+        instead of only from the raw terminal.
+
+        The pane is RE-READ first and the number checked against what is
+        actually on screen right now. That is the whole safety property: the
+        heartbeat a click was made against is up to a beat stale, and by the
+        time it lands the dialog may be gone — typing a bare digit into a live
+        composer would silently prepend a stray character to the operator's next
+        message. So a stale answer is dropped rather than sent."""
+        sess = self._find(sid)
+        if not sess or sess.get("status") != "running":
+            return
+        try:
+            number = int(number)
+        except (TypeError, ValueError):
+            return
+        prompt = parse_pane_prompt(_capture_pane(sess.get("tmuxName")))
+        if not prompt:
+            log(f"pane-prompt answer for {sid} dropped: no dialog on screen")
+            return
+        if not any(o["number"] == number for o in prompt["options"]):
+            log(f"pane-prompt answer {number} for {sid} dropped: not an option")
+            return
+        run(["tmux", "send-keys", "-t", sess["tmuxName"], str(number)])
+        log(f"answered pane prompt for session {sid}: option {number}")
+
     def set_summary(self, sid, summary):
         """Rename a session: replace the auto-generated few-word name the card
         leads with by one the operator typed. Works on a stopped session too (the
@@ -9019,6 +9179,9 @@ class SessionManager:
                         cmd.get("custom"),
                         cmd.get("optionIndices"),
                     )
+                elif ctype == "answerPanePrompt":
+                    self.answer_pane_prompt(
+                        cmd.get("sessionId"), cmd.get("optionNumber"))
                 elif ctype == "history":
                     self._stage_history(cmd.get("sessionId"))
                 elif ctype == "subagentHistory":
