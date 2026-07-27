@@ -5,7 +5,9 @@ import com.xerktech.turma.model.JiraBlock
 import com.xerktech.turma.model.JiraIssueDetail
 import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.JiraTicket
+import com.xerktech.turma.model.StatusOption
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -493,5 +495,13 @@ class BoardTest {
         // Never seen + absent: a stale cache, not an ack — wait, then time out.
         assertEquals(SweepVerdict.HOLD, startSweepVerdict(p, emptyList(), false, true, 50, 100).first)
         assertEquals(SweepVerdict.ERROR, startSweepVerdict(p, emptyList(), false, true, 150, 100).first)
+    }
+
+    // ---- status change (XERK-138): parity with board.js canChangeStatus -------
+    @Test fun `status is changeable only when online and options exist`() {
+        val opts = listOf(StatusOption(id = "31", name = "Done", category = "done"))
+        assertTrue(statusChangeable(online = true, options = opts))
+        assertFalse(statusChangeable(online = false, options = opts))   // write needs a live host
+        assertFalse(statusChangeable(online = true, options = emptyList()))  // nothing to move to
     }
 }

@@ -490,7 +490,7 @@ function invalidateAgentsCache() { agentsCache = null; }
 // Shared by the fleet payload and the SSE per-agent push so both stay in
 // lockstep.
 function serializeAgent(key, agent, now) {
-  const { history, subagentHistory, jiraIssues, ...a } = agent;
+  const { history, subagentHistory, jiraIssues, statusResults, ...a } = agent;
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   return {
     key,
@@ -744,6 +744,33 @@ function ingestJiraIssues(agent, jiraIssueResults) {
       .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
       .slice(0, over)
       .forEach(([key]) => delete agent.jiraIssues[key]);
+  }
+}
+
+// Merge the agent's board-status-change outcomes (heartbeat `ticketStatusResults`,
+// XERK-138) into a per-cmdId cache, so the panel that fired a change can poll
+// GET .../status?cmdId for its own answer. Keyed by cmdId (not issueKey) so two
+// changes to one ticket don't clobber each other's result, and bounded oldest-
+// first exactly like the issue cache.
+function ingestStatusResults(agent, ticketStatusResults) {
+  const now = Date.now();
+  for (const r of ticketStatusResults || []) {
+    if (!r || !r.cmdId) continue;
+    agent.statusResults[r.cmdId] = {
+      key: r.key || null, ok: !!r.ok, error: r.error || null,
+      status: r.status || null, statusCategory: r.statusCategory || null,
+      at: now,
+    };
+  }
+  for (const [id, e] of Object.entries(agent.statusResults)) {
+    if (now - e.at > JIRA_ISSUE_MAX_AGE_MS) delete agent.statusResults[id];
+  }
+  const over = Object.keys(agent.statusResults).length - JIRA_ISSUE_MAX;
+  if (over > 0) {
+    Object.entries(agent.statusResults)
+      .sort((a, b) => a[1].at - b[1].at)
+      .slice(0, over)
+      .forEach(([id]) => delete agent.statusResults[id]);
   }
 }
 
@@ -2252,6 +2279,11 @@ const server = http.createServer(async (req, res) => {
       // the {type:"jiraIssue"} command); cached below, like historyResults.
       const jiraIssueResults = payload.jiraIssueResults;
       delete payload.jiraIssueResults;
+      // Outcomes of board status changes the agent applied since the last beat
+      // (the {type:"setTicketStatus"} command, XERK-138); cached by cmdId below
+      // so the panel that asked can poll for its own answer.
+      const ticketStatusResults = payload.ticketStatusResults;
+      delete payload.ticketStatusResults;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -2281,10 +2313,14 @@ const server = http.createServer(async (req, res) => {
         // Per-issue Jira detail cache (see the /api/jira route); like `history`,
         // survives across beats.
         jiraIssues: prev.jiraIssues || {},
+        // Per-cmdId board-status-change outcome cache (see the /status route,
+        // XERK-138); survives across beats like `jiraIssues`.
+        statusResults: prev.statusResults || {},
       });
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);
+      ingestStatusResults(next, ticketStatusResults);
       heartbeatAlerts(key, prev, next);
       rearmMovedWatches(key, prev, next);
       // A migration finishes the instant its target session heartbeats in — do
@@ -2830,6 +2866,67 @@ const server = http.createServer(async (req, res) => {
         .find((c) => c.type === "jiraIssue" && c.issueKey === issueKey);
       const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "jiraIssue", issueKey });
       return json(res, 202, { pending: true, cmdId });
+    }
+
+    // POST /api/jira/<siteKey>/<issueKey>/status — change a ticket's status and
+    // push it to the board (XERK-138). Body: {value} — the transition id (Jira)
+    // or state name (Azure) the operator picked from the detail's statusOptions.
+    //
+    // This is the ONE thing Turma writes back to a board, so unlike the read-only
+    // ticket GET it REQUIRES an online host: a queued write sitting on a sleeping
+    // agent would land whenever it woke — a surprise, not a feature. The hub's
+    // job is only routing + delivery; the agent re-reads the available options
+    // and applies only a target still on offer, so `value` is passed through
+    // (checked as a non-empty string) rather than allowlisted here — the board's
+    // own workflow, not this endpoint, decides what a ticket can move to.
+    //
+    // The outcome rides back on the heartbeat keyed by the queued cmdId; the
+    // client polls the GET below for it. Single-flight per ticket, like the
+    // spawnTicket route: a double-click must not fire two changes.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "status") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const value = typeof body.value === "string" ? body.value.trim() : "";
+      if (!value) return json(res, 400, { error: "body needs {value}" });
+      if (!findJiraHost(siteKey, false)) {
+        return json(res, 404, { error: "no host reports that org" });
+      }
+      const key = findJiraHost(siteKey, true);
+      if (!key) return json(res, 503, { error: "no online host reports that org" });
+      const pending = (agents[key].commands || [])
+        .find((c) => c.type === "setTicketStatus" && c.issueKey === issueKey);
+      const cmdId = pending ? pending.cmdId
+        : queueCommand(key, { type: "setTicketStatus", issueKey, value });
+      return json(res, 202, { ok: true, cmdId, host: key });
+    }
+
+    // GET /api/jira/<siteKey>/<issueKey>/status?cmdId=<id> — poll the outcome of
+    // a status change queued by the POST above (XERK-138). {pending:true} until
+    // the agent's heartbeat carries the result for that cmdId, then {ok, error,
+    // status, statusCategory}. Keyed by cmdId so it answers the specific change
+    // the client made, not a stale prior one on the same ticket.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "status") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const cmdId = url.searchParams.get("cmdId");
+      if (!cmdId) return json(res, 400, { error: "cmdId required" });
+      const key = findJiraHost(siteKey, true) || findJiraHost(siteKey, false);
+      if (!key) return json(res, 404, { error: "no host reports that org" });
+      const r = (agents[key].statusResults || {})[cmdId];
+      if (!r) return json(res, 200, { pending: true });
+      return json(res, 200, {
+        ok: r.ok, error: r.error, status: r.status,
+        statusCategory: r.statusCategory,
+      });
     }
 
     // POST /api/jira/<siteKey>/<issueKey>/session -> start a session to work

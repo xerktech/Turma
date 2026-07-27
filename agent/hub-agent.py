@@ -3883,22 +3883,38 @@ def normalize_jira_site(raw):
     return r.strip(".").lower()
 
 
-def jira_get(path, params):
-    """One authenticated GET against the configured Jira Cloud site, parsed
-    JSON out. Exceptions propagate — collect_jira()'s caller turns them into
-    the block's `error` (stale-cache fail-open)."""
+def jira_req(path, params, body=None):
+    """One authenticated request against the configured Jira Cloud site, parsed
+    JSON out. GET when `body` is None, else a JSON POST — the board's status
+    change (XERK-138) is the one write path, a transitions POST. A transition
+    returns 204 with an empty body, so an empty response parses to {} rather
+    than raising. Exceptions propagate — the read callers turn them into the
+    block's `error` (stale-cache fail-open); the write caller stages them as a
+    per-command error result."""
     site = normalize_jira_site(JIRA_SITE)
     url = f"https://{site}{path}?{urllib.parse.urlencode(params)}"
     auth = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_TOKEN}".encode()).decode()
-    req = urllib.request.Request(url, headers={
+    headers = {
         "Authorization": f"Basic {auth}",
         "Accept": "application/json",
         # Explicit UA for parity with the hub POSTs (some edges 403 the
         # default Python-urllib signature).
         "User-Agent": "turma-agent/1.0",
-    })
+    }
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers,
+                                 method="POST" if body is not None else "GET")
     with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
-        return json.loads(resp.read().decode())
+        raw = resp.read().decode()
+        return json.loads(raw) if raw.strip() else {}
+
+
+def jira_get(path, params):
+    """A read against the configured Jira Cloud site — jira_req with no body."""
+    return jira_req(path, params)
 
 
 def _shape_issue(issue, site_key):
@@ -4063,9 +4079,47 @@ def adf_plain(node, limit):
     return text[:limit].rstrip(), True
 
 
+# --- Status change (XERK-138) --------------------------------------------------
+# The board's one write path. A ticket's changeable statuses are workflow- and
+# current-status-dependent, so the detail view carries the AVAILABLE targets it
+# fetched (Jira's transitions, Azure's states) and the operator picks one; the
+# agent re-reads them at write time and only applies a target still on offer.
+# statusOptions is a source-agnostic [{id, name, category}]: `id` is what the
+# write submits (Jira's transition id, Azure's state name), `name` is what the
+# picker shows, `category` maps to the board's todo/inprogress/done column.
+
+def _shape_transitions(transitions):
+    """Jira's `transitions` expansion -> the source-agnostic statusOptions shape.
+    Labelled with the RESULTING status (`to.name`), not the transition action's
+    own name, since the operator is choosing a status to land in; the submit
+    value is the transition id. Anything malformed is skipped, not raised."""
+    out = []
+    for tr in transitions or []:
+        if not isinstance(tr, dict):
+            continue
+        to = tr.get("to") if isinstance(tr.get("to"), dict) else {}
+        cat = ((to.get("statusCategory") or {}).get("key") or "").lower()
+        name = to.get("name") or tr.get("name")
+        tid = tr.get("id")
+        if tid is None or not name:
+            continue
+        out.append({"id": str(tid), "name": name,
+                    "category": _JIRA_CATEGORY.get(cat, "todo")})
+    return out
+
+
+def _jira_status_options(key):
+    """The transitions available from an issue's current status, fetched fresh —
+    the allowlist set_board_status validates a requested change against."""
+    data = jira_req(
+        f"/rest/api/3/issue/{urllib.parse.quote(key)}/transitions", {})
+    return _shape_transitions(data.get("transitions"))
+
+
 def _shape_issue_detail(issue, site_key):
     """One raw REST-v3 GET-issue response -> the card shape plus everything the
-    expanded view adds: description, comments, people, full labels."""
+    expanded view adds: description, comments, people, full labels, and the
+    available status transitions (from the `transitions` expansion)."""
     detail = _shape_issue(issue, site_key)
     fields = issue.get("fields") or {}
 
@@ -4108,19 +4162,23 @@ def _shape_issue_detail(issue, site_key):
     detail["comments"] = comments
     total = block.get("total")
     detail["commentTotal"] = total if isinstance(total, int) else len(comments)
+    detail["statusOptions"] = _shape_transitions(issue.get("transitions"))
     detail["fetchedAt"] = now_iso()
     return detail
 
 
 def fetch_jira_issue(key):
-    """One issue's full detail. Exceptions propagate — _stage_jira_issue turns
-    them into the staged result's `error` so the board can say why."""
+    """One issue's full detail. `expand=transitions` rides the one GET so the
+    available status changes come back with the issue rather than costing a
+    second call. Exceptions propagate — _stage_jira_issue turns them into the
+    staged result's `error` so the board can say why."""
     site_key = normalize_jira_site(JIRA_SITE)
     data = jira_get(
         f"/rest/api/3/issue/{urllib.parse.quote(key)}",
         {"fields": "summary,status,priority,issuetype,updated,created,duedate,"
                    "labels,project,parent,description,reporter,assignee,"
-                   "resolution,comment"},
+                   "resolution,comment",
+         "expand": "transitions"},
     )
     return _shape_issue_detail(data, site_key)
 
@@ -4136,8 +4194,9 @@ def fetch_jira_issue(key):
 #
 # Self-hosted is the point (AZDO_URL is any base — `https://tfs.company.com/
 # DefaultCollection`), and Azure DevOps Services (`https://dev.azure.com/org`)
-# is the same REST surface, so both work off the one base URL. Read-only by
-# construction — the only endpoints called are WIQL search and work-item GET.
+# is the same REST surface, so both work off the one base URL. Read-only save
+# for the one operator-driven status change (XERK-138): WIQL search, work-item
+# GET, the work-item-type states GET, and a single System.State PATCH.
 AZDO_URL = os.environ.get("AZDO_URL", "").strip()
 AZDO_TOKEN = os.environ.get("AZDO_TOKEN", "").strip()
 # Optional: scope the poll to one project (else org-wide, every project the PAT
@@ -4250,11 +4309,14 @@ def normalize_azure_site(url):
     return r.strip("/").lower()
 
 
-def azure_req(path, params, body=None):
+def azure_req(path, params, body=None, method=None, content_type="application/json"):
     """One authenticated request against the configured Azure DevOps org. GET
-    when `body` is None, else a JSON POST. PAT auth is Basic with an empty
-    username (`:PAT`), which both Services and Server accept. Exceptions
-    propagate — collect_azure()'s caller turns them into the block's `error`."""
+    when `body` is None, else `method` (default POST). A System.State change
+    (XERK-138) is the one write: a PATCH carrying a JSON-Patch document, which
+    needs `content_type="application/json-patch+json"`. PAT auth is Basic with
+    an empty username (`:PAT`), which both Services and Server accept.
+    Exceptions propagate — the read callers turn them into the block's `error`,
+    the write caller stages them as a per-command error result."""
     q = dict(params or {})
     q.setdefault("api-version", AZDO_API_VERSION)
     url = f"{azure_base()}{path}?{urllib.parse.urlencode(q)}"
@@ -4267,35 +4329,58 @@ def azure_req(path, params, body=None):
     data = None
     if body is not None:
         data = json.dumps(body).encode()
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers,
-                                 method="POST" if body is not None else "GET")
+        headers["Content-Type"] = content_type
+    req = urllib.request.Request(
+        url, data=data, headers=headers,
+        method=method or ("POST" if body is not None else "GET"))
     with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
-        return json.loads(resp.read().decode())
+        raw = resp.read().decode()
+        return json.loads(raw) if raw.strip() else {}
 
 
-def _azure_state_map(site_key, project, wtype):
-    """{state_name_lower: column} for one (project, work-item-type), from the
-    states API, cached. {} when the call fails or is unavailable, so the caller
-    falls back to the static name map. Best-effort and total."""
-    ck = (site_key, project or "", wtype or "")
+def _azure_states(site_key, project, wtype):
+    """The ordered [{name, category}] a (project, work-item-type) can be in, from
+    the states API, cached. [] when the call fails or is unavailable, so the
+    caller falls back to the static name map (category) or offers no status
+    options (XERK-138). Best-effort and total."""
+    ck = ("states", site_key, project or "", wtype or "")
     if ck in _AZDO_STATE_CACHE:
         return _AZDO_STATE_CACHE[ck]
-    out = {}
+    out = []
     if project and wtype:
         try:
             data = azure_req(
                 f"/{urllib.parse.quote(project)}/_apis/wit/workItemTypes/"
                 f"{urllib.parse.quote(wtype)}/states", {})
             for s in data.get("value") or []:
-                name = str(s.get("name") or "").strip().lower()
+                name = str(s.get("name") or "").strip()
                 cat = str(s.get("stateCategory") or "").strip().lower()
                 if name and cat in _AZDO_META_CATEGORY:
-                    out[name] = _AZDO_META_CATEGORY[cat]
+                    out.append({"name": name, "category": _AZDO_META_CATEGORY[cat]})
         except Exception as e:
             log(f"azure states fetch failed for {project}/{wtype}: {e}")
     _AZDO_STATE_CACHE[ck] = out
     return out
+
+
+def _azure_state_map(site_key, project, wtype):
+    """{state_name_lower: column} for one (project, work-item-type), derived from
+    the cached states list. {} when unavailable, so the caller falls back to the
+    static name map."""
+    return {s["name"].lower(): s["category"]
+            for s in _azure_states(site_key, project, wtype)}
+
+
+def _azure_status_options(site_key, project, wtype, current):
+    """The states this work item can be moved TO — every state of its type except
+    the one it's already in — in the source-agnostic statusOptions shape. For
+    Azure the submit value IS the state name (there is no transition id). [] when
+    the states API is unreachable (a locked-down server), so the row stays
+    read-only rather than offering a change that can't be validated."""
+    cur = str(current or "").strip().lower()
+    return [{"id": s["name"], "name": s["name"], "category": s["category"]}
+            for s in _azure_states(site_key, project, wtype)
+            if s["name"].strip().lower() != cur]
 
 
 def _azure_category(site_key, project, wtype, state):
@@ -4541,7 +4626,8 @@ def fetch_azure_issue(key):
     base = azure_base()
     wi = azure_req(f"/_apis/wit/workitems/{urllib.parse.quote(key)}",
                    {"$expand": "all"})
-    project = (wi.get("fields") or {}).get("System.TeamProject")
+    f = wi.get("fields") or {}
+    project = f.get("System.TeamProject")
     comments_data = {}
     if project:
         try:
@@ -4551,7 +4637,10 @@ def fetch_azure_issue(key):
                 {"api-version": f"{AZDO_API_VERSION}-preview.3"})
         except Exception as e:
             log(f"azure comments fetch failed for {key}: {e}")
-    return _shape_azure_detail(wi, comments_data, site_key, base)
+    detail = _shape_azure_detail(wi, comments_data, site_key, base)
+    detail["statusOptions"] = _azure_status_options(
+        site_key, project, f.get("System.WorkItemType"), f.get("System.State"))
+    return detail
 
 
 # --- Board source dispatch -----------------------------------------------------
@@ -4645,6 +4734,35 @@ def board_site_key():
     if azure_configured():
         return normalize_azure_site(AZDO_URL)
     return normalize_jira_site(JIRA_SITE)
+
+
+def board_status_options(key):
+    """The statuses `key` can be moved to right now, from the configured source
+    (Jira transitions / Azure states). The allowlist a status change is checked
+    against at write time — re-read fresh, never trusted from the client."""
+    if azure_configured():
+        wi = azure_req(f"/_apis/wit/workitems/{urllib.parse.quote(key)}",
+                       {"fields": "System.TeamProject,System.WorkItemType,System.State"})
+        f = wi.get("fields") or {}
+        return _azure_status_options(
+            normalize_azure_site(AZDO_URL), f.get("System.TeamProject"),
+            f.get("System.WorkItemType"), f.get("System.State"))
+    return _jira_status_options(key)
+
+
+def apply_board_status(key, value):
+    """Push a status change to the configured board (XERK-138). Jira: POST the
+    chosen transition id. Azure: PATCH System.State to the chosen state name via
+    a JSON-Patch document. Exceptions propagate to set_board_status, which stages
+    them as the command's error result."""
+    if azure_configured():
+        azure_req(
+            f"/_apis/wit/workitems/{urllib.parse.quote(key)}", {},
+            body=[{"op": "add", "path": "/fields/System.State", "value": value}],
+            method="PATCH", content_type="application/json-patch+json")
+    else:
+        jira_req(f"/rest/api/3/issue/{urllib.parse.quote(key)}/transitions", {},
+                 body={"transition": {"id": value}})
 
 
 # --- Jira ticket sessions ------------------------------------------------------
@@ -5427,6 +5545,11 @@ class SessionManager:
         # the next heartbeat payload — same held-across-a-failed-POST lifecycle
         # as history_results.
         self.jira_issue_results = []
+        # Staged `setTicketStatus` results (the outcome of a board status change,
+        # XERK-138) — each `{cmdId, key, ok, error, ...}` awaiting the next
+        # heartbeat, keyed back to the request by the command's cmdId. Same
+        # held-across-a-failed-POST lifecycle as jira_issue_results.
+        self.ticket_status_results = []
         # Archive sync: the manifest of inactive transcripts sent on the last slow
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
@@ -8052,6 +8175,62 @@ class SessionManager:
             self.jira_issue_results.append(
                 {"key": k, "issue": None, "error": str(e)[:200]})
 
+    def set_board_status(self, cmd_id, issue_key, value):
+        """Handle a {type:"setTicketStatus"} command: push a status change to the
+        configured board (Jira/Azure) — the one thing Turma writes back to a
+        board (XERK-138). The outcome is staged keyed by the command's cmdId so
+        the panel that requested it can poll for its own answer.
+
+        The requested target is re-validated against a FRESH read of the
+        available options — never trusted from the client — the same stance
+        set_jira_repo takes against the repo picker: the request arrives over
+        HTTP, and the board's own workflow, not the browser, decides what a
+        ticket can move to. A target no longer on offer (the board moved under
+        the operator, or a stale client) is refused rather than attempted.
+
+        On success it also re-fetches the issue and stages it into
+        jira_issue_results, so the hub's issue cache carries the new status +
+        the transitions available FROM it, and the panel's re-read is instant."""
+        k = (issue_key or "").strip()
+        result = {"cmdId": cmd_id, "key": k[:50], "ok": False, "error": None}
+
+        def stage(err=None, **extra):
+            if err is not None:
+                result["error"] = err
+            result.update(extra)
+            self.ticket_status_results.append(result)
+
+        if not valid_issue_key(k):
+            return stage("not a valid issue key")
+        if not board_configured():
+            return stage("no board credentials on this host")
+        v = str(value or "").strip()
+        if not v:
+            return stage("no status given")
+        try:
+            opts = board_status_options(k)
+        except Exception as e:
+            log(f"status options fetch failed for {k}: {e}")
+            return stage(f"couldn't read available statuses: {str(e)[:150]}")
+        match = next((o for o in opts if o.get("id") == v), None)
+        if match is None:
+            return stage("that status is no longer an available change")
+        try:
+            apply_board_status(k, v)
+        except Exception as e:
+            log(f"status change failed for {k}: {e}")
+            return stage(str(e)[:200])
+        # Refresh the cached detail so the panel's re-read shows the new status
+        # and the transitions now available from it (best-effort: the change
+        # already landed, so a failed re-read doesn't fail the command).
+        try:
+            issue = fetch_board_issue(k)
+            self.jira_issue_results.append({"key": k, "issue": issue, "error": None})
+        except Exception as e:
+            log(f"post-change issue re-fetch failed for {k}: {e}")
+        log(f"setTicketStatus: {k} -> {match['name']}")
+        stage(ok=True, status=match["name"], statusCategory=match["category"])
+
     # --- durable archive sync ---------------------------------------------
     # Ship every INACTIVE session's transcript to the hub so history is durable
     # (survives this host being wiped/offline) and searchable there. The agent
@@ -9234,6 +9413,9 @@ class SessionManager:
                         cmd.get("sessionId"), cmd.get("agentType"), cmd.get("label"))
                 elif ctype == "jiraIssue":
                     self._stage_jira_issue(cmd.get("issueKey"))
+                elif ctype == "setTicketStatus":
+                    self.set_board_status(
+                        cid, cmd.get("issueKey"), cmd.get("value"))
                 elif ctype == "setJiraRepo":
                     self.set_jira_repo(
                         cmd.get("issueKey"), cmd.get("repo"),
@@ -10007,6 +10189,8 @@ class SessionManager:
             payload["subagentHistoryResults"] = list(self.subagent_history_results)
         if self.jira_issue_results:
             payload["jiraIssueResults"] = list(self.jira_issue_results)
+        if self.ticket_status_results:
+            payload["ticketStatusResults"] = list(self.ticket_status_results)
         # Archive sync manifest on the slow cadence: the inactive transcripts the
         # hub could pull. Remember it by id so the reply's archiveHave cursors map
         # back to each one for the delta push (in run_forever).
@@ -10043,6 +10227,7 @@ class SessionManager:
             self.history_results.clear()  # delivered — same lifecycle
             self.subagent_history_results.clear()  # delivered — same lifecycle
             self.jira_issue_results.clear()  # delivered — same lifecycle
+            self.ticket_status_results.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
         except Exception as e:
             log(f"heartbeat failed: {e}")

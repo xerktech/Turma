@@ -36,8 +36,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import android.widget.Toast
 import androidx.compose.ui.Alignment
@@ -47,6 +47,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
+import kotlinx.coroutines.launch
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -544,6 +545,83 @@ private fun AgentPicker(site: BoardSite, pin: com.xerktech.turma.model.TicketAge
     }
 }
 
+/**
+ * The Status row of the detail sheet (XERK-138): the one board field that writes
+ * back to Jira/Azure. Mirrors board.js statusFieldHtml + statusPickerHtml — the
+ * current status, plus a picker of the changes the board offers (the fetched
+ * detail's statusOptions) once an ONLINE host can deliver the write. While a
+ * change is in flight the pill shows the optimistic target; on success the sheet
+ * re-fetches (the new status brings new options), on failure the reason shows.
+ */
+@Composable
+private fun StatusSection(
+    site: BoardSite,
+    t: JiraTicket,
+    detail: com.xerktech.turma.model.JiraIssueDetail?,
+    vm: BoardViewModel,
+    onDetailChange: (com.xerktech.turma.model.JiraIssueDetail) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var pending by remember(t.key) { mutableStateOf<String?>(null) }
+    var error by remember(t.key) { mutableStateOf<String?>(null) }
+    val options = detail?.statusOptions ?: emptyList()
+    val editable = com.xerktech.turma.core.statusChangeable(site.online, options)
+    val current = (detail?.status?.takeIf { it.isNotBlank() }) ?: t.status
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        SectionLabel("Status")
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Pill(pending ?: current)
+            if (pending != null) {
+                Text("— saving…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        if (error != null) {
+            Text("Couldn't save — $error", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+        }
+        if (editable && pending == null) {
+            StatusPicker(options, current) { opt ->
+                error = null
+                pending = opt.name
+                scope.launch {
+                    val err = vm.saveStatus(site.siteKey, t.key, opt.id)
+                    if (err != null) {
+                        error = err
+                        pending = null
+                    } else {
+                        onDetailChange(vm.fetchIssue(site.siteKey, t.key))
+                        pending = null
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** A pick IS the save (like [RepoPicker]); the first option keeps the current. */
+@Composable
+private fun StatusPicker(
+    options: List<com.xerktech.turma.model.StatusOption>,
+    current: String,
+    onPick: (com.xerktech.turma.model.StatusOption) -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        GhostButton("▾ Change status", onClick = { open = true })
+        androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text(if (current.isNotBlank()) "$current (current)" else "Keep current") },
+                onClick = { open = false },
+            )
+            for (o in options) {
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(o.name) },
+                    onClick = { open = false; onPick(o) },
+                )
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TicketDetailSheet(
@@ -556,9 +634,10 @@ private fun TicketDetailSheet(
 ) {
     val siteKey = site.siteKey
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val detail by produceState<com.xerktech.turma.model.JiraIssueDetail?>(initialValue = null, siteKey, t.key) {
-        value = vm.fetchIssue(siteKey, t.key)
-    }
+    // Held in mutable state (not produceState) so a status change (XERK-138) can
+    // replace it with the re-fetched issue — the new status brings new options.
+    var detail by remember(siteKey, t.key) { mutableStateOf<com.xerktech.turma.model.JiraIssueDetail?>(null) }
+    LaunchedEffect(siteKey, t.key) { detail = vm.fetchIssue(siteKey, t.key) }
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet) {
         Column(
             Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp, 0.dp, 20.dp, 32.dp),
@@ -570,6 +649,7 @@ private fun TicketDetailSheet(
                 if (t.priority.isNotBlank()) Pill(t.priority)
             }
             Text(t.summary, style = MaterialTheme.typography.titleMedium)
+            StatusSection(site, t, detail, vm, onDetailChange = { detail = it })
             RepoSection(site, t, vm)
             AgentSection(site, t, pin, vm)
             ModelSection(site, t, modelPin, vm)

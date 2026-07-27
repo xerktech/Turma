@@ -245,8 +245,21 @@ data class JiraIssueDetail(
     val commentTotal: Int = 0,
     val parentKey: String? = null,
     val url: String = "",
+    // The statuses this ticket can be moved to right now (XERK-138), from the
+    // board's own workflow (Jira transitions / Azure states). `id` is what a
+    // change submits (transition id / state name); empty when the row is not
+    // changeable (older agent, or a source that couldn't enumerate them).
+    val statusOptions: List<StatusOption> = emptyList(),
     val error: String? = null,
     val stale: Boolean = false,
+)
+
+/** One available status change (XERK-138): id submits it, name is shown. */
+@Serializable
+data class StatusOption(
+    val id: String = "",
+    val name: String = "",
+    val category: String = "", // todo | inprogress | done
 )
 
 /**
@@ -262,6 +275,25 @@ data class JiraIssueEnvelope(
     val error: String? = null,
     val stale: Boolean = false,
     val pending: Boolean = false,
+)
+
+/** POST .../status reply: the queued command id to poll the outcome by. */
+@Serializable
+data class StatusChangePost(
+    val ok: Boolean = false,
+    val cmdId: String = "",
+    val host: String = "",
+    val error: String? = null,
+)
+
+/** GET .../status?cmdId reply: pending until the agent reports the outcome. */
+@Serializable
+data class StatusChangeResult(
+    val pending: Boolean = false,
+    val ok: Boolean = false,
+    val error: String? = null,
+    val status: String? = null,
+    val statusCategory: String? = null,
 )
 
 @Serializable

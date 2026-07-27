@@ -857,6 +857,57 @@
     </div>`;
   }
 
+  // ---- ticket status change (XERK-138) --------------------------------------
+  // The board's one write-back: the operator picks a status the ticket can move
+  // to and it's pushed to Jira/Azure. The changeable statuses are the fetched
+  // detail's `statusOptions` (source-agnostic [{id, name, category}]; `id` is
+  // the transition id / state name the change submits), so the row is only
+  // editable once the detail has landed AND an online host can deliver the write.
+
+  // The Status row, shown by default: the current status pill plus a Change
+  // control when the ticket is editable. While a change is in flight the pill
+  // shows the optimistic target and the control reads "saving…"; an error shows
+  // inline, exactly like the repo/agent/model rows.
+  function statusFieldHtml(current, opts) {
+    const o = opts || {};
+    const shown = o.pending || current;
+    const bits = [shown
+      ? `<span class="jira-status">${esc(shown)}</span>`
+      : `<span class="td-dim">—</span>`];
+    if (o.pending) bits.push(`<span class="td-dim">— saving…</span>`);
+    else if (o.editable) bits.push(`<button type="button" class="td-edit" data-status-edit="1">Change</button>`);
+    if (o.error) bits.push(`<span class="td-err-inline">Couldn't save — ${esc(o.error)}</span>`);
+    return bits.join(" ");
+  }
+
+  // The value a "keep the current status" pick carries — the change handler
+  // compares a pick against this to know a real change was made, the same
+  // contract repoPickerValue/agentPickerValue/modelPickerValue follow.
+  function statusPickerValue() {
+    return "__keep__";
+  }
+
+  // The status picker, swapped in for the row on "Change". Choosing an option IS
+  // the save (like the repo/agent/model pickers); the first, selected option is
+  // "keep current", a no-op that just closes the picker. `detail.statusOptions`
+  // is the board's own list of what this ticket can move to right now.
+  function statusPickerHtml(detail, opts) {
+    const o = opts || {};
+    const options = detail && Array.isArray(detail.statusOptions)
+      ? detail.statusOptions : [];
+    const optHtml = (s) =>
+      `<option value="${esc(s.id)}">${esc(s.name)}</option>`;
+    const sel = `<select class="td-repo-select" data-status-select="1">
+      <option value="__keep__" selected>${o.current
+        ? esc(o.current) + " (current)" : "Keep current"}</option>
+      ${options.map(optHtml).join("")}
+    </select>`;
+    return `<div class="td-repo-edit">${sel}
+      <button type="button" class="td-edit" data-status-cancel="1">Cancel</button>
+      ${options.length ? "" : `<span class="td-dim">No status changes available</span>`}
+    </div>`;
+  }
+
   // `t` is the card's ticket (always present); `detail` is the fetched issue
   // (null until it lands). opts: {color, now, siteKey, error, loading}.
   function detailHtml(t, detail, opts) {
@@ -875,7 +926,17 @@
     const labels = Array.isArray(d.labels) && d.labels.length ? d.labels
       : (Array.isArray(t.labels) ? t.labels : []);
     const fields = [
-      fieldRow("Status", v("status") ? `<span class="jira-status">${esc(v("status"))}</span>` : ""),
+      // The one editable board field that writes back to Jira/Azure (XERK-138):
+      // `statusEditing` swaps the pill for the picker of `statusOptions`, and a
+      // pick pushes the change. Editable only once the detail (hence its options)
+      // has landed and an online host can deliver the write.
+      fieldRow("Status", o.statusEditing
+        ? statusPickerHtml(d, { current: v("status") })
+        : statusFieldHtml(v("status"), {
+            editable: !!o.canChangeStatus,
+            pending: o.statusPending,
+            error: o.statusError,
+          })),
       fieldRow("Resolution", d.resolution ? esc(d.resolution) : ""),
       fieldRow("Priority", v("priority")
         ? `<span class="kc-prio ${prioClass(v("priority"))}">${esc(v("priority"))}</span>` : ""),
@@ -1090,6 +1151,7 @@
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
     modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
+    statusFieldHtml, statusPickerHtml, statusPickerValue,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed, startSweepVerdict,
   };

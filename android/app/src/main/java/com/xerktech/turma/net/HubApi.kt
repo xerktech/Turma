@@ -6,6 +6,8 @@ import com.xerktech.turma.model.ArchiveTranscript
 import com.xerktech.turma.model.HistoryResponse
 import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.SearchResponse
+import com.xerktech.turma.model.StatusChangePost
+import com.xerktech.turma.model.StatusChangeResult
 import com.xerktech.turma.model.WsTokenResponse
 import kotlinx.serialization.Serializable
 import retrofit2.Response
@@ -186,6 +188,26 @@ interface HubApi {
         @Path("issueKey") issueKey: String,
         @Body body: kotlinx.serialization.json.JsonObject,
     ): OkResponse
+
+    // Change a ticket's status and push it to the board (XERK-138) — the one
+    // thing Turma writes back. Body: {value:"<transition id / state name>"}
+    // from the detail's statusOptions. Needs an online host (it's a write);
+    // 202 {ok, cmdId, host}, the cmdId to poll the outcome by below.
+    @POST("api/jira/{siteKey}/{issueKey}/status")
+    suspend fun setTicketStatus(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): Response<StatusChangePost>
+
+    // Poll a queued status change's outcome by its cmdId (XERK-138):
+    // {pending:true} until the agent reports, then {ok, error, status, ...}.
+    @GET("api/jira/{siteKey}/{issueKey}/status")
+    suspend fun ticketStatusResult(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Query("cmdId") cmdId: String,
+    ): Response<StatusChangeResult>
 
     // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
     // like the agent pin — an authoritative 200. Body: {enabled:true|false}.

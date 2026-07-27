@@ -527,8 +527,9 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Optional. With user-scoped Jira Cloud creds (`JIRA_SITE`/`JIRA_EMAIL`/`JIRA_TOKEN`), the agent
   heartbeats the tickets assigned to that user, polled slow (`collect_jira`: active work plus a bounded
   window of recently-Done, two capped queries), shaped to the card fields /board renders (`_shape_issue`).
-- Unset creds = feature off (zero Jira HTTP, `available:False`). Read-only by construction — only issue
-  search and issue GET.
+- Unset creds = feature off (zero Jira HTTP, `available:False`). Read-only save for the one
+  operator-driven status change (XERK-138): issue search, issue GET, and a transitions POST. See
+  "Changing the status by hand".
 - **On-demand issue detail.** Description/comment bodies are too big to heartbeat per ticket, so the
   board's expanded view fetches one issue on demand: a `{type:"jiraIssue", issueKey}` command
   (allowlist-checked against the `PROJECT-123` grammar) makes `_stage_jira_issue` call `fetch_jira_issue`;
@@ -553,7 +554,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   everything downstream is source-agnostic and reads `self.jira` unchanged.
 - **Self-hosted is the point.** `AZDO_URL` is any base — `https://tfs.company.com/DefaultCollection`
   (Server/TFS) or `https://dev.azure.com/org` (Services). PAT auth is Basic with empty username (`:PAT`).
-  Read-only: WIQL search + work-item GET.
+  Read-only save for the status change (XERK-138): WIQL search, work-item GET, the states GET, and a
+  System.State PATCH.
 - **siteKey keeps the org/collection PATH** (`normalize_azure_site` → `dev.azure.com/myorg`), unlike the
   Jira host-only key (else every cloud org merges into one board). It's percent-encoded into
   `/api/jira/<siteKey>/...` (client `encodeURIComponent`, hub `decodeURIComponent`). `board.js`/`Board.kt`
@@ -1140,8 +1142,9 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   then only the *colliding* orgs move. Unique up to 8 orgs; overflow falls back to its preferred (possibly
   shared) slot. The Android port (`core/Board.kt` `orgColorMap` → `ChartSeries`) uses the identical
   assignment, pinned by locked test vectors on each side.
-- Pull-only: nothing on this page writes to Jira. Tests: `turma/tests/board.test.js`, the ticket-detail
-  and jira-refresh endpoint cases in `server.test.js`.
+- Pull-only save for the detail panel's status change (XERK-138, "Changing the status by hand"): every
+  other control writes to a hub/agent ledger, never to the board. Tests: `turma/tests/board.test.js`,
+  the ticket-detail and jira-refresh endpoint cases in `server.test.js`.
 
 #### Repo chips
 
@@ -1262,8 +1265,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 - The lifecycle **counterpart** to auto-start: the SAME per-org "auto" opt-in **kills** a session once its
   ticket reaches **Done** (the switch's tooltip reads "start To Do tickets, stop Done sessions"). A
-  ticket only reaches Done by a **human** moving it (the board is pull-only), so it's a deliberate
-  "finished" signal.
+  ticket only reaches Done by a **human** moving it — on the real board, or via the detail panel's own
+  status control (XERK-138), both deliberate — so it's a deliberate "finished" signal.
 - The hub **KILLS**, not interrupts: a kill ends it cleanly (moves to Ended with worktree/conversation/PR
   chips intact and resumable) and frees the `MAX_SESSIONS` slot (symmetric with auto-start consuming one).
   An interrupt would leave it running idle, still holding the slot.
@@ -1413,6 +1416,37 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `modelPinOf`/`modelPickerHtml`/`modelChoices` cases in `board.test.js`, the model-pin cases in
   `TestSpawnTicket` (`agent/tests/test_hub_agent.py`), and the `modelPinOf`/`modelChoices` cases in
   `android/app/src/test/.../BoardTest.kt`.
+
+##### Changing the status by hand (XERK-138)
+
+- The Status row is the **one board field that writes BACK to Jira/Azure** — every other detail control
+  writes a hub/agent ledger. Its "Change" swaps in a picker of the statuses the ticket can move to; **a
+  pick IS the save**, same contract as the repo/agent/model pickers, its "keep current" first option the
+  no-op.
+- **The options are the board's own, fetched with the issue, not a fixed list.** The detail carries
+  `statusOptions` (`[{id, name, category}]`): Jira's available **transitions** (labelled by the resulting
+  status, valued by transition id — from `expand=transitions` on the one issue GET), or Azure's **states**
+  for the work-item type (id == the state name — from the states API, minus the current one). Empty →
+  the row stays read-only (an older agent, or a source that couldn't enumerate them, e.g. a locked-down
+  TFS with no states API).
+- **The write is re-validated against a FRESH read.** `POST /api/jira/<siteKey>/<issueKey>/status
+  {value}` routes to an **online** host (a queued write on a sleeping agent would land as a surprise —
+  unlike the read-only GET, which serves an offline host's cache), single-flight per ticket. The agent
+  (`set_board_status`) re-reads the available options and applies only a `value` still on offer — the
+  board's workflow, not the browser, decides what a ticket can move to — then Jira `POST .../transitions`
+  {transition:{id}} or Azure `PATCH .../workitems/<id>` [System.State]. `value` is passed through the hub
+  (checked non-empty), not allowlisted there, since only the agent can see the live option set.
+- **The outcome rides back keyed by the queued cmdId.** The agent stages `ticketStatusResults`
+  (`{cmdId, ok, error, status, statusCategory}`) plus the re-fetched issue into `jiraIssueResults`; the
+  hub caches the outcome per cmdId (`statusResults`, stripped from `/api/agents`). The panel POSTs, paints
+  the target optimistically, polls `GET .../status?cmdId` until `{ok}`/`{error}`, then re-fetches the
+  detail (the new status brings a new option set). On failure it reverts the pill and shows why.
+- The card's board COLUMN catches up on the next Jira/Azure poll (still pull for the ticket list); only
+  the open panel reflects the change at once.
+- Tests: `TestSetBoardStatus`, `TestAzureStatusOptions`, the statusOptions cases in `TestShapeIssueDetail`/
+  `TestFetchJiraIssue` (`agent/tests/test_hub_agent.py`); the `/status` endpoint cases in
+  `turma/tests/server.test.js`; the `statusFieldHtml`/`statusPickerHtml` cases in `board.test.js`; the
+  `statusChangeable` case in `android/app/src/test/.../BoardTest.kt`.
 
 #### Refresh button
 

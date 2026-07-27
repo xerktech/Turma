@@ -137,6 +137,16 @@ fun agentPinOf(
     ticketAgents["$siteKey/$issueKey"]?.takeIf { it.host.isNotBlank() }
 
 /**
+ * Whether the Status row can offer a change (XERK-138) — a port of board.js
+ * `canChangeStatus`. The status write rides the heartbeat command path, so it
+ * needs an ONLINE host to deliver it AND the fetched detail's `statusOptions`
+ * (the board's own list of what the ticket can move to); an offline org's ticket
+ * is still readable, just not changeable.
+ */
+fun statusChangeable(online: Boolean, options: List<com.xerktech.turma.model.StatusOption>): Boolean =
+    online && options.isNotEmpty()
+
+/**
  * Org display name (board.js orgName). Two siteKey shapes:
  *   - Jira Cloud is a bare host ("myorg.atlassian.net"); strip `.atlassian.net`.
  *   - Azure DevOps carries an org/collection PATH ("dev.azure.com/myorg"); the last
