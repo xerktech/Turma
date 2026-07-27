@@ -298,6 +298,14 @@ those are marked `[MODEL]`.
 - P1 Repo picker: cloned/not-cloned optgroups, "Currently set" orphan, `nameWithOwner`, save-error.
 - P1 Agent picker (XERK-38, shipped): inline save-error on the row (Android toasts like the repo
   picker's; the web paints "Couldn't save" on the row itself).
+- P1 **New-ticket creation (XERK-137).** The web board's `board-bar` now has a "New ticket" button that
+  opens a modal to create a ticket on the org's tracker (Jira or Azure DevOps): an org/project/type
+  cascade (project + type + label metadata fetched on demand via `GET /api/jira/<siteKey>/create-meta`),
+  a title/description/labels form worded per source (labels/tags), submitting to
+  `POST /api/jira/<siteKey>/tickets` and polling the outcome at `.../tickets/<cmdId>`. The created ticket
+  self-assigns to the tracker user so it lands on the board. Android has no create UI yet — port a
+  BoardScreen "+"/FAB → a create sheet driving the same three endpoints. Builders to mirror live in
+  `board.js` (`createFormHtml`/`createProjectOptions`/`createTypeOptions`/`createLabelWord`).
 - P2 Mobile scroll-snapping columns with peek; deep-link (`?ticket=&site=`); refresh outcome/landing.
 - P3 Card org-chip placement; empty-column + truncation notes. (The org chips themselves are gone —
   XERK-62 — and their "offline · synced N ago" note now rides the header control's org rows.)

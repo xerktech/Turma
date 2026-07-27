@@ -135,6 +135,10 @@
           // single-valued fields follow. An org's hosts are configured alike,
           // so there is nothing to union.
           orgName: block.orgName || "",
+          // Which tracker this org is ("jira" | "azure"), off the freshest block —
+          // the New-ticket form words its label field ("Labels" vs "Tags") and
+          // "Open in Jira/Azure DevOps" from it. Older agents omit it; default Jira.
+          source: block.source || "jira",
           users: [],
           hosts: [...rep.hosts].sort(),
           online: rep.online,
@@ -1084,8 +1088,131 @@
     return (p.ageMs > timeoutMs) ? "error" : "hold";              // never saw it; wait it out
   }
 
+  // --- New-ticket form (XERK-137) -------------------------------------------
+  // The board's one write path to the tracker: create a ticket with a title,
+  // description and labels, pushed to the org's board. Built as pure HTML here
+  // (like the pickers above) with the fetch/submit wiring in board.html.
+  //
+  // The label FIELD is worded per source — Jira calls them labels, Azure DevOps
+  // calls them tags — but both are the same free-text, comma-separated input.
+  function createLabelWord(source, cap) {
+    const az = source === "azure";
+    const w = az ? "tag" : "label";
+    return cap ? w.charAt(0).toUpperCase() + w.slice(1) : w;
+  }
+
+  // The org selector's options — every org the fleet reports, so a ticket can be
+  // created against any board from one form. An offline org is offered but marked
+  // (the create needs a live host, which the submit path reports if it's missing).
+  function createOrgOptions(sites, selected) {
+    return (sites || []).map((s) =>
+      `<option value="${esc(s.siteKey)}"${s.siteKey === selected ? " selected" : ""}>${
+        esc(orgName(s.siteKey, s.orgName))}${s.online ? "" : " (offline)"}</option>`).join("");
+  }
+
+  function createProjectOptions(projects, selected) {
+    const opts = (projects || []).filter((p) => p && p.key).map((p) =>
+      `<option value="${esc(p.key)}"${p.key === selected ? " selected" : ""}>${
+        esc(p.name || p.key)}${p.name && p.name !== p.key ? ` (${esc(p.key)})` : ""}</option>`);
+    return `<option value=""${selected ? "" : " selected"} disabled>Choose a project…</option>${opts.join("")}`;
+  }
+
+  function createTypeOptions(types, selected) {
+    const opts = (types || []).filter((t) => t && t.id).map((t) =>
+      `<option value="${esc(t.id)}"${t.id === selected ? " selected" : ""}>${esc(t.name || t.id)}</option>`);
+    return `<option value=""${selected ? "" : " selected"} disabled>Choose a type…</option>${opts.join("")}`;
+  }
+
+  // The whole New-ticket modal body. `st` is the page's create state:
+  //   { sites, siteKey, source, meta, types, values, busy, error, created }
+  // where meta = {loading|error|projects,labels}, types = {loading|error|types}.
+  function createFormHtml(st) {
+    const s = st || {};
+    const v = s.values || {};
+    const source = s.source || "jira";
+    const labelWord = createLabelWord(source, false);
+    // A successful create replaces the form with a confirmation + link, so the
+    // operator sees where the ticket landed and can open it or make another.
+    if (s.created && s.created.key) {
+      const link = s.created.url
+        ? `<a href="${esc(s.created.url)}" target="_blank" rel="noopener">${esc(s.created.key)} ↗</a>`
+        : esc(s.created.key);
+      return `<div class="cf-head">
+          <h2>Ticket created</h2>
+          <button class="td-close" type="button" data-cf-close="1" aria-label="Close">✕</button>
+        </div>
+        <div class="cf-done">Created ${link}. It'll appear on the board on the next poll.</div>
+        <div class="cf-actions">
+          <button type="button" class="cf-btn" data-cf-another="1">Create another</button>
+          <button type="button" class="cf-btn cf-primary" data-cf-close="1">Done</button>
+        </div>`;
+    }
+    const orgRow = (s.sites || []).length > 1
+      ? `<label class="cf-field"><span>Org</span>
+          <select data-cf-org="1">${createOrgOptions(s.sites, s.siteKey)}</select></label>`
+      : `<div class="cf-field"><span>Org</span>
+          <div class="cf-static">${esc(orgName(s.siteKey,
+            ((s.sites || [])[0] || {}).orgName))}</div></div>`;
+
+    // Project + type ride the on-demand metadata fetch, so each row carries its
+    // own loading / error state rather than an empty select that looks broken.
+    const meta = s.meta || {};
+    let projectField;
+    if (meta.error) {
+      projectField = `<div class="cf-note cf-err">Couldn't load projects — ${esc(meta.error)}</div>`;
+    } else if (!meta.projects) {
+      projectField = `<div class="cf-note">Loading projects…</div>`;
+    } else if (!meta.projects.length) {
+      projectField = `<div class="cf-note">No projects you can create in were reported for this org.</div>`;
+    } else {
+      projectField = `<select data-cf-project="1">${createProjectOptions(meta.projects, v.project)}</select>`;
+    }
+    const types = s.types || {};
+    let typeField;
+    if (!v.project) {
+      typeField = `<div class="cf-note">Pick a project first.</div>`;
+    } else if (types.error) {
+      typeField = `<div class="cf-note cf-err">Couldn't load types — ${esc(types.error)}</div>`;
+    } else if (!types.types) {
+      typeField = `<div class="cf-note">Loading types…</div>`;
+    } else if (!types.types.length) {
+      typeField = `<div class="cf-note">No issue types reported for this project.</div>`;
+    } else {
+      typeField = `<select data-cf-type="1">${createTypeOptions(types.types, v.issueType)}</select>`;
+    }
+
+    const suggestions = (meta.labels || []).slice(0, 200)
+      .map((l) => `<option value="${esc(l)}"></option>`).join("");
+    const canSubmit = !!(v.project && v.issueType && (v.summary || "").trim()) && !s.busy;
+    return `<div class="cf-head">
+        <h2>New ticket</h2>
+        <button class="td-close" type="button" data-cf-close="1" aria-label="Close">✕</button>
+      </div>
+      <div class="cf-body">
+        ${orgRow}
+        <label class="cf-field"><span>Project</span>${projectField}</label>
+        <label class="cf-field"><span>Type</span>${typeField}</label>
+        <label class="cf-field"><span>Title</span>
+          <input type="text" data-cf-summary="1" maxlength="250" placeholder="A short summary"
+            value="${esc(v.summary || "")}"></label>
+        <label class="cf-field"><span>Description</span>
+          <textarea data-cf-desc="1" rows="6" placeholder="What needs doing?">${esc(v.description || "")}</textarea></label>
+        <label class="cf-field"><span>${esc(createLabelWord(source, true))}s</span>
+          <input type="text" data-cf-labels="1" list="cf-label-suggestions"
+            placeholder="comma-separated ${esc(labelWord)}s" value="${esc(v.labels || "")}">
+          <datalist id="cf-label-suggestions">${suggestions}</datalist></label>
+      </div>
+      ${s.error ? `<div class="cf-note cf-err">Couldn't create — ${esc(s.error)}</div>` : ""}
+      <div class="cf-actions">
+        <button type="button" class="cf-btn" data-cf-cancel="1">Cancel</button>
+        <button type="button" class="cf-btn cf-primary" data-cf-submit="1"${canSubmit ? "" : " disabled"}>${
+          s.busy ? "Creating…" : "Create ticket"}</button>
+      </div>`;
+  }
+
   const api = {
     CATEGORIES, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgName, autoStartOn, ageStr,
+    createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
