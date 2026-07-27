@@ -1698,9 +1698,14 @@ class TestEntryBlocks(unittest.TestCase):
             {"t": "pr_link", "url": "https://github.com/o/r/pull/230", "number": 230, "repo": "o/r"},
         ])
         # No uuid on the wire entry: the feeds synthesize a stable id so the
-        # client's id-keyed merge doesn't drop it.
-        self.assertEqual(ha._entry_id(entry),
-                         "pr-link:https://github.com/o/r/pull/230:2026-07-17T04:25:18.299Z")
+        # client's id-keyed merge doesn't drop it. It keys on the URL ALONE, so
+        # the same PR re-stamped in a later turn's preamble collapses onto one
+        # entry instead of rendering a marker apiece.
+        self.assertEqual(ha._entry_id(entry), "pr-link:https://github.com/o/r/pull/230")
+        restamp = dict(entry, timestamp="2026-07-17T09:00:00.000Z")
+        self.assertEqual(ha._entry_id(restamp), ha._entry_id(entry))
+        other = dict(entry, prUrl="https://github.com/o/r/pull/231")
+        self.assertNotEqual(ha._entry_id(other), ha._entry_id(entry))
         self.assertIsNone(ha._entry_blocks({"type": "pr-link"}, ha.BLOCK_CAPS_LIVE))
         self.assertEqual(ha._entry_id({"type": "user", "uuid": "u9"}), "u9")
 
@@ -7269,8 +7274,7 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         entries = pushed[0]["entries"]
         self.assertEqual(len(entries), 2)
         pr = entries[1]
-        self.assertEqual(pr["uuid"],
-                         "pr-link:https://github.com/o/r/pull/230:2026-07-01T10:05:00Z")
+        self.assertEqual(pr["uuid"], "pr-link:https://github.com/o/r/pull/230")
         self.assertEqual(pr["text"], "")
         self.assertEqual(pr["blocks"], [
             {"t": "pr_link", "url": "https://github.com/o/r/pull/230",

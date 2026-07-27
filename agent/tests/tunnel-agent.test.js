@@ -319,8 +319,12 @@ test("entryBlocks: compact_boundary and pr-link entries become status marker blo
   assert.deepEqual(entryBlocks(pr, BLOCK_CAPS_LIVE),
     [{ t: "pr_link", url: "https://github.com/o/r/pull/230", number: 230, repo: "o/r" }]);
   // pr-link entries carry no uuid: the tail synthesizes a stable id so the
-  // chat's id-keyed merge doesn't drop them.
-  assert.equal(entryId(pr), "pr-link:https://github.com/o/r/pull/230:2026-07-17T04:25:18.299Z");
+  // chat's id-keyed merge doesn't drop them. It keys on the URL ALONE, so the
+  // same PR re-stamped in a later turn's preamble collapses onto one entry.
+  assert.equal(entryId(pr), "pr-link:https://github.com/o/r/pull/230");
+  assert.equal(entryId({ ...pr, timestamp: "2026-07-17T09:00:00.000Z" }), entryId(pr),
+    "a re-stamp of the same PR must share the first one's id");
+  assert.notEqual(entryId({ ...pr, prUrl: "https://github.com/o/r/pull/231" }), entryId(pr));
   assert.equal(entryId({ type: "user", uuid: "u9" }), "u9");
   assert.equal(entryBlocks({ type: "pr-link" }, BLOCK_CAPS_LIVE), null);
 });

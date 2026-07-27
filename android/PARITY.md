@@ -265,7 +265,8 @@ those are marked `[MODEL]`.
   markdown open-by-default (`block.plan`), any tool's human `description` beside the arg
   (`block.desc`), AskUserQuestion cards titled with the question text, plus two status markers:
   `compact_boundary` ("Context compacted (auto) — 123.4k → 5.9k tokens") and `pr_link` ("Opened PR
-  #N", linked, consecutive duplicates folded — synthesized ids, `entryId`). Android decodes these to
+  #N", linked, one marker per URL at its first sighting — Claude Code re-stamps pr-links every turn,
+  so a port that renders them per-entry shows the same PR ~6 times). Android decodes these to
   `UnknownBlock`/ignored keys today (safe degrade); port the fields onto `model/Models.kt`'s
   `ToolUseBlock` + new marker blocks, build items in `core/ChatItems.kt`, render in `ChatScreen`.
 - P1 **Blocking TUI dialogs (`session.panePrompt`).** The agent now reports the tool-permission /

@@ -270,6 +270,35 @@ test("buildItems/render: pr_link blocks -> one linked marker, consecutive duplic
   assert.match(html, /Opened PR #230 — o\/r/);
 });
 
+// Claude Code re-stamps a session's PR links in the metadata preamble it writes
+// at the top of EVERY user turn, so the repeats are separated by whole turns
+// rather than adjacent — a consecutive-only fold left one marker per re-stamp
+// (measured: 1154 markers for 195 real PRs across the corpus). Shape below is
+// taken from a real transcript.
+test("buildItems: a pr_link re-stamped in later turns marks only its first occurrence", () => {
+  const pr = (n) => ({ t: "pr_link", url: "https://github.com/o/r/pull/" + n, number: n, repo: "o/r" });
+  const items = buildItems([
+    { id: "u1", role: "user", blocks: [{ t: "text", text: "open a pr" }] },
+    { id: "p1", role: "assistant", blocks: [pr(230)] },
+    { id: "a1", role: "assistant", blocks: [{ t: "text", text: "opened it" }] },
+    { id: "u2", role: "user", blocks: [{ t: "text", text: "now another" }] },
+    { id: "p2", role: "assistant", blocks: [pr(230)] },   // re-stamp, a turn later
+    { id: "p3", role: "assistant", blocks: [pr(231)] },   // a genuinely new PR
+    { id: "a2", role: "assistant", blocks: [{ t: "text", text: "done" }] },
+    { id: "p4", role: "assistant", blocks: [pr(230)] },   // re-stamped again
+    { id: "p5", role: "assistant", blocks: [pr(231)] },
+  ]);
+  const prs = items.filter((i) => i.kind === "pr");
+  assert.deepEqual(prs.map((i) => i.number), [230, 231],
+    "one marker per PR, in the order each was first seen");
+  // The surviving marker is the FIRST sighting — where the PR actually landed
+  // in the conversation, not wherever the preamble last repeated it.
+  assert.equal(items.indexOf(prs[0]), 1);
+  // Nothing else is disturbed.
+  assert.deepEqual(items.filter((i) => i.kind === "msg").map((i) => i.text),
+    ["open a pr", "opened it", "now another", "done"]);
+});
+
 test("panePromptHtml: renders the TUI dialog with its context and numbered picks", () => {
   const html = panePromptHtml({
     prompt: "Do you want to proceed?",

@@ -929,8 +929,16 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Two more turns-about-the-session become status markers: a `system`/`compact_boundary` entry →
   `{t:"compact_boundary", trigger, preTokens, postTokens}` (the chat says a compaction ran and what
   it cost), and a `pr-link` entry → `{t:"pr_link", url, number, repo}` (where in the conversation the
-  PR landed; linked, consecutive duplicates folded). pr-link entries carry no uuid, so the feeds
-  synthesize a stable id (`_entry_id`/`entryId`) — the client merge drops id-less entries.
+  PR landed, linked). pr-link entries carry no uuid, so the feeds synthesize a stable id
+  (`_entry_id`/`entryId`) — the client merge drops id-less entries.
+- **A PR marks its FIRST sighting only.** Claude Code re-stamps a session's pr-links in the metadata
+  preamble it writes atop every user turn (beside `last-prompt`/`ai-title`/`mode`/`permission-mode`),
+  so one PR yields ~6 entries differing only in `timestamp` — 1163 entries for 195 real PRs across the
+  corpus. They re-record one fact, so the synthesized id keys on the **URL alone** (the tail merge
+  then collapses them) and `buildItems` dedups by URL over the whole conversation. Deduping in
+  `buildItems` is what covers the archive/ended view, which renders stored entries with no merge step.
+  A first sighting lands within ~6 entries of the `gh pr create` that opened it, so it is the true
+  spot. Folding only *consecutive* repeats left the rest to render a marker apiece.
 - Tests: `TestEntryBlocks` in `agent/tests/test_hub_agent.py`, the tool-detail/marker cases in
   `agent/tests/tunnel-agent.test.js` and `turma/tests/chat.test.js`.
 - **Still-queued prompts ride beside the entries, not inside them**: a message typed mid-turn only
