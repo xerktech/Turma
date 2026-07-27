@@ -3127,6 +3127,51 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.registry, [])
         self.assertEqual(got, [])   # bailed before spending a download
 
+    def test_localize_migrated_cwd(self):
+        """The target remaps a source worktree path onto its own REPOS_ROOT
+        (differing mounts), passes an already-local path through untouched, and
+        leaves a non-worktree/foreign path unchanged for the caller to reject."""
+        sm = self._manager()
+        wt_tail = os.path.join("Turma", "c59fe")
+        local = os.path.join(ha.WORKTREES_ROOT, "Turma", "c59fe")
+        # A source host mounting REPOS_ROOT elsewhere (WSL-native, container).
+        self.assertEqual(
+            sm._localize_migrated_cwd("/home/mhabeeb/git/.turma/worktrees/" +
+                                      wt_tail.replace(os.sep, "/")),
+            local)
+        # Already under this host's REPOS_ROOT -> unchanged.
+        self.assertEqual(sm._localize_migrated_cwd(local), local)
+        # No recognizable worktree tail -> unchanged (rejected downstream).
+        self.assertEqual(sm._localize_migrated_cwd("/home/me/elsewhere"),
+                         "/home/me/elsewhere")
+
+    def test_import_remaps_a_foreign_repos_root(self):
+        """A source mounting REPOS_ROOT at a DIFFERENT path ships its own
+        absolute worktree path; the target remaps the .turma/worktrees tail onto
+        its OWN REPOS_ROOT and resumes there, instead of wedging forever in
+        `importing` by rejecting it as foreign (the real-fleet migration bug)."""
+        foreign = "/home/otheruser/src/.turma/worktrees/Turma/c59fe"
+        local = os.path.join(ha.WORKTREES_ROOT, "Turma", "c59fe")
+        # Pack a transcript (its bytes are slug-agnostic) to hand to the target.
+        src_path = self._write_transcript(local, "transR")
+        blob = self._manager()._pack_transcript(src_path)
+        shutil.rmtree(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(local)))
+
+        sm = self._manager()
+        sm._worktree_add = mock.Mock()
+        sm._migration_download = lambda mid: blob
+        cmd = {"type": "importSession", "cmdId": "cR", "migrationId": "migR",
+               "transcriptId": "transR", "cwd": foreign, "repo": "Turma"}
+        with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
+            sm.import_session(cmd)
+        self.assertEqual(len(sm.registry), 1)
+        # Resumed at the LOCAL worktree path, not the foreign one.
+        self.assertEqual(sm.registry[0]["worktreePath"], local)
+        # The transcript landed under the LOCAL slug so claude --resume resolves.
+        self.assertTrue(os.path.isfile(os.path.join(
+            ha.PROJECTS_ROOT, ha._project_slug(local), "transR.jsonl")))
+        self.assertEqual(sm._launch_tmux.call_args.kwargs["resume_id"], "transR")
+
 
 class TestRegistryPersistence(ManagerMixin, unittest.TestCase):
     def test_save_load_round_trip(self):

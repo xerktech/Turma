@@ -7158,7 +7158,11 @@ class SessionManager:
         the conversation) is preserved, so the target continues in place."""
         migration_id = cmd.get("migrationId")
         transcript_id = cmd.get("transcriptId")
-        cwd = cmd.get("cwd")
+        # The source ships its OWN absolute worktree path; remap it onto this
+        # host's REPOS_ROOT so a fleet with differing mounts (WSL-native vs
+        # container) can move sessions. Both the slug and the re-created worktree
+        # below use this localized cwd, so they stay self-consistent.
+        cwd = self._localize_migrated_cwd(cmd.get("cwd"))
         if not migration_id or not VALID_MIGRATION_ID_RE.fullmatch(migration_id):
             log(f"importSession: bad migration id {migration_id!r}")
             return
@@ -8119,6 +8123,39 @@ class SessionManager:
             if len(rel) == 1 and rel[0] in repo_names:
                 return (rel[0], "repo dir", False)
         return None
+
+    def _localize_migrated_cwd(self, cwd):
+        """Remap a migrated session's origin worktree path from the SOURCE host's
+        REPOS_ROOT onto THIS host's, so a fleet whose hosts mount their git root
+        at DIFFERENT paths (a WSL-native agent at /home/<user>/git vs a container
+        at /mnt/data/Docker/git) can still move sessions between them.
+
+        XERK-101 originally assumed one shared REPOS_ROOT across the fleet, so it
+        handed the target the source's absolute worktree path verbatim — which
+        `_resumable_cwd_class` then rejected as foreign whenever the mounts
+        differed, wedging every such migration in `importing` forever.
+
+        A migration is always a worktree session (the hub's /migrate guard
+        rejects root), so the path always ends `.../.turma/worktrees/<repo>/<dir>`
+        — a REPOS_ROOT-independent tail that rebuilds under the LOCAL
+        WORKTREES_ROOT. Returns the local-equivalent path, or the input unchanged
+        when it already sits under this host's REPOS_ROOT (the same-mount fleet,
+        untouched) or carries no recognizable worktree tail (left for the caller
+        to reject as foreign)."""
+        if not cwd:
+            return cwd
+        norm = os.path.normpath(cwd)
+        local_root = os.path.normpath(REPOS_ROOT)
+        if norm == local_root or norm.startswith(local_root + os.sep):
+            return norm  # already under this host's REPOS_ROOT — nothing to remap
+        marker = os.sep + os.path.join(".turma", "worktrees") + os.sep
+        idx = norm.find(marker)
+        if idx < 0:
+            return cwd  # not a worktree path we recognize; caller rejects it
+        rel = norm[idx + len(marker):].split(os.sep)
+        if len(rel) != 2 or not rel[0] or not rel[1]:
+            return cwd  # not <repo>/<dir>; leave it for the caller to reject
+        return os.path.join(WORKTREES_ROOT, rel[0], rel[1])
 
     def _find_transcript_dir(self, transcript_id):
         """The PROJECTS_ROOT/<slug> dir holding <transcript_id>.jsonl, or None —
