@@ -600,6 +600,10 @@
   .chat-question .q-opt-pick { font: inherit; font-size: 12px; padding: 4px 12px; border-radius: 999px;
     border: 1px solid var(--accent); background: var(--surface); color: var(--accent); cursor: pointer; }
   .chat-question .q-opt-pick:hover { background: var(--accent); color: #fff; }
+  /* The option the TUI's own cursor is on, for a pane-scraped dialog. */
+  .chat-question .q-opt-pick.sel { background: var(--accent); color: #fff; }
+  /* A pane dialog's context (the command being asked about, or the plan). */
+  .chat-question .q-pane-detail { margin: 0 0 8px; max-height: 180px; }
   .chat-question .q-opt-desc { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
   .chat-question .q-prev-wrap { margin-top: 6px; }
   .chat-question .q-prev-wrap summary { font-size: 11px; color: var(--accent); cursor: pointer; }
@@ -1226,6 +1230,13 @@ function prBadgeHtml(pr) {
 function liveState(sess, host, now) {
   const s = sess.session;
   if (s && s.question) return { kind: "waiting", label: "waiting for your answer", question: s.question };
+  // A blocking TUI dialog (tool permission / plan approval) is the same thing
+  // for the operator. Checked ahead of the transcript/paneBusy reads because
+  // neither can see it: nothing about the dialog reaches the transcript, and
+  // while it is up the pane shows no interrupt hint — so the card would read
+  // "idle" for a session that is actually waiting on a human.
+  if (s && s.panePrompt && s.panePrompt.prompt)
+    return { kind: "waiting", label: "waiting for your answer", question: s.panePrompt.prompt };
   if (!s || s.transcriptAgeSec == null) return { kind: "idle", label: "no transcript yet" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   const working = s.paneBusy != null

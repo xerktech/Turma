@@ -330,6 +330,11 @@
   // Text of a question we just answered; suppresses re-showing its box while an
   // in-flight heartbeat still reports it as pending (cleared once it's gone).
   let answeredQuestion = null;
+  // The TUI's blocking dialog (permission / plan approval) is on screen, and
+  // the prompt text of one just answered — same roles as the two above, for the
+  // pane-scraped dialog rather than the hook-intercepted question.
+  let panePromptActive = false;
+  let answeredPanePrompt = null;
   // When Stop was clicked, or 0. See composeBusy().
   let stopPendingAt = 0;
   // Until when the compose button is showing a transient failure message.
@@ -965,6 +970,9 @@
     // interrupt the turn and destroy the question, which is exactly the wrong
     // thing when the operator only wanted to type a custom response (XERK-21).
     if (questionActive) { stopPendingAt = 0; return false; }
+    // Same for the TUI's own blocking dialog: it is answered with its buttons,
+    // and a Stop there would cancel the decision rather than a running turn.
+    if (panePromptActive) { stopPendingAt = 0; return false; }
     if (!liveStatus) { stopPendingAt = 0; return false; }
     // A clicked Stop only lands on the agent's next beat, so the pane keeps
     // reporting the turn for a second or two afterwards. Hide Stop immediately
@@ -1431,11 +1439,50 @@
       head + "</div>" + body + "</div>";
   }
 
+  // The blocking choice dialog the session's TUI is showing — a tool-permission
+  // request or a plan approval (agent parse_pane_prompt). It never reaches the
+  // transcript, and it suppresses the pane's busy hint, so before this the
+  // session read IDLE while it sat waiting on a human and the only way to
+  // answer was the raw terminal. Rendered in the same box as a pending
+  // AskUserQuestion: a session is never blocked on both (one blocks in the
+  // ask.py hook, the other in the TUI), and one "waiting on you" surface is
+  // what the operator wants.
+  function panePromptHtml(p) {
+    const opts = (p.options || []).map((o) =>
+      '<div class="q-opt-card"><div class="q-opt-head">' +
+      '<span class="q-opt-label">' + esc(o.label || "") + "</span>" +
+      '<button class="q-opt-pick' + (o.selected ? " sel" : "") +
+      '" data-num="' + esc(o.number) + '">' + esc(o.number) + ". Choose</button>" +
+      "</div></div>").join("");
+    return '<div class="q-meta"><span class="q-chip">waiting</span></div>' +
+      '<div class="q-text">' + esc(p.prompt || "") + "</div>" +
+      (p.detail ? '<pre class="q-prev q-pane-detail">' + esc(p.detail) + "</pre>" : "") +
+      '<div class="q-opts">' + opts + "</div>";
+  }
+
   function updateQuestion(s) {
     const box = $("chatQuestion");
     if (!box) return;
     const sess2 = s && s.session;
     const q = sess2 && sess2.question;
+    // No AskUserQuestion pending: a TUI dialog may still be blocking the turn.
+    if (!q) {
+      const p = sess2 && sess2.panePrompt;
+      const valid = p && p.prompt && p.options && p.options.length;
+      panePromptActive = !!valid && p.prompt !== answeredPanePrompt;
+      if (!panePromptActive) { answeredPanePrompt = null; }
+      updateComposeAction();
+      if (panePromptActive) {
+        questionActive = false;
+        box.hidden = false;
+        box.innerHTML = panePromptHtml(p);
+        box.querySelectorAll(".q-opt-pick").forEach((b) => b.addEventListener("click", () =>
+          answerPanePrompt(parseInt(b.getAttribute("data-num"), 10), p.prompt)));
+        return;
+      }
+    } else {
+      panePromptActive = false;
+    }
     // Prefer the rich options ({label, description?, preview?}); fall back to the
     // legacy label strings so an older agent still renders a pick list.
     const rich = (sess2 && sess2.questionOptionsRich) || null;
@@ -1484,6 +1531,30 @@
     } else {
       box.querySelectorAll(".q-opt-pick").forEach((b) => b.addEventListener("click", () =>
         answerQuestion(parseInt(b.getAttribute("data-idx"), 10), null)));
+    }
+  }
+
+  // Answer the TUI's blocking dialog by its option number — the agent re-reads
+  // the pane and drops the answer if the dialog has moved on (see
+  // answer_pane_prompt), so a click made against a stale beat can't type a
+  // stray digit into a live composer.
+  async function answerPanePrompt(optionNumber, prompt) {
+    if (!hostKey || !sessionId || !Number.isInteger(optionNumber)) return;
+    // Hide on click like the question box: the agent's next beat is a moment
+    // away, and leaving the dialog up reads as if the click didn't register.
+    answeredPanePrompt = prompt || null;
+    panePromptActive = false;
+    const box = $("chatQuestion"); if (box) { box.hidden = true; box.innerHTML = ""; }
+    updateComposeAction();
+    try {
+      const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/pane-prompt", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ optionNumber }),
+      });
+      if (!r.ok) throw new Error(String(r.status));
+    } catch {
+      answeredPanePrompt = null;   // let the next beat re-surface it
+      actionFailed("Couldn't answer");
     }
   }
 
@@ -1712,6 +1783,7 @@
     if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; }
     hostKey = null; sessionId = null; sess = null; agent = null;
     buffer = []; queuedPrompts = []; liveTurn = ""; liveStatus = null; questionActive = false; answeredQuestion = null;
+    panePromptActive = false; answeredPanePrompt = null;
     stopPendingAt = 0; actionFailUntil = 0; modelSwitchPending = null; modeSwitchPending = null;
     lastHtml = null; repaintDeferred = false;
     updateLiveStatus(); // hide the pinned bar when the view closes
@@ -1753,7 +1825,7 @@
     module.exports = {
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
-      agentsHtml, optionCardHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
+      agentsHtml, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
       isBusy, updateComposeAction, isToolBullet,
       // Drive the real `turn`-frame classifier (see applyTurn): the ws onmessage
       // hands it frame.text verbatim, so the flicker tests exercise it directly.
@@ -1766,6 +1838,7 @@
       __setModelSwitchPending: (p) => { modelSwitchPending = p; },
       __setModeSwitchPending: (p) => { modeSwitchPending = p; },
       __setQuestionActive: (v) => { questionActive = v; },
+      __setPanePromptActive: (v) => { panePromptActive = v; },
       __setVerbosity: (v) => { verbosity = v; },
       __setNoExpand: (v) => { noExpand = v; },
       __setBuffer: (b) => { buffer = b; },

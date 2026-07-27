@@ -1335,18 +1335,21 @@ class TestPaneBusy(unittest.TestCase):
 
 class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
     """session_report surfaces the (single-capture) pane probe as
-    report['paneBusy'] + report['modeActual'] on every return path (even
-    before any transcript exists)."""
+    report['paneBusy'] + report['modeActual'] + report['panePrompt'] on every
+    return path (even before any transcript exists)."""
 
     def test_pane_reads_reported_with_transcript(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, [{"type": "assistant",
                             "message": {"content": [{"type": "text", "text": "hi"}]}}])
+        prompt = {"prompt": "Do you want to proceed?",
+                  "options": [{"number": 1, "label": "Yes", "selected": True}]}
         with mock.patch.object(ha, "_pane_status",
-                               return_value=(True, "plan")) as ps:
+                               return_value=(True, "plan", prompt)) as ps:
             rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
         self.assertIs(rep["paneBusy"], True)
         self.assertEqual(rep["modeActual"], "plan")
+        self.assertEqual(rep["panePrompt"], prompt)
         # (tmux_name, state): state carries _stable_pane_busy's edge memory.
         self.assertEqual(ps.call_args[0][0], "agent-abc")
         self.assertIsInstance(ps.call_args[0][1], dict)
@@ -1354,10 +1357,11 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
     def test_pane_reads_reported_without_transcript(self):
         # No transcript yet — the pane reads must still ride the early-return
         # path.
-        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto")):
+        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None)):
             rep = ha.session_report("/absent/worktree", {}, "agent-abc")
         self.assertIs(rep["paneBusy"], False)
         self.assertEqual(rep["modeActual"], "auto")
+        self.assertIsNone(rep["panePrompt"])
 
     def test_pane_reads_default_none_without_tmux(self):
         path = os.path.join(self.proj, "s.jsonl")
@@ -1366,6 +1370,7 @@ class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, {})  # no tmux_name
         self.assertIsNone(rep["paneBusy"])
         self.assertIsNone(rep["modeActual"])
+        self.assertIsNone(rep["panePrompt"])
 
 
 class TestStablePaneBusy(unittest.TestCase):
@@ -4544,6 +4549,119 @@ class TestPollPrComments(ManagerMixin, unittest.TestCase):
         self.assertIn("knew", sess["prCommentBase"][self.URL])
 
 
+# Verbatim `tmux capture-pane -p` output from a live Claude Code 2.1.220
+# session, trimmed to the dialog region — the two blocking dialogs
+# parse_pane_prompt exists to read. Kept as real captures rather than
+# hand-written strings: the wordings, glyphs and blank-line placement are the
+# contract, and inventing them is how a parser passes its tests and fails a pane.
+PANE_PERMISSION_DIALOG = """\
+● Running 1 shell command…
+  ⎿  $ touch /tmp/permtest-marker
+
+────────────────────────────────────────────────────────────────────
+ Bash command
+
+   touch /tmp/permtest-marker
+   Create marker file in /tmp
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to tmp/ from this project
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain
+"""
+
+PANE_PLAN_DIALOG = """\
+  ────────────────────────────────────────────────────────────────────
+   Ready to code?
+
+   Here is Claude's plan:
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+   Plan
+
+   I will add one test.
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
+  ────────────────────────────────────────────────────────────────────
+   Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+   ❯ 1. Yes, and use auto mode
+     2. Yes, manually approve edits
+     3. No, refine with Ultraplan on Claude Code on the web
+     4. Tell Claude what to change
+        shift+tab to approve with this feedback
+"""
+
+# The same session with no dialog up: the composer is live, so the mode footer
+# is on screen. This is the shape that must NEVER parse as a dialog.
+PANE_IDLE_COMPOSER = """\
+● Done — PR #230 is up.
+
+  1. first thing
+  2. second thing
+  Which one?
+────────────────────────────────────────────────────────────────────
+❯ Try "edit <filepath> to..."
+────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents
+"""
+
+
+class TestAnswerPanePrompt(ManagerMixin, unittest.TestCase):
+    """Answering the TUI's blocking dialog from the chat page: type the option
+    digit, but only after re-reading the pane — the click was made against a
+    heartbeat that is up to a beat stale."""
+
+    def make_manager(self):
+        sm = super().make_manager()
+        self.run_calls.clear()
+        return sm
+
+    def _session(self, sm, status="running"):
+        sm.registry = [{"id": "abcde", "status": status, "tmuxName": "agent-abcde"}]
+
+    def _answer(self, sm, number, cap=PANE_PERMISSION_DIALOG):
+        with mock.patch.object(ha, "_capture_pane", return_value=cap):
+            sm.answer_pane_prompt("abcde", number)
+
+    def test_types_the_option_digit(self):
+        sm = self.make_manager()
+        self._session(sm)
+        self._answer(sm, 2)
+        self.assertEqual(
+            self.run_calls, [["tmux", "send-keys", "-t", "agent-abcde", "2"]])
+
+    def test_stale_click_is_dropped_when_the_dialog_is_gone(self):
+        # The whole safety property: without the re-read this would type a bare
+        # "1" into the live composer, silently prepending a stray character to
+        # the operator's next message.
+        sm = self.make_manager()
+        self._session(sm)
+        self._answer(sm, 1, cap=PANE_IDLE_COMPOSER)
+        self.assertEqual(self.run_calls, [])
+
+    def test_number_not_on_screen_is_dropped(self):
+        sm = self.make_manager()
+        self._session(sm)
+        self._answer(sm, 4)          # the permission dialog offers 1-3
+        self.assertEqual(self.run_calls, [])
+
+    def test_noop_for_stopped_or_unknown_session(self):
+        sm = self.make_manager()
+        self._session(sm, status="stopped")
+        self._answer(sm, 1)
+        sm.registry = []
+        self._answer(sm, 1)
+        self.assertEqual(self.run_calls, [])
+
+    def test_non_numeric_answer_is_dropped(self):
+        sm = self.make_manager()
+        self._session(sm)
+        self._answer(sm, "; rm -rf /")
+        self.assertEqual(self.run_calls, [])
+
+
 class TestInterrupt(ManagerMixin, unittest.TestCase):
     """Stop the turn a running session has in flight: a single Escape into its
     TUI, which cancels the generation/tool call and leaves the session running
@@ -4905,6 +5023,65 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         self._session(sm, perm="auto", status="stopped")
         sm.set_mode("abcde", "plan")
         self.assertEqual(self.run_calls, [])
+
+
+class TestParsePanePrompt(unittest.TestCase):
+    """Reading the TUI's blocking choice dialog off the pane. It never reaches
+    the transcript and it suppresses the busy hint, so without this read a
+    session blocked on a human reports idle."""
+
+    def test_permission_dialog(self):
+        p = ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)
+        self.assertEqual(p["prompt"], "Do you want to proceed?")
+        self.assertEqual(
+            [(o["number"], o["label"], o["selected"]) for o in p["options"]],
+            [(1, "Yes", True),
+             (2, "Yes, and always allow access to tmp/ from this project", False),
+             (3, "No", False)])
+        # The context is the fenced block above the question — the tool and the
+        # exact command it wants to run, which is the whole decision.
+        self.assertEqual(
+            p["detail"],
+            "Bash command\ntouch /tmp/permtest-marker\nCreate marker file in /tmp")
+
+    def test_plan_dialog(self):
+        p = ha.parse_pane_prompt(PANE_PLAN_DIALOG)
+        self.assertEqual(
+            p["prompt"],
+            "Claude has written up a plan and is ready to execute. Would you like to proceed?")
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3, 4])
+        self.assertEqual(p["options"][0]["label"], "Yes, and use auto mode")
+        self.assertTrue(p["options"][0]["selected"])
+        # The plan body sits one rule further up than a permission dialog's
+        # block; the same walk has to reach it.
+        self.assertEqual(p["detail"], "Plan\nI will add one test.")
+
+    def test_idle_composer_is_never_a_dialog(self):
+        # A numbered list in the conversation, a "?" line above it, and the
+        # composer live: the mode footer is what says nothing is blocking.
+        self.assertIsNone(ha.parse_pane_prompt(PANE_IDLE_COMPOSER))
+        self.assertIsNone(ha.parse_pane_prompt(""))
+        self.assertIsNone(ha.parse_pane_prompt(None))
+
+    def test_requires_cursor_numbering_and_a_question(self):
+        # No ❯ cursor -> not a live picker.
+        self.assertIsNone(ha.parse_pane_prompt(
+            "Do you want to proceed?\n 1. Yes\n 2. No\n"))
+        # Cursor and numbering, but no question line above.
+        self.assertIsNone(ha.parse_pane_prompt(
+            "some prose\n ❯ 1. Yes\n   2. No\n"))
+        # Numbering that doesn't start at 1 (a list continuing from off-screen).
+        self.assertIsNone(ha.parse_pane_prompt(
+            "Proceed?\n ❯ 2. Yes\n   3. No\n"))
+        # A single option is a list, not a choice.
+        self.assertIsNone(ha.parse_pane_prompt("Proceed?\n ❯ 1. Yes\n"))
+
+    def test_a_dialog_suppresses_the_busy_hint(self):
+        # This is WHY the read is needed: while the dialog is up the pane shows
+        # no interrupt hint and no mode footer, so paneBusy reads False — the
+        # session looks idle while it is actually blocked on a human.
+        self.assertFalse(ha._busy_from_capture(PANE_PERMISSION_DIALOG))
+        self.assertIsNone(ha.parse_pane_mode(PANE_PERMISSION_DIALOG))
 
 
 class TestParsePaneMode(unittest.TestCase):

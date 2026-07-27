@@ -2717,6 +2717,21 @@ const server = http.createServer(async (req, res) => {
         const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });
       }
+      // POST /api/agents/<host>/sessions/<id>/pane-prompt -> answer the blocking
+      // choice dialog the session's TUI is showing (a tool-permission request or
+      // a plan approval, reported as session.panePrompt). Body: {optionNumber},
+      // the 1-based number the dialog itself displays — the agent types that
+      // digit, and re-reads the pane first so a click made against a stale beat
+      // is dropped rather than typed into a live composer.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "pane-prompt") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const optionNumber = Number.isInteger(body.optionNumber) ? body.optionNumber : 0;
+        if (optionNumber < 1 || optionNumber > 9) {
+          return json(res, 400, { error: "optionNumber 1-9 required" });
+        }
+        const cmdId = queueCommand(key, { type: "answerPanePrompt", sessionId, optionNumber });
+        return json(res, 200, { ok: true, cmdId });
+      }
       // GET /api/agents/<host>/sessions/<id>/history -> that session's recent
       // transcript. Serves a fresh cached result (see ingestHistory) or, on a
       // cache miss/stale entry, queues a fetch and reports it pending; a

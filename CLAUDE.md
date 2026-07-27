@@ -368,6 +368,22 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   bridge (see "AskUserQuestion answer bridge"), which drops a `<sessionId>.req.json` under
   `~/.turma/questions/` while the call blocks. `session_report` reads it and the answer rides back as
   `<sessionId>.ans.json` — no pane scraping. A transcript scan is the already-answered fallback.
+- **`panePrompt`** — the TUI's OTHER blocking dialog (tool-permission request / plan approval): no hook
+  intercepts it and it writes nothing to the transcript, and while it is up the pane shows neither the
+  interrupt hint nor the mode footer — so `paneBusy` read False and a session blocked on a human read
+  **idle**. `parse_pane_prompt` reads it off the mode marker's capture as
+  `{prompt, options:[{number,label,selected}], detail}`.
+  - Nothing keys on the wording (it differs per dialog). A line run is a dialog only with ALL of: options
+    numbered 1..N (N≥2), exactly one carrying the `❯` cursor, a `?` line directly above, and **no mode
+    footer below** — the footer rides the composer, which a dialog replaces, so its absence is what
+    separates a live dialog from transcript text shaped like one. `detail` is the block above the question
+    (command + description, or the plan body): blanks never close it, a rule does.
+  - Answered by `answerPanePrompt` → `answer_pane_prompt`, typing the option digit — but it **re-reads the
+    pane first** and drops the answer unless that number is on screen NOW: the click was made against a
+    beat-old heartbeat, and a stray digit typed into a live composer prepends itself to the next message.
+  - Both `liveState`s check it ahead of the busy read, so the card reads "waiting for your answer". Tests:
+    `TestParsePanePrompt`/`TestAnswerPanePrompt` (verbatim `capture-pane` output from live dialogs), the
+    `pane-prompt` cases in `server.test.js`, the `panePromptHtml` cases in `chat.test.js`.
 
 #### PR status
 
