@@ -926,10 +926,13 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Tooling payloads ride the same queue (a background task finishing mid-turn enqueues its whole
   `<task-notification>` XML), so display filtering happens at REPORT time (`_queued_display` /
   `queuedDisplay`), never at fold time (which would desync the positional dequeues).
-- Blocks ride the live tail (tight per-block caps) and on-demand `history`
-  (`_entry_blocks(entry, BLOCK_CAPS_FULL)`, looser). They are the one place inclusion widens: a
-  tool_result-only turn, dropped by `_entry_text`, is kept when it has blocks. The heartbeat preview
-  (`transcript_tail`) and archive (`_archive_deltas`) stay text-only.
+- Blocks ride the live tail (tight per-block caps), on-demand `history` and the archive push
+  (`_entry_blocks(entry, BLOCK_CAPS_FULL)`, looser caps on the latter two — the archived copy is the
+  fullest, with no `/history` to expand into). They are the one place inclusion widens: a
+  tool_result-only turn, dropped by `_entry_text`, is kept when it has blocks. Only the heartbeat
+  preview (`transcript_tail`) stays text-only. Archive rows carry `_entry_id` (not the raw uuid), so
+  a uuid-less pr-link marker keys identically to the live feeds; already-archived bytes are never
+  re-parsed, so transcripts archived before a block existed keep their older shape.
 
 ### Archive sync
 
