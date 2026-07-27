@@ -21,7 +21,7 @@ process.env.CLAUDE_PROJECTS_ROOT = PROJECTS_ROOT;
 process.env.DEVICE_NAME = "testhost";
 process.env.TURMA_TOKEN = "x";
 
-const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, BLOCK_CAPS_LIVE } = require("../tunnel-agent.js");
+const { projectSlug, transcriptTail, entryText, entryBlocks, entryRole, entryToolSource, newestTranscript, sessionTranscript, pokeHeartbeat, parseTaskNotification, parseLocalCommand, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE } = require("../tunnel-agent.js");
 
 const ESC = String.fromCharCode(27); // ANSI escape, kept out of the source as a literal
 
@@ -266,6 +266,63 @@ test("entryBlocks/entryText/entryRole: the away recap surfaces; other system ent
   // An empty recap (hint only) drops.
   assert.equal(entryBlocks({ type: "system", subtype: "away_summary",
     content: " (disable recaps in /config)" }, BLOCK_CAPS_LIVE), null);
+});
+
+// Mirror of test_hub_agent.py TestEntryBlocks' tool-detail cases — keep in lockstep.
+test("entryBlocks: known tool calls carry their reviewable payload (edit/content/plan/desc)", () => {
+  const [edit] = entryBlocks({ type: "assistant", message: { content: [
+    { type: "tool_use", id: "toolu_e", name: "Edit", input: {
+      file_path: "/repo/a.py", old_string: "x = 1", new_string: "x = 2", replace_all: true } },
+  ] } }, BLOCK_CAPS_LIVE);
+  assert.deepEqual(edit, { t: "tool_use", name: "Edit", input: "/repo/a.py", id: "toolu_e",
+    edit: { old: "x = 1", new: "x = 2", replaceAll: true } });
+
+  const big = "z".repeat(BLOCK_CAPS_LIVE.result + 100);
+  const [clippedEdit] = entryBlocks({ type: "assistant", message: { content: [
+    { type: "tool_use", name: "Edit", input: { file_path: "/a", old_string: "x", new_string: big } },
+  ] } }, BLOCK_CAPS_LIVE);
+  assert.equal(clippedEdit.edit.new.length, BLOCK_CAPS_LIVE.result);
+  assert.equal(clippedEdit.truncated, true);
+
+  const [write] = entryBlocks({ type: "assistant", message: { content: [
+    { type: "tool_use", name: "Write", input: { file_path: "/repo/new.txt", content: "hello\nworld" } },
+  ] } }, BLOCK_CAPS_LIVE);
+  assert.equal(write.input, "/repo/new.txt");
+  assert.equal(write.content, "hello\nworld");
+
+  const [plan] = entryBlocks({ type: "assistant", message: { content: [
+    { type: "tool_use", name: "ExitPlanMode", input: { plan: "## Plan\n1. do it", allowedPrompts: [] } },
+  ] } }, BLOCK_CAPS_LIVE);
+  assert.equal(plan.plan, "## Plan\n1. do it");
+
+  const [bash] = entryBlocks({ type: "assistant", message: { content: [
+    { type: "tool_use", name: "Bash", input: { command: "ls", description: "List files" } },
+  ] } }, BLOCK_CAPS_LIVE);
+  assert.equal(bash.input, "ls");
+  assert.equal(bash.desc, "List files");
+
+  const [ask] = entryBlocks({ type: "assistant", message: { content: [
+    { type: "tool_use", name: "AskUserQuestion", input: {
+      questions: [{ question: "Ship it?", options: [{ label: "yes" }] }, { question: "Which env?" }] } },
+  ] } }, BLOCK_CAPS_LIVE);
+  assert.equal(ask.input, "Ship it? · Which env?");
+});
+
+// Mirror of test_hub_agent.py TestEntryBlocks' marker cases — keep in lockstep.
+test("entryBlocks: compact_boundary and pr-link entries become status marker blocks", () => {
+  assert.deepEqual(entryBlocks({ type: "system", subtype: "compact_boundary", uuid: "u1",
+    content: "Conversation compacted",
+    compactMetadata: { trigger: "auto", preTokens: 123380, postTokens: 5920 } }, BLOCK_CAPS_LIVE),
+    [{ t: "compact_boundary", trigger: "auto", preTokens: 123380, postTokens: 5920 }]);
+  const pr = { type: "pr-link", prNumber: 230, prUrl: "https://github.com/o/r/pull/230",
+    prRepository: "o/r", timestamp: "2026-07-17T04:25:18.299Z" };
+  assert.deepEqual(entryBlocks(pr, BLOCK_CAPS_LIVE),
+    [{ t: "pr_link", url: "https://github.com/o/r/pull/230", number: 230, repo: "o/r" }]);
+  // pr-link entries carry no uuid: the tail synthesizes a stable id so the
+  // chat's id-keyed merge doesn't drop them.
+  assert.equal(entryId(pr), "pr-link:https://github.com/o/r/pull/230:2026-07-17T04:25:18.299Z");
+  assert.equal(entryId({ type: "user", uuid: "u9" }), "u9");
+  assert.equal(entryBlocks({ type: "pr-link" }, BLOCK_CAPS_LIVE), null);
 });
 
 // Mirror of test_hub_agent.py TestToolReferenceResult — keep in lockstep.

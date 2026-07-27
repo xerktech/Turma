@@ -259,6 +259,15 @@ those are marked `[MODEL]`.
   "!", stderr wins only when non-empty); the `system/away_summary` recap as a collapsed assistant
   card; and queued (not-yet-sent) prompts as dimmed bubbles. Logic belongs in `core/ChatItems.kt`
   (JVM-tested against the web shapes) — the biggest new chat gap.
+- P1 **Rich tool-call payloads + transcript markers (chat-transcript-fidelity).** The web chat now
+  renders, from new block fields the agent emits: an Edit call's actual change as a −/+ diff
+  (`block.edit {old,new,replaceAll}`), a Write's file body (`block.content`), an ExitPlanMode plan as
+  markdown open-by-default (`block.plan`), any tool's human `description` beside the arg
+  (`block.desc`), AskUserQuestion cards titled with the question text, plus two status markers:
+  `compact_boundary` ("Context compacted (auto) — 123.4k → 5.9k tokens") and `pr_link` ("Opened PR
+  #N", linked, consecutive duplicates folded — synthesized ids, `entryId`). Android decodes these to
+  `UnknownBlock`/ignored keys today (safe degrade); port the fields onto `model/Models.kt`'s
+  `ToolUseBlock` + new marker blocks, build items in `core/ChatItems.kt`, render in `ChatScreen`.
 - P3 **Terminal compose Stop.** XERK-33 also split the terminal compose bar; Android's
   `ui/TerminalScreen.kt` bar still only sends (it's a separate WebView screen with no live busy read).
 

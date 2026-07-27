@@ -1623,6 +1623,82 @@ class TestEntryBlocks(unittest.TestCase):
         self.assertIsNone(ha._entry_blocks({"type": "user"}, ha.BLOCK_CAPS_LIVE))
         self.assertEqual(ha._entry_blocks({"type": "assistant", "message": {"content": ""}}, ha.BLOCK_CAPS_LIVE), [])
 
+    def test_edit_tool_use_carries_the_actual_change_as_a_diff(self):
+        entry = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_e", "name": "Edit", "input": {
+                "file_path": "/repo/a.py", "old_string": "x = 1", "new_string": "x = 2",
+                "replace_all": True}},
+        ]}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+            {"t": "tool_use", "name": "Edit", "input": "/repo/a.py", "id": "toolu_e",
+             "edit": {"old": "x = 1", "new": "x = 2", "replaceAll": True}},
+        ])
+
+    def test_edit_diff_over_cap_flags_the_block_truncated(self):
+        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 100)
+        block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {
+                "file_path": "/repo/a.py", "old_string": "x", "new_string": big}},
+        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(len(block["edit"]["new"]), ha.BLOCK_CAPS_LIVE["result"])
+        self.assertTrue(block["truncated"])
+
+    def test_write_tool_use_carries_the_file_body(self):
+        block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Write", "input": {
+                "file_path": "/repo/new.txt", "content": "hello\nworld"}},
+        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(block["input"], "/repo/new.txt")
+        self.assertEqual(block["content"], "hello\nworld")
+
+    def test_exit_plan_mode_carries_the_plan(self):
+        block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "ExitPlanMode", "input": {
+                "plan": "## Plan\n1. do it", "allowedPrompts": []}},
+        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(block["plan"], "## Plan\n1. do it")
+
+    def test_description_arg_rides_as_desc(self):
+        block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {
+                "command": "ls", "description": "List files"}},
+        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(block["input"], "ls")
+        self.assertEqual(block["desc"], "List files")
+
+    def test_ask_user_question_summary_is_the_question_text(self):
+        block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "AskUserQuestion", "input": {
+                "questions": [{"question": "Ship it?", "options": [{"label": "yes"}]},
+                              {"question": "Which env?"}]}},
+        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(block["input"], "Ship it? · Which env?")
+
+    def test_compact_boundary_becomes_a_status_marker_block(self):
+        entry = {"type": "system", "subtype": "compact_boundary",
+                 "content": "Conversation compacted", "uuid": "u1",
+                 "compactMetadata": {"trigger": "auto", "preTokens": 123380, "postTokens": 5920}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+            {"t": "compact_boundary", "trigger": "auto", "preTokens": 123380, "postTokens": 5920},
+        ])
+        # Other system subtypes still drop, and the text feed still skips it.
+        self.assertIsNone(ha._entry_text(entry))
+        self.assertIsNone(ha._entry_blocks(
+            {"type": "system", "subtype": "turn_duration", "durationMs": 5}, ha.BLOCK_CAPS_LIVE))
+
+    def test_pr_link_becomes_a_marker_block_with_a_synthesized_id(self):
+        entry = {"type": "pr-link", "prNumber": 230, "prUrl": "https://github.com/o/r/pull/230",
+                 "prRepository": "o/r", "timestamp": "2026-07-17T04:25:18.299Z"}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+            {"t": "pr_link", "url": "https://github.com/o/r/pull/230", "number": 230, "repo": "o/r"},
+        ])
+        # No uuid on the wire entry: the feeds synthesize a stable id so the
+        # client's id-keyed merge doesn't drop it.
+        self.assertEqual(ha._entry_id(entry),
+                         "pr-link:https://github.com/o/r/pull/230:2026-07-17T04:25:18.299Z")
+        self.assertIsNone(ha._entry_blocks({"type": "pr-link"}, ha.BLOCK_CAPS_LIVE))
+        self.assertEqual(ha._entry_id({"type": "user", "uuid": "u9"}), "u9")
+
 
 TASK_NOTIFICATION = (
     "<task-notification>\n"

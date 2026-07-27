@@ -470,7 +470,10 @@
     let w = (e.text || "").length;
     for (const b of (e.blocks || [])) {
       w += (b.text || "").length + (b.input || "").length + (b.name || "").length +
-        (b.args || "").length + (b.summary || "").length + (b.result || "").length;
+        (b.args || "").length + (b.summary || "").length + (b.result || "").length +
+        (b.desc || "").length + (b.content || "").length + (b.plan || "").length +
+        (b.url || "").length +
+        (b.edit ? (b.edit.old || "").length + (b.edit.new || "").length : 0);
     }
     return w;
   }
@@ -541,11 +544,19 @@
         } else if (b.t === "tool_use") {
           flush();
           const res = b.id ? resultsById.get(b.id) : null;
-          items.push({
+          const act = {
             kind: "action", id: b.id || null, name: b.name || "tool",
             input: b.input || "", inputTrunc: !!b.truncated, entryId: eid,
             result: res ? { text: res.text || "", isError: !!res.isError, truncated: !!res.truncated } : null,
-          });
+          };
+          // The reviewable payload of a known tool call (agent _tool_use_detail):
+          // an Edit's actual diff, a Write's file body, an ExitPlanMode plan,
+          // any tool's human description.
+          if (b.desc) act.desc = b.desc;
+          if (b.edit) act.edit = { old: b.edit.old || "", new: b.edit.new || "", replaceAll: !!b.edit.replaceAll };
+          if (b.content) act.content = b.content;
+          if (b.plan) act.plan = b.plan;
+          items.push(act);
         } else if (b.t === "tool_result") {
           if (b.forId && toolUseIds.has(b.forId)) continue; // folded into its tool_use card
           flush();
@@ -601,6 +612,23 @@
             kind: "action", id: null, name: b.summary || "Background task",
             input: "", inputTrunc: false, entryId: eid, result, task: true,
           });
+        } else if (b.t === "compact_boundary") {
+          // The record that a compaction RAN — a centred status marker like an
+          // interrupt, carrying the trigger and before/after token counts.
+          flush();
+          items.push({
+            kind: "compact_boundary", id: eid, trigger: b.trigger || "",
+            preTokens: b.preTokens, postTokens: b.postTokens,
+          });
+        } else if (b.t === "pr_link") {
+          // Claude Code's own record of a PR this session opened — an inline
+          // marker where in the conversation it landed. The transcript often
+          // logs the same PR twice back-to-back; consecutive duplicates fold.
+          flush();
+          const prev = items[items.length - 1];
+          if (!(prev && prev.kind === "pr" && prev.url === b.url)) {
+            items.push({ kind: "pr", id: eid, url: b.url || "", number: b.number, repo: b.repo || "" });
+          }
         }
       }
       flush();
@@ -640,11 +668,34 @@
 
   function renderActionCard(it, key) {
     const statusCls = it.result ? (it.result.isError ? "err" : "ok") : "";
-    const argOne = it.input ? esc(it.input.split("\n")[0]) : "";
+    // A plan card's salient line is the plan itself, not the raw input JSON the
+    // summary would otherwise fall back to.
+    const argSrc = it.plan || it.input;
+    const argOne = argSrc ? esc(argSrc.split("\n")[0]) : "";
+    const descOne = it.desc ? '<span class="tool-desc">' + esc(it.desc.split("\n")[0]) + "</span>" : "";
     let body = "";
-    if (it.input) {
+    if (it.input && !it.plan) {
       body += '<div class="tool-block"><div class="tool-label">input</div><pre>' +
         esc(it.input) + "</pre>" + truncBtn(it.entryId, it.inputTrunc) + "</div>";
+    }
+    // The reviewable payloads (agent _tool_use_detail): an Edit's actual old →
+    // new change as a −/+ diff, a Write's file body, an ExitPlanMode plan as
+    // rendered markdown — what the operator otherwise opens the terminal for.
+    if (it.edit) {
+      body += '<div class="tool-block"><div class="tool-label">edit' +
+        (it.edit.replaceAll ? " (replace all)" : "") + '</div><div class="tool-diff">' +
+        (it.edit.old ? '<pre class="diff-old">' + esc(it.edit.old) + "</pre>" : "") +
+        (it.edit.new ? '<pre class="diff-new">' + esc(it.edit.new) + "</pre>" : "") +
+        "</div></div>";
+    }
+    if (it.content) {
+      body += '<div class="tool-block"><div class="tool-label">content</div><pre>' +
+        esc(it.content) + "</pre></div>";
+    }
+    if (it.plan) {
+      body += '<div class="tool-block"><div class="tool-label">plan</div>' +
+        '<div class="tool-plan">' + renderProse(it.plan) + "</div>" +
+        truncBtn(it.entryId, it.inputTrunc) + "</div>";
     }
     if (it.result) {
       body += '<div class="tool-block"><div class="tool-label">' + (it.result.isError ? "error" : "output") +
@@ -654,11 +705,12 @@
     if (!body) body = '<div class="tool-block"><div class="tool-label">running…</div></div>';
     const taskCls = it.task ? " task" : "";
     const icon = it.task ? '<span class="tool-glyph">◆</span>' : '<span class="tool-dot"></span>';
+    // A plan is the thing the operator is asked to approve: open by default.
     return '<details class="action-card' + (statusCls ? " " + statusCls : "") + taskCls + '" data-dkey="' + esc(key) +
       '" data-uuid="' + esc(it.entryId) + '"' +
-      openAttr(key, verbosity.show.outputs) + ">" +
+      openAttr(key, it.plan ? true : verbosity.show.outputs) + ">" +
       "<summary>" + icon + '<span class="tool-name">' + esc(it.name) + "</span>" +
-      '<span class="tool-arg">' + argOne + "</span></summary>" +
+      '<span class="tool-arg">' + argOne + "</span>" + descOne + "</summary>" +
       '<div class="tool-body">' + body + "</div></details>";
   }
 
@@ -699,6 +751,26 @@
     return '<div class="chat-interrupt" data-uuid="' + esc(it.id) + '">◼ ' + esc(label) + "</div>";
   }
 
+  // A compaction that ran — a centred status marker like the interrupt one,
+  // saying WHY the context just reset and what it cost (pre → post tokens).
+  function fmtTokens(n) {
+    if (typeof n !== "number" || !isFinite(n)) return "";
+    return n >= 1000 ? (Math.round(n / 100) / 10) + "k" : String(n);
+  }
+  function renderCompactBoundary(it) {
+    let label = "Context compacted" + (it.trigger ? " (" + it.trigger + ")" : "");
+    const pre = fmtTokens(it.preTokens), post = fmtTokens(it.postTokens);
+    if (pre && post) label += " — " + pre + " → " + post + " tokens";
+    return '<div class="chat-interrupt chat-compact-mark" data-uuid="' + esc(it.id) + '">↺ ' + esc(label) + "</div>";
+  }
+
+  // Claude Code's own record of a PR this session opened — an inline linked
+  // marker at the point in the conversation where it landed.
+  function renderPrMarker(it) {
+    const label = "Opened PR" + (it.number ? " #" + it.number : "") + (it.repo ? " — " + it.repo : "");
+    return '<div class="chat-pr-mark" data-uuid="' + esc(it.id) + '">↗ ' + anchor(it.url, label) + "</div>";
+  }
+
   // The "while you were away" recap, collapsed like the compact-summary card.
   // Never hidden by verbosity: it exists precisely for the operator who was
   // not watching, and it's one line while closed.
@@ -719,6 +791,8 @@
       if (it.kind === "command") { out.push(renderCommandCard(it)); i++; continue; }
       if (it.kind === "compact") { out.push(renderCompactCard(it)); i++; continue; }
       if (it.kind === "interrupt") { out.push(renderInterrupt(it)); i++; continue; }
+      if (it.kind === "compact_boundary") { out.push(renderCompactBoundary(it)); i++; continue; }
+      if (it.kind === "pr") { out.push(renderPrMarker(it)); i++; continue; }
       if (it.kind === "away") { out.push(renderAwayCard(it)); i++; continue; }
       // action run
       let j = i;

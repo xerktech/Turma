@@ -905,6 +905,18 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     (`_away_summary_text`); every other system subtype stays dropped.
   - `tool_reference` blocks inside a tool_result (ToolSearch naming loaded tools) flatten to
     `[tool: <name>]` lines instead of leaving the card empty.
+- **A known tool call carries its reviewable payload on the tool_use block** (`_tool_use_detail` /
+  `toolUseDetail`), so the chat shows what the terminal shows instead of just the salient arg: Edit →
+  `edit {old,new,replaceAll?}` (rendered as a −/+ diff), Write → `content`, ExitPlanMode → `plan`
+  (markdown, card open by default), any tool's human `description` → `desc`. An AskUserQuestion card
+  is titled with its question text(s), not the input JSON.
+- Two more turns-about-the-session become status markers: a `system`/`compact_boundary` entry →
+  `{t:"compact_boundary", trigger, preTokens, postTokens}` (the chat says a compaction ran and what
+  it cost), and a `pr-link` entry → `{t:"pr_link", url, number, repo}` (where in the conversation the
+  PR landed; linked, consecutive duplicates folded). pr-link entries carry no uuid, so the feeds
+  synthesize a stable id (`_entry_id`/`entryId`) — the client merge drops id-less entries.
+- Tests: `TestEntryBlocks` in `agent/tests/test_hub_agent.py`, the tool-detail/marker cases in
+  `agent/tests/tunnel-agent.test.js` and `turma/tests/chat.test.js`.
 - **Still-queued prompts ride beside the entries, not inside them**: a message typed mid-turn only
   becomes a user entry when dequeued, so the live tail and `/history` fold the transcript's
   `queue-operation` entries FIFO (`_fold_queue_op` / `foldQueueOp`, enqueue → dequeue → remove-by-content)
