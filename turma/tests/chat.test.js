@@ -208,6 +208,68 @@ test("buildItems: non-completed task_notification flags its result as an error",
   assert.equal(items[0].result.text, "status: failed");
 });
 
+test("buildItems/render: an Edit tool_use carries its diff onto the card", () => {
+  const entries = [{ id: "e1", role: "assistant", blocks: [{
+    t: "tool_use", id: "t1", name: "Edit", input: "/repo/a.py",
+    edit: { old: "x = 1", new: "x = 2", replaceAll: true },
+  }] }];
+  const items = buildItems(entries);
+  assert.deepEqual(items[0].edit, { old: "x = 1", new: "x = 2", replaceAll: true });
+  const html = withVerbosity("normal", () => itemsToHtml(items));
+  assert.match(html, /tool-diff/);
+  assert.match(html, /class="diff-old">x = 1</);
+  assert.match(html, /class="diff-new">x = 2</);
+  assert.match(html, /edit \(replace all\)/);
+});
+
+test("buildItems/render: a Write's content and a Bash description show on the card", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([
+    { id: "w1", role: "assistant", blocks: [{ t: "tool_use", id: "t1", name: "Write",
+      input: "/repo/new.txt", content: "hello\nworld" }] },
+    { id: "b1", role: "assistant", blocks: [{ t: "tool_use", id: "t2", name: "Bash",
+      input: "ls -la", desc: "List files" }] },
+  ])));
+  assert.match(html, /tool-label">content<\/div><pre>hello\nworld</);
+  assert.match(html, /class="tool-desc">List files</);
+});
+
+test("buildItems/render: an ExitPlanMode plan renders as prose, open by default", () => {
+  const entries = [{ id: "p1", role: "assistant", blocks: [{
+    t: "tool_use", id: "t1", name: "ExitPlanMode", input: '{"allowedPrompts":[]}',
+    plan: "## The plan\n\ndo the thing",
+  }] }];
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
+  assert.match(html, /tool-plan/);
+  assert.match(html, /The plan/);
+  assert.match(html, /<details class="action-card[^"]*" [^>]*open>/); // approvable: open
+  // The summary leads with the plan's first line, not the raw input JSON.
+  assert.match(html, /tool-arg">## The plan</);
+  assert.doesNotMatch(html, /allowedPrompts/);
+});
+
+test("buildItems/render: a compact_boundary block -> a centred marker with token counts", () => {
+  const items = buildItems([{ id: "cb1", role: "assistant",
+    blocks: [{ t: "compact_boundary", trigger: "auto", preTokens: 123380, postTokens: 5920 }] }]);
+  assert.equal(items[0].kind, "compact_boundary");
+  const html = withVerbosity("concise", () => itemsToHtml(items));
+  assert.match(html, /chat-compact-mark/);
+  assert.match(html, /Context compacted \(auto\) — 123\.4k → 5\.9k tokens/);
+});
+
+test("buildItems/render: pr_link blocks -> one linked marker, consecutive duplicates fold", () => {
+  const pr = { t: "pr_link", url: "https://github.com/o/r/pull/230", number: 230, repo: "o/r" };
+  const items = buildItems([
+    { id: "p1", role: "assistant", blocks: [pr] },
+    { id: "p2", role: "assistant", blocks: [pr] }, // the transcript logs the same PR twice
+  ]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "pr");
+  const html = withVerbosity("concise", () => itemsToHtml(items));
+  assert.match(html, /chat-pr-mark/);
+  assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/230"/);
+  assert.match(html, /Opened PR #230 — o\/r/);
+});
+
 test("render: task_notification card carries the task class + glyph, hidden by 'concise'", () => {
   const entries = [{ id: "n1", role: "user", blocks: [{ t: "task_notification", summary: "done", status: "completed", result: "ok" }] }];
   const shown = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));

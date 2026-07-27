@@ -346,6 +346,15 @@ function entryText(entry) {
   return text || null;
 }
 
+// The entry's own uuid, or a synthesized stable id for the entry types Claude
+// Code writes WITHOUT one (pr-link): the chat's tail merge dedups on id and
+// drops id-less entries. Mirror of hub-agent.py _entry_id.
+function entryId(entry) {
+  if (entry.uuid) return entry.uuid;
+  if (entry.type === "pr-link") return `pr-link:${entry.prUrl || ""}:${entry.timestamp || ""}`;
+  return undefined;
+}
+
 // (clipped, wasTruncated). Mirror of hub-agent.py _clip.
 function clip(text, cap) {
   text = text || "";
@@ -354,11 +363,20 @@ function clip(text, cap) {
 }
 
 // Common Claude Code tools carry their salient arg under one of these keys.
-const TOOL_INPUT_KEYS = ["command", "file_path", "path", "pattern", "url", "query", "prompt"];
+const TOOL_INPUT_KEYS = ["command", "file_path", "path", "pattern", "url", "query", "prompt",
+  "skill", "subject"];
 
 // Compact display string for a tool_use `input` — mirror of _tool_input_summary.
+// An AskUserQuestion call's salient arg is the question text itself, nested in
+// its `questions` list — joined so the card reads as the question(s) asked.
 function toolInputSummary(inp) {
   if (inp && typeof inp === "object" && !Array.isArray(inp)) {
+    if (Array.isArray(inp.questions)) {
+      const texts = inp.questions
+        .map((q) => (q && typeof q === "object" && typeof q.question === "string") ? q.question.trim() : "")
+        .filter(Boolean);
+      if (texts.length) return texts.join(" · ");
+    }
     for (const key of TOOL_INPUT_KEYS) {
       const val = inp[key];
       if (typeof val === "string" && val.trim()) return val;
@@ -368,6 +386,43 @@ function toolInputSummary(inp) {
   if (typeof inp === "string") return inp;
   if (inp == null) return "";
   return String(inp);
+}
+
+// Attach the reviewable payload of a known tool call to its tool_use block —
+// the part an operator otherwise opens the raw terminal to see. Returns true
+// when a payload was clipped by its cap. Mirror of hub-agent.py
+// _tool_use_detail(): Edit -> edit {old, new, replaceAll?}; Write -> content;
+// ExitPlanMode -> plan; any tool's human `description` arg -> desc.
+function toolUseDetail(block, name, inp, caps) {
+  if (!inp || typeof inp !== "object" || Array.isArray(inp)) return false;
+  let truncated = false;
+  if (name === "Edit") {
+    const old = inp.old_string, nw = inp.new_string;
+    if (typeof old === "string" || typeof nw === "string") {
+      const [oldC, oldT] = clip(String(old || "").replace(ANSI_RE, ""), caps.result);
+      const [newC, newT] = clip(String(nw || "").replace(ANSI_RE, ""), caps.result);
+      const edit = { old: oldC, new: newC };
+      if (inp.replace_all) edit.replaceAll = true;
+      block.edit = edit;
+      truncated = oldT || newT;
+    }
+  } else if (name === "Write") {
+    if (typeof inp.content === "string" && inp.content.trim()) {
+      const [clipped, trunc] = clip(inp.content.replace(ANSI_RE, ""), caps.result);
+      block.content = clipped;
+      truncated = trunc;
+    }
+  } else if (name === "ExitPlanMode") {
+    if (typeof inp.plan === "string" && inp.plan.trim()) {
+      const [clipped, trunc] = clip(inp.plan.replace(ANSI_RE, "").trim(), caps.text);
+      block.plan = clipped;
+      truncated = trunc;
+    }
+  }
+  if (typeof inp.description === "string" && inp.description.trim()) {
+    block.desc = clip(inp.description.replace(ANSI_RE, "").trim(), caps.input)[0];
+  }
+  return truncated;
 }
 
 // Flatten a tool_result block's `content` to text — mirror of _tool_result_text.
@@ -406,6 +461,24 @@ function entryBlocks(entry, caps) {
     const [clipped, trunc] = clip(away, caps.text);
     const block = { t: "away_summary", text: clipped };
     if (trunc) block.truncated = true;
+    return [block];
+  }
+  // A compaction that RAN (trigger + before/after token counts) becomes a
+  // status marker; a pr-link entry (Claude Code's own record of a PR it
+  // opened) becomes a pr_link marker. Mirror of _entry_blocks.
+  if (entry.type === "system" && entry.subtype === "compact_boundary") {
+    const meta = entry.compactMetadata || {};
+    const block = { t: "compact_boundary" };
+    if (typeof meta.trigger === "string" && meta.trigger) block.trigger = meta.trigger;
+    if (Number.isInteger(meta.preTokens)) block.preTokens = meta.preTokens;
+    if (Number.isInteger(meta.postTokens)) block.postTokens = meta.postTokens;
+    return [block];
+  }
+  if (entry.type === "pr-link") {
+    if (typeof entry.prUrl !== "string" || !entry.prUrl) return null;
+    const block = { t: "pr_link", url: entry.prUrl };
+    if (Number.isInteger(entry.prNumber)) block.number = entry.prNumber;
+    if (typeof entry.prRepository === "string" && entry.prRepository) block.repo = entry.prRepository;
     return [block];
   }
   const type = entry.type;
@@ -493,6 +566,7 @@ function entryBlocks(entry, caps) {
         const block = { t: "tool_use", name: String(raw.name), input: clipped };
         if (raw.id) block.id = raw.id;
         if (trunc) block.truncated = true;
+        if (toolUseDetail(block, String(raw.name), raw.input, caps)) block.truncated = true;
         blocks.push(block);
       } else if (raw.type === "tool_result") {
         const text = toolResultText(raw.content).replace(ANSI_RE, "").trim();
@@ -584,7 +658,7 @@ function transcriptTail(worktreePath, cache, transcriptId) {
     // backward-compat flat string the glasses read.
     if (text === null && (!blocks || blocks.length === 0)) continue;
     tail.push({
-      id: entry.uuid,
+      id: entryId(entry),
       role: entryRole(entry),
       text: (text || "").slice(0, TAIL_MSG_CHARS),
       blocks: blocks || [],
@@ -1185,5 +1259,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, parseAgentList, awaySummaryText, foldQueueOp, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, parseAgentList, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
 }

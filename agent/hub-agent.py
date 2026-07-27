@@ -2028,6 +2028,19 @@ def _entry_tool_source(entry):
     return entry.get("sourceToolUseID") or None
 
 
+def _entry_id(entry):
+    """The entry's own uuid, or a synthesized stable id for the entry types
+    Claude Code writes WITHOUT one (pr-link): the client's tail merge dedups on
+    id and drops id-less entries, so without this a pr_link block never reaches
+    the chat. Mirror of tunnel-agent.js entryId()."""
+    eid = entry.get("uuid")
+    if eid:
+        return eid
+    if entry.get("type") == "pr-link":
+        return "pr-link:%s:%s" % (entry.get("prUrl") or "", entry.get("timestamp") or "")
+    return None
+
+
 def _entry_role(entry):
     """Display role for a transcript entry. Normally the entry type, but a
     compact summary is written as a USER turn carrying text the model wrote
@@ -2111,13 +2124,24 @@ def _clip(text, cap):
 
 # Common Claude Code tools carry their salient argument under one of these keys;
 # surface it as the tool_use's one-line summary rather than a raw JSON dump.
-_TOOL_INPUT_KEYS = ("command", "file_path", "path", "pattern", "url", "query", "prompt")
+_TOOL_INPUT_KEYS = ("command", "file_path", "path", "pattern", "url", "query", "prompt",
+                    "skill", "subject")
 
 
 def _tool_input_summary(inp):
     """A compact display string for a tool_use `input` object: the salient arg
-    for known tools, else a compact JSON dump, else str()."""
+    for known tools, else a compact JSON dump, else str(). An AskUserQuestion
+    call's salient arg is the question text itself, nested in its `questions`
+    list — joined here so the card reads as the question(s) asked, not a JSON
+    dump of the whole picker structure."""
     if isinstance(inp, dict):
+        questions = inp.get("questions")
+        if isinstance(questions, list):
+            texts = [q["question"].strip() for q in questions
+                     if isinstance(q, dict) and isinstance(q.get("question"), str)
+                     and q["question"].strip()]
+            if texts:
+                return " · ".join(texts)
         for key in _TOOL_INPUT_KEYS:
             val = inp.get(key)
             if isinstance(val, str) and val.strip():
@@ -2131,6 +2155,49 @@ def _tool_input_summary(inp):
     if inp is None:
         return ""
     return str(inp)
+
+
+def _tool_use_detail(block, name, inp, caps):
+    """Attach the reviewable payload of a known tool call to its tool_use block,
+    beyond the one-line `input` summary — the part an operator otherwise opens
+    the raw terminal to see. Returns True when a payload was clipped by its cap
+    (the caller flags the block truncated so "Show more" refetches the FULL copy).
+
+      Edit          -> edit: {old, new, replaceAll?}   (the actual change, as a diff)
+      Write         -> content: the file body written
+      ExitPlanMode  -> plan: the plan markdown the operator was asked to approve
+      any tool      -> desc: its human `description` arg (Bash, Agent, Monitor, …)
+
+    Mirror of tunnel-agent.js toolUseDetail()."""
+    if not isinstance(inp, dict):
+        return False
+    truncated = False
+    if name == "Edit":
+        old, new = inp.get("old_string"), inp.get("new_string")
+        if isinstance(old, str) or isinstance(new, str):
+            old_c, old_t = _clip(ANSI_RE.sub("", str(old or "")), caps["result"])
+            new_c, new_t = _clip(ANSI_RE.sub("", str(new or "")), caps["result"])
+            edit = {"old": old_c, "new": new_c}
+            if inp.get("replace_all"):
+                edit["replaceAll"] = True
+            block["edit"] = edit
+            truncated = old_t or new_t
+    elif name == "Write":
+        content = inp.get("content")
+        if isinstance(content, str) and content.strip():
+            clipped, trunc = _clip(ANSI_RE.sub("", content), caps["result"])
+            block["content"] = clipped
+            truncated = trunc
+    elif name == "ExitPlanMode":
+        plan = inp.get("plan")
+        if isinstance(plan, str) and plan.strip():
+            clipped, trunc = _clip(ANSI_RE.sub("", plan).strip(), caps["text"])
+            block["plan"] = clipped
+            truncated = trunc
+    desc = inp.get("description")
+    if isinstance(desc, str) and desc.strip():
+        block["desc"] = _clip(ANSI_RE.sub("", desc).strip(), caps["input"])[0]
+    return truncated
 
 
 def _tool_result_text(content):
@@ -2275,6 +2342,11 @@ def _entry_blocks(entry, caps):
       {t:"command_output", text, isError?, truncated?}
       {t:"interrupt",      text}
       {t:"away_summary",   text, truncated?}
+      {t:"compact_boundary", trigger?, preTokens?, postTokens?}
+      {t:"pr_link",        url, number?, repo?}
+    A tool_use block for a known tool also carries its reviewable payload —
+    edit/content/plan/desc, see _tool_use_detail — so the chat can show the
+    actual change/plan instead of just the salient argument.
     A skill body — a user turn Claude Code wrote as the result of a `Skill` tool
     call (see _entry_tool_source) — becomes that call's {t:"tool_result"} block,
     so the chat folds it into the Skill action card it belongs to instead of
@@ -2288,8 +2360,15 @@ def _entry_blocks(entry, caps):
     An "[Request interrupted by user…]" marker turn (INTERRUPT_RE) becomes an
     `interrupt` block — a statement about the turn, rendered as a status
     marker, not operator prose. An away_summary system entry (the "while you
-    were away" recap — see _away_summary_text) becomes an `away_summary` block;
-    all other system entries still drop.
+    were away" recap — see _away_summary_text) becomes an `away_summary` block.
+    A compact_boundary system entry — the record that a compaction actually
+    RAN, with its trigger and before/after token counts — becomes a
+    `compact_boundary` status marker (the TUI shows the compaction; without
+    this the chat's context silently resets). All other system entries still
+    drop. A `pr-link` entry (Claude Code's own record of a PR it opened)
+    becomes a `pr_link` marker so the reader sees where in the conversation
+    the PR landed; such entries carry no uuid, so the feeds synthesize an id
+    (_entry_id / entryId).
     Returns [] for a user/assistant message with no renderable blocks. Keep this
     mirrored with tunnel-agent.js entryBlocks()."""
     away = _away_summary_text(entry)
@@ -2298,6 +2377,25 @@ def _entry_blocks(entry, caps):
         block = {"t": "away_summary", "text": clipped}
         if trunc:
             block["truncated"] = True
+        return [block]
+    if entry.get("type") == "system" and entry.get("subtype") == "compact_boundary":
+        meta = entry.get("compactMetadata") or {}
+        block = {"t": "compact_boundary"}
+        if isinstance(meta.get("trigger"), str) and meta["trigger"]:
+            block["trigger"] = meta["trigger"]
+        for key in ("preTokens", "postTokens"):
+            if isinstance(meta.get(key), int):
+                block[key] = meta[key]
+        return [block]
+    if entry.get("type") == "pr-link":
+        url = entry.get("prUrl")
+        if not isinstance(url, str) or not url:
+            return None
+        block = {"t": "pr_link", "url": url}
+        if isinstance(entry.get("prNumber"), int):
+            block["number"] = entry["prNumber"]
+        if isinstance(entry.get("prRepository"), str) and entry["prRepository"]:
+            block["repo"] = entry["prRepository"]
         return [block]
     if entry.get("type") not in ("user", "assistant"):
         return None
@@ -2404,6 +2502,8 @@ def _entry_blocks(entry, caps):
                 if raw.get("id"):
                     block["id"] = raw["id"]
                 if trunc:
+                    block["truncated"] = True
+                if _tool_use_detail(block, str(raw["name"]), raw.get("input"), caps):
                     block["truncated"] = True
                 blocks.append(block)
             elif btype == "tool_result":
@@ -2743,7 +2843,7 @@ def _history_entries(path):
         if text is None and not blocks:
             continue
         entries.append({
-            "id": entry.get("uuid"),
+            "id": _entry_id(entry),
             "role": _entry_role(entry),
             "text": (text or "")[:TAIL_MSG_CHARS_FULL],
             "blocks": blocks or [],
