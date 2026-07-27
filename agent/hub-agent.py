@@ -8195,7 +8195,10 @@ class SessionManager:
                     if text is None and not blocks:
                         continue
                     entries.append({
-                        "uuid": entry.get("uuid"),
+                        # _entry_id, not the raw uuid: a pr-link entry has none,
+                        # and the archived row's synthesized id must match the
+                        # live feeds' so the viewer keys cards the same way.
+                        "uuid": _entry_id(entry),
                         "role": _entry_role(entry),
                         "ts": entry.get("timestamp"),
                         "text": text or "",

@@ -7070,6 +7070,35 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
             sm._archive_deltas({"t1": body["size"]})
         self.assertEqual(pushed, [])
 
+    def test_deltas_ship_pr_link_marker_with_synthesized_uuid(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        # A pr-link entry has no uuid and no display text, but it does have a
+        # pr_link marker block — it must survive into the archive under the same
+        # synthesized id the live feeds use (_entry_id), so the viewer keys it
+        # identically.
+        self._write_transcript(wt, "t1.jsonl", [
+            _text_entry("u1", "user", "open a pr"),
+            {"type": "pr-link", "prNumber": 230,
+             "prUrl": "https://github.com/o/r/pull/230", "prRepository": "o/r",
+             "timestamp": "2026-07-01T10:05:00Z"},
+        ])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed = []
+        with mock.patch.object(sm, "_post_archive_chunk",
+                               lambda tid, body: (pushed.append(body), {"bytesStored": body["endOffset"]})[1]):
+            sm._archive_deltas({})
+        entries = pushed[0]["entries"]
+        self.assertEqual(len(entries), 2)
+        pr = entries[1]
+        self.assertEqual(pr["uuid"],
+                         "pr-link:https://github.com/o/r/pull/230:2026-07-01T10:05:00Z")
+        self.assertEqual(pr["text"], "")
+        self.assertEqual(pr["blocks"], [
+            {"t": "pr_link", "url": "https://github.com/o/r/pull/230",
+             "number": 230, "repo": "o/r"}])
+
     def test_deltas_ship_tool_result_only_turn(self):
         sm = self.make_manager()
         wt = "/w/.turma/worktrees/Turma/aaa"
