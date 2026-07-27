@@ -56,11 +56,18 @@ private fun TranscriptBubble(b: ChatItem.Bubble) {
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.widthIn(max = cap),
             ) {
+                // Force full-contrast prose (web parity: assistant text is --ink,
+                // not the muted --ink-2). Without this the assistant bubble's
+                // surfaceVariant background makes Surface derive onSurfaceVariant
+                // (a grey) as its content color, so agent text read grey in dark
+                // mode while the user bubble — whose color isn't a theme token, so
+                // it keeps the ambient onSurface — read white (XERK-136).
                 Text(
                     shown,
                     Modifier.padding(10.dp, 6.dp),
                     fontSize = 13.sp,
                     lineHeight = 18.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
                 )
             }
         }
