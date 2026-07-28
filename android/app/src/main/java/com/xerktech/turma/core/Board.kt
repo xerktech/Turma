@@ -74,9 +74,14 @@ data class MoveState(
 )
 
 /** The column a card renders in: its real category, unless a live drag override
- *  (pending, no error) pins it to the dropped column meanwhile. */
+ *  pins it to the dropped column meanwhile — through BOTH the in-flight `pending`
+ *  state AND the `settled` state after it (the change landed on the tracker but
+ *  the board's slow poll hasn't reported the new status, so `categoryOf` still
+ *  reads the OLD column). Honouring `pending` alone snapped a just-moved card
+ *  back until the next poll; the sweep clears the override only once the poll has
+ *  caught up (moveSweepVerdict), so the card never moves backward. */
 fun boardColumnOf(t: JiraTicket, move: MoveState?): String =
-    if (move != null && move.pending && move.error == null) move.category else categoryOf(t)
+    if (move != null && (move.pending || move.settled) && move.error == null) move.category else categoryOf(t)
 
 /**
  * The per-beat sweep verdict for a drag override (board.js `moveSweepVerdict`):

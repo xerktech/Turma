@@ -1558,14 +1558,17 @@ test("startSweepVerdict: a never-seen command past the timeout errors (backstop)
 
 // --- Drag-and-drop status change (XERK-141) ----------------------------------
 
-test("boardColumnOf: a live override lands the card in the dropped column", () => {
+test("boardColumnOf: an override holds the dropped column through pending AND settled", () => {
   const t = { status: "To Do", statusCategory: "todo" };
-  // No override / not pending / errored → the ticket's real category.
+  // No override / errored → the ticket's real category.
   assert.equal(boardColumnOf(t, null), "todo");
-  assert.equal(boardColumnOf(t, { category: "done", settled: true }), "todo");
   assert.equal(boardColumnOf(t, { category: "done", error: "x" }), "todo");
-  // A pending, error-free override wins.
+  // Pending holds the dropped column…
   assert.equal(boardColumnOf(t, { category: "done", pending: true }), "done");
+  // …and so does settled — the change landed but the slow poll hasn't updated
+  // the ticket yet, so honouring pending alone here is what snapped the card
+  // back to its old column until the next poll (the regression this guards).
+  assert.equal(boardColumnOf(t, { category: "done", settled: true }), "done");
 });
 
 test("boardHtml: a pending drag renders the card in its dropped column, moving", () => {

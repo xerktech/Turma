@@ -1497,9 +1497,14 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   else (cmdId polling, result staging, the GET) is XERK-138 unchanged.
 - **An optimistic `moves` override holds the card in its dropped column across repaints** until the
   board's own (slow) Jira/Azure poll reports it there — else it would snap back to its old column each
-  ~1s beat (the same lag the panel documents). Pending while the write is in flight, settled-and-held
-  once it lands (cleared when `categoryOf` catches up, or a backstop), reverted on failure after a short
-  TTL. Pure `boardColumnOf`/`moveSweepVerdict` drive it, mirrored in `core/Board.kt`.
+  ~1s beat (the same lag the panel documents). `boardColumnOf` renders the override through BOTH the
+  in-flight `pending` state AND the `settled` state after it: dropping it the instant the change
+  CONFIRMED (honouring `pending` alone) let the card snap back to its old column until the next poll,
+  then jump forward again. The sweep (`moveSweepVerdict`) clears the override only once the poll has
+  caught up (`categoryOf` == the dropped column) or a backstop; a failure reverts after a short TTL. On
+  settle the client also nudges a Jira/Azure re-poll (`POST /api/jira/refresh` / `jiraRefresh`) so the
+  card's REAL status converges in a beat or two rather than waiting out the slow poll cadence. Pure
+  `boardColumnOf`/`moveSweepVerdict` drive it, mirrored in `core/Board.kt`.
 - Web: a pointer long-press drag with a floating ghost + column highlight in `board.html`; a real
   drag suppresses the click it would synthesize so a drop doesn't also open the panel. Android:
   `detectDragGesturesAfterLongPress` + a ghost card in `BoardScreen.kt`, the same `moves` override in

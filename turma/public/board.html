@@ -240,6 +240,12 @@ function settleMove(k) {
   if (!m) return;
   moves.set(k, { category: m.category, settled: true, settledAt: Date.now(), at: m.at });
   if (cache) render(cache);
+  // The change is on the tracker, but the board's ticket LIST only reflects it
+  // on the next Jira/Azure poll (the agent's set_board_status refreshes the
+  // issue cache, not the board list). Nudge that poll now so the card's REAL
+  // status catches up in a beat or two and the override releases cleanly,
+  // rather than the optimistic overlay lingering until the slow poll cadence.
+  fetch("/api/jira/refresh", { method: "POST", keepalive: true }).catch(() => {});
 }
 function failMove(k, error) {
   const m = moves.get(k);

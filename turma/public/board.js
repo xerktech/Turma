@@ -59,9 +59,16 @@
   // column (the same poll lag the detail panel documents) the instant it moved.
 
   // The column a card renders in: normally its real category, but a live drag
-  // override (pending, no error) pins it to the dropped column meanwhile.
+  // override pins it to the dropped column meanwhile. This holds through BOTH
+  // the in-flight `pending` state AND the `settled` state that follows — the
+  // change has landed on the tracker but the board's own (slow) poll hasn't
+  // reported the new status yet, so `categoryOf(t)` still reads the OLD column.
+  // Dropping the override the instant the change confirmed (honouring `pending`
+  // alone) is what made a just-moved card snap back to its old column until the
+  // next poll, then jump forward again — the sweep clears it only once the poll
+  // has actually caught up (moveSweepVerdict), so the card never moves backward.
   function boardColumnOf(t, move) {
-    return move && move.pending && !move.error ? move.category : categoryOf(t);
+    return move && (move.pending || move.settled) && !move.error ? move.category : categoryOf(t);
   }
 
   // Whether a drag override should still be held, be dropped, or has settled —
