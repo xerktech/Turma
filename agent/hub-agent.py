@@ -1209,11 +1209,21 @@ def _accumulate_usage(lines, acc):
         # Transcript timestamps are UTC ISO; date-prefix bucketing is close
         # enough for a dashboard.
         day = ts[:10] if len(ts) >= 10 else ""
-        m = acc.models.setdefault(model, _model_acc())
-        buckets = [acc.totals, m["totals"]]
+        buckets = [acc.totals]
         if day:
             buckets.append(acc.days.setdefault(day, _usage_bucket()))
-            buckets.append(m["days"].setdefault(day, _usage_bucket()))
+        # "<synthetic>" (and any "<...>") is Claude Code's stamp on assistant
+        # entries it fabricates itself — a session-limit notice, a "No response
+        # requested." placeholder — not a model that ran. Such entries carry an
+        # all-zero usage block, so folding them into the totals is a no-op; keep
+        # them OUT of the per-model breakdown so the usage page's "Tokens by
+        # model" table doesn't list a phantom "<synthetic>" model that consumed
+        # nothing. Mirrors _scan_model_entry's same guard.
+        if not model.startswith("<"):
+            m = acc.models.setdefault(model, _model_acc())
+            buckets.append(m["totals"])
+            if day:
+                buckets.append(m["days"].setdefault(day, _usage_bucket()))
         for b in buckets:
             _add_tokens(b, tok)
 

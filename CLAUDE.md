@@ -501,6 +501,11 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   `repoUsage[]` and a merged host-level `usage`, computed on the slow usage cadence by re-parsing *every*
   known transcript under `~/.claude/projects` (`repo_usage_report()`). Each `repoUsage` entry carries a
   `remoteKey` (normalized git origin via `normalize_remote()`) so the hub can unify a repo across hosts.
+- The per-model breakdown **excludes `<synthetic>`** (and any `<...>` model): Claude Code stamps entries
+  it fabricates itself (session-limit notices, "No response requested." placeholders) with that model and
+  an all-zero usage block, so `_accumulate_usage` keeps them out of `acc.models` — else the usage page's
+  "Tokens by model" table lists a phantom model that ran nothing. Their (zero) tokens still fold into the
+  grand totals. Mirrors `_scan_model_entry`'s same guard.
 - A durable worktree→{repo, remote, slug} **attribution ledger** (`~/.turma/repo-usage.json`) keeps a
   transcript traceable to its repo after its session and worktree are gone, so **usage history survives
   kill/delete/prune**. It is written at spawn via `_remember_usage`, backfilled from registry/closed
