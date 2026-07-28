@@ -50,6 +50,7 @@ import androidx.compose.ui.text.font.FontStyle
 import kotlinx.coroutines.launch
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.BOARD_CATEGORIES
@@ -340,59 +341,100 @@ private fun RepoChip(t: JiraTicket) {
 }
 
 /**
- * The Repo row of the detail sheet: the triaged repo + its rationale, a
- * "Start session" action when it's cloned, and a "Change" picker that pins the
- * repo by hand. Mirrors board.js repoFieldHtml + ticketStartHtml + repoPickerHtml.
+ * A detail-sheet field's current value rendered AS the control that changes it:
+ * a pill-shaped chip with a trailing ▾ that opens the field's dropdown on tap,
+ * instead of a value plus a separate "Change" button. Used by the Status, Repo,
+ * Agent and Model rows. When [enabled] is false it's a plain read-only pill (no
+ * ▾, not clickable) — a field with nothing to pick. This is a mobile-native
+ * interaction the web board doesn't share; see android/PARITY.md.
  */
 @Composable
-private fun RepoSection(site: BoardSite, t: JiraTicket, vm: BoardViewModel) {
-    var editing by remember(t.key) { mutableStateOf(false) }
-    val g = t.repoGuess
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        SectionLabel("Repo")
-        when {
-            g == null -> Text("Not triaged yet", style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            g.repo == null -> Text(
-                if (g.manual) "No repository — set by you" else "No repository fits this ticket",
-                style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic, color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            else -> {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Pill(g.repo!!, dashed = !g.cloned, mono = true)
-                    if (!g.cloned) Text("(not cloned)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (g.manual) Text("— set by you", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                if (g.reason.isNotBlank() && !g.manual) Text(g.reason, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            // Start is offered on any triaged repo — an uncloned one is a live
-            // start too: the hub routes to the most-available host, which clones
-            // on demand and queues the session behind the clone (XERK-14).
-            if (g?.repo != null) {
-                GhostButton(
-                    if (g.cloned) "▶ Start session" else "▶ Start (clone first)",
-                    onClick = { vm.startSession(site.siteKey, t.key) },
-                )
-            }
-            GhostButton(if (editing) "Cancel" else "Change repo", onClick = { editing = !editing })
-        }
-        if (editing) {
-            RepoPicker(site, t) { repo, auto ->
-                vm.setRepo(site.siteKey, t.key, repo, auto)
-                editing = false
-            }
+private fun SelectableValue(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    mono: Boolean = false,
+    dashed: Boolean = false,
+    italic: Boolean = false,
+) {
+    val fg = if (enabled) MaterialTheme.colorScheme.onSurface
+             else MaterialTheme.colorScheme.onSurfaceVariant
+    val border = if (dashed) fg.copy(alpha = 0.5f) else MaterialTheme.colorScheme.outline
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(7.dp))
+            .then(if (enabled) Modifier.clickable(onClick = onClick) else Modifier)
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .border(1.dp, border, RoundedCornerShape(7.dp))
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Text(
+            text,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
+            fontStyle = if (italic) FontStyle.Italic else FontStyle.Normal,
+            color = fg,
+        )
+        if (enabled) {
+            Text("▾", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
         }
     }
 }
 
+/**
+ * The Repo row of the detail sheet: the triaged repo + its rationale, a
+ * "Start session" action when it's cloned, and the repo value itself as the
+ * pin-by-hand picker. Mirrors board.js repoFieldHtml + ticketStartHtml +
+ * repoPickerHtml (the tap-the-value interaction is Android-only; see PARITY.md).
+ */
+@Composable
+private fun RepoSection(site: BoardSite, t: JiraTicket, vm: BoardViewModel) {
+    val g = t.repoGuess
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        SectionLabel("Repo")
+        // The value IS the picker: tapping it opens the pin-by-hand dropdown.
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            RepoPicker(site, t) { repo, auto -> vm.setRepo(site.siteKey, t.key, repo, auto) }
+            if (g?.repo != null && !g.cloned) Text("(not cloned)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (g?.manual == true) Text("— set by you", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (g?.repo != null && g.reason.isNotBlank() && !g.manual) {
+            Text(g.reason, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        // Start is offered on any triaged repo — an uncloned one is a live start
+        // too: the hub routes to the most-available host, which clones on demand
+        // and queues the session behind the clone (XERK-14).
+        if (g?.repo != null) {
+            GhostButton(
+                if (g.cloned) "▶ Start session" else "▶ Start (clone first)",
+                onClick = { vm.startSession(site.siteKey, t.key) },
+            )
+        }
+    }
+}
+
+/** The repo value rendered as the picker (a pick IS the save). */
 @Composable
 private fun RepoPicker(site: BoardSite, t: JiraTicket, onPick: (repo: String?, auto: Boolean) -> Unit) {
     var open by remember { mutableStateOf(false) }
     val g = t.repoGuess
-    val current = if (g?.manual == true) (g.repo ?: "No repository fits") else "Let the agent decide"
+    // The chip label is the current answer: a pinned/guessed repo name, or the
+    // state when there's no repo (matching the web row's phrasing).
+    val label = when {
+        g == null -> "Not triaged yet"
+        g.repo == null -> if (g.manual) "No repository fits" else "No repository fits this ticket"
+        else -> g.repo!!
+    }
     Box {
-        GhostButton("▾ $current", onClick = { open = true })
+        SelectableValue(
+            label, onClick = { open = true },
+            mono = g?.repo != null, dashed = g?.repo != null && !g.cloned,
+            italic = g?.repo == null,
+        )
         androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             androidx.compose.material3.DropdownMenuItem(
                 text = { Text("Let the agent decide") },
@@ -409,9 +451,6 @@ private fun RepoPicker(site: BoardSite, t: JiraTicket, onPick: (repo: String?, a
                 )
             }
         }
-    }
-    if (site.repoOptions.none { it.name.isNotBlank() }) {
-        Text("No repos reported for this org", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -431,17 +470,14 @@ private fun AgentSection(
     vm: BoardViewModel,
 ) {
     val opt = pin?.let { p -> site.hostOptions.find { it.key == p.host } }
+    // Nothing to pick and nothing to release -> read-only (matches the web row).
+    val editable = site.hostOptions.isNotEmpty() || pin != null
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         SectionLabel("Agent")
-        if (pin == null) {
-            Text(
-                "Auto — most available agent",
-                style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        } else {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Pill(opt?.name ?: pin.host, mono = true)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            // The value IS the picker.
+            AgentPicker(site, pin, enabled = editable) { host -> vm.setTicketAgent(site.siteKey, t.key, host) }
+            if (pin != null) {
                 val note = when {
                     opt == null -> "(no longer reports this org)"
                     !opt.online -> "(offline)"
@@ -450,11 +486,6 @@ private fun AgentSection(
                 if (note != null) Text(note, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("— set by you", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-        }
-        // Nothing to pick and nothing to release -> no picker (matches the web
-        // row going read-only).
-        if (site.hostOptions.isNotEmpty() || pin != null) {
-            AgentPicker(site, pin) { host -> vm.setTicketAgent(site.siteKey, t.key, host) }
         }
     }
 }
@@ -474,27 +505,18 @@ private fun ModelSection(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         SectionLabel("Model")
-        if (pin == null) {
-            val def = site.models.defaultLabel.takeIf { it.isNotBlank() }
-                ?.let { " (${com.xerktech.turma.core.prettyModel(it)})" } ?: ""
-            Text(
-                "Default$def — the agent's default model",
-                style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        } else {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Pill(com.xerktech.turma.core.prettyModel(pin.model), mono = true)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            // The value IS the picker; it's always offerable (static family
+            // aliases), matching the web row's always-editable Model field.
+            ModelPicker(site, pin) { model -> vm.setTicketModel(site.siteKey, t.key, model) }
+            if (pin != null) {
                 Text("— set by you", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-        // The picker is always available (the static family aliases are always
-        // offerable), matching the web row's always-editable Model field.
-        ModelPicker(site, pin) { model -> vm.setTicketModel(site.siteKey, t.key, model) }
     }
 }
 
-/** A pick IS the save; null = release to the default model. */
+/** The model value rendered as the picker; a pick IS the save, null = default. */
 @Composable
 private fun ModelPicker(site: BoardSite, pin: com.xerktech.turma.model.TicketModelPin?, onPick: (model: String?) -> Unit) {
     var open by remember { mutableStateOf(false) }
@@ -502,9 +524,11 @@ private fun ModelPicker(site: BoardSite, pin: com.xerktech.turma.model.TicketMod
     // the same orphan handling the web picker does.
     val choices = com.xerktech.turma.core.modelChoices(site.models).toMutableList()
     pin?.model?.takeIf { it.isNotBlank() && it !in choices }?.let { choices.add(0, it) }
-    val current = pin?.let { com.xerktech.turma.core.prettyModel(it.model) } ?: "Default"
+    val current = pin?.let { com.xerktech.turma.core.prettyModel(it.model) }
+        ?: ("Default" + (site.models.defaultLabel.takeIf { it.isNotBlank() }
+            ?.let { " (${com.xerktech.turma.core.prettyModel(it)})" } ?: ""))
     Box {
-        GhostButton("▾ $current", onClick = { open = true })
+        SelectableValue(current, onClick = { open = true }, mono = pin != null)
         androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             val def = site.models.defaultLabel.takeIf { it.isNotBlank() }
                 ?.let { " (${com.xerktech.turma.core.prettyModel(it)})" } ?: ""
@@ -522,14 +546,19 @@ private fun ModelPicker(site: BoardSite, pin: com.xerktech.turma.model.TicketMod
     }
 }
 
-/** A pick IS the save, same contract as [RepoPicker]; null = release to auto. */
+/** The agent value rendered as the picker; a pick IS the save, null = auto. */
 @Composable
-private fun AgentPicker(site: BoardSite, pin: com.xerktech.turma.model.TicketAgentPin?, onPick: (host: String?) -> Unit) {
+private fun AgentPicker(
+    site: BoardSite,
+    pin: com.xerktech.turma.model.TicketAgentPin?,
+    enabled: Boolean = true,
+    onPick: (host: String?) -> Unit,
+) {
     var open by remember { mutableStateOf(false) }
     val current = pin?.let { p -> site.hostOptions.find { it.key == p.host }?.name ?: p.host }
         ?: "Auto — most available agent"
     Box {
-        GhostButton("▾ $current", onClick = { open = true })
+        SelectableValue(current, onClick = { open = true }, enabled = enabled, mono = pin != null)
         androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             androidx.compose.material3.DropdownMenuItem(
                 text = { Text("Auto — most available agent") },
@@ -567,37 +596,42 @@ private fun StatusSection(
     val options = detail?.statusOptions ?: emptyList()
     val editable = com.xerktech.turma.core.statusChangeable(site.online, options)
     val current = (detail?.status?.takeIf { it.isNotBlank() }) ?: t.status
+    val onPick: (com.xerktech.turma.model.StatusOption) -> Unit = { opt ->
+        error = null
+        pending = opt.name
+        scope.launch {
+            val err = vm.saveStatus(site.siteKey, t.key, opt.id)
+            if (err != null) {
+                error = err
+                pending = null
+            } else {
+                onDetailChange(vm.fetchIssue(site.siteKey, t.key))
+                pending = null
+            }
+        }
+    }
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         SectionLabel("Status")
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Pill(pending ?: current)
-            if (pending != null) {
-                Text("— saving…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            when {
+                // Mid-change: the optimistic target as a plain (non-tappable) pill.
+                pending != null -> {
+                    Pill(pending!!)
+                    Text("— saving…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                // Editable: the status value IS the picker.
+                editable -> StatusPicker(options, current, onPick)
+                // Nothing to change to (older agent / offline): read-only pill.
+                else -> Pill(current)
             }
         }
         if (error != null) {
             Text("Couldn't save — $error", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
         }
-        if (editable && pending == null) {
-            StatusPicker(options, current) { opt ->
-                error = null
-                pending = opt.name
-                scope.launch {
-                    val err = vm.saveStatus(site.siteKey, t.key, opt.id)
-                    if (err != null) {
-                        error = err
-                        pending = null
-                    } else {
-                        onDetailChange(vm.fetchIssue(site.siteKey, t.key))
-                        pending = null
-                    }
-                }
-            }
-        }
     }
 }
 
-/** A pick IS the save (like [RepoPicker]); the first option keeps the current. */
+/** The status value rendered as the picker; a pick IS the save. */
 @Composable
 private fun StatusPicker(
     options: List<com.xerktech.turma.model.StatusOption>,
@@ -606,7 +640,7 @@ private fun StatusPicker(
 ) {
     var open by remember { mutableStateOf(false) }
     Box {
-        GhostButton("▾ Change status", onClick = { open = true })
+        SelectableValue(current.ifBlank { "Set status" }, onClick = { open = true })
         androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             androidx.compose.material3.DropdownMenuItem(
                 text = { Text(if (current.isNotBlank()) "$current (current)" else "Keep current") },
