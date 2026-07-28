@@ -40,6 +40,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -74,6 +75,7 @@ import kotlinx.coroutines.launch
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.core.ChatItem
+import com.xerktech.turma.core.TextSize
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.buildItems
 import com.xerktech.turma.core.sessionHeaderMeta
@@ -179,7 +181,7 @@ fun ChatScreen(
                     }
                 },
                 actions = {
-                    VerbosityMenu(state.verbosity) { vm.setVerbosity(it) }
+                    ChatSettingsMenu(state.verbosity) { vm.setVerbosity(it) }
                     IconButton(onClick = onTerminal) { Icon(Icons.Filled.Terminal, "Terminal") }
                     // Kill the session you're in (web chatKill): arm/confirm, then
                     // leave the view — the card drops on the agent's next beat.
@@ -560,18 +562,45 @@ private fun ChatFooter(
     }
 }
 
+/**
+ * The chat settings menu behind the top-bar ⚙/Tune button: verbosity (per-session,
+ * via [onSelect]) plus the fleet-wide chat text size (XERK-144, read/written
+ * through [LocalTextSize] so no call site has to thread the store). Selecting an
+ * option applies it and keeps the menu open, so both settings are adjustable in
+ * one visit; tap away to dismiss.
+ */
 @Composable
-internal fun VerbosityMenu(current: Verbosity, onSelect: (Verbosity) -> Unit) {
+internal fun ChatSettingsMenu(current: Verbosity, onSelect: (Verbosity) -> Unit) {
     var open by remember { mutableStateOf(false) }
-    IconButton(onClick = { open = true }) { Icon(Icons.Filled.Tune, "Verbosity") }
+    val textSize = LocalTextSize.current
+    IconButton(onClick = { open = true }) { Icon(Icons.Filled.Tune, "Settings") }
     DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+        MenuSectionHeader("Verbosity")
         Verbosity.entries.forEach { v ->
             DropdownMenuItem(
                 text = { Text(v.name.lowercase().replaceFirstChar { it.uppercase() } + if (v == current) "  ✓" else "") },
-                onClick = { onSelect(v); open = false },
+                onClick = { onSelect(v) },
+            )
+        }
+        HorizontalDivider()
+        MenuSectionHeader("Text size")
+        TextSize.entries.forEach { s ->
+            DropdownMenuItem(
+                text = { Text(s.label + if (s == textSize.current) "  ✓" else "") },
+                onClick = { textSize.set(s) },
             )
         }
     }
+}
+
+@Composable
+private fun MenuSectionHeader(label: String) {
+    Text(
+        label,
+        Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }
 
 @Composable

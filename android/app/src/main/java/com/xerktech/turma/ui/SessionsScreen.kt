@@ -909,7 +909,7 @@ internal fun EndedSessionView(
                     if (showBack) IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
                 },
                 actions = {
-                    VerbosityMenu(verbosity) { verbosity = it }
+                    ChatSettingsMenu(verbosity) { verbosity = it }
                     entry?.let { e ->
                         GhostButton(
                             "Resume",
@@ -998,7 +998,7 @@ private fun SubagentView(
                 navigationIcon = {
                     IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Session") }
                 },
-                actions = { VerbosityMenu(verbosity) { verbosity = it } },
+                actions = { ChatSettingsMenu(verbosity) { verbosity = it } },
             )
         },
     ) { pad ->

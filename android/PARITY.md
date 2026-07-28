@@ -35,6 +35,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   tappable chip reads better on a phone than a value plus a separate button; a pick is still the save,
   same as the web.
 - **In-app updater** (`ui/UpdateBanner.kt`) — a sideload stopgap until Play (XERK-11), no web analog.
+- **Chat text-size control** (XERK-144) — a phone-only addition, no web analog. The chat settings menu
+  (the top-bar ⚙/Tune button that holds verbosity) also picks a chat text size, scaling every bubble/
+  thinking/tool font in `ui/TranscriptView.kt`. Unlike verbosity (per-session) it is ONE fleet-wide
+  preference, stored in `data/TextSizePref.kt` and read by every transcript renderer through
+  `LocalTextSize`. A phone screen and the range of eyesight reading it vary far more than a desktop
+  browser (which has OS/browser zoom); the web can revisit this later.
 - **Chat verbosity defaults to Concise** (XERK-40), where the web defaults to Normal — a phone screen
   fits far less, so tool cards/outputs are opt-in there. A per-session pick still persists as on web.
 - **One "+" per repo, opening the composer** (XERK-69). The web dashboard has two spawn controls per
