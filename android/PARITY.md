@@ -28,6 +28,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
+- **Ticket-detail fields tap-to-change** (XERK-138 follow-up). The web detail panel shows each editable
+  field's value beside a separate "Change" link/control that swaps in a `<select>`. Android instead
+  renders the value itself as the control — a pill with a trailing ▾ (`SelectableValue` in
+  `BoardScreen.kt`) that opens the dropdown on tap — for the Status, Repo, Agent and Model rows. One
+  tappable chip reads better on a phone than a value plus a separate button; a pick is still the save,
+  same as the web.
 - **In-app updater** (`ui/UpdateBanner.kt`) — a sideload stopgap until Play (XERK-11), no web analog.
 - **Chat verbosity defaults to Concise** (XERK-40), where the web defaults to Normal — a phone screen
   fits far less, so tool cards/outputs are opt-in there. A per-session pick still persists as on web.
