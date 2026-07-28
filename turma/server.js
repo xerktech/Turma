@@ -599,6 +599,12 @@ function buildAgentsCache() {
     // In-flight (and just-settled) session migrations, so the Sessions page can
     // follow a moved session onto its new host and surface a failure (XERK-101).
     migrations: migrationList(),
+    // Whether the hub can actually deliver mobile push (FCM configured). Surfaced
+    // so a disabled/misconfigured push is VISIBLE on the dashboard instead of
+    // silently swallowing every alert — the failure mode of XERK-152, whose only
+    // prior signal was a boot log line. Hub-wide, not per-agent; constant for the
+    // process's life (the service account is parsed once at startup).
+    pushEnabled: push.fcmEnabled(),
   });
   const etag = '"' + crypto.createHash("sha1").update(body).digest("base64") + '"';
   agentsCache = { body, etag };
@@ -3921,11 +3927,11 @@ if (process.env.TURMA_TEST) {
   if (!TURMA_TRIGGER_TOKEN) console.warn("WARNING: TURMA_TRIGGER_TOKEN not set — POST /api/trigger accepts only the user login (no dedicated token)");
   server.listen(PORT, () => {
     console.log(`turma listening on :${PORT}`);
-    console.log(
-      push.fcmEnabled()
-        ? "FCM push alerts -> Android devices"
-        : "FCM push alerts disabled (FCM_SERVICE_ACCOUNT_JSON not set)"
-    );
+    if (push.fcmEnabled()) console.log("FCM push alerts -> Android devices");
+    // A warning, not an info line: a hub running without FCM delivers ZERO mobile
+    // notifications (every notify() is a no-op), and that has silently bitten us
+    // before (XERK-152). Loud enough to notice beside the other startup WARNINGs.
+    else console.warn("WARNING: FCM push alerts disabled (FCM_SERVICE_ACCOUNT_JSON not set) — no mobile notifications will be sent");
     console.log(
       WHISPER_URL ? `whisper STT -> ${WHISPER_URL}` : "whisper STT disabled (LITELLM_URL/WHISPER_URL not set)"
     );

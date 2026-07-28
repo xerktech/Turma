@@ -44,6 +44,11 @@ data class FleetState(
     // 1..8; every screen's org tint reads it. Refreshed by the poll and the
     // "orgColors" SSE event.
     val orgColors: Map<String, Int> = emptyMap(),
+    // Hub-wide mobile-push health (XERK-152): false when the hub has no FCM
+    // credential, so every alert is silently dropped. Drives the Dashboard's
+    // "push is off" banner. Poll-only (no SSE event); defaults true so an older
+    // hub never false-alarms.
+    val pushEnabled: Boolean = true,
 )
 
 class FleetRepository(
@@ -94,6 +99,7 @@ class FleetRepository(
             autoStartOrgs = resp.autoStartOrgs
             ticketModels = resp.ticketModels
             orgColors = resp.orgColors
+            pushEnabled = resp.pushEnabled
             emit(resp.now, error = null)
         } catch (e: Exception) {
             emit(_state.value.now, error = e.message ?: "hub unreachable")
@@ -112,6 +118,9 @@ class FleetRepository(
     @Volatile
     private var orgColors: Map<String, Int> = emptyMap()
 
+    @Volatile
+    private var pushEnabled: Boolean = true
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
@@ -120,6 +129,7 @@ class FleetRepository(
             autoStartOrgs = autoStartOrgs,
             ticketModels = ticketModels,
             orgColors = orgColors,
+            pushEnabled = pushEnabled,
         )
     }
 
