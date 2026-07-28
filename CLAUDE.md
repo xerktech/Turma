@@ -514,7 +514,18 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   3. else the repo from the transcript's own recorded `cwd` (`_repo_from_transcript_cwd` — Claude Code
      stamps the real un-slugified working dir, so its final segment names the repo, incl. dev-machine
      sessions synced through the shared `~/.claude`);
-  4. else `OTHER_REPO_NAME` (`(other)`), only when no `cwd` is recorded.
+  4. else the root bucket (`ROOT_REPO_NAME`) — there is no "(other)" bucket.
+- **A derived name (case 2/3) only stands when it names a repo this host scans** (XERK-147): both
+  heuristics are lossy (a scratchpad cwd embeds `-worktrees-` once slugified; a cwd tail can be
+  `tmp`/`repo`/`repos`) and unvalidated they minted phantom repos. A miss falls to case 4.
+  `_sanitize_junk_repo_entries` retires persisted junk the same way each beat (a stored name stands
+  only with a recorded git remote or a scanned repo; no-op when the repo scan is empty, so an
+  unreadable `REPOS_ROOT` can't fold real history into root). The usage page renders `(root)` as
+  **Root**, folding older agents' `(other)`/`?` in (`normRepo`/`repoLabel` in `usage.html`, mirrored
+  in android `UsageViewModel`).
+- **The `REPOS_ROOT` slug is never `internal`**: it holds every root session's transcript and the check
+  reads only the newest — a root session where the operator typed only `/model` reads exactly like the
+  models probe and once tombstoned the whole root history (the sanitizer lifts that tombstone).
 - **No real session is excluded.** The one carve-out is the manager's OWN internal `claude -p` helpers
   (session naming, Jira triage, models probe), which run with `cwd=REGISTRY_DIR` yet write a transcript
   into the shared `~/.claude/projects` — else the reconciler adopts the agent's overhead as a phantom
@@ -529,7 +540,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   reconciliation *intentionally* widens archival too: every ended session on the box, incl. synced
   dev-machine history, is shipped to and indexed in the hub's archive. Decouple the two inputs only if
   archival scope should diverge from usage scope.
-- Tests: `TestReconcileOrphanTranscripts` (incl. the internal-tool tombstone/signature/sanitize cases).
+- Tests: `TestReconcileOrphanTranscripts` (incl. the internal-tool tombstone/signature/sanitize cases),
+  `TestSanitizeJunkRepoEntries`, the fold-to-Root case in android `UsageViewModelTest`.
 
 ### Jira block
 

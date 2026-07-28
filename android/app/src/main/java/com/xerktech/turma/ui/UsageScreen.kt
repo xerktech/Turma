@@ -86,7 +86,7 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
     val ordered: List<UsageSeries> = remember(ui, tab) {
         when (tab) {
             // Chartable groupings sort by (label, key) — the stable paint order.
-            0 -> ui.byRepo.map { UsageSeries(it.skey, it.repo, it.today, it.total, it.days) }
+            0 -> ui.byRepo.map { UsageSeries(it.skey, it.label, it.today, it.total, it.days) }
                 .sortedWith(compareBy({ it.label }, { it.skey }))
             1 -> ui.byHost.map { UsageSeries(it.skey, it.host, it.today, it.total, it.days) }
                 .sortedWith(compareBy({ it.label }, { it.skey }))

@@ -2464,7 +2464,7 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
     """Usage counts EVERY transcript on disk, not only ledger-known slugs: an
     orphan transcript (session aged out of closed.json, or predating the ledger)
     is adopted with best-effort attribution, and nothing is excluded — an
-    unattributable one still counts under OTHER_REPO_NAME."""
+    unattributable one still counts, folded into the root bucket (XERK-147)."""
 
     def setUp(self):
         super().setUp()
@@ -2473,6 +2473,11 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
         p = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
         p.start()
         self.addCleanup(p.stop)
+
+    def _mk_repo(self, name):
+        """A scanned repo under REPOS_ROOT — a derived (slug/cwd) attribution
+        only stands when it names one of these."""
+        os.makedirs(os.path.join(ha.REPOS_ROOT, name, ".git"), exist_ok=True)
 
     def _write_transcript(self, worktree):
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(worktree))
@@ -2501,7 +2506,9 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
 
     def test_case2_recovers_repo_when_worktree_gone(self):
         # Worktree deleted; the transcript's slug still carries the
-        # .turma/worktrees/<repo>/<id> shape, so the repo is recovered from it.
+        # .turma/worktrees/<repo>/<id> shape, so the repo is recovered from it
+        # (a repo this host scans — validation's happy path).
+        self._mk_repo("DockerOps")
         wt = os.path.join(ha.WORKTREES_ROOT, "DockerOps", "zzzzz")
         proj = self._write_transcript(wt)
         sm = self.make_manager()
@@ -2513,17 +2520,33 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
     def test_sibling_tool_worktree_shape_attributed(self):
         # A different tool's worktree (e.g. .agenthub/worktrees/AgentHub/<id>):
         # not under WORKTREES_ROOT, so no exact match, but the worktrees-shaped
-        # slug still names the repo — attributed, not lumped into (other).
+        # slug still names the repo — attributed when this host has that repo.
+        self._mk_repo("AgentHub")
         wt = "/repos/.agenthub/worktrees/AgentHub/10ab3"
         proj = self._write_transcript(wt)
         sm = self.make_manager()
         sm._reconcile_orphan_transcripts()
         self.assertEqual(sm.usage_ledger[proj]["repo"], "AgentHub")
 
+    def test_scratchpad_slug_folds_to_root(self):
+        # A claude run inside a session's scratchpad dir: its cwd embeds the
+        # SLUGIFIED worktree path, so the transcript slug carries "-worktrees-"
+        # and false-matched the worktree shape — recovering a phantom
+        # "Turma-<id>-<uuid>" repo (XERK-147). Not a scanned repo, no usable
+        # cwd tail -> folded into the root bucket.
+        self._mk_repo("Turma")
+        cwd = ("/tmp/claude-0/-mnt-data-Docker-git--turma-worktrees-Turma-fd761"
+               "/b2e9b2c9-a9f2-4da9-8cbf-df0c27c31aae/scratchpad")
+        proj = self._write_transcript(cwd)
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertEqual(sm.usage_ledger[proj]["repo"], ha.ROOT_REPO_NAME)
+
     def test_repo_recovered_from_transcript_cwd(self):
         # No worktree and no worktrees-shaped slug, but the transcript records
         # its cwd (e.g. an operator's dev-machine session, Windows path) — the
-        # repo is read from there, not lumped into (other).
+        # repo is read from there when its tail names a repo this host has.
+        self._mk_repo("Foverlay")
         wt = "/home/me/OneDrive/personal/Foverlay"
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
         os.makedirs(proj, exist_ok=True)
@@ -2535,13 +2558,28 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
         sm._reconcile_orphan_transcripts()
         self.assertEqual(sm.usage_ledger[proj]["repo"], "Foverlay")
 
-    def test_unattributable_bucketed_as_other(self):
+    def test_junk_cwd_tail_folds_to_root(self):
+        # A cwd whose last segment names no repo this host has ("repo", "tmp",
+        # "repos") must not mint a phantom repo — it folds to root (XERK-147).
+        self._mk_repo("Turma")
+        cwd = "/mnt/data/Docker/SwitchBoard/repo"
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        write_jsonl(os.path.join(proj, "t.jsonl"), [
+            {"type": "user", "cwd": cwd,
+             "message": {"role": "user", "content": "hi"}},
+        ])
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertEqual(sm.usage_ledger[proj]["repo"], ha.ROOT_REPO_NAME)
+
+    def test_unattributable_bucketed_as_root(self):
         # No worktree, no worktrees-shaped slug, and no cwd recorded — still
-        # adopted so its usage counts, under OTHER_REPO_NAME.
+        # adopted so its usage counts, in the root bucket (XERK-147).
         proj = self._write_transcript("/root/scratch")  # usage_entry has no cwd
         sm = self.make_manager()
         sm._reconcile_orphan_transcripts()
-        self.assertEqual(sm.usage_ledger[proj]["repo"], ha.OTHER_REPO_NAME)
+        self.assertEqual(sm.usage_ledger[proj]["repo"], ha.ROOT_REPO_NAME)
 
     def test_skips_already_ledgered_slug(self):
         wt = self._mk_worktree("Turma", "abcde")
@@ -2623,6 +2661,7 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
     def test_real_session_prompt_not_treated_as_internal(self):
         # A genuine coding prompt from a repo cwd is still adopted as its repo —
         # the carve-out is narrow and keyed on the manager's own prompt text.
+        self._mk_repo("Widget")
         proj = self._write_prompted(
             "/home/me/personal/Widget", "Add a dark mode toggle to settings")
         sm = self.make_manager()
@@ -2646,6 +2685,73 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
                             for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
         self.assertTrue(any(ha.SUMMARY_INSTRUCTION.startswith(s)
                             for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
+
+
+class TestSanitizeJunkRepoEntries(ManagerMixin, unittest.TestCase):
+    """_sanitize_junk_repo_entries folds persisted ledger entries whose repo
+    names nothing real — the phantom "…-scratchpad"/"tmp"/"repo"/"(other)"
+    entries older builds adopted — into the root bucket, and lifts the internal
+    tombstone a /model-only root session once put on the REPOS_ROOT slug
+    (XERK-147)."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
+        p.start()
+        self.addCleanup(p.stop)
+        os.makedirs(os.path.join(ha.REPOS_ROOT, "Turma", ".git"), exist_ok=True)
+
+    def _entry(self, repo, slug, remote=""):
+        return {"repo": repo, "remote": remote, "slug": slug}
+
+    def test_junk_names_fold_to_root(self):
+        sm = self.make_manager()
+        sm.usage_ledger = {
+            "/p/a": self._entry("Turma-fd761-b2e9b2c9-scratchpad", "-p-a"),
+            "/p/b": self._entry("repo", "-p-b"),
+            "/p/c": self._entry("(other)", "-p-c"),
+            "/p/d": self._entry(None, "-p-d"),
+        }
+        sm._sanitize_junk_repo_entries()
+        for path in ("/p/a", "/p/b", "/p/c", "/p/d"):
+            self.assertEqual(sm.usage_ledger[path]["repo"], ha.ROOT_REPO_NAME)
+
+    def test_scanned_repo_and_remote_entries_kept(self):
+        sm = self.make_manager()
+        sm.usage_ledger = {
+            "/p/scanned": self._entry("Turma", "-p-scanned"),
+            "/p/gone": self._entry("Deleted",
+                                   "-p-gone", remote="git@gh:me/Deleted.git"),
+            "/p/root": self._entry(ha.ROOT_REPO_NAME, "-p-root"),
+        }
+        before = {p: dict(m) for p, m in sm.usage_ledger.items()}
+        sm._sanitize_junk_repo_entries()
+        # A scanned repo, a remote-carrying entry (real even though the repo
+        # left this host), and the root bucket itself are all untouched.
+        self.assertEqual(sm.usage_ledger, before)
+
+    def test_untombstones_repos_root_slug(self):
+        sm = self.make_manager()
+        root_slug = ha._project_slug(ha.REPOS_ROOT)
+        sm.usage_ledger = {
+            ha.REPOS_ROOT: {"internal": True, "slug": root_slug},
+            "/p/probe": {"internal": True, "slug": "-tmp-hub-agent-mgr-x"},
+        }
+        sm._sanitize_junk_repo_entries()
+        self.assertEqual(sm.usage_ledger[ha.REPOS_ROOT]["repo"],
+                         ha.ROOT_REPO_NAME)
+        self.assertNotIn("internal", sm.usage_ledger[ha.REPOS_ROOT])
+        # A genuine internal tombstone (the manager's own helpers) stays.
+        self.assertTrue(sm.usage_ledger["/p/probe"].get("internal"))
+
+    def test_noop_when_repo_scan_is_empty(self):
+        # An unreadable/empty REPOS_ROOT must not fold every real repo's
+        # history into root — the pass declines to judge without a repo list.
+        shutil.rmtree(os.path.join(ha.REPOS_ROOT, "Turma"))
+        sm = self.make_manager()
+        sm.usage_ledger = {"/p/a": self._entry("Whatever", "-p-a")}
+        sm._sanitize_junk_repo_entries()
+        self.assertEqual(sm.usage_ledger["/p/a"]["repo"], "Whatever")
 
 
 class TestTranscriptCwd(unittest.TestCase):
@@ -5443,6 +5549,15 @@ class TestInternalToolSlugModelProbe(ManagerMixin, unittest.TestCase):
             {"type": "user",
              "message": {"role": "user", "content": "now fix the login bug"}},
         ])
+        self.assertFalse(sm._is_internal_tool_slug(slug))
+
+    def test_repos_root_slug_never_internal(self):
+        # The REPOS_ROOT slug holds EVERY root session's transcript, and the
+        # check only reads the newest — a root session in which the operator
+        # typed nothing but /model reads exactly like the probe, and one such
+        # transcript must not tombstone the whole root history (XERK-147).
+        sm = self.make_manager()
+        slug = self._slug(ha._project_slug(ha.REPOS_ROOT), self._probe_entries())
         self.assertFalse(sm._is_internal_tool_slug(slug))
 
 

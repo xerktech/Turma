@@ -92,11 +92,11 @@ TTYD_PORT_BASE = int(os.environ.get("TTYD_PORT_BASE", "7700"))
 # run at a time. Parens keep it clear of any real (dir-name) repo in the scan.
 ROOT_REPO_NAME = "(root)"
 
-# Usage bucket for a transcript on disk that reconciliation can't attribute to
-# any repo (a bare `claude` run outside a managed worktree). Parenthesized like
-# ROOT_REPO_NAME so it never collides with a real repo name, and so every
-# transcript still counts toward the host total rather than being dropped.
-OTHER_REPO_NAME = "(other)"
+# A transcript reconciliation can't tie to a repo this host has (a bare
+# `claude` run outside a managed worktree, a foreign dev-machine session on the
+# shared login) folds into ROOT_REPO_NAME, so the usage page lists only real
+# repos plus the one root bucket (XERK-147). The old separate "(other)" bucket
+# is gone; _sanitize_junk_repo_entries retires ledger entries that carry it.
 
 # The coding agent this build launches for its sessions. Only a fallback: the
 # name is normally read out of the CLI's own `--version` reply (coding_agent()),
@@ -1462,7 +1462,7 @@ def repo_usage_report(ledger, fold_slug):
         meta = meta or {}
         if meta.get("internal"):
             continue  # the manager's own claude -p helper, not a repo (XERK-27)
-        repo = meta.get("repo") or "?"
+        repo = meta.get("repo") or ROOT_REPO_NAME
         slug = meta.get("slug") or _project_slug(path)
         g = by_repo.setdefault(repo, {"remote": "", "slugs": set()})
         g["slugs"].add(slug)
@@ -9998,6 +9998,12 @@ class SessionManager:
         a real coding session — see INTERNAL_TOOL_PROMPT_SIGS for why they leak
         into ~/.claude/projects and must be kept off the usage page (XERK-27).
 
+        The REPOS_ROOT slug is never internal: it is the root pseudo-repo's
+        shared project dir, holding EVERY root session's transcript, and this
+        check reads only the newest one — a root session in which the operator
+        typed nothing but /model reads exactly like the models probe, and one
+        such transcript must not tombstone the whole root history (XERK-147).
+
         Those helpers run with cwd=REGISTRY_DIR, so in production every one lands
         under the registry dir's own slug — matched here directly, with no
         transcript read. A test/verify harness that boots the manager against a
@@ -10007,6 +10013,8 @@ class SessionManager:
         path- and process-independent. This is the one carve-out to the usage
         ledger's 'every transcript on the box counts' rule: the agent's own
         overhead is not a repo."""
+        if slug == _project_slug(REPOS_ROOT):
+            return False
         if slug == _project_slug(REGISTRY_DIR):
             return True
         proj = os.path.join(PROJECTS_ROOT, slug)
@@ -10057,6 +10065,50 @@ class SessionManager:
         if changed:
             self._save_ledger()
 
+    def _sanitize_junk_repo_entries(self):
+        """Fold ledger entries whose repo names nothing real into the root
+        bucket (XERK-147). Earlier builds attributed an orphan transcript by its
+        worktree-shaped slug or its cwd's last path segment UNVALIDATED, so the
+        usage page grew phantom repos: "<worktree>-…-scratchpad" (a claude run
+        inside a session's scratchpad dir, whose slugified cwd embeds
+        "-worktrees-" and false-matches _repo_from_worktree_slug), "tmp",
+        "repo", "repos", "root", "(other)". A stored name now only stands when
+        the entry records a git remote (a real repo beyond doubt, even if since
+        deleted from this host) or names a repo this host scans; anything else
+        is re-attributed to ROOT_REPO_NAME, per the rule that usage belongs to
+        a repo or to root — never to a phantom.
+
+        Also lifts an `internal` tombstone off the REPOS_ROOT slug: before
+        _is_internal_tool_slug's root guard, one /model-only root session
+        tombstoned the whole root history, and the tombstone persists until
+        retired here.
+
+        Skipped entirely when the repo scan comes back empty — an unreadable
+        REPOS_ROOT (or a fresh box) must not permanently fold every real repo's
+        history into root."""
+        known = {r["name"] for r in scan_repos()}
+        if not known:
+            return
+        root_slug = _project_slug(REPOS_ROOT)
+        changed = False
+        for path, meta in list(self.usage_ledger.items()):
+            meta = meta or {}
+            slug = meta.get("slug") or _project_slug(path)
+            if meta.get("internal"):
+                if slug == root_slug:
+                    self.usage_ledger[path] = {
+                        "repo": ROOT_REPO_NAME, "remote": "", "slug": slug}
+                    changed = True
+                continue
+            repo = meta.get("repo")
+            if repo == ROOT_REPO_NAME or repo in known or meta.get("remote"):
+                continue
+            self.usage_ledger[path] = {
+                "repo": ROOT_REPO_NAME, "remote": "", "slug": slug}
+            changed = True
+        if changed:
+            self._save_ledger()
+
     def _reconcile_orphan_transcripts(self):
         """Adopt EVERY transcript sitting in PROJECTS_ROOT that no ledger entry
         covers, so persistent token usage reflects every session on disk — not
@@ -10065,10 +10117,11 @@ class SessionManager:
         worktree maybe surviving) or one predating _remember_usage would
         otherwise silently drop out of the totals, since repo_usage_report only
         folds slugs the ledger names. A REAL session is never excluded — an
-        unattributable one still counts under OTHER_REPO_NAME rather than being
-        dropped. The single carve-out is the manager's OWN internal `claude -p`
-        helper transcripts (_is_internal_tool_slug), which are its overhead, not a
-        repo; those are tombstoned so they never surface on the usage page (XERK-27).
+        unattributable one still counts, folded into the root bucket rather
+        than being dropped (XERK-147). The single carve-out is the manager's OWN
+        internal `claude -p` helper transcripts (_is_internal_tool_slug), which
+        are its overhead, not a repo; those are tombstoned so they never surface
+        on the usage page (XERK-27).
 
         Attribution, most precise first:
           1. slug matches a worktree still on disk -> exact repo + git remote,
@@ -10082,8 +10135,13 @@ class SessionManager:
           3. neither of those (a bare `claude` run, or the operator's own
              dev-machine session on the shared login) -> repo read from the
              transcript's recorded cwd (_repo_from_transcript_cwd).
-          4. still nothing (no cwd recorded) -> bucketed under OTHER_REPO_NAME
-             so it always counts.
+          4. still nothing -> bucketed under ROOT_REPO_NAME so it always counts.
+        Cases 2 and 3 only stand when the derived name matches a repo this host
+        scans: both are lossy heuristics, and unvalidated they invented phantom
+        repos on the usage page — a scratchpad cwd (/tmp/claude-0/<slugified
+        worktree cwd>/…) embeds "-worktrees-" once slugified and false-matches
+        the slug shape, and a cwd tail can be "tmp"/"repo"/"repos" (XERK-147).
+        A miss falls through to case 4 rather than minting a name.
         New entries are persisted and keyed so _prune_ledger removes them once
         the transcript dir finally disappears."""
         try:
@@ -10092,7 +10150,8 @@ class SessionManager:
             return
         known = {(m or {}).get("slug") or _project_slug(p)
                  for p, m in self.usage_ledger.items()}
-        existing = None  # built lazily — the listdirs aren't free
+        existing = None      # built lazily — the listdirs aren't free
+        repo_names = None    # likewise (a scan_repos listdir + .git checks)
         added = False
         for slug in names:
             proj = os.path.join(PROJECTS_ROOT, slug)
@@ -10129,11 +10188,16 @@ class SessionManager:
                 known.add(slug)
                 added = True
                 continue
-            # slug shape (case 2), then the recorded cwd (case 3), then the
-            # catch-all (case 4) — either way it's adopted, nothing is dropped.
-            repo = (_repo_from_worktree_slug(slug)
-                    or self._repo_from_transcript_cwd(proj)
-                    or OTHER_REPO_NAME)
+            # slug shape (case 2), then the recorded cwd (case 3), each accepted
+            # only when it names a repo this host scans, then the root catch-all
+            # (case 4) — either way it's adopted, nothing is dropped.
+            if repo_names is None:
+                repo_names = {r["name"] for r in scan_repos()}
+            repo = _repo_from_worktree_slug(slug)
+            if repo not in repo_names:
+                repo = self._repo_from_transcript_cwd(proj)
+            if repo not in repo_names:
+                repo = ROOT_REPO_NAME
             remote = ""
             repo_dir = os.path.join(REPOS_ROOT, repo)
             if os.path.isdir(repo_dir):
@@ -10159,6 +10223,7 @@ class SessionManager:
         every transcript from scratch."""
         self._backfill_ledger()
         self._sanitize_internal_tool_entries()
+        self._sanitize_junk_repo_entries()
         self._reconcile_orphan_transcripts()
         self._prune_ledger()
         try:

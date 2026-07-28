@@ -241,6 +241,17 @@ function mergeUsageInto(acc, u) {
   }
 }
 
+// The agent's reserved root pseudo-repo name. Usage the agent can't tie to a
+// repo folds in here too, and it reads as "Root" on this page (XERK-147).
+// Older agents reported such usage as "(other)"/"?" — those fold into the same
+// series client-side rather than listing phantom repos.
+const ROOT_REPO = "(root)";
+const LEGACY_ROOT_KEYS = new Set([ROOT_REPO, "(other)", "?"]);
+function normRepo(name) {
+  return !name || LEGACY_ROOT_KEYS.has(name) ? ROOT_REPO : name;
+}
+function repoLabel(name) { return name === ROOT_REPO ? "Root" : name; }
+
 // "By repo": one series per repo, summed across every host it runs on. Repos are
 // unified by the agent-supplied `remoteKey` (normalized git origin), so the same
 // repo cloned on two hosts collapses to one series.
@@ -248,14 +259,14 @@ function repoSeries(agents) {
   const byKey = new Map(); // remoteKey -> merged series
   for (const a of agents) {
     for (const r of a.repoUsage || []) {
-      const key = r.remoteKey || r.repo || "?";
+      const key = normRepo(r.remoteKey || r.repo);
       let g = byKey.get(key);
       if (!g) {
-        g = { skey: "repo::" + key, group: "Repos", repo: r.repo || key,
+        g = { skey: "repo::" + key, group: "Repos", repo: normRepo(r.repo) || key,
               id: key, hosts: new Set(), usage: blankUsage() };
         byKey.set(key, g);
       }
-      if (r.repo && r.repo !== "?") g.repo = r.repo;
+      if (r.repo) g.repo = normRepo(r.repo);
       g.hosts.add(a.device || a.key);
       mergeUsageInto(g.usage, r.usage);
     }
@@ -264,9 +275,9 @@ function repoSeries(agents) {
     const hosts = [...g.hosts].sort();
     return {
       skey: g.skey, group: g.group, repo: g.repo, id: g.id,
-      label: g.repo,
+      label: repoLabel(g.repo),
       device: hosts.join(", "),                 // shown as the muted host context
-      rcName: g.repo + " · " + hosts.join(", "),
+      rcName: repoLabel(g.repo) + " · " + hosts.join(", "),
       usage: g.usage,
     };
   });
