@@ -187,6 +187,15 @@ Replaced the old model of one fixed-repo container per session.
   `importing` forever — the target rejected the foreign path as not-resumable. History entries keep the
   source's absolute paths (harmless — `claude --resume` resolves by the local slug, not the recorded cwd).
   The tar extract guards against `..`/absolute members (crosses a host boundary — untrusted).
+- **A migrated session keeps its PR chips**, re-derived from the transcript rather than carried in the
+  command: the identity fields (ticket/name/model/mode) ride `importSession`, but PR links are the per-beat
+  transcript scan's job, and that scan PRIMES a resumed transcript's byte offset to EOF the first time it
+  sees the file — so the `gh pr create` events that opened the PRs sit past it and the chips would vanish
+  though the PR is right there in the moved conversation. `_resume_at_cwd` calls `_seed_prs` once at launch
+  to scan the whole transcript for those events (same `_scan_pr_line` rule) and seed `session_pr_urls` + the
+  record's `prUrls` + the durable `pr-sessions.json` ledger — keyed by the PRESERVED transcript id, so the
+  target lands the same URLs the source reported, and the status pill re-polls by URL. Shared by
+  `resume_transcript`, so a host-local resume-any keeps its chips too (same bug, same fix). Idempotent.
   Blob relay is agent-authed; `POST .../sessions/<id>/migrate {host}` validates same-org + online +
   repo-cloned + running/non-root/has-conversation, single-flight per session. Migration state is
   in-memory (blob included); a hub restart mid-move aborts it, leaving the source session intact. **The
