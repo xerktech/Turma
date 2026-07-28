@@ -371,6 +371,7 @@ private fun TicketCard(
             .onGloballyPositioned { cardPos = it.positionInWindow(); cardSize = it.size }
             .then(dragMod)
             .alpha(if (dragging) 0.35f else 1f),
+        tint = orgColor, // subtle org tint on the card fill (XERK-142)
     ) {
         Column(Modifier.clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
             // Top row (web .kc-top): org dot + project, issue type, age … key.

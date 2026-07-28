@@ -48,6 +48,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -60,7 +61,9 @@ import com.xerktech.turma.core.VerbosityPrefs
 import com.xerktech.turma.core.buildItems
 import com.xerktech.turma.core.eligibleMoveTargets
 import com.xerktech.turma.core.liveState
+import com.xerktech.turma.core.orgColorMap
 import com.xerktech.turma.core.scopedAgents
+import com.xerktech.turma.core.siteKeyOf
 import com.xerktech.turma.core.sessionBranch
 import com.xerktech.turma.core.sessionName
 import com.xerktech.turma.core.sessionRepoLabel
@@ -442,6 +445,17 @@ fun SessionsListPane(
     // it, so the lists AND the new-session host picker narrow together — a host
     // polls exactly one org, so scoping the agent list scopes all three.
     val agents = remember(fleet.agents, org) { scopedAgents(fleet.agents, org) }
+    // Org card tints (XERK-142): each host key → its org's palette colour (null when
+    // it has no tracker), so a session card reads its org at a glance the same way a
+    // board card does. Built over the WHOLE fleet so the colour is stable regardless
+    // of the header's org filter.
+    val hostTint = remember(fleet.agents) {
+        val cm = orgColorMap(fleet.agents.map { siteKeyOf(it) })
+        val series = com.xerktech.turma.ui.theme.TurmaColors.series
+        fleet.agents.associate { a ->
+            a.key to cm[siteKeyOf(a)]?.let { series[it % series.size] }
+        }
+    }
     // Running / queued / ended in one pass (web sessions.html collect()): the
     // live lists carry only running sessions; queued get their own section; a
     // non-running registry record lands in Ended with the killed + resumable
@@ -493,7 +507,7 @@ fun SessionsListPane(
             if (queued.isNotEmpty()) {
                 item(key = "queued-header") { SectionLabel("Queued (${queued.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
                 items(queued, key = { "q:" + it.host + "/" + it.session.id }) { r ->
-                    QueuedSessionCard(r, now, onCancel = { vm.kill(r.host, r.session.id) })
+                    QueuedSessionCard(r, now, tint = hostTint[r.host], onCancel = { vm.kill(r.host, r.session.id) })
                 }
             }
             // Active: sessions wanting attention (waiting on you, or working). The
@@ -514,6 +528,7 @@ fun SessionsListPane(
                 items(active, key = { "a:" + it.flat.host + "/" + it.flat.session.id }) { r ->
                     SessionListCard(
                         r.flat, now,
+                        tint = hostTint[r.flat.host],
                         selected = selectedKey == r.flat.host + "/" + r.flat.session.id,
                         moveTargets = eligibleMoveTargets(fleet.agents, r.flat.host, r.flat.session),
                         onKill = { vm.kill(r.flat.host, r.flat.session.id) },
@@ -529,6 +544,7 @@ fun SessionsListPane(
                 items(idle, key = { "i:" + it.flat.host + "/" + it.flat.session.id }) { r ->
                     SessionListCard(
                         r.flat, now,
+                        tint = hostTint[r.flat.host],
                         selected = selectedKey == r.flat.host + "/" + r.flat.session.id,
                         moveTargets = eligibleMoveTargets(fleet.agents, r.flat.host, r.flat.session),
                         onKill = { vm.kill(r.flat.host, r.flat.session.id) },
@@ -559,6 +575,7 @@ fun SessionsListPane(
                     items(ended, key = { "ended:" + it.host + "/" + it.id }) { e ->
                         EndedSessionRow(
                             e, now,
+                            tint = hostTint[e.host],
                             selected = selectedKey == e.host + "/" + e.transcriptId,
                             // Tap the card body to review the chat read-only; the
                             // Resume button re-launches it live (XERK-70).
@@ -612,10 +629,10 @@ fun resumeEnded(vm: FleetViewModel, e: EndedSession) = when (e.kind) {
  * record has no worktree to tear down).
  */
 @Composable
-private fun QueuedSessionCard(r: FlatSession, now: Long, onCancel: () -> Unit) {
+private fun QueuedSessionCard(r: FlatSession, now: Long, tint: Color?, onCancel: () -> Unit) {
     var armed by remember { mutableStateOf(false) }
     LaunchedEffect(armed) { if (armed) { kotlinx.coroutines.delay(KILL_ARM_MS); armed = false } }
-    TurmaCard(Modifier.fillMaxWidth()) {
+    TurmaCard(Modifier.fillMaxWidth(), tint = tint) {
         Row(
             Modifier.fillMaxWidth().padding(start = 10.dp, top = 8.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -651,13 +668,13 @@ private fun QueuedSessionCard(r: FlatSession, now: Long, onCancel: () -> Unit) {
 /** One ended session's row, whatever channel reported it (web endedRow). */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun EndedSessionRow(e: EndedSession, now: Long, selected: Boolean, onOpen: () -> Unit, onResume: () -> Unit) {
+private fun EndedSessionRow(e: EndedSession, now: Long, tint: Color?, selected: Boolean, onOpen: () -> Unit, onResume: () -> Unit) {
     val cardMod = Modifier.fillMaxWidth().then(
         if (selected)
             Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
         else Modifier,
     )
-    TurmaCard(cardMod) {
+    TurmaCard(cardMod, tint = tint) {
         Row(
             // Tapping the card body opens the read-only chat review; Resume stays a
             // separate action (XERK-70), the same split the web ended row has.
@@ -714,6 +731,7 @@ private fun EndedSessionRow(e: EndedSession, now: Long, selected: Boolean, onOpe
 private fun SessionListCard(
     r: FlatSession,
     now: Long,
+    tint: Color?,
     selected: Boolean,
     moveTargets: List<com.xerktech.turma.model.AgentInfo>,
     onKill: () -> Unit,
@@ -754,7 +772,7 @@ private fun SessionListCard(
         return
     }
 
-    TurmaCard(cardMod) {
+    TurmaCard(cardMod, tint = tint) {
         Row(
             Modifier.fillMaxWidth().clickable(onClick = onClick).padding(start = 10.dp, top = 8.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,

@@ -30,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -42,16 +43,27 @@ import com.xerktech.turma.ui.theme.TurmaColors
 
 // ---- surfaces / structure --------------------------------------------------
 
-/** The web's card: surface fill, hairline border, 14px radius. */
+/**
+ * The web's card: surface fill, hairline border, 14px radius.
+ *
+ * [tint] is an optional org colour (XERK-142): when set, the fill is that colour
+ * blended a little way into the surface (opaque, so it never washes the card out)
+ * — the same subtle org tint the web board/sessions/dashboard cards carry, so a
+ * card's org reads at a glance on every surface. Null → plain surface.
+ */
 @Composable
-fun TurmaCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+fun TurmaCard(modifier: Modifier = Modifier, tint: Color? = null, content: @Composable () -> Unit) {
+    val surface = MaterialTheme.colorScheme.surface
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(14.dp),
-        color = MaterialTheme.colorScheme.surface,
+        color = if (tint != null) lerp(surface, tint, ORG_TINT_AMOUNT) else surface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
     ) { content() }
 }
+
+/** How far an org colour is mixed into a card's surface — matches the web's 12%. */
+const val ORG_TINT_AMOUNT = 0.12f
 
 /** Small uppercase muted section label, like the web's section headers. */
 @Composable

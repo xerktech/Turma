@@ -570,7 +570,12 @@
     // and the handler's own Enter/Space keying. Each of those children is
     // early-returned by the board's delegated handlers so it does its own thing
     // rather than also opening the panel.
+    // --org drives both the org dot chip (below) and the card's subtle org-tinted
+    // background (app.css color-mixes it ~12% into --surface, opaque so it never
+    // washes the card out) — the XERK-142 rule that a card's org reads at a glance
+    // from its fill, the same on every surface.
     return `<div class="kanban-card${o.moving ? " kc-moving-card" : ""}" role="button" tabindex="0"
+      style="--org:${esc(color)}"
       data-key="${esc(t.key)}" data-site="${esc(site && site.siteKey || "")}"
       aria-label="${esc(t.key + ": " + (t.summary || ""))}">
       <div class="kc-top">

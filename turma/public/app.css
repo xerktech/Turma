@@ -347,7 +347,11 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .kanban-done .kanban-card { opacity: 0.72; }
 
 .kanban-card {
-  background: var(--surface); border: 1px solid var(--border);
+  /* Subtle, opaque org tint (XERK-142): --org (var(--sN), set inline per card)
+     mixed a little way into --surface, so the card's org reads at a glance without
+     the colour overwhelming it. Falls back to plain surface when no org is set. */
+  background: color-mix(in srgb, var(--org, var(--surface)) 12%, var(--surface));
+  border: 1px solid var(--border);
   border-radius: var(--radius-md); padding: 9px 11px 10px;
 }
 .kanban-card .kc-top { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
