@@ -1,6 +1,10 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.CreateMetaEnvelope
+import com.xerktech.turma.model.CreateProject
+import com.xerktech.turma.model.CreateResultEnvelope
+import com.xerktech.turma.model.CreateType
 import com.xerktech.turma.model.JiraIssueDetail
 import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.JiraTicket
@@ -52,6 +56,9 @@ data class BoardSite(
     // The freshest block's org-label override (board.js mergeSites `orgName`);
     // "" means the label derives from the siteKey.
     val orgName: String = "",
+    // Which tracker this org is ("jira" | "azure"), off the freshest block — the
+    // New-ticket form words its label field and splits labels from it (XERK-137).
+    val source: String = "jira",
     val online: Boolean,
     val error: String?,
     val fetchedAt: String,
@@ -213,6 +220,7 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
                 siteKey = site,
                 site = newest.site.ifBlank { site },
                 orgName = newest.orgName,
+                source = newest.source.ifBlank { "jira" },
                 online = reporterOnline[site] ?: false,
                 error = sorted.firstNotNullOfOrNull { it.j.error },
                 fetchedAt = newest.fetchedAt,
@@ -606,4 +614,62 @@ fun classifyIssueResponse(code: Int, body: JiraIssueEnvelope?): IssueFetch = whe
     // A non-2xx (4xx/5xx) parses no body; surface the code rather than spin.
     body == null -> IssueFetch.Done(JiraIssueDetail(error = "HTTP $code"))
     else -> IssueFetch.Done(JiraIssueDetail(error = "the host reported no issue"))
+}
+
+// --- New-ticket creation (XERK-137) ------------------------------------------
+// Pure ports of the board.js/board.html create flow: the 202-poll classifiers
+// (like classifyIssueResponse) and the per-source label splitter.
+
+/** The label FIELD word per source — Jira "label", Azure DevOps "tag". */
+fun createLabelWord(source: String, cap: Boolean = false): String {
+    val w = if (source == "azure") "tag" else "label"
+    return if (cap) w.replaceFirstChar { it.uppercase() } else w
+}
+
+/**
+ * Jira labels can't contain spaces, so split on commas AND whitespace; Azure tags
+ * can, so split on commas only. Deduped, trimmed, capped — a port of board.html
+ * `splitLabels`, matching the hub's own cap.
+ */
+fun splitLabels(raw: String, source: String): List<String> {
+    val parts = if (source == "azure") raw.split(",") else raw.split(Regex("[,\\s]+"))
+    val out = LinkedHashSet<String>()
+    for (p in parts) p.trim().takeIf { it.isNotEmpty() }?.let { out.add(it) }
+    return out.toList().take(20)
+}
+
+/** The project/label metadata a create-meta fetch resolves to (or is still pending). */
+sealed interface CreateMetaFetch {
+    object Pending : CreateMetaFetch
+    data class Projects(val projects: List<CreateProject>, val labels: List<String>, val source: String) : CreateMetaFetch
+    data class Types(val types: List<CreateType>) : CreateMetaFetch
+    data class Error(val message: String) : CreateMetaFetch
+}
+
+/**
+ * Classify a create-meta response (GET .../create-meta[?project=]). `wantTypes`
+ * says which shape the caller asked for, so an empty projects/types list reads
+ * correctly rather than as the other shape. Mirrors classifyIssueResponse.
+ */
+fun classifyCreateMeta(code: Int, body: CreateMetaEnvelope?, wantTypes: Boolean): CreateMetaFetch = when {
+    code == 202 || body?.pending == true -> CreateMetaFetch.Pending
+    body == null -> CreateMetaFetch.Error("HTTP $code")
+    body.error != null -> CreateMetaFetch.Error(body.error)
+    wantTypes -> CreateMetaFetch.Types(body.types)
+    else -> CreateMetaFetch.Projects(body.projects, body.labels, body.source.ifBlank { "jira" })
+}
+
+/** The outcome of a create POST, polled by cmdId. */
+sealed interface CreateResultFetch {
+    object Pending : CreateResultFetch
+    data class Created(val key: String, val url: String) : CreateResultFetch
+    data class Error(val message: String) : CreateResultFetch
+}
+
+fun classifyCreateResult(code: Int, body: CreateResultEnvelope?): CreateResultFetch = when {
+    code == 202 || body?.pending == true -> CreateResultFetch.Pending
+    body == null -> CreateResultFetch.Error("HTTP $code")
+    body.error != null -> CreateResultFetch.Error(body.error)
+    !body.key.isNullOrBlank() -> CreateResultFetch.Created(body.key, body.url.orEmpty())
+    else -> CreateResultFetch.Error("the host reported no ticket")
 }
