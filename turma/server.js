@@ -108,6 +108,26 @@ const CREATE_TYPES_MAX = 40; // cap the per-project type cache; oldest evicted
 const CREATE_RESULT_MAX_AGE_MS = 10 * 60 * 1000; // evict a create result older than this
 const CREATE_RESULT_MAX = 40; // cap the per-cmdId create-result cache
 
+// A command an agent doesn't implement is ACKED, not refused (hub-agent.py's
+// handle_commands logs `unknown command type` and acks so a poison command
+// can't be retried forever). So a host running an agent that PREDATES a board
+// write feature is indistinguishable from a merely slow one: the routes that
+// wait on a staged result 202 forever and the client gives up with "the host
+// didn't answer in time" (XERK-151 — an ADO host on agent v0.5.38, which has
+// no boardCreateMeta, so the New-ticket form's project list never loaded).
+//
+// The ack IS the evidence. These commands stage their result inside the same
+// handle_commands call, so the result rides the SAME beat as the ack: an ack
+// carrying no result means the agent did not handle the command, and the route
+// can say so in a beat or two instead of hanging. Version-free by design — the
+// agent proves what it can do rather than the hub keeping a version table.
+const RESULT_WAIT_MAX_MS = 5 * 60 * 1000; // forget a wait whose command never got acked
+// A proven gap is re-probed this often. The precise signal that an agent grew
+// the feature is its version CHANGING (below), which clears every gap at once;
+// this is the backstop for the update that doesn't move the string — a dev
+// build, a same-version reinstall, or a gap recorded from a one-off ack.
+const UNSUPPORTED_TTL_MS = 30 * 60 * 1000;
+
 // Single-user auth: TURMA_USER/TURMA_PASSWORD gate the UI and browser API. The
 // browser signs in through a real login form (/login -> POST /api/login) and
 // gets a signed, HttpOnly session cookie it replays on every same-origin
@@ -544,8 +564,11 @@ function invalidateAgentsCache() { agentsCache = null; }
 // Shared by the fleet payload and the SSE per-agent push so both stay in
 // lockstep.
 function serializeAgent(key, agent, now) {
+  // `resultWaits` is per-command bookkeeping with timestamps (XERK-151) — pure
+  // internal state, stripped like the caches. `unsupported` is NOT: it's a tiny,
+  // rarely-changing map of what this host's agent can't do, worth reading.
   const { history, subagentHistory, jiraIssues, statusResults,
-          createMeta, createTypes, createResults, ...a } = agent;
+          createMeta, createTypes, createResults, resultWaits, ...a } = agent;
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   return {
     key,
@@ -882,6 +905,72 @@ function ingestCreateResults(agent, results) {
       .slice(0, over)
       .forEach(([k]) => delete agent.createResults[k]);
   }
+}
+
+// --- Proven capability gaps (XERK-151) ---------------------------------------
+// Record that `cmdId` is a command whose whole answer is a staged result, so the
+// beat that acks it can decide whether the agent actually implements it. `extra`
+// carries whatever resultLanded needs to find that result (the project, for a
+// per-project boardCreateMeta).
+function awaitResult(agent, cmdId, kind, extra) {
+  agent.resultWaits = agent.resultWaits || {};
+  agent.resultWaits[cmdId] = { kind, at: Date.now(), ...(extra || {}) };
+}
+
+// Did the beat that acked this command also carry its staged result? The create
+// meta/type caches aren't cmdId-keyed (the agent stages them by shape), so they
+// are matched on being REFRESHED since the command was queued; the two per-cmdId
+// caches are matched by id. An unknown kind reads as landed — a capability gap
+// is only ever asserted from positive evidence.
+function resultLanded(agent, cmdId, wait) {
+  if (wait.kind === "boardCreateMeta") {
+    const e = wait.project
+      ? (agent.createTypes || {})[wait.project]
+      : agent.createMeta;
+    return !!e && e.fetchedAt >= wait.at;
+  }
+  if (wait.kind === "createTicket") return !!(agent.createResults || {})[cmdId];
+  if (wait.kind === "setTicketStatus") return !!(agent.statusResults || {})[cmdId];
+  return true;
+}
+
+// Settle every awaited command this beat acked (i.e. that has just left the
+// queue). Runs AFTER the ingests, so `next` already holds anything the beat
+// carried. A landed result also CLEARS the gap — an agent must be able to earn
+// a feature back the moment it demonstrably has it.
+//
+// A version change wipes every gap up front: an update is the one event that
+// makes what this host can do genuinely unknown again, and re-proving a gap
+// costs a single command.
+function resolveResultWaits(prev, next, commands) {
+  if ((prev.agentVersion || null) !== (next.agentVersion || null)) next.unsupported = {};
+  const waits = next.resultWaits;
+  if (!waits) return;
+  const queued = new Set((commands || []).map((c) => c.cmdId));
+  const now = Date.now();
+  for (const [cmdId, w] of Object.entries(waits)) {
+    if (queued.has(cmdId)) {
+      // Still undelivered (an offline host's queue, or a beat that crossed it).
+      // Nothing is concluded from a command the agent hasn't taken yet.
+      if (now - w.at > RESULT_WAIT_MAX_MS) delete waits[cmdId];
+      continue;
+    }
+    delete waits[cmdId];
+    if (resultLanded(next, cmdId, w)) delete next.unsupported[w.kind];
+    else next.unsupported[w.kind] = now;
+  }
+}
+
+// The operator-facing reason a host can't serve a request, or "" when it can.
+// `what` completes "…is too old to <what>". A gap past its TTL reads as absent,
+// so the next request re-probes rather than refusing on old evidence forever.
+function agentGapError(agent, kind, what) {
+  const at = ((agent || {}).unsupported || {})[kind];
+  if (!at || Date.now() - at > UNSUPPORTED_TTL_MS) return "";
+  const v = agent.agentVersion ? ` (v${agent.agentVersion})` : "";
+  // Semicolon, not a dash: every caller renders this inside its own
+  // "Couldn't load projects — <error>" sentence.
+  return `this host's Turma agent${v} is too old to ${what}; update the agent`;
 }
 
 // An issue key is interpolated into an agent REST path, so it's allowlist-checked
@@ -2441,6 +2530,11 @@ const server = http.createServer(async (req, res) => {
         createMeta: prev.createMeta || null,
         createTypes: prev.createTypes || {},
         createResults: prev.createResults || {},
+        // Commands awaiting a staged result, and the capability gaps their acks
+        // have proved (XERK-151). Both survive across beats like the caches
+        // above; `unsupported` is what the board routes refuse on.
+        resultWaits: prev.resultWaits || {},
+        unsupported: prev.unsupported || {},
       });
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
@@ -2448,6 +2542,9 @@ const server = http.createServer(async (req, res) => {
       ingestStatusResults(next, ticketStatusResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);
+      // Ordered after every ingest above: an ack settles against what this same
+      // beat delivered, which is the whole basis of the gap detection.
+      resolveResultWaits(prev, next, commands);
       heartbeatAlerts(key, prev, next);
       rearmMovedWatches(key, prev, next);
       // A migration finishes the instant its target session heartbeats in — do
@@ -2982,12 +3079,19 @@ const server = http.createServer(async (req, res) => {
           ? { types: cached.types }
           : { projects: cached.projects, labels: cached.labels, source: cached.source });
       }
+      // An agent that has already proved it doesn't implement this command would
+      // ack the next one just as silently, so say so instead of 202-ing until
+      // the client times out (XERK-151). Errors ride a 200 here, as a cached
+      // fetch error does — that's the shape both clients read the message from.
+      const gap = agentGapError(a, "boardCreateMeta", "offer the New-ticket options");
+      if (gap) return json(res, 200, { error: gap });
       // Single-flight: reuse an already-queued fetch for the same (project|meta).
       const pending = (a.commands || []).find(
         (c) => c.type === "boardCreateMeta" && (c.project || "") === project);
       const cmdId = pending
         ? pending.cmdId
         : queueCommand(key, { type: "boardCreateMeta", ...(project ? { project } : {}) });
+      if (!pending) awaitResult(a, cmdId, "boardCreateMeta", project ? { project } : null);
       return json(res, 202, { pending: true, cmdId });
     }
 
@@ -3021,9 +3125,14 @@ const server = http.createServer(async (req, res) => {
           ? json(res, 503, { error: "no online host reports that org" })
           : json(res, 404, { error: "no host reports that org" });
       }
+      // Refuse rather than queue a create this agent can't run (XERK-151); the
+      // client would otherwise poll the outcome until it timed out.
+      const gap = agentGapError(agents[key], "createTicket", "create tickets");
+      if (gap) return json(res, 409, { error: gap });
       const cmdId = queueCommand(key, {
         type: "createTicket", project, issueType, summary, description, labels,
       });
+      awaitResult(agents[key], cmdId, "createTicket");
       return json(res, 200, { ok: true, cmdId, host: key });
     }
 
@@ -3132,10 +3241,15 @@ const server = http.createServer(async (req, res) => {
       }
       const key = findJiraHost(siteKey, true);
       if (!key) return json(res, 503, { error: "no online host reports that org" });
+      // Same refusal as the create route: an agent predating XERK-138 acks this
+      // and stages nothing, which the panel/drag would poll out to a timeout.
+      const gap = agentGapError(agents[key], "setTicketStatus", "change a ticket's status");
+      if (gap) return json(res, 409, { error: gap });
       const pending = (agents[key].commands || [])
         .find((c) => c.type === "setTicketStatus" && c.issueKey === issueKey);
       const cmdId = pending ? pending.cmdId
         : queueCommand(key, { type: "setTicketStatus", issueKey, value, category });
+      if (!pending) awaitResult(agents[key], cmdId, "setTicketStatus");
       return json(res, 202, { ok: true, cmdId, host: key });
     }
 

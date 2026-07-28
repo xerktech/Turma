@@ -2169,6 +2169,108 @@ test("http: the create caches are stripped from the /api/agents payload", async 
   assert.equal(rec.createResults, undefined);
 });
 
+// ---- proven capability gaps (XERK-151) --------------------------------------
+// An agent that predates a board write feature ACKS its command and stages
+// nothing, so the routes waiting on a staged result used to 202 until the client
+// timed out ("the host didn't answer in time"). The ack with no result is the
+// evidence; these cover asserting the gap, refusing on it, and clearing it.
+
+// Ack `cmdIds` on a beat, optionally carrying the results that would prove the
+// agent handled them.
+const ackBeat = (device, siteKey, cmdIds, extra = {}) =>
+  jiraBeat(device, siteKey, { ackedCommands: cmdIds, ...extra });
+
+test("http: an acked boardCreateMeta that staged nothing proves the agent is too old", async () => {
+  await jiraBeat("gap1", "gap1.atlassian.net", { agentVersion: "0.5.38" });
+  const first = await request("GET", "/api/jira/gap1.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(first.status, 202);
+
+  // The beat that DELIVERS the command concludes nothing — it hasn't been taken.
+  await jiraBeat("gap1", "gap1.atlassian.net", { agentVersion: "0.5.38" });
+  const still = await request("GET", "/api/jira/gap1.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(still.status, 202, "an undelivered command must not read as a gap");
+
+  // Acked, with no createMetaResults: the agent doesn't implement it.
+  await ackBeat("gap1", "gap1.atlassian.net", [first.body.cmdId], { agentVersion: "0.5.38" });
+  const res = await request("GET", "/api/jira/gap1.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.match(res.body.error, /too old to offer the New-ticket options/);
+  assert.match(res.body.error, /v0\.5\.38/);
+  // ...and it stops queueing commands the host will only swallow.
+  const beat = await jiraBeat("gap1", "gap1.atlassian.net", { agentVersion: "0.5.38" });
+  assert.deepEqual(beat.body.commands, []);
+});
+
+test("http: a boardCreateMeta that DID stage its result asserts no gap", async () => {
+  await jiraBeat("gap2", "gap2.atlassian.net", { agentVersion: "0.6.1" });
+  const first = await request("GET", "/api/jira/gap2.atlassian.net/create-meta", { headers: userHeaders });
+  await ackBeat("gap2", "gap2.atlassian.net", [first.body.cmdId], {
+    agentVersion: "0.6.1",
+    createMetaResults: [{ project: null, projects: [{ key: "ENG", name: "Eng" }],
+                          labels: [], source: "azure", error: null }],
+  });
+  const res = await request("GET", "/api/jira/gap2.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.error, undefined);
+  assert.deepEqual(res.body.projects, [{ key: "ENG", name: "Eng" }]);
+});
+
+test("http: the per-project type fetch proves its gap on its own project", async () => {
+  await jiraBeat("gap3", "gap3.atlassian.net", { agentVersion: "0.5.38" });
+  const q = await request("GET", "/api/jira/gap3.atlassian.net/create-meta?project=ENG", { headers: userHeaders });
+  await ackBeat("gap3", "gap3.atlassian.net", [q.body.cmdId], { agentVersion: "0.5.38" });
+  const res = await request("GET", "/api/jira/gap3.atlassian.net/create-meta?project=ENG", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.match(res.body.error, /too old/);
+});
+
+test("http: an updated agent earns the feature back on its version change", async () => {
+  await jiraBeat("gap4", "gap4.atlassian.net", { agentVersion: "0.5.38" });
+  const first = await request("GET", "/api/jira/gap4.atlassian.net/create-meta", { headers: userHeaders });
+  await ackBeat("gap4", "gap4.atlassian.net", [first.body.cmdId], { agentVersion: "0.5.38" });
+  assert.match(
+    (await request("GET", "/api/jira/gap4.atlassian.net/create-meta", { headers: userHeaders })).body.error,
+    /too old/);
+
+  await jiraBeat("gap4", "gap4.atlassian.net", { agentVersion: "0.6.1" });
+  const res = await request("GET", "/api/jira/gap4.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(res.status, 202, "a version change re-probes rather than refusing on old evidence");
+});
+
+test("http: creating a ticket is refused on a proven createTicket gap", async () => {
+  await jiraBeat("gap5", "gap5.atlassian.net", { agentVersion: "0.5.38" });
+  const body = { project: "ENG", issueType: "1", summary: "New thing" };
+  const post = await request("POST", "/api/jira/gap5.atlassian.net/tickets", { body, headers: userHeaders });
+  assert.equal(post.status, 200);
+  await ackBeat("gap5", "gap5.atlassian.net", [post.body.cmdId], { agentVersion: "0.5.38" });
+
+  const again = await request("POST", "/api/jira/gap5.atlassian.net/tickets", { body, headers: userHeaders });
+  assert.equal(again.status, 409);
+  assert.match(again.body.error, /too old to create tickets/);
+});
+
+test("http: a status change is refused on a proven setTicketStatus gap", async () => {
+  await jiraBeat("gap6", "gap6.atlassian.net", { agentVersion: "0.5.38" });
+  const body = { value: "31" };
+  const post = await request("POST", "/api/jira/gap6.atlassian.net/ENG-1/status", { body, headers: userHeaders });
+  assert.equal(post.status, 202);
+  await ackBeat("gap6", "gap6.atlassian.net", [post.body.cmdId], { agentVersion: "0.5.38" });
+
+  const again = await request("POST", "/api/jira/gap6.atlassian.net/ENG-1/status", { body, headers: userHeaders });
+  assert.equal(again.status, 409);
+  assert.match(again.body.error, /too old to change a ticket's status/);
+});
+
+test("http: the gap bookkeeping is stripped from /api/agents but the gaps are not", async () => {
+  await jiraBeat("gap7", "gap7.atlassian.net", { agentVersion: "0.5.38" });
+  const first = await request("GET", "/api/jira/gap7.atlassian.net/create-meta", { headers: userHeaders });
+  await ackBeat("gap7", "gap7.atlassian.net", [first.body.cmdId], { agentVersion: "0.5.38" });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = res.body.agents.find((a) => a.key === "gap7");
+  assert.equal(rec.resultWaits, undefined);
+  assert.ok(rec.unsupported.boardCreateMeta, "the proven gap is worth reading off the fleet payload");
+});
+
 // POST /api/jira/<siteKey>/<issueKey>/repo — the operator's manual repo override.
 // Writes to the AGENT's triage ledger via the heartbeat command path; nothing
 // here writes to Jira, which stays pull-only.
