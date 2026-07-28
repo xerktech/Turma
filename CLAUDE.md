@@ -1537,6 +1537,31 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   pending-drag `boardHtml` cases in `board.test.js`; the `boardColumnOf`/`moveSweepVerdict` cases in
   `android/app/src/test/.../BoardTest.kt`.
 
+#### When a host's agent is too old for a write (XERK-151)
+
+- An agent **acks** a command it doesn't implement (`handle_commands`' `unknown command type` branch acks
+  so a poison command can't retry forever), so a host predating a board write feature was
+  indistinguishable from a slow one: the routes that wait on a staged result 202'd forever and the client
+  gave up with "the host didn't answer in time". A real ADO host on agent v0.5.38 (no `boardCreateMeta`)
+  showed exactly that — the New-ticket form's project list never loaded.
+- **The ack IS the evidence.** These commands stage their result inside the same `handle_commands` call,
+  so the result rides the SAME beat as the ack — an ack carrying no result means the agent didn't handle
+  it. Deliberately version-free: the agent PROVES what it can do, so there is no version table to drift.
+- `awaitResult` records a queued command; `resolveResultWaits` settles it on the beat that acks it (after
+  every ingest, so it judges against what that beat delivered), writing `agent.unsupported[kind] = at`.
+  `resultLanded` matches per-cmdId caches by id and the create meta/type caches (which aren't cmdId-keyed)
+  on being refreshed since the command was queued.
+- The three board routes that wait on a staged result then refuse with `agentGapError` instead of
+  queueing — create-meta as `200 {error}` (the shape both clients read a message from), the create and
+  status POSTs as `409 {error}`.
+- A gap **clears** when a result lands, when `agentVersion` CHANGES (an update makes the host's abilities
+  unknown again), or after `UNSUPPORTED_TTL_MS` — the backstop for an update that doesn't move the
+  version string. Never conclude anything from a command still in the queue: it hasn't been taken yet.
+- `resultWaits` is stripped from the fleet payload (per-command bookkeeping); `unsupported` rides it.
+- Android's `hubError()` reads the `{error}` out of Retrofit's `errorBody()`, so a refusing POST shows the
+  hub's message instead of a bare "HTTP 409" (it was already right on create-meta's 200).
+- Tests: the capability-gap cases in `turma/tests/server.test.js`.
+
 #### Refresh button
 
 - `POST /api/jira/refresh` fans a `refreshJira` out to every Jira-configured host, deduped so a mashed
