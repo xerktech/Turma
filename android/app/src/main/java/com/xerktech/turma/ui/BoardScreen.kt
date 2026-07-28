@@ -3,6 +3,7 @@ package com.xerktech.turma.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -42,22 +44,33 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import android.widget.Toast
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import kotlinx.coroutines.launch
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.math.roundToInt
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.BOARD_CATEGORIES
@@ -65,10 +78,12 @@ import com.xerktech.turma.core.BoardSite
 import com.xerktech.turma.core.CreateMetaFetch
 import com.xerktech.turma.core.CreateResultFetch
 import com.xerktech.turma.core.PrioEmphasis
+import com.xerktech.turma.core.MoveState
 import com.xerktech.turma.core.StartControl
 import com.xerktech.turma.core.StartState
 import com.xerktech.turma.core.TicketSession
 import com.xerktech.turma.core.ageStr
+import com.xerktech.turma.core.boardColumnOf
 import com.xerktech.turma.core.categoryOf
 import com.xerktech.turma.core.createLabelWord
 import com.xerktech.turma.core.filterSites
@@ -89,6 +104,17 @@ import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.BoardViewModel
 import kotlinx.coroutines.launch
 
+/** In-flight drag of a card across columns (XERK-141). Held by BoardScreen; the
+ *  ghost follows [pointer] (window coords) and drops into [overCat]. */
+private data class DragState(
+    val site: BoardSite,
+    val ticket: JiraTicket,
+    val fromCat: String,
+    val pointer: Offset,
+    val size: IntSize,
+    val overCat: String?,
+)
+
 @Composable
 fun BoardScreen(
     modifier: Modifier = Modifier,
@@ -103,6 +129,7 @@ fun BoardScreen(
     val refreshing by vm.refreshing.collectAsStateWithLifecycle()
     val orgFilter by vm.orgFilter.collectAsStateWithLifecycle()
     val starts by vm.starts.collectAsStateWithLifecycle()
+    val moves by vm.moves.collectAsStateWithLifecycle()
     val sites = remember(fleet) { mergeSites(fleet.agents) }
     // Ticket -> sessions reverse index over the whole fleet payload (XERK-78).
     val sessionIndex = remember(fleet) { ticketSessionIndex(fleet.agents) }
@@ -147,26 +174,84 @@ fun BoardScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         } else {
-            Row(
-                Modifier.fillMaxSize().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            // Drag-and-drop status change (XERK-141): long-press a card, drag it
+            // onto another column, drop to change its status. The board area is a
+            // Box so the dragged "ghost" card can float above the columns; each
+            // column reports its window bounds so the drop resolves to a column,
+            // and `moves` (the VM's optimistic override) keeps a dropped card in
+            // its new column until the board's own poll catches up.
+            var drag by remember { mutableStateOf<DragState?>(null) }
+            val colBounds = remember { mutableStateMapOf<String, Rect>() }
+            var boxOrigin by remember { mutableStateOf(Offset.Zero) }
+            Box(
+                Modifier.fillMaxSize().onGloballyPositioned { boxOrigin = it.positionInWindow() },
             ) {
-                for ((cat, title) in BOARD_CATEGORIES) {
-                    // Newest-updated first, matching board.js `ticketSort`.
-                    val cards = shown
-                        .flatMap { site -> site.tickets.filter { categoryOf(it) == cat }.map { site to it } }
-                        .sortedByDescending { it.second.updated }
-                    KanbanColumn(
-                        cat, title, cards, colorMap, now,
-                        sessionIndex = sessionIndex,
-                        starts = starts,
-                        onStart = { site, t -> vm.startSession(site.siteKey, t.key) },
-                        onOpenSession = { s ->
-                            if (s.status == "running" && s.id.isNotBlank()) onOpenChat(s.host, s.id)
-                            else if (s.transcriptId.isNotBlank()) onOpenEnded(s.host, s.transcriptId)
-                        },
-                        onOpen = { site, t -> detail = site to t },
-                    )
+                Row(
+                    Modifier.fillMaxSize().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    for ((cat, title) in BOARD_CATEGORIES) {
+                        // Newest-updated first, matching board.js `ticketSort`; a
+                        // live drag override lands the card in its dropped column.
+                        val cards = shown
+                            .flatMap { site -> site.tickets
+                                .filter { boardColumnOf(it, moves[BoardViewModel.startKey(site.siteKey, it.key)]) == cat }
+                                .map { site to it } }
+                            .sortedByDescending { it.second.updated }
+                        KanbanColumn(
+                            cat, title, cards, colorMap, now,
+                            sessionIndex = sessionIndex,
+                            starts = starts,
+                            moves = moves,
+                            dropTarget = drag != null && drag!!.overCat == cat && drag!!.fromCat != cat,
+                            draggingKey = drag?.let { BoardViewModel.startKey(it.site.siteKey, it.ticket.key) },
+                            onBounds = { r -> colBounds[cat] = r },
+                            onStart = { site, t -> vm.startSession(site.siteKey, t.key) },
+                            onOpenSession = { s ->
+                                if (s.status == "running" && s.id.isNotBlank()) onOpenChat(s.host, s.id)
+                                else if (s.transcriptId.isNotBlank()) onOpenEnded(s.host, s.transcriptId)
+                            },
+                            onOpen = { site, t -> detail = site to t },
+                            onDragStart = { site, t, size, rootPos ->
+                                drag = DragState(site, t, cat, rootPos, size, cat)
+                            },
+                            onDragDelta = { delta ->
+                                drag = drag?.let { d ->
+                                    val p = d.pointer + delta
+                                    d.copy(pointer = p,
+                                        overCat = colBounds.entries.firstOrNull { it.value.contains(p) }?.key)
+                                }
+                            },
+                            onDragEnd = {
+                                drag?.let { d ->
+                                    if (d.overCat != null && d.overCat != d.fromCat) {
+                                        vm.moveTicket(d.site.siteKey, d.ticket.key, d.overCat)
+                                    }
+                                }
+                                drag = null
+                            },
+                            onDragCancel = { drag = null },
+                        )
+                    }
+                }
+                // The floating ghost of the card being dragged, following the finger.
+                drag?.let { d ->
+                    val local = d.pointer - boxOrigin
+                    TurmaCard(
+                        Modifier
+                            .width(280.dp)
+                            .offset { IntOffset(
+                                (local.x - d.size.width / 2f).roundToInt(),
+                                (local.y - d.size.height / 2f).roundToInt()) }
+                            .alpha(0.95f),
+                    ) {
+                        Text(
+                            "${d.ticket.key}  ${d.ticket.summary}",
+                            Modifier.padding(12.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 2,
+                        )
+                    }
                 }
             }
         }
@@ -197,11 +282,29 @@ private fun KanbanColumn(
     now: Long,
     sessionIndex: Map<String, List<TicketSession>>,
     starts: Map<String, StartState>,
+    moves: Map<String, MoveState>,
+    dropTarget: Boolean,
+    draggingKey: String?,
+    onBounds: (Rect) -> Unit,
     onStart: (BoardSite, JiraTicket) -> Unit,
     onOpenSession: (TicketSession) -> Unit,
     onOpen: (BoardSite, JiraTicket) -> Unit,
+    onDragStart: (BoardSite, JiraTicket, IntSize, Offset) -> Unit,
+    onDragDelta: (Offset) -> Unit,
+    onDragEnd: () -> Unit,
+    onDragCancel: () -> Unit,
 ) {
-    Column(Modifier.width(300.dp).fillMaxSize()) {
+    // A card can be dropped anywhere over the whole column, so the WHOLE column
+    // reports its window bounds (not just the list) — else the gaps between
+    // cards would read as "no target".
+    var colMod = Modifier.width(300.dp).fillMaxSize().onGloballyPositioned { onBounds(it.boundsInWindow()) }
+    if (dropTarget) {
+        colMod = colMod
+            .clip(RoundedCornerShape(8.dp))
+            .border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.06f))
+    }
+    Column(colMod) {
         Row(Modifier.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             SectionLabel(title)
             Spacer(Modifier.width(6.dp))
@@ -209,15 +312,23 @@ private fun KanbanColumn(
         }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             items(cards, key = { it.second.key }) { (site, t) ->
+                val moveKey = BoardViewModel.startKey(site.siteKey, t.key)
                 TicketCard(
                     t,
                     TurmaColors.series[(colorMap[site.siteKey] ?: 0) % TurmaColors.series.size],
                     now = now,
                     sessions = ticketSessionsOf(sessionIndex, site.siteKey, t.key),
-                    start = starts[com.xerktech.turma.vm.BoardViewModel.startKey(site.siteKey, t.key)],
-                    onStart = { onStart(site, t) },
+                    start = starts[moveKey],
+                    move = moves[moveKey],
+                    dragging = draggingKey == moveKey,
                     onOpenSession = onOpenSession,
-                ) { onOpen(site, t) }
+                    onStart = { onStart(site, t) },
+                    onDragStart = { size, pos -> onDragStart(site, t, size, pos) },
+                    onDragDelta = onDragDelta,
+                    onDragEnd = onDragEnd,
+                    onDragCancel = onDragCancel,
+                    onClick = { onOpen(site, t) },
+                )
             }
         }
     }
@@ -231,11 +342,36 @@ private fun TicketCard(
     now: Long,
     sessions: List<TicketSession>,
     start: StartState?,
+    move: MoveState?,
+    dragging: Boolean,
     onStart: () -> Unit,
     onOpenSession: (TicketSession) -> Unit,
+    onDragStart: (IntSize, Offset) -> Unit,
+    onDragDelta: (Offset) -> Unit,
+    onDragEnd: () -> Unit,
+    onDragCancel: () -> Unit,
     onClick: () -> Unit,
 ) {
-    TurmaCard(Modifier.fillMaxWidth()) {
+    // The card's own window position, so a long-press's card-local start offset
+    // can be reported to the drag controller in the same window coords the
+    // column bounds are measured in.
+    var cardPos by remember { mutableStateOf(Offset.Zero) }
+    var cardSize by remember { mutableStateOf(IntSize.Zero) }
+    val dragMod = Modifier.pointerInput(t.key) {
+        detectDragGesturesAfterLongPress(
+            onDragStart = { local -> onDragStart(cardSize, cardPos + local) },
+            onDrag = { change, delta -> change.consume(); onDragDelta(delta) },
+            onDragEnd = { onDragEnd() },
+            onDragCancel = { onDragCancel() },
+        )
+    }
+    TurmaCard(
+        Modifier
+            .fillMaxWidth()
+            .onGloballyPositioned { cardPos = it.positionInWindow(); cardSize = it.size }
+            .then(dragMod)
+            .alpha(if (dragging) 0.35f else 1f),
+    ) {
         Column(Modifier.clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
             // Top row (web .kc-top): org dot + project, issue type, age … key.
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -272,6 +408,12 @@ private fun TicketCard(
                 RepoChip(t)
                 sessions.forEach { s -> TicketSessionChip(s, onClick = { onOpenSession(s) }) }
                 TicketStartControl(t, sessions, start, onStart)
+                // A drag in flight / just landed, or a failed one (XERK-141).
+                if (move?.error != null) {
+                    Text("couldn't move", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                } else if (move?.pending == true) {
+                    Text("moving…", style = MaterialTheme.typography.labelSmall, fontStyle = FontStyle.Italic, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
     }

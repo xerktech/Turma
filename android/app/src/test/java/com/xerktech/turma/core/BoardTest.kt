@@ -509,6 +509,33 @@ class BoardTest {
         assertFalse(statusChangeable(online = true, options = emptyList()))  // nothing to move to
     }
 
+    // ---- drag-and-drop status change (XERK-141): parity with board.js ---------
+    @Test fun `boardColumnOf lands a card in its dropped column only while pending`() {
+        val t = ticket("A", "todo")
+        assertEquals("todo", boardColumnOf(t, null))
+        assertEquals("todo", boardColumnOf(t, MoveState(category = "done", settled = true)))
+        assertEquals("todo", boardColumnOf(t, MoveState(category = "done", error = "x")))
+        assertEquals("done", boardColumnOf(t, MoveState(category = "done", pending = true)))
+    }
+
+    @Test fun `moveSweepVerdict holds a pending move`() {
+        val m = MoveState(category = "done", pending = true, at = 1_000)
+        assertEquals(SweepVerdict.HOLD, moveSweepVerdict(m, "todo", 1_000, 120_000, 6_000))
+    }
+
+    @Test fun `moveSweepVerdict holds a settled move until the poll catches up`() {
+        val m = MoveState(category = "done", settled = true, settledAt = 1_000, at = 1_000)
+        assertEquals(SweepVerdict.HOLD, moveSweepVerdict(m, "todo", 2_000, 120_000, 6_000))   // poll lags
+        assertEquals(SweepVerdict.CLEAR, moveSweepVerdict(m, "done", 2_000, 120_000, 6_000))  // caught up
+        assertEquals(SweepVerdict.CLEAR, moveSweepVerdict(m, "todo", 121_001, 120_000, 6_000)) // backstop
+    }
+
+    @Test fun `moveSweepVerdict shows a failed move briefly then clears`() {
+        val m = MoveState(category = "done", error = "nope", at = 1_000)
+        assertEquals(SweepVerdict.HOLD, moveSweepVerdict(m, "todo", 2_000, 120_000, 6_000))
+        assertEquals(SweepVerdict.CLEAR, moveSweepVerdict(m, "todo", 7_001, 120_000, 6_000))
+    }
+
     // ---- New-ticket creation (XERK-137): parity with board.js/board.html ----
 
     @Test fun `mergeSites carries the tracker source off the freshest block, defaulting jira`() {

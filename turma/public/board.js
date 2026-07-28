@@ -48,6 +48,40 @@
     return String(b.updated || "").localeCompare(String(a.updated || ""));
   }
 
+  // --- drag-and-drop status change (XERK-141) --------------------------------
+  // A card dragged into another column changes the ticket's status: the drop
+  // POSTs the target COLUMN (not a transition id — the card never loaded the
+  // ticket's transitions, only the detail panel does) and the agent resolves it
+  // to a real status against a fresh read. While that round-trip is in flight,
+  // and after it lands until the board's own Jira/Azure poll reports the ticket
+  // in its new column, an optimistic `move` override keeps the card in the
+  // dropped column across the ~1s repaints — else it would snap back to its old
+  // column (the same poll lag the detail panel documents) the instant it moved.
+
+  // The column a card renders in: normally its real category, but a live drag
+  // override (pending, no error) pins it to the dropped column meanwhile.
+  function boardColumnOf(t, move) {
+    return move && move.pending && !move.error ? move.category : categoryOf(t);
+  }
+
+  // Whether a drag override should still be held, be dropped, or has settled —
+  // the board's per-beat sweep verdict, kept pure so it can be unit-tested.
+  //   pending  -> "hold"  (the POST/poll loop owns the transition to settled/error)
+  //   settled  -> "clear" once the board poll reports the ticket in the new
+  //               column (realCat catches up), or after a backstop, so a poll
+  //               that never lands can't pin the card forever;
+  //   error    -> "hold" briefly (the failed move shows on the card), then "clear"
+  //               (which reverts the card to its real column).
+  function moveSweepVerdict(move, realCat, now, settleMs, errorTtlMs) {
+    if (!move) return "clear";
+    if (move.error) return (now - (move.at || 0)) > errorTtlMs ? "clear" : "hold";
+    if (move.settled) {
+      if (realCat === move.category) return "clear";
+      return (now - (move.settledAt || move.at || 0)) > settleMs ? "clear" : "hold";
+    }
+    return "hold";
+  }
+
   // Merge every agent's `jira` block into one entry per Jira site (org).
   //
   // Creds are per-agent and USER-scoped, so two hosts on one site may poll as
@@ -516,6 +550,10 @@
     if (repo) bits.push(repo);
     const start = ticketStartHtml(t, o.sessions, o.start);
     if (start) bits.push(start);
+    // A drag in flight / just landed (XERK-141) shows a "moving…" chip; a failed
+    // one shows why on the card (same inline convention as the start-error note).
+    if (o.moving) bits.push(`<span class="kc-moving">moving…</span>`);
+    else if (o.moveError) bits.push(`<span class="kc-move-err" title="${esc(o.moveError)}">couldn't move</span>`);
     bits.push(`<span class="kc-org" style="--org:${esc(color)}" title="${esc(site && site.siteKey || "")}">${esc(t.project || "")}</span>`);
     // The card itself opens the detail view (data-* carry what the click
     // handler needs to route the fetch: the issue and its owning org). It's a
@@ -525,7 +563,7 @@
     // and the handler's own Enter/Space keying. Each of those children is
     // early-returned by the board's delegated handlers so it does its own thing
     // rather than also opening the panel.
-    return `<div class="kanban-card" role="button" tabindex="0"
+    return `<div class="kanban-card${o.moving ? " kc-moving-card" : ""}" role="button" tabindex="0"
       data-key="${esc(t.key)}" data-site="${esc(site && site.siteKey || "")}"
       aria-label="${esc(t.key + ": " + (t.summary || ""))}">
       <div class="kc-top">
@@ -1046,11 +1084,15 @@
     const o = opts || {};
     const colorMap = orgColorMap(o.allKeys || sites.map(s => s.siteKey));
     const shown = sites.filter(s => !filter || s.siteKey === filter);
+    const moves = o.moves || null;
     const cards = { todo: [], inprogress: [], review: [], done: [] };
     for (const site of shown) {
       const color = colorMap.get(site.siteKey) || orgColor(site.siteKey);
       for (const t of site.tickets) {
-        cards[categoryOf(t)].push({ t, site, color });
+        // A live drag override (XERK-141) lands the card in the dropped column
+        // meanwhile; boardColumnOf falls back to the real category otherwise.
+        const mv = moves && moves.get((site.siteKey || "") + "\x00" + t.key);
+        cards[boardColumnOf(t, mv)].push({ t, site, color, mv });
       }
     }
     const cols = CATEGORIES.map(([cat, label]) => {
@@ -1060,9 +1102,12 @@
             color: c.color, now: o.now,
             sessions: ticketSessionsOf(o.sessionIndex, c.site.siteKey, c.t.key),
             start: o.starts && o.starts.get((c.site.siteKey || "") + "\x00" + c.t.key),
+            moving: !!(c.mv && c.mv.pending && !c.mv.error),
+            moveError: c.mv && c.mv.error,
           })).join("")
         : `<div class="kc-none">none</div>`;
-      return `<div class="kanban-col${cat === "done" ? " kanban-done" : ""}">
+      // data-cat lets the drag handler read which column a card was dropped on.
+      return `<div class="kanban-col${cat === "done" ? " kanban-done" : ""}" data-cat="${cat}">
         <div class="kc-head">${label} <span class="kc-count">${list.length}</span></div>
         <div class="kc-list">${body}</div>
       </div>`;
@@ -1279,6 +1324,7 @@
     agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
     modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
     statusFieldHtml, statusPickerHtml, statusPickerValue,
+    boardColumnOf, moveSweepVerdict,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed, startSweepVerdict,
   };

@@ -8895,6 +8895,104 @@ class TestSetBoardStatus(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.ticket_status_results[0]["cmdId"], "c9")
         self.assertEqual(sm.build_payload(1)["ticketStatusResults"][0]["cmdId"], "c9")
 
+    # --- drag-and-drop: resolve a dropped COLUMN to a transition (XERK-141) ---
+
+    def test_category_resolves_to_the_matching_transition(self):
+        """A drop POSTs a board column; the agent resolves it to a transition
+        against the fresh options and writes that transition's id."""
+        sm = self.make_manager()
+        opts = [{"id": "11", "name": "To Do", "category": "todo"},
+                {"id": "31", "name": "Done", "category": "done"}]
+        seen = {}
+
+        def fake_req(path, params, body=None):
+            seen["body"] = body
+            return {}
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "jira_req", fake_req), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "ENG-9", "status": "Done"}):
+            sm.set_board_status("c1", "ENG-9", "", category="done")
+        self.assertEqual(seen["body"], {"transition": {"id": "31"}})
+        r = sm.ticket_status_results[0]
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["status"], "Done")
+
+    def test_category_review_picks_a_review_named_inprogress_status(self):
+        """The In Review column has no wire category of its own — it's carved out
+        of `inprogress` by the status name, exactly as board.js categoryOf does."""
+        sm = self.make_manager()
+        opts = [{"id": "21", "name": "In Progress", "category": "inprogress"},
+                {"id": "22", "name": "In Review", "category": "inprogress"}]
+        seen = {}
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "jira_req",
+                               lambda p, params, body=None: seen.update(body=body) or {}), \
+             mock.patch.object(ha, "fetch_board_issue", return_value={"key": "ENG-9"}):
+            sm.set_board_status("c1", "ENG-9", "", category="review")
+        self.assertEqual(seen["body"], {"transition": {"id": "22"}})
+
+    def test_category_with_no_matching_option_is_refused(self):
+        sm = self.make_manager()
+        opts = [{"id": "21", "name": "In Progress", "category": "inprogress"}]
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "apply_board_status") as apply:
+            sm.set_board_status("c1", "ENG-9", "", category="done")
+        apply.assert_not_called()
+        r = sm.ticket_status_results[0]
+        self.assertFalse(r["ok"])
+        self.assertIn("Done", r["error"])   # labelled in the operator's own vocabulary
+
+    def test_neither_value_nor_category_is_refused(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=[]) as opts, \
+             mock.patch.object(ha, "apply_board_status") as apply:
+            sm.set_board_status("c1", "ENG-9", "")
+        apply.assert_not_called()
+        opts.assert_not_called()            # bailed before even reading options
+        self.assertIn("no status given", sm.ticket_status_results[0]["error"])
+
+    def test_command_passes_category_through(self):
+        sm = self.make_manager()
+        sm.registry = []
+        opts = [{"id": "31", "name": "Done", "category": "done"}]
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "jira_req", return_value={}), \
+             mock.patch.object(ha, "fetch_board_issue", return_value={"key": "ENG-9"}):
+            sm.handle_commands([{"cmdId": "c9", "type": "setTicketStatus",
+                                 "issueKey": "ENG-9", "value": "", "category": "done"}])
+        self.assertIn("c9", sm.acked)
+        self.assertTrue(sm.ticket_status_results[0]["ok"])
+
+
+class TestBoardColumn(unittest.TestCase):
+    """The status-column resolver behind drag-and-drop (XERK-141). Mirrors
+    board.js categoryOf: review is carved out of inprogress by the status name."""
+
+    def test_board_column_mirrors_category_of(self):
+        self.assertEqual(ha._board_column("Anything", "todo"), "todo")
+        self.assertEqual(ha._board_column("Anything", "weird"), "todo")
+        self.assertEqual(ha._board_column("In Progress", "inprogress"), "inprogress")
+        self.assertEqual(ha._board_column("Done", "done"), "done")
+        # Review carve-out, word-boundary matched, only from inprogress.
+        self.assertEqual(ha._board_column("In Review", "inprogress"), "review")
+        self.assertEqual(ha._board_column("Testing", "inprogress"), "review")
+        self.assertEqual(ha._board_column("QA", "inprogress"), "review")
+        self.assertEqual(ha._board_column("Attestation", "inprogress"), "inprogress")
+        self.assertEqual(ha._board_column("Testing complete", "done"), "done")
+
+    def test_first_matching_option_wins(self):
+        opts = [{"id": "a", "name": "First Done", "category": "done"},
+                {"id": "b", "name": "Second Done", "category": "done"}]
+        self.assertEqual(ha._status_option_for_column(opts, "done")["id"], "a")
+        self.assertIsNone(ha._status_option_for_column(opts, "todo"))
+        self.assertIsNone(ha._status_option_for_column([], "done"))
+
 
 # --- Ticket creation (XERK-137) ------------------------------------------------
 

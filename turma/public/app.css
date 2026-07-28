@@ -446,6 +446,27 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .kanban-card[role="button"]:focus-visible {
   outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring);
 }
+
+/* Drag-and-drop status change (XERK-141). Tap-and-hold a card, drag it onto
+   another status column, and it moves there. A floating ghost follows the
+   pointer, the source card dims, and the drop-target column lights up. */
+.kc-moving { color: var(--muted); font-size: 10.5px; font-style: italic; }
+.kc-move-err { color: var(--critical); font-size: 10.5px; }
+.kanban-card.kc-moving-card { opacity: .6; }
+.kanban-card.kc-drag-src { opacity: .3; }
+.kanban-col.kc-drop-into {
+  outline: 2px dashed var(--accent); outline-offset: 4px;
+  border-radius: var(--radius-md); background: var(--focus-ring);
+}
+.kc-ghost {
+  position: fixed; left: 0; top: 0; z-index: 60; margin: 0; pointer-events: none;
+  opacity: .96; box-shadow: 0 10px 26px rgba(0, 0, 0, .35); transition: none;
+}
+/* While a drag is active kill text selection, and let the captured card own the
+   gesture (touch-action:none) rather than scrolling the column strip under it. */
+body.kc-drag-on { user-select: none; -webkit-user-select: none; }
+body.kc-drag-on .kanban-card { touch-action: none; }
+
 @media (max-width: 900px) {
   .kanban-cols { grid-template-columns: repeat(2, 1fr); }
 }

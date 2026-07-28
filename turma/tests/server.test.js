@@ -1954,7 +1954,20 @@ test("http: a status change queues setTicketStatus on the org's online host", as
 
   const beat = await jiraBeat("js1", "s1.atlassian.net");
   assert.deepEqual(beat.body.commands, [
-    { type: "setTicketStatus", issueKey: "ENG-5", value: "31", cmdId: res.body.cmdId },
+    { type: "setTicketStatus", issueKey: "ENG-5", value: "31", category: "", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: a drag drops a target column, queued for the agent to resolve", async () => {
+  await jiraBeat("jsd", "sd.atlassian.net");
+  const res = await request("POST", "/api/jira/sd.atlassian.net/ENG-5/status",
+    { body: { category: "done" }, headers: userHeaders });
+  assert.equal(res.status, 202);
+  assert.equal(res.body.ok, true);
+  const beat = await jiraBeat("jsd", "sd.atlassian.net");
+  // The column rides the command; the agent resolves it to a real transition.
+  assert.deepEqual(beat.body.commands, [
+    { type: "setTicketStatus", issueKey: "ENG-5", value: "", category: "done", cmdId: res.body.cmdId },
   ]);
 });
 
