@@ -48,6 +48,13 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   these to a single "+" that opens the `SpawnDialog` (prompt/label/base/model/mode); the separate
   quick-spawn (was the ⚙/Tune icon) is gone. A phone header has room for one action, and the composer
   covers the bare case by leaving every field blank.
+- **New-ticket control: a ticket icon, not the web's labeled pill** (XERK-150). Both put the "New
+  ticket" create action in the shared header so it's reachable from every top-level screen (web
+  `newticket.js` → `#hdrNewTicket`; Android `NewTicketAction` in the shared `ScreenHeader`). The web has
+  room for a rounded accent pill reading "＋ New ticket"; a phone header does not, and a bare "＋" there
+  would read as a second copy of the "New session" ＋ the Sessions/Dashboard headers already carry. So
+  Android uses a distinct ticket glyph (`Icons.Filled.ConfirmationNumber`) with "New ticket" on its
+  content description / long-press tooltip. Same modal (`CreateTicketSheet`), same behavior.
 - **Auto history-upgrade instead of the "Show more…" button** (XERK-77). The web chat marks a
   cap-truncated block with a manual "Show more…" that refetches `/history` (looser caps). Android
   refetches `/history` automatically when a truncated block arrives on the live tail (once per entry,
