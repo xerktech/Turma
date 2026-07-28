@@ -199,6 +199,24 @@ const WORKING_WINDOW_MS = 90 * 1000;
 const BOOT_AT = Date.now();
 const BOOT_GRACE_MS = 90 * 1000;
 
+// A PR alert is held until that PR's CI is green (XERK-153), so these two
+// windows are what stop "held" from meaning "lost".
+//
+// A PR that genuinely has NO CI has to alert on creation, but a just-opened one
+// reports an empty check rollup for a beat or two before its workflows
+// register — indistinguishable from a repo with no CI at all. So "no CI" only
+// counts once it has held for this long (a couple of the agent's ~60s PR-status
+// refreshes), which is also the floor on how fast a CI-less repo's PR alerts.
+const PR_NO_CI_GRACE_MS = 2 * 60 * 1000;
+// Backstop for a PR whose CI verdict never arrives: an agent with no `gh`
+// login never fills in the status at all, and a session stopped mid-run freezes
+// its PRs at whatever they last read. Neither is a reason to lose the alert
+// entirely, so an inconclusive wait fires anyway once it ages out. A wait that
+// went FAILING is exempt — staying quiet on red is the point of the feature.
+const PR_ALERT_MAX_WAIT_MS = 30 * 60 * 1000;
+// Per-session ceiling on both PR bookkeeping lists (newest kept).
+const PR_ALERT_MAX_TRACKED = 20;
+
 // Keyed by the host name (`device`), value = last heartbeat payload +
 // bookkeeping. One container per host, so the host name is the stable identity.
 let agents = {};
@@ -1352,6 +1370,45 @@ function sessionWorking(session, lastSeen, now) {
   return age * 1000 + Math.max(0, now - (lastSeen || 0)) < WORKING_WINDOW_MS;
 }
 
+// Should a held PR alert fire yet (XERK-153)? `w` is that PR's wait record
+// ({at} when first seen, plus the sticky markers this advances), `status` the
+// PR-status object the agent reports for that URL on this beat, if any.
+//
+// A PR alert used to fire the instant the agent scraped the URL out of the
+// transcript, which is the moment the work is LEAST ready to look at: CI hasn't
+// run. So the alert now waits for the CI rollup to come back green, and the
+// interesting cases are the ones that aren't green:
+//
+//   - No status yet. `checks` is absent until the agent's PR-status refresh has
+//     fetched this PR at least once, so absence means "not looked at", never
+//     "no CI". Hold.
+//   - `checks: null` — the PR really has no checks. Fire, but only once it has
+//     held for PR_NO_CI_GRACE_MS (see there): a brand-new PR looks exactly like
+//     this while GitHub registers its workflows.
+//   - `failing`. Stay quiet, permanently: the session that opened the PR is
+//     expected to fix it and push again, and the alert is for the PR being
+//     ready, not for every round trip through red. Sticky, so the age-out
+//     backstop can't leak an alert for a PR that is known-broken.
+//   - `pending`, or anything inconclusive, until PR_ALERT_MAX_WAIT_MS. Hold,
+//     then fire regardless — the wait is meant to delay the alert, not to lose
+//     it to a host whose `gh` can't answer.
+//
+// Returns the body prefix to send, or null to keep holding. Mutates `w`.
+function prAlertDecision(w, status, now) {
+  const known = !!status && "checks" in status;
+  const checks = known ? status.checks : undefined;
+  if (checks === "failing") w.red = true;
+  if (checks === "passing") return "All checks passed";
+  if (known && checks == null) {
+    w.noCiAt = w.noCiAt || now;
+    if (now - w.noCiAt >= PR_NO_CI_GRACE_MS) return "No CI configured";
+  } else {
+    delete w.noCiAt; // checks appeared (or vanished): it isn't a CI-less PR
+  }
+  if (!w.red && now - (w.at || now) >= PR_ALERT_MAX_WAIT_MS) return "CI state unknown";
+  return null;
+}
+
 // Alert checks that key off a fresh heartbeat. `next.alerts` is per-agent
 // bookkeeping carried across beats (and persisted, so hub restarts don't
 // re-fire or drop edges).
@@ -1449,11 +1506,35 @@ function heartbeatAlerts(key, prev, next) {
     }
     if (!s.question) delete sa.lastQuestion;
 
+    // A new PR goes into a per-session wait list rather than alerting straight
+    // away, and leaves it when its CI settles (prAlertDecision). `prSeen` keeps
+    // its old meaning — URLs already alerted — so PRs an older hub announced
+    // don't re-fire after this upgrade.
+    const wait = (sa.prWait = sa.prWait || {});
     for (const url of s.newPrUrls || []) {
-      const seen = sa.prSeen || [];
-      if (seen.includes(url)) continue;
-      sa.prSeen = [...seen, url].slice(-20);
-      notify(`${label} created a PR`, url, { tags: "rocket", click: url, route });
+      if ((sa.prSeen || []).includes(url)) continue;
+      if (!wait[url]) wait[url] = { at: now };
+    }
+    // Statuses ride the session record (session.prs), not the per-beat signals:
+    // they're refreshed on the agent's slower PR cadence and persist between.
+    const prStatus = new Map();
+    for (const p of session.prs || []) if (p && p.url) prStatus.set(p.url, p);
+    for (const url of Object.keys(wait)) {
+      const note = prAlertDecision(wait[url], prStatus.get(url), now);
+      if (!note) continue;
+      delete wait[url];
+      sa.prSeen = [...(sa.prSeen || []), url].slice(-PR_ALERT_MAX_TRACKED);
+      notify(`${label} created a PR`, `${note} · ${url}`, { tags: "rocket", click: url, route });
+    }
+    // Bound the wait list the way prSeen is bounded: a PR whose CI never
+    // resolves ages out via the backstop, but a host that somehow outruns that
+    // must not grow this without limit. Oldest-first.
+    const waiting = Object.keys(wait);
+    if (waiting.length > PR_ALERT_MAX_TRACKED) {
+      waiting
+        .sort((a, b) => (wait[a].at || 0) - (wait[b].at || 0))
+        .slice(0, waiting.length - PR_ALERT_MAX_TRACKED)
+        .forEach((url) => delete wait[url]);
     }
 
     // Turn finished: was working, transcript went quiet, and the newest entry
@@ -3882,6 +3963,7 @@ if (process.env.TURMA_TEST) {
     wsParser,
     channelDuplex,
     heartbeatAlerts,
+    prAlertDecision,
     sessionWorking,
     userAuthorized,
     agentAuthorized,
