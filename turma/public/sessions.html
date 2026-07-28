@@ -63,7 +63,11 @@
   }
   button.s-card:hover:not(:disabled) { border-color: var(--accent); }
   button.s-card:disabled { cursor: default; opacity: 0.6; }
-  .s-card.cur { border-color: var(--accent); background: var(--accent-soft); }
+  /* Selected: a thicker accent border, but KEEP the org tint as the fill (XERK-142)
+     rather than washing it to accent-soft — the org colour still has to read on the
+     open card. box-sizing:border-box (app.css) means the 2px border adds no layout
+     shift. Mirrors the Android selected card's 2dp border over the tint. */
+  .s-card.cur { border-color: var(--accent); border-width: 2px; }
   /* A queued session card is a static <div>, not a selecting <button> (no pane to
      attach to yet), so it needs the card's flex layout spelled out here. It gets
      a dashed border + amber dot to read as "about to start", distinct from both a
