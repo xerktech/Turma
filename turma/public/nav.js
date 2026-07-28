@@ -10,11 +10,16 @@
 // unfilled slot collapses (`.sub:empty` in app.css), so pages using fewer slots
 // still ship the same DOM.
 //
-// A third slot, #hdrOrg, is the exception that proves the rule: no page fills
-// it. It is filled by org.js with the one org-scoping control every page obeys
-// (XERK-62), which is why it lives in the chrome rather than in any page's
-// markup. It sits after the spacer so it right-aligns beside the tabs, and it
-// collapses when the fleet reports no tracker org at all.
+// Two more slots follow the same "filled by a shared module, not by any page"
+// rule and sit after the spacer so they right-align beside the tabs:
+//   #hdrNewTicket — org.js's sibling, filled by newticket.js with the "New
+//     ticket" button + its create modal, so a ticket can be created from any
+//     page (XERK-150), not only the board. Collapses until the fleet reports an
+//     org to create against.
+//   #hdrOrg — filled by org.js with the one org-scoping control every page obeys
+//     (XERK-62). Collapses when the fleet reports no tracker org at all.
+// Both live in the chrome rather than in any page's markup precisely so they're
+// available everywhere at once.
 //
 // Loaded by every page in the browser (window.TurmaNav) and require()d directly
 // by tests/nav.test.js, the same dual-export pattern as chat.js / board.js.
@@ -69,6 +74,7 @@
     <span class="sub" id="hdrSub">${esc(sub ?? "")}</span>
     <span class="sub" id="hdrMeta"></span>
     <span class="spacer"></span>
+    <span class="newticket-slot" id="hdrNewTicket"></span>
     <span class="org-slot" id="hdrOrg"></span>
     ${tabsHtml(active)}
   </div>`;

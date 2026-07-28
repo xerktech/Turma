@@ -1677,6 +1677,7 @@ const STATIC_ASSETS = {
   "/board.js":             { body: fs.readFileSync(path.join(__dirname, "public", "board.js")),            type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
   "/nav.js":               { body: fs.readFileSync(path.join(__dirname, "public", "nav.js")),              type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
   "/org.js":               { body: fs.readFileSync(path.join(__dirname, "public", "org.js")),              type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
+  "/newticket.js":         { body: fs.readFileSync(path.join(__dirname, "public", "newticket.js")),        type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
   "/favicon.svg":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.svg")),         type: "image/svg+xml",                            cache: IMMUTABLE_CACHE },
   "/favicon.ico":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.ico")),         type: "image/x-icon",                             cache: IMMUTABLE_CACHE },
   "/favicon-16.png":       { body: fs.readFileSync(path.join(__dirname, "public", "favicon-16.png")),      type: "image/png",                                cache: IMMUTABLE_CACHE },

@@ -144,19 +144,15 @@ fun BoardScreen(
     // no org still reports, exactly as `effectiveOrg` does for the other screens.
     val shown = remember(sites, orgFilter) { filterSites(sites, orgFilter) }
     var detail by remember { mutableStateOf<Pair<BoardSite, JiraTicket>?>(null) }
-    // The New-ticket form (XERK-137): open state carries no data — the sheet reads
-    // the current sites/org scope itself, like the web modal.
-    var creating by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
     LaunchedEffect(Unit) { vm.messages.collect { Toast.makeText(context, it, Toast.LENGTH_SHORT).show() } }
 
     Column(modifier.fillMaxSize()) {
         ScreenHeader("Board") {
-            // Needs an org to create against, so it's hidden until one reports.
-            if (sites.isNotEmpty()) {
-                IconButton(onClick = { creating = true }) { Icon(Icons.Filled.Add, "New ticket") }
-            }
+            // The New-ticket button moved into the shared ScreenHeader (XERK-150),
+            // so it's on every screen — see NewTicketAction. Only Refresh is
+            // board-specific now.
             IconButton(onClick = { vm.refresh() }, enabled = !refreshing) {
                 if (refreshing) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                 else Icon(Icons.Filled.Refresh, "Refresh")
@@ -266,8 +262,27 @@ fun BoardScreen(
         val modelPin = com.xerktech.turma.core.modelPinOf(fleet.ticketModels, site.siteKey, ticket.key)
         TicketDetailSheet(site, ticket, pin, modelPin, vm, onDismiss = { detail = null })
     }
+}
 
-    if (creating && sites.isNotEmpty()) {
+/**
+ * The "New ticket" action, carried by the shared [ScreenHeader] so a ticket can
+ * be created from any of the four top-level screens (XERK-150) — the web mounts
+ * it in the site header's `#hdrNewTicket` slot beside the org filter for the same
+ * reason. It used to be a board-only button.
+ *
+ * It reads the shared fleet stream itself (like [OrgFilterAction]) rather than
+ * being handed data, so it works wherever the header renders. Hidden until a
+ * host reports a tracker org to create against, as the web slot collapses.
+ */
+@Composable
+fun NewTicketAction(vm: BoardViewModel = viewModel()) {
+    val fleet by vm.fleet.collectAsStateWithLifecycle()
+    val orgFilter by vm.orgFilter.collectAsStateWithLifecycle()
+    val sites = remember(fleet) { mergeSites(fleet.agents) }
+    if (sites.isEmpty()) return
+    var creating by remember { mutableStateOf(false) }
+    IconButton(onClick = { creating = true }) { Icon(Icons.Filled.Add, "New ticket") }
+    if (creating) {
         // Default the form's org to the header scope when it names a real one,
         // else the first org — the web openCreate's pick.
         val initial = sites.firstOrNull { it.siteKey == orgFilter }?.siteKey ?: sites.first().siteKey

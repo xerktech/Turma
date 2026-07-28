@@ -1003,9 +1003,11 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - Page-specific content goes in the two slots the page fills — `#hdrSub` (static descriptor) and
   `#hdrMeta` (dynamic). An unfilled slot collapses (`.site-header .sub:empty`). The row **ends at the
   tabs**: no right-hand slot (one carried an "updated <time>" stamp, dropped as noise).
-- A third slot, **`#hdrOrg`, is filled by nobody** — `org.js` mounts the fleet-wide org filter into it
-  (see "The org filter"). It sits after the spacer, before the tabs, and collapses when no host reports
-  a tracker org.
+- Two more slots after the spacer are **filled by shared modules, not by any page**, and collapse when
+  empty like the `.sub` slots: **`#hdrNewTicket`** (`newticket.js`'s "New ticket" button + create modal,
+  see "Creating a ticket"; collapses until an org reports) and **`#hdrOrg`** (`org.js`'s fleet-wide org
+  filter, see "The org filter"; collapses when no host reports a tracker org). Both live in the chrome so
+  they're on every page at once.
 - The header is full-bleed and `.site-header-in` caps its row at `--wrap` and centres it, so every page's
   chrome lands in the same 1180px column as a `.wrap` page's content. On `sessions.html` the two-pane
   `.sess-shell` below is capped at the same `--wrap` and centred too (XERK-28), so the whole page reads
@@ -1181,10 +1183,15 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 #### Creating a ticket (XERK-137)
 
-- The board bar's **"New ticket"** button opens a modal to create a ticket (title, description, labels)
-  on an org's tracker — the board's ONE write path, source-agnostic across Jira and Azure DevOps, hidden
-  until an org reports. It routes through the hub to an **ONLINE** host of the org (only the host holds
-  tracker creds), reusing the ticket-detail `{command → staged result → poll}` pattern:
+- The **"New ticket"** button opens a modal to create a ticket (title, description, labels) on an org's
+  tracker — the tracker's ONE write path, source-agnostic across Jira and Azure DevOps, hidden until an
+  org reports. It lives in the **shared site header** (`newticket.js` → nav.js's `#hdrNewTicket` slot, so
+  it's on every page, XERK-150), not the board toolbar; the button + create modal + all fetch/poll wiring
+  moved out of `board.html` into `newticket.js`, fed the beat via `TurmaNewTicket.update(data)` like the
+  org filter, with the form HTML (`createFormHtml` etc.) still in `board.js`. Android puts the same action
+  in the shared `ScreenHeader` (`NewTicketAction`) beside the org control. It routes through the hub to an
+  **ONLINE** host of the org (only the host holds tracker creds), reusing the ticket-detail
+  `{command → staged result → poll}` pattern:
   - `GET /api/jira/<siteKey>/create-meta` (`boardCreateMeta`) → the org's projects + existing labels/tags;
     `?project=<p>` → that project's creatable types. Cascade (project then types) so no meta call fans
     across every project and blocks a beat. Cached per host (`createMeta`/`createTypes`), 202-polled.
@@ -1200,10 +1207,16 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - Android has the same feature (a ＋ action → `CreateTicketSheet`, driving the same three endpoints):
   `source` on `JiraBlock`/`BoardSite`, the create endpoints in `net/HubApi.kt`, and the pure
   `createLabelWord`/`splitLabels`/`classifyCreateMeta`/`classifyCreateResult` ports in `core/Board.kt`.
+  The ＋ trigger lives in the shared `ScreenHeader` (`NewTicketAction` in `BoardScreen.kt`) so it's on
+  every top-level screen (XERK-150).
+- **Any new shared `/*.js` must be registered in `server.js`'s `STATIC_ASSETS`** (it's an allowlist, not
+  a directory serve) AND loaded by each page after `org.js` — a missing entry 404s and takes the module
+  (and every page's render) down. `newticket.test.js` guards both.
 - Tests: `TestCreateJiraIssue`/`TestCreateAzureIssue`/`TestStageCreateMeta`/`TestStageCreateTicket` (+
   meta/type/ADF cases) in `test_hub_agent.py`; the create-flow cases in `server.test.js`; the
-  `createFormHtml`/`createProjectOptions`/`createTypeOptions` cases in `board.test.js`; the
-  create/source cases in android `BoardTest.kt`.
+  `createFormHtml`/`createProjectOptions`/`createTypeOptions` cases in `board.test.js`; the header
+  placement, modal, and static-serve wiring cases in `newticket.test.js`; the create/source cases in
+  android `BoardTest.kt`.
 
 #### Repo chips
 

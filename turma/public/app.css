@@ -127,6 +127,21 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 .site-header .sub:empty { display: none; }
 .site-header .spacer { flex: 1; }
 
+/* ---- New ticket (#hdrNewTicket, built by newticket.js) -------------------
+   The tracker's one write control, in the chrome so a ticket can be created
+   from any page (XERK-150) — it moved out of the board toolbar. A filled accent
+   pill, so the primary action reads as primary beside the quiet org filter.
+   Collapses to nothing until the fleet reports an org to create against, like
+   the org slot below. */
+.site-header .newticket-slot:empty { display: none; }
+.newticket-btn {
+  font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
+  color: #fff; background: var(--accent); border: 1px solid var(--accent);
+  border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; flex: none;
+}
+.newticket-btn svg { width: 13px; height: 13px; flex: none; }
+.newticket-btn:hover { filter: brightness(1.06); }
+
 /* ---- Org filter (#hdrOrg, built by org.js) -------------------------------
    The one org-scoping control, in the chrome because every page obeys it
    (XERK-62) — it replaced the board-only chip strip. Collapses to nothing when
@@ -336,18 +351,9 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 
 /* ---- Jira board (/board) -------------------------------------------------- */
 /* Board toolbar: just the refresh button now, pinned right — the org chips it
-   used to run alongside became the header's org filter (XERK-62). */
+   used to run alongside became the header's org filter (XERK-62), and the New
+   ticket button moved into the header too (XERK-150). */
 .board-bar { display: flex; align-items: flex-start; justify-content: flex-end; gap: 10px; margin: 2px 0 14px; }
-/* The one write control on the board (XERK-137): a filled accent button, so the
-   primary action reads as primary next to the quiet Refresh. */
-.board-newticket {
-  font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
-  color: #fff; background: var(--accent); border: 1px solid var(--accent);
-  border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; flex: none;
-}
-.board-newticket svg { width: 13px; height: 13px; flex: none; }
-.board-newticket:hover { filter: brightness(1.06); }
-.board-newticket[hidden] { display: none; }
 .board-refresh {
   font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
   color: var(--ink-2); background: var(--surface);
