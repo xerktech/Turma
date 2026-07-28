@@ -858,10 +858,19 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     failed: `start` errored and `stop`/`restart` couldn't read the pid to kill, silently orphaning the old
     manager and spawning a second (two managers double-heartbeating). Tests:
     `agent/tests/test_turma_agentctl.sh`.
-- `turma-agent-update` — self-updater: reads the unified release stream via `gh`, comparing the release
+- `turma-agent-update` — self-updater: reads the unified release stream, comparing the release
   `manifest.json`'s **agent-native component version** (never the tag), verifies the sha256, swaps files,
   restarts the manager (re-adopting live sessions). Falls back to the legacy `agent-native-v*` stream.
   Driven by a systemd timer or `--loop` poller. Tests: `agent/tests/test_turma_agent_update.sh`.
+- **Auth on that read is an optimisation, never a precondition** (XERK-151): the repo is public, so
+  `all_tags`/`download_assets` try `gh` (fresh token, private fork, higher rate limit), then `$GH_TOKEN`,
+  then **anonymously** — the same credential-free read `bootstrap.sh` and the Android updater already do.
+  Requiring auth pinned a host with no GitHub login at its installed version forever, reporting only
+  "no native release found (or auth unavailable)"; an agent serving a non-GitHub tracker is exactly that
+  host. The asset endpoint + `Accept: application/octet-stream` serves a public release unauthenticated,
+  so one curl path covers both.
+- It exports the **same `$HOME/.local/bin` PATH the launcher does** (XERK-94's reason, restated): its unit
+  sets no PATH, so a `gh` installed there is invisible to the timer though it works in the login shell.
 - Not installed natively: cloud CLIs (aws/az/terraform) + PowerShell + docker CLI + the Android
   toolchain; the container is for those.
 - Container ⇄ native parity (the XERK-34 audit): the same runtime files run in both, so the session model,
