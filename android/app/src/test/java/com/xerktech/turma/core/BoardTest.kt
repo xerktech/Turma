@@ -510,12 +510,14 @@ class BoardTest {
     }
 
     // ---- drag-and-drop status change (XERK-141): parity with board.js ---------
-    @Test fun `boardColumnOf lands a card in its dropped column only while pending`() {
+    @Test fun `boardColumnOf holds the dropped column through pending AND settled`() {
         val t = ticket("A", "todo")
         assertEquals("todo", boardColumnOf(t, null))
-        assertEquals("todo", boardColumnOf(t, MoveState(category = "done", settled = true)))
         assertEquals("todo", boardColumnOf(t, MoveState(category = "done", error = "x")))
         assertEquals("done", boardColumnOf(t, MoveState(category = "done", pending = true)))
+        // settled must ALSO hold (the change landed, the slow poll hasn't caught
+        // up) — honouring pending alone snapped a just-moved card back.
+        assertEquals("done", boardColumnOf(t, MoveState(category = "done", settled = true)))
     }
 
     @Test fun `moveSweepVerdict holds a pending move`() {
