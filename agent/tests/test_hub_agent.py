@@ -596,6 +596,25 @@ class TestUsageReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(models["claude-sonnet-4-20250514"]["today"]["input"], 200_000)
         self.assertEqual(models["claude-sonnet-4-20250514"]["week"]["input"], 200_000)
 
+    def test_synthetic_is_kept_out_of_the_model_breakdown(self):
+        # Claude Code stamps a fabricated assistant entry (a session-limit
+        # notice, a "No response requested." placeholder) with model
+        # "<synthetic>" and an all-zero usage block. It ran no model, so it must
+        # not appear as a phantom "<synthetic>" row on the usage page, and it
+        # must not perturb the real per-model or grand totals.
+        today = ha._utc_today()
+        write_jsonl(os.path.join(self.proj, "a.jsonl"), [
+            usage_entry(f"{today}T01:00:00.000Z", "m1", "r1",
+                        "claude-opus-4-8", 500, 100),
+            usage_entry(f"{today}T02:00:00.000Z", "m2", "r2",
+                        "<synthetic>", 0, 0),
+        ])
+        rep = ha.usage_report(self.WORKDIR)
+        names = [m["model"] for m in rep["models"]]
+        self.assertEqual(names, ["claude-opus-4-8"])  # no "<synthetic>" row
+        self.assertEqual(rep["totals"]["input"], 500)
+        self.assertEqual(rep["totals"]["output"], 100)
+
     def test_week_window_is_utc_and_rolling(self):
         # Seven UTC days ending today, inclusive — the boundary day counts and
         # the day before it does not.
