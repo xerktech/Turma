@@ -3,6 +3,10 @@ package com.xerktech.turma.net
 import com.xerktech.turma.model.AgentsResponse
 import com.xerktech.turma.model.ArchiveListResponse
 import com.xerktech.turma.model.ArchiveTranscript
+import com.xerktech.turma.model.CreateMetaEnvelope
+import com.xerktech.turma.model.CreateResultEnvelope
+import com.xerktech.turma.model.CreateTicketRequest
+import com.xerktech.turma.model.CreateTicketResponse
 import com.xerktech.turma.model.HistoryResponse
 import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.SearchResponse
@@ -147,6 +151,31 @@ interface HubApi {
 
     @POST("api/jira/refresh")
     suspend fun jiraRefresh(): OkResponse
+
+    // New-ticket create metadata (XERK-137): the org's projects + existing labels
+    // (no `project`), or a project's creatable issue/work-item types (?project=).
+    // 200 with the data, or 202 {pending} while the host fetches it on demand.
+    @GET("api/jira/{siteKey}/create-meta")
+    suspend fun createMeta(
+        @Path("siteKey") siteKey: String,
+        @Query("project") project: String? = null,
+    ): Response<CreateMetaEnvelope>
+
+    // Create a ticket on the org's board. 200 {ok, cmdId, host}, or 4xx/5xx
+    // {error}. The agent creates it and stages the outcome, polled below.
+    @POST("api/jira/{siteKey}/tickets")
+    suspend fun createTicket(
+        @Path("siteKey") siteKey: String,
+        @Body body: CreateTicketRequest,
+    ): Response<CreateTicketResponse>
+
+    // Poll a create's outcome by the cmdId the POST returned. 200 {key,url} on
+    // success, 200 {error} on a create failure, 202 {pending} until then.
+    @GET("api/jira/{siteKey}/tickets/{cmdId}")
+    suspend fun createResult(
+        @Path("siteKey") siteKey: String,
+        @Path("cmdId") cmdId: String,
+    ): Response<CreateResultEnvelope>
 
     // Start a session on a ticket: the hub picks the host + triaged repo and
     // spawns with the ticket as context. 200 {ok, cmdId, host, repo}, or 4xx

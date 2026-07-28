@@ -182,6 +182,10 @@ data class JiraBlock(
     // The operator's org-label override (agent BOARD_ORG_NAME); "" falls back to
     // the siteKey-derived name. Presentational only — see core.orgName.
     val orgName: String = "",
+    // Which tracker this org is ("jira" | "azure"), so the New-ticket form words
+    // its label field (labels vs tags) and splits labels per source (XERK-137).
+    // Older agents omit it; core.mergeSites defaults it to "jira".
+    val source: String = "",
     val tickets: List<JiraTicket> = emptyList(),
     // The repos the board's manual "Change" picker offers — exactly what the
     // agent's set_jira_repo allowlists, so the two can't drift (hub-agent
@@ -294,6 +298,58 @@ data class StatusChangeResult(
     val error: String? = null,
     val status: String? = null,
     val statusCategory: String? = null,
+)
+
+// New-ticket creation (XERK-137). The board's create form fetches the metadata on
+// demand (projects/types/labels), then POSTs a new ticket and polls the outcome.
+
+@Serializable
+data class CreateProject(val key: String = "", val name: String = "")
+
+@Serializable
+data class CreateType(val id: String = "", val name: String = "")
+
+/**
+ * GET /api/jira/<siteKey>/create-meta[?project=]: 202 {pending} while the host
+ * fetches; else {projects, labels, source} (no project) or {types} (a project),
+ * or {error}. Kept lenient like [JiraIssueEnvelope].
+ */
+@Serializable
+data class CreateMetaEnvelope(
+    val projects: List<CreateProject> = emptyList(),
+    val labels: List<String> = emptyList(),
+    val source: String = "",
+    val types: List<CreateType> = emptyList(),
+    val error: String? = null,
+    val pending: Boolean = false,
+)
+
+/** POST /api/jira/<siteKey>/tickets body. */
+@Serializable
+data class CreateTicketRequest(
+    val project: String,
+    val issueType: String,
+    val summary: String,
+    val description: String = "",
+    val labels: List<String> = emptyList(),
+)
+
+/** POST /api/jira/<siteKey>/tickets reply: {ok, cmdId, host} or {error}. */
+@Serializable
+data class CreateTicketResponse(
+    val ok: Boolean = false,
+    val cmdId: String = "",
+    val host: String = "",
+    val error: String? = null,
+)
+
+/** GET /api/jira/<siteKey>/tickets/<cmdId>: {key,url} / {error} / 202 {pending}. */
+@Serializable
+data class CreateResultEnvelope(
+    val key: String? = null,
+    val url: String? = null,
+    val error: String? = null,
+    val pending: Boolean = false,
 )
 
 @Serializable
