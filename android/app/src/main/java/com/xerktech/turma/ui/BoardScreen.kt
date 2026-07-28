@@ -25,7 +25,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ConfirmationNumber
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
@@ -273,6 +273,12 @@ fun BoardScreen(
  * It reads the shared fleet stream itself (like [OrgFilterAction]) rather than
  * being handed data, so it works wherever the header renders. Hidden until a
  * host reports a tracker org to create against, as the web slot collapses.
+ *
+ * The glyph is a ticket (`ConfirmationNumber`), deliberately NOT a bare `+`: the
+ * Sessions and Dashboard headers already carry a `+` for "New session", so two
+ * plain `+`s read as the same action. The web affords the room for a full "New
+ * ticket" pill; a phone header doesn't, so the ticket glyph carries the meaning
+ * and "New ticket" rides its content description / long-press tooltip.
  */
 @Composable
 fun NewTicketAction(vm: BoardViewModel = viewModel()) {
@@ -281,7 +287,7 @@ fun NewTicketAction(vm: BoardViewModel = viewModel()) {
     val sites = remember(fleet) { mergeSites(fleet.agents) }
     if (sites.isEmpty()) return
     var creating by remember { mutableStateOf(false) }
-    IconButton(onClick = { creating = true }) { Icon(Icons.Filled.Add, "New ticket") }
+    IconButton(onClick = { creating = true }) { Icon(Icons.Filled.ConfirmationNumber, "New ticket") }
     if (creating) {
         // Default the form's org to the header scope when it names a real one,
         // else the first org — the web openCreate's pick.
