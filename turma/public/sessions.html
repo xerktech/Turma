@@ -54,7 +54,11 @@
   /* Session card: the auto task name leads; the 5-digit id + repo sit small below. */
   button.s-card {
     display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left;
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    /* Subtle, opaque org tint (XERK-142): --org (set inline on .s-card-wrap by
+       orgTintStyle) mixed a little into --surface, so a session's org reads at a
+       glance the same way it does on the board. No org set → plain surface. */
+    background: color-mix(in srgb, var(--org, var(--surface)) 12%, var(--surface));
+    border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 10px 12px; cursor: pointer; font: inherit; color: var(--ink);
   }
   button.s-card:hover:not(:disabled) { border-color: var(--accent); }
@@ -66,7 +70,8 @@
      live card and a muted ended one. */
   .s-card.queued {
     display: flex; align-items: flex-start; gap: 10px; width: 100%;
-    background: var(--surface); border: 1px dashed var(--border);
+    background: color-mix(in srgb, var(--org, var(--surface)) 12%, var(--surface));
+    border: 1px dashed var(--border);
     border-radius: var(--radius-md); padding: 10px 72px 10px 12px; color: var(--ink);
   }
   .s-card.queued .dot { background: var(--warning); box-shadow: none; }
@@ -852,6 +857,22 @@ let pendingMigration = null;
 let pendingMigrationFollowed = false;
 
 function siteKeyOfAgent(a) { return (a && a.jira && a.jira.siteKey) || ""; }
+
+// Org tint (XERK-142): a session card is subtly background-coloured by the org its
+// host polls, so which org a session belongs to reads at a glance — the same tint,
+// from the same orgColorMap, the board paints its ticket cards with. Built over the
+// WHOLE fleet's org set (not the header-filtered view) so an org keeps its colour
+// regardless of the current filter, matching board.js's use of the full org set.
+let orgColorByKey = new Map();
+function refreshOrgColors(agents) {
+  orgColorByKey = window.TurmaBoard.orgColorMap((agents || []).map(siteKeyOfAgent));
+}
+// Inline style setting --org for a card wrap; empty for a host with no org (leaves
+// the card on plain --surface). The card CSS color-mixes --org into --surface.
+function orgTintStyle(a) {
+  const c = orgColorByKey.get(siteKeyOfAgent(a));
+  return c ? ` style="--org:${c}"` : "";
+}
 // The online hosts a running session could move to: same org, a different host,
 // with the session's repo already cloned (the hub requires it — the target
 // resumes off that repo's default branch).
@@ -1426,6 +1447,9 @@ function render(data) {
   // not be torn off the stage because its org was filtered out of the sidebar.
   TurmaOrg.update(data);
   const agents = TurmaOrg.filter(data.agents || []);
+  // Org card tints come from the full fleet's org set, not the scoped one, so a
+  // card's colour is the same whether or not its org is the filtered-to one.
+  refreshOrgColors(data.agents || []);
 
   const { running, queued, ended } = collect(agents, now);
   const waiting = running.filter(x => x.live.kind === "waiting").length;
@@ -1534,7 +1558,7 @@ function queuedCard({ a, s }) {
   const ticket = s.ticket?.key ? ` · <span class="s-ticket">${esc(s.ticket.key)}</span>` : "";
   const meta = `<span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}${ticket}`;
   const since = s.queuedAt ? " · " + esc(ago(Date.now() - Date.parse(s.queuedAt))) : "";
-  return `<div class="s-card-wrap">
+  return `<div class="s-card-wrap"${orgTintStyle(a)}>
     <div class="s-card queued">
       <span class="dot queued"></span>
       <span class="body">
@@ -1563,7 +1587,7 @@ function activeCard({ a, s, live }) {
   const mig = migrationFor(a.key, s.id);
   const moving = mig
     ? `<div class="s-moving"><span class="spin"></span> Moving to ${esc(mig.targetHost)}…</div>` : "";
-  return `<div class="s-card-wrap">
+  return `<div class="s-card-wrap"${orgTintStyle(a)}>
     <button class="s-card ${cur ? "cur" : ""}" ${attachable ? "" : "disabled"}
         onclick="selectSession('${esc(s.id)}')"
         ${attachable ? "" : 'title="Terminal tunnel offline"'}>
@@ -1656,7 +1680,7 @@ function endedRow(e) {
     : kind === "resumable" ? "ended"
     : (s.status === "error" ? "failed" : "stopped"))
     + (when ? " " + when : "");
-  return `<div class="s-card-wrap ended-wrap">
+  return `<div class="s-card-wrap ended-wrap"${orgTintStyle(a)}>
     <button class="s-card ended ${cur ? "cur" : ""}" onclick="openEndedSession('${esc(e.id)}')">
       <span class="dot"></span>
       <span class="body">

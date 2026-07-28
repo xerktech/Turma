@@ -46,13 +46,16 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.compose.ui.graphics.Color
 import com.xerktech.turma.core.FleetSummary
 import com.xerktech.turma.core.LiveState
 import com.xerktech.turma.core.fleetSummary
 import com.xerktech.turma.core.liveState
+import com.xerktech.turma.core.orgColorMap
 import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.core.sessionBranch
 import com.xerktech.turma.core.sessionName
+import com.xerktech.turma.core.siteKeyOf
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.RepoInfo
 import com.xerktech.turma.model.SessionInfo
@@ -71,6 +74,9 @@ fun FleetScreen(
     // (XERK-62). A host polls exactly one org, so scoping the agent list scopes
     // the tiles, the host cards, their repos and their sessions in one move.
     val agents = remember(fleet.agents, org) { scopedAgents(fleet.agents, org) }
+    // Org card tints (XERK-142) come from the WHOLE fleet's org set, not the scoped
+    // one, so a host card keeps its colour regardless of the header's org filter.
+    val orgColors = remember(fleet.agents) { orgColorMap(fleet.agents.map { siteKeyOf(it) }) }
     val snackbar = remember { SnackbarHostState() }
 
     LaunchedEffect(Unit) { vm.start() }
@@ -115,6 +121,7 @@ fun FleetScreen(
                 items(agents, key = { it.key }) { agent ->
                     HostSection(
                         agent = agent,
+                        orgTint = orgTintOf(agent, orgColors),
                         now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis(),
                         expanded = expandedHosts[agent.key] ?: true,
                         pending = pending,
@@ -180,9 +187,19 @@ fun codingAgentLabel(a: AgentInfo): String {
     return if (m != null) "${m.groupValues[2]} ${m.groupValues[1]}" else "Claude Code $raw"
 }
 
+/** The org tint for a host card (XERK-142): its org's palette colour, or null for a
+ *  host with no tracker creds (no org → stays plain surface). colorMap is built over
+ *  the whole fleet so the colour is stable regardless of the header's org filter. */
+private fun orgTintOf(agent: AgentInfo, colorMap: Map<String, Int>): Color? {
+    val series = com.xerktech.turma.ui.theme.TurmaColors.series
+    val slot = colorMap[siteKeyOf(agent)] ?: return null
+    return series[slot % series.size]
+}
+
 @Composable
 private fun HostSection(
     agent: AgentInfo,
+    orgTint: Color?,
     now: Long,
     expanded: Boolean,
     pending: Map<String, FleetViewModel.SessPending>,
@@ -195,7 +212,7 @@ private fun HostSection(
     onSessionActions: (String, SessionInfo) -> Unit,
     onCancelQueued: (String, SessionInfo) -> Unit,
 ) {
-    TurmaCard(Modifier.fillMaxWidth()) {
+    TurmaCard(Modifier.fillMaxWidth(), tint = orgTint) {
         Column(Modifier.fillMaxWidth()) {
             Row(
                 Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(10.dp, 6.dp),

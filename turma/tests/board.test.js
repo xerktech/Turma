@@ -311,6 +311,30 @@ test("cardHtml: done tickets are not overdue", () => {
   assert.ok(!cardHtml(t, { siteKey: "s" }, { now }).includes("overdue"));
 });
 
+test("cardHtml: carries the org tint as --org on the card root (XERK-142)", () => {
+  const now = Date.parse("2026-07-14T12:00:00Z");
+  const t = ticket("X-3", {});
+  // The colour the board passes is a palette var; it must reach the card root's
+  // style so app.css can mix it into the card background.
+  const html = cardHtml(t, { siteKey: "s" }, { now, color: "var(--s3)" });
+  assert.ok(/class="kanban-card[^"]*"[\s\S]*style="--org:var\(--s3\)"/.test(html)
+    || html.includes('style="--org:var(--s3)"'), "card root sets --org to the org colour");
+});
+
+test("boardHtml: each org's cards carry its unique tint (XERK-142)", () => {
+  const sites = mergeSites([
+    agent("hostA", block({ tickets: [ticket("T-1", { status: "To Do", statusCategory: "todo" })] })),
+    agent("hostB", block({ siteKey: "other.atlassian.net", user: "b@x.com",
+                           tickets: [ticket("O-1", { status: "To Do", statusCategory: "todo" })] })),
+  ]);
+  const allKeys = sites.map((s) => s.siteKey);
+  const html = boardHtml(sites, null, { allKeys });
+  const map = orgColorMap(allKeys);
+  // Every card is tinted, and two distinct orgs get two distinct --org values.
+  for (const s of sites) assert.ok(html.includes(`--org:${map.get(s.siteKey)}`));
+  assert.notEqual(map.get(sites[0].siteKey), map.get(sites[1].siteKey));
+});
+
 test("boardHtml: four columns with counts, org filter scopes tickets", () => {
   const sites = mergeSites([
     agent("hostA", block({ tickets: [

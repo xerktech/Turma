@@ -26,7 +26,11 @@
   /* Hosts stack full-width — each expands into a repo → session tree. */
   .hosts { display: flex; flex-direction: column; gap: 16px; }
   .host-card {
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    /* Subtle, opaque org tint (XERK-142): --org (var(--sN), set inline per host)
+       mixed a little into --surface, so a host's org reads at a glance the same way
+       it does on the board. No org (host without tracker creds) → plain surface. */
+    background: color-mix(in srgb, var(--org, var(--surface)) 12%, var(--surface));
+    border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 16px; display: flex; flex-direction: column; gap: 12px;
   }
   .host-card.offline { opacity: 0.62; }
@@ -751,6 +755,9 @@ function render(data) {
   // the tiles, the host cards, their repos and their sessions in one move.
   TurmaOrg.update(data);
   const agents = TurmaOrg.filter(data.agents || []);
+  // Org card tints come from the full fleet's org set, not the scoped one, so a
+  // host card's colour is the same whether or not its org is the filtered-to one.
+  refreshOrgColors(data.agents || []);
 
   // Aggregate across every session on every host.
   const sess = agents.flatMap(a => (a.sessions || []).map(s => ({ s, host: a })));
@@ -807,6 +814,22 @@ function render(data) {
     $groups.innerHTML = `<div class="hosts">${agents.map(a => hostCard(a, now)).join("")}</div>`;
   });
   restoreComposerFocus(focus);
+}
+
+// Org tint (XERK-142): a host card is subtly background-coloured by the org it
+// polls, so a host's org reads at a glance — the same tint, from the same
+// orgColorMap, the board paints its ticket cards with. Built over the WHOLE fleet
+// (not the org-filtered view) so an org keeps its colour regardless of the filter.
+let orgColorByKey = new Map();
+function refreshOrgColors(agents) {
+  orgColorByKey = window.TurmaBoard.orgColorMap(
+    (agents || []).map(a => (a.jira && a.jira.siteKey) || ""));
+}
+// Inline style setting --org for a host card; empty for a host with no org (leaves
+// it on plain --surface). The card CSS color-mixes --org into --surface.
+function orgTintStyle(a) {
+  const c = orgColorByKey.get((a.jira && a.jira.siteKey) || "");
+  return c ? ` style="--org:${c}"` : "";
 }
 
 function hostCard(a, now) {
@@ -868,7 +891,7 @@ function hostCard(a, now) {
     ? `Agent is updating${a.updating.version ? " to " + a.updating.version : ""} — expected brief downtime, not an outage`
     : "";
 
-  return `<div class="host-card ${cardState} ${collapsed ? "collapsed" : ""}">
+  return `<div class="host-card ${cardState} ${collapsed ? "collapsed" : ""}"${orgTintStyle(a)}>
     <div class="host-top">
       <button class="host-name" onclick="hostToggle('${esc(a.key)}')"
           aria-expanded="${collapsed ? "false" : "true"}" title="${collapsed ? "Expand" : "Collapse"} host">

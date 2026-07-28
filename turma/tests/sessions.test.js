@@ -16,6 +16,11 @@ const path = require("node:path");
 const html = fs.readFileSync(path.join(__dirname, "..", "public", "sessions.html"), "utf8");
 const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
 
+// The page reads window.TurmaBoard.orgColorMap for the org card tint (XERK-142),
+// loaded by board.html alongside sessions.html; require the real module so the
+// tint the cards carry is the same one the board paints.
+const TurmaBoard = require("../public/board.js");
+
 // --- minimal DOM shim --------------------------------------------------------
 function makeEl(id) {
   const el = {
@@ -115,6 +120,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     // orgs") so these tests see every fabricated host; `setOrg` lets an
     // org-scoping test narrow it.
     TurmaOrg: { _k: "", get() { return this._k; }, filter(a) { return this._k ? (a || []).filter((x) => (x.jira && x.jira.siteKey) === this._k) : (a || []); }, update: noop, subscribe: noop, sse: noop },
+    TurmaBoard,
     scrollTo: noop, innerWidth: 1200, innerHeight: 800,
   };
   const names = Object.keys(stubs);
@@ -174,6 +180,30 @@ test("running sessions split: working/waiting -> Active, idle -> Idle", () => {
   assert.ok(!i.includes("Working Task"), "working sessions must not appear under Idle");
 
   assert.ok(els.ended.innerHTML.includes("Dead Task"), "ended section still renders");
+});
+
+test("session cards carry their host's org tint as --org (XERK-142)", () => {
+  const { render, els } = loadPage();
+  const now = Date.now();
+  const jira = { siteKey: "org.atlassian.net" };
+  const withOrg = {
+    key: "hostA", device: "hostA", online: true, terminalOnline: true,
+    lastSeen: now, jira, repos: [{ name: "repoX" }],
+    sessions: [working("11111", "Tinted Task")],
+  };
+  const noOrg = {
+    key: "hostB", device: "hostB", online: true, terminalOnline: true,
+    lastSeen: now, repos: [{ name: "repoY" }],
+    sessions: [working("22222", "Grey Task")],
+  };
+  render({ now, agents: [withOrg, noOrg] });
+  const color = TurmaBoard.orgColorMap(["org.atlassian.net"]).get("org.atlassian.net");
+  const a = els.active.innerHTML;
+  // The org host's card wrap sets --org to its palette colour...
+  assert.ok(a.includes(`style="--org:${color}"`), "org host's card carries the tint");
+  // ...and the org-less host's card sets no --org, staying on plain surface.
+  const wraps = a.match(/<div class="s-card-wrap"[^>]*>/g) || [];
+  assert.ok(wraps.some((w) => !w.includes("--org")), "org-less host's card carries no tint");
 });
 
 test("a queued session lands under Queued, not Ended, and offers Cancel", () => {

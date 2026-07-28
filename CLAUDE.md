@@ -1151,6 +1151,14 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   then only the *colliding* orgs move. Unique up to 8 orgs; overflow falls back to its preferred (possibly
   shared) slot. The Android port (`core/Board.kt` `orgColorMap` → `ChartSeries`) uses the identical
   assignment, pinned by locked test vectors on each side.
+- That org color also **tints the CARD BACKGROUND on every surface** (XERK-142), so which org a ticket,
+  session or host belongs to reads at a glance no matter the screen: the board ticket card, the Sessions
+  page session cards (active/idle/queued/ended), and the Dashboard host card. Web sets `--org` (a
+  `var(--sN)`) inline per card and `color-mix`es it **12% into `--surface`** — opaque and subtle, never
+  overwhelming; a card with no org (a host without tracker creds) falls back to plain surface. The tint
+  is computed over the WHOLE fleet's org set (via `orgColorMap`), not the header-filtered view, so a
+  card's colour is stable regardless of the org filter. Android mirrors it through one `TurmaCard(tint=)`
+  param (`lerp(surface, tint, 0.12)`). Tests: the `--org` cases in `board.test.js`/`sessions.test.js`.
 - The board READS the tracker; it makes exactly **two** writes back to it — **creating a ticket**
   (XERK-137, "Creating a ticket" below) and **changing a ticket's status** (XERK-138, "Changing the
   status by hand"). Every other control writes a hub/agent ledger, never the board. Tests:
