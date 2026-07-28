@@ -591,6 +591,9 @@ fun ScreenHeader(title: String, actions: @Composable () -> Unit = {}) {
     ) {
         Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.weight(1f))
+        // Both are shared-chrome controls, on every top-level screen: the one
+        // write action (New ticket, XERK-150) beside the org scope (XERK-62).
+        NewTicketAction()
         OrgFilterAction()
         actions()
         Box {

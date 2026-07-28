@@ -140,6 +140,7 @@
 <script src="/board.js"></script>
 <script src="/nav.js"></script>
 <script src="/org.js"></script>
+<script src="/newticket.js"></script>
 
 <script>
 const $chart = document.getElementById("chart");
@@ -412,6 +413,7 @@ function renderInner(data) {
   // and "By repo" charts only what the scoped org's hosts spent — a repo two
   // orgs share reads as that org's share of it, which is the point of scoping.
   TurmaOrg.update(data);
+  TurmaNewTicket.update(data);
   const agents = TurmaOrg.filter(data.agents || []);
   const series = toSeries(agents);
   if (!series.length) {

@@ -277,6 +277,7 @@
 <script src="/board.js"></script>
 <script src="/nav.js"></script>
 <script src="/org.js"></script>
+<script src="/newticket.js"></script>
 
 <script>
 const $tiles = document.getElementById("tiles");
@@ -754,6 +755,7 @@ function render(data) {
   // (XERK-62). A host polls exactly one org, so scoping the agent list scopes
   // the tiles, the host cards, their repos and their sessions in one move.
   TurmaOrg.update(data);
+  TurmaNewTicket.update(data);
   const agents = TurmaOrg.filter(data.agents || []);
   // Org card tints come from the full fleet's org set, not the scoped one, so a
   // host card's colour is the same whether or not its org is the filtered-to one.

@@ -800,6 +800,7 @@
 <script src="/board.js"></script>
 <script src="/nav.js"></script>
 <script src="/org.js"></script>
+<script src="/newticket.js"></script>
 
 <script>
 const $active = document.getElementById("active");
@@ -1453,6 +1454,7 @@ function render(data) {
   // findSession/sessionHit, which read `cache` directly: an open session must
   // not be torn off the stage because its org was filtered out of the sidebar.
   TurmaOrg.update(data);
+  TurmaNewTicket.update(data);
   const agents = TurmaOrg.filter(data.agents || []);
   // Org card tints come from the full fleet's org set, not the scoped one, so a
   // card's colour is the same whether or not its org is the filtered-to one.
