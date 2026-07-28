@@ -105,7 +105,7 @@ hub.registerDevice("capture-device", "android");
 const {
   server, agents, queueCommand, findSession,
   wsAccept, wsEncode, wsParser, channelDuplex,
-  heartbeatAlerts, sessionWorking,
+  heartbeatAlerts, prAlertDecision, sessionWorking,
   userAuthorized, agentAuthorized, agentWsAuthorized, triggerAuthorized, fmtDur,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
@@ -589,21 +589,144 @@ test("alerts: question fires on new text only, re-arms when cleared", () => {
   assert.deepEqual(titles(), ["nas-repo-s1 has a question"]);
 });
 
-test("alerts: PR created fires once per URL (persisted prSeen)", () => {
+// ---- PR alerts held until CI is green (XERK-153) ---------------------------
+
+const PR_URL = "https://github.com/xerktech/Turma/pull/34";
+const MIN = 60 * 1000;
+
+// One beat's worth of a session that has opened `urls` and whose PR statuses
+// currently read `prs`. `newPrUrls` is the per-beat scrape; `prs` is the
+// slower-cadence status the agent attaches to the session record.
+const prBeat = (urls, prs) => ({
+  sessions: [{
+    id: "s1", rcName: "nas-repo-s1",
+    prs: prs || null,
+    session: { newPrUrls: urls },
+  }],
+});
+
+test("alerts: PR alert waits for the CI rollup to come back green", () => {
   const beat = makeHost();
-  const url = "https://github.com/xerktech/Turma/pull/34";
-  const withPrs = (urls) => ({
-    sessions: [{ id: "s1", rcName: "nas-repo-s1", session: { newPrUrls: urls } }],
-  });
+  const t0 = Date.now();
   notifications.length = 0;
-  beat(withPrs([url]));
-  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
-  assert.equal(notifications[0].data.click, url);
-  notifications.length = 0;
-  beat(withPrs([url])); // agent re-delivered it: still only once
+  // Scraped out of the transcript, but the agent hasn't fetched its status yet:
+  // the URL alone says nothing about CI, so nothing fires.
+  beat(prBeat([PR_URL]), t0);
   assert.deepEqual(titles(), []);
-  beat(withPrs(["https://github.com/xerktech/Turma/pull/35"]));
+  // First status refresh lands, checks still queued.
+  beat(prBeat([], [{ url: PR_URL, checks: "pending" }]), t0 + MIN);
+  assert.deepEqual(titles(), []);
+  // Green.
+  beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + 2 * MIN);
   assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.equal(notifications[0].data.click, PR_URL);
+  assert.match(notifications[0].body, /All checks passed/);
+  assert.match(notifications[0].body, new RegExp(PR_URL.replace(/[/.]/g, "\\$&")));
+  // Still green on later beats: fires once, like every other alert.
+  notifications.length = 0;
+  beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + 3 * MIN);
+  assert.deepEqual(titles(), []);
+});
+
+test("alerts: a PR with no CI fires on its own, once the empty rollup holds", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  notifications.length = 0;
+  beat(prBeat([PR_URL]), t0);
+  // `checks: null` on a fetched status means "no checks at all" — but a
+  // brand-new PR reads that way too while its workflows register, so the
+  // verdict has to hold before it counts.
+  beat(prBeat([], [{ url: PR_URL, checks: null }]), t0 + MIN);
+  assert.deepEqual(titles(), []);
+  beat(prBeat([], [{ url: PR_URL, checks: null }]), t0 + 3 * MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.match(notifications[0].body, /No CI configured/);
+});
+
+test("alerts: an empty rollup that turns into real checks isn't 'no CI'", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  notifications.length = 0;
+  beat(prBeat([PR_URL]), t0);
+  beat(prBeat([], [{ url: PR_URL, checks: null }]), t0 + MIN);      // workflows not registered yet
+  beat(prBeat([], [{ url: PR_URL, checks: "pending" }]), t0 + 2 * MIN); // they register
+  beat(prBeat([], [{ url: PR_URL, checks: "pending" }]), t0 + 4 * MIN); // past the no-CI grace
+  assert.deepEqual(titles(), []);
+  beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + 5 * MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.match(notifications[0].body, /All checks passed/);
+});
+
+test("alerts: failing CI stays quiet, then fires when the fix goes green", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  notifications.length = 0;
+  beat(prBeat([PR_URL]), t0);
+  beat(prBeat([], [{ url: PR_URL, checks: "failing" }]), t0 + MIN);
+  assert.deepEqual(titles(), []);
+  // Red for well past the age-out backstop: still silent, because the session
+  // is expected to push a fix rather than the operator to be pinged.
+  beat(prBeat([], [{ url: PR_URL, checks: "failing" }]), t0 + 60 * MIN);
+  assert.deepEqual(titles(), []);
+  beat(prBeat([], [{ url: PR_URL, checks: "pending" }]), t0 + 61 * MIN); // re-run after a push
+  assert.deepEqual(titles(), []);
+  beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + 62 * MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+});
+
+test("alerts: a PR whose CI verdict never arrives fires on the backstop", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  notifications.length = 0;
+  // A host with no `gh` login never fills the status in, so the wait would
+  // otherwise hold forever and the alert be lost outright.
+  beat(prBeat([PR_URL]), t0);
+  beat(prBeat([], [{ url: PR_URL }]), t0 + 10 * MIN); // bare link, no `checks` key
+  assert.deepEqual(titles(), []);
+  beat(prBeat([], [{ url: PR_URL }]), t0 + 31 * MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.match(notifications[0].body, /CI state unknown/);
+});
+
+test("alerts: PR fires once per URL and tracks several PRs independently", () => {
+  const beat = makeHost();
+  const other = "https://github.com/xerktech/Turma/pull/35";
+  const t0 = Date.now();
+  notifications.length = 0;
+  beat(prBeat([PR_URL]), t0);
+  beat(prBeat([PR_URL, other], [{ url: PR_URL, checks: "passing" },
+                                { url: other, checks: "pending" }]), t0 + MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]); // only the green one
+  assert.equal(notifications[0].data.click, PR_URL);
+  notifications.length = 0;
+  // The agent re-delivers an already-alerted URL: still only the once.
+  beat(prBeat([PR_URL], [{ url: PR_URL, checks: "passing" },
+                         { url: other, checks: "passing" }]), t0 + 2 * MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.equal(notifications[0].data.click, other);
+});
+
+test("prAlertDecision: the verdict table, and its sticky markers", () => {
+  const now = Date.now();
+  // No status fetched yet is never "no CI" — hold.
+  assert.equal(prAlertDecision({ at: now }, undefined, now), null);
+  assert.equal(prAlertDecision({ at: now }, { url: PR_URL }, now), null);
+  assert.equal(prAlertDecision({ at: now }, { url: PR_URL, checks: "pending" }, now), null);
+  assert.equal(prAlertDecision({ at: now }, { url: PR_URL, checks: "passing" }, now),
+    "All checks passed");
+  // `checks: null` arms the no-CI timer rather than firing immediately.
+  const noCi = { at: now };
+  assert.equal(prAlertDecision(noCi, { url: PR_URL, checks: null }, now), null);
+  assert.equal(noCi.noCiAt, now);
+  assert.equal(prAlertDecision(noCi, { url: PR_URL, checks: null }, now + 3 * MIN),
+    "No CI configured");
+  // Failing is sticky, and immunizes the wait against the age-out backstop.
+  const red = { at: now };
+  assert.equal(prAlertDecision(red, { url: PR_URL, checks: "failing" }, now), null);
+  assert.equal(red.red, true);
+  assert.equal(prAlertDecision(red, { url: PR_URL, checks: "pending" }, now + 60 * MIN), null);
+  // An unresolved wait ages out instead of being lost.
+  assert.equal(prAlertDecision({ at: now }, undefined, now + 31 * MIN), "CI state unknown");
 });
 
 test("alerts: turn finished fires on the working->idle edge only", () => {

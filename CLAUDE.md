@@ -1858,6 +1858,22 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - The hub pushes edge-triggered alerts to the **Android client via FCM** — the sole notification transport
   (XERK-10 removed the ntfy path): host offline/recovered, restart loop, per-session turn finished /
   question waiting / PR created, and Claude login required/expiring/restored.
+- **A PR alert waits for that PR's CI to go green** (XERK-153) — it used to fire the instant the agent
+  scraped the URL, which is when the work is LEAST ready to look at. A new URL enters a per-session wait
+  list (`alerts.sessions[id].prWait`) that `prAlertDecision` re-judges each beat against `session.prs`;
+  `prSeen` keeps its old meaning (already alerted), so an older hub's PRs don't re-fire on upgrade.
+  - The gate is the **CI rollup alone** (`checks`), not the `ready` verdict — a green PR that conflicts
+    still alerts, and the card's ✓/✗ mark is where merge-readiness is read.
+  - **`failing` stays quiet, permanently** (sticky `w.red`): the session is expected to push a fix, and
+    the alert is for the PR being ready, not for every round trip through red.
+  - **Absent `checks` means "not fetched yet", never "no CI"** → hold. A fetched `checks: null` IS a
+    CI-less PR, but a just-opened one reads identically while GitHub registers its workflows, so it must
+    hold `PR_NO_CI_GRACE_MS` (2 min, ~2 agent PR-status refreshes) first.
+  - **An inconclusive wait ages out at `PR_ALERT_MAX_WAIT_MS`** (30 min) and fires anyway — a host with no
+    `gh` login never fills the status in. The wait delays the alert; it must not lose it. Red is exempt.
+  - Body carries the verdict ("All checks passed"/"No CI configured"/"CI state unknown" · url); title,
+    `rocket` tag, click and routing unchanged, so the clients need no change.
+  - Tests: the PR-alert cases + `prAlertDecision` table in `turma/tests/server.test.js`.
 - **Claude login alerts** (XERK-98) fire in `heartbeatAlerts` off the agent's `claudeAuth` block. Two
   edge-triggered states, deduped under `next.alerts` and cleared on recovery like the offline/online pair:
   `needsLogin` → urgent `key`-tagged "Claude login required", `expiringSoon` → default-priority "Claude
