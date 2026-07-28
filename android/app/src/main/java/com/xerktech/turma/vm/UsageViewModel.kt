@@ -34,6 +34,9 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
     ) {
         /** Legend/persistence key, the web's skey ("repo::<remoteKey>"). */
         val skey: String get() = "repo::$remoteKey"
+
+        /** Display name — the root bucket reads "Root" (web `repoLabel`). */
+        val label: String get() = repoLabel(repo)
     }
 
     data class HostTotal(
@@ -59,6 +62,21 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
     )
 
     companion object {
+        /**
+         * The agent's reserved root pseudo-repo name. Usage the agent can't tie
+         * to a repo folds in here too, and it reads as "Root" in the UI
+         * (XERK-147). Older agents reported such usage as "(other)"/"?" —
+         * [normRepo] folds those into the same series rather than listing
+         * phantom repos (web usage.html `normRepo`/`repoLabel`).
+         */
+        const val ROOT_REPO = "(root)"
+        private val legacyRootKeys = setOf(ROOT_REPO, "(other)", "?")
+
+        fun normRepo(name: String): String =
+            if (name.isBlank() || name in legacyRootKeys) ROOT_REPO else name
+
+        fun repoLabel(name: String): String = if (name == ROOT_REPO) "Root" else name
+
         /**
          * Pure — a companion fun rather than a method so the JVM unit tests can
          * exercise it without standing up an Application for the ViewModel.
@@ -95,12 +113,13 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 total += hostTotal
 
                 for (ru in a.repoUsage) {
-                    val key = ru.remoteKey.ifBlank { ru.repo }
+                    val key = normRepo(ru.remoteKey.ifBlank { ru.repo })
                     val prev = repoAcc[key]
                     val days = LinkedHashMap(prev?.days ?: emptyMap())
                     addDays(days, ru.usage)
                     repoAcc[key] = RepoTotal(
-                        repo = prev?.repo?.ifBlank { ru.repo } ?: ru.repo,
+                        repo = if (ru.repo.isNotBlank()) normRepo(ru.repo)
+                               else prev?.repo ?: key,
                         remoteKey = key,
                         today = (prev?.today ?: 0) + ru.usage.today.total,
                         week = (prev?.week ?: 0) + ru.usage.week.total,

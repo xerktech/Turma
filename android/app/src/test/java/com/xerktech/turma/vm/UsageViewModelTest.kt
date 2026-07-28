@@ -94,6 +94,28 @@ class UsageViewModelTest {
         assertEquals(11L, opus.week)
     }
 
+    @Test fun `root and legacy junk buckets fold into one Root series`() {
+        // The agent's root pseudo-repo plus the buckets older agents used for
+        // unattributable usage ("(other)", "?", a blank repo) collapse into ONE
+        // series, keyed "(root)" and labelled "Root" (XERK-147).
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "h1", repoUsage = listOf(
+                RepoUsage("(root)", "(root)", usage(today = 1, week = 2, all = 10)),
+                RepoUsage("(other)", "(other)", usage(today = 0, week = 0, all = 5)),
+            )),
+            AgentInfo(key = "h2", repoUsage = listOf(
+                RepoUsage("", "?", usage(today = 0, week = 0, all = 1)),
+            )),
+        ))
+        val root = UsageViewModel.compute(fleet).byRepo.single()
+        assertEquals("(root)", root.repo)
+        assertEquals("Root", root.label)
+        assertEquals("repo::(root)", root.skey)
+        assertEquals(16L, root.total)
+        // A real repo passes through the label untouched.
+        assertEquals("Turma", UsageViewModel.repoLabel("Turma"))
+    }
+
     @Test fun `an empty fleet computes to zeroes rather than throwing`() {
         val ui = UsageViewModel.compute(FleetState())
         assertEquals(0L, ui.total)
