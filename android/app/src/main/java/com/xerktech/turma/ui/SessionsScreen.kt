@@ -449,8 +449,8 @@ fun SessionsListPane(
     // it has no tracker), so a session card reads its org at a glance the same way a
     // board card does. Built over the WHOLE fleet so the colour is stable regardless
     // of the header's org filter.
-    val hostTint = remember(fleet.agents) {
-        val cm = orgColorMap(fleet.agents.map { siteKeyOf(it) })
+    val hostTint = remember(fleet.agents, fleet.orgColors) {
+        val cm = orgColorMap(fleet.agents.map { siteKeyOf(it) }, fleet.orgColors)
         val series = com.xerktech.turma.ui.theme.TurmaColors.series
         fleet.agents.associate { a ->
             a.key to cm[siteKeyOf(a)]?.let { series[it % series.size] }

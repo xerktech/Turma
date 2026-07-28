@@ -40,6 +40,10 @@ data class FleetState(
     // Ticket -> pinned model (XERK-123), from the same payload; the board's Model
     // row reads it. Refreshed by the poll and the "ticketModels" SSE event.
     val ticketModels: Map<String, com.xerktech.turma.model.TicketModelPin> = emptyMap(),
+    // Manual org-color pins (XERK-145), keyed by siteKey, value the palette slot
+    // 1..8; every screen's org tint reads it. Refreshed by the poll and the
+    // "orgColors" SSE event.
+    val orgColors: Map<String, Int> = emptyMap(),
 )
 
 class FleetRepository(
@@ -89,6 +93,7 @@ class FleetRepository(
             ticketAgents = resp.ticketAgents
             autoStartOrgs = resp.autoStartOrgs
             ticketModels = resp.ticketModels
+            orgColors = resp.orgColors
             emit(resp.now, error = null)
         } catch (e: Exception) {
             emit(_state.value.now, error = e.message ?: "hub unreachable")
@@ -104,6 +109,9 @@ class FleetRepository(
     @Volatile
     private var ticketModels: Map<String, com.xerktech.turma.model.TicketModelPin> = emptyMap()
 
+    @Volatile
+    private var orgColors: Map<String, Int> = emptyMap()
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
@@ -111,6 +119,7 @@ class FleetRepository(
             ticketAgents = ticketAgents,
             autoStartOrgs = autoStartOrgs,
             ticketModels = ticketModels,
+            orgColors = orgColors,
         )
     }
 
@@ -147,6 +156,10 @@ class FleetRepository(
                     "ticketModels" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketModelPin>>(data)
                     }.getOrNull()?.let { ticketModels = it; emit(_state.value.now, null) }
+                    // An org's color pin changed (XERK-145); whole tiny map.
+                    "orgColors" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, Int>>(data)
+                    }.getOrNull()?.let { orgColors = it; emit(_state.value.now, null) }
                 }
             }
 

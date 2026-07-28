@@ -137,7 +137,9 @@ fun BoardScreen(
     // One assignment of unique per-org colors over the whole org set, shared by
     // the header control and the columns so an org is one color everywhere
     // (XERK-48).
-    val colorMap = remember(sites) { orgColorMap(sites.map { it.siteKey }) }
+    val colorMap = remember(sites, fleet.orgColors) {
+        orgColorMap(sites.map { it.siteKey }, fleet.orgColors)
+    }
     // The scope is the header control's (XERK-62); filterSites self-heals a pick
     // no org still reports, exactly as `effectiveOrg` does for the other screens.
     val shown = remember(sites, orgFilter) { filterSites(sites, orgFilter) }

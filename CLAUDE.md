@@ -1151,6 +1151,16 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   then only the *colliding* orgs move. Unique up to 8 orgs; overflow falls back to its preferred (possibly
   shared) slot. The Android port (`core/Board.kt` `orgColorMap` → `ChartSeries`) uses the identical
   assignment, pinned by locked test vectors on each side.
+- **An org's color can be pinned by hand** (XERK-145): the header org menu's color dot expands a
+  swatch strip (8 palette slots + "auto" release) on web and Android. Hub-owned durable state like the
+  auto-start opt-in — `POST /api/jira/<siteKey>/color` `{slot:1..8}` / `{auto:true}`, persisted in
+  `/data/org-colors.json`, riding the fleet payload + an `orgColors` SSE event as `{siteKey: slot}` —
+  so the pick survives restarts and lands on every client. `orgColorMap(allKeys, pins)` gives a pinned
+  org EXACTLY its slot (two orgs pinned to one slot share it — the operator's explicit choice beats
+  uniqueness) and auto orgs probe around the pinned slots; a malformed pin is ignored. Web pages read
+  the pins through `TurmaOrg.orgColors()` (one live map, fed by the poll and the SSE event); Android
+  mirrors via `FleetState.orgColors` + `core/Board.kt`'s pins param, locked to the same test vectors.
+  Tests: the XERK-145 cases in `board.test.js`/`org.test.js`/`server.test.js` and android `BoardTest.kt`.
 - That org color also **tints the CARD BACKGROUND on every surface** (XERK-142), so which org a ticket,
   session or host belongs to reads at a glance no matter the screen: the board ticket card, the Sessions
   page session cards (active/idle/queued/ended), and the Dashboard host card. Web sets `--org` (a

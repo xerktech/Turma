@@ -126,6 +126,9 @@ function render(data) {
     $board.innerHTML = B.boardHtml(sites, orgFilter, {
       allKeys, sessionIndex, starts: sweepStarts(data.agents || [], sessionIndex),
       moves: activeMoves,
+      // Manual org-color pins (XERK-145), via TurmaOrg so the SSE event and the
+      // poll feed one map.
+      orgColors: TurmaOrg.orgColors(),
     });
   });
 }
@@ -441,7 +444,7 @@ function paintDetail() {
   s.agentPinShown = agentPin ? agentPin.host : "";
   s.modelPinShown = modelPin ? modelPin.model : "";
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
-    color: B.orgColor(s.siteKey, lastAllKeys),
+    color: B.orgColor(s.siteKey, lastAllKeys, TurmaOrg.orgColors()),
     siteKey: s.siteKey,
     error: s.error,
     // The override rides the heartbeat, so it needs a live host to reach; an
@@ -1291,6 +1294,17 @@ function connectSSE() {
     try { tm = JSON.parse(e.data); } catch { return; }
     if (!cache) cache = { now: Date.now(), agents: [] };
     cache.ticketModels = tm;
+    scheduleRender();
+  });
+  // An org's color pin changed (XERK-145) — same tiny-whole-map pattern. org.js
+  // owns the live map; this patch keeps THIS page's cache in step, else the next
+  // render's TurmaOrg.update(cache) would regress the pins to the stale copy the
+  // initial poll fetched (SSE-healthy pages never re-poll).
+  es.addEventListener("orgColors", (e) => {
+    let oc;
+    try { oc = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.orgColors = oc;
     scheduleRender();
   });
   // An org's auto-start opt-in changed (XERK-41) — same tiny-whole-map pattern

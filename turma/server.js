@@ -66,6 +66,12 @@ const TICKET_MODELS_MAX = 500;
 // /data volume, not the best-effort state.json, because the opt-in must survive a
 // hub restart.
 const AUTOSTART_ORGS_FILE = process.env.AUTOSTART_ORGS_FILE || "/data/autostart-orgs.json";
+// Manual org-color pins (XERK-145): siteKey -> palette slot 1..8, the operator's
+// override of the hash-assigned org color. Hub-owned durable state like the
+// auto-start opt-in (same reasons: per-org, tiny, must survive a restart, and
+// shared by web + android through the fleet payload + its own SSE event).
+const ORG_COLORS_FILE = process.env.ORG_COLORS_FILE || "/data/org-colors.json";
+const ORG_COLOR_SLOTS = 8; // categorical palette --s1..--s8 (app.css / TurmaColors.series)
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -439,6 +445,44 @@ function setAutoStartOrg(siteKey, enabled) {
   sseBroadcast("autoStartOrgs", autoStartOrgs);
 }
 
+// ---- manual org colors (XERK-145) ------------------------------------------
+// The operator's per-org palette pins, keyed by siteKey with the value the slot
+// number (1..8). Loaded like the auto-start opt-in: only well-formed entries
+// survive a read, so a hand-edited or corrupt file degrades to auto colors.
+let orgColors = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(ORG_COLORS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) {
+      if (Number.isInteger(v) && v >= 1 && v <= ORG_COLOR_SLOTS) orgColors[k] = v;
+    }
+  }
+} catch {
+  /* first boot or no volume mounted */
+}
+let ocSaveTimer = null;
+function scheduleOrgColorsSave() {
+  if (ocSaveTimer) return;
+  ocSaveTimer = setTimeout(() => {
+    ocSaveTimer = null;
+    fs.mkdir(path.dirname(ORG_COLORS_FILE), { recursive: true }, () => {
+      fs.writeFile(ORG_COLORS_FILE, JSON.stringify(orgColors), (err) => {
+        if (err) console.error(`org-colors save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  ocSaveTimer.unref();
+}
+// Pin an org's palette slot, or release it back to auto (slot = null). The
+// caller has validated the siteKey and the slot range; this owns the map.
+function setOrgColor(siteKey, slot) {
+  if (slot) orgColors[siteKey] = slot;
+  else delete orgColors[siteKey];
+  scheduleOrgColorsSave();
+  invalidateAgentsCache();
+  sseBroadcast("orgColors", orgColors);
+}
+
 // ---- session migration across hosts (XERK-101) -----------------------------
 // Move a running session from one agent to another in the same org (e.g. to the
 // host that has the container whose logs the conversation needs). The hub can't
@@ -528,7 +572,7 @@ function buildAgentsCache() {
   // board-scoped, and hub-owned, so this is their one read channel (plus their
   // own SSE events for open boards).
   const body = JSON.stringify({
-    now, agents: list, ticketAgents, ticketModels, autoStartOrgs,
+    now, agents: list, ticketAgents, ticketModels, autoStartOrgs, orgColors,
     // In-flight (and just-settled) session migrations, so the Sessions page can
     // follow a moved session onto its new host and surface a failure (XERK-101).
     migrations: migrationList(),
@@ -3335,6 +3379,28 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, enabled: body.enabled });
     }
 
+    // POST /api/jira/<siteKey>/color — pin an org's palette color (XERK-145).
+    // Body: {slot: 1..8} to pin, {auto:true} to release back to the
+    // hash-assigned color. Hub-owned durable state like /autostart: the save is
+    // authoritative on return, the org must be one the fleet reports (no
+    // phantom orgs), and the host need not be online (a color is a persistent
+    // presentation choice, nothing rides a heartbeat).
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "color") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const auto = body.auto === true;
+      if (!auto && !(Number.isInteger(body.slot) && body.slot >= 1 && body.slot <= ORG_COLOR_SLOTS)) {
+        return json(res, 400, { error: `body needs {slot:1..${ORG_COLOR_SLOTS}} or {auto:true}` });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      setOrgColor(siteKey, auto ? null : body.slot);
+      return json(res, 200, { ok: true, slot: auto ? null : body.slot });
+    }
+
     // Terminal proxy: /term/<sessionId>/… -> the ttyd of the host that owns
     // that session, tunneled to its per-session ttydPort. User auth already
     // enforced by the gate above.
@@ -3722,6 +3788,8 @@ if (process.env.TURMA_TEST) {
     autoStopped,
     autoStartOrgs,
     setAutoStartOrg,
+    orgColors,
+    setOrgColor,
     ticketAgents,
     ticketModels,
     ticketModelPin,

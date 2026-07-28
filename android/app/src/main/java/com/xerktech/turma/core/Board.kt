@@ -308,6 +308,14 @@ private fun orgSlotPref(siteKey: String): Int {
 }
 
 /**
+ * A manual pin's 0-based slot for a key, validated: only a wire value 1..8 from
+ * the hub's orgColors map counts (a malformed value reads as unpinned). The
+ * port of board.js `orgSlotPin`.
+ */
+fun orgSlotPin(pins: Map<String, Int>, key: String): Int? =
+    pins[key]?.takeIf { it in 1..8 }?.minus(1)
+
+/**
  * Assign every org a UNIQUE color slot (0..7 -> ChartSeries), no two sharing —
  * a port of board.js `orgColorMap` (XERK-48). Uniqueness couples the orgs, so
  * it takes the whole set: each org takes its djb2-preferred slot if free, else
@@ -317,12 +325,23 @@ private fun orgSlotPref(siteKey: String): Int {
  * back to their preferred (then possibly shared) slot. Persistent where it can
  * be — an org keeps its color as the fleet changes unless its preferred slot
  * actually collides, and even then only the colliding orgs move.
+ *
+ * [pins] (XERK-145) is the hub's manual orgColors map (siteKey -> slot 1..8): a
+ * pinned org takes exactly its pinned slot — the operator's explicit choice
+ * beats uniqueness, so two orgs pinned to one slot DO share it — and the
+ * auto-assigned orgs probe around the pinned slots.
  */
-fun orgColorMap(allKeys: List<String>): Map<String, Int> {
+fun orgColorMap(allKeys: List<String>, pins: Map<String, Int> = emptyMap()): Map<String, Int> {
     val keys = allKeys.filter { it.isNotEmpty() }.distinct().sorted()
     val used = BooleanArray(8)
     val map = LinkedHashMap<String, Int>()
     for (k in keys) {
+        val pin = orgSlotPin(pins, k) ?: continue
+        map[k] = pin
+        used[pin] = true
+    }
+    for (k in keys) {
+        if (map.containsKey(k)) continue
         val pref = orgSlotPref(k)
         var slot = -1
         for (step in 0 until 8) {
@@ -337,11 +356,11 @@ fun orgColorMap(allKeys: List<String>): Map<String, Int> {
 
 /**
  * The palette slot a single org paints, given every org it shares the board with
- * (uniqueness couples them). Mirrors board.js `orgColor`; a key absent from the
- * set falls back to its own preferred slot.
+ * (uniqueness couples them) and any manual pins. Mirrors board.js `orgColor`; a
+ * key absent from the set falls back to its own pinned, else preferred, slot.
  */
-fun orgColorIndex(siteKey: String, allKeys: List<String>): Int =
-    orgColorMap(allKeys)[siteKey] ?: orgSlotPref(siteKey)
+fun orgColorIndex(siteKey: String, allKeys: List<String>, pins: Map<String, Int> = emptyMap()): Int =
+    orgColorMap(allKeys, pins)[siteKey] ?: orgSlotPin(pins, siteKey) ?: orgSlotPref(siteKey)
 
 /**
  * Relative age of an ISO timestamp ("now"/"5m"/"3h"/"2d"/"1w"), a port of

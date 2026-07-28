@@ -275,6 +275,14 @@
     return h % SLOTS;
   }
 
+  // A manual pin's slot for a key, validated: only an integer 1..SLOTS from the
+  // hub's orgColors map counts (a malformed value renders as if unpinned, never
+  // as a broken style).
+  function orgSlotPin(pins, key) {
+    const v = pins && pins[key];
+    return Number.isInteger(v) && v >= 1 && v <= SLOTS ? v - 1 : null;
+  }
+
   // Assign every org a UNIQUE palette slot — no two orgs ever share a color
   // (XERK-48). Uniqueness couples the orgs (a slot one takes is one another
   // can't), so unlike a pure per-key hash this needs the whole set. Each org
@@ -288,12 +296,23 @@
   //     go unless its preferred slot actually collides, and even then only the
   //     colliding orgs move — never, as the old index-in-sorted-set rule did,
   //     every org on any fleet change.
+  // `pins` (XERK-145) is the hub's manual orgColors map (siteKey -> slot 1..8):
+  // a pinned org takes exactly its pinned slot — the operator's explicit choice
+  // beats uniqueness, so two orgs pinned to one slot DO share it — and the
+  // auto-assigned orgs probe around the pinned slots.
   // Returns a Map siteKey -> "var(--sN)".
-  function orgColorMap(allKeys) {
+  function orgColorMap(allKeys, pins) {
     const keys = [...new Set(allKeys)].filter(Boolean).sort();
     const used = new Array(SLOTS).fill(false);
     const map = new Map();
     for (const k of keys) {
+      const pin = orgSlotPin(pins, k);
+      if (pin === null) continue;
+      map.set(k, `var(--s${pin + 1})`);
+      used[pin] = true;
+    }
+    for (const k of keys) {
+      if (map.has(k)) continue;
       const pref = orgSlotPref(k);
       let slot = -1;
       for (let step = 0; step < SLOTS; step++) {
@@ -308,15 +327,16 @@
   }
 
   // The palette slot a single org paints, given every org it shares the board
-  // with (uniqueness couples them, so the full set is needed). Called with no
-  // set — or with one the key isn't in — it falls back to the org's own
-  // preferred slot.
-  function orgColor(siteKey, allKeys) {
+  // with (uniqueness couples them, so the full set is needed) and any manual
+  // pins. Called with no set — or with one the key isn't in — it falls back to
+  // the org's own pinned, else preferred, slot.
+  function orgColor(siteKey, allKeys, pins) {
     if (allKeys) {
-      const c = orgColorMap(allKeys).get(siteKey);
+      const c = orgColorMap(allKeys, pins).get(siteKey);
       if (c) return c;
     }
-    return `var(--s${orgSlotPref(siteKey) + 1})`;
+    const pin = orgSlotPin(pins, siteKey);
+    return `var(--s${(pin !== null ? pin : orgSlotPref(siteKey)) + 1})`;
   }
 
   function ageStr(iso, now) {
@@ -1094,7 +1114,7 @@
   // filtered-to one.
   function boardHtml(sites, filter, opts) {
     const o = opts || {};
-    const colorMap = orgColorMap(o.allKeys || sites.map(s => s.siteKey));
+    const colorMap = orgColorMap(o.allKeys || sites.map(s => s.siteKey), o.orgColors);
     const shown = sites.filter(s => !filter || s.siteKey === filter);
     const moves = o.moves || null;
     const cards = { todo: [], inprogress: [], review: [], done: [] };
@@ -1329,7 +1349,7 @@
   }
 
   const api = {
-    CATEGORIES, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgName, autoStartOn, ageStr,
+    CATEGORIES, SLOTS, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgSlotPin, orgName, autoStartOn, ageStr,
     createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
     prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
