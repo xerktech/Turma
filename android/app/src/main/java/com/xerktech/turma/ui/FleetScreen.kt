@@ -535,7 +535,6 @@ private fun SessionCard(
  * today / this week / all-time). Data is [fleetSummary], a pure port of the web
  * reducers.
  */
-@OptIn(ExperimentalLayoutApi::class)
 // Hub-wide "mobile push is off" banner (XERK-152) — shown above the tiles when
 // the hub reports no FCM credential, so a disabled push config is visible instead
 // of silently dropping every alert.
@@ -562,6 +561,7 @@ private fun PushOffBanner() {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun FleetTiles(s: FleetSummary) {
     FlowRow(
