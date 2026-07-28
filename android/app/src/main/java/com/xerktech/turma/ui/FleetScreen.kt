@@ -28,6 +28,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
@@ -101,6 +102,13 @@ fun FleetScreen(
                 contentPadding = PaddingValues(8.dp, 2.dp, 8.dp, 10.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
+                // Hub-wide push health (XERK-152): when the hub has no FCM
+                // credential every alert is silently dropped, so say so here.
+                // Hub-wide, so it shows above the tiles regardless of the org
+                // filter or an empty fleet.
+                if (!fleet.pushEnabled) {
+                    item(key = "pushWarn") { PushOffBanner() }
+                }
                 if (agents.isNotEmpty()) {
                     item(key = "tiles") { FleetTiles(remember(agents) { fleetSummary(agents) }) }
                 }
@@ -528,6 +536,32 @@ private fun SessionCard(
  * reducers.
  */
 @OptIn(ExperimentalLayoutApi::class)
+// Hub-wide "mobile push is off" banner (XERK-152) — shown above the tiles when
+// the hub reports no FCM credential, so a disabled push config is visible instead
+// of silently dropping every alert.
+@Composable
+private fun PushOffBanner() {
+    Surface(
+        color = MaterialTheme.colorScheme.tertiaryContainer,
+        contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+        shape = MaterialTheme.shapes.small,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("🔕")
+            Text(
+                "Mobile push is off — the hub has no FCM credential " +
+                    "(FCM_SERVICE_ACCOUNT_JSON), so Android notifications aren't being sent. " +
+                    "Set it on the hub and redeploy to restore them.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
 @Composable
 private fun FleetTiles(s: FleetSummary) {
     FlowRow(

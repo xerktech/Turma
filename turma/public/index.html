@@ -58,6 +58,13 @@
     background: color-mix(in srgb, var(--critical) 10%, transparent); }
   .host-auth.warn { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent);
     background: color-mix(in srgb, var(--warning) 10%, transparent); }
+  /* Hub-wide "push is off" warning bar (XERK-152), above the tiles. */
+  .push-warn { display: flex; gap: 8px; align-items: baseline; margin-bottom: 14px;
+    padding: 9px 13px; border-radius: 8px; font-size: 13px; color: var(--warning);
+    border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+    background: color-mix(in srgb, var(--warning) 10%, transparent); }
+  .push-warn b { color: var(--ink); font-weight: 600; }
+  .push-warn code { font-family: var(--font-mono); font-size: 12px; }
   .host-meta { display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 13px; color: var(--ink-2); }
   .host-meta .m-label { color: var(--muted); }
   .host-meta b { color: var(--ink); font-weight: 600; }
@@ -265,6 +272,9 @@
 <body>
 <header class="site-header" id="siteHeader" data-page="dashboard" data-sub="Session hosts"></header>
 <div class="wrap">
+  <!-- Shown only when the hub has no FCM credential, so a disabled mobile-push
+       config is visible here instead of silently dropping every alert (XERK-152). -->
+  <div id="pushWarn"></div>
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
 </div>
@@ -282,6 +292,7 @@
 <script>
 const $tiles = document.getElementById("tiles");
 const $groups = document.getElementById("groups");
+const $pushWarn = document.getElementById("pushWarn");
 
 // The tree re-renders every 5s. These module-level stores survive re-render so
 // open panels and in-progress two-click actions are not lost mid-poll.
@@ -747,6 +758,16 @@ function tile(label, value, hint) {
 
 function render(data) {
   const { now } = data;
+  // Hub-wide push health (XERK-152): when the hub has no FCM credential every
+  // mobile alert is silently dropped, so say so here rather than leaving the
+  // operator to guess why the phone went quiet. Strict === false so an older hub
+  // (no such field) or a partial SSE delta never false-alarms; it's hub-wide, so
+  // it sits above the tiles and ignores the org filter and the empty-fleet case.
+  $pushWarn.innerHTML = data.pushEnabled === false
+    ? `<span>🔕</span><span><b>Mobile push is off.</b> The hub has no FCM credential
+       (<code>FCM_SERVICE_ACCOUNT_JSON</code> unset), so Android notifications aren't
+       being sent. Set it on the hub and redeploy to restore them.</span>`
+    : "";
   // Pending commands are reconciled against the WHOLE fleet, not the scoped
   // view: a spawn fired before the operator narrowed to another org must still
   // be retired when its host reports, or it hangs "starting…" forever.

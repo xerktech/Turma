@@ -1869,6 +1869,14 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - The Android client owns the delivery half: `POST_NOTIFICATIONS`, the Android-13+ runtime request in
   `MainActivity`, channels + rendering in `push/Notifications.kt`, token registration/rotation in
   `push/PushRegistrar.kt` — all guarded so a build without `google-services.json` still runs.
+- **Push health is VISIBLE, not just logged** (XERK-152): a hub without `FCM_SERVICE_ACCOUNT_JSON` delivers
+  ZERO mobile notifications (`notify()` no-ops silently), which once went unnoticed because its only signal
+  was a boot log line. `buildAgentsCache` now reports hub-wide **`pushEnabled` = `push.fcmEnabled()`** on the
+  `/api/agents` payload; the dashboard (`index.html` `#pushWarn`) and Android (`FleetScreen` `PushOffBanner`,
+  `FleetState.pushEnabled`) show a "mobile push is off" banner above the tiles when it's false (strict
+  `=== false`, so an older hub / partial SSE delta never false-alarms). The disabled boot line is a
+  `console.warn`. The key itself is deployment config (DockerOps compose / a Portainer stack var), not in
+  this repo. Tests: the `pushEnabled` case in `server.test.js`.
 - Tests: `turma/tests/push.test.js`, the alert and device-registry cases in `server.test.js`.
 
 ### Auth and the glasses surface

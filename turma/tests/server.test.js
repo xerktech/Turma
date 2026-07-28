@@ -797,6 +797,28 @@ test("notify(): FCM fan-out prunes dead tokens, keeps live ones", () => {
   hub.unregisterDevice("live");
 });
 
+test("http: /api/agents carries pushEnabled reflecting FCM config (XERK-152)", async () => {
+  // The dashboard's "mobile push is off" banner keys off this one flag, so the
+  // hub must report its true push health. Default in tests: no FCM service
+  // account → fcmEnabled() false → the operator sees push is disabled.
+  const off = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.strictEqual(off.body.pushEnabled, false, "push reported disabled when FCM unconfigured");
+
+  // Configure a (fake but well-shaped) service account and force a cache rebuild
+  // via a heartbeat (publishAgent invalidates the memoized payload); the flag
+  // flips to true — exactly the difference between XERK-152's broken and fixed
+  // deployments.
+  push._setServiceAccount({ private_key: "k", client_email: "a@b", project_id: "p", token_uri: "https://t" });
+  await request("POST", "/api/heartbeat", { body: { device: "push-host" }, headers: agentHeaders });
+  const on = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.strictEqual(on.body.pushEnabled, true, "push reported enabled when FCM configured");
+
+  // Restore the unconfigured state so later tests see push off, and reset the
+  // stubbed sendFcm the suite installed at load (untouched here, but be explicit).
+  push._setServiceAccount(null);
+  await request("POST", "/api/heartbeat", { body: { device: "push-host" }, headers: agentHeaders });
+});
+
 // ---- updating status (XERK-29) -----------------------------------------------
 
 test("http: /updating shows an expected restart as `updating`, not `offline`", async () => {

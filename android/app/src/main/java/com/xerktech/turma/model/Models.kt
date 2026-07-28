@@ -30,6 +30,11 @@ data class AgentsResponse(
     // Manual org-color pins (XERK-145), keyed by siteKey, value the palette slot
     // 1..8 (presence = pinned). Hub-owned and durable; absent on older hubs.
     val orgColors: Map<String, Int> = emptyMap(),
+    // Whether the hub can deliver mobile push at all — FCM configured (XERK-152).
+    // Hub-wide, not per-agent. When false, every alert is silently dropped, so
+    // the Dashboard shows a "push is off" banner. Defaults true so an older hub
+    // (no such field) never false-alarms; a real hub always reports it.
+    val pushEnabled: Boolean = true,
 )
 
 /** One ticket->agent pin (the web board's Agent row; hub ticket-agents store). */
