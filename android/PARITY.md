@@ -60,6 +60,15 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Board "In Review" column.** `core/Board.kt` now carries the 4th category and the review/testing
   status-name carve-out from `inprogress` (was 3 columns → review tickets mis-bucketed). Columns sort
   newest-`updated` first. Ports `board.js` `categoryOf`/`ticketSort`. Tested in `BoardTest`.
+- **Drag-and-drop status change (XERK-141).** Long-press a ticket card and drag it onto another column
+  to change its status — the platform-idiomatic form of the web's tap-and-hold drag. The drop POSTs the
+  target COLUMN (the agent resolves it to a real transition/state), and an optimistic `moves` override
+  (`BoardViewModel`) holds the card in its dropped column until the board's own poll catches up, exactly
+  as web `board.html` does. Ports `board.js` `boardColumnOf`/`moveSweepVerdict` into `core/Board.kt`
+  (`MoveState` + the two fns, tested in `BoardTest`); the gesture is `detectDragGesturesAfterLongPress`
+  with a floating ghost card in `ui/BoardScreen.kt`. The pure logic is unit-tested and the app compiles
+  (`assembleDebug`); the gesture itself has no instrumented test (no emulator in CI, like every other
+  Compose interaction here).
 - **On-demand ticket detail loads (XERK-83).** The detail sheet fetched once and returned null on the
   hub's 202-while-fetching, so a first click spun "Loading details…" forever; it also decoded the
   `{issue, fetchedAt}` envelope's top level straight into `JiraIssueDetail`, blanking every field on a

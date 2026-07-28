@@ -111,6 +111,12 @@ function render(data) {
   const orgFilter = TurmaOrg.get();
 
   const sessionIndex = B.ticketSessionIndex(data.agents || []);
+  const activeMoves = sweepMoves(sites);
+  // A grid swap mid-drag would tear the card out from under the finger and drop
+  // the column highlight every beat; the drag ghost + highlight live outside the
+  // grid (on <body>), so we simply leave the grid as-is until the drag ends —
+  // `cache` stays current, and drag-end repaints with the fresh data + override.
+  if (dragActive()) return;
   // The board innerHTML-replaces every beat (SSE ~1s / 15s poll), which would
   // otherwise reset the scroll each time — on phones the columns are a
   // horizontally-scrollable strip (.kanban-cols) whose swipe kept snapping back
@@ -119,6 +125,7 @@ function render(data) {
   TurmaNav.preserveScroll($board, () => {
     $board.innerHTML = B.boardHtml(sites, orgFilter, {
       allKeys, sessionIndex, starts: sweepStarts(data.agents || [], sessionIndex),
+      moves: activeMoves,
     });
   });
 }
@@ -193,6 +200,216 @@ async function startSession(issueKey, siteKey) {
   starts.set(k, { pending: true, cmdId: body.cmdId, host: body.host, at: Date.now(), sawCmd: false });
   if (cache) render(cache);
 }
+
+// --- Drag a card into another column to change its status (XERK-141) --------
+// "Tap and hold" a card, drag it onto another status column, and the ticket
+// moves there. The drop reuses the whole XERK-138 status-change machinery — it
+// POSTs the target COLUMN (the card never loaded the ticket's transitions; the
+// agent resolves the column to a real status against a fresh read) and polls
+// the queued command's outcome by cmdId.
+//
+// An optimistic `moves` override lands the card in the dropped column at once
+// and HOLDS it there across the ~1s repaints: the change is on the tracker
+// within a beat, but the board's own ticket list only reflects it on the next
+// (slow) Jira/Azure poll — the exact lag the detail panel documents — so
+// without the hold the card would snap back to its old column until then.
+// Keyed like `starts`. Entry shapes:
+//   {category, pending:true, cmdId, host, at}  — POST/poll in flight
+//   {category, settled:true, settledAt, at}    — landed; held until the poll catches up
+//   {category, error, at}                      — failed; shown briefly, then reverts
+const moves = new Map();
+const MOVE_SETTLE_MS = 120000;   // backstop: hold a landed move this long if the poll never reports it
+const MOVE_ERROR_TTL = 6000;     // show a failed move on the card this long, then revert it
+
+function sweepMoves(sites) {
+  const now = Date.now();
+  for (const [k, m] of [...moves]) {
+    const [siteKey, key] = k.split("\x00");
+    const site = (sites || []).find(s => s.siteKey === siteKey);
+    const t = site && site.tickets.find(x => x.key === key);
+    if (!t) { moves.delete(k); continue; }   // ticket left the board (reassigned/gone)
+    if (B.moveSweepVerdict(m, B.categoryOf(t), now, MOVE_SETTLE_MS, MOVE_ERROR_TTL) === "clear") {
+      moves.delete(k);
+    }
+  }
+  return moves;
+}
+
+function settleMove(k) {
+  const m = moves.get(k);
+  if (!m) return;
+  moves.set(k, { category: m.category, settled: true, settledAt: Date.now(), at: m.at });
+  if (cache) render(cache);
+}
+function failMove(k, error) {
+  const m = moves.get(k);
+  moves.set(k, { category: m ? m.category : "", error, at: Date.now() });
+  if (cache) render(cache);
+}
+
+// Kick off a status change to `category` for a dropped card: optimistic paint,
+// POST, then poll the cmdId outcome — the drag counterpart of saveStatus.
+async function moveTo(siteKey, key, category) {
+  const k = startKey(siteKey, key);
+  if (moves.get(k)?.pending) return;   // one drag at a time per ticket
+  moves.set(k, { category, pending: true, cmdId: null, host: null, at: Date.now() });
+  if (cache) render(cache);            // the card jumps to the new column now
+
+  let cmdId = "", err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(key)}/status`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ category }), keepalive: true });
+    if (r.status === 401) return void (location.href = "/login");
+    let d = {};
+    try { d = await r.json(); } catch { /* non-JSON error body */ }
+    if (!r.ok) err = d.error || `HTTP ${r.status}`;
+    else { cmdId = d.cmdId; if (moves.get(k)?.pending) moves.get(k).cmdId = cmdId; }
+  } catch { err = "the hub is unreachable"; }
+  if (err) return void failMove(k, err);
+
+  const deadline = Date.now() + 60000;
+  let delay = 600;
+  while (moves.get(k)?.pending && Date.now() < deadline) {
+    let d = {};
+    try {
+      const r = await fetch(
+        `/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(key)}/status?cmdId=${encodeURIComponent(cmdId)}`);
+      if (r.status === 401) return void (location.href = "/login");
+      d = await r.json();
+    } catch { return void failMove(k, "the hub is unreachable"); }
+    if (d && d.pending) { await sleep(delay); delay = Math.min(delay * 1.5, 3000); continue; }
+    if (d && d.ok) return void settleMove(k);
+    return void failMove(k, (d && d.error) || "the change didn't take");
+  }
+  if (moves.get(k)?.pending) failMove(k, "the host didn't confirm in time");
+}
+
+// The pointer-driven drag itself. Touch has no native HTML5 drag, and the board
+// is a scrollable strip of scrollable columns, so this is built on pointer
+// events: a press ARMS a long-press timer; moving before it fires is a scroll
+// and disarms it; holding still fires it and enters drag mode (from then on we
+// own the gesture and preventDefault stops scrolling). Mouse works the same.
+let drag = null;
+const LONG_PRESS_MS = 300;
+const DRAG_ARM_CANCEL_PX = 10;   // moved this far before the timer fires = a scroll
+const EDGE_SCROLL_PX = 48;       // auto-scroll the column strip within this of an edge
+let lastDragEndAt = 0;           // suppresses the click a finished drag would synthesize
+
+function dragActive() { return !!(drag && drag.active); }
+
+function armDrag(e) {
+  if (e.button != null && e.button !== 0) return;      // primary button / touch only
+  if (e.target.closest(CARD_OWN)) return;              // leave the card's own controls alone
+  const card = e.target.closest(".kanban-card");
+  if (!card) return;
+  disarmDrag();
+  drag = {
+    pointerId: e.pointerId, card,
+    siteKey: card.dataset.site, key: card.dataset.key,
+    fromCat: card.closest(".kanban-col")?.dataset.cat || "",
+    startX: e.clientX, startY: e.clientY,
+    ghost: null, active: false, targetCat: null, targetCol: null,
+    timer: setTimeout(() => beginDrag(), LONG_PRESS_MS),
+  };
+}
+
+function beginDrag() {
+  if (!drag) return;
+  drag.active = true;
+  drag.timer = null;
+  try { drag.card.setPointerCapture(drag.pointerId); } catch { /* card may be gone */ }
+  if (navigator.vibrate) { try { navigator.vibrate(15); } catch { /* unsupported */ } }
+  document.body.classList.add("kc-drag-on");
+  drag.card.classList.add("kc-drag-src");
+  drag.ghost = makeGhost(drag.card, drag.startX, drag.startY);
+  highlightColAt(drag.startX, drag.startY);
+}
+
+function makeGhost(card, x, y) {
+  const r = card.getBoundingClientRect();
+  const g = card.cloneNode(true);
+  g.classList.add("kc-ghost");
+  g.style.width = r.width + "px";
+  g.style.left = "0"; g.style.top = "0";
+  g.dataset.ox = (x - r.left); g.dataset.oy = (y - r.top);
+  document.body.appendChild(g);
+  positionGhost(g, x, y);
+  return g;
+}
+function positionGhost(g, x, y) {
+  g.style.transform = `translate(${x - g.dataset.ox}px, ${y - g.dataset.oy}px)`;
+}
+
+function highlightColAt(x, y) {
+  if (drag.ghost) drag.ghost.style.pointerEvents = "none";
+  const el = document.elementFromPoint(x, y);
+  const col = el && el.closest && el.closest(".kanban-col");
+  if (col === drag.targetCol) return;
+  if (drag.targetCol) drag.targetCol.classList.remove("kc-drop-into");
+  drag.targetCol = col || null;
+  drag.targetCat = col ? col.dataset.cat : null;
+  // Only light up a column the ticket would actually move TO (not its own).
+  if (col && drag.targetCat && drag.targetCat !== drag.fromCat) col.classList.add("kc-drop-into");
+}
+
+function edgeScroll(x) {
+  const strip = $board.querySelector(".kanban-cols");
+  if (!strip || strip.scrollWidth <= strip.clientWidth) return;
+  const rect = strip.getBoundingClientRect();
+  if (x < rect.left + EDGE_SCROLL_PX) strip.scrollLeft -= 18;
+  else if (x > rect.right - EDGE_SCROLL_PX) strip.scrollLeft += 18;
+}
+
+function onDragMove(e) {
+  if (!drag || e.pointerId !== drag.pointerId) return;
+  if (!drag.active) {
+    const moved = Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY);
+    if (moved > DRAG_ARM_CANCEL_PX) disarmDrag();   // it's a scroll, not a hold
+    return;
+  }
+  e.preventDefault();                                // the gesture is ours now
+  positionGhost(drag.ghost, e.clientX, e.clientY);
+  highlightColAt(e.clientX, e.clientY);
+  edgeScroll(e.clientX);
+}
+
+function onDragEnd(e) {
+  if (!drag || e.pointerId !== drag.pointerId) return;
+  const wasActive = drag.active;
+  const { siteKey, key, fromCat, targetCat } = drag;
+  teardownDrag();
+  if (!wasActive) return;                            // a tap, not a drag → click opens the panel
+  lastDragEndAt = Date.now();
+  if (targetCat && targetCat !== fromCat) moveTo(siteKey, key, targetCat);
+  else if (cache) render(cache);                     // dropped on its own column → just repaint
+}
+
+// Clear an ARMED-but-not-yet-active drag (a scroll won).
+function disarmDrag() {
+  if (!drag) return;
+  if (drag.timer) clearTimeout(drag.timer);
+  drag = null;
+}
+// Tear down an active drag's DOM (ghost, highlight, capture, classes).
+function teardownDrag() {
+  if (!drag) return;
+  if (drag.timer) clearTimeout(drag.timer);
+  if (drag.active) {
+    try { drag.card.releasePointerCapture(drag.pointerId); } catch { /* card may be gone */ }
+    drag.card.classList.remove("kc-drag-src");
+    if (drag.targetCol) drag.targetCol.classList.remove("kc-drop-into");
+    if (drag.ghost) drag.ghost.remove();
+    document.body.classList.remove("kc-drag-on");
+  }
+  drag = null;
+}
+
+$board.addEventListener("pointerdown", armDrag);
+$board.addEventListener("pointermove", onDragMove);
+window.addEventListener("pointerup", onDragEnd);
+window.addEventListener("pointercancel", onDragEnd);
 
 // ---- Expanded ticket detail --------------------------------------------
 // A card click opens the panel immediately, painted from the card's own
@@ -603,6 +820,9 @@ $board.addEventListener("pointerdown", (e) => {
   if (startFrom(e.target)) e.preventDefault();       // don't also focus/select
 });
 $board.addEventListener("click", (e) => {
+  // A just-finished drag synthesizes a click on the captured card; swallow it so
+  // dropping a card doesn't also open its detail panel (XERK-141).
+  if (Date.now() - lastDragEndAt < 400) { lastDragEndAt = 0; return; }
   // Keyboard activation (and a mouse fallback if pointerdown was missed); the
   // pending guard in startSession makes a double-fire a no-op.
   if (e.target.closest(".kc-start[data-start]")) { startFrom(e.target); return; }

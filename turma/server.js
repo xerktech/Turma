@@ -3051,8 +3051,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     // POST /api/jira/<siteKey>/<issueKey>/status — change a ticket's status and
-    // push it to the board (XERK-138). Body: {value} — the transition id (Jira)
-    // or state name (Azure) the operator picked from the detail's statusOptions.
+    // push it to the board (XERK-138). Body is one of:
+    //   {value}    — the transition id (Jira) / state name (Azure) the operator
+    //                picked from the detail's statusOptions (the panel picker);
+    //   {category} — the board COLUMN a card was dropped onto (XERK-141:
+    //                todo/inprogress/review/done), which the agent resolves to a
+    //                transition against a fresh read of the available options.
+    // A drag carries the column rather than a transition id because the board
+    // card never loaded the ticket's transitions — only the detail panel does.
     //
     // This is the ONE thing Turma writes back to a board, so unlike the read-only
     // ticket GET it REQUIRES an online host: a queued write sitting on a sleeping
@@ -3074,7 +3080,8 @@ const server = http.createServer(async (req, res) => {
       }
       const body = JSON.parse((await readBody(req)) || "{}");
       const value = typeof body.value === "string" ? body.value.trim() : "";
-      if (!value) return json(res, 400, { error: "body needs {value}" });
+      const category = typeof body.category === "string" ? body.category.trim() : "";
+      if (!value && !category) return json(res, 400, { error: "body needs {value} or {category}" });
       if (!findJiraHost(siteKey, false)) {
         return json(res, 404, { error: "no host reports that org" });
       }
@@ -3083,7 +3090,7 @@ const server = http.createServer(async (req, res) => {
       const pending = (agents[key].commands || [])
         .find((c) => c.type === "setTicketStatus" && c.issueKey === issueKey);
       const cmdId = pending ? pending.cmdId
-        : queueCommand(key, { type: "setTicketStatus", issueKey, value });
+        : queueCommand(key, { type: "setTicketStatus", issueKey, value, category });
       return json(res, 202, { ok: true, cmdId, host: key });
     }
 

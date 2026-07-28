@@ -16,6 +16,7 @@ const {
   agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
   modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
   statusFieldHtml, statusPickerHtml, statusPickerValue,
+  boardColumnOf, moveSweepVerdict,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
   startSweepVerdict,
   createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
@@ -1553,6 +1554,49 @@ test("startSweepVerdict: a host that dropped out of the fleet only ever times ou
 test("startSweepVerdict: a never-seen command past the timeout errors (backstop)", () => {
   const p = { cmdId: "c1", host: "hostA", sawCmd: false, ageMs: TMO + 1 };
   assert.equal(startSweepVerdict(p, [], false, true, TMO), "error");
+});
+
+// --- Drag-and-drop status change (XERK-141) ----------------------------------
+
+test("boardColumnOf: a live override lands the card in the dropped column", () => {
+  const t = { status: "To Do", statusCategory: "todo" };
+  // No override / not pending / errored → the ticket's real category.
+  assert.equal(boardColumnOf(t, null), "todo");
+  assert.equal(boardColumnOf(t, { category: "done", settled: true }), "todo");
+  assert.equal(boardColumnOf(t, { category: "done", error: "x" }), "todo");
+  // A pending, error-free override wins.
+  assert.equal(boardColumnOf(t, { category: "done", pending: true }), "done");
+});
+
+test("boardHtml: a pending drag renders the card in its dropped column, moving", () => {
+  const sites = mergeSites([
+    agent("hostA", block({ tickets: [
+      ticket("T-1", { status: "To Do", statusCategory: "todo" }),
+    ] })),
+  ]);
+  const moves = new Map([["myorg.atlassian.net\x00T-1", { category: "done", pending: true }]]);
+  const html = boardHtml(sites, null, { moves });
+  // The Done column is last; the card and its "moving…" chip live inside it.
+  const doneCol = html.slice(html.lastIndexOf('data-cat="done"'));
+  assert.ok(doneCol.includes("T-1"), "the card is in the Done column");
+  assert.ok(doneCol.includes("moving…"), "it shows the moving chip");
+  assert.ok(html.includes("kc-moving-card"), "the card is dimmed as moving");
+});
+
+const NOW = 1_000_000;
+test("moveSweepVerdict: a pending move always holds (the poll loop owns it)", () => {
+  assert.equal(moveSweepVerdict({ category: "done", pending: true, at: NOW }, "todo", NOW, 120000, 6000), "hold");
+});
+test("moveSweepVerdict: a settled move holds until the board poll catches up", () => {
+  const m = { category: "done", settled: true, settledAt: NOW, at: NOW };
+  assert.equal(moveSweepVerdict(m, "todo", NOW + 1000, 120000, 6000), "hold");    // poll lags
+  assert.equal(moveSweepVerdict(m, "done", NOW + 1000, 120000, 6000), "clear");   // caught up
+  assert.equal(moveSweepVerdict(m, "todo", NOW + 120001, 120000, 6000), "clear"); // backstop
+});
+test("moveSweepVerdict: a failed move shows briefly, then clears (reverting)", () => {
+  const m = { category: "done", error: "nope", at: NOW };
+  assert.equal(moveSweepVerdict(m, "todo", NOW + 1000, 120000, 6000), "hold");
+  assert.equal(moveSweepVerdict(m, "todo", NOW + 6001, 120000, 6000), "clear");
 });
 
 // --- New-ticket form (XERK-137) ----------------------------------------------

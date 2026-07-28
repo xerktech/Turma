@@ -4988,6 +4988,38 @@ def board_status_options(key):
     return _jira_status_options(key)
 
 
+# Board columns a status change can target by name (XERK-141, drag-and-drop). A
+# label for each so a "nothing moves it there" refusal reads in the operator's
+# own board vocabulary.
+_COLUMN_LABEL = {"todo": "To Do", "inprogress": "In Progress",
+                 "review": "In Review", "done": "Done"}
+# The In Review column is carved out of `inprogress` by the status NAME, matched
+# on word boundaries — mirrors board.js REVIEW_STATUS_RE / isReviewStatus exactly.
+_REVIEW_STATUS_RE = re.compile(r"\b(review|reviewing|testing|test|qa)\b", re.I)
+
+
+def _board_column(name, category):
+    """A status's board COLUMN — todo/inprogress/review/done — from its wire
+    category (todo/inprogress/done) plus its name. Mirrors board.js categoryOf:
+    an `inprogress` status whose name reads as review/testing/QA lands in the
+    review column; everything else keeps its category, unknowns fall to todo.
+    This is how a drop onto a column is resolved to a status to move to."""
+    base = category if category in ("inprogress", "done") else "todo"
+    if base == "inprogress" and _REVIEW_STATUS_RE.search(str(name or "")):
+        return "review"
+    return base
+
+
+def _status_option_for_column(options, column):
+    """The first available status option that lands in board `column`
+    (todo/inprogress/review/done), or None. First-match: a workflow with two
+    transitions into one column is rare, and the drop names the column, not the
+    exact status — the operator can still pick a specific one from the panel."""
+    target = str(column or "").strip().lower()
+    return next((o for o in options or []
+                 if _board_column(o.get("name"), o.get("category")) == target), None)
+
+
 def apply_board_status(key, value):
     """Push a status change to the configured board (XERK-138). Jira: POST the
     chosen transition id. Azure: PATCH System.State to the chosen state name via
@@ -8495,18 +8527,20 @@ class SessionManager:
             self.jira_issue_results.append(
                 {"key": k, "issue": None, "error": str(e)[:200]})
 
-    def set_board_status(self, cmd_id, issue_key, value):
+    def set_board_status(self, cmd_id, issue_key, value, category=None):
         """Handle a {type:"setTicketStatus"} command: push a status change to the
         configured board (Jira/Azure) — the one thing Turma writes back to a
         board (XERK-138). The outcome is staged keyed by the command's cmdId so
         the panel that requested it can poll for its own answer.
 
-        The requested target is re-validated against a FRESH read of the
-        available options — never trusted from the client — the same stance
-        set_jira_repo takes against the repo picker: the request arrives over
-        HTTP, and the board's own workflow, not the browser, decides what a
-        ticket can move to. A target no longer on offer (the board moved under
-        the operator, or a stale client) is refused rather than attempted.
+        The target is either an exact option `value` (the detail panel's picker)
+        or a board `category` — todo/inprogress/review/done — the operator
+        dropped a card onto (XERK-141). Either way it is re-validated against a
+        FRESH read of the available options, never trusted from the client (the
+        same stance set_jira_repo takes against the repo picker): the request
+        arrives over HTTP, and the board's own workflow, not the browser, decides
+        what a ticket can move to. A `category` is resolved to a transition HERE,
+        against that fresh read, so a drag never carries a stale transition id.
 
         On success it also re-fetches the issue and stages it into
         jira_issue_results, so the hub's issue cache carries the new status +
@@ -8525,13 +8559,22 @@ class SessionManager:
         if not board_configured():
             return stage("no board credentials on this host")
         v = str(value or "").strip()
-        if not v:
+        col = str(category or "").strip().lower()
+        if not v and not col:
             return stage("no status given")
         try:
             opts = board_status_options(k)
         except Exception as e:
             log(f"status options fetch failed for {k}: {e}")
             return stage(f"couldn't read available statuses: {str(e)[:150]}")
+        # A drop names a column; resolve it to a concrete transition against the
+        # fresh options before the exact-id validation below runs unchanged.
+        if not v:
+            match = _status_option_for_column(opts, col)
+            if match is None:
+                label = _COLUMN_LABEL.get(col, col or "there")
+                return stage(f"nothing can move it to {label}")
+            v = match["id"]
         match = next((o for o in opts if o.get("id") == v), None)
         if match is None:
             return stage("that status is no longer an available change")
@@ -9806,7 +9849,8 @@ class SessionManager:
                     self._stage_jira_issue(cmd.get("issueKey"))
                 elif ctype == "setTicketStatus":
                     self.set_board_status(
-                        cid, cmd.get("issueKey"), cmd.get("value"))
+                        cid, cmd.get("issueKey"), cmd.get("value"),
+                        cmd.get("category"))
                 elif ctype == "boardCreateMeta":
                     self._stage_create_meta(cmd.get("project"))
                 elif ctype == "createTicket":

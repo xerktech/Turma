@@ -50,6 +50,51 @@ fun categoryOf(t: JiraTicket): String {
 fun ticketSort(tickets: List<JiraTicket>): List<JiraTicket> =
     tickets.sortedByDescending { it.updated }
 
+// --- drag-and-drop status change (XERK-141) ----------------------------------
+// Dragging a card into another column changes the ticket's status: the drop
+// POSTs the target COLUMN (the card never loaded the ticket's transitions — the
+// agent resolves it to a real status against a fresh read) and polls the queued
+// command's outcome. Meanwhile an optimistic [MoveState] override lands the card
+// in the dropped column across fleet beats until the board's own Jira/Azure poll
+// reports it there — else it would snap back (the same lag the detail sheet has).
+// A pure port of board.js boardColumnOf / moveSweepVerdict.
+
+/**
+ * An in-flight/just-landed drag override, keyed "<siteKey> <issueKey>" like
+ * [StartState]. `pending` -> POST/poll in flight; `settled` -> landed, held
+ * until the poll catches up; `error` -> failed, shown briefly then reverted.
+ */
+data class MoveState(
+    val category: String,
+    val pending: Boolean = false,
+    val settled: Boolean = false,
+    val settledAt: Long = 0,
+    val error: String? = null,
+    val at: Long = 0,
+)
+
+/** The column a card renders in: its real category, unless a live drag override
+ *  (pending, no error) pins it to the dropped column meanwhile. */
+fun boardColumnOf(t: JiraTicket, move: MoveState?): String =
+    if (move != null && move.pending && move.error == null) move.category else categoryOf(t)
+
+/**
+ * The per-beat sweep verdict for a drag override (board.js `moveSweepVerdict`):
+ *   pending -> HOLD  (the POST/poll loop owns it);
+ *   settled -> CLEAR once the board poll reports the ticket in the new column
+ *              (realCat catches up) or after `settleMs` (backstop), else HOLD;
+ *   error   -> HOLD briefly, then CLEAR (which reverts the card).
+ */
+fun moveSweepVerdict(move: MoveState, realCat: String, now: Long, settleMs: Long, errorTtlMs: Long): SweepVerdict {
+    if (move.error != null) return if (now - move.at > errorTtlMs) SweepVerdict.CLEAR else SweepVerdict.HOLD
+    if (move.settled) {
+        if (realCat == move.category) return SweepVerdict.CLEAR
+        return if (now - (if (move.settledAt != 0L) move.settledAt else move.at) > settleMs)
+            SweepVerdict.CLEAR else SweepVerdict.HOLD
+    }
+    return SweepVerdict.HOLD
+}
+
 data class BoardSite(
     val siteKey: String,
     val site: String,

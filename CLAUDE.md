@@ -1484,6 +1484,31 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `turma/tests/server.test.js`; the `statusFieldHtml`/`statusPickerHtml` cases in `board.test.js`; the
   `statusChangeable` case in `android/app/src/test/.../BoardTest.kt`.
 
+##### Drag-and-drop status change (XERK-141)
+
+- **Drag a card into another column to change its status** — the same write path as the panel picker,
+  reached by a gesture. Tap-and-hold a card, drag it onto another status column, drop.
+- **The drop POSTs the target COLUMN, not a transition** (`{category}` on the SAME
+  `POST .../status`/`setTicketStatus` command the picker's `{value}` uses): a board card never loaded the
+  ticket's transitions (only the detail panel fetches `statusOptions`), so the client can't name a
+  transition. The agent's `set_board_status` resolves the column to a real status against a FRESH options
+  read — `_status_option_for_column` picks the first option whose `_board_column(name, category)` matches
+  (the Python mirror of `board.js` `categoryOf`, review carve-out included); no match refuses. Everything
+  else (cmdId polling, result staging, the GET) is XERK-138 unchanged.
+- **An optimistic `moves` override holds the card in its dropped column across repaints** until the
+  board's own (slow) Jira/Azure poll reports it there — else it would snap back to its old column each
+  ~1s beat (the same lag the panel documents). Pending while the write is in flight, settled-and-held
+  once it lands (cleared when `categoryOf` catches up, or a backstop), reverted on failure after a short
+  TTL. Pure `boardColumnOf`/`moveSweepVerdict` drive it, mirrored in `core/Board.kt`.
+- Web: a pointer long-press drag with a floating ghost + column highlight in `board.html`; a real
+  drag suppresses the click it would synthesize so a drop doesn't also open the panel. Android:
+  `detectDragGesturesAfterLongPress` + a ghost card in `BoardScreen.kt`, the same `moves` override in
+  `BoardViewModel`.
+- Tests: the `category` cases in `TestSetBoardStatus` + `TestBoardColumn` (`agent/tests/test_hub_agent.py`);
+  the `{category}` case in `turma/tests/server.test.js`; the `boardColumnOf`/`moveSweepVerdict` and
+  pending-drag `boardHtml` cases in `board.test.js`; the `boardColumnOf`/`moveSweepVerdict` cases in
+  `android/app/src/test/.../BoardTest.kt`.
+
 #### Refresh button
 
 - `POST /api/jira/refresh` fans a `refreshJira` out to every Jira-configured host, deduped so a mashed
