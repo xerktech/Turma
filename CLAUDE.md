@@ -1736,6 +1736,13 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   in the container's `data/DraftStore.kt`, keyed per (host, session); `ChatViewModel` mirrors it into
   `ChatUiState.draft` and writes every change — incl. dictation and send-clears — back through it.
 - Tests: the draft-carry cases in `turma/tests/sessions.test.js`, `android/.../data/DraftStoreTest.kt`.
+- **A compose box auto-grows to its `scrollHeight`, but only while it is laid out** (XERK-149): a hidden
+  textarea (`.chat-pane`/`.term-pane[hidden]`, or a phone's `display:none` `.stage`) reports `scrollHeight`
+  0, and `growCompose`→`autoGrow` runs during the toggle's `carryDraft` exactly when the box can be hidden
+  — so an unguarded grow pinned an inline `height:0px` that squished the box below one line until a page
+  refresh. `autoGrow`/`autoGrowTermInput` bail on `offsetParent === null`, keeping the last laid-out height;
+  the pane's own `carryDraft` re-grows it when shown. Tests: the `autoGrowTermInput` cases in
+  `turma/tests/sessions.test.js`.
 
 #### Copying out of the terminal
 

@@ -2175,6 +2175,11 @@ document.addEventListener("keydown", (e) => {
 function autoGrowTermInput() {
   const inp = document.getElementById("termInput");
   if (!inp) return;
+  // Same hidden-textarea guard as chat.js autoGrow (XERK-149): scrollHeight is 0
+  // when the pane is `.term-pane[hidden]` (chat view) or the stage is hidden on a
+  // phone, and growCompose runs this mid carryDraft — pinning height:0px would
+  // squish the box below one line until a refresh. Skip while not laid out.
+  if (inp.offsetParent === null) return;
   inp.style.height = "auto";
   inp.style.height = Math.min(inp.scrollHeight, 160) + "px";
 }

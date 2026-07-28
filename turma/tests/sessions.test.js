@@ -133,7 +133,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
       + " termComposeAction, termComposeStop, openEndedSession, resumeEnded, openTranscript, backToList,"
-      + " chatToTerminal, terminalToChat, sessMeta,"
+      + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
   // One heartbeat, as the page would see it.
@@ -630,6 +630,41 @@ test("an empty compose box doesn't grab focus on a toggle (no soft keyboard on a
   chatToTerminal();
   assert.equal(els.termInput.value, "   ", "whitespace still moves — it's the operator's text");
   assert.ok(!els.termInput.focused, "but nothing worth continuing means no focus steal");
+});
+
+// --- autoGrow never squishes a hidden compose box (XERK-149) -----------------
+// The compose box grows to its scrollHeight, but a not-laid-out textarea reports
+// scrollHeight 0 — and growCompose runs autoGrow during the carryDraft when its
+// pane is hidden. Left unguarded that pins height:0px, squishing the box below a
+// line until a page refresh. offsetParent is null for a display:none element, so
+// the guard keeps the last laid-out height instead. (autoGrowTermInput is the
+// mirror of chat.js autoGrow; both carry the identical guard.)
+test("autoGrowTermInput leaves the height alone while the box is hidden", () => {
+  const { autoGrowTermInput, els } = loadPage();
+  const inp = els.termInput = makeEl("termInput");
+  inp.style.height = "42px";     // its last correct, laid-out height
+  inp.scrollHeight = 40;         // what a browser reports even when hidden it's 0
+  inp.offsetParent = null;       // display:none somewhere up the tree
+  autoGrowTermInput();
+  assert.equal(inp.style.height, "42px", "a hidden box keeps its last good height, never 0px");
+});
+
+test("autoGrowTermInput sizes to scrollHeight while the box is laid out", () => {
+  const { autoGrowTermInput, els } = loadPage();
+  const inp = els.termInput = makeEl("termInput");
+  inp.offsetParent = els.termPane || makeEl("termPane"); // laid out (non-null)
+  inp.scrollHeight = 73;
+  autoGrowTermInput();
+  assert.equal(inp.style.height, "73px", "a visible box grows to fit its content");
+});
+
+test("autoGrowTermInput clamps a tall box to the 160px max", () => {
+  const { autoGrowTermInput, els } = loadPage();
+  const inp = els.termInput = makeEl("termInput");
+  inp.offsetParent = makeEl("termPane");
+  inp.scrollHeight = 500;
+  autoGrowTermInput();
+  assert.equal(inp.style.height, "160px", "past the cap it scrolls internally");
 });
 
 test("?session=<id>: waits for a session that isn't running yet, then opens it", () => {
