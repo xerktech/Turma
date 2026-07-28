@@ -92,6 +92,16 @@ const JIRA_ISSUE_FRESH_MS = 60 * 1000; // serve a cached issue under this age
 const JIRA_ISSUE_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
 const JIRA_ISSUE_MAX = 40; // cap per-host cache; oldest fetchedAt evicted first
 
+// New-ticket create metadata + results (XERK-137), cached per host like the
+// issue detail above. Project/type/label meta changes rarely, so it's served for
+// longer; a create RESULT is kept just long enough for the submitting client to
+// poll it back (the created ticket then shows on the board via the normal poll).
+const CREATE_META_FRESH_MS = 5 * 60 * 1000; // serve cached create-meta under this age
+const CREATE_META_MAX_AGE_MS = 30 * 60 * 1000; // evict meta/type cache entries older
+const CREATE_TYPES_MAX = 40; // cap the per-project type cache; oldest evicted
+const CREATE_RESULT_MAX_AGE_MS = 10 * 60 * 1000; // evict a create result older than this
+const CREATE_RESULT_MAX = 40; // cap the per-cmdId create-result cache
+
 // Single-user auth: TURMA_USER/TURMA_PASSWORD gate the UI and browser API. The
 // browser signs in through a real login form (/login -> POST /api/login) and
 // gets a signed, HttpOnly session cookie it replays on every same-origin
@@ -490,7 +500,8 @@ function invalidateAgentsCache() { agentsCache = null; }
 // Shared by the fleet payload and the SSE per-agent push so both stay in
 // lockstep.
 function serializeAgent(key, agent, now) {
-  const { history, subagentHistory, jiraIssues, statusResults, ...a } = agent;
+  const { history, subagentHistory, jiraIssues, statusResults,
+          createMeta, createTypes, createResults, ...a } = agent;
   const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   return {
     key,
@@ -771,6 +782,61 @@ function ingestStatusResults(agent, ticketStatusResults) {
       .sort((a, b) => a[1].at - b[1].at)
       .slice(0, over)
       .forEach(([id]) => delete agent.statusResults[id]);
+  }
+}
+
+// Merge the agent's New-ticket create metadata (heartbeat `createMetaResults`,
+// XERK-137) into the host caches. Two shapes ride the one deque, told apart by
+// a `project` key: a project-keyed result carries that project's issue TYPES; a
+// project-less result carries the org's project + label list. A result carrying
+// an `error` is cached too (a doomed fetch mustn't re-queue every poll).
+function ingestCreateMeta(agent, results) {
+  const now = Date.now();
+  for (const r of results || []) {
+    if (!r) continue;
+    if (r.project) {
+      agent.createTypes[r.project] = {
+        types: r.types || [], error: r.error || null, fetchedAt: now,
+      };
+    } else {
+      agent.createMeta = {
+        projects: r.projects || [], labels: r.labels || [],
+        source: r.source || null, error: r.error || null, fetchedAt: now,
+      };
+    }
+  }
+  for (const [k, e] of Object.entries(agent.createTypes)) {
+    if (now - e.fetchedAt > CREATE_META_MAX_AGE_MS) delete agent.createTypes[k];
+  }
+  const over = Object.keys(agent.createTypes).length - CREATE_TYPES_MAX;
+  if (over > 0) {
+    Object.entries(agent.createTypes)
+      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
+      .slice(0, over)
+      .forEach(([k]) => delete agent.createTypes[k]);
+  }
+}
+
+// Merge the agent's create OUTCOMES (heartbeat `createTicketResults`) into the
+// host cache, keyed by the create command's cmdId — the correlation handle the
+// submitting client polls with (GET /api/jira/<siteKey>/tickets/<cmdId>).
+function ingestCreateResults(agent, results) {
+  const now = Date.now();
+  for (const r of results || []) {
+    if (!r || !r.cmdId) continue;
+    agent.createResults[r.cmdId] = {
+      key: r.key || null, url: r.url || null, error: r.error || null, fetchedAt: now,
+    };
+  }
+  for (const [k, e] of Object.entries(agent.createResults)) {
+    if (now - e.fetchedAt > CREATE_RESULT_MAX_AGE_MS) delete agent.createResults[k];
+  }
+  const over = Object.keys(agent.createResults).length - CREATE_RESULT_MAX;
+  if (over > 0) {
+    Object.entries(agent.createResults)
+      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
+      .slice(0, over)
+      .forEach(([k]) => delete agent.createResults[k]);
   }
 }
 
@@ -2284,6 +2350,13 @@ const server = http.createServer(async (req, res) => {
       // so the panel that asked can poll for its own answer.
       const ticketStatusResults = payload.ticketStatusResults;
       delete payload.ticketStatusResults;
+      // New-ticket create metadata + outcomes the agent produced since the last
+      // beat (see the {type:"boardCreateMeta"|"createTicket"} commands, XERK-137);
+      // cached below like jiraIssueResults, off the persisted record.
+      const createMetaResults = payload.createMetaResults;
+      delete payload.createMetaResults;
+      const createTicketResults = payload.createTicketResults;
+      delete payload.createTicketResults;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -2316,11 +2389,20 @@ const server = http.createServer(async (req, res) => {
         // Per-cmdId board-status-change outcome cache (see the /status route,
         // XERK-138); survives across beats like `jiraIssues`.
         statusResults: prev.statusResults || {},
+        // New-ticket create caches (XERK-137): the org's project/label metadata,
+        // per-project issue types, and per-cmdId create outcomes. Like the other
+        // on-demand caches, they survive across beats and are stripped from the
+        // fleet payload (served by their own routes).
+        createMeta: prev.createMeta || null,
+        createTypes: prev.createTypes || {},
+        createResults: prev.createResults || {},
       });
       ingestHistory(next, historyResults);
       ingestSubagentHistory(next, subagentHistoryResults);
       ingestJiraIssues(next, jiraIssueResults);
       ingestStatusResults(next, ticketStatusResults);
+      ingestCreateMeta(next, createMetaResults);
+      ingestCreateResults(next, createTicketResults);
       heartbeatAlerts(key, prev, next);
       rearmMovedWatches(key, prev, next);
       // A migration finishes the instant its target session heartbeats in — do
@@ -2826,6 +2908,106 @@ const server = http.createServer(async (req, res) => {
       invalidateAgentsCache();
       sseBroadcast("removed", { key });
       return json(res, 200, { ok: true });
+    }
+
+    // GET /api/jira/<siteKey>/create-meta[?project=<p>] -> the New-ticket form's
+    // choices (XERK-137). Without ?project: the org's project list + existing
+    // labels to suggest. With ?project: that project's creatable issue/work-item
+    // types. Routes to an ONLINE host reporting the org (the metadata is a live
+    // tracker fetch), rides the same {command -> staged result -> poll} path as
+    // the issue detail above, and is served from cache when fresh. Placed ahead
+    // of the <issueKey> route so "create-meta" isn't rejected as a bad key.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "create-meta") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const project = (url.searchParams.get("project") || "").trim();
+      const key = findJiraHost(siteKey, true);
+      if (!key) {
+        return findJiraHost(siteKey, false)
+          ? json(res, 503, { error: "no online host reports that org" })
+          : json(res, 404, { error: "no host reports that org" });
+      }
+      const a = agents[key];
+      const cached = project
+        ? (a.createTypes || {})[project]
+        : a.createMeta;
+      if (cached && Date.now() - cached.fetchedAt < CREATE_META_FRESH_MS) {
+        if (cached.error) return json(res, 200, { error: cached.error });
+        return json(res, 200, project
+          ? { types: cached.types }
+          : { projects: cached.projects, labels: cached.labels, source: cached.source });
+      }
+      // Single-flight: reuse an already-queued fetch for the same (project|meta).
+      const pending = (a.commands || []).find(
+        (c) => c.type === "boardCreateMeta" && (c.project || "") === project);
+      const cmdId = pending
+        ? pending.cmdId
+        : queueCommand(key, { type: "boardCreateMeta", ...(project ? { project } : {}) });
+      return json(res, 202, { pending: true, cmdId });
+    }
+
+    // POST /api/jira/<siteKey>/tickets -> create a new ticket on the org's board
+    // (XERK-137). Body: {project, issueType, summary, description?, labels?[]}.
+    //
+    // The board's first WRITE path to the tracker. Like the /session route the
+    // hub's job is ROUTING: the create runs agent-side (only the host holds the
+    // tracker creds), so this validates the inputs, routes to an ONLINE host
+    // reporting the org, and queues the create command. The agent creates the
+    // issue and stages the outcome keyed by this command's cmdId, which the
+    // client polls back at GET /api/jira/<siteKey>/tickets/<cmdId>.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "tickets") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const summary = typeof body.summary === "string" ? body.summary.trim() : "";
+      const project = typeof body.project === "string" ? body.project.trim() : "";
+      const issueType = typeof body.issueType === "string" ? body.issueType.trim() : "";
+      const description = typeof body.description === "string" ? body.description : "";
+      const labels = Array.isArray(body.labels)
+        ? body.labels.filter((l) => typeof l === "string" && l.trim())
+            .map((l) => l.trim()).slice(0, 20)
+        : [];
+      if (!summary) return json(res, 400, { error: "a title is required" });
+      if (!project) return json(res, 400, { error: "a project is required" });
+      if (!issueType) return json(res, 400, { error: "an issue type is required" });
+      const key = findJiraHost(siteKey, true);
+      if (!key) {
+        return findJiraHost(siteKey, false)
+          ? json(res, 503, { error: "no online host reports that org" })
+          : json(res, 404, { error: "no host reports that org" });
+      }
+      const cmdId = queueCommand(key, {
+        type: "createTicket", project, issueType, summary, description, labels,
+      });
+      return json(res, 200, { ok: true, cmdId, host: key });
+    }
+
+    // GET /api/jira/<siteKey>/tickets/<cmdId> -> poll a create's outcome
+    // (XERK-137). Searches every host reporting the org for the create result
+    // (the create was routed to one, but which one is the client's to not know):
+    // 200 with {key,url} on success, 200 with {error} on a create failure, 202
+    // while the agent hasn't reported the outcome yet.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[3] === "tickets") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const cmdId = decodeURIComponent(parts[4]);
+      let found = null, host = null;
+      for (const [k, a] of Object.entries(agents)) {
+        if (!a.jira || a.jira.siteKey !== siteKey) continue;
+        host = host || k;
+        const r = (a.createResults || {})[cmdId];
+        if (r) { found = r; break; }
+      }
+      if (!host) return json(res, 404, { error: "no host reports that org" });
+      if (found) {
+        return json(res, 200, found.error
+          ? { error: found.error }
+          : { key: found.key, url: found.url });
+      }
+      if (Date.now() - (agents[host].lastSeen || 0) >= OFFLINE_AFTER_MS) {
+        return json(res, 503, { error: "the host went offline before the ticket was created" });
+      }
+      return json(res, 202, { pending: true });
     }
 
     // GET /api/jira/<siteKey>/<issueKey> -> one ticket's full detail

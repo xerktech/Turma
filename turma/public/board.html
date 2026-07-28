@@ -17,6 +17,10 @@
         data-sub="Ticket board · assigned tickets across orgs"></header>
 <div class="wrap">
   <div class="board-bar">
+    <button id="newTicket" class="board-newticket" title="Create a new ticket on a board">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+      <span>New ticket</span>
+    </button>
     <button id="refresh" class="board-refresh" title="Re-poll Jira on every connected host now">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
       <span id="refreshLabel">Refresh</span>
@@ -26,7 +30,10 @@
   <div class="td-backdrop" id="detailBackdrop" hidden>
     <div class="td-panel" id="detailPanel" role="dialog" aria-modal="true" aria-label="Ticket detail"></div>
   </div>
-  <div class="footer">Each host agent polls its org's tracker — Jira Cloud (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code>) or a self-hosted/cloud Azure DevOps board (<code>AZDO_URL</code> / <code>AZDO_TOKEN</code>) in the agent's env — for tickets assigned to that user, active work plus the last two weeks of Done, and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow the tracker's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. The header's org filter scopes this board — and every other page — to one org; each org is labelled from its site unless the agent sets <code>BOARD_ORG_NAME</code>. Pull-only: nothing here writes back to the tracker.</div>
+  <div class="td-backdrop" id="createBackdrop" hidden>
+    <div class="td-panel cf-panel" id="createPanel" role="dialog" aria-modal="true" aria-label="New ticket"></div>
+  </div>
+  <div class="footer">Each host agent polls its org's tracker — Jira Cloud (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code>) or a self-hosted/cloud Azure DevOps board (<code>AZDO_URL</code> / <code>AZDO_TOKEN</code>) in the agent's env — for tickets assigned to that user, active work plus the last two weeks of Done, and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow the tracker's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. The header's org filter scopes this board — and every other page — to one org; each org is labelled from its site unless the agent sets <code>BOARD_ORG_NAME</code>. The board reads the tracker; the one write it makes is creating a ticket via the New ticket button.</div>
 </div>
 
 <nav class="bottom-nav" id="bottomNav"></nav>
@@ -86,6 +93,9 @@ function render(data) {
   checkRefreshDone();
   const sites = B.mergeSites(data.agents || []);
   lastSites = sites; lastAllKeys = sites.map(s => s.siteKey);
+  // The New-ticket button needs an org to create against; hide it until one reports.
+  const nt = document.getElementById("newTicket");
+  if (nt) nt.hidden = !sites.length;
   refreshOpenTicket();
   consumeDeepLink();
   // The header's org control is fed the same beat every page feeds it, so its
@@ -706,6 +716,240 @@ $panel.addEventListener("change", (e) => {
 });
 $backdrop.addEventListener("click", (e) => { if (e.target === $backdrop) closeDetail(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && openTicketState) closeDetail(); });
+
+// --- New ticket (XERK-137) ---------------------------------------------------
+// The board's one write path. A modal form: pick an org + project + type, set a
+// title/description/labels, and POST it to the tracker. The project/type/label
+// choices are fetched on demand (GET /api/jira/<siteKey>/create-meta, the same
+// 202-poll path as the detail fetch); the create itself POSTs to
+// /tickets and polls the outcome by cmdId. State lives in a page variable, like
+// the detail panel's, and mergeSites' sites give the org + project vocabulary.
+const $ctBackdrop = document.getElementById("createBackdrop");
+const $ctPanel = document.getElementById("createPanel");
+const $newTicket = document.getElementById("newTicket");
+// { sites, siteKey, source, meta, types, values, busy, error, created }
+let createState = null, createSeq = 0;
+
+function orgSites() {
+  return lastSites.map(s => ({
+    siteKey: s.siteKey, orgName: s.orgName, source: s.source, online: s.online }));
+}
+
+function paintCreate() {
+  if (createState) $ctPanel.innerHTML = B.createFormHtml(createState);
+}
+
+function openCreate() {
+  const sites = orgSites();
+  if (!sites.length) return;
+  const cur = TurmaOrg.get();
+  const pick = sites.find(s => s.siteKey === cur) || sites[0];
+  createState = {
+    sites, siteKey: pick.siteKey, source: pick.source || "jira",
+    meta: {}, types: {},
+    values: { project: "", issueType: "", summary: "", description: "", labels: "" },
+    busy: false, error: "", created: null,
+  };
+  $ctBackdrop.hidden = false;
+  document.body.classList.add("td-open");
+  paintCreate();
+  loadMeta();
+}
+
+function closeCreate() {
+  createSeq++;                 // abandon any in-flight meta/type fetch
+  createState = null;
+  $ctBackdrop.hidden = true;
+  $ctPanel.replaceChildren();
+  if (!openTicketState) document.body.classList.remove("td-open");
+}
+
+// Read the text fields back into state before any repaint (a select change
+// repaints, which would otherwise reset a half-typed title to its stored value).
+function syncCreateFields() {
+  if (!createState) return;
+  const g = (sel) => { const el = $ctPanel.querySelector(sel); return el ? el.value : undefined; };
+  const v = createState.values;
+  const s = g("[data-cf-summary]"); if (s !== undefined) v.summary = s;
+  const d = g("[data-cf-desc]"); if (d !== undefined) v.description = d;
+  const l = g("[data-cf-labels]"); if (l !== undefined) v.labels = l;
+}
+
+async function fetchCreateMeta(siteKey, project, alive) {
+  const q = project ? `?project=${encodeURIComponent(project)}` : "";
+  const url = `/api/jira/${encodeURIComponent(siteKey)}/create-meta${q}`;
+  const deadline = Date.now() + 45000;
+  let delay = 600;
+  while (alive() && Date.now() < deadline) {
+    let r;
+    try { r = await fetch(url); } catch { return { error: "the hub is unreachable" }; }
+    if (r.status === 401) { location.href = "/login"; return {}; }
+    if (r.status === 202) { await sleep(delay); delay = Math.min(delay * 1.5, 3000); continue; }
+    let d = {};
+    try { d = await r.json(); } catch { /* non-JSON error body */ }
+    if (!r.ok) return { error: d.error || `HTTP ${r.status}` };
+    return d;
+  }
+  return alive() ? { error: "the host didn't answer in time" } : {};
+}
+
+async function loadMeta() {
+  const mySeq = ++createSeq, site = createState.siteKey;
+  createState.meta = {};                 // loading
+  paintCreate();
+  const alive = () => createSeq === mySeq && createState && createState.siteKey === site;
+  const d = await fetchCreateMeta(site, "", alive);
+  if (!alive()) return;
+  if (d.error) { createState.meta = { error: d.error }; return void paintCreate(); }
+  createState.meta = { projects: d.projects || [], labels: d.labels || [] };
+  if (d.source) createState.source = d.source;
+  // A lone project is auto-selected so the type list loads without a click.
+  if ((d.projects || []).length === 1) {
+    createState.values.project = d.projects[0].key;
+    paintCreate();
+    return void loadTypes();
+  }
+  paintCreate();
+}
+
+async function loadTypes() {
+  const project = createState.values.project;
+  if (!project) return;
+  const mySeq = ++createSeq, site = createState.siteKey;
+  createState.types = {};                // loading
+  paintCreate();
+  const alive = () => createSeq === mySeq && createState &&
+    createState.siteKey === site && createState.values.project === project;
+  const d = await fetchCreateMeta(site, project, alive);
+  if (!alive()) return;
+  if (d.error) { createState.types = { error: d.error }; return void paintCreate(); }
+  const types = d.types || [];
+  createState.types = { types };
+  if (types.length === 1) createState.values.issueType = types[0].id;
+  paintCreate();
+}
+
+// Jira labels can't contain spaces, so split on commas AND whitespace; Azure
+// tags can, so split on commas only. Deduped, capped to match the hub.
+function splitLabels(raw, source) {
+  const parts = source === "azure"
+    ? String(raw || "").split(",")
+    : String(raw || "").split(/[,\s]+/);
+  const seen = new Set(), out = [];
+  for (let p of parts) {
+    p = p.trim();
+    if (p && !seen.has(p)) { seen.add(p); out.push(p); }
+  }
+  return out.slice(0, 20);
+}
+
+async function pollCreate(siteKey, cmdId) {
+  const url = `/api/jira/${encodeURIComponent(siteKey)}/tickets/${encodeURIComponent(cmdId)}`;
+  const deadline = Date.now() + 60000;
+  let delay = 700;
+  while (createState && Date.now() < deadline) {
+    let r;
+    try { r = await fetch(url); } catch { return { error: "the hub is unreachable" }; }
+    if (r.status === 401) { location.href = "/login"; return {}; }
+    if (r.status === 202) { await sleep(delay); delay = Math.min(delay * 1.5, 3000); continue; }
+    let d = {};
+    try { d = await r.json(); } catch { /* non-JSON error body */ }
+    if (!r.ok) return { error: d.error || `HTTP ${r.status}` };
+    return d;
+  }
+  return { error: "the create didn't complete in time" };
+}
+
+async function submitCreate() {
+  const s = createState;
+  if (!s || s.busy) return;
+  syncCreateFields();
+  const v = s.values;
+  if (!v.project || !v.issueType || !(v.summary || "").trim()) return;
+  s.busy = true; s.error = "";
+  paintCreate();
+  const labels = splitLabels(v.labels, s.source);
+  let r, body = {};
+  try {
+    r = await fetch(`/api/jira/${encodeURIComponent(s.siteKey)}/tickets`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        project: v.project, issueType: v.issueType,
+        summary: v.summary.trim(), description: v.description, labels }),
+    });
+  } catch { if (createState === s) { s.busy = false; s.error = "the hub is unreachable"; paintCreate(); } return; }
+  if (r.status === 401) { location.href = "/login"; return; }
+  try { body = await r.json(); } catch { /* non-JSON error body */ }
+  if (!r.ok) {
+    if (createState === s) { s.busy = false; s.error = body.error || `HTTP ${r.status}`; paintCreate(); }
+    return;
+  }
+  const out = await pollCreate(s.siteKey, body.cmdId);
+  if (createState !== s) return;         // closed while the create was in flight
+  s.busy = false;
+  if (out.error) { s.error = out.error; return void paintCreate(); }
+  s.created = { key: out.key, url: out.url };
+  paintCreate();
+}
+
+$newTicket.addEventListener("click", openCreate);
+$ctPanel.addEventListener("click", (e) => {
+  if (!createState) return;
+  if (e.target.closest("[data-cf-close]") || e.target.closest("[data-cf-cancel]")) {
+    return closeCreate();
+  }
+  if (e.target.closest("[data-cf-another]")) {
+    // Keep the org/project/type; clear the text for the next ticket.
+    createState.created = null; createState.error = "";
+    createState.values.summary = "";
+    createState.values.description = "";
+    createState.values.labels = "";
+    return void paintCreate();
+  }
+  if (e.target.closest("[data-cf-submit]")) return void submitCreate();
+});
+$ctPanel.addEventListener("change", (e) => {
+  if (!createState) return;
+  const org = e.target.closest("[data-cf-org]");
+  if (org) {
+    syncCreateFields();
+    createState.siteKey = org.value;
+    const site = createState.sites.find(x => x.siteKey === org.value);
+    createState.source = (site && site.source) || "jira";
+    createState.values.project = "";
+    createState.values.issueType = "";
+    createState.values.labels = "";     // wording differs per source
+    createState.error = "";
+    return void loadMeta();
+  }
+  const proj = e.target.closest("[data-cf-project]");
+  if (proj) {
+    syncCreateFields();
+    createState.values.project = proj.value;
+    createState.values.issueType = "";
+    return void loadTypes();
+  }
+  const typ = e.target.closest("[data-cf-type]");
+  if (typ) {
+    syncCreateFields();                 // keep any title/desc typed before this
+    createState.values.issueType = typ.value;
+    return void paintCreate();          // re-evaluate the submit button
+  }
+});
+// Text input: store the value and re-evaluate the submit button WITHOUT a full
+// repaint (which would drop the caret out of the field being typed into).
+$ctPanel.addEventListener("input", (e) => {
+  if (!createState) return;
+  if (!e.target.closest("[data-cf-summary],[data-cf-desc],[data-cf-labels]")) return;
+  syncCreateFields();
+  const btn = $ctPanel.querySelector("[data-cf-submit]");
+  if (btn) {
+    const v = createState.values;
+    btn.disabled = !(v.project && v.issueType && (v.summary || "").trim()) || !!createState.busy;
+  }
+});
+$ctBackdrop.addEventListener("click", (e) => { if (e.target === $ctBackdrop) closeCreate(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && createState) closeCreate(); });
 
 // --- Manual refresh ---------------------------------------------------------
 // The board is a merge of every host's Jira block, so the button re-polls the

@@ -3802,9 +3802,11 @@ def collect_github():
 # the tickets assigned to that user on a slow cadence and reports them as the
 # heartbeat's `jira` block. The hub's /board page merges every host's block into
 # one cross-org Kanban, keyed by siteKey (normalized site host) so several
-# agents sharing an org collapse to one board. Read-only by construction — the
-# only endpoint ever called is issue search. Unset env = feature off: zero Jira
-# HTTP calls, and the block heartbeats as available=False.
+# agents sharing an org collapse to one board. Almost entirely read-only: the
+# only calls are issue search + on-demand detail, plus the one WRITE path the
+# board exposes — creating a ticket (XERK-137), which POSTs a single new issue.
+# Unset env = feature off: zero Jira HTTP calls, and the block heartbeats as
+# available=False.
 JIRA_SITE = os.environ.get("JIRA_SITE", "").strip()
 JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "").strip()
 JIRA_TOKEN = os.environ.get("JIRA_TOKEN", "").strip()
@@ -3836,6 +3838,16 @@ JIRA_DESC_MAX_CHARS = 8000      # per-issue description text kept
 JIRA_COMMENT_MAX = 20           # newest comments kept
 JIRA_COMMENT_MAX_CHARS = 2000   # per-comment text kept
 JIRA_DETAIL_LABELS_MAX = 20     # labels kept (the card shape caps at 5)
+
+# Ticket creation (XERK-137). The board's "New ticket" form fetches the create
+# metadata (projects, issue types, existing labels) on demand — the same
+# {command -> staged result -> next beat} path as issue detail — then POSTs one
+# new issue. Bounded so a big org can't make the meta fetch block a heartbeat.
+CREATE_META_MAX_PROJECTS = 100  # projects offered in the New-ticket picker
+CREATE_META_MAX_LABELS = 200    # existing labels/tags offered as suggestions
+CREATE_TITLE_MAX_CHARS = 250    # summary/title cap (Jira's own limit is 255)
+CREATE_DESC_MAX_CHARS = 30000   # description cap
+CREATE_LABELS_MAX = 20          # labels/tags accepted on one new ticket
 # An issue key is interpolated into a REST path, so it's allowlist-checked
 # against Jira's own key grammar (PROJECT-123) before it ever reaches a URL —
 # the same "nothing free-form reaches the shell" stance as the spawn options.
@@ -3915,6 +3927,24 @@ def jira_req(path, params, body=None):
 def jira_get(path, params):
     """A read against the configured Jira Cloud site — jira_req with no body."""
     return jira_req(path, params)
+
+
+def jira_post(path, body):
+    """One authenticated POST against the configured Jira Cloud site (issue
+    creation, XERK-137) — the write counterpart of jira_get. Same Basic auth and
+    UA; a JSON body in, parsed JSON out. Exceptions propagate to the create
+    command's staged result. An empty 201 body (some endpoints) parses to {}."""
+    site = normalize_jira_site(JIRA_SITE)
+    url = f"https://{site}{path}"
+    auth = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={
+        "Authorization": f"Basic {auth}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "turma-agent/1.0",
+    }, method="POST")
+    with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
+        return json.loads(resp.read().decode() or "{}")
 
 
 def _shape_issue(issue, site_key):
@@ -4183,6 +4213,106 @@ def fetch_jira_issue(key):
     return _shape_issue_detail(data, site_key)
 
 
+# --- Jira ticket creation (XERK-137) -------------------------------------------
+# The board's "New ticket" form. The metadata (projects + per-project issue types
+# + existing labels) is fetched on demand so the picker offers real choices; the
+# create itself POSTs one issue and self-assigns it to the configured user, so the
+# new ticket lands on the board (which shows assignee = currentUser) straight away.
+
+# The account id of the configured Jira user, looked up once and cached, so a
+# created issue can be assigned to them (Jira Cloud's create wants an accountId,
+# not the email we hold). None if the lookup fails — self-assignment is then
+# skipped and the ticket is created unassigned (still valid, just not on the
+# board until someone assigns it).
+_JIRA_MYSELF = {"accountId": None, "tried": False}
+
+
+def _jira_account_id():
+    """The configured user's Jira accountId (cached, best-effort)."""
+    if _JIRA_MYSELF["tried"]:
+        return _JIRA_MYSELF["accountId"]
+    _JIRA_MYSELF["tried"] = True
+    try:
+        me = jira_get("/rest/api/3/myself", {})
+        _JIRA_MYSELF["accountId"] = me.get("accountId") or None
+    except Exception as e:
+        log(f"jira myself lookup failed: {e}")
+    return _JIRA_MYSELF["accountId"]
+
+
+def _text_to_adf(text):
+    """Plain text -> a minimal Atlassian Document Format doc (Jira Cloud's create
+    API takes ADF, not plain text/markdown). One paragraph per line; a blank line
+    is an empty paragraph, so the operator's line breaks survive the round trip.
+    The reverse of adf_plain."""
+    lines = str(text or "").split("\n")
+    content = []
+    for line in lines:
+        if line:
+            content.append({"type": "paragraph",
+                            "content": [{"type": "text", "text": line}]})
+        else:
+            content.append({"type": "paragraph"})
+    return {"type": "doc", "version": 1, "content": content or [{"type": "paragraph"}]}
+
+
+def jira_create_meta():
+    """The New-ticket form's project + label choices for a Jira org: the projects
+    the user can see (issue types are fetched per-project by jira_issue_types) and
+    a bounded list of existing labels to suggest. Exceptions propagate to the
+    staged result."""
+    data = jira_get("/rest/api/3/project/search",
+                    {"maxResults": CREATE_META_MAX_PROJECTS, "orderBy": "name"})
+    projects = [{"key": p.get("key"), "name": p.get("name") or p.get("key")}
+                for p in (data.get("values") or []) if p.get("key")]
+    labels = []
+    try:
+        ld = jira_get("/rest/api/3/label", {"maxResults": CREATE_META_MAX_LABELS})
+        labels = [l for l in (ld.get("values") or []) if isinstance(l, str)]
+    except Exception as e:
+        log(f"jira label suggestions fetch failed: {e}")
+    return {"projects": projects, "labels": labels, "source": "jira"}
+
+
+def jira_issue_types(project):
+    """The issue types creatable in one Jira project (subtasks excluded — the
+    board has no parent to hang them off). [{id, name}]."""
+    data = jira_get(
+        f"/rest/api/3/issue/createmeta/{urllib.parse.quote(project)}/issuetypes",
+        {"maxResults": 100})
+    out = []
+    for it in (data.get("issueTypes") or data.get("values") or []):
+        if it.get("subtask") or not it.get("id"):
+            continue
+        out.append({"id": str(it.get("id")), "name": it.get("name") or ""})
+    return out
+
+
+def create_jira_issue(project, issue_type, summary, description, labels):
+    """Create one Jira issue and return {key, url}. `issue_type` is an issue-type
+    id (from jira_issue_types); labels are the array Jira stores verbatim. The
+    issue is assigned to the configured user (best-effort) so it lands on their
+    board immediately."""
+    site_key = normalize_jira_site(JIRA_SITE)
+    fields = {
+        "project": {"key": project},
+        "summary": summary,
+        "issuetype": {"id": str(issue_type)},
+    }
+    if description:
+        fields["description"] = _text_to_adf(description)
+    if labels:
+        fields["labels"] = labels
+    acct = _jira_account_id()
+    if acct:
+        fields["assignee"] = {"id": acct}
+    data = jira_post("/rest/api/3/issue", {"fields": fields})
+    key = data.get("key")
+    if not key:
+        raise RuntimeError("Jira returned no issue key")
+    return {"key": key, "url": f"https://{site_key}/browse/{key}"}
+
+
 # --- Azure DevOps work-item polling --------------------------------------------
 # Optional second board source (XERK-43): with a PAT in the env (AZDO_URL +
 # AZDO_TOKEN) the agent polls the work items assigned to that PAT's owner and
@@ -4194,9 +4324,10 @@ def fetch_jira_issue(key):
 #
 # Self-hosted is the point (AZDO_URL is any base — `https://tfs.company.com/
 # DefaultCollection`), and Azure DevOps Services (`https://dev.azure.com/org`)
-# is the same REST surface, so both work off the one base URL. Read-only save
-# for the one operator-driven status change (XERK-138): WIQL search, work-item
-# GET, the work-item-type states GET, and a single System.State PATCH.
+# is the same REST surface, so both work off the one base URL. Almost entirely
+# read-only — WIQL search, work-item GET, the work-item-type states GET — plus
+# two operator-driven writes: creating a work item (XERK-137) and a single
+# System.State PATCH for a status change (XERK-138).
 AZDO_URL = os.environ.get("AZDO_URL", "").strip()
 AZDO_TOKEN = os.environ.get("AZDO_TOKEN", "").strip()
 # Optional: scope the poll to one project (else org-wide, every project the PAT
@@ -4643,6 +4774,113 @@ def fetch_azure_issue(key):
     return detail
 
 
+# --- Azure DevOps work-item creation (XERK-137) --------------------------------
+# The Azure counterpart of the Jira create path. Work-item create is a JSON-Patch
+# POST (application/json-patch+json) — a different content type than azure_req's
+# plain-JSON search/GET — with the work-item TYPE in the URL (`.../workitems/$Bug`).
+# "Labels" map to System.Tags (a `;`-joined string, not an array), and self-assign
+# uses the PAT owner's identity from the connection-data endpoint so the new item
+# lands on the board (which filters by @Me).
+_AZDO_ME = {"name": None, "tried": False}
+
+
+def _azure_self():
+    """The PAT owner's assignable identity (uniqueName, cached best-effort), so a
+    created work item can be self-assigned. AZDO_USER wins if the operator set it;
+    else it's read from the connection-data endpoint. None on failure — the item
+    is then created unassigned."""
+    if AZDO_USER:
+        return AZDO_USER
+    if _AZDO_ME["tried"]:
+        return _AZDO_ME["name"]
+    _AZDO_ME["tried"] = True
+    try:
+        data = azure_req("/_apis/connectionData", {})
+        au = data.get("authenticatedUser") or {}
+        props = (au.get("properties") or {}).get("Account") or {}
+        _AZDO_ME["name"] = props.get("$value") or au.get("uniqueName") or None
+    except Exception as e:
+        log(f"azure connection-data lookup failed: {e}")
+    return _AZDO_ME["name"]
+
+
+def azure_create_workitem(project, wtype, ops):
+    """POST a JSON-Patch work-item create and return the raw work item. `ops` is
+    the /fields patch list; the type rides the URL as `$<type>`. Separate from
+    azure_req because create requires the json-patch content type."""
+    q = {"api-version": AZDO_API_VERSION}
+    path = (f"/{urllib.parse.quote(project)}/_apis/wit/workitems/"
+            f"${urllib.parse.quote(wtype)}")
+    url = f"{azure_base()}{path}?{urllib.parse.urlencode(q)}"
+    auth = base64.b64encode(f":{AZDO_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url, data=json.dumps(ops).encode(), headers={
+        "Authorization": f"Basic {auth}",
+        "Accept": "application/json",
+        "Content-Type": "application/json-patch+json",
+        "User-Agent": "turma-agent/1.0",
+    }, method="POST")
+    with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
+        return json.loads(resp.read().decode() or "{}")
+
+
+def azure_create_meta():
+    """The New-ticket form's project + tag choices for an Azure org: the projects
+    the PAT can see (work-item types are fetched per-project by azure_workitem_types)
+    plus a bounded list of existing tags to suggest."""
+    data = azure_req("/_apis/projects", {"$top": CREATE_META_MAX_PROJECTS})
+    projects = [{"key": p.get("name"), "name": p.get("name")}
+                for p in (data.get("value") or []) if p.get("name")]
+    tags = []
+    try:
+        # Org-wide tags endpoint (preview); a failure just means no suggestions.
+        td = azure_req("/_apis/wit/tags",
+                       {"api-version": f"{AZDO_API_VERSION}-preview.1"})
+        tags = [t.get("name") for t in (td.get("value") or []) if t.get("name")]
+    except Exception as e:
+        log(f"azure tag suggestions fetch failed: {e}")
+    return {"projects": projects, "labels": tags[:CREATE_META_MAX_LABELS],
+            "source": "azure"}
+
+
+def azure_workitem_types(project):
+    """The creatable work-item types in one Azure project (hidden/disabled ones
+    excluded). [{id, name}] — id == name for Azure, so the wire shape matches
+    Jira's issue-type list."""
+    data = azure_req(f"/{urllib.parse.quote(project)}/_apis/wit/workitemtypes", {})
+    out = []
+    for wt in (data.get("value") or []):
+        name = wt.get("name")
+        if not name or wt.get("isDisabled"):
+            continue
+        out.append({"id": name, "name": name})
+    return out
+
+
+def create_azure_issue(project, wtype, title, description, tags):
+    """Create one Azure work item and return {key, url}. `wtype` is the work-item
+    type name; `tags` become System.Tags. Self-assigns to the PAT owner
+    (best-effort) so the item lands on the board."""
+    site_key = normalize_azure_site(AZDO_URL)
+    base = azure_base()
+    ops = [{"op": "add", "path": "/fields/System.Title", "value": title}]
+    if description:
+        # System.Description is HTML; escape the plain text and keep line breaks.
+        body_html = html.escape(str(description)).replace("\n", "<br>")
+        ops.append({"op": "add", "path": "/fields/System.Description",
+                    "value": body_html})
+    if tags:
+        ops.append({"op": "add", "path": "/fields/System.Tags",
+                    "value": "; ".join(tags)})
+    me = _azure_self()
+    if me:
+        ops.append({"op": "add", "path": "/fields/System.AssignedTo", "value": me})
+    data = azure_create_workitem(project, wtype, ops)
+    wid = data.get("id")
+    if wid is None:
+        raise RuntimeError("Azure returned no work-item id")
+    return {"key": str(wid), "url": _azure_item_url(base, project, wid)}
+
+
 # --- Board source dispatch -----------------------------------------------------
 # The board is source-agnostic downstream: the hub, board.js and every client
 # read one `jira` block per agent and never branch on where its tickets came
@@ -4763,6 +5001,29 @@ def apply_board_status(key, value):
     else:
         jira_req(f"/rest/api/3/issue/{urllib.parse.quote(key)}/transitions", {},
                  body={"transition": {"id": value}})
+
+
+def board_create_meta():
+    """The New-ticket form's project + label choices from the configured source
+    (XERK-137)."""
+    if azure_configured():
+        return azure_create_meta()
+    return jira_create_meta()
+
+
+def board_issue_types(project):
+    """The creatable issue/work-item types in one project, from the configured
+    source. [{id, name}]."""
+    if azure_configured():
+        return azure_workitem_types(project)
+    return jira_issue_types(project)
+
+
+def create_board_issue(project, issue_type, summary, description, labels):
+    """Create one ticket in the configured source and return {key, url}."""
+    if azure_configured():
+        return create_azure_issue(project, issue_type, summary, description, labels)
+    return create_jira_issue(project, issue_type, summary, description, labels)
 
 
 # --- Jira ticket sessions ------------------------------------------------------
@@ -5550,6 +5811,12 @@ class SessionManager:
         # heartbeat, keyed back to the request by the command's cmdId. Same
         # held-across-a-failed-POST lifecycle as jira_issue_results.
         self.ticket_status_results = []
+        # Staged New-ticket (XERK-137) results: the board's create form fetches
+        # the project/type/label metadata (create_meta_results) and then POSTs a
+        # new ticket (create_ticket_results), both riding the next beat with the
+        # same held-across-a-failed-POST lifecycle as jira_issue_results.
+        self.create_meta_results = []
+        self.create_ticket_results = []
         # Archive sync: the manifest of inactive transcripts sent on the last slow
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
@@ -8231,6 +8498,77 @@ class SessionManager:
         log(f"setTicketStatus: {k} -> {match['name']}")
         stage(ok=True, status=match["name"], statusCategory=match["category"])
 
+    # --- New-ticket creation (XERK-137) -----------------------------------
+    # The board's create form. Two staged results, same fail-into-`error`
+    # discipline as _stage_jira_issue (the form is waiting on an answer either
+    # way): the metadata a form open needs, and the outcome of a create POST.
+
+    def _stage_create_meta(self, project):
+        """Handle a {type:"boardCreateMeta"} command. With no `project`, stage the
+        project + label choices (createMetaResults, no `project` key); with one,
+        stage that project's issue/work-item types (a `project`-keyed result). A
+        failure stages the same shape carrying an `error`."""
+        proj = (project or "").strip()
+        if not board_configured():
+            self.create_meta_results.append(
+                {"project": proj or None,
+                 "error": "no board credentials on this host"})
+            return
+        try:
+            if proj:
+                self.create_meta_results.append(
+                    {"project": proj, "types": board_issue_types(proj), "error": None})
+            else:
+                meta = board_create_meta()
+                self.create_meta_results.append({
+                    "project": None,
+                    "projects": meta.get("projects") or [],
+                    "labels": meta.get("labels") or [],
+                    "source": meta.get("source"),
+                    "error": None,
+                })
+        except Exception as e:
+            log(f"board create meta failed ({proj or 'projects'}): {e}")
+            self.create_meta_results.append(
+                {"project": proj or None, "error": str(e)[:200]})
+
+    def _stage_create_ticket(self, cmd):
+        """Handle a {type:"createTicket"} command: create the ticket and stage the
+        outcome keyed by the command's cmdId (so the hub can hand the created key
+        back to the one client that submitted it). Validated defensively even
+        though the hub already checked — this is the only thing between a request
+        and a write to the tracker."""
+        cid = cmd.get("cmdId")
+        summary = (cmd.get("summary") or "").strip()[:CREATE_TITLE_MAX_CHARS]
+        project = (cmd.get("project") or "").strip()
+        issue_type = (cmd.get("issueType") or "").strip()
+        description = (cmd.get("description") or "")[:CREATE_DESC_MAX_CHARS]
+        labels = [str(l).strip() for l in (cmd.get("labels") or [])
+                  if str(l).strip()][:CREATE_LABELS_MAX]
+
+        def fail(msg):
+            self.create_ticket_results.append(
+                {"cmdId": cid, "key": None, "url": None, "error": msg})
+
+        if not board_configured():
+            return fail("no board credentials on this host")
+        if not summary:
+            return fail("a title is required")
+        if not project:
+            return fail("a project is required")
+        if not issue_type:
+            return fail("an issue type is required")
+        try:
+            created = create_board_issue(project, issue_type, summary,
+                                         description, labels)
+            self.create_ticket_results.append(
+                {"cmdId": cid, "key": created.get("key"),
+                 "url": created.get("url"), "error": None})
+            log(f"created ticket {created.get('key')} in {project}")
+        except Exception as e:
+            log(f"ticket creation failed in {project}: {e}")
+            fail(str(e)[:300])
+
     # --- durable archive sync ---------------------------------------------
     # Ship every INACTIVE session's transcript to the hub so history is durable
     # (survives this host being wiped/offline) and searchable there. The agent
@@ -9416,6 +9754,10 @@ class SessionManager:
                 elif ctype == "setTicketStatus":
                     self.set_board_status(
                         cid, cmd.get("issueKey"), cmd.get("value"))
+                elif ctype == "boardCreateMeta":
+                    self._stage_create_meta(cmd.get("project"))
+                elif ctype == "createTicket":
+                    self._stage_create_ticket(cmd)
                 elif ctype == "setJiraRepo":
                     self.set_jira_repo(
                         cmd.get("issueKey"), cmd.get("repo"),
@@ -10191,6 +10533,10 @@ class SessionManager:
             payload["jiraIssueResults"] = list(self.jira_issue_results)
         if self.ticket_status_results:
             payload["ticketStatusResults"] = list(self.ticket_status_results)
+        if self.create_meta_results:
+            payload["createMetaResults"] = list(self.create_meta_results)
+        if self.create_ticket_results:
+            payload["createTicketResults"] = list(self.create_ticket_results)
         # Archive sync manifest on the slow cadence: the inactive transcripts the
         # hub could pull. Remember it by id so the reply's archiveHave cursors map
         # back to each one for the delta push (in run_forever).
@@ -10228,6 +10574,8 @@ class SessionManager:
             self.subagent_history_results.clear()  # delivered — same lifecycle
             self.jira_issue_results.clear()  # delivered — same lifecycle
             self.ticket_status_results.clear()  # delivered — same lifecycle
+            self.create_meta_results.clear()  # delivered — same lifecycle
+            self.create_ticket_results.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
         except Exception as e:
             log(f"heartbeat failed: {e}")

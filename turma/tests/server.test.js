@@ -2037,6 +2037,120 @@ test("http: status results never leak into the /api/agents payload", async () =>
   }
 });
 
+// New-ticket create flow (XERK-137): create-meta (projects/labels + per-project
+// types), the create POST, and the create-outcome poll. The hub routes to the
+// org's online host and rides the same heartbeat command/result path as detail.
+
+test("http: create-meta returns 202 then serves projects/labels once the host reports", async () => {
+  await jiraBeat("cm1", "cm1.atlassian.net");
+  const first = await request("GET", "/api/jira/cm1.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(first.status, 202);
+  assert.ok(first.body.cmdId);
+  // Single-flight: a second form open reuses the queued command.
+  const again = await request("GET", "/api/jira/cm1.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(again.body.cmdId, first.body.cmdId);
+
+  const beat = await jiraBeat("cm1", "cm1.atlassian.net", {
+    createMetaResults: [{ project: null, projects: [{ key: "ENG", name: "Eng" }],
+                          labels: ["turma"], source: "jira", error: null }],
+  });
+  assert.deepEqual(beat.body.commands, [{ type: "boardCreateMeta", cmdId: first.body.cmdId }]);
+
+  const res = await request("GET", "/api/jira/cm1.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.projects, [{ key: "ENG", name: "Eng" }]);
+  assert.deepEqual(res.body.labels, ["turma"]);
+  assert.equal(res.body.source, "jira");
+});
+
+test("http: create-meta ?project= fetches that project's issue types", async () => {
+  await jiraBeat("cm2", "cm2.atlassian.net");
+  const q = await request("GET", "/api/jira/cm2.atlassian.net/create-meta?project=ENG", { headers: userHeaders });
+  assert.equal(q.status, 202);
+  const beat = await jiraBeat("cm2", "cm2.atlassian.net", {
+    createMetaResults: [{ project: "ENG", types: [{ id: "1", name: "Task" }], error: null }],
+  });
+  assert.deepEqual(beat.body.commands, [{ type: "boardCreateMeta", project: "ENG", cmdId: q.body.cmdId }]);
+  const res = await request("GET", "/api/jira/cm2.atlassian.net/create-meta?project=ENG", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.types, [{ id: "1", name: "Task" }]);
+});
+
+test("http: create-meta 404s an org nobody reports and 503s when its host is offline", async () => {
+  const none = await request("GET", "/api/jira/nobody-cm.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(none.status, 404);
+  await jiraBeat("cm3", "cm3.atlassian.net");
+  agents.cm3.lastSeen = Date.now() - 90 * 1000; // go offline
+  const off = await request("GET", "/api/jira/cm3.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(off.status, 503);
+});
+
+test("http: creating a ticket validates, queues createTicket, and polls the outcome", async () => {
+  await jiraBeat("ct1", "ct1.atlassian.net");
+  const post = (body) => request("POST", "/api/jira/ct1.atlassian.net/tickets", { body, headers: userHeaders });
+  // Each required field is enforced.
+  assert.equal((await post({ project: "ENG", issueType: "1" })).status, 400);
+  assert.equal((await post({ summary: "Hi", issueType: "1" })).status, 400);
+  assert.equal((await post({ summary: "Hi", project: "ENG" })).status, 400);
+
+  const res = await post({ project: "ENG", issueType: "1", summary: "New thing",
+                           description: "do it", labels: ["a", "b"] });
+  assert.equal(res.status, 200);
+  assert.ok(res.body.cmdId);
+  assert.equal(res.body.host, "ct1");
+
+  const beat = await jiraBeat("ct1", "ct1.atlassian.net");
+  assert.deepEqual(beat.body.commands, [{
+    type: "createTicket", project: "ENG", issueType: "1", summary: "New thing",
+    description: "do it", labels: ["a", "b"], cmdId: res.body.cmdId,
+  }]);
+
+  // Pending until the agent reports the outcome.
+  const pending = await request("GET", `/api/jira/ct1.atlassian.net/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(pending.status, 202);
+
+  await jiraBeat("ct1", "ct1.atlassian.net", {
+    createTicketResults: [{ cmdId: res.body.cmdId, key: "ENG-100",
+                            url: "https://ct1.atlassian.net/browse/ENG-100", error: null }],
+  });
+  const done = await request("GET", `/api/jira/ct1.atlassian.net/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(done.status, 200);
+  assert.equal(done.body.key, "ENG-100");
+  assert.match(done.body.url, /ENG-100/);
+});
+
+test("http: a create failure is reported to the poller as an error", async () => {
+  await jiraBeat("ct2", "ct2.atlassian.net");
+  const res = await request("POST", "/api/jira/ct2.atlassian.net/tickets", {
+    body: { project: "ENG", issueType: "1", summary: "Boom" }, headers: userHeaders,
+  });
+  await jiraBeat("ct2", "ct2.atlassian.net", {
+    createTicketResults: [{ cmdId: res.body.cmdId, key: null, url: null, error: "Jira 400: bad field" }],
+  });
+  const done = await request("GET", `/api/jira/ct2.atlassian.net/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(done.status, 200);
+  assert.equal(done.body.error, "Jira 400: bad field");
+});
+
+test("http: creating a ticket 404s an org nobody reports", async () => {
+  const res = await request("POST", "/api/jira/nobody-ct.atlassian.net/tickets", {
+    body: { project: "E", issueType: "1", summary: "x" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 404);
+});
+
+test("http: the create caches are stripped from the /api/agents payload", async () => {
+  await jiraBeat("cm4", "cm4.atlassian.net", {
+    createMetaResults: [{ project: null, projects: [{ key: "E", name: "E" }], labels: [], source: "jira", error: null }],
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = res.body.agents.find((a) => a.key === "cm4");
+  assert.ok(rec);
+  assert.equal(rec.createMeta, undefined);
+  assert.equal(rec.createTypes, undefined);
+  assert.equal(rec.createResults, undefined);
+});
+
 // POST /api/jira/<siteKey>/<issueKey>/repo — the operator's manual repo override.
 // Writes to the AGENT's triage ledger via the heartbeat command path; nothing
 // here writes to Jira, which stays pull-only.

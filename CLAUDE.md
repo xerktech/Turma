@@ -1142,9 +1142,33 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   then only the *colliding* orgs move. Unique up to 8 orgs; overflow falls back to its preferred (possibly
   shared) slot. The Android port (`core/Board.kt` `orgColorMap` → `ChartSeries`) uses the identical
   assignment, pinned by locked test vectors on each side.
-- Pull-only save for the detail panel's status change (XERK-138, "Changing the status by hand"): every
-  other control writes to a hub/agent ledger, never to the board. Tests: `turma/tests/board.test.js`,
-  the ticket-detail and jira-refresh endpoint cases in `server.test.js`.
+- The board READS the tracker; it makes exactly **two** writes back to it — **creating a ticket**
+  (XERK-137, "Creating a ticket" below) and **changing a ticket's status** (XERK-138, "Changing the
+  status by hand"). Every other control writes a hub/agent ledger, never the board. Tests:
+  `turma/tests/board.test.js`, the ticket-detail and jira-refresh endpoint cases in `server.test.js`.
+
+#### Creating a ticket (XERK-137)
+
+- The board bar's **"New ticket"** button opens a modal to create a ticket (title, description, labels)
+  on an org's tracker — the board's ONE write path, source-agnostic across Jira and Azure DevOps, hidden
+  until an org reports. It routes through the hub to an **ONLINE** host of the org (only the host holds
+  tracker creds), reusing the ticket-detail `{command → staged result → poll}` pattern:
+  - `GET /api/jira/<siteKey>/create-meta` (`boardCreateMeta`) → the org's projects + existing labels/tags;
+    `?project=<p>` → that project's creatable types. Cascade (project then types) so no meta call fans
+    across every project and blocks a beat. Cached per host (`createMeta`/`createTypes`), 202-polled.
+  - `POST /api/jira/<siteKey>/tickets` (`createTicket`) → the agent creates and stages
+    `{cmdId, key, url, error}`; client polls `GET .../tickets/<cmdId>` (cached `createResults`). All three
+    caches are stripped from the fleet payload.
+- The new ticket **self-assigns to the tracker user** (Jira `accountId` via `/myself`; Azure
+  `System.AssignedTo` via `AZDO_USER`/connection-data) so it lands on the board — best-effort, unassigned
+  on lookup failure. Agent dispatch: `create_board_issue`/`board_create_meta`/`board_issue_types`
+  (`create_jira_issue` POSTs `/rest/api/3/issue`, plain-text→ADF via `_text_to_adf`; `create_azure_issue`
+  POSTs a JSON-Patch work item, HTML-escaped description, `;`-joined `System.Tags`). Jira labels split on
+  whitespace+commas (spaces forbidden), Azure tags on commas.
+- Tests: `TestCreateJiraIssue`/`TestCreateAzureIssue`/`TestStageCreateMeta`/`TestStageCreateTicket` (+
+  meta/type/ADF cases) in `test_hub_agent.py`; the create-flow cases in `server.test.js`; the
+  `createFormHtml`/`createProjectOptions`/`createTypeOptions` cases in `board.test.js`. Android is a
+  follow-up (`android/PARITY.md`).
 
 #### Repo chips
 

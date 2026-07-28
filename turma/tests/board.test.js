@@ -18,6 +18,7 @@ const {
   statusFieldHtml, statusPickerHtml, statusPickerValue,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
   startSweepVerdict,
+  createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
 } = require("../public/board.js");
 
 function ticket(key, over = {}) {
@@ -1552,4 +1553,103 @@ test("startSweepVerdict: a host that dropped out of the fleet only ever times ou
 test("startSweepVerdict: a never-seen command past the timeout errors (backstop)", () => {
   const p = { cmdId: "c1", host: "hostA", sawCmd: false, ageMs: TMO + 1 };
   assert.equal(startSweepVerdict(p, [], false, true, TMO), "error");
+});
+
+// --- New-ticket form (XERK-137) ----------------------------------------------
+
+test("mergeSites: carries the tracker source off the freshest block", () => {
+  const sites = mergeSites([
+    agent("az", block({ siteKey: "dev.azure.com/o", source: "azure" })),
+  ]);
+  assert.equal(sites[0].source, "azure");
+  // Older agents omit `source`; default to jira so wording doesn't break.
+  const jira = mergeSites([agent("j", block({ siteKey: "o.atlassian.net" }))]);
+  assert.equal(jira[0].source, "jira");
+});
+
+test("createLabelWord: worded per source", () => {
+  assert.equal(createLabelWord("jira", false), "label");
+  assert.equal(createLabelWord("jira", true), "Label");
+  assert.equal(createLabelWord("azure", false), "tag");
+  assert.equal(createLabelWord("azure", true), "Tag");
+});
+
+test("createProjectOptions: a disabled placeholder + one option per project, preselecting", () => {
+  const html = createProjectOptions([{ key: "ENG", name: "Engineering" }, { key: "OPS", name: "OPS" }], "OPS");
+  assert.match(html, /Choose a project…/);
+  assert.match(html, /<option value="ENG">Engineering \(ENG\)<\/option>/);
+  assert.match(html, /<option value="OPS" selected>OPS<\/option>/);
+});
+
+test("createTypeOptions: preselects the chosen type", () => {
+  const html = createTypeOptions([{ id: "1", name: "Task" }, { id: "2", name: "Bug" }], "2");
+  assert.match(html, /<option value="2" selected>Bug<\/option>/);
+});
+
+test("createOrgOptions: marks offline orgs and preselects the current one", () => {
+  const sites = [
+    { siteKey: "a.atlassian.net", orgName: "", online: true },
+    { siteKey: "dev.azure.com/o", orgName: "", online: false },
+  ];
+  const html = createOrgOptions(sites, "dev.azure.com/o");
+  assert.match(html, /<option value="a.atlassian.net">a<\/option>/);
+  assert.match(html, /value="dev.azure.com\/o" selected>o \(offline\)</);
+});
+
+test("createFormHtml: renders the fields, source-worded labels, and gates submit", () => {
+  const st = {
+    sites: [{ siteKey: "o.atlassian.net", orgName: "", online: true }],
+    siteKey: "o.atlassian.net", source: "jira",
+    meta: { projects: [{ key: "ENG", name: "Eng" }], labels: ["turma"] },
+    types: { types: [{ id: "1", name: "Task" }] },
+    values: { project: "", issueType: "", summary: "", description: "", labels: "" },
+    busy: false, error: "", created: null,
+  };
+  const html = createFormHtml(st);
+  assert.match(html, /New ticket/);
+  assert.match(html, /data-cf-project/);
+  assert.match(html, /data-cf-summary/);
+  assert.match(html, /<span>Labels<\/span>/);          // Jira wording
+  assert.match(html, /turma/);                          // label suggestion in datalist
+  // Nothing filled in yet -> submit disabled.
+  assert.match(html, /data-cf-submit="1" disabled/);
+});
+
+test("createFormHtml: azure wording, and a complete form enables submit", () => {
+  const st = {
+    sites: [{ siteKey: "dev.azure.com/o", orgName: "", online: true }],
+    siteKey: "dev.azure.com/o", source: "azure",
+    meta: { projects: [{ key: "P", name: "P" }], labels: [] },
+    types: { types: [{ id: "Bug", name: "Bug" }] },
+    values: { project: "P", issueType: "Bug", summary: "Fix it", description: "", labels: "" },
+    busy: false, error: "", created: null,
+  };
+  const html = createFormHtml(st);
+  assert.match(html, /<span>Tags<\/span>/);             // Azure wording
+  assert.doesNotMatch(html, /data-cf-submit="1" disabled/);
+});
+
+test("createFormHtml: loading and error states per row", () => {
+  const loading = createFormHtml({
+    sites: [{ siteKey: "o", orgName: "", online: true }], siteKey: "o", source: "jira",
+    meta: {}, types: {}, values: { project: "" }, busy: false,
+  });
+  assert.match(loading, /Loading projects…/);
+  assert.match(loading, /Pick a project first/);
+  const err = createFormHtml({
+    sites: [{ siteKey: "o", orgName: "", online: true }], siteKey: "o", source: "jira",
+    meta: { error: "boom" }, types: {}, values: { project: "" }, busy: false,
+  });
+  assert.match(err, /Couldn't load projects — boom/);
+});
+
+test("createFormHtml: the created state shows a link and hides the form", () => {
+  const html = createFormHtml({
+    sites: [{ siteKey: "o", orgName: "", online: true }], siteKey: "o", source: "jira",
+    values: {}, created: { key: "ENG-9", url: "https://o/browse/ENG-9" },
+  });
+  assert.match(html, /Ticket created/);
+  assert.match(html, /href="https:\/\/o\/browse\/ENG-9"[^>]*>ENG-9/);
+  assert.match(html, /data-cf-another/);
+  assert.doesNotMatch(html, /data-cf-submit/);
 });
