@@ -170,10 +170,11 @@ function mountOrg({ storedOrg = null, storedBoardOrg = null } = {}) {
   global.window.addEventListener = () => {};
   Org.mount(doc);
   // Click the control the way a browser would: an event whose target closest()s
-  // to the element carrying the data attribute.
-  const click = (attr, value) => {
+  // to the element carrying the data attribute. `extra` merges further dataset
+  // keys (the swatch buttons carry two).
+  const click = (attr, value, extra = {}) => {
     const target = {
-      dataset: { orgKey: value, orgAuto: value },
+      dataset: Object.assign({ orgKey: value, orgAuto: value, orgColor: value }, extra),
       classList: { contains: () => false },
       closest: (sel) => (sel === `[${attr}]` ? target : null),
     };
@@ -268,6 +269,87 @@ test("org: the auto switch flips optimistically and rolls back on a failed POST"
   await p;
   assert.deepEqual(posts, [{ url: "/api/jira/acme.atlassian.net/autostart", body: { enabled: true } }]);
   assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/);
+});
+
+// ---- manual org colors (XERK-145) ------------------------------------------
+
+test("org: each org row carries a color chip; the swatch strip only when expanded", () => {
+  const sites = [site("acme.atlassian.net"), site("dev.azure.com/xerk")];
+  const colors = window.TurmaBoard.orgColorMap(sites.map(s => s.siteKey));
+  const closed = Org.menuHtml(sites, "", colors, {}, () => "", {}, null);
+  assert.equal((closed.match(/data-org-color=/g) || []).length, 2);
+  assert.doesNotMatch(closed, /org-swatch-row/);
+  const open = Org.menuHtml(sites, "", colors, {}, () => "", {}, "acme.atlassian.net");
+  assert.equal((open.match(/class="org-swatch-row"/g) || []).length, 1);
+  // 8 slot swatches + the auto release, keyed to the expanded org.
+  assert.equal((open.match(/data-org-swatch="\d+"/g) || []).length, 8);
+  assert.match(open, /data-org-swatch="auto"/);
+  assert.match(open, /data-org-swatch-key="acme\.atlassian\.net"/);
+});
+
+test("org: the swatch strip marks the pinned slot, else the auto release", () => {
+  const sites = [site("acme.atlassian.net")];
+  const colors = window.TurmaBoard.orgColorMap(["acme.atlassian.net"], { "acme.atlassian.net": 3 });
+  const pinned = Org.menuHtml(sites, "", colors, {}, () => "", { "acme.atlassian.net": 3 }, "acme.atlassian.net");
+  assert.match(pinned, /class="org-swatch picked"[^>]*data-org-swatch="3"/);
+  assert.doesNotMatch(pinned, /org-swatch-auto picked/);
+  const unpinned = Org.menuHtml(sites, "", colors, {}, () => "", {}, "acme.atlassian.net");
+  assert.doesNotMatch(unpinned, /org-swatch picked/);
+  assert.match(unpinned, /org-swatch-auto picked/);
+});
+
+test("org: a swatch pick paints optimistically, POSTs, and rolls back on failure", async () => {
+  const { slot, click } = mountOrg();
+  const seen = [];
+  Org.subscribe(() => seen.push(1));
+  Org.update({ agents: [agent("a", "acme.atlassian.net")], orgColors: {} });
+  click("data-org-toggle", "");
+  click("data-org-color", "acme.atlassian.net");         // expand the strip
+  assert.match(slot.innerHTML, /org-swatch-row/);
+  const posts = [];
+  global.fetch = (url, init) => {
+    posts.push({ url, body: JSON.parse(init.body) });
+    return Promise.resolve({ ok: false, status: 500 });
+  };
+  const p = Org.setOrgColor("acme.atlassian.net", 5);
+  // Painted (and pages notified, so their card tints follow) before the POST
+  // settles; the strip closes on the pick.
+  assert.deepEqual(Org.orgColors(), { "acme.atlassian.net": 5 });
+  assert.doesNotMatch(slot.innerHTML, /org-swatch-row/);
+  assert.ok(seen.length >= 1);
+  await p;
+  assert.deepEqual(posts, [{ url: "/api/jira/acme.atlassian.net/color", body: { slot: 5 } }]);
+  assert.deepEqual(Org.orgColors(), {});
+});
+
+test("org: releasing a pin POSTs {auto:true}", async () => {
+  mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")], orgColors: { "acme.atlassian.net": 5 } });
+  const posts = [];
+  global.fetch = (url, init) => {
+    posts.push({ url, body: JSON.parse(init.body) });
+    return Promise.resolve({ ok: true, status: 200 });
+  };
+  await Org.setOrgColor("acme.atlassian.net", null);
+  assert.deepEqual(posts, [{ url: "/api/jira/acme.atlassian.net/color", body: { auto: true } }]);
+  assert.deepEqual(Org.orgColors(), {});
+});
+
+test("org: the hub's orgColors broadcast updates the pins and notifies the pages", () => {
+  const { slot } = mountOrg();
+  const seen = [];
+  Org.subscribe(() => seen.push(1));
+  Org.update({ agents: [agent("a", "acme.atlassian.net")] });
+  const handlers = {};
+  Org.sse({ addEventListener: (t, fn) => { handlers[t] = fn; } });
+  handlers.orgColors({ data: JSON.stringify({ "acme.atlassian.net": 2 }) });
+  assert.deepEqual(Org.orgColors(), { "acme.atlassian.net": 2 });
+  assert.equal(seen.length, 1);
+  // The button's dot follows the pin (the control repaints from the new map).
+  assert.match(slot.innerHTML, /org-filter/);
+  // Malformed payloads are ignored rather than blanking the pins.
+  handlers.orgColors({ data: "{" });
+  assert.deepEqual(Org.orgColors(), { "acme.atlassian.net": 2 });
 });
 
 test("org: the hub's autoStartOrgs broadcast repaints the switches", () => {

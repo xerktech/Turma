@@ -246,6 +246,15 @@ interface HubApi {
         @Body body: AutoStartRequest,
     ): OkResponse
 
+    // Pin an org's palette color, or release it back to auto (XERK-145).
+    // Hub-owned durable state like /autostart, an authoritative 200.
+    // Body: {slot:1..8} or {auto:true}.
+    @POST("api/jira/{siteKey}/color")
+    suspend fun setOrgColor(
+        @Path("siteKey") siteKey: String,
+        @Body body: OrgColorRequest,
+    ): OkResponse
+
     @POST("api/devices")
     suspend fun registerDevice(@Body body: DeviceRequest): OkResponse
 
@@ -293,6 +302,10 @@ data class SummaryRequest(val summary: String)
 
 @Serializable
 data class AutoStartRequest(val enabled: Boolean)
+
+/** Pin an org's palette slot (1..8), or `auto = true` to release the pin. */
+@Serializable
+data class OrgColorRequest(val slot: Int? = null, val auto: Boolean? = null)
 
 @Serializable
 data class AnswerRequest(

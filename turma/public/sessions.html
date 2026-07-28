@@ -865,7 +865,10 @@ function siteKeyOfAgent(a) { return (a && a.jira && a.jira.siteKey) || ""; }
 // regardless of the current filter, matching board.js's use of the full org set.
 let orgColorByKey = new Map();
 function refreshOrgColors(agents) {
-  orgColorByKey = window.TurmaBoard.orgColorMap((agents || []).map(siteKeyOfAgent));
+  // Manual pins (XERK-145) come through TurmaOrg — its map is fed by both the
+  // poll payload and the orgColors SSE event, so a pin repaints at once.
+  orgColorByKey = window.TurmaBoard.orgColorMap((agents || []).map(siteKeyOfAgent),
+    window.TurmaOrg.orgColors());
 }
 // Inline style setting --org for a card wrap; empty for a host with no org (leaves
 // the card on plain --surface). The card CSS color-mixes --org into --surface.
@@ -2548,6 +2551,16 @@ function connectSSE() {
   es.addEventListener("removed", (e) => {
     try { const { key } = JSON.parse(e.data); cache.agents = (cache.agents || []).filter(a => a.key !== key); }
     catch { return; }
+    render(cache);
+  });
+  // An org's color pin changed (XERK-145): org.js owns the live map; patching
+  // this page's cache keeps the next render's TurmaOrg.update(cache) from
+  // regressing the pins to the stale copy the initial poll fetched.
+  es.addEventListener("orgColors", (e) => {
+    let oc;
+    try { oc = JSON.parse(e.data); } catch { return; }
+    if (!cache) return;   // org.js already took the event; nothing painted yet
+    cache.orgColors = oc;
     render(cache);
   });
   // The header's per-org auto-start switches (XERK-41) ride the same socket —

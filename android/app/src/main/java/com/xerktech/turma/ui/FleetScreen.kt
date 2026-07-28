@@ -76,7 +76,9 @@ fun FleetScreen(
     val agents = remember(fleet.agents, org) { scopedAgents(fleet.agents, org) }
     // Org card tints (XERK-142) come from the WHOLE fleet's org set, not the scoped
     // one, so a host card keeps its colour regardless of the header's org filter.
-    val orgColors = remember(fleet.agents) { orgColorMap(fleet.agents.map { siteKeyOf(it) }) }
+    val orgColors = remember(fleet.agents, fleet.orgColors) {
+        orgColorMap(fleet.agents.map { siteKeyOf(it) }, fleet.orgColors)
+    }
     val snackbar = remember { SnackbarHostState() }
 
     LaunchedEffect(Unit) { vm.start() }

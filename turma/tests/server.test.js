@@ -52,6 +52,10 @@ process.env.TICKET_MODELS_FILE = path.join(
   os.tmpdir(),
   `turma-test-ticket-models-${process.pid}.json`
 );
+process.env.ORG_COLORS_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-org-colors-${process.pid}.json`
+);
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
 process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-archive-"));
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
@@ -108,6 +112,7 @@ const {
   TERM_OSC52_JS,
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStartOrgs, setAutoStartOrg,
+  orgColors, setOrgColor,
   migrations, advanceMigrations,
 } = hub;
 
@@ -3052,6 +3057,53 @@ test("POST /api/jira/<site>/autostart rejects a bad body and an unknown org", as
     { body: { enabled: true }, headers: userHeaders });
   assert.equal(r.status, 404);
   assert.equal("nobody.atlassian.net" in autoStartOrgs, false);
+});
+
+// ---- manual org colors (XERK-145) -------------------------------------------
+
+test("POST /api/jira/<site>/color pins the slot, rides the payload, releases on auto", async () => {
+  await asBeat("ocApi", "ocapi.atlassian.net", { autoStart: false });
+
+  // Pin slot 3.
+  let r = await request("POST", "/api/jira/ocapi.atlassian.net/color",
+    { body: { slot: 3 }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true, slot: 3 });
+  assert.equal(orgColors["ocapi.atlassian.net"], 3);
+
+  // It rides the fleet payload as a top-level siteKey -> slot map.
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.orgColors["ocapi.atlassian.net"], 3);
+
+  // Release back to auto — the key is removed (presence = pinned).
+  r = await request("POST", "/api/jira/ocapi.atlassian.net/color",
+    { body: { auto: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true, slot: null });
+  assert.equal("ocapi.atlassian.net" in orgColors, false);
+});
+
+test("POST /api/jira/<site>/color rejects a bad slot and an unknown org", async () => {
+  await asBeat("ocApi2", "ocapi2.atlassian.net", { autoStart: false });
+  // Out-of-range, non-integer, or missing slot without auto.
+  for (const body of [{}, { slot: 0 }, { slot: 9 }, { slot: 2.5 }, { slot: "3" }, { auto: false }]) {
+    const r = await request("POST", "/api/jira/ocapi2.atlassian.net/color",
+      { body, headers: userHeaders });
+    assert.equal(r.status, 400, JSON.stringify(body));
+  }
+  // An org no host reports can't be pinned (no phantom entries).
+  const r = await request("POST", "/api/jira/nobody.atlassian.net/color",
+    { body: { slot: 3 }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal("nobody.atlassian.net" in orgColors, false);
+});
+
+test("POST /api/jira/<site>/color needs the user login", async () => {
+  await asBeat("ocApi3", "ocapi3.atlassian.net", { autoStart: false });
+  const r = await request("POST", "/api/jira/ocapi3.atlassian.net/color",
+    { body: { slot: 3 } });
+  assert.equal(r.status, 401);
+  assert.equal("ocapi3.atlassian.net" in orgColors, false);
 });
 
 test("POST /api/jira/<site>/autostart needs the user login", async () => {

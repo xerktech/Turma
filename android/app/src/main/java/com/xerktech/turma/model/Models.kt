@@ -27,6 +27,9 @@ data class AgentsResponse(
     // a ticket's session runs, when the operator overrode the login's default.
     // Hub-owned and durable like ticketAgents; absent on older hubs.
     val ticketModels: Map<String, TicketModelPin> = emptyMap(),
+    // Manual org-color pins (XERK-145), keyed by siteKey, value the palette slot
+    // 1..8 (presence = pinned). Hub-owned and durable; absent on older hubs.
+    val orgColors: Map<String, Int> = emptyMap(),
 )
 
 /** One ticket->agent pin (the web board's Agent row; hub ticket-agents store). */

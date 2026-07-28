@@ -119,7 +119,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     // The header's org filter (org.js). Stubbed as the identity scope ("all
     // orgs") so these tests see every fabricated host; `setOrg` lets an
     // org-scoping test narrow it.
-    TurmaOrg: { _k: "", get() { return this._k; }, filter(a) { return this._k ? (a || []).filter((x) => (x.jira && x.jira.siteKey) === this._k) : (a || []); }, update: noop, subscribe: noop, sse: noop },
+    TurmaOrg: { _k: "", get() { return this._k; }, filter(a) { return this._k ? (a || []).filter((x) => (x.jira && x.jira.siteKey) === this._k) : (a || []); }, update: noop, subscribe: noop, sse: noop, orgColors: () => ({}) },
     TurmaBoard,
     scrollTo: noop, innerWidth: 1200, innerHeight: 800,
   };

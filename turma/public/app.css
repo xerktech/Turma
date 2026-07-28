@@ -175,6 +175,39 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 .org-row.active .org-row-main { color: var(--accent); font-weight: 600; }
 .org-row-main .chip-n { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .org-row-main .chip-stale { color: var(--warning); font-size: 11px; }
+/* The color-chip segment (XERK-145): the org's current dot, opening the swatch
+   strip below its row. Divided from the pick like the auto segment. */
+.org-chip-color {
+  font: inherit; padding: 5px 9px; cursor: pointer;
+  color: var(--muted); background: transparent;
+  border: none; border-left: 1px solid var(--border); border-radius: 0;
+  display: inline-flex; align-items: center; flex: none;
+}
+.org-chip-color .org-color-dot {
+  width: 9px; height: 9px; border-radius: 50%; background: var(--org); flex: none;
+  box-shadow: 0 0 0 1px var(--border);
+}
+.org-chip-color:hover .org-color-dot, .org-chip-color[aria-expanded="true"] .org-color-dot {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+/* The swatch strip an org row expands into: one swatch per palette slot, plus
+   the "auto" release back to the hash-assigned color. */
+.org-swatch-row {
+  display: flex; align-items: center; gap: 6px; padding: 4px 10px 6px;
+}
+.org-swatch {
+  width: 16px; height: 16px; border-radius: 50%; cursor: pointer; padding: 0;
+  background: var(--org); border: 1px solid var(--border); flex: none;
+}
+.org-swatch:hover { box-shadow: 0 0 0 2px var(--accent); }
+.org-swatch.picked { box-shadow: 0 0 0 2px var(--accent); }
+.org-swatch-auto {
+  font: inherit; font-size: 11px; padding: 1px 8px; cursor: pointer;
+  color: var(--muted); background: transparent;
+  border: 1px solid var(--border); border-radius: 999px; flex: none;
+}
+.org-swatch-auto:hover { color: var(--ink); }
+.org-swatch-auto.picked { color: var(--accent); border-color: var(--accent); }
 /* The auto-start toggle segment, divided from the pick by an inner border. */
 .org-chip-auto {
   font: inherit; font-size: 11px; padding: 5px 10px; cursor: pointer;

@@ -1,6 +1,8 @@
 package com.xerktech.turma.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -74,11 +76,16 @@ fun OrgFilterAction(vm: OrgViewModel = viewModel()) {
 
     // One assignment of unique per-org colors over the whole org set, so an org's
     // dot here is the color its cards and columns paint elsewhere (XERK-48).
-    val colorMap = remember(sites) { orgColorMap(sites.map { it.siteKey }) }
+    // Manual pins (XERK-145) ride the fleet payload and beat the hash.
+    val colorMap = remember(sites, fleet.orgColors) {
+        orgColorMap(sites.map { it.siteKey }, fleet.orgColors)
+    }
     val key = effectiveOrg(stored, sites)
     val scoped = sites.firstOrNull { it.siteKey == key }
     val now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis()
     var open by remember { mutableStateOf(false) }
+    // The org whose color-swatch strip is expanded (XERK-145), or null.
+    var colorFor by remember { mutableStateOf<String?>(null) }
 
     Box {
         TextButton(onClick = { open = true }) {
@@ -98,10 +105,10 @@ fun OrgFilterAction(vm: OrgViewModel = viewModel()) {
             )
             Icon(Icons.Filled.ArrowDropDown, "Filter by org")
         }
-        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+        DropdownMenu(expanded = open, onDismissRequest = { open = false; colorFor = null }) {
             DropdownMenuItem(
                 text = { OrgRowLabel("All orgs", null, sites.sumOf { it.tickets.size }, null, key.isBlank()) },
-                onClick = { open = false; vm.setOrg("") },
+                onClick = { open = false; colorFor = null; vm.setOrg("") },
             )
             for (s in sites) {
                 OrgMenuRow(
@@ -111,17 +118,63 @@ fun OrgFilterAction(vm: OrgViewModel = viewModel()) {
                     now = now,
                     autoOn = autoStartOn(fleet.autoStartOrgs, s.siteKey),
                     onToggleAuto = { vm.setAutoStart(s.siteKey, it) },
-                    onPick = { open = false; vm.setOrg(s.siteKey) },
+                    onPick = { open = false; colorFor = null; vm.setOrg(s.siteKey) },
+                    onToggleColor = { colorFor = if (colorFor == s.siteKey) null else s.siteKey },
                 )
+                // The swatch strip the color dot expands into (XERK-145): one
+                // swatch per palette slot — the pinned one ringed — plus the
+                // auto release. A pick saves and closes the strip (the menu
+                // stays up), matching the web's contract.
+                if (colorFor == s.siteKey) {
+                    OrgSwatchRow(
+                        pinned = fleet.orgColors[s.siteKey],
+                        onPick = { slot -> colorFor = null; vm.setOrgColor(s.siteKey, slot) },
+                    )
+                }
             }
         }
     }
 }
 
+/** One swatch per palette slot (1..8) plus the "auto" release (XERK-145). */
+@Composable
+private fun OrgSwatchRow(pinned: Int?, onPick: (Int?) -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+    ) {
+        for (n in 1..TurmaColors.series.size) {
+            Box(
+                Modifier
+                    .size(20.dp)
+                    .clip(CircleShape)
+                    .background(TurmaColors.series[n - 1])
+                    .border(
+                        width = if (pinned == n) 2.dp else 1.dp,
+                        color = if (pinned == n) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.outlineVariant,
+                        shape = CircleShape,
+                    )
+                    .clickable { onPick(n) },
+            )
+        }
+        TextButton(onClick = { onPick(null) }) {
+            Text(
+                "auto",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (pinned == null) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
 /**
- * One org's row: the scope pick, plus its auto-start switch as the trailing
- * control (the second segment of the old divided chip). The switch handles its
- * own tap, so touching it flips auto-start without also re-scoping the fleet.
+ * One org's row: the scope pick, plus its color dot (XERK-145) and auto-start
+ * switch as the trailing controls (the segments of the old divided chip). Each
+ * trailing control handles its own tap, so touching it doesn't also re-scope
+ * the fleet.
  */
 @Composable
 private fun OrgMenuRow(
@@ -132,6 +185,7 @@ private fun OrgMenuRow(
     autoOn: Boolean,
     onToggleAuto: (Boolean) -> Unit,
     onPick: () -> Unit,
+    onToggleColor: () -> Unit,
 ) {
     // An org whose every host is offline is still shown (its last report is the
     // truth we have), flagged with how stale that report is.
@@ -146,6 +200,15 @@ private fun OrgMenuRow(
         onClick = onPick,
         trailingIcon = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                // The org's color, tappable to open the swatch strip (XERK-145).
+                Box(
+                    Modifier
+                        .size(16.dp)
+                        .clip(CircleShape)
+                        .background(color)
+                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
+                        .clickable(onClick = onToggleColor),
+                )
                 Text(
                     "auto",
                     style = MaterialTheme.typography.labelSmall,

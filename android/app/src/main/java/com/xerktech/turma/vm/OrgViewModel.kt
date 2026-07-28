@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.net.AutoStartRequest
+import com.xerktech.turma.net.OrgColorRequest
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -40,6 +41,25 @@ class OrgViewModel(app: Application) : AndroidViewModel(app) {
                 container.client.api.setAutoStart(siteKey, AutoStartRequest(enabled))
             }.isSuccess
             _messages.tryEmit(if (ok) "✓ auto-start updated" else "✗ hub unreachable")
+            container.fleet.nudge()
+        }
+    }
+
+    /**
+     * Pin an org's palette slot (1..8), or release it back to auto with a null
+     * slot (XERK-145). Hub-owned durable state like the auto-start opt-in; the
+     * fleet payload's orgColors (plus its SSE event) reflects it on the next
+     * poll, so every screen's org tint follows.
+     */
+    fun setOrgColor(siteKey: String, slot: Int?) {
+        viewModelScope.launch {
+            val ok = runCatching {
+                container.client.api.setOrgColor(
+                    siteKey,
+                    if (slot != null) OrgColorRequest(slot = slot) else OrgColorRequest(auto = true),
+                )
+            }.isSuccess
+            _messages.tryEmit(if (ok) "✓ org color updated" else "✗ hub unreachable")
             container.fleet.nudge()
         }
     }

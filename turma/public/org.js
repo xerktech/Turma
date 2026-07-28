@@ -83,10 +83,32 @@
       `<span class="org-chev" aria-hidden="true">▾</span></button>`;
   }
 
-  // The menu: "All orgs" plus one row per reporting org. Each named row is two
-  // segments — the scope pick, and the org's auto-start switch — the same
-  // divided-pill shape the board chips carried, laid out as a list.
-  function menuHtml(sites, key, colorMap, autoMap, ageStr) {
+  // The swatch strip an org row expands into when its color chip is clicked
+  // (XERK-145): one swatch per palette slot — the pinned one marked — plus an
+  // "auto" release back to the hash-assigned color. Every option is a complete
+  // answer, so a click saves and closes (the repo/agent picker contract).
+  function swatchRowHtml(siteKey, pin) {
+    const B = board();
+    const slots = B.SLOTS || 8;
+    const cells = [];
+    for (let n = 1; n <= slots; n++) {
+      cells.push(
+        `<button type="button" class="org-swatch${pin === n ? " picked" : ""}"` +
+        ` data-org-swatch="${n}" data-org-swatch-key="${esc(siteKey)}"` +
+        ` style="--org:var(--s${n})" aria-pressed="${pin === n ? "true" : "false"}"` +
+        ` title="Color ${n}${pin === n ? " (current)" : ""}"></button>`);
+    }
+    return `<div class="org-swatch-row" data-org-swatch-row="${esc(siteKey)}">${cells.join("")}` +
+      `<button type="button" class="org-swatch-auto${pin ? "" : " picked"}"` +
+      ` data-org-swatch="auto" data-org-swatch-key="${esc(siteKey)}"` +
+      ` title="Let the palette assign this org's color">auto</button></div>`;
+  }
+
+  // The menu: "All orgs" plus one row per reporting org. Each named row is three
+  // segments — the scope pick, the org's color chip (XERK-145), and its
+  // auto-start switch — the divided-pill shape the board chips carried, laid
+  // out as a list. `colorFor` is the org whose swatch strip is expanded.
+  function menuHtml(sites, key, colorMap, autoMap, ageStr, colorPins, colorFor) {
     const B = board();
     const total = (sites || []).reduce((n, s) => n + (s.tickets || []).length, 0);
     const rows = [
@@ -97,7 +119,7 @@
       `<span class="chip-n">${total}</span></button></div>`,
     ];
     for (const s of sites || []) {
-      const color = colorMap.get(s.siteKey) || B.orgColor(s.siteKey);
+      const color = colorMap.get(s.siteKey) || B.orgColor(s.siteKey, null, colorPins);
       const on = autoOn(autoMap, s.siteKey);
       const hosts = (s.hosts || []).length;
       const age = s.online ? "" : (ageStr ? ageStr(s.lastFetched) : "");
@@ -111,18 +133,26 @@
         `<span class="chip-n">${(s.tickets || []).length}</span>` +
         (s.online ? "" : `<span class="chip-stale" title="No host reporting this org is online — showing its last report">⚠ offline${age ? " · synced " + esc(age) + " ago" : ""}</span>`) +
         `</button>` +
+        `<button type="button" class="org-chip-color" data-org-color="${esc(s.siteKey)}"` +
+        ` aria-expanded="${colorFor === s.siteKey ? "true" : "false"}"` +
+        ` title="Change this org's color"><span class="org-color-dot" aria-hidden="true"></span></button>` +
         `<button type="button" class="org-chip-auto${on ? " on" : ""}" data-org-auto="${esc(s.siteKey)}"` +
         ` aria-pressed="${on ? "true" : "false"}"` +
         ` title="Auto: start To Do tickets, stop Done sessions — ${on ? "ON, click to turn off" : "OFF, click to turn on"}">` +
         `<span class="org-auto-dot" aria-hidden="true"></span>auto</button></div>`);
+      if (colorFor === s.siteKey) {
+        // orgSlotPin validates (0-based or null); the strip marks the 1-based slot.
+        const pin = B.orgSlotPin ? B.orgSlotPin(colorPins, s.siteKey) : null;
+        rows.push(swatchRowHtml(s.siteKey, pin === null ? null : pin + 1));
+      }
     }
     return `<div class="org-menu" role="menu">${rows.join("")}</div>`;
   }
 
-  function controlHtml(sites, key, colorMap, autoMap, open, ageStr) {
+  function controlHtml(sites, key, colorMap, autoMap, open, ageStr, colorPins, colorFor) {
     return `<span class="org-filter${open ? " open" : ""}">` +
       buttonHtml(sites, key, colorMap, open) +
-      (open ? menuHtml(sites, key, colorMap, autoMap, ageStr) : "") +
+      (open ? menuHtml(sites, key, colorMap, autoMap, ageStr, colorPins, colorFor) : "") +
       `</span>`;
   }
 
@@ -139,6 +169,8 @@
   let stored = "";        // what localStorage says, whether or not it applies
   let sites = [];         // the orgs the fleet currently reports
   let autoMap = {};       // the hub's per-org auto-start opt-in
+  let colorPins = {};     // the hub's manual org-color pins (XERK-145)
+  let colorFor = null;    // the org whose swatch strip is expanded, or null
   let open = false;
   let slot = null;
   let painted = "";       // last markup written, so a beat repaint is a no-op
@@ -177,7 +209,7 @@
     if (typeof fn === "function") listeners.push(fn);
   }
 
-  function close() { open = false; }
+  function close() { open = false; colorFor = null; }
 
   // Feed the control the heartbeat every page already has. Cheap on a settled
   // fleet: the markup is rebuilt but only written when it actually changed, so
@@ -186,6 +218,7 @@
     const B = board();
     sites = B.mergeSites((data && data.agents) || []);
     if (data && data.autoStartOrgs) autoMap = data.autoStartOrgs;
+    if (data && data.orgColors) colorPins = data.orgColors;
     paint();
   }
 
@@ -193,11 +226,11 @@
     if (!slot) return;
     const B = board();
     const key = get();
-    const colorMap = B.orgColorMap(sites.map(s => s.siteKey));
+    const colorMap = B.orgColorMap(sites.map(s => s.siteKey), colorPins);
     // Nothing to scope by until at least one host reports a tracker org, so the
     // slot stays empty and collapses (#hdrOrg:empty in app.css) rather than
     // offering a menu whose only entry is "All orgs".
-    const html = sites.length ? controlHtml(sites, key, colorMap, autoMap, open, B.ageStr) : "";
+    const html = sites.length ? controlHtml(sites, key, colorMap, autoMap, open, B.ageStr, colorPins, colorFor) : "";
     if (html === painted) return;
     painted = html;
     slot.innerHTML = html;
@@ -227,6 +260,37 @@
     }
   }
 
+  // Pin an org's palette slot (1..8), or release it back to auto (slot null) —
+  // XERK-145. Hub-owned durable state like the auto-start opt-in, painted
+  // optimistically and rolled back if the POST fails. notify() runs on every
+  // change so each page repaints its org-tinted cards at once — every page
+  // reads the pins through orgColors() below, so a repaint sees the new map.
+  async function setOrgColor(siteKey, slotN) {
+    const prev = colorPins;
+    colorPins = Object.assign({}, colorPins);
+    if (slotN) colorPins[siteKey] = slotN; else delete colorPins[siteKey];
+    colorFor = null;
+    paint();
+    notify();
+    let ok = false;
+    try {
+      const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/color`,
+        { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify(slotN ? { slot: slotN } : { auto: true }) });
+      if (r.status === 401) { location.href = "/login"; return; }
+      ok = r.ok;
+    } catch { /* network error — fall through to rollback */ }
+    if (!ok) {
+      colorPins = prev;
+      paint();
+      notify();
+    }
+  }
+
+  // The current org-color pins, for the pages' own card tints: one live source
+  // (fed by update() and the SSE event), so a pin lands everywhere at once.
+  function orgColors() { return colorPins; }
+
   // The hub broadcasts the whole (tiny) opt-in map whenever it changes. Each
   // page hands its EventSource over rather than opening a second one.
   function sse(es) {
@@ -237,6 +301,15 @@
       autoMap = m || {};
       paint();
     });
+    es.addEventListener("orgColors", (e) => {
+      let m;
+      try { m = JSON.parse(e.data); } catch { return; }
+      colorPins = m || {};
+      paint();
+      // The pins tint cards on every page, so a change (this tab's or another's)
+      // repaints more than this control.
+      notify();
+    });
   }
 
   function mount(doc) {
@@ -244,7 +317,7 @@
     if (!slot) return;
     // A freshly-mounted control starts closed, with nothing painted and nothing
     // known about the fleet — it learns the orgs from the first update().
-    painted = ""; open = false; sites = []; autoMap = {};
+    painted = ""; open = false; sites = []; autoMap = {}; colorPins = {}; colorFor = null;
     stored = readStored();
     // One delegated listener set, attached once — the control's markup is
     // replaced on every change, so per-element handlers would have to be
@@ -258,6 +331,19 @@
       e.turmaOrgHandled = true;
       const auto = e.target.closest("[data-org-auto]");
       if (auto) { setAutoStart(auto.dataset.orgAuto, !auto.classList.contains("on")); return; }
+      const swatch = e.target.closest("[data-org-swatch]");
+      if (swatch) {
+        const v = swatch.dataset.orgSwatch;
+        setOrgColor(swatch.dataset.orgSwatchKey, v === "auto" ? null : Number(v));
+        return;
+      }
+      const colorChip = e.target.closest("[data-org-color]");
+      if (colorChip) {
+        const k = colorChip.dataset.orgColor;
+        colorFor = colorFor === k ? null : k;
+        paint();
+        return;
+      }
       const pick = e.target.closest("[data-org-key]");
       if (pick) { set(pick.dataset.orgKey); return; }
       if (e.target.closest("[data-org-toggle]")) { open = !open; paint(); }
@@ -282,8 +368,8 @@
   const api = {
     KEY, LEGACY_KEY, esc,
     siteKeyOf, filterAgents, effectiveKey, autoOn,
-    buttonHtml, menuHtml, controlHtml,
-    get, set, subscribe, update, sse, setAutoStart, mount,
+    buttonHtml, menuHtml, controlHtml, swatchRowHtml,
+    get, set, subscribe, update, sse, setAutoStart, setOrgColor, orgColors, mount,
     // The common call site: scope the beat's fleet to the current pick.
     filter(agents) { return filterAgents(agents, get()); },
   };

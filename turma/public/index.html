@@ -822,8 +822,11 @@ function render(data) {
 // (not the org-filtered view) so an org keeps its colour regardless of the filter.
 let orgColorByKey = new Map();
 function refreshOrgColors(agents) {
+  // Manual pins (XERK-145) come through TurmaOrg — its map is fed by both the
+  // poll payload and the orgColors SSE event, so a pin repaints at once.
   orgColorByKey = window.TurmaBoard.orgColorMap(
-    (agents || []).map(a => (a.jira && a.jira.siteKey) || ""));
+    (agents || []).map(a => (a.jira && a.jira.siteKey) || ""),
+    window.TurmaOrg.orgColors());
 }
 // Inline style setting --org for a host card; empty for a host with no org (leaves
 // it on plain --surface). The card CSS color-mixes --org into --surface.
@@ -1499,6 +1502,16 @@ function connectSSE() {
   es.addEventListener("removed", (e) => {
     try { const { key } = JSON.parse(e.data); cache.agents = (cache.agents || []).filter(a => a.key !== key); }
     catch { return; }
+    bgRender();
+  });
+  // An org's color pin changed (XERK-145): org.js owns the live map; patching
+  // this page's cache keeps the next render's TurmaOrg.update(cache) from
+  // regressing the pins to the stale copy the initial poll fetched.
+  es.addEventListener("orgColors", (e) => {
+    let oc;
+    try { oc = JSON.parse(e.data); } catch { return; }
+    if (!cache) return;   // org.js already took the event; nothing painted yet
+    cache.orgColors = oc;
     bgRender();
   });
   // The header's per-org auto-start switches (XERK-41) ride the same socket —

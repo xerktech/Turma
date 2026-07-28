@@ -217,6 +217,46 @@ test("orgColor: single-org helper falls back to the preferred slot without a set
   assert.equal(orgColor("gamma.atlassian.net", four), orgColorMap(four).get("gamma.atlassian.net"));
 });
 
+test("orgColorMap: a manual pin takes exactly its slot, and autos probe around it (XERK-145)", () => {
+  const four = ["alpha.atlassian.net", "beta.atlassian.net", "gamma.atlassian.net", "delta.atlassian.net"];
+  // Unpinned, gamma hashes to --s4 (locked above). Pin it to slot 1.
+  const m = orgColorMap(four, { "gamma.atlassian.net": 1 });
+  assert.equal(m.get("gamma.atlassian.net"), "var(--s1)");
+  // The others keep their (non-colliding) hash slots untouched.
+  assert.equal(m.get("alpha.atlassian.net"), "var(--s7)");
+  assert.equal(m.get("beta.atlassian.net"), "var(--s5)");
+  assert.equal(m.get("delta.atlassian.net"), "var(--s3)");
+  // An auto org whose preferred slot is pinned away probes to the next free one:
+  // "a.net" prefers slot 3 (--s4); pin beta onto --s4 and a.net moves on.
+  const m2 = orgColorMap(["a.net", "beta.atlassian.net"], { "beta.atlassian.net": 4 });
+  assert.equal(m2.get("beta.atlassian.net"), "var(--s4)");
+  assert.equal(m2.get("a.net"), "var(--s5)");
+});
+
+test("orgColorMap: two orgs pinned to one slot DO share it — the operator's explicit choice", () => {
+  const m = orgColorMap(["alpha.atlassian.net", "beta.atlassian.net"],
+    { "alpha.atlassian.net": 2, "beta.atlassian.net": 2 });
+  assert.equal(m.get("alpha.atlassian.net"), "var(--s2)");
+  assert.equal(m.get("beta.atlassian.net"), "var(--s2)");
+});
+
+test("orgColorMap: a malformed pin is ignored, never a broken style", () => {
+  const four = ["alpha.atlassian.net", "beta.atlassian.net", "gamma.atlassian.net", "delta.atlassian.net"];
+  const clean = orgColorMap(four);
+  for (const bad of [0, 9, -1, 2.5, "3", null, undefined, {}]) {
+    const m = orgColorMap(four, { "gamma.atlassian.net": bad });
+    assert.deepEqual([...m.entries()].sort(), [...clean.entries()].sort(), `pin ${JSON.stringify(bad)} ignored`);
+  }
+});
+
+test("orgColor: honors a pin, with and without the full set (XERK-145)", () => {
+  const four = ["alpha.atlassian.net", "beta.atlassian.net", "gamma.atlassian.net", "delta.atlassian.net"];
+  const pins = { "gamma.atlassian.net": 1 };
+  assert.equal(orgColor("gamma.atlassian.net", four, pins), "var(--s1)");
+  // No set: the pin still beats the hash fallback.
+  assert.equal(orgColor("gamma.atlassian.net", null, pins), "var(--s1)");
+});
+
 test("orgName: the org, not the Jira Cloud host", () => {
   assert.equal(orgName("myorg.atlassian.net"), "myorg");
   assert.equal(orgName("MyOrg.Atlassian.Net"), "MyOrg", "case-insensitive suffix");

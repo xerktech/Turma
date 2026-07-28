@@ -140,6 +140,50 @@ class BoardTest {
         assertTrue(orgColorIndex("x.atlassian.net", emptyList()) in 0..7)
     }
 
+    @Test fun `a manual pin takes exactly its slot and autos probe around it`() {
+        // Locked to the board.test.js XERK-145 vectors (wire slot 1..8 -> 0-based).
+        val four = listOf(
+            "alpha.atlassian.net", "beta.atlassian.net", "gamma.atlassian.net", "delta.atlassian.net",
+        )
+        val m = orgColorMap(four, mapOf("gamma.atlassian.net" to 1))
+        assertEquals(0, m["gamma.atlassian.net"])  // --s1, the pin
+        assertEquals(6, m["alpha.atlassian.net"])  // the rest keep their hash slots
+        assertEquals(4, m["beta.atlassian.net"])
+        assertEquals(2, m["delta.atlassian.net"])
+        // An auto org whose preferred slot is pinned away probes to the next free.
+        val m2 = orgColorMap(listOf("a.net", "beta.atlassian.net"), mapOf("beta.atlassian.net" to 4))
+        assertEquals(3, m2["beta.atlassian.net"])  // --s4, the pin
+        assertEquals(4, m2["a.net"])               // --s5, probed past it
+    }
+
+    @Test fun `two orgs pinned to one slot share it - the operator's explicit choice`() {
+        val m = orgColorMap(
+            listOf("alpha.atlassian.net", "beta.atlassian.net"),
+            mapOf("alpha.atlassian.net" to 2, "beta.atlassian.net" to 2),
+        )
+        assertEquals(1, m["alpha.atlassian.net"])
+        assertEquals(1, m["beta.atlassian.net"])
+    }
+
+    @Test fun `a malformed pin is ignored`() {
+        val four = listOf(
+            "alpha.atlassian.net", "beta.atlassian.net", "gamma.atlassian.net", "delta.atlassian.net",
+        )
+        val clean = orgColorMap(four)
+        for (bad in listOf(0, 9, -1)) {
+            assertEquals(clean, orgColorMap(four, mapOf("gamma.atlassian.net" to bad)))
+        }
+    }
+
+    @Test fun `orgColorIndex honors a pin with and without the full set`() {
+        val four = listOf(
+            "alpha.atlassian.net", "beta.atlassian.net", "gamma.atlassian.net", "delta.atlassian.net",
+        )
+        val pins = mapOf("gamma.atlassian.net" to 1)
+        assertEquals(0, orgColorIndex("gamma.atlassian.net", four, pins))
+        assertEquals(0, orgColorIndex("gamma.atlassian.net", emptyList(), pins))
+    }
+
     @Test fun `org name strips the atlassian net suffix`() {
         assertEquals("xerktech", orgName("xerktech.atlassian.net"))
         assertEquals("self-hosted.example.com", orgName("self-hosted.example.com"))
