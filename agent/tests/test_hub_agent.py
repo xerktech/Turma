@@ -8712,6 +8712,333 @@ class TestStageJiraIssue(ManagerMixin, unittest.TestCase):
                          [{"key": "ENG-9", "issue": None, "error": "x"}])
 
 
+# --- Ticket creation (XERK-137) ------------------------------------------------
+
+class TestTextToAdf(unittest.TestCase):
+    """Plain text -> the minimal ADF doc Jira's create API wants."""
+
+    def test_paragraphs_and_blank_lines(self):
+        doc = ha._text_to_adf("one\n\ntwo")
+        self.assertEqual(doc["type"], "doc")
+        self.assertEqual(doc["content"][0],
+                         {"type": "paragraph",
+                          "content": [{"type": "text", "text": "one"}]})
+        self.assertEqual(doc["content"][1], {"type": "paragraph"})  # blank line
+        self.assertEqual(doc["content"][2]["content"][0]["text"], "two")
+
+    def test_empty_is_still_a_valid_doc(self):
+        self.assertEqual(ha._text_to_adf("")["content"], [{"type": "paragraph"}])
+
+
+class TestJiraAccountId(unittest.TestCase):
+    def test_caches_the_lookup(self):
+        calls = []
+
+        def fg(path, params):
+            calls.append(path)
+            return {"accountId": "abc"}
+
+        with mock.patch.object(ha, "_JIRA_MYSELF", {"accountId": None, "tried": False}), \
+             mock.patch.object(ha, "jira_get", fg):
+            self.assertEqual(ha._jira_account_id(), "abc")
+            self.assertEqual(ha._jira_account_id(), "abc")  # served from cache
+        self.assertEqual(calls, ["/rest/api/3/myself"])
+
+    def test_failure_is_swallowed_and_not_retried(self):
+        with mock.patch.object(ha, "_JIRA_MYSELF", {"accountId": None, "tried": False}), \
+             mock.patch.object(ha, "jira_get", side_effect=RuntimeError("401")):
+            self.assertIsNone(ha._jira_account_id())
+
+
+class TestCreateJiraIssue(unittest.TestCase):
+    def test_builds_fields_and_self_assigns(self):
+        seen = {}
+
+        def fake_post(path, body):
+            seen["path"], seen["body"] = path, body
+            return {"key": "ENG-99"}
+
+        with mock.patch.object(ha, "JIRA_SITE", "MyOrg.atlassian.net"), \
+             mock.patch.object(ha, "jira_post", fake_post), \
+             mock.patch.object(ha, "_jira_account_id", lambda: "acc-1"):
+            out = ha.create_jira_issue("ENG", "10001", "Title", "Desc", ["a", "b"])
+        self.assertEqual(seen["path"], "/rest/api/3/issue")
+        f = seen["body"]["fields"]
+        self.assertEqual(f["project"], {"key": "ENG"})
+        self.assertEqual(f["summary"], "Title")
+        self.assertEqual(f["issuetype"], {"id": "10001"})
+        self.assertEqual(f["labels"], ["a", "b"])
+        self.assertEqual(f["assignee"], {"id": "acc-1"})
+        self.assertEqual(f["description"]["type"], "doc")
+        self.assertEqual(out, {"key": "ENG-99",
+                               "url": "https://myorg.atlassian.net/browse/ENG-99"})
+
+    def test_omits_optional_fields_when_empty(self):
+        captured = {}
+
+        def fp(path, body):
+            captured["body"] = body
+            return {"key": "E-1"}
+
+        with mock.patch.object(ha, "JIRA_SITE", "o.atlassian.net"), \
+             mock.patch.object(ha, "jira_post", fp), \
+             mock.patch.object(ha, "_jira_account_id", lambda: None):
+            ha.create_jira_issue("E", "1", "T", "", [])
+        f = captured["body"]["fields"]
+        for k in ("assignee", "description", "labels"):
+            self.assertNotIn(k, f)
+
+    def test_missing_key_raises(self):
+        with mock.patch.object(ha, "JIRA_SITE", "o.atlassian.net"), \
+             mock.patch.object(ha, "jira_post", lambda p, b: {}), \
+             mock.patch.object(ha, "_jira_account_id", lambda: None):
+            with self.assertRaises(RuntimeError):
+                ha.create_jira_issue("E", "1", "T", "", [])
+
+
+class TestJiraCreateMeta(unittest.TestCase):
+    def test_projects_and_labels(self):
+        def fg(path, params):
+            if "project/search" in path:
+                return {"values": [{"key": "ENG", "name": "Engineering"},
+                                   {"key": "OPS"}]}
+            if path == "/rest/api/3/label":
+                return {"values": ["turma", "bug", 7]}  # non-str dropped
+            raise AssertionError(path)
+
+        with mock.patch.object(ha, "jira_get", fg):
+            m = ha.jira_create_meta()
+        self.assertEqual(m["source"], "jira")
+        self.assertEqual(m["projects"], [{"key": "ENG", "name": "Engineering"},
+                                         {"key": "OPS", "name": "OPS"}])
+        self.assertEqual(m["labels"], ["turma", "bug"])
+
+    def test_label_fetch_failure_degrades(self):
+        def fg(path, params):
+            if "project/search" in path:
+                return {"values": [{"key": "ENG", "name": "Eng"}]}
+            raise RuntimeError("no labels")
+
+        with mock.patch.object(ha, "jira_get", fg):
+            self.assertEqual(ha.jira_create_meta()["labels"], [])
+
+
+class TestJiraIssueTypes(unittest.TestCase):
+    def test_excludes_subtasks_and_idless(self):
+        def fg(path, params):
+            self.assertIn("/createmeta/ENG/issuetypes", path)
+            return {"issueTypes": [
+                {"id": "1", "name": "Task"},
+                {"id": "2", "name": "Sub-task", "subtask": True},
+                {"name": "NoId"},
+            ]}
+
+        with mock.patch.object(ha, "jira_get", fg):
+            self.assertEqual(ha.jira_issue_types("ENG"), [{"id": "1", "name": "Task"}])
+
+
+class TestCreateAzureIssue(unittest.TestCase):
+    def test_builds_json_patch_ops(self):
+        seen = {}
+
+        def fake_create(project, wtype, ops):
+            seen.update(project=project, wtype=wtype, ops=ops)
+            return {"id": 77}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                 AZDO_TOKEN="p", AZDO_USER="me@x"), \
+             mock.patch.object(ha, "azure_create_workitem", fake_create):
+            out = ha.create_azure_issue("Proj", "Bug", "Title", "l1\nl2", ["t1", "t2"])
+        ops = {o["path"]: o["value"] for o in seen["ops"]}
+        self.assertEqual(ops["/fields/System.Title"], "Title")
+        self.assertIn("l1<br>l2", ops["/fields/System.Description"])
+        self.assertEqual(ops["/fields/System.Tags"], "t1; t2")
+        self.assertEqual(ops["/fields/System.AssignedTo"], "me@x")
+        self.assertEqual(seen["wtype"], "Bug")
+        self.assertEqual(out["key"], "77")
+        self.assertIn("/_workitems/edit/77", out["url"])
+
+    def test_escapes_html_and_skips_unknown_assignee(self):
+        captured = {}
+
+        def fc(p, w, ops):
+            captured["ops"] = ops
+            return {"id": 1}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER=""), \
+             mock.patch.object(ha, "_azure_self", lambda: None), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            ha.create_azure_issue("P", "Task", "T", "<script>", [])
+        desc = [o for o in captured["ops"]
+                if o["path"].endswith("Description")][0]["value"]
+        self.assertIn("&lt;script&gt;", desc)
+        self.assertFalse(any(o["path"].endswith("AssignedTo") for o in captured["ops"]))
+
+    def test_missing_id_raises(self):
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "_azure_self", lambda: None), \
+             mock.patch.object(ha, "azure_create_workitem", lambda p, w, o: {}):
+            with self.assertRaises(RuntimeError):
+                ha.create_azure_issue("P", "Task", "T", "", [])
+
+
+class TestAzureCreateMeta(unittest.TestCase):
+    def test_projects_and_tags(self):
+        def req(path, params, body=None):
+            if path == "/_apis/projects":
+                return {"value": [{"name": "Proj A"}, {"name": "Proj B"}]}
+            if path == "/_apis/wit/tags":
+                return {"value": [{"name": "tag1"}, {"name": "tag2"}]}
+            raise AssertionError(path)
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "azure_req", req):
+            m = ha.azure_create_meta()
+        self.assertEqual(m["source"], "azure")
+        self.assertEqual(m["projects"],
+                         [{"key": "Proj A", "name": "Proj A"},
+                          {"key": "Proj B", "name": "Proj B"}])
+        self.assertEqual(m["labels"], ["tag1", "tag2"])
+
+    def test_tag_failure_degrades(self):
+        def req(path, params, body=None):
+            if path == "/_apis/projects":
+                return {"value": [{"name": "P"}]}
+            raise RuntimeError("no tags")
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "azure_req", req):
+            self.assertEqual(ha.azure_create_meta()["labels"], [])
+
+
+class TestAzureWorkitemTypes(unittest.TestCase):
+    def test_excludes_disabled(self):
+        def req(path, params, body=None):
+            self.assertIn("/workitemtypes", path)
+            return {"value": [{"name": "Bug"}, {"name": "Old", "isDisabled": True},
+                              {"foo": 1}]}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "azure_req", req):
+            self.assertEqual(ha.azure_workitem_types("P"), [{"id": "Bug", "name": "Bug"}])
+
+
+class TestStageCreateMeta(ManagerMixin, unittest.TestCase):
+    """{type:"boardCreateMeta"}: two shapes on one deque, told apart by `project`;
+    every failure stages an `error` rather than raising out of the beat."""
+
+    def _cfg(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e",
+                                   JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN="")
+
+    def test_projects_shape(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "board_create_meta",
+                return_value={"projects": [{"key": "E", "name": "E"}],
+                              "labels": ["x"], "source": "jira"}):
+            sm._stage_create_meta(None)
+        r = sm.create_meta_results[0]
+        self.assertIsNone(r["project"])
+        self.assertEqual(r["projects"], [{"key": "E", "name": "E"}])
+        self.assertEqual(r["labels"], ["x"])
+        self.assertIsNone(r["error"])
+
+    def test_types_shape(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "board_issue_types",
+                return_value=[{"id": "1", "name": "Task"}]) as f:
+            sm._stage_create_meta("ENG")
+        f.assert_called_once_with("ENG")
+        r = sm.create_meta_results[0]
+        self.assertEqual(r["project"], "ENG")
+        self.assertEqual(r["types"], [{"id": "1", "name": "Task"}])
+
+    def test_error_stages_not_raises(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "board_create_meta", side_effect=RuntimeError("boom")):
+            sm._stage_create_meta(None)
+        self.assertTrue(sm.create_meta_results[0]["error"].startswith("boom"))
+
+    def test_unconfigured_says_so(self):
+        sm = self.make_manager()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="", AZDO_TOKEN=""):
+            sm._stage_create_meta(None)
+        self.assertIn("no board credentials", sm.create_meta_results[0]["error"])
+
+
+class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
+    """{type:"createTicket"}: creates and stages the outcome keyed by cmdId; a bad
+    request or a create failure stages an `error` rather than raising."""
+
+    def _cfg(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e",
+                                   JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN="")
+
+    def _cmd(self, **kw):
+        base = {"cmdId": "c1", "type": "createTicket", "project": "ENG",
+                "issueType": "1", "summary": "Hi", "description": "d",
+                "labels": ["a"]}
+        base.update(kw)
+        return base
+
+    def test_success_stages_key(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "create_board_issue",
+                return_value={"key": "ENG-5", "url": "u"}) as f:
+            sm._stage_create_ticket(self._cmd())
+        f.assert_called_once_with("ENG", "1", "Hi", "d", ["a"])
+        self.assertEqual(sm.create_ticket_results[0],
+                         {"cmdId": "c1", "key": "ENG-5", "url": "u", "error": None})
+
+    def test_missing_title_fails_without_creating(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(ha, "create_board_issue") as f:
+            sm._stage_create_ticket(self._cmd(summary="  "))
+        f.assert_not_called()
+        self.assertIn("title", sm.create_ticket_results[0]["error"])
+
+    def test_create_error_stages_bounded_error(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "create_board_issue",
+                side_effect=RuntimeError("Jira 400 " + "x" * 400)):
+            sm._stage_create_ticket(self._cmd())
+        r = sm.create_ticket_results[0]
+        self.assertIsNone(r["key"])
+        self.assertTrue(r["error"].startswith("Jira 400"))
+        self.assertLessEqual(len(r["error"]), 300)
+
+    def test_command_routes_and_acks(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "create_board_issue", return_value={"key": "E-1", "url": "u"}):
+            sm.handle_commands([self._cmd()])
+        self.assertEqual(sm.create_ticket_results[0]["key"], "E-1")
+        self.assertIn("c1", sm.acked)
+
+    def test_results_ride_payload_only_when_staged(self):
+        sm = self.make_manager()
+        sm.registry = []
+        p = sm.build_payload(1)
+        self.assertNotIn("createTicketResults", p)
+        self.assertNotIn("createMetaResults", p)
+        sm.create_ticket_results = [
+            {"cmdId": "c1", "key": "E-1", "url": "u", "error": None}]
+        sm.create_meta_results = [
+            {"project": None, "projects": [], "labels": [], "source": "jira",
+             "error": None}]
+        p = sm.build_payload(1)
+        self.assertEqual(p["createTicketResults"][0]["key"], "E-1")
+        self.assertEqual(p["createMetaResults"][0]["source"], "jira")
+
+
 class TestRefreshJira(ManagerMixin, unittest.TestCase):
     """The manager's slow-cadence Jira refresh: stale-cache fail-open (a fetch
     error keeps the prior tickets and surfaces only the error string)."""
