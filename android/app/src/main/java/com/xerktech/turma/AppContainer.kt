@@ -4,6 +4,7 @@ import android.content.Context
 import com.xerktech.turma.data.Config
 import com.xerktech.turma.data.DraftStore
 import com.xerktech.turma.data.OrgFilter
+import com.xerktech.turma.data.TextSizePref
 import com.xerktech.turma.net.Dictation
 import com.xerktech.turma.net.FleetRepository
 import com.xerktech.turma.net.HubClient
@@ -38,6 +39,13 @@ class AppContainer(context: Context) {
      * them — so it can't live in either screen's own state.
      */
     val drafts = DraftStore()
+
+    /**
+     * The in-session chat text size (XERK-144). Here for the same reason as [org]:
+     * it is ONE value shared by every chat — set from any session's settings menu,
+     * read by every transcript renderer (live chat, archive, ended review).
+     */
+    val textSize = TextSizePref(context.applicationContext)
 
     /** In-app self-updater (XERK-11); [installedVersion] read once from the package manager. */
     val updater = Updater(context.applicationContext, appScope, installedVersion(context))

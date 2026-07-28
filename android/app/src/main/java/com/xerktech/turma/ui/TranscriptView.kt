@@ -23,6 +23,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xerktech.turma.core.ChatItem
@@ -37,6 +38,14 @@ fun ChatItemView(item: ChatItem) {
         is ChatItem.TaskNote -> Pill("⚑ ${item.summary} (${item.status})")
     }
 }
+
+/**
+ * The fleet-wide chat text size (XERK-144): every hardcoded `.sp` below is scaled
+ * by this so one preference moves all of them together, keeping their relative
+ * proportions. Reads `ui.LocalTextSize`, provided at the app root.
+ */
+@Composable
+private fun scaledSp(base: Float): TextUnit = (base * LocalTextSize.current.current.scale).sp
 
 // The bubble keeps a max width so a long turn doesn't run edge to edge, but the
 // leftover gutter (available width − BASE_BUBBLE_MAX) is halved (XERK-74): the cap
@@ -65,8 +74,8 @@ private fun TranscriptBubble(b: ChatItem.Bubble) {
                 Text(
                     shown,
                     Modifier.padding(10.dp, 6.dp),
-                    fontSize = 13.sp,
-                    lineHeight = 18.sp,
+                    fontSize = scaledSp(13f),
+                    lineHeight = scaledSp(18f),
                     color = MaterialTheme.colorScheme.onSurface,
                 )
             }
@@ -78,8 +87,8 @@ private fun TranscriptBubble(b: ChatItem.Bubble) {
 private fun TranscriptThinking(text: String) {
     var open by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().clickable { open = !open }) {
-        Text("💭 thinking", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (open) Text(text, fontSize = 12.sp, lineHeight = 16.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 8.dp, top = 2.dp))
+        Text("💭 thinking", fontSize = scaledSp(12f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (open) Text(text, fontSize = scaledSp(12f), lineHeight = scaledSp(16f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 8.dp, top = 2.dp))
     }
 }
 
@@ -95,11 +104,11 @@ private fun TranscriptTool(t: ChatItem.Tool) {
     ) {
         Column(Modifier.padding(horizontal = 10.dp, vertical = 7.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("🔧 ${t.name}", fontWeight = FontWeight.SemiBold, fontSize = 12.sp, modifier = Modifier.weight(1f))
-                if (t.input.isNotBlank()) Text(t.input.take(48), fontSize = 11.sp, fontFamily = FontFamily.Monospace, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("🔧 ${t.name}", fontWeight = FontWeight.SemiBold, fontSize = scaledSp(12f), modifier = Modifier.weight(1f))
+                if (t.input.isNotBlank()) Text(t.input.take(48), fontSize = scaledSp(11f), fontFamily = FontFamily.Monospace, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             if (open && t.result.isNotBlank()) {
-                Text(t.result, Modifier.padding(top = 5.dp), fontSize = 11.sp, lineHeight = 15.sp, fontFamily = FontFamily.Monospace)
+                Text(t.result, Modifier.padding(top = 5.dp), fontSize = scaledSp(11f), lineHeight = scaledSp(15f), fontFamily = FontFamily.Monospace)
             }
         }
     }

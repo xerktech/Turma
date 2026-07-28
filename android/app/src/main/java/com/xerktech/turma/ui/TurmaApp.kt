@@ -15,6 +15,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.xerktech.turma.AppContainer
 import com.xerktech.turma.MainActivity
+import com.xerktech.turma.core.TextSize
 import com.xerktech.turma.push.PushRegistrar
 import java.net.URLEncoder
 
@@ -37,6 +38,19 @@ object Routes {
  */
 val LocalSignOut = staticCompositionLocalOf<() -> Unit> { {} }
 
+/**
+ * The fleet-wide chat text size (XERK-144), provided around the NavHost so the
+ * settings menu on any chat can set it and every transcript renderer can read it
+ * without threading the store through each screen — the same pattern as
+ * [LocalSignOut]. Backed by [data.TextSizePref] via the container. Default keeps
+ * previews/tests rendering at the standard size with a no-op setter.
+ */
+data class TextSizeControl(
+    val current: TextSize = TextSize.DEFAULT,
+    val set: (TextSize) -> Unit = {},
+)
+val LocalTextSize = staticCompositionLocalOf { TextSizeControl() }
+
 @Composable
 fun TurmaApp(
     container: AppContainer,
@@ -47,6 +61,7 @@ fun TurmaApp(
     val nav = rememberNavController()
     val ctx = LocalContext.current
     val settings by container.config.state.collectAsStateWithLifecycle()
+    val textSize by container.textSize.size.collectAsStateWithLifecycle()
     val start = if (settings.configured) TopDest.DASHBOARD.route else Routes.LOGIN
 
     // Unregister push, drop the stored credentials, and return to the login
@@ -88,7 +103,10 @@ fun TurmaApp(
         }
     }
 
-    CompositionLocalProvider(LocalSignOut provides signOut) {
+    CompositionLocalProvider(
+        LocalSignOut provides signOut,
+        LocalTextSize provides TextSizeControl(textSize, container.textSize::set),
+    ) {
     NavHost(navController = nav, startDestination = start) {
         composable(Routes.LOGIN) {
             LoginScreen(onSignedIn = {
