@@ -212,6 +212,22 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - Still open here: the web's optimistic clone row (a spec fired but not yet echoed by the agent) —
   Android shows a "clone queued" snackbar instead, and the real job row lands a beat later. P2.
 
+## Done (XERK-137 — New ticket)
+
+- **Create a ticket from the board.** The board header gains a **＋ New ticket** action (shown once an
+  org reports) opening a `ModalBottomSheet` create form (`CreateTicketSheet` in `ui/BoardScreen.kt`) —
+  the Android port of the web `board.html` modal, source-agnostic across Jira and Azure DevOps. An
+  org/project/type cascade (project + type metadata fetched on demand with the same 202-poll as the
+  detail sheet — `BoardViewModel.fetchCreateMeta`), a title/description/labels form worded per source
+  (labels vs tags), then a submit that POSTs and polls the outcome (`submitCreate`), ending on a
+  "Ticket created" confirmation with an open-in-tracker link. The created ticket self-assigns to the
+  tracker user (hub-side) so it lands on the board on the next poll.
+- Wire + logic: `source` added to `JiraBlock`/`BoardSite` (`mergeSites` defaults it to jira); the
+  create models + envelopes in `model/Models.kt`; three Retrofit endpoints in `net/HubApi.kt`
+  (`createMeta`/`createTicket`/`createResult`). Pure ports in `core/Board.kt` — `createLabelWord`,
+  `splitLabels` (Jira on whitespace+commas, Azure on commas), and the `classifyCreateMeta`/
+  `classifyCreateResult` 202-poll classifiers — JVM-tested in `BoardTest` against the board.js behaviour.
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
@@ -298,14 +314,6 @@ those are marked `[MODEL]`.
 - P1 Repo picker: cloned/not-cloned optgroups, "Currently set" orphan, `nameWithOwner`, save-error.
 - P1 Agent picker (XERK-38, shipped): inline save-error on the row (Android toasts like the repo
   picker's; the web paints "Couldn't save" on the row itself).
-- P1 **New-ticket creation (XERK-137).** The web board's `board-bar` now has a "New ticket" button that
-  opens a modal to create a ticket on the org's tracker (Jira or Azure DevOps): an org/project/type
-  cascade (project + type + label metadata fetched on demand via `GET /api/jira/<siteKey>/create-meta`),
-  a title/description/labels form worded per source (labels/tags), submitting to
-  `POST /api/jira/<siteKey>/tickets` and polling the outcome at `.../tickets/<cmdId>`. The created ticket
-  self-assigns to the tracker user so it lands on the board. Android has no create UI yet — port a
-  BoardScreen "+"/FAB → a create sheet driving the same three endpoints. Builders to mirror live in
-  `board.js` (`createFormHtml`/`createProjectOptions`/`createTypeOptions`/`createLabelWord`).
 - P2 Mobile scroll-snapping columns with peek; deep-link (`?ticket=&site=`); refresh outcome/landing.
 - P3 Card org-chip placement; empty-column + truncation notes. (The org chips themselves are gone —
   XERK-62 — and their "offline · synced N ago" note now rides the header control's org rows.)

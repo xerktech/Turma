@@ -1,6 +1,10 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.CreateMetaEnvelope
+import com.xerktech.turma.model.CreateProject
+import com.xerktech.turma.model.CreateResultEnvelope
+import com.xerktech.turma.model.CreateType
 import com.xerktech.turma.model.JiraBlock
 import com.xerktech.turma.model.JiraIssueDetail
 import com.xerktech.turma.model.JiraIssueEnvelope
@@ -503,5 +507,54 @@ class BoardTest {
         assertTrue(statusChangeable(online = true, options = opts))
         assertFalse(statusChangeable(online = false, options = opts))   // write needs a live host
         assertFalse(statusChangeable(online = true, options = emptyList()))  // nothing to move to
+    }
+
+    // ---- New-ticket creation (XERK-137): parity with board.js/board.html ----
+
+    @Test fun `mergeSites carries the tracker source off the freshest block, defaulting jira`() {
+        val az = agent("az", true, JiraBlock(siteKey = "dev.azure.com/o", user = "u", fetchedAt = "2026-07-16T01:00:00Z", source = "azure"))
+        assertEquals("azure", mergeSites(listOf(az))[0].source)
+        // An older agent omits `source`; it must default to jira, not blank.
+        val jira = agent("j", true, JiraBlock(siteKey = "o.atlassian.net", user = "u", fetchedAt = "2026-07-16T01:00:00Z"))
+        assertEquals("jira", mergeSites(listOf(jira))[0].source)
+    }
+
+    @Test fun `createLabelWord is worded per source`() {
+        assertEquals("label", createLabelWord("jira"))
+        assertEquals("Label", createLabelWord("jira", cap = true))
+        assertEquals("tag", createLabelWord("azure"))
+        assertEquals("Tag", createLabelWord("azure", cap = true))
+    }
+
+    @Test fun `splitLabels splits jira on whitespace+commas and azure on commas only`() {
+        // Jira forbids spaces in a label, so "e2e test" is two labels.
+        assertEquals(listOf("turma", "e2e", "test"), splitLabels("turma, e2e test", "jira"))
+        // Azure tags may contain spaces, so it stays one tag.
+        assertEquals(listOf("turma", "e2e test"), splitLabels("turma, e2e test", "azure"))
+        // Deduped, trimmed, blanks dropped.
+        assertEquals(listOf("a", "b"), splitLabels(" a , a ,, b ", "azure"))
+    }
+
+    @Test fun `classifyCreateMeta distinguishes pending, projects, types, and error`() {
+        assertEquals(CreateMetaFetch.Pending, classifyCreateMeta(202, null, wantTypes = false))
+        assertEquals(CreateMetaFetch.Pending, classifyCreateMeta(200, CreateMetaEnvelope(pending = true), wantTypes = false))
+        val projects = classifyCreateMeta(200, CreateMetaEnvelope(projects = listOf(CreateProject("E", "Eng")), labels = listOf("x"), source = "jira"), wantTypes = false)
+        assertEquals(CreateMetaFetch.Projects(listOf(CreateProject("E", "Eng")), listOf("x"), "jira"), projects)
+        val types = classifyCreateMeta(200, CreateMetaEnvelope(types = listOf(CreateType("1", "Task"))), wantTypes = true)
+        assertEquals(CreateMetaFetch.Types(listOf(CreateType("1", "Task"))), types)
+        assertTrue(classifyCreateMeta(200, CreateMetaEnvelope(error = "boom"), wantTypes = false) is CreateMetaFetch.Error)
+        assertTrue(classifyCreateMeta(500, null, wantTypes = false) is CreateMetaFetch.Error)
+        // A project-less body with no source still reads jira.
+        val defaulted = classifyCreateMeta(200, CreateMetaEnvelope(projects = emptyList()), wantTypes = false) as CreateMetaFetch.Projects
+        assertEquals("jira", defaulted.source)
+    }
+
+    @Test fun `classifyCreateResult distinguishes pending, created, and error`() {
+        assertEquals(CreateResultFetch.Pending, classifyCreateResult(202, null))
+        assertEquals(CreateResultFetch.Created("ENG-9", "u"), classifyCreateResult(200, CreateResultEnvelope(key = "ENG-9", url = "u")))
+        assertTrue(classifyCreateResult(200, CreateResultEnvelope(error = "bad field")) is CreateResultFetch.Error)
+        assertTrue(classifyCreateResult(500, null) is CreateResultFetch.Error)
+        // A 200 with neither key nor error is an error, not a false success.
+        assertTrue(classifyCreateResult(200, CreateResultEnvelope()) is CreateResultFetch.Error)
     }
 }

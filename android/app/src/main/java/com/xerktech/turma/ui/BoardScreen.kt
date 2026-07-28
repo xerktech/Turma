@@ -23,14 +23,20 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -45,6 +51,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import kotlinx.coroutines.launch
@@ -54,25 +61,32 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.BOARD_CATEGORIES
 import com.xerktech.turma.core.BoardSite
+import com.xerktech.turma.core.CreateMetaFetch
+import com.xerktech.turma.core.CreateResultFetch
 import com.xerktech.turma.core.PrioEmphasis
 import com.xerktech.turma.core.StartControl
 import com.xerktech.turma.core.StartState
 import com.xerktech.turma.core.TicketSession
 import com.xerktech.turma.core.ageStr
 import com.xerktech.turma.core.categoryOf
+import com.xerktech.turma.core.createLabelWord
 import com.xerktech.turma.core.filterSites
 import com.xerktech.turma.core.mergeSites
 import com.xerktech.turma.core.orgColorMap
+import com.xerktech.turma.core.orgName
 import com.xerktech.turma.core.overdueOf
 import com.xerktech.turma.core.prioClass
+import com.xerktech.turma.core.splitLabels
 import com.xerktech.turma.core.ticketSessionIndex
 import com.xerktech.turma.core.ticketSessionLabel
 import com.xerktech.turma.core.ticketSessionState
 import com.xerktech.turma.core.ticketSessionsOf
 import com.xerktech.turma.core.ticketStartControl
+import com.xerktech.turma.model.CreateTicketRequest
 import com.xerktech.turma.model.JiraTicket
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.BoardViewModel
+import kotlinx.coroutines.launch
 
 @Composable
 fun BoardScreen(
@@ -100,12 +114,19 @@ fun BoardScreen(
     // no org still reports, exactly as `effectiveOrg` does for the other screens.
     val shown = remember(sites, orgFilter) { filterSites(sites, orgFilter) }
     var detail by remember { mutableStateOf<Pair<BoardSite, JiraTicket>?>(null) }
+    // The New-ticket form (XERK-137): open state carries no data — the sheet reads
+    // the current sites/org scope itself, like the web modal.
+    var creating by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
     LaunchedEffect(Unit) { vm.messages.collect { Toast.makeText(context, it, Toast.LENGTH_SHORT).show() } }
 
     Column(modifier.fillMaxSize()) {
         ScreenHeader("Board") {
+            // Needs an org to create against, so it's hidden until one reports.
+            if (sites.isNotEmpty()) {
+                IconButton(onClick = { creating = true }) { Icon(Icons.Filled.Add, "New ticket") }
+            }
             IconButton(onClick = { vm.refresh() }, enabled = !refreshing) {
                 if (refreshing) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                 else Icon(Icons.Filled.Refresh, "Refresh")
@@ -156,6 +177,13 @@ fun BoardScreen(
         val pin = com.xerktech.turma.core.agentPinOf(fleet.ticketAgents, site.siteKey, ticket.key)
         val modelPin = com.xerktech.turma.core.modelPinOf(fleet.ticketModels, site.siteKey, ticket.key)
         TicketDetailSheet(site, ticket, pin, modelPin, vm, onDismiss = { detail = null })
+    }
+
+    if (creating && sites.isNotEmpty()) {
+        // Default the form's org to the header scope when it names a real one,
+        // else the first org — the web openCreate's pick.
+        val initial = sites.firstOrNull { it.siteKey == orgFilter }?.siteKey ?: sites.first().siteKey
+        CreateTicketSheet(sites, initial, vm, onDismiss = { creating = false })
     }
 }
 
@@ -683,4 +711,215 @@ private fun TicketDetailSheet(
             Spacer(Modifier.height(8.dp))
         }
     }
+}
+
+/**
+ * The New-ticket form (XERK-137) — the board's one write path, source-agnostic
+ * across Jira and Azure DevOps. A port of board.html's create modal: an
+ * org/project/type cascade (project + type metadata fetched on demand, the same
+ * 202-poll as the detail sheet), a title/description/labels form worded per
+ * source, then a submit that POSTs and polls the outcome. All state is local to
+ * the sheet, like the web modal.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CreateTicketSheet(
+    sites: List<BoardSite>,
+    initialSiteKey: String,
+    vm: BoardViewModel,
+    onDismiss: () -> Unit,
+) {
+    val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val scope = rememberCoroutineScope()
+    val uriHandler = LocalUriHandler.current
+
+    var siteKey by remember { mutableStateOf(initialSiteKey) }
+    val site = sites.firstOrNull { it.siteKey == siteKey } ?: sites.first()
+    val source = site.source
+
+    var meta by remember { mutableStateOf<CreateMetaFetch?>(null) }   // null = loading
+    var project by remember { mutableStateOf("") }
+    var types by remember { mutableStateOf<CreateMetaFetch?>(null) }  // null = none loaded
+    var issueType by remember { mutableStateOf("") }
+    var summary by remember { mutableStateOf("") }
+    var description by remember { mutableStateOf("") }
+    var labels by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf("") }
+    var created by remember { mutableStateOf<CreateResultFetch.Created?>(null) }
+
+    // Projects (+ labels) reload when the org changes; a lone project auto-selects.
+    LaunchedEffect(siteKey) {
+        meta = null; project = ""; issueType = ""; types = null; error = ""
+        val m = vm.fetchCreateMeta(siteKey, null)
+        meta = m
+        (m as? CreateMetaFetch.Projects)?.projects?.singleOrNull()?.let { project = it.key }
+    }
+    // Types reload when the project changes; a lone type auto-selects.
+    LaunchedEffect(siteKey, project) {
+        if (project.isBlank()) { types = null; return@LaunchedEffect }
+        issueType = ""; types = null
+        val ty = vm.fetchCreateMeta(siteKey, project)
+        types = ty
+        (ty as? CreateMetaFetch.Types)?.types?.singleOrNull()?.let { issueType = it.id }
+    }
+
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet) {
+        val done = created
+        if (done != null) {
+            Column(
+                Modifier.fillMaxWidth().padding(20.dp, 0.dp, 20.dp, 32.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("Ticket created", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Created ${done.key}. It'll appear on the board on the next poll.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                if (done.url.isNotBlank()) {
+                    GhostButton("Open ${done.key} ↗", onClick = { uriHandler.openUri(done.url) })
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { created = null; summary = ""; description = ""; labels = "" }) {
+                        Text("Create another")
+                    }
+                    Spacer(Modifier.weight(1f))
+                    PrimaryButton("Done", onClick = onDismiss)
+                }
+            }
+            return@ModalBottomSheet
+        }
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp, 0.dp, 20.dp, 32.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("New ticket", style = MaterialTheme.typography.titleMedium)
+
+            if (sites.size > 1) {
+                CreatePicker(
+                    "Org",
+                    sites.map { it.siteKey to (orgName(it.siteKey, it.orgName) + if (!it.online) " (offline)" else "") },
+                    siteKey,
+                ) { siteKey = it }
+            }
+
+            when (val m = meta) {
+                null -> LoadingRow("Loading projects…")
+                is CreateMetaFetch.Error -> ErrorRow("Couldn't load projects: ${m.message}")
+                is CreateMetaFetch.Projects ->
+                    if (m.projects.isEmpty()) DimRow("No projects you can create in for this org.")
+                    else CreatePicker(
+                        "Project",
+                        m.projects.map { it.key to if (it.name.isNotBlank() && it.name != it.key) "${it.name} (${it.key})" else it.key },
+                        project,
+                    ) { project = it }
+                else -> {}
+            }
+
+            if (project.isNotBlank()) {
+                when (val ty = types) {
+                    null -> LoadingRow("Loading types…")
+                    is CreateMetaFetch.Error -> ErrorRow("Couldn't load types: ${ty.message}")
+                    is CreateMetaFetch.Types ->
+                        if (ty.types.isEmpty()) DimRow("No issue types reported for this project.")
+                        else CreatePicker(
+                            "Type",
+                            ty.types.map { it.id to it.name.ifBlank { it.id } },
+                            issueType,
+                        ) { issueType = it }
+                    else -> {}
+                }
+            }
+
+            OutlinedTextField(
+                summary, { summary = it },
+                label = { Text("Title") }, singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                description, { description = it },
+                label = { Text("Description (optional)") }, minLines = 3, maxLines = 8,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                labels, { labels = it },
+                label = { Text("${createLabelWord(source, true)}s — comma-separated (optional)") },
+                singleLine = true, modifier = Modifier.fillMaxWidth(),
+            )
+
+            if (error.isNotBlank()) ErrorRow("Couldn't create: $error")
+
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") }
+                Spacer(Modifier.weight(1f))
+                val canSubmit = project.isNotBlank() && issueType.isNotBlank() && summary.isNotBlank() && !busy
+                PrimaryButton(
+                    if (busy) "Creating…" else "Create ticket",
+                    enabled = canSubmit,
+                    onClick = {
+                        busy = true; error = ""
+                        scope.launch {
+                            val req = CreateTicketRequest(
+                                project = project, issueType = issueType,
+                                summary = summary.trim(), description = description,
+                                labels = splitLabels(labels, source),
+                            )
+                            when (val out = vm.submitCreate(siteKey, req)) {
+                                is CreateResultFetch.Created -> created = out
+                                is CreateResultFetch.Error -> error = out.message
+                                CreateResultFetch.Pending -> error = "the create didn't complete in time"
+                            }
+                            busy = false
+                        }
+                    },
+                )
+            }
+        }
+    }
+}
+
+/** One dropdown row of (value, display-label) pairs; a pick calls [onSelect]. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CreatePicker(
+    label: String,
+    options: List<Pair<String, String>>,
+    selectedValue: String,
+    onSelect: (String) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val selectedLabel = options.firstOrNull { it.first == selectedValue }?.second ?: ""
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = selectedLabel,
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(label) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            modifier = Modifier.fillMaxWidth().menuAnchor(),
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            for ((value, text) in options) {
+                DropdownMenuItem(text = { Text(text) }, onClick = { onSelect(value); expanded = false })
+            }
+        }
+    }
+}
+
+@Composable
+private fun LoadingRow(text: String) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+        Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable
+private fun ErrorRow(text: String) {
+    Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+}
+
+@Composable
+private fun DimRow(text: String) {
+    Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }

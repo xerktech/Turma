@@ -1165,10 +1165,13 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   (`create_jira_issue` POSTs `/rest/api/3/issue`, plain-text→ADF via `_text_to_adf`; `create_azure_issue`
   POSTs a JSON-Patch work item, HTML-escaped description, `;`-joined `System.Tags`). Jira labels split on
   whitespace+commas (spaces forbidden), Azure tags on commas.
+- Android has the same feature (a ＋ action → `CreateTicketSheet`, driving the same three endpoints):
+  `source` on `JiraBlock`/`BoardSite`, the create endpoints in `net/HubApi.kt`, and the pure
+  `createLabelWord`/`splitLabels`/`classifyCreateMeta`/`classifyCreateResult` ports in `core/Board.kt`.
 - Tests: `TestCreateJiraIssue`/`TestCreateAzureIssue`/`TestStageCreateMeta`/`TestStageCreateTicket` (+
   meta/type/ADF cases) in `test_hub_agent.py`; the create-flow cases in `server.test.js`; the
-  `createFormHtml`/`createProjectOptions`/`createTypeOptions` cases in `board.test.js`. Android is a
-  follow-up (`android/PARITY.md`).
+  `createFormHtml`/`createProjectOptions`/`createTypeOptions` cases in `board.test.js`; the
+  create/source cases in android `BoardTest.kt`.
 
 #### Repo chips
 
