@@ -3177,6 +3177,52 @@ class TestMigrateSession(ManagerMixin, unittest.TestCase):
             ha.PROJECTS_ROOT, ha._project_slug(local), "transR.jsonl")))
         self.assertEqual(sm._launch_tmux.call_args.kwargs["resume_id"], "transR")
 
+    def _write_pr_transcript(self, cwd, tid, url):
+        """A transcript whose conversation OPENED a PR: the two entries a real
+        `gh pr create` leaves behind (the call, then its URL output)."""
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, tid + ".jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "assistant", "cwd": cwd, "message": {
+                "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                             "input": {"command": "gh pr create --fill"}}]}}) + "\n")
+            f.write(json.dumps({"type": "user", "cwd": cwd, "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "t1",
+                             "content": url}]}}) + "\n")
+        return path
+
+    def test_import_keeps_the_pr_chips(self):
+        """A migrated session KEEPS the PR chips it opened: the transcript holds
+        the `gh pr create` events, the transcript id is preserved, so the target
+        re-derives them at launch (session_report's per-beat scan primes past
+        them, and session_pr_urls is keyed by the freshly-minted id)."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "prsess")
+        url = "https://github.com/xerktech/Turma/pull/77"
+        src_path = self._write_pr_transcript(wt, "transP", url)
+        blob = self._manager()._pack_transcript(src_path)
+        shutil.rmtree(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt)))
+
+        sm = self._manager()
+        # _launch_tmux is mocked, so pin the id itself as the real one would —
+        # _seed_prs resolves the transcript by the session's pinned id.
+        sm._launch_tmux = mock.Mock(
+            side_effect=lambda sess, **kw: sess.__setitem__(
+                "claudeSessionId", kw.get("resume_id")))
+        sm._worktree_add = mock.Mock()
+        sm._migration_download = lambda mid: blob
+        cmd = {"type": "importSession", "cmdId": "cP", "migrationId": "migP",
+               "transcriptId": "transP", "cwd": wt, "repo": "Turma"}
+        with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
+            sm.import_session(cmd)
+        sess = sm.registry[0]
+        # The chip is on the record, in session_pr_urls, and in the durable
+        # ledger (keyed by the preserved transcript id) — all three channels the
+        # PR-status feature reads.
+        self.assertEqual(sess.get("prUrls"), [url])
+        self.assertEqual(sm.session_pr_urls[sess["id"]], [url])
+        self.assertEqual(sm.pr_ledger["transP"]["urls"], [url])
+
 
 class TestRegistryPersistence(ManagerMixin, unittest.TestCase):
     def test_save_load_round_trip(self):

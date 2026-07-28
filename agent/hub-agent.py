@@ -6440,6 +6440,55 @@ class SessionManager:
             return None
         return [self.pr_status_cache.get(u) or {"url": u} for u in urls]
 
+    def _seed_prs(self, sess):
+        """Re-derive a resumed/migrated session's PR chips from its transcript.
+
+        A live session's chips come from session_report's incremental per-beat
+        scan, which primes a transcript's byte offset to EOF the first time it
+        sees the file (so a restarted agent never replays old PR links). That is
+        exactly wrong for a session that RESUMES an existing transcript — a
+        host-local resume-any, or a session migrated in from another agent: the
+        `gh pr create` events that opened its PRs are already in the conversation
+        the moment it launches, past the EOF the scan primes to, so the chips
+        never reappear even though the PR is right there. And session_pr_urls is
+        keyed by session id, which is freshly minted here, so nothing carries the
+        source's links either.
+
+        So scan the whole transcript once at launch, keyed like the live scan,
+        and seed session_pr_urls + the record's prUrls + the durable ledger. The
+        transcript id is preserved across a migration, so the target lands the
+        same URLs the source reported. Idempotent (dedups into whatever the live
+        scan later finds) and a no-op for a session that opened no PR."""
+        sid = sess.get("id")
+        path = _session_transcript_path(sess)
+        if not sid or not path or not os.path.isfile(path):
+            return
+        report = {"prUrls": []}
+        state = {}
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return
+        end = raw.rfind(b"\n") + 1  # only complete lines, like the live scan
+        for line in raw[:end].split(b"\n"):
+            if line.strip():
+                _scan_pr_line(line, state, report)
+        if not report["prUrls"]:
+            return
+        known = self.session_pr_urls.setdefault(sid, [])
+        grew = False
+        for url in report["prUrls"]:
+            if url not in known:
+                known.append(url)
+                grew = True
+        del known[:-10]
+        if grew:
+            sess["prUrls"] = list(known)
+            self._remember_prs(sess, save=False)
+            self.save()
+            self._save_pr_ledger()
+
     def _save_pr_status_ledger(self):
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
@@ -7506,6 +7555,10 @@ class SessionManager:
             self._remember_usage(sess)
             self._launch_tmux(sess, resume=True, resume_id=transcript_id)
             self._launch_ttyd(sess)
+            # The transcript already holds this session's history — including any
+            # PR it opened before the resume. The per-beat scan primes past that,
+            # so re-derive the chips once here (covers migration and resume-any).
+            self._seed_prs(sess)
             log(f"resumed transcript {transcript_id} for {repo} in {cwd} "
                 f"on :{sess['ttydPort']}")
             return sess
