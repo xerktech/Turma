@@ -8240,6 +8240,36 @@ class TestShapeIssueDetail(unittest.TestCase):
         self.assertEqual(len(ha._shape_issue_detail(payload, "s")["labels"]),
                          ha.JIRA_DETAIL_LABELS_MAX)
 
+    def test_status_options_from_transitions_expansion(self):
+        # The `transitions` expansion rides the issue GET; each option is labelled
+        # with the RESULTING status (to.name), valued by the transition id, and
+        # its column mapped from to.statusCategory. XERK-138.
+        payload = _issue_detail_payload(transitions=[
+            {"id": "11", "name": "Start Progress",
+             "to": {"name": "In Progress", "statusCategory": {"key": "indeterminate"}}},
+            {"id": "31", "name": "Done",
+             "to": {"name": "Done", "statusCategory": {"key": "done"}}},
+        ])
+        d = ha._shape_issue_detail(payload, "s")
+        self.assertEqual(d["statusOptions"], [
+            {"id": "11", "name": "In Progress", "category": "inprogress"},
+            {"id": "31", "name": "Done", "category": "done"},
+        ])
+
+    def test_status_options_empty_without_expansion(self):
+        # No `transitions` (the expansion wasn't asked for, or a permissions wall)
+        # -> no options, so the row stays read-only rather than raising.
+        self.assertEqual(
+            ha._shape_issue_detail(_issue_detail_payload(), "s")["statusOptions"], [])
+
+    def test_status_options_skip_malformed(self):
+        payload = _issue_detail_payload(transitions=[
+            "junk", {"name": "no id"}, {"id": "9"},          # each dropped
+            {"id": "5", "to": {"name": "Ready"}},            # kept; category -> todo
+        ])
+        self.assertEqual(ha._shape_issue_detail(payload, "s")["statusOptions"],
+                         [{"id": "5", "name": "Ready", "category": "todo"}])
+
 
 class TestFetchJiraIssue(unittest.TestCase):
     def test_requests_the_issue_with_detail_fields(self):
@@ -8255,6 +8285,9 @@ class TestFetchJiraIssue(unittest.TestCase):
         self.assertEqual(seen["path"], "/rest/api/3/issue/ENG-42")
         for f in ("description", "comment", "reporter", "assignee"):
             self.assertIn(f, seen["params"]["fields"])
+        # The available status changes come back with the issue (XERK-138), not
+        # in a second round trip.
+        self.assertEqual(seen["params"]["expand"], "transitions")
         self.assertEqual(d["key"], "ENG-42")
         self.assertEqual(d["url"], "https://myorg.atlassian.net/browse/ENG-42")
 
@@ -8428,6 +8461,34 @@ class TestAzureCategory(unittest.TestCase):
             ha._azure_category("s", "P", "Bug", "Active")
             ha._azure_category("s", "P", "Bug", "Active")
         self.assertEqual(len(calls), 1)   # second lookup hits the cache
+
+
+class TestAzureStatusOptions(unittest.TestCase):
+    """XERK-138: a work item's changeable states, from the states API, minus the
+    one it's already in — the source-agnostic statusOptions shape (id == name)."""
+
+    def _states(self):
+        return {"value": [
+            {"name": "New", "stateCategory": "Proposed"},
+            {"name": "Active", "stateCategory": "InProgress"},
+            {"name": "Closed", "stateCategory": "Completed"},
+        ]}
+
+    def test_lists_states_except_current(self):
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", return_value=self._states()):
+            opts = ha._azure_status_options("s", "P", "Bug", "Active")
+        self.assertEqual(opts, [
+            {"id": "New", "name": "New", "category": "todo"},
+            {"id": "Closed", "name": "Closed", "category": "done"},
+        ])
+
+    def test_empty_when_states_api_unavailable(self):
+        def boom(*a, **k):
+            raise RuntimeError("403")
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", boom):
+            self.assertEqual(ha._azure_status_options("s", "P", "Bug", "New"), [])
 
 
 class TestCollectAzure(unittest.TestCase):
@@ -8710,6 +8771,129 @@ class TestStageJiraIssue(ManagerMixin, unittest.TestCase):
         sm.jira_issue_results = [{"key": "ENG-9", "issue": None, "error": "x"}]
         self.assertEqual(sm.build_payload(1)["jiraIssueResults"],
                          [{"key": "ENG-9", "issue": None, "error": "x"}])
+
+
+class TestSetBoardStatus(ManagerMixin, unittest.TestCase):
+    """XERK-138: the board's one write path. A status change is re-validated
+    against a FRESH options read, applied to the configured source, and its
+    outcome staged keyed by the command's cmdId. Nothing raises out of the loop."""
+
+    def _jira(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t",
+                                   AZDO_URL="", AZDO_TOKEN="")
+
+    def _azure(self):
+        return mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                   AZDO_TOKEN="p", JIRA_SITE="", JIRA_EMAIL="",
+                                   JIRA_TOKEN="")
+
+    def test_jira_transition_posts_the_chosen_id(self):
+        sm = self.make_manager()
+        opts = [{"id": "31", "name": "Done", "category": "done"}]
+        seen = {}
+
+        def fake_req(path, params, body=None):
+            seen["path"], seen["body"] = path, body
+            return {}
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "jira_req", fake_req), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "ENG-9", "status": "Done"}):
+            sm.set_board_status("c1", "ENG-9", "31")
+        self.assertEqual(seen["path"], "/rest/api/3/issue/ENG-9/transitions")
+        self.assertEqual(seen["body"], {"transition": {"id": "31"}})
+        r = sm.ticket_status_results[0]
+        self.assertEqual((r["cmdId"], r["key"], r["ok"], r["status"]),
+                         ("c1", "ENG-9", True, "Done"))
+        # The fresh issue rides jira_issue_results so the panel's re-read is instant.
+        self.assertEqual(sm.jira_issue_results[0]["issue"]["status"], "Done")
+
+    def test_azure_patches_system_state(self):
+        sm = self.make_manager()
+        opts = [{"id": "Closed", "name": "Closed", "category": "done"}]
+        seen = {}
+
+        def fake_req(path, params, body=None, method=None, content_type="application/json"):
+            seen.update(path=path, body=body, method=method, ct=content_type)
+            return {}
+        with self._azure(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "azure_req", fake_req), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "42", "status": "Closed"}):
+            sm.set_board_status("c2", "42", "Closed")
+        self.assertEqual(seen["path"], "/_apis/wit/workitems/42")
+        self.assertEqual(seen["method"], "PATCH")
+        self.assertEqual(seen["ct"], "application/json-patch+json")
+        self.assertEqual(seen["body"],
+                         [{"op": "add", "path": "/fields/System.State", "value": "Closed"}])
+        self.assertTrue(sm.ticket_status_results[0]["ok"])
+
+    def test_target_not_on_offer_is_refused_without_writing(self):
+        sm = self.make_manager()
+        opts = [{"id": "31", "name": "Done", "category": "done"}]
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "apply_board_status") as apply:
+            sm.set_board_status("c1", "ENG-9", "99")
+        apply.assert_not_called()
+        r = sm.ticket_status_results[0]
+        self.assertFalse(r["ok"])
+        self.assertIn("no longer an available change", r["error"])
+
+    def test_write_failure_stages_error_not_raises(self):
+        sm = self.make_manager()
+        opts = [{"id": "31", "name": "Done", "category": "done"}]
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "apply_board_status",
+                               side_effect=RuntimeError("403 forbidden " + "x" * 300)):
+            sm.set_board_status("c1", "ENG-9", "31")
+        r = sm.ticket_status_results[0]
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["error"].startswith("403 forbidden"))
+        self.assertLessEqual(len(r["error"]), 200)
+
+    def test_options_read_failure_stages_error(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch.object(ha, "apply_board_status") as apply:
+            sm.set_board_status("c1", "ENG-9", "31")
+        apply.assert_not_called()
+        self.assertIn("couldn't read available statuses",
+                      sm.ticket_status_results[0]["error"])
+
+    def test_bad_key_and_unconfigured_never_write(self):
+        sm = self.make_manager()
+        with self._jira(), mock.patch.object(ha, "apply_board_status") as apply:
+            sm.set_board_status("c1", "../secrets", "31")
+        apply.assert_not_called()
+        self.assertEqual(sm.ticket_status_results[0]["error"], "not a valid issue key")
+        sm.ticket_status_results.clear()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="", AZDO_TOKEN=""), \
+             mock.patch.object(ha, "apply_board_status") as apply:
+            sm.set_board_status("c1", "ENG-9", "31")
+        apply.assert_not_called()
+        self.assertIn("no board credentials", sm.ticket_status_results[0]["error"])
+
+    def test_command_routes_acks_and_rides_payload(self):
+        sm = self.make_manager()
+        sm.registry = []
+        opts = [{"id": "31", "name": "Done", "category": "done"}]
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "jira_req", return_value={}), \
+             mock.patch.object(ha, "fetch_board_issue", return_value={"key": "ENG-9"}):
+            sm.handle_commands([{"cmdId": "c9", "type": "setTicketStatus",
+                                 "issueKey": "ENG-9", "value": "31"}])
+        self.assertIn("c9", sm.acked)
+        self.assertEqual(sm.ticket_status_results[0]["cmdId"], "c9")
+        self.assertEqual(sm.build_payload(1)["ticketStatusResults"][0]["cmdId"], "c9")
 
 
 # --- Ticket creation (XERK-137) ------------------------------------------------

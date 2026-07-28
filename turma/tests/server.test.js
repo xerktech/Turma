@@ -1941,6 +1941,102 @@ test("http: ticket detail 404s an org no host reports", async () => {
   assert.equal(res.status, 404);
 });
 
+// POST/GET /api/jira/<siteKey>/<issueKey>/status — the board's one write path
+// (XERK-138): queue a status change on an online host, poll its outcome by cmdId.
+
+test("http: a status change queues setTicketStatus on the org's online host", async () => {
+  await jiraBeat("js1", "s1.atlassian.net");
+  const res = await request("POST", "/api/jira/s1.atlassian.net/ENG-5/status",
+    { body: { value: "31" }, headers: userHeaders });
+  assert.equal(res.status, 202);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.host, "js1");
+
+  const beat = await jiraBeat("js1", "s1.atlassian.net");
+  assert.deepEqual(beat.body.commands, [
+    { type: "setTicketStatus", issueKey: "ENG-5", value: "31", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: a status change is single-flight per ticket", async () => {
+  await jiraBeat("js2", "s2.atlassian.net");
+  const first = await request("POST", "/api/jira/s2.atlassian.net/ENG-5/status",
+    { body: { value: "31" }, headers: userHeaders });
+  const second = await request("POST", "/api/jira/s2.atlassian.net/ENG-5/status",
+    { body: { value: "41" }, headers: userHeaders });
+  assert.equal(second.body.cmdId, first.body.cmdId);
+  const beat = await jiraBeat("js2", "s2.atlassian.net");
+  assert.equal(beat.body.commands.length, 1);   // no duplicate queued
+});
+
+test("http: a status change needs an online host and a value", async () => {
+  await jiraBeat("js3", "s3.atlassian.net");
+  const noVal = await request("POST", "/api/jira/s3.atlassian.net/ENG-5/status",
+    { body: {}, headers: userHeaders });
+  assert.equal(noVal.status, 400);
+  const badKey = await request("POST", "/api/jira/s3.atlassian.net/12ab/status",
+    { body: { value: "31" }, headers: userHeaders });
+  assert.equal(badKey.status, 400);
+  const noOrg = await request("POST", "/api/jira/nobody.atlassian.net/ENG-5/status",
+    { body: { value: "31" }, headers: userHeaders });
+  assert.equal(noOrg.status, 404);
+});
+
+test("http: an offline-only org refuses a status change with 503", async () => {
+  await jiraBeat("js4", "s4.atlassian.net");
+  agents.js4.lastSeen = Date.now() - 10 * 60 * 1000;   // fudge offline
+  const res = await request("POST", "/api/jira/s4.atlassian.net/ENG-5/status",
+    { body: { value: "31" }, headers: userHeaders });
+  assert.equal(res.status, 503);
+  assert.equal((agents.js4.commands || []).length, 0);
+});
+
+test("http: GET status polls the outcome by cmdId", async () => {
+  await jiraBeat("js5", "s5.atlassian.net");
+  const post = await request("POST", "/api/jira/s5.atlassian.net/ENG-5/status",
+    { body: { value: "31" }, headers: userHeaders });
+  const cmdId = post.body.cmdId;
+
+  // Before the agent reports back, the poll is pending.
+  const pending = await request("GET",
+    `/api/jira/s5.atlassian.net/ENG-5/status?cmdId=${cmdId}`, { headers: userHeaders });
+  assert.equal(pending.status, 200);
+  assert.equal(pending.body.pending, true);
+
+  // The agent's heartbeat carries the outcome keyed by cmdId.
+  await jiraBeat("js5", "s5.atlassian.net", {
+    ticketStatusResults: [{ cmdId, key: "ENG-5", ok: true, error: null,
+      status: "Done", statusCategory: "done" }],
+  });
+  const done = await request("GET",
+    `/api/jira/s5.atlassian.net/ENG-5/status?cmdId=${cmdId}`, { headers: userHeaders });
+  assert.equal(done.body.ok, true);
+  assert.equal(done.body.status, "Done");
+  assert.equal(done.body.statusCategory, "done");
+});
+
+test("http: a failed status change surfaces its error to the poll", async () => {
+  await jiraBeat("js6", "s6.atlassian.net");
+  await jiraBeat("js6", "s6.atlassian.net", {
+    ticketStatusResults: [{ cmdId: "cx", key: "ENG-5", ok: false,
+      error: "403 forbidden", status: null, statusCategory: null }],
+  });
+  const res = await request("GET",
+    "/api/jira/s6.atlassian.net/ENG-5/status?cmdId=cx", { headers: userHeaders });
+  assert.equal(res.body.ok, false);
+  assert.equal(res.body.error, "403 forbidden");
+});
+
+test("http: status results never leak into the /api/agents payload", async () => {
+  await jiraBeat("js7", "s7.atlassian.net", {
+    ticketStatusResults: [{ cmdId: "cy", key: "ENG-5", ok: true, status: "Done" }],
+  });
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  for (const a of list.body.agents) {
+    assert.ok(!("statusResults" in a), `agent ${a.key} leaked its statusResults cache`);
+  }
+});
+
 // New-ticket create flow (XERK-137): create-meta (projects/labels + per-project
 // types), the create POST, and the create-outcome poll. The hub routes to the
 // org's online host and rides the same heartbeat command/result path as detail.

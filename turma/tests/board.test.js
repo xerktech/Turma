@@ -15,6 +15,7 @@ const {
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
   agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
   modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
+  statusFieldHtml, statusPickerHtml, statusPickerValue,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
   startSweepVerdict,
   createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
@@ -994,6 +995,70 @@ test("detailHtml: the Model row renders, and swaps for the picker when editing",
   const editing = detailHtml(ticket("X-1"), null,
     { siteKey: "s", modelPin: null, models, modelEditing: true });
   assert.ok(editing.includes("data-model-select"));
+});
+
+// ---- status change (XERK-138) ----------------------------------------------
+
+test("statusFieldHtml: shows the pill, a Change control only when editable", () => {
+  const ro = statusFieldHtml("In Progress", { editable: false });
+  assert.ok(ro.includes("In Progress"));
+  assert.ok(!ro.includes("data-status-edit"));
+  const rw = statusFieldHtml("In Progress", { editable: true });
+  assert.ok(rw.includes("data-status-edit"));
+});
+
+test("statusFieldHtml: while a change is in flight the pill shows the target and reads saving", () => {
+  const html = statusFieldHtml("In Progress", { editable: true, pending: "Done" });
+  assert.ok(html.includes("Done"));
+  assert.ok(html.includes("saving"));
+  assert.ok(!html.includes("data-status-edit"));   // no Change while saving
+});
+
+test("statusFieldHtml: a failed save is reported inline", () => {
+  const html = statusFieldHtml("In Progress", { editable: true, error: "403 forbidden" });
+  assert.ok(html.includes("Couldn't save"));
+  assert.ok(html.includes("403 forbidden"));
+});
+
+test("statusPickerHtml: keep-current is the selected no-op, options are the transitions", () => {
+  const d = detail({ statusOptions: [
+    { id: "11", name: "In Progress", category: "inprogress" },
+    { id: "31", name: "Done", category: "done" },
+  ] });
+  const html = statusPickerHtml(d, { current: "To Do" });
+  const selected = /<option value="([^"]*)" selected>/.exec(html);
+  assert.equal(selected[1], statusPickerValue());
+  assert.ok(html.includes("To Do (current)"));
+  assert.ok(html.includes(`value="11"`) && html.includes("In Progress"));
+  assert.ok(html.includes(`value="31"`) && html.includes("Done"));
+  assert.ok(html.includes("data-status-cancel"));
+});
+
+test("statusPickerHtml: no options says so instead of an empty dropdown", () => {
+  const html = statusPickerHtml(detail({ statusOptions: [] }), { current: "Done" });
+  assert.ok(html.includes("No status changes available"));
+});
+
+test("statusPickerHtml: a hostile option can't break out of the markup", () => {
+  const d = detail({ statusOptions: [
+    { id: '"><script>alert(1)</script>', name: '"><script>x</script>', category: "todo" },
+  ] });
+  assert.ok(!statusPickerHtml(d, {}).includes("<script"));
+});
+
+test("detailHtml: the Status row is editable only when told, and swaps for the picker", () => {
+  const d = detail({ status: "To Do",
+    statusOptions: [{ id: "31", name: "Done", category: "done" }] });
+  // Not editable (offline host / no options) -> a plain pill, no Change.
+  const ro = detailHtml(ticket("X-1"), d, { siteKey: "s", canChangeStatus: false });
+  assert.ok(ro.includes("To Do") && !ro.includes("data-status-edit"));
+  // Editable -> a Change control.
+  const rw = detailHtml(ticket("X-1"), d, { siteKey: "s", canChangeStatus: true });
+  assert.ok(rw.includes("data-status-edit"));
+  // Editing -> the picker.
+  const editing = detailHtml(ticket("X-1"), d,
+    { siteKey: "s", canChangeStatus: true, statusEditing: true });
+  assert.ok(editing.includes("data-status-select"));
 });
 
 test("repoPickerHtml: a hostile repo name can't break out of the option", () => {

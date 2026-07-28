@@ -239,6 +239,15 @@ function paintDetail() {
     modelEditing: s.modelEditing,
     modelError: s.modelError,
     models: (site && site.models) || null,
+    // The status change writes back to Jira/Azure via the heartbeat command
+    // path, so — like the Repo override, unlike the hub-owned agent/model pins —
+    // it needs an online host AND the fetched detail (its statusOptions) to be
+    // editable. The optimistic target is held while the change is in flight.
+    statusEditing: s.statusEditing,
+    statusError: s.statusError,
+    statusPending: s.statusPending,
+    canChangeStatus: !!(site && site.online && s.detail &&
+      Array.isArray(s.detail.statusOptions) && s.detail.statusOptions.length),
   });
   if (s.editing) {
     const sel = $panel.querySelector("[data-repo-select]");
@@ -250,6 +259,10 @@ function paintDetail() {
   }
   if (s.modelEditing) {
     const sel = $panel.querySelector("[data-model-select]");
+    if (sel) sel.focus();
+  }
+  if (s.statusEditing) {
+    const sel = $panel.querySelector("[data-status-select]");
     if (sel) sel.focus();
   }
 }
@@ -301,7 +314,8 @@ function refreshOpenTicket() {
     (mpin ? mpin.model : "") !== (s.modelPinShown || "");
   s.ticket = fresh;
   // No picker may be swapped out from under an operator mid-edit.
-  if (changed && !s.editing && !s.agentEditing && !s.modelEditing) paintDetail();
+  if (changed && !s.editing && !s.agentEditing && !s.modelEditing &&
+      !s.statusEditing) paintDetail();
 }
 
 // The operator's own answer to which HOST the ticket's sessions spawn on
@@ -435,6 +449,79 @@ async function saveRepo(value) {
   }
 }
 
+// Push a status change to the board (XERK-138). Unlike the repo/agent/model
+// pins this writes back to Jira/Azure: the hub queues a command on an online
+// host, the agent applies it, and the outcome rides back keyed by the queued
+// cmdId, which we poll. The pill shows the optimistic target while in flight; on
+// success we re-fetch the detail (the new status brings new available options),
+// on failure we revert the pill and show why.
+async function saveStatus(value) {
+  const s = openTicketState;
+  if (!s) return;
+  const opt = ((s.detail && s.detail.statusOptions) || [])
+    .find(o => String(o.id) === String(value));
+  s.statusEditing = false;
+  s.statusError = "";
+  s.statusPending = (opt && opt.name) || value;   // shown in the pill meanwhile
+  paintDetail();
+
+  let cmdId = "", err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/status`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ value }) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    let d = {};
+    try { d = await r.json(); } catch { /* non-JSON error body */ }
+    if (!r.ok) err = d.error || `HTTP ${r.status}`;
+    else cmdId = d.cmdId;
+  } catch { err = "the hub is unreachable"; }
+
+  // Poll the outcome by cmdId. The agent applies the change on its next beat and
+  // reports back; the host beats every ~20s, so give it a couple of shots.
+  if (cmdId) {
+    const deadline = Date.now() + 60000;
+    let delay = 600;
+    while (openTicketState === s && Date.now() < deadline) {
+      let d = {};
+      try {
+        const r = await fetch(
+          `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/status?cmdId=${encodeURIComponent(cmdId)}`);
+        if (r.status === 401) { location.href = "/login"; return; }
+        d = await r.json();
+      } catch { err = "the hub is unreachable"; break; }
+      if (d && d.pending) {
+        await sleep(delay);
+        delay = Math.min(delay * 1.5, 3000);
+        continue;
+      }
+      if (d && d.ok) { err = ""; break; }
+      err = (d && d.error) || "the change didn't take";
+      break;
+    }
+    if (openTicketState === s && !err && Date.now() >= deadline) {
+      err = "the host didn't confirm in time";
+    }
+  }
+
+  if (openTicketState !== s) return;   // panel closed or another ticket opened
+  if (err) {
+    s.statusPending = null;
+    s.statusError = err;
+    paintDetail();
+    return;
+  }
+  // The change landed. Re-fetch the detail so the pill and the (now different)
+  // available options reflect the new status.
+  s.statusPending = null;
+  const alive = () => openTicketState === s;
+  const d = await fetchDetail(s.siteKey, s.key, alive);
+  if (!alive()) return;
+  if (d.issue) { s.detail = d.issue; s.error = null; }
+  paintDetail();
+}
+
 function closeDetail() {
   openSeq++;               // abandon any in-flight fetch for this panel
   openTicketState = null;
@@ -563,6 +650,15 @@ $panel.addEventListener("click", (e) => {
     openTicketState.modelEditing = false;
     return paintDetail();
   }
+  if (e.target.closest("[data-status-edit]")) {
+    openTicketState.statusEditing = true;
+    openTicketState.statusError = "";   // a new attempt clears the old complaint
+    return paintDetail();
+  }
+  if (e.target.closest("[data-status-cancel]")) {
+    openTicketState.statusEditing = false;
+    return paintDetail();
+  }
 });
 // Choosing an option IS the save — the dropdown is the setting, so picking a repo
 // answers the question the row asked and there is nothing left to confirm.
@@ -599,6 +695,16 @@ $panel.addEventListener("change", (e) => {
       return paintDetail();
     }
     return void saveModel(msel.value);
+  }
+  // The status picker follows the same contract; its "keep current" first
+  // option is the no-op (XERK-138).
+  const ssel = e.target.closest("[data-status-select]");
+  if (ssel) {
+    if (ssel.value === B.statusPickerValue()) {
+      openTicketState.statusEditing = false;
+      return paintDetail();
+    }
+    return void saveStatus(ssel.value);
   }
   const sel = e.target.closest("[data-repo-select]");
   if (!sel) return;
