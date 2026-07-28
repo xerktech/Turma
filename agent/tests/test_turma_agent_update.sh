@@ -225,5 +225,117 @@ else
 fi
 rm -rf "$root" "$d"
 
+# --- No GitHub login at all (XERK-151) ---------------------------------------
+# The repo is PUBLIC, so reading the release stream needs no credential — but
+# the updater used to require `gh auth` or $GH_TOKEN and reported "no native
+# release found (or auth unavailable)" forever on a host with neither. That is
+# exactly a host that only ever talks to a non-GitHub tracker, and it silently
+# pinned it to whatever version it was installed at.
+
+# A `gh` that EXISTS but is not logged in — deterministically false `have_gh`
+# whether or not the runner has a real gh on PATH, and the real-world shape of
+# the failure (a work box with gh installed and never authed).
+install_unauthed_gh() {  # <bindir>
+  # Always fails, so `gh auth status` (the whole of have_gh's second half) is
+  # false and no gh path can be taken.
+  printf '#!/bin/sh\nexit 1\n' > "$1/gh"
+  chmod +x "$1/gh"
+}
+
+# A `curl` serving the same $FAKE_GH_DIR fixtures over the public REST shapes
+# the script falls back to: the release list, one release's assets, and an
+# asset's bytes. Logs every header it was given so a case can assert on auth.
+install_fake_curl() {  # <bindir>
+  cat > "$1/curl" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+D="$FAKE_GH_DIR"
+out=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift; out="$1" ;;
+    -H) shift; printf '%s\n' "$1" >> "$D/curl-headers.log" ;;
+    -*) ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
+printf '%s\n' "$url" >> "$D/curl-urls.log"
+case "$url" in
+  TESTASSET:*)
+    rest="${url#TESTASSET:}"; tag="${rest%%:*}"; name="${rest#*:}"
+    [ -f "$D/assets/$tag/$name" ] || exit 1
+    if [ -n "$out" ]; then cp "$D/assets/$tag/$name" "$out"; else cat "$D/assets/$tag/$name"; fi ;;
+  *releases/tags/*)
+    tag="${url##*/}"
+    printf '{"assets":['
+    first=1
+    for f in "$D/assets/$tag/"*; do
+      [ -e "$f" ] || continue
+      b="$(basename "$f")"
+      [ "$first" = 1 ] || printf ','
+      printf '{"name":"%s","url":"TESTASSET:%s:%s"}' "$b" "$tag" "$b"; first=0
+    done
+    printf ']}' ;;
+  *releases*per_page*)
+    printf '['
+    first=1
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      [ "$first" = 1 ] || printf ','
+      printf '{"tag_name":"%s"}' "$t"; first=0
+    done < "$D/tags"
+    printf ']' ;;
+  *) exit 1 ;;
+esac
+STUB
+  chmod +x "$1/curl"
+}
+
+# Run the updater with NO usable gh, so only the curl path can work.
+run_noauth_case() {  # <installed_version> <fake_gh_dir> [GH_TOKEN]
+  local installed="$1" ghdir="$2" token="${3:-}" root prefix bin
+  root="$(mktemp -d)"
+  prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+  cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+  echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+  mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
+  echo "$installed" >"$prefix/VERSION"
+  printf '#!/bin/sh\nexit 0\n' > "$bin/turma-agentctl"; chmod +x "$bin/turma-agentctl"
+  install_unauthed_gh "$bin"
+  install_fake_curl "$bin"
+  FAKE_GH_DIR="$ghdir" HOME="$root/home" PATH="$bin:$PATH" \
+    TURMA_REPO="xerktech/turma" GH_TOKEN="$token" \
+    "$bin/turma-agent-update" >/dev/null 2>&1 || true
+  tr -d '[:space:]' < "$prefix/VERSION"
+  rm -rf "$root"
+}
+
+# 8. No gh login and no token -> the anonymous public read still updates.
+d="$(new_gh_dir)"
+add_unified_release "$d" "v0.6.4" "0.6.4" "v0.6.4"
+got="$(run_noauth_case "0.5.38" "$d")"
+assert_eq "0.6.4" "$got" "updates with no gh login and no token (-> $got)" "a host with no GitHub auth stayed at $got"
+# ...and it sent no Authorization header it doesn't have.
+if grep -qi 'authorization' "$d/curl-headers.log" 2>/dev/null; then
+  fail "sent an Authorization header with no token available"
+else
+  pass "anonymous read sends no Authorization header"
+fi
+rm -rf "$d"
+
+# 9. No gh login but $GH_TOKEN set -> same path, and the token is carried (a
+#    private fork / a rate-limited host still authenticates).
+d="$(new_gh_dir)"
+add_unified_release "$d" "v0.6.4" "0.6.4" "v0.6.4"
+got="$(run_noauth_case "0.5.38" "$d" "tok123")"
+assert_eq "0.6.4" "$got" "updates via GH_TOKEN when gh is unusable (-> $got)" "GH_TOKEN path failed, got $got"
+if grep -q 'Authorization: Bearer tok123' "$d/curl-headers.log" 2>/dev/null; then
+  pass "GH_TOKEN rides the request when set"
+else
+  fail "GH_TOKEN was set but never sent"
+fi
+rm -rf "$d"
+
 if [ "$FAILED" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
 exit "$FAILED"
