@@ -61,6 +61,17 @@ CVE-2026-50525 exp:2026-10-10
 CVE-2026-50527 exp:2026-10-10
 CVE-2026-50648 exp:2026-10-10
 
+# CVE-2026-56852 — HIGH infinite loop in golang.org/x/text's norm.Iter on
+# crafted input (fixed in x/text 0.39.0). Present only in bundled third-party
+# Go binaries — gh 2.96.0 (x/text 0.38.0) and terraform 1.15.8 (0.37.0) — where
+# x/text is compiled in, not independently patchable. Both are already the
+# newest upstream releases (gh 2.96.0 2026-07-02, terraform 1.15.8 latest
+# stable), so GH_VERSION / TERRAFORM_VERSION have nothing to bump to; the next
+# upstream release built against x/text 0.39+ clears it. Not first-party code,
+# and a DoS against a CLI a session runs by hand on input it chose. The expiry
+# forces the revisit: bump the pins once upstream ships x/text-0.39+ rebuilds.
+CVE-2026-56852 exp:2026-10-10
+
 # CVE-2026-14257 — HIGH ReDoS/DoS in brace-expansion through 5.0.7 (fixed in
 # 5.0.8). Present ONLY in the npm bundled inside the node base image
 # (/usr/local/lib/node_modules/npm/node_modules/brace-expansion), a transitive

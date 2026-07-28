@@ -68,7 +68,7 @@ ENV LANG=C.UTF-8 \
 
 # Static Docker CLI only (no daemon) — bump as needed (kept current so the
 # bundled Go stdlib stays ahead of known CVEs; the image scan gates on this).
-ARG DOCKER_CLI_VERSION=29.6.1
+ARG DOCKER_CLI_VERSION=29.6.2
 # GitHub CLI — used by Claude for PRs/issues and as git's credential helper.
 ARG GH_VERSION=2.96.0
 # ttyd — serves the in-container tmux session (the live Claude TUI) over the web
@@ -76,7 +76,7 @@ ARG GH_VERSION=2.96.0
 ARG TTYD_VERSION=1.7.7
 # PowerShell — cross-platform shell/scripting available to Claude. Self-contained
 # linux-x64 tarball (needs libicu, installed below). Bump as needed for CVEs.
-ARG POWERSHELL_VERSION=7.6.3
+ARG POWERSHELL_VERSION=7.6.4
 # npm — pinned ahead of the base image's bundled npm to pull in patched
 # transitive deps (e.g. undici); the image scan gates on npm's node_modules.
 ARG NPM_VERSION=11.18.0
