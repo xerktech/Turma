@@ -48,14 +48,13 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   these to a single "+" that opens the `SpawnDialog` (prompt/label/base/model/mode); the separate
   quick-spawn (was the ⚙/Tune icon) is gone. A phone header has room for one action, and the composer
   covers the bare case by leaving every field blank.
-- **New-ticket pill: a ticket glyph inside it, not the web's ＋** (XERK-150). Both put the "New ticket"
-  create action in the shared header as a rounded, LABELED accent pill (web `newticket.js` →
-  `#hdrNewTicket`; Android `NewTicketAction` in the shared `ScreenHeader`) — the label is what makes it
-  obvious, so an icon-only control was not enough. The one difference is the icon inside the pill: the
-  web uses a ＋, but on a phone the Sessions/Dashboard headers already carry a ＋ for "New session", so
-  Android uses a ticket glyph (`Icons.Filled.ConfirmationNumber`) to keep the two apart. Android's pill
-  is kept compact (small label, tight padding) so it and the org filter share the narrow header. Same
-  modal (`CreateTicketSheet`), same behavior.
+- **New-ticket pill: text-only, no icon** (XERK-150). Both put the "New ticket" create action in the
+  shared header as a rounded, LABELED accent pill (web `newticket.js` → `#hdrNewTicket`; Android
+  `NewTicketAction` in the shared `ScreenHeader`) — the label is what makes it obvious, so an icon-only
+  control was not enough. The web pill carries a ＋ beside the label; Android's is text-only, both to keep
+  it as small as possible in the narrow phone header and because a ＋ there would collide with the "New
+  session" ＋ the Sessions/Dashboard headers already carry. Same modal (`CreateTicketSheet`), same
+  behavior.
 - **Auto history-upgrade instead of the "Show more…" button** (XERK-77). The web chat marks a
   cap-truncated block with a manual "Show more…" that refetches `/history` (looser caps). Android
   refetches `/history` automatically when a truncated block arrives on the live tail (once per entry,
