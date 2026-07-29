@@ -96,7 +96,10 @@ push.sendFcm = (tokens, { title, body, data = {} } = {}) => {
   notifications.push({ tokens, title, body, data });
   return Promise.resolve({ sent: tokens.length, dead: [] });
 };
-const titles = () => notifications.map((n) => n.title);
+// Real alerts carry a title; retractions (XERK-154) are title-less data-only
+// messages, so titles() naturally excludes them and dismisses() reads their key.
+const titles = () => notifications.filter((n) => n.title != null).map((n) => n.title);
+const dismisses = () => notifications.filter((n) => n.data?.action === "dismiss").map((n) => n.data.notifKey);
 
 const hub = require("../server.js");
 // notify() no-ops when no device is registered; register one so the alert tests
@@ -589,6 +592,24 @@ test("alerts: question fires on new text only, re-arms when cleared", () => {
   assert.deepEqual(titles(), ["nas-repo-s1 has a question"]);
 });
 
+test("alerts: answering a question retracts its notification (XERK-154)", () => {
+  const beat = makeHost();
+  const withQ = (q) => ({
+    sessions: [{ id: "s1", rcName: "nas-repo-s1", session: q ? { question: q } : {} }],
+  });
+  notifications.length = 0;
+  beat(withQ("Deploy to prod?"));
+  assert.deepEqual(titles(), ["nas-repo-s1 has a question"]);
+  assert.equal(notifications[0].data.notifKey, "question:host1:s1"); // posted under a stable key
+  notifications.length = 0;
+  beat(withQ(null)); // answered from the desktop: retract, no new alert
+  assert.deepEqual(titles(), []);
+  assert.deepEqual(dismisses(), ["question:host1:s1"]);
+  notifications.length = 0;
+  beat(withQ(null)); // still no question: the retract fired once, on the edge
+  assert.deepEqual(dismisses(), []);
+});
+
 // ---- PR alerts held until CI is green (XERK-153) ---------------------------
 
 const PR_URL = "https://github.com/xerktech/Turma/pull/34";
@@ -706,6 +727,26 @@ test("alerts: PR fires once per URL and tracks several PRs independently", () =>
   assert.equal(notifications[0].data.click, other);
 });
 
+for (const finalState of ["MERGED", "CLOSED"]) {
+  test(`alerts: a ${finalState} PR retracts its notification (XERK-154)`, () => {
+    const beat = makeHost();
+    const t0 = Date.now();
+    notifications.length = 0;
+    beat(prBeat([PR_URL]), t0);
+    beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + MIN); // the alert fires
+    assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+    assert.equal(notifications.at(-1).data.notifKey, `pr:${PR_URL}`);
+    notifications.length = 0;
+    // Operator resolves it on their computer; the agent reports the new state.
+    beat(prBeat([], [{ url: PR_URL, checks: "passing", state: finalState }]), t0 + 2 * MIN);
+    assert.deepEqual(titles(), []); // no new alert
+    assert.deepEqual(dismisses(), [`pr:${PR_URL}`]);
+    notifications.length = 0;
+    beat(prBeat([], [{ url: PR_URL, checks: "passing", state: finalState }]), t0 + 3 * MIN);
+    assert.deepEqual(dismisses(), []); // retracted once, on the edge
+  });
+}
+
 test("prAlertDecision: the verdict table, and its sticky markers", () => {
   const now = Date.now();
   // No status fetched yet is never "no CI" — hold.
@@ -746,6 +787,29 @@ test("alerts: turn finished fires on the working->idle edge only", () => {
   notifications.length = 0;
   beat(sess(620), now + 40000); // stays idle: edge already fired
   assert.deepEqual(titles(), []);
+});
+
+test("alerts: replying to a finished turn retracts its notification (XERK-154)", () => {
+  const beat = makeHost();
+  const sess = (ageSec, busy) => ({
+    sessions: [{
+      id: "s1", rcName: "nas-repo-s1",
+      session: { paneBusy: busy, transcriptAgeSec: ageSec, lastRole: "assistant", lastHasToolUse: false },
+    }],
+  });
+  const now = Date.now();
+  notifications.length = 0;
+  beat(sess(0, true), now);            // working
+  beat(sess(600, false), now + 20000); // went idle: turn finished
+  assert.deepEqual(titles(), ["nas-repo-s1 finished its turn"]);
+  assert.equal(notifications.at(-1).data.notifKey, "turn:host1:s1");
+  notifications.length = 0;
+  beat(sess(0, true), now + 40000);    // operator replied: working again
+  assert.deepEqual(titles(), []);
+  assert.deepEqual(dismisses(), ["turn:host1:s1"]);
+  notifications.length = 0;
+  beat(sess(10, true), now + 60000);   // stays working: retracted once, on the edge
+  assert.deepEqual(dismisses(), []);
 });
 
 test("alerts: no turn-finished when idle entry is a pending tool call", () => {

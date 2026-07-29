@@ -1889,6 +1889,17 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `FCM_SERVICE_ACCOUNT_JSON`), carrying `tags`/`priority`/`click`/`route:{host,sessionId}` as message data
   so the client picks a channel and deep-links a tap. `notify()` is a no-op when no device is registered or
   FCM is unconfigured.
+- **An addressed alert is retracted from the phone** (XERK-154): a delivered notification whose subject
+  gets resolved elsewhere is auto-cancelled, so the phone doesn't keep stale flags. Every alert now posts
+  under a stable **`notifKey`** (`question:<host>:<id>`, `pr:<url>`, `turn:<host>:<id>`), and `dismiss()` —
+  a title-less data-only FCM message `{action:"dismiss", notifKey}` — retracts it. `heartbeatAlerts` fires
+  a dismiss on three edges, each once: a question cleared (`!s.question` while `sa.lastQuestion` was set),
+  a PR reaching MERGED/CLOSED (watched over `sa.prSeen` via the `prStatus` map, deduped by `sa.prDismissed`),
+  and a finished turn the operator replied to (`sa.turnAlerted` + the idle→working edge). App-side,
+  `Notifications.idFor` derives the id from `notifKey` (falling back to session/host/title for host-level
+  and older-hub alerts), so distinct alert kinds now COEXIST instead of clobbering one id per session, and
+  a `dismiss` cancels the exact one. push.js is unchanged (it spreads `data` through). Tests: the
+  `XERK-154` retract cases in `server.test.js`.
 - Devices register via `POST /api/devices` (user-authed, persisted to `/data/devices.json`), unregister
   via `DELETE /api/devices?token=`; dead tokens (404 UNREGISTERED) are pruned on send.
 - The Android client owns the delivery half: `POST_NOTIFICATIONS`, the Android-13+ runtime request in
