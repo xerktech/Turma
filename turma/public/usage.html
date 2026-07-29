@@ -697,14 +697,40 @@ function tableView(list, dates) {
   return details;
 }
 
-// One token figure: the bucket's total, with the in/out split underneath —
-// cache traffic dominates the total and would otherwise leave the headline
-// number unreadable on its own.
+// Share of the PROMPT served from cache, as a percent. The denominator is the
+// input side only (fresh input + cache write + cache read = the whole prompt);
+// output never caches, so folding it in would understate the rate.
+// `null` when there is no input-side traffic to take a ratio of.
+function cacheHitRate(b) {
+  if (!b) return null;
+  const read = b.cacheRead || 0;
+  const prompt = read + (b.cacheWrite || 0) + (b.input || 0);
+  return prompt ? Math.round((read / prompt) * 100) : null;
+}
+
+// The cache half of a bucket. Omitted entirely when a bucket carries no cache
+// traffic at all — an older agent reports none, and a bare "0 cached · 0
+// written" would read as caching being broken rather than unreported.
+function cacheSubLine(b) {
+  const read = b.cacheRead || 0, write = b.cacheWrite || 0;
+  if (!read && !write) return "";
+  const hit = cacheHitRate(b);
+  return `<span class="sub-tok">${fmtTokens(read)} cached · ${fmtTokens(write)} written` +
+    (hit === null ? "" : ` · ${hit}% hit`) + `</span>`;
+}
+
+// One token figure: the bucket's total, with the in/out split and the cache
+// split underneath. The total alone can't answer the question the page exists
+// for, because its parts are priced nothing like each other — a cache read is
+// ~0.1x fresh input and a write ~1.25x, so a big number is cheap when it is
+// mostly reads and expensive when it is mostly writes. The hit rate is what
+// says whether sessions on a repo are re-paying for the same prefix.
 function tokenCell(b, cls) {
   const klass = (extra) => ` class="${[cls, extra].filter(Boolean).join(" ")}"`;
   if (!dayTokens(b)) return `<td${klass("zero")}>–</td>`;
   return `<td${klass()}><span class="tok">${fmtTokens(dayTokens(b))}</span>` +
-    `<span class="sub-tok">${fmtTokens(b.input)} in · ${fmtTokens(b.output)} out</span></td>`;
+    `<span class="sub-tok">${fmtTokens(b.input)} in · ${fmtTokens(b.output)} out</span>` +
+    cacheSubLine(b) + `</td>`;
 }
 
 // "Tokens by model" — which model consumed what, merged across whichever series
