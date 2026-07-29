@@ -325,4 +325,12 @@ data class CloneRequest(val repo: String)
 data class ResumeRequest(val cwd: String = "")
 
 @Serializable
-data class DeviceRequest(val token: String, val platform: String = "android")
+data class DeviceRequest(
+    val token: String,
+    val platform: String = "android",
+    // Capabilities this build supports, so the hub only sends messages it can
+    // handle. "dismiss" = it cancels a notification on an {action:"dismiss"}
+    // message (XERK-154); without it the hub withholds those, since an older
+    // build would render one as a blank notification.
+    val features: List<String> = listOf("dismiss"),
+)

@@ -289,14 +289,20 @@ function scheduleDeviceSave() {
   }, 5 * 1000);
   devSaveTimer.unref();
 }
-function registerDevice(token, platform) {
+function registerDevice(token, platform, features) {
   const now = Date.now();
+  // What this app build can do (XERK-154). Only a build that declares "dismiss"
+  // is sent retractions — an older one has no handler for them and would render
+  // the data-only dismiss as a blank "Turma" notification. Omitted on re-register
+  // keeps the stored set (an old app can't erase a newer one's capabilities).
+  const caps = Array.isArray(features) ? features.filter((f) => typeof f === "string") : null;
   const existing = devices.find((d) => d.token === token);
   if (existing) {
     existing.platform = platform || existing.platform;
+    if (caps) existing.features = caps;
     existing.seenAt = now;
   } else {
-    devices.push({ token, platform: platform || "android", addedAt: now, seenAt: now });
+    devices.push({ token, platform: platform || "android", features: caps || [], addedAt: now, seenAt: now });
   }
   scheduleDeviceSave();
 }
@@ -1361,10 +1367,16 @@ function notify(title, message, opts = {}) {
 // notify(); carries no title/body, so it shows nothing itself.
 function dismiss(notifKey) {
   if (!notifKey) return;
-  const tokens = listDevices();
+  // Only devices whose app build declared "dismiss" support — a retraction is a
+  // data-only message an older build would show as a blank notification instead
+  // of cancelling (XERK-154). Withheld devices simply keep the stale alert until
+  // the app updates, which is strictly better than a blank one.
+  const tokens = listDevices()
+    .filter((d) => Array.isArray(d.features) && d.features.includes("dismiss"))
+    .map((d) => d.token);
   if (!tokens.length) return;
   push
-    .sendFcm(tokens.map((d) => d.token), { data: { action: "dismiss", notifKey } })
+    .sendFcm(tokens, { data: { action: "dismiss", notifKey } })
     .then((r) => pruneDevices(r.dead))
     .catch((e) => console.error(`fcm dismiss failed: ${e.message}`));
 }
@@ -2533,7 +2545,8 @@ const server = http.createServer(async (req, res) => {
       const token = typeof body.token === "string" ? body.token.trim() : "";
       if (!token) return json(res, 400, { error: "token required" });
       const platform = typeof body.platform === "string" ? body.platform : "android";
-      registerDevice(token, platform);
+      const features = Array.isArray(body.features) ? body.features : undefined;
+      registerDevice(token, platform, features);
       return json(res, 200, { ok: true });
     }
     if (req.method === "DELETE" && url.pathname === "/api/devices") {
