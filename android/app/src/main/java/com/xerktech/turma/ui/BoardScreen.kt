@@ -25,7 +25,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ConfirmationNumber
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
@@ -275,11 +274,11 @@ fun BoardScreen(
  * being handed data, so it works wherever the header renders. Hidden until a
  * host reports a tracker org to create against, as the web slot collapses.
  *
- * A LABELED accent pill (ticket icon + "New ticket"), matching the web's rounded
- * button — an icon alone (a `+`, or even a ticket glyph) didn't say "create a
- * ticket", and the `+` collided with the "New session" `+` the Sessions and
- * Dashboard headers carry. The text is what makes it obvious; it's kept compact
- * (small label, tight padding) so it and the org filter still share the header.
+ * A LABELED accent pill reading "New ticket", matching the web's rounded button.
+ * Text-only, no icon: the words are what make it obvious, and dropping the icon
+ * keeps the pill as small as possible in the narrow phone header (an icon alone
+ * wasn't clear, and a `+` collided with the "New session" `+` the Sessions and
+ * Dashboard headers carry — so the label carries the meaning on its own).
  */
 @Composable
 fun NewTicketAction(vm: BoardViewModel = viewModel()) {
@@ -294,14 +293,12 @@ fun NewTicketAction(vm: BoardViewModel = viewModel()) {
         color = MaterialTheme.colorScheme.primary,
         contentColor = MaterialTheme.colorScheme.onPrimary,
     ) {
-        Row(
-            Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(Icons.Filled.ConfirmationNumber, contentDescription = null, modifier = Modifier.size(16.dp))
-            Spacer(Modifier.width(6.dp))
-            Text("New ticket", style = MaterialTheme.typography.labelLarge, maxLines = 1)
-        }
+        Text(
+            "New ticket",
+            style = MaterialTheme.typography.labelLarge,
+            maxLines = 1,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+        )
     }
     if (creating) {
         // Default the form's org to the header scope when it names a real one,
