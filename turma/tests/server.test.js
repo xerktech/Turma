@@ -104,7 +104,7 @@ const dismisses = () => notifications.filter((n) => n.data?.action === "dismiss"
 const hub = require("../server.js");
 // notify() no-ops when no device is registered; register one so the alert tests
 // see the fan-out. Real fan-out/pruning is exercised separately below.
-hub.registerDevice("capture-device", "android");
+hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
   server, agents, queueCommand, findSession,
   wsAccept, wsEncode, wsParser, channelDuplex,
@@ -590,6 +590,24 @@ test("alerts: question fires on new text only, re-arms when cleared", () => {
   beat(withQ(null)); // answered
   beat(withQ("Deploy to prod?")); // same text as before, but re-armed
   assert.deepEqual(titles(), ["nas-repo-s1 has a question"]);
+});
+
+test("alerts: a retraction is withheld from a build that lacks dismiss support (XERK-154)", () => {
+  // An older app registered before it understood dismisses — it must still get
+  // the alert, but a dismiss would show as a blank notification on it.
+  hub.registerDevice("legacy-nofeat", "android"); // no features declared
+  const beat = makeHost();
+  const withQ = (q) => ({ sessions: [{ id: "sL", rcName: "r", session: q ? { question: q } : {} }] });
+  notifications.length = 0;
+  beat(withQ("Ship it?"));
+  assert.ok(notifications[0].tokens.includes("legacy-nofeat"), "the alert itself reaches every device");
+  notifications.length = 0;
+  beat(withQ(null)); // answered -> dismiss
+  const d = notifications.find((n) => n.data?.action === "dismiss");
+  assert.ok(d, "a dismiss was sent");
+  assert.ok(d.tokens.includes("capture-device"), "to the dismiss-capable device");
+  assert.ok(!d.tokens.includes("legacy-nofeat"), "but withheld from the legacy one");
+  hub.unregisterDevice("legacy-nofeat"); // keep the shared registry clean for other tests
 });
 
 test("alerts: answering a question retracts its notification (XERK-154)", () => {

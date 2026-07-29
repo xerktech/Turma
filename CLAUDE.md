@@ -1564,8 +1564,12 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   (watched over `sa.prSeen` via `prStatus`, deduped by `sa.prDismissed`), a finished turn the operator
   replied to (`sa.turnAlerted` + the idle→working edge). App-side `Notifications.idFor` keys the
   notification off `notifKey` (falling back to session/host/title), so distinct alert kinds coexist instead
-  of colliding on one per-session id, and a dismiss cancels the exact one. Tests: the `XERK-154` retract
-  cases in `server.test.js`.
+  of colliding on one per-session id, and a dismiss cancels the exact one. **`dismiss()` is capability-gated**:
+  it only fans out to devices whose registration declared `features:["dismiss"]` (the app sends it via
+  `DeviceRequest`), because an older build has no dismiss handler and would render the data-only message
+  as a blank "Turma" notification — a withheld device keeps the stale alert until the app updates, which
+  beats a blank one. Regular alerts still go to every device. Tests: the `XERK-154` retract cases in
+  `server.test.js`.
 - The Android client owns the delivery half: `POST_NOTIFICATIONS`, the Android-13+ runtime request in
   `MainActivity`, channels + rendering in `push/Notifications.kt`, `push/PushRegistrar.kt`.
 - **Push health is VISIBLE, not just logged** (XERK-152): a hub without `FCM_SERVICE_ACCOUNT_JSON` delivers
