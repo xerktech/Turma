@@ -1557,6 +1557,15 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   so the client picks a channel and deep-links a tap. A no-op when no device is registered or FCM is
   unconfigured. Devices register via `POST /api/devices` (user-authed, persisted to
   `/data/devices.json`), unregister via `DELETE /api/devices?token=`; dead tokens are pruned on send.
+- **An addressed alert is retracted from the phone** (XERK-154): every session alert posts under a stable
+  `notifKey` (`question:<host>:<id>`, `pr:<url>`, `turn:<host>:<id>`), and `dismiss(notifKey)` sends a
+  title-less `{action:"dismiss", notifKey}` FCM message (no-op with no device / FCM off, like `notify()`).
+  `heartbeatAlerts` fires it once per addressed edge: a question cleared, a PR reaching MERGED/CLOSED
+  (watched over `sa.prSeen` via `prStatus`, deduped by `sa.prDismissed`), a finished turn the operator
+  replied to (`sa.turnAlerted` + the idle→working edge). App-side `Notifications.idFor` keys the
+  notification off `notifKey` (falling back to session/host/title), so distinct alert kinds coexist instead
+  of colliding on one per-session id, and a dismiss cancels the exact one. Tests: the `XERK-154` retract
+  cases in `server.test.js`.
 - The Android client owns the delivery half: `POST_NOTIFICATIONS`, the Android-13+ runtime request in
   `MainActivity`, channels + rendering in `push/Notifications.kt`, `push/PushRegistrar.kt`.
 - **Push health is VISIBLE, not just logged** (XERK-152): a hub without `FCM_SERVICE_ACCOUNT_JSON` delivers

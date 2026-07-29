@@ -1338,6 +1338,10 @@ function notify(title, message, opts = {}) {
     tags: opts.tags || "",
     priority: opts.priority || "default",
   };
+  // A stable per-notification key so a later beat can retract this exact alert
+  // once its subject is addressed (XERK-154, dismiss() below). The app posts the
+  // notification under it and cancels by it; alerts sharing a key collapse.
+  if (opts.notifKey) data.notifKey = opts.notifKey;
   if (opts.click) data.click = opts.click;
   if (opts.route) {
     if (opts.route.host) data.host = opts.route.host;
@@ -1347,6 +1351,22 @@ function notify(title, message, opts = {}) {
     .sendFcm(tokens.map((d) => d.token), { title, body: message, data })
     .then((r) => pruneDevices(r.dead))
     .catch((e) => console.error(`fcm fan-out failed: ${e.message}`));
+}
+
+// Retract an already-delivered notification once the thing it flagged has been
+// addressed elsewhere — a merged/closed PR, an answered question, a resumed
+// turn (XERK-154). A data-only FCM message the app recognises by
+// `action:"dismiss"` and cancels by the same `notifKey` the original alert
+// carried. Best-effort and a no-op with no devices / FCM off, exactly like
+// notify(); carries no title/body, so it shows nothing itself.
+function dismiss(notifKey) {
+  if (!notifKey) return;
+  const tokens = listDevices();
+  if (!tokens.length) return;
+  push
+    .sendFcm(tokens.map((d) => d.token), { data: { action: "dismiss", notifKey } })
+    .then((r) => pruneDevices(r.dead))
+    .catch((e) => console.error(`fcm dismiss failed: ${e.message}`));
 }
 
 function fmtDur(ms) {
@@ -1500,11 +1520,18 @@ function heartbeatAlerts(key, prev, next) {
     const s = session.session || {}; // null for stopped sessions
 
     const route = { host: key, sessionId: session.id };
+    const questionKey = `question:${key}:${session.id}`;
     if (s.question && s.question !== sa.lastQuestion) {
       sa.lastQuestion = s.question;
-      notify(`${label} has a question`, s.question, { tags: "question", priority: "high", route });
+      notify(`${label} has a question`, s.question, { tags: "question", priority: "high", route, notifKey: questionKey });
     }
-    if (!s.question) delete sa.lastQuestion;
+    if (!s.question) {
+      // Answered/cleared elsewhere (e.g. from the desktop) — retract the
+      // phone's now-stale question notification (XERK-154). The guard fires the
+      // dismiss once, on the edge, not every quiet beat.
+      if (sa.lastQuestion) dismiss(questionKey);
+      delete sa.lastQuestion;
+    }
 
     // A new PR goes into a per-session wait list rather than alerting straight
     // away, and leaves it when its CI settles (prAlertDecision). `prSeen` keeps
@@ -1524,7 +1551,22 @@ function heartbeatAlerts(key, prev, next) {
       if (!note) continue;
       delete wait[url];
       sa.prSeen = [...(sa.prSeen || []), url].slice(-PR_ALERT_MAX_TRACKED);
-      notify(`${label} created a PR`, `${note} · ${url}`, { tags: "rocket", click: url, route });
+      notify(`${label} created a PR`, `${note} · ${url}`, { tags: "rocket", click: url, route, notifKey: `pr:${url}` });
+    }
+    // Retract a delivered PR alert once the PR has been merged or closed — the
+    // reason to look at it on the phone is gone (XERK-154). `prSeen` holds the
+    // URLs already alerted; `prDismissed` remembers which we've retracted so the
+    // dismiss fires once on the state edge, not every beat, and is bounded like
+    // prSeen. The PR state rides session.prs (prStatus), refreshed on the
+    // agent's PR cadence, so a merge done from the desktop lands within a beat.
+    sa.prDismissed = sa.prDismissed || [];
+    for (const url of sa.prSeen || []) {
+      const st = prStatus.get(url);
+      const done = st && (st.state === "MERGED" || st.state === "CLOSED");
+      if (done && !sa.prDismissed.includes(url)) {
+        sa.prDismissed = [...sa.prDismissed, url].slice(-PR_ALERT_MAX_TRACKED);
+        dismiss(`pr:${url}`);
+      }
     }
     // Bound the wait list the way prSeen is bounded: a PR whose CI never
     // resolves ages out via the backstop, but a host that somehow outruns that
@@ -1542,10 +1584,19 @@ function heartbeatAlerts(key, prev, next) {
     // still mid-turn / already alerted above). A beat that just recovered from
     // an offline period skips this — "back online" already covers it and the
     // working->idle edge across the gap is stale.
+    const turnKey = `turn:${key}:${session.id}`;
     const working = sessionWorking(session, next.lastSeen, now);
     if (sa.wasWorking && !working && !recovered && s.lastRole === "assistant" && !s.lastHasToolUse) {
       const repo = session.git?.repoName ? ` · ${session.git.repoName}@${session.git.branch}` : "";
-      notify(`${label} finished its turn`, `Waiting for input${repo}`, { tags: "checkered_flag", route });
+      notify(`${label} finished its turn`, `Waiting for input${repo}`, { tags: "checkered_flag", route, notifKey: turnKey });
+      sa.turnAlerted = true;
+    }
+    // The "finished its turn — waiting for input" notice is addressed the moment
+    // the session is working again (the operator replied), so retract it
+    // (XERK-154). Fires once on the idle->working edge via the turnAlerted flag.
+    if (working && sa.turnAlerted) {
+      dismiss(turnKey);
+      delete sa.turnAlerted;
     }
     sa.wasWorking = working;
   }
