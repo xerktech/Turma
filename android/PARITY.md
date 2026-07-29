@@ -353,7 +353,12 @@ those are marked `[MODEL]`.
 - ~~P0 30-day stacked daily chart.~~ ~~P0 Legend with per-series + per-group toggles, persisted,
   rescoping.~~ Both done (XERK-78, see Done above); series colors are the categorical palette now.
 - P1 Move "By model" out of the grouping tabs into a standalone "Tokens by model" card (Today / Last
-  7 days / All-time). Add a collapsible table view with in/out split.
+  7 days / All-time). Add a collapsible table view with the in/out and cache splits.
+- The **cache split** (`N cached · N written · N% hit`) is at parity, laid out platform-idiomatically:
+  the web hangs it under every token figure in the table view and by-model card, Android under each
+  `UsageRow` and the headline stat row, since Android has no table view yet (the P1 above). The
+  `CacheSummary` reducer is `UsageViewModel`'s, tested against the same vectors as the web's
+  `cacheHitRate` (`UsageViewModelTest` ↔ `turma/tests/usage.test.js`).
 - P2 Per-day tooltip; the web's texture channel for series 9+ (Android reuses hues past 8).
 
 ### Nav / Login

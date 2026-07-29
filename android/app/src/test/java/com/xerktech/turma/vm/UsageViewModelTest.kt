@@ -174,4 +174,69 @@ class UsageViewModelTest {
         assertEquals(500L, UsageViewModel.niceMax(400))
         assertEquals(1000L, UsageViewModel.niceMax(999))
     }
+
+    // --- cache split (mirrors turma/tests/usage.test.js) ----------------------
+    // The denominator is the prompt (input + cacheWrite + cacheRead), never
+    // output: output is generated, never served from cache, so counting it would
+    // make a perfectly-cached repo look like it was missing.
+
+    private fun cache(read: Long = 0, write: Long = 0, input: Long = 0) =
+        UsageViewModel.CacheSummary(read = read, write = write, input = input)
+
+    @Test fun `hitPct is the cached share of the prompt`() {
+        assertEquals(90, cache(read = 900, input = 100).hitPct)
+    }
+
+    @Test fun `hitPct counts a cache write as a miss`() {
+        // The session paid 1.25x to write this prefix; it read none of it back.
+        assertEquals(0, cache(write = 1000).hitPct)
+    }
+
+    @Test fun `hitPct is null when there is no prompt traffic`() {
+        assertEquals(null, cache().hitPct)
+    }
+
+    @Test fun `hitPct rounds rather than truncating`() {
+        // 2/3 -> 67, not 66. Same vector as the web test.
+        assertEquals(67, cache(read = 2000, input = 1000).hitPct)
+    }
+
+    @Test fun `any is false for an agent reporting no cache fields`() {
+        // Drives whether the sub-line renders at all: "0 cached · 0 written"
+        // would read as caching being broken rather than simply unreported.
+        assertEquals(false, cache(input = 500).any)
+        assertEquals(true, cache(write = 1).any)
+        assertEquals(true, cache(read = 1).any)
+    }
+
+    @Test fun `compute carries the cache split onto repos, hosts and the fleet`() {
+        val split = UsageBucket(input = 100, output = 50, cacheWrite = 200, cacheRead = 700)
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(
+                key = "h1",
+                usage = UsageInfo(totals = split),
+                repoUsage = listOf(RepoUsage("turma", "github.com/x/turma", UsageInfo(totals = split))),
+            ),
+        ))
+        val ui = UsageViewModel.compute(fleet)
+        // Prompt = 100 + 200 + 700 = 1000, of which 700 was read from cache.
+        assertEquals(70, ui.cache.hitPct)
+        assertEquals(700L, ui.byHost.single().cache.read)
+        assertEquals(200L, ui.byRepo.single().cache.write)
+    }
+
+    @Test fun `a host with no usage block sums its repos for the cache split too`() {
+        // Same host-block-then-repos fallback the totals use — an older agent's
+        // cache traffic must not silently read as zero.
+        val fleet = FleetState(agents = listOf(
+            AgentInfo(key = "old", usage = null, repoUsage = listOf(
+                RepoUsage("A", "k/a", UsageInfo(totals = UsageBucket(cacheRead = 30, input = 10))),
+                RepoUsage("B", "k/b", UsageInfo(totals = UsageBucket(cacheRead = 30, input = 30))),
+            )),
+        ))
+        val host = UsageViewModel.compute(fleet).byHost.single()
+        assertEquals(60L, host.cache.read)
+        assertEquals(100L, host.cache.prompt)
+        assertEquals(60, host.cache.hitPct)
+    }
 }

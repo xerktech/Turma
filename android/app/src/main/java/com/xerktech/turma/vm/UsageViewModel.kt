@@ -23,6 +23,30 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
 
     fun start() = container.fleet.start()
 
+    /**
+     * The all-time cache split behind a token total (web usage.html
+     * `cacheSubLine`/`cacheHitRate`). Carried alongside the flat totals because
+     * a total alone can't say what it cost: its parts are priced nothing like
+     * each other — a cache read is ~0.1x fresh input, a write ~1.25x — so a big
+     * number is cheap when it is mostly reads and expensive when mostly writes.
+     */
+    data class CacheSummary(val read: Long = 0, val write: Long = 0, val input: Long = 0) {
+        /** The prompt side only. Output is generated, never cached. */
+        val prompt: Long get() = read + write + input
+
+        /**
+         * Percent of the prompt served from cache, or null when there is no
+         * prompt traffic to take a ratio of.
+         */
+        val hitPct: Int? get() = if (prompt > 0) Math.round(read * 100.0 / prompt).toInt() else null
+
+        /** False for an older agent that reports no cache fields at all. */
+        val any: Boolean get() = read > 0 || write > 0
+
+        operator fun plus(o: CacheSummary) =
+            CacheSummary(read + o.read, write + o.write, input + o.input)
+    }
+
     data class RepoTotal(
         val repo: String,
         val remoteKey: String,
@@ -31,6 +55,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val total: Long,
         /** "YYYY-MM-DD" (UTC) -> that day's total tokens, summed across hosts. */
         val days: Map<String, Long> = emptyMap(),
+        val cache: CacheSummary = CacheSummary(),
     ) {
         /** Legend/persistence key, the web's skey ("repo::<remoteKey>"). */
         val skey: String get() = "repo::$remoteKey"
@@ -45,12 +70,19 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val week: Long,
         val total: Long,
         val days: Map<String, Long> = emptyMap(),
+        val cache: CacheSummary = CacheSummary(),
     ) {
         val skey: String get() = "host::$host"
     }
 
     /** One model's fleet-wide token counts. */
-    data class ModelTotal(val model: String, val today: Long, val week: Long, val total: Long)
+    data class ModelTotal(
+        val model: String,
+        val today: Long,
+        val week: Long,
+        val total: Long,
+        val cache: CacheSummary = CacheSummary(),
+    )
 
     data class UsageUi(
         val byRepo: List<RepoTotal> = emptyList(),
@@ -59,6 +91,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         val today: Long = 0,
         val week: Long = 0,
         val total: Long = 0,
+        val cache: CacheSummary = CacheSummary(),
     )
 
     companion object {
@@ -86,6 +119,9 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
             for ((d, b) in u.days) acc[d] = (acc[d] ?: 0) + b.total
         }
 
+        /** The prompt-side split of a bucket (web `cacheHitRate`'s inputs). */
+        fun UsageBucket.cacheSummary() = CacheSummary(cacheRead, cacheWrite, input)
+
         fun compute(fleet: FleetState): UsageUi {
             val repoAcc = LinkedHashMap<String, RepoTotal>()
             val modelAcc = LinkedHashMap<String, ModelTotal>()
@@ -93,6 +129,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
             var today = 0L
             var week = 0L
             var total = 0L
+            var cache = CacheSummary()
 
             for (a in fleet.agents) {
                 // Prefer the host-level block (aggregated from every transcript
@@ -104,13 +141,18 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 val hostToday = window { it.today }
                 val hostWeek = window { it.week }
                 val hostTotal = window { it.totals }
+                // Same host-block-then-repos fallback as the totals above, so a
+                // host without an aggregate still reports its cache split.
+                val hostCache = a.usage?.totals?.cacheSummary()
+                    ?: a.repoUsage.fold(CacheSummary()) { acc, r -> acc + r.usage.totals.cacheSummary() }
                 val hostDays = LinkedHashMap<String, Long>()
                 a.usage?.let { addDays(hostDays, it) }
                     ?: a.repoUsage.forEach { addDays(hostDays, it.usage) }
-                hosts.add(HostTotal(a.key, hostToday, hostWeek, hostTotal, hostDays))
+                hosts.add(HostTotal(a.key, hostToday, hostWeek, hostTotal, hostDays, hostCache))
                 today += hostToday
                 week += hostWeek
                 total += hostTotal
+                cache += hostCache
 
                 for (ru in a.repoUsage) {
                     val key = normRepo(ru.remoteKey.ifBlank { ru.repo })
@@ -125,6 +167,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                         week = (prev?.week ?: 0) + ru.usage.week.total,
                         total = (prev?.total ?: 0) + ru.usage.totals.total,
                         days = days,
+                        cache = (prev?.cache ?: CacheSummary()) + ru.usage.totals.cacheSummary(),
                     )
                 }
 
@@ -137,6 +180,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                         today = (prev?.today ?: 0) + m.today.total,
                         week = (prev?.week ?: 0) + m.week.total,
                         total = (prev?.total ?: 0) + m.totals.total,
+                        cache = (prev?.cache ?: CacheSummary()) + m.totals.cacheSummary(),
                     )
                 }
             }
@@ -147,6 +191,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 today = today,
                 week = week,
                 total = total,
+                cache = cache,
             )
         }
 

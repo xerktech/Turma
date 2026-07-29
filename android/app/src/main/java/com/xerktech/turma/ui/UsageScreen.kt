@@ -57,6 +57,7 @@ private data class UsageSeries(
     val today: Long,
     val total: Long,
     val days: Map<String, Long>,
+    val cache: UsageViewModel.CacheSummary = UsageViewModel.CacheSummary(),
 )
 
 @Composable
@@ -86,12 +87,12 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
     val ordered: List<UsageSeries> = remember(ui, tab) {
         when (tab) {
             // Chartable groupings sort by (label, key) — the stable paint order.
-            0 -> ui.byRepo.map { UsageSeries(it.skey, it.label, it.today, it.total, it.days) }
+            0 -> ui.byRepo.map { UsageSeries(it.skey, it.label, it.today, it.total, it.days, it.cache) }
                 .sortedWith(compareBy({ it.label }, { it.skey }))
-            1 -> ui.byHost.map { UsageSeries(it.skey, it.host, it.today, it.total, it.days) }
+            1 -> ui.byHost.map { UsageSeries(it.skey, it.host, it.today, it.total, it.days, it.cache) }
                 .sortedWith(compareBy({ it.label }, { it.skey }))
             // Models keep biggest-consumer-first (no chart, no legend).
-            else -> ui.byModel.map { UsageSeries("model::" + it.model, it.model, it.today, it.total, emptyMap()) }
+            else -> ui.byModel.map { UsageSeries("model::" + it.model, it.model, it.today, it.total, emptyMap(), it.cache) }
         }
     }
     val visible = remember(ordered, hidden) { ordered.filter { it.skey !in hidden } }
@@ -103,10 +104,15 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
 
     Column(modifier.fillMaxSize()) {
         ScreenHeader("Usage")
-        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-            Stat("Today", ui.today)
-            Stat("This week", ui.week)
-            Stat("All-time", ui.total)
+        Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                Stat("Today", ui.today)
+                Stat("This week", ui.week)
+                Stat("All-time", ui.total)
+            }
+            // Fleet-wide cache split: how much of the all-time prompt traffic was
+            // served from cache rather than paid for fresh.
+            CacheLine(ui.cache)
         }
         TabRow(selectedTabIndex = tab, containerColor = MaterialTheme.colorScheme.background) {
             Tab(selected = tab == 0, onClick = { setTab(0) }, text = { Text("By repo") })
@@ -142,7 +148,7 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
                 val s = rows[i]
                 val color = if (tab < 2) paint[s.skey] ?: MaterialTheme.colorScheme.primary
                 else MaterialTheme.colorScheme.primary
-                UsageRow(s.label, s.today, s.total, s.total.toDouble() / maxTotal, color)
+                UsageRow(s.label, s.today, s.total, s.total.toDouble() / maxTotal, color, s.cache)
             }
             if (rows.isEmpty()) item {
                 Text(
@@ -296,8 +302,33 @@ private fun Stat(label: String, tokens: Long) {
     }
 }
 
+/**
+ * The cache split under a token figure (web usage.html `cacheSubLine`). Omitted
+ * entirely when a series reports no cache traffic — an older agent sends none,
+ * and a bare "0 cached · 0 written" would read as caching being broken rather
+ * than simply unreported.
+ */
 @Composable
-private fun UsageRow(name: String, today: Long, total: Long, fraction: Double, color: androidx.compose.ui.graphics.Color) {
+private fun CacheLine(cache: UsageViewModel.CacheSummary) {
+    if (!cache.any) return
+    val hit = cache.hitPct
+    Text(
+        "${fmtTokens(cache.read)} cached · ${fmtTokens(cache.write)} written" +
+            (if (hit == null) "" else " · $hit% hit"),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+@Composable
+private fun UsageRow(
+    name: String,
+    today: Long,
+    total: Long,
+    fraction: Double,
+    color: androidx.compose.ui.graphics.Color,
+    cache: UsageViewModel.CacheSummary = UsageViewModel.CacheSummary(),
+) {
     Column(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(name, Modifier.weight(1f), maxLines = 1)
@@ -318,5 +349,6 @@ private fun UsageRow(name: String, today: Long, total: Long, fraction: Double, c
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        CacheLine(cache)
     }
 }
