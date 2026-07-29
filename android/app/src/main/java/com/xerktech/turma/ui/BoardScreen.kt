@@ -35,6 +35,7 @@ import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -274,11 +275,11 @@ fun BoardScreen(
  * being handed data, so it works wherever the header renders. Hidden until a
  * host reports a tracker org to create against, as the web slot collapses.
  *
- * The glyph is a ticket (`ConfirmationNumber`), deliberately NOT a bare `+`: the
- * Sessions and Dashboard headers already carry a `+` for "New session", so two
- * plain `+`s read as the same action. The web affords the room for a full "New
- * ticket" pill; a phone header doesn't, so the ticket glyph carries the meaning
- * and "New ticket" rides its content description / long-press tooltip.
+ * A LABELED accent pill (ticket icon + "New ticket"), matching the web's rounded
+ * button — an icon alone (a `+`, or even a ticket glyph) didn't say "create a
+ * ticket", and the `+` collided with the "New session" `+` the Sessions and
+ * Dashboard headers carry. The text is what makes it obvious; it's kept compact
+ * (small label, tight padding) so it and the org filter still share the header.
  */
 @Composable
 fun NewTicketAction(vm: BoardViewModel = viewModel()) {
@@ -287,7 +288,21 @@ fun NewTicketAction(vm: BoardViewModel = viewModel()) {
     val sites = remember(fleet) { mergeSites(fleet.agents) }
     if (sites.isEmpty()) return
     var creating by remember { mutableStateOf(false) }
-    IconButton(onClick = { creating = true }) { Icon(Icons.Filled.ConfirmationNumber, "New ticket") }
+    Surface(
+        onClick = { creating = true },
+        shape = RoundedCornerShape(50),
+        color = MaterialTheme.colorScheme.primary,
+        contentColor = MaterialTheme.colorScheme.onPrimary,
+    ) {
+        Row(
+            Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Filled.ConfirmationNumber, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("New ticket", style = MaterialTheme.typography.labelLarge, maxLines = 1)
+        }
+    }
     if (creating) {
         // Default the form's org to the header scope when it names a real one,
         // else the first org — the web openCreate's pick.
