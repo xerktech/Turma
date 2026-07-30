@@ -1009,7 +1009,6 @@ function cloneSources(a) {
 // while it's collapsed — with an optimistic row per clone just fired but not
 // yet echoed back.
 function cloneBar(a) {
-  const gh = a.github || {};
   const sources = cloneSources(a);
   const avail = sources.some(s => s.available);
   const multi = sources.length > 1;
@@ -1030,11 +1029,13 @@ function cloneBar(a) {
     .map(p => `<div class="clone-job"><span class="spin"></span> Cloning <b>${esc(p.repo)}</b>…</div>`)
     .join("");
 
-  // With one (GitHub) source the header keeps its historical wording; several
-  // sources make it generic and the per-source labels move into the list.
+  // With one source the header names it — "Clone from GitHub" / "Clone from
+  // gitlab.example.com" — so a GitLab- or Azure-only host never claims GitHub;
+  // several sources make it generic and the labels move into the list.
+  const one = sources[0] || {};
   const label = multi
     ? "Clone a repo"
-    : `Clone from GitHub${gh.login ? ` <span class="clone-note">as ${esc(gh.login)}</span>` : ""}`;
+    : `Clone from ${esc(one.label || "GitHub")}${one.user ? ` <span class="clone-note">as ${esc(one.user)}</span>` : ""}`;
   const header = `<button class="clone-toggle" aria-expanded="${open}"
       title="${open ? "Collapse" : "Expand"} clone panel" onclick="cloneToggle('${esc(a.key)}')">
     <span class="caret">▼</span>
@@ -1046,7 +1047,7 @@ function cloneBar(a) {
   const inner = !open ? "" : (!avail
     ? `<div class="clone-body"><span class="clone-note">${multi
         ? "No usable git-source credentials on this host — cloning unavailable."
-        : "No GitHub credentials on this host — cloning unavailable."}</span></div>`
+        : `No ${esc(one.label || "GitHub")} credentials on this host — cloning unavailable.`}</span></div>`
     : cloneBody(a, sources, hid));
 
   return `<div class="clone-bar${open ? "" : " collapsed"}${avail ? "" : " disabled"}">

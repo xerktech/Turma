@@ -60,6 +60,26 @@ fun cloneSources(github: GithubInfo?, gitSources: List<GitSourceInfo>): List<Clo
 }
 
 /**
+ * The clone bar's header. One source names it — "Clone from GitHub · as me",
+ * "Clone from gitlab.example.com" — so a GitLab- or Azure-only host never
+ * claims GitHub; several sources make it generic ("Clone a repo") and the
+ * per-source labels move into the list.
+ */
+fun cloneBarTitle(sources: List<CloneSource>): String {
+    val one = sources.singleOrNull() ?: return "Clone a repo"
+    return "Clone from ${one.label.ifBlank { "GitHub" }}" +
+        one.user?.let { " · as $it" }.orEmpty()
+}
+
+/** The greyed note when no source on the bar is usable, naming the single
+ *  source it is about (the generic wording covers a multi-source host). */
+fun cloneUnavailableNote(sources: List<CloneSource>): String {
+    val one = sources.singleOrNull()
+        ?: return "No usable git-source credentials on this host — cloning unavailable."
+    return "No ${one.label.ifBlank { "GitHub" }} credentials on this host — cloning unavailable."
+}
+
+/**
  * A pick's identity in the multi-select: `<source>|<nameWithOwner>` — the same
  * key the web stores, safe because '|' can appear in neither half. cloneSpecs
  * splits it back apart for the POST.

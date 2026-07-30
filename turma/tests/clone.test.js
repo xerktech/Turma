@@ -282,3 +282,25 @@ test("cloneRepo: an azure pick POSTs its source", () => {
   assert.equal(m.posts.length, 1);
   assert.deepEqual(m.posts[0].body, { repo: "Proj/Api", source: "azure" });
 });
+
+test("cloneBar: a single non-GitHub source names itself in the header (no 'Clone from GitHub')", () => {
+  const m = loadCloneModule();
+  const a = {
+    key: "glhost", online: true, repos: [],
+    github: { available: false, login: null, repos: [] },
+    gitSources: [
+      { source: "gitlab", label: "gitlab.example.com", available: true, user: null,
+        repos: [{ name: "app", nameWithOwner: "grp/app", isPrivate: true, source: "gitlab" }] },
+    ],
+  };
+  m.setCache({ agents: [a] });
+  expand(m, a.key);
+  const html = m.cloneBar(a);
+  assert.match(html, /Clone from gitlab\.example\.com/, "header names the real source");
+  assert.ok(!html.includes("Clone from GitHub"), "never claims GitHub");
+  assert.ok(!html.includes("clone-src"), "single source keeps the flat list");
+  // And when that lone source has no usable creds yet, the note names it too.
+  a.gitSources[0].available = false;
+  const off = m.cloneBar(a);
+  assert.match(off, /No gitlab\.example\.com credentials on this host/);
+});
