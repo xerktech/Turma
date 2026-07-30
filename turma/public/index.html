@@ -58,6 +58,9 @@
     background: color-mix(in srgb, var(--critical) 10%, transparent); }
   .host-auth.warn { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent);
     background: color-mix(in srgb, var(--warning) 10%, transparent); }
+  /* "Restart agent" button (XERK-157) sits in the header beside the status chip;
+     keep it from being squeezed when the row is tight. */
+  .host-restart { flex-shrink: 0; }
   /* Hub-wide "push is off" warning bar (XERK-152), above the tiles. */
   .push-warn { display: flex; gap: 8px; align-items: baseline; margin-bottom: 14px;
     padding: 9px 13px; border-radius: 8px; font-size: 13px; color: var(--warning);
@@ -459,6 +462,11 @@ function restoreComposerFocus(f) {
 const pending = new Map();
 const PENDING_TTL_MS = 45000;
 const RESTART_TTL_MS = 15000;
+// A whole-agent restart (XERK-157) takes longer than a single session's restart:
+// a container recreate rebuilds the stack, so give the "Restarting…" spinner a
+// generous fallback before it gives up (it normally clears on the new manager's
+// first beat — a changed startedAt).
+const RESTART_AGENT_TTL_MS = 120000;
 function pendKey(kind, host, x) { return kind + "::" + host + "::" + x; }
 function setPending(key, val) { pending.set(key, { ...val, at: Date.now() }); }
 function sessPending(host, id) {
@@ -480,7 +488,9 @@ function reconcilePending(agents) {
     index.set(a.key + "::" + s.id, s);
   }
   for (const [key, p] of pending) {
-    if (t - p.at > (p.kind === "restart" ? RESTART_TTL_MS : PENDING_TTL_MS)) { pending.delete(key); continue; }
+    const ttl = p.kind === "restart" ? RESTART_TTL_MS
+      : p.kind === "restartAgent" ? RESTART_AGENT_TTL_MS : PENDING_TTL_MS;
+    if (t - p.at > ttl) { pending.delete(key); continue; }
     if (p.kind === "spawn") {
       if ((counts.get(p.host + "::" + p.repo) || 0) > p.baseline) pending.delete(key);
     } else if (p.kind === "clone") {
@@ -496,6 +506,13 @@ function reconcilePending(agents) {
       const a = byHost.get(p.host);
       const r = a && (a.prunes || []).find(x => x.repo === p.repo);
       if (r && r.at !== p.prevAt) pending.delete(key);
+    } else if (p.kind === "restartAgent") {
+      // Done once a fresh manager has beaten in — its startedAt differs from the
+      // one showing when we queued the restart. If startedAt wasn't captured (an
+      // older agent), the RESTART_AGENT_TTL_MS timeout is the fallback.
+      const a = byHost.get(p.host);
+      if (a && p.startedAt != null && a.startedAt != null && a.startedAt !== p.startedAt)
+        pending.delete(key);
     } else {
       const s = index.get(p.host + "::" + p.id);
       // kill now removes the record entirely (keeping only the branch), so like
@@ -579,6 +596,21 @@ function claudeAuthBadge(a) {
     return `<span class="host-auth warn" title="Claude login expiring — re-login soon with 'claude /login'">🔑 Login expires${when}</span>`;
   }
   return "";
+}
+// "Restart agent" button for a host header (XERK-157) — restarts the manager
+// process, e.g. after fixing an expired Claude login, without SSHing in. Only
+// offered on a LIVE host that isn't already restarting: an offline host has no
+// heartbeat to carry the command, and an `updating` one is already on its way
+// back. Arm/confirm first — it briefly takes the whole host's control plane down
+// (running sessions are re-adopted on boot, but it's still a fleet-level action).
+function restartBtn(a) {
+  if (!a.online || a.updating) return "";
+  if (pending.has(pendKey("restartAgent", a.key, "_")))
+    return `<button class="host-restart btn-sm" disabled title="Restarting the agent…"><span class="spin"></span> Restarting…</button>`;
+  const armed = confirming.has("ra::" + a.key);
+  return `<button class="host-restart btn-sm${armed ? " confirm" : ""}"`
+    + ` title="Restart this host's agent (running sessions are re-adopted)"`
+    + ` onclick="restartHost('${esc(a.key)}')">${armed ? "Confirm restart" : "↻ Restart"}</button>`;
 }
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
@@ -926,6 +958,7 @@ function hostCard(a, now) {
       </button>
       ${collapsedMeta}
       ${claudeAuthBadge(a)}
+      ${restartBtn(a)}
       <span class="status"${statusTitle ? ` title="${esc(statusTitle)}"` : ""}><span class="dot ${dot}"></span>${esc(state)}</span>
     </div>${body}
   </div>`;
@@ -1349,6 +1382,19 @@ function twoClick(actionKey, doIt) {
 }
 
 function removeHost(key)  { del(`/api/agents/${enc(key)}`); }
+
+// Restart a host's agent manager (XERK-157). Arm/confirm first, then POST; the
+// pending state captures the current startedAt so reconcilePending can clear the
+// "Restarting…" spinner the moment a fresh manager beats in (a changed
+// startedAt) rather than waiting out the TTL.
+function restartHost(key) {
+  twoClick("ra::" + key, () => {
+    const host = (cache.agents || []).find(a => a.key === key);
+    busy(pendKey("restartAgent", key, "_"),
+      { kind: "restartAgent", host: key, startedAt: host ? host.startedAt : null },
+      () => post(`/api/agents/${enc(key)}/restart`));
+  });
+}
 
 // Mark an action pending and re-render immediately (instant feedback), then fire
 // it. `busy` de-dupes so a queued command can't be double-sent from the same

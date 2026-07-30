@@ -46,7 +46,7 @@ function loadHeaderModule() {
   // Suppress render(): the module body kicks off its own poll on load, whose
   // fetch resolves after the test and would paint into a DOM that isn't there.
   const exportTail = `
-    ;globalThis.__hdr = { codingAgent };
+    ;globalThis.__hdr = { codingAgent, restartBtn, pending, confirming, pendKey };
     render = () => {};
   `;
   const fn = new Function(
@@ -109,4 +109,34 @@ test("codingAgent: the parsed field wins over the raw string both report", () =>
     }),
     "Claude Code 2.1.211",
   );
+});
+
+test("restartBtn: offered only on a live host that isn't already restarting", () => {
+  // XERK-157: an offline host has no heartbeat to carry the command; an
+  // `updating` one is already on its way back. Both suppress the button.
+  const { restartBtn } = loadHeaderModule();
+  assert.match(restartBtn({ key: "h1", online: true }), /Restart/);
+  assert.equal(restartBtn({ key: "h1", online: false }), "");
+  assert.equal(restartBtn({ key: "h1", online: true, updating: { at: 1 } }), "");
+});
+
+test("restartBtn: arms on the first click, then shows a spinner while in flight", () => {
+  const { restartBtn, pending, confirming, pendKey } = loadHeaderModule();
+  const a = { key: "h2", online: true };
+  // Default: an actionable button wired to restartHost.
+  const idle = restartBtn(a);
+  assert.match(idle, /onclick="restartHost\('h2'\)"/);
+  assert.doesNotMatch(idle, /Confirm restart/);
+
+  // Armed (first click recorded in `confirming`): asks for confirmation.
+  confirming.set("ra::h2", 0);
+  assert.match(restartBtn(a), /Confirm restart/);
+  confirming.delete("ra::h2");
+
+  // Pending (POST fired): disabled spinner, no further clicks.
+  pending.set(pendKey("restartAgent", "h2", "_"), { at: Date.now() });
+  const busy = restartBtn(a);
+  assert.match(busy, /Restarting…/);
+  assert.match(busy, /disabled/);
+  pending.clear();
 });

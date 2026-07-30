@@ -90,6 +90,7 @@ fun FleetScreen(
     var resumeFor by remember { mutableStateOf<Pair<String, RepoInfo>?>(null) }
     var actionsFor by remember { mutableStateOf<Pair<String, SessionInfo>?>(null) }
     var pruneFor by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var restartFor by remember { mutableStateOf<String?>(null) }
 
     Box(modifier) {
         Column(Modifier.fillMaxSize()) {
@@ -139,6 +140,7 @@ fun FleetScreen(
                         onComposeSpawn = { host, repo, isRoot -> spawnFor = Triple(host, repo, isRoot) },
                         onResume = { host, repo -> resumeFor = host to repo },
                         onPrune = { host, repo -> pruneFor = host to repo },
+                        onRestart = { host -> restartFor = host },
                         onClone = { host, repo -> vm.clone(host, repo) },
                         onOpenSession = onOpenChat,
                         onSessionActions = { host, s -> actionsFor = host to s },
@@ -185,6 +187,15 @@ fun FleetScreen(
             onDismiss = { pruneFor = null },
         )
     }
+    restartFor?.let { host ->
+        ConfirmDialog(
+            title = "Restart $host's agent?",
+            message = "Restarts the agent manager (e.g. after fixing an expired Claude login). It briefly goes down and comes back; running sessions are re-adopted on boot.",
+            confirmLabel = "Restart",
+            onConfirm = { vm.restartAgent(host); restartFor = null },
+            onDismiss = { restartFor = null },
+        )
+    }
 }
 
 /** The coding agent a host runs, for its header — mirrors index.html codingAgent(). */
@@ -217,6 +228,7 @@ private fun HostSection(
     onComposeSpawn: (String, String, Boolean) -> Unit,
     onResume: (String, RepoInfo) -> Unit,
     onPrune: (String, String) -> Unit,
+    onRestart: (String) -> Unit,
     onClone: (String, String) -> Unit,
     onOpenSession: (String, String) -> Unit,
     onSessionActions: (String, SessionInfo) -> Unit,
@@ -241,6 +253,15 @@ private fun HostSection(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                     )
+                }
+                // Restart the host's agent manager (XERK-157) — mirrors
+                // index.html's restartBtn. Offered only on a live host that isn't
+                // already restarting (an offline one has no heartbeat to carry the
+                // command; an `updating` one is already on its way back).
+                if (agent.online && agent.updating == null) {
+                    IconButton(onClick = { onRestart(agent.key) }, modifier = Modifier.size(32.dp)) {
+                        Icon(Icons.Filled.Refresh, "Restart agent", Modifier.size(18.dp))
+                    }
                 }
                 // Claude subscription-login health (XERK-98): a red "login" pill
                 // when the shared login has lapsed (sessions can't authenticate)
