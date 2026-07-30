@@ -46,7 +46,7 @@ function loadHeaderModule() {
   // Suppress render(): the module body kicks off its own poll on load, whose
   // fetch resolves after the test and would paint into a DOM that isn't there.
   const exportTail = `
-    ;globalThis.__hdr = { codingAgent, restartBtn, pending, confirming, pendKey };
+    ;globalThis.__hdr = { codingAgent, restartBtn, pending, confirming, pendKey, boardHealthBadge, claudeAuthBadge };
     render = () => {};
   `;
   const fn = new Function(
@@ -139,4 +139,43 @@ test("restartBtn: arms on the first click, then shows a spinner while in flight"
   assert.match(busy, /Restarting…/);
   assert.match(busy, /disabled/);
   pending.clear();
+});
+
+// --- boardHealthBadge (XERK-156) --------------------------------------------
+
+test("boardHealthBadge: a failed board poll on an online host shows the chip", () => {
+  const { boardHealthBadge } = loadHeaderModule();
+  const html = boardHealthBadge({
+    online: true,
+    jira: { configured: true, error: "Azure DevOps temporarily unreachable (HTTP 530)" },
+  });
+  assert.ok(html.includes("Board unreachable"));
+  assert.ok(html.includes("host-auth req"));
+  // The friendly poll error rides as the tooltip.
+  assert.ok(html.includes("Azure DevOps temporarily unreachable (HTTP 530)"));
+});
+
+test("boardHealthBadge: healthy / unconfigured / no-block boards show nothing", () => {
+  const { boardHealthBadge } = loadHeaderModule();
+  assert.equal(boardHealthBadge({ online: true, jira: { configured: true, error: null } }), "");
+  assert.equal(boardHealthBadge({ online: true, jira: { configured: false, error: "x" } }), "");
+  assert.equal(boardHealthBadge({ online: true }), "");
+});
+
+test("boardHealthBadge: an offline host suppresses it (offline already implies it)", () => {
+  const { boardHealthBadge } = loadHeaderModule();
+  assert.equal(
+    boardHealthBadge({ online: false, jira: { configured: true, error: "unreachable" } }),
+    "",
+  );
+});
+
+test("boardHealthBadge: the tooltip is HTML-escaped", () => {
+  const { boardHealthBadge } = loadHeaderModule();
+  const html = boardHealthBadge({
+    online: true,
+    jira: { configured: true, error: '<img src=x onerror="alert(1)">' },
+  });
+  assert.ok(!html.includes("<img"));
+  assert.ok(html.includes("&lt;img"));
 });
