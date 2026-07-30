@@ -2902,6 +2902,22 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, cmdId });
     }
 
+    // POST /api/agents/<host>/restart — restart the host's agent MANAGER from
+    // the dashboard (XERK-157), e.g. after fixing an expired Claude login. The
+    // agent exits for its supervisor (systemd Restart=always / Docker restart
+    // policy / turma-agentctl) to bring it back; running sessions are re-adopted
+    // on boot. The agent announces the expected downtime so the coming beat gap
+    // reads as `updating`, not an outage. Collapse a mashed button: don't queue
+    // a second restart while one is already unacked in flight.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "restart" && parts.length === 4) {
+      const key = decodeURIComponent(parts[2]);
+      if (!agents[key]) return json(res, 404, { error: "unknown agent" });
+      const pending = (agents[key].commands || []).find((c) => c.type === "restartAgent");
+      const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "restartAgent" });
+      return json(res, 200, { ok: true, cmdId });
+    }
+
     // POST /api/jira/refresh — the /board page's manual refresh: re-poll Jira
     // now rather than waiting out each agent's slow cadence (30 beats). It fans
     // out across hosts because the board is a MERGE of every host's block —

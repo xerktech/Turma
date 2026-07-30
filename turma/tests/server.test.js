@@ -1456,6 +1456,34 @@ test("http: prune route queues a prune command per repo; validates host", async 
   assert.equal(ghost.status, 404);
 });
 
+test("http: restart route queues one restartAgent; collapses a mashed button", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ device: "hra" });
+
+  // A valid restart rides the next reply as a bare {type:"restartAgent"}.
+  const ok = await request("POST", "/api/agents/hra/restart", { body: {}, headers: userHeaders });
+  assert.equal(ok.status, 200);
+
+  // A second press while the first is still unacked reuses the same cmdId — one
+  // restart, not a queue of them.
+  const again = await request("POST", "/api/agents/hra/restart", { body: {}, headers: userHeaders });
+  assert.equal(again.status, 200);
+  assert.equal(again.body.cmdId, ok.body.cmdId);
+
+  const res = await beat({ device: "hra" });
+  assert.deepEqual(res.body.commands, [
+    { type: "restartAgent", cmdId: ok.body.cmdId },
+  ]);
+
+  // Unknown host -> 404; and the browser login is required (no agent token, no
+  // anonymous access).
+  const ghost = await request("POST", "/api/agents/ghost/restart", { body: {}, headers: userHeaders });
+  assert.equal(ghost.status, 404);
+  const noauth = await request("POST", "/api/agents/hra/restart", { body: {} });
+  assert.equal(noauth.status, 401);
+});
+
 test("http: jira refresh fans out to configured hosts only, and dedupes", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });

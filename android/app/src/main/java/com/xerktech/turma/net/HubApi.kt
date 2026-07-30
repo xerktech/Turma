@@ -115,6 +115,12 @@ interface HubApi {
     @POST("api/agents/{host}/repos/{repo}/prune")
     suspend fun prune(@Path("host") host: String, @Path("repo") repo: String): OkResponse
 
+    // Restart the host's agent manager (XERK-157) — e.g. after fixing an expired
+    // Claude login — without SSHing in. The agent exits for its supervisor to
+    // bring it back; running sessions are re-adopted on boot.
+    @POST("api/agents/{host}/restart")
+    suspend fun restartAgent(@Path("host") host: String): OkResponse
+
     @POST("api/agents/{host}/transcripts/{tid}/resume")
     suspend fun resumeTranscript(
         @Path("host") host: String,

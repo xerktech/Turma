@@ -57,6 +57,7 @@ import sys
 import tarfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -4537,7 +4538,7 @@ def azure_base():
         b = "https://" + b
     b = b.rstrip("/")
     # Trim anything from a pasted board/REST URL back to the collection root.
-    b = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", b, 1)[0]
+    b = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", b, maxsplit=1)[0]
     return b.rstrip("/")
 
 
@@ -4576,7 +4577,7 @@ def normalize_azure_site(url):
     r = (url or "").strip()
     r = re.sub(r"^[a-zA-Z][\w.+-]*://", "", r)   # scheme
     r = re.sub(r"^[^/@]+@", "", r)               # credentials
-    r = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", r, 1)[0]
+    r = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", r, maxsplit=1)[0]
     return r.strip("/").lower()
 
 
@@ -5081,6 +5082,34 @@ def collect_board():
     block = collect_azure() if azure_configured() else collect_jira()
     block["orgName"] = BOARD_ORG_NAME or None
     return block
+
+
+def _board_error_summary(e):
+    """A short, human-readable summary of a board-poll failure for the block's
+    `error` field (shown on the dashboard's board). An upstream 5xx (e.g. the
+    Cloudflare-family HTTP 530 a self-hosted org's front returns when its origin
+    is unreachable) or a connection failure means the tracker was momentarily
+    unreachable — NOT a bug in the request — so say that plainly rather than
+    surfacing a cryptic `HTTP Error 530: <none>`. Auth and rate-limit failures
+    get their own hint; anything unrecognised falls back to the raw text. The
+    raw exception is still logged verbatim for diagnosis; only this UI-facing
+    string is cleaned up."""
+    src = "Azure DevOps" if board_source() == "azure" else "Jira"
+    if isinstance(e, urllib.error.HTTPError):
+        code = e.code
+        if code >= 500:
+            return f"{src} temporarily unreachable (HTTP {code})"
+        if code == 429:
+            return f"{src} rate-limited the request (HTTP 429)"
+        if code in (401, 403):
+            return f"{src} rejected the credentials (HTTP {code})"
+        reason = str(getattr(e, "reason", "") or "").strip()
+        return f"{src} request failed: HTTP {code}" + (f" {reason}" if reason else "")
+    if isinstance(e, (urllib.error.URLError, TimeoutError)):
+        reason = getattr(e, "reason", None)
+        detail = str(reason if reason is not None else e).strip()
+        return f"{src} unreachable" + (f" ({detail})" if detail else "")
+    return str(e)[:200]
 
 
 def board_empty():
@@ -6067,6 +6096,12 @@ class SessionManager:
         # at-least-once command de-dup: cmdIds we've already executed.
         self.acked = set()
         self.acked_order = deque(maxlen=1000)
+        # A dashboard-requested manager restart (restartAgent). Set by the
+        # command handler and consumed by run_forever, which exits for the
+        # supervisor to bring us back — but only AFTER a heartbeat carrying the
+        # command's ack reached the hub, so the still-queued command can't
+        # re-fire on the next boot and restart-loop us.
+        self._restart_pending = False
 
     # --- registry persistence ---------------------------------------------
 
@@ -9305,7 +9340,7 @@ class SessionManager:
         except Exception as e:
             log(f"board refresh failed: {e}")
             prev = dict(self.jira)
-            prev["error"] = str(e)[:200]
+            prev["error"] = _board_error_summary(e)
             self.jira = prev
         # Re-stamp cached repo guesses onto the freshly-collected tickets: a
         # collect_jira() builds new ticket dicts, so without this every beat that
@@ -10139,6 +10174,13 @@ class SessionManager:
                     # fresh block straight back.
                     if board_configured():
                         self.refresh_jira()
+                elif ctype == "restartAgent":
+                    # The dashboard's "Restart agent" button (XERK-157). We only
+                    # arm a flag here — the actual exit happens in run_forever
+                    # once this command's ack has been delivered to the hub, so
+                    # the command is off the queue before we go and can't
+                    # re-fire on boot.
+                    self.request_restart()
                 else:
                     log(f"unknown command type {ctype!r} (cmdId {cid})")
             except Exception as e:
@@ -11053,6 +11095,55 @@ class SessionManager:
         except Exception as e:
             log(f"updating announce failed (continuing shutdown): {e}")
 
+    def request_restart(self):
+        """Arm a dashboard-requested manager restart (restartAgent command). We
+        do NOT restart inline in handle_commands: run_forever calls
+        _restart_if_delivered once the ack for this command has reached the hub,
+        so the command leaves the queue before we exit and can't re-fire on the
+        next boot (a restart loop)."""
+        self._restart_pending = True
+        log("restartAgent: queued; will restart once the ack reaches the hub")
+
+    def _restart_if_delivered(self, delivered):
+        """Perform an armed restart, but only once `delivered` says a heartbeat
+        carrying the command's ack (in `ackedCommands`) reached the hub — which
+        means the hub has dropped the command from this host's queue. Exiting
+        before that risks the still-queued command re-firing on boot."""
+        if self._restart_pending and delivered:
+            self._restart_pending = False
+            self._perform_restart()
+
+    def _perform_restart(self):
+        """Bring the manager back the way a SIGTERM restart (XERK-29) does, but
+        triggered from the dashboard rather than the supervisor. Announce the
+        expected downtime so the coming heartbeat gap reads as `updating` (not an
+        outage), then hand off to whatever will restart us:
+
+        - **Under systemd** (`INVOCATION_ID` set) — a clean exit is enough;
+          `Restart=always` brings us back. KillMode=process keeps the sessions.
+        - **In a container** — likewise; Docker's restart policy recreates us
+          (there's no turma-agentctl to call).
+        - **Native without systemd** (turma-agentctl/nohup) — there is NO
+          supervisor to restart us on exit, so we relaunch through the ctl
+          script (detached so it outlives us). It SIGTERMs this manager, which
+          `_handle_shutdown` turns into the announce + exit, then starts a fresh
+          one that re-adopts the live sessions."""
+        self._announce_updating("restart")
+        under_systemd = bool(os.environ.get("INVOCATION_ID"))
+        ctl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "bin", "turma-agentctl")
+        if not under_systemd and os.path.isfile(ctl):
+            try:
+                subprocess.Popen([ctl, "restart"], start_new_session=True,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                log("restartAgent: handed off to turma-agentctl restart")
+                return  # the ctl script will SIGTERM us
+            except Exception as e:
+                log(f"restartAgent: turma-agentctl handoff failed ({e}); exiting")
+        log("restartAgent: exiting for the supervisor to restart us")
+        raise SystemExit(0)
+
     def _handle_shutdown(self, signum, frame):
         """SIGTERM/SIGINT: we're being stopped for a restart we can't heartbeat
         through — a container recreate on an image update, or the native updater's
@@ -11090,6 +11181,10 @@ class SessionManager:
             _poke.clear()
             reply = self.post(self.build_payload(beat))
             beat += 1
+            # If a prior beat armed a restart but couldn't confirm its ack
+            # reached the hub, this successful beat just carried the ack
+            # (ackedCommands rides every payload), so it's now safe to restart.
+            self._restart_if_delivered(reply is not None)
             if reply is not None:
                 # Push archive deltas the hub asked for (byte cursors on the reply).
                 # Best-effort: a sync hiccup must never disrupt the beat loop.
@@ -11108,6 +11203,10 @@ class SessionManager:
                     beat += 1
                     if reply2 is not None:
                         self.handle_commands(reply2.get("commands"))
+                    # A restartAgent just acked this beat restarts here — the
+                    # follow-up heartbeat above delivered its ack, so we don't
+                    # wait a whole interval for the top-of-loop check.
+                    self._restart_if_delivered(reply2 is not None)
             # Interruptible sleep: returns immediately if a poke arrived, else
             # after the normal interval.
             _poke.wait(INTERVAL)

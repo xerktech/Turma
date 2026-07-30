@@ -130,6 +130,10 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
         run("clone queued") { container.client.api.clone(host, CloneRequest(repo, source)) }
     fun prune(host: String, repo: String) = run("prune queued") { container.client.api.prune(host, repo) }
 
+    /** Restart a host's agent manager (XERK-157). The host announces the expected
+     *  downtime, exits for its supervisor to relaunch it, and re-adopts sessions. */
+    fun restartAgent(host: String) = run("restart queued") { container.client.api.restartAgent(host) }
+
     fun resumeTranscript(host: String, transcriptId: String, cwd: String) =
         run("resume queued") { container.client.api.resumeTranscript(host, transcriptId, ResumeRequest(cwd)) }
 
