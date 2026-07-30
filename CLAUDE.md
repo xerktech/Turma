@@ -630,11 +630,18 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - A `clone` command `git clone`s a validated `owner/repo` (allowlist-checked before it reaches git) into
   `REPOS_ROOT` as a **detached subprocess** (reaped across later beats), after which the new repo joins
   the scan. Private-repo auth rides the system git credential helper (`gh auth git-credential`).
+- **Multiple git sources (XERK-155)** — `gitSources` heartbeats the EXTRA clone sources beside `github`
+  (contract unchanged — gh-gated features read it): the board's ADO org (`AZDO_URL`/`AZDO_TOKEN`,
+  `_apis/git/repositories`) and a GitLab host (`GITLAB_URL` + `GITLAB_TOKEN`,
+  `/api/v4/projects?membership`; clones over SSH via the mounted `~/.ssh` — the token only LISTS).
+  Listings are per-source keep-last-good; a clone command carries `{repo, source?}` and the agent
+  resolves the URL from its OWN cached listing (free text stays the GitHub fallback). Triage candidates /
+  `repoOptions` / ticket clone-on-demand consume the union, entries tagged `source`; the clone bar groups
+  per source ("Clone a repo" when >1). Tests: `TestGitSources`, `clone.test.js`, android `CloneTest.kt`.
 - **Non-GitHub git creds (XERK-54)** — the image wires a SECOND system credential helper after gh:
   `store --file=/root/.git-credentials`. gh serves github.com; every other host falls through to
   `store`, reading cached git credentials from an **optional** bind mount. gh is first so github.com
-  always gets a fresh token even if the store file carries a staler line; an unmounted file is an empty
-  helper = a no-op. The `entrypoint.sh` preflight reports the mount (non-fatal). The guard denies writing
+  always gets a fresh token; an unmounted file is a no-op. The guard denies writing
   `~/.git-credentials`. **Native inherits the host's git config untouched.** Tests:
   `agent/tests/test_entrypoint.sh`, `test_denies_non_github_git_credential_writes` in
   `test_guard_settings.py`.

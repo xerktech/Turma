@@ -2,6 +2,7 @@ package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.CloneInfo
+import com.xerktech.turma.model.GitSourceInfo
 import com.xerktech.turma.model.GithubInfo
 import com.xerktech.turma.model.GithubRepo
 import com.xerktech.turma.model.TurmaJson
@@ -101,17 +102,91 @@ class CloneTest {
     @Test
     fun `specs combine picks and the free-text box`() {
         assertEquals(
-            listOf("octocat/Hello", "octocat/World", "other/Thing"),
-            cloneSpecs(setOf("octocat/World", "octocat/Hello"), "other/Thing"),
+            listOf(
+                CloneSpec("octocat/Hello", "github"),
+                CloneSpec("octocat/World", "github"),
+                CloneSpec("other/Thing", null),
+            ),
+            cloneSpecs(setOf("github|octocat/World", "github|octocat/Hello"), "other/Thing"),
         )
     }
 
     @Test
     fun `specs drop blanks and duplicate destinations`() {
-        assertEquals(emptyList<String>(), cloneSpecs(emptySet(), "   "))
+        assertEquals(emptyList<CloneSpec>(), cloneSpecs(emptySet(), "   "))
         // Same landing dir typed twice must fire one POST, not two.
-        assertEquals(listOf("octocat/Hello"), cloneSpecs(setOf("octocat/Hello"), "octocat/Hello.git"))
-        assertEquals(listOf("octocat/Hello"), cloneSpecs(setOf("octocat/Hello"), "/"))
+        assertEquals(
+            listOf(CloneSpec("octocat/Hello", "github")),
+            cloneSpecs(setOf("github|octocat/Hello"), "octocat/Hello.git"),
+        )
+        assertEquals(
+            listOf(CloneSpec("octocat/Hello", "github")),
+            cloneSpecs(setOf("github|octocat/Hello"), "/"),
+        )
+    }
+
+    @Test
+    fun `a pick carries its source and a sourceless legacy key stays github-free`() {
+        assertEquals(
+            listOf(CloneSpec("grp/sub/app", "gitlab")),
+            cloneSpecs(setOf("gitlab|grp/sub/app"), ""),
+        )
+        // A key with no separator (should not happen, but must not corrupt).
+        assertEquals(listOf(CloneSpec("octocat/Hello", null)), cloneSpecs(setOf("octocat/Hello"), ""))
+    }
+
+    // --- multiple sources (XERK-155) ---------------------------------------
+
+    private fun srcBlock(source: String, label: String, nwo: String, user: String = "") =
+        GitSourceInfo(
+            source = source, label = label, available = true, user = user,
+            repos = listOf(repo(nwo)),
+        )
+
+    @Test
+    fun `gitSources decode beside the github block`() {
+        val a = TurmaJson.decodeFromString(
+            AgentInfo.serializer(),
+            """{"key":"h1","online":true,
+                "github":{"available":true,"login":"me","repos":[]},
+                "gitSources":[
+                  {"source":"azure","label":"dev.azure.com/xerk","available":true,
+                   "user":"mal","error":null,
+                   "repos":[{"nameWithOwner":"Proj/Api","name":"Api","isPrivate":true,"source":"azure"}]},
+                  {"source":"gitlab","label":"gitlab.example.com","available":true,
+                   "user":null,"error":null,
+                   "repos":[{"nameWithOwner":"grp/sub/app","name":"app","isPrivate":true,"source":"gitlab"}]}]}""",
+        )
+        assertEquals(listOf("azure", "gitlab"), a.gitSources.map { it.source })
+        assertEquals("Proj/Api", a.gitSources[0].repos.single().nameWithOwner)
+        assertEquals("", a.gitSources[1].user)   // null coerces like GithubInfo.login
+    }
+
+    @Test
+    fun `cloneSources lists github then each extra source`() {
+        val gh = GithubInfo(available = true, login = "me", repos = listOf(repo("me/alpha")))
+        val out = cloneSources(gh, listOf(srcBlock("azure", "dev.azure.com/xerk", "Proj/Api", "mal")))
+        assertEquals(listOf("github", "azure"), out.map { it.source })
+        assertEquals("me", out[0].user)
+        assertEquals("mal", out[1].user)
+        assertEquals("dev.azure.com/xerk", out[1].label)
+    }
+
+    @Test
+    fun `an agent predating gitSources keeps its github-only bar`() {
+        val gh = GithubInfo(available = false)
+        val out = cloneSources(gh, emptyList())
+        assertEquals(listOf("github"), out.map { it.source })
+        assertFalse(out.single().available)
+        // No github block at all decodes the same way.
+        assertEquals(listOf("github"), cloneSources(null, emptyList()).map { it.source })
+    }
+
+    @Test
+    fun `candidates carry their source into the pick key`() {
+        val c = cloneCandidates(listOf(repo("grp/app")), emptySet(), source = "gitlab").single()
+        assertEquals("gitlab", c.source)
+        assertEquals("gitlab|grp/app", clonePickKey(c.source, c.nameWithOwner))
     }
 
     // --- job rows -----------------------------------------------------------

@@ -2864,18 +2864,27 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, t);
     }
 
-    // POST /api/agents/<host>/clone — queue a GitHub clone into the host's
-    // repos root. Body: {repo} (owner/repo or a GitHub URL); the agent validates
-    // and clones it (gated on the host actually having GitHub creds — the UI
-    // greys the control out otherwise). The new repo joins the scan and becomes
-    // spawnable once the clone lands.
+    // POST /api/agents/<host>/clone — queue a clone into the host's repos
+    // root. Body: {repo, source?} — repo is owner/repo or a GitHub URL, and
+    // source ("github"/"azure"/"gitlab", XERK-155) says which listing the pick
+    // came from; the agent resolves the clone URL against its OWN cached
+    // listing for that source, so nothing here is more than routing. Omitted
+    // source keeps the legacy free-text GitHub meaning. The new repo joins the
+    // scan and becomes spawnable once the clone lands.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "clone" && parts.length === 4) {
       const key = decodeURIComponent(parts[2]);
       if (!agents[key]) return json(res, 404, { error: "unknown agent" });
       const body = JSON.parse((await readBody(req)) || "{}");
       if (!body.repo) return json(res, 400, { error: "repo required" });
-      const cmdId = queueCommand(key, { type: "clone", repo: String(body.repo) });
+      const cmd = { type: "clone", repo: String(body.repo) };
+      if (body.source != null) {
+        if (!["github", "azure", "gitlab"].includes(body.source)) {
+          return json(res, 400, { error: "unknown clone source" });
+        }
+        cmd.source = body.source;
+      }
+      const cmdId = queueCommand(key, cmd);
       return json(res, 200, { ok: true, cmdId });
     }
 

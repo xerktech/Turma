@@ -1,6 +1,8 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.CloneInfo
+import com.xerktech.turma.model.GitSourceInfo
+import com.xerktech.turma.model.GithubInfo
 import com.xerktech.turma.model.GithubRepo
 
 /**
@@ -18,7 +20,55 @@ data class CloneCandidate(
     val isPrivate: Boolean,
     /** True when this host already has the repo, so the row is un-pickable. */
     val alreadyHere: Boolean,
+    /** Which listing the row came from — rides the pick key into the POST. */
+    val source: String = "github",
 )
+
+/**
+ * One clone source the picker lists (the web's `cloneSources`, XERK-155):
+ * the legacy `github` block as the GitHub section plus every extra source the
+ * agent reports in `gitSources`. An agent predating the block yields the
+ * GitHub section alone, so the bar renders exactly as it always did.
+ */
+data class CloneSource(
+    val source: String,
+    val label: String,
+    val user: String?,
+    val available: Boolean,
+    val repos: List<GithubRepo>,
+)
+
+fun cloneSources(github: GithubInfo?, gitSources: List<GitSourceInfo>): List<CloneSource> {
+    val out = mutableListOf<CloneSource>()
+    if ((github != null && github.available) || gitSources.isEmpty()) {
+        out += CloneSource(
+            source = "github", label = "GitHub",
+            user = github?.login?.takeIf { it.isNotBlank() },
+            available = github != null && github.available,
+            repos = github?.repos ?: emptyList(),
+        )
+    }
+    for (s in gitSources) {
+        if (s.source.isBlank()) continue
+        out += CloneSource(
+            source = s.source, label = s.label.ifBlank { s.source },
+            user = s.user.takeIf { it.isNotBlank() },
+            available = s.available, repos = s.repos,
+        )
+    }
+    return out
+}
+
+/**
+ * A pick's identity in the multi-select: `<source>|<nameWithOwner>` — the same
+ * key the web stores, safe because '|' can appear in neither half. cloneSpecs
+ * splits it back apart for the POST.
+ */
+fun clonePickKey(source: String, nameWithOwner: String): String = "$source|$nameWithOwner"
+
+/** One clone POST: the repo spec plus the listing it was picked from (null = the
+ *  legacy free-text GitHub path). */
+data class CloneSpec(val repo: String, val source: String?)
 
 /**
  * The pickable repo list: every repo the host's gh login can clone, marked with
@@ -31,6 +81,7 @@ fun cloneCandidates(
     repos: List<GithubRepo>,
     present: Set<String>,
     query: String = "",
+    source: String = "github",
 ): List<CloneCandidate> {
     val q = query.trim().lowercase()
     return repos
@@ -41,6 +92,7 @@ fun cloneCandidates(
                 name = it.name,
                 isPrivate = it.isPrivate,
                 alreadyHere = it.name in present,
+                source = source,
             )
         }
 }
@@ -56,16 +108,22 @@ fun cloneRepoName(spec: String): String =
     spec.trim().trimEnd('/').removeSuffix(".git").trimEnd('/').substringAfterLast('/')
 
 /**
- * The specs a Clone press fires, one POST each: every checked repo plus a
- * non-blank free-text box. Deduped by the dir they'd land in, and anything that
- * resolves to no name is dropped (the agent would refuse it anyway).
+ * The specs a Clone press fires, one POST each: every checked repo (a
+ * `<source>|<nameWithOwner>` pick key) plus a non-blank free-text box, which
+ * stays source-less — the legacy GitHub meaning. Deduped by the dir they'd
+ * land in, and anything that resolves to no name is dropped (the agent would
+ * refuse it anyway).
  */
-fun cloneSpecs(picked: Set<String>, freeText: String): List<String> {
-    val out = mutableListOf<String>()
+fun cloneSpecs(picked: Set<String>, freeText: String): List<CloneSpec> {
+    val out = mutableListOf<CloneSpec>()
     val seen = mutableSetOf<String>()
-    for (spec in picked.sorted() + listOf(freeText.trim())) {
-        if (spec.isBlank()) continue
-        val name = cloneRepoName(spec)
+    val all = picked.sorted().map { key ->
+        val i = key.indexOf('|')
+        if (i < 0) CloneSpec(key, null) else CloneSpec(key.substring(i + 1), key.substring(0, i))
+    } + listOf(CloneSpec(freeText.trim(), null))
+    for (spec in all) {
+        if (spec.repo.isBlank()) continue
+        val name = cloneRepoName(spec.repo)
         if (name.isBlank() || !seen.add(name)) continue
         out += spec
     }

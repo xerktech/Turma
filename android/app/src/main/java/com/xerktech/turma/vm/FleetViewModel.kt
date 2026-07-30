@@ -126,7 +126,8 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
     fun migrate(host: String, id: String, targetHost: String) =
         run("move queued") { container.client.api.migrateSession(host, id, MigrateRequest(targetHost)) }
 
-    fun clone(host: String, repo: String) = run("clone queued") { container.client.api.clone(host, CloneRequest(repo)) }
+    fun clone(host: String, repo: String, source: String? = null) =
+        run("clone queued") { container.client.api.clone(host, CloneRequest(repo, source)) }
     fun prune(host: String, repo: String) = run("prune queued") { container.client.api.prune(host, repo) }
 
     /** Restart a host's agent manager (XERK-157). The host announces the expected

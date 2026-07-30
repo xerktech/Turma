@@ -48,7 +48,7 @@ function loadCloneModule() {
   // Expose the pieces we test and give the test a way to observe post()/render()
   // and seed `cache`, then evaluate under the stubs.
   const exportTail = `
-    ;globalThis.__clone = { cloneBar, clonePick, clonePickCount, cloneRepo, cloneSearch, cloneText, updateCloneButton, cloneToggle, cloneDraft, cloneOpen, hostId };
+    ;globalThis.__clone = { cloneBar, cloneSources, clonePick, clonePickCount, cloneRepo, cloneSearch, cloneText, updateCloneButton, cloneToggle, cloneDraft, cloneOpen, hostId };
     globalThis.__setRender = (f) => { render = f; };
     globalThis.__setPost = (f) => { post = f; };
     globalThis.__setCache = (c) => { cache = c; };
@@ -137,10 +137,10 @@ test("clonePick / clonePickCount: accumulate selections plus the free-text box",
   const a = sampleAgent();
   m.setCache({ agents: [a] });
   assert.equal(m.clonePickCount(a.key), 0);
-  m.clonePick(a.key, "me/alpha", true);
-  m.clonePick(a.key, "org/gamma", true);
+  m.clonePick(a.key, "github|me/alpha", true);
+  m.clonePick(a.key, "github|org/gamma", true);
   assert.equal(m.clonePickCount(a.key), 2, "two checked");
-  m.clonePick(a.key, "org/gamma", false);
+  m.clonePick(a.key, "github|org/gamma", false);
   assert.equal(m.clonePickCount(a.key), 1, "unchecking removes it");
   m.cloneText(a.key, "foo/bar");
   assert.equal(m.clonePickCount(a.key), 2, "free-text counts as one more");
@@ -157,16 +157,16 @@ test("updateCloneButton: reflects the live count on the button + count span", ()
   const cnt = { textContent: "" };
   m.els.set("clone-btn-" + hid, btn);
   m.els.set("clone-count-" + hid, cnt);
-  m.clonePick(a.key, "me/alpha", true);       // clonePick calls updateCloneButton
+  m.clonePick(a.key, "github|me/alpha", true);  // clonePick calls updateCloneButton
   assert.equal(btn.textContent, "Clone");
   assert.equal(btn.disabled, false);
   assert.equal(cnt.textContent, "1 selected");
-  m.clonePick(a.key, "me/beta", true);
+  m.clonePick(a.key, "github|me/beta", true);
   assert.equal(btn.textContent, "Clone 2");
   assert.equal(cnt.textContent, "2 selected");
   // Clearing all selections re-disables the button.
-  m.clonePick(a.key, "me/alpha", false);
-  m.clonePick(a.key, "me/beta", false);
+  m.clonePick(a.key, "github|me/alpha", false);
+  m.clonePick(a.key, "github|me/beta", false);
   assert.equal(btn.disabled, true);
   assert.equal(cnt.textContent, "");
 });
@@ -175,12 +175,17 @@ test("cloneRepo: fires one POST per selected repo plus the free-text box, then c
   const m = loadCloneModule();
   const a = sampleAgent();
   m.setCache({ agents: [a] });
-  m.clonePick(a.key, "me/alpha", true);
-  m.clonePick(a.key, "org/gamma", true);
+  m.clonePick(a.key, "github|me/alpha", true);
+  m.clonePick(a.key, "github|org/gamma", true);
   m.cloneText(a.key, "foo/bar");
   m.cloneRepo(a.key);
   assert.equal(m.posts.length, 3, "one clone POST per selection + free-text");
   assert.deepEqual(m.posts.map((p) => p.body.repo).sort(), ["foo/bar", "me/alpha", "org/gamma"]);
+  // Picks carry the source of the listing they came from; free text stays
+  // source-less (the legacy GitHub meaning).
+  const bySrc = Object.fromEntries(m.posts.map((p) => [p.body.repo, p.body.source]));
+  assert.equal(bySrc["me/alpha"], "github");
+  assert.equal(bySrc["foo/bar"], undefined);
   assert.ok(m.posts.every((p) => p.url === "/api/agents/host1/clone"), "all hit the clone endpoint");
   assert.deepEqual(m.cloneDraft.get(a.key), {}, "draft cleared after cloning");
 });
@@ -209,4 +214,71 @@ test("cloneBar: a host with no GitHub creds renders greyed out with no picker", 
   const html = m.cloneBar(bare);
   assert.match(html, /cloning unavailable/);
   assert.ok(!html.includes('type="checkbox"'), "no picker when creds are absent");
+});
+
+// --- XERK-155: multiple git sources ------------------------------------------
+
+// A host reporting extra sources beside GitHub (the agent's gitSources block).
+function multiSourceAgent() {
+  const a = sampleAgent();
+  a.gitSources = [
+    { source: "azure", label: "dev.azure.com/xerk", available: true, user: "mal",
+      repos: [{ name: "Api", nameWithOwner: "Proj/Api", isPrivate: true, source: "azure" }] },
+    { source: "gitlab", label: "gitlab.example.com", available: true, user: null,
+      repos: [{ name: "app", nameWithOwner: "grp/sub/app", isPrivate: true, source: "gitlab" }] },
+  ];
+  return a;
+}
+
+test("cloneSources: github block plus each gitSources entry, tagged by source", () => {
+  const m = loadCloneModule();
+  const srcs = m.cloneSources(multiSourceAgent());
+  assert.deepEqual(srcs.map((s) => s.source), ["github", "azure", "gitlab"]);
+  assert.ok(srcs[0].repos.every((r) => r.source === "github"));
+  assert.equal(srcs[1].label, "dev.azure.com/xerk");
+  // An agent predating gitSources still renders its github-only bar.
+  const legacy = m.cloneSources(sampleAgent());
+  assert.deepEqual(legacy.map((s) => s.source), ["github"]);
+  // No creds at all: the github placeholder carries the unavailable state.
+  const bare = m.cloneSources({ key: "h2", github: { available: false } });
+  assert.equal(bare.length, 1);
+  assert.equal(bare[0].available, false);
+});
+
+test("cloneBar: multiple sources render a generic label and per-source group headings", () => {
+  const m = loadCloneModule();
+  const a = multiSourceAgent();
+  m.setCache({ agents: [a] });
+  expand(m, a.key);
+  const html = m.cloneBar(a);
+  assert.match(html, /Clone a repo/, "generic header with several sources");
+  assert.ok(!html.includes("Clone from GitHub"), "GitHub-only wording gone");
+  assert.match(html, /clone-src/, "group headings present");
+  assert.match(html, /dev\.azure\.com\/xerk/);
+  assert.match(html, /gitlab\.example\.com/);
+  assert.match(html, /Proj\/Api/);
+  assert.match(html, /grp\/sub\/app/);
+  assert.equal((html.match(/type="checkbox"/g) || []).length, 6, "4 github + 1 azure + 1 gitlab");
+  // Picks are keyed source|nameWithOwner so the POST knows the listing.
+  assert.match(html, /clonePick\('host1','azure\|Proj\/Api'/);
+});
+
+test("cloneBar: a single-source host keeps its flat list (no group headings)", () => {
+  const m = loadCloneModule();
+  const a = sampleAgent();
+  m.setCache({ agents: [a] });
+  expand(m, a.key);
+  const html = m.cloneBar(a);
+  assert.match(html, /Clone from GitHub/);
+  assert.ok(!html.includes("clone-src"), "no headings for one source");
+});
+
+test("cloneRepo: an azure pick POSTs its source", () => {
+  const m = loadCloneModule();
+  const a = multiSourceAgent();
+  m.setCache({ agents: [a] });
+  m.clonePick(a.key, "azure|Proj/Api", true);
+  m.cloneRepo(a.key);
+  assert.equal(m.posts.length, 1);
+  assert.deepEqual(m.posts[0].body, { repo: "Proj/Api", source: "azure" });
 });

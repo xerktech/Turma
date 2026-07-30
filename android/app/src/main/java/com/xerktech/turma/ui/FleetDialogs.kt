@@ -262,8 +262,10 @@ private fun ConfirmActionRow(label: String, confirmLabel: String, onConfirm: () 
  * fire (the clone rides the heartbeat, so it would just hang).
  */
 @Composable
-fun CloneBar(agent: com.xerktech.turma.model.AgentInfo, onClone: (String) -> Unit) {
-    val gh = agent.github
+fun CloneBar(agent: com.xerktech.turma.model.AgentInfo, onClone: (String, String?) -> Unit) {
+    val sources = com.xerktech.turma.core.cloneSources(agent.github, agent.gitSources)
+    val avail = sources.any { it.available }
+    val multi = sources.size > 1
     var expanded by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxWidth().padding(10.dp, 2.dp)) {
@@ -276,21 +278,26 @@ fun CloneBar(agent: com.xerktech.turma.model.AgentInfo, onClone: (String) -> Uni
                 if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            // Several sources make the header generic (the per-source labels
+            // move into the list); a GitHub-only host keeps its wording.
             Text(
-                "Clone from GitHub" + gh?.login?.takeIf { it.isNotBlank() }?.let { " · as $it" }.orEmpty(),
+                if (multi) "Clone a repo"
+                else "Clone from GitHub" +
+                    agent.github?.login?.takeIf { it.isNotBlank() }?.let { " · as $it" }.orEmpty(),
                 style = MaterialTheme.typography.bodyMedium,
             )
         }
         if (expanded) {
-            if (gh == null || !gh.available) {
+            if (!avail) {
                 Text(
-                    "No GitHub credentials on this host — cloning unavailable.",
+                    if (multi) "No usable git-source credentials on this host — cloning unavailable."
+                    else "No GitHub credentials on this host — cloning unavailable.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(bottom = 6.dp),
                 )
             } else {
-                ClonePicker(agent, gh, onClone)
+                ClonePicker(agent, sources, onClone)
             }
         }
         // Job rows stay visible while collapsed — they are the answer to "did my
@@ -319,23 +326,31 @@ fun CloneBar(agent: com.xerktech.turma.model.AgentInfo, onClone: (String) -> Uni
     }
 }
 
-/** The expanded clone panel: search + multi-select list + free-text + Clone. */
+/** The expanded clone panel: search + multi-select list (grouped by source when
+ *  several report, XERK-155) + free-text + Clone. */
 @Composable
 private fun ClonePicker(
     agent: com.xerktech.turma.model.AgentInfo,
-    gh: com.xerktech.turma.model.GithubInfo,
-    onClone: (String) -> Unit,
+    sources: List<com.xerktech.turma.core.CloneSource>,
+    onClone: (String, String?) -> Unit,
 ) {
     var search by remember { mutableStateOf("") }
     var free by remember { mutableStateOf("") }
     val picks = remember { mutableStateListOf<String>() }
 
     val present = agent.repos.map { it.name }.toSet()
-    val candidates = com.xerktech.turma.core.cloneCandidates(gh.repos, present, search)
+    val avail = sources.filter { it.available }
+    val multi = sources.size > 1
+    val groups = avail.map { s ->
+        s to com.xerktech.turma.core.cloneCandidates(s.repos, present, search, s.source)
+    }
+    val total = avail.sumOf { it.repos.size }
+    val shownTotal = groups.sumOf { it.second.size }
+    val ghUser = sources.firstOrNull { it.source == "github" }?.user
     val specs = com.xerktech.turma.core.cloneSpecs(picks.toSet(), free)
 
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        if (gh.repos.isNotEmpty()) {
+        if (total > 0) {
             OutlinedTextField(
                 search, { search = it },
                 label = { Text("Search repos…") }, singleLine = true,
@@ -348,40 +363,54 @@ private fun ClonePicker(
             Modifier.fillMaxWidth().heightIn(max = 200.dp).verticalScroll(rememberScrollState()),
         ) {
             when {
-                gh.repos.isEmpty() -> Text(
-                    "No repos found${gh.login.takeIf { it.isNotBlank() }?.let { " for $it" }.orEmpty()} — " +
+                total == 0 -> Text(
+                    "No repos found${ghUser?.let { " for $it" }.orEmpty()} — " +
                         "type an owner/repo below to clone.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                candidates.isEmpty() -> Text(
+                shownTotal == 0 -> Text(
                     "No repos match “$search”.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                else -> for (c in candidates) {
-                    val pickable = agent.online && !c.alreadyHere
-                    Row(
-                        Modifier.fillMaxWidth().clickable(enabled = pickable) {
-                            if (!picks.remove(c.nameWithOwner)) picks.add(c.nameWithOwner)
-                        },
-                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-                    ) {
-                        Checkbox(
-                            checked = c.nameWithOwner in picks,
-                            onCheckedChange = { on ->
-                                if (on) picks.add(c.nameWithOwner) else picks.remove(c.nameWithOwner)
-                            },
-                            enabled = pickable,
-                        )
+                else -> for ((src, candidates) in groups) {
+                    if (candidates.isEmpty()) continue
+                    // A group heading only when several sources report — a
+                    // GitHub-only host keeps its flat list.
+                    if (multi) {
                         Text(
-                            c.nameWithOwner + (if (c.isPrivate) " 🔒" else "") +
-                                (if (c.alreadyHere) " · already here" else ""),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (c.alreadyHere) MaterialTheme.colorScheme.onSurfaceVariant
-                            else androidx.compose.ui.graphics.Color.Unspecified,
-                            maxLines = 1,
+                            src.label + src.user?.let { " · as $it" }.orEmpty(),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
                         )
+                    }
+                    for (c in candidates) {
+                        val pickKey = com.xerktech.turma.core.clonePickKey(c.source, c.nameWithOwner)
+                        val pickable = agent.online && !c.alreadyHere
+                        Row(
+                            Modifier.fillMaxWidth().clickable(enabled = pickable) {
+                                if (!picks.remove(pickKey)) picks.add(pickKey)
+                            },
+                            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                        ) {
+                            Checkbox(
+                                checked = pickKey in picks,
+                                onCheckedChange = { on ->
+                                    if (on) picks.add(pickKey) else picks.remove(pickKey)
+                                },
+                                enabled = pickable,
+                            )
+                            Text(
+                                c.nameWithOwner + (if (c.isPrivate) " 🔒" else "") +
+                                    (if (c.alreadyHere) " · already here" else ""),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (c.alreadyHere) MaterialTheme.colorScheme.onSurfaceVariant
+                                else androidx.compose.ui.graphics.Color.Unspecified,
+                                maxLines = 1,
+                            )
+                        }
                     }
                 }
             }
@@ -394,7 +423,7 @@ private fun ClonePicker(
             )
             TextButton(
                 onClick = {
-                    specs.forEach(onClone)
+                    specs.forEach { onClone(it.repo, it.source) }
                     picks.clear(); free = ""; search = ""
                 },
                 enabled = agent.online && specs.isNotEmpty(),
