@@ -274,6 +274,16 @@ private fun HostSection(
                         else -> {}
                     }
                 }
+                // Board (Jira/Azure DevOps) reachability (XERK-156): a red pill
+                // when the configured tracker's last poll failed — most often the
+                // board being VPN-only and the host off it. Shown only on an
+                // online host with a configured board; mirrors index.html's
+                // boardHealthBadge.
+                agent.jira?.let { j ->
+                    if (agent.online && j.configured && !j.error.isNullOrBlank()) {
+                        Pill("📋 board", color = com.xerktech.turma.ui.theme.TurmaColors.critical)
+                    }
+                }
                 // An announced update restart reads as "updating" (warning), not
                 // the outage-looking "offline" (XERK-29).
                 when {

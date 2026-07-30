@@ -620,6 +620,17 @@ function restartBtn(a) {
     + ` title="Restart this host's agent (running sessions are re-adopted)"`
     + ` onclick="restartHost('${esc(a.key)}')">${armed ? "Confirm restart" : "↻ Restart"}</button>`;
 }
+// Board (Jira/Azure DevOps) reachability chip for a host header (XERK-156): a red
+// pill when the configured tracker's last poll failed — most often because the
+// board is only reachable over VPN and the host is off it, but any poll failure
+// (auth, rate-limit, 5xx) shows here with the reason as its tooltip. Mirrors
+// claudeAuthBadge: nothing when the board is healthy, unconfigured, or the host
+// is offline (its offline state already implies nothing is reachable).
+function boardHealthBadge(a) {
+  const j = a.jira;
+  if (!a.online || !j || !j.configured || !j.error) return "";
+  return `<span class="host-auth req" title="${esc(j.error)}">📋 Board unreachable</span>`;
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -965,6 +976,7 @@ function hostCard(a, now) {
         <h3>${esc(a.key)}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
       </button>
       ${collapsedMeta}
+      ${boardHealthBadge(a)}
       ${claudeAuthBadge(a)}
       ${restartBtn(a)}
       <span class="status"${statusTitle ? ` title="${esc(statusTitle)}"` : ""}><span class="dot ${dot}"></span>${esc(state)}</span>
