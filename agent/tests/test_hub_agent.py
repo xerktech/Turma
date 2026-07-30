@@ -3488,6 +3488,18 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.prune_repo.assert_called_once_with("Turma")
         self.assertIn("cp", sm.acked)
 
+    def test_restart_agent_command_arms_flag_without_exiting(self):
+        # XERK-157: restartAgent only ARMS the restart in handle_commands (so the
+        # command gets acked and leaves the hub's queue); the exit happens later
+        # in run_forever, once that ack has been delivered.
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        sm._perform_restart = mock.Mock(side_effect=AssertionError("must not exit here"))
+        self.assertTrue(sm.handle_commands([{"cmdId": "ra", "type": "restartAgent"}]))
+        self.assertTrue(sm._restart_pending)
+        self.assertIn("ra", sm.acked)
+        sm._perform_restart.assert_not_called()
+
     def test_unknown_type_and_poison_command_still_acked(self):
         sm = self.make_manager()
         sm.save = mock.Mock()
@@ -10847,6 +10859,87 @@ class TestUpdatingAnnounce(ManagerMixin, unittest.TestCase):
             with self.assertRaises(SystemExit):
                 sm._handle_shutdown(ha.signal.SIGTERM, None)
         self.assertEqual(calls, [("restart", None)])
+
+
+class TestRestartAgent(ManagerMixin, unittest.TestCase):
+    """XERK-157: the dashboard's "Restart agent" button restarts the manager the
+    same way a supervisor SIGTERM does, but the exit is deferred until the
+    command's ack has reached the hub so it can't re-fire on boot (a loop)."""
+
+    def _no_systemd_env(self, **extra):
+        # A copy of the real env with INVOCATION_ID removed (so `not under_systemd`
+        # holds), plus any overrides — patch.dict(clear=True) restores it after.
+        env = {k: v for k, v in os.environ.items() if k != "INVOCATION_ID"}
+        env.update(extra)
+        return env
+
+    def test_delivered_gate_defers_until_ack_reaches_hub(self):
+        sm = self.make_manager()
+        sm._perform_restart = mock.Mock()
+        sm._restart_pending = True
+        # Not delivered yet: the follow-up heartbeat failed to reach the hub, so
+        # the command is still queued — do NOT exit, keep the flag for a retry.
+        sm._restart_if_delivered(False)
+        sm._perform_restart.assert_not_called()
+        self.assertTrue(sm._restart_pending)
+        # Delivered: the ack landed, the command is off the queue — restart now.
+        sm._restart_if_delivered(True)
+        sm._perform_restart.assert_called_once()
+        self.assertFalse(sm._restart_pending)
+
+    def test_delivered_gate_noop_when_not_armed(self):
+        sm = self.make_manager()
+        sm._perform_restart = mock.Mock()
+        sm._restart_if_delivered(True)
+        sm._perform_restart.assert_not_called()
+
+    def test_perform_restart_exits_under_systemd(self):
+        # INVOCATION_ID set => systemd started us; a clean exit is enough
+        # (Restart=always brings us back). Never shell out to the ctl script,
+        # even if one happens to be present, or we'd fight the supervisor.
+        sm = self.make_manager()
+        bindir = os.path.join(self.tmp, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        open(os.path.join(bindir, "turma-agentctl"), "w").close()
+        with mock.patch.object(ha, "__file__", os.path.join(self.tmp, "hub-agent.py")), \
+             mock.patch.dict(ha.os.environ, self._no_systemd_env(INVOCATION_ID="abc"), clear=True), \
+             mock.patch.object(sm, "_announce_updating") as ann, \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            with self.assertRaises(SystemExit):
+                sm._perform_restart()
+        ann.assert_called_once_with("restart")
+        popen.assert_not_called()
+
+    def test_perform_restart_exits_in_container(self):
+        # No systemd and no ctl script beside hub-agent.py (the container layout):
+        # exit and let Docker's restart policy recreate us.
+        sm = self.make_manager()
+        with mock.patch.object(ha, "__file__", os.path.join(self.tmp, "hub-agent.py")), \
+             mock.patch.dict(ha.os.environ, self._no_systemd_env(), clear=True), \
+             mock.patch.object(sm, "_announce_updating") as ann, \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            with self.assertRaises(SystemExit):
+                sm._perform_restart()
+        ann.assert_called_once_with("restart")
+        popen.assert_not_called()
+
+    def test_perform_restart_hands_off_to_agentctl_when_no_supervisor(self):
+        # Native WSL without systemd: a ctl script sits beside hub-agent.py and
+        # there's no supervisor, so relaunch through it (detached) rather than
+        # exiting into the void. It SIGTERMs us to complete the restart.
+        sm = self.make_manager()
+        bindir = os.path.join(self.tmp, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        ctl = os.path.join(bindir, "turma-agentctl")
+        open(ctl, "w").close()
+        with mock.patch.object(ha, "__file__", os.path.join(self.tmp, "hub-agent.py")), \
+             mock.patch.dict(ha.os.environ, self._no_systemd_env(), clear=True), \
+             mock.patch.object(sm, "_announce_updating") as ann, \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm._perform_restart()  # returns, does NOT SystemExit — ctl stops us
+        ann.assert_called_once_with("restart")
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.args[0], [ctl, "restart"])
 
 
 if __name__ == "__main__":
