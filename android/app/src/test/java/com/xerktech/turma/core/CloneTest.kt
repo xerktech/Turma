@@ -189,6 +189,23 @@ class CloneTest {
         assertEquals("gitlab|grp/app", clonePickKey(c.source, c.nameWithOwner))
     }
 
+    @Test
+    fun `the bar title names a lone source and goes generic for several`() {
+        val gh = CloneSource("github", "GitHub", "me", true, emptyList())
+        val gl = CloneSource("gitlab", "gitlab.example.com", null, true, emptyList())
+        assertEquals("Clone from GitHub \u00b7 as me", cloneBarTitle(listOf(gh)))
+        assertEquals("Clone from gitlab.example.com", cloneBarTitle(listOf(gl)))
+        assertEquals("Clone a repo", cloneBarTitle(listOf(gh, gl)))
+        assertEquals(
+            "No gitlab.example.com credentials on this host — cloning unavailable.",
+            cloneUnavailableNote(listOf(gl)),
+        )
+        assertEquals(
+            "No usable git-source credentials on this host — cloning unavailable.",
+            cloneUnavailableNote(listOf(gh, gl)),
+        )
+    }
+
     // --- job rows -----------------------------------------------------------
 
     @Test

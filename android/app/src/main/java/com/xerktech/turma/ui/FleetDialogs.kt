@@ -265,7 +265,6 @@ private fun ConfirmActionRow(label: String, confirmLabel: String, onConfirm: () 
 fun CloneBar(agent: com.xerktech.turma.model.AgentInfo, onClone: (String, String?) -> Unit) {
     val sources = com.xerktech.turma.core.cloneSources(agent.github, agent.gitSources)
     val avail = sources.any { it.available }
-    val multi = sources.size > 1
     var expanded by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxWidth().padding(10.dp, 2.dp)) {
@@ -278,20 +277,17 @@ fun CloneBar(agent: com.xerktech.turma.model.AgentInfo, onClone: (String, String
                 if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            // Several sources make the header generic (the per-source labels
-            // move into the list); a GitHub-only host keeps its wording.
+            // One source names itself; several go generic (the per-source
+            // labels move into the list) — core.cloneBarTitle, JVM-tested.
             Text(
-                if (multi) "Clone a repo"
-                else "Clone from GitHub" +
-                    agent.github?.login?.takeIf { it.isNotBlank() }?.let { " · as $it" }.orEmpty(),
+                com.xerktech.turma.core.cloneBarTitle(sources),
                 style = MaterialTheme.typography.bodyMedium,
             )
         }
         if (expanded) {
             if (!avail) {
                 Text(
-                    if (multi) "No usable git-source credentials on this host — cloning unavailable."
-                    else "No GitHub credentials on this host — cloning unavailable.",
+                    com.xerktech.turma.core.cloneUnavailableNote(sources),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(bottom = 6.dp),
