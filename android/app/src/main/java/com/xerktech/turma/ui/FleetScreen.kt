@@ -139,7 +139,7 @@ fun FleetScreen(
                         onComposeSpawn = { host, repo, isRoot -> spawnFor = Triple(host, repo, isRoot) },
                         onResume = { host, repo -> resumeFor = host to repo },
                         onPrune = { host, repo -> pruneFor = host to repo },
-                        onClone = { host, repo -> vm.clone(host, repo) },
+                        onClone = { host, repo, source -> vm.clone(host, repo, source) },
                         onOpenSession = onOpenChat,
                         onSessionActions = { host, s -> actionsFor = host to s },
                         onCancelQueued = { host, s -> vm.kill(host, s.id) },
@@ -217,7 +217,7 @@ private fun HostSection(
     onComposeSpawn: (String, String, Boolean) -> Unit,
     onResume: (String, RepoInfo) -> Unit,
     onPrune: (String, String) -> Unit,
-    onClone: (String, String) -> Unit,
+    onClone: (String, String, String?) -> Unit,
     onOpenSession: (String, String) -> Unit,
     onSessionActions: (String, SessionInfo) -> Unit,
     onCancelQueued: (String, SessionInfo) -> Unit,
@@ -266,7 +266,7 @@ private fun HostSection(
             }
             AnimatedVisibility(expanded) {
                 Column(Modifier.fillMaxWidth().padding(bottom = 4.dp)) {
-                    CloneBar(agent, onClone = { repo -> onClone(agent.key, repo) })
+                    CloneBar(agent, onClone = { repo, source -> onClone(agent.key, repo, source) })
                     for (repo in agent.repos) {
                         val sessions = agent.sessions.filter { if (repo.root) it.root else (!it.root && it.repo == repo.name) }
                         RepoSection(

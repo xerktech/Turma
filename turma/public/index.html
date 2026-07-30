@@ -182,6 +182,14 @@
   .clone-opt.here { color: var(--muted); cursor: default; }
   .clone-opt.here:hover { background: none; }
   .clone-list-empty { padding: 8px 9px; font-size: 12.5px; color: var(--muted); }
+  /* Source group heading inside the list (only when a host reports more than
+     one clone source — GitHub / Azure DevOps / GitLab, XERK-155). */
+  .clone-src {
+    padding: 5px 9px 3px; font-size: 11px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em;
+    border-bottom: 1px solid var(--hairline); background: var(--page);
+    position: sticky; top: 0;
+  }
   .clone-count { font-size: 12px; color: var(--ink-2); }
   .clone-job {
     display: flex; align-items: center; gap: 8px; margin-top: 8px;
@@ -934,17 +942,44 @@ function hostCard(a, now) {
 // DOM-safe host id for the clone control's field ids.
 function hostId(key) { return key.replace(/[^A-Za-z0-9]/g, "_"); }
 
-// "Clone from GitHub" control for a host — a collapsible section (collapsed by
-// default; cloneOpen tracks which hosts are expanded). Its header toggles the
-// body: when the host has usable GitHub creds the body offers a searchable,
-// multi-select checkbox list of the login's repos (already-present ones
-// disabled) plus a free-text owner/repo box, and queues a clone into REPOS_ROOT
-// for each selected repo; they then join the scan and become spawnable. With no
-// creds the body is a greyed-out note. In-flight / recent clone jobs (reported
-// by the agent) show below the section — visible even while it's collapsed — with
-// an optimistic row per clone just fired but not yet echoed back.
+// The host's clone sources (XERK-155): the legacy `github` block as the GitHub
+// section plus every extra source the agent reports in `gitSources` (Azure
+// DevOps, GitLab). Each repo is tagged with its source, and a pick's key is
+// "<source>|<nameWithOwner>" — '|' can't appear in either — so the POST can say
+// which listing the pick came from. An agent predating gitSources reports none
+// and the bar renders exactly as it always did.
+function cloneSources(a) {
+  const gh = a.github || {};
+  const out = [];
+  if (gh.available || !(a.gitSources || []).length) {
+    out.push({ source: "github", label: "GitHub", user: gh.login || null,
+               available: !!gh.available,
+               repos: (gh.repos || []).map(r => ({ ...r, source: "github" })) });
+  }
+  for (const s of a.gitSources || []) {
+    if (!s || !s.source) continue;
+    out.push({ source: s.source, label: s.label || s.source, user: s.user || null,
+               available: !!s.available,
+               repos: (s.repos || []).map(r => ({ ...r, source: s.source })) });
+  }
+  return out;
+}
+
+// Clone control for a host — a collapsible section (collapsed by default;
+// cloneOpen tracks which hosts are expanded). Its header toggles the body: when
+// the host has a usable clone source the body offers a searchable,
+// multi-select checkbox list of each source's repos (already-present ones
+// disabled) plus a free-text owner/repo box (GitHub), and queues a clone into
+// REPOS_ROOT for each selected repo; they then join the scan and become
+// spawnable. With no creds the body is a greyed-out note. In-flight / recent
+// clone jobs (reported by the agent) show below the section — visible even
+// while it's collapsed — with an optimistic row per clone just fired but not
+// yet echoed back.
 function cloneBar(a) {
   const gh = a.github || {};
+  const sources = cloneSources(a);
+  const avail = sources.some(s => s.available);
+  const multi = sources.length > 1;
   const hid = hostId(a.key);
   const open = cloneOpen.has(a.key);
   const clones = a.clones || [];
@@ -962,52 +997,75 @@ function cloneBar(a) {
     .map(p => `<div class="clone-job"><span class="spin"></span> Cloning <b>${esc(p.repo)}</b>…</div>`)
     .join("");
 
+  // With one (GitHub) source the header keeps its historical wording; several
+  // sources make it generic and the per-source labels move into the list.
+  const label = multi
+    ? "Clone a repo"
+    : `Clone from GitHub${gh.login ? ` <span class="clone-note">as ${esc(gh.login)}</span>` : ""}`;
   const header = `<button class="clone-toggle" aria-expanded="${open}"
       title="${open ? "Collapse" : "Expand"} clone panel" onclick="cloneToggle('${esc(a.key)}')">
     <span class="caret">▼</span>
-    <span class="clone-label">Clone from GitHub${gh.login ? ` <span class="clone-note">as ${esc(gh.login)}</span>` : ""}</span>
+    <span class="clone-label">${label}</span>
   </button>`;
 
   // Body only renders while expanded — keeps the collapsed row cheap and, since
   // the poll re-render then emits no picker, there's nothing to scroll-reset.
-  const inner = !open ? "" : (!gh.available
-    ? `<div class="clone-body"><span class="clone-note">No GitHub credentials on this host — cloning unavailable.</span></div>`
-    : cloneBody(a, gh, hid));
+  const inner = !open ? "" : (!avail
+    ? `<div class="clone-body"><span class="clone-note">${multi
+        ? "No usable git-source credentials on this host — cloning unavailable."
+        : "No GitHub credentials on this host — cloning unavailable."}</span></div>`
+    : cloneBody(a, sources, hid));
 
-  return `<div class="clone-bar${open ? "" : " collapsed"}${gh.available ? "" : " disabled"}">
+  return `<div class="clone-bar${open ? "" : " collapsed"}${avail ? "" : " disabled"}">
     ${header}${inner}
   </div>${jobRows}${optimistic}`;
 }
 
-// The expanded picker: search box + scrollable multi-select list, a free-text
-// owner/repo box, and the Clone button/count. Split out of cloneBar so the
-// collapsed path stays a one-liner.
-function cloneBody(a, gh, hid) {
+// The expanded picker: search box + scrollable multi-select list (grouped by
+// source when there is more than one), a free-text owner/repo box (GitHub), and
+// the Clone button/count. Split out of cloneBar so the collapsed path stays a
+// one-liner.
+function cloneBody(a, sources, hid) {
   const existing = new Set((a.repos || []).map(r => r.name));
   const d = cloneDraft.get(a.key) || {};
   const picks = d.picks || {};
   const dis = a.online ? "" : "disabled";
-  const repos = gh.repos || [];
+  const avail = sources.filter(s => s.available);
+  const multi = sources.length > 1;
+  const total = avail.reduce((n, s) => n + s.repos.length, 0);
   // Filter the checkbox list by the search box (matches owner/repo, case-insensitive).
   const q = (d.search || "").trim().toLowerCase();
-  const shown = q ? repos.filter(r => r.nameWithOwner.toLowerCase().includes(q)) : repos;
-  const rows = shown.map(r => {
-    const here = existing.has(r.name);
-    const checked = picks[r.nameWithOwner] ? " checked" : "";
-    return `<label class="clone-opt${here ? " here" : ""}">
-      <input type="checkbox"${checked}${here || dis ? " disabled" : ""}
-        onchange="clonePick('${esc(a.key)}','${esc(r.nameWithOwner)}',this.checked)">
-      <span>${esc(r.nameWithOwner)}${r.isPrivate ? " 🔒" : ""}${here ? " · already here" : ""}</span>
-    </label>`;
+  let shownTotal = 0;
+  const groups = avail.map(s => {
+    const shown = q ? s.repos.filter(r => r.nameWithOwner.toLowerCase().includes(q)) : s.repos;
+    shownTotal += shown.length;
+    const rows = shown.map(r => {
+      const here = existing.has(r.name);
+      const pickKey = r.source + "|" + r.nameWithOwner;
+      const checked = picks[pickKey] ? " checked" : "";
+      return `<label class="clone-opt${here ? " here" : ""}">
+        <input type="checkbox"${checked}${here || dis ? " disabled" : ""}
+          onchange="clonePick('${esc(a.key)}','${esc(pickKey)}',this.checked)">
+        <span>${esc(r.nameWithOwner)}${r.isPrivate ? " 🔒" : ""}${here ? " · already here" : ""}</span>
+      </label>`;
+    }).join("");
+    if (!rows) return "";
+    // A group heading only when several sources report — a GitHub-only host
+    // keeps its flat list.
+    const head = multi
+      ? `<div class="clone-src">${esc(s.label)}${s.user ? ` <span class="clone-note">as ${esc(s.user)}</span>` : ""}</div>`
+      : "";
+    return head + rows;
   }).join("");
-  // The scrollable list only appears when the login reported repos. Its inner
+  const ghSrc = sources.find(s => s.source === "github") || {};
+  // The scrollable list only appears when a source reported repos. Its inner
   // message covers "search matched nothing" vs "no repos discovered at all".
-  const listInner = repos.length === 0
-    ? `<div class="clone-list-empty">No repos found${gh.login ? ` for ${esc(gh.login)}` : ""} — type an <code>owner/repo</code> below to clone.</div>`
-    : shown.length === 0
+  const listInner = total === 0
+    ? `<div class="clone-list-empty">No repos found${ghSrc.user ? ` for ${esc(ghSrc.user)}` : ""} — type an <code>owner/repo</code> below to clone.</div>`
+    : shownTotal === 0
     ? `<div class="clone-list-empty">No repos match “${esc(d.search || "")}”.</div>`
-    : rows;
-  const searchBox = repos.length
+    : groups;
+  const searchBox = total
     ? `<input id="clone-search-${hid}" class="clone-search" type="text" placeholder="Search repos…"
         value="${esc(d.search || "")}" ${dis} oninput="cloneSearch('${esc(a.key)}',this.value)">`
     : "";
@@ -1359,22 +1417,30 @@ function busy(key, val, run) {
   render(cache);
   run();
 }
-// Clone the selected GitHub repos into a host's REPOS_ROOT. Every checked repo
-// plus a non-empty free-text owner/repo box is queued as its own clone (the
-// endpoint takes one repo at a time). Each dest name (last path segment, sans
-// .git) keys an optimistic pending row that clears when the agent reports the
-// clone or the repo appears in the scan.
+// Clone the selected repos into a host's REPOS_ROOT. Every checked repo plus a
+// non-empty free-text owner/repo box (always GitHub) is queued as its own clone
+// (the endpoint takes one repo at a time). A pick's key is
+// "<source>|<nameWithOwner>" (see cloneSources), so the POST carries the source
+// the pick came from; the free-text box sends no source, keeping the legacy
+// GitHub meaning. Each dest name (last path segment, sans .git) keys an
+// optimistic pending row that clears when the agent reports the clone or the
+// repo appears in the scan.
 function cloneRepo(key) {
   const d = cloneDraft.get(key) || {};
-  const specs = Object.keys(d.picks || {});
+  const specs = Object.keys(d.picks || {}).map(k => {
+    const i = k.indexOf("|");
+    return i < 0 ? { repo: k, source: null }
+                 : { repo: k.slice(i + 1), source: k.slice(0, i) };
+  });
   const free = (d.text || "").trim();
-  if (free) specs.push(free);
+  if (free) specs.push({ repo: free, source: null });
   if (!specs.length) return;
   for (const spec of specs) {
-    const name = spec.replace(/\.git$/, "").replace(/\/+$/, "").split("/").pop();
+    const name = spec.repo.replace(/\.git$/, "").replace(/\/+$/, "").split("/").pop();
     if (!name) continue;
-    busy(pendKey("clone", key, name), { kind: "clone", host: key, name, repo: spec },
-      () => post(`/api/agents/${enc(key)}/clone`, { repo: spec }));
+    const body = spec.source ? { repo: spec.repo, source: spec.source } : { repo: spec.repo };
+    busy(pendKey("clone", key, name), { kind: "clone", host: key, name, repo: spec.repo },
+      () => post(`/api/agents/${enc(key)}/clone`, body));
   }
   cloneDraft.set(key, {}); // clear search/picks/box; progress shows as clone-job rows
   render(cache);

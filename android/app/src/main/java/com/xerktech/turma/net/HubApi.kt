@@ -319,7 +319,7 @@ data class AnswerRequest(
 data class MigrateRequest(val host: String)
 
 @Serializable
-data class CloneRequest(val repo: String)
+data class CloneRequest(val repo: String, val source: String? = null)
 
 @Serializable
 data class ResumeRequest(val cwd: String = "")

@@ -6267,7 +6267,8 @@ class TestClone(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.clones["Turma"]["status"], "done")
         # The serializable view never leaks the Popen/file handles.
         payload = sm._clones_payload()[0]
-        self.assertEqual(set(payload), {"name", "repo", "status", "error", "startedAt"})
+        self.assertEqual(set(payload),
+                         {"name", "repo", "status", "error", "source", "startedAt"})
 
     def test_failed_clone_captures_error(self):
         sm = self.make_manager()
@@ -6283,6 +6284,209 @@ class TestClone(ManagerMixin, unittest.TestCase):
             sm.clone("xerktech/Turma")
         sm._poll_clones()
         self.assertEqual(sm.clones["Turma"]["status"], "error")
+
+
+class TestValidSourceRepo(unittest.TestCase):
+    """XERK-155: the loose path check for non-GitHub listings — spaces are legal
+    in an Azure DevOps project segment, but the LAST segment becomes a directory
+    under REPOS_ROOT and stays on the strict GitHub charset."""
+
+    def test_accepts_plain_and_nested_and_spaced_paths(self):
+        for ok in ("owner/repo", "group/sub/project", "My Project/repo",
+                    "a/b/c/d/e/f"):
+            self.assertTrue(ha.valid_source_repo(ok), ok)
+
+    def test_rejects_unsafe_paths(self):
+        for bad in ("", "single", "a/b/c/d/e/f/g", "owner/re po",
+                    "owner/../repo", "-lead/repo", "owner/-repo",
+                    "owner/", "/repo", "owner//repo", "owner/re;po"):
+            self.assertFalse(ha.valid_source_repo(bad), bad)
+
+
+class _FakeHttpResp:
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return json.dumps(self._body).encode()
+
+
+class TestCollectGitlabRepos(unittest.TestCase):
+    def test_shapes_and_filters_projects(self):
+        page = [
+            {"path_with_namespace": "grp/sub/app",
+             "ssh_url_to_repo": "git@gitlab.example.com:grp/sub/app.git",
+             "description": "the app", "visibility": "private",
+             "last_activity_at": "2026-07-02T00:00:00Z"},
+            {"path_with_namespace": "grp/site",
+             "ssh_url_to_repo": "git@gitlab.example.com:grp/site.git",
+             "visibility": "public", "last_activity_at": "2026-07-01T00:00:00Z"},
+            # Malformed entries are dropped, never sanitized.
+            {"path_with_namespace": "grp/evil repo",
+             "ssh_url_to_repo": "git@gitlab.example.com:grp/evil.git"},
+            {"path_with_namespace": "grp/nossh", "ssh_url_to_repo": ""},
+        ]
+        with mock.patch.object(ha, "GITLAB_URL", "https://gitlab.example.com"), \
+                mock.patch.object(ha, "GITLAB_TOKEN", "tok"), \
+                mock.patch.object(ha.urllib.request, "urlopen",
+                                  return_value=_FakeHttpResp(page)):
+            repos = ha.collect_gitlab_repos()
+        self.assertEqual([r["nameWithOwner"] for r in repos],
+                         ["grp/sub/app", "grp/site"])
+        self.assertEqual(repos[0]["name"], "app")
+        self.assertEqual(repos[0]["cloneUrl"],
+                         "git@gitlab.example.com:grp/sub/app.git")
+        self.assertTrue(repos[0]["isPrivate"])
+        self.assertFalse(repos[1]["isPrivate"])
+        self.assertEqual(repos[0]["description"], "the app")
+
+    def test_http_failure_raises_for_keep_last_good(self):
+        with mock.patch.object(ha, "GITLAB_URL", "https://gitlab.example.com"), \
+                mock.patch.object(ha, "GITLAB_TOKEN", "tok"), \
+                mock.patch.object(ha.urllib.request, "urlopen",
+                                  side_effect=OSError("down")):
+            with self.assertRaises(OSError):
+                ha.collect_gitlab_repos()
+
+
+class TestCollectAzureRepos(unittest.TestCase):
+    def test_shapes_and_filters_repos(self):
+        data = {"value": [
+            {"name": "Api", "remoteUrl": "https://dev.azure.com/org/Proj/_git/Api",
+             "project": {"name": "My Project",
+                         "lastUpdateTime": "2026-06-01T00:00:00Z"}},
+            {"name": "Old", "isDisabled": True,
+             "remoteUrl": "https://x", "project": {"name": "My Project"}},
+            {"name": "re po", "remoteUrl": "https://x",
+             "project": {"name": "My Project"}},   # unsafe dest name -> dropped
+        ]}
+        with mock.patch.object(ha, "azure_req", return_value=data):
+            repos = ha.collect_azure_repos()
+        self.assertEqual([r["nameWithOwner"] for r in repos], ["My Project/Api"])
+        self.assertEqual(repos[0]["name"], "Api")
+        self.assertEqual(repos[0]["cloneUrl"],
+                         "https://dev.azure.com/org/Proj/_git/Api")
+        self.assertTrue(repos[0]["isPrivate"])
+
+
+class TestGitSources(ManagerMixin, unittest.TestCase):
+    """XERK-155: the extra clone sources' refresh, payload and clone routing."""
+
+    def setUp(self):
+        super().setUp()
+        self.repos_root = os.path.join(self.tmp, "root")
+        os.makedirs(self.repos_root)
+        p = mock.patch.object(ha, "REPOS_ROOT", self.repos_root)
+        p.start()
+        self.addCleanup(p.stop)
+
+    GL_REPO = {"nameWithOwner": "grp/app", "name": "app", "description": "",
+               "isPrivate": True, "updatedAt": "2026-07-01",
+               "cloneUrl": "git@gitlab.example.com:grp/app.git"}
+    AZ_REPO = {"nameWithOwner": "Proj/Api", "name": "Api", "description": "",
+               "isPrivate": True, "updatedAt": "2026-06-01",
+               "cloneUrl": "https://dev.azure.com/org/Proj/_git/Api"}
+
+    def _sourced_manager(self):
+        sm = self.make_manager()
+        sm.git_sources = {
+            "azure": {"available": True, "repos": [dict(self.AZ_REPO)], "error": None},
+            "gitlab": {"available": True, "repos": [dict(self.GL_REPO)], "error": None},
+        }
+        return sm
+
+    def test_refresh_keeps_last_good_list_on_failure(self):
+        sm = self._sourced_manager()
+        with mock.patch.object(ha, "collect_azure_repos",
+                               side_effect=OSError("down")), \
+                mock.patch.object(ha, "collect_gitlab_repos",
+                                  return_value=[dict(self.GL_REPO)]):
+            sm.refresh_git_sources()
+        az = sm.git_sources["azure"]
+        self.assertEqual(az["repos"], [self.AZ_REPO])   # kept, not blanked
+        self.assertIn("down", az["error"])
+        self.assertIsNone(sm.git_sources["gitlab"]["error"])
+
+    def test_payload_strips_clone_url_and_tags_source(self):
+        sm = self._sourced_manager()
+        with mock.patch.object(ha, "AZDO_URL", "https://dev.azure.com/org"), \
+                mock.patch.object(ha, "GITLAB_URL", "https://gitlab.example.com"):
+            payload = sm._git_sources_payload()
+        self.assertEqual([b["source"] for b in payload], ["azure", "gitlab"])
+        self.assertEqual(payload[0]["label"], "dev.azure.com/org")
+        self.assertEqual(payload[1]["label"], "gitlab.example.com")
+        for block in payload:
+            for r in block["repos"]:
+                self.assertNotIn("cloneUrl", r)
+                self.assertEqual(r["source"], block["source"])
+        # The internal listings still hold their cloneUrl for clone-time use.
+        self.assertIn("cloneUrl", sm.git_sources["gitlab"]["repos"][0])
+
+    def test_clone_resolves_listed_gitlab_repo_over_ssh(self):
+        sm = self._sourced_manager()
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("grp/app", source="gitlab")
+        args = popen.call_args[0][0]
+        self.assertIn("git@gitlab.example.com:grp/app.git", args)
+        env = popen.call_args[1]["env"]
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertIn("BatchMode=yes", env["GIT_SSH_COMMAND"])
+        self.assertEqual(sm.clones["app"]["source"], "gitlab")
+
+    def test_clone_resolves_bare_spec_across_sources(self):
+        # An older hub (or the triage ledger) sends no source; the bare
+        # nameWithOwner still finds the azure listing and its remoteUrl.
+        sm = self._sourced_manager()
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("Proj/Api")
+        args = popen.call_args[0][0]
+        self.assertIn("https://dev.azure.com/org/Proj/_git/Api", args)
+        self.assertEqual(sm.clones["Api"]["source"], "azure")
+
+    def test_github_listing_wins_a_bare_spec_collision(self):
+        sm = self._sourced_manager()
+        sm.github = {"available": True, "login": "me", "repos": [
+            {"nameWithOwner": "Proj/Api", "name": "Api"}]}
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("Proj/Api")
+        self.assertIn("https://github.com/Proj/Api.git", popen.call_args[0][0])
+        self.assertEqual(sm.clones["Api"]["source"], "github")
+
+    def test_unlisted_repo_for_explicit_source_is_refused(self):
+        sm = self._sourced_manager()
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("grp/unknown", source="gitlab")
+            popen.assert_not_called()
+        jobs = sm._clones_payload()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["status"], "error")
+        self.assertIn("not in the gitlab repo listing", jobs[0]["error"])
+
+    def test_free_text_still_falls_back_to_github(self):
+        sm = self._sourced_manager()
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("someone/elsewhere")
+        self.assertIn("https://github.com/someone/elsewhere.git",
+                      popen.call_args[0][0])
+
+    def test_triage_candidates_include_extra_sources(self):
+        sm = self._sourced_manager()
+        sm.triage_gh_repos = [{"nameWithOwner": "xerktech/Turma", "name": "Turma",
+                               "description": "hub"}]
+        with mock.patch.object(sm, "_triage_repos", return_value=[]):
+            cands = sm._refresh_triage_candidates()
+        by_name = {c["name"]: c for c in cands}
+        self.assertEqual(by_name["Turma"]["source"], "github")
+        self.assertEqual(by_name["Api"]["source"], "azure")
+        self.assertEqual(by_name["app"]["source"], "gitlab")
+        for c in cands:
+            self.assertNotIn("cloneUrl", c)
 
 
 class TestCleanSummary(unittest.TestCase):
@@ -9609,6 +9813,7 @@ class TestTriageCandidates(unittest.TestCase):
         ])
         self.assertEqual(cands, [{"name": "Widget", "cloned": False,
                                   "nameWithOwner": "xerktech/Widget",
+                                  "source": "github",
                                   "description": "the widget service"}])
 
     def test_a_cloned_repo_shadows_its_own_gh_listing(self):
@@ -9733,7 +9938,7 @@ class TestParseTriage(unittest.TestCase):
             '{"ENG-1": {"repo": "Turma", "why": "heartbeat code"}}',
             self.tickets, self.cands)
         self.assertEqual(out["ENG-1"], {"repo": "Turma", "cloned": True,
-                                        "nameWithOwner": None,
+                                        "nameWithOwner": None, "source": None,
                                         "reason": "heartbeat code"})
 
     def test_uncloned_candidate_keeps_its_owner(self):
@@ -9849,7 +10054,7 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
             sm._poll_jira_triage()
         self.assertEqual(sm.jira["tickets"][0]["repoGuess"], {
             "repo": "Turma", "cloned": True, "nameWithOwner": None,
-            "reason": "heartbeat lives there", "manual": False,
+            "source": None, "reason": "heartbeat lives there", "manual": False,
             "at": sm.jira["tickets"][0]["repoGuess"]["at"],
         })
 
@@ -10610,7 +10815,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.triage_ledger[ha._triage_key(self.SITE, "PROJ-7")]["nameWithOwner"] = \
             "xerktech/Elsewhere"
         started = []
-        sm.clone = lambda nwo: started.append(nwo)
+        sm.clone = lambda nwo, source=None: started.append(nwo)
         with mock.patch.object(ha, "fetch_jira_issue",
                                return_value={"summary": "s", "url": "u"}):
             sm.spawn_ticket("PROJ-7")

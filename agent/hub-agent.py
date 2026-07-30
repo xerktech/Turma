@@ -3806,6 +3806,136 @@ def collect_github():
     return {"available": True, "login": login, "repos": list_github_repos()}
 
 
+# --- Extra git sources (XERK-155) ----------------------------------------------
+# Beyond GitHub, a host can list and clone repos from the Azure DevOps
+# org/collection whose PAT it already holds for the board (AZDO_URL/AZDO_TOKEN)
+# and from a GitLab host (GITLAB_URL + GITLAB_TOKEN — the token only LISTS;
+# cloning goes over SSH with the host's mounted ~/.ssh key). The extra sources'
+# listings ride the heartbeat as the `gitSources` block BESIDE the legacy
+# `github` block, which keeps its exact contract — both older hubs and the
+# agent's own gh-gated features (PR comments, the triage gh sweep) read it.
+# A clone request is resolved back against these cached listings, so the clone
+# URL always comes from the source's own API, never from the request.
+GITLAB_URL = os.environ.get("GITLAB_URL", "").strip()
+GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "").strip()
+GITLAB_PAGE_MAX = 3   # pages of 100 projects swept per refresh (bounds the HTTP)
+
+# A non-GitHub repo path segment ('My Project' in 'My Project/repo'): printable,
+# no path separators, no leading dash/dot. Looser than _GH_SEG_RE because Azure
+# DevOps project names routinely carry spaces; the segment only ever feeds
+# fingerprints, labels and prompts — never a shell.
+_SRC_SEG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+
+
+def valid_source_repo(path):
+    """True when a listing's repo path ('owner/repo', 'group/sub/project') is
+    safe to carry: 2-6 loose-checked segments, and a LAST segment (the repo
+    name, which becomes the clone's directory under REPOS_ROOT) passing the
+    strict GitHub charset. An entry that fails is dropped at collection time
+    rather than sanitized, so nothing downstream ever re-validates."""
+    segs = (path or "").split("/")
+    if not 2 <= len(segs) <= 6:
+        return False
+    if not all(len(s) <= 100 and ".." not in s and _SRC_SEG_RE.match(s)
+               for s in segs):
+        return False
+    return bool(_GH_SEG_RE.match(segs[-1]))
+
+
+def gitlab_configured():
+    return bool(GITLAB_URL and GITLAB_TOKEN)
+
+
+def gitlab_base():
+    """GITLAB_URL -> a scheme-qualified, trailing-slash-free API base."""
+    b = GITLAB_URL
+    if not b:
+        return ""
+    if not re.match(r"^[a-zA-Z][\w.+-]*://", b):
+        b = "https://" + b
+    return b.rstrip("/")
+
+
+def gitlab_host():
+    """The bare host of GITLAB_URL — the source's UI label."""
+    return re.sub(r"^[a-zA-Z][\w.+-]*://", "", gitlab_base()).split("/")[0]
+
+
+def collect_gitlab_repos():
+    """The GitLab projects the token's user is a member of, shaped like the
+    github listing (nameWithOwner = path_with_namespace, which may nest as
+    group/subgroup/project). cloneUrl is the project's SSH URL — GitLab repos
+    clone over ssh, so the mounted ~/.ssh key is the git credential and the
+    token never reaches git. Raises on HTTP failure (the caller keeps the last
+    good list); a malformed entry is dropped."""
+    out = []
+    for page in range(1, GITLAB_PAGE_MAX + 1):
+        q = urllib.parse.urlencode({
+            "membership": "true", "archived": "false",
+            "order_by": "last_activity_at", "sort": "desc",
+            "per_page": 100, "page": page,
+        })
+        req = urllib.request.Request(
+            f"{gitlab_base()}/api/v4/projects?{q}",
+            headers={"PRIVATE-TOKEN": GITLAB_TOKEN,
+                     "Accept": "application/json",
+                     "User-Agent": "turma-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
+            data = json.loads(resp.read().decode() or "[]")
+        if not isinstance(data, list) or not data:
+            break
+        for p in data:
+            p = p if isinstance(p, dict) else {}
+            path = p.get("path_with_namespace") or ""
+            ssh = p.get("ssh_url_to_repo") or ""
+            if not (valid_source_repo(path) and ssh):
+                continue
+            out.append({
+                "nameWithOwner": path,
+                "name": path.split("/")[-1],
+                "description": (p.get("description") or "")[:120],
+                "isPrivate": (p.get("visibility") or "private") != "public",
+                "updatedAt": p.get("last_activity_at") or "",
+                "cloneUrl": ssh,
+            })
+        if len(data) < 100 or len(out) >= GH_REPO_MAX:
+            break
+    return out[:GH_REPO_MAX]
+
+
+def collect_azure_repos():
+    """The git repos of the board's Azure DevOps org/collection — the same
+    AZDO_URL/AZDO_TOKEN the board polls with — across every project the PAT can
+    see (the collection-level repositories API enumerates them all in one call).
+    nameWithOwner = 'Project/Repo'; cloneUrl is the https remoteUrl, which plain
+    git already authenticates against via the extraHeader wired at boot
+    (--wire-azure-git). Raises on HTTP failure; malformed entries are dropped."""
+    data = azure_req("/_apis/git/repositories", {})
+    out = []
+    for r in (data.get("value") or []):
+        r = r if isinstance(r, dict) else {}
+        if r.get("isDisabled"):
+            continue
+        name = r.get("name") or ""
+        proj = (r.get("project") or {}).get("name") or ""
+        url = r.get("remoteUrl") or ""
+        path = f"{proj}/{name}"
+        if not (proj and name and url and valid_source_repo(path)):
+            continue
+        out.append({
+            "nameWithOwner": path,
+            "name": name,
+            "description": "",
+            # The repos API reports no visibility; an ADO org's repos are
+            # private to it, which is what the lock glyph means in the UI.
+            "isPrivate": True,
+            "updatedAt": str((r.get("project") or {}).get("lastUpdateTime") or ""),
+            "cloneUrl": url,
+        })
+    out.sort(key=lambda e: e["updatedAt"], reverse=True)
+    return out[:GH_REPO_MAX]
+
+
 # --- Jira Cloud ticket polling --------------------------------------------------
 # Optional: with user-scoped Jira Cloud creds in the env (JIRA_SITE + JIRA_EMAIL
 # + JIRA_TOKEN — an ordinary Atlassian API token, Basic auth), the agent polls
@@ -5303,6 +5433,7 @@ def _triage_candidates(repos, github):
         gh = by_name.get(name) or {}
         out.append({"name": name, "cloned": True,
                     "nameWithOwner": gh.get("nameWithOwner") or None,
+                    "source": gh.get("source") or ("github" if gh else None),
                     "description": (gh.get("description") or "")[:120]})
     for name in sorted(by_name):
         if name in seen:
@@ -5311,6 +5442,7 @@ def _triage_candidates(repos, github):
         r = by_name[name]
         out.append({"name": name, "cloned": False,
                     "nameWithOwner": r.get("nameWithOwner") or None,
+                    "source": r.get("source") or "github",
                     "description": (r.get("description") or "")[:120]})
     return out[:JIRA_TRIAGE_CANDIDATES]
 
@@ -5490,6 +5622,7 @@ def _parse_triage(raw, tickets, cands):
             "repo": cand["name"],
             "cloned": bool(cand.get("cloned")),
             "nameWithOwner": cand.get("nameWithOwner"),
+            "source": cand.get("source"),
             "reason": why,
         }
     return out
@@ -5869,6 +6002,16 @@ class SessionManager:
         # view is heartbeated).
         self.github = {"available": False, "login": None, "repos": []}
         self.clones = {}
+        # Extra clone sources (XERK-155), keyed by source ("azure"/"gitlab"),
+        # present only when that source's creds are configured. Each holds the
+        # last GOOD listing (repos keep their internal cloneUrl; the payload
+        # strips it) — a failed sweep records the error but never blanks the
+        # repos, for the same reason triage_gh_repos exists.
+        self.git_sources = {}
+        if azure_configured():
+            self.git_sources["azure"] = {"available": False, "repos": [], "error": None}
+        if gitlab_configured():
+            self.git_sources["gitlab"] = {"available": False, "repos": [], "error": None}
         # Jira Cloud assigned-ticket block (refreshed on its own slow cadence
         # or on a hub `refreshJira` command, reported every beat; stays the
         # empty shape on unconfigured hosts).
@@ -6013,12 +6156,21 @@ class SessionManager:
 
         The same list is the operator's picker options and set_jira_repo's
         allowlist, so a repo the board offers is by construction one this host will
-        accept."""
+        accept.
+
+        The extra git sources (XERK-155) join the clonable tail: their listings
+        are already keep-last-good (refresh_git_sources never blanks on error),
+        so they need no gate of their own. gh first, so a cross-source name
+        collision keeps its legacy GitHub resolution."""
         gh = self.github or {}
         if gh.get("available"):
             self.triage_gh_repos = list(gh.get("repos") or [])
-        self.triage_cands = _triage_candidates(self._triage_repos(),
-                                               self.triage_gh_repos)
+        clonable = list(self.triage_gh_repos)
+        for src in ("azure", "gitlab"):
+            state = self.git_sources.get(src) or {}
+            clonable.extend(dict(r, source=src)
+                            for r in state.get("repos") or [])
+        self.triage_cands = _triage_candidates(self._triage_repos(), clonable)
         return self.triage_cands
 
     def _start_jira_triage(self):
@@ -6249,6 +6401,7 @@ class SessionManager:
                 "repo": repo,
                 "cloned": bool(cand.get("cloned")) if cand else bool(entry.get("cloned")),
                 "nameWithOwner": (cand or {}).get("nameWithOwner") or entry.get("nameWithOwner"),
+                "source": (cand or {}).get("source") or entry.get("source"),
                 "reason": entry.get("reason") or "",
                 "manual": bool(entry.get("manual")),
                 "at": entry.get("at"),
@@ -7290,7 +7443,9 @@ class SessionManager:
                 return
             job = self.clones.get(repo_name)
             if not job or job.get("status") == "error":
-                self.clone(nwo)
+                # The ledger's source (when it has one) routes the clone to the
+                # right listing; a bare nwo still resolves by search.
+                self.clone(nwo, source=entry.get("source"))
             await_clone = repo_name
         # Committed to spawning now — fetch the ticket text for the prompt, and
         # (when the repo already exists) reserve the branch name against it.
@@ -8487,7 +8642,8 @@ class SessionManager:
                 log(f"setJiraRepo: refusing non-candidate repo {str(repo)[:80]!r} for {k}")
                 return
             entry.update({"repo": cand["name"], "cloned": bool(cand.get("cloned")),
-                          "nameWithOwner": cand.get("nameWithOwner")})
+                          "nameWithOwner": cand.get("nameWithOwner"),
+                          "source": cand.get("source")})
         self.triage_ledger[lkey] = entry
         self._prune_triage_ledger()
         self._save_triage_ledger()
@@ -8510,7 +8666,8 @@ class SessionManager:
         if not self.jira.get("configured"):
             return self.jira
         opts = [{"name": c["name"], "cloned": bool(c.get("cloned")),
-                 "nameWithOwner": c.get("nameWithOwner")}
+                 "nameWithOwner": c.get("nameWithOwner"),
+                 "source": c.get("source")}
                 for c in (self.triage_cands or [])]
         return dict(self.jira, repoOptions=opts)
 
@@ -9071,6 +9228,71 @@ class SessionManager:
         except Exception as e:
             log(f"github refresh failed: {e}")
             self.github = {"available": False, "login": None, "repos": []}
+        self.refresh_git_sources()
+
+    def refresh_git_sources(self):
+        """Refresh the extra clone sources' listings (XERK-155), on the same
+        cadence as the gh sweep. Keep-last-good per source: a failed sweep
+        records the error but leaves the previous repos standing — a transient
+        must not blank the board's uncloned candidates (the same reason
+        _refresh_triage_candidates only updates from a successful gh sweep)."""
+        collectors = {"azure": collect_azure_repos, "gitlab": collect_gitlab_repos}
+        for src, state in self.git_sources.items():
+            try:
+                state["repos"] = collectors[src]()
+                state["available"] = True
+                state["error"] = None
+            except Exception as e:
+                state["error"] = str(e)[:200]
+                log(f"{src} repo listing failed: {e}")
+
+    def _git_sources_payload(self):
+        """The heartbeat's `gitSources` block (XERK-155): the EXTRA clone
+        sources beyond GitHub — clients render the legacy `github` block as the
+        GitHub section and append these, so the repo list is never carried
+        twice. cloneUrl is stripped: the hub and clients identify a repo by
+        (source, nameWithOwner) and the agent re-resolves the URL from its own
+        cached listing at clone time, so no URL ever round-trips."""
+        labels = {"azure": normalize_azure_site(AZDO_URL) or "Azure DevOps",
+                  "gitlab": gitlab_host() or "GitLab"}
+        users = {"azure": AZDO_USER or None, "gitlab": None}
+        out = []
+        for src in ("azure", "gitlab"):
+            state = self.git_sources.get(src)
+            if not state:
+                continue
+            out.append({
+                "source": src, "label": labels[src],
+                "available": bool(state.get("available")),
+                "user": users[src], "error": state.get("error"),
+                "repos": [
+                    {k: v for k, v in dict(r, source=src).items()
+                     if k != "cloneUrl"}
+                    for r in state.get("repos") or []],
+            })
+        return out
+
+    def _resolve_clone_source(self, spec, source=None):
+        """Resolve a requested repo to (source, listing entry): the exact
+        (source, nameWithOwner) the UI's picker sent, or a bare nameWithOwner
+        from an older hub / the triage ledger — searched github first (the
+        legacy meaning of a bare owner/repo), then each extra source in a fixed
+        order so a cross-source name collision resolves deterministically.
+        (None, None) when nothing in the cached listings matches."""
+        spec = (spec or "").strip().strip("/")
+        if spec.endswith(".git"):
+            spec = spec[:-len(".git")]
+        order = [source] if source else ["github", "azure", "gitlab"]
+        for src in order:
+            if src == "github":
+                for r in (self.github or {}).get("repos") or []:
+                    if r.get("nameWithOwner") == spec:
+                        return "github", r
+            else:
+                for r in (self.git_sources.get(src) or {}).get("repos") or []:
+                    if r.get("nameWithOwner") == spec:
+                        return src, r
+        return None, None
 
     def refresh_jira(self):
         """Refresh the cached assigned-tickets block from the configured source
@@ -9216,60 +9438,93 @@ class SessionManager:
                 sess["prCommentBase"] = base
                 self.save()
 
-    def clone(self, repo_spec):
-        """Clone a GitHub repo into REPOS_ROOT so it joins the scanned repo list.
+    def clone(self, repo_spec, source=None):
+        """Clone a repo into REPOS_ROOT so it joins the scanned repo list.
 
         Launched as a DETACHED subprocess and reaped by _poll_clones on later
         beats — `git clone` can take minutes and must never block the heartbeat
-        loop (a blocked loop would make the hub mark the host offline). The spec
-        is validated to a bare owner/repo first; the dest is that repo name
-        directly under REPOS_ROOT and must not already exist. Auth (private
-        repos) rides the system git credential helper (`gh auth git-credential`,
-        configured in the image)."""
+        loop (a blocked loop would make the hub mark the host offline).
+
+        The spec is resolved against the cached source listings first
+        (_resolve_clone_source), so a listed Azure DevOps or GitLab repo clones
+        from the URL its own API reported — never one built from the request.
+        Anything unlisted falls back to the legacy free-text GitHub path,
+        validated to a bare owner/repo. Auth: GitHub rides the system git
+        credential helper (`gh auth git-credential`), Azure DevOps the
+        extraHeader wired at boot (--wire-azure-git), GitLab the host's mounted
+        ~/.ssh key (its listing URLs are ssh). The dest is the repo name
+        directly under REPOS_ROOT and must not already exist."""
         raw = (repo_spec or "").strip()
-        try:
-            owner_repo = normalize_github_repo(raw)
-        except ValueError as e:
+        src, entry = self._resolve_clone_source(raw, source)
+        if entry:
+            name = entry["name"]
+            url = (f"https://github.com/{entry['nameWithOwner']}.git"
+                   if src == "github" else entry.get("cloneUrl"))
+            repo_id = entry["nameWithOwner"]
+        elif source and source != "github":
+            # An explicit non-GitHub source has no free-text form: the clone
+            # URL only exists in that source's listing, so an unlisted repo is
+            # a refusal, not a guess.
             key = slugify(raw) or "clone"
             self.clones[key] = {
-                "name": key, "repo": raw, "status": "error", "error": str(e),
+                "name": key, "repo": raw, "status": "error",
+                "error": f"{raw!r} is not in the {source} repo listing",
                 "startedAt": now_iso(), "startedMono": time.time(),
                 "proc": None, "logf": None, "logPath": None,
             }
-            log(f"clone refused: {e}")
+            log(f"clone refused: {raw!r} not listed for source {source!r}")
             return
-        name = owner_repo.split("/")[1]
-        dest = os.path.join(REPOS_ROOT, name)
+        else:
+            try:
+                repo_id = normalize_github_repo(raw)
+            except ValueError as e:
+                key = slugify(raw) or "clone"
+                self.clones[key] = {
+                    "name": key, "repo": raw, "status": "error", "error": str(e),
+                    "startedAt": now_iso(), "startedMono": time.time(),
+                    "proc": None, "logf": None, "logPath": None,
+                }
+                log(f"clone refused: {e}")
+                return
+            src = "github"
+            name = repo_id.split("/")[1]
+            url = f"https://github.com/{repo_id}.git"
         job = {
-            "name": name, "repo": owner_repo, "status": "cloning", "error": None,
-            "startedAt": now_iso(), "startedMono": time.time(),
+            "name": name, "repo": repo_id, "status": "cloning", "error": None,
+            "source": src, "startedAt": now_iso(), "startedMono": time.time(),
             "proc": None, "logf": None,
             "logPath": os.path.join(REGISTRY_DIR, f"clone-{slugify(name)}.log"),
         }
         self.clones[name] = job
+        dest = os.path.join(REPOS_ROOT, name)
         if os.path.exists(dest):
             job["status"] = "error"
             job["error"] = f"'{name}' already exists under the repos root"
             job["startedMono"] = time.time()
             log(f"clone refused: {job['error']}")
             return
-        url = f"https://github.com/{owner_repo}.git"
+        # Headless: never let git or ssh sit on a prompt — a missing credential
+        # or unknown host key should fail fast into the job's error, which the
+        # UI shows, rather than hang until CLONE_TIMEOUT_SEC reaps it.
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        if url.startswith(("git@", "ssh://")):
+            env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             logf = open(job["logPath"], "w")
             proc = subprocess.Popen(
                 ["git", "clone", "--", url, dest],
-                stdout=logf, stderr=subprocess.STDOUT,
+                stdout=logf, stderr=subprocess.STDOUT, env=env,
             )
         except Exception as e:
             job["status"] = "error"
             job["error"] = str(e)
             job["startedMono"] = time.time()
-            log(f"clone launch failed for {owner_repo}: {e}")
+            log(f"clone launch failed for {repo_id}: {e}")
             return
         job["proc"] = proc
         job["logf"] = logf
-        log(f"cloning {owner_repo} into {dest}")
+        log(f"cloning {repo_id} ({src}) into {dest}")
 
     def _clone_log_tail(self, job):
         try:
@@ -9330,7 +9585,7 @@ class SessionManager:
         return [
             {"name": j.get("name"), "repo": j.get("repo"),
              "status": j.get("status"), "error": j.get("error"),
-             "startedAt": j.get("startedAt")}
+             "source": j.get("source"), "startedAt": j.get("startedAt")}
             for j in self.clones.values()
         ]
 
@@ -9870,7 +10125,7 @@ class SessionManager:
                         cmd.get("issueKey"), cmd.get("repo"),
                         auto=bool(cmd.get("auto")), site_key=cmd.get("siteKey"))
                 elif ctype == "clone":
-                    self.clone(cmd.get("repo"))
+                    self.clone(cmd.get("repo"), source=cmd.get("source"))
                 elif ctype == "prune":
                     self.prune_repo(cmd.get("repo"))
                 elif ctype == "refreshJira":
@@ -10687,6 +10942,10 @@ class SessionManager:
             # GitHub clone-into-root: availability + clonable repos for the hub's
             # clone control, and any in-flight/recent clone jobs.
             "github": self.github,
+            # Extra clone sources beyond GitHub (XERK-155): Azure DevOps /
+            # GitLab listings, rendered by clients as sections beside the
+            # github block's repos. [] on a host with neither configured.
+            "gitSources": self._git_sources_payload(),
             # Jira Cloud assigned tickets (user-scoped creds); the hub's /board
             # merges these across hosts by siteKey into one cross-org Kanban.
             "jira": self._jira_payload(),

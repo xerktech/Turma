@@ -1410,6 +1410,30 @@ test("http: clone route queues a clone command; validates repo and host", async 
   assert.equal(ghost.status, 404);
 });
 
+test("http: clone route carries a valid source through and refuses an unknown one (XERK-155)", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ device: "hclsrc" });
+
+  // A picked gitlab repo rides as {type:"clone", repo, source}.
+  const ok = await request("POST", "/api/agents/hclsrc/clone", {
+    body: { repo: "grp/sub/app", source: "gitlab" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+  const res = await beat({ device: "hclsrc" });
+  assert.deepEqual(res.body.commands, [
+    { type: "clone", repo: "grp/sub/app", source: "gitlab", cmdId: ok.body.cmdId },
+  ]);
+
+  // A source outside the known set is refused before anything is queued.
+  const bad = await request("POST", "/api/agents/hclsrc/clone", {
+    body: { repo: "a/b", source: "sourceforge" }, headers: userHeaders,
+  });
+  assert.equal(bad.status, 400);
+  const res2 = await beat({ device: "hclsrc", ackedCommands: [ok.body.cmdId] });
+  assert.deepEqual(res2.body.commands, []);
+});
+
 test("http: prune route queues a prune command per repo; validates host", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });

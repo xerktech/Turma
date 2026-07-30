@@ -104,6 +104,9 @@ data class AgentInfo(
     val usage: UsageInfo? = null,
     val repoUsage: List<RepoUsage> = emptyList(),
     val github: GithubInfo? = null,
+    // Extra clone sources beside GitHub (XERK-155): the agent's Azure DevOps /
+    // GitLab listings. Empty on an agent predating the block.
+    val gitSources: List<GitSourceInfo> = emptyList(),
     val clones: List<CloneInfo> = emptyList(),
     val commands: List<CommandInfo> = emptyList(),
     val jira: JiraBlock? = null,
@@ -421,6 +424,22 @@ data class GithubRepo(
     val description: String = "",
     val isPrivate: Boolean = false,
     val updatedAt: String = "",
+)
+
+/**
+ * One EXTRA clone source's block (agent `_git_sources_payload`, XERK-155):
+ * an Azure DevOps org/collection or a GitLab host whose clonable repos the
+ * agent lists beside the GitHub ones. `source` routes a pick's clone POST;
+ * `label` is the section heading; `user` (nullable on the wire) names the
+ * account where the source knows one. Repos share the GithubRepo shape.
+ */
+@Serializable
+data class GitSourceInfo(
+    val source: String = "",
+    val label: String = "",
+    val available: Boolean = false,
+    val user: String = "",
+    val repos: List<GithubRepo> = emptyList(),
 )
 
 /**
