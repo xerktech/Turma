@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from collections import deque
 from unittest import mock
 
@@ -8852,6 +8853,62 @@ class TestBoardSourceDispatch(unittest.TestCase):
             self.assertEqual(ha.ticket_branch_base("1234", {"project": "My Proj"}),
                              "My-Proj-1234")
             self.assertEqual(ha.ticket_branch_base("1234", {}), "wi-1234")
+
+
+class TestBoardErrorSummary(unittest.TestCase):
+    """A board-poll failure is turned into a short, human-readable `error` for
+    the dashboard (XERK-156): an upstream 5xx (the Cloudflare-family HTTP 530 a
+    self-hosted org's front returns) or a connection failure reads as
+    'temporarily unreachable' rather than the cryptic `HTTP Error 530: <none>`."""
+
+    AZ = dict(JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+              AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p")
+    JI = dict(AZDO_URL="", AZDO_TOKEN="",
+              JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e", JIRA_TOKEN="t")
+
+    def _http(self, code, msg="<none>"):
+        return urllib.error.HTTPError("https://x/y", code, msg, {}, None)
+
+    def test_upstream_5xx_reads_as_temporarily_unreachable(self):
+        with mock.patch.multiple(ha, **self.AZ):
+            self.assertEqual(ha._board_error_summary(self._http(530)),
+                             "Azure DevOps temporarily unreachable (HTTP 530)")
+            self.assertEqual(ha._board_error_summary(self._http(503)),
+                             "Azure DevOps temporarily unreachable (HTTP 503)")
+        with mock.patch.multiple(ha, **self.JI):
+            self.assertEqual(ha._board_error_summary(self._http(502)),
+                             "Jira temporarily unreachable (HTTP 502)")
+
+    def test_auth_and_rate_limit_get_their_own_hint(self):
+        with mock.patch.multiple(ha, **self.AZ):
+            self.assertEqual(ha._board_error_summary(self._http(401)),
+                             "Azure DevOps rejected the credentials (HTTP 401)")
+            self.assertEqual(ha._board_error_summary(self._http(403)),
+                             "Azure DevOps rejected the credentials (HTTP 403)")
+            self.assertEqual(ha._board_error_summary(self._http(429)),
+                             "Azure DevOps rate-limited the request (HTTP 429)")
+
+    def test_other_4xx_keeps_the_code(self):
+        with mock.patch.multiple(ha, **self.AZ):
+            msg = ha._board_error_summary(self._http(404, "Not Found"))
+            self.assertIn("HTTP 404", msg)
+            self.assertIn("Azure DevOps", msg)
+
+    def test_connection_failure_reads_as_unreachable(self):
+        with mock.patch.multiple(ha, **self.JI):
+            msg = ha._board_error_summary(
+                urllib.error.URLError("Name or service not known"))
+            self.assertTrue(msg.startswith("Jira unreachable"))
+            self.assertIn("Name or service not known", msg)
+
+    def test_timeout_reads_as_unreachable(self):
+        with mock.patch.multiple(ha, **self.JI):
+            self.assertTrue(
+                ha._board_error_summary(TimeoutError()).startswith("Jira unreachable"))
+
+    def test_unrecognised_falls_back_to_raw_text(self):
+        with mock.patch.multiple(ha, **self.AZ):
+            self.assertEqual(ha._board_error_summary(ValueError("boom")), "boom")
 
 
 class TestBoardOrgName(unittest.TestCase):

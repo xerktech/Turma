@@ -57,6 +57,7 @@ import sys
 import tarfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -4407,7 +4408,7 @@ def azure_base():
         b = "https://" + b
     b = b.rstrip("/")
     # Trim anything from a pasted board/REST URL back to the collection root.
-    b = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", b, 1)[0]
+    b = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", b, maxsplit=1)[0]
     return b.rstrip("/")
 
 
@@ -4446,7 +4447,7 @@ def normalize_azure_site(url):
     r = (url or "").strip()
     r = re.sub(r"^[a-zA-Z][\w.+-]*://", "", r)   # scheme
     r = re.sub(r"^[^/@]+@", "", r)               # credentials
-    r = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", r, 1)[0]
+    r = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", r, maxsplit=1)[0]
     return r.strip("/").lower()
 
 
@@ -4951,6 +4952,34 @@ def collect_board():
     block = collect_azure() if azure_configured() else collect_jira()
     block["orgName"] = BOARD_ORG_NAME or None
     return block
+
+
+def _board_error_summary(e):
+    """A short, human-readable summary of a board-poll failure for the block's
+    `error` field (shown on the dashboard's board). An upstream 5xx (e.g. the
+    Cloudflare-family HTTP 530 a self-hosted org's front returns when its origin
+    is unreachable) or a connection failure means the tracker was momentarily
+    unreachable — NOT a bug in the request — so say that plainly rather than
+    surfacing a cryptic `HTTP Error 530: <none>`. Auth and rate-limit failures
+    get their own hint; anything unrecognised falls back to the raw text. The
+    raw exception is still logged verbatim for diagnosis; only this UI-facing
+    string is cleaned up."""
+    src = "Azure DevOps" if board_source() == "azure" else "Jira"
+    if isinstance(e, urllib.error.HTTPError):
+        code = e.code
+        if code >= 500:
+            return f"{src} temporarily unreachable (HTTP {code})"
+        if code == 429:
+            return f"{src} rate-limited the request (HTTP 429)"
+        if code in (401, 403):
+            return f"{src} rejected the credentials (HTTP {code})"
+        reason = str(getattr(e, "reason", "") or "").strip()
+        return f"{src} request failed: HTTP {code}" + (f" {reason}" if reason else "")
+    if isinstance(e, (urllib.error.URLError, TimeoutError)):
+        reason = getattr(e, "reason", None)
+        detail = str(reason if reason is not None else e).strip()
+        return f"{src} unreachable" + (f" ({detail})" if detail else "")
+    return str(e)[:200]
 
 
 def board_empty():
@@ -9083,7 +9112,7 @@ class SessionManager:
         except Exception as e:
             log(f"board refresh failed: {e}")
             prev = dict(self.jira)
-            prev["error"] = str(e)[:200]
+            prev["error"] = _board_error_summary(e)
             self.jira = prev
         # Re-stamp cached repo guesses onto the freshly-collected tickets: a
         # collect_jira() builds new ticket dicts, so without this every beat that
