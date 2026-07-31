@@ -1804,27 +1804,30 @@ function autoStartSweep() {
     }
   }
 }
-// The lifecycle counterpart to autoStartSweep (XERK-45): when a ticket in an
-// opted-in org moves to Done, stop the session(s) working it. Same per-org
-// opt-in as auto-start (orgsWithAutoStart) — turning "auto" on for an org means
-// the board drives that org's WHOLE session lifecycle, both halves: start a To
-// Do ticket that has a repo, stop a Done one's session.
+// The lifecycle counterpart to autoStartSweep (XERK-45): when a ticket moves to
+// Done, stop the session(s) working it.
 //
-// A ticket only reaches Done by a HUMAN moving it (the board is pull-only — no
-// session writes to Jira), so it's a deliberate "this work is finished" signal,
-// even more intentional than the To Do state auto-start reacts to. So the hub
-// KILLS the session rather than merely interrupting it: a kill ends the session
-// cleanly — it moves to the Ended list with its worktree, conversation and PR
-// chips intact and still resumable, and frees the MAX_SESSIONS slot the
-// auto-started session took (symmetric with auto-start consuming one). An
+// UNLIKE auto-start, this is UNCONDITIONAL — it is NOT gated on the per-org
+// "auto" opt-in (orgsWithAutoStart), which governs ONLY whether the hub
+// auto-STARTS work (XERK-161). A ticket only reaches Done by a HUMAN moving it
+// (the board is pull-only — no session writes to Jira), so it's a deliberate
+// "this work is finished" signal that should always retire its session, whatever
+// the org's auto-start preference. So this sweep runs for EVERY org that reports
+// a board block. It can only ever touch a session that was spawned to WORK a
+// ticket (s.ticket is set) whose key now reads Done on the board — a
+// manually-started session carries no ticket and is never affected.
+//
+// The hub KILLS the session rather than merely interrupting it: a kill ends the
+// session cleanly — it moves to the Ended list with its worktree, conversation
+// and PR chips intact and still resumable, and frees the MAX_SESSIONS slot. An
 // interrupt would only cancel the in-flight turn and leave the session running
 // idle, still holding that slot with nothing to do.
 //
 // The DECISION and ROUTING live here for the same reason auto-start's do: only
-// the hub sees the whole fleet. The tickets (and which is Done) come from an
-// org's freshest jira block, but a session can live on ANY of the org's hosts,
-// so the sweep scans the whole fleet and routes each kill to the host that owns
-// the session — the kill command is keyed on the sessionId the agent minted.
+// the hub sees the whole fleet. The tickets (and which is Done) come from each
+// org's freshest jira block, but a session can live on ANY host, so the sweep
+// scans the whole fleet and routes each kill to the host that owns the session —
+// the kill command is keyed on the sessionId the agent minted.
 //
 // Guard: autoStopped fires the kill for a given session at most once per hub
 // lifetime. A kill drops the session's registry record within a beat or two, but
@@ -1836,22 +1839,22 @@ function autoStartSweep() {
 const autoStopped = new Set(); // "<host>\x00<sessionId>" already auto-stopped
 
 function autoStopSweep() {
-  const orgs = orgsWithAutoStart();
-  if (!orgs.size) return;
-  // The set of now-Done tickets, per opted-in org, from the freshest reporting
-  // block — the same copy the board renders and autoStartSweep reads its To Dos
-  // from, so the hub stops on what the board shows, not a lagging host's view.
+  // The set of now-Done tickets across EVERY reporting org — no opt-in gate —
+  // each taken from that org's freshest block, the same copy the board renders,
+  // so the hub stops on what the board shows, not a lagging host's view.
+  const freshest = new Map(); // siteKey -> { block, at }
+  for (const a of Object.values(agents)) {
+    const j = a && a.jira;
+    if (!j || !j.siteKey) continue;
+    const at = String(j.fetchedAt || "");
+    const cur = freshest.get(j.siteKey);
+    if (!cur || at > cur.at) freshest.set(j.siteKey, { block: j, at });
+  }
   const doneKeys = new Set(); // "<siteKey>\x00<issueKey>"
-  for (const siteKey of orgs) {
-    let block = null, bestAt = "";
-    for (const a of Object.values(agents)) {
-      if (!a.jira || a.jira.siteKey !== siteKey) continue;
-      const at = String(a.jira.fetchedAt || "");
-      if (!block || at > bestAt) { block = a.jira; bestAt = at; }
-    }
-    for (const t of (block && block.tickets) || []) {
+  for (const { block } of freshest.values()) {
+    for (const t of block.tickets || []) {
       if (t && t.key && t.statusCategory === "done") {
-        doneKeys.add(siteKey + "\x00" + t.key);
+        doneKeys.add(block.siteKey + "\x00" + t.key);
       }
     }
   }

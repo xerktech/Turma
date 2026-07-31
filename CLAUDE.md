@@ -1126,21 +1126,21 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `turma/tests/board.test.js` and android `BoardTest.kt`, `test_no_agent_side_auto_start_flag` in
   `TestSetJiraRepo`.
 
-##### Auto-stopping Done tickets (XERK-45)
+##### Auto-stopping Done tickets (XERK-45, XERK-161)
 
-- The lifecycle **counterpart** to auto-start: the SAME per-org "auto" opt-in **kills** a session once its
-  ticket reaches **Done** — only a **human** moves a ticket there, so it's a deliberate "finished"
-  signal.
+- The lifecycle **counterpart** to auto-start: moving a ticket to **Done** **kills** its session(s) — only
+  a **human** moves it there, a deliberate "finished" signal. **Regardless of the per-org "auto" opt-in**
+  (XERK-161) — that toggle governs ONLY auto-STARTING work. Only a ticket-backed session (`s.ticket`) is
+  touched.
 - The hub **KILLS**, not interrupts: a kill ends it cleanly (Ended, resumable, worktree/conversation/PR
   chips intact) and frees the `MAX_SESSIONS` slot; an interrupt would leave it idle holding the slot.
-- Decision and routing on the HUB. `autoStopSweep()` (same 15s `setInterval`, beside `autoStartSweep`)
-  reads each opted-in org's **Done** tickets from its freshest jira block, then scans the WHOLE fleet for
+- Decision and routing on the HUB. `autoStopSweep()` (15s `setInterval`, beside `autoStartSweep`) reads
+  **every** reporting org's **Done** tickets from its freshest block, then scans the WHOLE fleet for
   sessions whose `ticket` names one, routing each `{type:"kill", sessionId}` to the owning host.
-- Only **live** sessions are stopped (`status` `running`/`queued`); every live session on the ticket is
-  killed, since a two-branch or restart-clear-context ticket has more than one.
-- Guard: `autoStopped`, an in-memory `<host>\x00<sessionId>` once-per-hub-lifetime set. Needs no
-  durability — a re-issued kill of an already-dead session is a harmless no-op. The Android client shows
-  the identical toggle and behaviour. Tests: the `auto-stop:` cases in `turma/tests/server.test.js`.
+- Only **live** sessions (`running`/`queued`) are stopped; every one on the ticket is killed (a
+  two-branch or restart-clear-context ticket has more than one).
+- Guard: `autoStopped`, a `<host>\x00<sessionId>` once-per-hub-lifetime set (a re-issued kill of a dead
+  session is a no-op). Tests: the `auto-stop:` cases in `turma/tests/server.test.js`.
 
 #### Ticket ↔ session chips
 
