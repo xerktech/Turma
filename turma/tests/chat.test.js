@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderProse, prFooterChip, __setVerbosity, __setNoExpand } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -78,6 +78,29 @@ test("buildItems: user text -> right bubble; assistant text+tool_use pairs its r
   assert.ok(!items.some((i) => i.kind === "msg" && i.role === "user" && i.text === "file.txt"));
 });
 
+test("buildItems: a skill body folds into its Skill card, never a user bubble", () => {
+  // The agent tags a skill body with the id of the Skill tool_use that pulled it
+  // in (hub-agent.py _entry_tool_source), so it arrives as that call's
+  // tool_result and pairs like any other — the operator never typed it.
+  const body = "# Verifying Turma changes\n\nPick the surface the change reaches.";
+  const items = buildItems([
+    { id: "u1", role: "user", blocks: [{ t: "text", text: "verify the board" }] },
+    { id: "a1", role: "assistant", blocks: [
+      { t: "tool_use", id: "t1", name: "Skill", input: '{"skill":"verify"}' },
+    ] },
+    // A Skill call reports twice: the launch stub, then the body tagged with the
+    // same id. Both fold into the one card, and the richer body wins.
+    { id: "r1", role: "user", blocks: [{ t: "tool_result", forId: "t1", text: "Launching skill: verify" }] },
+    { id: "s1", role: "user", blocks: [{ t: "tool_result", forId: "t1", text: body }] },
+  ]);
+  assert.deepEqual(items.map((i) => i.kind), ["msg", "action"]);
+  assert.equal(items[1].name, "Skill");
+  assert.equal(items[1].result.text, body);
+  // The one user bubble is the human's prompt — the skill body is not beside it.
+  const bubbles = items.filter((i) => i.kind === "msg" && i.role === "user");
+  assert.deepEqual(bubbles.map((b) => b.text), ["verify the board"]);
+});
+
 test("buildItems: thinking becomes its own item; error results flagged", () => {
   const items = buildItems([
     { id: "a1", role: "assistant", blocks: [
@@ -107,6 +130,62 @@ test("buildItems: text-only entry with no blocks (older agent / seed) still bubb
   assert.deepEqual(items, [{ kind: "msg", role: "assistant", id: "a1", text: "legacy text", truncated: false }]);
 });
 
+test("mergeTail: a text-only seed can't clobber an equal-text command-block copy", () => {
+  // A command block keeps its content in name/args, which the old weight()
+  // ignored — so the rich copy TIED its own flattened text and the `>=`
+  // tie-break let the heartbeat's text-only seed strip the blocks back off.
+  const rich = [{ id: "b1", role: "user", text: "! git status",
+    blocks: [{ t: "command", name: "!", args: "git status" }] }];
+  const seed = [{ id: "b1", role: "user", text: "! git status" }];
+  const merged = mergeTail(rich, seed);
+  assert.deepEqual(merged[0].blocks, [{ t: "command", name: "!", args: "git status" }]);
+  // And the seed arriving first is still upgraded by the rich copy.
+  assert.deepEqual(mergeTail(seed, rich)[0].blocks,
+    [{ t: "command", name: "!", args: "git status" }]);
+});
+
+test("buildItems/render: an interrupt block -> a centred marker, not a user bubble", () => {
+  const entries = [{ id: "i1", role: "user",
+    blocks: [{ t: "interrupt", text: "[Request interrupted by user for tool use]" }] }];
+  const items = buildItems(entries);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "interrupt");
+  const html = withVerbosity("concise", () => itemsToHtml(items));
+  // Visible even in Concise (it says what happened to the turn), never a bubble.
+  assert.match(html, /class="chat-interrupt"/);
+  assert.match(html, /Request interrupted by user for tool use/);
+  assert.doesNotMatch(html, /\[Request/);        // brackets stripped for display
+  assert.doesNotMatch(html, /tr-msg user/);
+});
+
+test("buildItems/render: an away_summary block -> a collapsed assistant-side card", () => {
+  const entries = [{ id: "aw1", role: "assistant",
+    blocks: [{ t: "away_summary", text: "Fixed the bug and opened a PR." }] }];
+  const items = buildItems(entries);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "away");
+  const html = withVerbosity("concise", () => itemsToHtml(items));
+  assert.match(html, /class="away-card"/);
+  assert.match(html, /While you were away/);
+  assert.match(html, /Fixed the bug and opened a PR\./);
+  assert.doesNotMatch(html, /tr-msg/); // a card, not a bubble on either side
+});
+
+test("buildItems: a bash `!` passthrough pairs its output like a slash command", () => {
+  // <bash-input> and <bash-stdout> arrive as consecutive entries; the shared
+  // command/command_output shapes mean the existing pairing folds them into
+  // one chip + output card.
+  const items = buildItems([
+    { id: "b1", role: "user", blocks: [{ t: "command", name: "!", args: "git push" }] },
+    { id: "b2", role: "user", blocks: [{ t: "command_output", text: "pushed" }] },
+  ]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "command");
+  assert.equal(items[0].name, "!");
+  assert.equal(items[0].args, "git push");
+  assert.equal(items[0].result.text, "pushed");
+});
+
 test("buildItems: a task_notification block -> an action card, not a user bubble", () => {
   const items = buildItems([{
     id: "n1", role: "user", blocks: [{
@@ -129,6 +208,141 @@ test("buildItems: non-completed task_notification flags its result as an error",
   assert.equal(items[0].result.text, "status: failed");
 });
 
+test("buildItems/render: an Edit tool_use carries its diff onto the card", () => {
+  const entries = [{ id: "e1", role: "assistant", blocks: [{
+    t: "tool_use", id: "t1", name: "Edit", input: "/repo/a.py",
+    edit: { old: "x = 1", new: "x = 2", replaceAll: true },
+  }] }];
+  const items = buildItems(entries);
+  assert.deepEqual(items[0].edit, { old: "x = 1", new: "x = 2", replaceAll: true });
+  const html = withVerbosity("normal", () => itemsToHtml(items));
+  assert.match(html, /tool-diff/);
+  assert.match(html, /class="diff-old">x = 1</);
+  assert.match(html, /class="diff-new">x = 2</);
+  assert.match(html, /edit \(replace all\)/);
+});
+
+test("buildItems/render: a Write's content and a Bash description show on the card", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([
+    { id: "w1", role: "assistant", blocks: [{ t: "tool_use", id: "t1", name: "Write",
+      input: "/repo/new.txt", content: "hello\nworld" }] },
+    { id: "b1", role: "assistant", blocks: [{ t: "tool_use", id: "t2", name: "Bash",
+      input: "ls -la", desc: "List files" }] },
+  ])));
+  assert.match(html, /tool-label">content<\/div><pre>hello\nworld</);
+  assert.match(html, /class="tool-desc">List files</);
+});
+
+test("buildItems/render: an ExitPlanMode plan renders as prose, open by default", () => {
+  const entries = [{ id: "p1", role: "assistant", blocks: [{
+    t: "tool_use", id: "t1", name: "ExitPlanMode", input: '{"allowedPrompts":[]}',
+    plan: "## The plan\n\ndo the thing",
+  }] }];
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
+  assert.match(html, /tool-plan/);
+  assert.match(html, /The plan/);
+  assert.match(html, /<details class="action-card[^"]*" [^>]*open>/); // approvable: open
+  // The summary leads with the plan's first line, not the raw input JSON.
+  assert.match(html, /tool-arg">## The plan</);
+  assert.doesNotMatch(html, /allowedPrompts/);
+});
+
+test("buildItems/render: a compact_boundary block -> a centred marker with token counts", () => {
+  const items = buildItems([{ id: "cb1", role: "assistant",
+    blocks: [{ t: "compact_boundary", trigger: "auto", preTokens: 123380, postTokens: 5920 }] }]);
+  assert.equal(items[0].kind, "compact_boundary");
+  const html = withVerbosity("concise", () => itemsToHtml(items));
+  assert.match(html, /chat-compact-mark/);
+  assert.match(html, /Context compacted \(auto\) — 123\.4k → 5\.9k tokens/);
+});
+
+test("buildItems/render: pr_link blocks -> one linked marker, consecutive duplicates fold", () => {
+  const pr = { t: "pr_link", url: "https://github.com/o/r/pull/230", number: 230, repo: "o/r" };
+  const items = buildItems([
+    { id: "p1", role: "assistant", blocks: [pr] },
+    { id: "p2", role: "assistant", blocks: [pr] }, // the transcript logs the same PR twice
+  ]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "pr");
+  const html = withVerbosity("concise", () => itemsToHtml(items));
+  assert.match(html, /chat-pr-mark/);
+  assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/230"/);
+  assert.match(html, /Opened PR #230 — o\/r/);
+});
+
+// Claude Code re-stamps a session's PR links in the metadata preamble it writes
+// at the top of EVERY user turn, so the repeats are separated by whole turns
+// rather than adjacent — a consecutive-only fold left one marker per re-stamp
+// (measured: 1154 markers for 195 real PRs across the corpus). Shape below is
+// taken from a real transcript.
+test("buildItems: a pr_link re-stamped in later turns marks only its first occurrence", () => {
+  const pr = (n) => ({ t: "pr_link", url: "https://github.com/o/r/pull/" + n, number: n, repo: "o/r" });
+  const items = buildItems([
+    { id: "u1", role: "user", blocks: [{ t: "text", text: "open a pr" }] },
+    { id: "p1", role: "assistant", blocks: [pr(230)] },
+    { id: "a1", role: "assistant", blocks: [{ t: "text", text: "opened it" }] },
+    { id: "u2", role: "user", blocks: [{ t: "text", text: "now another" }] },
+    { id: "p2", role: "assistant", blocks: [pr(230)] },   // re-stamp, a turn later
+    { id: "p3", role: "assistant", blocks: [pr(231)] },   // a genuinely new PR
+    { id: "a2", role: "assistant", blocks: [{ t: "text", text: "done" }] },
+    { id: "p4", role: "assistant", blocks: [pr(230)] },   // re-stamped again
+    { id: "p5", role: "assistant", blocks: [pr(231)] },
+  ]);
+  const prs = items.filter((i) => i.kind === "pr");
+  assert.deepEqual(prs.map((i) => i.number), [230, 231],
+    "one marker per PR, in the order each was first seen");
+  // The surviving marker is the FIRST sighting — where the PR actually landed
+  // in the conversation, not wherever the preamble last repeated it.
+  assert.equal(items.indexOf(prs[0]), 1);
+  // Nothing else is disturbed.
+  assert.deepEqual(items.filter((i) => i.kind === "msg").map((i) => i.text),
+    ["open a pr", "opened it", "now another", "done"]);
+});
+
+test("panePromptHtml: renders the TUI dialog with its context and numbered picks", () => {
+  const html = panePromptHtml({
+    prompt: "Do you want to proceed?",
+    detail: "Bash command\ntouch /tmp/marker",
+    options: [
+      { number: 1, label: "Yes", selected: true },
+      { number: 2, label: "Yes, and always allow access to tmp/", selected: false },
+      { number: 3, label: "No", selected: false },
+    ],
+  });
+  assert.match(html, /Do you want to proceed\?/);
+  assert.match(html, /q-pane-detail">Bash command\ntouch \/tmp\/marker</);
+  // Answered by the number the dialog itself shows — that's the key typed.
+  assert.match(html, /data-num="1"[^>]*>1\. Choose</);
+  assert.match(html, /data-num="3"[^>]*>3\. Choose</);
+  // The TUI's own cursor position is carried through as the marked pick.
+  assert.match(html, /q-opt-pick sel" data-num="1"/);
+  assert.doesNotMatch(html, /q-opt-pick sel" data-num="2"/);
+});
+
+test("panePromptHtml: escapes dialog text (it is scraped terminal output)", () => {
+  const html = panePromptHtml({
+    prompt: "Run <script>alert(1)</script>?",
+    detail: "rm -rf <x> && echo 'y'",
+    options: [{ number: 1, label: "<b>Yes</b>", selected: true },
+              { number: 2, label: "No", selected: false }],
+  });
+  assert.doesNotMatch(html, /<script>/);
+  assert.doesNotMatch(html, /<b>Yes<\/b>/);
+  assert.match(html, /&lt;script&gt;/);
+});
+
+test("compose bar: a blocking TUI dialog hides Stop, like a pending question", () => {
+  // Same reasoning as XERK-21: the dialog is answered with its own buttons, and
+  // a Stop there would cancel the decision rather than a running turn.
+  __setLiveStatus({ verb: "Working" });
+  __stopPending(0);
+  __setQuestionActive(false);
+  __setPanePromptActive(true);
+  assert.equal(isBusy(), false);
+  __setPanePromptActive(false);
+  assert.equal(isBusy(), true);
+});
+
 test("render: task_notification card carries the task class + glyph, hidden by 'concise'", () => {
   const entries = [{ id: "n1", role: "user", blocks: [{ t: "task_notification", summary: "done", status: "completed", result: "ok" }] }];
   const shown = withVerbosity("normal", () => itemsToHtml(buildItems(entries)));
@@ -137,6 +351,134 @@ test("render: task_notification card carries the task class + glyph, hidden by '
   assert.doesNotMatch(shown, /tr-msg user/); // never a user bubble
   const concise = withVerbosity("concise", () => itemsToHtml(buildItems(entries)));
   assert.doesNotMatch(concise, /action-card/); // Concise hides tool actions (incl. task cards) entirely
+});
+
+// ---- slash-command + compact-summary turns --------------------------------
+// Claude Code writes these as USER turns; the chat must not render them as the
+// operator typing raw XML. Agent-side parity: agent/tests/test_hub_agent.py
+// TestLocalCommand / TestCompactSummary.
+
+test("buildItems: a command block + the output entry after it fold into one card", () => {
+  const items = buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact", args: "be brief" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "Compacted" }] },
+  ]);
+  assert.equal(items.length, 1);                 // the output folded into the invocation
+  assert.equal(items[0].kind, "command");
+  assert.equal(items[0].name, "/compact");
+  assert.equal(items[0].args, "be brief");
+  assert.equal(items[0].result.text, "Compacted");
+  assert.equal(items[0].result.isError, false);
+});
+
+test("buildItems: a command with no output stays a resultless chip", () => {
+  const items = buildItems([{ id: "c1", role: "user", blocks: [{ t: "command", name: "/clear" }] }]);
+  assert.equal(items[0].kind, "command");
+  assert.equal(items[0].args, "");
+  assert.equal(items[0].result, null);
+});
+
+test("buildItems: stderr output flags the command card as an error", () => {
+  const items = buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "No messages", isError: true }] },
+  ]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].result.isError, true);
+});
+
+test("buildItems: an output with no invocation ahead of it stands alone", () => {
+  // A tail window that starts mid-sequence: the command scrolled off.
+  const items = buildItems([{ id: "o1", role: "user", blocks: [{ t: "command_output", text: "Compacted" }] }]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "command");
+  assert.equal(items[0].name, "output");
+  assert.equal(items[0].result.text, "Compacted");
+});
+
+test("buildItems: a message between a command and an output stops the fold", () => {
+  const items = buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact" }] },
+    { id: "u1", role: "user", blocks: [{ t: "text", text: "actually wait" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "Compacted" }] },
+  ]);
+  assert.deepEqual(items.map((i) => i.kind), ["command", "msg", "command"]);
+  assert.equal(items[0].result, null);          // never paired across the message
+  assert.equal(items[2].name, "output");
+});
+
+test("buildItems: a compact_summary is its own item, never a bubble", () => {
+  const items = buildItems([{
+    id: "s1", role: "assistant", blocks: [{ t: "compact_summary", text: "Summary: we did things" }],
+  }]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, "compact");
+  assert.equal(items[0].text, "Summary: we did things");
+});
+
+test("render: a command is a chip on the operator's side, not a bubble, in every verbosity", () => {
+  const entries = [
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact", args: "be brief" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "Compacted" }] },
+  ];
+  for (const preset of ["concise", "normal", "verbose"]) {
+    const html = withVerbosity(preset, () => itemsToHtml(buildItems(entries)));
+    assert.match(html, /class="cmd-card"/);
+    assert.match(html, /\/compact/);
+    assert.match(html, /Compacted/);
+    // It's the operator's own intent, so unlike a tool card it survives Concise…
+    assert.doesNotMatch(html, /tr-msg/);        // …but is never a chat bubble.
+  }
+});
+
+test("render: a command card collapses its output and flags stderr with .err", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "No messages", isError: true }] },
+  ])));
+  assert.match(html, /class="cmd-card err"/);
+  assert.doesNotMatch(html, /<details[^>]* open>/); // collapsed by default
+});
+
+test("render: a compact summary renders collapsed on the assistant's side", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([
+    { id: "s1", role: "assistant", blocks: [{ t: "compact_summary", text: "Summary: we did things" }] },
+  ])));
+  assert.match(html, /class="compact-card"/);
+  assert.match(html, /Context compacted/);
+  assert.match(html, /Summary: we did things/);
+  assert.doesNotMatch(html, /tr-msg user/);     // the bug: never the operator's bubble
+  assert.doesNotMatch(html, /<details[^>]* open>/);
+});
+
+test("render: HTML in a command / compact turn is escaped (no injection)", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/x", args: "<img src=x onerror=alert(1)>" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "<script>alert(1)</script>" }] },
+    { id: "s1", role: "assistant", blocks: [{ t: "compact_summary", text: "<script>alert(2)</script>" }] },
+  ])));
+  assert.doesNotMatch(html, /<img src=x/);
+  assert.doesNotMatch(html, /<script>/);
+  assert.match(html, /&lt;script&gt;/);
+});
+
+test("render: a truncated command output / compact summary offers Show more", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact" }] },
+    { id: "o1", role: "user", blocks: [{ t: "command_output", text: "cut", truncated: true }] },
+    { id: "s1", role: "assistant", blocks: [{ t: "compact_summary", text: "cut", truncated: true }] },
+  ])));
+  // The output folds into c1's card but is o1's entry — Show more must re-fetch
+  // the entry the text actually came from, not the card it's drawn in.
+  assert.match(html, /<button class="trunc" data-eid="o1">/);
+  assert.match(html, /<button class="trunc" data-eid="s1">/);
+});
+
+test("render: a folded card's truncated ARGS still expand the invocation entry", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(buildItems([
+    { id: "c1", role: "user", blocks: [{ t: "command", name: "/compact", args: "cut", truncated: true }] },
+  ])));
+  assert.match(html, /<button class="trunc" data-eid="c1">/);
 });
 
 // ---- verbosity-driven HTML rendering -------------------------------------
@@ -319,16 +661,18 @@ test("prFooterChip: '' when the session has no PRs", () => {
   assert.equal(prFooterChip({ prs: [] }), "");
 });
 
-test("prFooterChip: lists every PR, newest first, each linked with state + CI mark", () => {
+test("prFooterChip: lists every PR, newest first, each linked with state + readiness mark", () => {
   const html = prFooterChip({ prs: [
     { url: "https://github.com/o/r/pull/1", number: 1, state: "MERGED" },
-    { url: "https://github.com/o/r/pull/2", number: 2, state: "OPEN", checks: "passing", title: "Add flag" },
+    { url: "https://github.com/o/r/pull/2", number: 2, state: "OPEN", checks: "passing",
+      mergeable: "MERGEABLE", ready: "ready", title: "Add flag" },
   ] });
   assert.match(html, /pr-badge pr-open/);          // newest PR's state
   assert.match(html, /#2 Open/);                    // number + capitalized state
   assert.match(html, /pr-badge pr-merged/);        // older PR still shown
   assert.match(html, /#1 Merged/);
-  assert.match(html, /pr-checks passing/);          // CI rollup mark
+  assert.match(html, /pr-ready ready/);             // merge-readiness mark
+  assert.match(html, /title="CI passing · no conflicts"/);
   assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/1"/);
   assert.match(html, /href="https:\/\/github\.com\/o\/r\/pull\/2"/);
   assert.match(html, /title="Add flag"/);
@@ -336,16 +680,201 @@ test("prFooterChip: lists every PR, newest first, each linked with state + CI ma
   assert.ok(html.indexOf("pull/2") < html.indexOf("pull/1"));
 });
 
-test("prFooterChip: derives #number from the URL when absent, no CI mark when unknown", () => {
+test("prFooterChip: derives #number from the URL when absent, no mark when unknown", () => {
   const html = prFooterChip({ prs: [{ url: "https://github.com/o/r/pull/42" }] });
   assert.match(html, /#42/);
-  assert.doesNotMatch(html, /pr-checks/);
+  assert.doesNotMatch(html, /pr-ready/);
+});
+
+// The mark answers "can this land", not "is CI green": a conflicting branch
+// merges nowhere however clean its checks are, so it reads ✗ and says why.
+test("prFooterChip: a merge conflict blocks the mark despite green CI", () => {
+  const html = prFooterChip({ prs: [{
+    url: "https://github.com/o/r/pull/7", number: 7, state: "OPEN",
+    checks: "passing", mergeable: "CONFLICTING", ready: "blocked",
+  }] });
+  assert.match(html, /pr-ready blocked/);
+  assert.match(html, /✗/);
+  assert.match(html, /title="CI passing · merge conflict"/);
+});
+
+// An agent predating `ready` reports the CI half alone — render that rather
+// than dropping the mark.
+test("prFooterChip: falls back to the CI rollup when the agent reports no verdict", () => {
+  const html = prFooterChip({ prs: [{
+    url: "https://github.com/o/r/pull/9", number: 9, state: "OPEN", checks: "failing",
+  }] });
+  assert.match(html, /pr-ready blocked/);
+  assert.match(html, /title="CI failing"/);   // nothing claimed about conflicts
+});
+
+// The Jira ticket this session was spawned to work — the reverse of the board's
+// ticket -> session link. It links out to Jira, not back to the board: from
+// inside a session, the useful thing is the live ticket.
+
+test("ticketFooterChip: '' for an ordinary session (not started from a ticket)", () => {
+  assert.equal(ticketFooterChip(null), "");
+  assert.equal(ticketFooterChip({}), "");
+  assert.equal(ticketFooterChip({ ticket: null }), "");
+  assert.equal(ticketFooterChip({ ticket: {} }), "");
+});
+
+test("ticketFooterChip: shows the key and links to the ticket on the turma board", () => {
+  const html = ticketFooterChip({ ticket: {
+    key: "ENG-42", siteKey: "myorg.atlassian.net",
+    url: "https://myorg.atlassian.net/browse/ENG-42",
+    summary: "Fix the board", branch: "ENG-42-1",
+  } });
+  assert.match(html, /jira-chip/);
+  assert.match(html, />ENG-42</);
+  // Deep-links the board's own ticket panel (XERK-16), not out to Jira.
+  assert.match(html, /href="\/board\?ticket=ENG-42&amp;site=myorg\.atlassian\.net"/);
+  assert.doesNotMatch(html, /atlassian\.net\/browse/);
+  assert.doesNotMatch(html, /target="_blank"/);
+  // The summary and the branch it was told to use ride as the tooltip — the
+  // chip itself only has room for the key.
+  assert.match(html, /title="Fix the board · branch ENG-42-1"/);
+});
+
+test("ticketFooterChip: a ticket with no siteKey still links to the board (never a broken chip)", () => {
+  const html = ticketFooterChip({ ticket: { key: "ENG-1" } });
+  assert.match(html, />ENG-1</);
+  assert.match(html, /href="\/board\?ticket=ENG-1"/);
+  assert.doesNotMatch(html, /site=/);
+  assert.match(html, /title="ENG-1"/);
+});
+
+test("ticketFooterChip: escapes a malicious ticket summary (no injection)", () => {
+  const html = ticketFooterChip({ ticket: {
+    key: "ENG-1", url: "https://x/browse/ENG-1", summary: '<img src=x onerror=alert(1)>',
+  } });
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /&lt;img/);
 });
 
 test("prFooterChip: escapes a malicious PR title (no injection)", () => {
   const html = prFooterChip({ prs: [{ url: "https://github.com/o/r/pull/1", number: 1, state: "OPEN", title: '<img src=x onerror=alert(1)>' }] });
   assert.doesNotMatch(html, /<img/);
   assert.match(html, /&lt;img/);
+});
+
+// ---- filterModeOpts (mode selector shows only reachable modes) -----------
+const modeVals = (opts) => opts.map((o) => o.value);
+
+test("filterModeOpts: no permissionModes info -> every mode shown (older agent)", () => {
+  assert.deepEqual(filterModeOpts(MODE_OPTS, undefined, "auto"), MODE_OPTS);
+  assert.deepEqual(filterModeOpts(MODE_OPTS, null, "auto"), MODE_OPTS);
+});
+
+test("filterModeOpts: auto-launched cycle hides the unreachable bypassPermissions", () => {
+  const avail = ["default", "acceptEdits", "plan", "auto"];
+  assert.deepEqual(modeVals(filterModeOpts(MODE_OPTS, avail, "auto")),
+    ["auto", "acceptEdits", "plan", "default"]);  // MODE_OPTS order, no bypass
+});
+
+test("filterModeOpts: bypass-launched cycle shows bypass, hides the unreachable auto", () => {
+  const avail = ["default", "acceptEdits", "plan", "bypassPermissions"];
+  const vals = modeVals(filterModeOpts(MODE_OPTS, avail, "bypassPermissions"));
+  assert.ok(vals.includes("bypassPermissions"));
+  assert.ok(!vals.includes("auto"));
+});
+
+test("filterModeOpts: the current mode is always kept even if not in the reachable set", () => {
+  // Defensive: a stale current mode outside the reported cycle still appears, so
+  // the selector never hides the active choice.
+  const avail = ["default", "acceptEdits", "plan"];
+  const vals = modeVals(filterModeOpts(MODE_OPTS, avail, "bypassPermissions"));
+  assert.ok(vals.includes("bypassPermissions"));
+});
+
+// ---- modelOpts / prettyModel (the accurate model selector, XERK-33) ------
+const modelVals = (opts) => opts.map((o) => o.value);
+
+test("modelOpts: no models block -> the static fallback menu (older agent)", () => {
+  assert.deepEqual(modelOpts(undefined), MODEL_OPTS);
+  assert.deepEqual(modelOpts(null), MODEL_OPTS);
+  assert.deepEqual(modelOpts({ available: [] }), MODEL_OPTS);
+});
+
+test("modelOpts: the probed list curates the menu — fable in, absent aliases out", () => {
+  const models = { available: ["sonnet", "opus", "fable", "best", "opusplan", "default"] };
+  // haiku not probed -> not offered; best/opusplan have no picker row -> never offered.
+  assert.deepEqual(modelVals(modelOpts(models)), ["default", "opus", "fable", "sonnet"]);
+});
+
+test("modelOpts: the Default entry says what default actually is", () => {
+  const models = { available: ["sonnet", "default"], defaultLabel: "Fable 5" };
+  assert.equal(modelOpts(models)[0].label, "Default (Fable 5)");
+  // ...and stays plain when the probe carried no label.
+  assert.equal(modelOpts({ available: ["sonnet", "default"] })[0].label, "Default");
+});
+
+test("modelOpts: a probe listing nothing offerable falls back rather than emptying the menu", () => {
+  assert.deepEqual(modelOpts({ available: ["best", "opusplan"] }), MODEL_OPTS);
+});
+
+test("prettyModel: transcript model ids render human", () => {
+  assert.equal(prettyModel("claude-opus-4-8"), "Opus 4.8");
+  assert.equal(prettyModel("claude-fable-5"), "Fable 5");
+  assert.equal(prettyModel("claude-sonnet-5"), "Sonnet 5");
+  assert.equal(prettyModel("claude-haiku-4-5-20251001"), "Haiku 4.5"); // date dropped
+  assert.equal(prettyModel("claude-3-5-haiku-20241022"), "Haiku 3.5"); // legacy order
+  assert.equal(prettyModel("claude-fable-5[1m]"), "Fable 5 1M");
+});
+
+test("prettyModel: a switch confirmation's display label passes through", () => {
+  assert.equal(prettyModel("Sonnet 5"), "Sonnet 5");
+  assert.equal(prettyModel(""), "");
+  assert.equal(prettyModel(null), "");
+});
+
+// ---- modelChipLabel / modeChipValue (switch-in-flight display) -----------
+function resetChipState() {
+  __setSess(null); __setAgent(null);
+  __setModelSwitchPending(null); __setModeSwitchPending(null);
+}
+
+test("modelChipLabel: the agent's deferred pendingModel outranks everything and reads in-flight", () => {
+  __setSess({ pendingModel: "sonnet", modelActual: "claude-opus-4-8", model: null });
+  assert.equal(modelChipLabel(), "Sonnet…");
+  resetChipState();
+});
+
+test("modelChipLabel: actual model beats the picked alias beats Default", () => {
+  __setSess({ modelActual: "claude-opus-4-8", model: "sonnet" });
+  assert.equal(modelChipLabel(), "Opus 4.8");
+  __setSess({ model: "sonnet" });
+  assert.equal(modelChipLabel(), "Sonnet");
+  __setSess({});
+  assert.equal(modelChipLabel(), "Default");
+  resetChipState();
+});
+
+test("modelChipLabel: the click memo holds until the actual model moves", () => {
+  __setSess({ modelActual: "claude-opus-4-8", model: "sonnet" });
+  __setModelSwitchPending({ value: "sonnet", prevActual: "claude-opus-4-8", at: Date.now() });
+  assert.equal(modelChipLabel(), "Sonnet…"); // a stale heartbeat can't flash the old model back
+  __setSess({ modelActual: "Sonnet 5", model: "sonnet" });
+  assert.equal(modelChipLabel(), "Sonnet 5"); // confirmation arrived; memo retires
+  resetChipState();
+});
+
+test("modeChipValue: holds the picked mode until the heartbeat agrees", () => {
+  __setSess({ permissionMode: "auto" });
+  __setModeSwitchPending({ value: "plan", at: Date.now() });
+  assert.equal(modeChipValue(), "plan"); // agent hasn't applied it yet
+  __setSess({ permissionMode: "plan" });
+  assert.equal(modeChipValue(), "plan"); // agreement retires the memo...
+  __setSess({ permissionMode: "auto" });
+  assert.equal(modeChipValue(), "auto"); // ...so later changes show through
+  resetChipState();
+});
+
+test("modeChipValue: an expired memo stops overriding the truth", () => {
+  __setSess({ permissionMode: "auto" });
+  __setModeSwitchPending({ value: "bypassPermissions", at: Date.now() - 60000 });
+  assert.equal(modeChipValue(), "auto"); // unreachable mode never landed; chip goes honest
+  resetChipState();
 });
 
 // ---- renderProse (markdown tables in prose bubbles) ----------------------
@@ -402,4 +931,303 @@ test("renderProse: a lone pipe row with no delimiter stays plain (not a table)",
 test("renderProse: table-free text is byte-identical to linkify", () => {
   const t = "opened [PR #42](https://github.com/o/r/pull/42) — <b>done</b> & dusted";
   assert.equal(renderProse(t), linkify(t));
+});
+
+// ---- renderProse (fenced code blocks in prose bubbles) -------------------
+test("renderProse: a fenced block becomes a <pre> tagged with its language", () => {
+  const md = 'Try this:\n\n```hcl\nfeatures = local.env_features[var.environment]\n```\n\nThen apply.';
+  const html = renderProse(md);
+  assert.match(html, /<pre class="md-code" data-lang="hcl"><code>features = local\.env_features\[var\.environment\]<\/code><\/pre>/);
+  // Prose either side survives, and no fence markers leak through.
+  assert.match(html, /Try this:/);
+  assert.match(html, /Then apply\./);
+  assert.doesNotMatch(html, /```/);
+});
+
+test("renderProse: a fence with no info string omits data-lang", () => {
+  assert.match(renderProse("```\nplain\n```"), /<pre class="md-code"><code>plain<\/code><\/pre>/);
+});
+
+test("renderProse: code body is escaped and never linkified", () => {
+  const html = renderProse('```js\nconst u = "https://x.io"; // <script>alert(1)</script>\n```');
+  assert.doesNotMatch(html, /<script>/);
+  assert.doesNotMatch(html, /<a /);           // a URL in code stays text
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.match(html, /&quot;https:\/\/x\.io&quot;/);
+});
+
+test("renderProse: blank lines and indentation inside a block are preserved", () => {
+  const md = "```py\ndef f():\n    return 1\n\n\nx = f()\n```";
+  assert.match(renderProse(md), /<code>def f\(\):\n    return 1\n\n\nx = f\(\)<\/code>/);
+});
+
+test("renderProse: an unterminated fence still renders as code (mid-stream)", () => {
+  // The typewriter reveals a block a chunk at a time; the closer hasn't arrived
+  // yet, and the partial body must not flash as prose in the meantime.
+  const html = renderProse("Here:\n```hcl\nenv_features = {\n  dev = {");
+  assert.match(html, /<pre class="md-code" data-lang="hcl"><code>env_features = \{\n {2}dev = \{<\/code><\/pre>/);
+  assert.match(html, /Here:/);
+});
+
+test("renderProse: pipe rows inside a code block are not read as a table", () => {
+  const md = "```sh\n| Col |\n|---|\n| a |\n```";
+  const html = renderProse(md);
+  assert.doesNotMatch(html, /<table/);
+  assert.match(html, /<code>\| Col \|\n\|---\|\n\| a \|<\/code>/);
+});
+
+test("renderProse: a table after a code block is still a table", () => {
+  const html = renderProse("```\ncode\n```\n\n| A |\n|---|\n| b |");
+  assert.match(html, /<pre class="md-code"><code>code<\/code><\/pre>/);
+  assert.match(html, /<table class="md-table">/);
+});
+
+test("renderProse: a longer closing fence closes the block", () => {
+  // ````…```` wraps a body that itself contains a ``` fence.
+  const html = renderProse("````md\n```\ninner\n```\n````\nafter");
+  assert.match(html, /<code>```\ninner\n```<\/code>/);
+  assert.match(html, /after/);
+});
+
+test("renderProse: inline backticks in prose don't open a block", () => {
+  // A fence line must be the fence plus at most a one-word info string; these
+  // are inline spans (see renderInline) sitting mid-sentence, not blocks.
+  const html = renderProse("run ```npm ci``` first, then ``` npm test ``` after");
+  assert.doesNotMatch(html, /<pre/);
+  assert.match(html, /run <code class="md-code-inline">npm ci<\/code> first/);
+});
+
+test("renderProse: fence-free text is byte-identical to the table renderer", () => {
+  const t = "opened [PR #42](https://github.com/o/r/pull/42) — <b>done</b> & dusted";
+  assert.equal(renderProse(t), linkify(t));
+});
+
+// ---- renderInline (inline `code` spans in prose) -------------------------
+test("renderInline: a backtick span becomes a <code> chip", () => {
+  assert.equal(renderInline("run `npm ci` first"),
+    'run <code class="md-code-inline">npm ci</code> first');
+});
+
+test("renderInline: span contents are escaped and never linkified", () => {
+  const html = renderInline("hit `https://x.io/<b>` then");
+  assert.doesNotMatch(html, /<a /);        // a URL being shown, not offered
+  assert.doesNotMatch(html, /<b>/);
+  assert.match(html, /<code class="md-code-inline">https:\/\/x\.io\/&lt;b&gt;<\/code>/);
+});
+
+test("renderInline: prose around a span is still linkified", () => {
+  const html = renderInline("see https://x.io for `--flag` docs");
+  assert.match(html, /<a href="https:\/\/x\.io"/);
+  assert.match(html, /<code class="md-code-inline">--flag<\/code>/);
+});
+
+test("renderInline: an unclosed backtick is literal text", () => {
+  const html = renderInline("a lone ` backtick sits here");
+  assert.doesNotMatch(html, /<code/);
+  assert.match(html, /a lone ` backtick sits here/);
+});
+
+test("renderInline: a span never crosses a line break", () => {
+  // Two stray backticks on different lines must not swallow the lines between.
+  const html = renderInline("first ` line\nsecond ` line");
+  assert.doesNotMatch(html, /<code/);
+  assert.match(html, /first ` line\nsecond ` line/);
+});
+
+test("renderInline: a double-backtick span can hold a literal backtick", () => {
+  assert.equal(renderInline("write ``a `b` c`` here"),
+    'write <code class="md-code-inline">a `b` c</code> here');
+});
+
+test("renderInline: one leading+trailing space is stripped (GFM)", () => {
+  assert.equal(renderInline("a `` ` `` b"), 'a <code class="md-code-inline">`</code> b');
+  // ...but an all-space body is left alone, and a single side isn't stripped.
+  assert.equal(renderInline("a ` x ` b"), 'a <code class="md-code-inline">x</code> b');
+  assert.equal(renderInline("a ` x` b"), 'a <code class="md-code-inline"> x</code> b');
+});
+
+test("renderInline: several spans in one line all render", () => {
+  const html = renderInline("`a` then `b` then `c`");
+  assert.equal((html.match(/<code class="md-code-inline">/g) || []).length, 3);
+});
+
+test("renderInline: backtick-free text is byte-identical to linkify", () => {
+  const t = "opened [PR #42](https://github.com/o/r/pull/42) — <b>done</b> & dusted";
+  assert.equal(renderInline(t), linkify(t));
+});
+
+test("renderProse: `code` works inside a table cell", () => {
+  const html = renderProse("| Flag | Use |\n|---|---|\n| `--fabric` | on in prod |");
+  assert.match(html, /<td><code class="md-code-inline">--fabric<\/code><\/td>/);
+});
+
+test("renderProse: backticks inside a fenced block stay literal", () => {
+  // The fence pass runs first, so the block body is never inline-scanned.
+  const html = renderProse("```sh\necho `date`\n```");
+  assert.doesNotMatch(html, /md-code-inline/);
+  assert.match(html, /<code>echo `date`<\/code>/);
+});
+
+// ---- agentsHtml: the live pane agent-list rendered under the status bar ------
+
+test("agentsHtml: '' when there are no agents", () => {
+  assert.equal(agentsHtml(null), "");
+  assert.equal(agentsHtml([]), "");
+});
+
+test("agentsHtml: subagents are buttons carrying type+label; 'main' is a plain marker", () => {
+  const html = agentsHtml([
+    { sel: true, type: "main", label: "" },
+    { sel: false, type: "Explore", label: "Explore Jira agent-side code" },
+  ]);
+  // main: not a button (no separate transcript), carries the selected dot.
+  assert.match(html, /<div class="cc-agent main"><span class="dot sel">/);
+  assert.doesNotMatch(html, /<button[^>]*>[^<]*main/);
+  // subagent: a button with the data-attrs openSubagentView reads.
+  assert.match(html, /<button type="button" class="cc-agent" data-atype="Explore" data-alabel="Explore Jira agent-side code">/);
+  assert.match(html, /<span class="alabel">Explore Jira agent-side code<\/span>/);
+});
+
+test("agentsHtml: escapes type + label (no attribute/markup injection)", () => {
+  const html = agentsHtml([{ sel: false, type: "Ex\"plore", label: '<img src=x onerror=1>' }]);
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /data-alabel="&lt;img/);
+});
+
+
+// --- optionCardHtml: an AskUserQuestion option card ---------------------------
+
+test("optionCardHtml: single-select renders a Choose button, no checkbox", () => {
+  const html = optionCardHtml({ label: "One-shot" }, 0, false);
+  assert.match(html, /class="q-opt-pick" data-idx="0"/);
+  assert.match(html, /One-shot/);
+  assert.doesNotMatch(html, /type="checkbox"/);
+});
+
+test("optionCardHtml: multiSelect renders a checkbox bound to its label", () => {
+  const html = optionCardHtml({ label: "Feature A" }, 1, true);
+  assert.match(html, /type="checkbox" class="q-check" id="qopt-1" data-idx="1"/);
+  assert.match(html, /<label class="q-opt-label" for="qopt-1">Feature A<\/label>/);
+  assert.doesNotMatch(html, /q-opt-pick/);
+});
+
+test("optionCardHtml: description and preview render when present", () => {
+  const html = optionCardHtml(
+    { label: "L", description: "what it means", preview: "Card meta row" }, 0, false);
+  assert.match(html, /class="q-opt-desc">what it means</);
+  assert.match(html, /<details class="q-prev-wrap">/);
+  assert.match(html, /class="q-prev">Card meta row<\/pre>/);
+});
+
+test("optionCardHtml: no description/preview -> only the head", () => {
+  const html = optionCardHtml({ label: "L" }, 0, false);
+  assert.doesNotMatch(html, /q-opt-desc/);
+  assert.doesNotMatch(html, /q-prev/);
+});
+
+test("optionCardHtml: escapes label, description and preview (no injection)", () => {
+  const html = optionCardHtml(
+    { label: '<b>x', description: '<i>d', preview: '<script>y</script>' }, 0, false);
+  assert.doesNotMatch(html, /<b>x/);
+  assert.doesNotMatch(html, /<script>y/);
+  assert.match(html, /&lt;script&gt;y/);
+});
+
+
+// --- the compose bar: Send always sends; ◼ Stop appears only mid-turn --------
+// The busy read is the live pane status (a `turn` frame every ~1s), not the
+// heartbeat, so Stop appears/hides within a second of the turn starting or
+// ending. Send never morphs: a mid-turn send QUEUES (the chat renders the
+// "queued" bubble), so the button that talks must stay available while the
+// agent works — on a phone it is the only way to send.
+
+function fakeButtons(n = 2) {
+  const mk = () => ({
+    textContent: "Send", title: "", hidden: false, _s: new Set(),
+    classList: { _s: new Set(), toggle(c, f) { f ? this._s.add(c) : this._s.delete(c); },
+      contains(c) { return this._s.has(c); } },
+  });
+  const send = [], stop = [];
+  for (let i = 0; i < n; i++) { send.push(mk()); stop.push(mk()); }
+  global.document = { querySelectorAll: (sel) =>
+    (sel === ".compose-action" ? send : sel === ".compose-stop" ? stop : []) };
+  return { send, stop };
+}
+function clearDom() { delete global.document; }
+
+test("compose bar: idle -> Stop hidden; generating -> Stop shown, Send unchanged", () => {
+  const { send, stop } = fakeButtons();
+  __stopPending(0);
+
+  __setLiveStatus(null);
+  updateComposeAction();
+  assert.equal(send[0].textContent, "Send");
+  assert.equal(stop[0].hidden, true);
+  assert.equal(isBusy(), false);
+
+  __setLiveStatus({ verb: "Thinking", up: "1.2k" });
+  updateComposeAction();
+  assert.equal(isBusy(), true);
+  // Every compose bar on the page (chat's and the terminal toggle's) flips
+  // together — they read the one status. Send stays Send: it queues mid-turn.
+  for (const b of send) assert.equal(b.textContent, "Send");
+  for (const b of stop) {
+    assert.equal(b.hidden, false);
+    assert.equal(b.textContent, "◼ Stop");
+  }
+  clearDom();
+});
+
+test("compose bar: a clicked Stop hides the button immediately", () => {
+  const { send, stop } = fakeButtons();
+  // The turn is still being reported — the interrupt only lands on the agent's
+  // next beat — but the operator already asked for it to end.
+  __setLiveStatus({ verb: "Thinking" });
+  __stopPending(Date.now());
+  updateComposeAction();
+  assert.equal(isBusy(), false, "no waiting on the pane to catch up");
+  assert.equal(stop[0].hidden, true);
+  assert.equal(send[0].textContent, "Send");
+  clearDom();
+});
+
+test("compose bar: a Stop that never landed gives Stop back", () => {
+  fakeButtons();
+  __setLiveStatus({ verb: "Thinking" });
+  __stopPending(Date.now() - 60000); // clicked long ago; the turn outlived it
+  assert.equal(isBusy(), true, "the turn is still running, so Stop is live again");
+  clearDom();
+});
+
+test("compose bar: the turn ending clears a pending Stop", () => {
+  fakeButtons();
+  __setLiveStatus(null);
+  __stopPending(Date.now());
+  assert.equal(isBusy(), false);
+  // The suppression is spent, so the NEXT turn shows Stop from its first frame.
+  __setLiveStatus({ verb: "Thinking" });
+  assert.equal(isBusy(), true);
+  clearDom();
+});
+
+test("compose bar: a pending question hides Stop (XERK-21)", () => {
+  const { send, stop } = fakeButtons();
+  __stopPending(0);
+  // The AskUserQuestion tool call blocks the pane, so the pane still reads busy —
+  // but the answer is typed into the compose box, and an accidental Stop would
+  // destroy the question, so the Stop button must not be offered.
+  __setLiveStatus({ verb: "Thinking" });
+  __setQuestionActive(true);
+  updateComposeAction();
+  assert.equal(isBusy(), false, "a live question overrides the busy pane read");
+  assert.equal(send[0].textContent, "Send");
+  assert.equal(stop[0].hidden, true);
+  // Answering the question (questionActive clears) brings Stop back while the
+  // pane is still working.
+  __setQuestionActive(false);
+  updateComposeAction();
+  assert.equal(isBusy(), true);
+  assert.equal(stop[0].hidden, false);
+  __setQuestionActive(false);
+  clearDom();
 });

@@ -1,0 +1,67 @@
+# Hub + one agent on a single machine. The smallest thing that actually works,
+# and the best way to try Turma out.
+#
+#   cp .env.example .env && $EDITOR .env     # set HOST_REPOS_ROOT + the 2 secrets
+#   docker compose -f all-in-one.yaml up -d
+#   open http://localhost:8300
+#
+# For a real fleet, split these: run hub.yaml once somewhere reachable, then
+# agent.yaml on each machine you want sessions to run on. The only thing that
+# changes is TURMA_URL — agents dial out to the hub, so the hub never needs a
+# route back.
+#
+# Prerequisite: a logged-in Claude on this host (`claude /login`). The agent
+# reuses that login through the ~/.claude mount and idles without it.
+
+services:
+  turma:
+    image: ghcr.io/xerktech/turma:latest
+    container_name: turma
+    restart: unless-stopped
+    ports:
+      - "8300:8300"
+    environment:
+      TURMA_USER: "${TURMA_USER:?set TURMA_USER in .env}"
+      TURMA_PASSWORD: "${TURMA_PASSWORD:?set TURMA_PASSWORD in .env}"
+      TURMA_AGENT_TOKEN: "${TURMA_AGENT_TOKEN:?set TURMA_AGENT_TOKEN in .env}"
+      NODE_NO_WARNINGS: "1"
+    volumes:
+      - turma-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8300/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  agent-host:
+    image: ghcr.io/xerktech/turma-agent:latest
+    container_name: turma-agent
+    restart: unless-stopped
+    depends_on:
+      turma:
+        condition: service_healthy
+    environment:
+      # Both containers are on this compose's network, so the agent reaches the
+      # hub by service name and neither needs to be published to the LAN.
+      TURMA_URL: "${HUB_URL:-http://turma:8300}"
+      TURMA_TOKEN: "${TURMA_AGENT_TOKEN:?set TURMA_AGENT_TOKEN in .env}"
+      DEVICE_NAME: "${AGENT_DEVICE_NAME:-my-host}"
+      REPOS_ROOT: "/repos"
+      MAX_SESSIONS: "${AGENT_MAX_SESSIONS:-6}"
+      TTYD_PORT_BASE: "7700"
+      IS_SANDBOX: "1"
+    volumes:
+      - "${HOST_REPOS_ROOT:?set HOST_REPOS_ROOT in .env}:/repos"
+      - "${HOME}/.claude:/root/.claude"
+      - "${HOME}/.claude.json:/root/.claude.json"
+      - "${HOME}/.config/gh:/root/.config/gh"
+      - /var/run/docker.sock:/var/run/docker.sock
+      - turma-agent-state:/root/.turma
+    mem_limit: "${AGENT_MEM_LIMIT:-12g}"
+    cpus: ${AGENT_CPUS:-6}
+    pids_limit: 4096
+
+volumes:
+  turma-data:
+  turma-agent-state:

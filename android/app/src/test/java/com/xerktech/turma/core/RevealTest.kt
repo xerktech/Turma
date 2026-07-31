@@ -41,6 +41,23 @@ class RevealTest {
         assertEquals(RevealState("e", 12), s)
     }
 
+    @Test fun `live base continues when new capture extends the revealed prefix`() {
+        // Typed 10 of "hello world", now "hello world foo" — continues, keep 10.
+        assertEquals(10, liveRevealBase("hello world", 10, "hello world foo"))
+    }
+
+    @Test fun `live base snaps when the pane scrape swaps to unrelated text`() {
+        // Revealed 8 of "reading…" then the scrape swaps to a longer, unrelated
+        // tool bullet — must snap to the new length, not type from offset 8.
+        val swapped = "Bash(npm test) running the suite"
+        assertEquals(swapped.length, liveRevealBase("reading…", 8, swapped))
+    }
+
+    @Test fun `live base snaps on a same-length but different capture`() {
+        // Length-only clamps missed this: same length, different text.
+        assertEquals(5, liveRevealBase("aaaaa", 5, "bbbbb"))
+    }
+
     @Test fun `revealComplete when shown reaches target`() {
         assertTrue(revealComplete(RevealState("e", 40), 40))
         assertFalse(revealComplete(RevealState("e", 39), 40))

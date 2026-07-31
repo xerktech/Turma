@@ -3,8 +3,15 @@ package com.xerktech.turma.net
 import com.xerktech.turma.model.AgentsResponse
 import com.xerktech.turma.model.ArchiveListResponse
 import com.xerktech.turma.model.ArchiveTranscript
+import com.xerktech.turma.model.CreateMetaEnvelope
+import com.xerktech.turma.model.CreateResultEnvelope
+import com.xerktech.turma.model.CreateTicketRequest
+import com.xerktech.turma.model.CreateTicketResponse
 import com.xerktech.turma.model.HistoryResponse
+import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.SearchResponse
+import com.xerktech.turma.model.StatusChangePost
+import com.xerktech.turma.model.StatusChangeResult
 import com.xerktech.turma.model.WsTokenResponse
 import kotlinx.serialization.Serializable
 import retrofit2.Response
@@ -41,6 +48,18 @@ interface HubApi {
     @DELETE("api/agents/{host}/sessions/{id}")
     suspend fun deleteSession(@Path("host") host: String, @Path("id") id: String): OkResponse
 
+    /** Interrupt the turn a running session has in flight (agent sends Escape). */
+    @POST("api/agents/{host}/sessions/{id}/interrupt")
+    suspend fun interruptSession(@Path("host") host: String, @Path("id") id: String): OkResponse
+
+    /** Move a running session to another agent in the same org (XERK-101). */
+    @POST("api/agents/{host}/sessions/{id}/migrate")
+    suspend fun migrateSession(
+        @Path("host") host: String,
+        @Path("id") id: String,
+        @Body body: MigrateRequest,
+    ): OkResponse
+
     @POST("api/agents/{host}/sessions/{id}/input")
     suspend fun sendInput(
         @Path("host") host: String,
@@ -62,6 +81,13 @@ interface HubApi {
         @Body body: ModeRequest,
     ): OkResponse
 
+    @POST("api/agents/{host}/sessions/{id}/summary")
+    suspend fun setSummary(
+        @Path("host") host: String,
+        @Path("id") id: String,
+        @Body body: SummaryRequest,
+    ): OkResponse
+
     @POST("api/agents/{host}/sessions/{id}/answer")
     suspend fun answerQuestion(
         @Path("host") host: String,
@@ -73,11 +99,27 @@ interface HubApi {
     @GET("api/agents/{host}/sessions/{id}/history")
     suspend fun history(@Path("host") host: String, @Path("id") id: String): Response<HistoryResponse>
 
+    // One live background agent's transcript (same fresh-cache / queue-and-202
+    // shape as history). type+label identify the pane agent-list row.
+    @GET("api/agents/{host}/sessions/{id}/subagents/history")
+    suspend fun subagentHistory(
+        @Path("host") host: String,
+        @Path("id") id: String,
+        @Query("type") type: String,
+        @Query("label") label: String,
+    ): Response<HistoryResponse>
+
     @POST("api/agents/{host}/clone")
     suspend fun clone(@Path("host") host: String, @Body body: CloneRequest): OkResponse
 
     @POST("api/agents/{host}/repos/{repo}/prune")
     suspend fun prune(@Path("host") host: String, @Path("repo") repo: String): OkResponse
+
+    // Restart the host's agent manager (XERK-157) — e.g. after fixing an expired
+    // Claude login — without SSHing in. The agent exits for its supervisor to
+    // bring it back; running sessions are re-adopted on boot.
+    @POST("api/agents/{host}/restart")
+    suspend fun restartAgent(@Path("host") host: String): OkResponse
 
     @POST("api/agents/{host}/transcripts/{tid}/resume")
     suspend fun resumeTranscript(
@@ -105,6 +147,120 @@ interface HubApi {
     @GET("api/archive/{tid}")
     suspend fun archiveTranscript(@Path("tid") transcriptId: String): ArchiveTranscript
 
+    // 200 {issue|error, fetchedAt, stale?}, or 202 {pending} while the host
+    // fetches it on demand. The issue is nested under `issue` in the envelope.
+    @GET("api/jira/{siteKey}/{issueKey}")
+    suspend fun jiraIssue(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+    ): Response<JiraIssueEnvelope>
+
+    @POST("api/jira/refresh")
+    suspend fun jiraRefresh(): OkResponse
+
+    // New-ticket create metadata (XERK-137): the org's projects + existing labels
+    // (no `project`), or a project's creatable issue/work-item types (?project=).
+    // 200 with the data, or 202 {pending} while the host fetches it on demand.
+    @GET("api/jira/{siteKey}/create-meta")
+    suspend fun createMeta(
+        @Path("siteKey") siteKey: String,
+        @Query("project") project: String? = null,
+    ): Response<CreateMetaEnvelope>
+
+    // Create a ticket on the org's board. 200 {ok, cmdId, host}, or 4xx/5xx
+    // {error}. The agent creates it and stages the outcome, polled below.
+    @POST("api/jira/{siteKey}/tickets")
+    suspend fun createTicket(
+        @Path("siteKey") siteKey: String,
+        @Body body: CreateTicketRequest,
+    ): Response<CreateTicketResponse>
+
+    // Poll a create's outcome by the cmdId the POST returned. 200 {key,url} on
+    // success, 200 {error} on a create failure, 202 {pending} until then.
+    @GET("api/jira/{siteKey}/tickets/{cmdId}")
+    suspend fun createResult(
+        @Path("siteKey") siteKey: String,
+        @Path("cmdId") cmdId: String,
+    ): Response<CreateResultEnvelope>
+
+    // Start a session on a ticket: the hub picks the host + triaged repo and
+    // spawns with the ticket as context. 200 {ok, cmdId, host, repo}, or 4xx
+    // when the ticket has no triaged/cloned repo.
+    @POST("api/jira/{siteKey}/{issueKey}/session")
+    suspend fun startJiraSession(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+    ): Response<JiraSessionResponse>
+
+    // Override which repo a ticket belongs to (fans out to every host reporting
+    // the org). Body: {repo:"name"} to pin, {repo:null} for "no repo fits",
+    // {auto:true} to release the pin. Built as a JsonObject so an explicit null
+    // survives the shared decoder's explicitNulls=false. 202 {ok, hosts, ...}.
+    @POST("api/jira/{siteKey}/{issueKey}/repo")
+    suspend fun setJiraRepo(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): OkResponse
+
+    // Pin which HOST a ticket's sessions spawn on (XERK-38), overriding the
+    // hub's most-available routing. Hub-owned and durable (no agent fan-out),
+    // so the save is an authoritative 200. Body: {host:"<agent key>"} to pin,
+    // {auto:true} to release.
+    @POST("api/jira/{siteKey}/{issueKey}/agent")
+    suspend fun setTicketAgent(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): OkResponse
+
+    // Pin which MODEL a ticket's session runs (XERK-123), or release it back to
+    // the login's default. Hub-owned and durable like the agent pin, so an
+    // authoritative 200. Body: {model:"<alias>"} to pin, {auto:true} to release.
+    @POST("api/jira/{siteKey}/{issueKey}/model")
+    suspend fun setTicketModel(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): OkResponse
+
+    // Change a ticket's status and push it to the board (XERK-138) — the one
+    // thing Turma writes back. Body: {value:"<transition id / state name>"}
+    // from the detail's statusOptions. Needs an online host (it's a write);
+    // 202 {ok, cmdId, host}, the cmdId to poll the outcome by below.
+    @POST("api/jira/{siteKey}/{issueKey}/status")
+    suspend fun setTicketStatus(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): Response<StatusChangePost>
+
+    // Poll a queued status change's outcome by its cmdId (XERK-138):
+    // {pending:true} until the agent reports, then {ok, error, status, ...}.
+    @GET("api/jira/{siteKey}/{issueKey}/status")
+    suspend fun ticketStatusResult(
+        @Path("siteKey") siteKey: String,
+        @Path("issueKey") issueKey: String,
+        @Query("cmdId") cmdId: String,
+    ): Response<StatusChangeResult>
+
+    // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
+    // like the agent pin — an authoritative 200. Body: {enabled:true|false}.
+    @POST("api/jira/{siteKey}/autostart")
+    suspend fun setAutoStart(
+        @Path("siteKey") siteKey: String,
+        @Body body: AutoStartRequest,
+    ): OkResponse
+
+    // Pin an org's palette color, or release it back to auto (XERK-145).
+    // Hub-owned durable state like /autostart, an authoritative 200.
+    // Body: {slot:1..8} or {auto:true}.
+    @POST("api/jira/{siteKey}/color")
+    suspend fun setOrgColor(
+        @Path("siteKey") siteKey: String,
+        @Body body: OrgColorRequest,
+    ): OkResponse
+
     @POST("api/devices")
     suspend fun registerDevice(@Body body: DeviceRequest): OkResponse
 
@@ -114,6 +270,18 @@ interface HubApi {
 
 @Serializable
 data class OkResponse(val ok: Boolean = false, val cmdId: String = "", val error: String = "")
+
+@Serializable
+data class JiraSessionResponse(
+    val ok: Boolean = false,
+    val cmdId: String = "",
+    val host: String = "",
+    val repo: String = "",
+    // True when no host had the repo cloned: the chosen host clones it on
+    // demand and the session queues behind the clone (XERK-14).
+    val needsClone: Boolean = false,
+    val error: String = "",
+)
 
 @Serializable
 data class SpawnRequest(
@@ -134,14 +302,41 @@ data class ModelRequest(val model: String)
 @Serializable
 data class ModeRequest(val permissionMode: String)
 
+/** Rename a session — a blank [summary] clears the name back to the fallback. */
 @Serializable
-data class AnswerRequest(val optionIndex: Int = -1, val custom: String? = null)
+data class SummaryRequest(val summary: String)
 
 @Serializable
-data class CloneRequest(val repo: String)
+data class AutoStartRequest(val enabled: Boolean)
+
+/** Pin an org's palette slot (1..8), or `auto = true` to release the pin. */
+@Serializable
+data class OrgColorRequest(val slot: Int? = null, val auto: Boolean? = null)
+
+@Serializable
+data class AnswerRequest(
+    val optionIndex: Int = -1,
+    val custom: String? = null,
+    val optionIndices: List<Int>? = null,
+)
+
+/** The target agent a session should move to (XERK-101). */
+@Serializable
+data class MigrateRequest(val host: String)
+
+@Serializable
+data class CloneRequest(val repo: String, val source: String? = null)
 
 @Serializable
 data class ResumeRequest(val cwd: String = "")
 
 @Serializable
-data class DeviceRequest(val token: String, val platform: String = "android")
+data class DeviceRequest(
+    val token: String,
+    val platform: String = "android",
+    // Capabilities this build supports, so the hub only sends messages it can
+    // handle. "dismiss" = it cancels a notification on an {action:"dismiss"}
+    // message (XERK-154); without it the hub withholds those, since an older
+    // build would render one as a blank notification.
+    val features: List<String> = listOf("dismiss"),
+)

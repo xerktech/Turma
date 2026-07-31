@@ -10,7 +10,8 @@
     "test": "vitest run",
     "mock-hub": "node tests/mock-hub.mjs",
     "audio-client": "node tests/audio-client.mjs",
-    "pack": "evenhub pack app.json dist -o ../turma-hud.ehpk",
+    "pack": "evenhub pack app.json dist -o ../turma.ehpk",
+    "publish:hub": "node scripts/evenhub-publish.mjs",
     "simulate": "evenhub-simulator http://localhost:5173 --automation-port 9898"
   },
   "dependencies": {
@@ -21,7 +22,7 @@
   "devDependencies": {
     "@evenrealities/evenhub-cli": "^0.1.13",
     "@evenrealities/evenhub-simulator": "^0.7.3",
-    "@types/node": "^22.10.5",
+    "@types/node": "^24.0.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.0",
     "vitest": "^4.1.0"

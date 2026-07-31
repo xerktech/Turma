@@ -46,4 +46,101 @@ class SessionsTest {
         assertEquals("mylabel", sessionName(SessionInfo(label = "mylabel", worktreePath = "/a/wt-9")))
         assertEquals("wt-9", sessionName(SessionInfo(worktreePath = "/a/wt-9")))
     }
+
+    @Test fun `card repo label names the repo, or says repos root in words`() {
+        assertEquals("Turma", sessionRepoLabel(SessionInfo(repo = "Turma")))
+        // A repos-root session: by the flag, and by the agent's "(root)" sentinel
+        // (a closed/resumable record can carry the name without the flag).
+        assertEquals("repos root", sessionRepoLabel(SessionInfo(repo = "(root)", root = true)))
+        assertEquals("repos root", sessionRepoLabel(SessionInfo(repo = "(root)")))
+        // Nothing reported at all — never blank, so the row can't lose a separator.
+        assertEquals("?", sessionRepoLabel(SessionInfo(repo = "")))
+    }
+
+    @Test fun `header meta joins host repo and branch, dropping blanks`() {
+        assertEquals(
+            "truenas · Turma · XERK-121",
+            sessionHeaderMeta("truenas", SessionInfo(repo = "Turma", git = GitState(branch = "XERK-121"))),
+        )
+        // No repo (repos-root) or no branch (detached) still reads cleanly.
+        assertEquals("truenas · detached", sessionHeaderMeta("truenas", SessionInfo(repo = "")))
+        assertEquals(
+            "truenas · Turma · detached",
+            sessionHeaderMeta("truenas", SessionInfo(repo = "Turma", git = GitState(branch = "HEAD"))),
+        )
+    }
+
+    // ---- workLine (web index.html workLine/unpushedCommits, XERK-78) ---------
+
+    private fun sessWork(
+        pushed: Boolean? = null, aheadOfBase: Int? = null, aheadOfRemote: Int? = null,
+        baseRef: String? = null, dirty: Int = 0,
+    ) = SessionInfo(
+        work = com.xerktech.turma.model.WorkInfo(
+            baseRef = baseRef, aheadOfBase = aheadOfBase, pushed = pushed, aheadOfRemote = aheadOfRemote,
+        ),
+        git = GitState(dirtyFiles = dirty),
+    )
+
+    @Test fun `workLine is null when nothing is known`() {
+        assertEquals(null, workLine(SessionInfo()))
+        assertEquals(null, workLine(sessWork()))
+    }
+
+    @Test fun `unpushed commits or dirty files read as risk`() {
+        val risky = workLine(sessWork(pushed = false, aheadOfBase = 3, baseRef = "main", dirty = 2))!!
+        assertEquals("3 commits ahead of main · not pushed · 2 dirty files", risky.text)
+        assertEquals(true, risky.risk)
+        // Singulars singular.
+        val one = workLine(sessWork(pushed = false, aheadOfBase = 1, dirty = 1))!!
+        assertEquals("1 commit ahead · not pushed · 1 dirty file", one.text)
+    }
+
+    @Test fun `pushed and clean reads safe`() {
+        val safe = workLine(sessWork(pushed = true, aheadOfBase = 2, aheadOfRemote = 0, baseRef = "main"))!!
+        assertEquals("2 commits ahead of main · pushed", safe.text)
+        assertEquals(false, safe.risk)
+        // Pushed with unknown sync says so rather than claiming either way.
+        val unknown = workLine(sessWork(pushed = true, aheadOfBase = 2, aheadOfRemote = null))!!
+        assertEquals("2 commits ahead · pushed · sync unknown", unknown.text)
+        assertEquals(false, unknown.risk)
+        // Pushed but with commits origin doesn't have yet: risk again.
+        val behind = workLine(sessWork(pushed = true, aheadOfBase = 5, aheadOfRemote = 2))!!
+        assertEquals("5 commits ahead · 2 unpushed", behind.text)
+        assertEquals(true, behind.risk)
+    }
+
+    // --- eligibleMoveTargets (XERK-101) --------------------------------------
+
+    private fun agent(
+        key: String,
+        online: Boolean = true,
+        org: String = "org.a",
+        repos: List<String> = listOf("repoX"),
+        sessions: List<SessionInfo> = emptyList(),
+    ) = com.xerktech.turma.model.AgentInfo(
+        key = key, device = key, online = online,
+        jira = com.xerktech.turma.model.JiraBlock(siteKey = org),
+        repos = repos.map { com.xerktech.turma.model.RepoInfo(name = it) },
+        sessions = sessions,
+    )
+
+    @Test fun `move targets are online same-org hosts with the repo, minus the source`() {
+        val sess = SessionInfo(id = "s1", status = "running", repo = "repoX")
+        val agents = listOf(
+            agent("src", sessions = listOf(sess)),
+            agent("ok"),                              // eligible
+            agent("off", online = false),             // offline
+            agent("otherOrg", org = "org.b"),         // different org
+            agent("noRepo", repos = listOf("other")), // lacks the repo
+        )
+        val targets = eligibleMoveTargets(agents, "src", sess).map { it.key }
+        assertEquals(listOf("ok"), targets)
+    }
+
+    @Test fun `no eligible targets when the org has only the source host`() {
+        val sess = SessionInfo(id = "s1", status = "running", repo = "repoX")
+        val agents = listOf(agent("src", sessions = listOf(sess)))
+        assertEquals(emptyList<String>(), eligibleMoveTargets(agents, "src", sess).map { it.key })
+    }
 }

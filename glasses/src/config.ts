@@ -15,24 +15,39 @@ export const CONFIG_STORAGE_KEY = "turma.glasses.config";
 // to delete in a later cleanup once devices have re-saved under the new key.
 export const LEGACY_CONFIG_STORAGE_KEY = "agenthub.glasses.config";
 
-// The hub URL is hardcoded — the phone login page only asks for username and
-// password, exactly like the web dashboard's login. `VITE_HUB_URL` can still
-// override it for local dev (`npm run dev` against a mock-hub), but packaged
-// production builds always target this host.
-export const DEFAULT_HUB_URL = "https://turma.xerktech.com";
+// Shown as the hub-URL field's placeholder. Deliberately an example host, not a
+// real one: the hub is self-hosted, so there is no default deployment to point
+// at and this app must not ship one operator's host baked in.
+export const HUB_URL_PLACEHOLDER = "https://turma.example.com";
 
-// The single source of truth for which hub to talk to: the dev env override
-// if present, otherwise the hardcoded production host. Never comes from a
-// user-editable field.
+// Normalize a hand-typed hub URL: trim it, default a missing scheme to https
+// (a phone keyboard makes "turma.example.com" the likely input), and drop any
+// trailing slash so every caller can append a path. Blank stays blank — the
+// caller decides whether that's an error.
+//
+// NOTE: reaching the resulting host on-device also requires it to be listed in
+// app.json's `network` permission whitelist, which the Even WebView enforces at
+// the network layer. That whitelist is a pack-time constant, so a build can
+// only talk to the hosts it was packaged for — see glasses/README.md.
+export function normalizeHubUrl(raw: string): string {
+  const s = (raw ?? "").trim();
+  if (!s) return "";
+  const withScheme = /^https?:\/\//i.test(s) ? s : `https://${s}`;
+  return withScheme.replace(/\/+$/, "");
+}
+
+// Vite dev-only hub override (`npm run dev` against a local mock-hub). Returns
+// "" when unset, which is the signal that the stored/user-entered value is the
+// one to use. Packaged builds never set it.
 export function resolveHubUrl(): string {
   const env = (import.meta as { env?: Record<string, string | undefined> }).env ?? {};
-  return env.VITE_HUB_URL || DEFAULT_HUB_URL;
+  return normalizeHubUrl(env.VITE_HUB_URL ?? "");
 }
 
 // Vite dev-only credential defaults so `npm run dev` can point at a local
 // hub/mock-hub without hand-typing settings every reload. Production
 // (packaged) builds won't have these env vars set, so the config falls back
-// to storage/empty strings for the creds and the resolved hub URL.
+// to storage/empty strings.
 function envDefaults(): Partial<Config> {
   const env = (import.meta as { env?: Record<string, string | undefined> }).env ?? {};
   return {
@@ -52,6 +67,12 @@ function emptyConfig(): Config {
   };
 }
 
+// True once the config names a hub and a user to reach it as — i.e. the login
+// page has been filled in at least once on this device.
+export function isConfigured(config: Config): boolean {
+  return Boolean(config.hubUrl && config.user && config.password);
+}
+
 // Loads the persisted config, if any, layered over env defaults; malformed or
 // missing stored JSON falls back to the env-derived empty config rather than
 // throwing.
@@ -69,10 +90,15 @@ export async function loadConfig(storage: KeyValueStorage): Promise<Config> {
   if (!raw) return base;
   try {
     const parsed = JSON.parse(raw) as Partial<Config>;
+    const storedUrl =
+      typeof parsed.hubUrl === "string" ? normalizeHubUrl(parsed.hubUrl) : "";
     return {
-      // hubUrl is hardcoded (resolveHubUrl via base) — never honor a stored
-      // value, so an old saved host can't shadow the current target.
-      hubUrl: base.hubUrl,
+      // The hub is whatever the operator typed on the login page and we then
+      // persisted — that's the whole point of the field, and it's why an
+      // install survives a restart without re-entry. `base.hubUrl` (the
+      // VITE_HUB_URL dev override) still wins when set, so `npm run dev`
+      // against a mock-hub can't be hijacked by a value stored on that device.
+      hubUrl: base.hubUrl || storedUrl,
       user: typeof parsed.user === "string" ? parsed.user : base.user,
       password: typeof parsed.password === "string" ? parsed.password : base.password,
       pollMs: typeof parsed.pollMs === "number" && parsed.pollMs > 0 ? parsed.pollMs : base.pollMs,

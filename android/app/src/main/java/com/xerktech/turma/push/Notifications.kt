@@ -42,11 +42,29 @@ object Notifications {
         tags.contains("question") -> CH_QUESTION
         tags.contains("checkered_flag") -> CH_TURN
         tags.contains("rocket") -> CH_PR
-        tags.contains("circle") || tags.contains("rotating_light") || tags.contains("moneybag") -> CH_HOST
+        // "key" is the Claude-login alert (XERK-98); "circle" also catches the
+        // green_circle "login restored" notification. Both are host-level.
+        tags.contains("circle") || tags.contains("rotating_light") || tags.contains("moneybag") || tags.contains("key") -> CH_HOST
         else -> CH_ALERTS
     }
 
+    // The notification id: a stable key derived from the hub's message so
+    // repeated alerts of one kind collapse and a later `dismiss` can cancel this
+    // exact one (XERK-154). Prefers the hub's explicit `notifKey` (question/PR/
+    // turn each get a distinct one, so they coexist instead of clobbering each
+    // other), falling back to session/host/title for host-level and older-hub
+    // alerts that carry none.
+    private fun idFor(data: Map<String, String>): Int =
+        (data["notifKey"] ?: data["sessionId"] ?: data["host"] ?: data["title"] ?: "Turma").hashCode()
+
     fun show(context: Context, data: Map<String, String>) {
+        // A retraction from the hub: the alert's subject was addressed elsewhere
+        // (PR merged/closed, question answered, turn replied to), so cancel the
+        // notification posted under the same key. It carries no title/body.
+        if (data["action"] == "dismiss") {
+            NotificationManagerCompat.from(context).cancel(idFor(data))
+            return
+        }
         val title = data["title"] ?: "Turma"
         val body = data["body"] ?: ""
         val tags = data["tags"] ?: ""
@@ -59,9 +77,9 @@ object Notifications {
             sessionId?.let { putExtra(MainActivity.EXTRA_SESSION, it) }
             data["click"]?.let { putExtra(MainActivity.EXTRA_URL, it) }
         }
-        // A per-session/host request code so the tap routes to the right place
-        // and repeated alerts for one session collapse rather than stack.
-        val reqCode = (sessionId ?: host ?: title).hashCode()
+        // A per-alert request code so the tap routes to the right place and a
+        // repeated alert of the same kind collapses onto its predecessor.
+        val reqCode = idFor(data)
         val pending = PendingIntent.getActivity(
             context, reqCode, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,

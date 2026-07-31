@@ -30,6 +30,25 @@ data class FleetState(
     val now: Long = 0,
     val loading: Boolean = true,
     val error: String? = null,
+    // Ticket -> pinned host (XERK-38), from the same /api/agents payload; the
+    // board's Agent row reads it. Refreshed by the poll and the hub's
+    // "ticketAgents" SSE event.
+    val ticketAgents: Map<String, com.xerktech.turma.model.TicketAgentPin> = emptyMap(),
+    // Per-org auto-start opt-in (XERK-41), keyed by siteKey; the board's org-chip
+    // switch reads it. Refreshed by the poll and the "autoStartOrgs" SSE event.
+    val autoStartOrgs: Map<String, Boolean> = emptyMap(),
+    // Ticket -> pinned model (XERK-123), from the same payload; the board's Model
+    // row reads it. Refreshed by the poll and the "ticketModels" SSE event.
+    val ticketModels: Map<String, com.xerktech.turma.model.TicketModelPin> = emptyMap(),
+    // Manual org-color pins (XERK-145), keyed by siteKey, value the palette slot
+    // 1..8; every screen's org tint reads it. Refreshed by the poll and the
+    // "orgColors" SSE event.
+    val orgColors: Map<String, Int> = emptyMap(),
+    // Hub-wide mobile-push health (XERK-152): false when the hub has no FCM
+    // credential, so every alert is silently dropped. Drives the Dashboard's
+    // "push is off" banner. Poll-only (no SSE event); defaults true so an older
+    // hub never false-alarms.
+    val pushEnabled: Boolean = true,
 )
 
 class FleetRepository(
@@ -76,15 +95,42 @@ class FleetRepository(
                 byKey.clear()
                 for (a in resp.agents) byKey[a.key] = a
             }
+            ticketAgents = resp.ticketAgents
+            autoStartOrgs = resp.autoStartOrgs
+            ticketModels = resp.ticketModels
+            orgColors = resp.orgColors
+            pushEnabled = resp.pushEnabled
             emit(resp.now, error = null)
         } catch (e: Exception) {
             emit(_state.value.now, error = e.message ?: "hub unreachable")
         }
     }
 
+    @Volatile
+    private var ticketAgents: Map<String, com.xerktech.turma.model.TicketAgentPin> = emptyMap()
+
+    @Volatile
+    private var autoStartOrgs: Map<String, Boolean> = emptyMap()
+
+    @Volatile
+    private var ticketModels: Map<String, com.xerktech.turma.model.TicketModelPin> = emptyMap()
+
+    @Volatile
+    private var orgColors: Map<String, Int> = emptyMap()
+
+    @Volatile
+    private var pushEnabled: Boolean = true
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
-        _state.value = FleetState(agents = list, now = now, loading = false, error = error)
+        _state.value = FleetState(
+            agents = list, now = now, loading = false, error = error,
+            ticketAgents = ticketAgents,
+            autoStartOrgs = autoStartOrgs,
+            ticketModels = ticketModels,
+            orgColors = orgColors,
+            pushEnabled = pushEnabled,
+        )
     }
 
     private fun upsert(agent: AgentInfo) {
@@ -106,6 +152,24 @@ class FleetRepository(
                     "agent" -> runCatching { TurmaJson.decodeFromString<AgentInfo>(data) }.getOrNull()?.let { upsert(it) }
                     "removed" -> runCatching { TurmaJson.decodeFromString<JsonObject>(data) }
                         .getOrNull()?.get("key")?.jsonPrimitive?.content?.let { remove(it) }
+                    // A ticket->agent pin changed somewhere; the event carries
+                    // the whole (tiny) map, same as the web board consumes it.
+                    "ticketAgents" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketAgentPin>>(data)
+                    }.getOrNull()?.let { ticketAgents = it; emit(_state.value.now, null) }
+                    // An org's auto-start opt-in changed (XERK-41); the event
+                    // carries the whole (tiny) map, same as the web board.
+                    "autoStartOrgs" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, Boolean>>(data)
+                    }.getOrNull()?.let { autoStartOrgs = it; emit(_state.value.now, null) }
+                    // A ticket->model pin changed (XERK-123); whole tiny map.
+                    "ticketModels" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.TicketModelPin>>(data)
+                    }.getOrNull()?.let { ticketModels = it; emit(_state.value.now, null) }
+                    // An org's color pin changed (XERK-145); whole tiny map.
+                    "orgColors" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, Int>>(data)
+                    }.getOrNull()?.let { orgColors = it; emit(_state.value.now, null) }
                 }
             }
 

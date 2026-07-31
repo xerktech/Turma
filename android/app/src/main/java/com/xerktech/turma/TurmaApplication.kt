@@ -17,5 +17,8 @@ class TurmaApplication : Application() {
         // Register this device's FCM token with the hub (no-op if Firebase or
         // the hub credentials aren't configured yet; retried after sign-in).
         runCatching { PushRegistrar.register(this, container) }
+        // Check GitHub for a newer APK (XERK-11). Quiet on failure; the banner
+        // only surfaces on the Dashboard when there's actually an update.
+        runCatching { container.updater.check() }
     }
 }

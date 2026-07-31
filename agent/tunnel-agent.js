@@ -35,11 +35,13 @@ const DEFAULT_TTYD_PORT = 7681;
 // ---- live transcript tail ---------------------------------------------------
 // The near-real-time path for the glasses' session screen. When a glasses
 // client is watching a session, the hub sends {"watch":<sessionId>,
-// "worktreePath":<path>} on the control channel; we then tail that ONE
-// transcript every LIVE_TAIL_MS and push {"tail":<sessionId>,"entries":[...]}
-// deltas straight back on the same control channel (the hub fans them out to
-// the watching glasses). {"unwatch":<sessionId>} stops it. Tailing runs only
-// while a session is actively watched, so idle sessions cost nothing.
+// "worktreePath":<path>,"transcriptId":<id>} on the control channel — the id
+// naming which transcript in that cwd's project dir is the session's own (see
+// sessionTranscript). We then tail that ONE transcript every LIVE_TAIL_MS and
+// push {"tail":<sessionId>,"entries":[...]} deltas straight back on the same
+// control channel (the hub fans them out to the watching glasses).
+// {"unwatch":<sessionId>} stops it. Tailing runs only while a session is
+// actively watched, so idle sessions cost nothing.
 //
 // The transcript read here is a deliberate re-implementation of hub-agent.py's
 // transcript_tail / _entry_text / _project_slug (same entry->text mapping,
@@ -86,6 +88,29 @@ const BLOCK_CAPS_LIVE = {
 // wrong for the dotted worktree paths this agent uses).
 function projectSlug(p) {
   return p.replace(/[^A-Za-z0-9]/g, "-");
+}
+
+// The transcript to tail for a watched session: the one the hub named
+// (<transcriptId>.jsonl in the session cwd's project-slug dir), else the newest
+// in that dir. Null when the named one doesn't exist yet, or when there is
+// nothing in the dir at all.
+//
+// The id is what makes a repos-root session tail its OWN conversation: every
+// root session shares REPOS_ROOT as its cwd, hence one project dir, so newest-
+// mtime hands a fresh root session the previous one's transcript (XERK-6). A
+// named-but-absent file means the session hasn't spoken yet — never fall back to
+// newest there, that IS the bug. A hub predating the pin sends no id, leaving
+// the newest-mtime rule it always used. Mirrors _session_transcript_path in
+// hub-agent.py.
+function sessionTranscript(worktreePath, transcriptId) {
+  if (!transcriptId) return newestTranscript(worktreePath);
+  // Same containment argument as newestTranscript's slug, applied to the id: a
+  // path can only be built from a plain uuid-ish word, so it names a child of
+  // the slug dir and nothing else.
+  if (!/^[A-Za-z0-9-]+$/.test(transcriptId)) return null;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  const p = path.join(PROJECTS_ROOT, projectSlug(worktreePath), `${transcriptId}.jsonl`);
+  return fs.existsSync(p) ? p : null;
 }
 
 // Newest *.jsonl transcript for a worktree (its project-slug dir), or null.
@@ -166,26 +191,150 @@ function tnPreview(tn) {
   return parts.filter(Boolean).join("\n\n");
 }
 
+// Claude Code's slash-command bookkeeping turns (the ignore-this caveat, the
+// <command-name>/<command-args> invocation wrapper, and the command's
+// stdout/stderr) also land as user-role turns of raw XML. Parse them into
+// {kind:"caveat"|"command"|"output"} so entryBlocks can render a chip / output
+// card and drop the caveat. Mirror of hub-agent.py _parse_local_command.
+const LOCAL_COMMAND_CAVEAT_RE = /^\s*<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*$/;
+const COMMAND_NAME_RE = /<command-name>([\s\S]*?)<\/command-name>/;
+const COMMAND_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
+const COMMAND_STDOUT_RE = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/;
+const COMMAND_STDERR_RE = /<local-command-stderr>([\s\S]*?)<\/local-command-stderr>/;
+// The `!` prefix runs a shell command straight from the composer/TUI; Claude
+// Code records the command as <bash-input> and its output as
+// <bash-stdout>/<bash-stderr> user turns. Parsed into the same
+// command/output shapes (name "!") so the chat renders a chip + output card
+// instead of raw XML. Mirror of hub-agent.py BASH_*_RE.
+const BASH_INPUT_RE = /<bash-input>([\s\S]*?)<\/bash-input>/;
+const BASH_STDOUT_RE = /<bash-stdout>([\s\S]*?)<\/bash-stdout>/;
+const BASH_STDERR_RE = /<bash-stderr>([\s\S]*?)<\/bash-stderr>/;
+function parseLocalCommand(text) {
+  if (!text) return null;
+  if (LOCAL_COMMAND_CAVEAT_RE.test(text)) return { kind: "caveat" };
+  const nameM = COMMAND_NAME_RE.exec(text);
+  if (nameM) {
+    const name = nameM[1].replace(ANSI_RE, "").trim();
+    if (name) {
+      const argsM = COMMAND_ARGS_RE.exec(text);
+      return { kind: "command", name, args: argsM ? argsM[1].replace(ANSI_RE, "").trim() : "" };
+    }
+  }
+  const bashM = BASH_INPUT_RE.exec(text);
+  if (bashM) {
+    const cmd = bashM[1].replace(ANSI_RE, "").trim();
+    if (cmd) return { kind: "command", name: "!", args: cmd };
+  }
+  // stderr wins over stdout when a turn carries both — but ONLY when it
+  // carries text: a bash turn routinely ships both tags with one empty, and an
+  // empty stderr must not swallow the stdout beside it (or vice versa).
+  let first = null;
+  for (const [re, isError] of [[COMMAND_STDERR_RE, true], [BASH_STDERR_RE, true],
+    [COMMAND_STDOUT_RE, false], [BASH_STDOUT_RE, false]]) {
+    const m = re.exec(text);
+    if (m) {
+      const out = { kind: "output", text: m[1].replace(ANSI_RE, "").trim(), isError };
+      if (out.text) return out;
+      if (!first) first = out;
+    }
+  }
+  return first;
+}
+// Flatten a parsed local-command turn to text-feed form, or null to drop it —
+// mirror of hub-agent.py _lc_preview.
+function lcPreview(lc) {
+  if (lc.kind === "caveat") return null;
+  if (lc.kind === "command") return [lc.name, lc.args].filter(Boolean).join(" ");
+  return lc.text || null;
+}
+
+// The tool_use id this user turn was PRODUCED BY, or null — mirror of
+// hub-agent.py _entry_tool_source, where the reasoning lives. Claude Code
+// writes a skill's body back as a user turn tagged with the id of the `Skill`
+// tool_use that pulled it in; on a user turn that field means the tooling
+// authored the entry, not the operator, so it is really that call's result.
+function entryToolSource(entry) {
+  if (entry.type !== "user") return null;
+  return entry.sourceToolUseID || null;
+}
+
+// The entry's first raw text payload (string content, or the first `text` block
+// of list content), or "" — mirror of hub-agent.py _entry_first_text.
+function entryFirstText(entry) {
+  const msg = entry.message;
+  if (!msg || typeof msg !== "object") return "";
+  const content = msg.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === "object" && block.type === "text") return String(block.text || "");
+    }
+  }
+  return "";
+}
+
+// Pressing Esc (or the hub's Stop) mid-turn writes a user-role "[Request
+// interrupted by user…]" marker entry — a statement about the turn, not
+// something the operator typed. Mirror of hub-agent.py INTERRUPT_RE.
+const INTERRUPT_RE = /^\s*\[Request interrupted by user[^\]\n]*\]\s*$/;
+
+// Claude Code's "while you were away" recap: a `system` entry (subtype
+// "away_summary") whose content the model wrote. Every other system subtype is
+// TUI bookkeeping and stays dropped; the trailing "(disable recaps in
+// /config)" hint is a TUI affordance and is stripped. Mirror of hub-agent.py
+// _away_summary_text.
+const AWAY_HINT_RE = /\s*\(disable recaps in \/config\)\s*$/;
+function awaySummaryText(entry) {
+  if (entry.type !== "system" || entry.subtype !== "away_summary") return null;
+  const text = String(entry.content || "").replace(ANSI_RE, "").replace(AWAY_HINT_RE, "").trim();
+  return text || null;
+}
+
+// Display role for an entry — mirror of hub-agent.py _entry_role. A compact
+// summary is written as a USER turn carrying text the model wrote about itself;
+// it reports as the assistant so the chat doesn't misattribute it to the human.
+// A system entry only ever survives the feeds as an away_summary recap, which
+// the model also wrote — same rule.
+function entryRole(entry) {
+  if (entry.isCompactSummary) return "assistant";
+  if (entry.type === "system") return "assistant";
+  return entry.type;
+}
+
+// One text payload -> its text-feed form, or null to drop it. Mirror of
+// hub-agent.py _flatten_text.
+function flattenText(raw) {
+  const tn = parseTaskNotification(raw);
+  if (tn) return tnPreview(tn);
+  const lc = parseLocalCommand(raw);
+  if (lc) return lcPreview(lc);
+  return raw;
+}
+
 // One transcript entry -> glasses display text, or null to drop it (wrong
 // type, no message, tool_result-only turn, empty after ANSI strip). Mirrors
 // hub-agent.py _entry_text.
 function entryText(entry) {
+  const away = awaySummaryText(entry);
+  if (away !== null) return away;
   const type = entry.type;
   if (type !== "user" && type !== "assistant") return null;
   const msg = entry.message;
   if (!msg || typeof msg !== "object") return null;
+  // Tool-authored: a tool_result by another name, and this feed drops those.
+  if (entryToolSource(entry)) return null;
   const content = msg.content;
   let text;
   if (typeof content === "string") {
-    const tn = parseTaskNotification(content);
-    text = tn ? tnPreview(tn) : content;
+    text = flattenText(content);
+    if (text === null) return null;
   } else if (Array.isArray(content)) {
     const parts = [];
     for (const block of content) {
       if (!block || typeof block !== "object") continue;
       if (block.type === "text") {
-        const tn = parseTaskNotification(String(block.text || ""));
-        parts.push(tn ? tnPreview(tn) : String(block.text || ""));
+        const flat = flattenText(String(block.text || ""));
+        if (flat !== null) parts.push(flat);
       } else if (block.type === "tool_use" && block.name) parts.push(`[${block.name}]`);
       // "thinking" and "tool_result" blocks are dropped.
     }
@@ -197,6 +346,20 @@ function entryText(entry) {
   return text || null;
 }
 
+// The entry's own uuid, or a synthesized stable id for the entry types Claude
+// Code writes WITHOUT one (pr-link): the chat's tail merge dedups on id and
+// drops id-less entries. Mirror of hub-agent.py _entry_id.
+//
+// A pr-link keys on its URL ALONE, deliberately excluding the timestamp: Claude
+// Code re-stamps a session's PR links in the metadata preamble it writes at the
+// top of every user turn, so one PR yields ~6 entries differing only in
+// `timestamp`. Sharing an id collapses them to the first — where the PR landed.
+function entryId(entry) {
+  if (entry.uuid) return entry.uuid;
+  if (entry.type === "pr-link") return `pr-link:${entry.prUrl || ""}`;
+  return undefined;
+}
+
 // (clipped, wasTruncated). Mirror of hub-agent.py _clip.
 function clip(text, cap) {
   text = text || "";
@@ -205,11 +368,20 @@ function clip(text, cap) {
 }
 
 // Common Claude Code tools carry their salient arg under one of these keys.
-const TOOL_INPUT_KEYS = ["command", "file_path", "path", "pattern", "url", "query", "prompt"];
+const TOOL_INPUT_KEYS = ["command", "file_path", "path", "pattern", "url", "query", "prompt",
+  "skill", "subject"];
 
 // Compact display string for a tool_use `input` — mirror of _tool_input_summary.
+// An AskUserQuestion call's salient arg is the question text itself, nested in
+// its `questions` list — joined so the card reads as the question(s) asked.
 function toolInputSummary(inp) {
   if (inp && typeof inp === "object" && !Array.isArray(inp)) {
+    if (Array.isArray(inp.questions)) {
+      const texts = inp.questions
+        .map((q) => (q && typeof q === "object" && typeof q.question === "string") ? q.question.trim() : "")
+        .filter(Boolean);
+      if (texts.length) return texts.join(" · ");
+    }
     for (const key of TOOL_INPUT_KEYS) {
       const val = inp[key];
       if (typeof val === "string" && val.trim()) return val;
@@ -221,6 +393,43 @@ function toolInputSummary(inp) {
   return String(inp);
 }
 
+// Attach the reviewable payload of a known tool call to its tool_use block —
+// the part an operator otherwise opens the raw terminal to see. Returns true
+// when a payload was clipped by its cap. Mirror of hub-agent.py
+// _tool_use_detail(): Edit -> edit {old, new, replaceAll?}; Write -> content;
+// ExitPlanMode -> plan; any tool's human `description` arg -> desc.
+function toolUseDetail(block, name, inp, caps) {
+  if (!inp || typeof inp !== "object" || Array.isArray(inp)) return false;
+  let truncated = false;
+  if (name === "Edit") {
+    const old = inp.old_string, nw = inp.new_string;
+    if (typeof old === "string" || typeof nw === "string") {
+      const [oldC, oldT] = clip(String(old || "").replace(ANSI_RE, ""), caps.result);
+      const [newC, newT] = clip(String(nw || "").replace(ANSI_RE, ""), caps.result);
+      const edit = { old: oldC, new: newC };
+      if (inp.replace_all) edit.replaceAll = true;
+      block.edit = edit;
+      truncated = oldT || newT;
+    }
+  } else if (name === "Write") {
+    if (typeof inp.content === "string" && inp.content.trim()) {
+      const [clipped, trunc] = clip(inp.content.replace(ANSI_RE, ""), caps.result);
+      block.content = clipped;
+      truncated = trunc;
+    }
+  } else if (name === "ExitPlanMode") {
+    if (typeof inp.plan === "string" && inp.plan.trim()) {
+      const [clipped, trunc] = clip(inp.plan.replace(ANSI_RE, "").trim(), caps.text);
+      block.plan = clipped;
+      truncated = trunc;
+    }
+  }
+  if (typeof inp.description === "string" && inp.description.trim()) {
+    block.desc = clip(inp.description.replace(ANSI_RE, "").trim(), caps.input)[0];
+  }
+  return truncated;
+}
+
 // Flatten a tool_result block's `content` to text — mirror of _tool_result_text.
 function toolResultText(content) {
   if (typeof content === "string") return content;
@@ -230,6 +439,9 @@ function toolResultText(content) {
       if (block && typeof block === "object") {
         if (block.type === "text") parts.push(String(block.text || ""));
         else if (block.type === "image") parts.push("[image]");
+        // A ToolSearch result names the tools it loaded as tool_reference
+        // blocks; flattening them away left the call's output card empty.
+        else if (block.type === "tool_reference") parts.push(`\n[tool: ${block.tool_name || "tool"}]`);
       } else if (typeof block === "string") {
         parts.push(block);
       }
@@ -247,11 +459,51 @@ function toolResultText(content) {
 // truncated:true. Returns [] for a user/assistant message with no renderable
 // blocks. Line-for-line mirror of hub-agent.py _entry_blocks — keep in lockstep.
 function entryBlocks(entry, caps) {
+  // The "while you were away" recap becomes its own block (assistant-side
+  // card); all other system entries still drop. Mirror of _entry_blocks.
+  const away = awaySummaryText(entry);
+  if (away !== null) {
+    const [clipped, trunc] = clip(away, caps.text);
+    const block = { t: "away_summary", text: clipped };
+    if (trunc) block.truncated = true;
+    return [block];
+  }
+  // A compaction that RAN (trigger + before/after token counts) becomes a
+  // status marker; a pr-link entry (Claude Code's own record of a PR it
+  // opened) becomes a pr_link marker. Mirror of _entry_blocks.
+  if (entry.type === "system" && entry.subtype === "compact_boundary") {
+    const meta = entry.compactMetadata || {};
+    const block = { t: "compact_boundary" };
+    if (typeof meta.trigger === "string" && meta.trigger) block.trigger = meta.trigger;
+    if (Number.isInteger(meta.preTokens)) block.preTokens = meta.preTokens;
+    if (Number.isInteger(meta.postTokens)) block.postTokens = meta.postTokens;
+    return [block];
+  }
+  if (entry.type === "pr-link") {
+    if (typeof entry.prUrl !== "string" || !entry.prUrl) return null;
+    const block = { t: "pr_link", url: entry.prUrl };
+    if (Number.isInteger(entry.prNumber)) block.number = entry.prNumber;
+    if (typeof entry.prRepository === "string" && entry.prRepository) block.repo = entry.prRepository;
+    return [block];
+  }
   const type = entry.type;
   if (type !== "user" && type !== "assistant") return null;
   const msg = entry.message;
   if (!msg || typeof msg !== "object") return null;
   const content = msg.content;
+
+  // A skill body is the result of the Skill call that pulled it in: emit it as
+  // that call's tool_result so the chat folds it into the action card. Ahead of
+  // the content walk — the body arrives as an ordinary text block.
+  const toolSrc = entryToolSource(entry);
+  if (toolSrc) {
+    const text = entryFirstText(entry).replace(ANSI_RE, "").trim();
+    const [clipped, trunc] = clip(text, caps.result);
+    const block = { t: "tool_result", text: clipped, forId: toolSrc };
+    if (trunc) block.truncated = true;
+    return [block];
+  }
+
   const blocks = [];
   const addText = (kind, text, cap) => {
     text = String(text || "").replace(ANSI_RE, "").trim();
@@ -270,17 +522,47 @@ function entryBlocks(entry, caps) {
     if (rtrunc) block.truncated = true;
     blocks.push(block);
   };
+  // The caveat contributes no block (its entry drops out entirely).
+  const addLocalCommand = (lc) => {
+    if (lc.kind === "command") {
+      const [name] = clip(lc.name, caps.input);
+      const [args, atrunc] = clip(lc.args, caps.input);
+      const block = { t: "command", name };
+      if (args) block.args = args;
+      if (atrunc) block.truncated = true;
+      blocks.push(block);
+    } else if (lc.kind === "output" && lc.text) {
+      const [text, trunc] = clip(lc.text, caps.result);
+      const block = { t: "command_output", text };
+      if (lc.isError) block.isError = true;
+      if (trunc) block.truncated = true;
+      blocks.push(block);
+    }
+  };
+  // One text payload -> its block(s): a task-notification card, a slash-command
+  // chip/output card, else plain text. A compact summary is prose the model
+  // wrote about the conversation so far, injected as a user turn — it gets its
+  // own block so the chat renders it as a collapsed agent-side card rather than
+  // a wall of text in a user bubble. entryRole() puts it on the assistant side.
+  const addPayload = (raw) => {
+    const tn = parseTaskNotification(raw);
+    if (tn) return addTaskNotification(tn);
+    const lc = parseLocalCommand(raw);
+    if (lc) return addLocalCommand(lc);
+    // An interrupt marker is a statement about the turn, not operator prose.
+    if (INTERRUPT_RE.test(raw)) {
+      blocks.push({ t: "interrupt", text: String(raw).replace(ANSI_RE, "").trim() });
+      return;
+    }
+    addText(entry.isCompactSummary ? "compact_summary" : "text", raw, caps.text);
+  };
   if (typeof content === "string") {
-    const tn = parseTaskNotification(content);
-    if (tn) addTaskNotification(tn);
-    else addText("text", content, caps.text);
+    addPayload(content);
   } else if (Array.isArray(content)) {
     for (const raw of content) {
       if (!raw || typeof raw !== "object") continue;
       if (raw.type === "text") {
-        const tn = parseTaskNotification(raw.text || "");
-        if (tn) addTaskNotification(tn);
-        else addText("text", raw.text || "", caps.text);
+        addPayload(raw.text || "");
       } else if (raw.type === "thinking") {
         addText("thinking", raw.thinking || raw.text || "", caps.text);
       } else if (raw.type === "tool_use" && raw.name) {
@@ -289,6 +571,7 @@ function entryBlocks(entry, caps) {
         const block = { t: "tool_use", name: String(raw.name), input: clipped };
         if (raw.id) block.id = raw.id;
         if (trunc) block.truncated = true;
+        if (toolUseDetail(block, String(raw.name), raw.input, caps)) block.truncated = true;
         blocks.push(block);
       } else if (raw.type === "tool_result") {
         const text = toolResultText(raw.content).replace(ANSI_RE, "").trim();
@@ -307,19 +590,58 @@ function entryBlocks(entry, caps) {
   return blocks;
 }
 
+// The prompt queue: a message typed mid-turn is enqueued, and Claude Code
+// records the queue's life as `queue-operation` transcript entries (enqueue
+// carries the text; dequeue pops the OLDEST into a real user turn; remove
+// withdraws one by content). Folded in file order so the chat can show a
+// still-queued prompt instead of it vanishing until the turn ends — when its
+// dequeue lands, the real user turn takes over, so there's no duplicate. A
+// window opening mid-sequence can see a dequeue whose enqueue was cut off;
+// popping an empty queue is a no-op, erring toward briefly hiding a queued
+// prompt rather than inventing a phantom one. Mirror of hub-agent.py
+// _fold_queue_op / QUEUED_*.
+const QUEUED_PROMPTS_MAX = 10;
+const QUEUED_PROMPT_CHARS = 4000;
+function foldQueueOp(entry, queue) {
+  const op = entry.operation;
+  const content = entry.content;
+  if (op === "enqueue") {
+    if (typeof content === "string" && content.trim()) queue.push(content.trim().slice(0, QUEUED_PROMPT_CHARS));
+  } else if (op === "dequeue") {
+    if (queue.length) queue.shift();
+  } else if (op === "remove") {
+    if (typeof content === "string") {
+      const c = content.trim().slice(0, QUEUED_PROMPT_CHARS);
+      const i = queue.indexOf(c);
+      if (i >= 0) queue.splice(i, 1);
+    }
+  }
+}
+
+// The queue entries worth SHOWING: capped, minus the tooling's own payloads —
+// a background task finishing mid-turn rides the same queue as a
+// `<task-notification>` XML wall, which must keep its FIFO slot (dequeues are
+// positional) but must not render as a queued operator bubble. Prefix-matched:
+// the enqueue copy is clipped, which can cut the closing tag a parse needs.
+// Mirror of hub-agent.py _queued_display.
+function queuedDisplay(queue) {
+  return queue.filter((q) => !q.startsWith("<task-notification>")).slice(-QUEUED_PROMPTS_MAX);
+}
+
 // Last TAIL_MSGS surviving messages of a worktree's newest transcript, oldest
-// first: [{id: uuid, role, text}]. [] when there's no transcript yet.
+// first, plus the still-queued prompts: {entries: [{id: uuid, role, text,
+// blocks}], queued: [text]}. Empty both when there's no transcript yet.
 //
 // Optional `cache` ({path, mtimeMs, size, result}, one per watched session)
-// skips the ~128 KB read+parse when the newest transcript is unchanged since the
-// last poll (same file, same mtime+size) — pollWatcher ticks this ~1s per
-// session and most ticks find nothing new. newestTranscript already stat'd each
-// candidate, so one more stat of the winner is cheap next to re-reading the tail.
-function transcriptTail(worktreePath, cache) {
-  const p = newestTranscript(worktreePath);
+// skips the ~128 KB read+parse when the transcript is unchanged since the last
+// poll (same file, same mtime+size) — pollWatcher ticks this ~1s per session and
+// most ticks find nothing new. sessionTranscript already stat'd the candidates,
+// so one more stat of the winner is cheap next to re-reading the tail.
+function transcriptTail(worktreePath, cache, transcriptId) {
+  const p = sessionTranscript(worktreePath, transcriptId);
   if (!p) {
-    if (cache) { cache.path = null; cache.result = []; }
-    return [];
+    if (cache) { cache.path = null; cache.result = { entries: [], queued: [] }; }
+    return { entries: [], queued: [] };
   }
   let st = null;
   try { st = fs.statSync(p); } catch {}
@@ -328,10 +650,12 @@ function transcriptTail(worktreePath, cache) {
     return cache.result; // unchanged since last poll -> reuse, no read+parse
   }
   const tail = [];
+  const queued = [];
   for (const raw of readTailLines(p, TAIL_READ_BYTES)) {
     let entry;
     try { entry = JSON.parse(raw); } catch { continue; }
     if (!entry || typeof entry !== "object") continue;
+    if (entry.type === "queue-operation") { foldQueueOp(entry, queued); continue; }
     const text = entryText(entry);
     const blocks = entryBlocks(entry, BLOCK_CAPS_LIVE);
     // Rich path widens inclusion: a tool_result-only turn (text === null) still
@@ -339,13 +663,13 @@ function transcriptTail(worktreePath, cache) {
     // backward-compat flat string the glasses read.
     if (text === null && (!blocks || blocks.length === 0)) continue;
     tail.push({
-      id: entry.uuid,
-      role: entry.type,
+      id: entryId(entry),
+      role: entryRole(entry),
       text: (text || "").slice(0, TAIL_MSG_CHARS),
       blocks: blocks || [],
     });
   }
-  const result = tail.slice(-TAIL_MSGS);
+  const result = { entries: tail.slice(-TAIL_MSGS), queued: queuedDisplay(queued) };
   if (cache) {
     cache.path = p;
     cache.mtimeMs = st ? st.mtimeMs : 0;
@@ -420,6 +744,45 @@ function cleanHint(l) {
   return String(l == null ? "" : l).trim().replace(/^[⌊⌞└⎿⎣]\s*/, "").trim();
 }
 
+// An active-task checklist item Claude Code paints beneath the spinner: an
+// optional tree connector then a to-do status glyph (done ✓ / active ■ /
+// pending □). Only the first item carries the connector; the rest are bare, so
+// isHintLine alone catches just that first item. Requiring a status glyph is
+// what keeps this from swallowing a `⎿`-connected tool-result line (its glyph
+// is followed by prose, not a checkbox).
+function isChecklistLine(l) {
+  const t = String(l == null ? "" : l).trim();
+  if (!t) return false;
+  return /^(?:[⌊⌞└⎿⎣]\s*)?[✓✔☑☒☐□■◼◻▪▫]\s/u.test(t);
+}
+
+// Claude Code's agent-manager list (opened with ↓/← from the working footer)
+// paints one row per live agent below the input box: a radio glyph
+// (◉/● = the one currently in focus, ○/◯ = a background agent), then the agent
+// type, then — for a subagent — its short description. e.g. "◉ main",
+// "○ Explore   Explore Jira agent-side code". We surface it beside the working
+// status so the web chat can list the live agents and open one. Type and label
+// are separated by the TUI's 2+-space gutter; "main" has no label. Scanned only
+// in the footer region (below the input box) — see parsePaneLiveTurn — so the
+// column-0 ● assistant-text bullet can never be mistaken for a focused agent.
+const AGENT_ROW_RE = /^\s*([◉●◯○])\s+(\S.*?)\s*$/;
+function parseAgentList(lines) {
+  const agents = [];
+  for (const raw of lines || []) {
+    const m = AGENT_ROW_RE.exec(String(raw == null ? "" : raw));
+    if (!m) continue;
+    const parts = m[2].split(/\s{2,}/);
+    const type = (parts[0] || "").trim();
+    if (!type) continue;
+    agents.push({
+      sel: /[◉●]/.test(m[1]),
+      type,
+      label: parts.slice(1).join(" ").trim(),
+    });
+  }
+  return agents;
+}
+
 // Parse a working-status line into { verb, up, down, elapsed } — display strings
 // kept verbatim from the TUI (e.g. up: "1.2k", down: "340", elapsed: "12s").
 // Absent fields come back as "". Order/format vary across Claude Code versions,
@@ -437,9 +800,39 @@ function parsePaneStatus(l) {
   return { verb: verb ? verb[1] : "", up: u, down: d, elapsed: elapsed ? elapsed[1] + "s" : "" };
 }
 
+// "Is a turn running" read off the whole capture — the same three shapes
+// hub-agent.py's _busy_from_capture keys on (XERK-130), because the full
+// "esc to interrupt" hint alone misses a NARROW pane: tmux sizes the window to
+// its smallest-ever attached client (a phone leaves ~54 columns), and at that
+// width the TUI ellipsizes the footer hint to "· esc to inte…", so every
+// working session on such a pane read "not generating" and the live working
+// bar never appeared. Busy is any of:
+//  - the full hint (wide pane), as before;
+//  - the width-truncated hint on the mode footer line — a line carrying the
+//    mode marker's ⏸/⏵ glyph whose LAST "·"-separated segment is a PREFIX of
+//    "esc to interrupt" (character class, so every cut point matches) ending
+//    in the TUI's own "…". Glyph-anchored because the middle segments vary
+//    ("(shift+tab to cycle)" comes and goes, a "· PR #98" chip can sit before
+//    the hint); the idle footer's "· ← for agents" suffix can't match (it
+//    never starts with "e"). The only visible signal while text streams on a
+//    narrow pane (no spinner line then) or the conversation is scrolled up
+//    (spinner off-screen);
+//  - the column-0 spinner line ("✢ Determining… (12m 19s · ↓ 44.2k tokens)",
+//    "· Perusing… (54m 38s · still thinking)"): glyph-agnostic but never the
+//    assistant "●" bullet or "❯" prompt, one capitalized gerund, then the
+//    ellipsis — which the completed-turn line an IDLE pane keeps on screen
+//    ("✻ Brewed for 9s") lacks, so it can't fake busy.
+const PANE_BUSY_TRUNC_RE = /[⏸⏵][^\n]*·\s*e[sc to interup]*…\s*$/im;
+const PANE_SPINNER_RE = /^[^\sA-Za-z0-9●❯]\s+[A-Z][a-z]+(?:…|\.\.\.)(?:\s*\(|\s*$)/;
+function paneShowsBusy(raw) {
+  if (/esc to interrupt/i.test(raw)) return true;
+  if (PANE_BUSY_TRUNC_RE.test(raw)) return true;
+  return raw.split("\n").some((l) => PANE_SPINNER_RE.test(l));
+}
+
 function parsePaneLiveTurn(pane) {
   const raw = String(pane || "").replace(/\r/g, "");
-  if (!/esc to interrupt/i.test(raw)) return { generating: false, text: "", status: null };
+  if (!paneShowsBusy(raw)) return { generating: false, text: "", status: null };
   const lines = raw.split("\n");
   const isRule = (l) => /^─{20,}$/.test(l.trim());
   // Drop the whole bottom input box (its top border ─, the ❯ prompt line(s),
@@ -462,17 +855,38 @@ function parsePaneLiveTurn(pane) {
   // The working footer (status line + its contextual hint/task line) sits just
   // above the input box. Grab both — they're the last such lines — for the
   // pinned bar; scanning independently means their order doesn't matter.
-  let statusLine = null, hintLine = null;
+  let statusLine = null, hintIdx = -1;
   for (let i = convo.length - 1; i >= 0; i--) {
     if (statusLine == null && isStatusLine(convo[i])) statusLine = convo[i];
-    if (hintLine == null && isHintLine(convo[i])) hintLine = convo[i];
-    if (statusLine != null && hintLine != null) break;
+    if (hintIdx < 0 && isHintLine(convo[i])) hintIdx = i;
+    if (statusLine != null && hintIdx >= 0) break;
   }
   let status = null;
-  if (statusLine != null || hintLine != null) {
+  if (statusLine != null || hintIdx >= 0) {
     status = statusLine != null ? parsePaneStatus(statusLine) : { verb: "", up: "", down: "", elapsed: "" };
-    const h = hintLine != null ? cleanHint(hintLine) : "";
-    if (h) status.hint = h;
+    if (hintIdx >= 0) {
+      // The hint is either a single rotating tip / active-task line or the head
+      // of a multi-line to-do checklist (a corner-glyph item followed by bare
+      // checkbox items). When it's a checklist, gather the contiguous block that
+      // follows so the WHOLE list — not just its first item — reaches the footer.
+      const hintBlock = [convo[hintIdx]];
+      if (isChecklistLine(convo[hintIdx])) {
+        for (let j = hintIdx + 1; j < convo.length && isChecklistLine(convo[j]); j++) {
+          hintBlock.push(convo[j]);
+        }
+      }
+      const h = hintBlock.map(cleanHint).filter(Boolean).join("\n");
+      if (h) status.hint = h;
+    }
+  }
+  // The agent-manager list, when expanded, is painted BELOW the input box
+  // (after `bottom`, the box's bottom rule) alongside the mode line — a region
+  // the convo slice above intentionally drops. Parse it there so the assistant
+  // block can't swallow it and the column-0 ● bullet can't fake a row.
+  const agents = bottom >= 0 ? parseAgentList(lines.slice(bottom + 1)) : [];
+  if (agents.length) {
+    status = status || { verb: "", up: "", down: "", elapsed: "" };
+    status.agents = agents;
   }
   // The in-progress assistant block starts at the last column-0 ● bullet.
   let start = -1;
@@ -487,13 +901,36 @@ function parsePaneLiveTurn(pane) {
     // Stop at the next turn marker (a new ● bullet or the ❯ prompt) OR any
     // footer line — the status/spinner line and its hint/task line — so none of
     // the working footer bleeds into the message regardless of its order.
-    if (i > start && (/^[●❯]/.test(l) || isStatusLine(l) || isHintLine(l))) break;
+    if (i > start && (/^[●❯]/.test(l) || isStatusLine(l) || isHintLine(l) || isChecklistLine(l))) break;
     block.push(i === start ? l.replace(/^●\s?/, "") : l.replace(/^ {1,3}/, ""));
   }
   // Reflow the TUI's hard-wrapped lines into flowing text; the glasses re-wrap,
   // and the transcript delivers the authoritative structure on completion.
   const text = block.join(" ").replace(/\s+/g, " ").trim();
   return { generating: true, text, status };
+}
+
+// Suppress a single-frame busy->idle blip in the live turn scrape. Claude Code
+// repaints its spinner (and the "esc to interrupt" hint parsePaneLiveTurn keys
+// on) several times a second by clearing and rewriting the status line, so one
+// capture can read "not generating" mid-repaint while the model is still
+// working. Clearing the hub's pinned working bar (and the chat's Stop button) on
+// that blip makes it flicker off for a poll. So on the busy->idle EDGE we HOLD
+// one poll before clearing: if the very next poll is still generating it was a
+// redraw gap and nothing flickered; if it's still idle the turn really ended and
+// we clear (the committed transcript tail owns the finished message either way,
+// so the ~1s hold is invisible). Busy is never held — status must light up
+// promptly, and nothing fakes busy while idle. This mirrors _stable_pane_busy in
+// hub-agent.py, which guards the heartbeat's paneBusy the same way; the shorter
+// (1s) live cadence lets a poll-hold stand in for that one's re-capture.
+//
+// Pure so it's unit-testable: given the prior (gen, pending) hold state and this
+// poll's `generating`, returns whether to `emit` this frame plus the next hold
+// state. emit=false means skip the frame, leaving the last one on screen.
+function liveTurnDecision(prevGen, prevPending, generating) {
+  if (generating) return { emit: true, gen: true, pending: false };
+  if (prevGen && !prevPending) return { emit: false, gen: true, pending: true };
+  return { emit: true, gen: false, pending: false };
 }
 
 // Capture the session's tmux pane (agent-<id>) and extract the in-progress
@@ -511,15 +948,19 @@ function captureLiveTurn(sessionId, cb) {
 function pollWatcher(sessionId) {
   const w = watchers.get(sessionId);
   if (!w) return;
-  // 1. Committed transcript tail (authoritative history). The per-session cache
-  //    skips the read+parse on ticks where the transcript file hasn't changed.
-  let entries = null;
-  try { entries = transcriptTail(w.worktreePath, w.tailCache); } catch { entries = null; }
-  if (entries && entries.length) {
-    const json = JSON.stringify(entries);
+  // 1. Committed transcript tail (authoritative history) plus the still-queued
+  //    prompts. The per-session cache skips the read+parse on ticks where the
+  //    transcript file hasn't changed. `queued` joins the dedup key because a
+  //    queue op is a transcript line that changes NO entry — without it, the
+  //    frame that reports "your prompt is queued" would never fire.
+  let tail = null;
+  try { tail = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId); }
+  catch { tail = null; }
+  if (tail && (tail.entries.length || tail.queued.length)) {
+    const json = JSON.stringify(tail);
     if (json !== w.lastJson) {
       w.lastJson = json;
-      sendControl({ tail: sessionId, entries });
+      sendControl({ tail: sessionId, entries: tail.entries, queued: tail.queued });
     }
   }
   // 2. Live in-progress assistant turn scraped from the TUI (real-time). Sent
@@ -530,9 +971,17 @@ function pollWatcher(sessionId) {
   //    status-only change (the token counter ticking) still pushes an update.
   captureLiveTurn(sessionId, (live) => {
     if (!watchers.has(sessionId)) return; // stopped mid-capture
+    const d = liveTurnDecision(w.liveGen === true, w.livePending === true, live.generating);
+    w.liveGen = d.gen;
+    w.livePending = d.pending;
+    if (!d.emit) return; // holding a busy->idle blip for one poll; keep last frame
     const text = live.generating ? live.text : "";
     const status = live.generating ? (live.status || null) : null;
-    const key = text + " " + (status ? JSON.stringify(status) : "");
+    // NUL separator: a byte that cannot occur in pane text. Written as an
+    // escape, not a literal: a raw NUL makes grep treat this whole file as
+    // binary and silently report no matches for anything in it (the same
+    // reason the tests keep ESC as String.fromCharCode(27)).
+    const key = text + "\u0000" + (status ? JSON.stringify(status) : "");
     if (key !== w.lastTurn) {
       w.lastTurn = key;
       sendControl({ turn: sessionId, text, status });
@@ -540,15 +989,24 @@ function pollWatcher(sessionId) {
   });
 }
 
-function startWatch(sessionId, worktreePath) {
+function startWatch(sessionId, worktreePath, transcriptId) {
   if (!sessionId || !worktreePath) return;
   const existing = watchers.get(sessionId);
-  if (existing) { existing.worktreePath = worktreePath; return; } // already tailing
+  if (existing) {
+    // A re-armed watch (control-channel flap) carries the hub's current view of
+    // where this session's transcript is; a restart-clear-context moves it, so
+    // take the newer answer rather than keeping the one we started with.
+    existing.worktreePath = worktreePath;
+    existing.transcriptId = transcriptId || null;
+    return; // already tailing
+  }
   if (watchers.size >= MAX_WATCHERS) {
     log(`live tail: at MAX_WATCHERS (${MAX_WATCHERS}); ignoring watch for ${sessionId}`);
     return;
   }
-  const w = { worktreePath, lastJson: null, lastTurn: "", timer: null,
+  const w = { worktreePath, transcriptId: transcriptId || null,
+    lastJson: null, lastTurn: "", timer: null,
+    liveGen: false, livePending: false, // busy->idle blip hold; see liveTurnDecision
     tailCache: { path: null, mtimeMs: 0, size: 0, result: [] } };
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
@@ -571,21 +1029,35 @@ function stopAllWatches() {
 
 // Nudge the session-manager process (hub-agent.py) to heartbeat immediately so
 // a just-queued hub command is delivered in that beat's reply rather than up
-// to a whole TURMA_INTERVAL later. entrypoint.sh `exec`s hub-agent.py as PID 1
-// and starts this tunnel as a child, so PID 1 is the manager; it installs a
-// SIGUSR1 handler that cuts its interval sleep short. Best-effort — a failed
-// signal (e.g. running outside that entrypoint) just falls back to the
-// scheduled beat.
+// to a whole TURMA_INTERVAL later. The manager installs a SIGUSR1 handler that
+// cuts its interval sleep short.
+//
+// Which pid that is depends on how the agent was launched, so the launcher
+// names it: turma-agent exports TURMA_MANAGER_PID (its own $$, which `exec`
+// makes the manager's). PID 1 is the fallback for the container, where
+// entrypoint.sh `exec`s hub-agent.py as PID 1 — but ONLY there. On a native
+// install PID 1 is systemd, and signalling it raised EPERM on every poke, so
+// every hub command silently waited out a full beat instead of landing in
+// about a round-trip. Still best-effort: a failed signal costs latency, never
+// correctness, since the scheduled beat delivers the command anyway.
 function pokeHeartbeat() {
+  const pid = Number(process.env.TURMA_MANAGER_PID) || 1;
   try {
-    process.kill(1, "SIGUSR1");
+    process.kill(pid, "SIGUSR1");
   } catch (err) {
-    log(`poke failed: ${(err && err.message) || err}`);
+    log(`poke failed (pid ${pid}): ${(err && err.message) || err}`);
   }
 }
 
 // ws(s):// base derived from TURMA_URL's scheme.
 const WS_BASE = TURMA_URL.replace(/^http/, "ws").replace(/\/+$/, "");
+
+// How long the control channel may go completely silent before we treat the hub
+// as gone and reconnect. The hub beats every CONTROL_PING_EVERY_MS (30s), so
+// this is 3 missed beats — long enough that a slow link or a paused hub isn't
+// mistaken for a dead one.
+const CONTROL_IDLE_TIMEOUT_MS = Number(process.env.TURMA_CONTROL_IDLE_TIMEOUT_MS) || 90 * 1000;
+const CONTROL_WATCHDOG_EVERY_MS = Number(process.env.TURMA_CONTROL_WATCHDOG_EVERY_MS) || 15 * 1000;
 
 function log(msg) {
   console.log(`[tunnel-agent] ${msg}`);
@@ -705,11 +1177,54 @@ function connectControl() {
   const ws = new WebSocket(url);
   controlWs = ws;
 
+  // Liveness. A dead hub does not necessarily close this socket: when the hub
+  // is reached through Cloudflare, the edge holds our end open after the origin
+  // dies, so no 'close' ever fires and the reconnect below never runs. The
+  // channel then stays wedged forever — every session reads "terminal offline"
+  // while hub-agent.py's heartbeat (a separate HTTP POST) keeps the host green.
+  //
+  // We cannot see the hub's protocol ping: Node's built-in WebSocket answers it
+  // internally and exposes neither a ping event nor a ping method. So the hub
+  // also sends an app-level {ping} we CAN see, and silence is what we act on.
+  let lastMsgAt = Date.now();
+  let hubPings = false; // set once the hub proves it sends app-level pings
+  let watchdog = null;
+
+  // Reconnect at most once per socket, whether we got here from a real close or
+  // from the watchdog. Deliberately does NOT wait on ws.close(): closing a
+  // half-open socket waits for a peer close frame that is never coming, so the
+  // 'close' event we would be relying on may never arrive. We schedule the
+  // reconnect ourselves and let the doomed socket be reaped whenever it likes.
+  let retired = false;
+  const retire = (reason) => {
+    if (retired) return;
+    retired = true;
+    if (watchdog) clearInterval(watchdog);
+    // The channel the deltas ride is gone; stop every tail loop. The hub
+    // re-arms the watches once we reconnect, so no state is lost.
+    if (controlWs === ws) controlWs = null;
+    stopAllWatches();
+    const wait = backoff;
+    backoff = Math.min(backoff * 2, 30000);
+    log(`control channel ${reason}; reconnecting in ${Math.round(wait / 1000)}s`);
+    try { ws.close(); } catch {}
+    setTimeout(connectControl, wait);
+  };
+
   ws.addEventListener("open", () => {
     backoff = 1000;
+    lastMsgAt = Date.now();
     log(`control channel connected to ${WS_BASE} as ${NAME}`);
+    // Armed only once the hub has proven it pings (below), so a hub predating
+    // the app-level ping never trips this — it just keeps the old behaviour.
+    watchdog = setInterval(() => {
+      if (!hubPings || retired) return;
+      const idle = Date.now() - lastMsgAt;
+      if (idle > CONTROL_IDLE_TIMEOUT_MS) retire(`silent for ${Math.round(idle / 1000)}s (hub gone)`);
+    }, CONTROL_WATCHDOG_EVERY_MS);
   });
   ws.addEventListener("message", (ev) => {
+    lastMsgAt = Date.now(); // any frame proves the hub is still there
     let msg;
     try {
       msg = JSON.parse(typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString());
@@ -717,32 +1232,26 @@ function connectControl() {
       return;
     }
     if (!msg) return;
-    if (msg.open) {
+    if (msg.ping) {
+      // The hub's liveness beat. Nothing to do but note that this hub sends
+      // them, which is what arms the watchdog above.
+      hubPings = true;
+    } else if (msg.open) {
       const port = Number(msg.port) || DEFAULT_TTYD_PORT;
       openDataChannel(String(msg.open), port);
     } else if (msg.watch) {
       // The hub re-sends a watch for every still-attached glasses client on
-      // reconnect, so startWatch is idempotent (it just refreshes the path).
-      startWatch(String(msg.watch), msg.worktreePath ? String(msg.worktreePath) : "");
+      // reconnect, and again whenever a watched session's transcript moves, so
+      // startWatch is idempotent (it just refreshes the target).
+      startWatch(String(msg.watch), msg.worktreePath ? String(msg.worktreePath) : "",
+        msg.transcriptId ? String(msg.transcriptId) : "");
     } else if (msg.unwatch) {
       stopWatch(String(msg.unwatch));
     } else if (msg.poke) {
       pokeHeartbeat();
     }
   });
-  const reconnect = () => {
-    const wait = backoff;
-    backoff = Math.min(backoff * 2, 30000);
-    setTimeout(connectControl, wait);
-  };
-  ws.addEventListener("close", () => {
-    // The channel the deltas ride is gone; stop every tail loop. The hub
-    // re-arms the watches once we reconnect, so no state is lost.
-    if (controlWs === ws) controlWs = null;
-    stopAllWatches();
-    log(`control channel closed; reconnecting in ${Math.round(backoff / 1000)}s`);
-    reconnect();
-  });
+  ws.addEventListener("close", () => retire("closed"));
   ws.addEventListener("error", (e) => {
     // 'close' fires after 'error'; let it drive the reconnect to avoid double.
     log(`control channel error: ${e.message || "connection failed"}`);
@@ -755,5 +1264,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, entryText, entryBlocks, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, parseTaskNotification, parsePaneStatus, isStatusLine, isHintLine, cleanHint, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, parseAgentList, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
 }

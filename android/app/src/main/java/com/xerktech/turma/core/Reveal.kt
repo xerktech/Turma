@@ -47,6 +47,28 @@ fun advanceReveal(
     return RevealState(newestId, shown)
 }
 
+/**
+ * The live-turn base char count to carry into [advanceReveal], accounting for
+ * the fact that the tmux pane scrape driving the live turn is NOT monotonic:
+ * mid-generation it SWAPS between unrelated blocks (prose → a `Bash(…)`/`Read(…)`
+ * tool bullet → the next prose), so [newText] often does not continue the slice
+ * already revealed. When it doesn't, the reveal must SNAP to the new text rather
+ * than keep typing from a stale offset — otherwise the last line "deletes and
+ * re-streams over and over" (XERK-19). A port of chat.js `repaint`'s
+ * `startsWith(revealed prefix)` check, which Android's length-only
+ * [advanceReveal] can't do on its own.
+ *
+ * @param prevText the live text the previous [prevShown] indexes into
+ * @param prevShown chars revealed so far of [prevText]
+ * @param newText the newest live capture
+ * @return [prevShown] (clamped) when [newText] continues the revealed prefix,
+ *         else [newText].length (snap to full)
+ */
+fun liveRevealBase(prevText: String, prevShown: Int, newText: String): Int {
+    val revealed = prevText.take(prevShown.coerceIn(0, prevText.length))
+    return if (newText.startsWith(revealed)) prevShown.coerceAtMost(newText.length) else newText.length
+}
+
 /** Show an entry outright (entering a session so history renders full). */
 fun fullReveal(id: String, len: Int): RevealState = RevealState(id, len)
 

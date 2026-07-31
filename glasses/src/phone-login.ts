@@ -1,8 +1,12 @@
 // Phone-side login page (index.html) — plain DOM, no framework. This is what
 // the user sees on their phone screen while the WebView is open; it mirrors
-// the web dashboard's login (turma/public/login.html): the hub URL is
-// hardcoded (config.ts `resolveHubUrl`), so it only collects a username and
-// password.
+// the web dashboard's login (turma/public/login.html), plus a hub URL field:
+// the hub is self-hosted, so there is no default host this app could assume.
+//
+// The URL is persisted alongside the credentials (BridgeStorage survives Even
+// app restarts), so it is typed once per device and prefilled thereafter —
+// including across a sign-out, which clears the credentials but deliberately
+// keeps the hub you're signing back in to.
 //
 // On sign-in it POSTs /api/login (like the web login) with credentials
 // included, which both validates the password and sets the hub's session
@@ -12,7 +16,15 @@
 // iframe; the cookie set during sign-in authenticates that cross-site iframe
 // (the glasses keep rendering in parallel via the SDK, so navigating away is
 // not an option). Sign out clears the cookie and the stored credentials.
-import { authHeader, loadConfig, saveConfig, resolveHubUrl, type Config } from "./config.ts";
+import {
+  authHeader,
+  isConfigured,
+  loadConfig,
+  normalizeHubUrl,
+  resolveHubUrl,
+  saveConfig,
+  type Config,
+} from "./config.ts";
 import type { KeyValueStorage } from "./storage.ts";
 
 export interface PhoneLoginElements {
@@ -20,6 +32,7 @@ export interface PhoneLoginElements {
   app: HTMLElement; // the signed-in view
   dashboard: HTMLIFrameElement; // embedded hub dashboard
   form: HTMLFormElement;
+  url: HTMLInputElement;
   user: HTMLInputElement;
   password: HTMLInputElement;
   submit: HTMLButtonElement;
@@ -39,6 +52,7 @@ export function queryPhoneLoginElements(doc: Document = document): PhoneLoginEle
     app: byId("app"),
     dashboard: byId("dashboard"),
     form: byId("login-form"),
+    url: byId("hub-url"),
     user: byId("hub-user"),
     password: byId("hub-password"),
     submit: byId("login-submit"),
@@ -78,7 +92,10 @@ function showDashboard(els: PhoneLoginElements, config: Config): void {
   els.app.hidden = false;
 }
 
+// Prefills the hub URL as well as the user, so a device that has signed in
+// before (or signed out) only has to re-type the password.
 function showLogin(els: PhoneLoginElements, config: Config): void {
+  els.url.value = config.hubUrl;
   els.user.value = config.user;
   els.login.hidden = false;
   els.app.hidden = true;
@@ -96,7 +113,7 @@ export async function initPhoneLogin(
 ): Promise<void> {
   const config = await loadConfig(storage);
 
-  if (config.user && config.password) {
+  if (isConfigured(config)) {
     // Already signed in: refresh the dashboard cookie (best-effort — if it
     // fails, the iframe falls back to the hub's own login page) and show the
     // embedded dashboard.
@@ -114,12 +131,19 @@ export async function initPhoneLogin(
     e.preventDefault();
     void (async () => {
       els.error.classList.remove("show");
+      // The VITE_HUB_URL dev override, when set, still wins over the field —
+      // same precedence loadConfig applies — so `npm run dev` against a
+      // mock-hub behaves identically whatever the box happens to contain.
+      const typedUrl = normalizeHubUrl(els.url.value);
+      const hubUrl = resolveHubUrl() || typedUrl;
+      if (!hubUrl) {
+        showError(els, "Enter the URL of your Turma hub.");
+        return;
+      }
       els.submit.disabled = true;
       els.submit.textContent = "Signing in…";
-      // The hub URL is never user-editable — always the resolved (hardcoded /
-      // dev-override) host.
       const candidate: Config = {
-        hubUrl: resolveHubUrl(),
+        hubUrl,
         user: els.user.value,
         password: els.password.value,
         pollMs: config.pollMs,
@@ -128,7 +152,10 @@ export async function initPhoneLogin(
       try {
         res = await postLogin(candidate, fetchFn);
       } catch {
-        showError(els, "Couldn't reach the hub. Check your connection and try again.");
+        // Now that the host is hand-typed, an unreachable hub is as likely to
+        // be a typo (or a host missing from app.json's network whitelist) as it
+        // is to be the connection, so the message names the URL it just tried.
+        showError(els, `Couldn't reach ${hubUrl}. Check the URL and your connection.`);
         els.submit.disabled = false;
         els.submit.textContent = "Sign in";
         return;

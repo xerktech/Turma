@@ -47,11 +47,12 @@ export interface UsagePeriod {
   output?: number;
   cacheWrite?: number;
   cacheRead?: number;
-  cost?: number;
 }
 
 export interface UsageSummary {
   today?: UsagePeriod;
+  week?: UsagePeriod;
+  totals?: UsagePeriod;
   [key: string]: unknown;
 }
 

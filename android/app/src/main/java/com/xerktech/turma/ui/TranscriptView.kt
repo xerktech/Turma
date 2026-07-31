@@ -2,6 +2,7 @@ package com.xerktech.turma.ui
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -22,6 +23,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xerktech.turma.core.ChatItem
@@ -37,16 +39,47 @@ fun ChatItemView(item: ChatItem) {
     }
 }
 
+/**
+ * The fleet-wide chat text size (XERK-144): every hardcoded `.sp` below is scaled
+ * by this so one preference moves all of them together, keeping their relative
+ * proportions. Reads `ui.LocalTextSize`, provided at the app root.
+ */
+@Composable
+private fun scaledSp(base: Float): TextUnit = (base * LocalTextSize.current.current.scale).sp
+
+// The bubble keeps a max width so a long turn doesn't run edge to edge, but the
+// leftover gutter (available width − BASE_BUBBLE_MAX) is halved (XERK-74): the cap
+// is (available + BASE_BUBBLE_MAX)/2, so the empty space shrinks by half at any
+// screen width. Short turns still hug their text; only the cap moves.
+private val BASE_BUBBLE_MAX = 340.dp
+
 @Composable
 private fun TranscriptBubble(b: ChatItem.Bubble) {
     val isUser = b.role == "user"
     val shown = if (b.revealLen in 0 until b.text.length) b.text.take(b.revealLen) else b.text
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start) {
-        Surface(
-            color = if (isUser) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surfaceVariant,
-            shape = RoundedCornerShape(12.dp),
-            modifier = Modifier.widthIn(max = 320.dp),
-        ) { Text(shown, Modifier.padding(12.dp, 8.dp)) }
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val cap = (maxWidth + BASE_BUBBLE_MAX) / 2
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start) {
+            Surface(
+                color = if (isUser) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.widthIn(max = cap),
+            ) {
+                // Force full-contrast prose (web parity: assistant text is --ink,
+                // not the muted --ink-2). Without this the assistant bubble's
+                // surfaceVariant background makes Surface derive onSurfaceVariant
+                // (a grey) as its content color, so agent text read grey in dark
+                // mode while the user bubble — whose color isn't a theme token, so
+                // it keeps the ambient onSurface — read white (XERK-136).
+                Text(
+                    shown,
+                    Modifier.padding(10.dp, 6.dp),
+                    fontSize = scaledSp(13f),
+                    lineHeight = scaledSp(18f),
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+        }
     }
 }
 
@@ -54,8 +87,8 @@ private fun TranscriptBubble(b: ChatItem.Bubble) {
 private fun TranscriptThinking(text: String) {
     var open by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().clickable { open = !open }) {
-        Text("💭 thinking", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (open) Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 8.dp, top = 2.dp))
+        Text("💭 thinking", fontSize = scaledSp(12f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (open) Text(text, fontSize = scaledSp(12f), lineHeight = scaledSp(16f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 8.dp, top = 2.dp))
     }
 }
 
@@ -69,13 +102,13 @@ private fun TranscriptTool(t: ChatItem.Tool) {
         ),
         modifier = Modifier.fillMaxWidth().clickable { open = !open },
     ) {
-        Column(Modifier.padding(10.dp)) {
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 7.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("🔧 ${t.name}", fontWeight = FontWeight.SemiBold, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                if (t.input.isNotBlank()) Text(t.input.take(48), style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("🔧 ${t.name}", fontWeight = FontWeight.SemiBold, fontSize = scaledSp(12f), modifier = Modifier.weight(1f))
+                if (t.input.isNotBlank()) Text(t.input.take(48), fontSize = scaledSp(11f), fontFamily = FontFamily.Monospace, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             if (open && t.result.isNotBlank()) {
-                Text(t.result, Modifier.padding(top = 6.dp), style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+                Text(t.result, Modifier.padding(top = 5.dp), fontSize = scaledSp(11f), lineHeight = scaledSp(15f), fontFamily = FontFamily.Monospace)
             }
         }
     }

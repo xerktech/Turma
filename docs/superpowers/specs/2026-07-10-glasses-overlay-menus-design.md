@@ -7,9 +7,9 @@ Dictate more / Kill / Delete) and the **confirm dialog** (Kill/Delete →
 Cancel / Confirm) currently render as full-screen pages (`{type:"lines"}`) that
 replace the whole screen. The user wants them to **pop up on top of the current
 session** — a bordered box over the still-visible transcript — instead of
-navigating to a new page. This matches ClaudeHUD's sheet model and reuses the
-bordered-box machinery we already have for the session's bottom bar (the input
-box and the AskUserQuestion sheet).
+navigating to a new page. This matches the established sheet model and reuses
+the bordered-box machinery we already have for the session's bottom bar (the
+input box and the AskUserQuestion sheet).
 
 Scope (confirmed): **only** the actions menu and the confirm dialog — the two
 menus that pop over a session. The spawn flow (host/repo/prompt pickers) and

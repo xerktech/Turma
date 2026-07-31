@@ -3,10 +3,16 @@ package com.xerktech.turma.ui
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -15,23 +21,17 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
-import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -43,81 +43,113 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.compose.ui.graphics.Color
+import com.xerktech.turma.core.FleetSummary
 import com.xerktech.turma.core.LiveState
+import com.xerktech.turma.core.fleetSummary
 import com.xerktech.turma.core.liveState
+import com.xerktech.turma.core.orgColorMap
+import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.core.sessionBranch
 import com.xerktech.turma.core.sessionName
+import com.xerktech.turma.core.siteKeyOf
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.RepoInfo
 import com.xerktech.turma.model.SessionInfo
 import com.xerktech.turma.vm.FleetViewModel
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FleetScreen(
     onOpenChat: (String, String) -> Unit,
-    onHistory: () -> Unit,
-    onArchive: () -> Unit,
-    onSettings: () -> Unit,
+    modifier: Modifier = Modifier,
     vm: FleetViewModel = viewModel(),
 ) {
     val fleet by vm.fleet.collectAsStateWithLifecycle()
+    val org by vm.orgFilter.collectAsStateWithLifecycle()
+    val pending by vm.pending.collectAsStateWithLifecycle()
+    // Everything below is the fleet as scoped by the header's org control
+    // (XERK-62). A host polls exactly one org, so scoping the agent list scopes
+    // the tiles, the host cards, their repos and their sessions in one move.
+    val agents = remember(fleet.agents, org) { scopedAgents(fleet.agents, org) }
+    // Org card tints (XERK-142) come from the WHOLE fleet's org set, not the scoped
+    // one, so a host card keeps its colour regardless of the header's org filter.
+    val orgColors = remember(fleet.agents, fleet.orgColors) {
+        orgColorMap(fleet.agents.map { siteKeyOf(it) }, fleet.orgColors)
+    }
     val snackbar = remember { SnackbarHostState() }
 
     LaunchedEffect(Unit) { vm.start() }
     LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
 
-    // UI-only expansion + dialog state.
     val expandedHosts = remember { mutableStateMapOf<String, Boolean>() }
-    var spawnFor by remember { mutableStateOf<Triple<String, String, Boolean>?>(null) } // host, repo, isRoot
+    var spawnFor by remember { mutableStateOf<Triple<String, String, Boolean>?>(null) }
     var resumeFor by remember { mutableStateOf<Pair<String, RepoInfo>?>(null) }
     var actionsFor by remember { mutableStateOf<Pair<String, SessionInfo>?>(null) }
     var pruneFor by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var restartFor by remember { mutableStateOf<String?>(null) }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Turma") },
-                actions = {
-                    IconButton(onClick = onArchive) { Icon(Icons.Filled.Search, "Search / archive") }
-                    IconButton(onClick = onHistory) { Icon(Icons.Filled.History, "History") }
-                    IconButton(onClick = { vm.refresh() }) { Icon(Icons.Filled.Refresh, "Refresh") }
-                    IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, "Settings") }
-                },
-            )
-        },
-        snackbarHost = { SnackbarHost(snackbar) },
-    ) { pad ->
-        LazyColumn(Modifier.fillMaxSize().padding(pad)) {
-            if (fleet.agents.isEmpty()) {
-                item {
-                    Text(
-                        if (fleet.loading) "Loading fleet…" else (fleet.error ?: "No hosts reporting."),
-                        Modifier.padding(24.dp),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    Box(modifier) {
+        Column(Modifier.fillMaxSize()) {
+            ScreenHeader("Dashboard") {
+                IconButton(onClick = { vm.refresh() }) { Icon(Icons.Filled.Refresh, "Refresh") }
+            }
+            UpdateBanner()
+            LazyColumn(
+                Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(8.dp, 2.dp, 8.dp, 10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                // Hub-wide push health (XERK-152): when the hub has no FCM
+                // credential every alert is silently dropped, so say so here.
+                // Hub-wide, so it shows above the tiles regardless of the org
+                // filter or an empty fleet.
+                if (!fleet.pushEnabled) {
+                    item(key = "pushWarn") { PushOffBanner() }
+                }
+                if (agents.isNotEmpty()) {
+                    item(key = "tiles") { FleetTiles(remember(agents) { fleetSummary(agents) }) }
+                }
+                if (agents.isEmpty()) {
+                    item {
+                        Text(
+                            // Distinguish an empty fleet from one the org filter
+                            // narrowed to nothing — otherwise a scoped-out
+                            // dashboard reads as "no agents at all".
+                            when {
+                                fleet.agents.isNotEmpty() ->
+                                    "No hosts report this org. Pick another org (or “All orgs”) in the header."
+                                fleet.loading -> "Loading fleet…"
+                                else -> fleet.error ?: "No hosts reporting."
+                            },
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                items(agents, key = { it.key }) { agent ->
+                    HostSection(
+                        agent = agent,
+                        orgTint = orgTintOf(agent, orgColors),
+                        now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis(),
+                        expanded = expandedHosts[agent.key] ?: true,
+                        pending = pending,
+                        onToggle = { expandedHosts[agent.key] = !(expandedHosts[agent.key] ?: true) },
+                        onComposeSpawn = { host, repo, isRoot -> spawnFor = Triple(host, repo, isRoot) },
+                        onResume = { host, repo -> resumeFor = host to repo },
+                        onPrune = { host, repo -> pruneFor = host to repo },
+                        onRestart = { host -> restartFor = host },
+                        onClone = { host, repo, source -> vm.clone(host, repo, source) },
+                        onOpenSession = onOpenChat,
+                        onSessionActions = { host, s -> actionsFor = host to s },
+                        onCancelQueued = { host, s -> vm.kill(host, s.id) },
                     )
                 }
             }
-            items(fleet.agents, key = { it.key }) { agent ->
-                HostSection(
-                    agent = agent,
-                    now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis(),
-                    expanded = expandedHosts[agent.key] ?: true,
-                    onToggle = { expandedHosts[agent.key] = !(expandedHosts[agent.key] ?: true) },
-                    onQuickSpawn = { host, repo -> vm.spawn(host, repo) },
-                    onComposeSpawn = { host, repo, isRoot -> spawnFor = Triple(host, repo, isRoot) },
-                    onResume = { host, repo -> resumeFor = host to repo },
-                    onPrune = { host, repo -> pruneFor = host to repo },
-                    onClone = { host, repo -> vm.clone(host, repo) },
-                    onOpenSession = onOpenChat,
-                    onSessionActions = { host, s -> actionsFor = host to s },
-                )
-                HorizontalDivider()
-            }
         }
+        SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(16.dp))
     }
 
     spawnFor?.let { (host, repo, isRoot) ->
@@ -155,46 +187,130 @@ fun FleetScreen(
             onDismiss = { pruneFor = null },
         )
     }
+    restartFor?.let { host ->
+        ConfirmDialog(
+            title = "Restart $host's agent?",
+            message = "Restarts the agent manager (e.g. after fixing an expired Claude login). It briefly goes down and comes back; running sessions are re-adopted on boot.",
+            confirmLabel = "Restart",
+            onConfirm = { vm.restartAgent(host); restartFor = null },
+            onDismiss = { restartFor = null },
+        )
+    }
+}
+
+/** The coding agent a host runs, for its header — mirrors index.html codingAgent(). */
+fun codingAgentLabel(a: AgentInfo): String {
+    val c = a.codingAgent
+    if (c != null && c.version.isNotBlank()) return "${c.name.ifBlank { "Claude Code" }} ${c.version}"
+    val raw = a.claudeVersion.trim()
+    if (raw.isEmpty()) return "–"
+    val m = Regex("^(\\S+)\\s+\\((.+)\\)$").find(raw)
+    return if (m != null) "${m.groupValues[2]} ${m.groupValues[1]}" else "Claude Code $raw"
+}
+
+/** The org tint for a host card (XERK-142): its org's palette colour, or null for a
+ *  host with no tracker creds (no org → stays plain surface). colorMap is built over
+ *  the whole fleet so the colour is stable regardless of the header's org filter. */
+private fun orgTintOf(agent: AgentInfo, colorMap: Map<String, Int>): Color? {
+    val series = com.xerktech.turma.ui.theme.TurmaColors.series
+    val slot = colorMap[siteKeyOf(agent)] ?: return null
+    return series[slot % series.size]
 }
 
 @Composable
 private fun HostSection(
     agent: AgentInfo,
+    orgTint: Color?,
     now: Long,
     expanded: Boolean,
+    pending: Map<String, FleetViewModel.SessPending>,
     onToggle: () -> Unit,
-    onQuickSpawn: (String, String) -> Unit,
     onComposeSpawn: (String, String, Boolean) -> Unit,
     onResume: (String, RepoInfo) -> Unit,
     onPrune: (String, String) -> Unit,
-    onClone: (String, String) -> Unit,
+    onRestart: (String) -> Unit,
+    onClone: (String, String, String?) -> Unit,
     onOpenSession: (String, String) -> Unit,
     onSessionActions: (String, SessionInfo) -> Unit,
+    onCancelQueued: (String, SessionInfo) -> Unit,
 ) {
-    Column(Modifier.fillMaxWidth()) {
-        Row(
-            Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(16.dp, 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Icon(if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, null)
-            Text(agent.device.ifBlank { agent.key }, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-            Pill(if (agent.online) "online" else "offline")
-        }
-        AnimatedVisibility(expanded) {
-            Column(Modifier.fillMaxWidth()) {
-                CloneBar(agent, onClone = { repo -> onClone(agent.key, repo) })
-                for (repo in agent.repos) {
-                    val sessions = agent.sessions.filter { if (repo.root) it.root else (!it.root && it.repo == repo.name) }
-                    RepoSection(
-                        host = agent.key, repo = repo, sessions = sessions, now = now, hostLastSeen = agent.lastSeen,
-                        onQuickSpawn = { onQuickSpawn(agent.key, repo.name) },
-                        onComposeSpawn = { onComposeSpawn(agent.key, repo.name, repo.root) },
-                        onResume = { onResume(agent.key, repo) },
-                        onPrune = { onPrune(agent.key, repo.name) },
-                        onOpenSession = { s -> onOpenSession(agent.key, s.id) },
-                        onSessionActions = { s -> onSessionActions(agent.key, s) },
+    TurmaCard(Modifier.fillMaxWidth(), tint = orgTint) {
+        Column(Modifier.fillMaxWidth()) {
+            Row(
+                Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(10.dp, 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Column(Modifier.weight(1f)) {
+                    Text(agent.device.ifBlank { agent.key }, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                    Text(
+                        "${codingAgentLabel(agent)} · Turma ${agent.agentVersion.ifBlank { "–" }}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
                     )
+                }
+                // Restart the host's agent manager (XERK-157) — mirrors
+                // index.html's restartBtn. Offered only on a live host that isn't
+                // already restarting (an offline one has no heartbeat to carry the
+                // command; an `updating` one is already on its way back).
+                if (agent.online && agent.updating == null) {
+                    IconButton(onClick = { onRestart(agent.key) }, modifier = Modifier.size(32.dp)) {
+                        Icon(Icons.Filled.Refresh, "Restart agent", Modifier.size(18.dp))
+                    }
+                }
+                // Claude subscription-login health (XERK-98): a red "login" pill
+                // when the shared login has lapsed (sessions can't authenticate)
+                // and an amber "expiring" one when it's about to. Shown only when
+                // it needs action — mirrors index.html's claudeAuthBadge.
+                agent.claudeAuth?.let { ca ->
+                    when {
+                        ca.needsLogin -> Pill("🔑 login", color = com.xerktech.turma.ui.theme.TurmaColors.critical)
+                        ca.expiringSoon -> Pill("🔑 expiring", color = com.xerktech.turma.ui.theme.TurmaColors.warning)
+                        else -> {}
+                    }
+                }
+                // Board (Jira/Azure DevOps) reachability (XERK-156): a red pill
+                // when the configured tracker's last poll failed — most often the
+                // board being VPN-only and the host off it. Shown only on an
+                // online host with a configured board; mirrors index.html's
+                // boardHealthBadge.
+                agent.jira?.let { j ->
+                    if (agent.online && j.configured && !j.error.isNullOrBlank()) {
+                        Pill("📋 board", color = com.xerktech.turma.ui.theme.TurmaColors.critical)
+                    }
+                }
+                // An announced update restart reads as "updating" (warning), not
+                // the outage-looking "offline" (XERK-29).
+                when {
+                    agent.updating != null -> Pill(
+                        "updating" + agent.updating.version.takeIf { it.isNotBlank() }?.let { " → $it" }.orEmpty(),
+                        color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                    )
+                    agent.online -> Pill("online", color = com.xerktech.turma.ui.theme.TurmaColors.good)
+                    else -> Pill("offline", color = null)
+                }
+            }
+            AnimatedVisibility(expanded) {
+                Column(Modifier.fillMaxWidth().padding(bottom = 4.dp)) {
+                    CloneBar(agent, onClone = { repo, source -> onClone(agent.key, repo, source) })
+                    for (repo in agent.repos) {
+                        val sessions = agent.sessions.filter { if (repo.root) it.root else (!it.root && it.repo == repo.name) }
+                        RepoSection(
+                            repo = repo, sessions = sessions, now = now, hostLastSeen = agent.lastSeen,
+                            hostKey = agent.key, pending = pending,
+                            onComposeSpawn = { onComposeSpawn(agent.key, repo.name, repo.root) },
+                            onResume = { onResume(agent.key, repo) },
+                            onPrune = { onPrune(agent.key, repo.name) },
+                            onOpenSession = { s -> onOpenSession(agent.key, s.id) },
+                            onSessionActions = { s -> onSessionActions(agent.key, s) },
+                            onCancelQueued = { s -> onCancelQueued(agent.key, s) },
+                        )
+                    }
                 }
             }
         }
@@ -203,73 +319,356 @@ private fun HostSection(
 
 @Composable
 private fun RepoSection(
-    host: String,
     repo: RepoInfo,
     sessions: List<SessionInfo>,
     now: Long,
     hostLastSeen: Long,
-    onQuickSpawn: () -> Unit,
+    hostKey: String,
+    pending: Map<String, FleetViewModel.SessPending>,
     onComposeSpawn: () -> Unit,
     onResume: () -> Unit,
     onPrune: () -> Unit,
     onOpenSession: (SessionInfo) -> Unit,
     onSessionActions: (SessionInfo) -> Unit,
+    onCancelQueued: (SessionInfo) -> Unit,
 ) {
-    Column(Modifier.fillMaxWidth().padding(start = 12.dp)) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
         Row(
-            Modifier.fillMaxWidth().padding(8.dp, 6.dp),
+            Modifier.fillMaxWidth().heightIn(min = 30.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
         ) {
             Text(
                 if (repo.root) "⌂ Repos root" else repo.name,
-                fontWeight = FontWeight.SemiBold,
+                style = MaterialTheme.typography.titleSmall,
                 modifier = Modifier.weight(1f),
             )
-            // One root session at a time — hide "+ New" once a root session exists.
             val rootBusy = repo.root && sessions.any { it.status == "running" }
             if (!rootBusy) {
-                IconButton(onClick = onQuickSpawn) { Icon(Icons.Filled.Add, "New session") }
-                IconButton(onClick = onComposeSpawn) { Icon(Icons.Filled.Tune, "New session with options") }
+                IconButton(onClick = onComposeSpawn, modifier = Modifier.size(32.dp)) { Icon(Icons.Filled.Add, "New session", Modifier.size(18.dp)) }
             }
-            if (repo.resumable.isNotEmpty()) TextButton(onClick = onResume) { Text("Resume") }
-            if (!repo.root) TextButton(onClick = onPrune) { Text("Prune") }
+            if (repo.resumable.isNotEmpty()) GhostButton("Resume", onResume)
+            if (!repo.root) GhostButton("Prune", onPrune)
         }
-        for (s in sessions) {
-            SessionRow(
-                session = s,
-                state = liveState(s, hostLastSeen, now),
-                onClick = { onOpenSession(s) },
-                onActions = { onSessionActions(s) },
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(bottom = 4.dp)) {
+            for (s in sessions) {
+                SessionCard(
+                    session = s,
+                    state = liveState(s, hostLastSeen, now),
+                    now = now,
+                    pendingKind = FleetViewModel.sessPending(pending, hostKey, s.id),
+                    onClick = { onOpenSession(s) },
+                    onActions = { onSessionActions(s) },
+                    onCancelQueued = { onCancelQueued(s) },
+                )
+            }
+        }
+    }
+}
+
+/** Trim "claude-opus-4-8-20250801" → "opus-4-8" (web index.html shortModels). */
+private fun shortModels(models: List<com.xerktech.turma.model.ModelUsage>): String =
+    if (models.isEmpty()) "–"
+    else models.take(2).joinToString(", ") {
+        it.model.removePrefix("claude-").replace(Regex("-\\d{8}$"), "")
+    }
+
+/**
+ * A session card with the web dashboard card's detail set (index.html
+ * `sessCard`, XERK-78): status badge (incl. queued + the optimistic "stopping"),
+ * id, worktree/branch (or "repos root"), the work-risk line, state/queued-reason
+ * row, question preview, error, created/activity, and all-time tokens + output.
+ * A queued card's one action is Cancel; an in-flight action shows as a busy
+ * marker until the fleet reflects it (FleetViewModel.pending).
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SessionCard(
+    session: SessionInfo,
+    state: LiveState,
+    now: Long,
+    pendingKind: String?,
+    onClick: () -> Unit,
+    onActions: () -> Unit,
+    onCancelQueued: () -> Unit,
+) {
+    val st = session.status.ifBlank { "stopped" }
+    val killing = pendingKind == "kill"
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    TurmaCard(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().clickable(onClick = onClick).padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            StateDot(if (st == "queued") LiveState.WAITING else state)
+            // Name on one ellipsized line; the detail rows wrap in FlowRows; any
+            // PR pill(s) sit on their OWN line below the info — never squeezing
+            // the name into a many-line, oversized card.
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        sessionName(session),
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    // Status badge; a confirmed kill flips it to "stopping" before
+                    // the command even reaches the agent (web `killing`).
+                    when {
+                        killing -> Pill("stopping", color = com.xerktech.turma.ui.theme.TurmaColors.waiting)
+                        st == "running" -> {}
+                        st == "queued" -> Pill("queued", color = com.xerktech.turma.ui.theme.TurmaColors.waiting)
+                        st == "error" -> Pill("error", color = MaterialTheme.colorScheme.error)
+                        else -> Pill(st)
+                    }
+                }
+                // id · worktree (or repos root) · branch — the card's identity row.
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(session.id, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = muted, maxLines = 1)
+                    if (session.root) {
+                        Text("· repos root (no worktree)", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                    } else {
+                        val wt = session.worktreePath.substringAfterLast('/').ifBlank { "–" }
+                        Text("· $wt", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            "· ${sessionBranch(session)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = muted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                // The claude.ai/code Remote Control name this session registered.
+                if (session.rcName.isNotBlank()) {
+                    Text(
+                        "RC ${session.rcName}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = muted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                // Work-risk line: unpushed commits / dirty files read as risk.
+                com.xerktech.turma.core.workLine(session)?.let { w ->
+                    Text(
+                        w.text,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (w.risk) com.xerktech.turma.ui.theme.TurmaColors.waiting else muted,
+                        maxLines = 2,
+                    )
+                }
+                // State row: shutting down / live state / queued reason + since.
+                when {
+                    killing -> Text("shutting down…", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                    st == "running" -> Text(liveStateLabel(state), style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                    st == "queued" -> {
+                        val since = session.queuedAt.takeIf { it.isNotBlank() }
+                            ?.let { " · " + com.xerktech.turma.core.ageStr(it, now) }.orEmpty()
+                        Text(
+                            "queued — " + queuedReasonText(session.queuedReason) + since,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                            maxLines = 1,
+                        )
+                    }
+                }
+                // Pending question preview (web Question row).
+                session.session?.question?.takeIf { it.isNotBlank() }?.let { q ->
+                    Text(
+                        "“$q”",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                if (st == "error" && session.errorMsg.isNotBlank()) {
+                    Text(session.errorMsg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, maxLines = 2)
+                }
+                // Created / stopped · activity + models · all-time tokens + out.
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    session.createdAt.takeIf { it.isNotBlank() }?.let {
+                        Text("created ${com.xerktech.turma.core.ageStr(it, now)}", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                    }
+                    session.stoppedAt.takeIf { it.isNotBlank() }?.let {
+                        Text("· stopped ${com.xerktech.turma.core.ageStr(it, now)}", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                    }
+                    session.usage?.let { u ->
+                        u.lastActivity.takeIf { it.isNotBlank() }?.let {
+                            Text("· active ${com.xerktech.turma.core.ageStr(it, now)}", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                        }
+                        u.totals.total.takeIf { it > 0 }?.let {
+                            Text(
+                                "· ${fmtTokens(it)} (${fmtTokens(u.totals.output)} out) · ${shortModels(u.models)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = muted,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                }
+                if (session.prs.isNotEmpty()) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        session.prs.forEach { PrBadge(it) }
+                    }
+                }
+            }
+            when {
+                // A command is in flight — one busy marker, controls disabled
+                // until the polled state reflects it (web sessPending labels).
+                pendingKind != null -> Text(
+                    when (pendingKind) {
+                        "kill" -> "Killing…"
+                        "start" -> "Starting…"
+                        "restart" -> "Restarting…"
+                        "resume" -> "Resuming…"
+                        "delete" -> "Deleting…"
+                        else -> "Working…"
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = muted,
+                    modifier = Modifier.padding(end = 6.dp),
+                )
+                // A queued session has no worktree yet: the only action is
+                // Cancel (an arm/confirm kill dropping the queued record).
+                st == "queued" -> {
+                    var armed by remember(session.id) { mutableStateOf(false) }
+                    LaunchedEffect(armed) { if (armed) { kotlinx.coroutines.delay(3500); armed = false } }
+                    GhostButton(
+                        if (armed) "Confirm" else "Cancel",
+                        onClick = { if (armed) { armed = false; onCancelQueued() } else armed = true },
+                    )
+                }
+                else -> IconButton(onClick = onActions) { Icon(Icons.Filled.MoreVert, "Actions", modifier = Modifier.size(20.dp)) }
+            }
+        }
+    }
+}
+
+/**
+ * The six fleet summary tiles at the top of the dashboard, a 2-up grid matching
+ * the web dashboard's `#tiles` (Hosts online / Running / Waiting on you / Tokens
+ * today / this week / all-time). Data is [fleetSummary], a pure port of the web
+ * reducers.
+ */
+// Hub-wide "mobile push is off" banner (XERK-152) — shown above the tiles when
+// the hub reports no FCM credential, so a disabled push config is visible instead
+// of silently dropping every alert.
+@Composable
+private fun PushOffBanner() {
+    Surface(
+        color = MaterialTheme.colorScheme.tertiaryContainer,
+        contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+        shape = MaterialTheme.shapes.small,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("🔕")
+            Text(
+                "Mobile push is off — the hub has no FCM credential " +
+                    "(FCM_SERVICE_ACCOUNT_JSON), so Android notifications aren't being sent. " +
+                    "Set it on the hub and redeploy to restore them.",
+                style = MaterialTheme.typography.bodySmall,
             )
         }
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SessionRow(session: SessionInfo, state: LiveState, onClick: () -> Unit, onActions: () -> Unit) {
-    Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(start = 16.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+private fun FleetTiles(s: FleetSummary) {
+    FlowRow(
+        Modifier.fillMaxWidth().padding(vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+        maxItemsInEachRow = 2,
     ) {
-        StateDot(state)
-        Column(Modifier.weight(1f)) {
-            Text(sessionName(session), fontWeight = FontWeight.Medium)
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    sessionBranch(session),
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = FontFamily.Monospace,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+        val tileMod = Modifier.weight(1f)
+        SummaryTile("Hosts online", "${s.hostsOnline} / ${s.hostsTotal}",
+            s.devices.joinToString(", ").ifBlank { "no devices yet" }, tileMod)
+        SummaryTile("Running sessions",
+            if (s.maxSessions != null) "${s.running} / ${s.maxSessions}" else s.running.toString(),
+            "${s.totalSessions} total", tileMod)
+        SummaryTile("Waiting on you", s.waiting.toString(), "sessions with a question", tileMod)
+        SummaryTile("Tokens today", fmtTokens(s.tokensToday), "all sessions, incl. cache", tileMod)
+        SummaryTile("Tokens this week", fmtTokens(s.tokensWeek), "last 7 days (UTC)", tileMod)
+        SummaryTile("Tokens all-time", fmtTokens(s.tokensAllTime),
+            if (s.topModels == "–") "every session ever" else "mostly ${s.topModels}", tileMod)
+    }
+}
+
+@Composable
+private fun SummaryTile(label: String, value: String, hint: String, modifier: Modifier = Modifier) {
+    TurmaCard(modifier) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+            SectionLabel(label)
+            Text(
+                value,
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+            Text(
+                hint,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 1.dp),
+            )
+        }
+    }
+}
+
+/**
+ * Slim page header used on the top-level screens in place of the removed app bar.
+ * Always carries a ⋮ overflow with "Sign out" (via [LocalSignOut]) so it's
+ * reachable on every top-level page, matching the web's per-page nav Sign out,
+ * and the org filter (XERK-62) for the same reason — one scope, on every screen.
+ */
+@Composable
+fun ScreenHeader(title: String, actions: @Composable () -> Unit = {}) {
+    val signOut = LocalSignOut.current
+    var menuOpen by remember { mutableStateOf(false) }
+    Row(
+        // Tight to the status bar: the Scaffold already insets past it, so only a
+        // hair of top padding here keeps the title hugging the status bar.
+        Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 2.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.weight(1f))
+        // Both are shared-chrome controls, on every top-level screen: the one
+        // write action (New ticket, XERK-150) beside the org scope (XERK-62).
+        NewTicketAction()
+        OrgFilterAction()
+        actions()
+        Box {
+            IconButton(onClick = { menuOpen = true }) { Icon(Icons.Filled.MoreVert, "More") }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Sign out") },
+                    onClick = { menuOpen = false; signOut() },
                 )
-                Text("· ${liveStateLabel(state)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                session.usage?.today?.cost?.takeIf { it > 0 }?.let {
-                    Text("· $%.2f".format(it), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
             }
         }
-        session.prs.firstOrNull()?.let { PrBadge(it) }
-        IconButton(onClick = onActions) { Icon(Icons.Filled.MoreVert, "Actions", modifier = Modifier.size(20.dp)) }
     }
 }

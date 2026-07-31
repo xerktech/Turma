@@ -9,6 +9,8 @@ faked at its two chokepoints, run()/run_ok(), plus Popen for ttyd — no
 docker/tmux/git needed.
 """
 
+import base64
+import datetime
 import importlib.util
 import io
 import json
@@ -21,6 +23,8 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
+import urllib.request
 from collections import deque
 from unittest import mock
 
@@ -40,6 +44,14 @@ def write_jsonl(path, lines):
         for line in lines:
             f.write(line if isinstance(line, str) else json.dumps(line))
             f.write("\n")
+
+
+def write_json(path, data):
+    """Seed one of the manager's own state files (sessions.json, closed.json, a
+    ledger) as it would find it on disk at construction."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f)
 
 
 def usage_entry(ts, msg_id, request_id, model, inp, out, cw=0, cr=0):
@@ -166,6 +178,175 @@ class TestDeviceName(unittest.TestCase):
             self._run(docker_name="docker-desktop", smb_name=""), "unknown-device")
 
 
+class TestCodingAgent(unittest.TestCase):
+    """Which coding agent this host runs, as heartbeated for the hub's header.
+    The name comes out of the CLI's own --version reply so it stays right if the
+    product renames itself, with the build's default as the fallback."""
+
+    def _run(self, out):
+        with mock.patch.object(ha, "run", return_value=out):
+            return ha.coding_agent()
+
+    def test_version_reply_is_split_into_name_and_version(self):
+        # `claude --version` prints "<version> (<product>)".
+        self.assertEqual(
+            self._run("2.1.211 (Claude Code)"),
+            {"name": "Claude Code", "version": "2.1.211"},
+        )
+
+    def test_product_name_is_read_from_the_reply_not_assumed(self):
+        self.assertEqual(
+            self._run("1.0.0 (Claude Code Next)"),
+            {"name": "Claude Code Next", "version": "1.0.0"},
+        )
+
+    def test_unparseable_reply_keeps_the_whole_string_as_the_version(self):
+        # Still more use to the operator than dropping it.
+        self.assertEqual(
+            self._run("2.1.211"), {"name": "Claude Code", "version": "2.1.211"})
+
+    def test_cli_that_cannot_be_run_reports_nothing(self):
+        # run() returns "" on any failure; the hub renders unknown.
+        self.assertIsNone(self._run(""))
+
+
+class TestClaudeAuthStatus(unittest.TestCase):
+    """The shared subscription login's health, heartbeated so the hub can alert
+    when re-login is required (XERK-98). The REFRESH-token expiry is the signal;
+    the short-lived access token is not."""
+
+    NOW = 1_700_000_000_000  # fixed "now" in epoch ms for deterministic windows
+
+    def _status(self, oauth, warn_ms=None):
+        """Run claude_auth_status against a temp credentials file holding
+        `oauth` under claudeAiOauth (None writes no such key)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".credentials.json")
+            body = {} if oauth is None else {"claudeAiOauth": oauth}
+            with open(path, "w") as f:
+                json.dump(body, f)
+            warn = ha.CLAUDE_AUTH_WARN_MS if warn_ms is None else warn_ms
+            with mock.patch.object(ha, "CLAUDE_AUTH_WARN_MS", warn):
+                return ha.claude_auth_status(path=path, now_ms=self.NOW)
+
+    def test_missing_file_reads_as_not_logged_in(self):
+        st = ha.claude_auth_status(path="/no/such/creds.json", now_ms=self.NOW)
+        self.assertFalse(st["present"])
+        self.assertTrue(st["needsLogin"])
+        self.assertFalse(st["expiringSoon"])
+
+    def test_file_without_oauth_block_is_not_a_login(self):
+        st = self._status(None)
+        self.assertFalse(st["present"])
+        self.assertTrue(st["needsLogin"])
+
+    def test_oauth_without_access_token_is_not_a_login(self):
+        st = self._status({"refreshTokenExpiresAt": self.NOW + 10**9})
+        self.assertFalse(st["present"])
+        self.assertTrue(st["needsLogin"])
+
+    def test_healthy_login_needs_nothing(self):
+        st = self._status({
+            "accessToken": "a",
+            "refreshTokenExpiresAt": self.NOW + 30 * 24 * 3600 * 1000,
+            "subscriptionType": "max",
+        })
+        self.assertTrue(st["present"])
+        self.assertFalse(st["needsLogin"])
+        self.assertFalse(st["expiringSoon"])
+        self.assertEqual(st["subscriptionType"], "max")
+
+    def test_lapsed_refresh_token_needs_login(self):
+        # A refresh token in the past means claude hasn't refreshed in its
+        # window — the operator must run `claude /login`.
+        st = self._status({"accessToken": "a", "refreshTokenExpiresAt": self.NOW - 1})
+        self.assertTrue(st["present"])
+        self.assertTrue(st["needsLogin"])
+        self.assertFalse(st["expiringSoon"])
+
+    def test_refresh_token_inside_warn_window_is_expiring_soon(self):
+        warn = 3 * 24 * 3600 * 1000
+        st = self._status(
+            {"accessToken": "a", "refreshTokenExpiresAt": self.NOW + warn // 2},
+            warn_ms=warn,
+        )
+        self.assertFalse(st["needsLogin"])
+        self.assertTrue(st["expiringSoon"])
+
+    def test_expired_access_token_alone_does_not_need_login(self):
+        # The access token is auto-refreshed; only the refresh token matters.
+        st = self._status({
+            "accessToken": "a",
+            "expiresAt": self.NOW - 3600 * 1000,           # access expired
+            "refreshTokenExpiresAt": self.NOW + 30 * 24 * 3600 * 1000,
+        })
+        self.assertFalse(st["needsLogin"])
+        self.assertFalse(st["expiringSoon"])
+
+    def test_present_login_with_unknown_expiry_is_assumed_ok(self):
+        # An older credential shape with no refresh expiry: never cry wolf.
+        st = self._status({"accessToken": "a"})
+        self.assertTrue(st["present"])
+        self.assertFalse(st["needsLogin"])
+        self.assertFalse(st["expiringSoon"])
+        self.assertIsNone(st["refreshExpiresAt"])
+
+    def test_unreadable_json_reads_as_not_logged_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".credentials.json")
+            with open(path, "w") as f:
+                f.write("{ not json")
+            st = ha.claude_auth_status(path=path, now_ms=self.NOW)
+        self.assertFalse(st["present"])
+        self.assertTrue(st["needsLogin"])
+
+
+class TestAgentVersion(unittest.TestCase):
+    """This build's own version, as heartbeated for the hub's host header:
+    baked env (container image) -> VERSION beside hub-agent.py (native install)
+    -> repo-root VERSION (dev checkout) -> None."""
+
+    def _run(self, *, env=None, prefix_version=None, root_version=None):
+        """Resolve agent_version() with hub-agent.py pretending to live in a
+        temp dir, so the VERSION files a real install/checkout would leave next
+        to it can be laid out per-case."""
+        with tempfile.TemporaryDirectory() as tmp:
+            here = os.path.join(tmp, "prefix")
+            os.makedirs(here)
+            if prefix_version is not None:
+                with open(os.path.join(here, "VERSION"), "w") as f:
+                    f.write(prefix_version)
+            if root_version is not None:
+                with open(os.path.join(tmp, "VERSION"), "w") as f:
+                    f.write(root_version)
+            with mock.patch.dict(os.environ, env or {}, clear=True), \
+                    mock.patch.object(ha, "__file__",
+                                      os.path.join(here, "hub-agent.py")):
+                return ha.agent_version()
+
+    def test_env_wins_first(self):
+        # The image bakes TURMA_AGENT_VERSION at build time; it beats any file
+        # and doubles as an operator override.
+        self.assertEqual(
+            self._run(env={"TURMA_AGENT_VERSION": "0.4.2"},
+                      prefix_version="0.3.9", root_version="0.3"),
+            "0.4.2",
+        )
+
+    def test_installed_version_file_beats_repo_root(self):
+        # native/install.sh stamps VERSION into the prefix beside hub-agent.py.
+        self.assertEqual(self._run(prefix_version="0.3.9\n", root_version="0.3"), "0.3.9")
+
+    def test_repo_root_version_used_for_a_dev_checkout(self):
+        self.assertEqual(self._run(root_version="0.3\n"), "0.3")
+
+    def test_unstamped_build_reports_nothing(self):
+        # Nothing to read -> None, so the hub says "unknown" rather than showing
+        # a version this build can't actually vouch for.
+        self.assertIsNone(self._run())
+        self.assertIsNone(self._run(env={"TURMA_AGENT_VERSION": "  "}))
+
+
 class TestSmbHostName(unittest.TestCase):
     """The SMB2/NTLM computer-name extraction (Docker Desktop / WSL2 path)."""
 
@@ -254,9 +435,23 @@ class TestSpawnOptionHelpers(unittest.TestCase):
         self.assertEqual(ha.resolve_model("opus"), "opus")
         self.assertEqual(ha.resolve_model("SONNET"), "sonnet")
         self.assertEqual(ha.resolve_model("haiku"), "haiku")
+        self.assertEqual(ha.resolve_model("fable"), "fable")
         for bad in ("gpt-4", "opus; rm", "claude-3"):
             with self.assertRaises(ValueError):
                 ha.resolve_model(bad)
+
+    def test_resolve_model_probed_extras(self):
+        # An alias the CLI itself reported available is accepted; anything not
+        # on either list still isn't, and the bracketed 1M variants never pass
+        # (they'd be interpolated into a launch command line, where the
+        # brackets are a shell glob).
+        extra = ("opusplan", "sonnet[1m]", "best")
+        self.assertEqual(ha.resolve_model("opusplan", extra), "opusplan")
+        self.assertEqual(ha.resolve_model("best", extra), "best")
+        with self.assertRaises(ValueError):
+            ha.resolve_model("sonnet[1m]", extra)
+        with self.assertRaises(ValueError):
+            ha.resolve_model("opusplan")  # not probed, not static
 
     def test_resolve_permission_mode(self):
         self.assertEqual(ha.resolve_permission_mode(""), "auto")
@@ -269,6 +464,20 @@ class TestSpawnOptionHelpers(unittest.TestCase):
         for bad in ("root", "yolo", "accept edits"):
             with self.assertRaises(ValueError):
                 ha.resolve_permission_mode(bad)
+
+    def test_perm_cycle_for(self):
+        base = ["default", "acceptEdits", "plan"]
+        # Base modes / blank / unknown launch -> base cycle only, no optionals.
+        self.assertEqual(ha.perm_cycle_for("default"), base)
+        self.assertEqual(ha.perm_cycle_for("acceptEdits"), base)
+        self.assertEqual(ha.perm_cycle_for("plan"), base)
+        # None -> assume auto (Turma's launch default).
+        self.assertEqual(ha.perm_cycle_for(None), base + ["auto"])
+        self.assertEqual(ha.perm_cycle_for(""), base + ["auto"])
+        # Launching into an optional mode puts exactly that one in the cycle.
+        self.assertEqual(ha.perm_cycle_for("auto"), base + ["auto"])
+        self.assertEqual(ha.perm_cycle_for("bypassPermissions"),
+                         base + ["bypassPermissions"])
 
     def test_resolve_base_ref(self):
         # Blank / HEAD -> the latest default branch (delegates to default_base_ref).
@@ -321,20 +530,20 @@ class TestUsageReport(ProjectDirMixin, unittest.TestCase):
     def test_missing_project_dir_returns_none(self):
         self.assertIsNone(ha.usage_report("/does/not/exist"))
 
-    def test_aggregation_dedup_and_pricing(self):
-        today = time.strftime("%Y-%m-%d")
+    def test_aggregation_dedup_and_model_tokens(self):
+        today = ha._utc_today()
         opus = usage_entry(
             "2026-07-01T10:00:00.000Z", "m1", "r1",
             "claude-opus-4-20250514", 1_000_000, 100_000,
-        )  # 1M in @ $5 + 100k out @ $25 = $7.50
+        )
         unknown = usage_entry(
             "2026-07-02T09:00:00.000Z", "m2", "r2",
             "weird-model-x", 10, 20, cw=30, cr=40,
-        )  # unknown model: tokens counted, cost 0
+        )  # a model the agent has never heard of still counts, by name
         no_id = usage_entry(
             f"{today}T01:00:00.000Z", None, None,
             "claude-sonnet-4-20250514", 100_000, 0,
-        )  # id-less entries are never deduped; sonnet 100k in = $0.30
+        )  # id-less entries are never deduped
 
         write_jsonl(os.path.join(self.proj, "a.jsonl"), [
             opus,
@@ -357,19 +566,82 @@ class TestUsageReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["totals"]["output"], 100_000 + 20)
         self.assertEqual(rep["totals"]["cacheWrite"], 30)
         self.assertEqual(rep["totals"]["cacheRead"], 40)
-        self.assertAlmostEqual(rep["totals"]["cost"], 7.5 + 0.0 + 0.6, places=2)
 
         # Per-day buckets: opus on 07-01, unknown on 07-02, sonnet today.
-        self.assertAlmostEqual(rep["days"]["2026-07-01"]["cost"], 7.5, places=2)
+        self.assertEqual(rep["days"]["2026-07-01"]["input"], 1_000_000)
         self.assertEqual(rep["days"]["2026-07-02"]["input"], 10)
-        self.assertAlmostEqual(rep["days"]["2026-07-02"]["cost"], 0.0, places=2)
         self.assertEqual(rep["today"], rep["days"][today])
         self.assertEqual(rep["today"]["input"], 200_000)
+        # Today is inside the week window; the older days are far outside it.
+        self.assertEqual(rep["week"]["input"], 200_000)
 
         self.assertEqual(rep["lastActivity"], f"{today}T01:00:00.000Z")
-        # sonnet has 2 messages, opus and weird-model-x 1 each -> sonnet first.
-        self.assertEqual(rep["models"][0], "claude-sonnet-4-20250514")
-        self.assertIn("weird-model-x", rep["models"])
+
+        # Per-model token counts, biggest consumer first. Opus leads on tokens
+        # (1.1M) despite sonnet having more messages (2) — the report ranks by
+        # what was consumed, not how many turns it took.
+        models = {m["model"]: m for m in rep["models"]}
+        self.assertEqual([m["model"] for m in rep["models"]], [
+            "claude-opus-4-20250514",
+            "claude-sonnet-4-20250514",
+            "weird-model-x",
+        ])
+        self.assertEqual(models["claude-opus-4-20250514"]["totals"], {
+            "input": 1_000_000, "output": 100_000, "cacheWrite": 0, "cacheRead": 0,
+        })
+        # The de-duped opus message counts once, on its own day, not today.
+        self.assertEqual(models["claude-opus-4-20250514"]["today"], ha._usage_bucket())
+        self.assertEqual(models["weird-model-x"]["totals"], {
+            "input": 10, "output": 20, "cacheWrite": 30, "cacheRead": 40,
+        })
+        # The id-less sonnet entry counted twice, and lands in today AND week.
+        self.assertEqual(models["claude-sonnet-4-20250514"]["today"]["input"], 200_000)
+        self.assertEqual(models["claude-sonnet-4-20250514"]["week"]["input"], 200_000)
+
+    def test_synthetic_is_kept_out_of_the_model_breakdown(self):
+        # Claude Code stamps a fabricated assistant entry (a session-limit
+        # notice, a "No response requested." placeholder) with model
+        # "<synthetic>" and an all-zero usage block. It ran no model, so it must
+        # not appear as a phantom "<synthetic>" row on the usage page, and it
+        # must not perturb the real per-model or grand totals.
+        today = ha._utc_today()
+        write_jsonl(os.path.join(self.proj, "a.jsonl"), [
+            usage_entry(f"{today}T01:00:00.000Z", "m1", "r1",
+                        "claude-opus-4-8", 500, 100),
+            usage_entry(f"{today}T02:00:00.000Z", "m2", "r2",
+                        "<synthetic>", 0, 0),
+        ])
+        rep = ha.usage_report(self.WORKDIR)
+        names = [m["model"] for m in rep["models"]]
+        self.assertEqual(names, ["claude-opus-4-8"])  # no "<synthetic>" row
+        self.assertEqual(rep["totals"]["input"], 500)
+        self.assertEqual(rep["totals"]["output"], 100)
+
+    def test_week_window_is_utc_and_rolling(self):
+        # Seven UTC days ending today, inclusive — the boundary day counts and
+        # the day before it does not.
+        window = ha._week_window("2026-07-14")
+        self.assertEqual(len(window), 7)
+        self.assertEqual(window[-1], "2026-07-14")   # today, last
+        self.assertEqual(window[0], "2026-07-08")    # oldest day still inside
+        # Crossing a month boundary is date arithmetic, not day-of-month math.
+        self.assertEqual(ha._week_window("2026-07-03")[0], "2026-06-27")
+
+    def test_week_counts_only_the_last_seven_days(self):
+        today = ha._utc_today()
+        inside = ha._week_window()[0]                 # 6 days ago: still counted
+        outside = (datetime.date.fromisoformat(today)
+                   - datetime.timedelta(days=7)).isoformat()  # 7 days ago: not
+        write_jsonl(os.path.join(self.proj, "a.jsonl"), [
+            usage_entry(f"{today}T01:00:00.000Z", "m1", "r1", "sonnet", 100, 0),
+            usage_entry(f"{inside}T01:00:00.000Z", "m2", "r2", "sonnet", 20, 0),
+            usage_entry(f"{outside}T01:00:00.000Z", "m3", "r3", "sonnet", 5_000, 0),
+        ])
+        rep = ha.usage_report(self.WORKDIR)
+        self.assertEqual(rep["today"]["input"], 100)
+        self.assertEqual(rep["week"]["input"], 120)          # today + 6-days-ago
+        self.assertEqual(rep["totals"]["input"], 5_120)      # all-time keeps all
+        self.assertEqual(rep["models"][0]["week"]["input"], 120)
 
     def test_empty_project_dir(self):
         rep = ha.usage_report(self.WORKDIR)
@@ -431,15 +703,15 @@ class TestRepoUsageReport(unittest.TestCase):
         wt_c = "/w/.turma/worktrees/DockerOps/ccc"
         write_jsonl(os.path.join(self._proj(wt_a), "a.jsonl"), [
             usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
-                        "claude-opus-4-20250514", 1_000_000, 100_000),  # $7.50
+                        "claude-opus-4-20250514", 1_000_000, 100_000),
         ])
         write_jsonl(os.path.join(self._proj(wt_b), "b.jsonl"), [
             usage_entry("2026-07-01T12:00:00.000Z", "m2", "r2",
-                        "claude-sonnet-4-20250514", 100_000, 0),        # $0.30
+                        "claude-sonnet-4-20250514", 100_000, 0),
         ])
         write_jsonl(os.path.join(self._proj(wt_c), "c.jsonl"), [
             usage_entry("2026-07-02T09:00:00.000Z", "m3", "r3",
-                        "claude-sonnet-4-20250514", 200_000, 0),        # $0.60
+                        "claude-sonnet-4-20250514", 200_000, 0),
         ])
         ledger = {
             # Same repo, two worktrees, ssh vs https remote -> one repo series.
@@ -450,16 +722,25 @@ class TestRepoUsageReport(unittest.TestCase):
         repo_usage, host = ha.repo_usage_report(ledger, self._fold_full)
         by = {r["repo"]: r for r in repo_usage}
 
-        self.assertAlmostEqual(by["Turma"]["usage"]["totals"]["cost"], 7.8, places=2)
+        # Both of Turma's worktrees fold into the one repo series.
         self.assertEqual(by["Turma"]["usage"]["totals"]["input"], 1_100_000)
-        self.assertAlmostEqual(
-            by["Turma"]["usage"]["days"]["2026-07-01"]["cost"], 7.8, places=2)
+        self.assertEqual(by["Turma"]["usage"]["days"]["2026-07-01"]["input"], 1_100_000)
         self.assertEqual(by["Turma"]["remoteKey"], "github.com/xerktech/turma")
-        self.assertAlmostEqual(by["DockerOps"]["usage"]["totals"]["cost"], 0.6, places=2)
+        self.assertEqual(by["DockerOps"]["usage"]["totals"]["input"], 200_000)
 
-        self.assertAlmostEqual(host["totals"]["cost"], 7.8 + 0.6, places=2)
+        # A repo's per-model breakdown merges across its worktrees too.
+        turma_models = {m["model"]: m for m in by["Turma"]["usage"]["models"]}
+        self.assertEqual(turma_models["claude-opus-4-20250514"]["totals"]["input"],
+                         1_000_000)
+        self.assertEqual(turma_models["claude-sonnet-4-20250514"]["totals"]["input"],
+                         100_000)
+
         self.assertEqual(host["totals"]["input"], 1_100_000 + 200_000)
-        # Sorted by cost desc.
+        # The host total merges the same model across repos (sonnet ran in both).
+        host_models = {m["model"]: m for m in host["models"]}
+        self.assertEqual(host_models["claude-sonnet-4-20250514"]["totals"]["input"],
+                         100_000 + 200_000)
+        # Sorted by total tokens desc.
         self.assertEqual(repo_usage[0]["repo"], "Turma")
 
     def test_empty_and_missing_dirs_excluded(self):
@@ -583,6 +864,37 @@ class TestLastEntry(ProjectDirMixin, unittest.TestCase):
         self.assertIsNone(ha._last_entry(os.path.join(self.proj, "nope.jsonl")))
 
 
+class TestLastActivityTs(ProjectDirMixin, unittest.TestCase):
+    """XERK-73: the last new message's own timestamp, the accurate ended-list sort
+    key that the file mtime is not."""
+
+    def test_newest_timestamped_entry_wins(self):
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [
+            {"type": "user", "timestamp": "2026-07-01T00:00:00.000Z"},
+            {"type": "assistant", "timestamp": "2026-07-01T00:05:00.000Z"},
+        ])
+        self.assertEqual(ha._last_activity_ts(path), "2026-07-01T00:05:00.000Z")
+
+    def test_skips_a_trailing_untimestamped_entry(self):
+        """A summary/system tail entry without a timestamp doesn't blank the key —
+        the scan keeps walking back to the last real message."""
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [
+            {"type": "assistant", "timestamp": "2026-07-01T00:05:00.000Z"},
+            {"type": "summary", "summary": "recap"},   # no timestamp
+        ])
+        self.assertEqual(ha._last_activity_ts(path), "2026-07-01T00:05:00.000Z")
+
+    def test_none_without_any_timestamp(self):
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [{"type": "assistant", "n": 1}])
+        self.assertIsNone(ha._last_activity_ts(path))
+
+    def test_missing_file(self):
+        self.assertIsNone(ha._last_activity_ts(os.path.join(self.proj, "nope.jsonl")))
+
+
 class TestSessionReport(ProjectDirMixin, unittest.TestCase):
     PR1 = "https://github.com/xerktech/Turma/pull/34"
     PR2 = "https://github.com/xerktech/DockerOps/pull/7"
@@ -592,6 +904,28 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
             "type": "assistant",
             "message": {"content": [{"type": "text", "text": text}]},
         }
+
+    def pr_create_call(self, tool_id, cmd="gh pr create --fill"):
+        return {
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "id": tool_id, "name": "Bash",
+                 "input": {"command": cmd}},
+            ]},
+        }
+
+    def tool_result(self, tool_id, text):
+        return {
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": text},
+            ]},
+        }
+
+    def opened_pr(self, url, tool_id="t1"):
+        """The two entries a real `gh pr create` leaves behind: the call, then
+        its output — which is the new PR's URL."""
+        return [self.pr_create_call(tool_id), self.tool_result(tool_id, url)]
 
     def test_missing_project_dir(self):
         state = {}
@@ -603,23 +937,78 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
 
     def test_prime_to_eof_then_incremental_pr_scan(self):
         path = os.path.join(self.proj, "s.jsonl")
-        write_jsonl(path, [self.entry_with_text(f"old PR: {self.PR1}")])
+        write_jsonl(path, self.opened_pr(self.PR1, "old"))
 
         state = {}
         rep = ha.session_report(self.WORKDIR, state)
         # First beat primes offsets to EOF: pre-existing PR link NOT replayed.
         self.assertEqual(rep["prUrls"], [])
-        self.assertEqual(rep["lastRole"], "assistant")
         self.assertIsNotNone(rep["transcriptAgeSec"])
 
-        write_jsonl(path, [self.entry_with_text(f"opened {self.PR2} just now")])
+        write_jsonl(path, self.opened_pr(self.PR2, "new"))
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [self.PR2])
 
-        # Same URL appended again -> already seen, not re-reported.
-        write_jsonl(path, [self.entry_with_text(f"again {self.PR2}")])
+        # Same URL out of a second create (a re-run) -> already seen, not
+        # re-reported.
+        write_jsonl(path, self.opened_pr(self.PR2, "again"))
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [])
+
+    def test_pr_url_only_mentioned_is_not_this_sessions_pr(self):
+        """The bug this scan's narrowness exists for: a PR link a session merely
+        SAW — `gh pr list` output, a link the operator pasted, the model quoting
+        another session's PR — is not a PR this session opened, and must not
+        chip its card."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        listed = f"#34\tSome older work\tfeat/thing\t{self.PR1}"
+        write_jsonl(path, [
+            # Prose quoting a PR, a user pasting one...
+            self.entry_with_text(f"I opened {self.PR2} earlier"),
+            {"type": "user", "message": {"content": [
+                {"type": "text", "text": f"what is {self.PR2} about?"}]}},
+            # ...and a read-only gh call whose output is full of other PRs.
+            self.pr_create_call("read", cmd="gh pr list --limit 5"),
+            self.tool_result("read", listed),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [])
+
+    def test_pr_create_result_lands_on_a_later_beat(self):
+        """The call and its output are separate entries, and a `gh pr create`
+        that spans a beat boundary still resolves — the pending id carries."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        write_jsonl(path, [self.pr_create_call("t9")])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+        write_jsonl(path, [self.tool_result("t9", f"{self.PR1}\n")])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
+
+    def test_partial_line_is_reread_whole_next_beat(self):
+        """The offset stops at the last newline, so an entry still being written
+        is parsed once, whole — not lost as two unparseable halves."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        line = json.dumps(self.tool_result("t1", self.PR1))
+        write_jsonl(path, [self.pr_create_call("t1")])
+        with open(path, "a") as f:  # first half of the result entry, no newline
+            f.write(line[:40])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+        with open(path, "a") as f:
+            f.write(line[40:] + "\n")
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
 
     def test_truncated_file_resets_offset_without_rescan(self):
         path = os.path.join(self.proj, "s.jsonl")
@@ -630,12 +1019,13 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         # Rewrite shorter (context clear / rotation). The old bytes contain a
         # PR URL, but offset resets to the new size — nothing is rescanned.
         with open(path, "w") as f:
-            f.write(json.dumps(self.entry_with_text(f"reset {self.PR1}")) + "\n")
+            for e in self.opened_pr(self.PR1, "reset"):
+                f.write(json.dumps(e) + "\n")
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [])
 
         # Appends after the truncation ARE picked up.
-        write_jsonl(path, [self.entry_with_text(f"new {self.PR2}")])
+        write_jsonl(path, self.opened_pr(self.PR2, "after"))
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [self.PR2])
 
@@ -737,6 +1127,28 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["question"], "Which direction should I run with?")
         self.assertEqual(rep["questionOptions"], ["Turma", "Tutela"])
         self.assertEqual(rep["questionSource"], "hook")
+
+    def test_hook_file_fills_rich_question_fields(self):
+        # The rich picker fields (header, position, multiSelect, per-option
+        # description/preview) ride the heartbeat alongside the flat labels.
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("working on it")])
+        req = {"sessionId": "sess-1", "question": "What should it mean?",
+               "header": "Semantics", "index": 0, "total": 4, "multiSelect": True,
+               "options": [{"label": "One-shot", "description": "start now",
+                            "preview": "Card meta row: [Start]"},
+                           {"label": "Standing", "description": "auto-spawn"}]}
+        with open(os.path.join(self.questions_dir, "sess-1.req.json"), "w") as f:
+            json.dump(req, f)
+        rep = ha.session_report(self.WORKDIR, {}, "agent-abc", session_id="sess-1")
+        self.assertEqual(rep["questionOptions"], ["One-shot", "Standing"])
+        self.assertEqual(rep["questionHeader"], "Semantics")
+        self.assertEqual(rep["questionIndex"], 0)
+        self.assertEqual(rep["questionTotal"], 4)
+        self.assertTrue(rep["questionMulti"])
+        self.assertEqual(rep["questionOptionsRich"][0],
+                         {"label": "One-shot", "description": "start now",
+                          "preview": "Card meta row: [Start]"})
 
     def test_hook_file_works_when_no_transcript_yet(self):
         # No .jsonl in the project dir at all — the early-return path must still
@@ -880,32 +1292,189 @@ class TestPaneBusy(unittest.TestCase):
         finally:
             ha.PANE_BUSY_MARKERS = markers
 
+    # XERK-130: a pane once viewed from a narrow client (a phone) stays ~54
+    # columns wide, and at that width the TUI ellipsizes the footer's
+    # "· esc to interrupt" to "· esc to inte…" — the plain substring match read
+    # every such working session as idle for its whole turn. Fixtures below are
+    # verbatim captures from live sessions.
+
+    def test_true_when_hint_truncated_by_a_narrow_pane(self):
+        pane = ("  Cat\n  Sunbeam on the floor,\n\n"
+                + "─" * 54 + "\n❯ \n" + "─" * 54 + "\n"
+                "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to inte…\n")
+        with mock.patch.object(ha.subprocess, "run", self._capture(stdout=pane)):
+            self.assertIs(ha._pane_busy("agent-x"), True)
+
+    def test_true_when_hint_truncated_with_varying_middle_segments(self):
+        # The footer's middle segments vary — "(shift+tab to cycle)" comes and
+        # goes, a "· PR #98" chip can sit between the mode and the hint — so
+        # the anchor is the mode glyph + the ellipsized "e…" tail segment.
+        for footer in ("  ⏵⏵ bypass permissions on · esc to i…",
+                       "  ⏵⏵ auto mode on · PR #98 · esc to inte…"):
+            with mock.patch.object(ha.subprocess, "run",
+                                   self._capture(stdout=footer + "\n")):
+                self.assertIs(ha._pane_busy("agent-x"), True, footer)
+
+    def test_false_when_the_idle_suffix_is_what_got_truncated(self):
+        # An IDLE footer can be width-cut too ("· ← for agents" -> "· ← for
+        # ag…"); the remnant doesn't start with "e", so it must stay idle.
+        pane = "  ⏵⏵ bypass permissions on · PR #98 · ← for ag…\n"
+        with mock.patch.object(ha.subprocess, "run", self._capture(stdout=pane)):
+            self.assertIs(ha._pane_busy("agent-x"), False)
+
+    def test_true_from_the_spinner_line_alone(self):
+        # A narrow pane running a tool: the hint is fully elided but the
+        # column-0 spinner line is visible above the input box.
+        for spinner in ("✢ Determining… (12m 19s · ↓ 44.2k tokens)",
+                        "· Perusing… (54m 38s · still thinking)",
+                        "✻ Hashing… (2m 58s · ↓ 5.7k tokens)"):
+            pane = spinner + "\n  ⎿  Tip: Use /btw to ask a quick side question\n"
+            with mock.patch.object(ha.subprocess, "run",
+                                   self._capture(stdout=pane)):
+                self.assertIs(ha._pane_busy("agent-x"), True, spinner)
+
+    def test_false_on_an_idle_narrow_pane(self):
+        # Idle keeps a completed-turn line ("✻ Brewed for 9s" — spinner glyph,
+        # NO ellipsis) on screen, and the footer suffix is "· ← for agents":
+        # neither may read as busy or a finished session pins busy forever.
+        pane = ("  the cat sleeps through it.\n\n✻ Brewed for 9s\n"
+                + "─" * 54 + "\n❯ \n" + "─" * 54 + "\n"
+                "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n")
+        with mock.patch.object(ha.subprocess, "run", self._capture(stdout=pane)):
+            self.assertIs(ha._pane_busy("agent-x"), False)
+
+    def test_false_when_a_spinner_line_is_quoted_in_tool_output(self):
+        # A session debugging Turma echoes captured panes into its own
+        # conversation; the echoed copy is INDENTED (tool results always are),
+        # so the column-0 anchor keeps it from faking busy on an idle pane.
+        pane = ("  ⎿  $ tmux capture-pane -p -t agent-y\n"
+                "     ✻ Hashing… (2m 58s · ↓ 5.7k tokens)\n"
+                "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n")
+        with mock.patch.object(ha.subprocess, "run", self._capture(stdout=pane)):
+            self.assertIs(ha._pane_busy("agent-x"), False)
+
 
 class TestSessionReportPaneBusy(ProjectDirMixin, unittest.TestCase):
-    """session_report surfaces the pane probe as report['paneBusy'] on every
+    """session_report surfaces the (single-capture) pane probe as
+    report['paneBusy'] + report['modeActual'] + report['panePrompt'] on every
     return path (even before any transcript exists)."""
 
-    def test_pane_busy_reported_with_transcript(self):
+    def test_pane_reads_reported_with_transcript(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, [{"type": "assistant",
                             "message": {"content": [{"type": "text", "text": "hi"}]}}])
-        with mock.patch.object(ha, "_pane_busy", return_value=True) as pb:
+        prompt = {"prompt": "Do you want to proceed?",
+                  "options": [{"number": 1, "label": "Yes", "selected": True}]}
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(True, "plan", prompt)) as ps:
             rep = ha.session_report(self.WORKDIR, {}, "agent-abc")
         self.assertIs(rep["paneBusy"], True)
-        pb.assert_called_once_with("agent-abc")
+        self.assertEqual(rep["modeActual"], "plan")
+        self.assertEqual(rep["panePrompt"], prompt)
+        # (tmux_name, state): state carries _stable_pane_busy's edge memory.
+        self.assertEqual(ps.call_args[0][0], "agent-abc")
+        self.assertIsInstance(ps.call_args[0][1], dict)
 
-    def test_pane_busy_reported_without_transcript(self):
-        # No transcript yet — paneBusy must still ride the early-return path.
-        with mock.patch.object(ha, "_pane_busy", return_value=False):
+    def test_pane_reads_reported_without_transcript(self):
+        # No transcript yet — the pane reads must still ride the early-return
+        # path.
+        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None)):
             rep = ha.session_report("/absent/worktree", {}, "agent-abc")
         self.assertIs(rep["paneBusy"], False)
+        self.assertEqual(rep["modeActual"], "auto")
+        self.assertIsNone(rep["panePrompt"])
 
-    def test_pane_busy_defaults_none_without_tmux(self):
+    def test_pane_reads_default_none_without_tmux(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, [{"type": "assistant",
                             "message": {"content": [{"type": "text", "text": "hi"}]}}])
         rep = ha.session_report(self.WORKDIR, {})  # no tmux_name
         self.assertIsNone(rep["paneBusy"])
+        self.assertIsNone(rep["modeActual"])
+        self.assertIsNone(rep["panePrompt"])
+
+
+class TestStablePaneBusy(unittest.TestCase):
+    """_stable_pane_busy suppresses the busy->idle flicker a single mid-repaint
+    capture would otherwise cause: a busy read is instant, an idle read is
+    re-confirmed on the busy->idle edge, and None passes through untouched.
+    time.sleep is patched out so the confirm delay costs the tests nothing."""
+
+    def setUp(self):
+        self._sleep = mock.patch.object(ha.time, "sleep").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_busy_is_instant_and_marks_state(self):
+        # A busy read is trusted on the first capture — status lights up promptly
+        # — and there is no confirmation re-capture.
+        st = {}
+        with mock.patch.object(ha, "_pane_busy", return_value=True) as pb:
+            self.assertIs(ha._stable_pane_busy("agent-x", st), True)
+        pb.assert_called_once_with("agent-x")
+        self.assertIs(st["paneBusyStable"], True)
+        self._sleep.assert_not_called()
+
+    def test_steady_idle_is_not_re_confirmed(self):
+        # Never was busy this session -> nothing to flicker off, so a single idle
+        # read is believed with no second capture.
+        st = {}  # no paneBusyStable
+        with mock.patch.object(ha, "_pane_busy", return_value=False) as pb:
+            self.assertIs(ha._stable_pane_busy("agent-x", st), False)
+        pb.assert_called_once_with("agent-x")
+        self.assertIs(st["paneBusyStable"], False)
+        self._sleep.assert_not_called()
+
+    def test_single_idle_frame_while_busy_is_held(self):
+        # busy->idle edge: the first capture missed the marker (redraw gap) but
+        # the confirming re-capture sees it -> stays working, no flip.
+        st = {"paneBusyStable": True}
+        with mock.patch.object(ha, "_pane_busy", side_effect=[False, True]) as pb:
+            self.assertIs(ha._stable_pane_busy("agent-x", st), True)
+        self.assertEqual(pb.call_count, 2)  # confirmed with a second capture
+        self.assertIs(st["paneBusyStable"], True)
+        self._sleep.assert_called_once()
+
+    def test_genuine_idle_confirms_and_flips(self):
+        # busy->idle edge with the marker really gone: both captures agree,
+        # so it flips to idle (only one confirm delay was spent).
+        st = {"paneBusyStable": True}
+        with mock.patch.object(ha, "_pane_busy", side_effect=[False, False]) as pb:
+            self.assertIs(ha._stable_pane_busy("agent-x", st), False)
+        self.assertEqual(pb.call_count, 2)
+        self.assertIs(st["paneBusyStable"], False)
+
+    def test_unknown_passes_through_without_touching_state(self):
+        # A capture failure is not evidence the turn ended: return None (so the
+        # transcript fallback decides) and leave the remembered state alone.
+        st = {"paneBusyStable": True}
+        with mock.patch.object(ha, "_pane_busy", return_value=None) as pb:
+            self.assertIsNone(ha._stable_pane_busy("agent-x", st))
+        pb.assert_called_once_with("agent-x")
+        self.assertIs(st["paneBusyStable"], True)  # untouched
+        self._sleep.assert_not_called()
+
+    def test_confirm_disabled_via_env(self):
+        # PANE_IDLE_CONFIRM_SEC=0 restores the raw single-read behaviour.
+        st = {"paneBusyStable": True}
+        orig = ha.PANE_IDLE_CONFIRM_SEC
+        ha.PANE_IDLE_CONFIRM_SEC = 0.0
+        try:
+            with mock.patch.object(ha, "_pane_busy", side_effect=[False, True]) as pb:
+                self.assertIs(ha._stable_pane_busy("agent-x", st), False)
+            pb.assert_called_once_with("agent-x")  # no confirmation capture
+        finally:
+            ha.PANE_IDLE_CONFIRM_SEC = orig
+
+    def test_flicker_suppressed_across_beats_in_session_report(self):
+        # End-to-end through session_report: one shared state dict, a busy beat
+        # then a single idle-frame beat -> paneBusy stays True across the blip.
+        st = {}
+        with mock.patch.object(ha, "_pane_busy", return_value=True):
+            r1 = ha.session_report("/absent/worktree", st, "agent-x")
+        self.assertIs(r1["paneBusy"], True)
+        with mock.patch.object(ha, "_pane_busy", side_effect=[False, True]):
+            r2 = ha.session_report("/absent/worktree", st, "agent-x")
+        self.assertIs(r2["paneBusy"], True)
 
 
 class TestHookQuestion(unittest.TestCase):
@@ -923,28 +1492,47 @@ class TestHookQuestion(unittest.TestCase):
             json.dump(data, f)
 
     def test_missing_file(self):
-        self.assertEqual(ha._hook_question("nope"), (None, []))
+        self.assertIsNone(ha._hook_question("nope"))
 
     def test_no_session_id(self):
-        self.assertEqual(ha._hook_question(None), (None, []))
-        self.assertEqual(ha._hook_question(""), (None, []))
+        self.assertIsNone(ha._hook_question(None))
+        self.assertIsNone(ha._hook_question(""))
 
     def test_reads_question_and_labels(self):
         self._write("s", {"question": "Which?",
                           "options": [{"label": "A"}, {"label": "B"}]})
-        self.assertEqual(ha._hook_question("s"), ("Which?", ["A", "B"]))
+        hq = ha._hook_question("s")
+        self.assertEqual(hq["question"], "Which?")
+        self.assertEqual(hq["labels"], ["A", "B"])
+        self.assertEqual(hq["options"], [{"label": "A"}, {"label": "B"}])
+        self.assertIsNone(hq["header"])
+        self.assertFalse(hq["multi"])
+
+    def test_reads_rich_option_fields(self):
+        self._write("s", {"question": "Pick", "header": "Semantics",
+                          "index": 2, "total": 4, "multiSelect": True,
+                          "options": [{"label": "A", "description": "d",
+                                       "preview": "P" * 5000}]})
+        hq = ha._hook_question("s")
+        self.assertEqual(hq["header"], "Semantics")
+        self.assertEqual(hq["index"], 2)
+        self.assertEqual(hq["total"], 4)
+        self.assertTrue(hq["multi"])
+        opt = hq["options"][0]
+        self.assertEqual(opt["description"], "d")
+        self.assertEqual(len(opt["preview"]), ha._Q_PREVIEW_MAX)  # capped
 
     def test_corrupt_file_is_no_question(self):
         with open(os.path.join(self.tmp, "s.req.json"), "w") as f:
             f.write("{not json")
-        self.assertEqual(ha._hook_question("s"), (None, []))
+        self.assertIsNone(ha._hook_question("s"))
 
     def test_question_capped_at_300_and_labels_at_80(self):
         self._write("s", {"question": "Q" * 400,
                           "options": [{"label": "L" * 100}]})
-        q, opts = ha._hook_question("s")
-        self.assertEqual(len(q), 300)
-        self.assertEqual(opts, ["L" * 80])
+        hq = ha._hook_question("s")
+        self.assertEqual(len(hq["question"]), 300)
+        self.assertEqual(hq["labels"], ["L" * 80])
 
 
 class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
@@ -1061,6 +1649,87 @@ class TestEntryBlocks(unittest.TestCase):
         self.assertIsNone(ha._entry_blocks({"type": "user"}, ha.BLOCK_CAPS_LIVE))
         self.assertEqual(ha._entry_blocks({"type": "assistant", "message": {"content": ""}}, ha.BLOCK_CAPS_LIVE), [])
 
+    def test_edit_tool_use_carries_the_actual_change_as_a_diff(self):
+        entry = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_e", "name": "Edit", "input": {
+                "file_path": "/repo/a.py", "old_string": "x = 1", "new_string": "x = 2",
+                "replace_all": True}},
+        ]}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+            {"t": "tool_use", "name": "Edit", "input": "/repo/a.py", "id": "toolu_e",
+             "edit": {"old": "x = 1", "new": "x = 2", "replaceAll": True}},
+        ])
+
+    def test_edit_diff_over_cap_flags_the_block_truncated(self):
+        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 100)
+        block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {
+                "file_path": "/repo/a.py", "old_string": "x", "new_string": big}},
+        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(len(block["edit"]["new"]), ha.BLOCK_CAPS_LIVE["result"])
+        self.assertTrue(block["truncated"])
+
+    def test_write_tool_use_carries_the_file_body(self):
+        block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Write", "input": {
+                "file_path": "/repo/new.txt", "content": "hello\nworld"}},
+        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(block["input"], "/repo/new.txt")
+        self.assertEqual(block["content"], "hello\nworld")
+
+    def test_exit_plan_mode_carries_the_plan(self):
+        block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "ExitPlanMode", "input": {
+                "plan": "## Plan\n1. do it", "allowedPrompts": []}},
+        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(block["plan"], "## Plan\n1. do it")
+
+    def test_description_arg_rides_as_desc(self):
+        block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {
+                "command": "ls", "description": "List files"}},
+        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(block["input"], "ls")
+        self.assertEqual(block["desc"], "List files")
+
+    def test_ask_user_question_summary_is_the_question_text(self):
+        block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "AskUserQuestion", "input": {
+                "questions": [{"question": "Ship it?", "options": [{"label": "yes"}]},
+                              {"question": "Which env?"}]}},
+        ]}}, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(block["input"], "Ship it? · Which env?")
+
+    def test_compact_boundary_becomes_a_status_marker_block(self):
+        entry = {"type": "system", "subtype": "compact_boundary",
+                 "content": "Conversation compacted", "uuid": "u1",
+                 "compactMetadata": {"trigger": "auto", "preTokens": 123380, "postTokens": 5920}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+            {"t": "compact_boundary", "trigger": "auto", "preTokens": 123380, "postTokens": 5920},
+        ])
+        # Other system subtypes still drop, and the text feed still skips it.
+        self.assertIsNone(ha._entry_text(entry))
+        self.assertIsNone(ha._entry_blocks(
+            {"type": "system", "subtype": "turn_duration", "durationMs": 5}, ha.BLOCK_CAPS_LIVE))
+
+    def test_pr_link_becomes_a_marker_block_with_a_synthesized_id(self):
+        entry = {"type": "pr-link", "prNumber": 230, "prUrl": "https://github.com/o/r/pull/230",
+                 "prRepository": "o/r", "timestamp": "2026-07-17T04:25:18.299Z"}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [
+            {"t": "pr_link", "url": "https://github.com/o/r/pull/230", "number": 230, "repo": "o/r"},
+        ])
+        # No uuid on the wire entry: the feeds synthesize a stable id so the
+        # client's id-keyed merge doesn't drop it. It keys on the URL ALONE, so
+        # the same PR re-stamped in a later turn's preamble collapses onto one
+        # entry instead of rendering a marker apiece.
+        self.assertEqual(ha._entry_id(entry), "pr-link:https://github.com/o/r/pull/230")
+        restamp = dict(entry, timestamp="2026-07-17T09:00:00.000Z")
+        self.assertEqual(ha._entry_id(restamp), ha._entry_id(entry))
+        other = dict(entry, prUrl="https://github.com/o/r/pull/231")
+        self.assertNotEqual(ha._entry_id(other), ha._entry_id(entry))
+        self.assertIsNone(ha._entry_blocks({"type": "pr-link"}, ha.BLOCK_CAPS_LIVE))
+        self.assertEqual(ha._entry_id({"type": "user", "uuid": "u9"}), "u9")
+
 
 TASK_NOTIFICATION = (
     "<task-notification>\n"
@@ -1139,6 +1808,440 @@ class TestTaskNotification(unittest.TestCase):
         )
 
 
+# The three bookkeeping turns Claude Code writes for `/compact summaries appear
+# as user text`, verbatim from a real transcript (note the indentation on the
+# invocation wrapper — it is not anchored to the start of a line).
+COMMAND_CAVEAT = (
+    "<local-command-caveat>Caveat: The messages below were generated by the user "
+    "while running local commands. DO NOT respond to these messages or otherwise "
+    "consider them in your response unless the user explicitly asks you to."
+    "</local-command-caveat>"
+)
+COMMAND_INVOCATION = (
+    "<command-name>/compact</command-name>\n"
+    "            <command-message>compact</command-message>\n"
+    "            <command-args>summaries appear as user text</command-args>"
+)
+COMMAND_STDOUT = "<local-command-stdout>Compacted (ctrl+o to see full summary)</local-command-stdout>"
+
+
+class TestLocalCommand(unittest.TestCase):
+    """Running a slash command writes three XML-ish USER turns (the caveat, the
+    invocation wrapper, the command's output). Rendered verbatim they read as the
+    operator typing raw XML into chat, so they must parse into structured blocks
+    — and the caveat must drop out entirely. Kept in lockstep with
+    tunnel-agent.js parseLocalCommand (mirror cases in tunnel-agent.test.js)."""
+
+    def test_parse_caveat(self):
+        self.assertEqual(ha._parse_local_command(COMMAND_CAVEAT), {"kind": "caveat"})
+
+    def test_parse_invocation_extracts_name_and_args(self):
+        self.assertEqual(ha._parse_local_command(COMMAND_INVOCATION), {
+            "kind": "command",
+            "name": "/compact",
+            "args": "summaries appear as user text",
+        })
+
+    def test_parse_invocation_without_args(self):
+        text = "<command-name>/clear</command-name>\n<command-args></command-args>"
+        self.assertEqual(ha._parse_local_command(text),
+                         {"kind": "command", "name": "/clear", "args": ""})
+
+    def test_parse_stdout_and_stderr(self):
+        self.assertEqual(ha._parse_local_command(COMMAND_STDOUT), {
+            "kind": "output",
+            "text": "Compacted (ctrl+o to see full summary)",
+            "isError": False,
+        })
+        self.assertEqual(
+            ha._parse_local_command("<local-command-stderr>Error: No messages</local-command-stderr>"),
+            {"kind": "output", "text": "Error: No messages", "isError": True},
+        )
+
+    def test_stderr_wins_when_a_turn_carries_both(self):
+        text = ("<local-command-stdout></local-command-stdout>"
+                "<local-command-stderr>boom</local-command-stderr>")
+        self.assertEqual(ha._parse_local_command(text),
+                         {"kind": "output", "text": "boom", "isError": True})
+
+    def test_non_command_text_is_not_parsed(self):
+        self.assertIsNone(ha._parse_local_command("just a normal prompt"))
+        self.assertIsNone(ha._parse_local_command("talk about <command-name> inline"))
+        self.assertIsNone(ha._parse_local_command(""))
+
+    def test_caveat_needs_the_whole_entry(self):
+        # Prose that merely quotes the caveat is the human talking; only a turn
+        # that IS the caveat gets dropped.
+        text = "why does <local-command-caveat>x</local-command-caveat> show up?"
+        self.assertIsNone(ha._parse_local_command(text))
+
+    def test_blocks_drop_the_caveat_entirely(self):
+        entry = {"type": "user", "isMeta": True, "message": {"content": COMMAND_CAVEAT}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [])
+        self.assertIsNone(ha._entry_text(entry))
+
+    def test_blocks_emit_command_from_string_and_list_content(self):
+        expected = [{"t": "command", "name": "/compact", "args": "summaries appear as user text"}]
+        self.assertEqual(
+            ha._entry_blocks({"type": "user", "message": {"content": COMMAND_INVOCATION}},
+                             ha.BLOCK_CAPS_LIVE),
+            expected)
+        self.assertEqual(
+            ha._entry_blocks({"type": "user", "message": {"content": [
+                {"type": "text", "text": COMMAND_INVOCATION}]}}, ha.BLOCK_CAPS_LIVE),
+            expected)
+
+    def test_blocks_omit_empty_args(self):
+        text = "<command-name>/clear</command-name>\n<command-args></command-args>"
+        self.assertEqual(ha._entry_blocks({"type": "user", "message": {"content": text}},
+                                          ha.BLOCK_CAPS_LIVE),
+                         [{"t": "command", "name": "/clear"}])
+
+    def test_blocks_emit_command_output(self):
+        entry = {"type": "user", "message": {"content": COMMAND_STDOUT}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE),
+                         [{"t": "command_output", "text": "Compacted (ctrl+o to see full summary)"}])
+
+    def test_blocks_flag_stderr_output_as_an_error(self):
+        entry = {"type": "user", "message": {"content":
+                 "<local-command-stderr>Error: No messages to compact</local-command-stderr>"}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE),
+                         [{"t": "command_output", "text": "Error: No messages to compact",
+                           "isError": True}])
+
+    def test_empty_output_yields_no_block(self):
+        entry = {"type": "user", "message": {"content":
+                 "<local-command-stdout></local-command-stdout>"}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE), [])
+        self.assertIsNone(ha._entry_text(entry))
+
+    def test_long_output_is_capped_and_truncated(self):
+        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        entry = {"type": "user", "message": {"content":
+                 f"<local-command-stdout>{big}</local-command-stdout>"}}
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["result"])
+        self.assertTrue(block["truncated"])
+
+    def test_entry_text_flattens_command_and_output(self):
+        self.assertEqual(
+            ha._entry_text({"type": "user", "message": {"content": COMMAND_INVOCATION}}),
+            "/compact summaries appear as user text")
+        self.assertEqual(
+            ha._entry_text({"type": "user", "message": {"content": COMMAND_STDOUT}}),
+            "Compacted (ctrl+o to see full summary)")
+
+
+class TestCompactSummary(unittest.TestCase):
+    """`/compact` writes its summary as a USER turn, but the text is the MODEL's
+    writing about the conversation so far. It must report as the assistant (so
+    the chat doesn't render it as a wall of text the operator typed) and carry
+    its own block kind so the UI can collapse it."""
+
+    SUMMARY = ("This session is being continued from a previous conversation that ran "
+               "out of context.\n\nSummary:\n1. Primary Request and Intent: …")
+
+    def _entry(self):
+        return {"type": "user", "isCompactSummary": True,
+                "message": {"role": "user", "content": self.SUMMARY}}
+
+    def test_role_reports_as_assistant(self):
+        self.assertEqual(ha._entry_role(self._entry()), "assistant")
+
+    def test_ordinary_turns_keep_their_own_role(self):
+        self.assertEqual(ha._entry_role({"type": "user", "message": {"content": "hi"}}), "user")
+        self.assertEqual(ha._entry_role({"type": "assistant", "message": {"content": "hi"}}),
+                         "assistant")
+
+    def test_blocks_emit_a_compact_summary_block(self):
+        self.assertEqual(ha._entry_blocks(self._entry(), ha.BLOCK_CAPS_FULL),
+                         [{"t": "compact_summary", "text": self.SUMMARY}])
+
+    def test_an_ordinary_user_turn_stays_a_text_block(self):
+        entry = {"type": "user", "message": {"content": self.SUMMARY}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_FULL),
+                         [{"t": "text", "text": self.SUMMARY}])
+
+    def test_long_summary_is_capped_and_truncated(self):
+        big = "z" * (ha.BLOCK_CAPS_LIVE["text"] + 500)
+        entry = {"type": "user", "isCompactSummary": True, "message": {"content": big}}
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(block["t"], "compact_summary")
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["text"])
+        self.assertTrue(block["truncated"])
+
+    def test_entry_text_keeps_the_summary_prose(self):
+        # The text feed is the lossy contract: the summary stays readable there,
+        # it just rides under the assistant role now.
+        self.assertEqual(ha._entry_text(self._entry()), self.SUMMARY)
+
+
+class TestSkillBody(unittest.TestCase):
+    """Invoking a skill makes Claude Code write the whole SKILL.md back as a USER
+    turn — the only role tool output can ride — tagged with `sourceToolUseID`,
+    the id of the Skill tool_use that pulled it in. Taken at its wire role that
+    renders as the operator typing 150KB of skill docs into chat. It's really the
+    Skill call's result, so it reports as one and the chat folds it into that
+    call's action card."""
+
+    BODY = ("Base directory for this skill: /repos/x/.claude/skills/verify\n\n"
+            "# Verifying Turma changes\n\nPick the surface the change reaches.…")
+
+    def _entry(self):
+        return {"type": "user", "isMeta": True, "sourceToolUseID": "toolu_01ABC",
+                "message": {"role": "user", "content": [{"type": "text", "text": self.BODY}]}}
+
+    def test_tool_source_is_the_invoking_tool_use_id(self):
+        self.assertEqual(ha._entry_tool_source(self._entry()), "toolu_01ABC")
+
+    def test_ordinary_turns_have_no_tool_source(self):
+        self.assertIsNone(ha._entry_tool_source({"type": "user", "message": {"content": "hi"}}))
+        # An assistant turn is never tool-authored, whatever it carries.
+        self.assertIsNone(ha._entry_tool_source(
+            {"type": "assistant", "sourceToolUseID": "toolu_01ABC", "message": {"content": "hi"}}))
+
+    def test_blocks_emit_the_body_as_its_skill_calls_tool_result(self):
+        self.assertEqual(ha._entry_blocks(self._entry(), ha.BLOCK_CAPS_FULL),
+                         [{"t": "tool_result", "text": self.BODY, "forId": "toolu_01ABC"}])
+
+    def test_the_same_body_typed_by_a_human_stays_a_text_block(self):
+        # Only the tool tag makes it tool output — pasting a skill body by hand
+        # is the operator talking, and must still read as a user bubble.
+        entry = {"type": "user", "message": {"content": [{"type": "text", "text": self.BODY}]}}
+        self.assertEqual(ha._entry_blocks(entry, ha.BLOCK_CAPS_FULL),
+                         [{"t": "text", "text": self.BODY}])
+
+    def test_a_long_body_is_capped_and_truncated(self):
+        entry = self._entry()
+        big = "z" * (ha.BLOCK_CAPS_LIVE["result"] + 500)
+        entry["message"]["content"] = [{"type": "text", "text": big}]
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(block["t"], "tool_result")
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["result"])
+        self.assertTrue(block["truncated"])
+
+    def test_entry_text_drops_it_like_any_tool_result(self):
+        # The text feed (glasses tail, heartbeat preview, archive index) carries
+        # no tool results; the assistant's own "[Skill]" marker already shows the
+        # invocation, so dropping the wall costs it nothing.
+        self.assertIsNone(ha._entry_text(self._entry()))
+
+
+class TestBashPassthrough(unittest.TestCase):
+    """The `!` prefix's shell turns (<bash-input>, <bash-stdout>/<bash-stderr>)
+    are recorded as user-role XML — not the human talking. They parse into the
+    SAME command/output shapes the slash commands use (name "!"), so the chat
+    renders a chip + output card instead of raw XML prose. Kept in lockstep
+    with tunnel-agent.js parseLocalCommand (mirror cases in
+    tunnel-agent.test.js)."""
+
+    def test_parse_bash_input(self):
+        self.assertEqual(
+            ha._parse_local_command("<bash-input> git status</bash-input>"),
+            {"kind": "command", "name": "!", "args": "git status"})
+
+    def test_parse_bash_stdout_and_stderr(self):
+        self.assertEqual(
+            ha._parse_local_command("<bash-stdout>2 files changed</bash-stdout>"),
+            {"kind": "output", "text": "2 files changed", "isError": False})
+        self.assertEqual(
+            ha._parse_local_command("<bash-stderr>fatal: not a repo</bash-stderr>"),
+            {"kind": "output", "text": "fatal: not a repo", "isError": True})
+
+    def test_empty_stderr_does_not_swallow_stdout(self):
+        # A bash turn routinely ships BOTH tags with one empty — the empty
+        # stream must not win just by matching first.
+        self.assertEqual(
+            ha._parse_local_command(
+                "<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>"),
+            {"kind": "output", "text": "ok", "isError": False})
+        self.assertEqual(
+            ha._parse_local_command(
+                "<bash-stdout></bash-stdout><bash-stderr>boom</bash-stderr>"),
+            {"kind": "output", "text": "boom", "isError": True})
+
+    def test_blocks_emit_command_and_output(self):
+        self.assertEqual(
+            ha._entry_blocks({"type": "user", "message": {
+                "content": "<bash-input> ls -la</bash-input>"}}, ha.BLOCK_CAPS_LIVE),
+            [{"t": "command", "name": "!", "args": "ls -la"}])
+        self.assertEqual(
+            ha._entry_blocks({"type": "user", "message": {
+                "content": "<bash-stderr>boom</bash-stderr>"}}, ha.BLOCK_CAPS_LIVE),
+            [{"t": "command_output", "text": "boom", "isError": True}])
+
+    def test_text_feed_flattens_like_a_slash_command(self):
+        self.assertEqual(
+            ha._entry_text({"type": "user", "message": {
+                "content": "<bash-input> ls</bash-input>"}}),
+            "! ls")
+
+    def test_prose_quoting_a_bash_tag_stays_prose(self):
+        self.assertIsNone(ha._parse_local_command("talk about <bash-input> inline"))
+
+
+class TestInterruptMarker(unittest.TestCase):
+    """Esc / the hub's Stop mid-turn writes a user-role "[Request interrupted
+    by user…]" marker — a statement ABOUT the turn, not something the operator
+    typed, so the rich path classifies it as an `interrupt` block (the chat's
+    centred status marker) instead of a user text bubble. Mirror cases in
+    tunnel-agent.test.js."""
+
+    def test_marker_becomes_interrupt_block(self):
+        for text in ("[Request interrupted by user]",
+                     "[Request interrupted by user for tool use]"):
+            for content in (text, [{"type": "text", "text": text}]):
+                self.assertEqual(
+                    ha._entry_blocks({"type": "user", "message": {"content": content}},
+                                     ha.BLOCK_CAPS_LIVE),
+                    [{"t": "interrupt", "text": text}])
+
+    def test_text_feed_keeps_the_raw_line(self):
+        # Glasses/heartbeat/archive are one-dimensional text, where the bracket
+        # line already reads as the marker it is.
+        self.assertEqual(
+            ha._entry_text({"type": "user", "message": {
+                "content": "[Request interrupted by user]"}}),
+            "[Request interrupted by user]")
+
+    def test_prose_mentioning_an_interrupt_stays_prose(self):
+        text = "the log said [Request interrupted by user] at 3pm"
+        self.assertEqual(
+            ha._entry_blocks({"type": "user", "message": {"content": text}},
+                             ha.BLOCK_CAPS_LIVE),
+            [{"t": "text", "text": text}])
+
+
+class TestAwaySummary(unittest.TestCase):
+    """The "while you were away" recap is a `system` entry (subtype
+    away_summary) whose content the model wrote — the one system subtype worth
+    rendering. It surfaces as an assistant-side `away_summary` block/text with
+    the "(disable recaps in /config)" TUI hint stripped; every other system
+    subtype stays dropped. Mirror cases in tunnel-agent.test.js."""
+
+    ENTRY = {"type": "system", "subtype": "away_summary",
+             "content": "Fixed the bug and opened a PR. (disable recaps in /config)"}
+
+    def test_becomes_an_away_summary_block(self):
+        self.assertEqual(ha._entry_blocks(self.ENTRY, ha.BLOCK_CAPS_LIVE),
+                         [{"t": "away_summary", "text": "Fixed the bug and opened a PR."}])
+
+    def test_text_feed_and_role(self):
+        self.assertEqual(ha._entry_text(self.ENTRY), "Fixed the bug and opened a PR.")
+        self.assertEqual(ha._entry_role(self.ENTRY), "assistant")
+
+    def test_other_system_subtypes_stay_dropped(self):
+        for sub in ("turn_duration", "bridge_status", "stop_hook_summary", None):
+            entry = {"type": "system", "subtype": sub, "content": "x"}
+            self.assertIsNone(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE))
+            self.assertIsNone(ha._entry_text(entry))
+
+    def test_empty_recap_drops(self):
+        entry = {"type": "system", "subtype": "away_summary",
+                 "content": " (disable recaps in /config)"}
+        self.assertIsNone(ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE))
+        self.assertIsNone(ha._entry_text(entry))
+
+    def test_long_recap_is_capped_and_truncated(self):
+        entry = {"type": "system", "subtype": "away_summary",
+                 "content": "z" * (ha.BLOCK_CAPS_LIVE["text"] + 100)}
+        block = ha._entry_blocks(entry, ha.BLOCK_CAPS_LIVE)[0]
+        self.assertEqual(len(block["text"]), ha.BLOCK_CAPS_LIVE["text"])
+        self.assertTrue(block["truncated"])
+
+
+class TestToolReferenceResult(unittest.TestCase):
+    """A ToolSearch result names the tools it loaded as tool_reference blocks
+    inside its tool_result content; flattening them away left the call's
+    output card reading empty. Mirror cases in tunnel-agent.test.js."""
+
+    def test_tool_reference_flattens_to_a_named_line(self):
+        self.assertEqual(
+            ha._tool_result_text([{"type": "text", "text": "loaded:"},
+                                  {"type": "tool_reference", "tool_name": "WebFetch"},
+                                  {"type": "tool_reference", "tool_name": "Monitor"}]),
+            "loaded:\n[tool: WebFetch]\n[tool: Monitor]")
+
+    def test_nameless_reference_still_shows(self):
+        self.assertEqual(ha._tool_result_text([{"type": "tool_reference"}]),
+                         "\n[tool: tool]")
+
+
+class TestQueuedPrompts(ProjectDirMixin, unittest.TestCase):
+    """A message typed mid-turn only becomes a user entry when Claude Code
+    dequeues it; until then it lives in queue-operation transcript entries.
+    _fold_queue_op replays them FIFO so /history (and the JS live tail, mirror
+    in tunnel-agent.test.js) can report the still-queued prompts."""
+
+    def _fold(self, ops):
+        q = []
+        for op in ops:
+            ha._fold_queue_op(op, q)
+        return q
+
+    def test_enqueue_dequeue_remove_fifo(self):
+        q = self._fold([
+            {"operation": "enqueue", "content": "first"},
+            {"operation": "enqueue", "content": "second"},
+            {"operation": "enqueue", "content": "third"},
+            {"operation": "dequeue"},                      # pops "first"
+            {"operation": "remove", "content": "third"},   # withdrawn by hand
+        ])
+        self.assertEqual(q, ["second"])
+
+    def test_unmatched_dequeue_and_remove_are_noops(self):
+        # A read window can open mid-sequence: a dequeue whose enqueue was cut
+        # off must not invent or destroy anything.
+        self.assertEqual(self._fold([{"operation": "dequeue"},
+                                     {"operation": "remove", "content": "ghost"}]), [])
+
+    def test_blank_enqueue_is_ignored(self):
+        self.assertEqual(self._fold([{"operation": "enqueue", "content": "  "},
+                                     {"operation": "enqueue"}]), [])
+
+    def test_history_entries_reports_still_queued_prompts(self):
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [
+            {"uuid": "u1", "type": "user", "message": {"content": "start work"}},
+            {"type": "queue-operation", "operation": "enqueue", "content": "also do X"},
+            {"type": "queue-operation", "operation": "enqueue", "content": "and Y"},
+            {"type": "queue-operation", "operation": "dequeue"},
+            # the dequeued prompt lands as its real user turn — no duplicate
+            {"uuid": "u2", "type": "user", "message": {"content": "also do X"}},
+        ])
+        entries, capped, queued = ha._history_entries(path)
+        self.assertFalse(capped)
+        self.assertEqual([e["id"] for e in entries], ["u1", "u2"])
+        self.assertEqual(queued, ["and Y"])
+
+    def test_task_notifications_keep_their_slot_but_never_display(self):
+        # A background task finishing mid-turn rides the same queue as a
+        # <task-notification> XML wall. It must occupy its FIFO slot (dequeues
+        # are positional) yet never render as a queued operator bubble.
+        path = os.path.join(self.proj, "t.jsonl")
+        write_jsonl(path, [
+            {"type": "queue-operation", "operation": "enqueue",
+             "content": "<task-notification>\n<task-id>x</task-id>\n</task-notification>"},
+            {"type": "queue-operation", "operation": "enqueue", "content": "real prompt"},
+            {"type": "queue-operation", "operation": "dequeue"},  # pops the notification
+        ])
+        _, _, queued = ha._history_entries(path)
+        self.assertEqual(queued, ["real prompt"])
+        # And an undequeued notification is filtered at display, not from the FIFO.
+        self.assertEqual(ha._queued_display(
+            ["<task-notification>x</task-notification>", "real prompt"]),
+            ["real prompt"])
+
+    def test_queued_list_is_capped(self):
+        path = os.path.join(self.proj, "t.jsonl")
+        ops = [{"type": "queue-operation", "operation": "enqueue", "content": f"p{i}"}
+               for i in range(ha.QUEUED_PROMPTS_MAX + 5)]
+        write_jsonl(path, ops)
+        _, _, queued = ha._history_entries(path)
+        self.assertEqual(len(queued), ha.QUEUED_PROMPTS_MAX)
+        self.assertEqual(queued[-1], f"p{ha.QUEUED_PROMPTS_MAX + 4}")
+
+
 class TestHistoryEntriesRich(ProjectDirMixin, unittest.TestCase):
     def test_blocks_attached_and_tool_result_only_turn_surfaces(self):
         path = os.path.join(self.proj, "t.jsonl")
@@ -1151,8 +2254,9 @@ class TestHistoryEntriesRich(ProjectDirMixin, unittest.TestCase):
             {"uuid": "r1", "type": "user", "message": {"content": [
                 {"type": "tool_result", "tool_use_id": "t1", "content": "file.txt"}]}},
         ])
-        entries, capped = ha._history_entries(path)
+        entries, capped, queued = ha._history_entries(path)
         self.assertFalse(capped)
+        self.assertEqual(queued, [])
         self.assertEqual([e["id"] for e in entries], ["u1", "a1", "r1"])
         self.assertEqual(entries[2]["text"], "")
         self.assertEqual(entries[2]["blocks"], [{"t": "tool_result", "text": "file.txt", "forId": "t1"}])
@@ -1184,6 +2288,10 @@ class ManagerMixin:
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
+            ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
+            ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
+            ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", os.path.join(self.tmp, "worktrees")),
         ]:
@@ -1193,6 +2301,125 @@ class ManagerMixin:
 
     def make_manager(self):
         return ha.SessionManager()
+
+
+class TestStartedAt(ManagerMixin, unittest.TestCase):
+    """The heartbeat's startedAt: docker's StartedAt where it answers, else the
+    manager's own start — never empty. The hub's restart-loop alert keys on this
+    field CHANGING, so an agent that reports none (a native host, where `docker
+    inspect` isn't there) could crash-loop with no notification (XERK-34)."""
+
+    def test_falls_back_to_manager_start_when_docker_cannot_answer(self):
+        # ManagerMixin's fake_run returns "" for every command, docker included.
+        sm = self.make_manager()
+        self.assertTrue(sm.started_at)
+        # The fallback is a parseable UTC timestamp (what the hub Date.parse's).
+        time.strptime(sm.started_at, "%Y-%m-%dT%H:%M:%SZ")
+
+    def test_docker_answer_wins(self):
+        real_run = ha.run
+
+        def docker_aware_run(cmd, cwd=None):
+            if cmd[:2] == ["docker", "inspect"]:
+                return "2024-01-01T00:00:00.000000000Z"
+            return real_run(cmd, cwd)
+
+        with mock.patch.object(ha, "run", docker_aware_run):
+            sm = self.make_manager()
+        self.assertEqual(sm.started_at, "2024-01-01T00:00:00.000000000Z")
+
+
+class TestTicketLedger(ManagerMixin, unittest.TestCase):
+    """The transcript -> ticket ledger: which conversation worked which Jira
+    ticket, recorded durably so the board's chips outlive the session record —
+    killed, aged out of closed.json, or wiped with ~/.turma."""
+
+    def _sess(self, sid="s1", tid="t1", key="PROJ-7", **over):
+        s = {"id": sid, "repo": "Turma", "claudeSessionId": tid,
+             "ticket": {"key": key, "siteKey": "x.atlassian.net",
+                        "url": f"https://x.atlassian.net/browse/{key}",
+                        "summary": "Fix the thing", "branch": key}}
+        s.update(over)
+        return s
+
+    def test_remember_persists_and_reloads(self):
+        sm = self.make_manager()
+        sm._remember_ticket(self._sess())
+        # A fresh manager reads it back off disk — the whole point of the file.
+        sm2 = self.make_manager()
+        self.assertEqual(sm2.ticket_ledger["t1"]["key"], "PROJ-7")
+        self.assertEqual(sm2.ticket_ledger["t1"]["branch"], "PROJ-7")
+        self.assertEqual(sm2.ticket_ledger["t1"]["repo"], "Turma")
+
+    def test_ignores_a_session_with_no_ticket_or_no_transcript(self):
+        sm = self.make_manager()
+        sm._remember_ticket({"id": "s1", "repo": "Turma", "claudeSessionId": "t1"})
+        sm._remember_ticket(self._sess(tid=None))          # not launched yet
+        sm._remember_ticket(self._sess(sid="s3", tid="t3", key=None))
+        self.assertEqual(sm.ticket_ledger, {})
+
+    def test_remember_is_idempotent(self):
+        """Every launch calls this, so an unchanged entry must not rewrite the
+        file — and must not restamp `at`, which is the prune's sort key."""
+        sm = self.make_manager()
+        self.assertTrue(sm._remember_ticket(self._sess()))
+        at = sm.ticket_ledger["t1"]["at"]
+        self.assertFalse(sm._remember_ticket(self._sess()))
+        self.assertEqual(sm.ticket_ledger["t1"]["at"], at)
+
+    def test_clear_context_records_both_conversations(self):
+        """A restart-clear-context relaunches the same session under a NEW
+        transcript. Both worked the ticket and both stay separately resumable, so
+        the old one is kept rather than replaced."""
+        sm = self.make_manager()
+        sess = self._sess()
+        sm._remember_ticket(sess)
+        sess["claudeSessionId"] = "t2"     # what _launch_tmux does on a restart
+        sm._remember_ticket(sess)
+        self.assertEqual(set(sm.ticket_ledger), {"t1", "t2"})
+        self.assertEqual(sm.ticket_ledger["t2"]["key"], "PROJ-7")
+
+    def test_backfills_from_registry_and_closed(self):
+        """Sessions that predate the ledger are adopted from the two records that
+        already carry both a ticket and a transcript id — so it doesn't start
+        empty on the very update that makes it durable."""
+        write_json(ha.REGISTRY_PATH, [self._sess(sid="live", tid="t-live")])
+        write_json(ha.CLOSED_PATH, [self._sess(sid="dead", tid="t-dead", key="PROJ-9")])
+        sm = self.make_manager()
+        self.assertEqual(sm.ticket_ledger["t-live"]["key"], "PROJ-7")
+        self.assertEqual(sm.ticket_ledger["t-dead"]["key"], "PROJ-9")
+        # And it was persisted, not just held in memory.
+        self.assertEqual(self.make_manager().ticket_ledger["t-dead"]["key"], "PROJ-9")
+
+    def test_backfill_keys_a_pre_pin_record_on_its_transcript_id(self):
+        """A closed record written before the session-id pin has no
+        claudeSessionId; its resolved transcriptId is the only handle it ever
+        had, so key on that rather than skipping it."""
+        rec = self._sess(sid="old", tid=None)
+        rec["transcriptId"] = "t-old"
+        write_json(ha.CLOSED_PATH, [rec])
+        self.assertEqual(self.make_manager().ticket_ledger["t-old"]["key"], "PROJ-7")
+
+    def test_survives_the_registry_and_closed_history_being_wiped(self):
+        """The reason this exists. ~/.turma outlives an agent update only if it's
+        mounted, but even then closed.json keeps just CLOSED_PER_REPO per repo —
+        so the ledger has to answer once both records are gone."""
+        sm = self.make_manager()
+        sm._remember_ticket(self._sess())
+        sm2 = self.make_manager()
+        sm2.registry, sm2.closed = [], []
+        self.assertEqual(sm2.ticket_ledger["t1"]["key"], "PROJ-7")
+
+    def test_prune_bounds_the_ledger_oldest_first(self):
+        p = mock.patch.object(ha, "TICKET_LEDGER_MAX", 2)
+        p.start()
+        self.addCleanup(p.stop)
+        sm = self.make_manager()
+        for i, at in enumerate(["2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z",
+                                "2026-03-01T00:00:00Z"]):
+            sm.ticket_ledger[f"t{i}"] = {"key": f"P-{i}", "at": at}
+        sm._prune_ticket_ledger()
+        self.assertEqual(set(sm.ticket_ledger), {"t1", "t2"})  # oldest t0 fell off
 
 
 class TestUsageLedger(ManagerMixin, unittest.TestCase):
@@ -1258,7 +2485,7 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
     """Usage counts EVERY transcript on disk, not only ledger-known slugs: an
     orphan transcript (session aged out of closed.json, or predating the ledger)
     is adopted with best-effort attribution, and nothing is excluded — an
-    unattributable one still counts under OTHER_REPO_NAME."""
+    unattributable one still counts, folded into the root bucket (XERK-147)."""
 
     def setUp(self):
         super().setUp()
@@ -1267,6 +2494,11 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
         p = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
         p.start()
         self.addCleanup(p.stop)
+
+    def _mk_repo(self, name):
+        """A scanned repo under REPOS_ROOT — a derived (slug/cwd) attribution
+        only stands when it names one of these."""
+        os.makedirs(os.path.join(ha.REPOS_ROOT, name, ".git"), exist_ok=True)
 
     def _write_transcript(self, worktree):
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(worktree))
@@ -1295,7 +2527,9 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
 
     def test_case2_recovers_repo_when_worktree_gone(self):
         # Worktree deleted; the transcript's slug still carries the
-        # .turma/worktrees/<repo>/<id> shape, so the repo is recovered from it.
+        # .turma/worktrees/<repo>/<id> shape, so the repo is recovered from it
+        # (a repo this host scans — validation's happy path).
+        self._mk_repo("DockerOps")
         wt = os.path.join(ha.WORKTREES_ROOT, "DockerOps", "zzzzz")
         proj = self._write_transcript(wt)
         sm = self.make_manager()
@@ -1307,17 +2541,33 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
     def test_sibling_tool_worktree_shape_attributed(self):
         # A different tool's worktree (e.g. .agenthub/worktrees/AgentHub/<id>):
         # not under WORKTREES_ROOT, so no exact match, but the worktrees-shaped
-        # slug still names the repo — attributed, not lumped into (other).
+        # slug still names the repo — attributed when this host has that repo.
+        self._mk_repo("AgentHub")
         wt = "/repos/.agenthub/worktrees/AgentHub/10ab3"
         proj = self._write_transcript(wt)
         sm = self.make_manager()
         sm._reconcile_orphan_transcripts()
         self.assertEqual(sm.usage_ledger[proj]["repo"], "AgentHub")
 
+    def test_scratchpad_slug_folds_to_root(self):
+        # A claude run inside a session's scratchpad dir: its cwd embeds the
+        # SLUGIFIED worktree path, so the transcript slug carries "-worktrees-"
+        # and false-matched the worktree shape — recovering a phantom
+        # "Turma-<id>-<uuid>" repo (XERK-147). Not a scanned repo, no usable
+        # cwd tail -> folded into the root bucket.
+        self._mk_repo("Turma")
+        cwd = ("/tmp/claude-0/-mnt-data-Docker-git--turma-worktrees-Turma-fd761"
+               "/b2e9b2c9-a9f2-4da9-8cbf-df0c27c31aae/scratchpad")
+        proj = self._write_transcript(cwd)
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertEqual(sm.usage_ledger[proj]["repo"], ha.ROOT_REPO_NAME)
+
     def test_repo_recovered_from_transcript_cwd(self):
         # No worktree and no worktrees-shaped slug, but the transcript records
         # its cwd (e.g. an operator's dev-machine session, Windows path) — the
-        # repo is read from there, not lumped into (other).
+        # repo is read from there when its tail names a repo this host has.
+        self._mk_repo("Foverlay")
         wt = "/home/me/OneDrive/personal/Foverlay"
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
         os.makedirs(proj, exist_ok=True)
@@ -1329,13 +2579,28 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
         sm._reconcile_orphan_transcripts()
         self.assertEqual(sm.usage_ledger[proj]["repo"], "Foverlay")
 
-    def test_unattributable_bucketed_as_other(self):
+    def test_junk_cwd_tail_folds_to_root(self):
+        # A cwd whose last segment names no repo this host has ("repo", "tmp",
+        # "repos") must not mint a phantom repo — it folds to root (XERK-147).
+        self._mk_repo("Turma")
+        cwd = "/mnt/data/Docker/SwitchBoard/repo"
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        write_jsonl(os.path.join(proj, "t.jsonl"), [
+            {"type": "user", "cwd": cwd,
+             "message": {"role": "user", "content": "hi"}},
+        ])
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertEqual(sm.usage_ledger[proj]["repo"], ha.ROOT_REPO_NAME)
+
+    def test_unattributable_bucketed_as_root(self):
         # No worktree, no worktrees-shaped slug, and no cwd recorded — still
-        # adopted so its cost counts, under OTHER_REPO_NAME.
+        # adopted so its usage counts, in the root bucket (XERK-147).
         proj = self._write_transcript("/root/scratch")  # usage_entry has no cwd
         sm = self.make_manager()
         sm._reconcile_orphan_transcripts()
-        self.assertEqual(sm.usage_ledger[proj]["repo"], ha.OTHER_REPO_NAME)
+        self.assertEqual(sm.usage_ledger[proj]["repo"], ha.ROOT_REPO_NAME)
 
     def test_skips_already_ledgered_slug(self):
         wt = self._mk_worktree("Turma", "abcde")
@@ -1353,6 +2618,161 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sm._reconcile_orphan_transcripts()
         self.assertFalse(sm.usage_ledger)
+
+    # --- The manager's OWN internal claude -p helpers are not repos (XERK-27) ---
+    # Session naming and Jira triage run headless with cwd=REGISTRY_DIR but still
+    # write a transcript into the shared ~/.claude/projects, which earlier builds
+    # adopted as phantom ".turma" / "hub-agent-mgr-*" repos on the usage page.
+
+    def _write_prompted(self, cwd_dir, prompt, tid="t"):
+        """A transcript whose first user turn is `prompt`, recorded from cwd_dir —
+        the shape the manager's own summary/triage claude -p leaves behind. Carries
+        usage so a test can also prove the tokens don't reach the host total."""
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd_dir))
+        os.makedirs(proj, exist_ok=True)
+        write_jsonl(os.path.join(proj, tid + ".jsonl"), [
+            {"type": "user", "cwd": cwd_dir,
+             "message": {"role": "user", "content": prompt}},
+            usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
+                        "claude-sonnet-4-20250514", 100_000, 0),
+        ])
+        return proj
+
+    def test_registry_dir_transcript_tombstoned_by_slug(self):
+        # cwd=REGISTRY_DIR -> the registry dir's own slug, matched WITHOUT reading
+        # the transcript (the production ".turma" leak). Tombstoned, not a repo.
+        proj = self._write_prompted(
+            ha.REGISTRY_DIR, ha.SUMMARY_INSTRUCTION + "Add a compose flag")
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertTrue(sm.usage_ledger[proj].get("internal"))
+        self.assertNotIn("repo", sm.usage_ledger[proj])
+        sm._refresh_repo_usage()          # nothing surfaces, no tokens counted
+        self.assertFalse(sm.repo_usage)
+        self.assertIsNone(sm.host_usage)
+
+    def test_triage_signature_tombstoned_under_foreign_slug(self):
+        # A verify/test harness boots the manager against a temp REGISTRY_DIR, so
+        # its triage claude -p lands under …-tmp-hub-agent-mgr-<rand>, NOT the
+        # running manager's registry slug. The prompt signature still catches it —
+        # otherwise it would have been named "hub-agent-mgr-abcd1234".
+        proj = self._write_prompted(
+            "/tmp/hub-agent-mgr-abcd1234",
+            ha.JIRA_TRIAGE_INSTRUCTION + "Candidate repositories:\n- Turma")
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertTrue(sm.usage_ledger[proj].get("internal"))
+        self.assertNotIn("repo", sm.usage_ledger[proj])
+
+    def test_sanitize_flips_existing_phantom_repo_entry(self):
+        # An older build already adopted the harness transcript as a real repo
+        # entry; the sanitize pass retires it to a tombstone so it drops off the
+        # usage page instead of lingering forever.
+        cwd = "/tmp/hub-agent-mgr-zzzz9999"
+        proj = self._write_prompted(cwd, ha.JIRA_TRIAGE_INSTRUCTION + "x")
+        sm = self.make_manager()
+        sm.usage_ledger = {proj: {"repo": "hub-agent-mgr-zzzz9999",
+                                  "remote": "", "slug": ha._project_slug(cwd)}}
+        sm._sanitize_internal_tool_entries()
+        self.assertTrue(sm.usage_ledger[proj].get("internal"))
+        sm._refresh_repo_usage()
+        self.assertFalse(any("hub-agent-mgr" in r["repo"]
+                             for r in sm.repo_usage))
+
+    def test_real_session_prompt_not_treated_as_internal(self):
+        # A genuine coding prompt from a repo cwd is still adopted as its repo —
+        # the carve-out is narrow and keyed on the manager's own prompt text.
+        self._mk_repo("Widget")
+        proj = self._write_prompted(
+            "/home/me/personal/Widget", "Add a dark mode toggle to settings")
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertFalse(sm.usage_ledger[proj].get("internal"))
+        self.assertEqual(sm.usage_ledger[proj]["repo"], "Widget")
+
+    def test_archive_manifest_skips_internal_tool_transcript(self):
+        # The reconcile ledger is the archive's input too, so a tombstone keeps the
+        # helper transcripts out of the durable/searchable archive, not just usage.
+        self._write_prompted(ha.REGISTRY_DIR, ha.SUMMARY_INSTRUCTION + "x")
+        sm = self.make_manager()
+        sm._reconcile_orphan_transcripts()
+        self.assertFalse(sm._archive_manifest())
+
+    def test_internal_signatures_track_the_live_prompts(self):
+        # The signatures must stay a prefix of the live instructions, or a reword
+        # would silently stop excluding the helper transcripts (XERK-27). Reading
+        # the transcript is the harness-proof path; this guards its input.
+        self.assertTrue(any(ha.JIRA_TRIAGE_INSTRUCTION.startswith(s)
+                            for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
+        self.assertTrue(any(ha.SUMMARY_INSTRUCTION.startswith(s)
+                            for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
+
+
+class TestSanitizeJunkRepoEntries(ManagerMixin, unittest.TestCase):
+    """_sanitize_junk_repo_entries folds persisted ledger entries whose repo
+    names nothing real — the phantom "…-scratchpad"/"tmp"/"repo"/"(other)"
+    entries older builds adopted — into the root bucket, and lifts the internal
+    tombstone a /model-only root session once put on the REPOS_ROOT slug
+    (XERK-147)."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
+        p.start()
+        self.addCleanup(p.stop)
+        os.makedirs(os.path.join(ha.REPOS_ROOT, "Turma", ".git"), exist_ok=True)
+
+    def _entry(self, repo, slug, remote=""):
+        return {"repo": repo, "remote": remote, "slug": slug}
+
+    def test_junk_names_fold_to_root(self):
+        sm = self.make_manager()
+        sm.usage_ledger = {
+            "/p/a": self._entry("Turma-fd761-b2e9b2c9-scratchpad", "-p-a"),
+            "/p/b": self._entry("repo", "-p-b"),
+            "/p/c": self._entry("(other)", "-p-c"),
+            "/p/d": self._entry(None, "-p-d"),
+        }
+        sm._sanitize_junk_repo_entries()
+        for path in ("/p/a", "/p/b", "/p/c", "/p/d"):
+            self.assertEqual(sm.usage_ledger[path]["repo"], ha.ROOT_REPO_NAME)
+
+    def test_scanned_repo_and_remote_entries_kept(self):
+        sm = self.make_manager()
+        sm.usage_ledger = {
+            "/p/scanned": self._entry("Turma", "-p-scanned"),
+            "/p/gone": self._entry("Deleted",
+                                   "-p-gone", remote="git@gh:me/Deleted.git"),
+            "/p/root": self._entry(ha.ROOT_REPO_NAME, "-p-root"),
+        }
+        before = {p: dict(m) for p, m in sm.usage_ledger.items()}
+        sm._sanitize_junk_repo_entries()
+        # A scanned repo, a remote-carrying entry (real even though the repo
+        # left this host), and the root bucket itself are all untouched.
+        self.assertEqual(sm.usage_ledger, before)
+
+    def test_untombstones_repos_root_slug(self):
+        sm = self.make_manager()
+        root_slug = ha._project_slug(ha.REPOS_ROOT)
+        sm.usage_ledger = {
+            ha.REPOS_ROOT: {"internal": True, "slug": root_slug},
+            "/p/probe": {"internal": True, "slug": "-tmp-hub-agent-mgr-x"},
+        }
+        sm._sanitize_junk_repo_entries()
+        self.assertEqual(sm.usage_ledger[ha.REPOS_ROOT]["repo"],
+                         ha.ROOT_REPO_NAME)
+        self.assertNotIn("internal", sm.usage_ledger[ha.REPOS_ROOT])
+        # A genuine internal tombstone (the manager's own helpers) stays.
+        self.assertTrue(sm.usage_ledger["/p/probe"].get("internal"))
+
+    def test_noop_when_repo_scan_is_empty(self):
+        # An unreadable/empty REPOS_ROOT must not fold every real repo's
+        # history into root — the pass declines to judge without a repo list.
+        shutil.rmtree(os.path.join(ha.REPOS_ROOT, "Turma"))
+        sm = self.make_manager()
+        sm.usage_ledger = {"/p/a": self._entry("Whatever", "-p-a")}
+        sm._sanitize_junk_repo_entries()
+        self.assertEqual(sm.usage_ledger["/p/a"]["repo"], "Whatever")
 
 
 class TestTranscriptCwd(unittest.TestCase):
@@ -1440,6 +2860,40 @@ class TestResumableReport(ManagerMixin, unittest.TestCase):
         rep = sm._resumable_report()
         self.assertNotIn("Turma", rep)  # its only transcript is on a live card
 
+    def test_carries_the_ticket_a_transcript_worked(self):
+        """The durable channel is re-derived from the transcripts on disk, which
+        know nothing of Jira — the ticket ledger is what re-attaches the two, and
+        this is the only channel still reporting a session once its record has
+        aged out of closed.json."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        self._write_at(wt, tid="tkt1")
+        self._write_at(wt, tid="plain1")
+        sm = self.make_manager()
+        sm.ticket_ledger = {"tkt1": {"key": "PROJ-7", "siteKey": "x.atlassian.net",
+                                     "branch": "PROJ-7", "repo": "Turma"}}
+        by_tid = {e["transcriptId"]: e for e in sm._resumable_report()["Turma"]}
+        self.assertEqual(by_tid["tkt1"]["ticket"]["key"], "PROJ-7")
+        self.assertEqual(by_tid["tkt1"]["ticket"]["branch"], "PROJ-7")
+        # An ordinary session reports no ticket rather than an empty one.
+        self.assertIsNone(by_tid["plain1"]["ticket"])
+
+    def test_carries_the_prs_a_transcript_opened(self):
+        """This scan is the only channel still reporting a session once its
+        closed record has aged out — so an ended session's PR chips (and their
+        last-known status) have to come from the durable PR ledger here (XERK-13),
+        exactly as the ticket does above."""
+        url = "https://github.com/o/r/pull/1"
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        self._write_at(wt, tid="pr1")
+        self._write_at(wt, tid="plain1")
+        sm = self.make_manager()
+        sm.pr_ledger = {"pr1": {"urls": [url], "at": "2026-01-01T00:00:00Z"}}
+        sm.pr_status_cache = {url: {"url": url, "state": "MERGED"}}
+        by_tid = {e["transcriptId"]: e for e in sm._resumable_report()["Turma"]}
+        self.assertEqual(by_tid["pr1"]["prs"], [{"url": url, "state": "MERGED"}])
+        # An ordinary session reports no PRs rather than an empty list.
+        self.assertIsNone(by_tid["plain1"]["prs"])
+
     def test_caps_per_repo(self):
         p = mock.patch.object(ha, "RESUMABLE_PER_REPO", 2)
         p.start()
@@ -1450,6 +2904,113 @@ class TestResumableReport(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         rep = sm._resumable_report()
         self.assertEqual(len(rep["Turma"]), 2)
+
+    def test_survives_a_wiped_registry_dir(self):
+        """The report is what makes the hub's Ended list durable, so it must be
+        derivable from the bind-mounted transcripts ALONE. ~/.turma's durability
+        is the host's to provide — a container that doesn't bind-mount it has
+        sessions.json, closed.json and the ledgers on the image's writable layer,
+        which an agent update recreates. What's left is ~/.claude/projects and
+        each transcript's own recorded cwd."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "gone1")
+        self._write_at(wt, tid="t1", text="the work it was doing")
+        sm = self.make_manager()
+        sm.registry, sm.closed, sm.usage_ledger = [], [], {}   # as if ~/.turma went
+
+        rep = sm._resumable_report()
+        self.assertEqual([e["transcriptId"] for e in rep["Turma"]], ["t1"])
+        self.assertEqual(rep["Turma"][0]["cwd"], wt)
+        self.assertEqual(rep["Turma"][0]["summary"], "the work it was doing")
+
+    def test_entries_carry_their_slug(self):
+        """_sorted_repo_entries()'s per-beat carded filter keys on it (below), so it
+        is reported rather than dropped after picking the summary source."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "w1")
+        self._write_at(wt, tid="t1")
+        sm = self.make_manager()
+        self.assertEqual(sm._resumable_report()["Turma"][0]["slug"],
+                         ha._project_slug(wt))
+
+    def test_endedTs_is_the_last_message_timestamp_not_the_mtime(self):
+        """XERK-73: the ended list sorts on endedTs, so it must be the last new
+        message's own timestamp — NOT the file mtime, which a synced ~/.claude or
+        a backup restore inflates to copy-time (a week-old chat sorting to the top
+        of Ended though nothing was said). The transcript's entries keep their
+        real timestamps, so those are the truth."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "w1")
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, "t1.jsonl")
+        write_jsonl(path, [
+            {"type": "user", "cwd": wt, "timestamp": "2026-07-01T00:00:00.000Z",
+             "message": {"role": "user", "content": "hi"}},
+            {"type": "assistant", "cwd": wt, "timestamp": "2026-07-01T00:05:00.000Z",
+             "message": {"role": "assistant", "content": "done"}},
+        ])
+        # The file was touched recently (a fresh copy), but that is a lie.
+        recent = time.time()
+        os.utime(path, (recent, recent))
+        sm = self.make_manager()
+        e = sm._resumable_report()["Turma"][0]
+        self.assertEqual(e["endedTs"], "2026-07-01T00:05:00.000Z")
+
+    def test_endedTs_falls_back_to_mtime_without_a_timestamped_entry(self):
+        """A transcript whose tail carries no timestamp (an older/odd shape) keeps
+        the mtime fallback rather than losing its endedTs entirely."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "w1")
+        self._write_at(wt, tid="t1")   # _write_at writes no timestamp
+        path = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt), "t1.jsonl")
+        os.utime(path, (1_600_000_000, 1_600_000_000))   # 2020-09-13T12:26:40Z
+        sm = self.make_manager()
+        e = sm._resumable_report()["Turma"][0]
+        self.assertEqual(e["endedTs"], "2020-09-13T12:26:40Z")
+
+    def test_report_re_cuts_a_stale_scan_against_the_live_registry(self):
+        """The scan is cached across the slow beats between refreshes, so on its
+        own it still lists a session that has since been RESUMED and is running
+        right now — offering Resume for a live session, and showing it in the
+        hub's Active and Ended lists at once. The registry is current every beat,
+        so the cut is re-applied at report time."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "w1")
+        self._write_at(wt, tid="t1")
+        sm = self.make_manager()
+        sm.resumable = sm._resumable_report()           # scanned while it was ended
+        self.assertEqual(len(sm.resumable["Turma"]), 1)
+
+        # It gets resumed. The cache still says otherwise until the next slow beat.
+        sm.registry = [{"id": "w1", "repo": "Turma", "worktreePath": wt,
+                        "status": "running"}]
+        turma = next(r for r in sm._sorted_repo_entries(refresh=False)
+                     if r["name"] == "Turma")
+        self.assertEqual(turma["resumable"], [],
+                         "a running session must not be offered for resume")
+        self.assertEqual(len(sm.resumable["Turma"]), 1,
+                         "the filter is a view — it must not mutate the cache")
+
+        # Killed again: the record leaves the registry, and it comes straight back
+        # without waiting out a rescan.
+        sm.registry = []
+        turma = next(r for r in sm._sorted_repo_entries(refresh=False)
+                     if r["name"] == "Turma")
+        self.assertEqual([e["transcriptId"] for e in turma["resumable"]], ["t1"])
+
+
+class TestCardedSlugs(ManagerMixin, unittest.TestCase):
+    """_carded_slugs: every registry session's project slug, running or stopped —
+    the sessions that already have a card of their own."""
+
+    def test_covers_running_stopped_and_root(self):
+        sm = self.make_manager()
+        sm.registry = [
+            {"id": "a", "worktreePath": "/g/.turma/worktrees/r/a", "status": "running"},
+            {"id": "b", "worktreePath": "/g/.turma/worktrees/r/b", "status": "stopped"},
+            {"id": "c", "worktreePath": ha.REPOS_ROOT, "root": True, "status": "running"},
+        ]
+        self.assertEqual(sm._carded_slugs(), {
+            ha._project_slug("/g/.turma/worktrees/r/a"),
+            ha._project_slug("/g/.turma/worktrees/r/b"),
+            ha._project_slug(ha.REPOS_ROOT),
+        })
 
 
 class TestResumeTranscript(ManagerMixin, unittest.TestCase):
@@ -1488,10 +3049,13 @@ class TestResumeTranscript(ManagerMixin, unittest.TestCase):
         self._write_at(wt, "trans1")
         sm = self._manager()
         sm._worktree_add = mock.Mock()
-        sm.resume_transcript("trans1", wt)
+        sm.resume_transcript("trans1", wt, cmd_id="c7")
         self.assertEqual(len(sm.registry), 1)
         sess = sm.registry[0]
         self.assertEqual(sess["worktreePath"], wt)
+        # A resume mints a fresh id like spawn, so the hub correlates the same
+        # way — by the command id echoed back onto the record.
+        self.assertEqual(sess["spawnCmdId"], "c7")
         self.assertEqual(sess["repo"], "Turma")
         self.assertEqual(sess["status"], "running")
         sm._worktree_add.assert_not_called()          # worktree still present
@@ -1541,6 +3105,250 @@ class TestResumeTranscript(ManagerMixin, unittest.TestCase):
         sm.resume_transcript("../etc/passwd", "/x")
         self.assertEqual(sm.registry, [])
         sm._launch_tmux.assert_not_called()
+
+
+class TestMigrateSession(ManagerMixin, unittest.TestCase):
+    """Moving a session to another agent (XERK-101): the source packs its raw
+    transcript and ships it through the hub; the target unpacks it under the
+    origin cwd's slug and resumes the same conversation, carrying the moved
+    session's identity."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(ha, "REPOS_ROOT", os.path.join(self.tmp, "git"))
+        p.start()
+        self.addCleanup(p.stop)
+        self.repo = {"name": "Turma", "path": os.path.join(ha.REPOS_ROOT, "Turma")}
+        os.makedirs(self.repo["path"], exist_ok=True)
+        p2 = mock.patch.object(ha, "scan_repos", lambda: [self.repo])
+        p2.start()
+        self.addCleanup(p2.stop)
+
+    def _write_transcript(self, cwd, tid, *, tail="\n", subagents=False):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, tid + ".jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "user", "cwd": cwd,
+                                "message": {"role": "user", "content": "hi"}}) + "\n")
+            f.write(tail)  # a trailing partial (no newline) or a clean "\n"
+        if subagents:
+            sub = ha._subagents_dir(path)
+            os.makedirs(sub, exist_ok=True)
+            with open(os.path.join(sub, "agent-x.jsonl"), "w") as f:
+                f.write('{"sub":1}\n')
+        return path
+
+    def _manager(self):
+        sm = self.make_manager()
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        sm.device = "hostA"
+        return sm
+
+    def test_pack_unpack_round_trip_truncates_partial_tail(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        # A half-written final line (no newline) must not travel — the target
+        # would choke resuming a partial-JSON tail.
+        path = self._write_transcript(wt, "trans1", tail='{"partial', subagents=True)
+        sm = self._manager()
+        blob = sm._pack_transcript(path)
+        dest = os.path.join(self.tmp, "dest")
+        os.makedirs(dest)
+        sm._unpack_transcript(blob, dest)
+        out = os.path.join(dest, "trans1.jsonl")
+        self.assertTrue(os.path.isfile(out))
+        with open(out) as f:
+            body = f.read()
+        self.assertNotIn("partial", body)          # truncated at the last newline
+        self.assertTrue(body.endswith("\n"))
+        # The subagents dir travels alongside, laid out for the slug dir.
+        self.assertTrue(os.path.isfile(
+            os.path.join(dest, "trans1", "subagents", "agent-x.jsonl")))
+
+    def test_unpack_rejects_a_traversing_member(self):
+        sm = self._manager()
+        buf = io.BytesIO()
+        with __import__("tarfile").open(fileobj=buf, mode="w:gz") as tar:
+            data = b"x"
+            ti = __import__("tarfile").TarInfo(name="../escape.jsonl")
+            ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+        with self.assertRaises(ValueError):
+            sm._unpack_transcript(buf.getvalue(), os.path.join(self.tmp, "d2"))
+
+    def test_export_packs_and_uploads(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "sess1")
+        self._write_transcript(wt, "transE")
+        sm = self._manager()
+        sm.registry = [{"id": "sess1", "worktreePath": wt, "status": "running",
+                        "repo": "Turma", "claudeSessionId": "transE"}]
+        sent = {}
+        sm._migration_upload = lambda mid, blob: sent.update(mid=mid, blob=blob)
+        sm.export_session("sess1", "mig123")
+        self.assertEqual(sent["mid"], "mig123")
+        # What it uploaded really is the packed transcript.
+        dest = os.path.join(self.tmp, "dl")
+        os.makedirs(dest)
+        sm._unpack_transcript(sent["blob"], dest)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "transE.jsonl")))
+
+    def test_export_no_transcript_uploads_nothing(self):
+        sm = self._manager()
+        sm.registry = [{"id": "s", "worktreePath": "/nope", "status": "running",
+                        "repo": "Turma", "claudeSessionId": "gone"}]
+        called = []
+        sm._migration_upload = lambda *a: called.append(a)
+        sm.export_session("s", "mig1")
+        self.assertEqual(called, [])
+
+    def test_import_unpacks_and_resumes_with_identity(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "orig")  # not on disk here
+        # Pack a transcript on a "source", then import it on this "target".
+        src_path = self._write_transcript(wt, "transI")
+        src = self._manager()
+        blob = src._pack_transcript(src_path)
+        # Wipe the target's copy so import is what puts it on disk.
+        shutil.rmtree(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt)))
+
+        sm = self._manager()
+        sm._worktree_add = mock.Mock()
+        sm._migration_download = lambda mid: blob
+        cmd = {
+            "type": "importSession", "cmdId": "c9", "migrationId": "mig9",
+            "transcriptId": "transI", "cwd": wt, "repo": "Turma",
+            "model": "opus", "permissionMode": "plan", "summary": "Fix the logs",
+            "ticket": {"key": "ENG-9", "branch": "ENG-9"},
+            "migratedFrom": {"host": "hostA", "sessionId": "orig"},
+        }
+        with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
+            sm.import_session(cmd)
+        # The transcript landed at the origin cwd's slug so claude --resume finds it.
+        self.assertTrue(os.path.isfile(os.path.join(
+            ha.PROJECTS_ROOT, ha._project_slug(wt), "transI.jsonl")))
+        self.assertEqual(len(sm.registry), 1)
+        sess = sm.registry[0]
+        self.assertEqual(sess["worktreePath"], wt)
+        self.assertEqual(sess["repo"], "Turma")
+        self.assertEqual(sess["spawnCmdId"], "c9")
+        self.assertEqual(sess["model"], "opus")
+        self.assertEqual(sess["permissionMode"], "plan")
+        self.assertEqual(sess["summary"], "Fix the logs")
+        self.assertEqual(sess["ticket"]["key"], "ENG-9")
+        self.assertEqual(sess["migratedFrom"]["host"], "hostA")
+        # The moved conversation is resumed (its id pinned), and the missing
+        # worktree re-created at the exact origin path.
+        self.assertEqual(sm._launch_tmux.call_args.kwargs["resume_id"], "transI")
+        sm._worktree_add.assert_called_once()
+
+    def test_import_download_failure_creates_no_session(self):
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "orig2")
+        sm = self._manager()
+        sm._migration_download = lambda mid: None
+        sm.import_session({"migrationId": "m", "transcriptId": "t",
+                           "cwd": wt, "repo": "Turma"})
+        self.assertEqual(sm.registry, [])
+        sm._launch_tmux.assert_not_called()
+
+    def test_import_rejects_a_foreign_cwd(self):
+        sm = self._manager()
+        got = []
+        sm._migration_download = lambda mid: got.append(mid)
+        sm.import_session({"migrationId": "m", "transcriptId": "t",
+                           "cwd": "/home/me/elsewhere", "repo": "Turma"})
+        self.assertEqual(sm.registry, [])
+        self.assertEqual(got, [])   # bailed before spending a download
+
+    def test_localize_migrated_cwd(self):
+        """The target remaps a source worktree path onto its own REPOS_ROOT
+        (differing mounts), passes an already-local path through untouched, and
+        leaves a non-worktree/foreign path unchanged for the caller to reject."""
+        sm = self._manager()
+        wt_tail = os.path.join("Turma", "c59fe")
+        local = os.path.join(ha.WORKTREES_ROOT, "Turma", "c59fe")
+        # A source host mounting REPOS_ROOT elsewhere (WSL-native, container).
+        self.assertEqual(
+            sm._localize_migrated_cwd("/home/mhabeeb/git/.turma/worktrees/" +
+                                      wt_tail.replace(os.sep, "/")),
+            local)
+        # Already under this host's REPOS_ROOT -> unchanged.
+        self.assertEqual(sm._localize_migrated_cwd(local), local)
+        # No recognizable worktree tail -> unchanged (rejected downstream).
+        self.assertEqual(sm._localize_migrated_cwd("/home/me/elsewhere"),
+                         "/home/me/elsewhere")
+
+    def test_import_remaps_a_foreign_repos_root(self):
+        """A source mounting REPOS_ROOT at a DIFFERENT path ships its own
+        absolute worktree path; the target remaps the .turma/worktrees tail onto
+        its OWN REPOS_ROOT and resumes there, instead of wedging forever in
+        `importing` by rejecting it as foreign (the real-fleet migration bug)."""
+        foreign = "/home/otheruser/src/.turma/worktrees/Turma/c59fe"
+        local = os.path.join(ha.WORKTREES_ROOT, "Turma", "c59fe")
+        # Pack a transcript (its bytes are slug-agnostic) to hand to the target.
+        src_path = self._write_transcript(local, "transR")
+        blob = self._manager()._pack_transcript(src_path)
+        shutil.rmtree(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(local)))
+
+        sm = self._manager()
+        sm._worktree_add = mock.Mock()
+        sm._migration_download = lambda mid: blob
+        cmd = {"type": "importSession", "cmdId": "cR", "migrationId": "migR",
+               "transcriptId": "transR", "cwd": foreign, "repo": "Turma"}
+        with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
+            sm.import_session(cmd)
+        self.assertEqual(len(sm.registry), 1)
+        # Resumed at the LOCAL worktree path, not the foreign one.
+        self.assertEqual(sm.registry[0]["worktreePath"], local)
+        # The transcript landed under the LOCAL slug so claude --resume resolves.
+        self.assertTrue(os.path.isfile(os.path.join(
+            ha.PROJECTS_ROOT, ha._project_slug(local), "transR.jsonl")))
+        self.assertEqual(sm._launch_tmux.call_args.kwargs["resume_id"], "transR")
+
+    def _write_pr_transcript(self, cwd, tid, url):
+        """A transcript whose conversation OPENED a PR: the two entries a real
+        `gh pr create` leaves behind (the call, then its URL output)."""
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(cwd))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, tid + ".jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "assistant", "cwd": cwd, "message": {
+                "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                             "input": {"command": "gh pr create --fill"}}]}}) + "\n")
+            f.write(json.dumps({"type": "user", "cwd": cwd, "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "t1",
+                             "content": url}]}}) + "\n")
+        return path
+
+    def test_import_keeps_the_pr_chips(self):
+        """A migrated session KEEPS the PR chips it opened: the transcript holds
+        the `gh pr create` events, the transcript id is preserved, so the target
+        re-derives them at launch (session_report's per-beat scan primes past
+        them, and session_pr_urls is keyed by the freshly-minted id)."""
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "prsess")
+        url = "https://github.com/xerktech/Turma/pull/77"
+        src_path = self._write_pr_transcript(wt, "transP", url)
+        blob = self._manager()._pack_transcript(src_path)
+        shutil.rmtree(os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt)))
+
+        sm = self._manager()
+        # _launch_tmux is mocked, so pin the id itself as the real one would —
+        # _seed_prs resolves the transcript by the session's pinned id.
+        sm._launch_tmux = mock.Mock(
+            side_effect=lambda sess, **kw: sess.__setitem__(
+                "claudeSessionId", kw.get("resume_id")))
+        sm._worktree_add = mock.Mock()
+        sm._migration_download = lambda mid: blob
+        cmd = {"type": "importSession", "cmdId": "cP", "migrationId": "migP",
+               "transcriptId": "transP", "cwd": wt, "repo": "Turma"}
+        with mock.patch.object(ha, "resolve_base_ref", return_value="origin/main"):
+            sm.import_session(cmd)
+        sess = sm.registry[0]
+        # The chip is on the record, in session_pr_urls, and in the durable
+        # ledger (keyed by the preserved transcript id) — all three channels the
+        # PR-status feature reads.
+        self.assertEqual(sess.get("prUrls"), [url])
+        self.assertEqual(sm.session_pr_urls[sess["id"]], [url])
+        self.assertEqual(sm.pr_ledger["transP"]["urls"], [url])
 
 
 class TestRegistryPersistence(ManagerMixin, unittest.TestCase):
@@ -1620,10 +3428,11 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
             "not-a-dict",                                 # garbage -> ignored
         ]
         self.assertTrue(sm.handle_commands(cmds))
-        # spawn now threads the composer options (all None for a bare command).
+        # spawn now threads the composer options (all None for a bare command)
+        # plus the cmdId, which it echoes onto the session it creates.
         sm.spawn.assert_called_once_with(
             "Turma", prompt=None, label=None, base_ref=None,
-            model=None, permission_mode=None,
+            model=None, permission_mode=None, cmd_id="c1",
         )
         sm.kill.assert_called_once_with("ab123")
         sm.save.assert_called_once()
@@ -1636,6 +3445,29 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.spawn.assert_not_called()
         sm.kill.assert_not_called()
 
+    def test_refresh_jira_command_polls_when_configured(self):
+        sm = self.make_manager()
+        sm.refresh_jira = mock.Mock()
+        sm.save = mock.Mock()
+        with mock.patch.object(ha, "jira_configured", return_value=True):
+            self.assertTrue(sm.handle_commands(
+                [{"cmdId": "j1", "type": "refreshJira"}]))
+        sm.refresh_jira.assert_called_once_with()
+        self.assertEqual(sm.acked, {"j1"})
+
+    def test_refresh_jira_command_is_a_noop_when_unconfigured(self):
+        # The "unset env = zero Jira HTTP calls, ever" guarantee has to hold
+        # even against a command an older/confused hub aimed at this host.
+        sm = self.make_manager()
+        sm.refresh_jira = mock.Mock()
+        sm.save = mock.Mock()
+        with mock.patch.object(ha, "jira_configured", return_value=False):
+            self.assertTrue(sm.handle_commands(
+                [{"cmdId": "j2", "type": "refreshJira"}]))
+        sm.refresh_jira.assert_not_called()
+        # Still acked — an unexecutable command must not redeliver forever.
+        self.assertEqual(sm.acked, {"j2"})
+
     def test_spawn_command_threads_composer_options(self):
         sm = self.make_manager()
         sm.spawn = mock.Mock()
@@ -1647,7 +3479,7 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         }])
         sm.spawn.assert_called_once_with(
             "Turma", prompt="fix the bug", label="Fix login", base_ref="main",
-            model="opus", permission_mode="plan",
+            model="opus", permission_mode="plan", cmd_id="c9",
         )
 
     def test_prune_command_dispatches_to_prune_repo(self):
@@ -1657,6 +3489,18 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         sm.handle_commands([{"cmdId": "cp", "type": "prune", "repo": "Turma"}])
         sm.prune_repo.assert_called_once_with("Turma")
         self.assertIn("cp", sm.acked)
+
+    def test_restart_agent_command_arms_flag_without_exiting(self):
+        # XERK-157: restartAgent only ARMS the restart in handle_commands (so the
+        # command gets acked and leaves the hub's queue); the exit happens later
+        # in run_forever, once that ack has been delivered.
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        sm._perform_restart = mock.Mock(side_effect=AssertionError("must not exit here"))
+        self.assertTrue(sm.handle_commands([{"cmdId": "ra", "type": "restartAgent"}]))
+        self.assertTrue(sm._restart_pending)
+        self.assertIn("ra", sm.acked)
+        sm._perform_restart.assert_not_called()
 
     def test_unknown_type_and_poison_command_still_acked(self):
         sm = self.make_manager()
@@ -1675,6 +3519,136 @@ class TestHandleCommands(ManagerMixin, unittest.TestCase):
         self.assertFalse(sm.handle_commands([]))
         self.assertFalse(sm.handle_commands(None))
         sm.save.assert_not_called()
+
+
+class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
+    """Boot re-adopts a session whose claude tmux is STILL ALIVE instead of
+    killing+relaunching it — the property that lets the native agent update
+    itself (restart just this manager) without stopping active sessions. When
+    the tmux is gone it falls back to today's --resume relaunch."""
+
+    def _running_sess(self):
+        return {
+            "id": "aaaaa", "status": "running", "ttydPort": 7700,
+            "worktreePath": self.tmp,  # exists, so it isn't demoted
+            "tmuxName": "agent-aaaaa",
+        }
+
+    def test_adopts_live_tmux_without_relaunch(self):
+        sm = self.make_manager()
+        sm.registry = [self._running_sess()]
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(sm, "_tmux_alive", return_value=True):
+            sm.resume_on_boot()
+        # The live claude is left running: no kill, no relaunch...
+        sm._launch_tmux.assert_not_called()
+        # ...but the ttyd bridge is re-ensured, and the session stays running.
+        sm._launch_ttyd.assert_called_once()
+        self.assertEqual(sm.registry[0]["status"], "running")
+
+    def test_relaunches_when_tmux_gone(self):
+        sm = self.make_manager()
+        sm.registry = [self._running_sess()]
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(sm, "_tmux_alive", return_value=False):
+            sm.resume_on_boot()
+        # Whole tree died (container restart / reboot): relaunch with --resume,
+        # continuing the prior conversation.
+        sm._launch_tmux.assert_called_once()
+        self.assertTrue(sm._launch_tmux.call_args.kwargs.get("resume"))
+        sm._launch_ttyd.assert_called_once()
+
+    def test_worktree_gone_is_demoted(self):
+        sm = self.make_manager()
+        sess = self._running_sess()
+        sess["worktreePath"] = os.path.join(self.tmp, "vanished")
+        sm.registry = [sess]
+        sm._launch_tmux = mock.Mock()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(sm, "_tmux_alive", return_value=True):
+            sm.resume_on_boot()
+        self.assertEqual(sess["status"], "stopped")
+        sm._launch_tmux.assert_not_called()
+        sm._launch_ttyd.assert_not_called()
+
+    def test_launch_ttyd_adopts_our_surviving_ttyd(self):
+        # A ttyd WE launched that survived a manager restart still holds the port
+        # and its pid is alive. _launch_ttyd must adopt it (no rebind, no Popen).
+        sm = self.make_manager()
+        sess = self._running_sess()
+        sess["ttydPid"] = 5150
+        with mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_port_open", return_value=True), \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm._launch_ttyd(sess)
+        popen.assert_not_called()
+        self.assertNotIn(sess["id"], sm.ttyd)
+
+    def test_launch_ttyd_does_not_adopt_a_reused_open_port(self):
+        # Fresh spawn onto a port that happens to be open (just freed by a killed
+        # session whose ttyd hasn't died): no ttydPid, so we must NOT adopt — we
+        # launch our own, avoiding attaching to the wrong session's terminal.
+        sm = self.make_manager()
+        sess = self._running_sess()  # no ttydPid
+
+        class FakeProc:
+            pid = 7000
+            def poll(self_i):
+                return None
+
+        with mock.patch.object(ha, "_port_open", return_value=True), \
+             mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()) as popen:
+            sm._launch_ttyd(sess)
+        popen.assert_called_once()
+        self.assertEqual(sess["ttydPid"], 7000)
+
+    def test_launch_ttyd_persists_pid_when_port_free(self):
+        sm = self.make_manager()
+        sess = self._running_sess()
+
+        class FakeProc:
+            pid = 4242
+            def poll(self_i):
+                return None
+
+        with mock.patch.object(ha, "_port_open", return_value=False), \
+             mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()):
+            sm._launch_ttyd(sess)
+        # The pid is persisted so a later manager can reap an adopted orphan.
+        self.assertEqual(sess["ttydPid"], 4242)
+        self.assertIs(sm.ttyd[sess["id"]].pid, 4242)
+
+    def test_launch_ttyd_lets_a_mac_force_a_selection(self):
+        # The Claude TUI holds mouse tracking, so xterm.js only makes a
+        # selection — the prerequisite for copying anything out — when a
+        # modifier forces one. On macOS that modifier is Alt AND ONLY with this
+        # option on, so without it a Mac operator cannot select at all (XERK-7).
+        sm = self.make_manager()
+        sess = self._running_sess()
+
+        class FakeProc:
+            pid = 4243
+            def poll(self_i):
+                return None
+
+        with mock.patch.object(ha, "_port_open", return_value=False), \
+             mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()) as popen:
+            sm._launch_ttyd(sess)
+        args = popen.call_args[0][0]
+        self.assertIn("macOptionClickForcesSelection=true", args)
+
+    def test_kill_ttyd_reaps_adopted_orphan_by_pid(self):
+        # An adopted ttyd isn't in self.ttyd; _kill_ttyd must still reap it via
+        # the persisted pid so stop/delete don't leak the process and its port.
+        sm = self.make_manager()
+        sess = self._running_sess()
+        sess["ttydPid"] = 9191
+        sm.registry = [sess]
+        with mock.patch.object(ha.os, "kill") as oskill:
+            sm._kill_ttyd(sess["id"])
+        oskill.assert_called_once_with(9191, ha.signal.SIGTERM)
 
 
 class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
@@ -1708,7 +3682,49 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertIn("--detach", wt)
         self.assertNotIn("-b", wt)
 
-    def test_spawn_refused_at_max_sessions(self):
+    def test_spawn_echoes_the_hub_command_id_onto_the_session(self):
+        # The hub can't name the session it asked for — we mint the id here — so
+        # it correlates by the command id, which must survive onto the record and
+        # into the heartbeat payload for the UI to open the session it started.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma", cmd_id="c42")
+        sess = sm.registry[0]
+        self.assertEqual(sess["spawnCmdId"], "c42")
+        self.assertEqual(sm._session_payload(sess, refresh=False)["spawnCmdId"], "c42")
+
+    def test_spawn_without_a_command_id_reports_none(self):
+        # Spawns that don't come from a hub command (and sessions predating the
+        # echo) simply have nothing to correlate — never a missing key.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        self.assertIsNone(sm.registry[0]["spawnCmdId"])
+        self.assertIsNone(sm._session_payload(sm.registry[0], refresh=False)["spawnCmdId"])
+
+    def test_spawn_at_max_sessions_queues_instead_of_refusing(self):
+        # A spawn that overruns the cap is no longer dropped on the floor — it
+        # lands as a `queued` record with no worktree/tmux, waiting for a slot.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        p = mock.patch.object(ha, "MAX_SESSIONS", 1)
+        p.start()
+        self.addCleanup(p.stop)
+        sm.registry = [{"id": "aaaaa", "status": "running", "ttydPort": 7700}]
+        self.run_ok_calls.clear()
+        sm.spawn("Turma")
+        self.assertEqual(len(sm.registry), 2)
+        q = sm.registry[1]
+        self.assertEqual(q["status"], "queued")
+        self.assertEqual(q["queuedReason"], "capacity")
+        self.assertIsNotNone(q["queuedAt"])
+        # No worktree was added for a queued session (it isn't provisioned yet).
+        self.assertFalse(any("worktree" in c and "add" in c for c in self.run_ok_calls))
+        # The queue markers ride the heartbeat so the card can explain the wait.
+        pay = sm._session_payload(q, refresh=False)
+        self.assertEqual(pay["queuedReason"], "capacity")
+
+    def test_drain_queue_provisions_when_a_slot_frees(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
         p = mock.patch.object(ha, "MAX_SESSIONS", 1)
@@ -1716,12 +3732,71 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.addCleanup(p.stop)
         sm.registry = [{"id": "aaaaa", "status": "running", "ttydPort": 7700}]
         sm.spawn("Turma")
-        self.assertEqual(len(sm.registry), 1)  # unchanged
+        q = sm.registry[1]
+        self.assertEqual(q["status"], "queued")
+        # Still full — draining does nothing.
+        sm._drain_queue()
+        self.assertEqual(q["status"], "queued")
+        # Free the slot; the next drain provisions the queued session in place.
+        sm.registry[0]["status"] = "stopped"
+        self.run_ok_calls.clear()
+        sm._drain_queue()
+        self.assertEqual(q["status"], "running")
+        self.assertIsNone(q.get("queuedReason"))
+        self.assertTrue(any("worktree" in c and "add" in c for c in self.run_ok_calls))
+
+    def test_drain_queue_is_one_per_beat(self):
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        p = mock.patch.object(ha, "MAX_SESSIONS", 5)
+        p.start()
+        self.addCleanup(p.stop)
+        sm.spawn("Turma")  # runs (slot free)
+        # Two more that queue only because they await a clone that never comes;
+        # force them queued via a low cap instead.
+        p.stop()
+        p2 = mock.patch.object(ha, "MAX_SESSIONS", 1)
+        p2.start()
+        self.addCleanup(p2.stop)
+        sm.spawn("Turma")
+        sm.spawn("Turma")
+        queued = [s for s in sm.registry if s["status"] == "queued"]
+        self.assertEqual(len(queued), 2)
+        # Raise the cap so both COULD run, then drain: exactly one provisions.
+        p2.stop()
+        p3 = mock.patch.object(ha, "MAX_SESSIONS", 5)
+        p3.start()
+        self.addCleanup(p3.stop)
+        sm._drain_queue()
+        self.assertEqual(sum(1 for s in sm.registry if s["status"] == "running"), 2)
+        self.assertEqual(sum(1 for s in sm.registry if s["status"] == "queued"), 1)
 
     def test_spawn_refused_for_unknown_repo(self):
         sm = self.make_spawn_ready_manager([])
         sm.spawn("NoSuchRepo")
         self.assertEqual(sm.registry, [])
+
+    def test_capacity_payload_reports_the_ceiling_and_load(self):
+        # The hub can't split work across an org's hosts unless each reports its
+        # ceiling and current load; this is the fact ticket routing ranks on.
+        sm = self.make_spawn_ready_manager([])
+        p = mock.patch.object(ha, "MAX_SESSIONS", 3)
+        p.start()
+        self.addCleanup(p.stop)
+        sm.registry = [
+            {"id": "a", "status": "running"},
+            {"id": "b", "status": "running"},
+            {"id": "c", "status": "queued"},
+        ]
+        cap = sm._capacity_payload()
+        self.assertEqual(cap["maxSessions"], 3)
+        self.assertEqual(cap["running"], 2)
+        self.assertEqual(cap["queued"], 1)
+        self.assertEqual(cap["free"], 1)
+        self.assertFalse(cap["rootRunning"])
+        # free never goes negative even when the cap is lowered under a full host.
+        with mock.patch.object(ha, "MAX_SESSIONS", 1):
+            self.assertEqual(sm._capacity_payload()["free"], 0)
 
     def test_kill_drops_record_but_keeps_worktree(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
@@ -1747,6 +3822,123 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         )
         # It is offered for resume (closed history records it).
         self.assertTrue(any(c.get("id") == sid for c in sm.closed))
+
+    def test_kill_snapshots_prs_and_transcript_onto_the_closed_record(self):
+        """kill() drops the live caches keyed by session id, so the two things
+        the hub's Ended-sessions view needs — which PRs this session opened, and
+        which conversation was its own — have to move onto the closed record on
+        the way out, or they are simply gone."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        sid = sess["id"]
+        url = "https://github.com/o/r/pull/7"
+        sm.session_pr_urls[sid] = [url]
+        sm.pr_status_cache[url] = {"url": url, "state": "MERGED", "checks": "passing"}
+        # The transcript this session was having — the one its launch pinned.
+        cs = sess["claudeSessionId"]
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, f"{cs}.jsonl"), "w") as f:
+            f.write("{}\n")
+
+        sm.kill(sid)
+
+        rec = next(c for c in sm.closed if c["id"] == sid)
+        self.assertEqual(rec["prUrls"], [url])
+        self.assertEqual(rec["transcriptId"], cs)
+        # The live cache is gone, but the payload still resolves full PR status
+        # through the snapshot — the whole point of keeping the URLs.
+        self.assertNotIn(sid, sm.session_pr_urls)
+        entry = next(c for c in sm._closed_payload() if c["id"] == sid)
+        self.assertEqual(entry["prs"], [{"url": url, "state": "MERGED", "checks": "passing"}])
+        self.assertEqual(entry["transcriptId"], cs)
+
+    def test_session_payload_reports_the_pinned_transcript_id_while_running(self):
+        """The pin makes a session's conversation free to name, so the payload
+        reports it from the moment it spawns — no listdir, running or not. The
+        hub needs it live: it's what points the live tail at THIS session's
+        transcript rather than the newest one sharing its project dir."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        self.assertEqual(sm._session_payload(sess, refresh=False)["transcriptId"],
+                         sess["claudeSessionId"])
+        sess["status"] = "stopped"
+        self.assertEqual(sm._session_payload(sess, refresh=False)["transcriptId"],
+                         sess["claudeSessionId"])
+
+    def test_unpinned_session_payload_carries_its_transcript_id_running_or_stopped(self):
+        """A session spawned before the pin has no id to report, so the payload
+        falls back to the newest transcript in its project dir.
+
+        It pays that listdir while RUNNING too. The lookup used to be skipped for
+        a running session (it's read live over /live, not opened from the
+        archive), but the hub's Ended list now dedupes on this id, and a running
+        session is the one case where a duplicate is intolerable: the durable
+        side of that list is a transcript scan that's minutes stale by design, so
+        with nothing to recognise a just-resumed session by it would show as
+        running and ended at once."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        sess["claudeSessionId"] = None  # as an older agent left it
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, "t-xyz.jsonl"), "w") as f:
+            f.write("{}\n")
+
+        self.assertEqual(sm._session_payload(sess, refresh=False)["transcriptId"], "t-xyz")
+        sess["status"] = "stopped"
+        self.assertEqual(sm._session_payload(sess, refresh=False)["transcriptId"], "t-xyz")
+
+    def test_unpinned_session_payload_transcript_id_is_none_before_one_exists(self):
+        """An unpinned session that hasn't written a transcript yet has no id to
+        report and nothing on disk to guess from. The key is still present and
+        null — the hub reads it unconditionally to key its Ended-list dedupe, and
+        a missing key would read as a session with no conversation rather than
+        one whose conversation hasn't started."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        sess["claudeSessionId"] = None   # as an older agent left it
+        payload = sm._session_payload(sess, refresh=False)
+        self.assertIn("transcriptId", payload)
+        self.assertIsNone(payload["transcriptId"])
+
+    def test_closed_payload_is_null_safe_for_a_session_with_no_pr_or_transcript(self):
+        """The common case: a session killed before it opened a PR, and (on an
+        older agent's closed.json) one recorded before the snapshot existed. The
+        keys must still be present and null rather than absent — the hub reads
+        them unconditionally."""
+        sm = self.make_manager()
+        sm.closed = [{"id": "s1", "repo": "r"}]   # a pre-snapshot record
+        entry = sm._closed_payload()[0]
+        self.assertIsNone(entry["prs"])
+        self.assertIsNone(entry["transcriptId"])
+        self.assertIsNone(entry["ticket"])
+
+    def test_closed_payload_reports_the_ticket_the_session_worked(self):
+        """_remember_closed has always snapshotted the ticket onto the record, but
+        it never reached the wire — so the board, which reverse-indexes
+        session.ticket, lost a ticket's session the moment it was killed and could
+        only ever say which session IS working a ticket, never which one DID.
+
+        summaryManual rides along for the same reason: it decides how the board
+        labels the chip, which must not change just because the session was
+        killed."""
+        ticket = {"key": "PROJ-7", "siteKey": "x.atlassian.net", "branch": "PROJ-7",
+                  "url": "https://x.atlassian.net/browse/PROJ-7", "summary": "Fix it"}
+        sm = self.make_manager()
+        sm.closed = [{"id": "s1", "repo": "r", "ticket": ticket,
+                      "summary": "My Own Name", "summaryManual": True}]
+        entry = sm._closed_payload()[0]
+        self.assertEqual(entry["ticket"], ticket)
+        self.assertTrue(entry["summaryManual"])
 
     def test_delete_removes_worktree_but_touches_no_branch(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
@@ -1821,8 +4013,9 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
     def test_spawn_no_options_keeps_todays_command_shape(self):
         """Regression guard: a bare spawn adds a DETACHED worktree (no -b, no
         app branch) and launches with the default auto mode, no --model, no
-        positional prompt. (No default base resolves under the fake git, so the
-        detach point is HEAD — nothing trails the worktree path.)"""
+        positional prompt, on a freshly minted claude session id. (No default
+        base resolves under the fake git, so the detach point is HEAD — nothing
+        trails the worktree path.)"""
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])
         sm.spawn("Turma")
@@ -1837,8 +4030,10 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             self._claude_cmd(),
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(ha.QUESTIONS_DIR)} "
-            f"claude --remote-control '{sess['rcName']}' "
-            f"--permission-mode auto --settings {shlex.quote(settings)}",
+            f"claude --session-id {sess['claudeSessionId']} "
+            f"--remote-control '{sess['rcName']}' "
+            f"--permission-mode auto --settings {shlex.quote(settings)} "
+            f"--append-system-prompt {shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT)}",
         )
         # The guard settings file was written and wires the Bash guard hook plus
         # the AskUserQuestion → glasses bridge, both as PreToolUse matchers.
@@ -1899,6 +4094,46 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         # The whole prompt is one shlex-quoted token after `--`; no metachar leaks.
         self.assertIn(" -- '", cmd)
         self.assertTrue(cmd.rstrip().endswith("'"))
+
+    # --- new-work branching policy (--append-system-prompt) ---------------
+
+    def test_spawn_appends_new_work_branching_policy(self):
+        """Every session is told to fork new work off the latest default branch,
+        since its checkout is only as fresh as spawn time (worktree) or as the
+        host left it (repos root). Shell-quoted as one token."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        cmd = self._claude_cmd()
+        self.assertIn(
+            f"--append-system-prompt {shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT)}",
+            cmd,
+        )
+
+    def test_new_work_policy_names_the_fetch_and_remote_ref(self):
+        """The directive's load-bearing content: fetch, resolve origin/HEAD, and
+        branch off the REMOTE ref rather than the local HEAD."""
+        policy = ha.NEW_WORK_SYSTEM_PROMPT
+        self.assertIn("git fetch origin", policy)
+        self.assertIn("refs/remotes/origin/HEAD", policy)
+        self.assertIn("git switch -c <your-branch> origin/main", policy)
+
+    def test_root_session_also_gets_branching_policy(self):
+        """A repos-root session has no worktree, so it works in the repo dirs on
+        whatever branch the host left checked out — it needs this MOST."""
+        sm = self._root_ready_manager()
+        sm.spawn(ha.ROOT_REPO_NAME)
+        self.assertIn("--append-system-prompt", self._claude_cmd())
+
+    def test_resume_relaunch_keeps_branching_policy(self):
+        """It's session policy, not spawn state: a resumed session is launched
+        with it too."""
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        sm.spawn("Turma")
+        sess = sm.registry[0]
+        sm._launch_tmux(sess, resume=True)
+        self.assertIn("--append-system-prompt", self._claude_cmd())
 
     def test_spawn_rejects_missing_base_ref(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
@@ -1965,12 +4200,14 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["model"], "opus")            # model still applies
         self.assertEqual(sess["permissionMode"], "acceptEdits")
 
-    def test_spawn_root_refused_when_root_already_running(self):
+    def test_second_root_session_queues_behind_the_first(self):
         sm = self._root_ready_manager()
         sm.spawn(ha.ROOT_REPO_NAME)
-        self.assertEqual(len(sm.registry), 1)
-        sm.spawn(ha.ROOT_REPO_NAME)  # a second concurrent root is refused
-        self.assertEqual(len(sm.registry), 1)
+        self.assertEqual(sm.registry[0]["status"], "running")
+        sm.spawn(ha.ROOT_REPO_NAME)  # only one root slot — the second waits
+        self.assertEqual(len(sm.registry), 2)
+        self.assertEqual(sm.registry[1]["status"], "queued")
+        self.assertEqual(sm.registry[1]["queuedReason"], "root-busy")
 
     def test_kill_root_keeps_repos_root_and_records_root(self):
         sm = self._root_ready_manager()
@@ -2122,40 +4359,808 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         sm.send_input(sess["id"], "   \t\n  ")
         self.assertEqual(self.run_calls, [])
 
+    def test_records_the_message_on_the_outbox(self):
+        # Every sent message is recorded so _poll_pending_inputs can guarantee it
+        # across a compaction (XERK-47): text as typed (newlines flattened),
+        # attempts=1 (the initial send).
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sm.send_input(sess["id"], "run the tests")
+        pend = sess["pendingInputs"]
+        self.assertEqual(len(pend), 1)
+        self.assertEqual(pend[0]["text"], "run the tests")
+        self.assertEqual(pend[0]["attempts"], 1)
+        self.assertIn("at", pend[0])
 
-class TestSetModelMode(ManagerMixin, unittest.TestCase):
-    """Live model / permission-mode switches on a running session: model via a
-    typed `/model <name>`, mode via computed Shift+Tab (BTab) presses over
-    PERM_CYCLE. Both re-validate their argument and persist the new value."""
+    def test_outbox_is_bounded(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        for i in range(ha.PENDING_INPUT_MAX + 5):
+            sm.send_input(sess["id"], f"msg {i}")
+        self.assertEqual(len(sess["pendingInputs"]), ha.PENDING_INPUT_MAX)
+        # The OLDEST are dropped, newest kept.
+        self.assertEqual(sess["pendingInputs"][-1]["text"],
+                         f"msg {ha.PENDING_INPUT_MAX + 4}")
+
+
+class TestPendingScan(ProjectDirMixin, unittest.TestCase):
+    """_pending_scan folds a transcript into (delivered user turns, still-queued
+    prompts, compaction count) in one pass — the facts the resend guarantee
+    keys on (XERK-47)."""
+
+    def _write(self, lines):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.WORKDIR))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, "t.jsonl")
+        with open(path, "w") as f:
+            for e in lines:
+                f.write(json.dumps(e) + "\n")
+        return path
+
+    def test_delivered_queued_and_compactions(self):
+        path = self._write([
+            {"type": "user", "message": {"role": "user", "content": "hello"}},
+            {"type": "queue-operation", "operation": "enqueue", "content": "later msg"},
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}},
+            {"type": "user", "message": {"role": "user", "content": "second"}},
+        ])
+        delivered, queued, compactions = ha._pending_scan(path)
+        self.assertIn("hello", delivered)
+        self.assertIn("second", delivered)
+        self.assertEqual(queued, ["later msg"])
+        self.assertEqual(compactions, 1)
+
+    def test_compact_summary_and_meta_turns_are_not_delivered(self):
+        # A compact summary is written as a user turn but is the model's own prose
+        # (isCompactSummary); a system-sourced turn (a task-notification) isn't a
+        # human message. Neither counts as a delivered operator message.
+        path = self._write([
+            {"type": "user", "isCompactSummary": True,
+             "message": {"role": "user", "content": "summary prose"}},
+            {"type": "user", "isMeta": True,
+             "message": {"role": "user", "content": "meta"}},
+            {"type": "user", "promptSource": "system",
+             "message": {"role": "user", "content": "injected"}},
+            {"type": "user", "message": {"role": "user", "content": "real one"}},
+        ])
+        delivered, _queued, _c = ha._pending_scan(path)
+        self.assertEqual(delivered, ["real one"])
+
+    def test_dequeue_empties_the_queue(self):
+        path = self._write([
+            {"type": "queue-operation", "operation": "enqueue", "content": "q"},
+            {"type": "queue-operation", "operation": "dequeue"},
+        ])
+        _d, queued, _c = ha._pending_scan(path)
+        self.assertEqual(queued, [])
+
+
+class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
+    """_poll_pending_inputs confirms sent messages landed and re-sends any a
+    compaction dropped (XERK-47)."""
+
+    SID = "11111111-1111-4111-8111-111111111111"
 
     def make_manager(self):
         sm = super().make_manager()
         self.run_calls.clear()
-        sm.save = mock.Mock()  # don't touch disk; just assert the record update
         return sm
 
-    def _session(self, sm, sid="abcde", model=None, perm="auto", status="running"):
-        sess = {"id": sid, "status": status, "tmuxName": f"agent-{sid}",
-                "model": model, "permissionMode": perm}
+    def _session(self, sm, pending, worktree=None):
+        wt = worktree or os.path.join(self.tmp, "wt")
+        os.makedirs(wt, exist_ok=True)
+        sess = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+                "worktreePath": wt, "claudeSessionId": self.SID,
+                "pendingInputs": pending}
+        sm.registry = [sess]
+        return sess, wt
+
+    def _write_transcript(self, wt, lines):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, f"{self.SID}.jsonl"), "w") as f:
+            for e in lines:
+                f.write(json.dumps(e) + "\n")
+
+    def test_delivered_message_is_reaped(self):
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "do it", "at": time.time(),
+                                       "attempts": 1}])
+        self._write_transcript(wt, [
+            {"type": "user", "message": {"role": "user", "content": "do it"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        self.assertNotIn("pendingInputs", sess)
+        self.assertEqual(self.run_calls, [])  # no resend
+
+    def test_still_queued_message_is_kept_not_resent(self):
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "later", "at": time.time(),
+                                       "attempts": 1}])
+        self._write_transcript(wt, [
+            {"type": "queue-operation", "operation": "enqueue", "content": "later"}])
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        self.assertEqual(len(sess["pendingInputs"]), 1)
+        self.assertEqual(self.run_calls, [])
+
+    def test_compaction_dropped_message_is_resent_when_idle(self):
+        sm = self.make_manager()
+        # compactBase 0: a compaction (count 1) has happened since it was sent.
+        sess, wt = self._session(sm, [{"text": "hi there", "at": time.time(),
+                                       "attempts": 1, "compactBase": 0}])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        self.assertEqual(self.run_calls, [
+            ["tmux", "send-keys", "-t", "agent-s1", "-l", "--", "hi there"],
+            ["tmux", "send-keys", "-t", "agent-s1", "Enter"],
+        ])
+        it = sess["pendingInputs"][0]
+        self.assertEqual(it["attempts"], 2)
+        self.assertEqual(it["compactBase"], 1)  # only a NEWER compaction re-loses it
+
+    def test_no_resend_while_pane_is_busy(self):
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
+                                       "attempts": 1, "compactBase": 0}])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=True):
+            sm._poll_pending_inputs()
+        self.assertEqual(self.run_calls, [])            # deferred
+        self.assertEqual(len(sess["pendingInputs"]), 1)  # still tracked
+
+    def test_no_resend_without_a_new_compaction(self):
+        sm = self.make_manager()
+        # compactBase already 1 and the transcript holds one compaction: no NEW
+        # compaction, so a not-yet-delivered message just waits (in-flight).
+        sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
+                                       "attempts": 1, "compactBase": 1}])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(len(sess["pendingInputs"]), 1)
+
+    def test_resend_budget_is_bounded(self):
+        sm = self.make_manager()
+        sess, wt = self._session(
+            sm, [{"text": "hi", "at": time.time(),
+                  "attempts": ha.PENDING_INPUT_MAX_ATTEMPTS, "compactBase": 0}])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        self.assertEqual(self.run_calls, [])       # budget spent, no resend
+        self.assertNotIn("pendingInputs", sess)     # given up, reaped
+
+    def test_only_one_resend_per_beat(self):
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [
+            {"text": "one", "at": time.time(), "attempts": 1, "compactBase": 0},
+            {"text": "two", "at": time.time(), "attempts": 1, "compactBase": 0},
+        ])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        # Exactly one message re-typed this beat (type + Enter); the other waits.
+        typed = [c for c in self.run_calls if c[:2] == ["tmux", "send-keys"]
+                 and "-l" in c]
+        self.assertEqual(len(typed), 1)
+        self.assertEqual(len(sess["pendingInputs"]), 2)
+
+    def test_expired_unconfirmed_message_is_dropped(self):
+        sm = self.make_manager()
+        sess, wt = self._session(
+            sm, [{"text": "stale", "at": time.time() - ha.PENDING_INPUT_TTL_SEC - 1,
+                  "attempts": 1, "compactBase": 0}])
+        self._write_transcript(wt, [])  # never landed, no compaction
+        with mock.patch.object(ha, "_pane_busy", return_value=False):
+            sm._poll_pending_inputs()
+        self.assertEqual(self.run_calls, [])
+        self.assertNotIn("pendingInputs", sess)
+
+    def test_stopped_session_drops_its_outbox(self):
+        sm = self.make_manager()
+        sess, _wt = self._session(sm, [{"text": "x", "at": time.time(),
+                                        "attempts": 1}])
+        sess["status"] = "stopped"
+        sm._poll_pending_inputs()
+        self.assertNotIn("pendingInputs", sess)
+
+    def test_unknown_pane_state_does_not_resend(self):
+        # _pane_busy None (uncapturable) is not "idle" — never resend on it.
+        sm = self.make_manager()
+        sess, wt = self._session(sm, [{"text": "hi", "at": time.time(),
+                                       "attempts": 1, "compactBase": 0}])
+        self._write_transcript(wt, [
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto"}}])
+        with mock.patch.object(ha, "_pane_busy", return_value=None):
+            sm._poll_pending_inputs()
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(len(sess["pendingInputs"]), 1)
+
+
+class TestPrCommentEvents(unittest.TestCase):
+    """_pr_comment_events normalizes conversation comments, review bodies and
+    inline review-thread comments into one self-flagged event list (XERK-49)."""
+
+    URL = "https://github.com/o/r/pull/7"
+
+    def _fake_run(self, view, api):
+        def run(cmd, cwd=None):
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return json.dumps(view)
+            if cmd[:2] == ["gh", "api"]:
+                return json.dumps(api)
+            return ""
+        return run
+
+    def test_gathers_all_three_channels(self):
+        view = {
+            "comments": [
+                {"id": "c1", "author": {"login": "alice"}, "body": "please rename",
+                 "url": "u1"},
+            ],
+            "reviews": [
+                {"id": "r1", "author": {"login": "bob"}, "state": "CHANGES_REQUESTED",
+                 "body": "needs a test"},
+                {"id": "r2", "author": {"login": "bob"}, "state": "APPROVED",
+                 "body": ""},                      # bare approve — dropped
+            ],
+        }
+        api = [{"id": 99, "user": {"login": "carol"}, "body": "off by one",
+                "path": "x.py", "line": 12, "html_url": "u3"}]
+        with mock.patch.object(ha, "run", self._fake_run(view, api)):
+            events = ha._pr_comment_events(self.URL, "botlogin")
+        kinds = {e["kind"] for e in events}
+        self.assertEqual(len(events), 3)
+        self.assertIn("comment", kinds)
+        self.assertIn("review Changes Requested", kinds)
+        self.assertIn("inline", kinds)
+        inline = next(e for e in events if e["kind"] == "inline")
+        self.assertEqual(inline["loc"], "x.py:12")
+        self.assertEqual(inline["key"], "99")
+
+    def test_self_authored_is_flagged(self):
+        view = {
+            "comments": [
+                {"id": "c1", "author": {"login": "botlogin"}, "body": "opened this",
+                 "viewerDidAuthor": True},
+                {"id": "c2", "author": {"login": "alice"}, "body": "fix it"},
+            ],
+            "reviews": [],
+        }
+        with mock.patch.object(ha, "run", self._fake_run(view, [])):
+            events = ha._pr_comment_events(self.URL, "botlogin")
+        by_key = {e["key"]: e for e in events}
+        self.assertTrue(by_key["c1"]["is_self"])
+        self.assertFalse(by_key["c2"]["is_self"])
+
+    def test_login_compare_flags_self_without_viewer_field(self):
+        # Inline comments have no viewerDidAuthor; fall back to a login compare.
+        api = [{"id": 5, "user": {"login": "botlogin"}, "body": "mine"}]
+        view = {"comments": [], "reviews": []}
+        with mock.patch.object(ha, "run", self._fake_run(view, api)):
+            events = ha._pr_comment_events(self.URL, "botlogin")
+        self.assertTrue(events[0]["is_self"])
+
+    def test_fetch_failure_returns_none(self):
+        with mock.patch.object(ha, "run", lambda cmd, cwd=None: ""):
+            self.assertIsNone(ha._pr_comment_events(self.URL, "botlogin"))
+
+    def test_empty_pr_returns_empty_not_none(self):
+        view = {"comments": [], "reviews": []}
+        with mock.patch.object(ha, "run", self._fake_run(view, [])):
+            self.assertEqual(ha._pr_comment_events(self.URL, "botlogin"), [])
+
+
+class TestPrCommentMessage(unittest.TestCase):
+    """_pr_comment_message folds new comments into the single typed message."""
+
+    def test_names_pr_and_each_comment(self):
+        msg = ha._pr_comment_message(
+            "https://github.com/o/r/pull/7",
+            [{"author": "alice", "body": "rename the flag", "kind": "comment",
+              "loc": None},
+             {"author": "carol", "body": "off by one", "kind": "inline",
+              "loc": "x.py:12"}])
+        self.assertIn("#7", msg)
+        self.assertIn("this session", msg)
+        self.assertIn("@alice", msg)
+        self.assertIn("rename the flag", msg)
+        self.assertIn("inline on x.py:12", msg)
+
+    def test_body_is_capped(self):
+        msg = ha._pr_comment_message(
+            "https://github.com/o/r/pull/1",
+            [{"author": "a", "body": "x" * 5000, "kind": "comment", "loc": None}])
+        self.assertLessEqual(len(msg), ha.PR_COMMENTS_BODY_CAP + 200)
+
+
+class TestPollPrComments(ManagerMixin, unittest.TestCase):
+    """_poll_pr_comments types new PR review activity into the running session
+    that opened the PR, baselining history on first sight (XERK-49)."""
+
+    URL = "https://github.com/o/r/pull/7"
+
+    def make_manager(self):
+        sm = super().make_manager()
+        sm.github = {"available": True, "login": "botlogin", "repos": []}
+        self.run_calls.clear()
+        return sm
+
+    def _session(self, sm, base=None):
+        sess = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+                "worktreePath": os.path.join(self.tmp, "wt"), "summary": "work"}
+        if base is not None:
+            sess["prCommentBase"] = base
+        sm.registry = [sess]
+        sm.session_pr_urls = {"s1": [self.URL]}
+        return sess
+
+    def _typed(self):
+        return [c for c in self.run_calls
+                if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+
+    def _events(self, *events):
+        return mock.patch.object(ha, "_pr_comment_events",
+                                 return_value=list(events))
+
+    def _ev(self, key, author="alice", body="fix", is_self=False, kind="comment"):
+        return {"key": key, "author": author, "body": body, "kind": kind,
+                "loc": None, "is_self": is_self}
+
+    def test_first_sighting_baselines_silently(self):
+        sm = self.make_manager()
+        sess = self._session(sm)                    # no prior base -> first sight
+        with self._events(self._ev("c1"), self._ev("c2")):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])         # nothing delivered
+        self.assertEqual(set(sess["prCommentBase"][self.URL]), {"c1", "c2"})
+
+    def test_new_comment_is_delivered(self):
+        sm = self.make_manager()
+        sess = self._session(sm, base={self.URL: ["c1"]})
+        with self._events(self._ev("c1"), self._ev("c2", body="rename it")):
+            sm._poll_pr_comments()
+        typed = self._typed()
+        self.assertEqual(len(typed), 1)
+        self.assertIn("rename it", typed[0][-1])
+        self.assertEqual(set(sess["prCommentBase"][self.URL]), {"c1", "c2"})
+
+    def test_self_comment_is_not_delivered_but_is_seen(self):
+        sm = self.make_manager()
+        sess = self._session(sm, base={self.URL: ["c1"]})
+        with self._events(self._ev("c1"),
+                          self._ev("c2", author="botlogin", is_self=True)):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])
+        self.assertIn("c2", sess["prCommentBase"][self.URL])
+
+    def test_fetch_failure_keeps_baseline(self):
+        sm = self.make_manager()
+        sess = self._session(sm, base={self.URL: ["c1"]})
+        with mock.patch.object(ha, "_pr_comment_events", return_value=None):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])
+        self.assertEqual(sess["prCommentBase"][self.URL], ["c1"])
+
+    def test_skipped_without_gh_login(self):
+        sm = self.make_manager()
+        sm.github = {"available": False, "login": None, "repos": []}
+        self._session(sm, base={self.URL: ["c1"]})
+        with self._events(self._ev("c2")):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])
+
+    def test_stopped_session_is_skipped(self):
+        sm = self.make_manager()
+        sess = self._session(sm, base={self.URL: ["c1"]})
+        sess["status"] = "stopped"
+        with self._events(self._ev("c2")):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])
+
+    def test_seen_set_is_capped(self):
+        sm = self.make_manager()
+        big = [f"k{i}" for i in range(ha.PR_COMMENTS_SEEN_MAX + 10)]
+        sess = self._session(sm, base={self.URL: big})
+        with self._events(self._ev("knew", body="hi")):
+            sm._poll_pr_comments()
+        self.assertLessEqual(len(sess["prCommentBase"][self.URL]),
+                             ha.PR_COMMENTS_SEEN_MAX)
+        self.assertIn("knew", sess["prCommentBase"][self.URL])
+
+
+# Verbatim `tmux capture-pane -p` output from a live Claude Code 2.1.220
+# session, trimmed to the dialog region — the two blocking dialogs
+# parse_pane_prompt exists to read. Kept as real captures rather than
+# hand-written strings: the wordings, glyphs and blank-line placement are the
+# contract, and inventing them is how a parser passes its tests and fails a pane.
+PANE_PERMISSION_DIALOG = """\
+● Running 1 shell command…
+  ⎿  $ touch /tmp/permtest-marker
+
+────────────────────────────────────────────────────────────────────
+ Bash command
+
+   touch /tmp/permtest-marker
+   Create marker file in /tmp
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to tmp/ from this project
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain
+"""
+
+PANE_PLAN_DIALOG = """\
+  ────────────────────────────────────────────────────────────────────
+   Ready to code?
+
+   Here is Claude's plan:
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+   Plan
+
+   I will add one test.
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
+  ────────────────────────────────────────────────────────────────────
+   Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+   ❯ 1. Yes, and use auto mode
+     2. Yes, manually approve edits
+     3. No, refine with Ultraplan on Claude Code on the web
+     4. Tell Claude what to change
+        shift+tab to approve with this feedback
+"""
+
+# The same session with no dialog up: the composer is live, so the mode footer
+# is on screen. This is the shape that must NEVER parse as a dialog.
+PANE_IDLE_COMPOSER = """\
+● Done — PR #230 is up.
+
+  1. first thing
+  2. second thing
+  Which one?
+────────────────────────────────────────────────────────────────────
+❯ Try "edit <filepath> to..."
+────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents
+"""
+
+
+class TestAnswerPanePrompt(ManagerMixin, unittest.TestCase):
+    """Answering the TUI's blocking dialog from the chat page: type the option
+    digit, but only after re-reading the pane — the click was made against a
+    heartbeat that is up to a beat stale."""
+
+    def make_manager(self):
+        sm = super().make_manager()
+        self.run_calls.clear()
+        return sm
+
+    def _session(self, sm, status="running"):
+        sm.registry = [{"id": "abcde", "status": status, "tmuxName": "agent-abcde"}]
+
+    def _answer(self, sm, number, cap=PANE_PERMISSION_DIALOG):
+        with mock.patch.object(ha, "_capture_pane", return_value=cap):
+            sm.answer_pane_prompt("abcde", number)
+
+    def test_types_the_option_digit(self):
+        sm = self.make_manager()
+        self._session(sm)
+        self._answer(sm, 2)
+        self.assertEqual(
+            self.run_calls, [["tmux", "send-keys", "-t", "agent-abcde", "2"]])
+
+    def test_stale_click_is_dropped_when_the_dialog_is_gone(self):
+        # The whole safety property: without the re-read this would type a bare
+        # "1" into the live composer, silently prepending a stray character to
+        # the operator's next message.
+        sm = self.make_manager()
+        self._session(sm)
+        self._answer(sm, 1, cap=PANE_IDLE_COMPOSER)
+        self.assertEqual(self.run_calls, [])
+
+    def test_number_not_on_screen_is_dropped(self):
+        sm = self.make_manager()
+        self._session(sm)
+        self._answer(sm, 4)          # the permission dialog offers 1-3
+        self.assertEqual(self.run_calls, [])
+
+    def test_noop_for_stopped_or_unknown_session(self):
+        sm = self.make_manager()
+        self._session(sm, status="stopped")
+        self._answer(sm, 1)
+        sm.registry = []
+        self._answer(sm, 1)
+        self.assertEqual(self.run_calls, [])
+
+    def test_non_numeric_answer_is_dropped(self):
+        sm = self.make_manager()
+        self._session(sm)
+        self._answer(sm, "; rm -rf /")
+        self.assertEqual(self.run_calls, [])
+
+
+class TestInterrupt(ManagerMixin, unittest.TestCase):
+    """Stop the turn a running session has in flight: a single Escape into its
+    TUI, which cancels the generation/tool call and leaves the session running
+    with its conversation intact."""
+
+    def make_manager(self):
+        sm = super().make_manager()
+        self.run_calls.clear()  # drop __init__'s own run() calls
+        return sm
+
+    def _session(self, sm, status="running"):
+        sess = {"id": "abcde", "status": status, "tmuxName": "agent-abcde"}
         sm.registry = [sess]
         return sess
 
-    def test_set_model_types_slash_model_and_persists(self):
+    def test_sends_escape_to_the_session_pane(self):
+        sm = self.make_manager()
+        self._session(sm)
+        sm.interrupt("abcde")
+        self.assertEqual(
+            self.run_calls, [["tmux", "send-keys", "-t", "agent-abcde", "Escape"]])
+
+    def test_noop_for_stopped_session(self):
+        sm = self.make_manager()
+        self._session(sm, status="stopped")
+        sm.interrupt("abcde")
+        self.assertEqual(self.run_calls, [])
+
+    def test_noop_for_unknown_session(self):
+        sm = self.make_manager()
+        self._session(sm)
+        sm.interrupt("nope")
+        self.assertEqual(self.run_calls, [])
+
+    def test_idle_session_is_still_interrupted(self):
+        # Stop is deliberately not gated on paneBusy: that read is up to a beat
+        # stale when the operator clicks, and Escape into an idle pane is
+        # harmless — refusing would break the case the button exists for.
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["paneBusy"] = False
+        sm.interrupt("abcde")
+        self.assertEqual(
+            self.run_calls, [["tmux", "send-keys", "-t", "agent-abcde", "Escape"]])
+
+
+# A realistic /model picker pane capture: ❯ on the current model (Fable, row
+# index 2), descriptions two-plus spaces right of the label, ✔ on the current
+# row. What parse_model_picker and the set_model tests below drive against.
+MODEL_PICKER_PANE = """
+❯ /model
+   Select model
+   Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names, specify with --model.
+
+     1. Default (recommended)  Opus 4.8 with 1M context · Best for everyday, complex tasks
+     2. Opus                   Opus 4.8 with 1M context · Best for everyday, complex tasks
+   ❯ 3. Fable ✔                Fable 5 · Most capable for your hardest and longest-running tasks
+     4. Sonnet                 Sonnet 5 · Efficient for routine tasks
+     5. Haiku                  Haiku 4.5 · Fastest for quick answers
+
+   Enter to set as default · s to use this session only · Esc to cancel
+"""
+
+
+class _PickerPane:
+    """A /model-picker pane simulator for set_model's closed loop: send-keys
+    move its ❯ cursor, `s` closes it and prints the confirmation — and it can
+    be told to drop arrow presses or never confirm, which is exactly the
+    flakiness the verified loop exists to survive."""
+    ROWS = ("Default (recommended)", "Opus", "Fable", "Sonnet", "Haiku")
+
+    def __init__(self, cur=2, drop_arrows=0, confirm=True, opens=True):
+        self.cur = cur                  # ❯ starts on Fable, like the real pane
+        self.drop_arrows = drop_arrows  # swallow this many arrow presses
+        self.confirm = confirm          # print "Set model to…" after `s`
+        self.opens = opens              # whether /model paints a picker at all
+        self.open = False
+        self.confirmed = False
+
+    def key(self, key):
+        if key == "Enter" and not self.open:
+            self.open = self.opens
+        elif key in ("Down", "Up") and self.open:
+            if self.drop_arrows > 0:
+                self.drop_arrows -= 1
+                return
+            step = 1 if key == "Down" else -1
+            self.cur = min(len(self.ROWS) - 1, max(0, self.cur + step))
+        elif key == "s" and self.open:
+            self.open = False
+            self.confirmed = self.confirm
+        elif key == "Escape":
+            self.open = False
+
+    def capture(self):
+        if self.open:
+            lines = ["   Select model"]
+            for i, label in enumerate(self.ROWS):
+                mark = "❯ " if i == self.cur else "  "
+                lines.append(f"   {mark}{i + 1}. {label}    a description")
+            return "\n".join(lines)
+        if self.confirmed:
+            return "  ⎿  Set model to Sonnet 5 for this session only\n❯ "
+        return "❯ \n  ? for shortcuts"  # idle; deliberately no mode marker
+
+
+class _ModePane:
+    """A footer-mode pane simulator for set_mode's closed loop: BTab advances
+    through `cycle`, capture() shows the current mode's real footer marker."""
+    MARKERS = {
+        "default": "⏸ manual mode on",
+        "acceptEdits": "⏵⏵ accept edits on",
+        "plan": "⏸ plan mode on",
+        "auto": "⏵⏵ auto mode on",
+        "bypassPermissions": "⏵⏵ bypass permissions on",
+    }
+
+    def __init__(self, cycle, cur=0):
+        self.cycle = list(cycle)
+        self.i = cur
+
+    @property
+    def mode(self):
+        return self.cycle[self.i]
+
+    def key(self, key):
+        if key == "BTab":
+            self.i = (self.i + 1) % len(self.cycle)
+
+    def capture(self):
+        return f"❯ \n  {self.MARKERS[self.mode]} (shift+tab to cycle)"
+
+
+class TestSetModelMode(ManagerMixin, unittest.TestCase):
+    """Live model / permission-mode switches on a running session — both are
+    CLOSED LOOPS: model by driving the /model picker one verified arrow at a
+    time and pressing `s` (session-only; the typed `/model <name>` form would
+    also rewrite the shared login's saved default), mode by pressing Shift+Tab
+    and reading the footer marker back until the target shows. The real mode
+    cycle is account- AND model-dependent, so no precomputed press count is
+    trusted; the guessed-cycle math survives only as the fallback for a pane
+    whose marker can't be read."""
+
+    def make_manager(self, pane=None, busy=False):
+        sm = super().make_manager()
+        self.run_calls.clear()
+        sm.save = mock.Mock()  # don't touch disk; just assert the record update
+        self.pane = _PickerPane() if pane is None else pane
+
+        def fake_run(cmd, cwd=None):
+            self.run_calls.append(cmd)
+            if cmd[:2] == ["tmux", "send-keys"] and hasattr(self.pane, "key"):
+                self.pane.key(cmd[-1])
+            return ""
+
+        def fake_capture(tmux_name):
+            return self.pane.capture() if hasattr(self.pane, "capture") else self.pane
+
+        for name, value in [("run", fake_run),
+                            ("_pane_busy", lambda t: busy),
+                            ("_capture_pane", fake_capture),
+                            ("MODEL_PICKER_WAIT_SEC", 0),
+                            ("MODEL_STEP_WAIT_SEC", 0),
+                            ("MODEL_CONFIRM_WAIT_SEC", 0),
+                            ("MODE_STEP_WAIT_SEC", 0)]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        return sm
+
+    def _session(self, sm, sid="abcde", model=None, perm="auto", status="running",
+                 launch=None):
+        # launch defaults to perm — a just-launched session's current mode is the
+        # mode it launched into, which fixes its blind-fallback cycle.
+        sess = {"id": sid, "status": status, "tmuxName": f"agent-{sid}",
+                "model": model, "permissionMode": perm,
+                "launchPermissionMode": perm if launch is None else launch}
+        sm.registry = [sess]
+        return sess
+
+    def _keys(self):
+        return [c[-1] for c in self.run_calls]
+
+    # ---- set_model ---------------------------------------------------------
+
+    def test_set_model_drives_picker_to_row_and_session_only(self):
         sm = self.make_manager()
         sess = self._session(sm, model=None)
         sm.set_model("abcde", "sonnet")
-        self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--", "/model sonnet"],
-            ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
-        ])
+        self.assertEqual(self._keys(), ["C-u", "/model", "Enter", "Down", "s"])
         self.assertEqual(sess["model"], "sonnet")
         sm.save.assert_called_once()
 
-    def test_set_model_default_resets_and_stores_none(self):
+    def test_set_model_default_arrows_up_and_stores_none(self):
         sm = self.make_manager()
         sess = self._session(sm, model="opus")
         sm.set_model("abcde", "default")
-        self.assertEqual(self.run_calls[0][-1], "/model default")
+        self.assertEqual(self._keys(), ["C-u", "/model", "Enter", "Up", "Up", "s"])
+        self.assertIsNone(sess["model"])
+
+    def test_set_model_dropped_arrow_self_corrects(self):
+        # A dropped keypress used to leave the old press-burst one row short,
+        # and `s` then silently selected the WRONG model. The verified loop
+        # sees the unmoved ❯ and simply presses again.
+        sm = self.make_manager(pane=_PickerPane(drop_arrows=1))
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys(),
+                         ["C-u", "/model", "Enter", "Down", "Down", "s"])
+        self.assertEqual(sess["model"], "sonnet")
+
+    def test_set_model_busy_pane_defers_instead_of_dropping(self):
+        # Typed into a mid-turn pane the command would only queue as a prompt.
+        # The pick is deferred (pendingModel), not silently dropped — the old
+        # log-only refusal is what made the button feel dead.
+        sm = self.make_manager(busy=True)
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(sess["pendingModel"], "sonnet")
+        self.assertIsNone(sess["model"])
+
+    def test_apply_pending_switches_lands_the_deferred_pick(self):
+        sm = self.make_manager(busy=False)
+        sess = self._session(sm, model=None)
+        sess["pendingModel"] = "sonnet"
+        sm._apply_pending_switches()
+        self.assertNotIn("pendingModel", sess)
+        self.assertEqual(sess["model"], "sonnet")
+        self.assertIn("s", self._keys())
+
+    def test_apply_pending_switches_waits_out_a_busy_pane(self):
+        sm = self.make_manager(busy=True)
+        sess = self._session(sm, model=None)
+        sess["pendingModel"] = "sonnet"
+        sm._apply_pending_switches()
+        self.assertEqual(sess["pendingModel"], "sonnet")  # still waiting
+        self.assertEqual(self.run_calls, [])
+
+    def test_set_model_no_picker_escapes_and_keeps_model(self):
+        sm = self.make_manager(pane=_PickerPane(opens=False))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys()[-1], "Escape")
+        self.assertEqual(sess["model"], "opus")
+
+    def test_set_model_unconfirmed_selection_leaves_the_record(self):
+        # `s` was sent but the TUI never printed its confirmation: the record
+        # must not assert a switch nobody proved — the transcript scan's
+        # modelActual settles what the chip shows either way.
+        sm = self.make_manager(pane=_PickerPane(confirm=False))
+        sess = self._session(sm, model="opus")
+        sm.set_model("abcde", "sonnet")
+        self.assertEqual(self._keys()[-1], "s")
+        self.assertEqual(sess["model"], "opus")
+
+    def test_set_model_row_not_offered_escapes(self):
+        # A probed alias with no picker row (the bracketed 1M variants) backs
+        # out rather than pressing keys at a row that isn't there.
+        sm = self.make_manager()
+        sm.models_info = {"available": ["sonnet", "opusplan", "default"]}
+        sess = self._session(sm, model=None)
+        sm.set_model("abcde", "opusplan")
+        self.assertEqual(self._keys()[-1], "Escape")
         self.assertIsNone(sess["model"])
 
     def test_set_model_rejects_unknown_before_any_keystroke(self):
@@ -2171,29 +5176,75 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         sm.set_model("abcde", "sonnet")
         self.assertEqual(self.run_calls, [])
 
-    def test_set_mode_cycles_forward_the_minimal_presses(self):
-        # auto (idx 4) -> plan (idx 2) over the 5-mode cycle = (2-4) % 5 = 3.
-        sm = self.make_manager()
+    # ---- set_mode (closed loop) --------------------------------------------
+
+    def test_set_mode_presses_until_the_marker_reads_the_target(self):
+        pane = _ModePane(["default", "acceptEdits", "plan", "auto"], cur=3)
+        sm = self.make_manager(pane=pane)
         sess = self._session(sm, perm="auto")
         sm.set_mode("abcde", "plan")
-        self.assertEqual(self.run_calls,
-                         [["tmux", "send-keys", "-t", "agent-abcde", "BTab"]] * 3)
+        self.assertEqual(self._keys(), ["BTab"] * 3)
         self.assertEqual(sess["permissionMode"], "plan")
+        self.assertEqual(pane.mode, "plan")
         sm.save.assert_called_once()
 
-    def test_set_mode_default_to_auto_wraps_to_four(self):
-        # default (idx 0) -> auto (idx 4) = (4-0) % 5 = 4 presses.
-        sm = self.make_manager()
-        self._session(sm, perm="default")
+    def test_set_mode_reaches_a_mode_the_guessed_cycle_says_is_absent(self):
+        # Observed live: a bypass-launched session's real cycle DOES contain
+        # auto (account-enabled), which perm_cycle_for guesses absent — the
+        # old computed-press path refused this switch outright. The closed
+        # loop doesn't consult the guess at all.
+        pane = _ModePane(["default", "acceptEdits", "plan", "auto",
+                          "bypassPermissions"], cur=4)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, perm="bypassPermissions")
         sm.set_mode("abcde", "auto")
-        self.assertEqual(len(self.run_calls), 4)
+        self.assertEqual(sess["permissionMode"], "auto")
+        self.assertEqual(pane.mode, "auto")
 
-    def test_set_mode_noop_when_already_target(self):
-        sm = self.make_manager()
-        self._session(sm, perm="plan")
+    def test_set_mode_trusts_the_pane_over_a_stale_record(self):
+        # The operator cycled by hand in the live terminal: the record says
+        # auto but the pane shows plan. The loop starts from the PANE's truth,
+        # where the old path counted presses from the stale record and landed
+        # on the wrong mode.
+        pane = _ModePane(["default", "acceptEdits", "plan", "auto"], cur=2)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, perm="auto")  # stale
+        sm.set_mode("abcde", "acceptEdits")
+        self.assertEqual(self._keys(), ["BTab"] * 3)  # plan→auto→default→acceptEdits
+        self.assertEqual(sess["permissionMode"], "acceptEdits")
+
+    def test_set_mode_unreachable_target_wraps_and_keeps_the_truth(self):
+        pane = _ModePane(["default", "acceptEdits", "plan", "auto"], cur=0)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, perm="default")
+        sm.set_mode("abcde", "bypassPermissions")
+        self.assertEqual(self._keys(), ["BTab"] * 4)  # one full lap, then stop
+        self.assertEqual(sess["permissionMode"], "default")
+
+    def test_set_mode_already_there_presses_nothing(self):
+        pane = _ModePane(["default", "acceptEdits", "plan", "auto"], cur=2)
+        sm = self.make_manager(pane=pane)
+        sess = self._session(sm, perm="plan")
         sm.set_mode("abcde", "plan")
         self.assertEqual(self.run_calls, [])
-        sm.save.assert_not_called()
+        self.assertEqual(sess["permissionMode"], "plan")
+
+    def test_set_mode_unreadable_pane_falls_back_to_computed_presses(self):
+        # No marker to read (a TUI wording this parser predates): the guessed
+        # cycle is still better than nothing. auto-launch cycle
+        # [default, acceptEdits, plan, auto]: auto -> plan = 3 presses.
+        sm = self.make_manager(pane="❯ \n  ? for shortcuts")
+        sess = self._session(sm, perm="auto")
+        sm.set_mode("abcde", "plan")
+        self.assertEqual(self._keys(), ["BTab"] * 3)
+        self.assertEqual(sess["permissionMode"], "plan")
+
+    def test_set_mode_blind_unreachable_is_a_noop(self):
+        sm = self.make_manager(pane="❯ \n  ? for shortcuts")
+        sess = self._session(sm, perm="auto")
+        sm.set_mode("abcde", "bypassPermissions")
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(sess["permissionMode"], "auto")
 
     def test_set_mode_rejects_unknown(self):
         sm = self.make_manager()
@@ -2201,6 +5252,390 @@ class TestSetModelMode(ManagerMixin, unittest.TestCase):
         with self.assertRaises(ValueError):
             sm.set_mode("abcde", "yolo")
         self.assertEqual(self.run_calls, [])
+
+    def test_set_mode_noop_for_non_running(self):
+        sm = self.make_manager()
+        self._session(sm, perm="auto", status="stopped")
+        sm.set_mode("abcde", "plan")
+        self.assertEqual(self.run_calls, [])
+
+
+class TestParsePanePrompt(unittest.TestCase):
+    """Reading the TUI's blocking choice dialog off the pane. It never reaches
+    the transcript and it suppresses the busy hint, so without this read a
+    session blocked on a human reports idle."""
+
+    def test_permission_dialog(self):
+        p = ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)
+        self.assertEqual(p["prompt"], "Do you want to proceed?")
+        self.assertEqual(
+            [(o["number"], o["label"], o["selected"]) for o in p["options"]],
+            [(1, "Yes", True),
+             (2, "Yes, and always allow access to tmp/ from this project", False),
+             (3, "No", False)])
+        # The context is the fenced block above the question — the tool and the
+        # exact command it wants to run, which is the whole decision.
+        self.assertEqual(
+            p["detail"],
+            "Bash command\ntouch /tmp/permtest-marker\nCreate marker file in /tmp")
+
+    def test_plan_dialog(self):
+        p = ha.parse_pane_prompt(PANE_PLAN_DIALOG)
+        self.assertEqual(
+            p["prompt"],
+            "Claude has written up a plan and is ready to execute. Would you like to proceed?")
+        self.assertEqual([o["number"] for o in p["options"]], [1, 2, 3, 4])
+        self.assertEqual(p["options"][0]["label"], "Yes, and use auto mode")
+        self.assertTrue(p["options"][0]["selected"])
+        # The plan body sits one rule further up than a permission dialog's
+        # block; the same walk has to reach it.
+        self.assertEqual(p["detail"], "Plan\nI will add one test.")
+
+    def test_idle_composer_is_never_a_dialog(self):
+        # A numbered list in the conversation, a "?" line above it, and the
+        # composer live: the mode footer is what says nothing is blocking.
+        self.assertIsNone(ha.parse_pane_prompt(PANE_IDLE_COMPOSER))
+        self.assertIsNone(ha.parse_pane_prompt(""))
+        self.assertIsNone(ha.parse_pane_prompt(None))
+
+    def test_requires_cursor_numbering_and_a_question(self):
+        # No ❯ cursor -> not a live picker.
+        self.assertIsNone(ha.parse_pane_prompt(
+            "Do you want to proceed?\n 1. Yes\n 2. No\n"))
+        # Cursor and numbering, but no question line above.
+        self.assertIsNone(ha.parse_pane_prompt(
+            "some prose\n ❯ 1. Yes\n   2. No\n"))
+        # Numbering that doesn't start at 1 (a list continuing from off-screen).
+        self.assertIsNone(ha.parse_pane_prompt(
+            "Proceed?\n ❯ 2. Yes\n   3. No\n"))
+        # A single option is a list, not a choice.
+        self.assertIsNone(ha.parse_pane_prompt("Proceed?\n ❯ 1. Yes\n"))
+
+    def test_a_dialog_suppresses_the_busy_hint(self):
+        # This is WHY the read is needed: while the dialog is up the pane shows
+        # no interrupt hint and no mode footer, so paneBusy reads False — the
+        # session looks idle while it is actually blocked on a human.
+        self.assertFalse(ha._busy_from_capture(PANE_PERMISSION_DIALOG))
+        self.assertIsNone(ha.parse_pane_mode(PANE_PERMISSION_DIALOG))
+
+
+class TestParsePaneMode(unittest.TestCase):
+    def test_all_five_markers(self):
+        for marker, mode in [
+            ("⏸ manual mode on · ? for shortcuts", "default"),
+            ("⏵⏵ accept edits on (shift+tab to cycle)", "acceptEdits"),
+            ("⏸ plan mode on (shift+tab to cycle)", "plan"),
+            ("⏵⏵ auto mode on (shift+tab to cycle)", "auto"),
+            ("⏵⏵ bypass permissions on (shift+tab to cycle)",
+             "bypassPermissions"),
+        ]:
+            self.assertEqual(ha.parse_pane_mode(f"❯ \n  {marker}"), mode, marker)
+
+    def test_conversation_text_without_the_glyph_is_not_a_marker(self):
+        self.assertIsNone(ha.parse_pane_mode("we turned plan mode on earlier\n❯ "))
+
+    def test_the_footers_marker_wins_over_a_quoted_one(self):
+        cap = ("…the TUI says ⏸ plan mode on while planning…\n"
+               "❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)")
+        self.assertEqual(ha.parse_pane_mode(cap), "auto")
+
+    def test_none_cases(self):
+        self.assertIsNone(ha.parse_pane_mode(""))
+        self.assertIsNone(ha.parse_pane_mode(None))
+        self.assertIsNone(ha.parse_pane_mode("❯ \n  ? for shortcuts"))
+
+
+# What `claude -p "/model"` really prints (v2.1.214): the current default's
+# label, then the usage line carrying the login's whole alias list.
+MODEL_PROBE_OUT = (
+    "Current model: Fable 5\n"
+    "Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, "
+    "sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.\n"
+)
+
+
+class TestParseModelProbe(unittest.TestCase):
+    def test_parses_aliases_and_default_label(self):
+        got = ha.parse_model_probe(MODEL_PROBE_OUT)
+        self.assertEqual(got["defaultLabel"], "Fable 5")
+        self.assertEqual(got["available"], [
+            "sonnet", "opus", "haiku", "fable", "best",
+            "sonnet[1m]", "opus[1m]", "fable[1m]", "opusplan", "default"])
+
+    def test_ansi_is_stripped(self):
+        got = ha.parse_model_probe(
+            "Current model: \x1b[1mFable 5\x1b[22m\n"
+            "Usage: /model <name>. Available: sonnet, default.")
+        self.assertEqual(got["defaultLabel"], "Fable 5")
+        self.assertEqual(got["available"], ["sonnet", "default"])
+
+    def test_no_available_line_is_a_failed_attempt_not_an_empty_list(self):
+        self.assertIsNone(ha.parse_model_probe("Current model: X"))
+        self.assertIsNone(ha.parse_model_probe(""))
+        self.assertIsNone(ha.parse_model_probe(None))
+
+    def test_default_is_guaranteed_and_missing_label_is_none(self):
+        got = ha.parse_model_probe("Usage: /model <name>. Available: sonnet, opus.")
+        self.assertIn("default", got["available"])
+        self.assertIsNone(got["defaultLabel"])
+
+
+class TestParseModelPicker(unittest.TestCase):
+    def test_rows_cursor_and_labels(self):
+        rows, cur = ha.parse_model_picker(MODEL_PICKER_PANE)
+        self.assertEqual(rows, ["Default (recommended)", "Opus", "Fable",
+                                "Sonnet", "Haiku"])
+        self.assertEqual(cur, 2)  # the ❯ sits on Fable
+
+    def test_capture_without_a_picker(self):
+        self.assertEqual(ha.parse_model_picker("❯ \n  1. not a picker"),
+                         ([], None))
+        self.assertEqual(ha.parse_model_picker(""), ([], None))
+        self.assertEqual(ha.parse_model_picker(None), ([], None))
+
+    def test_numbered_chat_lines_above_the_picker_are_not_rows(self):
+        rows, cur = ha.parse_model_picker(
+            "  1. buy groceries\n  2. do laundry\n" + MODEL_PICKER_PANE)
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(cur, 2)
+
+    def test_picker_index_for(self):
+        rows, _ = ha.parse_model_picker(MODEL_PICKER_PANE)
+        self.assertEqual(ha._picker_index_for(rows, None), 0)  # default
+        self.assertEqual(ha._picker_index_for(rows, "fable"), 2)
+        self.assertEqual(ha._picker_index_for(rows, "sonnet"), 3)
+        self.assertIsNone(ha._picker_index_for(rows, "opusplan"))
+
+
+class TestScanModelEntry(unittest.TestCase):
+    def _fold(self, entry):
+        rep = {"modelActual": None}
+        ha._scan_model_entry(entry, rep)
+        return rep["modelActual"]
+
+    def test_assistant_entry_names_the_model_that_answered(self):
+        self.assertEqual(
+            self._fold({"type": "assistant",
+                        "message": {"model": "claude-opus-4-8"}}),
+            "claude-opus-4-8")
+
+    def test_synthetic_is_not_a_model(self):
+        self.assertIsNone(self._fold(
+            {"type": "assistant", "message": {"model": "<synthetic>"}}))
+
+    def test_tui_switch_confirmation_with_ansi(self):
+        e = {"type": "user", "message": {"role": "user", "content":
+             "<local-command-stdout>Set model to \x1b[1mSonnet 5\x1b[22m and "
+             "saved as your default for new sessions</local-command-stdout>"}}
+        self.assertEqual(self._fold(e), "Sonnet 5")
+
+    def test_session_only_switch_confirmation(self):
+        e = {"type": "user", "message": {"content":
+             "<local-command-stdout>Set model to Haiku 4.5 for this session "
+             "only</local-command-stdout>"}}
+        self.assertEqual(self._fold(e), "Haiku 4.5")
+
+    def test_print_mode_system_shape(self):
+        e = {"type": "system", "subtype": "local_command", "content":
+             "<local-command-stdout>Set model to Sonnet 5 for this session "
+             "only</local-command-stdout>"}
+        self.assertEqual(self._fold(e), "Sonnet 5")
+
+    def test_kept_model_is_no_change(self):
+        e = {"type": "user", "message": {"content":
+             "<local-command-stdout>Kept model as Fable 5</local-command-stdout>"}}
+        self.assertIsNone(self._fold(e))
+
+
+class TestSessionReportModelActual(ProjectDirMixin, unittest.TestCase):
+    def test_incremental_scan_reports_newest_signal(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [{"type": "assistant",
+                            "message": {"model": "claude-old-1"}}])
+        state = {}
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertIsNone(rep["modelActual"])  # primed to EOF, no replay
+        write_jsonl(path, [
+            {"type": "assistant", "message": {"model": "claude-old-1"}},
+            {"type": "assistant", "message": {"model": "claude-opus-4-8"}},
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["modelActual"], "claude-opus-4-8")
+
+
+class TestModelsProbe(ManagerMixin, unittest.TestCase):
+    def _start(self, sm, rc):
+        fake = mock.Mock()
+        fake.poll.return_value = rc
+        with mock.patch.object(ha.subprocess, "Popen",
+                               return_value=fake) as pop:
+            sm._start_models_probe()
+        return fake, pop
+
+    def test_probe_reaps_into_models_info(self):
+        sm = self.make_manager()
+        fake, pop = self._start(sm, 0)
+        args, kwargs = pop.call_args
+        self.assertEqual(args[0], ["claude", "-p", "/model"])
+        self.assertEqual(kwargs["cwd"], ha.REGISTRY_DIR)  # internal-tool cwd
+        with open(sm.models_probe["outPath"], "w") as f:
+            f.write(MODEL_PROBE_OUT)
+        sm._poll_models_probe()
+        self.assertIsNone(sm.models_probe)
+        self.assertEqual(sm.models_info["defaultLabel"], "Fable 5")
+        self.assertIn("fable", sm.models_info["available"])
+        self.assertEqual(sm.models_available()[0], "sonnet")
+
+    def test_failed_probe_keeps_the_previous_list(self):
+        sm = self.make_manager()
+        sm.models_info = {"available": ["opus"], "defaultLabel": "X", "at": "t"}
+        self._start(sm, 1)
+        sm._poll_models_probe()
+        self.assertIsNone(sm.models_probe)
+        self.assertEqual(sm.models_info["available"], ["opus"])
+
+    def test_overrunning_probe_is_killed(self):
+        sm = self.make_manager()
+        fake, _ = self._start(sm, None)
+        sm.models_probe["startedMono"] = (
+            time.time() - ha.MODELS_PROBE_TIMEOUT_SEC - 1)
+        sm._poll_models_probe()
+        fake.kill.assert_called_once()
+        self.assertIsNone(sm.models_probe)
+        self.assertIsNone(sm.models_info)
+
+    def test_second_start_is_a_noop_while_one_is_in_flight(self):
+        sm = self.make_manager()
+        self._start(sm, None)
+        job = sm.models_probe
+        with mock.patch.object(ha.subprocess, "Popen") as pop:
+            sm._start_models_probe()
+            pop.assert_not_called()
+        self.assertIs(sm.models_probe, job)
+
+
+class TestSeedModelActual(ManagerMixin, unittest.TestCase):
+    SID = "11111111-1111-4111-8111-111111111111"
+
+    def _transcript(self, wt, entries):
+        d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, f"{self.SID}.jsonl"), entries)
+
+    def test_seeds_the_newest_signal_from_the_tail(self):
+        sm = self.make_manager()
+        wt = os.path.join(self.tmp, "wt")
+        self._transcript(wt, [
+            {"type": "assistant", "message": {"model": "claude-sonnet-5"}},
+            {"type": "user", "message": {"content":
+             "<local-command-stdout>Set model to Haiku 4.5 for this session "
+             "only</local-command-stdout>"}},
+        ])
+        sess = {"id": "s1", "worktreePath": wt, "claudeSessionId": self.SID}
+        self.assertEqual(sm._seed_model_actual(sess), "Haiku 4.5")
+
+    def test_no_transcript_seeds_nothing(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "worktreePath": os.path.join(self.tmp, "none"),
+                "claudeSessionId": self.SID}
+        self.assertIsNone(sm._seed_model_actual(sess))
+
+
+class TestInternalToolSlugModelProbe(ManagerMixin, unittest.TestCase):
+    """The models probe's transcript is nothing but the /model command — no
+    genuine user text for the prompt-signature match — so _is_internal_tool_slug
+    recognizes it by its first command instead (the harness-foreign-slug case;
+    in production its REGISTRY_DIR cwd already matches by slug)."""
+
+    CAVEAT = ("Caveat: The messages below were generated by the user while "
+              "running local commands. DO NOT respond to these messages or "
+              "otherwise consider them in your response unless the user "
+              "explicitly asks you to.")
+
+    def _slug(self, name, entries):
+        d = os.path.join(ha.PROJECTS_ROOT, name)
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, "t.jsonl"), entries)
+        return name
+
+    def _probe_entries(self):
+        return [
+            {"type": "user", "isMeta": True,
+             "message": {"role": "user",
+                         "content": f"<local-command-caveat>{self.CAVEAT}"
+                                    "</local-command-caveat>"}},
+            {"type": "user", "message": {"role": "user", "content":
+             "<command-name>/model</command-name><command-message>model"
+             "</command-message><command-args></command-args>"}},
+            {"type": "system", "subtype": "local_command", "content":
+             "<local-command-stdout>Current model: Fable 5</local-command-stdout>"},
+        ]
+
+    def test_model_probe_transcript_is_internal(self):
+        sm = self.make_manager()
+        slug = self._slug("-tmp-hub-agent-mgr-zzz", self._probe_entries())
+        self.assertTrue(sm._is_internal_tool_slug(slug))
+
+    def test_real_session_opening_with_model_still_counts(self):
+        sm = self.make_manager()
+        slug = self._slug("-w-repo", self._probe_entries() + [
+            {"type": "user",
+             "message": {"role": "user", "content": "now fix the login bug"}},
+        ])
+        self.assertFalse(sm._is_internal_tool_slug(slug))
+
+    def test_repos_root_slug_never_internal(self):
+        # The REPOS_ROOT slug holds EVERY root session's transcript, and the
+        # check only reads the newest — a root session in which the operator
+        # typed nothing but /model reads exactly like the probe, and one such
+        # transcript must not tombstone the whole root history (XERK-147).
+        sm = self.make_manager()
+        slug = self._slug(ha._project_slug(ha.REPOS_ROOT), self._probe_entries())
+        self.assertFalse(sm._is_internal_tool_slug(slug))
+
+
+class TestModelActualPayload(ManagerMixin, unittest.TestCase):
+    def _sess(self):
+        return {"id": "abcde", "status": "running", "repo": "Turma",
+                "repoPath": "/w/Turma", "worktreePath": "/w/.turma/worktrees/x",
+                "branch": None, "rcName": "rc", "tmuxName": "agent-abcde",
+                "claudeSessionId": "22222222-2222-4222-8222-222222222222"}
+
+    def test_scan_signal_persists_on_the_record_and_payload(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        sm.registry = [sess]
+        signals = {"prUrls": [], "modelActual": "claude-opus-4-8", "tail": []}
+        with mock.patch.object(ha, "session_report", return_value=signals), \
+             mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            payload = sm._session_payload(sess, refresh=False)
+        self.assertEqual(payload["modelActual"], "claude-opus-4-8")
+        self.assertEqual(sess["modelActual"], "claude-opus-4-8")
+        # ...and it stays on the payload once the scan has nothing new.
+        signals2 = {"prUrls": [], "modelActual": None, "tail": []}
+        with mock.patch.object(ha, "session_report", return_value=signals2), \
+             mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            payload = sm._session_payload(sess, refresh=False)
+        self.assertEqual(payload["modelActual"], "claude-opus-4-8")
+
+    def test_mode_reconciles_to_the_pane_and_pending_model_rides(self):
+        # The operator can cycle modes by hand in the live terminal, which no
+        # command ever reports: the pane's modeActual is the truth, so the
+        # stored permissionMode follows it. A deferred model pick rides the
+        # payload so the chip can show the switch as in-flight.
+        sm = self.make_manager()
+        sess = self._sess()
+        sess["permissionMode"] = "auto"
+        sess["pendingModel"] = "sonnet"
+        sm.registry = [sess]
+        signals = {"prUrls": [], "modelActual": None, "modeActual": "plan",
+                   "tail": []}
+        with mock.patch.object(ha, "session_report", return_value=signals), \
+             mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            payload = sm._session_payload(sess, refresh=False)
+        self.assertEqual(payload["permissionMode"], "plan")
+        self.assertEqual(sess["permissionMode"], "plan")
+        self.assertEqual(payload["pendingModel"], "sonnet")
 
 
 class TestAnswerQuestion(ManagerMixin, unittest.TestCase):
@@ -2258,6 +5693,23 @@ class TestAnswerQuestion(ManagerMixin, unittest.TestCase):
         self._req(sess["id"])
         sm.answer_question(sess["id"], -1, "   ")  # blank custom, negative index
         self.assertIsNone(self._ans(sess["id"]))
+
+    def test_writes_multi_select_answer(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        self._req(sess["id"])
+        # A multiSelect answer carries a list; the single-index compat key is the
+        # first pick. Duplicates and negatives are sanitized out.
+        sm.answer_question(sess["id"], -1, None, [2, 0, 2, -1])
+        self.assertEqual(self._ans(sess["id"]),
+                         {"optionIndices": [2, 0], "optionIndex": 2})
+
+    def test_empty_multi_select_list_falls_back_to_single(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        self._req(sess["id"])
+        sm.answer_question(sess["id"], 1, None, [])  # empty list -> single index
+        self.assertEqual(self._ans(sess["id"]), {"optionIndex": 1})
 
     def test_kill_clears_pending_question_files(self):
         sm = self.make_manager()
@@ -2355,7 +5807,7 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
         sm.registry = []
         sm._stage_history("nope")
         self.assertEqual(sm.history_results, [
-            {"sessionId": "nope", "entries": [], "truncated": False},
+            {"sessionId": "nope", "entries": [], "truncated": False, "queued": []},
         ])
 
     def test_fixture_transcript_entries_ids_roles_order(self):
@@ -2377,6 +5829,7 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
                  "blocks": [{"t": "text", "text": "hello back"}]},
             ],
             "truncated": False,
+            "queued": [],
         }])
 
     def test_truncated_false_when_everything_fits(self):
@@ -2413,7 +5866,7 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
         open(os.path.join(proj, "t.jsonl"), "w").close()
         sm._stage_history(sess["id"])
         self.assertEqual(sm.history_results, [
-            {"sessionId": sess["id"], "entries": [], "truncated": False},
+            {"sessionId": sess["id"], "entries": [], "truncated": False, "queued": []},
         ])
 
     def test_missing_project_dir_stages_empty(self):
@@ -2421,7 +5874,7 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
         sess = self._running_session(sm, workdir="/absent/worktree")
         sm._stage_history(sess["id"])
         self.assertEqual(sm.history_results, [
-            {"sessionId": sess["id"], "entries": [], "truncated": False},
+            {"sessionId": sess["id"], "entries": [], "truncated": False, "queued": []},
         ])
 
     def test_keeps_full_message_beyond_tail_preview_cap(self):
@@ -2471,6 +5924,15 @@ class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
         sm._stage_history.assert_called_once_with("s1")
         self.assertEqual(sm.acked, {"i1", "h1"})
 
+    def test_dispatches_interrupt(self):
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        sm.interrupt = mock.Mock()
+        cmds = [{"cmdId": "x1", "type": "interrupt", "sessionId": "s1"}]
+        self.assertTrue(sm.handle_commands(cmds))
+        sm.interrupt.assert_called_once_with("s1")
+        self.assertEqual(sm.acked, {"x1"})
+
     def test_dispatches_answer_question(self):
         sm = self.make_manager()
         sm.save = mock.Mock()
@@ -2478,8 +5940,18 @@ class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
         cmds = [{"cmdId": "a1", "type": "answerQuestion", "sessionId": "s1",
                  "optionIndex": 2, "custom": "other"}]
         self.assertTrue(sm.handle_commands(cmds))
-        sm.answer_question.assert_called_once_with("s1", 2, "other")
+        sm.answer_question.assert_called_once_with("s1", 2, "other", None)
         self.assertEqual(sm.acked, {"a1"})
+
+    def test_dispatches_answer_question_multi(self):
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        sm.answer_question = mock.Mock()
+        cmds = [{"cmdId": "a2", "type": "answerQuestion", "sessionId": "s1",
+                 "optionIndex": -1, "optionIndices": [0, 2]}]
+        self.assertTrue(sm.handle_commands(cmds))
+        sm.answer_question.assert_called_once_with("s1", -1, None, [0, 2])
+        self.assertEqual(sm.acked, {"a2"})
 
 
 class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
@@ -2501,7 +5973,8 @@ class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):
         self.assertTrue(did_work)
         extra_beat_payload = sm.build_payload(1)
         self.assertEqual(extra_beat_payload["historyResults"],
-                          [{"sessionId": "s1", "entries": [], "truncated": False}])
+                          [{"sessionId": "s1", "entries": [], "truncated": False,
+                            "queued": []}])
 
     def test_absent_when_nothing_staged(self):
         sm = self.make_manager()
@@ -2808,7 +6281,8 @@ class TestClone(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.clones["Turma"]["status"], "done")
         # The serializable view never leaks the Popen/file handles.
         payload = sm._clones_payload()[0]
-        self.assertEqual(set(payload), {"name", "repo", "status", "error", "startedAt"})
+        self.assertEqual(set(payload),
+                         {"name", "repo", "status", "error", "source", "startedAt"})
 
     def test_failed_clone_captures_error(self):
         sm = self.make_manager()
@@ -2824,6 +6298,209 @@ class TestClone(ManagerMixin, unittest.TestCase):
             sm.clone("xerktech/Turma")
         sm._poll_clones()
         self.assertEqual(sm.clones["Turma"]["status"], "error")
+
+
+class TestValidSourceRepo(unittest.TestCase):
+    """XERK-155: the loose path check for non-GitHub listings — spaces are legal
+    in an Azure DevOps project segment, but the LAST segment becomes a directory
+    under REPOS_ROOT and stays on the strict GitHub charset."""
+
+    def test_accepts_plain_and_nested_and_spaced_paths(self):
+        for ok in ("owner/repo", "group/sub/project", "My Project/repo",
+                    "a/b/c/d/e/f"):
+            self.assertTrue(ha.valid_source_repo(ok), ok)
+
+    def test_rejects_unsafe_paths(self):
+        for bad in ("", "single", "a/b/c/d/e/f/g", "owner/re po",
+                    "owner/../repo", "-lead/repo", "owner/-repo",
+                    "owner/", "/repo", "owner//repo", "owner/re;po"):
+            self.assertFalse(ha.valid_source_repo(bad), bad)
+
+
+class _FakeHttpResp:
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return json.dumps(self._body).encode()
+
+
+class TestCollectGitlabRepos(unittest.TestCase):
+    def test_shapes_and_filters_projects(self):
+        page = [
+            {"path_with_namespace": "grp/sub/app",
+             "ssh_url_to_repo": "git@gitlab.example.com:grp/sub/app.git",
+             "description": "the app", "visibility": "private",
+             "last_activity_at": "2026-07-02T00:00:00Z"},
+            {"path_with_namespace": "grp/site",
+             "ssh_url_to_repo": "git@gitlab.example.com:grp/site.git",
+             "visibility": "public", "last_activity_at": "2026-07-01T00:00:00Z"},
+            # Malformed entries are dropped, never sanitized.
+            {"path_with_namespace": "grp/evil repo",
+             "ssh_url_to_repo": "git@gitlab.example.com:grp/evil.git"},
+            {"path_with_namespace": "grp/nossh", "ssh_url_to_repo": ""},
+        ]
+        with mock.patch.object(ha, "GITLAB_URL", "https://gitlab.example.com"), \
+                mock.patch.object(ha, "GITLAB_TOKEN", "tok"), \
+                mock.patch.object(ha.urllib.request, "urlopen",
+                                  return_value=_FakeHttpResp(page)):
+            repos = ha.collect_gitlab_repos()
+        self.assertEqual([r["nameWithOwner"] for r in repos],
+                         ["grp/sub/app", "grp/site"])
+        self.assertEqual(repos[0]["name"], "app")
+        self.assertEqual(repos[0]["cloneUrl"],
+                         "git@gitlab.example.com:grp/sub/app.git")
+        self.assertTrue(repos[0]["isPrivate"])
+        self.assertFalse(repos[1]["isPrivate"])
+        self.assertEqual(repos[0]["description"], "the app")
+
+    def test_http_failure_raises_for_keep_last_good(self):
+        with mock.patch.object(ha, "GITLAB_URL", "https://gitlab.example.com"), \
+                mock.patch.object(ha, "GITLAB_TOKEN", "tok"), \
+                mock.patch.object(ha.urllib.request, "urlopen",
+                                  side_effect=OSError("down")):
+            with self.assertRaises(OSError):
+                ha.collect_gitlab_repos()
+
+
+class TestCollectAzureRepos(unittest.TestCase):
+    def test_shapes_and_filters_repos(self):
+        data = {"value": [
+            {"name": "Api", "remoteUrl": "https://dev.azure.com/org/Proj/_git/Api",
+             "project": {"name": "My Project",
+                         "lastUpdateTime": "2026-06-01T00:00:00Z"}},
+            {"name": "Old", "isDisabled": True,
+             "remoteUrl": "https://x", "project": {"name": "My Project"}},
+            {"name": "re po", "remoteUrl": "https://x",
+             "project": {"name": "My Project"}},   # unsafe dest name -> dropped
+        ]}
+        with mock.patch.object(ha, "azure_req", return_value=data):
+            repos = ha.collect_azure_repos()
+        self.assertEqual([r["nameWithOwner"] for r in repos], ["My Project/Api"])
+        self.assertEqual(repos[0]["name"], "Api")
+        self.assertEqual(repos[0]["cloneUrl"],
+                         "https://dev.azure.com/org/Proj/_git/Api")
+        self.assertTrue(repos[0]["isPrivate"])
+
+
+class TestGitSources(ManagerMixin, unittest.TestCase):
+    """XERK-155: the extra clone sources' refresh, payload and clone routing."""
+
+    def setUp(self):
+        super().setUp()
+        self.repos_root = os.path.join(self.tmp, "root")
+        os.makedirs(self.repos_root)
+        p = mock.patch.object(ha, "REPOS_ROOT", self.repos_root)
+        p.start()
+        self.addCleanup(p.stop)
+
+    GL_REPO = {"nameWithOwner": "grp/app", "name": "app", "description": "",
+               "isPrivate": True, "updatedAt": "2026-07-01",
+               "cloneUrl": "git@gitlab.example.com:grp/app.git"}
+    AZ_REPO = {"nameWithOwner": "Proj/Api", "name": "Api", "description": "",
+               "isPrivate": True, "updatedAt": "2026-06-01",
+               "cloneUrl": "https://dev.azure.com/org/Proj/_git/Api"}
+
+    def _sourced_manager(self):
+        sm = self.make_manager()
+        sm.git_sources = {
+            "azure": {"available": True, "repos": [dict(self.AZ_REPO)], "error": None},
+            "gitlab": {"available": True, "repos": [dict(self.GL_REPO)], "error": None},
+        }
+        return sm
+
+    def test_refresh_keeps_last_good_list_on_failure(self):
+        sm = self._sourced_manager()
+        with mock.patch.object(ha, "collect_azure_repos",
+                               side_effect=OSError("down")), \
+                mock.patch.object(ha, "collect_gitlab_repos",
+                                  return_value=[dict(self.GL_REPO)]):
+            sm.refresh_git_sources()
+        az = sm.git_sources["azure"]
+        self.assertEqual(az["repos"], [self.AZ_REPO])   # kept, not blanked
+        self.assertIn("down", az["error"])
+        self.assertIsNone(sm.git_sources["gitlab"]["error"])
+
+    def test_payload_strips_clone_url_and_tags_source(self):
+        sm = self._sourced_manager()
+        with mock.patch.object(ha, "AZDO_URL", "https://dev.azure.com/org"), \
+                mock.patch.object(ha, "GITLAB_URL", "https://gitlab.example.com"):
+            payload = sm._git_sources_payload()
+        self.assertEqual([b["source"] for b in payload], ["azure", "gitlab"])
+        self.assertEqual(payload[0]["label"], "dev.azure.com/org")
+        self.assertEqual(payload[1]["label"], "gitlab.example.com")
+        for block in payload:
+            for r in block["repos"]:
+                self.assertNotIn("cloneUrl", r)
+                self.assertEqual(r["source"], block["source"])
+        # The internal listings still hold their cloneUrl for clone-time use.
+        self.assertIn("cloneUrl", sm.git_sources["gitlab"]["repos"][0])
+
+    def test_clone_resolves_listed_gitlab_repo_over_ssh(self):
+        sm = self._sourced_manager()
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("grp/app", source="gitlab")
+        args = popen.call_args[0][0]
+        self.assertIn("git@gitlab.example.com:grp/app.git", args)
+        env = popen.call_args[1]["env"]
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertIn("BatchMode=yes", env["GIT_SSH_COMMAND"])
+        self.assertEqual(sm.clones["app"]["source"], "gitlab")
+
+    def test_clone_resolves_bare_spec_across_sources(self):
+        # An older hub (or the triage ledger) sends no source; the bare
+        # nameWithOwner still finds the azure listing and its remoteUrl.
+        sm = self._sourced_manager()
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("Proj/Api")
+        args = popen.call_args[0][0]
+        self.assertIn("https://dev.azure.com/org/Proj/_git/Api", args)
+        self.assertEqual(sm.clones["Api"]["source"], "azure")
+
+    def test_github_listing_wins_a_bare_spec_collision(self):
+        sm = self._sourced_manager()
+        sm.github = {"available": True, "login": "me", "repos": [
+            {"nameWithOwner": "Proj/Api", "name": "Api"}]}
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("Proj/Api")
+        self.assertIn("https://github.com/Proj/Api.git", popen.call_args[0][0])
+        self.assertEqual(sm.clones["Api"]["source"], "github")
+
+    def test_unlisted_repo_for_explicit_source_is_refused(self):
+        sm = self._sourced_manager()
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("grp/unknown", source="gitlab")
+            popen.assert_not_called()
+        jobs = sm._clones_payload()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["status"], "error")
+        self.assertIn("not in the gitlab repo listing", jobs[0]["error"])
+
+    def test_free_text_still_falls_back_to_github(self):
+        sm = self._sourced_manager()
+        with mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm.clone("someone/elsewhere")
+        self.assertIn("https://github.com/someone/elsewhere.git",
+                      popen.call_args[0][0])
+
+    def test_triage_candidates_include_extra_sources(self):
+        sm = self._sourced_manager()
+        sm.triage_gh_repos = [{"nameWithOwner": "xerktech/Turma", "name": "Turma",
+                               "description": "hub"}]
+        with mock.patch.object(sm, "_triage_repos", return_value=[]):
+            cands = sm._refresh_triage_candidates()
+        by_name = {c["name"]: c for c in cands}
+        self.assertEqual(by_name["Turma"]["source"], "github")
+        self.assertEqual(by_name["Api"]["source"], "azure")
+        self.assertEqual(by_name["app"]["source"], "gitlab")
+        for c in cands:
+            self.assertNotIn("cloneUrl", c)
 
 
 class TestCleanSummary(unittest.TestCase):
@@ -2843,6 +6520,248 @@ class TestCleanSummary(unittest.TestCase):
         self.assertIsNone(ha.clean_summary(""))
         self.assertIsNone(ha.clean_summary("   \n  "))
         self.assertIsNone(ha.clean_summary(None))
+
+
+class TestCleanManualSummary(unittest.TestCase):
+    def test_keeps_the_text_the_operator_typed(self):
+        # Unlike clean_summary, punctuation/quotes inside a human's own name are
+        # deliberate, not model noise.
+        self.assertEqual(ha.clean_manual_summary("Malcolm's v2.1 fix"), "Malcolm's v2.1 fix")
+
+    def test_first_line_only_whitespace_collapsed(self):
+        self.assertEqual(ha.clean_manual_summary("  Fix   Login \n second line "), "Fix Login")
+
+    def test_caps_length_to_the_card_width(self):
+        self.assertEqual(len(ha.clean_manual_summary("x" * 200)), ha.SUMMARY_MAX_CHARS)
+
+    def test_word_count_is_not_capped(self):
+        # The model's reply is capped at SUMMARY_MAX_WORDS; a human's isn't.
+        self.assertEqual(ha.clean_manual_summary("one two three four five six seven"),
+                         "one two three four five six seven")
+
+    def test_blank_clears(self):
+        self.assertIsNone(ha.clean_manual_summary(""))
+        self.assertIsNone(ha.clean_manual_summary("   \n  "))
+        self.assertIsNone(ha.clean_manual_summary(None))
+
+
+class TestResolveSubagent(unittest.TestCase):
+    """_resolve_subagent maps a pane agent-list row (type + description) to the
+    background agent's transcript, via the main transcript's Task call + its
+    result's 'agentId: <id>'."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hub-agent-sub-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _main_with_task(self, agent_id, subagent_type, description):
+        """Write a main transcript holding one Task tool_use + its tool_result
+        (carrying agentId) and the subagent transcript it names. Returns the
+        main transcript path."""
+        main = os.path.join(self.tmp, "main.jsonl")
+        tool_id = "toolu_" + agent_id
+        lines = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": tool_id, "name": "Task",
+                 "input": {"subagent_type": subagent_type,
+                           "description": description, "prompt": "go"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": [
+                    {"type": "text",
+                     "text": f"Async agent launched successfully.\nagentId: {agent_id} (internal)"}]}]}},
+        ]
+        with open(main, "w") as f:
+            for e in lines:
+                f.write(json.dumps(e) + "\n")
+        subdir = os.path.join(self.tmp, "main", "subagents")
+        os.makedirs(subdir)
+        sub = os.path.join(subdir, f"agent-{agent_id}.jsonl")
+        with open(sub, "w") as f:
+            f.write(json.dumps({"agentId": agent_id, "isSidechain": True,
+                                "message": {"content": "working"}}) + "\n")
+        return main, sub
+
+    def test_resolves_exact_type_and_label(self):
+        main, sub = self._main_with_task("abc123", "Explore", "Find the parser")
+        self.assertEqual(ha._resolve_subagent(main, "Explore", "Find the parser"), sub)
+
+    def test_resolves_truncated_label_by_prefix(self):
+        main, sub = self._main_with_task("abc123", "Explore", "Find the parser code")
+        # A pane-truncated label (a prefix) still resolves.
+        self.assertEqual(ha._resolve_subagent(main, "Explore", "Find the parser"), sub)
+
+    def test_resolves_ellipsized_label_and_type(self):
+        # XERK-130: on a narrow pane the TUI cuts a long cell with its own "…"
+        # ellipsis, which is not part of the real value — it must be stripped
+        # or the prefix match can never succeed.
+        main, sub = self._main_with_task(
+            "abc123", "general-purpose", "Search for pane busy detection code")
+        self.assertEqual(
+            ha._resolve_subagent(main, "general-purpose",
+                                 "Search for pane busy dete…"), sub)
+        # The type column can be cut too on an extreme width.
+        self.assertEqual(
+            ha._resolve_subagent(main, "general-pur…",
+                                 "Search for pane busy detection code"), sub)
+        # "..." accepted alongside for safety.
+        self.assertEqual(
+            ha._resolve_subagent(main, "general-purpose",
+                                 "Search for pane busy dete..."), sub)
+
+    def test_ellipsis_stripping_does_not_break_a_genuine_match(self):
+        # A description whose real text ends in "…" still resolves when the
+        # pane shows it whole (the stripped remnant is a prefix of the real one).
+        main, sub = self._main_with_task("abc123", "Explore", "Keep digging…")
+        self.assertEqual(ha._resolve_subagent(main, "Explore", "Keep digging…"), sub)
+
+    def test_newest_matching_task_wins(self):
+        main = os.path.join(self.tmp, "main.jsonl")
+        subdir = os.path.join(self.tmp, "main", "subagents")
+        os.makedirs(subdir)
+        rows = []
+        for aid in ("old1", "new2"):
+            tid = "toolu_" + aid
+            rows.append({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": tid, "name": "Task",
+                 "input": {"subagent_type": "Explore", "description": "Same task"}}]}})
+            rows.append({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tid, "content":
+                 f"agentId: {aid}"}]}})
+            with open(os.path.join(subdir, f"agent-{aid}.jsonl"), "w") as f:
+                f.write("{}\n")
+        with open(main, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        self.assertEqual(ha._resolve_subagent(main, "Explore", "Same task"),
+                         os.path.join(subdir, "agent-new2.jsonl"))
+
+    def test_no_match_or_missing_file_returns_none(self):
+        main, _sub = self._main_with_task("abc123", "Explore", "Find the parser")
+        self.assertIsNone(ha._resolve_subagent(main, "general-purpose", "Find the parser"))
+        self.assertIsNone(ha._resolve_subagent(main, "Explore", "Nonexistent"))
+        # main is the pseudo-agent — never a subagent file.
+        self.assertIsNone(ha._resolve_subagent(main, "main", ""))
+
+
+class TestStageSubagentHistory(ManagerMixin, unittest.TestCase):
+    def _setup_session(self, sm):
+        wt = "/w/.turma/worktrees/repo/aaa"
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj)
+        main = os.path.join(proj, "trans1.jsonl")
+        tool_id = "toolu_xyz"
+        with open(main, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": tool_id, "name": "Task",
+                 "input": {"subagent_type": "Explore", "description": "Map the code"}}]}}) + "\n")
+            f.write(json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tool_id,
+                 "content": "agentId: sub777"}]}}) + "\n")
+        subdir = os.path.join(proj, "trans1", "subagents")
+        os.makedirs(subdir)
+        with open(os.path.join(subdir, "agent-sub777.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "user", "uuid": "u1",
+                                "message": {"content": "explore this repo"}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "uuid": "u2",
+                                "message": {"content": [{"type": "text", "text": "done exploring"}]}}) + "\n")
+        sm.registry = [{"id": "s1", "status": "running", "worktreePath": wt}]
+
+    def test_stages_the_resolved_subagent_transcript(self):
+        sm = self.make_manager()
+        self._setup_session(sm)
+        sm._stage_subagent_history("s1", "Explore", "Map the code")
+        self.assertEqual(len(sm.subagent_history_results), 1)
+        r = sm.subagent_history_results[0]
+        self.assertEqual((r["sessionId"], r["type"], r["label"]),
+                         ("s1", "Explore", "Map the code"))
+        self.assertTrue(any("done exploring" in (e.get("text") or "") for e in r["entries"]))
+
+    def test_unresolved_row_stages_empty_result(self):
+        sm = self.make_manager()
+        self._setup_session(sm)
+        sm._stage_subagent_history("s1", "Explore", "No such agent")
+        self.assertEqual(sm.subagent_history_results[0]["entries"], [])
+
+    def test_unknown_session_stages_empty_without_raising(self):
+        sm = self.make_manager()
+        sm.registry = []
+        sm._stage_subagent_history("ghost", "Explore", "x")
+        self.assertEqual(sm.subagent_history_results[0]["entries"], [])
+
+
+class TestSetSummary(ManagerMixin, unittest.TestCase):
+    def test_renames_and_pins_the_name(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "summary": "Auto Name",
+                        "summaryRetryAt": 999}]
+        sm.set_summary("s1", "  My Own Name  ")
+        self.assertEqual(sm.registry[0]["summary"], "My Own Name")
+        self.assertTrue(sm.registry[0]["summaryManual"])
+        self.assertNotIn("summaryRetryAt", sm.registry[0])
+
+    def test_blank_clears_the_name_and_unpins(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "summary": "My Own Name",
+                        "summaryManual": True}]
+        sm.set_summary("s1", "  ")
+        self.assertIsNone(sm.registry[0]["summary"])
+        self.assertFalse(sm.registry[0]["summaryManual"])
+
+    def test_works_on_a_stopped_session(self):
+        # Presentational only — no process is touched, so state doesn't gate it.
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "stopped", "summary": None}]
+        sm.set_summary("s1", "Renamed While Stopped")
+        self.assertEqual(sm.registry[0]["summary"], "Renamed While Stopped")
+
+    def test_unknown_session_is_a_no_op(self):
+        sm = self.make_manager()
+        sm.registry = []
+        sm.set_summary("nope", "Whatever")  # must not raise
+
+    def test_manual_name_survives_an_in_flight_naming_job(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "summary": None}]
+
+        class FakeProc:
+            def poll(self_i):
+                return 0
+
+            def kill(self_i):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()):
+            sm._start_summary(sm.registry[0], "Add a docker compose flag")
+        sm.set_summary("s1", "My Own Name")          # renamed mid-flight
+        with open(sm.summaries["s1"]["outPath"], "w") as f:
+            f.write("Adding Compose Flag\n")
+        sm._poll_summaries()
+        self.assertEqual(sm.registry[0]["summary"], "My Own Name")  # operator wins
+        self.assertEqual(sm.summaries, {})                          # still reaped
+
+    def test_command_routes_to_set_summary(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "summary": None}]
+        sm.handle_commands([
+            {"cmdId": "c1", "type": "setSummary", "sessionId": "s1", "summary": "Named By Hand"},
+        ])
+        self.assertEqual(sm.registry[0]["summary"], "Named By Hand")
+
+    def test_manual_name_and_its_pin_survive_kill_then_resume(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "repo": "r", "root": True,
+                        "summary": "My Own Name", "summaryManual": True,
+                        "tmuxName": "agent-s1", "worktreePath": None,
+                        "rcName": "h-r-s1", "ttydPort": 7681}]
+        with mock.patch.object(sm, "_kill_tmux"), mock.patch.object(sm, "_kill_ttyd"):
+            sm.kill("s1")
+        rec = sm.closed[-1]
+        self.assertEqual(rec["summary"], "My Own Name")
+        self.assertTrue(rec["summaryManual"])
+        with mock.patch.object(sm, "_launch_tmux"), mock.patch.object(sm, "_launch_ttyd"):
+            sm.resume("s1")
+        self.assertEqual(sm.registry[0]["summary"], "My Own Name")
+        self.assertTrue(sm.registry[0]["summaryManual"])
 
 
 class TestSessionSummaries(ManagerMixin, unittest.TestCase):
@@ -2897,9 +6816,11 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.registry[0]["summary"], "Adding Compose Flag")
         self.assertEqual(sm.summaries, {})            # reaped
         self.assertFalse(os.path.exists(out_path))    # temp output cleaned up
-        sm.save.assert_called_once()
+        self.assertTrue(sm.save.called)
+        # A named session owes no retry, so the armed backoff is cleared.
+        self.assertNotIn("summaryRetryAt", sm.registry[0])
 
-    def test_timeout_kills_and_leaves_unnamed(self):
+    def test_timeout_kills_and_schedules_a_retry(self):
         sm = self.make_manager()
         sm.registry = [{"id": "s1", "status": "running", "summary": None}]
         killed = {"v": False}
@@ -2918,6 +6839,68 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
         self.assertTrue(killed["v"])
         self.assertEqual(sm.summaries, {})
         self.assertIsNone(sm.registry[0]["summary"])
+        # A hung attempt is a property of the attempt, not the session: it spends
+        # one try and leaves the session eligible for the rest.
+        self.assertEqual(sm.registry[0]["summaryAttempts"], 1)
+        self.assertGreater(sm.registry[0]["summaryRetryAt"], time.time())
+
+    def test_empty_reply_schedules_a_retry(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "s1", "status": "running", "summary": None}]
+
+        class FakeProc:
+            def poll(self_i):
+                return 0  # clean exit, but the model said nothing
+
+            def kill(self_i):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()):
+            sm._start_summary(sm.registry[0], "do a thing")
+        sm._poll_summaries()  # stdout file is empty
+        self.assertIsNone(sm.registry[0]["summary"])
+        self.assertEqual(sm.registry[0]["summaryAttempts"], 1)
+        self.assertGreater(sm.registry[0]["summaryRetryAt"], time.time())
+
+    def test_attempts_are_capped(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "status": "running", "summary": None}
+        sm.registry = [sess]
+
+        class FakeProc:
+            def poll(self_i):
+                return 1  # every attempt fails
+
+            def kill(self_i):
+                pass
+
+        with mock.patch.object(ha.subprocess, "Popen", return_value=FakeProc()):
+            for _ in range(ha.SUMMARY_MAX_ATTEMPTS + 2):
+                sess["summaryRetryAt"] = 0  # backoff elapsed
+                if ha._summary_due(sess, time.time()):
+                    sm._start_summary(sess, "do a thing")
+                sm._poll_summaries()
+        self.assertEqual(sess["summaryAttempts"], ha.SUMMARY_MAX_ATTEMPTS)
+        self.assertFalse(ha._summary_due(sess, time.time()))  # gives up for good
+
+    def test_launch_failure_spends_an_attempt_and_retries(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "status": "running", "summary": None}
+        sm.registry = [sess]
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=OSError("boom")):
+            sm._start_summary(sess, "do a thing")
+        self.assertEqual(sm.summaries, {})
+        self.assertEqual(sess["summaryAttempts"], 1)
+        self.assertGreater(sess["summaryRetryAt"], time.time())
+
+    def test_no_prompt_spends_no_attempt(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "status": "running", "summary": None}
+        with mock.patch.object(ha.subprocess, "Popen"):
+            sm._start_summary(sess, "")
+        # Nothing to name yet is not a failed try — the bare session must keep all
+        # of its attempts for when a first prompt finally lands.
+        self.assertEqual(ha._summary_attempts(sess), 0)
 
     def test_session_deleted_mid_summary_is_safe(self):
         sm = self.make_manager()
@@ -2936,6 +6919,32 @@ class TestSessionSummaries(ManagerMixin, unittest.TestCase):
             f.write("Some Name")
         sm._poll_summaries()  # must not raise even with no matching session
         self.assertEqual(sm.summaries, {})
+
+
+class TestSummaryDue(unittest.TestCase):
+    def test_named_session_is_never_due(self):
+        self.assertFalse(ha._summary_due({"summary": "Adding Flag"}, 1000))
+
+    def test_unnamed_untried_session_is_due(self):
+        self.assertTrue(ha._summary_due({"summary": None}, 1000))
+
+    def test_backoff_defers_then_releases(self):
+        sess = {"summary": None, "summaryAttempts": 1, "summaryRetryAt": 1000}
+        self.assertFalse(ha._summary_due(sess, 999))
+        self.assertTrue(ha._summary_due(sess, 1000))
+
+    def test_exhausted_attempts_close_it_out(self):
+        sess = {"summary": None, "summaryAttempts": ha.SUMMARY_MAX_ATTEMPTS,
+                "summaryRetryAt": 0}
+        self.assertFalse(ha._summary_due(sess, 10_000))
+
+    def test_legacy_summary_started_counts_as_one_attempt(self):
+        # Records persisted by the one-shot agent carry summaryStarted with no
+        # counter. Reading it as "one try spent" (not as a permanent gate) is what
+        # lets a session it failed to name still get its remaining retries.
+        sess = {"summary": None, "summaryStarted": True}
+        self.assertEqual(ha._summary_attempts(sess), 1)
+        self.assertTrue(ha._summary_due(sess, 10_000))
 
 
 class TestFirstUserText(unittest.TestCase):
@@ -2988,6 +6997,25 @@ class TestFirstUserText(unittest.TestCase):
         ])
         self.assertEqual(ha._first_user_text(path), "actual work please")
 
+    def test_skips_command_wrappers_the_chat_now_flattens(self):
+        # _entry_text renders the wrapper as "/compact <args>" for the chat, so
+        # this skip has to key on the turn's KIND, not on the display text still
+        # looking like raw XML — else a session gets named after its slash command.
+        path = self._write("t.jsonl", [
+            self._user(COMMAND_INVOCATION),
+            self._user(COMMAND_STDOUT),
+            self._user("actual work please"),
+        ])
+        self.assertEqual(ha._first_user_text(path), "actual work please")
+
+    def test_skips_a_compact_summary(self):
+        # A resumed-after-compaction transcript opens with the model's own
+        # summary on a user turn; the human's prompt is what names the session.
+        summary = dict(self._user("This session is being continued from a previous…"))
+        summary["isCompactSummary"] = True
+        path = self._write("t.jsonl", [summary, self._user("actual work please")])
+        self.assertEqual(ha._first_user_text(path), "actual work please")
+
     def test_skips_tool_result_only_user_turns(self):
         # A user turn that is only a tool_result has no display text -> skipped.
         path = self._write("t.jsonl", [
@@ -3022,6 +7050,224 @@ class TestFirstUserText(unittest.TestCase):
         entries = [{"type": "mode"}] * 10 + [self._user("late prompt")]
         path = self._write("t.jsonl", entries)
         self.assertIsNone(ha._first_user_text(path, max_lines=5))
+
+
+class TestRootSessionIsolation(ManagerMixin, unittest.TestCase):
+    """XERK-6: a fresh root session must not open onto the previous one's chat.
+
+    Every repos-root session runs at REPOS_ROOT, so they all share ONE
+    ~/.claude/projects slug dir — unlike a worktree session, whose cwd (and
+    therefore slug) is its own. Resolving "this session's transcript" as
+    "the newest *.jsonl in that dir" is exact for a worktree and wrong here: the
+    newest is the PREVIOUS root session's until the new claude writes its first
+    entry, so a just-spawned root session reported that session's tail, served
+    its history, seeded its name from its first prompt — and on resume relaunched
+    it. Pinning claude's session id per launch (--session-id) is what tells the
+    two apart.
+
+    Each test runs the real sequence: root session A converses, ends, root
+    session B spawns.
+    """
+
+    def setUp(self):
+        super().setUp()
+        for name, value in [("REPOS_ROOT", self.tmp)]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(ha, "scan_repos", lambda: [])  # root needs no repo
+        p.start()
+        self.addCleanup(p.stop)
+        # The one project dir every root session's transcript lands in.
+        self.proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.tmp))
+        os.makedirs(self.proj, exist_ok=True)
+
+    def _manager(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()  # avoid the real Popen
+        return sm
+
+    def _converse(self, sess, text, mtime):
+        """Write the transcript claude would have written for `sess`, at a fixed
+        mtime so "newest" is unambiguous rather than a filesystem-clock race."""
+        path = os.path.join(self.proj, f"{sess['claudeSessionId']}.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "mode"}) + "\n")
+            f.write(json.dumps({"type": "user", "uuid": f"u-{text}",
+                                "message": {"role": "user", "content": text}}) + "\n")
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def _spawn_root(self, sm):
+        sm.spawn(ha.ROOT_REPO_NAME)
+        return sm.registry[-1]
+
+    def test_each_root_session_is_pinned_to_its_own_claude_session_id(self):
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+        self.assertTrue(a["claudeSessionId"] and b["claudeSessionId"])
+        self.assertNotEqual(a["claudeSessionId"], b["claudeSessionId"],
+                            "two root sessions must not share a conversation")
+        # Both were LAUNCHED under those ids, not just labelled with them.
+        launches = [c[-1] for c in self.run_ok_calls if "new-session" in c]
+        self.assertIn(f"--session-id {a['claudeSessionId']}", launches[0])
+        self.assertIn(f"--session-id {b['claudeSessionId']}", launches[1])
+
+    def test_new_root_session_does_not_report_the_previous_ones_tail(self):
+        # The reported symptom: session A's whole history showing up in B.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "session A work", mtime=1000)
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+
+        # B has not spoken yet: no transcript, so nothing to show.
+        rep = ha.session_report(self.tmp, {}, claude_sid=b["claudeSessionId"])
+        self.assertEqual(rep["tail"], [])
+        self.assertIsNone(rep["transcriptAgeSec"])
+
+        # ...and once it does speak, it shows ITS conversation, not A's.
+        self._converse(b, "session B work", mtime=2000)
+        rep = ha.session_report(self.tmp, {}, claude_sid=b["claudeSessionId"])
+        self.assertEqual([e["text"] for e in rep["tail"]], ["session B work"])
+
+    def test_a_root_session_reports_its_own_tail_even_when_not_the_newest(self):
+        # mtime order is not session order: A is still the newest file on disk
+        # while B is spawning, and B's own transcript stays older than a root
+        # session that outlives it. Only the pin distinguishes them.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "session A work", mtime=9000)  # the newest file
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+        self._converse(b, "session B work", mtime=1000)  # older, but B's own
+
+        rep = ha.session_report(self.tmp, {}, claude_sid=b["claudeSessionId"])
+        self.assertEqual([e["text"] for e in rep["tail"]], ["session B work"])
+        # The rule this replaced, on the same fixture, is what shipped the bug:
+        # B's card showing A's chat. If this ever stops differing, the test above
+        # has stopped proving anything.
+        stale = ha.session_report(self.tmp, {}, claude_sid=None)
+        self.assertEqual([e["text"] for e in stale["tail"]], ["session A work"])
+
+    def test_history_serves_the_new_root_sessions_own_conversation(self):
+        # The chat view's initial scrollback comes from here, so this is the
+        # other half of "the whole previous chat history is there".
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "session A work", mtime=1000)
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+
+        sm._stage_history(b["id"])
+        self.assertEqual(sm.history_results[-1]["entries"], [],
+                         "a root session that hasn't spoken has no history")
+
+        self._converse(b, "session B work", mtime=2000)
+        sm._stage_history(b["id"])
+        self.assertEqual([e["text"] for e in sm.history_results[-1]["entries"]],
+                         ["session B work"])
+
+    def test_new_root_session_is_not_named_from_the_previous_ones_prompt(self):
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "Add a docker compose flag", mtime=1000)
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()  # B has no prompt of its own yet
+
+        self._converse(b, "Fix the board filter", mtime=2000)
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_called_once_with(b, "Fix the board filter")
+
+    def test_resuming_a_root_session_rejoins_its_own_conversation(self):
+        # The worst form of the bug: not just displaying the wrong history but
+        # handing the relaunched claude someone else's context.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "session A work", mtime=1000)
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+        self._converse(b, "session B work", mtime=9000)  # B's is now the newest
+        sm.kill(b["id"])
+
+        sm.resume(a["id"])
+        cmd = [c[-1] for c in self.run_ok_calls if "new-session" in c][-1]
+        self.assertIn(f"--resume {a['claudeSessionId']}", cmd)
+        self.assertNotIn(b["claudeSessionId"], cmd)
+
+    def test_killing_a_root_session_records_its_own_transcript_id(self):
+        # What the Ended-sessions card opens from the archive.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "session A work", mtime=1000)
+        sm.kill(a["id"])
+        b = self._spawn_root(sm)
+        self._converse(b, "session B work", mtime=9000)
+        sm.kill(b["id"])
+
+        rec_a = next(c for c in sm.closed if c["id"] == a["id"])
+        self.assertEqual(rec_a["transcriptId"], a["claudeSessionId"])
+        rec_b = next(c for c in sm.closed if c["id"] == b["id"])
+        self.assertEqual(rec_b["transcriptId"], b["claudeSessionId"])
+
+    def test_restart_moves_a_root_session_to_a_fresh_conversation(self):
+        # "Restart (clear context)" means a new conversation, and the session has
+        # to follow it — its pre-restart transcript stays the newest on disk.
+        sm = self._manager()
+        a = self._spawn_root(sm)
+        self._converse(a, "before the restart", mtime=9000)
+        before = a["claudeSessionId"]
+
+        sm.restart(a["id"])
+
+        self.assertNotEqual(a["claudeSessionId"], before)
+        cmd = [c[-1] for c in self.run_ok_calls if "new-session" in c][-1]
+        self.assertIn(f"--session-id {a['claudeSessionId']}", cmd)
+        self.assertNotIn("--resume", cmd)
+        rep = ha.session_report(self.tmp, {}, claude_sid=a["claudeSessionId"])
+        self.assertEqual(rep["tail"], [], "cleared context, not the old chat")
+
+    def test_a_session_predating_the_pin_keeps_the_newest_transcript_rule(self):
+        # An agent update must not blank the history of a session already
+        # running under the old rule: with no id there is nothing to pin to, and
+        # newest-mtime is the only handle it ever had.
+        sm = self._manager()
+        legacy = self._spawn_root(sm)
+        path = os.path.join(self.proj, "legacy-transcript.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "user", "uuid": "u1",
+                                "message": {"role": "user", "content": "old work"}}) + "\n")
+        legacy["claudeSessionId"] = None  # as an older agent left the record
+
+        rep = ha.session_report(self.tmp, {}, claude_sid=None)
+        self.assertEqual([e["text"] for e in rep["tail"]], ["old work"])
+        self.assertEqual(ha._session_transcript_path(legacy), path)
+        sm._stage_history(legacy["id"])
+        self.assertEqual([e["text"] for e in sm.history_results[-1]["entries"]],
+                         ["old work"])
+
+    def test_a_worktree_session_resolves_the_same_either_way(self):
+        # The pin is not a root-only special case; it's the general rule, and a
+        # worktree session (private slug dir) must answer identically under it.
+        sm = self._manager()
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        with mock.patch.object(ha, "scan_repos", lambda: [repo]):
+            sm.spawn("Turma")
+        sess = sm.registry[-1]
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, f"{sess['claudeSessionId']}.jsonl")
+        with open(path, "w") as f:
+            f.write("{}\n")
+        self.assertEqual(ha._session_transcript_path(sess), path)
+        self.assertEqual(ha._newest_transcript_path(sess["worktreePath"]), path)
 
 
 class TestSeedSummaries(ManagerMixin, unittest.TestCase):
@@ -3072,9 +7318,31 @@ class TestSeedSummaries(ManagerMixin, unittest.TestCase):
             sm._seed_summaries()
         start.assert_not_called()
 
-    def test_skips_already_attempted(self):
+    def test_retries_a_failed_attempt_once_the_backoff_elapses(self):
+        # The bug this guards: a first attempt that came back with no name (rate
+        # limit, empty reply, timeout) used to gate the session forever, so its
+        # card showed the raw id for life.
         sm = self.make_manager()
-        sm.registry = [self._session(summaryStarted=True)]
+        sm.registry = [self._session(summaryAttempts=1, summaryRetryAt=0)]
+        self._transcript("Add a docker compose flag")
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        # Named from the FIRST prompt, same as the original attempt would have.
+        start.assert_called_once_with(sm.registry[0], "Add a docker compose flag")
+
+    def test_waits_out_the_backoff_before_retrying(self):
+        sm = self.make_manager()
+        sm.registry = [self._session(summaryAttempts=1,
+                                     summaryRetryAt=time.time() + 300)]
+        self._transcript("Add a docker compose flag")
+        with mock.patch.object(sm, "_start_summary") as start:
+            sm._seed_summaries()
+        start.assert_not_called()  # spaced out — the login is shared
+
+    def test_skips_once_attempts_are_exhausted(self):
+        sm = self.make_manager()
+        sm.registry = [self._session(summaryAttempts=ha.SUMMARY_MAX_ATTEMPTS,
+                                     summaryRetryAt=0)]
         self._transcript("Add a docker compose flag")
         with mock.patch.object(sm, "_start_summary") as start:
             sm._seed_summaries()
@@ -3113,8 +7381,8 @@ class TestProjectSlug(unittest.TestCase):
 
     def test_windows_style_path(self):
         self.assertEqual(
-            ha._project_slug(r"C:\Users\me/.switchboard"),
-            "C--Users-me--switchboard",
+            ha._project_slug(r"C:\Users\me/.myapp"),
+            "C--Users-me--myapp",
         )
 
 
@@ -3269,6 +7537,10 @@ class TestPruneRepo(unittest.TestCase):
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
+            ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
+            ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
+            ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", self.wt_root),
             ("REPOS_ROOT", self.tmp),
@@ -3362,7 +7634,10 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         self.assertEqual(m["remoteKey"], "github.com/xerk/turma")
         self.assertEqual(m["summary"], "My Task")
         self.assertGreater(m["size"], 0)
+        # endedTs is the last message's own timestamp, not the file mtime (XERK-73).
+        self.assertEqual(m["endedTs"], "2026-07-01T10:00:00Z")
         self.assertNotIn("mtime", m)  # internal sort key stripped
+        self.assertNotIn("path", m)   # internal read path stripped
 
     def test_manifest_excludes_running_session_slug(self):
         sm = self.make_manager()
@@ -3419,6 +7694,34 @@ class TestArchiveSync(ManagerMixin, unittest.TestCase):
         with mock.patch.object(sm, "_post_archive_chunk", fake_post):
             sm._archive_deltas({"t1": body["size"]})
         self.assertEqual(pushed, [])
+
+    def test_deltas_ship_pr_link_marker_with_synthesized_uuid(self):
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        # A pr-link entry has no uuid and no display text, but it does have a
+        # pr_link marker block — it must survive into the archive under the same
+        # synthesized id the live feeds use (_entry_id), so the viewer keys it
+        # identically.
+        self._write_transcript(wt, "t1.jsonl", [
+            _text_entry("u1", "user", "open a pr"),
+            {"type": "pr-link", "prNumber": 230,
+             "prUrl": "https://github.com/o/r/pull/230", "prRepository": "o/r",
+             "timestamp": "2026-07-01T10:05:00Z"},
+        ])
+        self._ledger(sm, wt)
+        sm._archive_pending = {m["transcriptId"]: m for m in sm._archive_manifest()}
+        pushed = []
+        with mock.patch.object(sm, "_post_archive_chunk",
+                               lambda tid, body: (pushed.append(body), {"bytesStored": body["endOffset"]})[1]):
+            sm._archive_deltas({})
+        entries = pushed[0]["entries"]
+        self.assertEqual(len(entries), 2)
+        pr = entries[1]
+        self.assertEqual(pr["uuid"], "pr-link:https://github.com/o/r/pull/230")
+        self.assertEqual(pr["text"], "")
+        self.assertEqual(pr["blocks"], [
+            {"t": "pr_link", "url": "https://github.com/o/r/pull/230",
+             "number": 230, "repo": "o/r"}])
 
     def test_deltas_ship_tool_result_only_turn(self):
         sm = self.make_manager()
@@ -3540,12 +7843,73 @@ class TestPrStatus(unittest.TestCase):
         out = ha._summarize_pr({"state": "MERGED", "isDraft": False, "statusCheckRollup": []})
         self.assertEqual(out["state"], "MERGED")
 
+    # ---- merge readiness: CI *and* mergeability, not CI alone ----
+
+    def _mergeable_pr(self, mergeable, rollup=None, state="OPEN"):
+        return ha._summarize_pr({
+            "state": state, "mergeable": mergeable,
+            "statusCheckRollup": rollup if rollup is not None
+            else [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        })
+
+    def test_ready_needs_green_ci_and_no_conflict(self):
+        out = self._mergeable_pr("MERGEABLE")
+        self.assertEqual(out["checks"], "passing")
+        self.assertEqual(out["mergeable"], "MERGEABLE")
+        self.assertEqual(out["ready"], "ready")
+
+    def test_conflict_blocks_despite_green_ci(self):
+        # The bug this exists for: green checks on a branch that merges nowhere
+        # used to read as a ✓.
+        out = self._mergeable_pr("CONFLICTING")
+        self.assertEqual(out["checks"], "passing")   # CI half unchanged...
+        self.assertEqual(out["ready"], "blocked")    # ...but the PR can't land
+
+    def test_conflict_blocks_even_while_ci_pends(self):
+        out = self._mergeable_pr("CONFLICTING", [{"status": "IN_PROGRESS"}])
+        self.assertEqual(out["checks"], "pending")
+        self.assertEqual(out["ready"], "blocked")
+
+    def test_unproven_mergeability_is_pending_not_ready(self):
+        # GitHub computes mergeability lazily; UNKNOWN is not a MERGEABLE.
+        self.assertEqual(self._mergeable_pr("UNKNOWN")["ready"], "pending")
+        self.assertEqual(self._mergeable_pr(None)["ready"], "pending")
+
+    def test_failing_ci_blocks_whatever_mergeability_says(self):
+        out = self._mergeable_pr("MERGEABLE",
+                                 [{"status": "COMPLETED", "conclusion": "FAILURE"}])
+        self.assertEqual(out["ready"], "blocked")
+
+    def test_no_checks_gets_no_verdict_unless_conflicting(self):
+        # Absent CI is not evidence of anything, so the card keeps its no-mark —
+        # but a conflict is evidence, and blocks on its own.
+        self.assertIsNone(self._mergeable_pr("MERGEABLE", [])["ready"])
+        self.assertIsNone(self._mergeable_pr("UNKNOWN", [])["ready"])
+        self.assertEqual(self._mergeable_pr("CONFLICTING", [])["ready"], "blocked")
+
+    def test_closed_pr_ignores_mergeability(self):
+        # A merged/closed PR merges nowhere by definition; its mark is CI alone,
+        # and gh reports these as UNKNOWN/CONFLICTING as it pleases.
+        self.assertEqual(self._mergeable_pr("UNKNOWN", state="MERGED")["ready"], "ready")
+        self.assertEqual(self._mergeable_pr("CONFLICTING", state="CLOSED")["ready"], "ready")
+
+    def test_draft_conflict_blocks(self):
+        # DRAFT is an OPEN sub-state — still a PR whose conflict matters.
+        out = ha._summarize_pr({
+            "state": "OPEN", "isDraft": True, "mergeable": "CONFLICTING",
+            "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        })
+        self.assertEqual(out["state"], "DRAFT")
+        self.assertEqual(out["ready"], "blocked")
+
     def test_pr_status_parses_gh(self):
         payload = json.dumps({"number": 7, "state": "OPEN", "url": "u",
-                              "statusCheckRollup": []})
-        with mock.patch.object(ha, "run", return_value=payload):
+                              "mergeable": "MERGEABLE", "statusCheckRollup": []})
+        with mock.patch.object(ha, "run", return_value=payload) as run:
             out = ha.pr_status("https://github.com/o/r/pull/7")
         self.assertEqual(out["number"], 7)
+        # The verdict is only as good as the field it needs being asked for.
+        self.assertIn("mergeable", run.call_args[0][0][-1])
 
     def test_pr_status_none_on_failure(self):
         with mock.patch.object(ha, "run", return_value=""):
@@ -3612,6 +7976,34 @@ class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
             sm.refresh_pr_status()
         self.assertEqual(sm.pr_status_cache[url]["state"], "MERGED")
 
+    def test_keeps_killed_session_last_known_status(self):
+        """A killed session has NO registry record — only a closed record holding
+        its own prUrls. Its status must survive the sweep anyway: the Ended
+        sessions list renders those chips, so evicting them here would mean the
+        act of killing a session blanked the PR state its ended card shows."""
+        url = "https://github.com/o/r/pull/1"
+        sm = self.make_manager()
+        sm.registry = []
+        sm.closed = [{"id": "s1", "repo": "r", "prUrls": [url]}]
+        sm.pr_status_cache[url] = {"url": url, "state": "MERGED"}
+        sm.github = {"available": True}
+        with mock.patch.object(ha, "pr_status") as pr:
+            sm.refresh_pr_status()
+        pr.assert_not_called()   # not re-polled, same rule as a stopped session
+        self.assertEqual(sm.pr_status_cache[url]["state"], "MERGED")
+
+    def test_closed_prs_shape(self):
+        url = "https://github.com/o/r/pull/1"
+        sm = self.make_manager()
+        rec = {"id": "s1", "prUrls": [url]}
+        # Mirrors _session_prs: a bare {url} placeholder until the status lands.
+        self.assertEqual(sm._closed_prs(rec), [{"url": url}])
+        sm.pr_status_cache[url] = {"url": url, "state": "MERGED"}
+        self.assertEqual(sm._closed_prs(rec), [{"url": url, "state": "MERGED"}])
+        # A session that opened no PR reports None, like the live payload.
+        self.assertIsNone(sm._closed_prs({"id": "s2"}))
+        self.assertIsNone(sm._closed_prs({"id": "s3", "prUrls": []}))
+
     def test_session_prs_shape(self):
         url = "https://github.com/o/r/pull/1"
         sm = self._running_session("s1", [url])
@@ -3658,6 +8050,3480 @@ class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "pr_status", return_value={"url": url, "state": "OPEN"}) as pr:
             sm.refresh_pr_status()
         pr.assert_called_once_with(url)
+
+    def test_prs_survive_agent_restart(self):
+        """XERK-15: a running session's opened-PR chips must survive an agent
+        restart. session_pr_urls is in-memory and the transcript scan primes to
+        EOF on boot (so it never replays old links), so the links have to be
+        mirrored onto the durable session record and rehydrated from it — the
+        same durability a killed session's PRs already get off closed.json."""
+        url = "https://github.com/o/r/pull/9"
+        sm = self.make_manager()
+        sess = {"id": "s1", "status": "running", "repo": "r", "repoPath": "/p",
+                "worktreePath": "/w", "branch": None, "rcName": "n"}
+        sm.registry = [sess]
+        with mock.patch.object(sm, "_session_git", return_value=(None, {})):
+            with mock.patch.object(ha, "session_report",
+                                   return_value={"prUrls": [url], **self._SIGNAL_STUB}):
+                sm._session_payload(sess)
+        # The link is now mirrored onto the record and persisted to disk.
+        self.assertEqual(sess["prUrls"], [url])
+        # A fresh manager (agent restart) reads the registry back and rehydrates
+        # the in-memory store, so the chip is on the card from the first beat.
+        sm2 = self.make_manager()
+        self.assertEqual(sm2.session_pr_urls["s1"], [url])
+        self.assertEqual([pr["url"] for pr in sm2._session_prs("s1")], [url])
+        # And the rehydrated link is re-pollable, so the full state/CI returns.
+        sm2.github = {"available": True}
+        with mock.patch.object(ha, "pr_status",
+                               return_value={"url": url, "state": "OPEN"}) as pr:
+            sm2.refresh_pr_status()
+        pr.assert_called_once_with(url)
+
+
+class TestPrLedger(ManagerMixin, unittest.TestCase):
+    """The durable transcript -> PR-links ledger (XERK-13): what makes a
+    session's PR chips survive a manager restart and outlive its record —
+    killed, aged out of closed.json, or wiped with the in-memory scan."""
+
+    URL = "https://github.com/o/r/pull/1"
+    URL2 = "https://github.com/o/r/pull/2"
+
+    def _running(self, sm, sid="s1", tid="t1", urls=(URL,)):
+        sm.registry = [{"id": sid, "status": "running", "claudeSessionId": tid}]
+        sm.session_pr_urls[sid] = list(urls)
+        return sm
+
+    def test_remember_persists_and_reloads(self):
+        sm = self._running(self.make_manager())
+        self.assertTrue(sm._remember_prs(sm.registry[0]))
+        # A fresh manager reads the links back off disk — the whole point.
+        self.assertEqual(self.make_manager().pr_ledger["t1"]["urls"], [self.URL])
+
+    def test_ignores_a_session_with_no_pr_or_no_transcript(self):
+        sm = self.make_manager()
+        # No PR opened.
+        sm.registry = [{"id": "s1", "status": "running", "claudeSessionId": "t1"}]
+        self.assertFalse(sm._remember_prs(sm.registry[0]))
+        # A PR but no transcript to key on (not launched / pinned yet).
+        sm.session_pr_urls["s2"] = [self.URL]
+        self.assertFalse(sm._remember_prs({"id": "s2"}))
+        self.assertEqual(sm.pr_ledger, {})
+
+    def test_remember_is_idempotent(self):
+        """Called each beat a URL is present, so an unchanged entry must not
+        rewrite the file — and must not restamp `at`, the prune's sort key."""
+        sm = self._running(self.make_manager())
+        self.assertTrue(sm._remember_prs(sm.registry[0]))
+        at = sm.pr_ledger["t1"]["at"]
+        self.assertFalse(sm._remember_prs(sm.registry[0]))
+        self.assertEqual(sm.pr_ledger["t1"]["at"], at)
+
+    def test_a_new_url_merges_without_restamping(self):
+        sm = self._running(self.make_manager())
+        sm._remember_prs(sm.registry[0])
+        at = sm.pr_ledger["t1"]["at"]
+        sm.session_pr_urls["s1"].append(self.URL2)
+        self.assertTrue(sm._remember_prs(sm.registry[0]))
+        self.assertEqual(sm.pr_ledger["t1"]["urls"], [self.URL, self.URL2])
+        self.assertEqual(sm.pr_ledger["t1"]["at"], at)   # first-seen preserved
+
+    def test_ledger_backfills_a_live_session_the_xerk15_mirror_missed(self):
+        """The ledger fills the gap XERK-15's sess["prUrls"] mirror can't: a
+        registry record predating that mirror carries no prUrls to rehydrate
+        from, but its ledgered links (from a prior run) still name its PRs, so the
+        chip comes back on boot anyway (setdefault — XERK-15 wins when it has a
+        copy). The record here has no prUrls, exactly that pre-mirror shape."""
+        sm = self._running(self.make_manager())
+        sm._remember_prs(sm.registry[0])
+        write_json(ha.REGISTRY_PATH, sm.registry)   # persisted WITHOUT prUrls
+        sm2 = self.make_manager()
+        self.assertEqual(sm2.session_pr_urls["s1"], [self.URL])   # re-seeded
+        self.assertEqual([p["url"] for p in sm2._session_prs("s1")], [self.URL])
+
+    def test_backfills_from_closed_history(self):
+        """A closed record snapshots its own prUrls; adopt those so a ledger
+        added after the fact doesn't start empty on the sessions already ended."""
+        rec = {"id": "dead", "repo": "r", "transcriptId": "t-dead",
+               "prUrls": [self.URL]}
+        write_json(ha.CLOSED_PATH, [rec])
+        sm = self.make_manager()
+        self.assertEqual(sm.pr_ledger["t-dead"]["urls"], [self.URL])
+        # And it was persisted, not just held in memory.
+        self.assertEqual(self.make_manager().pr_ledger["t-dead"]["urls"], [self.URL])
+
+    def test_ledger_prs_shape(self):
+        sm = self.make_manager()
+        sm.pr_ledger["t1"] = {"urls": [self.URL], "at": "2026-01-01T00:00:00Z"}
+        # Bare {url} until the status lands (mirrors _session_prs/_closed_prs).
+        self.assertEqual(sm._ledger_prs("t1"), [{"url": self.URL}])
+        sm.pr_status_cache[self.URL] = {"url": self.URL, "state": "MERGED"}
+        self.assertEqual(sm._ledger_prs("t1"), [{"url": self.URL, "state": "MERGED"}])
+        # Nothing ledgered / opened -> None, so the payload key stays empty.
+        self.assertIsNone(sm._ledger_prs("nope"))
+        self.assertIsNone(sm._ledger_prs(None))
+
+    def test_refresh_persists_status_so_the_pill_survives_a_restart(self):
+        """A polled PR's status is persisted, so a fresh manager loads it back and
+        the chip keeps its state/CI pill rather than degrading to a bare link."""
+        sm = self._running(self.make_manager())
+        sm.github = {"available": True}
+        with mock.patch.object(
+                ha, "pr_status", return_value={"url": self.URL, "state": "OPEN"}):
+            sm.refresh_pr_status()
+        self.assertEqual(
+            self.make_manager().pr_status_cache[self.URL]["state"], "OPEN")
+
+    def test_a_ledgered_ended_pr_status_is_not_evicted(self):
+        """An ended session aged out of closed.json is reported only through the
+        resumable scan, which reads its links from the ledger — so its last-known
+        status has to survive the prune even with no live/closed record holding
+        it, or its ended card shows a bare link."""
+        stale = "https://github.com/o/r/pull/99"
+        sm = self.make_manager()
+        sm.registry = []
+        sm.closed = []
+        sm.pr_ledger["t1"] = {"urls": [self.URL], "at": "2026-01-01T00:00:00Z"}
+        sm.pr_status_cache = {self.URL: {"url": self.URL, "state": "MERGED"},
+                              stale: {"url": stale, "state": "CLOSED"}}
+        sm.github = {"available": True}
+        with mock.patch.object(ha, "pr_status") as pr:
+            sm.refresh_pr_status()
+        pr.assert_not_called()                                  # never re-polled
+        self.assertEqual(sm.pr_status_cache[self.URL]["state"], "MERGED")  # kept
+        self.assertNotIn(stale, sm.pr_status_cache)   # truly unreferenced: evicted
+
+    def test_kill_records_to_the_ledger(self):
+        sm = self._running(self.make_manager())
+        sm.registry[0].update({"repo": "r", "worktreePath": "/w"})
+        with mock.patch.object(sm, "_kill_tmux"), \
+                mock.patch.object(sm, "_kill_ttyd"), \
+                mock.patch.object(sm, "_session_transcript_id", return_value="t1"):
+            sm.kill("s1")
+        self.assertEqual(sm.pr_ledger["t1"]["urls"], [self.URL])
+        # Survives the kill dropping the in-memory set.
+        self.assertNotIn("s1", sm.session_pr_urls)
+
+    def test_end_to_end_scan_then_restart_keeps_the_chip(self):
+        """The whole path: the real transcript scan discovers an opened PR through
+        _session_payload, the ledger persists it, and a fresh manager (a restart,
+        with the scan primed to EOF and unable to re-find it) still reports it."""
+        sm = self.make_manager()
+        tid = "22222222-2222-4222-8222-222222222222"
+        wt = os.path.join(ha.WORKTREES_ROOT, "Turma", "abcde")
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, tid + ".jsonl")
+        write_jsonl(path, [{"type": "user",
+                            "message": {"role": "user", "content": "hi"}}])
+        sess = {"id": "s1", "status": "running", "repo": "Turma", "repoPath": "/p",
+                "worktreePath": wt, "branch": None, "rcName": "n",
+                "claudeSessionId": tid}
+        sm.registry = [sess]
+        write_json(ha.REGISTRY_PATH, sm.registry)
+        with mock.patch.object(sm, "_session_git", return_value=(None, {})):
+            self.assertIsNone(sm._session_payload(sess)["prs"])   # beat 1 primes
+            # Now the session actually opens a PR — the two entries `gh pr create`
+            # leaves: the call, then its output (the new PR's URL).
+            write_jsonl(path, [
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "c1", "name": "Bash",
+                     "input": {"command": "gh pr create --fill"}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "c1",
+                     "content": self.URL}]}},
+            ])
+            p1 = sm._session_payload(sess)   # beat 2: scan scrapes the URL
+        self.assertEqual([pr["url"] for pr in p1["prs"]], [self.URL])
+        self.assertEqual(sm.pr_ledger[tid]["urls"], [self.URL])   # and it's durable
+
+        # Restart: a fresh manager reads the same registry + transcript. The scan
+        # primes to EOF and finds nothing new, but the chip comes back anyway.
+        sm2 = self.make_manager()
+        with mock.patch.object(sm2, "_session_git", return_value=(None, {})):
+            p2 = sm2._session_payload(sm2.registry[0])
+        self.assertEqual([pr["url"] for pr in p2["prs"]], [self.URL])
+
+    def test_prune_bounds_oldest_first(self):
+        p = mock.patch.object(ha, "PR_LEDGER_MAX", 2)
+        p.start()
+        self.addCleanup(p.stop)
+        sm = self.make_manager()
+        for i, at in enumerate(["2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z",
+                                "2026-03-01T00:00:00Z"]):
+            sm.pr_ledger[f"t{i}"] = {"urls": [f"u{i}"], "at": at}
+        sm._prune_pr_ledger()
+        self.assertEqual(set(sm.pr_ledger), {"t1", "t2"})   # oldest t0 fell off
+
+
+class TestNormalizeJiraSite(unittest.TestCase):
+    """Every way an operator might write the site collapses to one bare
+    lowercase host — the cross-host siteKey the hub dedupes boards on."""
+
+    def test_variants_collapse(self):
+        for raw in ("myorg.atlassian.net",
+                    "MyOrg.Atlassian.Net",
+                    "https://myorg.atlassian.net",
+                    "https://myorg.atlassian.net/",
+                    "https://myorg.atlassian.net/jira/software/projects/X/boards/1",
+                    "https://user@myorg.atlassian.net:443/browse/PROJ-1"):
+            self.assertEqual(ha.normalize_jira_site(raw), "myorg.atlassian.net", raw)
+
+    def test_empty(self):
+        self.assertEqual(ha.normalize_jira_site(""), "")
+        self.assertEqual(ha.normalize_jira_site(None), "")
+
+
+class TestShapeIssue(unittest.TestCase):
+    """Raw REST-v3 search issue -> the compact wire ticket the board renders."""
+
+    def _issue(self, **overrides):
+        fields = {
+            "summary": "Fix the flux capacitor",
+            "status": {"name": "In Review",
+                       "statusCategory": {"key": "indeterminate"}},
+            "priority": {"name": "High"},
+            "issuetype": {"name": "Bug"},
+            "project": {"key": "PROJ", "name": "Project X"},
+            "labels": ["infra", "urgent"],
+            "updated": "2026-07-14T08:12:00.000+0000",
+            "created": "2026-07-01T08:12:00.000+0000",
+            "duedate": "2026-07-20",
+            "parent": {"key": "PROJ-100"},
+        }
+        fields.update(overrides)
+        return {"key": "PROJ-123", "fields": fields}
+
+    def test_full_issue(self):
+        t = ha._shape_issue(self._issue(), "myorg.atlassian.net")
+        self.assertEqual(t["key"], "PROJ-123")
+        self.assertEqual(t["url"], "https://myorg.atlassian.net/browse/PROJ-123")
+        self.assertEqual(t["summary"], "Fix the flux capacitor")
+        self.assertEqual(t["status"], "In Review")
+        self.assertEqual(t["statusCategory"], "inprogress")
+        self.assertEqual(t["priority"], "High")
+        self.assertEqual(t["type"], "Bug")
+        self.assertEqual(t["project"], "PROJ")
+        self.assertEqual(t["projectName"], "Project X")
+        self.assertEqual(t["labels"], ["infra", "urgent"])
+        self.assertEqual(t["dueDate"], "2026-07-20")
+        self.assertEqual(t["parentKey"], "PROJ-100")
+
+    def test_category_mapping(self):
+        for key, cat in (("new", "todo"), ("indeterminate", "inprogress"),
+                         ("done", "done"), ("weird-future-key", "todo")):
+            issue = self._issue(status={"name": "S",
+                                        "statusCategory": {"key": key}})
+            self.assertEqual(
+                ha._shape_issue(issue, "s")["statusCategory"], cat, key)
+
+    def test_missing_optionals_degrade_to_none(self):
+        issue = self._issue(priority=None, duedate=None, labels=None)
+        del issue["fields"]["parent"]
+        t = ha._shape_issue(issue, "s")
+        self.assertIsNone(t["priority"])
+        self.assertIsNone(t["dueDate"])
+        self.assertIsNone(t["parentKey"])
+        self.assertEqual(t["labels"], [])
+
+    def test_caps(self):
+        issue = self._issue(summary="x" * 500,
+                            labels=[f"l{i}" for i in range(20)])
+        t = ha._shape_issue(issue, "s")
+        self.assertEqual(len(t["summary"]), 200)
+        self.assertEqual(len(t["labels"]), 5)
+
+    def test_empty_issue_never_raises(self):
+        t = ha._shape_issue({}, "s")
+        self.assertEqual(t["statusCategory"], "todo")
+        self.assertEqual(t["summary"], "")
+
+
+def _jira_page(keys, next_token=None):
+    page = {"issues": [
+        {"key": k, "fields": {"summary": k,
+                              "status": {"name": "To Do",
+                                         "statusCategory": {"key": "new"}}}}
+        for k in keys]}
+    if next_token:
+        page["nextPageToken"] = next_token
+    return page
+
+
+class TestFetchJiraIssues(unittest.TestCase):
+    """Pagination against /rest/api/3/search/jql (the nextPageToken API that
+    replaced the removed /rest/api/3/search) and the truncation cap."""
+
+    def test_stitches_pages_via_next_page_token(self):
+        pages = [_jira_page(["A-1", "A-2"], next_token="tok1"),
+                 _jira_page(["A-3"])]
+        calls = []
+
+        def fake_get(path, params):
+            calls.append((path, dict(params)))
+            return pages[len(calls) - 1]
+
+        with mock.patch.object(ha, "JIRA_SITE", "myorg.atlassian.net"), \
+             mock.patch.object(ha, "jira_get", fake_get):
+            tickets, truncated = ha.fetch_jira_issues("jql here", 100)
+        self.assertEqual([t["key"] for t in tickets], ["A-1", "A-2", "A-3"])
+        self.assertFalse(truncated)
+        # The new endpoint, never the removed one, on every page.
+        self.assertTrue(all(p == "/rest/api/3/search/jql" for p, _ in calls))
+        self.assertNotIn("nextPageToken", calls[0][1])
+        self.assertEqual(calls[1][1]["nextPageToken"], "tok1")
+        self.assertIn("summary", calls[0][1]["fields"])
+
+    def test_cap_stops_pagination_and_flags_truncated(self):
+        def fake_get(path, params):
+            return _jira_page(["B-1", "B-2"], next_token="more")
+
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "jira_get", fake_get):
+            tickets, truncated = ha.fetch_jira_issues("jql", 3)
+        self.assertEqual(len(tickets), 3)
+        self.assertTrue(truncated)
+
+    def test_page_bound_flags_truncated(self):
+        def fake_get(path, params):
+            return _jira_page(["C-1"], next_token="forever")
+
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "jira_get", fake_get):
+            tickets, truncated = ha.fetch_jira_issues("jql", 1000)
+        self.assertEqual(len(tickets), ha.JIRA_MAX_PAGES)
+        self.assertTrue(truncated)
+
+
+class TestCollectJira(unittest.TestCase):
+    def test_unconfigured_full_schema_no_http(self):
+        with mock.patch.object(ha, "JIRA_SITE", ""), \
+             mock.patch.object(ha, "JIRA_EMAIL", ""), \
+             mock.patch.object(ha, "JIRA_TOKEN", ""), \
+             mock.patch.object(ha, "jira_get") as get:
+            block = ha.collect_jira()
+        get.assert_not_called()
+        self.assertEqual(block, ha.JIRA_EMPTY)
+        self.assertIsNot(block, ha.JIRA_EMPTY)   # a copy, never the shared dict
+        self.assertFalse(block["configured"])
+
+    def test_configured_flag_marks_creds_not_success(self):
+        # `configured` is what lets the hub aim the board's manual refresh at a
+        # host whose polls are FAILING — which reports available=False and is
+        # otherwise indistinguishable from a host with no Jira at all.
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "e@x.com"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "t"):
+            empty = ha.jira_empty()
+            self.assertTrue(empty["configured"])
+            self.assertFalse(empty["available"])  # creds != a successful poll
+
+            with mock.patch.object(ha, "fetch_jira_issues",
+                                   return_value=([], False)):
+                block = ha.collect_jira()
+        self.assertTrue(block["configured"])
+        self.assertTrue(block["available"])
+
+
+    def test_configured_issues_both_queries(self):
+        jqls = []
+
+        def fake_fetch(jql, cap):
+            jqls.append(jql)
+            key = "D-1" if "!= Done" in jql else "D-2"
+            return ([ha._shape_issue({"key": key, "fields": {}}, "s")],
+                    False)
+
+        with mock.patch.object(ha, "JIRA_SITE", "MyOrg.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "me@x.com"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "tok"), \
+             mock.patch.object(ha, "fetch_jira_issues", fake_fetch):
+            block = ha.collect_jira()
+        self.assertTrue(block["available"])
+        self.assertEqual(block["siteKey"], "myorg.atlassian.net")
+        self.assertEqual(block["user"], "me@x.com")
+        self.assertIsNone(block["error"])
+        self.assertFalse(block["truncated"])
+        self.assertEqual([t["key"] for t in block["tickets"]], ["D-1", "D-2"])
+        self.assertTrue(block["fetchedAt"])
+        # Active work and recently-Done are separate queries with separate caps.
+        self.assertEqual(len(jqls), 2)
+        self.assertIn("statusCategory != Done", jqls[0])
+        self.assertIn("statusCategory = Done", jqls[1])
+        self.assertIn(f"-{ha.JIRA_DONE_DAYS}d", jqls[1])
+
+    def test_truncated_rolls_up(self):
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "e"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "t"), \
+             mock.patch.object(ha, "fetch_jira_issues",
+                               side_effect=[([], True), ([], False)]):
+            self.assertTrue(ha.collect_jira()["truncated"])
+
+
+def _adf(*content):
+    return {"type": "doc", "version": 1, "content": list(content)}
+
+
+def _para(*content):
+    return {"type": "paragraph", "content": list(content)}
+
+
+def _txt(text, marks=None):
+    node = {"type": "text", "text": text}
+    if marks:
+        node["marks"] = marks
+    return node
+
+
+class TestAdfText(unittest.TestCase):
+    """Jira's rich text (ADF node tree) -> the plain text the board renders."""
+
+    def test_paragraphs_separated(self):
+        doc = _adf(_para(_txt("first")), _para(_txt("second")))
+        self.assertEqual(ha.adf_plain(doc, 999), ("first\n\nsecond", False))
+
+    def test_plain_string_body(self):
+        # REST v2 / some webhooks send a bare string, not a node tree.
+        self.assertEqual(ha.adf_plain("just text", 999), ("just text", False))
+
+    def test_link_mark_keeps_href(self):
+        doc = _adf(_para(_txt("the PR", [{"type": "link", "attrs": {"href": "https://x/1"}}])))
+        self.assertEqual(ha.adf_plain(doc, 999)[0], "the PR (https://x/1)")
+
+    def test_link_mark_skips_redundant_href(self):
+        url = "https://x/1"
+        doc = _adf(_para(_txt(url, [{"type": "link", "attrs": {"href": url}}])))
+        self.assertEqual(ha.adf_plain(doc, 999)[0], url)
+
+    def test_lists_bullets_and_hard_breaks(self):
+        doc = _adf({"type": "bulletList", "content": [
+            {"type": "listItem", "content": [_para(_txt("one"))]},
+            {"type": "listItem", "content": [_para(_txt("two"))]},
+        ]}, _para(_txt("a"), {"type": "hardBreak"}, _txt("b")))
+        self.assertEqual(ha.adf_plain(doc, 999)[0], "- one\n- two\n\na\nb")
+
+    def test_mention_emoji_card_and_table(self):
+        doc = _adf(
+            _para(_txt("cc "), {"type": "mention", "attrs": {"text": "@Sam"}}),
+            {"type": "table", "content": [{"type": "tableRow", "content": [
+                {"type": "tableCell", "content": [_para(_txt("k"))]},
+                {"type": "tableCell", "content": [_para(_txt("v"))]},
+            ]}]},
+            _para({"type": "inlineCard", "attrs": {"url": "https://x/2"}}),
+        )
+        self.assertEqual(ha.adf_plain(doc, 999)[0], "cc @Sam\n\nk | v\n\nhttps://x/2")
+
+    def test_unknown_node_still_yields_its_text(self):
+        doc = _adf({"type": "someFutureThing", "content": [_para(_txt("kept"))]})
+        self.assertEqual(ha.adf_plain(doc, 999)[0], "kept")
+
+    def test_malformed_never_raises(self):
+        for bad in (None, 12, [], {"type": "text"}, {"content": None},
+                    {"type": "paragraph", "content": "nope"},
+                    {"type": "text", "text": "x", "marks": ["junk"]}):
+            ha.adf_plain(bad, 99)   # just must not raise
+
+    def test_clip_reports_truncation(self):
+        doc = _adf(_para(_txt("x" * 50)))
+        text, trunc = ha.adf_plain(doc, 10)
+        self.assertEqual(text, "x" * 10)
+        self.assertTrue(trunc)
+        self.assertFalse(ha.adf_plain(doc, 50)[1])
+
+    def test_blank_line_runs_collapse(self):
+        doc = _adf(_para(_txt("a")), _para(), _para(), _para(_txt("b")))
+        self.assertEqual(ha.adf_plain(doc, 999)[0], "a\n\nb")
+
+
+def _issue_detail_payload(**over):
+    fields = {
+        "summary": "Fix the thing",
+        "status": {"name": "In Review", "statusCategory": {"key": "indeterminate"}},
+        "priority": {"name": "High"},
+        "issuetype": {"name": "Bug"},
+        "project": {"key": "ENG", "name": "Engineering"},
+        "parent": {"key": "ENG-1", "fields": {"summary": "the epic"}},
+        "labels": ["a", "b"],
+        "updated": "2026-07-14T10:00:00.000+0000",
+        "created": "2026-07-01T10:00:00.000+0000",
+        "duedate": "2026-07-20",
+        "resolution": {"name": "Done"},
+        "reporter": {"displayName": "Ada"},
+        "assignee": {"displayName": "Grace"},
+        "description": _adf(_para(_txt("why it matters"))),
+        "comment": {"total": 2, "comments": [
+            {"id": "1", "author": {"displayName": "Ada"},
+             "created": "2026-07-02T10:00:00.000+0000",
+             "updated": "2026-07-02T10:00:00.000+0000",
+             "body": _adf(_para(_txt("first note")))},
+            {"id": "2", "author": {"displayName": "Grace"},
+             "created": "2026-07-03T10:00:00.000+0000",
+             "updated": "2026-07-03T10:00:00.000+0000",
+             "body": _adf(_para(_txt("second note")))},
+        ]},
+    }
+    fields.update(over.pop("fields", {}))
+    return {"key": "ENG-42", "fields": fields, **over}
+
+
+class TestShapeIssueDetail(unittest.TestCase):
+    """The expanded-view shape: the card's fields plus description/comments."""
+
+    def test_full_shape(self):
+        d = ha._shape_issue_detail(_issue_detail_payload(), "myorg.atlassian.net")
+        # Everything the card already had still rides along.
+        self.assertEqual(d["key"], "ENG-42")
+        self.assertEqual(d["url"], "https://myorg.atlassian.net/browse/ENG-42")
+        self.assertEqual(d["status"], "In Review")
+        self.assertEqual(d["statusCategory"], "inprogress")
+        self.assertEqual(d["priority"], "High")
+        self.assertEqual(d["project"], "ENG")
+        # …plus what only the detail view shows.
+        self.assertEqual(d["description"], "why it matters")
+        self.assertFalse(d["descriptionTruncated"])
+        self.assertEqual(d["reporter"], "Ada")
+        self.assertEqual(d["assignee"], "Grace")
+        self.assertEqual(d["resolution"], "Done")
+        self.assertEqual(d["parentSummary"], "the epic")
+        self.assertEqual([c["body"] for c in d["comments"]], ["first note", "second note"])
+        self.assertEqual([c["author"] for c in d["comments"]], ["Ada", "Grace"])
+        self.assertEqual(d["commentTotal"], 2)
+        self.assertTrue(d["fetchedAt"])
+
+    def test_keeps_newest_comments_and_reports_total(self):
+        many = [{"id": str(i), "author": {"displayName": "A"},
+                 "body": _adf(_para(_txt(f"c{i}")))}
+                for i in range(ha.JIRA_COMMENT_MAX + 5)]
+        d = ha._shape_issue_detail(
+            _issue_detail_payload(fields={"comment": {"total": len(many), "comments": many}}),
+            "s")
+        self.assertEqual(len(d["comments"]), ha.JIRA_COMMENT_MAX)
+        # Jira lists comments oldest-first; the newest are the ones kept.
+        self.assertEqual(d["comments"][-1]["body"], f"c{len(many) - 1}")
+        self.assertEqual(d["commentTotal"], len(many))   # so the UI can say what it dropped
+
+    def test_long_text_truncated_and_flagged(self):
+        big = _adf(_para(_txt("x" * (ha.JIRA_DESC_MAX_CHARS + 100))))
+        huge = _adf(_para(_txt("y" * (ha.JIRA_COMMENT_MAX_CHARS + 100))))
+        d = ha._shape_issue_detail(_issue_detail_payload(fields={
+            "description": big,
+            "comment": {"total": 1, "comments": [{"id": "1", "body": huge}]},
+        }), "s")
+        self.assertEqual(len(d["description"]), ha.JIRA_DESC_MAX_CHARS)
+        self.assertTrue(d["descriptionTruncated"])
+        self.assertEqual(len(d["comments"][0]["body"]), ha.JIRA_COMMENT_MAX_CHARS)
+        self.assertTrue(d["comments"][0]["truncated"])
+
+    def test_empty_fields_degrade_not_raise(self):
+        d = ha._shape_issue_detail({"key": "X-1", "fields": {}}, "s")
+        self.assertEqual(d["description"], "")
+        self.assertEqual(d["comments"], [])
+        self.assertEqual(d["commentTotal"], 0)
+        self.assertIsNone(d["reporter"])
+        self.assertIsNone(d["resolution"])
+        self.assertEqual(d["labels"], [])
+        self.assertIsNone(d["parentSummary"])
+
+    def test_junk_comment_container_ignored(self):
+        for junk in ("nope", {"comments": "nope"}, {}, None):
+            d = ha._shape_issue_detail(
+                _issue_detail_payload(fields={"comment": junk}), "s")
+            self.assertEqual(d["comments"], [])
+
+    def test_detail_keeps_more_labels_than_the_card(self):
+        labels = [f"l{i}" for i in range(ha.JIRA_DETAIL_LABELS_MAX + 5)]
+        payload = _issue_detail_payload(fields={"labels": labels})
+        self.assertEqual(len(ha._shape_issue(payload, "s")["labels"]), 5)
+        self.assertEqual(len(ha._shape_issue_detail(payload, "s")["labels"]),
+                         ha.JIRA_DETAIL_LABELS_MAX)
+
+    def test_status_options_from_transitions_expansion(self):
+        # The `transitions` expansion rides the issue GET; each option is labelled
+        # with the RESULTING status (to.name), valued by the transition id, and
+        # its column mapped from to.statusCategory. XERK-138.
+        payload = _issue_detail_payload(transitions=[
+            {"id": "11", "name": "Start Progress",
+             "to": {"name": "In Progress", "statusCategory": {"key": "indeterminate"}}},
+            {"id": "31", "name": "Done",
+             "to": {"name": "Done", "statusCategory": {"key": "done"}}},
+        ])
+        d = ha._shape_issue_detail(payload, "s")
+        self.assertEqual(d["statusOptions"], [
+            {"id": "11", "name": "In Progress", "category": "inprogress"},
+            {"id": "31", "name": "Done", "category": "done"},
+        ])
+
+    def test_status_options_empty_without_expansion(self):
+        # No `transitions` (the expansion wasn't asked for, or a permissions wall)
+        # -> no options, so the row stays read-only rather than raising.
+        self.assertEqual(
+            ha._shape_issue_detail(_issue_detail_payload(), "s")["statusOptions"], [])
+
+    def test_status_options_skip_malformed(self):
+        payload = _issue_detail_payload(transitions=[
+            "junk", {"name": "no id"}, {"id": "9"},          # each dropped
+            {"id": "5", "to": {"name": "Ready"}},            # kept; category -> todo
+        ])
+        self.assertEqual(ha._shape_issue_detail(payload, "s")["statusOptions"],
+                         [{"id": "5", "name": "Ready", "category": "todo"}])
+
+
+class TestFetchJiraIssue(unittest.TestCase):
+    def test_requests_the_issue_with_detail_fields(self):
+        seen = {}
+
+        def fake_get(path, params):
+            seen["path"], seen["params"] = path, params
+            return _issue_detail_payload()
+
+        with mock.patch.object(ha, "JIRA_SITE", "MyOrg.atlassian.net"), \
+             mock.patch.object(ha, "jira_get", fake_get):
+            d = ha.fetch_jira_issue("ENG-42")
+        self.assertEqual(seen["path"], "/rest/api/3/issue/ENG-42")
+        for f in ("description", "comment", "reporter", "assignee"):
+            self.assertIn(f, seen["params"]["fields"])
+        # The available status changes come back with the issue (XERK-138), not
+        # in a second round trip.
+        self.assertEqual(seen["params"]["expand"], "transitions")
+        self.assertEqual(d["key"], "ENG-42")
+        self.assertEqual(d["url"], "https://myorg.atlassian.net/browse/ENG-42")
+
+
+# --- Azure DevOps (XERK-43) ----------------------------------------------------
+
+class TestNormalizeAzureSite(unittest.TestCase):
+    """Every way an operator writes AZDO_URL collapses to one siteKey that KEEPS
+    the org/collection path (unlike the Jira host-only key)."""
+
+    def test_cloud_and_server_variants(self):
+        cases = {
+            "https://dev.azure.com/MyOrg": "dev.azure.com/myorg",
+            "https://dev.azure.com/MyOrg/": "dev.azure.com/myorg",
+            "dev.azure.com/MyOrg": "dev.azure.com/myorg",
+            "https://user@dev.azure.com/MyOrg": "dev.azure.com/myorg",
+            "https://dev.azure.com/MyOrg/_apis/wit/wiql": "dev.azure.com/myorg",
+            "https://tfs.co:8080/tfs/DefaultCollection":
+                "tfs.co:8080/tfs/defaultcollection",
+            "https://tfs.co/DefaultCollection/_apis/wit/wiql":
+                "tfs.co/defaultcollection",
+        }
+        for raw, want in cases.items():
+            self.assertEqual(ha.normalize_azure_site(raw), want, raw)
+
+    def test_empty(self):
+        self.assertEqual(ha.normalize_azure_site(""), "")
+        self.assertEqual(ha.normalize_azure_site(None), "")
+
+
+class TestAzureBase(unittest.TestCase):
+    """AZDO_URL -> the scheme-qualified API/link base, trimmed of any pasted tail."""
+
+    def test_defaults_https_and_trims(self):
+        with mock.patch.object(ha, "AZDO_URL", "dev.azure.com/org"):
+            self.assertEqual(ha.azure_base(), "https://dev.azure.com/org")
+        # The REST/board tail is trimmed; any project segment before it is kept
+        # (AZDO_URL is documented as the org/collection base, not a deep link).
+        with mock.patch.object(ha, "AZDO_URL",
+                               "https://tfs.co/Collection/_workitems/edit/9/"):
+            self.assertEqual(ha.azure_base(), "https://tfs.co/Collection")
+        with mock.patch.object(ha, "AZDO_URL", ""):
+            self.assertEqual(ha.azure_base(), "")
+
+
+class TestAzureGitAuthConfig(unittest.TestCase):
+    """XERK-54: reuse the board's PAT to authenticate plain git against a
+    non-GitHub Azure DevOps org, via a URL-scoped http.extraHeader."""
+
+    def test_wires_url_scoped_basic_header(self):
+        with mock.patch.multiple(ha, AZDO_URL="https://tfs.co/DefaultCollection",
+                                 AZDO_TOKEN="pat123"):
+            key, value = ha.azure_git_auth_config()
+            # Scoped to the collection base, so no other host sees the header.
+            self.assertEqual(key, "http.https://tfs.co/DefaultCollection.extraHeader")
+            # Basic with an empty username, exactly like azure_req().
+            expect = base64.b64encode(b":pat123").decode()
+            self.assertEqual(value, f"Authorization: Basic {expect}")
+
+    def test_dev_azure_services_and_pasted_tail(self):
+        # A bare host and a pasted deep link both collapse to the base via
+        # azure_base(), so the header scope is the org/collection.
+        with mock.patch.multiple(ha, AZDO_URL="dev.azure.com/MyOrg", AZDO_TOKEN="p"):
+            self.assertEqual(ha.azure_git_auth_config()[0],
+                             "http.https://dev.azure.com/MyOrg.extraHeader")
+        with mock.patch.multiple(
+                ha, AZDO_URL="https://tfs.co/Col/_git/repo", AZDO_TOKEN="p"):
+            self.assertEqual(ha.azure_git_auth_config()[0],
+                             "http.https://tfs.co/Col.extraHeader")
+
+    def test_none_when_unconfigured(self):
+        with mock.patch.multiple(ha, AZDO_URL="", AZDO_TOKEN=""):
+            self.assertIsNone(ha.azure_git_auth_config())
+        # A URL without a token (or vice versa) is not enough to wire anything.
+        with mock.patch.multiple(ha, AZDO_URL="https://tfs.co/Col", AZDO_TOKEN=""):
+            self.assertIsNone(ha.azure_git_auth_config())
+        with mock.patch.multiple(ha, AZDO_URL="", AZDO_TOKEN="p"):
+            self.assertIsNone(ha.azure_git_auth_config())
+
+
+def _azure_wi(wid, state, wtype="Bug", project="Proj", title=None, **fields):
+    f = {
+        "System.Id": wid,
+        "System.Title": title if title is not None else f"WI {wid}",
+        "System.State": state,
+        "System.WorkItemType": wtype,
+        "System.TeamProject": project,
+        "System.ChangedDate": "2026-07-16T00:00:00Z",
+        "System.CreatedDate": "2026-07-01T00:00:00Z",
+    }
+    f.update(fields)
+    return {"id": wid, "fields": f}
+
+
+class TestShapeAzureItem(unittest.TestCase):
+    """A raw work item -> the SAME wire ticket shape Jira's _shape_issue makes."""
+
+    def test_full_item(self):
+        wi = _azure_wi(1234, "Active", wtype="User Story", project="Payments",
+                       title="Fix checkout",
+                       **{"Microsoft.VSTS.Common.Priority": 2,
+                          "System.Tags": "infra; urgent",
+                          "System.Parent": 900,
+                          "Microsoft.VSTS.Scheduling.DueDate": "2026-08-01T00:00:00Z"})
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}):
+            t = ha._shape_azure_item(wi, "dev.azure.com/org", "https://dev.azure.com/org")
+        self.assertEqual(t["key"], "1234")
+        self.assertEqual(t["url"],
+                         "https://dev.azure.com/org/Payments/_workitems/edit/1234")
+        self.assertEqual(t["summary"], "Fix checkout")
+        self.assertEqual(t["status"], "Active")
+        self.assertEqual(t["statusCategory"], "inprogress")
+        self.assertEqual(t["priority"], "P2")
+        self.assertEqual(t["type"], "User Story")
+        self.assertEqual(t["project"], "Payments")
+        self.assertEqual(t["projectName"], "Payments")
+        self.assertEqual(t["labels"], ["infra", "urgent"])
+        self.assertEqual(t["dueDate"], "2026-08-01T00:00:00Z")
+        self.assertEqual(t["parentKey"], "900")
+
+    def test_missing_optionals_degrade(self):
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}):
+            t = ha._shape_azure_item(_azure_wi(7, "New"), "s", "https://s")
+        self.assertIsNone(t["priority"])
+        self.assertIsNone(t["dueDate"])
+        self.assertIsNone(t["parentKey"])
+        self.assertEqual(t["labels"], [])
+        self.assertEqual(t["statusCategory"], "todo")
+
+    def test_url_without_project(self):
+        wi = _azure_wi(5, "Active", project=None)
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}):
+            t = ha._shape_azure_item(wi, "s", "https://s")
+        self.assertEqual(t["url"], "https://s/_workitems/edit/5")
+
+
+class TestAzureCategory(unittest.TestCase):
+    """Azure state -> board column: the per-type states API when reachable (custom
+    processes), else the static name map, else todo."""
+
+    def test_states_api_metastate_wins(self):
+        def fake_req(path, params, body=None):
+            self.assertTrue(path.endswith("/states"))
+            return {"value": [{"name": "Peer Review", "stateCategory": "InProgress"},
+                              {"name": "Shipped", "stateCategory": "Completed"}]}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", fake_req):
+            self.assertEqual(ha._azure_category("s", "P", "Bug", "Peer Review"),
+                             "inprogress")
+            self.assertEqual(ha._azure_category("s", "P", "Bug", "Shipped"), "done")
+
+    def test_name_map_fallback_when_api_fails(self):
+        def boom(*a, **k):
+            raise RuntimeError("403")
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", boom):
+            self.assertEqual(ha._azure_category("s", "P", "Bug", "Active"), "inprogress")
+            self.assertEqual(ha._azure_category("s", "P", "Bug", "Closed"), "done")
+            self.assertEqual(ha._azure_category("s", "P", "Bug", "New"), "todo")
+            # Genuinely unknown state -> todo, the safe default.
+            self.assertEqual(ha._azure_category("s", "P", "Bug", "Wibble"), "todo")
+
+    def test_state_map_is_cached_per_type(self):
+        calls = []
+
+        def fake_req(path, params, body=None):
+            calls.append(path)
+            return {"value": [{"name": "Active", "stateCategory": "InProgress"}]}
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", fake_req):
+            ha._azure_category("s", "P", "Bug", "Active")
+            ha._azure_category("s", "P", "Bug", "Active")
+        self.assertEqual(len(calls), 1)   # second lookup hits the cache
+
+
+class TestAzureStatusOptions(unittest.TestCase):
+    """XERK-138: a work item's changeable states, from the states API, minus the
+    one it's already in — the source-agnostic statusOptions shape (id == name)."""
+
+    def _states(self):
+        return {"value": [
+            {"name": "New", "stateCategory": "Proposed"},
+            {"name": "Active", "stateCategory": "InProgress"},
+            {"name": "Closed", "stateCategory": "Completed"},
+        ]}
+
+    def test_lists_states_except_current(self):
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", return_value=self._states()):
+            opts = ha._azure_status_options("s", "P", "Bug", "Active")
+        self.assertEqual(opts, [
+            {"id": "New", "name": "New", "category": "todo"},
+            {"id": "Closed", "name": "Closed", "category": "done"},
+        ])
+
+    def test_empty_when_states_api_unavailable(self):
+        def boom(*a, **k):
+            raise RuntimeError("403")
+        with mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", boom):
+            self.assertEqual(ha._azure_status_options("s", "P", "Bug", "New"), [])
+
+
+class TestCollectAzure(unittest.TestCase):
+    def _configured(self):
+        return mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/MyOrg",
+                                   AZDO_TOKEN="pat", AZDO_PROJECT="", AZDO_USER="")
+
+    def test_unconfigured_full_schema_no_http(self):
+        with mock.patch.object(ha, "AZDO_URL", ""), \
+             mock.patch.object(ha, "AZDO_TOKEN", ""), \
+             mock.patch.object(ha, "azure_req") as req:
+            block = ha.collect_azure()
+        req.assert_not_called()
+        self.assertFalse(block["configured"])
+        self.assertFalse(block["available"])
+        self.assertEqual(block["source"], "azure")
+        self.assertEqual(block["tickets"], [])
+
+    def _fake_req(self, items):
+        def req(path, params, body=None):
+            if path == "/_apis/wit/wiql":
+                self.assertIsNotNone(body)      # WIQL is a POST
+                self.assertIn("@Me", body["query"])
+                return {"workItems": [{"id": i["id"]} for i in items]}
+            if path == "/_apis/wit/workitems":
+                self.assertIn("errorPolicy", params)
+                want = set(params["ids"].split(","))
+                return {"value": [i for i in items if str(i["id"]) in want]}
+            if path.endswith("/states"):
+                return {"value": []}            # force the name-map path
+            raise AssertionError(path)
+        return req
+
+    def test_buckets_active_and_recent_done_like_jira(self):
+        items = [
+            _azure_wi(1, "Active"),
+            _azure_wi(2, "Closed", **{"System.ChangedDate": "2099-01-01T00:00:00Z"}),
+            _azure_wi(3, "Closed", **{"System.ChangedDate": "2000-01-01T00:00:00Z"}),
+            _azure_wi(4, "New"),
+        ]
+        with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", self._fake_req(items)):
+            block = ha.collect_azure()
+        self.assertTrue(block["available"])
+        self.assertEqual(block["source"], "azure")
+        self.assertEqual(block["siteKey"], "dev.azure.com/myorg")
+        self.assertEqual(block["user"], "myorg")   # AZDO_USER unset -> org segment
+        keys = [t["key"] for t in block["tickets"]]
+        self.assertIn("1", keys)          # active
+        self.assertIn("4", keys)          # active
+        self.assertIn("2", keys)          # recent done kept
+        self.assertNotIn("3", keys)       # done older than the window dropped
+
+    def test_project_scope_added_to_wiql(self):
+        seen = {}
+
+        def req(path, params, body=None):
+            if path == "/_apis/wit/wiql":
+                seen["q"] = body["query"]
+                return {"workItems": []}
+            return {"value": []}
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_PROJECT="My Proj", AZDO_USER=""), \
+             mock.patch.object(ha, "azure_req", req):
+            ha.collect_azure()
+        self.assertIn("[System.TeamProject] = 'My Proj'", seen["q"])
+
+    def test_truncated_when_capped(self):
+        items = [_azure_wi(i, "Active") for i in range(5)]
+        with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "AZDO_MAX_IDS", 2), \
+             mock.patch.object(ha, "azure_req", self._fake_req(items)):
+            block = ha.collect_azure()
+        self.assertTrue(block["truncated"])
+        self.assertEqual(len(block["tickets"]), 2)
+
+
+class TestAzureHtmlToText(unittest.TestCase):
+    def test_blocks_lists_links_entities(self):
+        html = ('<p>Hello <b>world</b></p><ul><li>one</li><li>two</li></ul>'
+                '<div>see <a href="http://x.io/p">here</a> &amp; there</div>')
+        out = ha.azure_html_to_text(html)
+        self.assertIn("Hello world", out)
+        self.assertIn("- one", out)
+        self.assertIn("- two", out)
+        self.assertIn("here (http://x.io/p)", out)
+        self.assertIn("& there", out)
+
+    def test_plain_string_passes_through(self):
+        self.assertEqual(ha.azure_html_to_text("just text"), "just text")
+
+    def test_empty_and_none(self):
+        self.assertEqual(ha.azure_html_to_text(""), "")
+        self.assertEqual(ha.azure_html_to_text(None), "")
+
+    def test_plain_truncates(self):
+        text, trunc = ha.azure_plain("<p>" + "x" * 50 + "</p>", 10)
+        self.assertTrue(trunc)
+        self.assertLessEqual(len(text), 10)
+
+
+class TestFetchAzureIssue(unittest.TestCase):
+    def test_detail_shape_with_comments(self):
+        def req(path, params, body=None):
+            if path == "/_apis/wit/workitems/42":
+                self.assertEqual(params.get("$expand"), "all")
+                return _azure_wi(42, "Active", title="Detail",
+                                 **{"System.Description": "<p>full <b>desc</b></p>",
+                                    "System.Reason": "Investigation complete",
+                                    "System.CreatedBy": {"displayName": "Ada"},
+                                    "System.AssignedTo": {"displayName": "Grace"}})
+            if path.endswith("/comments"):
+                self.assertIn("preview", params["api-version"])
+                return {"totalCount": 2, "comments": [
+                    {"id": 1, "text": "<p>older</p>", "createdDate": "2026-07-01T00:00:00Z",
+                     "createdBy": {"displayName": "Ada"}},
+                    {"id": 2, "text": "<p>newer</p>", "createdDate": "2026-07-05T00:00:00Z",
+                     "createdBy": {"displayName": "Grace"}},
+                ]}
+            raise AssertionError(path)
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                 AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            d = ha.fetch_azure_issue("42")
+        self.assertEqual(d["key"], "42")
+        self.assertIn("full desc", d["description"])
+        self.assertEqual(d["reporter"], "Ada")
+        self.assertEqual(d["assignee"], "Grace")
+        self.assertEqual(d["resolution"], "Investigation complete")
+        self.assertEqual(d["commentTotal"], 2)
+        self.assertEqual([c["body"] for c in d["comments"]], ["older", "newer"])
+
+    def test_comments_failure_degrades_to_none(self):
+        def req(path, params, body=None):
+            if path == "/_apis/wit/workitems/42":
+                return _azure_wi(42, "Active", **{"System.Description": "<p>x</p>"})
+            raise RuntimeError("comments 404")
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                 AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            d = ha.fetch_azure_issue("42")
+        self.assertEqual(d["comments"], [])
+        self.assertEqual(d["commentTotal"], 0)
+
+
+class TestBoardSourceDispatch(unittest.TestCase):
+    """The shims that pick the one configured source; azure wins if both set."""
+
+    def test_source_and_configured(self):
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="", AZDO_TOKEN=""):
+            self.assertIsNone(ha.board_source())
+            self.assertFalse(ha.board_configured())
+        with mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e",
+                                 JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN=""):
+            self.assertEqual(ha.board_source(), "jira")
+            self.assertTrue(ha.board_configured())
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"):
+            self.assertEqual(ha.board_source(), "azure")
+            self.assertEqual(ha.board_site_key(), "dev.azure.com/o")
+
+    def test_valid_issue_key_is_source_aware(self):
+        with mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e",
+                                 JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN=""):
+            self.assertTrue(ha.valid_issue_key("PROJ-7"))
+            self.assertFalse(ha.valid_issue_key("1234"))   # numeric isn't a Jira key
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"):
+            self.assertTrue(ha.valid_issue_key("1234"))
+            self.assertFalse(ha.valid_issue_key("PROJ-7"))  # keys aren't Azure ids
+
+    def test_ticket_branch_base(self):
+        with mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e",
+                                 JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN=""):
+            self.assertEqual(ha.ticket_branch_base("PROJ-7", {}), "PROJ-7")
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"):
+            self.assertEqual(ha.ticket_branch_base("1234", {"project": "My Proj"}),
+                             "My-Proj-1234")
+            self.assertEqual(ha.ticket_branch_base("1234", {}), "wi-1234")
+
+
+class TestBoardErrorSummary(unittest.TestCase):
+    """A board-poll failure is turned into a short, human-readable `error` for
+    the dashboard (XERK-156): an upstream 5xx (the Cloudflare-family HTTP 530 a
+    self-hosted org's front returns) or a connection failure reads as
+    'temporarily unreachable' rather than the cryptic `HTTP Error 530: <none>`."""
+
+    AZ = dict(JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+              AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p")
+    JI = dict(AZDO_URL="", AZDO_TOKEN="",
+              JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e", JIRA_TOKEN="t")
+
+    def _http(self, code, msg="<none>"):
+        return urllib.error.HTTPError("https://x/y", code, msg, {}, None)
+
+    def test_upstream_5xx_reads_as_temporarily_unreachable(self):
+        with mock.patch.multiple(ha, **self.AZ):
+            self.assertEqual(ha._board_error_summary(self._http(530)),
+                             "Azure DevOps temporarily unreachable (HTTP 530)")
+            self.assertEqual(ha._board_error_summary(self._http(503)),
+                             "Azure DevOps temporarily unreachable (HTTP 503)")
+        with mock.patch.multiple(ha, **self.JI):
+            self.assertEqual(ha._board_error_summary(self._http(502)),
+                             "Jira temporarily unreachable (HTTP 502)")
+
+    def test_auth_and_rate_limit_get_their_own_hint(self):
+        with mock.patch.multiple(ha, **self.AZ):
+            self.assertEqual(ha._board_error_summary(self._http(401)),
+                             "Azure DevOps rejected the credentials (HTTP 401)")
+            self.assertEqual(ha._board_error_summary(self._http(403)),
+                             "Azure DevOps rejected the credentials (HTTP 403)")
+            self.assertEqual(ha._board_error_summary(self._http(429)),
+                             "Azure DevOps rate-limited the request (HTTP 429)")
+
+    def test_other_4xx_keeps_the_code(self):
+        with mock.patch.multiple(ha, **self.AZ):
+            msg = ha._board_error_summary(self._http(404, "Not Found"))
+            self.assertIn("HTTP 404", msg)
+            self.assertIn("Azure DevOps", msg)
+
+    def test_connection_failure_reads_as_unreachable(self):
+        with mock.patch.multiple(ha, **self.JI):
+            msg = ha._board_error_summary(
+                urllib.error.URLError("Name or service not known"))
+            self.assertTrue(msg.startswith("Jira unreachable"))
+            self.assertIn("Name or service not known", msg)
+
+    def test_timeout_reads_as_unreachable(self):
+        with mock.patch.multiple(ha, **self.JI):
+            self.assertTrue(
+                ha._board_error_summary(TimeoutError()).startswith("Jira unreachable"))
+
+    def test_unrecognised_falls_back_to_raw_text(self):
+        with mock.patch.multiple(ha, **self.AZ):
+            self.assertEqual(ha._board_error_summary(ValueError("boom")), "boom")
+
+
+class TestBoardOrgName(unittest.TestCase):
+    """BOARD_ORG_NAME: the operator's presentational override for the board's org
+    label, source-agnostic and applied in collect_board()."""
+
+    def test_clean_org_name(self):
+        self.assertEqual(ha.clean_org_name("Acme"), "Acme")
+        self.assertEqual(ha.clean_org_name("  Acme   Corp \n junk"), "Acme Corp")
+        # Blank in, blank out — the clients then derive from the siteKey.
+        for blank in ("", "   ", "\n", None):
+            self.assertEqual(ha.clean_org_name(blank), "")
+        self.assertEqual(len(ha.clean_org_name("x" * 200)), ha.ORG_NAME_MAX_CHARS)
+
+    def test_collect_board_stamps_the_override(self):
+        with mock.patch.object(ha, "collect_jira", lambda: {"siteKey": "s", "tickets": []}), \
+             mock.patch.object(ha, "azure_configured", lambda: False):
+            with mock.patch.object(ha, "BOARD_ORG_NAME", "Acme"):
+                self.assertEqual(ha.collect_board()["orgName"], "Acme")
+            # Unset rides as None, which every client reads as "derive it".
+            with mock.patch.object(ha, "BOARD_ORG_NAME", ""):
+                self.assertIsNone(ha.collect_board()["orgName"])
+
+    def test_it_never_touches_the_site_key(self):
+        """The siteKey is what the hub keys, merges and routes on (and what the
+        hub's ticket-agent/auto-start ledgers are stored under), so the label
+        override must leave it exactly as the collector reported it."""
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="https://tfs.co/tfs/DefaultCollection",
+                                 AZDO_TOKEN="p", BOARD_ORG_NAME="Acme"), \
+             mock.patch.object(ha, "collect_azure",
+                               lambda: {"siteKey": ha.normalize_azure_site(ha.AZDO_URL)}):
+            self.assertEqual(ha.collect_board()["siteKey"], "tfs.co/tfs/defaultcollection")
+
+
+class TestStageJiraIssue(ManagerMixin, unittest.TestCase):
+    """The {type:"jiraIssue"} command: every path stages a result (the board is
+    waiting on this key) and none of them raises out of the heartbeat loop."""
+
+    def _configured(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t")
+
+    def test_success_stages_issue(self):
+        sm = self.make_manager()
+        with self._configured(), \
+             mock.patch.object(ha, "fetch_jira_issue",
+                               return_value={"key": "ENG-42"}) as f:
+            sm._stage_jira_issue("ENG-42")
+        f.assert_called_once_with("ENG-42")
+        self.assertEqual(sm.jira_issue_results,
+                         [{"key": "ENG-42", "issue": {"key": "ENG-42"}, "error": None}])
+
+    def test_fetch_error_stages_error_not_raises(self):
+        sm = self.make_manager()
+        with self._configured(), \
+             mock.patch.object(ha, "fetch_jira_issue",
+                               side_effect=RuntimeError("404 " + "x" * 300)):
+            sm._stage_jira_issue("ENG-42")
+        r = sm.jira_issue_results[0]
+        self.assertIsNone(r["issue"])
+        self.assertTrue(r["error"].startswith("404"))
+        self.assertLessEqual(len(r["error"]), 200)
+
+    def test_bad_key_never_reaches_jira(self):
+        sm = self.make_manager()
+        bad = ["", None, "../../secrets", "ENG-42/comment", "ENG 42", "42",
+               "ENG-", "ENG-42?x=1", "-1"]
+        with self._configured(), mock.patch.object(ha, "fetch_jira_issue") as f:
+            for k in bad:
+                sm._stage_jira_issue(k)
+        f.assert_not_called()
+        self.assertEqual(len(sm.jira_issue_results), len(bad))
+        for r in sm.jira_issue_results:
+            self.assertEqual(r["error"], "not a valid issue key")
+
+    def test_unconfigured_host_says_so_without_fetching(self):
+        sm = self.make_manager()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN=""), \
+             mock.patch.object(ha, "fetch_jira_issue") as f:
+            sm._stage_jira_issue("ENG-42")
+        f.assert_not_called()
+        self.assertIn("no board credentials", sm.jira_issue_results[0]["error"])
+
+    def test_command_routes_and_acks(self):
+        sm = self.make_manager()
+        with self._configured(), \
+             mock.patch.object(ha, "fetch_jira_issue", return_value={"key": "ENG-9"}):
+            sm.handle_commands([{"cmdId": "c1", "type": "jiraIssue", "issueKey": "ENG-9"}])
+        self.assertEqual(sm.jira_issue_results[0]["key"], "ENG-9")
+        self.assertIn("c1", sm.acked)
+
+    def test_results_ride_the_payload_only_when_staged(self):
+        sm = self.make_manager()
+        sm.registry = []
+        self.assertNotIn("jiraIssueResults", sm.build_payload(1))
+        sm.jira_issue_results = [{"key": "ENG-9", "issue": None, "error": "x"}]
+        self.assertEqual(sm.build_payload(1)["jiraIssueResults"],
+                         [{"key": "ENG-9", "issue": None, "error": "x"}])
+
+
+class TestSetBoardStatus(ManagerMixin, unittest.TestCase):
+    """XERK-138: the board's one write path. A status change is re-validated
+    against a FRESH options read, applied to the configured source, and its
+    outcome staged keyed by the command's cmdId. Nothing raises out of the loop."""
+
+    def _jira(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t",
+                                   AZDO_URL="", AZDO_TOKEN="")
+
+    def _azure(self):
+        return mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                   AZDO_TOKEN="p", JIRA_SITE="", JIRA_EMAIL="",
+                                   JIRA_TOKEN="")
+
+    def test_jira_transition_posts_the_chosen_id(self):
+        sm = self.make_manager()
+        opts = [{"id": "31", "name": "Done", "category": "done"}]
+        seen = {}
+
+        def fake_req(path, params, body=None):
+            seen["path"], seen["body"] = path, body
+            return {}
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "jira_req", fake_req), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "ENG-9", "status": "Done"}):
+            sm.set_board_status("c1", "ENG-9", "31")
+        self.assertEqual(seen["path"], "/rest/api/3/issue/ENG-9/transitions")
+        self.assertEqual(seen["body"], {"transition": {"id": "31"}})
+        r = sm.ticket_status_results[0]
+        self.assertEqual((r["cmdId"], r["key"], r["ok"], r["status"]),
+                         ("c1", "ENG-9", True, "Done"))
+        # The fresh issue rides jira_issue_results so the panel's re-read is instant.
+        self.assertEqual(sm.jira_issue_results[0]["issue"]["status"], "Done")
+
+    def test_azure_patches_system_state(self):
+        sm = self.make_manager()
+        opts = [{"id": "Closed", "name": "Closed", "category": "done"}]
+        seen = {}
+
+        def fake_req(path, params, body=None, method=None, content_type="application/json"):
+            seen.update(path=path, body=body, method=method, ct=content_type)
+            return {}
+        with self._azure(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "azure_req", fake_req), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "42", "status": "Closed"}):
+            sm.set_board_status("c2", "42", "Closed")
+        self.assertEqual(seen["path"], "/_apis/wit/workitems/42")
+        self.assertEqual(seen["method"], "PATCH")
+        self.assertEqual(seen["ct"], "application/json-patch+json")
+        self.assertEqual(seen["body"],
+                         [{"op": "add", "path": "/fields/System.State", "value": "Closed"}])
+        self.assertTrue(sm.ticket_status_results[0]["ok"])
+
+    def test_target_not_on_offer_is_refused_without_writing(self):
+        sm = self.make_manager()
+        opts = [{"id": "31", "name": "Done", "category": "done"}]
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "apply_board_status") as apply:
+            sm.set_board_status("c1", "ENG-9", "99")
+        apply.assert_not_called()
+        r = sm.ticket_status_results[0]
+        self.assertFalse(r["ok"])
+        self.assertIn("no longer an available change", r["error"])
+
+    def test_write_failure_stages_error_not_raises(self):
+        sm = self.make_manager()
+        opts = [{"id": "31", "name": "Done", "category": "done"}]
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "apply_board_status",
+                               side_effect=RuntimeError("403 forbidden " + "x" * 300)):
+            sm.set_board_status("c1", "ENG-9", "31")
+        r = sm.ticket_status_results[0]
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["error"].startswith("403 forbidden"))
+        self.assertLessEqual(len(r["error"]), 200)
+
+    def test_options_read_failure_stages_error(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch.object(ha, "apply_board_status") as apply:
+            sm.set_board_status("c1", "ENG-9", "31")
+        apply.assert_not_called()
+        self.assertIn("couldn't read available statuses",
+                      sm.ticket_status_results[0]["error"])
+
+    def test_bad_key_and_unconfigured_never_write(self):
+        sm = self.make_manager()
+        with self._jira(), mock.patch.object(ha, "apply_board_status") as apply:
+            sm.set_board_status("c1", "../secrets", "31")
+        apply.assert_not_called()
+        self.assertEqual(sm.ticket_status_results[0]["error"], "not a valid issue key")
+        sm.ticket_status_results.clear()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="", AZDO_TOKEN=""), \
+             mock.patch.object(ha, "apply_board_status") as apply:
+            sm.set_board_status("c1", "ENG-9", "31")
+        apply.assert_not_called()
+        self.assertIn("no board credentials", sm.ticket_status_results[0]["error"])
+
+    def test_command_routes_acks_and_rides_payload(self):
+        sm = self.make_manager()
+        sm.registry = []
+        opts = [{"id": "31", "name": "Done", "category": "done"}]
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "jira_req", return_value={}), \
+             mock.patch.object(ha, "fetch_board_issue", return_value={"key": "ENG-9"}):
+            sm.handle_commands([{"cmdId": "c9", "type": "setTicketStatus",
+                                 "issueKey": "ENG-9", "value": "31"}])
+        self.assertIn("c9", sm.acked)
+        self.assertEqual(sm.ticket_status_results[0]["cmdId"], "c9")
+        self.assertEqual(sm.build_payload(1)["ticketStatusResults"][0]["cmdId"], "c9")
+
+    # --- drag-and-drop: resolve a dropped COLUMN to a transition (XERK-141) ---
+
+    def test_category_resolves_to_the_matching_transition(self):
+        """A drop POSTs a board column; the agent resolves it to a transition
+        against the fresh options and writes that transition's id."""
+        sm = self.make_manager()
+        opts = [{"id": "11", "name": "To Do", "category": "todo"},
+                {"id": "31", "name": "Done", "category": "done"}]
+        seen = {}
+
+        def fake_req(path, params, body=None):
+            seen["body"] = body
+            return {}
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "jira_req", fake_req), \
+             mock.patch.object(ha, "fetch_board_issue",
+                               return_value={"key": "ENG-9", "status": "Done"}):
+            sm.set_board_status("c1", "ENG-9", "", category="done")
+        self.assertEqual(seen["body"], {"transition": {"id": "31"}})
+        r = sm.ticket_status_results[0]
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["status"], "Done")
+
+    def test_category_review_picks_a_review_named_inprogress_status(self):
+        """The In Review column has no wire category of its own — it's carved out
+        of `inprogress` by the status name, exactly as board.js categoryOf does."""
+        sm = self.make_manager()
+        opts = [{"id": "21", "name": "In Progress", "category": "inprogress"},
+                {"id": "22", "name": "In Review", "category": "inprogress"}]
+        seen = {}
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "jira_req",
+                               lambda p, params, body=None: seen.update(body=body) or {}), \
+             mock.patch.object(ha, "fetch_board_issue", return_value={"key": "ENG-9"}):
+            sm.set_board_status("c1", "ENG-9", "", category="review")
+        self.assertEqual(seen["body"], {"transition": {"id": "22"}})
+
+    def test_category_with_no_matching_option_is_refused(self):
+        sm = self.make_manager()
+        opts = [{"id": "21", "name": "In Progress", "category": "inprogress"}]
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "apply_board_status") as apply:
+            sm.set_board_status("c1", "ENG-9", "", category="done")
+        apply.assert_not_called()
+        r = sm.ticket_status_results[0]
+        self.assertFalse(r["ok"])
+        self.assertIn("Done", r["error"])   # labelled in the operator's own vocabulary
+
+    def test_neither_value_nor_category_is_refused(self):
+        sm = self.make_manager()
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=[]) as opts, \
+             mock.patch.object(ha, "apply_board_status") as apply:
+            sm.set_board_status("c1", "ENG-9", "")
+        apply.assert_not_called()
+        opts.assert_not_called()            # bailed before even reading options
+        self.assertIn("no status given", sm.ticket_status_results[0]["error"])
+
+    def test_command_passes_category_through(self):
+        sm = self.make_manager()
+        sm.registry = []
+        opts = [{"id": "31", "name": "Done", "category": "done"}]
+        with self._jira(), \
+             mock.patch.object(ha, "board_status_options", return_value=opts), \
+             mock.patch.object(ha, "jira_req", return_value={}), \
+             mock.patch.object(ha, "fetch_board_issue", return_value={"key": "ENG-9"}):
+            sm.handle_commands([{"cmdId": "c9", "type": "setTicketStatus",
+                                 "issueKey": "ENG-9", "value": "", "category": "done"}])
+        self.assertIn("c9", sm.acked)
+        self.assertTrue(sm.ticket_status_results[0]["ok"])
+
+
+class TestBoardColumn(unittest.TestCase):
+    """The status-column resolver behind drag-and-drop (XERK-141). Mirrors
+    board.js categoryOf: review is carved out of inprogress by the status name."""
+
+    def test_board_column_mirrors_category_of(self):
+        self.assertEqual(ha._board_column("Anything", "todo"), "todo")
+        self.assertEqual(ha._board_column("Anything", "weird"), "todo")
+        self.assertEqual(ha._board_column("In Progress", "inprogress"), "inprogress")
+        self.assertEqual(ha._board_column("Done", "done"), "done")
+        # Review carve-out, word-boundary matched, only from inprogress.
+        self.assertEqual(ha._board_column("In Review", "inprogress"), "review")
+        self.assertEqual(ha._board_column("Testing", "inprogress"), "review")
+        self.assertEqual(ha._board_column("QA", "inprogress"), "review")
+        self.assertEqual(ha._board_column("Attestation", "inprogress"), "inprogress")
+        self.assertEqual(ha._board_column("Testing complete", "done"), "done")
+
+    def test_first_matching_option_wins(self):
+        opts = [{"id": "a", "name": "First Done", "category": "done"},
+                {"id": "b", "name": "Second Done", "category": "done"}]
+        self.assertEqual(ha._status_option_for_column(opts, "done")["id"], "a")
+        self.assertIsNone(ha._status_option_for_column(opts, "todo"))
+        self.assertIsNone(ha._status_option_for_column([], "done"))
+
+
+# --- Ticket creation (XERK-137) ------------------------------------------------
+
+class TestTextToAdf(unittest.TestCase):
+    """Plain text -> the minimal ADF doc Jira's create API wants."""
+
+    def test_paragraphs_and_blank_lines(self):
+        doc = ha._text_to_adf("one\n\ntwo")
+        self.assertEqual(doc["type"], "doc")
+        self.assertEqual(doc["content"][0],
+                         {"type": "paragraph",
+                          "content": [{"type": "text", "text": "one"}]})
+        self.assertEqual(doc["content"][1], {"type": "paragraph"})  # blank line
+        self.assertEqual(doc["content"][2]["content"][0]["text"], "two")
+
+    def test_empty_is_still_a_valid_doc(self):
+        self.assertEqual(ha._text_to_adf("")["content"], [{"type": "paragraph"}])
+
+
+class TestJiraAccountId(unittest.TestCase):
+    def test_caches_the_lookup(self):
+        calls = []
+
+        def fg(path, params):
+            calls.append(path)
+            return {"accountId": "abc"}
+
+        with mock.patch.object(ha, "_JIRA_MYSELF", {"accountId": None, "tried": False}), \
+             mock.patch.object(ha, "jira_get", fg):
+            self.assertEqual(ha._jira_account_id(), "abc")
+            self.assertEqual(ha._jira_account_id(), "abc")  # served from cache
+        self.assertEqual(calls, ["/rest/api/3/myself"])
+
+    def test_failure_is_swallowed_and_not_retried(self):
+        with mock.patch.object(ha, "_JIRA_MYSELF", {"accountId": None, "tried": False}), \
+             mock.patch.object(ha, "jira_get", side_effect=RuntimeError("401")):
+            self.assertIsNone(ha._jira_account_id())
+
+
+class TestCreateJiraIssue(unittest.TestCase):
+    def test_builds_fields_and_self_assigns(self):
+        seen = {}
+
+        def fake_post(path, body):
+            seen["path"], seen["body"] = path, body
+            return {"key": "ENG-99"}
+
+        with mock.patch.object(ha, "JIRA_SITE", "MyOrg.atlassian.net"), \
+             mock.patch.object(ha, "jira_post", fake_post), \
+             mock.patch.object(ha, "_jira_account_id", lambda: "acc-1"):
+            out = ha.create_jira_issue("ENG", "10001", "Title", "Desc", ["a", "b"])
+        self.assertEqual(seen["path"], "/rest/api/3/issue")
+        f = seen["body"]["fields"]
+        self.assertEqual(f["project"], {"key": "ENG"})
+        self.assertEqual(f["summary"], "Title")
+        self.assertEqual(f["issuetype"], {"id": "10001"})
+        self.assertEqual(f["labels"], ["a", "b"])
+        self.assertEqual(f["assignee"], {"id": "acc-1"})
+        self.assertEqual(f["description"]["type"], "doc")
+        self.assertEqual(out, {"key": "ENG-99",
+                               "url": "https://myorg.atlassian.net/browse/ENG-99",
+                               "assigned": True})
+
+    def test_omits_optional_fields_when_empty(self):
+        captured = {}
+
+        def fp(path, body):
+            captured["body"] = body
+            return {"key": "E-1"}
+
+        with mock.patch.object(ha, "JIRA_SITE", "o.atlassian.net"), \
+             mock.patch.object(ha, "jira_post", fp), \
+             mock.patch.object(ha, "_jira_account_id", lambda: None):
+            ha.create_jira_issue("E", "1", "T", "", [])
+        f = captured["body"]["fields"]
+        for k in ("assignee", "description", "labels"):
+            self.assertNotIn(k, f)
+
+    def test_missing_key_raises(self):
+        with mock.patch.object(ha, "JIRA_SITE", "o.atlassian.net"), \
+             mock.patch.object(ha, "jira_post", lambda p, b: {}), \
+             mock.patch.object(ha, "_jira_account_id", lambda: None):
+            with self.assertRaises(RuntimeError):
+                ha.create_jira_issue("E", "1", "T", "", [])
+
+
+class TestJiraCreateMeta(unittest.TestCase):
+    def test_projects_and_labels(self):
+        def fg(path, params):
+            if "project/search" in path:
+                return {"values": [{"key": "ENG", "name": "Engineering"},
+                                   {"key": "OPS"}]}
+            if path == "/rest/api/3/label":
+                return {"values": ["turma", "bug", 7]}  # non-str dropped
+            raise AssertionError(path)
+
+        with mock.patch.object(ha, "jira_get", fg):
+            m = ha.jira_create_meta()
+        self.assertEqual(m["source"], "jira")
+        self.assertEqual(m["projects"], [{"key": "ENG", "name": "Engineering"},
+                                         {"key": "OPS", "name": "OPS"}])
+        self.assertEqual(m["labels"], ["turma", "bug"])
+
+    def test_label_fetch_failure_degrades(self):
+        def fg(path, params):
+            if "project/search" in path:
+                return {"values": [{"key": "ENG", "name": "Eng"}]}
+            raise RuntimeError("no labels")
+
+        with mock.patch.object(ha, "jira_get", fg):
+            self.assertEqual(ha.jira_create_meta()["labels"], [])
+
+
+class TestJiraIssueTypes(unittest.TestCase):
+    def test_excludes_subtasks_and_idless(self):
+        def fg(path, params):
+            self.assertIn("/createmeta/ENG/issuetypes", path)
+            return {"issueTypes": [
+                {"id": "1", "name": "Task"},
+                {"id": "2", "name": "Sub-task", "subtask": True},
+                {"name": "NoId"},
+            ]}
+
+        with mock.patch.object(ha, "jira_get", fg):
+            self.assertEqual(ha.jira_issue_types("ENG"), [{"id": "1", "name": "Task"}])
+
+
+class TestHttpErrorDetail(unittest.TestCase):
+    """A rejected tracker request must carry the SERVER's explanation: urllib
+    stringifies an HTTPError to "HTTP Error 400: Bad Request" and drops the body,
+    which is the only place either tracker says what was actually wrong."""
+
+    def _err(self, body, code=400):
+        return urllib.error.HTTPError(
+            "http://x", code, "Bad Request", {},
+            io.BytesIO(body.encode() if isinstance(body, str) else body))
+
+    def test_azure_message(self):
+        detail = ha._http_error_detail(self._err(json.dumps(
+            {"message": "TF401326: Work item type Bug does not have field "
+                        "System.Description."})))
+        self.assertIn("HTTP 400", detail)
+        self.assertIn("does not have field System.Description", detail)
+
+    def test_jira_error_messages_and_field_errors(self):
+        self.assertIn("summary is required", ha._http_error_detail(self._err(
+            json.dumps({"errorMessages": ["summary is required"]}))))
+        detail = ha._http_error_detail(self._err(
+            json.dumps({"errorMessages": [], "errors": {"project": "no such"}})))
+        self.assertIn("project: no such", detail)
+
+    def test_html_body_is_stripped_to_its_sentence(self):
+        detail = ha._http_error_detail(self._err(
+            "<html><style>b{}</style><body><h1>Access denied</h1></body></html>",
+            code=403))
+        self.assertIn("HTTP 403", detail)
+        self.assertIn("Access denied", detail)
+        self.assertNotIn("<", detail)
+        self.assertNotIn("b{}", detail)
+
+    def test_empty_body_still_names_the_code(self):
+        self.assertEqual(ha._http_error_detail(self._err("")), "HTTP 400")
+
+    def test_capped(self):
+        detail = ha._http_error_detail(self._err(json.dumps({"message": "x" * 900})))
+        self.assertLessEqual(len(detail), ha.BOARD_ERROR_MAX_CHARS + 20)
+
+    def test_board_urlopen_raises_with_the_detail(self):
+        def boom(req, timeout=None):
+            raise self._err(json.dumps({"message": "TF401320: Rule Error"}))
+
+        with mock.patch.object(ha.urllib.request, "urlopen", boom):
+            with self.assertRaises(RuntimeError) as cm:
+                ha._board_urlopen(urllib.request.Request("http://x"))
+        self.assertIn("TF401320: Rule Error", str(cm.exception))
+
+    def test_board_urlopen_parses_empty_body_as_empty_dict(self):
+        class _Resp:
+            def read(self):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                               lambda req, timeout=None: _Resp()):
+            self.assertEqual(ha._board_urlopen(urllib.request.Request("http://x")), {})
+
+
+class TestAzureDescriptionField(unittest.TestCase):
+    """The Agile/Scrum Bug keeps its description in ReproSteps and has no
+    System.Description, and patching a field a type doesn't have fails the whole
+    create — so the field is looked up rather than assumed."""
+
+    def _fields(self, *refs):
+        return {"value": [{"referenceName": r} for r in refs]}
+
+    def test_bug_without_description_uses_repro_steps(self):
+        with mock.patch.object(ha, "_AZDO_FIELD_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", return_value=self._fields(
+                 "System.Title", "Microsoft.VSTS.TCM.ReproSteps")):
+            self.assertEqual(ha._azure_description_field("s", "P", "Bug"),
+                             "Microsoft.VSTS.TCM.ReproSteps")
+
+    def test_description_wins_when_the_type_has_it(self):
+        with mock.patch.object(ha, "_AZDO_FIELD_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", return_value=self._fields(
+                 "System.Description", "Microsoft.VSTS.TCM.ReproSteps")):
+            self.assertEqual(ha._azure_description_field("s", "P", "Task"),
+                             "System.Description")
+
+    def test_unknown_field_list_falls_back_to_description(self):
+        def boom(*a, **k):
+            raise RuntimeError("403")
+
+        with mock.patch.object(ha, "_AZDO_FIELD_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", boom):
+            self.assertEqual(ha._azure_description_field("s", "P", "Bug"),
+                             "System.Description")
+
+    def test_neither_field_means_send_none(self):
+        with mock.patch.object(ha, "_AZDO_FIELD_CACHE", {}), \
+             mock.patch.object(ha, "azure_req",
+                               return_value=self._fields("System.Title")):
+            self.assertIsNone(ha._azure_description_field("s", "P", "Odd"))
+
+    def test_cached_per_project_and_type(self):
+        calls = []
+
+        def req(path, params, body=None):
+            calls.append(path)
+            return self._fields("System.Description")
+
+        with mock.patch.object(ha, "_AZDO_FIELD_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            ha._azure_description_field("s", "P", "Bug")
+            ha._azure_description_field("s", "P", "Bug")
+            ha._azure_description_field("s", "P", "Task")
+        self.assertEqual(len(calls), 2)
+
+
+class TestCreateAzureIssue(unittest.TestCase):
+    def _has_description(self):
+        """The common case: the type carries System.Description."""
+        return mock.patch.object(
+            ha, "_azure_description_field", lambda s, p, w: "System.Description")
+
+    def test_builds_json_patch_ops(self):
+        seen = {}
+
+        def fake_create(project, wtype, ops):
+            seen.update(project=project, wtype=wtype, ops=ops)
+            return {"id": 77}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                 AZDO_TOKEN="p", AZDO_USER="me@x"), \
+             self._has_description(), \
+             mock.patch.object(ha, "azure_create_workitem", fake_create):
+            out = ha.create_azure_issue("Proj", "Bug", "Title", "l1\nl2", ["t1", "t2"])
+        ops = {o["path"]: o["value"] for o in seen["ops"]}
+        self.assertEqual(ops["/fields/System.Title"], "Title")
+        self.assertIn("l1<br>l2", ops["/fields/System.Description"])
+        self.assertEqual(ops["/fields/System.Tags"], "t1; t2")
+        self.assertEqual(ops["/fields/System.AssignedTo"], "me@x")
+        self.assertEqual(seen["wtype"], "Bug")
+        self.assertEqual(out["key"], "77")
+        self.assertIn("/_workitems/edit/77", out["url"])
+
+    def test_escapes_html_and_skips_unknown_assignee(self):
+        captured = {}
+
+        def fc(p, w, ops):
+            captured["ops"] = ops
+            return {"id": 1}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER=""), \
+             self._has_description(), \
+             mock.patch.object(ha, "_azure_identities", lambda: []), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            ha.create_azure_issue("P", "Task", "T", "<script>", [])
+        desc = [o for o in captured["ops"]
+                if o["path"].endswith("Description")][0]["value"]
+        self.assertIn("&lt;script&gt;", desc)
+        self.assertFalse(any(o["path"].endswith("AssignedTo") for o in captured["ops"]))
+
+    def test_missing_id_raises(self):
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p"), \
+             self._has_description(), \
+             mock.patch.object(ha, "_azure_identities", lambda: []), \
+             mock.patch.object(ha, "azure_create_workitem", lambda p, w, o: {}):
+            with self.assertRaises(RuntimeError):
+                ha.create_azure_issue("P", "Task", "T", "", [])
+
+    def test_description_goes_to_the_field_the_type_actually_has(self):
+        captured = {}
+
+        def fc(p, w, ops):
+            captured["ops"] = ops
+            return {"id": 5}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER=""), \
+             mock.patch.object(ha, "_azure_description_field",
+                               lambda s, p, w: "Microsoft.VSTS.TCM.ReproSteps"), \
+             mock.patch.object(ha, "_azure_identities", lambda: []), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            ha.create_azure_issue("P", "Bug", "T", "steps", [])
+        paths = [o["path"] for o in captured["ops"]]
+        self.assertIn("/fields/Microsoft.VSTS.TCM.ReproSteps", paths)
+        self.assertNotIn("/fields/System.Description", paths)
+
+    def test_type_with_no_description_field_still_creates(self):
+        captured = {}
+
+        def fc(p, w, ops):
+            captured["ops"] = ops
+            return {"id": 6}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER=""), \
+             mock.patch.object(ha, "_azure_description_field", lambda s, p, w: None), \
+             mock.patch.object(ha, "_azure_identities", lambda: []), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            out = ha.create_azure_issue("P", "Odd", "T", "dropped", [])
+        self.assertEqual(out["key"], "6")
+        self.assertEqual([o["path"] for o in captured["ops"]],
+                         ["/fields/System.Title"])
+
+    def test_falls_through_the_identity_ladder(self):
+        """The identity a collection accepts is unguessable (email / DOMAIN\\user
+        / display name), so a rejected one must move to the next candidate, not
+        straight to unassigned — an unassigned item misses the board's @Me."""
+        tries = []
+
+        def fc(p, w, ops):
+            tries.append(ops)
+            who = [o["value"] for o in ops if o["path"].endswith("AssignedTo")]
+            if who and who[0] != "DOMAIN\\me":
+                raise ha.BoardHttpError("HTTP 400: TF401320: Rule Error", 400)
+            return {"id": 9}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p"), \
+             self._has_description(), \
+             mock.patch.object(ha, "_azure_identities",
+                               lambda: ["Board Label", "DOMAIN\\me"]), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            out = ha.create_azure_issue("P", "Task", "T", "d", [])
+        self.assertEqual(out["key"], "9")
+        self.assertTrue(out["assigned"])
+        self.assertEqual(len(tries), 2)
+
+    def test_unassigned_is_the_last_resort_and_is_reported(self):
+        tries = []
+
+        def fc(p, w, ops):
+            tries.append(ops)
+            if any(o["path"].endswith("AssignedTo") for o in ops):
+                raise ha.BoardHttpError("HTTP 400: TF401320: Rule Error", 400)
+            return {"id": 9}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p"), \
+             self._has_description(), \
+             mock.patch.object(ha, "_azure_identities", lambda: ["a", "b"]), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            out = ha.create_azure_issue("P", "Task", "T", "d", [])
+        self.assertEqual(out["key"], "9")
+        self.assertFalse(out["assigned"])          # drives the client's warning
+        self.assertEqual(len(tries), 3)
+        self.assertFalse(any(o["path"].endswith("AssignedTo") for o in tries[2]))
+
+    def test_keeps_the_first_error_when_every_attempt_fails(self):
+        """A later attempt only proves that identity didn't work either; the
+        first rejection is the one that names the real problem."""
+        def fc(p, w, ops):
+            raise ha.BoardHttpError(
+                "HTTP 400: TF401326: missing required field Area", 400)
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p"), \
+             self._has_description(), \
+             mock.patch.object(ha, "_azure_identities", lambda: ["me@x"]), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            with self.assertRaises(RuntimeError) as cm:
+                ha.create_azure_issue("P", "Task", "T", "d", [])
+        self.assertIn("missing required field Area", str(cm.exception))
+
+    def test_an_unrefused_failure_is_never_retried(self):
+        """A 4xx proves nothing was created; a timeout or 5xx does not, so
+        re-sending could duplicate the work item."""
+        for boom in (ha.BoardHttpError("HTTP 503: busy", 503),
+                     TimeoutError("timed out")):
+            tries = []
+
+            def fc(p, w, ops, _b=boom):
+                tries.append(ops)
+                raise _b
+
+            with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                     AZDO_TOKEN="p"), \
+                 self._has_description(), \
+                 mock.patch.object(ha, "_azure_identities", lambda: ["a", "b"]), \
+                 mock.patch.object(ha, "azure_create_workitem", fc):
+                with self.assertRaises(Exception):
+                    ha.create_azure_issue("P", "Task", "T", "d", [])
+            self.assertEqual(len(tries), 1, f"retried after {boom!r}")
+
+    def test_no_ladder_means_one_unassigned_attempt(self):
+        tries = []
+
+        def fc(p, w, ops):
+            tries.append(ops)
+            raise ha.BoardHttpError("HTTP 400: something else", 400)
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER=""), \
+             self._has_description(), \
+             mock.patch.object(ha, "_azure_identities", lambda: []), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            with self.assertRaises(RuntimeError):
+                ha.create_azure_issue("P", "Task", "T", "d", [])
+        self.assertEqual(len(tries), 1)
+
+
+class TestAzureIdentities(unittest.TestCase):
+    """The candidates tried as System.AssignedTo, best first."""
+
+    def _conn(self):
+        return {"authenticatedUser": {
+            "properties": {"Account": {"$value": "DOMAIN\\me"}},
+            "uniqueName": "me@corp.com", "providerDisplayName": "Me Myself",
+            "id": "guid-1"}}
+
+    def _fresh(self):
+        return mock.patch.object(ha, "_AZDO_ME", {"names": [], "tried": False})
+
+    def test_operator_setting_leads_then_connection_data(self):
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER="Board Label"), \
+             self._fresh(), \
+             mock.patch.object(ha, "azure_req", return_value=self._conn()):
+            self.assertEqual(ha._azure_identities(),
+                             ["Board Label", "DOMAIN\\me", "me@corp.com",
+                              "Me Myself", "guid-1"])
+
+    def test_deduped_when_the_setting_is_already_a_candidate(self):
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER="me@corp.com"), \
+             self._fresh(), \
+             mock.patch.object(ha, "azure_req", return_value=self._conn()):
+            got = ha._azure_identities()
+        self.assertEqual(got[0], "me@corp.com")
+        self.assertEqual(len(got), len(set(got)))
+
+    def test_a_failed_probe_is_retried_not_cached(self):
+        """Marking the probe tried up-front turned one transient failure into a
+        process that never self-assigned again."""
+        calls = []
+
+        def flaky(path, params, body=None):
+            calls.append(path)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            return self._conn()
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER=""), \
+             self._fresh(), mock.patch.object(ha, "azure_req", flaky):
+            self.assertEqual(ha._azure_identities(), [])
+            self.assertIn("DOMAIN\\me", ha._azure_identities())
+            ha._azure_identities()
+        self.assertEqual(len(calls), 2)            # cached after the success
+
+
+class TestAzureCreateMeta(unittest.TestCase):
+    def test_projects_and_tags(self):
+        def req(path, params, body=None):
+            if path == "/_apis/projects":
+                return {"value": [{"name": "Proj A"}, {"name": "Proj B"}]}
+            if path == "/_apis/wit/tags":
+                return {"value": [{"name": "tag1"}, {"name": "tag2"}]}
+            raise AssertionError(path)
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "azure_req", req):
+            m = ha.azure_create_meta()
+        self.assertEqual(m["source"], "azure")
+        self.assertEqual(m["projects"],
+                         [{"key": "Proj A", "name": "Proj A"},
+                          {"key": "Proj B", "name": "Proj B"}])
+        self.assertEqual(m["labels"], ["tag1", "tag2"])
+
+    def test_tag_failure_degrades(self):
+        def req(path, params, body=None):
+            if path == "/_apis/projects":
+                return {"value": [{"name": "P"}]}
+            raise RuntimeError("no tags")
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "azure_req", req):
+            self.assertEqual(ha.azure_create_meta()["labels"], [])
+
+
+class TestAzureWorkitemTypes(unittest.TestCase):
+    def test_excludes_disabled(self):
+        def req(path, params, body=None):
+            self.assertIn("/workitemtypes", path)
+            return {"value": [{"name": "Bug"}, {"name": "Old", "isDisabled": True},
+                              {"foo": 1}]}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "azure_req", req):
+            self.assertEqual(ha.azure_workitem_types("P"), [{"id": "Bug", "name": "Bug"}])
+
+
+class TestStageCreateMeta(ManagerMixin, unittest.TestCase):
+    """{type:"boardCreateMeta"}: two shapes on one deque, told apart by `project`;
+    every failure stages an `error` rather than raising out of the beat."""
+
+    def _cfg(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e",
+                                   JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN="")
+
+    def test_projects_shape(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "board_create_meta",
+                return_value={"projects": [{"key": "E", "name": "E"}],
+                              "labels": ["x"], "source": "jira"}):
+            sm._stage_create_meta(None)
+        r = sm.create_meta_results[0]
+        self.assertIsNone(r["project"])
+        self.assertEqual(r["projects"], [{"key": "E", "name": "E"}])
+        self.assertEqual(r["labels"], ["x"])
+        self.assertIsNone(r["error"])
+
+    def test_types_shape(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "board_issue_types",
+                return_value=[{"id": "1", "name": "Task"}]) as f:
+            sm._stage_create_meta("ENG")
+        f.assert_called_once_with("ENG")
+        r = sm.create_meta_results[0]
+        self.assertEqual(r["project"], "ENG")
+        self.assertEqual(r["types"], [{"id": "1", "name": "Task"}])
+
+    def test_error_stages_not_raises(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "board_create_meta", side_effect=RuntimeError("boom")):
+            sm._stage_create_meta(None)
+        self.assertTrue(sm.create_meta_results[0]["error"].startswith("boom"))
+
+    def test_unconfigured_says_so(self):
+        sm = self.make_manager()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="", AZDO_TOKEN=""):
+            sm._stage_create_meta(None)
+        self.assertIn("no board credentials", sm.create_meta_results[0]["error"])
+
+
+class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
+    """{type:"createTicket"}: creates and stages the outcome keyed by cmdId; a bad
+    request or a create failure stages an `error` rather than raising."""
+
+    def _cfg(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net", JIRA_EMAIL="e",
+                                   JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN="")
+
+    def _cmd(self, **kw):
+        base = {"cmdId": "c1", "type": "createTicket", "project": "ENG",
+                "issueType": "1", "summary": "Hi", "description": "d",
+                "labels": ["a"]}
+        base.update(kw)
+        return base
+
+    def test_success_stages_key(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "create_board_issue",
+                return_value={"key": "ENG-5", "url": "u", "assigned": True}) as f:
+            sm._stage_create_ticket(self._cmd())
+        f.assert_called_once_with("ENG", "1", "Hi", "d", ["a"])
+        self.assertEqual(sm.create_ticket_results[0],
+                         {"cmdId": "c1", "key": "ENG-5", "url": "u", "error": None,
+                          "warning": None})
+
+    def test_unassigned_create_succeeds_but_warns(self):
+        """The board filters on the tracker user, so an unassigned ticket is
+        created and then invisible there — that has to be said out loud."""
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "create_board_issue",
+                return_value={"key": "ENG-6", "url": "u", "assigned": False}):
+            sm._stage_create_ticket(self._cmd())
+        out = sm.create_ticket_results[0]
+        self.assertEqual(out["key"], "ENG-6")
+        self.assertIsNone(out["error"])
+        self.assertIn("couldn't be assigned", out["warning"])
+
+    def test_missing_title_fails_without_creating(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(ha, "create_board_issue") as f:
+            sm._stage_create_ticket(self._cmd(summary="  "))
+        f.assert_not_called()
+        self.assertIn("title", sm.create_ticket_results[0]["error"])
+
+    def test_create_error_stages_bounded_error(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "create_board_issue",
+                side_effect=RuntimeError("Jira 400 " + "x" * 400)):
+            sm._stage_create_ticket(self._cmd())
+        r = sm.create_ticket_results[0]
+        self.assertIsNone(r["key"])
+        self.assertTrue(r["error"].startswith("Jira 400"))
+        self.assertLessEqual(len(r["error"]), 300)
+
+    def test_command_routes_and_acks(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "create_board_issue", return_value={"key": "E-1", "url": "u"}):
+            sm.handle_commands([self._cmd()])
+        self.assertEqual(sm.create_ticket_results[0]["key"], "E-1")
+        self.assertIn("c1", sm.acked)
+
+    def test_results_ride_payload_only_when_staged(self):
+        sm = self.make_manager()
+        sm.registry = []
+        p = sm.build_payload(1)
+        self.assertNotIn("createTicketResults", p)
+        self.assertNotIn("createMetaResults", p)
+        sm.create_ticket_results = [
+            {"cmdId": "c1", "key": "E-1", "url": "u", "error": None}]
+        sm.create_meta_results = [
+            {"project": None, "projects": [], "labels": [], "source": "jira",
+             "error": None}]
+        p = sm.build_payload(1)
+        self.assertEqual(p["createTicketResults"][0]["key"], "E-1")
+        self.assertEqual(p["createMetaResults"][0]["source"], "jira")
+
+
+class TestRefreshJira(ManagerMixin, unittest.TestCase):
+    """The manager's slow-cadence Jira refresh: stale-cache fail-open (a fetch
+    error keeps the prior tickets and surfaces only the error string)."""
+
+    def test_success_replaces_block(self):
+        sm = self.make_manager()
+        fresh = {**ha.JIRA_EMPTY, "available": True, "tickets": [{"key": "A-1"}]}
+        with mock.patch.object(ha, "collect_jira", return_value=fresh):
+            sm.refresh_jira()
+        self.assertEqual(sm.jira["tickets"], [{"key": "A-1"}])
+
+    def test_failure_keeps_stale_tickets_and_sets_error(self):
+        sm = self.make_manager()
+        sm.jira = {**ha.JIRA_EMPTY, "available": True,
+                   "fetchedAt": "2026-07-14T00:00:00Z",
+                   "tickets": [{"key": "A-1"}]}
+        with mock.patch.object(ha, "collect_jira",
+                               side_effect=RuntimeError("boom " + "x" * 300)):
+            sm.refresh_jira()
+        self.assertEqual(sm.jira["tickets"], [{"key": "A-1"}])       # stale kept
+        self.assertEqual(sm.jira["fetchedAt"], "2026-07-14T00:00:00Z")
+        self.assertTrue(sm.jira["error"].startswith("boom"))
+        self.assertLessEqual(len(sm.jira["error"]), 200)
+
+    def test_failed_first_poll_still_reports_configured(self):
+        # The regression the board's manual refresh depends on: a host whose
+        # very FIRST poll fails must still advertise configured=True, or the hub
+        # filters it out of the fan-out and the button can never retry the one
+        # host that's actually broken. (This is the real 503-at-boot case.)
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "e@x.com"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "t"):
+            sm = self.make_manager()
+            with mock.patch.object(ha, "collect_jira",
+                                   side_effect=RuntimeError("HTTP Error 503")):
+                sm.refresh_jira()
+        self.assertTrue(sm.jira["configured"])
+        self.assertFalse(sm.jira["available"])   # indistinguishable from "off"...
+        self.assertIsNone(sm.jira["siteKey"])    # ...on every field but the flag
+        self.assertIn("503", sm.jira["error"])
+
+    def test_success_after_failure_clears_error(self):
+        sm = self.make_manager()
+        sm.jira = {**ha.JIRA_EMPTY, "error": "old failure"}
+        fresh = {**ha.JIRA_EMPTY, "available": True}
+        with mock.patch.object(ha, "collect_jira", return_value=fresh):
+            sm.refresh_jira()
+        self.assertIsNone(sm.jira["error"])
+
+    def test_payload_cadence_and_light_gating(self):
+        sm = self.make_manager()
+        sm.registry = []
+        calls = []
+        sm.refresh_jira = lambda: calls.append(1)
+        with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
+             mock.patch.object(ha, "JIRA_EMAIL", "e"), \
+             mock.patch.object(ha, "JIRA_TOKEN", "t"):
+            payload = sm.build_payload(0)                 # beat 0 -> refresh
+            self.assertEqual(len(calls), 1)
+            sm.build_payload(1)                           # off-cadence -> no
+            self.assertEqual(len(calls), 1)
+            sm.build_payload(ha.JIRA_REFRESH_EVERY)       # on-cadence -> yes
+            self.assertEqual(len(calls), 2)
+            sm.build_payload(0, light=True)               # light beat -> no
+            self.assertEqual(len(calls), 2)
+        # The cached block rides every payload regardless, carrying the polled
+        # fields verbatim plus the picker's repo options.
+        self.assertIn("jira", payload)
+        self.assertEqual({k: v for k, v in payload["jira"].items()
+                          if k != "repoOptions"}, sm.jira)
+
+    def test_payload_skips_refresh_when_unconfigured(self):
+        # The manager is built INSIDE the patch: the block's `configured` flag
+        # is stamped at init from the creds, so a host is only genuinely
+        # unconfigured if it was unconfigured when it started. (Constructing it
+        # outside also leaks the ambient JIRA_* env of whatever box runs the
+        # suite — a real agent container has creds.)
+        with mock.patch.object(ha, "JIRA_SITE", ""), \
+             mock.patch.object(ha, "JIRA_EMAIL", ""), \
+             mock.patch.object(ha, "JIRA_TOKEN", ""):
+            sm = self.make_manager()
+            sm.registry = []
+            calls = []
+            sm.refresh_jira = lambda: calls.append(1)
+            payload = sm.build_payload(0)
+        self.assertEqual(calls, [])                       # zero Jira work
+        self.assertEqual(payload["jira"], ha.JIRA_EMPTY)  # block still present
+        self.assertFalse(payload["jira"]["configured"])
+
+
+class TestTriageCandidates(unittest.TestCase):
+    """The candidate set a ticket may be matched to: cloned repos first, then the
+    org's clonable ones. This list IS the org boundary and the allowlist."""
+
+    def test_cloned_repos_come_first_and_are_marked(self):
+        cands = ha._triage_candidates(
+            [{"name": "Turma"}, {"name": "DockerOps"}],
+            [{"nameWithOwner": "xerktech/Other", "name": "Other"}])
+        self.assertEqual([c["name"] for c in cands], ["Turma", "DockerOps", "Other"])
+        self.assertEqual([c["cloned"] for c in cands], [True, True, False])
+
+    def test_uncloned_org_repos_are_selectable_and_keep_their_owner(self):
+        cands = ha._triage_candidates([], [
+            {"nameWithOwner": "xerktech/Widget", "name": "Widget",
+             "description": "the widget service"},
+        ])
+        self.assertEqual(cands, [{"name": "Widget", "cloned": False,
+                                  "nameWithOwner": "xerktech/Widget",
+                                  "source": "github",
+                                  "description": "the widget service"}])
+
+    def test_a_cloned_repo_shadows_its_own_gh_listing(self):
+        # The same repo arrives twice (scanned on disk + listed by gh). It must
+        # collapse to ONE candidate, and to the cloned one — otherwise the model
+        # sees a duplicate name and the "prefer cloned" hint is meaningless.
+        cands = ha._triage_candidates(
+            [{"name": "Turma"}],
+            [{"nameWithOwner": "xerktech/Turma", "name": "Turma"}])
+        self.assertEqual(len(cands), 1)
+        self.assertTrue(cands[0]["cloned"])
+
+    def test_a_cloned_repo_inherits_its_gh_description(self):
+        # The scan knows a name and nothing else. Shadowing the gh half outright
+        # would leave the candidates the prompt tells the model to PREFER as bare
+        # names — describing worst exactly the repos most likely to win.
+        cands = ha._triage_candidates(
+            [{"name": "Turma"}],
+            [{"nameWithOwner": "xerktech/Turma", "name": "Turma",
+              "description": "agent fleet hub"}])
+        self.assertEqual(cands[0]["description"], "agent fleet hub")
+        self.assertEqual(cands[0]["nameWithOwner"], "xerktech/Turma")
+
+    def test_truncation_is_stable_against_gh_updatedat_churn(self):
+        # gh lists repos updatedAt-DESC, so a cut in THAT order makes the surviving
+        # name set move whenever anyone pushes to a cold repo — which would defeat
+        # _candidates_fingerprint's names-only design and re-triage the board on
+        # every sweep. The candidate cut must not depend on updatedAt at all.
+        gh = [{"nameWithOwner": f"o/r{i:03d}", "name": f"r{i:03d}",
+               "updatedAt": f"2026-01-{(i % 28) + 1:02d}T00:00:00Z"} for i in range(300)]
+        before = ha._triage_candidates([], gh)
+        shuffled = list(reversed(gh))   # the same repos, a later sweep's order
+        after = ha._triage_candidates([], shuffled)
+        self.assertEqual([c["name"] for c in before], [c["name"] for c in after])
+        self.assertEqual(ha._candidates_fingerprint(before),
+                         ha._candidates_fingerprint(after))
+
+    def test_root_pseudo_repo_is_never_a_candidate(self):
+        cands = ha._triage_candidates([{"name": ha.ROOT_REPO_NAME}], [])
+        self.assertEqual(cands, [])
+
+    def test_candidate_list_is_bounded(self):
+        gh = [{"nameWithOwner": f"o/r{i}", "name": f"r{i}"} for i in range(400)]
+        self.assertEqual(len(ha._triage_candidates([], gh)), ha.JIRA_TRIAGE_CANDIDATES)
+
+
+class TestTriageFingerprints(unittest.TestCase):
+    """What re-triages a ticket and — just as important — what doesn't."""
+
+    def test_ticket_text_change_invalidates(self):
+        a = {"summary": "Fix login", "type": "Bug", "project": "ENG", "labels": []}
+        b = {**a, "summary": "Fix logout"}
+        self.assertNotEqual(ha._ticket_fingerprint(a), ha._ticket_fingerprint(b))
+
+    def test_status_or_updated_churn_does_not_invalidate(self):
+        # A ticket moving column, or any field edit bumping `updated`, is not new
+        # information about WHICH REPO the work belongs in. Re-triaging on it
+        # would burn the shared login re-deciding the same answer.
+        a = {"summary": "Fix login", "type": "Bug", "project": "ENG", "labels": [],
+             "status": "To Do", "updated": "2026-07-01T00:00:00Z"}
+        b = {**a, "status": "In Progress", "updated": "2026-07-15T00:00:00Z"}
+        self.assertEqual(ha._ticket_fingerprint(a), ha._ticket_fingerprint(b))
+
+    def test_new_candidate_repo_invalidates(self):
+        one = ha._triage_candidates([{"name": "Turma"}], [])
+        two = ha._triage_candidates([{"name": "Turma"}, {"name": "Widget"}], [])
+        self.assertNotEqual(ha._candidates_fingerprint(one),
+                            ha._candidates_fingerprint(two))
+
+    def test_cloning_an_existing_candidate_invalidates(self):
+        # Same repo, now on disk: worth re-deciding, since "prefer cloned" may
+        # now pull a ticket to it.
+        before = ha._triage_candidates([], [{"nameWithOwner": "o/Widget", "name": "Widget"}])
+        after = ha._triage_candidates([{"name": "Widget"}], [])
+        self.assertNotEqual(ha._candidates_fingerprint(before),
+                            ha._candidates_fingerprint(after))
+
+    def test_gh_metadata_churn_does_not_invalidate(self):
+        # The regression this guards: the gh block re-sweeps on its own cadence
+        # and `updatedAt`/`description` move constantly. Hashing them would
+        # re-triage the ENTIRE board every sweep, forever.
+        before = ha._triage_candidates([], [
+            {"nameWithOwner": "o/Widget", "name": "Widget",
+             "description": "old", "updatedAt": "2026-01-01T00:00:00Z"}])
+        after = ha._triage_candidates([], [
+            {"nameWithOwner": "o/Widget", "name": "Widget",
+             "description": "new words entirely", "updatedAt": "2026-07-15T00:00:00Z"}])
+        self.assertEqual(ha._candidates_fingerprint(before),
+                         ha._candidates_fingerprint(after))
+
+    def test_candidate_order_does_not_invalidate(self):
+        a = [{"name": "A", "cloned": True}, {"name": "B", "cloned": False}]
+        self.assertEqual(ha._candidates_fingerprint(a),
+                         ha._candidates_fingerprint(list(reversed(a))))
+
+    def test_fingerprints_are_stable_across_processes(self):
+        # crc32, not the salted builtin hash: a per-process salt would invalidate
+        # the whole ledger on every manager restart.
+        import subprocess
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import importlib.util,sys;"
+             f"spec=importlib.util.spec_from_file_location('ha', {ha.__file__!r});"
+             "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);"
+             "print(m._ticket_fingerprint({'summary':'Fix login'}))"],
+            capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(),
+                         str(ha._ticket_fingerprint({"summary": "Fix login"})))
+
+
+class TestParseTriage(unittest.TestCase):
+    """The trust boundary: a model reply becomes a decision only if it names a
+    repo from the candidate list."""
+
+    def setUp(self):
+        self.cands = ha._triage_candidates(
+            [{"name": "Turma"}], [{"nameWithOwner": "xerktech/Widget", "name": "Widget"}])
+        self.tickets = [{"key": "ENG-1"}, {"key": "ENG-2"}]
+
+    def test_parses_repo_and_reason(self):
+        out = ha._parse_triage(
+            '{"ENG-1": {"repo": "Turma", "why": "heartbeat code"}}',
+            self.tickets, self.cands)
+        self.assertEqual(out["ENG-1"], {"repo": "Turma", "cloned": True,
+                                        "nameWithOwner": None, "source": None,
+                                        "reason": "heartbeat code"})
+
+    def test_uncloned_candidate_keeps_its_owner(self):
+        out = ha._parse_triage('{"ENG-1": {"repo": "Widget"}}', self.tickets, self.cands)
+        self.assertEqual(out["ENG-1"]["nameWithOwner"], "xerktech/Widget")
+        self.assertFalse(out["ENG-1"]["cloned"])
+
+    def test_hallucinated_repo_is_no_answer_not_a_no_repo_verdict(self):
+        # The model picks from a list, so an off-list name is invented. That's a
+        # BROKEN attempt — omitting the key leaves the ticket undecided so the
+        # retry picks it up. Recording it as "no repo fits" would paint a
+        # confident chip asserting something the model never said, and (decisions
+        # are never re-triaged) leave it there for good.
+        out = ha._parse_triage(
+            '{"ENG-1": {"repo": "totally-made-up", "why": "vibes"}}',
+            self.tickets, self.cands)
+        self.assertEqual(out, {})
+
+    def test_null_is_an_answer_meaning_no_repo_fits(self):
+        # The one case that IS a verdict: null was asked for and means what it says.
+        for raw in ['{"ENG-1": null}', '{"ENG-1": {"repo": null}}']:
+            out = ha._parse_triage(raw, self.tickets, self.cands)
+            self.assertEqual(out["ENG-1"]["repo"], None, raw)
+
+    def test_unreadable_value_shapes_are_no_answer(self):
+        # Haiku deviating from the asked-for shape ({"repository": ...}, a bare
+        # list) must retry, not silently become "no repo fits" for the batch.
+        for raw in ['{"ENG-1": {"repository": "Turma"}}',
+                    '{"ENG-1": ["Turma"]}',
+                    '{"ENG-1": 42}',
+                    '{"ENG-1": {"why": "no repo key at all"}}']:
+            self.assertEqual(ha._parse_triage(raw, self.tickets, self.cands), {}, raw)
+
+    def test_unasked_keys_are_ignored(self):
+        out = ha._parse_triage(
+            '{"ENG-1": {"repo": "Turma"}, "OPS-9": {"repo": "Turma"}}',
+            self.tickets, self.cands)
+        self.assertEqual(list(out), ["ENG-1"])
+
+    def test_bare_string_reply_is_tolerated(self):
+        out = ha._parse_triage('{"ENG-1": "Turma"}', self.tickets, self.cands)
+        self.assertEqual(out["ENG-1"]["repo"], "Turma")
+
+    def test_json_in_a_fence_or_prose_is_recovered(self):
+        for raw in ['```json\n{"ENG-1": {"repo": "Turma"}}\n```',
+                    'Sure! Here you go:\n{"ENG-1": {"repo": "Turma"}}\nHope that helps.']:
+            out = ha._parse_triage(raw, self.tickets, self.cands)
+            self.assertEqual(out["ENG-1"]["repo"], "Turma", raw)
+
+    def test_unusable_reply_is_no_decision_not_a_null_decision(self):
+        # An empty/garbage reply is a failed ATTEMPT (retry it), not the model
+        # saying "no repo fits" (which would render a chip and never retry).
+        for raw in ["", None, "I could not determine this.", "{oops", "[1,2]"]:
+            self.assertEqual(ha._parse_triage(raw, self.tickets, self.cands), {}, repr(raw))
+
+    def test_reason_is_capped(self):
+        out = ha._parse_triage(
+            '{"ENG-1": {"repo": "Turma", "why": "%s"}}' % ("x" * 400),
+            self.tickets, self.cands)
+        self.assertEqual(len(out["ENG-1"]["reason"]), ha.JIRA_TRIAGE_REASON_MAX)
+
+
+class TestJiraTriage(ManagerMixin, unittest.TestCase):
+    """The triage lifecycle on the manager: batching, caching, retries, and the
+    repoGuess that rides the heartbeat."""
+
+    def setUp(self):
+        super().setUp()
+        self.popen_calls = []
+        p = mock.patch.object(ha, "scan_repos",
+                              return_value=[{"name": "Turma",
+                                             "path": os.path.join(self.tmp, "Turma")}])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _configured(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t")
+
+    def _manager(self, tickets):
+        sm = self.make_manager()
+        sm.jira = {**ha.JIRA_EMPTY, "available": True, "configured": True,
+                   "siteKey": "s.atlassian.net", "tickets": tickets}
+        sm.github = {"available": True, "login": "x",
+                     "repos": [{"nameWithOwner": "xerktech/Widget", "name": "Widget"}]}
+        return sm
+
+    def _fake_popen(self, reply, rc=0):
+        """Stand in for the detached `claude -p`: record the argv and write the
+        reply where the real subprocess's stdout redirect would have put it."""
+        test = self
+
+        class FakeProc:
+            def __init__(self, cmd, stdout=None, **kw):
+                test.popen_calls.append(cmd)
+                if reply is not None and stdout is not None:
+                    stdout.write(reply)
+                    stdout.flush()
+
+            def poll(self):
+                return rc
+
+            def kill(self):
+                pass
+
+        return mock.patch.object(ha.subprocess, "Popen", FakeProc)
+
+    def test_triage_decides_and_stamps_repo_guess_on_the_ticket(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen(
+                '{"ENG-1": {"repo": "Turma", "why": "heartbeat lives there"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"], {
+            "repo": "Turma", "cloned": True, "nameWithOwner": None,
+            "source": None, "reason": "heartbeat lives there", "manual": False,
+            "at": sm.jira["tickets"][0]["repoGuess"]["at"],
+        })
+
+    def test_untriaged_ticket_carries_no_guess_at_all(self):
+        # Absence must not read as "no repo fits" — the board draws nothing for
+        # a ticket it simply hasn't looked at yet.
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        sm._apply_triage()
+        self.assertNotIn("repoGuess", sm.jira["tickets"][0])
+
+    def test_declined_ticket_carries_an_explicit_null_repo(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Design review"}])
+        with self._configured(), self._fake_popen('{"ENG-1": null}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        self.assertIn("repoGuess", sm.jira["tickets"][0])
+        self.assertIsNone(sm.jira["tickets"][0]["repoGuess"]["repo"])
+
+    def test_the_model_only_ever_sees_candidate_repos(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), self._fake_popen('{"ENG-1": null}'):
+            sm._start_jira_triage()
+        prompt = self.popen_calls[0][-1]
+        self.assertIn("Turma [cloned]", prompt)
+        self.assertIn("- Widget", prompt)
+        self.assertIn("ENG-1: x", prompt)
+
+    def test_launch_is_headless_and_never_enters_a_repo(self):
+        # Same posture as the session summarizer: no --settings (so no guard to
+        # load), cwd outside any worktree, argv list (so ticket text can't inject).
+        sm = self._manager([{"key": "ENG-1", "summary": "x; rm -rf /"}])
+        with self._configured(), self._fake_popen('{"ENG-1": null}'):
+            sm._start_jira_triage()
+        cmd = self.popen_calls[0]
+        self.assertEqual(cmd[:4], ["claude", "-p", "--model", ha.JIRA_TRIAGE_MODEL])
+        self.assertEqual(len(cmd), 5)          # the prompt is ONE argv element
+        self.assertNotIn("--settings", cmd)
+
+    def test_a_settled_board_costs_nothing(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+            self.popen_calls.clear()
+            for _ in range(5):
+                sm._start_jira_triage()
+        self.assertEqual(self.popen_calls, [])
+
+    def test_decisions_survive_a_manager_restart(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        again = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        again._apply_triage()
+        self.assertEqual(again.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+        self.popen_calls.clear()
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            again._start_jira_triage()
+        self.assertEqual(self.popen_calls, [])   # no re-run
+
+    def test_edited_ticket_is_retriaged(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "Rewrite the Widget API"}]
+        self.popen_calls.clear()
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Widget"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        self.assertEqual(len(self.popen_calls), 1)
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Widget")
+
+    def test_a_stale_decision_keeps_rendering_until_a_new_one_lands(self):
+        # Stale means "re-triage this", NOT "stop showing it". The old answer is
+        # the best one available until a better one arrives, and blanking it here
+        # would wipe every chip on the board over a transient (a gh hiccup
+        # restales every ticket at once).
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "Rewrite the Widget API"}]
+        with self._configured(), self._fake_popen(None):
+            sm._start_jira_triage()   # re-triage in flight
+        sm._apply_triage()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+    def test_a_failed_attempt_does_not_destroy_the_existing_decision(self):
+        # The regression: an unrelated transient (a rate limit on the one shared
+        # ~/.claude login) must not cost the board a decision it already paid for.
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "Rewrite the Widget API"}]
+        with self._configured(), self._fake_popen("garbage"):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()    # attempt fails outright
+        sm._apply_triage()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+    def test_a_gh_outage_neither_restales_nor_blanks_the_board(self):
+        # refresh_github blanks the block to repos:[] on ANY error — on that field
+        # alone, identical to "the org has no repos". Triaging against it would
+        # re-run the whole board through the model twice (once when gh breaks,
+        # once when it recovers) and burn every ticket's retry budget.
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        sm.github = {"available": False, "login": None, "repos": []}   # gh hiccup
+        self.popen_calls.clear()
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+        self.assertEqual(self.popen_calls, [], "no re-triage from a gh outage")
+        sm._apply_triage()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+    def test_a_new_question_gets_a_fresh_retry_budget(self):
+        # attempts are scoped to the question being asked, not to the ticket's
+        # life. A lifetime counter would let three invalidations spread over months
+        # permanently ban a ticket from re-triage — freezing a now-wrong chip.
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        for i in range(ha.JIRA_TRIAGE_MAX_ATTEMPTS):
+            with self._configured(), self._fake_popen("garbage"), \
+                 mock.patch.object(ha.time, "time", return_value=1e9 + i * 1e6):
+                sm._start_jira_triage()
+                sm._poll_jira_triage()
+        self.popen_calls.clear()
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "a different ticket now"}]
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        self.assertEqual(len(self.popen_calls), 1, "exhausted budget must not carry over")
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+    def test_a_landed_decision_clears_the_attempt_run(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), self._fake_popen("garbage"):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()    # burns attempt 1
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'), \
+             mock.patch.object(ha.time, "time", return_value=1e12):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()    # succeeds on attempt 2
+        entry = sm.triage_ledger["s.atlassian.net/ENG-1"]
+        self.assertTrue(entry["decided"])
+        for k in ("attempts", "retryAt", "tryTicketFp", "tryCandFp"):
+            self.assertNotIn(k, entry)
+
+    def test_batch_is_bounded_and_one_job_runs_at_a_time(self):
+        tickets = [{"key": f"ENG-{i}", "summary": f"t{i}"} for i in range(60)]
+        sm = self._manager(tickets)
+        with self._configured(), self._fake_popen(None):
+            sm._start_jira_triage()
+            sm._start_jira_triage()   # a job is in flight; must not fork another
+        self.assertEqual(len(self.popen_calls), 1)
+        self.assertEqual(self.popen_calls[0][-1].count("(type:"), 0)
+        self.assertEqual(len(sm.triage_job["batch"]), ha.JIRA_TRIAGE_BATCH)
+
+    def test_a_backlog_drains_over_later_beats(self):
+        tickets = [{"key": f"ENG-{i}", "summary": f"t{i}"} for i in range(60)]
+        sm = self._manager(tickets)
+        seen = set()
+        for _ in range(3):
+            reply = json.dumps({t["key"]: {"repo": "Turma"} for t in tickets})
+            with self._configured(), self._fake_popen(reply):
+                sm._start_jira_triage()
+                sm._poll_jira_triage()
+        for t in sm.jira["tickets"]:
+            seen.add(t.get("repoGuess", {}).get("repo"))
+        self.assertEqual(seen, {"Turma"})   # all 60 decided in 3 batches of 25
+
+    def test_unanswered_ticket_retries_then_gives_up(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        for i in range(ha.JIRA_TRIAGE_MAX_ATTEMPTS + 2):
+            with self._configured(), self._fake_popen("garbage"),                  mock.patch.object(ha.time, "time", return_value=1e9 + i * 1e6):
+                sm._start_jira_triage()
+                sm._poll_jira_triage()
+        self.assertEqual(len(self.popen_calls), ha.JIRA_TRIAGE_MAX_ATTEMPTS)
+        self.assertNotIn("repoGuess", sm.jira["tickets"][0])
+
+    def test_backoff_spaces_the_retries(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), self._fake_popen("garbage"):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+            self.popen_calls.clear()
+            sm._start_jira_triage()   # immediately after: still inside the backoff
+        self.assertEqual(self.popen_calls, [])
+
+    def test_timeout_kills_the_job_and_frees_the_slot(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), self._fake_popen(None, rc=None):
+            sm._start_jira_triage()
+            sm.triage_job["startedMono"] -= ha.JIRA_TRIAGE_TIMEOUT_SEC + 1
+            sm._poll_jira_triage()
+        self.assertIsNone(sm.triage_job)
+
+    def test_unconfigured_host_never_triages(self):
+        sm = self.make_manager()
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN=""), \
+             self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+        self.assertEqual(self.popen_calls, [])
+        self.assertIsNone(sm.triage_job)
+
+    def test_no_candidates_means_no_triage(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        sm.github = {"available": False, "login": None, "repos": []}
+        with self._configured(), mock.patch.object(ha, "scan_repos", return_value=[]), \
+             self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+        self.assertEqual(self.popen_calls, [])
+
+    def test_refresh_jira_restamps_guesses_onto_the_new_tickets(self):
+        # collect_jira() builds fresh dicts every poll; without the re-stamp the
+        # board's chips would blank on every slow beat.
+        sm = self._manager([{"key": "ENG-1", "summary": "Fix the heartbeat"}])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        fresh = {**ha.JIRA_EMPTY, "available": True, "siteKey": "s.atlassian.net",
+                 "tickets": [{"key": "ENG-1", "summary": "Fix the heartbeat"}]}
+        with mock.patch.object(ha, "collect_jira", return_value=fresh):
+            sm.refresh_jira()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+
+class TestSetJiraRepo(ManagerMixin, unittest.TestCase):
+    """The operator's own answer to which repo a ticket belongs in — a manual pin
+    that outranks the model and is never re-triaged, the same posture a hand-typed
+    session rename takes against the auto-summarizer."""
+
+    def setUp(self):
+        super().setUp()
+        self.popen_calls = []
+        p = mock.patch.object(ha, "scan_repos",
+                              return_value=[{"name": "Turma",
+                                             "path": os.path.join(self.tmp, "Turma")}])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _configured(self):
+        return mock.patch.multiple(ha, JIRA_SITE="s.atlassian.net",
+                                   JIRA_EMAIL="e", JIRA_TOKEN="t")
+
+    def _manager(self, tickets=None):
+        sm = self.make_manager()
+        sm.jira = {**ha.JIRA_EMPTY, "available": True, "configured": True,
+                   "siteKey": "s.atlassian.net",
+                   "tickets": tickets if tickets is not None
+                   else [{"key": "ENG-1", "summary": "x"}]}
+        sm.github = {"available": True, "login": "x",
+                     "repos": [{"nameWithOwner": "xerktech/Widget", "name": "Widget"}]}
+        sm._refresh_triage_candidates()
+        return sm
+
+    def _fake_popen(self, reply, rc=0):
+        test = self
+
+        class FakeProc:
+            def __init__(self, cmd, stdout=None, **kw):
+                test.popen_calls.append(cmd)
+                if reply is not None and stdout is not None:
+                    stdout.write(reply)
+                    stdout.flush()
+
+            def poll(self):
+                return rc
+
+            def kill(self):
+                pass
+
+        return mock.patch.object(ha.subprocess, "Popen", FakeProc)
+
+    def test_pins_a_cloned_repo_and_marks_it_manual(self):
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Turma")
+        g = sm.jira["tickets"][0]["repoGuess"]
+        self.assertEqual(g["repo"], "Turma")
+        self.assertTrue(g["cloned"])
+        self.assertTrue(g["manual"])
+
+    def test_pins_an_uncloned_repo_too(self):
+        # The whole point of offering uncloned repos: a ticket can belong to a repo
+        # this host hasn't cloned yet, and saying so is a real answer.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Widget")
+        g = sm.jira["tickets"][0]["repoGuess"]
+        self.assertEqual(g["repo"], "Widget")
+        self.assertFalse(g["cloned"])
+        self.assertEqual(g["nameWithOwner"], "xerktech/Widget")
+        self.assertTrue(g["manual"])
+
+    def test_an_explicit_none_is_a_manual_no_repo_fits(self):
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", None)
+        g = sm.jira["tickets"][0]["repoGuess"]
+        self.assertIsNone(g["repo"])
+        self.assertTrue(g["manual"])
+
+    def test_a_manual_pin_is_never_re_triaged(self):
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Widget")
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+        self.assertEqual(self.popen_calls, [], "a pinned ticket must not be triaged")
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Widget")
+
+    def test_a_pin_survives_the_ticket_text_changing(self):
+        # A ticket edit restales an AUTO decision; it must not unpin a manual one.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Widget")
+        sm.jira["tickets"] = [{"key": "ENG-1", "summary": "completely rewritten"}]
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+        self.assertEqual(self.popen_calls, [])
+        sm._apply_triage()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Widget")
+
+    def test_a_pin_landing_mid_flight_beats_the_model_reply(self):
+        # The batch was built before the override existed, so its reply answers a
+        # question no longer being asked.
+        sm = self._manager()
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm.set_jira_repo("ENG-1", "Widget")   # operator overrides mid-flight
+            sm._poll_jira_triage()
+        g = sm.jira["tickets"][0]["repoGuess"]
+        self.assertEqual(g["repo"], "Widget")
+        self.assertTrue(g["manual"])
+
+    def test_auto_releases_the_pin_with_a_full_retry_budget(self):
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Widget")
+        sm.set_jira_repo("ENG-1", None, auto=True)
+        self.assertNotIn("s.atlassian.net/ENG-1", sm.triage_ledger)
+        self.assertNotIn("repoGuess", sm.jira["tickets"][0])
+        with self._configured(), self._fake_popen('{"ENG-1": {"repo": "Turma"}}'):
+            sm._start_jira_triage()
+            sm._poll_jira_triage()
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+        self.assertFalse(sm.jira["tickets"][0]["repoGuess"]["manual"])
+
+    def test_a_non_candidate_repo_is_refused(self):
+        # The operator is likelier right than the model, but the request still
+        # arrives over HTTP, and a name this host can't offer is one its own picker
+        # never showed.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "NotARepo")
+        self.assertNotIn("repoGuess", sm.jira["tickets"][0])
+        self.assertNotIn("s.atlassian.net/ENG-1", sm.triage_ledger)
+
+    def test_a_bad_issue_key_is_refused_before_it_reaches_the_ledger(self):
+        sm = self._manager()
+        for bad in ["../../etc/passwd", "", "42", "ENG-", None]:
+            sm.set_jira_repo(bad, "Turma")
+        self.assertEqual(sm.triage_ledger, {})
+
+    def test_a_command_for_another_org_is_refused(self):
+        # The hub routes by siteKey; a mismatch means it reached the wrong host,
+        # and filing it under ours would corrupt a key another board reads.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Turma", site_key="other.atlassian.net")
+        self.assertEqual(sm.triage_ledger, {})
+        sm.set_jira_repo("ENG-1", "Turma", site_key="s.atlassian.net")
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Turma")
+
+    def test_a_pin_persists_across_a_manager_restart(self):
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Widget")
+        sm2 = self._manager()
+        self.assertTrue(sm2.triage_ledger["s.atlassian.net/ENG-1"]["manual"])
+        sm2._apply_triage()
+        self.assertEqual(sm2.jira["tickets"][0]["repoGuess"]["repo"], "Widget")
+
+    def test_cloning_a_pinned_repo_updates_its_clone_state(self):
+        # A pin never re-triages, so a stored cloned:false would outlive the clone
+        # forever and leave the chip dashed for good.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Widget")
+        self.assertFalse(sm.jira["tickets"][0]["repoGuess"]["cloned"])
+        with mock.patch.object(ha, "scan_repos", return_value=[
+                {"name": "Turma", "path": os.path.join(self.tmp, "Turma")},
+                {"name": "Widget", "path": os.path.join(self.tmp, "Widget")}]):
+            sm._refresh_triage_candidates()
+        sm._apply_triage()
+        self.assertTrue(sm.jira["tickets"][0]["repoGuess"]["cloned"])
+
+    def test_a_gh_outage_does_not_flip_a_pinned_repo_to_uncloned(self):
+        # The candidate list blanks on a failed sweep; absence there is not
+        # evidence a repo stopped being cloned.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Turma")
+        sm.github = {"available": False, "login": None, "repos": []}
+        with mock.patch.object(ha, "scan_repos", return_value=[]):
+            sm._refresh_triage_candidates()
+        sm._apply_triage()
+        self.assertTrue(sm.jira["tickets"][0]["repoGuess"]["cloned"])
+
+    def test_a_pin_is_evicted_last_when_the_ledger_is_bounded(self):
+        # An auto decision a prune drops is recomputed next beat; a pin is the one
+        # thing here that cannot be regenerated.
+        sm = self._manager()
+        sm.set_jira_repo("ENG-1", "Turma")
+        for i in range(ha.JIRA_TRIAGE_LEDGER_MAX + 10):
+            sm.triage_ledger[f"s.atlassian.net/AUTO-{i}"] = {
+                "decided": True, "repo": "Turma", "at": "2999-01-01T00:00:00Z"}
+        sm._prune_triage_ledger()
+        self.assertIn("s.atlassian.net/ENG-1", sm.triage_ledger)
+
+    def test_the_picker_options_ride_the_heartbeat_and_match_the_allowlist(self):
+        # The board offers exactly what set_jira_repo accepts — the two read the
+        # same list, so they cannot drift.
+        sm = self._manager()
+        with self._configured():
+            payload = sm.build_payload(1)
+        names = [o["name"] for o in payload["jira"]["repoOptions"]]
+        self.assertEqual(sorted(names), ["Turma", "Widget"])
+        for name in names:
+            sm.set_jira_repo("ENG-1", name)
+            self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], name)
+
+    def test_an_unconfigured_host_ships_no_picker_options(self):
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN=""):
+            sm = self.make_manager()
+            payload = sm.build_payload(1)
+        self.assertNotIn("repoOptions", payload["jira"])
+
+    def test_no_agent_side_auto_start_flag(self):
+        # Auto-start opt-in is HUB-ONLY (XERK-41): the agent carries no
+        # TICKET_AUTO_START env and reports no ticketAutoStart flag.
+        self.assertFalse(hasattr(ha, "TICKET_AUTO_START"))
+        sm = self._manager()
+        with self._configured():
+            payload = sm.build_payload(1)
+        self.assertNotIn("ticketAutoStart", payload)
+        self.assertNotIn("autoStart", payload["jira"])
+
+    def test_the_command_reaches_set_jira_repo(self):
+        sm = self._manager()
+        sm.handle_commands([{"cmdId": "c1", "type": "setJiraRepo",
+                             "siteKey": "s.atlassian.net", "issueKey": "ENG-1",
+                             "repo": "Widget", "auto": False}])
+        self.assertEqual(sm.jira["tickets"][0]["repoGuess"]["repo"], "Widget")
+        sm.handle_commands([{"cmdId": "c2", "type": "setJiraRepo",
+                             "siteKey": "s.atlassian.net", "issueKey": "ENG-1",
+                             "repo": None, "auto": True}])
+        self.assertNotIn("repoGuess", sm.jira["tickets"][0])
+
+    def test_ledger_is_bounded(self):
+        sm = self._manager([])
+        for i in range(ha.JIRA_TRIAGE_LEDGER_MAX + 50):
+            sm.triage_ledger[f"s/OLD-{i}"] = {"decided": True, "repo": "Turma",
+                                              "at": f"2026-01-01T00:00:{i:02d}Z"}
+        sm._prune_triage_ledger()
+        self.assertEqual(len(sm.triage_ledger), ha.JIRA_TRIAGE_LEDGER_MAX)
+
+    def test_prune_keeps_work_still_owed(self):
+        # An undecided entry is a retry the manager still owes; dropping it would
+        # silently cancel that work.
+        sm = self._manager([])
+        for i in range(ha.JIRA_TRIAGE_LEDGER_MAX + 10):
+            sm.triage_ledger[f"s/OLD-{i}"] = {"decided": True, "repo": "Turma",
+                                              "at": f"2026-01-01T00:00:{i:02d}Z"}
+        sm.triage_ledger["s/NEW-1"] = {"decided": False, "attempts": 1}
+        sm._prune_triage_ledger()
+        self.assertIn("s/NEW-1", sm.triage_ledger)
+
+    def test_triage_never_raises_out_of_the_heartbeat(self):
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        sm.registry = []
+        with self._configured(), \
+             mock.patch.object(ha.subprocess, "Popen", side_effect=OSError("no claude")):
+            payload = sm.build_payload(1)
+        self.assertIn("jira", payload)
+        self.assertIsNone(sm.triage_job)
+
+
+class TestNextTicketBranch(unittest.TestCase):
+    """The ticket -> branch name rule: the bare key, then -1/-2 as it's taken."""
+
+    def test_bare_key_when_nothing_holds_it(self):
+        self.assertEqual(ha.next_ticket_branch("PROJ-123", set()), "PROJ-123")
+
+    def test_suffixes_climb_past_taken_names(self):
+        self.assertEqual(ha.next_ticket_branch("PROJ-123", {"PROJ-123"}), "PROJ-123-1")
+        self.assertEqual(
+            ha.next_ticket_branch("PROJ-123", {"PROJ-123", "PROJ-123-1"}), "PROJ-123-2")
+
+    def test_fills_a_gap_left_by_a_deleted_branch(self):
+        # -1 was merged and pruned. The rule is "first free name", not "count how
+        # many ever existed" — otherwise a pruned repo keeps climbing forever.
+        self.assertEqual(
+            ha.next_ticket_branch("PROJ-123", {"PROJ-123", "PROJ-123-2"}), "PROJ-123-1")
+
+    def test_a_similar_key_is_not_a_collision(self):
+        # PROJ-1230 shares a prefix but is a different ticket entirely.
+        self.assertEqual(ha.next_ticket_branch("PROJ-123", {"PROJ-1230"}), "PROJ-123")
+
+    def test_blank_entries_are_ignored(self):
+        self.assertEqual(ha.next_ticket_branch("PROJ-123", ["", None, "  "]), "PROJ-123")
+
+    def test_none_when_every_suffix_is_taken(self):
+        taken = {"PROJ-9"} | {f"PROJ-9-{n}"
+                              for n in range(1, ha.TICKET_BRANCH_MAX_SUFFIX + 1)}
+        self.assertIsNone(ha.next_ticket_branch("PROJ-9", taken))
+
+
+class TestBranchNames(unittest.TestCase):
+    """Every name a new branch could collide with: local heads, plus remote
+    branches reduced to the name they'd have locally."""
+
+    def _names(self, refs):
+        with mock.patch.object(ha, "run", lambda cmd, cwd=None: "\n".join(refs)):
+            return ha.branch_names("/repo")
+
+    def test_local_and_remote_branches_both_count(self):
+        # A branch pushed for this ticket from another host counts even on a host
+        # that has never checked it out — that's the point of reading remotes.
+        self.assertEqual(
+            self._names(["refs/heads/main", "refs/heads/PROJ-1",
+                         "refs/remotes/origin/PROJ-2"]),
+            {"main", "PROJ-1", "PROJ-2"})
+
+    def test_origin_head_is_not_a_name(self):
+        # It's a symbolic alias for the default branch, not a branch anyone took.
+        self.assertEqual(self._names(["refs/remotes/origin/HEAD"]), set())
+
+    def test_a_slashed_branch_keeps_its_whole_name(self):
+        # Only the REMOTE prefix is stripped; "feat/x" is the branch's real name.
+        self.assertEqual(
+            self._names(["refs/heads/feat/x", "refs/remotes/origin/feat/y"]),
+            {"feat/x", "feat/y"})
+
+    def test_junk_lines_are_skipped(self):
+        self.assertEqual(self._names(["", "  ", "refs/tags/v1", "refs/heads/ok"]),
+                         {"ok"})
+
+
+class TestBuildTicketPrompt(unittest.TestCase):
+    """The ticket -> initial prompt. The session has no Jira creds of its own, so
+    this text is all it will ever see of the ticket."""
+
+    def _detail(self, **over):
+        d = {"key": "PROJ-7", "summary": "Fix the board",
+             "url": "https://x.atlassian.net/browse/PROJ-7",
+             "status": "In Progress", "type": "Bug", "priority": "High",
+             "assignee": "Ann", "description": "The board is broken.",
+             "comments": [], "commentTotal": 0}
+        d.update(over)
+        return d
+
+    def test_carries_the_ticket_text(self):
+        p = ha.build_ticket_prompt(self._detail())
+        for want in ("PROJ-7", "Fix the board", "In Progress", "High", "Ann",
+                     "The board is broken.",
+                     "https://x.atlassian.net/browse/PROJ-7"):
+            self.assertIn(want, p)
+
+    def test_says_plainly_that_it_is_a_snapshot(self):
+        # The session can't re-read Jira itself, so the prompt has to be honest
+        # about what it is and point at the live copy.
+        p = ha.build_ticket_prompt(self._detail())
+        self.assertIn("snapshot", p)
+
+    def test_missing_fields_are_omitted_rather_than_blank(self):
+        p = ha.build_ticket_prompt({"key": "PROJ-8"})
+        self.assertIn("PROJ-8", p)
+        self.assertNotIn("Priority:", p)
+        self.assertNotIn("Assignee:", p)
+        self.assertIn("_No description._", p)
+        self.assertIn("_No comments._", p)
+
+    def test_comments_are_inlined_newest_first_kept(self):
+        cs = [{"author": f"U{i}", "created": "2026-01-01", "body": f"note {i}"}
+              for i in range(12)]
+        p = ha.build_ticket_prompt(self._detail(comments=cs, commentTotal=12))
+        self.assertIn("note 11", p)       # newest kept
+        self.assertNotIn("note 0\n", p)   # oldest dropped by the cap
+        self.assertIn("2 older are in Jira", p)
+
+    def test_labels_and_parent_are_flattened(self):
+        p = ha.build_ticket_prompt(self._detail(
+            labels=["ops", "urgent"], parentKey="PROJ-1", parentSummary="Epic"))
+        self.assertIn("ops, urgent", p)
+        self.assertIn("PROJ-1 — Epic", p)
+
+    def test_never_raises_on_a_junk_detail(self):
+        # It's built from a network response; a shape surprise must not take the
+        # spawn (and with it the manager's beat) down.
+        for junk in (None, {}, {"comments": [None, "x"], "labels": "nope"},
+                     {"key": "P-1", "comments": [{}]}):
+            self.assertIsInstance(ha.build_ticket_prompt(junk), str)
+
+
+class TestSpawnTicket(ManagerMixin, unittest.TestCase):
+    """The board's start button, agent-side: resolve the repo from THIS host's
+    triage ledger, fetch the ticket, reserve a branch, spawn."""
+
+    SITE = "x.atlassian.net"
+
+    def make_ticket_manager(self, *, repos=None, decided=True, repo="Turma"):
+        if repos is None:
+            repos = [{"name": "Turma", "path": os.path.join(self.tmp, "Turma")}]
+        sm = self.make_manager()
+        for name, value in [("scan_repos", lambda: repos),
+                            ("JIRA_SITE", self.SITE),
+                            ("JIRA_EMAIL", "a@b.c"),
+                            ("JIRA_TOKEN", "t")]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        if decided:
+            sm.triage_ledger[ha._triage_key(self.SITE, "PROJ-7")] = {
+                "decided": True, "repo": repo, "cloned": True, "reason": "it's there"}
+        sm._launch_ttyd = mock.Mock()   # avoid the real Popen
+        return sm
+
+    def _detail(self, **over):
+        d = {"key": "PROJ-7", "summary": "Fix the board",
+             "url": f"https://{self.SITE}/browse/PROJ-7",
+             "description": "broken", "comments": []}
+        d.update(over)
+        return d
+
+    def _launches(self):
+        return [c for c in self.run_ok_calls if c and c[0] == "tmux" and "new-session" in c]
+
+    def test_spawns_with_the_ticket_and_a_reserved_branch(self):
+        sm = self.make_ticket_manager()
+        sm._start_summary = mock.Mock()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", cmd_id="c1")
+        self.assertEqual(len(sm.registry), 1)
+        sess = sm.registry[0]
+        self.assertEqual(sess["repo"], "Turma")
+        self.assertEqual(sess["spawnCmdId"], "c1")     # the UI's handle on it
+        self.assertEqual(sess["ticket"], {
+            "key": "PROJ-7", "siteKey": self.SITE,
+            "url": f"https://{self.SITE}/browse/PROJ-7",
+            "summary": "Fix the board", "branch": "PROJ-7",
+        })
+        # The ticket names the session, so no `claude -p` naming job is spent.
+        self.assertEqual(sess["summary"], "PROJ-7 Fix the board")
+        sm._start_summary.assert_not_called()
+        # ...and the link rides the heartbeat, which is what the board indexes.
+        self.assertEqual(
+            sm._session_payload(sess, refresh=False)["ticket"]["key"], "PROJ-7")
+
+    def test_the_link_outlives_the_session_it_was_spawned_for(self):
+        """The whole ask: which session was tasked with a ticket must survive.
+        Three channels, each covering the next one's blind spot — the live record,
+        the closed record it becomes when killed, and the durable ledger that is
+        all that's left once closed.json evicts it (CLOSED_PER_REPO per repo)."""
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        sess = sm.registry[0]
+        tid = sess["claudeSessionId"]
+        self.assertEqual(sm.ticket_ledger[tid]["key"], "PROJ-7")
+
+        sm.kill(sess["id"])
+        self.assertEqual(sm._closed_payload()[0]["ticket"]["key"], "PROJ-7")
+
+        # Now evict the closed record, as the 6th kill in this repo would. The
+        # ledger is the only thing left that knows, and it's on disk — so a fresh
+        # manager (an agent restart) still answers.
+        sm.closed = []
+        sm.save()
+        self.assertEqual(self.make_manager().ticket_ledger[tid]["key"], "PROJ-7")
+
+    def test_the_ticket_text_is_the_initial_prompt(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue",
+                               lambda k: self._detail(description="the board is broken")):
+            sm.spawn_ticket("PROJ-7")
+        cmd = self._launches()[-1][-1]
+        self.assertIn("the board is broken", cmd)
+
+    def test_the_reserved_branch_rides_the_system_prompt(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        cmd = self._launches()[-1][-1]
+        self.assertIn("--append-system-prompt", cmd)
+        self.assertIn("Name the branch you create for it exactly: PROJ-7", cmd)
+        # The directive EXTENDS the branching policy rather than replacing it —
+        # the branch still has to be cut from the refreshed remote default.
+        self.assertIn("git fetch origin", cmd)
+
+    def test_a_second_session_on_one_ticket_gets_the_next_branch(self):
+        # The first session hasn't branched yet, so git knows nothing about its
+        # name (branch_names sees an empty repo here) — the reservation has to
+        # come from the registry, or both would be told "PROJ-7".
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual([s["ticket"]["branch"] for s in sm.registry],
+                         ["PROJ-7", "PROJ-7-1"])
+
+    def test_an_existing_branch_in_git_is_avoided(self):
+        # The ticket was worked months ago and the branch pushed; the name is
+        # taken even though this manager has no session for it.
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "run",
+                               lambda cmd, cwd=None: "refs/remotes/origin/PROJ-7"), \
+             mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry[0]["ticket"]["branch"], "PROJ-7-1")
+
+    def test_the_ticket_survives_kill_and_resume(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        sid = sm.registry[0]["id"]
+        sm.kill(sid)
+        sm.resume(sid)
+        sess = next(s for s in sm.registry if s["id"] == sid)
+        # The reserved name is re-TOLD, not re-reserved: it's what this session
+        # is, and re-reserving would hand it -1 against its own first branch.
+        self.assertEqual(sess["ticket"]["branch"], "PROJ-7")
+        self.assertIn("Name the branch you create for it exactly: PROJ-7",
+                      self._launches()[-1][-1])
+
+    def test_an_ordinary_session_reports_no_ticket(self):
+        sm = self.make_ticket_manager()
+        sm.spawn("Turma")
+        self.assertIsNone(sm.registry[0]["ticket"])
+        self.assertIsNone(
+            sm._session_payload(sm.registry[0], refresh=False)["ticket"])
+
+    def test_refuses_an_untriaged_ticket_without_calling_jira(self):
+        sm = self.make_ticket_manager(decided=False)
+        with mock.patch.object(ha, "fetch_jira_issue") as f:
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry, [])
+        f.assert_not_called()
+
+    def test_refuses_an_uncloned_repo_with_no_owner_to_clone(self):
+        # Not cloned here AND the ledger recorded no owner/repo to clone from —
+        # there's nothing to clone, so refuse before spending a Jira fetch.
+        sm = self.make_ticket_manager(repo="Elsewhere")  # no nameWithOwner
+        with mock.patch.object(ha, "fetch_jira_issue") as f:
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry, [])
+        f.assert_not_called()
+
+    def test_uncloned_repo_with_an_owner_clones_on_demand_and_queues(self):
+        # The hub routes a ticket to the most-available host in the org even when
+        # NO host has the repo; that host clones it and queues the session behind
+        # the clone (provisioned by _drain_queue once the .git dir lands).
+        sm = self.make_ticket_manager(repo="Elsewhere")
+        sm.triage_ledger[ha._triage_key(self.SITE, "PROJ-7")]["nameWithOwner"] = \
+            "xerktech/Elsewhere"
+        started = []
+        sm.clone = lambda nwo, source=None: started.append(nwo)
+        with mock.patch.object(ha, "fetch_jira_issue",
+                               return_value={"summary": "s", "url": "u"}):
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(started, ["xerktech/Elsewhere"])  # clone kicked off
+        self.assertEqual(len(sm.registry), 1)
+        q = sm.registry[0]
+        self.assertEqual(q["status"], "queued")
+        self.assertEqual(q["queuedReason"], "awaiting-clone")
+        self.assertEqual(q["awaitClone"], "Elsewhere")
+        self.assertEqual(q["awaitCloneOwner"], "xerktech/Elsewhere")
+        # Its repoPath points at where the clone will land, and its branch is
+        # deferred (no repo yet to scan for a free name).
+        self.assertEqual(q["repoPath"], os.path.join(ha.REPOS_ROOT, "Elsewhere"))
+        self.assertIsNone(q["ticket"]["branch"])
+
+    def test_refuses_anything_that_is_not_a_jira_key(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue") as f:
+            for bad in ("", None, "PROJ", "-1", "../../etc/passwd",
+                        "PROJ-7; rm -rf /", "PROJ-7 && curl x"):
+                sm.spawn_ticket(bad)
+        self.assertEqual(sm.registry, [])
+        f.assert_not_called()
+
+    def test_an_unconfigured_host_makes_no_jira_call(self):
+        # "unset creds = zero Jira HTTP, ever" stays a property of the AGENT, not
+        # of the hub's targeting — same stance as refreshJira.
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "JIRA_TOKEN", ""), \
+             mock.patch.object(ha, "fetch_jira_issue") as f:
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry, [])
+        f.assert_not_called()
+
+    def test_a_failed_fetch_does_not_spawn_a_blind_session(self):
+        # handle_commands logs and acks it. A session working a ticket it can't
+        # see would be worse than no session.
+        sm = self.make_ticket_manager()
+
+        def boom(_k):
+            raise RuntimeError("jira 500")
+
+        with mock.patch.object(ha, "fetch_jira_issue", boom):
+            sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
+                                 "cmdId": "c9"}])
+        self.assertEqual(sm.registry, [])
+        self.assertIn("c9", sm.acked)
+
+    def test_handle_commands_dispatches_spawn_ticket(self):
+        sm = self.make_ticket_manager()
+        sm.spawn_ticket = mock.Mock()
+        sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
+                             "cmdId": "c9"}])
+        sm.spawn_ticket.assert_called_once_with("PROJ-7", cmd_id="c9", model=None)
+
+    def test_handle_commands_carries_the_model_pin(self):
+        # The hub's per-ticket model pin (XERK-123) rides the command; the agent
+        # forwards it to spawn_ticket, which validates it like any spawn model.
+        sm = self.make_ticket_manager()
+        sm.spawn_ticket = mock.Mock()
+        sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
+                             "model": "opus", "cmdId": "c9"}])
+        sm.spawn_ticket.assert_called_once_with("PROJ-7", cmd_id="c9", model="opus")
+
+    def test_a_model_pin_lands_on_the_session_and_command_line(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", model="opus")
+        sess = sm.registry[0]
+        self.assertEqual(sess["model"], "opus")     # resolve_model(opus) -> opus
+        cmd = self._launches()[-1][-1]
+        self.assertIn("--model opus", cmd)
+
+    def test_no_model_pin_spawns_with_the_default_model(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        sess = sm.registry[0]
+        self.assertIsNone(sess["model"])            # omit --model = login default
+        self.assertNotIn("--model", self._launches()[-1][-1])
+
+    def test_hostile_ticket_text_cannot_break_out_of_the_command_line(self):
+        # Ticket text is the one genuinely untrusted input here: unlike an
+        # operator-typed prompt, ANY Jira user can write a description or comment,
+        # and it lands on the tmux command line. shlex.quote is what holds — this
+        # pins that it's actually applied to every field that reaches the prompt.
+        evil = "'; touch /tmp/pwned; echo '"
+        detail = self._detail(
+            summary=evil, description=evil, labels=[evil],
+            comments=[{"author": evil, "body": evil, "created": evil}])
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: detail):
+            sm.spawn_ticket("PROJ-7")
+        cmd = self._launches()[-1][-1]
+        # The payload rides as DATA, with every quote it carries neutralised.
+        self.assertIn("touch /tmp/pwned", cmd)
+        self.assertIn("'\"'\"'", cmd, "shlex.quote's escaped-quote form")
+        # The proof it can't ESCAPE is the round trip, not a substring search
+        # (the escaped form '"'"'; touch … happens to CONTAIN the raw payload):
+        # the command parses back into shell words with the whole prompt as
+        # exactly one of them, byte-for-byte what we built...
+        words = shlex.split(cmd)
+        self.assertEqual(words[-1], ha.build_ticket_prompt(detail))
+        # ...so nothing the ticket carried ever became a word of its own.
+        self.assertNotIn("touch", words)
+
+    def test_spawns_an_azure_work_item(self):
+        """An Azure host spawns a numeric-id work item through the SAME path,
+        with a project-prefixed branch and Azure-worded prompt (XERK-43)."""
+        site = "dev.azure.com/org"
+        repos = [{"name": "Turma", "path": os.path.join(self.tmp, "Turma")}]
+        sm = self.make_manager()
+        for name, value in [("scan_repos", lambda: repos),
+                            ("JIRA_SITE", ""), ("JIRA_EMAIL", ""), ("JIRA_TOKEN", ""),
+                            ("AZDO_URL", "https://dev.azure.com/org"),
+                            ("AZDO_TOKEN", "pat")]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        sm.triage_ledger[ha._triage_key(site, "1234")] = {
+            "decided": True, "repo": "Turma", "cloned": True, "reason": "x"}
+        sm._launch_ttyd = mock.Mock()
+        detail = {"key": "1234", "summary": "Fix checkout",
+                  "url": "https://dev.azure.com/org/Proj/_workitems/edit/1234",
+                  "project": "Proj", "projectName": "Proj",
+                  "description": "broken", "comments": []}
+        with mock.patch.object(ha, "fetch_azure_issue", lambda k: detail):
+            sm.spawn_ticket("1234", cmd_id="a1")
+        self.assertEqual(len(sm.registry), 1)
+        sess = sm.registry[0]
+        self.assertEqual(sess["repo"], "Turma")
+        self.assertEqual(sess["ticket"], {
+            "key": "1234", "siteKey": site, "url": detail["url"],
+            "summary": "Fix checkout", "branch": "Proj-1234",
+            "branchBase": "Proj-1234",
+        })
+        cmd = self._launches()[-1][-1]
+        self.assertIn("Work Azure DevOps work item #1234", cmd)
+        self.assertIn("Name the branch you create for it exactly: Proj-1234", cmd)
+
+
+class TestUpdatingAnnounce(ManagerMixin, unittest.TestCase):
+    """XERK-29: before the manager restarts for an update it can't heartbeat
+    through, it tells the hub the downtime is EXPECTED so the host shows an
+    `updating` status instead of an unexpected-outage `offline`."""
+
+    def setUp(self):
+        super().setUp()
+        self.flag = os.path.join(self.tmp, "updating.json")
+        p = mock.patch.object(ha, "UPDATING_FLAG_PATH", self.flag)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _write_flag(self, **d):
+        with open(self.flag, "w") as f:
+            json.dump(d, f)
+
+    def test_read_flag_present_absent_and_garbled(self):
+        sm = self.make_manager()
+        # Absent (the container-update case: no updater wrote one).
+        self.assertEqual(sm._read_updating_flag(), (None, None))
+        # Present (the native updater left the target version).
+        self._write_flag(reason="update", version="9.9.9")
+        self.assertEqual(sm._read_updating_flag(), ("update", "9.9.9"))
+        # Garbled JSON degrades to "generic restart, no version".
+        with open(self.flag, "w") as f:
+            f.write("{not json")
+        self.assertEqual(sm._read_updating_flag(), (None, None))
+
+    def test_boot_clears_a_stale_flag(self):
+        # A SIGKILL (no handler ran) can leave the file behind; the next boot
+        # must not let it leak a stale version into a future announce.
+        self._write_flag(reason="update", version="1.2.3")
+        self.make_manager()
+        self.assertFalse(os.path.exists(self.flag))
+
+    def test_announce_noops_without_hub_url(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "TURMA_URL", ""), \
+             mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=AssertionError("must not POST")):
+            sm._announce_updating("update", "9.9.9")  # no raise = no POST
+
+    def test_announce_posts_signal_with_reason_and_version(self):
+        sm = self.make_manager()
+        seen = {}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b""
+
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["method"] = req.get_method()
+            seen["body"] = json.loads(req.data.decode())
+            seen["auth"] = req.get_header("Authorization")
+            return _Resp()
+
+        with mock.patch.object(ha, "TURMA_URL", "http://hub:8300"), \
+             mock.patch.object(ha, "TURMA_TOKEN", "tok"), \
+             mock.patch.object(ha.urllib.request, "urlopen", fake_urlopen):
+            sm._announce_updating("update", "9.9.9")
+
+        self.assertEqual(seen["method"], "POST")
+        self.assertEqual(
+            seen["url"], f"http://hub:8300/api/agents/{sm.device}/updating")
+        self.assertEqual(seen["body"], {"reason": "update", "version": "9.9.9"})
+        self.assertEqual(seen["auth"], "Bearer tok")
+
+    def test_announce_swallows_network_failure(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "TURMA_URL", "http://hub:8300"), \
+             mock.patch.object(ha.urllib.request, "urlopen",
+                               side_effect=OSError("boom")):
+            sm._announce_updating("restart", None)  # best-effort, must not raise
+
+    def test_shutdown_handler_announces_from_flag_then_exits(self):
+        sm = self.make_manager()
+        self._write_flag(reason="update", version="9.9.9")
+        calls = []
+        with mock.patch.object(sm, "_announce_updating",
+                               side_effect=lambda *a: calls.append(a)):
+            with self.assertRaises(SystemExit):
+                sm._handle_shutdown(ha.signal.SIGTERM, None)
+        self.assertEqual(calls, [("update", "9.9.9")])
+
+    def test_shutdown_handler_defaults_to_generic_restart(self):
+        # The container case: Watchtower's SIGTERM, no flag on disk.
+        sm = self.make_manager()
+        calls = []
+        with mock.patch.object(sm, "_announce_updating",
+                               side_effect=lambda *a: calls.append(a)):
+            with self.assertRaises(SystemExit):
+                sm._handle_shutdown(ha.signal.SIGTERM, None)
+        self.assertEqual(calls, [("restart", None)])
+
+
+class TestRestartAgent(ManagerMixin, unittest.TestCase):
+    """XERK-157: the dashboard's "Restart agent" button restarts the manager the
+    same way a supervisor SIGTERM does, but the exit is deferred until the
+    command's ack has reached the hub so it can't re-fire on boot (a loop)."""
+
+    def _no_systemd_env(self, **extra):
+        # A copy of the real env with INVOCATION_ID removed (so `not under_systemd`
+        # holds), plus any overrides — patch.dict(clear=True) restores it after.
+        env = {k: v for k, v in os.environ.items() if k != "INVOCATION_ID"}
+        env.update(extra)
+        return env
+
+    def test_delivered_gate_defers_until_ack_reaches_hub(self):
+        sm = self.make_manager()
+        sm._perform_restart = mock.Mock()
+        sm._restart_pending = True
+        # Not delivered yet: the follow-up heartbeat failed to reach the hub, so
+        # the command is still queued — do NOT exit, keep the flag for a retry.
+        sm._restart_if_delivered(False)
+        sm._perform_restart.assert_not_called()
+        self.assertTrue(sm._restart_pending)
+        # Delivered: the ack landed, the command is off the queue — restart now.
+        sm._restart_if_delivered(True)
+        sm._perform_restart.assert_called_once()
+        self.assertFalse(sm._restart_pending)
+
+    def test_delivered_gate_noop_when_not_armed(self):
+        sm = self.make_manager()
+        sm._perform_restart = mock.Mock()
+        sm._restart_if_delivered(True)
+        sm._perform_restart.assert_not_called()
+
+    def test_perform_restart_exits_under_systemd(self):
+        # INVOCATION_ID set => systemd started us; a clean exit is enough
+        # (Restart=always brings us back). Never shell out to the ctl script,
+        # even if one happens to be present, or we'd fight the supervisor.
+        sm = self.make_manager()
+        bindir = os.path.join(self.tmp, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        open(os.path.join(bindir, "turma-agentctl"), "w").close()
+        with mock.patch.object(ha, "__file__", os.path.join(self.tmp, "hub-agent.py")), \
+             mock.patch.dict(ha.os.environ, self._no_systemd_env(INVOCATION_ID="abc"), clear=True), \
+             mock.patch.object(sm, "_announce_updating") as ann, \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            with self.assertRaises(SystemExit):
+                sm._perform_restart()
+        ann.assert_called_once_with("restart")
+        popen.assert_not_called()
+
+    def test_perform_restart_exits_in_container(self):
+        # No systemd and no ctl script beside hub-agent.py (the container layout):
+        # exit and let Docker's restart policy recreate us.
+        sm = self.make_manager()
+        with mock.patch.object(ha, "__file__", os.path.join(self.tmp, "hub-agent.py")), \
+             mock.patch.dict(ha.os.environ, self._no_systemd_env(), clear=True), \
+             mock.patch.object(sm, "_announce_updating") as ann, \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            with self.assertRaises(SystemExit):
+                sm._perform_restart()
+        ann.assert_called_once_with("restart")
+        popen.assert_not_called()
+
+    def test_perform_restart_hands_off_to_agentctl_when_no_supervisor(self):
+        # Native WSL without systemd: a ctl script sits beside hub-agent.py and
+        # there's no supervisor, so relaunch through it (detached) rather than
+        # exiting into the void. It SIGTERMs us to complete the restart.
+        sm = self.make_manager()
+        bindir = os.path.join(self.tmp, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        ctl = os.path.join(bindir, "turma-agentctl")
+        open(ctl, "w").close()
+        with mock.patch.object(ha, "__file__", os.path.join(self.tmp, "hub-agent.py")), \
+             mock.patch.dict(ha.os.environ, self._no_systemd_env(), clear=True), \
+             mock.patch.object(sm, "_announce_updating") as ann, \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            sm._perform_restart()  # returns, does NOT SystemExit — ctl stops us
+        ann.assert_called_once_with("restart")
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.args[0], [ctl, "restart"])
 
 
 if __name__ == "__main__":

@@ -39,22 +39,31 @@ for the already-answered case), and PR URLs newly appended to the transcript.
 stdlib only — no pip installs in the image.
 """
 
+import base64
+import datetime
+import html
+import io
 import json
 import os
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tarfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zlib
 from collections import deque
+from html.parser import HTMLParser
 
 # Set by a SIGUSR1 handler (installed in run_forever). tunnel-agent.js sends
 # SIGUSR1 when the hub pokes it over the control channel because a command was
@@ -84,11 +93,16 @@ TTYD_PORT_BASE = int(os.environ.get("TTYD_PORT_BASE", "7700"))
 # run at a time. Parens keep it clear of any real (dir-name) repo in the scan.
 ROOT_REPO_NAME = "(root)"
 
-# Usage bucket for a transcript on disk that reconciliation can't attribute to
-# any repo (a bare `claude` run outside a managed worktree). Parenthesized like
-# ROOT_REPO_NAME so it never collides with a real repo name, and so every
-# transcript still counts toward the host total rather than being dropped.
-OTHER_REPO_NAME = "(other)"
+# A transcript reconciliation can't tie to a repo this host has (a bare
+# `claude` run outside a managed worktree, a foreign dev-machine session on the
+# shared login) folds into ROOT_REPO_NAME, so the usage page lists only real
+# repos plus the one root bucket (XERK-147). The old separate "(other)" bucket
+# is gone; _sanitize_junk_repo_entries retires ledger entries that carry it.
+
+# The coding agent this build launches for its sessions. Only a fallback: the
+# name is normally read out of the CLI's own `--version` reply (coding_agent()),
+# so it stays right if the product renames itself.
+CODING_AGENT_NAME = "Claude Code"
 
 # Where worktrees live: under a dot-dir so the repo scan never lists them, and
 # on the mounted tree so they survive a container restart.
@@ -96,27 +110,118 @@ WORKTREES_ROOT = os.path.join(REPOS_ROOT, ".turma", "worktrees")
 # Persisted session registry (survives container restart).
 REGISTRY_DIR = os.path.expanduser("~/.turma")
 REGISTRY_PATH = os.path.join(REGISTRY_DIR, "sessions.json")
+# Expected-restart signal (XERK-29). Before the manager goes down for a restart
+# it can't heartbeat through — an image update recreating the whole container,
+# or the native updater swapping files and `systemctl restart`ing us — it POSTs
+# the hub a one-shot "I'm updating" so the coming heartbeat gap renders as an
+# `updating` status instead of an unexpected-outage `offline`. The native
+# updater drops the target version here for our SIGTERM handler to read and
+# enrich the announcement with; a container update (Watchtower) leaves no file
+# and we announce a generic restart. Lives beside the other ~/.turma ledgers.
+UPDATING_FLAG_PATH = os.path.join(REGISTRY_DIR, "updating.json")
+UPDATING_ANNOUNCE_TIMEOUT_SEC = float(
+    os.environ.get("TURMA_UPDATING_ANNOUNCE_TIMEOUT_SEC", "4"))
 # Rendezvous dir for the AskUserQuestion bridge (agent/hooks/ask.py). A pending
 # question lives here as `<sessionId>.req.json`; the answer the glasses client
 # sends rides back as `<sessionId>.ans.json`. See _hook_question / answer_question.
 QUESTIONS_DIR = os.path.join(REGISTRY_DIR, "questions")
 # Killed-but-resumable session history (branch + transcript survive a kill).
+#
+# This is a CACHE of what a kill knew, not the record of it. It buys a killed
+# session two things the transcript scan below can't recover — the PRs it opened
+# and its original session id, so `resume` can hand it straight back — and it
+# buys them from the moment of the kill, without waiting out a slow beat. It is
+# NOT the history: it holds only the newest CLOSED_PER_REPO per repo, so the 6th
+# kill in a repo evicts the oldest however durably the file is stored. Anything
+# that has to still be there afterwards belongs on the durable side (the
+# transcripts, the hub's archive, and the ledgers this dir keeps beside it).
+#
+# It lives in ~/.turma, whose durability is the HOST's to provide: a native
+# install puts it in the invoking user's $HOME, and a container must bind-mount
+# it or it is the image's writable layer, which an agent update recreates. The
+# deployed stack mounts it (DockerOps compose/turma-truenas.yaml) — but that is a
+# deployment promise, not an invariant of this file, so nothing here may assume
+# it and every ledger beside it reconciles from disk rather than trusting itself.
 CLOSED_PATH = os.path.join(REGISTRY_DIR, "closed.json")
 # Only the newest N closed sessions per repo are kept/offered for resume —
-# bounds both the file and the heartbeat payload.
+# bounds both the file and the heartbeat payload. Older kills don't fall out of
+# the hub's Ended list when they fall out of here; they keep listing through the
+# resumable scan, just without their PR chips.
 CLOSED_PER_REPO = 5
-# Newest N resumable transcripts offered per repo in the "Resume any session"
-# picker — bounds the heartbeat (the durable archive holds the full history).
-RESUMABLE_PER_REPO = 15
+# Newest N resumable transcripts reported per repo. This is the durable side of
+# the hub's Ended-sessions list and the "Resume any session" picker: unlike
+# closed.json it is re-derived from the transcripts on disk, so it is what makes
+# both survive an agent restart. Sized well above CLOSED_PER_REPO because "every
+# session I ended" is the point of it, and bounded at all only to bound the
+# heartbeat — the hub's archive holds the tail beyond this, searchably.
+RESUMABLE_PER_REPO = 50
 # Durable worktree-path -> {repo, remote, slug} attribution ledger. Written at
 # spawn and NEVER dropped on kill/delete, so a transcript's token usage stays
 # traceable to its repo long after the session (and even its worktree) is gone.
 # This is what makes host/repo usage persist regardless of active sessions.
 USAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "repo-usage.json")
+# Cached Jira-ticket -> repo triage decisions, keyed by "<siteKey>/<issueKey>".
+# Persisted so a triaged board survives a manager restart without re-running the
+# model over every ticket. See the "Jira -> repo triage" section.
+TRIAGE_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-repos.json")
+# Durable transcriptId -> ticket ledger: which Jira ticket a conversation was
+# spawned to work. The exact counterpart of USAGE_LEDGER_PATH above, for the same
+# reason — the session record answers this only while it exists, and the board's
+# ticket chips have to outlive it.
+#
+# A killed session's ticket rides its closed record, but closed.json keeps only
+# CLOSED_PER_REPO per repo; past that the record is gone and the only channel
+# still reporting the session is the resumable scan, which is re-derived from the
+# transcripts on disk and so knows nothing of tickets. Keying here on the
+# transcript id — the handle that scan reports and the hub's Ended list dedupes
+# on — is what re-attaches the two.
+#
+# Written wherever a launch names its conversation (_launch_tmux), so a
+# restart-clear-context's NEW transcript is recorded alongside the old rather
+# than replacing it: both were that ticket's work.
+TICKET_LEDGER_PATH = os.path.join(REGISTRY_DIR, "jira-sessions.json")
+# Bound on the above. Entries are small and only ticket-backed sessions make one,
+# so this is a runaway backstop rather than a working limit; the oldest fall off.
+TICKET_LEDGER_MAX = 500
+# Durable transcriptId -> {urls, at} ledger: the PR links each conversation
+# opened. The exact counterpart of TICKET_LEDGER_PATH above, and for the same
+# reason — the PR chips on a session's card (and in the hub's Ended-sessions
+# list) have to outlive the in-memory scan that first found the links.
+#
+# The set of PRs a session opened lived ONLY in the in-memory session_pr_urls,
+# rebuilt by an incremental transcript scan that primes to EOF on restart — so a
+# manager restart blanked a running session's chips (the `gh pr create` lines
+# are behind the primed offset and never re-read), and a session aged out of
+# closed.json lost its chips entirely (the resumable scan carries no PRs). Keying
+# here on the transcript id — the handle the resumable scan reports and the hub's
+# Ended list dedupes on — is what re-attaches links to a session across all of it.
+PR_LEDGER_PATH = os.path.join(REGISTRY_DIR, "pr-sessions.json")
+# Bound on the above, oldest-first — a runaway backstop, like the ticket ledger.
+PR_LEDGER_MAX = 500
+# Durable url -> compact `gh pr view` status ledger, so the chip keeps its
+# state/CI PILL (not just a bare link) across a restart. The in-memory
+# pr_status_cache seeds from this at boot; running sessions re-poll and refresh
+# it, but an ENDED session's PR is never re-polled, so its last-known status
+# would otherwise degrade to a bare link the moment the cache was lost.
+PR_STATUS_LEDGER_PATH = os.path.join(REGISTRY_DIR, "pr-status.json")
 # Where Claude Code keeps per-project transcript JSONLs (slug = cwd via
 # _project_slug below). Overridable so the test suite can point it at
 # fixtures; unset in production, so the default is the real path.
 PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", "/root/.claude/projects")
+# The subscription login every session and headless probe on this host shares.
+# Its refresh-token expiry is the "re-login required" signal the hub alerts on
+# (XERK-98). Derived from PROJECTS_ROOT's parent so the CLAUDE_PROJECTS_ROOT
+# override (native install) and the test suite move both together; overridable
+# on its own too.
+CLAUDE_CREDS_PATH = os.environ.get(
+    "CLAUDE_CREDS_PATH",
+    os.path.join(os.path.dirname(PROJECTS_ROOT), ".credentials.json"),
+)
+# Nudge the operator this long before the refresh token lapses, so a "re-login
+# soon" warning lands before sessions actually start failing. Env override in
+# seconds; 0 disables the early warning (the hard needsLogin edge still fires).
+CLAUDE_AUTH_WARN_MS = int(
+    os.environ.get("TURMA_CLAUDE_AUTH_WARN_SEC", str(3 * 24 * 3600)) or 0) * 1000
 
 # Archive sync: ship INACTIVE-session transcripts to the hub's durable, searchable
 # store (see turma/archive.js). The agent enumerates ended transcripts, and pushes
@@ -126,6 +231,12 @@ PROJECTS_ROOT = os.environ.get("CLAUDE_PROJECTS_ROOT", "/root/.claude/projects")
 ARCHIVE_MANIFEST_MAX = int(os.environ.get("ARCHIVE_MANIFEST_MAX", "200"))
 ARCHIVE_CHUNK_BYTES = 1 << 23   # 8 MiB read+POST per delta
 ARCHIVE_BEAT_BUDGET = 1 << 25   # ~32 MiB pushed per sync pass (backfill throttle)
+# The compressed transcript bundle a session migration ships through the hub
+# (source host -> hub -> target host). A single gzipped POST, capped so a
+# pathologically long conversation fails loudly rather than OOM-ing the hub's
+# in-memory relay. Transcripts are JSON and compress ~10x, so this covers very
+# large sessions; the guard is a backstop, not an expected limit (XERK-101).
+MIGRATION_BLOB_MAX = int(os.environ.get("TURMA_MIGRATION_BLOB_MAX", str(1 << 26)))  # 64 MiB
 
 
 def _project_slug(path):
@@ -136,6 +247,14 @@ def _project_slug(path):
     '--turma-' — every transcript lookup missed, silently blanking
     session signals, tails, history, and usage for worktree sessions."""
     return re.sub(r"[^A-Za-z0-9]", "-", path)
+# A claude session id, which is both a transcript FILENAME and a token we
+# interpolate into the tmux command line (--session-id / --resume). Never let
+# anything through that isn't a plain uuid-ish word.
+VALID_CLAUDE_SID_RE = re.compile(r"[A-Za-z0-9-]+")
+# A migration id, minted hub-side (crypto random hex) and echoed into the blob
+# relay URL — validated the same strict way as a transcript id since it also
+# reaches a URL path.
+VALID_MIGRATION_ID_RE = re.compile(r"[A-Za-z0-9-]+")
 # Glasses-client transcript tail: how many surviving messages to report per
 # beat, and how many chars of each to keep (payload-size bounds).
 TAIL_MSGS = int(os.environ.get("SESSION_TAIL_MSGS", "30"))
@@ -199,69 +318,8 @@ def _usage_slot(sid):
 # same instant contend on that shared state; staggering reduces the contention.
 LAUNCH_STAGGER = 1.0
 
-# API-equivalent pricing per MTok (input, output, cache write, cache read).
-# Cache write = 1.25x input (5m TTL), cache read = 0.1x input. Sessions run on
-# a subscription, so this is a notional "what this would have cost via the
-# API" figure, not a bill. Matched by substring on the model id.
-PRICING = {
-    "fable": (10.0, 50.0, 12.50, 1.00),
-    "mythos": (10.0, 50.0, 12.50, 1.00),
-    "opus": (5.0, 25.0, 6.25, 0.50),
-    "sonnet": (3.0, 15.0, 3.75, 0.30),
-    "haiku": (1.0, 5.0, 1.25, 0.10),
-}
-
-
 def log(msg):
     print(f"[hub-agent] {msg}", flush=True)
-
-
-def load_pricing_extra():
-    """Extra pricing entries from the PRICING_JSON env var (inline JSON, per the
-    everything-inline-env convention): {"model-substring": [input, output,
-    cacheWrite, cacheRead]} per MTok. Consulted ONLY when the built-in PRICING
-    table has no match, so it can price new/unknown models but never override a
-    built-in rate. Anything malformed is logged loudly and the whole override
-    ignored — a bad env var must never take the agent down."""
-    raw = os.environ.get("PRICING_JSON", "").strip()
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("top level must be a JSON object")
-        extra = {}
-        for key, rates in data.items():
-            if not key or not isinstance(key, str):
-                raise ValueError(f"bad model key {key!r}")
-            if (
-                not isinstance(rates, (list, tuple))
-                or len(rates) != 4
-                or not all(
-                    isinstance(r, (int, float)) and not isinstance(r, bool) and r >= 0
-                    for r in rates
-                )
-            ):
-                raise ValueError(
-                    f"{key!r} must map to [input, output, cacheWrite, cacheRead] per MTok"
-                )
-            if key in PRICING:
-                log(f"PRICING_JSON: {key!r} duplicates a built-in entry — ignored")
-                continue
-            extra[key] = tuple(float(r) for r in rates)
-        return extra
-    except ValueError as e:
-        log(f"PRICING_JSON invalid — ignoring it entirely: {e}")
-        return {}
-
-
-PRICING_EXTRA = load_pricing_extra()
-# Logged unconditionally at boot so a bad/missing override is diagnosable from
-# the container-log tail in the hub UI.
-log(
-    "pricing extras from PRICING_JSON (consulted for unknown models only): "
-    + (", ".join(f"{k}={list(v)}" for k, v in PRICING_EXTRA.items()) or "none")
-)
 
 
 def run(cmd, cwd=None):
@@ -289,6 +347,33 @@ def run_ok(cmd, cwd=None, timeout=30):
         return None, str(e)
 
 
+def _port_open(port, host="127.0.0.1", timeout=0.3):
+    """Whether something is already listening on a local TCP port. Used to detect
+    a per-session ttyd that survived a *manager* restart (tmux and ttyd are their
+    own daemons, so they outlive this process) — the loopback bridge the tunnel
+    drives is still up, so we can adopt it instead of rebinding the port. Cheap
+    connect-probe; any error (nothing listening, bad port) reads as closed."""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            return s.connect_ex((host, port)) == 0
+    except OSError:
+        return False
+
+
+def _pid_alive(pid):
+    """Whether a pid is a live process (signal 0 probes without delivering)."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 # Short bound for the two network `git fetch`es that run synchronously inside a
 # command handler on the main heartbeat loop (default_base_ref on spawn,
 # prune_repo). A fetch is best-effort — both already fall open to local refs —
@@ -312,18 +397,33 @@ def slugify(s):
 
 # Model aliases the UI offers -> the value handed to `claude --model`. "default"
 # (or blank) means "don't pass --model at all" (claude's own default model).
-MODEL_ALIASES = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku"}
+# The static floor, not the whole story: the account's REAL alias list is probed
+# from the CLI itself on a slow cadence (see "available-models probe" below) and
+# resolve_model() accepts those probed aliases too, so a model the login gains
+# (e.g. fable) is offerable without a rebuild.
+MODEL_ALIASES = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku",
+                 "fable": "fable"}
+# A probed alias that may be interpolated into a launch command line: lowercase
+# word-ish, no brackets — `--model sonnet[1m]` unquoted is a shell glob, so the
+# bracketed aliases are valid to SWITCH to live (the picker path types nothing)
+# but are never accepted into a spawn's command string.
+SPAWN_MODEL_RE = re.compile(r"^[a-z0-9.-]{1,40}$")
+# A token from the CLI's own "Available: …" alias list (bracketed 1M variants
+# included).
+MODEL_ALIAS_TOKEN_RE = re.compile(r"^[a-z0-9.-]{1,40}(\[1m\])?$")
 # Permission modes the UI offers. "auto" is the default (claude's classifier-
 # gated hands-off mode); "bypassPermissions" disables prompts entirely; "default"
 # means "omit --permission-mode" (claude's own manual-review default).
 PERMISSION_MODES = {"auto", "bypassPermissions", "acceptEdits", "plan", "default"}
-# The order Claude Code's Shift+Tab cycles permission modes through — each press
-# advances one step, wrapping at the end. `set_mode` computes how many Shift+Tab
-# presses to inject to move a live session from its current mode to a target one.
-# Best-effort: the modes actually present in a given session's cycle depend on how
-# it was launched (bypassPermissions only appears when launched with it; auto only
-# when the account allows it), so an off-cycle target may land elsewhere.
-PERM_CYCLE = ["default", "acceptEdits", "plan", "bypassPermissions", "auto"]
+# Claude Code's Shift+Tab permission-mode cycle. The three BASE modes are always
+# present, in this order; each Shift+Tab press advances one step and wraps at the
+# end. The two OPTIONAL modes are conditional: `bypassPermissions` is in the cycle
+# only when the session was launched into it, and `auto` only when the launch /
+# account enables it — so the cycle a *running* session actually exposes depends
+# on how that session was launched. Computing presses against a fixed all-modes
+# list therefore lands on the wrong mode (the whole point of `perm_cycle_for`).
+PERM_CYCLE_BASE = ["default", "acceptEdits", "plan"]
+PERM_CYCLE_OPTIONAL = ["bypassPermissions", "auto"]  # canonical trailing order
 # git-ref-safe token: our allowlist is a strict subset of what git accepts, so
 # anything matching is also validated below for the few remaining git rules.
 _REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
@@ -394,14 +494,19 @@ def resolve_base_ref(repo_path, base_ref):
     return base_ref
 
 
-def resolve_model(model):
+def resolve_model(model, extra=()):
     """Map a UI model choice to a `claude --model` value, or None to omit the
-    flag. Fixed allowlist — never passes free-form text to claude."""
+    flag. Allowlist only — never passes free-form text to claude: the static
+    MODEL_ALIASES, plus `extra` (the aliases the CLI itself reported available,
+    from the models probe), each still charset-checked because they end up
+    interpolated into a launch command line."""
     model = (model or "").strip().lower()
     if not model or model == "default":
         return None
     if model in MODEL_ALIASES:
         return MODEL_ALIASES[model]
+    if model in extra and SPAWN_MODEL_RE.fullmatch(model):
+        return model
     raise ValueError(f"unknown model {model!r}")
 
 
@@ -416,6 +521,91 @@ def resolve_permission_mode(mode):
     raise ValueError(f"unknown permission mode {mode!r}")
 
 
+def perm_cycle_for(launch_mode):
+    """The ordered Shift+Tab permission-mode cycle a running session actually
+    exposes, given the mode it was LAUNCHED into. The three base modes are always
+    present; an optional mode (bypassPermissions / auto) is included only when the
+    session was launched into it — that's the one optional we can be certain sits
+    in this session's live cycle (bypassPermissions appears solely when claude was
+    started with it; auto only when the launch/account enables it). Appended in
+    Claude Code's canonical trailing order. `set_mode` computes its BTab presses
+    against this so the switch lands on the chosen mode instead of drifting off a
+    cycle that doesn't contain the target."""
+    cycle = list(PERM_CYCLE_BASE)
+    launch_mode = launch_mode or "auto"
+    for opt in PERM_CYCLE_OPTIONAL:
+        if launch_mode == opt:
+            cycle.append(opt)
+    return cycle
+
+
+# --- new-work branching policy (--append-system-prompt) -------------------
+
+# Every session's checkout can be behind the real upstream default branch. A
+# Turma worktree is detached at origin/<default> as of SPAWN time (see
+# default_base_ref) — minutes or hours stale by the time the agent branches, and
+# staler still if that spawn-time `git fetch` timed out and fell back to a local
+# ref. A repos-root session is worse: it works in the repo dirs themselves,
+# sitting on whatever branch the host last left checked out.
+#
+# There is no settings.json field that carries instructions, so the policy rides
+# --append-system-prompt on every launch. It tells the agent to refresh the base
+# ITSELF at the moment it starts work, which is the only place with enough
+# context to do it smartly: it knows whether a fetch failure is worth retrying,
+# whether there's uncommitted work to carry across, and which of several repos it
+# is about to touch. Deliberately a directive, not enforcement — the manager
+# can't know when "new work" begins.
+NEW_WORK_SYSTEM_PROMPT = """\
+Branching policy for this session (set by Turma, the agent host):
+
+Do not assume this checkout is at the latest default branch. It is either a
+detached worktree forked when this session spawned, or a repo left on whatever
+branch was last checked out on this host. Either can be well behind origin.
+
+Before starting new work in a repo — and before creating the branch you will
+commit it to — refresh the base yourself:
+  1. `git fetch origin` in that repo.
+  2. Find the default branch: `git symbolic-ref --short refs/remotes/origin/HEAD`
+     (typically origin/main, else origin/master).
+  3. Create your branch from that REMOTE ref, not from the current HEAD:
+     `git switch -c <your-branch> origin/main`.
+
+Handle the exceptions with judgment rather than stopping:
+  - If the fetch fails (offline, no remote, auth), base off the best local ref
+    instead, and say the base may be stale in your first reply and in the PR.
+  - If the checkout already has uncommitted work, carry it onto the fresh branch
+    rather than discarding it; if you can't, explain why instead of forcing it.
+  - If you are continuing existing work on a branch you already made, stay on it
+    — this applies when work STARTS, not to every commit.
+
+A session working across several repos applies this per repo, as it reaches each.
+"""
+
+# Extends the policy above for a session spawned to work a Jira ticket. The
+# branch name is decided at spawn (see _reserve_ticket_branch) rather than left
+# to the agent for two reasons: it has to be derivable from the ticket by a human
+# scanning branches, and the -1/-2 suffix needs a scan of every existing local
+# and remote branch that the agent has no particular reason to do correctly.
+#
+# It rides the same --append-system-prompt as the policy it extends, on every
+# launch including resume. The name is persisted on the session record, so a
+# resumed session is told the same name it was told at spawn rather than
+# re-deriving one against a repo whose branches have since moved.
+TICKET_BRANCH_PROMPT = """
+This session is work on Jira ticket {key}, whose full text is in your first
+user message.
+
+Name the branch you create for it exactly: {branch}
+
+That exact name is reserved for this session and already accounts for any branch
+this ticket has been worked on before (hence a possible -1/-2 suffix), so use it
+rather than deriving your own name from the ticket key.
+
+Everything above still applies: cut that branch from the REFRESHED remote default
+branch, not from this checkout.
+"""
+
+
 # --- agent safety guard (--settings wiring) ------------------------------
 
 # Host credential / agent-config stores the agent must never write or delete.
@@ -426,10 +616,18 @@ _GUARD_DENY_PATH_RULES = [
     "Write(~/.ssh/**)",
     "Edit(~/.aws/**)",
     "Write(~/.aws/**)",
+    "Edit(~/.azure/**)",
+    "Write(~/.azure/**)",
+    "Edit(~/.terraform.d/**)",
+    "Write(~/.terraform.d/**)",
     "Edit(~/.claude/**)",
     "Write(~/.claude/**)",
     "Edit(~/.config/gcloud/**)",
     "Write(~/.config/gcloud/**)",
+    # The host's cached non-GitHub git creds (the `store` helper's file), shared
+    # by every session on the box exactly like ~/.aws.
+    "Edit(~/.git-credentials)",
+    "Write(~/.git-credentials)",
 ]
 
 # Operator-supplied extra permissions. Claude Code does NOT read a *user-level*
@@ -713,6 +911,61 @@ def device_name():
     return "unknown-device"
 
 
+def agent_version():
+    """This build's own version — the unified release version (see RELEASING.md)
+    of the code currently running, reported on the heartbeat so the hub's host
+    header can show which build a host is on.
+
+    The two install shapes stamp it differently, so both are read here:
+      1. TURMA_AGENT_VERSION env — the container image bakes it at build time
+         (release.yml passes the release version as a build-arg), and it doubles
+         as an operator override anywhere.
+      2. A VERSION file next to this script — what native/install.sh writes into
+         its prefix, alongside hub-agent.py, on every install and self-update.
+      3. The repo-root VERSION (a dev checkout running agent/hub-agent.py
+         straight out of the tree) — bare MAJOR.MINOR, same fallback install.sh
+         uses.
+    None when nothing stamped it, which the hub renders as unknown rather than
+    guessing a number.
+    """
+    env = os.environ.get("TURMA_AGENT_VERSION", "").strip()
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, "VERSION"), os.path.join(here, os.pardir, "VERSION")):
+        try:
+            with open(path) as f:
+                ver = f.read().strip()
+            if ver:
+                return ver
+        except OSError:
+            pass
+    return None
+
+
+def coding_agent():
+    """Which coding agent this host runs for its sessions, and its version —
+    heartbeated as `codingAgent` for the hub's host header.
+
+    The NAME is reported rather than left for the hub to assume: this image is
+    deliberately agent-generic (Claude Code today, another CLI later), and this
+    process is the only party that knows which one it actually execs.
+
+    `claude --version` prints "<version> (<product>)" — "2.1.211 (Claude Code)" —
+    so the parenthesized product name is preferred over the hardcoded default.
+    An unparseable reply keeps the whole string as the version, which still tells
+    the operator more than nothing. None when the CLI can't be run at all, which
+    the hub renders as unknown.
+    """
+    out = run(["claude", "--version"])
+    if not out:
+        return None
+    m = re.match(r"^(\S+)\s+\((.+)\)$", out)
+    if m:
+        return {"name": m.group(2).strip(), "version": m.group(1)}
+    return {"name": CODING_AGENT_NAME, "version": out}
+
+
 def git_info_cheap(cwd):
     """Fast, fast-changing worktree facts read EVERY heartbeat: the current
     checked-out branch and the `git status --porcelain` dirty count. None when
@@ -826,11 +1079,79 @@ def memory_usage():
     return None
 
 
+def claude_auth_status(path=None, now_ms=None):
+    """The shared subscription login's health, for the heartbeat (XERK-98).
+
+    Claude Code stores an OAuth pair in ~/.claude/.credentials.json under
+    `claudeAiOauth`. Two expiries live there and they mean different things:
+
+      * `expiresAt` is the ACCESS token — short-lived (hours) and silently
+        refreshed on every run, so it is NOT a re-login signal on its own.
+      * `refreshTokenExpiresAt` is the REFRESH token — it only lapses when
+        claude has not refreshed inside its ~30-day window, i.e. the login has
+        gone stale on an idle or logged-out host. THAT is when a human must run
+        `claude /login`, so it is what `needsLogin`/`expiringSoon` key off.
+
+    A missing file, unreadable JSON, or a login with no access token reads as
+    not-logged-in (`present:false`, `needsLogin:true`). A present login whose
+    refresh expiry is unknown (an older credential shape) is reported healthy —
+    without a timestamp to stand on we never cry wolf. All times are epoch ms,
+    matching the file's own format and the hub's Date.now().
+    """
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    status = {
+        "present": False,
+        "needsLogin": True,
+        "expiringSoon": False,
+        "expiresAt": None,
+        "refreshExpiresAt": None,
+        "subscriptionType": None,
+        "at": now_ms,
+    }
+    try:
+        with open(path or CLAUDE_CREDS_PATH) as f:
+            oauth = (json.load(f) or {}).get("claudeAiOauth") or {}
+    except (OSError, ValueError):
+        return status  # missing/unreadable => not logged in
+    if not oauth.get("accessToken"):
+        return status  # a file without a token is not a login
+    status["present"] = True
+    status["subscriptionType"] = oauth.get("subscriptionType")
+    access = oauth.get("expiresAt")
+    refresh = oauth.get("refreshTokenExpiresAt")
+    status["expiresAt"] = access if isinstance(access, (int, float)) else None
+    status["refreshExpiresAt"] = refresh if isinstance(refresh, (int, float)) else None
+    if isinstance(refresh, (int, float)):
+        if refresh <= now_ms:
+            status["needsLogin"] = True        # refresh token lapsed: must re-login
+        else:
+            status["needsLogin"] = False
+            status["expiringSoon"] = bool(
+                CLAUDE_AUTH_WARN_MS and refresh - now_ms <= CLAUDE_AUTH_WARN_MS)
+    else:
+        status["needsLogin"] = False           # present, expiry unknown: assume ok
+    return status
+
+
 HISTORY_DAYS = 60  # per-day breakdown reported to the hub (bounds payload size)
 
 
+TOKEN_KEYS = ("input", "output", "cacheWrite", "cacheRead")
+WEEK_DAYS = 7  # rolling window (UTC days, today inclusive) behind the `week` bucket
+
+
 def _usage_bucket():
-    return {"input": 0, "output": 0, "cacheWrite": 0, "cacheRead": 0, "cost": 0.0}
+    return {k: 0 for k in TOKEN_KEYS}
+
+
+def _add_tokens(bucket, tok):
+    """Fold one message's (input, output, cacheWrite, cacheRead) into `bucket`."""
+    for k, n in zip(TOKEN_KEYS, tok):
+        bucket[k] += n
+
+
+def _model_acc():
+    return {"totals": _usage_bucket(), "days": {}}
 
 
 class _UsageAcc:
@@ -843,8 +1164,12 @@ class _UsageAcc:
     def __init__(self):
         self.totals = _usage_bucket()
         self.days = {}      # "YYYY-MM-DD" (UTC) -> bucket
-        self.models = {}    # model id -> message count
-        self.unpriced = set()
+        # model id -> {"totals": bucket, "days": {"YYYY-MM-DD": bucket}}. The
+        # per-model day buckets never leave the agent: _finalize_usage derives
+        # each model's today/week from them and drops them, so the per-model
+        # breakdown costs a few scalars per model on the wire rather than a
+        # whole second days matrix.
+        self.models = {}
         self.seen = set()   # (message id, requestId) dedup keys
         self.last_ts = ""
         self.sessions = 0   # transcript files folded in
@@ -852,7 +1177,7 @@ class _UsageAcc:
 
 def _accumulate_usage(lines, acc):
     """Fold transcript JSONL lines into `acc` in place. Only lines that mention a
-    usage block cost anything; each priced message is deduped on
+    usage block count for anything; each message is deduped on
     (message id, requestId) via acc.seen, so a message re-seen across files or
     across incremental beats counts exactly once."""
     for line in lines:
@@ -875,7 +1200,6 @@ def _accumulate_usage(lines, acc):
         if ts > acc.last_ts:
             acc.last_ts = ts
         model = msg.get("model") or "unknown"
-        acc.models[model] = acc.models.get(model, 0) + 1
 
         tok = (
             usage.get("input_tokens", 0) or 0,
@@ -883,36 +1207,26 @@ def _accumulate_usage(lines, acc):
             usage.get("cache_creation_input_tokens", 0) or 0,
             usage.get("cache_read_input_tokens", 0) or 0,
         )
-        # Built-in table first (authoritative); PRICING_EXTRA only covers
-        # models the built-ins don't match.
-        price = next(
-            (p for k, p in PRICING.items() if k in model), None
-        ) or next(
-            (p for k, p in PRICING_EXTRA.items() if k in model), None
-        )
-        cost = (
-            sum(t * p for t, p in zip(tok, price)) / 1e6
-            if price
-            else 0.0
-        )
-        # An unpriced model costs $0.00 — flag every bucket it lands in so the
-        # UI never understates cost silently.
-        is_unpriced = price is None and any(tok)
-        if is_unpriced:
-            acc.unpriced.add(model)
-        buckets = [acc.totals]
         # Transcript timestamps are UTC ISO; date-prefix bucketing is close
         # enough for a dashboard.
-        if len(ts) >= 10:
-            buckets.append(acc.days.setdefault(ts[:10], _usage_bucket()))
+        day = ts[:10] if len(ts) >= 10 else ""
+        buckets = [acc.totals]
+        if day:
+            buckets.append(acc.days.setdefault(day, _usage_bucket()))
+        # "<synthetic>" (and any "<...>") is Claude Code's stamp on assistant
+        # entries it fabricates itself — a session-limit notice, a "No response
+        # requested." placeholder — not a model that ran. Such entries carry an
+        # all-zero usage block, so folding them into the totals is a no-op; keep
+        # them OUT of the per-model breakdown so the usage page's "Tokens by
+        # model" table doesn't list a phantom "<synthetic>" model that consumed
+        # nothing. Mirrors _scan_model_entry's same guard.
+        if not model.startswith("<"):
+            m = acc.models.setdefault(model, _model_acc())
+            buckets.append(m["totals"])
+            if day:
+                buckets.append(m["days"].setdefault(day, _usage_bucket()))
         for b in buckets:
-            b["input"] += tok[0]
-            b["output"] += tok[1]
-            b["cacheWrite"] += tok[2]
-            b["cacheRead"] += tok[3]
-            b["cost"] += cost
-            if is_unpriced:
-                b["unpriced"] = True
+            _add_tokens(b, tok)
 
 
 def _aggregate_project(proj, acc, offsets=None):
@@ -985,27 +1299,73 @@ def _aggregate_project(proj, acc, offsets=None):
     return True
 
 
+def _total_tokens(bucket):
+    return sum(bucket.get(k, 0) for k in TOKEN_KEYS)
+
+
+def _utc_today():
+    """Today's UTC date. Day buckets are keyed off the transcripts' UTC ISO
+    timestamps, so `today`/`week` MUST be resolved in UTC too — reading them
+    against local time silently mis-slices the window on any host that isn't
+    on UTC (and skips/double-counts a day around its midnight)."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _week_window(today=None):
+    """The WEEK_DAYS UTC dates ending `today` (inclusive), newest last. Dated in
+    UTC via date arithmetic rather than epoch-second subtraction, which would
+    skip or repeat a day across a DST boundary on a non-UTC host."""
+    end = datetime.date.fromisoformat(today or _utc_today())
+    return [
+        (end - datetime.timedelta(days=i)).isoformat()
+        for i in range(WEEK_DAYS - 1, -1, -1)
+    ]
+
+
+def _sum_days(days, window):
+    """Total the buckets of `window`'s dates out of a {date: bucket} map."""
+    out = _usage_bucket()
+    for d in window:
+        b = days.get(d)
+        if b:
+            _add_tokens(out, [b[k] for k in TOKEN_KEYS])
+    return out
+
+
 def _finalize_usage(acc):
-    """Snapshot the running accumulator into the heartbeat's usage shape. Rounds
-    into COPIES so the accumulator keeps its raw floats — rounding in place would
-    drift the running total a little more every incremental beat, and the same
-    per-slug acc is reused across beats and merged into repo/host totals."""
-    totals = dict(acc.totals)
-    totals["cost"] = round(totals["cost"], 2)
+    """Snapshot the running accumulator into the heartbeat's usage shape. Builds
+    COPIES throughout: the same per-slug acc is reused across beats and merged
+    into repo/host totals, so a report must never alias (let alone mutate) the
+    accumulator's own buckets.
+
+    `today`/`week` are pre-sliced here rather than left to each client: the day
+    buckets are UTC and the clients aren't, and three surfaces (hub, Android,
+    glasses) would otherwise each re-derive the same window."""
+    window = _week_window()
     days = {d: dict(acc.days[d]) for d in sorted(acc.days)[-HISTORY_DAYS:]}
-    for day in days.values():
-        day["cost"] = round(day["cost"], 2)
-    today = days.get(time.strftime("%Y-%m-%d"), _usage_bucket())
     return {
-        "totals": totals,
-        "today": today,
+        "totals": dict(acc.totals),
+        "today": days.get(window[-1], _usage_bucket()),
+        "week": _sum_days(acc.days, window),
         "days": days,
         "sessions": acc.sessions,
         "lastActivity": acc.last_ts,
-        "models": sorted(acc.models, key=acc.models.get, reverse=True),
-        # Models whose usage no pricing entry matched (their cost counted as
-        # $0.00) — the UI flags any figure that includes them.
-        "unpricedModels": sorted(acc.unpriced),
+        # Per-model token counts, biggest consumer first. Each model's day
+        # buckets stay agent-side (see _UsageAcc.models) — only the three
+        # windows the UI shows travel.
+        "models": sorted(
+            (
+                {
+                    "model": name,
+                    "totals": dict(m["totals"]),
+                    "today": dict(m["days"].get(window[-1]) or _usage_bucket()),
+                    "week": _sum_days(m["days"], window),
+                }
+                for name, m in acc.models.items()
+            ),
+            key=lambda m: _total_tokens(m["totals"]),
+            reverse=True,
+        ),
     }
 
 
@@ -1022,23 +1382,23 @@ def usage_report(workdir):
     return _finalize_usage(acc)
 
 
+def _merge_bucket(dst, src):
+    for k in TOKEN_KEYS:
+        dst[k] += src.get(k, 0)
+
+
 def _merge_acc(dst, src):
-    """Fold accumulator `src` into `dst` (pre-finalize, so costs stay full
-    precision). Buckets are copied by value, so later finalizing one side never
-    disturbs the other, and `src` (a persistent per-slug acc) is left intact."""
-    for k in ("input", "output", "cacheWrite", "cacheRead", "cost"):
-        dst.totals[k] += src.totals[k]
-    if src.totals.get("unpriced"):
-        dst.totals["unpriced"] = True
+    """Fold accumulator `src` into `dst` (pre-finalize). Buckets are merged by
+    value, so later finalizing one side never disturbs the other, and `src` (a
+    persistent per-slug acc) is left intact."""
+    _merge_bucket(dst.totals, src.totals)
     for d, b in src.days.items():
-        tgt = dst.days.setdefault(d, _usage_bucket())
-        for k in ("input", "output", "cacheWrite", "cacheRead", "cost"):
-            tgt[k] += b[k]
-        if b.get("unpriced"):
-            tgt["unpriced"] = True
-    for m, c in src.models.items():
-        dst.models[m] = dst.models.get(m, 0) + c
-    dst.unpriced |= src.unpriced
+        _merge_bucket(dst.days.setdefault(d, _usage_bucket()), b)
+    for name, m in src.models.items():
+        tgt = dst.models.setdefault(name, _model_acc())
+        _merge_bucket(tgt["totals"], m["totals"])
+        for d, b in m["days"].items():
+            _merge_bucket(tgt["days"].setdefault(d, _usage_bucket()), b)
     dst.seen |= src.seen
     dst.sessions += src.sessions
     if src.last_ts > dst.last_ts:
@@ -1105,13 +1465,15 @@ def repo_usage_report(ledger, fold_slug):
     the same repo across hosts.
 
     Returns (repo_usage, host_usage): repo_usage is
-    [{repo, remote, remoteKey, usage}] sorted by cost desc (repos that never
-    spent anything are omitted); host_usage is the merged report, or None when no
-    transcript exists at all."""
+    [{repo, remote, remoteKey, usage}] sorted by total tokens desc (repos that
+    never consumed anything are omitted); host_usage is the merged report, or
+    None when no transcript exists at all."""
     by_repo = {}  # repo name -> {"remote": str, "slugs": set()}
     for path, meta in (ledger or {}).items():
         meta = meta or {}
-        repo = meta.get("repo") or "?"
+        if meta.get("internal"):
+            continue  # the manager's own claude -p helper, not a repo (XERK-27)
+        repo = meta.get("repo") or ROOT_REPO_NAME
         slug = meta.get("slug") or _project_slug(path)
         g = by_repo.setdefault(repo, {"remote": "", "slugs": set()})
         g["slugs"].add(slug)
@@ -1138,11 +1500,21 @@ def repo_usage_report(ledger, fold_slug):
         })
 
     host_usage = _finalize_usage(host) if host.sessions else None
-    repo_usage.sort(key=lambda r: r["usage"]["totals"]["cost"], reverse=True)
+    repo_usage.sort(key=lambda r: _total_tokens(r["usage"]["totals"]), reverse=True)
     return repo_usage, host_usage
 
 
 PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+
+# The Bash command that OPENS a pull request. `gh pr create` prints the new PR's
+# URL as its own output, and that pairing — this command, this output — is the
+# only thing in a transcript that says the session opened the PR rather than
+# merely looked at one. See _scan_pr_line.
+PR_CREATE_RE = re.compile(r"\bgh\s+pr\s+create\b")
+# Unresolved `gh pr create` tool_use ids remembered per session between beats.
+# Capped: a call whose result never lands (the turn was interrupted, the pane
+# died) must not grow the set for the life of the session.
+PR_CALLS_MAX = 20
 
 # Beats between `gh pr view` status refreshes for the PR links a session opened
 # (~INTERVAL*N sec). Faster than the github-block cadence so CI/merge state on a
@@ -1150,6 +1522,17 @@ PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 # call). Bounded per refresh so a host with many PRs never stalls a beat.
 PR_STATUS_REFRESH_EVERY = int(os.environ.get("TURMA_PR_REFRESH_EVERY", "3"))
 PR_STATUS_MAX = 20
+
+# PR-comment delivery (XERK-49): poll the PRs running sessions opened for new
+# review activity and TYPE it into the authoring session, so a reply asking for
+# corrections continues the work in the session that made the PR — no operator
+# in the loop. Same cadence and per-beat cap as the status poll (one gh call per
+# PR, or two when the inline-review-thread fetch runs). Disable with =0.
+PR_COMMENTS_DELIVER = os.environ.get("TURMA_PR_COMMENTS", "1") != "0"
+PR_COMMENTS_REFRESH_EVERY = int(os.environ.get("TURMA_PR_COMMENTS_EVERY", "3"))
+PR_COMMENTS_MAX = 20               # PRs polled per beat, like PR_STATUS_MAX
+PR_COMMENTS_SEEN_MAX = 500         # per-PR seen-key ceiling (newest kept)
+PR_COMMENTS_BODY_CAP = 1200        # per-comment body chars folded into the message
 
 
 def _check_class(entry):
@@ -1175,10 +1558,41 @@ def _check_class(entry):
     return None
 
 
+def _merge_ready(state, checks, mergeable):
+    """The card's single merge-readiness verdict: 'ready' | 'blocked' |
+    'pending' | None, from the CI rollup AND GitHub's mergeability.
+
+    Green CI is only half of "can this land": a PR whose branch conflicts with
+    its base merges nowhere, however clean its checks are, and a ✓ that says
+    otherwise is the one claim this mark must never make. So a conflict blocks
+    on its own, and a pass requires GitHub to have affirmatively said MERGEABLE.
+
+    Mergeability is computed lazily server-side, so a just-opened PR reports
+    UNKNOWN for a beat or two; that's 'pending' rather than 'ready' — unproven
+    is not proven, and the next refresh resolves it.
+
+    Conflicts are only a question for a PR that is still open: a MERGED or
+    CLOSED one merges nowhere by definition, and its mark reports CI alone, as
+    it always has. Likewise a PR with no checks at all keeps its no-mark unless
+    it CONFLICTS — absent CI is not evidence of anything, but a conflict is."""
+    if mergeable == "CONFLICTING" and state in ("OPEN", "DRAFT"):
+        return "blocked"
+    if checks == "failing":
+        return "blocked"
+    if checks == "pending":
+        return "pending"
+    if checks == "passing":
+        if state in ("OPEN", "DRAFT") and mergeable != "MERGEABLE":
+            return "pending"
+        return "ready"
+    return None
+
+
 def _summarize_pr(data):
     """Condense `gh pr view --json …` output to the compact status the hub cards
-    render: number, title, state (OPEN/DRAFT/MERGED/CLOSED), and a CI-check
-    rollup ('passing'/'failing'/'pending'/None) with per-bucket counts."""
+    render: number, title, state (OPEN/DRAFT/MERGED/CLOSED), a CI-check rollup
+    ('passing'/'failing'/'pending'/None) with per-bucket counts, GitHub's raw
+    mergeability, and the merge-readiness verdict the two combine into."""
     state = str(data.get("state") or "").upper()  # OPEN / MERGED / CLOSED
     draft = bool(data.get("isDraft"))
     counts = {"pass": 0, "fail": 0, "pending": 0}
@@ -1191,25 +1605,32 @@ def _summarize_pr(data):
     if total:
         checks = ("failing" if counts["fail"]
                   else "pending" if counts["pending"] else "passing")
+    # MERGEABLE / CONFLICTING / UNKNOWN. Reported raw beside the verdict so the
+    # card can say WHY it is blocked rather than only that it is.
+    mergeable = str(data.get("mergeable") or "").upper() or None
+    # DRAFT is really an OPEN sub-state in the API; surface it as its own state
+    # so the card can grey it out like GitHub does.
+    state = "DRAFT" if draft and state == "OPEN" else state
     return {
         "url": data.get("url"),
         "number": data.get("number"),
         "title": (data.get("title") or "")[:120],
-        # DRAFT is really an OPEN sub-state in the API; surface it as its own
-        # state so the card can grey it out like GitHub does.
-        "state": "DRAFT" if draft and state == "OPEN" else state,
+        "state": state,
         "checks": checks,
         "checkCounts": counts if total else None,
+        "mergeable": mergeable,
+        "ready": _merge_ready(state, checks, mergeable),
     }
 
 
 def pr_status(url):
-    """Fetch a PR's state + CI-check rollup via `gh pr view <url>`. Returns the
-    compact status dict, or None on any failure (gh accepts the full URL, so this
-    works from any cwd as long as the login can see the repo). Best-effort and
-    network-cheap — one gh call, capped by run()'s timeout."""
+    """Fetch a PR's state, CI-check rollup and mergeability via `gh pr view
+    <url>`. Returns the compact status dict, or None on any failure (gh accepts
+    the full URL, so this works from any cwd as long as the login can see the
+    repo). Best-effort and network-cheap — one gh call, capped by run()'s
+    timeout."""
     raw = run(["gh", "pr", "view", url, "--json",
-               "number,title,state,isDraft,url,statusCheckRollup"])
+               "number,title,state,isDraft,url,statusCheckRollup,mergeable"])
     if not raw:
         return None
     try:
@@ -1217,6 +1638,126 @@ def pr_status(url):
     except ValueError:
         return None
     return _summarize_pr(data)
+
+
+PR_URL_PARTS_RE = re.compile(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)")
+
+
+def _pr_comment_events(url, self_login):
+    """Every human-visible comment on a PR, normalized to the fields the
+    delivery poller needs (XERK-49). Three channels, because "reply in a PR"
+    means any of them and a correction routinely arrives as an inline note on a
+    diff line:
+
+      - conversation comments (`gh pr view --json comments`),
+      - review summaries with a body (`--json reviews` — a bare approve carries
+        no correction text and is skipped),
+      - inline review-thread comments on specific lines
+        (`gh api repos/<o>/<r>/pulls/<n>/comments`).
+
+    Each event is `{key, author, body, kind, loc, is_self}`. `key` is the item's
+    stable GitHub id (its url as a fallback) — what the seen-set dedupes on.
+    `is_self` marks a comment the agent's own login wrote (via GitHub's
+    `viewerDidAuthor` where present, else a login compare), so the poller can
+    baseline it as seen yet never react to the session's own words.
+
+    Returns the event list (possibly empty — a real PR with no comments), or
+    None on a hard fetch failure so the caller leaves the baseline untouched
+    rather than treating "gh errored" as "every prior comment vanished"."""
+    raw = run(["gh", "pr", "view", url, "--json", "comments,reviews"])
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+
+    def _login(obj):
+        return str(((obj or {}).get("author") or {}).get("login") or "")
+
+    def _is_self(obj, login):
+        if obj.get("viewerDidAuthor"):
+            return True
+        return bool(self_login) and login == self_login
+
+    events = []
+    for c in data.get("comments") or []:
+        if not isinstance(c, dict):
+            continue
+        body = str(c.get("body") or "").strip()
+        if not body:
+            continue
+        login = _login(c)
+        events.append({
+            "key": str(c.get("id") or c.get("url") or ""),
+            "author": login, "body": body, "kind": "comment", "loc": None,
+            "is_self": _is_self(c, login),
+        })
+    for r in data.get("reviews") or []:
+        if not isinstance(r, dict):
+            continue
+        body = str(r.get("body") or "").strip()
+        if not body:                       # a bare approve/comment carries no text
+            continue
+        login = _login(r)
+        state = str(r.get("state") or "").replace("_", " ").title()
+        events.append({
+            "key": str(r.get("id") or r.get("url") or ""),
+            "author": login, "body": body,
+            "kind": f"review {state}".strip(), "loc": None,
+            "is_self": _is_self(r, login),
+        })
+    # Inline review-thread comments aren't in `gh pr view`; fetch them straight
+    # from the API. Best-effort — a failure just leaves inline notes uncovered
+    # this beat rather than losing the conversation ones already gathered.
+    m = PR_URL_PARTS_RE.search(url or "")
+    if m:
+        owner, repo, num = m.group(1), m.group(2), m.group(3)
+        raw2 = run(["gh", "api", f"repos/{owner}/{repo}/pulls/{num}/comments",
+                    "--paginate"])
+        if raw2:
+            try:
+                inline = json.loads(raw2)
+            except ValueError:
+                inline = None
+            for c in inline or []:
+                if not isinstance(c, dict):
+                    continue
+                body = str(c.get("body") or "").strip()
+                if not body:
+                    continue
+                login = str((c.get("user") or {}).get("login") or "")
+                loc = c.get("path") or None
+                if loc and c.get("line"):
+                    loc = f"{loc}:{c['line']}"
+                events.append({
+                    "key": str(c.get("id") or c.get("html_url") or ""),
+                    "author": login, "body": body, "kind": "inline", "loc": loc,
+                    "is_self": bool(self_login) and login == self_login,
+                })
+    return [e for e in events if e["key"]]
+
+
+def _pr_comment_message(url, events):
+    """Fold new PR comments into the single free-text message typed into the
+    session (XERK-49). send_input collapses newlines to spaces, so this is built
+    flat: a header naming the PR and telling the agent to act on it in THIS
+    session, then each comment as `@author (kind, loc): body`, bodies capped so
+    one long comment can't crowd out the rest before INPUT_MAX_CHARS truncates."""
+    if not events:
+        return ""
+    m = PR_URL_PARTS_RE.search(url or "")
+    num = f"#{m.group(3)}" if m else ""
+    parts = [f"New review activity on the PR {num} you opened ({url}). "
+             f"Address it and update the PR — continue in this session:"]
+    for e in events:
+        who = f"@{e['author']}" if e.get("author") else "someone"
+        tag = e.get("kind") or "comment"
+        if e.get("loc"):
+            tag = f"{tag} on {e['loc']}"
+        body = " ".join(str(e.get("body") or "").split())[:PR_COMMENTS_BODY_CAP]
+        parts.append(f"[{who} — {tag}] {body}")
+    return "  ".join(parts)
 
 
 LOG_TAIL_LINES = 50
@@ -1246,6 +1787,26 @@ def _last_entry(path):
             return json.loads(raw)
         except ValueError:
             continue  # partial write at the tail, or the seek-point fragment
+    return None
+
+
+def _last_activity_ts(path):
+    """ISO timestamp of the newest transcript entry that carries one — the true
+    'last new message' time (XERK-73). This is the accurate sort key for the
+    ended list, immune to the file-mtime drift the `resumable` scan otherwise
+    inherits: a week-old conversation copied onto this host (a synced ~/.claude,
+    a backup restore) gets mtime=now and sorts to the top though nothing was
+    said, but its entries keep their original UTC timestamps. Scans the tail
+    newest-first and returns the first entry's `timestamp`; None when no tail
+    entry has one (an older/odd transcript), leaving the caller its mtime
+    fallback."""
+    for raw in reversed(_read_tail_lines(path, 1 << 17)):  # ~128 KB
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue  # partial write at the tail, or the seek-point fragment
+        if isinstance(entry, dict) and entry.get("timestamp"):
+            return entry["timestamp"]
     return None
 
 
@@ -1307,19 +1868,251 @@ def _tn_preview(tn):
     return "\n\n".join(p for p in parts if p)
 
 
+# Running a slash command writes three more XML-ish user-role turns that are not
+# the human talking either: a boilerplate <local-command-caveat> telling the
+# model to ignore what follows, the <command-name>/<command-args> invocation
+# wrapper, and the command's <local-command-stdout>/<local-command-stderr>.
+# Rendered verbatim they read as the operator typing raw XML into chat, so —
+# exactly as with <task-notification> above — we parse them here into structured
+# blocks the web chat renders as a command chip / output card, and drop the
+# caveat outright. Keep mirrored with tunnel-agent.js parseLocalCommand().
+#
+# Matched with `search`, not `match`: Claude Code emits the wrapper tags indented
+# and sometimes with sibling text, so anchoring to the whole string would miss
+# them. The caveat, by contrast, is the ENTIRE entry when present, hence fullmatch.
+LOCAL_COMMAND_CAVEAT_RE = re.compile(
+    r"\s*<local-command-caveat>.*?</local-command-caveat>\s*", re.DOTALL)
+COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.DOTALL)
+COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
+COMMAND_STDOUT_RE = re.compile(
+    r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL)
+COMMAND_STDERR_RE = re.compile(
+    r"<local-command-stderr>(.*?)</local-command-stderr>", re.DOTALL)
+
+# The `!` prefix runs a shell command straight from the composer/TUI, and
+# Claude Code records it as two more XML-ish user turns: the command
+# (<bash-input>) and its output (<bash-stdout>/<bash-stderr>). Not the human
+# talking either — parse them into the SAME command/output shapes the slash
+# commands produce (name "!", the exact prefix the operator typed), so the chat
+# renders a chip + output card instead of a raw-XML user bubble. Keep mirrored
+# with tunnel-agent.js parseLocalCommand.
+BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
+BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
+BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
+
+
+def _parse_local_command(text):
+    """Parse one of Claude Code's slash-command / `!`-shell bookkeeping turns,
+    or None when `text` isn't one. Mirror of tunnel-agent.js parseLocalCommand().
+    Returns:
+      {"kind": "caveat"}                        -> drop the entry entirely
+      {"kind": "command", "name", "args"}       -> the /slash or ! invocation
+      {"kind": "output", "text", "isError"}     -> the command's stdout/stderr
+    stderr wins over stdout when a turn carries both, so a failing command reads
+    as an error rather than silently showing its (usually empty) stdout — the
+    same rule for both the slash and the bash tags."""
+    if not text:
+        return None
+    if LOCAL_COMMAND_CAVEAT_RE.fullmatch(text):
+        return {"kind": "caveat"}
+    m = COMMAND_NAME_RE.search(text)
+    if m:
+        name = ANSI_RE.sub("", m.group(1)).strip()
+        args = COMMAND_ARGS_RE.search(text)
+        if name:
+            return {
+                "kind": "command",
+                "name": name,
+                "args": ANSI_RE.sub("", args.group(1)).strip() if args else "",
+            }
+    m = BASH_INPUT_RE.search(text)
+    if m:
+        cmd = ANSI_RE.sub("", m.group(1)).strip()
+        if cmd:
+            return {"kind": "command", "name": "!", "args": cmd}
+    first = None
+    for regex, is_error in ((COMMAND_STDERR_RE, True), (BASH_STDERR_RE, True),
+                            (COMMAND_STDOUT_RE, False), (BASH_STDOUT_RE, False)):
+        m = regex.search(text)
+        if m:
+            out = {
+                "kind": "output",
+                "text": ANSI_RE.sub("", m.group(1)).strip(),
+                "isError": is_error,
+            }
+            # stderr wins over stdout ONLY when it carries text — a bash turn
+            # routinely ships both tags with one of them empty, and an empty
+            # stderr must not swallow the stdout beside it (or vice versa).
+            if out["text"]:
+                return out
+            if first is None:
+                first = out
+    return first
+
+
+def _lc_preview(lc):
+    """Flatten a parsed local-command turn to display text, the text-feed form
+    used by the glasses tail, heartbeat preview and archive — or None to drop it
+    (the caveat, and an output turn that carried nothing)."""
+    if lc["kind"] == "caveat":
+        return None
+    if lc["kind"] == "command":
+        return " ".join(p for p in (lc["name"], lc["args"]) if p)
+    return lc["text"] or None
+
+
+def _entry_first_text(entry):
+    """The entry's first raw text payload (string content, or the first `text`
+    block of list content), or "" — the pre-flatten form callers need to ask
+    what KIND of turn this is."""
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return str(block.get("text") or "")
+    return ""
+
+
+def _entry_local_command(entry):
+    """The parsed slash-command turn this entry IS, or None. Callers that want
+    to skip command plumbing must ask this rather than sniffing _entry_text's
+    output, which has already flattened the wrapper away."""
+    return _parse_local_command(_entry_first_text(entry))
+
+
+# Pressing Esc (or the hub's Stop button) mid-turn writes a user-role
+# "[Request interrupted by user]" / "[Request interrupted by user for tool
+# use]" marker entry. That is a statement ABOUT the turn, not something the
+# operator typed, so _entry_blocks classifies it as an `interrupt` block the
+# chat renders as a muted status marker instead of a user bubble. The text
+# feed (_entry_text) keeps the raw bracket line: glasses/heartbeat/archive are
+# one-dimensional text, where it already reads as the marker it is. Keep
+# mirrored with tunnel-agent.js INTERRUPT_RE.
+INTERRUPT_RE = re.compile(r"^\s*\[Request interrupted by user[^\]\n]*\]\s*$")
+
+
+# Claude Code's "while you were away" recap: a `system` entry (subtype
+# "away_summary") whose content is prose the model wrote about what happened
+# since the operator left — the TUI paints it as a recap box, so the chat
+# should too rather than dropping it with the rest of the system bookkeeping
+# (turn_duration, bridge_status, …, which stay dropped). The trailing
+# "(disable recaps in /config)" hint is a TUI affordance the chat has no
+# equivalent of, so it is stripped.
+AWAY_HINT_RE = re.compile(r"\s*\(disable recaps in /config\)\s*$")
+
+
+def _away_summary_text(entry):
+    """The recap text of an away_summary system entry, or None when `entry`
+    isn't one (any other type/subtype, or empty content). Mirror of
+    tunnel-agent.js awaySummaryText."""
+    if entry.get("type") != "system" or entry.get("subtype") != "away_summary":
+        return None
+    text = AWAY_HINT_RE.sub("", ANSI_RE.sub("", str(entry.get("content") or ""))).strip()
+    return text or None
+
+
+def _entry_tool_source(entry):
+    """The tool_use id this user turn was PRODUCED BY, or None.
+
+    Claude Code feeds a skill's body back to the model by writing it as a
+    user-role turn — role `user` is the only channel tool output can travel on —
+    tagged with `sourceToolUseID`, the id of the `Skill` tool_use that pulled it
+    in. So on a user turn that field means "the tooling authored this, not the
+    operator": every such entry on this box resolves to a Skill call.
+
+    Taken at its wire role the entry renders as the human typing a whole
+    SKILL.md into chat (151KB for some skills). It is really the tool's result,
+    so that's what we emit: _entry_blocks() hands it back as the tool_result of
+    its own Skill call, which the chat pairs into that call's action card, and
+    _entry_text() drops it like any other tool_result. Keyed on sourceToolUseID
+    rather than the broader `isMeta`, which also tags hook feedback, command
+    caveats and resume prompts — turns with quite different authors.
+
+    Mirror of tunnel-agent.js entryToolSource()."""
+    if entry.get("type") != "user":
+        return None
+    return entry.get("sourceToolUseID") or None
+
+
+def _entry_id(entry):
+    """The entry's own uuid, or a synthesized stable id for the entry types
+    Claude Code writes WITHOUT one (pr-link): the client's tail merge dedups on
+    id and drops id-less entries, so without this a pr_link block never reaches
+    the chat. Mirror of tunnel-agent.js entryId().
+
+    A pr-link keys on its URL ALONE, deliberately excluding the timestamp: Claude
+    Code re-stamps a session's PR links in the metadata preamble it writes at the
+    top of every user turn (beside last-prompt/ai-title/mode/permission-mode), so
+    one PR yields ~6 entries differing only in `timestamp`. They are re-records of
+    one fact, not separate events, and sharing an id is what lets the tail merge
+    collapse them to the FIRST — which lands within a few entries of the `gh pr
+    create` that opened it, i.e. where the PR really landed in the conversation."""
+    eid = entry.get("uuid")
+    if eid:
+        return eid
+    if entry.get("type") == "pr-link":
+        return "pr-link:%s" % (entry.get("prUrl") or "",)
+    return None
+
+
+def _entry_role(entry):
+    """Display role for a transcript entry. Normally the entry type, but a
+    compact summary is written as a USER turn carrying text the model wrote
+    about itself — showing it on the human's side (as the raw transcript role
+    would) misattributes it, so it reports as the assistant. A system entry
+    only ever survives the feeds as an away_summary recap (see
+    _away_summary_text), which the model also wrote — same rule."""
+    if entry.get("isCompactSummary"):
+        return "assistant"
+    if entry.get("type") == "system":
+        return "assistant"
+    return entry.get("type")
+
+
+def _flatten_text(raw):
+    """One text payload -> its text-feed form: a <task-notification> or
+    slash-command bookkeeping turn flattened to its preview, anything else
+    verbatim. None to drop the payload (a caveat / empty command output)."""
+    tn = _parse_task_notification(raw)
+    if tn:
+        return _tn_preview(tn)
+    lc = _parse_local_command(raw)
+    if lc:
+        return _lc_preview(lc)
+    return raw
+
+
 def _entry_text(entry):
     """Map one transcript entry to display text for the glasses tail feed, or
-    None to drop it (wrong type, no message, tool_result-only turn, or empty
-    after stripping ANSI)."""
+    None to drop it (wrong type, no message, tool_result-only turn, a skill body
+    (_entry_tool_source), a slash-command caveat, or empty after stripping
+    ANSI). An away_summary system entry survives as its recap text (role
+    "assistant" via _entry_role); every other system subtype stays dropped."""
+    away = _away_summary_text(entry)
+    if away is not None:
+        return away
     if entry.get("type") not in ("user", "assistant"):
+        return None
+    # Tool-authored: a tool_result by another name, and this feed drops those.
+    # The invoking `[Skill]` tool_use still shows in the assistant turn, and its
+    # arguments ride that call's input, so nothing readable is lost — only the
+    # SKILL.md wall, which would otherwise dominate the tail, the heartbeat
+    # preview and the archive's search index.
+    if _entry_tool_source(entry):
         return None
     msg = entry.get("message")
     if not isinstance(msg, dict):
         return None
     content = msg.get("content")
     if isinstance(content, str):
-        tn = _parse_task_notification(content)
-        text = _tn_preview(tn) if tn else content
+        text = _flatten_text(content)
+        if text is None:
+            return None
     elif isinstance(content, list):
         parts = []
         for block in content:
@@ -1327,9 +2120,9 @@ def _entry_text(entry):
                 continue
             btype = block.get("type")
             if btype == "text":
-                raw = str(block.get("text") or "")
-                tn = _parse_task_notification(raw)
-                parts.append(_tn_preview(tn) if tn else raw)
+                flat = _flatten_text(str(block.get("text") or ""))
+                if flat is not None:
+                    parts.append(flat)
             elif btype == "tool_use" and block.get("name"):
                 parts.append(f"[{block['name']}]")
             # "thinking" and "tool_result" blocks are dropped.
@@ -1350,13 +2143,24 @@ def _clip(text, cap):
 
 # Common Claude Code tools carry their salient argument under one of these keys;
 # surface it as the tool_use's one-line summary rather than a raw JSON dump.
-_TOOL_INPUT_KEYS = ("command", "file_path", "path", "pattern", "url", "query", "prompt")
+_TOOL_INPUT_KEYS = ("command", "file_path", "path", "pattern", "url", "query", "prompt",
+                    "skill", "subject")
 
 
 def _tool_input_summary(inp):
     """A compact display string for a tool_use `input` object: the salient arg
-    for known tools, else a compact JSON dump, else str()."""
+    for known tools, else a compact JSON dump, else str(). An AskUserQuestion
+    call's salient arg is the question text itself, nested in its `questions`
+    list — joined here so the card reads as the question(s) asked, not a JSON
+    dump of the whole picker structure."""
     if isinstance(inp, dict):
+        questions = inp.get("questions")
+        if isinstance(questions, list):
+            texts = [q["question"].strip() for q in questions
+                     if isinstance(q, dict) and isinstance(q.get("question"), str)
+                     and q["question"].strip()]
+            if texts:
+                return " · ".join(texts)
         for key in _TOOL_INPUT_KEYS:
             val = inp.get(key)
             if isinstance(val, str) and val.strip():
@@ -1372,6 +2176,49 @@ def _tool_input_summary(inp):
     return str(inp)
 
 
+def _tool_use_detail(block, name, inp, caps):
+    """Attach the reviewable payload of a known tool call to its tool_use block,
+    beyond the one-line `input` summary — the part an operator otherwise opens
+    the raw terminal to see. Returns True when a payload was clipped by its cap
+    (the caller flags the block truncated so "Show more" refetches the FULL copy).
+
+      Edit          -> edit: {old, new, replaceAll?}   (the actual change, as a diff)
+      Write         -> content: the file body written
+      ExitPlanMode  -> plan: the plan markdown the operator was asked to approve
+      any tool      -> desc: its human `description` arg (Bash, Agent, Monitor, …)
+
+    Mirror of tunnel-agent.js toolUseDetail()."""
+    if not isinstance(inp, dict):
+        return False
+    truncated = False
+    if name == "Edit":
+        old, new = inp.get("old_string"), inp.get("new_string")
+        if isinstance(old, str) or isinstance(new, str):
+            old_c, old_t = _clip(ANSI_RE.sub("", str(old or "")), caps["result"])
+            new_c, new_t = _clip(ANSI_RE.sub("", str(new or "")), caps["result"])
+            edit = {"old": old_c, "new": new_c}
+            if inp.get("replace_all"):
+                edit["replaceAll"] = True
+            block["edit"] = edit
+            truncated = old_t or new_t
+    elif name == "Write":
+        content = inp.get("content")
+        if isinstance(content, str) and content.strip():
+            clipped, trunc = _clip(ANSI_RE.sub("", content), caps["result"])
+            block["content"] = clipped
+            truncated = trunc
+    elif name == "ExitPlanMode":
+        plan = inp.get("plan")
+        if isinstance(plan, str) and plan.strip():
+            clipped, trunc = _clip(ANSI_RE.sub("", plan).strip(), caps["text"])
+            block["plan"] = clipped
+            truncated = trunc
+    desc = inp.get("description")
+    if isinstance(desc, str) and desc.strip():
+        block["desc"] = _clip(ANSI_RE.sub("", desc).strip(), caps["input"])[0]
+    return truncated
+
+
 def _tool_result_text(content):
     """Flatten a tool_result block's `content` (a string, or a list of
     {type:'text'|'image', ...} blocks) to plain text."""
@@ -1385,12 +2232,116 @@ def _tool_result_text(content):
                     parts.append(str(block.get("text") or ""))
                 elif block.get("type") == "image":
                     parts.append("[image]")
+                elif block.get("type") == "tool_reference":
+                    # A ToolSearch result names the tools it loaded as
+                    # tool_reference blocks; flattening them away left the
+                    # call's output card reading empty. Own line each.
+                    parts.append(f"\n[tool: {block.get('tool_name') or 'tool'}]")
             elif isinstance(block, str):
                 parts.append(block)
         return "".join(parts)
     if content is None:
         return ""
     return str(content)
+
+
+def _scan_pr_line(raw, state, report):
+    """Fold one appended transcript line into a session's PR-URL scan.
+
+    Attribution is deliberately narrow: a URL counts only when it comes back in
+    a `gh pr create` call's OWN tool_result — i.e. the session literally opened
+    that PR. A PR link reaches a transcript a dozen other ways (`gh pr
+    list`/`view`/`checks` output, a link the operator pasted, the model quoting
+    a PR another session opened), and taking any of those as "this session's
+    PR" is what used to hang a chip — and fire a "created a PR" alert — on the
+    wrong card, for a PR the session never touched.
+
+    The call and its result are separate entries and routinely land in
+    different beats, so the pending tool_use ids live in `state` across beats.
+    """
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return  # partial write, or the backlog cap's leading fragment
+    if isinstance(entry, dict):
+        _scan_pr_entry(entry, state, report)
+
+
+def _scan_pr_entry(entry, state, report):
+    """_scan_pr_line's fold, taking the already-parsed entry (the shared
+    per-line scan parses each line once for every scanner)."""
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return
+    calls = state.setdefault("pr_calls", [])
+    seen = state.setdefault("pr_seen", set())
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use":
+            cmd = (block.get("input") or {}).get("command")
+            if (block.get("name") == "Bash" and isinstance(cmd, str)
+                    and PR_CREATE_RE.search(cmd) and block.get("id")):
+                calls.append(block["id"])
+                del calls[:-PR_CALLS_MAX]
+        elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
+            for m in PR_URL_RE.finditer(_tool_result_text(block.get("content"))):
+                url = m.group(0)
+                if url not in seen:
+                    seen.add(url)
+                    report["prUrls"].append(url)
+
+
+# The confirmation line Claude Code prints (and transcribes as local-command
+# stdout) when its model changes: "Set model to <X> for this session only" /
+# "…and saved as your default for new sessions". The captured label ("Sonnet 5")
+# is display text, not a model id. "Kept model as X" (a cancelled picker) is
+# deliberately not matched — nothing changed.
+SET_MODEL_STDOUT_RE = re.compile(
+    r"Set model to\s+(.+?)"
+    r"(?:\s+for this session only|\s+and saved as your default\b.*)?\s*$",
+    re.MULTILINE)
+
+
+def _scan_model_entry(entry, report):
+    """Fold one parsed transcript entry into the session's actual-model read.
+
+    Two signals, both chronological (the scan feeds lines in order, so the last
+    one seen wins): an assistant entry's `message.model` — the id of the model
+    that actually produced that turn — and the "Set model to X" local-command
+    stdout a live `/model` switch writes, which confirms a switch the instant it
+    lands rather than a whole turn later. The result is a model ID in the first
+    case and a display label in the second; the hub's prettifier renders both."""
+    if entry.get("type") == "assistant":
+        model = (entry.get("message") or {}).get("model")
+        # "<synthetic>" is Claude Code's stamp on entries it fabricates itself
+        # (e.g. error placeholders) — not a model that answered.
+        if isinstance(model, str) and model and not model.startswith("<"):
+            report["modelActual"] = model
+        return
+    if entry.get("type") == "system" and entry.get("subtype") == "local_command":
+        lc = _parse_local_command(entry.get("content") or "")  # `claude -p` shape
+    else:
+        lc = _entry_local_command(entry)  # the interactive-TUI (user turn) shape
+    if not lc or lc.get("kind") != "output" or not lc.get("text"):
+        return
+    m = SET_MODEL_STDOUT_RE.search(lc["text"])
+    if m:
+        report["modelActual"] = m.group(1).strip()
+
+
+def _scan_entry_line(raw, state, report):
+    """Fold one appended transcript line into every incremental per-beat scan
+    (PR attribution + actual model) with a single JSON parse."""
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return  # partial write, or the backlog cap's leading fragment
+    if not isinstance(entry, dict):
+        return
+    _scan_pr_entry(entry, state, report)
+    _scan_model_entry(entry, report)
 
 
 def _entry_blocks(entry, caps):
@@ -1401,21 +2352,91 @@ def _entry_blocks(entry, caps):
     component by verbosity. `caps` is a {text, input, result} char-limit dict
     (BLOCK_CAPS_LIVE for the ~1s tail, BLOCK_CAPS_FULL for on-demand history); a
     block cut to its cap gets truncated:true. Blocks:
-      {t:"text",        text}
-      {t:"thinking",    text, truncated?}
-      {t:"tool_use",    id, name, input, truncated?}
-      {t:"tool_result", forId, text, isError?, truncated?}
+      {t:"text",           text}
+      {t:"thinking",       text, truncated?}
+      {t:"tool_use",       id, name, input, truncated?}
+      {t:"tool_result",    forId, text, isError?, truncated?}
+      {t:"compact_summary", text, truncated?}
+      {t:"command",        name, args?, truncated?}
+      {t:"command_output", text, isError?, truncated?}
+      {t:"interrupt",      text}
+      {t:"away_summary",   text, truncated?}
+      {t:"compact_boundary", trigger?, preTokens?, postTokens?}
+      {t:"pr_link",        url, number?, repo?}
+    A tool_use block for a known tool also carries its reviewable payload —
+    edit/content/plan/desc, see _tool_use_detail — so the chat can show the
+    actual change/plan instead of just the salient argument.
+    A skill body — a user turn Claude Code wrote as the result of a `Skill` tool
+    call (see _entry_tool_source) — becomes that call's {t:"tool_result"} block,
+    so the chat folds it into the Skill action card it belongs to instead of
+    rendering a SKILL.md-sized operator bubble.
     A `<task-notification>` user turn becomes a single {t:"task_notification",
     summary, status?, result?, truncated?} block (see _parse_task_notification)
-    so the web chat renders it as an action card, not raw XML.
+    so the web chat renders it as an action card, not raw XML. The slash-command
+    bookkeeping turns get the same treatment via _parse_local_command: the
+    invocation becomes a `command` block, its stdout/stderr a `command_output`
+    block, and the boilerplate caveat is dropped (yielding []).
+    An "[Request interrupted by user…]" marker turn (INTERRUPT_RE) becomes an
+    `interrupt` block — a statement about the turn, rendered as a status
+    marker, not operator prose. An away_summary system entry (the "while you
+    were away" recap — see _away_summary_text) becomes an `away_summary` block.
+    A compact_boundary system entry — the record that a compaction actually
+    RAN, with its trigger and before/after token counts — becomes a
+    `compact_boundary` status marker (the TUI shows the compaction; without
+    this the chat's context silently resets). All other system entries still
+    drop. A `pr-link` entry (Claude Code's own record of a PR it opened)
+    becomes a `pr_link` marker so the reader sees where in the conversation
+    the PR landed; such entries carry no uuid, so the feeds synthesize an id
+    (_entry_id / entryId).
     Returns [] for a user/assistant message with no renderable blocks. Keep this
     mirrored with tunnel-agent.js entryBlocks()."""
+    away = _away_summary_text(entry)
+    if away is not None:
+        clipped, trunc = _clip(away, caps["text"])
+        block = {"t": "away_summary", "text": clipped}
+        if trunc:
+            block["truncated"] = True
+        return [block]
+    if entry.get("type") == "system" and entry.get("subtype") == "compact_boundary":
+        meta = entry.get("compactMetadata") or {}
+        block = {"t": "compact_boundary"}
+        if isinstance(meta.get("trigger"), str) and meta["trigger"]:
+            block["trigger"] = meta["trigger"]
+        for key in ("preTokens", "postTokens"):
+            if isinstance(meta.get(key), int):
+                block[key] = meta[key]
+        return [block]
+    if entry.get("type") == "pr-link":
+        url = entry.get("prUrl")
+        if not isinstance(url, str) or not url:
+            return None
+        block = {"t": "pr_link", "url": url}
+        if isinstance(entry.get("prNumber"), int):
+            block["number"] = entry["prNumber"]
+        if isinstance(entry.get("prRepository"), str) and entry["prRepository"]:
+            block["repo"] = entry["prRepository"]
+        return [block]
     if entry.get("type") not in ("user", "assistant"):
         return None
     msg = entry.get("message")
     if not isinstance(msg, dict):
         return None
     content = msg.get("content")
+
+    # A skill body is the result of the Skill call that pulled it in: emit it as
+    # that call's tool_result and let the chat's existing tool_use/tool_result
+    # pairing fold it into the action card. Ahead of the content walk, because
+    # the body arrives as an ordinary text block and would otherwise read as
+    # operator prose.
+    tool_src = _entry_tool_source(entry)
+    if tool_src:
+        text = ANSI_RE.sub("", _entry_first_text(entry)).strip()
+        clipped, trunc = _clip(text, caps["result"])
+        block = {"t": "tool_result", "text": clipped, "forId": tool_src}
+        if trunc:
+            block["truncated"] = True
+        return [block]
+
     blocks = []
 
     def add_text(kind, text, cap):
@@ -1440,23 +2461,57 @@ def _entry_blocks(entry, caps):
             block["truncated"] = True
         blocks.append(block)
 
-    if isinstance(content, str):
-        tn = _parse_task_notification(content)
+    def add_local_command(lc):
+        """The caveat contributes no block (its entry drops out entirely)."""
+        if lc["kind"] == "command":
+            name, _ = _clip(lc["name"], caps["input"])
+            args, atrunc = _clip(lc["args"], caps["input"])
+            block = {"t": "command", "name": name}
+            if args:
+                block["args"] = args
+            if atrunc:
+                block["truncated"] = True
+            blocks.append(block)
+        elif lc["kind"] == "output" and lc["text"]:
+            text, trunc = _clip(lc["text"], caps["result"])
+            block = {"t": "command_output", "text": text}
+            if lc["isError"]:
+                block["isError"] = True
+            if trunc:
+                block["truncated"] = True
+            blocks.append(block)
+
+    def add_payload(raw):
+        """One text payload -> its block(s): a task-notification card, a
+        slash-command / `!`-shell chip/output card, an interrupt marker, else
+        plain text."""
+        tn = _parse_task_notification(raw)
         if tn:
             add_task_notification(tn)
-        else:
-            add_text("text", content, caps["text"])
+            return
+        lc = _parse_local_command(raw)
+        if lc:
+            add_local_command(lc)
+            return
+        if INTERRUPT_RE.match(raw):
+            blocks.append({"t": "interrupt", "text": ANSI_RE.sub("", raw).strip()})
+            return
+        # A compact summary is prose the model wrote about the conversation so
+        # far, injected as a user turn. It gets its own block so the chat can
+        # render it as a collapsed agent-side card rather than a wall of text in
+        # a user bubble. _entry_role() puts it on the assistant's side.
+        add_text("compact_summary" if entry.get("isCompactSummary") else "text",
+                 raw, caps["text"])
+
+    if isinstance(content, str):
+        add_payload(content)
     elif isinstance(content, list):
         for raw in content:
             if not isinstance(raw, dict):
                 continue
             btype = raw.get("type")
             if btype == "text":
-                tn = _parse_task_notification(str(raw.get("text") or ""))
-                if tn:
-                    add_task_notification(tn)
-                else:
-                    add_text("text", str(raw.get("text") or ""), caps["text"])
+                add_payload(str(raw.get("text") or ""))
             elif btype == "thinking":
                 add_text("thinking", str(raw.get("thinking") or raw.get("text") or ""), caps["text"])
             elif btype == "tool_use" and raw.get("name"):
@@ -1466,6 +2521,8 @@ def _entry_blocks(entry, caps):
                 if raw.get("id"):
                     block["id"] = raw["id"]
                 if trunc:
+                    block["truncated"] = True
+                if _tool_use_detail(block, str(raw["name"]), raw.get("input"), caps):
                     block["truncated"] = True
                 blocks.append(block)
             elif btype == "tool_result":
@@ -1498,7 +2555,7 @@ def transcript_tail(path):
             continue
         tail.append({
             "id": entry.get("uuid"),
-            "role": entry.get("type"),
+            "role": _entry_role(entry),
             "text": text[:TAIL_MSG_CHARS],
         })
     return tail[-TAIL_MSGS:]
@@ -1527,6 +2584,47 @@ def _newest_transcript_path(workdir):
     return newest
 
 
+def _pinned_transcript_path(workdir, claude_sid):
+    """Path of the transcript claude was PINNED to for a session, or None.
+
+    Every launch fixes claude's session id (--session-id on a fresh one, the
+    --resume id otherwise), and Claude Code names the transcript after it, so
+    the file is <claude_sid>.jsonl under the cwd's project slug. None when the
+    session predates the pin (no id) or claude hasn't written its first entry
+    yet — see _session_transcript_path for why that is NOT a fallback."""
+    if not claude_sid or not VALID_CLAUDE_SID_RE.fullmatch(claude_sid):
+        return None
+    path = os.path.join(PROJECTS_ROOT, _project_slug(workdir),
+                        f"{claude_sid}.jsonl")
+    return path if os.path.exists(path) else None
+
+
+def _session_transcript_path(sess):
+    """The transcript THIS session's conversation lives in, or None.
+
+    Resolved from the session's own pinned claude id rather than "whichever
+    *.jsonl in the project dir was written most recently". The two rules agree
+    for a worktree session — its cwd is unique, so its slug dir holds only its
+    own transcripts — and disagree for exactly one thing: the repos-root
+    pseudo-repo, where every root session ever run shares REPOS_ROOT as its cwd
+    and therefore one slug dir. There, newest-mtime resolved a brand-new root
+    session to the PREVIOUS root session's conversation, which is what made a
+    fresh root session open onto the last one's whole chat history (XERK-6),
+    seed its name off that session's first prompt, and — worst — resume it.
+
+    A pinned session with no transcript on disk yet has not started a
+    conversation, and returns None rather than falling back to newest-mtime.
+    The fallback IS the bug: in a shared slug dir it silently answers with a
+    neighbour's conversation. Sessions launched by an agent predating the pin
+    carry no id and keep the newest-mtime rule, which is all they ever had."""
+    wt = sess.get("worktreePath") or (REPOS_ROOT if sess.get("root") else None)
+    if not wt:
+        return None
+    if sess.get("claudeSessionId"):
+        return _pinned_transcript_path(wt, sess["claudeSessionId"])
+    return _newest_transcript_path(wt)
+
+
 def _first_user_text(path, max_lines=500):
     """The first genuine human prompt from the START of a transcript, or None.
 
@@ -1538,9 +2636,11 @@ def _first_user_text(path, max_lines=500):
     first prompt is almost always typed into the live ttyd terminal, which writes
     straight to the tmux pane and never reaches send_input, so the transcript —
     which every input path lands in — is the only channel-agnostic place to find
-    it. Bounded to the first max_lines lines so an already-long resumed transcript
-    can't make this walk expensive (the real first prompt sits within the first
-    handful of entries anyway)."""
+    it. Reading from the top also means a naming RETRY sees the same first prompt
+    the original attempt saw, however many turns later it runs. Bounded to the
+    first max_lines lines so an already-long resumed transcript can't make this
+    walk expensive (the real first prompt sits within the first handful of entries
+    anyway)."""
     try:
         with open(path, errors="replace") as f:
             for i, line in enumerate(f):
@@ -1559,12 +2659,41 @@ def _first_user_text(path, max_lines=500):
                     continue
                 if entry.get("promptSource") == "system":
                     continue  # injected turn (e.g. a task-notification), not human
+                if entry.get("isCompactSummary"):
+                    continue  # the model's own summary, injected as a user turn
+                if _entry_local_command(entry):
+                    continue  # slash-command plumbing, not a real prompt
                 text = _entry_text(entry)
                 if not text:
                     continue  # tool_result-only turn, or empty after stripping
-                if text.startswith("<command-") or text.startswith("<local-command"):
-                    continue  # slash-command plumbing, not a real prompt
                 return text
+    except OSError:
+        return None
+    return None
+
+
+def _first_command_name(path, max_lines=50):
+    """The first slash-command invocation recorded at the top of a transcript
+    ("/model", …), or None. The complement of _first_user_text — which
+    deliberately skips command plumbing — for recognizing a transcript that IS
+    nothing but a command, like the manager's own models probe."""
+    try:
+        with open(path, errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                lc = _entry_local_command(entry)
+                if lc and lc.get("kind") == "command" and lc.get("name"):
+                    return lc["name"]
     except OSError:
         return None
     return None
@@ -1595,25 +2724,134 @@ def _transcript_cwd(path):
     return None
 
 
+# The prompt queue: a message typed mid-turn is enqueued, and Claude Code
+# records the queue's life as `queue-operation` transcript entries — enqueue
+# carries the text, dequeue pops the OLDEST into a real user turn, remove
+# withdraws one by content. The TUI shows the still-queued prompts below the
+# input box; the chat view reads them off these entries, folded in file order,
+# so a prompt sent mid-turn shows as "queued" instead of vanishing until the
+# turn ends (when its dequeue lands, the real user turn takes over — no
+# duplicate). A read window that opens mid-sequence can see a dequeue whose
+# enqueue was cut off; popping an empty queue is a no-op, which errs toward
+# briefly hiding a queued prompt rather than inventing a phantom one.
+QUEUED_PROMPTS_MAX = 10
+QUEUED_PROMPT_CHARS = 4000
+
+
+def _fold_queue_op(entry, queue):
+    """Fold one queue-operation entry into `queue` (still-queued prompt texts,
+    oldest first). Mirror of tunnel-agent.js foldQueueOp."""
+    op = entry.get("operation")
+    content = entry.get("content")
+    if op == "enqueue":
+        if isinstance(content, str) and content.strip():
+            queue.append(content.strip()[:QUEUED_PROMPT_CHARS])
+    elif op == "dequeue":
+        if queue:
+            queue.pop(0)
+    elif op == "remove":
+        if isinstance(content, str):
+            c = content.strip()[:QUEUED_PROMPT_CHARS]
+            if c in queue:
+                queue.remove(c)
+
+
+def _queued_display(queue):
+    """The queue entries worth SHOWING as queued prompts: capped, and minus the
+    tooling's own payloads. A background task finishing mid-turn rides the same
+    queue as a `<task-notification>` XML wall — rendering that as a queued
+    operator bubble is the exact misclassification the block parsers exist to
+    fix. It must still occupy its FIFO slot in `queue` (dequeues are
+    positional), so it is filtered here at report time, never at fold time.
+    Prefix-matched (not parsed): the enqueue copy is clipped to
+    QUEUED_PROMPT_CHARS, which can cut the closing tag a full parse needs.
+    Mirror of tunnel-agent.js queuedDisplay."""
+    return [q for q in queue
+            if not q.startswith("<task-notification>")][-QUEUED_PROMPTS_MAX:]
+
+
+# A conversation that auto-compacts (context near-full, ~95%) rewrites its own
+# history, and a message the operator sent that was still QUEUED — or was typed
+# straight into the pane as compaction began — can be dropped by it instead of
+# consumed: it never becomes a real user turn and never reaches the model, so
+# the operator's message silently vanishes (XERK-47). send_input records every
+# sent message on the session record and _poll_pending_inputs gives it an
+# at-least-once guarantee across a compaction: it reaps the record on delivery,
+# and on a FRESH compaction that ate the message re-types it once the pane has
+# settled. A compaction is detected authoritatively from the transcript's own
+# `compact_boundary` system entry (written when a compaction completes), not by
+# scraping the pane for an undocumented "Compacting…" string.
+PENDING_INPUT_MAX = 20                # cap the per-session outbox
+PENDING_INPUT_MAX_ATTEMPTS = int(os.environ.get("SESSION_INPUT_RESEND_MAX", "3"))
+# Drop an outbox entry that never lands and never sees a compaction (some
+# non-compaction loss, e.g. a tmux hiccup) so the record can't leak forever.
+PENDING_INPUT_TTL_SEC = float(os.environ.get("SESSION_INPUT_PENDING_TTL_SEC", "900"))
+
+
+def _pending_scan(path):
+    """Read a session's transcript tail for the three facts the resend-across-
+    compaction guarantee needs (XERK-47), in one pass:
+
+      - delivered:  stripped texts of genuine user turns (a queued message the
+                    model consumed becomes one) — a sent message present here has
+                    LANDED and its outbox record is reaped;
+      - queued:     the still-queued prompt texts (folded, see _fold_queue_op) —
+                    IN-FLIGHT, neither delivered nor lost, so it is left to land;
+      - compactions: how many `compact_boundary` system entries the transcript
+                    holds — a rise since a message was sent means a compaction
+                    happened that could have dropped it.
+
+    Same 4 MiB tail window _history_entries reads. Delivered is matched by text
+    with no timestamp/offset filter, which is deliberately biased AGAINST a
+    resend: the only cost is that a message re-sending the EXACT text of an older
+    turn is treated as already delivered and not resent (a missed resend, never a
+    duplicate) — and a duplicate is the worse failure to show the operator."""
+    delivered, queued, compactions = [], [], 0
+    for raw in _read_tail_lines(path, 1 << 22):
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        etype = entry.get("type")
+        if etype == "queue-operation":
+            _fold_queue_op(entry, queued)
+        elif etype == "system" and entry.get("subtype") == "compact_boundary":
+            compactions += 1
+        elif (etype == "user" and not entry.get("isMeta")
+              and not entry.get("isCompactSummary")
+              and entry.get("promptSource") != "system"):
+            text = _entry_text(entry)
+            if text:
+                delivered.append(text.strip())
+    return delivered, _queued_display(queued), compactions
+
+
 def _history_entries(path):
     """On-demand `history` read of a transcript: bounded to the last 4 MiB
     (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
     ~128 KB, tolerant JSONL parse, entries mapped through _entry_text (no
-    duplicated entry->text logic). Returns (entries, byte_capped) — oldest
-    first; byte_capped is True when the file is bigger than the 4 MiB window,
-    i.e. older content was cut off before parsing even started."""
+    duplicated entry->text logic). Returns (entries, byte_capped, queued) —
+    entries oldest first; byte_capped is True when the file is bigger than the
+    4 MiB window, i.e. older content was cut off before parsing even started;
+    queued is the still-queued prompt texts (see _fold_queue_op)."""
     read_cap = 1 << 22
     try:
         byte_capped = os.path.getsize(path) > read_cap
     except OSError:
         byte_capped = False
     entries = []
+    queued = []
     for raw in _read_tail_lines(path, read_cap):
         try:
             entry = json.loads(raw)
         except ValueError:
             continue
         if not isinstance(entry, dict):
+            continue
+        if entry.get("type") == "queue-operation":
+            _fold_queue_op(entry, queued)
             continue
         text = _entry_text(entry)
         blocks = _entry_blocks(entry, BLOCK_CAPS_FULL)
@@ -1624,12 +2862,98 @@ def _history_entries(path):
         if text is None and not blocks:
             continue
         entries.append({
-            "id": entry.get("uuid"),
-            "role": entry.get("type"),
+            "id": _entry_id(entry),
+            "role": _entry_role(entry),
             "text": (text or "")[:TAIL_MSG_CHARS_FULL],
             "blocks": blocks or [],
         })
-    return entries, byte_capped
+    return entries, byte_capped, _queued_display(queued)
+
+
+# The Task tool's result text carries the spawned agent's id ("agentId: <id>"),
+# which is also its subagent-transcript filename (subagents/agent-<id>.jsonl).
+_AGENT_ID_RE = re.compile(r"agentId:\s*([A-Za-z0-9_-]+)")
+
+
+def _subagents_dir(main_path):
+    """The subagents/ dir Claude Code writes background-agent transcripts into,
+    a sibling of the main transcript keyed on its id:
+    <PROJECTS_ROOT>/<slug>/<id>.jsonl -> <PROJECTS_ROOT>/<slug>/<id>/subagents/."""
+    stem = main_path[:-len(".jsonl")] if main_path.endswith(".jsonl") else main_path
+    return os.path.join(stem, "subagents")
+
+
+def _strip_pane_ellipsis(cell):
+    """(text, truncated) for a cell scraped off a pane row: the TUI ellipsizes
+    a long cell with its own "…" on a narrow window, and that ellipsis is not
+    part of the real value — a prefix match against it can never succeed
+    (XERK-130). "..." is accepted alongside for safety."""
+    if cell.endswith("…"):
+        return cell[:-1].rstrip(), True
+    if cell.endswith("..."):
+        return cell[:-3].rstrip(), True
+    return cell, False
+
+
+def _resolve_subagent(main_path, agent_type, label):
+    """Map a pane agent-list row (its `type` + short `label`/description) to the
+    background agent's transcript file, via the main transcript's Task calls.
+
+    A Task tool_use carries {subagent_type, description}; its paired tool_result
+    text carries "agentId: <id>", and that id names the subagent transcript
+    (subagents/agent-<id>.jsonl). We read the main transcript, index Task calls
+    by tool_use id, resolve each id's agentId from its result, then pick the
+    NEWEST call whose type+description match the clicked row (exact, else a
+    prefix match so a pane-truncated label still resolves — the TUI ellipsizes
+    a long cell with "…" on a narrow window, so a trailing ellipsis is stripped
+    first and marks the cell as a prefix, XERK-130). Returns the subagent
+    transcript path, or None when nothing matches / the file is absent — a miss
+    must not raise (the caller stages an empty result)."""
+    want_type, type_trunc = _strip_pane_ellipsis((agent_type or "").strip())
+    want_label, _ = _strip_pane_ellipsis((label or "").strip())
+    if not want_type:
+        return None
+    tasks = []          # [(tool_use_id, description)] for the wanted type, in order
+    agent_ids = {}      # tool_use_id -> agentId (from the paired result)
+    for raw in _read_tail_lines(main_path, 1 << 23):  # last 8 MiB
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        msg = entry.get("message") if isinstance(entry, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") == "Task":
+                inp = block.get("input") or {}
+                have_type = str(inp.get("subagent_type") or "").strip()
+                if have_type == want_type or (type_trunc and
+                                              have_type.startswith(want_type)):
+                    tasks.append((block.get("id"),
+                                  str(inp.get("description") or "").strip()))
+            elif block.get("type") == "tool_result":
+                m = _AGENT_ID_RE.search(_tool_result_text(block.get("content")))
+                if m and block.get("tool_use_id"):
+                    agent_ids[block["tool_use_id"]] = m.group(1)
+
+    def _matches(desc):
+        if not want_label or desc == want_label:
+            return True
+        return desc.startswith(want_label) or want_label.startswith(desc)
+
+    for tool_id, desc in reversed(tasks):  # newest matching call wins
+        if not _matches(desc):
+            continue
+        aid = agent_ids.get(tool_id)
+        if not aid:
+            continue
+        path = os.path.join(_subagents_dir(main_path), f"agent-{aid}.jsonl")
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 # A req file only marks a *live* pending question while the ask.py bridge is
@@ -1644,10 +2968,15 @@ QUESTION_STALE_AFTER_SEC = ASK_HOOK_TIMEOUT_SEC + 60
 
 def _hook_question(session_id):
     """Read a *live* pending AskUserQuestion published by the ask.py PreToolUse
-    bridge for `session_id`, as (question, options) or (None, []). The bridge
-    blocks the tool call while this request file exists, so its presence is an
-    exact "a question is waiting right now" signal — no pane scraping, no
-    transcript timing.
+    bridge for `session_id`, as a rich dict or None. The bridge blocks the tool
+    call while this request file exists, so its presence is an exact "a question
+    is waiting right now" signal — no pane scraping, no transcript timing.
+
+    The dict carries everything the native chat needs to render the picker the
+    TUI shows: ``question`` text, backward-compat ``labels`` (option labels
+    only), the richer ``options`` (``[{label, description?, preview?}]``), the
+    question ``header`` chip, its ``index``/``total`` position in a multi-question
+    call, and whether it's ``multi``-select. None when no question is pending.
 
     A req is only live while the bridge is actually blocked on it, so two states
     are *not* reported (both are how an already-answered question would linger):
@@ -1662,13 +2991,13 @@ def _hook_question(session_id):
 
     Best-effort: a missing/half-written file is just no question."""
     if not session_id:
-        return None, []
+        return None
     path = os.path.join(QUESTIONS_DIR, f"{session_id}.req.json")
     ans_path = os.path.join(QUESTIONS_DIR, f"{session_id}.ans.json")
     try:
         mtime = os.stat(path).st_mtime
     except OSError:
-        return None, []
+        return None
     # Orphaned by a dead bridge (too old to still be blocking) — drop and tidy.
     if time.time() - mtime > QUESTION_STALE_AFTER_SEC:
         for p in (path, ans_path):
@@ -1676,24 +3005,76 @@ def _hook_question(session_id):
                 os.remove(p)
             except OSError:
                 pass
-        return None, []
+        return None
     # Answer already delivered — the bridge is consuming it, not still asking.
     if os.path.exists(ans_path):
-        return None, []
+        return None
     try:
         with open(path, encoding="utf-8") as f:
             req = json.load(f)
     except (FileNotFoundError, ValueError, OSError):
-        return None, []
+        return None
     if not isinstance(req, dict):
-        return None, []
+        return None
     question = str(req.get("question") or "")[:300] or None
-    opts = req.get("options") or []
-    labels = [
-        opt["label"][:80] for opt in opts[:4]
+    if not question:
+        return None
+    return {
+        "question": question,
+        "labels": _question_labels(req.get("options")),
+        "options": _question_options(req.get("options")),
+        "header": _question_header(req.get("header")),
+        "index": req.get("index") if isinstance(req.get("index"), int) else 0,
+        "total": req.get("total") if isinstance(req.get("total"), int) else 1,
+        "multi": req.get("multiSelect") is True,
+    }
+
+
+# Per-option caps for the heartbeat. Previews (rendered mockups/code) are the
+# heaviest field, so they're capped hardest here — the on-demand history read
+# isn't a factor since a pending question rides the live heartbeat, not history.
+_Q_LABEL_MAX = 80
+_Q_DESC_MAX = 400
+_Q_PREVIEW_MAX = 1200
+_Q_OPTS_MAX = 4
+
+
+def _question_labels(opts):
+    """Backward-compat: the option *labels* only, for older clients (glasses,
+    android) that render a flat pick list."""
+    if not isinstance(opts, list):
+        return []
+    return [
+        opt["label"][:_Q_LABEL_MAX] for opt in opts[:_Q_OPTS_MAX]
         if isinstance(opt, dict) and isinstance(opt.get("label"), str)
     ]
-    return question, labels
+
+
+def _question_options(opts):
+    """Rich options — ``[{label, description?, preview?}]`` — for the native chat
+    to render option cards with the description and preview the TUI shows."""
+    out = []
+    if not isinstance(opts, list):
+        return out
+    for opt in opts[:_Q_OPTS_MAX]:
+        if not (isinstance(opt, dict) and isinstance(opt.get("label"), str)):
+            continue
+        item = {"label": opt["label"][:_Q_LABEL_MAX]}
+        desc = opt.get("description")
+        if isinstance(desc, str) and desc:
+            item["description"] = desc[:_Q_DESC_MAX]
+        preview = opt.get("preview")
+        if isinstance(preview, str) and preview:
+            item["preview"] = preview[:_Q_PREVIEW_MAX]
+        out.append(item)
+    return out
+
+
+def _question_header(header):
+    """The question's short header chip (e.g. "Semantics"), or None."""
+    if isinstance(header, str) and header.strip():
+        return header[:24]
+    return None
 
 
 # Claude Code's TUI paints an "esc to interrupt" hint on its status line for
@@ -1712,6 +3093,43 @@ PANE_BUSY_MARKERS = tuple(
     if m.strip()
 )
 
+# The hint alone is not enough on a NARROW pane (XERK-130). tmux sizes the
+# window to its smallest-ever attached client, so a session once viewed from a
+# phone renders ~54 columns wide — and at that width the TUI ellipsizes the
+# footer's ") · esc to interrupt" suffix to ") · esc to inte…", which the plain
+# substring match reads as idle. Every working session on a narrowed pane
+# reported idle for its whole turn, which is the "active sessions are marked
+# idle" defect. Two extra shapes, each verified against live panes, recover it:
+#
+# - PANE_BUSY_TRUNC_RE — the mode footer line with any width-truncation of the
+#   hint: a line carrying the mode marker's ⏸/⏵ glyph whose LAST "·"-separated
+#   segment is a PREFIX of "esc to interrupt" (character class, so every cut
+#   point matches) ending in the TUI's own "…" ellipsis. Anchored on the glyph
+#   rather than fixed wording because the middle segments vary — "(shift+tab
+#   to cycle)" comes and goes, a "· PR #98" chip can sit between the mode and
+#   the hint — while the hint is always the segment being cut. The idle
+#   footer's "· ← for agents" suffix cannot match (it never starts with "e").
+#   This is the ONLY visible signal while text streams on a narrow pane (no
+#   spinner line is painted then) and while the operator has scrolled the
+#   conversation up (the spinner is off-screen).
+#
+# - PANE_SPINNER_RE — the column-0 working spinner line itself, e.g.
+#   "✢ Determining… (12m 19s · ↓ 44.2k tokens)" or "· Perusing… (54m 38s ·
+#   still thinking)": a single spinner glyph (glyph-agnostic — the frames vary
+#   by version — but never the assistant-turn "●" bullet or the "❯" prompt),
+#   one capitalized gerund, then the TUI's ellipsis and "(" detail. The
+#   ellipsis is load-bearing: the completed-turn line left on an IDLE pane
+#   ("✻ Brewed for 9s") has none, and prose can't sit at column 0 (assistant
+#   text is bulleted then indented).
+#
+# Both fail toward idle (today's behaviour) if the TUI wording shifts, and both
+# are disabled with the markers (empty TURMA_PANE_BUSY_MARKERS = feature off).
+PANE_BUSY_TRUNC_RE = re.compile(
+    r"[⏸⏵][^\n]*·\s*e[sc to interup]*…\s*$",
+    re.IGNORECASE | re.MULTILINE)
+PANE_SPINNER_RE = re.compile(
+    r"^[^\sA-Za-z0-9●❯]\s+[A-Z][a-z]+(?:…|\.\.\.)(?:\s*\(|\s*$)")
+
 
 def _pane_busy(tmux_name):
     """Whether the session's live TUI shows the model actively working.
@@ -1722,7 +3140,251 @@ def _pane_busy(tmux_name):
             captured (e.g. the tmux session is gone). Callers fall back to the
             transcript-mtime heuristic on None, so an old/crashed pane degrades
             gracefully rather than reporting a wrong state."""
-    if not tmux_name or not PANE_BUSY_MARKERS:
+    if not tmux_name:
+        return None
+    return _busy_from_capture(_capture_pane(tmux_name))
+
+
+def _busy_from_capture(cap):
+    """The paneBusy read off an already-taken capture (None-capture = unknown).
+
+    Busy is any of: a configured marker ("esc to interrupt" on a pane wide
+    enough to show it whole), the width-truncated remnant of that hint on the
+    mode footer line, or the column-0 working-spinner line — see the regexes'
+    comment for why all three are needed (XERK-130)."""
+    if cap is None or not PANE_BUSY_MARKERS:
+        return None
+    low = cap.lower()
+    if any(m in low for m in PANE_BUSY_MARKERS):
+        return True
+    if PANE_BUSY_TRUNC_RE.search(cap):
+        return True
+    return any(PANE_SPINNER_RE.match(line) for line in cap.splitlines())
+
+
+# A single capture can read "idle" while the model is really still working:
+# Claude Code's TUI repaints its spinner (and the "esc to interrupt" hint that
+# rides it) several times a second by CLEARING the status line and rewriting it,
+# so a capture that lands in that sub-frame gap sees no marker even though the
+# turn hasn't ended. It's a momentary artifact — but paneBusy is sampled only
+# once per heartbeat (TURMA_INTERVAL, 20s by default), so a single missed frame
+# shows the session "idle" for a whole interval on EVERY status surface (the
+# fleet dots, the session cards, the glasses glyph, the Android list — all key
+# off this one field) AND fires a bogus "finished its turn" notification on the
+# hub's working->idle edge. That interval-long flip off and back is the "flaky
+# status icons" this guards against.
+#
+# The asymmetry is the whole idea: a redraw gap can fake IDLE while working, but
+# nothing fakes BUSY while idle (once a turn ends the marker is gone from the
+# grid for good). So a busy read is trusted instantly — status must light up
+# promptly — while an idle read is distrusted only on the busy->idle EDGE, where
+# we re-capture once after a short delay and believe idle only if it HOLDS. A
+# genuinely finished turn confirms in a frame; a redraw gap doesn't. A steady
+# idle session needs no confirmation and pays nothing.
+#
+# 0 disables (report the raw single read). The delay must clear one repaint
+# cycle — a couple hundred ms — without meaningfully taxing the beat, and it is
+# spent only on the transition, not every idle beat.
+PANE_IDLE_CONFIRM_SEC = float(os.environ.get("TURMA_PANE_IDLE_CONFIRM_SEC", "0.2"))
+
+
+def _stable_pane_busy(tmux_name, state):
+    """paneBusy with the busy->idle flicker suppressed, using per-session `state`
+    (persisted across beats) to remember the last stable reading. See
+    PANE_IDLE_CONFIRM_SEC for the mechanism and why it's asymmetric.
+
+    None (unknown — no pane, capture failed) is passed straight through and
+    leaves the remembered state untouched, so the transcript-mtime fallback still
+    decides and a transient capture failure can't be mistaken for "went idle"."""
+    raw = _pane_busy(tmux_name)
+    if raw is None:
+        return None
+    if raw:
+        state["paneBusyStable"] = True
+        return True
+    # raw is False. Only distrust it on the busy->idle edge.
+    if state.get("paneBusyStable") and PANE_IDLE_CONFIRM_SEC > 0:
+        time.sleep(PANE_IDLE_CONFIRM_SEC)
+        if _pane_busy(tmux_name):  # the marker was one frame away -> still working
+            state["paneBusyStable"] = True
+            return True
+    state["paneBusyStable"] = False
+    return False
+
+# The TUI names the ACTIVE permission mode on its footer at all times — even
+# mid-generation — as "⏸ manual mode on" / "⏵⏵ accept edits on" / "⏸ plan mode
+# on" / "⏵⏵ auto mode on" / "⏵⏵ bypass permissions on". Anchored on the leading
+# glyph so conversation text that merely SAYS "plan mode on" can't read as the
+# marker. This read is what makes set_mode a closed loop (press, read, repeat)
+# instead of a press-count computed against a guessed cycle: the real cycle is
+# account- AND model-dependent (auto joins it when the account enables it —
+# observed even on a bypass-launched session, where perm_cycle_for guesses it
+# absent — and drops out for models that can't do auto), so any precomputed
+# count lands on the wrong mode somewhere.
+PANE_MODE_RE = re.compile(
+    r"[⏸⏵]+\s+(bypass permissions|accept edits|plan mode|auto mode|manual mode) on")
+_PANE_MODE_NAMES = {
+    "bypass permissions": "bypassPermissions",
+    "accept edits": "acceptEdits",
+    "plan mode": "plan",
+    "auto mode": "auto",
+    "manual mode": "default",
+}
+
+
+def parse_pane_mode(cap):
+    """The permission mode the session's TUI is REALLY in, read off the footer
+    marker, or None when no marker is visible (pane gone, or a TUI wording this
+    parser predates). Scanned bottom-up: the footer owns the last lines, so a
+    marker quoted higher up in the conversation can't shadow the live one."""
+    if not cap:
+        return None
+    for line in reversed(cap.splitlines()):
+        m = PANE_MODE_RE.search(line)
+        if m:
+            return _PANE_MODE_NAMES[m.group(1)]
+    return None
+
+
+# Claude Code blocks a turn on a CHOICE DIALOG the transcript never records: a
+# tool-permission request ("Bash command … Do you want to proceed?") or a plan
+# approval ("Claude has written up a plan … Would you like to proceed?"). It is
+# a TUI affordance, like the AskUserQuestion picker the ask.py bridge
+# intercepts — but this one has no hook to intercept it, so nothing about it
+# reaches the transcript, the tail, or the chat.
+#
+# Worse, while a dialog is up the pane shows NEITHER the "esc to interrupt"
+# hint NOR the mode footer (the composer is replaced by the dialog), so
+# `paneBusy` reads False and every status surface calls the session IDLE. It is
+# in fact blocked on a human, and the only way to see that — or to answer — was
+# to open the raw terminal. So we read the dialog off the pane, the same way
+# `parse_pane_mode` reads the mode marker.
+#
+# Shapes verified against live panes (Claude Code 2.1.220), a permission
+# dialog and a plan approval:
+#
+#     Bash command                    │   Claude has written up a plan and is
+#                                     │   ready to execute. Would you like to
+#       touch /tmp/marker             │   proceed?
+#       Create marker file in /tmp    │
+#                                     │   ❯ 1. Yes, and use auto mode
+#     Do you want to proceed?         │     2. Yes, manually approve edits
+#     ❯ 1. Yes                        │     3. No, refine with Ultraplan …
+#       2. Yes, and always allow …    │     4. Tell Claude what to change
+#       3. No                         │
+#
+# The wordings differ, so nothing keys on them. What both share, and what an
+# ordinary numbered list in conversation text does not, is all four of:
+#   1. a contiguous run of >= 2 options numbered 1..N in order;
+#   2. exactly one carrying the TUI's "❯" selection cursor;
+#   3. a question line (ends in "?") directly above the run;
+#   4. NO mode footer below it — the footer marker rides the composer, which a
+#      dialog replaces, so its absence is what says "this is a live dialog"
+#      rather than transcript text that happens to look like one.
+PANE_PROMPT_OPTION_RE = re.compile(r"^\s*(❯\s+)?(\d+)\.\s+(\S.*?)\s*$")
+# A box/rule line the TUI draws between sections. The dialog's context is the
+# nearest block ABOVE the question fenced by these, which is why they are
+# skipped before the block and end it after: a permission dialog's block sits
+# directly above the question ("Bash command" + the command + its description),
+# while a plan's body sits one rule further up (the approval sentence has its
+# own rule under it), and one walk has to find both.
+PANE_PROMPT_RULE_RE = re.compile(r"^[\s─╌━▔▁═_│╭╮╰╯┌┐└┘├┤┬┴┼-]+$")
+# How much context above the question to carry (the tool's command + its
+# description, or the plan's body): enough to decide on, bounded for the beat.
+PANE_PROMPT_DETAIL_LINES = 14
+PANE_PROMPT_DETAIL_CHARS = 800
+PANE_PROMPT_MAX_OPTIONS = 9   # answered by typing the digit; 10+ isn't one key
+
+
+def parse_pane_prompt(cap):
+    """The blocking choice dialog the session's TUI is showing, or None.
+
+    Returns {prompt, options: [{number, label, selected}], detail} — `detail`
+    being the context lines above the question (the command being asked about,
+    or the plan). See the comment above for the four conditions a run of lines
+    must meet, and why an idle/working pane can't produce a false positive.
+
+    Scanned bottom-up: the dialog owns the bottom of the pane, so an earlier
+    dialog still scrolled on screen can't shadow the live one."""
+    if not cap:
+        return None
+    lines = cap.splitlines()
+    # A mode footer anywhere below means the composer is live -> no dialog.
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i]
+        m = PANE_PROMPT_OPTION_RE.match(line)
+        if not m or m.group(2) == "0":
+            if PANE_MODE_RE.search(line):
+                return None          # composer footer: nothing is blocking
+            continue
+        # Walk up while the numbers keep descending to 1.
+        end = i
+        start = i
+        want = int(m.group(2))
+        while start >= 0:
+            om = PANE_PROMPT_OPTION_RE.match(lines[start])
+            if not om or int(om.group(2)) != want:
+                break
+            start -= 1
+            want -= 1
+        if want != 0 or end - start < 2:
+            continue                 # not 1..N, or fewer than two options
+        start += 1
+        opts = []
+        for line_no in range(start, end + 1):
+            om = PANE_PROMPT_OPTION_RE.match(lines[line_no])
+            opts.append({"number": int(om.group(2)),
+                         "label": om.group(3)[:200],
+                         "selected": bool(om.group(1))})
+        if sum(1 for o in opts if o["selected"]) != 1:
+            continue                 # no cursor (or several): not a live picker
+        if len(opts) > PANE_PROMPT_MAX_OPTIONS:
+            continue
+        # The question sits directly above, skipping blanks.
+        q = start - 1
+        while q >= 0 and not lines[q].strip():
+            q -= 1
+        if q < 0 or not lines[q].strip().endswith("?"):
+            continue
+        prompt = lines[q].strip()
+        # Walk up for the fenced block above the question: skip blanks and rules
+        # until real text starts, then stop at the rule that closes it.
+        detail = []
+        for line in reversed(lines[:q]):
+            text = line.strip()
+            if not text:
+                continue         # a blank never closes the block (the TUI puts
+                                 # one between a dialog's title and its body)
+            if PANE_PROMPT_RULE_RE.match(line):
+                if detail:
+                    break        # the rule fencing the block we just collected
+                continue         # still above/between rules — keep looking
+            detail.append(text)
+            if len(detail) >= PANE_PROMPT_DETAIL_LINES:
+                break
+        detail.reverse()
+        out = {"prompt": prompt[:300], "options": opts}
+        if detail:
+            out["detail"] = "\n".join(detail)[:PANE_PROMPT_DETAIL_CHARS]
+        return out
+    return None
+
+
+def _pane_status(tmux_name, state):
+    """(paneBusy, modeActual, panePrompt) for one beat: the busy half goes
+    through _stable_pane_busy's busy->idle flicker suppression (hence `state`),
+    the mode and blocking-dialog halves read one shared capture."""
+    if not tmux_name:
+        return None, None, None
+    busy = _stable_pane_busy(tmux_name, state)
+    cap = _capture_pane(tmux_name)
+    return busy, parse_pane_mode(cap), parse_pane_prompt(cap)
+
+
+def _capture_pane(tmux_name):
+    """The session pane's current text, or None when it can't be captured
+    (tmux gone, timeout)."""
+    if not tmux_name:
         return None
     try:
         out = subprocess.run(
@@ -1733,35 +3395,61 @@ def _pane_busy(tmux_name):
         return None
     if out.returncode != 0:
         return None
-    low = out.stdout.lower()
-    return any(m in low for m in PANE_BUSY_MARKERS)
+    return out.stdout
 
 
-def session_report(workdir, state, tmux_name=None, session_id=None):
+def session_report(workdir, state, tmux_name=None, session_id=None,
+                   claude_sid=None):
     """Cheap per-heartbeat session signals (stat + tail reads, no full parse).
 
     state carries per-file byte offsets between beats so the PR-URL scan only
-    reads what was appended since the last beat. The first call primes the
-    offsets to EOF for every existing transcript, so a restarted agent never
-    replays PR links from old sessions.
+    reads what was appended since the last beat (plus the scan's own carry-over
+    — see _scan_pr_line). The first call primes the offsets to EOF for every
+    existing transcript, so a restarted agent never replays PR links from old
+    sessions.
+
+    claude_sid pins WHICH transcript in the project dir is this session's (see
+    _session_transcript_path); without one — a session from an agent predating
+    the pin — the newest by mtime is the best guess available.
     """
     slug = _project_slug(workdir)
     proj = os.path.join(PROJECTS_ROOT, slug)
     primed = state.get("primed", False)
     offsets = state.setdefault("offsets", {})
-    seen = state.setdefault("pr_seen", set())
+    pane_busy, mode_actual, pane_prompt = _pane_status(tmux_name, state)
     report = {
         "bridgeAttached": os.path.exists(os.path.join(proj, "bridge-pointer.json")),
         # Live "is it working right now" read straight off the session's TUI —
         # the primary working/idle signal; transcriptAgeSec is the fallback.
-        "paneBusy": _pane_busy(tmux_name),
+        # Flicker-suppressed via `state` (see _stable_pane_busy) so a single
+        # capture landing in a spinner-repaint gap can't flip every status icon
+        # to idle for a whole interval.
+        "paneBusy": pane_busy,
+        # The permission mode the TUI is REALLY in (footer marker), or None.
+        # The record reconciles to it each beat (_session_payload), so a mode
+        # the operator cycled by hand in the terminal doesn't leave the stored
+        # mode — and every switch computed from it — wrong forever.
+        "modeActual": mode_actual,
+        # The blocking choice dialog the TUI is showing (tool permission / plan
+        # approval), or None. Nothing about it reaches the transcript, and it
+        # suppresses the busy hint — so without this read the session looks idle
+        # while it waits on a human. See parse_pane_prompt.
+        "panePrompt": pane_prompt,
         "transcriptAgeSec": None,  # seconds since the newest transcript write
         "lastRole": None,          # "assistant"/"user"/... of the newest entry
         "lastHasToolUse": False,
         "question": None,          # pending AskUserQuestion text, if any
         "questionOptions": [],     # pending AskUserQuestion option labels, if any
+        # Rich pending-question fields for the native chat picker (backward-compat
+        # clients ignore these and read `questionOptions` labels):
+        "questionOptionsRich": [], # [{label, description?, preview?}] for option cards
+        "questionHeader": None,    # short header chip, e.g. "Semantics"
+        "questionIndex": None,     # 0-based position in a multi-question call
+        "questionTotal": None,     # count of questions in the call
+        "questionMulti": False,    # multiSelect (pick several, then submit)
         "questionSource": None,    # "transcript" | "hook" | None — which detector fired
         "prUrls": [],              # PR links newly appended since last beat
+        "modelActual": None,       # newest actual-model signal appended this beat
         "tail": [],                # recent transcript messages, for the glasses client
     }
 
@@ -1770,14 +3458,27 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
         # long as a question is actually blocking the tool call, so it's the
         # authoritative pending signal — prefer it over the transcript scan
         # (which can only see a question once it's already answered/denied).
-        hq, hopts = _hook_question(session_id)
+        hq = _hook_question(session_id)
         if hq:
-            report["question"] = hq
-            report["questionOptions"] = hopts
+            report["question"] = hq["question"]
+            report["questionOptions"] = hq["labels"]
+            report["questionOptionsRich"] = hq["options"]
+            report["questionHeader"] = hq["header"]
+            report["questionIndex"] = hq["index"]
+            report["questionTotal"] = hq["total"]
+            report["questionMulti"] = hq["multi"]
             report["questionSource"] = "hook"
         return report
 
+    # One listdir serves both jobs: priming every file's offset (so a restarted
+    # agent doesn't replay old PR links) and finding this session's transcript.
+    # An unusable id matches no file rather than falling back — a session that
+    # HAS an id reports on its own conversation or on none, same as
+    # _session_transcript_path.
+    pinned = (os.path.join(proj, f"{claude_sid}.jsonl")
+              if claude_sid and VALID_CLAUDE_SID_RE.fullmatch(claude_sid) else "")
     newest, newest_mtime = None, 0.0
+    found, found_mtime = None, 0.0
     try:
         for fname in os.listdir(proj):
             if not fname.endswith(".jsonl"):
@@ -1789,12 +3490,19 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
                 continue
             if not primed:
                 offsets[path] = st.st_size
+            if path == pinned:
+                found, found_mtime = path, st.st_mtime
             if st.st_mtime > newest_mtime:
                 newest, newest_mtime = path, st.st_mtime
     except OSError:
         state["primed"] = True
         return _finish()
     state["primed"] = True
+    if claude_sid:
+        # A pinned session reports on its own transcript or on none at all: an
+        # absent file means it hasn't spoken yet, NOT that the newest neighbour
+        # in a shared project dir is its conversation.
+        newest, newest_mtime = found, found_mtime
     if not newest:
         return _finish()
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
@@ -1813,16 +3521,23 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
                 if block.get("name") == "AskUserQuestion" and report["lastRole"] == "assistant":
                     qs = (block.get("input") or {}).get("questions") or []
                     if qs and isinstance(qs[0], dict):
-                        report["question"] = str(qs[0].get("question") or "")[:300] or None
-                        opts = qs[0].get("options") or []
-                        report["questionOptions"] = [
-                            opt["label"][:80] for opt in opts[:4]
-                            if isinstance(opt, dict) and isinstance(opt.get("label"), str)
-                        ]
+                        q0 = qs[0]
+                        report["question"] = str(q0.get("question") or "")[:300] or None
+                        opts = q0.get("options") or []
+                        report["questionOptions"] = _question_labels(opts)
+                        report["questionOptionsRich"] = _question_options(opts)
+                        report["questionHeader"] = _question_header(q0.get("header"))
+                        report["questionIndex"] = 0
+                        report["questionTotal"] = len(qs)
+                        report["questionMulti"] = q0.get("multiSelect") is True
                         if report["question"]:
                             report["questionSource"] = "transcript"
 
-    # Incremental PR-URL scan over bytes appended to the active transcript.
+    # Incremental scan over the bytes appended to the active transcript, for the
+    # PRs this session OPENED (see _scan_pr_line for what counts) and the model
+    # actually answering (_scan_model_entry). Only COMPLETE JSONL lines are
+    # consumed — the offset stops at the last newline, so an entry still being
+    # written is re-read whole next beat rather than parsed in half and lost.
     try:
         size = os.stat(newest).st_size
         start = offsets.get(newest, 0)
@@ -1830,16 +3545,17 @@ def session_report(workdir, state, tmux_name=None, session_id=None):
             start = size  # file was truncated/rewritten; don't rescan
         if size - start > 1 << 22:
             start = size - (1 << 22)  # cap a huge backlog at 4 MiB
+        consumed = start
         if size > start:
             with open(newest, "rb") as f:
                 f.seek(start)
-                chunk = f.read(size - start).decode(errors="replace")
-            for m in PR_URL_RE.finditer(chunk):
-                url = m.group(0)
-                if url not in seen:
-                    seen.add(url)
-                    report["prUrls"].append(url)
-        offsets[newest] = size
+                raw = f.read(size - start)
+            end = raw.rfind(b"\n") + 1  # 0 when no line has completed yet
+            for line in raw[:end].split(b"\n"):
+                if line.strip():
+                    _scan_entry_line(line, state, report)
+            consumed = start + end
+        offsets[newest] = consumed
     except OSError:
         pass
     return _finish()
@@ -2091,25 +3807,2057 @@ def collect_github():
     return {"available": True, "login": login, "repos": list_github_repos()}
 
 
+# --- Extra git sources (XERK-155) ----------------------------------------------
+# Beyond GitHub, a host can list and clone repos from the Azure DevOps
+# org/collection whose PAT it already holds for the board (AZDO_URL/AZDO_TOKEN)
+# and from a GitLab host (GITLAB_URL + GITLAB_TOKEN — the token only LISTS;
+# cloning goes over SSH with the host's mounted ~/.ssh key). The extra sources'
+# listings ride the heartbeat as the `gitSources` block BESIDE the legacy
+# `github` block, which keeps its exact contract — both older hubs and the
+# agent's own gh-gated features (PR comments, the triage gh sweep) read it.
+# A clone request is resolved back against these cached listings, so the clone
+# URL always comes from the source's own API, never from the request.
+GITLAB_URL = os.environ.get("GITLAB_URL", "").strip()
+GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "").strip()
+GITLAB_PAGE_MAX = 3   # pages of 100 projects swept per refresh (bounds the HTTP)
+
+# A non-GitHub repo path segment ('My Project' in 'My Project/repo'): printable,
+# no path separators, no leading dash/dot. Looser than _GH_SEG_RE because Azure
+# DevOps project names routinely carry spaces; the segment only ever feeds
+# fingerprints, labels and prompts — never a shell.
+_SRC_SEG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+
+
+def valid_source_repo(path):
+    """True when a listing's repo path ('owner/repo', 'group/sub/project') is
+    safe to carry: 2-6 loose-checked segments, and a LAST segment (the repo
+    name, which becomes the clone's directory under REPOS_ROOT) passing the
+    strict GitHub charset. An entry that fails is dropped at collection time
+    rather than sanitized, so nothing downstream ever re-validates."""
+    segs = (path or "").split("/")
+    if not 2 <= len(segs) <= 6:
+        return False
+    if not all(len(s) <= 100 and ".." not in s and _SRC_SEG_RE.match(s)
+               for s in segs):
+        return False
+    return bool(_GH_SEG_RE.match(segs[-1]))
+
+
+def gitlab_configured():
+    return bool(GITLAB_URL and GITLAB_TOKEN)
+
+
+def gitlab_base():
+    """GITLAB_URL -> a scheme-qualified, trailing-slash-free API base."""
+    b = GITLAB_URL
+    if not b:
+        return ""
+    if not re.match(r"^[a-zA-Z][\w.+-]*://", b):
+        b = "https://" + b
+    return b.rstrip("/")
+
+
+def gitlab_host():
+    """The bare host of GITLAB_URL — the source's UI label."""
+    return re.sub(r"^[a-zA-Z][\w.+-]*://", "", gitlab_base()).split("/")[0]
+
+
+def collect_gitlab_repos():
+    """The GitLab projects the token's user is a member of, shaped like the
+    github listing (nameWithOwner = path_with_namespace, which may nest as
+    group/subgroup/project). cloneUrl is the project's SSH URL — GitLab repos
+    clone over ssh, so the mounted ~/.ssh key is the git credential and the
+    token never reaches git. Raises on HTTP failure (the caller keeps the last
+    good list); a malformed entry is dropped."""
+    out = []
+    for page in range(1, GITLAB_PAGE_MAX + 1):
+        q = urllib.parse.urlencode({
+            "membership": "true", "archived": "false",
+            "order_by": "last_activity_at", "sort": "desc",
+            "per_page": 100, "page": page,
+        })
+        req = urllib.request.Request(
+            f"{gitlab_base()}/api/v4/projects?{q}",
+            headers={"PRIVATE-TOKEN": GITLAB_TOKEN,
+                     "Accept": "application/json",
+                     "User-Agent": "turma-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
+            data = json.loads(resp.read().decode() or "[]")
+        if not isinstance(data, list) or not data:
+            break
+        for p in data:
+            p = p if isinstance(p, dict) else {}
+            path = p.get("path_with_namespace") or ""
+            ssh = p.get("ssh_url_to_repo") or ""
+            if not (valid_source_repo(path) and ssh):
+                continue
+            out.append({
+                "nameWithOwner": path,
+                "name": path.split("/")[-1],
+                "description": (p.get("description") or "")[:120],
+                "isPrivate": (p.get("visibility") or "private") != "public",
+                "updatedAt": p.get("last_activity_at") or "",
+                "cloneUrl": ssh,
+            })
+        if len(data) < 100 or len(out) >= GH_REPO_MAX:
+            break
+    return out[:GH_REPO_MAX]
+
+
+def collect_azure_repos():
+    """The git repos of the board's Azure DevOps org/collection — the same
+    AZDO_URL/AZDO_TOKEN the board polls with — across every project the PAT can
+    see (the collection-level repositories API enumerates them all in one call).
+    nameWithOwner = 'Project/Repo'; cloneUrl is the https remoteUrl, which plain
+    git already authenticates against via the extraHeader wired at boot
+    (--wire-azure-git). Raises on HTTP failure; malformed entries are dropped."""
+    data = azure_req("/_apis/git/repositories", {})
+    out = []
+    for r in (data.get("value") or []):
+        r = r if isinstance(r, dict) else {}
+        if r.get("isDisabled"):
+            continue
+        name = r.get("name") or ""
+        proj = (r.get("project") or {}).get("name") or ""
+        url = r.get("remoteUrl") or ""
+        path = f"{proj}/{name}"
+        if not (proj and name and url and valid_source_repo(path)):
+            continue
+        out.append({
+            "nameWithOwner": path,
+            "name": name,
+            "description": "",
+            # The repos API reports no visibility; an ADO org's repos are
+            # private to it, which is what the lock glyph means in the UI.
+            "isPrivate": True,
+            "updatedAt": str((r.get("project") or {}).get("lastUpdateTime") or ""),
+            "cloneUrl": url,
+        })
+    out.sort(key=lambda e: e["updatedAt"], reverse=True)
+    return out[:GH_REPO_MAX]
+
+
+# --- Jira Cloud ticket polling --------------------------------------------------
+# Optional: with user-scoped Jira Cloud creds in the env (JIRA_SITE + JIRA_EMAIL
+# + JIRA_TOKEN — an ordinary Atlassian API token, Basic auth), the agent polls
+# the tickets assigned to that user on a slow cadence and reports them as the
+# heartbeat's `jira` block. The hub's /board page merges every host's block into
+# one cross-org Kanban, keyed by siteKey (normalized site host) so several
+# agents sharing an org collapse to one board. Almost entirely read-only: the
+# only calls are issue search + on-demand detail, plus the one WRITE path the
+# board exposes — creating a ticket (XERK-137), which POSTs a single new issue.
+# Unset env = feature off: zero Jira HTTP calls, and the block heartbeats as
+# available=False.
+JIRA_SITE = os.environ.get("JIRA_SITE", "").strip()
+JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "").strip()
+JIRA_TOKEN = os.environ.get("JIRA_TOKEN", "").strip()
+try:
+    JIRA_REFRESH_EVERY = int(os.environ.get("TURMA_JIRA_REFRESH_EVERY", "30"))
+except ValueError:
+    JIRA_REFRESH_EVERY = 30   # beats between polls (30 × 20s beat ≈ 10 min)
+# Ticket auto-start (XERK-32) is opt-in PER ORG so the hub starts a session for
+# every "To Do" ticket the moment it has a repo assigned (by the model's triage or
+# a manual pin). The opt-in is HUB-ONLY (XERK-41): the operator flips it from the
+# board's per-org auto-start switch (a durable hub setting — see the hub's
+# autostart-orgs store), so there is no agent-side config for it and this host
+# reports no auto-start flag. The hub owns the decision and the routing anyway,
+# because only it sees the whole fleet and can spread the org's sessions across
+# ALL its agents.
+JIRA_TIMEOUT_SEC = 15
+JIRA_PAGE_SIZE = 100    # /search/jql hard-caps maxResults at 100
+JIRA_MAX_ACTIVE = 150   # not-Done tickets reported (bounds the heartbeat)
+JIRA_MAX_DONE = 50      # recently-Done tickets reported
+JIRA_DONE_DAYS = 14     # how far back the Done column reaches
+JIRA_MAX_PAGES = 5      # hard bound on pagination per query
+
+# On-demand single-issue detail (the board's expanded ticket view). The board
+# card's fields ride the heartbeat for every ticket; description + comments are
+# far too big for that, so they're fetched one issue at a time when an operator
+# actually opens a ticket — the same {command -> staged result -> next beat}
+# path the session `history` command uses.
+JIRA_DESC_MAX_CHARS = 8000      # per-issue description text kept
+JIRA_COMMENT_MAX = 20           # newest comments kept
+JIRA_COMMENT_MAX_CHARS = 2000   # per-comment text kept
+JIRA_DETAIL_LABELS_MAX = 20     # labels kept (the card shape caps at 5)
+
+# Ticket creation (XERK-137). The board's "New ticket" form fetches the create
+# metadata (projects, issue types, existing labels) on demand — the same
+# {command -> staged result -> next beat} path as issue detail — then POSTs one
+# new issue. Bounded so a big org can't make the meta fetch block a heartbeat.
+CREATE_META_MAX_PROJECTS = 100  # projects offered in the New-ticket picker
+CREATE_META_MAX_LABELS = 200    # existing labels/tags offered as suggestions
+CREATE_TITLE_MAX_CHARS = 250    # summary/title cap (Jira's own limit is 255)
+CREATE_DESC_MAX_CHARS = 30000   # description cap
+CREATE_LABELS_MAX = 20          # labels/tags accepted on one new ticket
+# An issue key is interpolated into a REST path, so it's allowlist-checked
+# against Jira's own key grammar (PROJECT-123) before it ever reaches a URL —
+# the same "nothing free-form reaches the shell" stance as the spawn options.
+JIRA_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
+
+# Full block schema even when off/unavailable, mirroring the github block's
+# contract: the hub always sees every field, never a partial dict.
+#
+# `configured` is creds-present, which is NOT the same as `available` (a
+# successful poll). A host whose very first poll failed looks identical to an
+# unconfigured one on every other field — both are available=False/siteKey=None
+# — so this is the only thing that lets the hub aim a manual refresh at the
+# configured-but-failing host that most needs the retry.
+JIRA_EMPTY = {"available": False, "configured": False, "source": "jira",
+              "site": None, "siteKey": None, "user": None, "fetchedAt": None,
+              "error": None, "truncated": False, "tickets": []}
+
+# fields.status.statusCategory.key is one of Jira's three fixed, cross-org
+# categories — the only workflow facet guaranteed to unify orgs with different
+# status schemes, hence the board's column model.
+_JIRA_CATEGORY = {"new": "todo", "indeterminate": "inprogress", "done": "done"}
+
+
+def jira_configured():
+    return bool(JIRA_SITE and JIRA_EMAIL and JIRA_TOKEN)
+
+
+def jira_empty():
+    """The off/never-polled block, stamped with whether creds are present. The
+    creds are read once at import, so `configured` is fixed for the process —
+    every later block (success or fail-open) carries it forward unchanged."""
+    block = dict(JIRA_EMPTY)
+    block["configured"] = jira_configured()
+    return block
+
+
+def normalize_jira_site(raw):
+    """A Jira site spec ('myorg.atlassian.net', 'https://MyOrg.atlassian.net/',
+    even a pasted board URL) -> the bare lowercase host, the cross-host
+    `siteKey` the hub dedupes boards on. '' when nothing host-like remains."""
+    r = (raw or "").strip()
+    r = re.sub(r"^[a-zA-Z][\w.+-]*://", "", r)   # scheme
+    r = re.sub(r"^[^/@]+@", "", r)               # credentials
+    r = r.split("/", 1)[0].split(":", 1)[0]      # path, port
+    return r.strip(".").lower()
+
+
+# --- Tracker HTTP --------------------------------------------------------------
+# Every Jira and Azure DevOps request funnels through _board_urlopen so a
+# rejection reads the same wherever it surfaces (a block's `error`, a staged
+# command result, the New-ticket dialog).
+BOARD_ERROR_MAX_CHARS = 200
+
+
+def _http_error_detail(err):
+    """A failed tracker request as text an operator can act on.
+
+    urllib's HTTPError stringifies to just "HTTP Error 400: Bad Request" and
+    DISCARDS the response body — but that body is the only place either tracker
+    says why: a field the work-item type doesn't have, an identity the
+    collection can't resolve, a workflow rule. Without it every rejected write
+    reads as the same unactionable sentence, with nothing to act on and no way
+    to tell two unrelated failures apart.
+    """
+    code = getattr(err, "code", None) or "?"
+    body = ""
+    try:
+        body = (err.read() or b"").decode("utf-8", "replace")
+    except Exception:
+        pass
+    msg = ""
+    try:
+        parsed = json.loads(body) if body.strip() else None
+        if isinstance(parsed, dict):
+            # Azure DevOps says {"message": ...}; Jira says {"errorMessages":
+            # [...]} and/or a per-field {"errors": {field: why}}.
+            msg = str(parsed.get("message") or "").strip()
+            if not msg:
+                msg = "; ".join(str(m) for m in (parsed.get("errorMessages") or []))
+            errors = parsed.get("errors")
+            if not msg and isinstance(errors, dict):
+                msg = "; ".join(f"{k}: {v}" for k, v in errors.items())
+    except Exception:
+        pass
+    if not msg:
+        # Not JSON: an HTML error page from a proxy or IIS in front of a
+        # self-hosted server. Strip the markup so the sentence inside survives.
+        msg = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", body)
+        msg = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", msg)).strip()
+    msg = msg[:BOARD_ERROR_MAX_CHARS].strip()
+    return f"HTTP {code}: {msg}" if msg else f"HTTP {code}"
+
+
+class BoardHttpError(RuntimeError):
+    """A tracker request the server REFUSED, carrying its status. The code is
+    what lets a caller tell "rejected, nothing happened" (4xx) from "we don't
+    know what happened" (a timeout, a 5xx) — the difference between a retry that
+    is safe and one that can duplicate a write."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+def _board_urlopen(req):
+    """Send one prepared tracker request and parse its JSON reply ({} when the
+    body is empty — a Jira transition answers 204). An HTTP error is re-raised
+    carrying the server's own explanation; everything else (DNS, TLS, timeout)
+    propagates untouched, since urllib already stringifies those usefully."""
+    try:
+        with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
+            raw = resp.read().decode()
+    except urllib.error.HTTPError as e:
+        raise BoardHttpError(_http_error_detail(e), getattr(e, "code", None)) from e
+    return json.loads(raw) if raw.strip() else {}
+
+
+def _write_was_refused(err):
+    """Whether a failed write provably changed NOTHING, so re-sending it can't
+    duplicate anything. Only a 4xx says that: the server parsed the request and
+    declined it. A timeout or a 5xx may have applied the write anyway."""
+    code = getattr(err, "code", None)
+    return isinstance(code, int) and 400 <= code < 500
+
+
+def jira_req(path, params, body=None):
+    """One authenticated request against the configured Jira Cloud site, parsed
+    JSON out. GET when `body` is None, else a JSON POST — the board's status
+    change (XERK-138) is the one write path, a transitions POST. A transition
+    returns 204 with an empty body, so an empty response parses to {} rather
+    than raising. Exceptions propagate — the read callers turn them into the
+    block's `error` (stale-cache fail-open); the write caller stages them as a
+    per-command error result."""
+    site = normalize_jira_site(JIRA_SITE)
+    url = f"https://{site}{path}?{urllib.parse.urlencode(params)}"
+    auth = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_TOKEN}".encode()).decode()
+    headers = {
+        "Authorization": f"Basic {auth}",
+        "Accept": "application/json",
+        # Explicit UA for parity with the hub POSTs (some edges 403 the
+        # default Python-urllib signature).
+        "User-Agent": "turma-agent/1.0",
+    }
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers,
+                                 method="POST" if body is not None else "GET")
+    return _board_urlopen(req)
+
+
+def jira_get(path, params):
+    """A read against the configured Jira Cloud site — jira_req with no body."""
+    return jira_req(path, params)
+
+
+def jira_post(path, body):
+    """One authenticated POST against the configured Jira Cloud site (issue
+    creation, XERK-137) — the write counterpart of jira_get. Same Basic auth and
+    UA; a JSON body in, parsed JSON out. Exceptions propagate to the create
+    command's staged result. An empty 201 body (some endpoints) parses to {}."""
+    site = normalize_jira_site(JIRA_SITE)
+    url = f"https://{site}{path}"
+    auth = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={
+        "Authorization": f"Basic {auth}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "turma-agent/1.0",
+    }, method="POST")
+    return _board_urlopen(req)
+
+
+def _shape_issue(issue, site_key):
+    """One raw REST-v3 search issue -> the compact wire ticket the board
+    renders. Everything optional degrades to None/[] rather than raising."""
+    fields = issue.get("fields") or {}
+    key = issue.get("key") or ""
+    status = fields.get("status") or {}
+    category = ((status.get("statusCategory") or {}).get("key") or "").lower()
+
+    def name_of(field):
+        v = fields.get(field)
+        return (v or {}).get("name") if isinstance(v, dict) else None
+
+    project = fields.get("project") or {}
+    parent = fields.get("parent") or {}
+    labels = fields.get("labels")
+    return {
+        "key": key,
+        "url": f"https://{site_key}/browse/{key}",
+        "summary": (fields.get("summary") or "")[:200],
+        "status": status.get("name"),                 # org-specific name (pill)
+        "statusCategory": _JIRA_CATEGORY.get(category, "todo"),  # column
+        "priority": name_of("priority"),
+        "type": name_of("issuetype"),
+        "project": project.get("key"),
+        "projectName": project.get("name"),
+        "labels": labels[:5] if isinstance(labels, list) else [],
+        "updated": fields.get("updated"),
+        "created": fields.get("created"),
+        "dueDate": fields.get("duedate"),
+        "parentKey": parent.get("key"),
+    }
+
+
+def fetch_jira_issues(jql, max_issues):
+    """All issues matching a JQL, shaped, via GET /rest/api/3/search/jql —
+    the nextPageToken-paginated replacement for the removed (410 since 2025)
+    /rest/api/3/search. Returns (tickets, truncated): truncated means the cap
+    (or the page bound) cut the result short."""
+    site_key = normalize_jira_site(JIRA_SITE)
+    tickets, token = [], None
+    for _ in range(JIRA_MAX_PAGES):
+        params = {
+            "jql": jql,
+            "maxResults": min(JIRA_PAGE_SIZE, max_issues - len(tickets)),
+            "fields": "summary,status,priority,issuetype,updated,created,"
+                      "duedate,labels,project,parent",
+        }
+        if token:
+            params["nextPageToken"] = token
+        data = jira_get("/rest/api/3/search/jql", params)
+        for issue in data.get("issues") or []:
+            tickets.append(_shape_issue(issue, site_key))
+        token = data.get("nextPageToken")
+        if not token:
+            return tickets, False
+        if len(tickets) >= max_issues:
+            return tickets[:max_issues], True
+    return tickets[:max_issues], True
+
+
+def collect_jira():
+    """The heartbeat's `jira` block: the configured user's assigned tickets on
+    this host's org. Two separate queries — active work, and a bounded window
+    of recently-Done so that column is populated without growing forever —
+    with separate caps so neither can crowd the other out."""
+    if not jira_configured():
+        return jira_empty()
+    site_key = normalize_jira_site(JIRA_SITE)
+    active, trunc_active = fetch_jira_issues(
+        "assignee = currentUser() AND statusCategory != Done"
+        " ORDER BY updated DESC", JIRA_MAX_ACTIVE)
+    done, trunc_done = fetch_jira_issues(
+        "assignee = currentUser() AND statusCategory = Done"
+        f" AND updated >= -{JIRA_DONE_DAYS}d ORDER BY updated DESC",
+        JIRA_MAX_DONE)
+    return {
+        "available": True,
+        "configured": True,
+        "source": "jira",
+        "site": site_key,
+        "siteKey": site_key,
+        "user": JIRA_EMAIL,
+        "fetchedAt": now_iso(),
+        "error": None,
+        "truncated": trunc_active or trunc_done,
+        "tickets": active + done,
+    }
+
+
+# --- Jira issue detail (on-demand) ---------------------------------------------
+# Jira Cloud's REST v3 returns rich text (descriptions, comment bodies) as ADF —
+# Atlassian Document Format, a nested {type, content[], attrs} node tree, not
+# HTML or markdown. The board renders plain text, so the agent flattens it here
+# rather than shipping the tree and re-implementing the walk in the browser.
+# Only the shapes Jira actually emits are special-cased; anything unrecognized
+# still recurses into its `content`, so an unknown node degrades to its text
+# instead of vanishing.
+
+_ADF_BLOCKS = {"paragraph", "heading", "blockquote", "codeBlock", "panel",
+               "bulletList", "orderedList", "taskList", "table", "mediaGroup",
+               "mediaSingle", "expand", "nestedExpand"}
+
+
+def adf_text(node):
+    """An ADF node (or a plain string — REST v2 and some webhooks send one) ->
+    plain text. Best-effort and total: never raises on a malformed tree, just
+    returns what it could read."""
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(adf_text(n) for n in node)
+    if not isinstance(node, dict):
+        return ""
+    t = node.get("type")
+    attrs = node.get("attrs") if isinstance(node.get("attrs"), dict) else {}
+
+    if t == "text":
+        txt = node.get("text") or ""
+        # A link's href is part of the detail an operator is reviewing, so keep
+        # it alongside the anchor text unless the text already is the URL.
+        for m in node.get("marks") or []:
+            if isinstance(m, dict) and m.get("type") == "link":
+                href = (m.get("attrs") or {}).get("href")
+                if href and href != txt:
+                    txt = f"{txt} ({href})"
+        return txt
+    if t == "hardBreak":
+        return "\n"
+    if t == "rule":
+        return "\n---\n"
+    if t == "mention":
+        return "@" + str(attrs.get("text") or attrs.get("displayName") or "").lstrip("@")
+    if t == "emoji":
+        return str(attrs.get("text") or attrs.get("shortName") or "")
+    if t in ("inlineCard", "blockCard", "embedCard"):
+        return str(attrs.get("url") or "")
+    if t == "media":
+        return f"[attachment: {attrs.get('alt') or attrs.get('id') or ''}]"
+    if t == "tableRow":
+        cells = [adf_text(c).strip() for c in node.get("content") or []]
+        return " | ".join(cells) + "\n"
+
+    inner = "".join(adf_text(c) for c in node.get("content") or [])
+    if t in ("listItem", "taskItem"):
+        return "- " + inner.strip() + "\n"
+    if t in _ADF_BLOCKS:
+        return inner.strip("\n") + "\n\n"
+    return inner
+
+
+def adf_plain(node, limit):
+    """adf_text() normalized for display and clipped: (text, truncated). Runs of
+    blank lines collapse to one so a paragraph-heavy description doesn't render
+    as a column of gaps."""
+    text = re.sub(r"\n{3,}", "\n\n", adf_text(node)).strip()
+    if len(text) <= limit:
+        return text, False
+    return text[:limit].rstrip(), True
+
+
+# --- Status change (XERK-138) --------------------------------------------------
+# The board's one write path. A ticket's changeable statuses are workflow- and
+# current-status-dependent, so the detail view carries the AVAILABLE targets it
+# fetched (Jira's transitions, Azure's states) and the operator picks one; the
+# agent re-reads them at write time and only applies a target still on offer.
+# statusOptions is a source-agnostic [{id, name, category}]: `id` is what the
+# write submits (Jira's transition id, Azure's state name), `name` is what the
+# picker shows, `category` maps to the board's todo/inprogress/done column.
+
+def _shape_transitions(transitions):
+    """Jira's `transitions` expansion -> the source-agnostic statusOptions shape.
+    Labelled with the RESULTING status (`to.name`), not the transition action's
+    own name, since the operator is choosing a status to land in; the submit
+    value is the transition id. Anything malformed is skipped, not raised."""
+    out = []
+    for tr in transitions or []:
+        if not isinstance(tr, dict):
+            continue
+        to = tr.get("to") if isinstance(tr.get("to"), dict) else {}
+        cat = ((to.get("statusCategory") or {}).get("key") or "").lower()
+        name = to.get("name") or tr.get("name")
+        tid = tr.get("id")
+        if tid is None or not name:
+            continue
+        out.append({"id": str(tid), "name": name,
+                    "category": _JIRA_CATEGORY.get(cat, "todo")})
+    return out
+
+
+def _jira_status_options(key):
+    """The transitions available from an issue's current status, fetched fresh —
+    the allowlist set_board_status validates a requested change against."""
+    data = jira_req(
+        f"/rest/api/3/issue/{urllib.parse.quote(key)}/transitions", {})
+    return _shape_transitions(data.get("transitions"))
+
+
+def _shape_issue_detail(issue, site_key):
+    """One raw REST-v3 GET-issue response -> the card shape plus everything the
+    expanded view adds: description, comments, people, full labels, and the
+    available status transitions (from the `transitions` expansion)."""
+    detail = _shape_issue(issue, site_key)
+    fields = issue.get("fields") or {}
+
+    def person(field):
+        v = fields.get(field)
+        return (v or {}).get("displayName") if isinstance(v, dict) else None
+
+    desc, desc_trunc = adf_plain(fields.get("description"), JIRA_DESC_MAX_CHARS)
+    detail["description"] = desc
+    detail["descriptionTruncated"] = desc_trunc
+    detail["reporter"] = person("reporter")
+    detail["assignee"] = person("assignee")
+    detail["resolution"] = (fields.get("resolution") or {}).get("name") \
+        if isinstance(fields.get("resolution"), dict) else None
+    labels = fields.get("labels")
+    detail["labels"] = labels[:JIRA_DETAIL_LABELS_MAX] if isinstance(labels, list) else []
+    parent = fields.get("parent") or {}
+    detail["parentSummary"] = ((parent.get("fields") or {}).get("summary")
+                               if isinstance(parent.get("fields"), dict) else None)
+
+    # `comment` is a paginated container: {comments:[…oldest first], total}. We
+    # keep the NEWEST few — a long thread's recent replies are the ones being
+    # reviewed — and report `commentTotal` so the UI can say what it dropped.
+    block = fields.get("comment") if isinstance(fields.get("comment"), dict) else {}
+    raw = block.get("comments") if isinstance(block.get("comments"), list) else []
+    comments = []
+    for c in raw[-JIRA_COMMENT_MAX:]:
+        if not isinstance(c, dict):
+            continue
+        body, trunc = adf_plain(c.get("body"), JIRA_COMMENT_MAX_CHARS)
+        author = c.get("author")
+        comments.append({
+            "id": c.get("id"),
+            "author": (author or {}).get("displayName") if isinstance(author, dict) else None,
+            "created": c.get("created"),
+            "updated": c.get("updated"),
+            "body": body,
+            "truncated": trunc,
+        })
+    detail["comments"] = comments
+    total = block.get("total")
+    detail["commentTotal"] = total if isinstance(total, int) else len(comments)
+    detail["statusOptions"] = _shape_transitions(issue.get("transitions"))
+    detail["fetchedAt"] = now_iso()
+    return detail
+
+
+def fetch_jira_issue(key):
+    """One issue's full detail. `expand=transitions` rides the one GET so the
+    available status changes come back with the issue rather than costing a
+    second call. Exceptions propagate — _stage_jira_issue turns them into the
+    staged result's `error` so the board can say why."""
+    site_key = normalize_jira_site(JIRA_SITE)
+    data = jira_get(
+        f"/rest/api/3/issue/{urllib.parse.quote(key)}",
+        {"fields": "summary,status,priority,issuetype,updated,created,duedate,"
+                   "labels,project,parent,description,reporter,assignee,"
+                   "resolution,comment",
+         "expand": "transitions"},
+    )
+    return _shape_issue_detail(data, site_key)
+
+
+# --- Jira ticket creation (XERK-137) -------------------------------------------
+# The board's "New ticket" form. The metadata (projects + per-project issue types
+# + existing labels) is fetched on demand so the picker offers real choices; the
+# create itself POSTs one issue and self-assigns it to the configured user, so the
+# new ticket lands on the board (which shows assignee = currentUser) straight away.
+
+# The account id of the configured Jira user, looked up once and cached, so a
+# created issue can be assigned to them (Jira Cloud's create wants an accountId,
+# not the email we hold). None if the lookup fails — self-assignment is then
+# skipped and the ticket is created unassigned (still valid, just not on the
+# board until someone assigns it).
+_JIRA_MYSELF = {"accountId": None, "tried": False}
+
+
+def _jira_account_id():
+    """The configured user's Jira accountId (cached, best-effort)."""
+    if _JIRA_MYSELF["tried"]:
+        return _JIRA_MYSELF["accountId"]
+    _JIRA_MYSELF["tried"] = True
+    try:
+        me = jira_get("/rest/api/3/myself", {})
+        _JIRA_MYSELF["accountId"] = me.get("accountId") or None
+    except Exception as e:
+        log(f"jira myself lookup failed: {e}")
+    return _JIRA_MYSELF["accountId"]
+
+
+def _text_to_adf(text):
+    """Plain text -> a minimal Atlassian Document Format doc (Jira Cloud's create
+    API takes ADF, not plain text/markdown). One paragraph per line; a blank line
+    is an empty paragraph, so the operator's line breaks survive the round trip.
+    The reverse of adf_plain."""
+    lines = str(text or "").split("\n")
+    content = []
+    for line in lines:
+        if line:
+            content.append({"type": "paragraph",
+                            "content": [{"type": "text", "text": line}]})
+        else:
+            content.append({"type": "paragraph"})
+    return {"type": "doc", "version": 1, "content": content or [{"type": "paragraph"}]}
+
+
+def jira_create_meta():
+    """The New-ticket form's project + label choices for a Jira org: the projects
+    the user can see (issue types are fetched per-project by jira_issue_types) and
+    a bounded list of existing labels to suggest. Exceptions propagate to the
+    staged result."""
+    data = jira_get("/rest/api/3/project/search",
+                    {"maxResults": CREATE_META_MAX_PROJECTS, "orderBy": "name"})
+    projects = [{"key": p.get("key"), "name": p.get("name") or p.get("key")}
+                for p in (data.get("values") or []) if p.get("key")]
+    labels = []
+    try:
+        ld = jira_get("/rest/api/3/label", {"maxResults": CREATE_META_MAX_LABELS})
+        labels = [l for l in (ld.get("values") or []) if isinstance(l, str)]
+    except Exception as e:
+        log(f"jira label suggestions fetch failed: {e}")
+    return {"projects": projects, "labels": labels, "source": "jira"}
+
+
+def jira_issue_types(project):
+    """The issue types creatable in one Jira project (subtasks excluded — the
+    board has no parent to hang them off). [{id, name}]."""
+    data = jira_get(
+        f"/rest/api/3/issue/createmeta/{urllib.parse.quote(project)}/issuetypes",
+        {"maxResults": 100})
+    out = []
+    for it in (data.get("issueTypes") or data.get("values") or []):
+        if it.get("subtask") or not it.get("id"):
+            continue
+        out.append({"id": str(it.get("id")), "name": it.get("name") or ""})
+    return out
+
+
+def create_jira_issue(project, issue_type, summary, description, labels):
+    """Create one Jira issue and return {key, url}. `issue_type` is an issue-type
+    id (from jira_issue_types); labels are the array Jira stores verbatim. The
+    issue is assigned to the configured user (best-effort) so it lands on their
+    board immediately."""
+    site_key = normalize_jira_site(JIRA_SITE)
+    fields = {
+        "project": {"key": project},
+        "summary": summary,
+        "issuetype": {"id": str(issue_type)},
+    }
+    if description:
+        fields["description"] = _text_to_adf(description)
+    if labels:
+        fields["labels"] = labels
+    acct = _jira_account_id()
+    if acct:
+        fields["assignee"] = {"id": acct}
+    data = jira_post("/rest/api/3/issue", {"fields": fields})
+    key = data.get("key")
+    if not key:
+        raise RuntimeError("Jira returned no issue key")
+    return {"key": key, "url": f"https://{site_key}/browse/{key}",
+            "assigned": bool(acct)}
+
+
+# --- Azure DevOps work-item polling --------------------------------------------
+# Optional second board source (XERK-43): with a PAT in the env (AZDO_URL +
+# AZDO_TOKEN) the agent polls the work items assigned to that PAT's owner and
+# reports them in the SAME heartbeat block, ticket shape and detail shape as Jira
+# — so the hub, the board, and every downstream client render an Azure DevOps
+# org exactly like a Jira one with zero changes on their side. An agent serves
+# exactly ONE org (one board's creds), so a host is either a Jira host or an
+# Azure host, never both; `board_source()` picks which collector runs.
+#
+# Self-hosted is the point (AZDO_URL is any base — `https://tfs.company.com/
+# DefaultCollection`), and Azure DevOps Services (`https://dev.azure.com/org`)
+# is the same REST surface, so both work off the one base URL. Almost entirely
+# read-only — WIQL search, work-item GET, the work-item-type states GET — plus
+# two operator-driven writes: creating a work item (XERK-137) and a single
+# System.State PATCH for a status change (XERK-138).
+AZDO_URL = os.environ.get("AZDO_URL", "").strip()
+AZDO_TOKEN = os.environ.get("AZDO_TOKEN", "").strip()
+# Optional: scope the poll to one project (else org-wide, every project the PAT
+# can see). Display-only creds for the board's `user` merge field; the poll uses
+# the PAT's own identity via WIQL's @Me, so no email/username is ever required.
+AZDO_PROJECT = os.environ.get("AZDO_PROJECT", "").strip()
+AZDO_USER = os.environ.get("AZDO_USER", "").strip()
+# Self-hosted servers trail cloud on api-version; 6.0 is supported by Azure
+# DevOps Server 2019+ and Services alike. Override for an older TFS (4.1/5.0).
+AZDO_API_VERSION = os.environ.get("AZDO_API_VERSION", "").strip() or "6.0"
+AZDO_MAX_IDS = 300      # most-recently-changed assigned items pulled before bucketing
+AZDO_BATCH = 200        # ids per work-items GET (the API's own hard cap)
+
+# Azure exposes a work item's cross-process "state category" (metastate) the same
+# way Jira exposes statusCategory — the one facet that unifies orgs with custom
+# state names. We read it from the work-item-type states API when reachable and
+# fall back to a name map for older/locked-down servers. Both collapse to the
+# board's three columns.
+_AZDO_META_CATEGORY = {
+    "proposed": "todo",
+    "inprogress": "inprogress",
+    "resolved": "inprogress",
+    "completed": "done",
+    "removed": "done",
+}
+_AZDO_STATE_CATEGORY = {
+    "new": "todo", "to do": "todo", "approved": "todo", "proposed": "todo",
+    "open": "todo", "backlog": "todo", "design": "todo",
+    "active": "inprogress", "committed": "inprogress", "in progress": "inprogress",
+    "doing": "inprogress", "resolved": "inprogress", "in review": "inprogress",
+    "code review": "inprogress", "testing": "inprogress", "ready": "inprogress",
+    "done": "done", "closed": "done", "completed": "done", "removed": "done",
+}
+# (siteKey, project, workItemType) -> {state_name_lower: column}. Populated
+# lazily from the states API, so a settled poll costs one cached lookup.
+_AZDO_STATE_CACHE = {}
+
+# Work item ids are bare integers, so the JIRA_KEY_RE grammar (PROJECT-123) would
+# reject every one. This is the allowlist gate before an id reaches a REST path.
+AZDO_KEY_RE = re.compile(r"^[0-9]+$")
+
+AZDO_EMPTY = {"available": False, "configured": False, "source": "azure",
+              "site": None, "siteKey": None, "user": None, "fetchedAt": None,
+              "error": None, "truncated": False, "tickets": []}
+
+
+def azure_configured():
+    return bool(AZDO_URL and AZDO_TOKEN)
+
+
+def azure_empty():
+    """The off/never-polled Azure block, stamped with whether creds are present —
+    the counterpart of jira_empty(), same full-schema contract."""
+    block = dict(AZDO_EMPTY)
+    block["configured"] = azure_configured()
+    return block
+
+
+def azure_base():
+    """AZDO_URL -> the API/link base: a scheme-qualified, trailing-slash-free
+    org/collection URL. A pasted deep link (`.../_workitems/...`, `.../_apis/...`)
+    is trimmed back to the collection root so links and REST paths rebuild cleanly."""
+    b = (AZDO_URL or "").strip()
+    if not b:
+        return ""
+    if not re.match(r"^[a-zA-Z][\w.+-]*://", b):
+        b = "https://" + b
+    b = b.rstrip("/")
+    # Trim anything from a pasted board/REST URL back to the collection root.
+    b = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", b, maxsplit=1)[0]
+    return b.rstrip("/")
+
+
+def azure_git_auth_config():
+    """The `git config` that lets plain git (clone/fetch/push) authenticate
+    against the configured Azure DevOps org, or None when ADO isn't configured.
+
+    Returns (key, value) for `git config --system`:
+      http.<base>.extraHeader = Authorization: Basic <base64(":<PAT>")>
+    URL-scoped to the ADO base, so no other host ever receives the header. The
+    PAT is the same AZDO_TOKEN the board already uses; Basic with an empty
+    username matches azure_req().
+
+    Why extraHeader and not a credential helper: self-hosted TFS / Azure DevOps
+    Server often does not issue a Basic challenge git can act on, so a helper is
+    never invoked at all (which is why such hosts set `http.proactiveAuth=basic`).
+    The image's git is too old for proactiveAuth (Debian bookworm ships git 2.39;
+    it landed in 2.46), whereas extraHeader (git 2.4+) forces the header
+    proactively on every request and works on the shipped git. This is the
+    non-GitHub counterpart to github.com going through `gh auth git-credential`."""
+    base = azure_base()
+    if not (base and AZDO_TOKEN):
+        return None
+    token = base64.b64encode(f":{AZDO_TOKEN}".encode()).decode()
+    return (f"http.{base}.extraHeader", f"Authorization: Basic {token}")
+
+
+def normalize_azure_site(url):
+    """An Azure DevOps base URL -> the cross-host `siteKey` the hub dedupes on:
+    the bare lowercase host (with port) plus the org/collection path, no scheme or
+    creds. `https://dev.azure.com/MyOrg/` -> `dev.azure.com/myorg`;
+    `https://tfs.co:8080/tfs/DefaultCollection` -> `tfs.co:8080/tfs/defaultcollection`.
+    Unlike the Jira siteKey this keeps the path — that org/collection segment IS
+    the org identity, and the host alone (`dev.azure.com`) would merge every
+    unrelated cloud org into one board."""
+    r = (url or "").strip()
+    r = re.sub(r"^[a-zA-Z][\w.+-]*://", "", r)   # scheme
+    r = re.sub(r"^[^/@]+@", "", r)               # credentials
+    r = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", r, maxsplit=1)[0]
+    return r.strip("/").lower()
+
+
+def azure_req(path, params, body=None, method=None, content_type="application/json"):
+    """One authenticated request against the configured Azure DevOps org. GET
+    when `body` is None, else `method` (default POST). A System.State change
+    (XERK-138) is the one write: a PATCH carrying a JSON-Patch document, which
+    needs `content_type="application/json-patch+json"`. PAT auth is Basic with
+    an empty username (`:PAT`), which both Services and Server accept.
+    Exceptions propagate — the read callers turn them into the block's `error`,
+    the write caller stages them as a per-command error result."""
+    q = dict(params or {})
+    q.setdefault("api-version", AZDO_API_VERSION)
+    url = f"{azure_base()}{path}?{urllib.parse.urlencode(q)}"
+    auth = base64.b64encode(f":{AZDO_TOKEN}".encode()).decode()
+    headers = {
+        "Authorization": f"Basic {auth}",
+        "Accept": "application/json",
+        "User-Agent": "turma-agent/1.0",
+    }
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = content_type
+    req = urllib.request.Request(
+        url, data=data, headers=headers,
+        method=method or ("POST" if body is not None else "GET"))
+    return _board_urlopen(req)
+
+
+def _azure_states(site_key, project, wtype):
+    """The ordered [{name, category}] a (project, work-item-type) can be in, from
+    the states API, cached. [] when the call fails or is unavailable, so the
+    caller falls back to the static name map (category) or offers no status
+    options (XERK-138). Best-effort and total."""
+    ck = ("states", site_key, project or "", wtype or "")
+    if ck in _AZDO_STATE_CACHE:
+        return _AZDO_STATE_CACHE[ck]
+    out = []
+    if project and wtype:
+        try:
+            data = azure_req(
+                f"/{urllib.parse.quote(project)}/_apis/wit/workItemTypes/"
+                f"{urllib.parse.quote(wtype)}/states", {})
+            for s in data.get("value") or []:
+                name = str(s.get("name") or "").strip()
+                cat = str(s.get("stateCategory") or "").strip().lower()
+                if name and cat in _AZDO_META_CATEGORY:
+                    out.append({"name": name, "category": _AZDO_META_CATEGORY[cat]})
+        except Exception as e:
+            log(f"azure states fetch failed for {project}/{wtype}: {e}")
+    _AZDO_STATE_CACHE[ck] = out
+    return out
+
+
+def _azure_state_map(site_key, project, wtype):
+    """{state_name_lower: column} for one (project, work-item-type), derived from
+    the cached states list. {} when unavailable, so the caller falls back to the
+    static name map."""
+    return {s["name"].lower(): s["category"]
+            for s in _azure_states(site_key, project, wtype)}
+
+
+def _azure_status_options(site_key, project, wtype, current):
+    """The states this work item can be moved TO — every state of its type except
+    the one it's already in — in the source-agnostic statusOptions shape. For
+    Azure the submit value IS the state name (there is no transition id). [] when
+    the states API is unreachable (a locked-down server), so the row stays
+    read-only rather than offering a change that can't be validated."""
+    cur = str(current or "").strip().lower()
+    return [{"id": s["name"], "name": s["name"], "category": s["category"]}
+            for s in _azure_states(site_key, project, wtype)
+            if s["name"].strip().lower() != cur]
+
+
+def _azure_category(site_key, project, wtype, state):
+    """An Azure work item's `System.State` -> the board's todo/inprogress/done.
+    Prefers the per-type state metadata (handles custom processes), then the
+    static name map, then `todo` — the same safe default as Jira's unknowns."""
+    name = str(state or "").strip().lower()
+    live = _azure_state_map(site_key, project, wtype)
+    if name in live:
+        return live[name]
+    return _AZDO_STATE_CATEGORY.get(name, "todo")
+
+
+def _azure_org_user():
+    """The board block's `user` (the merge/union axis): the operator's AZDO_USER
+    if given, else the org/collection segment of the site — a stable per-org
+    label, which is all mergeSites needs it to be."""
+    if AZDO_USER:
+        return AZDO_USER
+    seg = [s for s in normalize_azure_site(AZDO_URL).split("/") if s]
+    return seg[-1] if seg else normalize_azure_site(AZDO_URL)
+
+
+def _azure_item_url(base, project, wid):
+    proj = f"/{urllib.parse.quote(str(project))}" if project else ""
+    return f"{base}{proj}/_workitems/edit/{wid}"
+
+
+def _shape_azure_item(wi, site_key, base):
+    """One raw work item (from the batch GET) -> the compact wire ticket the
+    board renders — the SAME shape _shape_issue produces for Jira, so the board
+    can't tell them apart. Everything optional degrades to None/[]."""
+    f = wi.get("fields") or {}
+    wid = wi.get("id")
+    key = str(wid) if wid is not None else ""
+    project = f.get("System.TeamProject")
+    wtype = f.get("System.WorkItemType")
+    state = f.get("System.State")
+    prio = f.get("Microsoft.VSTS.Common.Priority")
+    tags = f.get("System.Tags")
+    labels = [t.strip() for t in str(tags).split(";") if t.strip()] if tags else []
+    parent = f.get("System.Parent")
+    return {
+        "key": key,
+        "url": _azure_item_url(base, project, key),
+        "summary": (f.get("System.Title") or "")[:200],
+        "status": state,                                         # org state (pill)
+        "statusCategory": _azure_category(site_key, project, wtype, state),
+        "priority": f"P{prio}" if isinstance(prio, int) else None,
+        "type": wtype,
+        "project": project,
+        "projectName": project,
+        "labels": labels[:5],
+        "updated": f.get("System.ChangedDate"),
+        "created": f.get("System.CreatedDate"),
+        "dueDate": f.get("Microsoft.VSTS.Scheduling.DueDate"),
+        "parentKey": str(parent) if parent is not None else None,
+    }
+
+
+_AZDO_LIST_FIELDS = [
+    "System.Id", "System.Title", "System.State", "System.WorkItemType",
+    "System.TeamProject", "System.ChangedDate", "System.CreatedDate",
+    "System.Tags", "Microsoft.VSTS.Common.Priority", "System.Parent",
+    "Microsoft.VSTS.Scheduling.DueDate",
+]
+
+
+def fetch_azure_items(ids, site_key, base):
+    """Batch-GET work items by id (chunked to the API's 200 cap), shaped. Missing
+    ids are omitted (errorPolicy) rather than failing the whole batch."""
+    out = []
+    for i in range(0, len(ids), AZDO_BATCH):
+        chunk = ids[i:i + AZDO_BATCH]
+        data = azure_req("/_apis/wit/workitems", {
+            "ids": ",".join(str(x) for x in chunk),
+            "fields": ",".join(_AZDO_LIST_FIELDS),
+            "errorPolicy": "omit",
+        })
+        for wi in data.get("value") or []:
+            if isinstance(wi, dict) and wi.get("id") is not None:
+                out.append(_shape_azure_item(wi, site_key, base))
+    return out
+
+
+def collect_azure():
+    """The heartbeat's board block, Azure edition: the PAT owner's assigned work
+    items, bucketed into the same active + recently-done windows as collect_jira
+    and returned in the identical block shape (source:"azure"). One WIQL search
+    for the ids, then batched detail GETs; @Me resolves the assignee, so no
+    username is needed."""
+    if not azure_configured():
+        return azure_empty()
+    site_key = normalize_azure_site(AZDO_URL)
+    base = azure_base()
+    where = ["[System.AssignedTo] = @Me"]
+    if AZDO_PROJECT:
+        where.append(f"[System.TeamProject] = '{AZDO_PROJECT.replace(chr(39), chr(39) * 2)}'")
+    wiql = ("SELECT [System.Id] FROM WorkItems WHERE " + " AND ".join(where) +
+            " ORDER BY [System.ChangedDate] DESC")
+    res = azure_req("/_apis/wit/wiql", {}, body={"query": wiql})
+    ids = [w.get("id") for w in (res.get("workItems") or []) if w.get("id") is not None]
+    truncated = len(ids) > AZDO_MAX_IDS
+    tickets = fetch_azure_items(ids[:AZDO_MAX_IDS], site_key, base)
+
+    # Same two-window model as Jira: all active work, plus a bounded tail of
+    # recently-changed done items so the Done column is populated without growing
+    # forever. WIQL already sorted by ChangedDate desc, so slicing preserves it.
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(days=JIRA_DONE_DAYS)).isoformat()
+    active = [t for t in tickets if t["statusCategory"] != "done"][:JIRA_MAX_ACTIVE]
+    done = [t for t in tickets if t["statusCategory"] == "done"
+            and str(t.get("updated") or "") >= cutoff][:JIRA_MAX_DONE]
+    if len(active) < len([t for t in tickets if t["statusCategory"] != "done"]):
+        truncated = True
+    return {
+        "available": True,
+        "configured": True,
+        "source": "azure",
+        "site": site_key,
+        "siteKey": site_key,
+        "user": _azure_org_user(),
+        "fetchedAt": now_iso(),
+        "error": None,
+        "truncated": truncated,
+        "tickets": active + done,
+    }
+
+
+# --- Azure DevOps work-item detail (on-demand) ---------------------------------
+# Azure returns description and comment bodies as HTML (not ADF, not markdown),
+# so the ADF flattener's counterpart here is a small HTML->text pass, keeping the
+# same (text, truncated) contract adf_plain has.
+
+class _HTMLTextExtractor(HTMLParser):
+    """Flattens HTML to plain text: block tags become newlines, <li> a bullet,
+    <a href> keeps its target, and entities are unescaped. Best-effort, total."""
+    _BLOCK = {"p", "div", "br", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
+              "ul", "ol", "table", "blockquote", "section", "pre"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._href = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "li":
+            self.parts.append("\n- ")
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+        elif tag == "a":
+            self._href = dict(attrs).get("href")
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href:
+            if self._href not in "".join(self.parts[-3:]):
+                self.parts.append(f" ({self._href})")
+            self._href = None
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def text(self):
+        return "".join(self.parts)
+
+
+def azure_html_to_text(raw):
+    """HTML (or a plain string) -> plain text. Never raises on malformed markup."""
+    if not raw:
+        return ""
+    if not isinstance(raw, str):
+        return str(raw)
+    try:
+        p = _HTMLTextExtractor()
+        p.feed(raw)
+        p.close()
+        return p.text()
+    except Exception:
+        # A last-ditch tag strip so unparseable markup still degrades to its text.
+        return html.unescape(re.sub(r"<[^>]+>", " ", raw))
+
+
+def azure_plain(raw, limit):
+    """azure_html_to_text normalized and clipped: (text, truncated) — the exact
+    contract adf_plain gives the Jira detail shape."""
+    text = re.sub(r"[ \t]+\n", "\n", azure_html_to_text(raw))
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) <= limit:
+        return text, False
+    return text[:limit].rstrip(), True
+
+
+def _shape_azure_detail(wi, comments_data, site_key, base):
+    """A GET work item ($expand=all) + its comments -> the same detail shape
+    _shape_issue_detail produces for Jira."""
+    detail = _shape_azure_item(wi, site_key, base)
+    f = wi.get("fields") or {}
+
+    def person(field):
+        v = f.get(field)
+        return v.get("displayName") if isinstance(v, dict) else (v or None)
+
+    desc, desc_trunc = azure_plain(f.get("System.Description"), JIRA_DESC_MAX_CHARS)
+    detail["description"] = desc
+    detail["descriptionTruncated"] = desc_trunc
+    detail["reporter"] = person("System.CreatedBy")
+    detail["assignee"] = person("System.AssignedTo")
+    detail["resolution"] = f.get("System.Reason") or None
+    tags = f.get("System.Tags")
+    detail["labels"] = ([t.strip() for t in str(tags).split(";") if t.strip()]
+                        [:JIRA_DETAIL_LABELS_MAX] if tags else [])
+    detail["parentSummary"] = None   # would need a second fetch; parentKey suffices
+
+    raw = (comments_data or {}).get("comments") or []
+    raw = [c for c in raw if isinstance(c, dict)]
+    raw.sort(key=lambda c: str(c.get("createdDate") or ""))   # oldest-first, like Jira
+    comments = []
+    for c in raw[-JIRA_COMMENT_MAX:]:
+        body, trunc = azure_plain(c.get("text"), JIRA_COMMENT_MAX_CHARS)
+        author = c.get("createdBy")
+        comments.append({
+            "id": c.get("id"),
+            "author": author.get("displayName") if isinstance(author, dict) else None,
+            "created": c.get("createdDate"),
+            "updated": c.get("modifiedDate"),
+            "body": body,
+            "truncated": trunc,
+        })
+    detail["comments"] = comments
+    total = (comments_data or {}).get("totalCount")
+    detail["commentTotal"] = total if isinstance(total, int) else len(comments)
+    detail["fetchedAt"] = now_iso()
+    return detail
+
+
+def fetch_azure_issue(key):
+    """One work item's full detail. Comments ride a separate endpoint (and a
+    preview api-version); a comments failure degrades to no comments rather than
+    losing the whole detail. Exceptions on the item itself propagate."""
+    site_key = normalize_azure_site(AZDO_URL)
+    base = azure_base()
+    wi = azure_req(f"/_apis/wit/workitems/{urllib.parse.quote(key)}",
+                   {"$expand": "all"})
+    f = wi.get("fields") or {}
+    project = f.get("System.TeamProject")
+    comments_data = {}
+    if project:
+        try:
+            comments_data = azure_req(
+                f"/{urllib.parse.quote(project)}/_apis/wit/workItems/"
+                f"{urllib.parse.quote(key)}/comments",
+                {"api-version": f"{AZDO_API_VERSION}-preview.3"})
+        except Exception as e:
+            log(f"azure comments fetch failed for {key}: {e}")
+    detail = _shape_azure_detail(wi, comments_data, site_key, base)
+    detail["statusOptions"] = _azure_status_options(
+        site_key, project, f.get("System.WorkItemType"), f.get("System.State"))
+    return detail
+
+
+# --- Azure DevOps work-item creation (XERK-137) --------------------------------
+# The Azure counterpart of the Jira create path. Work-item create is a JSON-Patch
+# POST (application/json-patch+json) — a different content type than azure_req's
+# plain-JSON search/GET — with the work-item TYPE in the URL (`.../workitems/$Bug`).
+# "Labels" map to System.Tags (a `;`-joined string, not an array), and self-assign
+# uses the PAT owner's identity from the connection-data endpoint so the new item
+# lands on the board (which filters by @Me).
+_AZDO_ME = {"names": [], "tried": False}
+_AZDO_FIELD_CACHE = {}
+
+# Where a work-item type keeps its long description. Most types use
+# System.Description, but the Agile and Scrum process templates give Bug
+# Microsoft.VSTS.TCM.ReproSteps INSTEAD, and no System.Description at all — and a
+# patch naming a field the type doesn't have is rejected outright, so the whole
+# create fails rather than the description being dropped. Ordered by preference;
+# the first one the type actually has wins.
+AZDO_DESCRIPTION_FIELDS = ("System.Description", "Microsoft.VSTS.TCM.ReproSteps")
+
+
+def _azure_type_fields(site_key, project, wtype):
+    """The field reference names a (project, work-item type) accepts, cached like
+    _azure_states. An empty set means "couldn't ask" (the lookup failed, or the
+    args were incomplete), which callers read as unknown rather than as none."""
+    ck = ("fields", site_key, project or "", wtype or "")
+    if ck in _AZDO_FIELD_CACHE:
+        return _AZDO_FIELD_CACHE[ck]
+    out = set()
+    if project and wtype:
+        try:
+            data = azure_req(
+                f"/{urllib.parse.quote(project)}/_apis/wit/workItemTypes/"
+                f"{urllib.parse.quote(wtype)}/fields", {})
+            for f in data.get("value") or []:
+                ref = str(f.get("referenceName") or "").strip()
+                if ref:
+                    out.add(ref)
+        except Exception as e:
+            log(f"azure field list failed for {project}/{wtype}: {e}")
+    _AZDO_FIELD_CACHE[ck] = out
+    return out
+
+
+def _azure_description_field(site_key, project, wtype):
+    """The field to put a new work item's description in, or None to send none.
+
+    Falls back to System.Description when the field list is unknown — the old
+    unconditional behaviour, and right for every type that has it. Returning
+    None only happens when the type demonstrably has neither field, where
+    dropping the text beats losing the ticket to a 400."""
+    fields = _azure_type_fields(site_key, project, wtype)
+    if not fields:
+        return AZDO_DESCRIPTION_FIELDS[0]
+    for ref in AZDO_DESCRIPTION_FIELDS:
+        if ref in fields:
+            return ref
+    return None
+
+
+def _azure_identities():
+    """Every identity string worth trying as `System.AssignedTo`, best first.
+
+    There is no single spelling that works everywhere: Services wants an email,
+    a self-hosted collection usually wants `DOMAIN\\user`, and some accept only
+    the display name or the guid. Rather than guess one and lose the assignment
+    when it's the wrong one, offer them in order and let the create fall through
+    (`create_azure_issue`).
+
+    `AZDO_USER` leads because it is the operator saying so explicitly — but it
+    is documented as (and `_azure_org_user` uses it as) the board's display
+    LABEL, so it is frequently NOT an assignable identity, and the connection
+    data behind it is what `@Me` resolves to in the board's own WIQL. That is
+    why it is a candidate rather than the answer."""
+    out = []
+    if AZDO_USER:
+        out.append(AZDO_USER)
+    if not _AZDO_ME["tried"]:
+        try:
+            data = azure_req("/_apis/connectionData", {})
+            au = data.get("authenticatedUser") or {}
+            props = (au.get("properties") or {}).get("Account") or {}
+            _AZDO_ME["names"] = [str(v).strip() for v in (
+                props.get("$value"), au.get("uniqueName"), au.get("mailAddress"),
+                au.get("providerDisplayName"), au.get("id"),
+            ) if str(v or "").strip()]
+            # Cache only a SUCCESSFUL probe: marking it tried up-front turns one
+            # transient failure into a process that never self-assigns again.
+            _AZDO_ME["tried"] = True
+        except Exception as e:
+            log(f"azure connection-data lookup failed: {e}")
+    out.extend(_AZDO_ME["names"])
+    seen, ordered = set(), []
+    for name in out:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def azure_create_workitem(project, wtype, ops):
+    """POST a JSON-Patch work-item create and return the raw work item. `ops` is
+    the /fields patch list; the type rides the URL as `$<type>`. Separate from
+    azure_req because create requires the json-patch content type."""
+    q = {"api-version": AZDO_API_VERSION}
+    path = (f"/{urllib.parse.quote(project)}/_apis/wit/workitems/"
+            f"${urllib.parse.quote(wtype)}")
+    url = f"{azure_base()}{path}?{urllib.parse.urlencode(q)}"
+    auth = base64.b64encode(f":{AZDO_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url, data=json.dumps(ops).encode(), headers={
+        "Authorization": f"Basic {auth}",
+        "Accept": "application/json",
+        "Content-Type": "application/json-patch+json",
+        "User-Agent": "turma-agent/1.0",
+    }, method="POST")
+    return _board_urlopen(req)
+
+
+def azure_create_meta():
+    """The New-ticket form's project + tag choices for an Azure org: the projects
+    the PAT can see (work-item types are fetched per-project by azure_workitem_types)
+    plus a bounded list of existing tags to suggest."""
+    data = azure_req("/_apis/projects", {"$top": CREATE_META_MAX_PROJECTS})
+    projects = [{"key": p.get("name"), "name": p.get("name")}
+                for p in (data.get("value") or []) if p.get("name")]
+    tags = []
+    try:
+        # Org-wide tags endpoint (preview); a failure just means no suggestions.
+        td = azure_req("/_apis/wit/tags",
+                       {"api-version": f"{AZDO_API_VERSION}-preview.1"})
+        tags = [t.get("name") for t in (td.get("value") or []) if t.get("name")]
+    except Exception as e:
+        log(f"azure tag suggestions fetch failed: {e}")
+    return {"projects": projects, "labels": tags[:CREATE_META_MAX_LABELS],
+            "source": "azure"}
+
+
+def azure_workitem_types(project):
+    """The creatable work-item types in one Azure project (hidden/disabled ones
+    excluded). [{id, name}] — id == name for Azure, so the wire shape matches
+    Jira's issue-type list."""
+    data = azure_req(f"/{urllib.parse.quote(project)}/_apis/wit/workitemtypes", {})
+    out = []
+    for wt in (data.get("value") or []):
+        name = wt.get("name")
+        if not name or wt.get("isDisabled"):
+            continue
+        out.append({"id": name, "name": name})
+    return out
+
+
+def create_azure_issue(project, wtype, title, description, tags):
+    """Create one Azure work item and return {key, url}. `wtype` is the work-item
+    type name; `tags` become System.Tags. Self-assigns to the PAT owner
+    (best-effort) so the item lands on the board."""
+    site_key = normalize_azure_site(AZDO_URL)
+    base = azure_base()
+    ops = [{"op": "add", "path": "/fields/System.Title", "value": title}]
+    if description:
+        field = _azure_description_field(site_key, project, wtype)
+        if field:
+            # The description field is HTML; escape the plain text, keep breaks.
+            body_html = html.escape(str(description)).replace("\n", "<br>")
+            ops.append({"op": "add", "path": f"/fields/{field}",
+                        "value": body_html})
+        else:
+            log(f"azure type {wtype!r} has no description field; "
+                "creating without one")
+    if tags:
+        ops.append({"op": "add", "path": "/fields/System.Tags",
+                    "value": "; ".join(tags)})
+    # Try each candidate identity, then unassigned. Self-assignment is
+    # best-effort BY CONTRACT, so it must never cost the operator the ticket —
+    # but an item created unassigned falls outside the board's own @Me filter,
+    # so silently giving up on the first rejection is nearly as bad. Only a
+    # REFUSED write (4xx) is retried: after a timeout the create may have
+    # landed, and re-sending would duplicate it.
+    data, assigned, first = None, None, None
+    for me in _azure_identities() + [None]:
+        attempt = list(ops)
+        if me:
+            attempt.append({"op": "add", "path": "/fields/System.AssignedTo",
+                            "value": me})
+        try:
+            data = azure_create_workitem(project, wtype, attempt)
+            assigned = me
+            break
+        except Exception as e:
+            # Keep the FIRST error: it describes the real problem, where a later
+            # one only says the identity after it didn't work either.
+            first = first if first is not None else e
+            if not _write_was_refused(e):
+                raise first from None
+            if me is not None:
+                log(f"azure create rejected assignee {me!r} ({e})")
+    if data is None:
+        raise first
+    if assigned is None:
+        log(f"azure work item in {project} created UNASSIGNED "
+            "(no identity this collection accepts)")
+    wid = data.get("id")
+    if wid is None:
+        raise RuntimeError("Azure returned no work-item id")
+    return {"key": str(wid), "url": _azure_item_url(base, project, wid),
+            "assigned": bool(assigned)}
+
+
+# --- Board source dispatch -----------------------------------------------------
+# The board is source-agnostic downstream: the hub, board.js and every client
+# read one `jira` block per agent and never branch on where its tickets came
+# from. These helpers pick the collector for the one source THIS host is
+# configured for, so a host is a Jira host or an Azure host but the wire contract
+# is identical. Azure takes precedence if both are somehow set (one org per host).
+
+# The board chip's org label is DERIVED from the siteKey by every client
+# (board.js `orgName`), which reads well for Jira Cloud ("myorg.atlassian.net" ->
+# "myorg") and for Azure DevOps Services ("dev.azure.com/myorg" -> "myorg"), but
+# not for a self-hosted collection: "tfs.company.com/tfs/DefaultCollection" is
+# named after its COLLECTION ("defaultcollection"), which is a deployment detail,
+# not the org. So the operator can override the label from the agent's env.
+#
+# Presentational ONLY, and deliberately not part of the siteKey: the siteKey is
+# what the hub keys, merges and routes on, and what /api/jira/<siteKey>/... paths
+# and the hub's own ticket-agent/auto-start ledgers are stored under. Renaming it
+# would orphan every one of those; renaming the LABEL costs nothing.
+ORG_NAME_MAX_CHARS = 40
+
+
+def clean_org_name(raw):
+    """BOARD_ORG_NAME as the board may render it: first line, whitespace
+    collapsed, capped. "" for anything blank, so an unset or whitespace-only
+    override falls straight back to the client's derived name."""
+    text = str(raw or "").strip()
+    first = text.splitlines()[0] if text else ""
+    return re.sub(r"\s+", " ", first).strip()[:ORG_NAME_MAX_CHARS]
+
+
+BOARD_ORG_NAME = clean_org_name(os.environ.get("BOARD_ORG_NAME", ""))
+
+
+def board_source():
+    """"azure" | "jira" | None — which ticket source this host polls."""
+    if azure_configured():
+        return "azure"
+    if jira_configured():
+        return "jira"
+    return None
+
+
+def board_configured():
+    """Whether ANY ticket source is configured (the gate that used to be
+    jira_configured() alone)."""
+    return jira_configured() or azure_configured()
+
+
+def collect_board():
+    """The heartbeat board block from whichever source is configured: Azure when
+    its creds are set, else Jira. collect_jira() itself returns the empty block
+    when Jira is unconfigured too, so it's the safe default (and refresh_jira only
+    runs at all behind a board_configured() gate).
+
+    The operator's `orgName` override rides here rather than in either collector
+    because it is presentational and source-agnostic — the siteKey a board is
+    keyed, merged and routed on is untouched."""
+    block = collect_azure() if azure_configured() else collect_jira()
+    block["orgName"] = BOARD_ORG_NAME or None
+    return block
+
+
+def _board_error_summary(e):
+    """A short, human-readable summary of a board-poll failure for the block's
+    `error` field (shown on the dashboard's board). An upstream 5xx (e.g. the
+    Cloudflare-family HTTP 530 a self-hosted org's front returns when its origin
+    is unreachable) or a connection failure means the tracker was momentarily
+    unreachable — NOT a bug in the request — so say that plainly rather than
+    surfacing a cryptic `HTTP Error 530: <none>`. Auth and rate-limit failures
+    get their own hint; anything unrecognised falls back to the raw text. The
+    raw exception is still logged verbatim for diagnosis; only this UI-facing
+    string is cleaned up."""
+    src = "Azure DevOps" if board_source() == "azure" else "Jira"
+    if isinstance(e, urllib.error.HTTPError):
+        code = e.code
+        if code >= 500:
+            return f"{src} temporarily unreachable (HTTP {code})"
+        if code == 429:
+            return f"{src} rate-limited the request (HTTP 429)"
+        if code in (401, 403):
+            return f"{src} rejected the credentials (HTTP {code})"
+        reason = str(getattr(e, "reason", "") or "").strip()
+        return f"{src} request failed: HTTP {code}" + (f" {reason}" if reason else "")
+    if isinstance(e, (urllib.error.URLError, TimeoutError)):
+        reason = getattr(e, "reason", None)
+        detail = str(reason if reason is not None else e).strip()
+        return f"{src} unreachable" + (f" ({detail})" if detail else "")
+    return str(e)[:200]
+
+
+def board_empty():
+    """The off/never-polled block for the configured source (or a Jira-shaped
+    empty when nothing is configured — the historical default)."""
+    if azure_configured():
+        return azure_empty()
+    return jira_empty()
+
+
+def valid_issue_key(key):
+    """The allowlist gate for an issue key reaching a REST path, source-aware:
+    Jira's PROJECT-123 grammar, or Azure's bare integer work-item id."""
+    k = (key or "").strip()
+    if board_source() == "azure":
+        return bool(AZDO_KEY_RE.match(k))
+    return bool(JIRA_KEY_RE.match(k))
+
+
+def fetch_board_issue(key):
+    """One ticket's full detail from the configured source."""
+    if azure_configured():
+        return fetch_azure_issue(key)
+    return fetch_jira_issue(key)
+
+
+def board_site_key():
+    """This host's siteKey for the configured source (the ledger/routing key)."""
+    if azure_configured():
+        return normalize_azure_site(AZDO_URL)
+    return normalize_jira_site(JIRA_SITE)
+
+
+def board_status_options(key):
+    """The statuses `key` can be moved to right now, from the configured source
+    (Jira transitions / Azure states). The allowlist a status change is checked
+    against at write time — re-read fresh, never trusted from the client."""
+    if azure_configured():
+        wi = azure_req(f"/_apis/wit/workitems/{urllib.parse.quote(key)}",
+                       {"fields": "System.TeamProject,System.WorkItemType,System.State"})
+        f = wi.get("fields") or {}
+        return _azure_status_options(
+            normalize_azure_site(AZDO_URL), f.get("System.TeamProject"),
+            f.get("System.WorkItemType"), f.get("System.State"))
+    return _jira_status_options(key)
+
+
+# Board columns a status change can target by name (XERK-141, drag-and-drop). A
+# label for each so a "nothing moves it there" refusal reads in the operator's
+# own board vocabulary.
+_COLUMN_LABEL = {"todo": "To Do", "inprogress": "In Progress",
+                 "review": "In Review", "done": "Done"}
+# The In Review column is carved out of `inprogress` by the status NAME, matched
+# on word boundaries — mirrors board.js REVIEW_STATUS_RE / isReviewStatus exactly.
+_REVIEW_STATUS_RE = re.compile(r"\b(review|reviewing|testing|test|qa)\b", re.I)
+
+
+def _board_column(name, category):
+    """A status's board COLUMN — todo/inprogress/review/done — from its wire
+    category (todo/inprogress/done) plus its name. Mirrors board.js categoryOf:
+    an `inprogress` status whose name reads as review/testing/QA lands in the
+    review column; everything else keeps its category, unknowns fall to todo.
+    This is how a drop onto a column is resolved to a status to move to."""
+    base = category if category in ("inprogress", "done") else "todo"
+    if base == "inprogress" and _REVIEW_STATUS_RE.search(str(name or "")):
+        return "review"
+    return base
+
+
+def _status_option_for_column(options, column):
+    """The first available status option that lands in board `column`
+    (todo/inprogress/review/done), or None. First-match: a workflow with two
+    transitions into one column is rare, and the drop names the column, not the
+    exact status — the operator can still pick a specific one from the panel."""
+    target = str(column or "").strip().lower()
+    return next((o for o in options or []
+                 if _board_column(o.get("name"), o.get("category")) == target), None)
+
+
+def apply_board_status(key, value):
+    """Push a status change to the configured board (XERK-138). Jira: POST the
+    chosen transition id. Azure: PATCH System.State to the chosen state name via
+    a JSON-Patch document. Exceptions propagate to set_board_status, which stages
+    them as the command's error result."""
+    if azure_configured():
+        azure_req(
+            f"/_apis/wit/workitems/{urllib.parse.quote(key)}", {},
+            body=[{"op": "add", "path": "/fields/System.State", "value": value}],
+            method="PATCH", content_type="application/json-patch+json")
+    else:
+        jira_req(f"/rest/api/3/issue/{urllib.parse.quote(key)}/transitions", {},
+                 body={"transition": {"id": value}})
+
+
+def board_create_meta():
+    """The New-ticket form's project + label choices from the configured source
+    (XERK-137)."""
+    if azure_configured():
+        return azure_create_meta()
+    return jira_create_meta()
+
+
+def board_issue_types(project):
+    """The creatable issue/work-item types in one project, from the configured
+    source. [{id, name}]."""
+    if azure_configured():
+        return azure_workitem_types(project)
+    return jira_issue_types(project)
+
+
+def create_board_issue(project, issue_type, summary, description, labels):
+    """Create one ticket in the configured source and return {key, url}."""
+    if azure_configured():
+        return create_azure_issue(project, issue_type, summary, description, labels)
+    return create_jira_issue(project, issue_type, summary, description, labels)
+
+
+# --- Jira ticket sessions ------------------------------------------------------
+# Spawn a session to WORK a ticket: the board's per-card start button. Like the
+# triage above, this runs agent-side because this host is the only place the
+# three inputs meet — the Jira creds (hence the ticket's full text), the triage
+# ledger (hence which repo it belongs in), and the repos themselves.
+
+TICKET_PROMPT_COMMENTS = 10          # newest comments inlined into the prompt
+TICKET_BRANCH_MAX_SUFFIX = 200       # -1..-200 before we give up naming it
+
+
+def next_ticket_branch(issue_key, taken):
+    """The branch name for a new session on `issue_key`: the bare ticket key, or
+    the first free key-1/key-2/... when it's already taken. None when even the
+    suffixes are exhausted (the caller then just lets the agent name its own —
+    an absurd number of branches for one ticket is not worth failing a spawn)."""
+    taken = {str(t).strip() for t in (taken or []) if str(t or "").strip()}
+    if issue_key not in taken:
+        return issue_key
+    for n in range(1, TICKET_BRANCH_MAX_SUFFIX + 1):
+        cand = f"{issue_key}-{n}"
+        if cand not in taken:
+            return cand
+    return None
+
+
+def ticket_branch_base(key, detail):
+    """The branch base a ticket session cuts from — kept human-scannable per the
+    branch-naming policy. A Jira key (PROJECT-123) already reads that way and is
+    used as-is. An Azure work-item id is a bare integer, so we prefix it with the
+    project for the same at-a-glance mapping (`MyProject-1234`), falling back to
+    `wi-<id>` when the project is unknown."""
+    if board_source() != "azure":
+        return key
+    project = (detail or {}).get("project") or (detail or {}).get("projectName")
+    if project:
+        slug = re.sub(r"-{2,}", "-", re.sub(r"[^A-Za-z0-9._]+", "-", str(project))).strip("-.")
+        if slug:
+            return f"{slug}-{key}"
+    return f"wi-{key}"
+
+
+def branch_names(repo_path):
+    """Every branch name a new branch here could collide with: local heads, plus
+    remote-tracking branches reduced to the name they'd have locally (a pushed
+    `origin/PROJ-123` means that ticket already has a branch, even on a host that
+    has never checked it out). origin/HEAD is skipped — it's a symbolic alias for
+    the default branch, not a name anyone would take."""
+    out = run(["git", "-C", repo_path, "for-each-ref", "--format=%(refname)",
+               "refs/heads", "refs/remotes"])
+    names = set()
+    for line in out.splitlines():
+        ref = line.strip()
+        if ref.startswith("refs/heads/"):
+            names.add(ref[len("refs/heads/"):])
+        elif ref.startswith("refs/remotes/"):
+            rest = ref[len("refs/remotes/"):]
+            # "<remote>/<branch>" -> "<branch>"; a bare "refs/remotes/<remote>"
+            # has no branch part to take.
+            if "/" in rest:
+                name = rest.split("/", 1)[1]
+                if name != "HEAD":
+                    names.add(name)
+    return names
+
+
+def build_ticket_prompt(detail):
+    """A fetched ticket -> the initial task prompt for its session: everything the
+    agent would otherwise have to go and read, inlined.
+
+    The session has no board creds of its own (they live in the manager's env, not
+    the worktree), so this text is all it will ever see of the ticket — hence the
+    header saying plainly that it's a spawn-time snapshot and pointing at the URL
+    for the live copy. Caps mirror the detail fetch's own (description and comment
+    bodies are already clipped agent-side by the shaping)."""
+    d = detail or {}
+    key = d.get("key") or ""
+    summary = (d.get("summary") or "").strip()
+    # Name the source in the prompt so the session knows what it's working, and
+    # phrase an Azure work-item id as `#1234` the way that tracker does.
+    if board_source() == "azure":
+        source_name, noun, ref = "Azure DevOps", "work item", (f"#{key}" if key else "")
+    else:
+        source_name, noun, ref = "Jira", "ticket", key
+    head = f"Work {source_name} {noun} {ref}." if ref else f"Work the {source_name} {noun} below."
+    out = [
+        head + f" Its full text, as fetched from {source_name} when this session"
+        " spawned, follows. That is a snapshot — if something looks stale or"
+        " contradictory, the ticket's own URL below is the live copy.",
+        "",
+        f"# {ref}: {summary}".strip(": ") if (ref or summary) else "# Ticket",
+    ]
+    project = d.get("projectName") or d.get("project")
+    if (project and d.get("projectName") and d.get("project")
+            and d["projectName"] != d["project"]):
+        project = f"{d['projectName']} ({d['project']})"
+    parent = d.get("parentKey")
+    if parent and d.get("parentSummary"):
+        parent = f"{parent} — {d['parentSummary']}"
+    labels = d.get("labels")
+    fields = [
+        ("URL", d.get("url")),
+        ("Status", d.get("status")),
+        ("Type", d.get("type")),
+        ("Priority", d.get("priority")),
+        ("Assignee", d.get("assignee")),
+        ("Reporter", d.get("reporter")),
+        ("Project", project),
+        ("Parent", parent),
+        ("Due", d.get("dueDate")),
+        ("Labels", ", ".join(labels) if isinstance(labels, list) and labels else None),
+    ]
+    rows = [f"- {label}: {value}" for label, value in fields if value]
+    if rows:
+        out += ["", *rows]
+
+    desc = (d.get("description") or "").strip()
+    out += ["", "## Description", ""]
+    out.append(desc or "_No description._")
+    if d.get("descriptionTruncated"):
+        out.append(f"\n_(description truncated — the rest is in {source_name})_")
+
+    comments = [c for c in (d.get("comments") or []) if isinstance(c, dict)]
+    shown = comments[-TICKET_PROMPT_COMMENTS:]
+    total = d.get("commentTotal")
+    total = total if isinstance(total, int) else len(comments)
+    out += ["", f"## Comments ({total})", ""]
+    if not shown:
+        out.append("_No comments._")
+    else:
+        dropped = total - len(shown)
+        if dropped > 0:
+            out.append(f"_Showing the {len(shown)} newest; {dropped} older are in {source_name}._\n")
+        for c in shown:
+            who = c.get("author") or "Unknown"
+            when = c.get("created") or ""
+            body = (c.get("body") or "").strip() or "_(empty)_"
+            out.append(f"**{who}**{f' — {when}' if when else ''}\n{body}\n")
+
+    out += [
+        "",
+        "Start by working out what this ticket actually asks for, then do it. If"
+        " the ticket is ambiguous enough that you'd be guessing at the goal, ask"
+        " rather than guess.",
+    ]
+    return "\n".join(out)
+
+
+# --- Jira -> repo triage -------------------------------------------------------
+# Guess WHICH REPO each assigned ticket's work belongs in, so the board card can
+# say where a ticket would be worked. Like the session summaries below, this runs
+# on the container's already-authenticated `claude` in headless print mode (Haiku
+# by default) — the mounted login, so no external API, key, or cost env — as a
+# detached subprocess reaped on later beats.
+#
+# It runs on the AGENT rather than the hub because this host is the only place
+# the three inputs meet: the Jira creds (hence the tickets), the scanned repos in
+# REPOS_ROOT, and the `gh` sweep of clonable repos. That colocation is also what
+# enforces "same org": only the host holding an org's Jira creds ever classifies
+# that org's tickets, so a ticket can only ever be matched to a repo that host can
+# actually reach. Candidates are its cloned repos (preferred — see the prompt)
+# plus everything its gh login can clone, so an uncloned repo is still selectable.
+#
+# The model picks from a fixed candidate list and its answer is validated back
+# against that list (_parse_triage): a name that isn't a candidate is DROPPED, not
+# rendered. Nothing here is trusted into a shell, a path, or a URL — the guess is
+# presentational, and the board never acts on it.
+#
+# Triage is cached in a ledger (~/.turma/jira-repos.json) keyed by site+issue, so
+# it runs ONCE per ticket rather than per beat: re-triage only when the ticket's
+# own text changes or the candidate repo set does (cloning a repo should let it
+# win a ticket it's a better fit for). The candidate fingerprint deliberately
+# hashes only repo NAMES — the gh block's `updatedAt` churns constantly and would
+# otherwise re-triage the whole board on every sweep.
+JIRA_TRIAGE_MODEL = os.environ.get("JIRA_TRIAGE_MODEL", "haiku").strip() or "haiku"
+try:
+    JIRA_TRIAGE_TIMEOUT_SEC = int(os.environ.get("JIRA_TRIAGE_TIMEOUT_SEC", "120"))
+except ValueError:
+    JIRA_TRIAGE_TIMEOUT_SEC = 120
+JIRA_TRIAGE_BATCH = 25          # tickets per `claude -p` call (one call in flight)
+JIRA_TRIAGE_CANDIDATES = 200    # candidate repos shown to the model (bounds the prompt)
+JIRA_TRIAGE_MAX_ATTEMPTS = 3    # tries before a ticket stays unclassified for good
+JIRA_TRIAGE_BACKOFF_SEC = 300   # base gap between tries; grows with the try count
+JIRA_TRIAGE_REASON_MAX = 120    # per-ticket rationale kept (a card tooltip, not an essay)
+JIRA_TRIAGE_LEDGER_MAX = 500    # ledger entries kept (bounds the file)
+JIRA_TRIAGE_INSTRUCTION = (
+    "You are triaging Jira tickets to the code repository each one's work "
+    "belongs in.\n\n"
+    "Rules:\n"
+    "- Choose ONLY from the candidate repositories listed below. Never invent a "
+    "name.\n"
+    "- Prefer a repository marked [cloned] when it fits the ticket as well as an "
+    "uncloned one; pick an uncloned one when it is a clearly better fit.\n"
+    "- If no repository plausibly fits (for example a pure design, meeting, or "
+    "access-request ticket), use null. Do not guess.\n\n"
+    "Reply with ONLY a JSON object mapping each ticket key to either null or "
+    '{\"repo\": \"<exact candidate name>\", \"why\": \"<max 12 words>\"}. '
+    "No markdown fences, no preamble.\n\n"
+)
+
+
+def _triage_candidates(repos, github):
+    """The repos a ticket on this host may be matched to: its cloned repos first
+    (they carry `cloned`, which the prompt tells the model to prefer), then every
+    repo its gh login can clone. Deduped by repo name — a cloned repo and its gh
+    listing are the same repo, and the cloned copy is the one worth preferring.
+
+    Keyed on the bare repo NAME (not owner/repo) because that is what the board
+    shows and what a scanned REPOS_ROOT dir is called; a name collision across two
+    owners collapses to the first, which is the cloned one when there is one.
+
+    A cloned repo INHERITS its gh listing's description and owner rather than
+    shadowing them: the scan knows a repo's name and nothing else, so dropping the
+    gh half would leave the candidates the prompt says to PREFER as bare names —
+    describing worst exactly the repos most likely to win.
+
+    The gh tail is sorted by name, not left in gh's `updatedAt` order, because it
+    is about to be truncated: an updatedAt-ordered cut makes the surviving NAME set
+    move whenever anyone pushes to a cold repo, which would defeat
+    _candidates_fingerprint's whole reason for hashing names only and re-triage the
+    board every gh sweep."""
+    by_name = {}
+    for r in github or []:
+        nwo = (r or {}).get("nameWithOwner") or ""
+        name = (r or {}).get("name") or nwo.split("/")[-1]
+        if name and name not in by_name:
+            by_name[name] = r
+    out, seen = [], set()
+    for r in repos or []:
+        name = (r or {}).get("name")
+        if not name or name == ROOT_REPO_NAME or name in seen:
+            continue
+        seen.add(name)
+        gh = by_name.get(name) or {}
+        out.append({"name": name, "cloned": True,
+                    "nameWithOwner": gh.get("nameWithOwner") or None,
+                    "source": gh.get("source") or ("github" if gh else None),
+                    "description": (gh.get("description") or "")[:120]})
+    for name in sorted(by_name):
+        if name in seen:
+            continue
+        seen.add(name)
+        r = by_name[name]
+        out.append({"name": name, "cloned": False,
+                    "nameWithOwner": r.get("nameWithOwner") or None,
+                    "source": r.get("source") or "github",
+                    "description": (r.get("description") or "")[:120]})
+    return out[:JIRA_TRIAGE_CANDIDATES]
+
+
+def _triage_fingerprint(parts):
+    """A stable fingerprint for cache invalidation. crc32 for the same reason
+    _usage_slot uses it — the builtin hash is salted per process and would
+    invalidate the whole ledger on every restart."""
+    return zlib.crc32("\x00".join(parts).encode()) & 0xFFFFFFFF
+
+
+def _ticket_fingerprint(t):
+    """Changes when the text a triage decision was made FROM changes. Deliberately
+    not `updated`, which moves on any field edit (a status transition, an assignee
+    change) and would re-triage a ticket whose description never moved."""
+    labels = (t or {}).get("labels")
+    return _triage_fingerprint([
+        str((t or {}).get("summary") or ""),
+        str((t or {}).get("type") or ""),
+        str((t or {}).get("project") or ""),
+        ",".join(labels) if isinstance(labels, list) else "",
+    ])
+
+
+def _candidates_fingerprint(cands):
+    """Changes when the repos on offer change — names and cloned-ness only. NOT
+    descriptions or gh's `updatedAt`, which churn on their own and would re-triage
+    every ticket on the board for no new information."""
+    return _triage_fingerprint(
+        sorted(f"{c['name']}:{int(bool(c.get('cloned')))}" for c in cands))
+
+
+def _triage_key(site_key, issue_key):
+    return f"{site_key or ''}/{issue_key}"
+
+
+# A ledger entry holds two independent things, and keeping them apart is what
+# makes the cache safe:
+#
+#   the DECISION   — repo/cloned/nameWithOwner/reason/at, plus ticketFp/candFp
+#                    recording the question it ANSWERS.
+#   the ATTEMPT RUN — attempts/retryAt, plus tryTicketFp/tryCandFp recording the
+#                    question currently being ASKED.
+#
+# They were originally one blob, and the two bugs that produced are worth
+# remembering: starting an attempt overwrote the decision, so an unrelated
+# transient (a `gh` hiccup blanking the repo list) blanked every repo chip on the
+# board until a replacement landed; and the attempt counter, never reset, made
+# three invalidations spread over a ticket's whole life a PERMANENT ban on
+# re-triaging it — the exact opposite of what invalidation exists for.
+
+def _triage_stale(entry, ticket_fp, cand_fp):
+    """True when an entry's decision doesn't answer the question now being asked —
+    never decided, decided from different ticket text, or decided against a
+    different candidate set. Stale means "re-triage this"; it does NOT mean "stop
+    showing it". The old answer keeps rendering until a new one lands, because a
+    slightly outdated repo chip beats a board that blanks whenever a repo is
+    cloned or a gh sweep stumbles."""
+    if not isinstance(entry, dict) or not entry.get("decided"):
+        return True
+    return entry.get("ticketFp") != ticket_fp or entry.get("candFp") != cand_fp
+
+
+def _triage_attempts(entry, ticket_fp, cand_fp):
+    """How many attempts have been spent on the question currently being asked.
+
+    Scoped to the question rather than to the ticket's lifetime: a changed ticket
+    or candidate set is a NEW question, and it gets a fresh budget. A lifetime
+    counter would let three invalidations spaced months apart disqualify a ticket
+    from ever being triaged again, freezing a now-wrong chip on the board for
+    good."""
+    if not isinstance(entry, dict):
+        return 0
+    if entry.get("tryTicketFp") != ticket_fp or entry.get("tryCandFp") != cand_fp:
+        return 0    # the attempts on record were spent answering something else
+    n = entry.get("attempts")
+    return n if isinstance(n, int) else 0
+
+
+def _triage_prompt(tickets, cands):
+    """The candidate list + the ticket list, as text. Ticket text is DATA here: it
+    reaches `claude -p` as a single argv element (no shell), the model's reply is
+    allowlist-checked against `cands`, and the result is only ever rendered as a
+    chip — so a ticket summary carrying prompt-injection text can at worst make a
+    card name the wrong candidate repo."""
+    lines = [JIRA_TRIAGE_INSTRUCTION, "Candidate repositories:"]
+    for c in cands:
+        mark = " [cloned]" if c.get("cloned") else ""
+        desc = f" — {c['description']}" if c.get("description") else ""
+        lines.append(f"- {c['name']}{mark}{desc}")
+    lines.append("\nTickets:")
+    for t in tickets:
+        bits = [f"- {t.get('key')}: {t.get('summary') or ''}"]
+        if t.get("type"):
+            bits.append(f"(type: {t['type']})")
+        if t.get("project"):
+            bits.append(f"(project: {t['project']})")
+        labels = t.get("labels")
+        if isinstance(labels, list) and labels:
+            bits.append(f"(labels: {', '.join(labels)})")
+        lines.append(" ".join(bits))
+    return "\n".join(lines)
+
+
+def _extract_json_object(raw):
+    """The outermost {...} in a model reply, parsed. `claude -p` is asked for bare
+    JSON but will sometimes wrap it in prose or a ```json fence; slicing to the
+    outermost braces handles both without a fence-stripping special case."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _parse_triage(raw, tickets, cands):
+    """Model reply -> {issueKey: {repo, cloned, nameWithOwner, reason}}, where
+    repo is None for "no repo fits".
+
+    This is the trust boundary, and it draws a sharp line between the model's two
+    very different kinds of non-answer:
+
+    - An EXPLICIT null is a verdict. It was asked for, it means "no repo fits", and
+      it becomes a decision the board renders as the muted "no repo" chip.
+    - Anything unreadable — a value whose shape we can't parse, or a repo name that
+      isn't on the candidate list (a hallucination; the model is choosing from a
+      list, so off-list is definitionally made up) — is a FAILED ATTEMPT. Its key
+      is simply omitted, leaving the ticket undecided so the caller's retry picks
+      it up.
+
+    Conflating the two is the trap: recording a garbled reply as "no repo fits"
+    would paint a confident chip asserting something the model never said, and —
+    because a decision is never re-triaged — leave it there for good. A key that
+    wasn't asked about is ignored outright. An entirely unusable reply returns {},
+    which the caller likewise counts as a failed attempt."""
+    data = _extract_json_object(raw)
+    if data is None:
+        return {}
+    by_name = {c["name"]: c for c in cands}
+    asked = {t.get("key") for t in tickets}
+    decline = {"repo": None, "cloned": False, "nameWithOwner": None, "reason": ""}
+    out = {}
+    for key, val in data.items():
+        if key not in asked:
+            continue
+        if val is None:
+            out[key] = dict(decline)   # the model was asked for null and meant it
+            continue
+        why = ""
+        if isinstance(val, dict):
+            if "repo" not in val:
+                continue      # unreadable shape -> no answer for this ticket
+            name = val.get("repo")
+            why = str(val.get("why") or "")[:JIRA_TRIAGE_REASON_MAX]
+        elif isinstance(val, str):
+            name = val        # tolerate a bare "KEY": "repo" reply
+        else:
+            continue          # a list/number is not an answer we can read
+        if name is None:
+            out[key] = dict(decline)   # explicit {"repo": null}
+            continue
+        cand = by_name.get(name) if isinstance(name, str) else None
+        if cand is None:
+            # A name that isn't on the list is a BROKEN attempt, not a verdict of
+            # "no repo fits" — recording it as the latter would render a confident
+            # muted chip that is never revisited. Omitting the key leaves the
+            # ticket undecided, so the caller's retry picks it back up.
+            log(f"triage: dropping non-candidate repo {name!r} for {key}")
+            continue
+        out[key] = {
+            "repo": cand["name"],
+            "cloned": bool(cand.get("cloned")),
+            "nameWithOwner": cand.get("nameWithOwner"),
+            "source": cand.get("source"),
+            "reason": why,
+        }
+    return out
+
+
 # --- Session activity summaries ------------------------------------------------
 # Optionally give each session a few-word "name" describing its task (e.g.
 # "Adding Compose Flag"), generated once at spawn from the initial prompt by the
 # container's already-authenticated `claude` in headless print mode (`claude -p`,
 # Haiku by default). It reuses the mounted login, so there is NO external API or
 # key. The call runs as a detached subprocess reaped on later beats (never blocks
-# the heartbeat) and is deliberately ONE-SHOT — the single naming attempt per
-# session — because every session shares the one login, so re-summarizing per
-# beat would draw on the working sessions' rate limits. A session spawned with no
-# initial prompt (the one-click bare spawn, the repos-root pseudo-repo) is named
-# instead from its FIRST user prompt, read straight out of its transcript by
-# _seed_summaries() each beat (see _first_user_text). That transcript read is the
-# channel-agnostic path: the first prompt is usually typed into the live ttyd
-# terminal, which writes to the tmux pane and never reaches send_input, so keying
-# off any single input channel misses it — the transcript is where every input
-# path lands. send_input still kicks a name off immediately when a prompt does
-# arrive that way (a fast path); both are gated on summary/summaryStarted so the
-# attempt fires exactly once. A session with no prompt yet stays unnamed and the
-# card falls back to the label/worktree until one lands.
+# the heartbeat). A session spawned with no initial prompt (the one-click bare
+# spawn, the repos-root pseudo-repo) is named instead from its FIRST user prompt,
+# read straight out of its transcript by _seed_summaries() each beat (see
+# _first_user_text). That transcript read is the channel-agnostic path: the first
+# prompt is usually typed into the live ttyd terminal, which writes to the tmux
+# pane and never reaches send_input, so keying off any single input channel misses
+# it — the transcript is where every input path lands. send_input still kicks the
+# FIRST attempt off immediately when a prompt does arrive that way (a fast path).
+# A session with no prompt yet stays unnamed and the card falls back to the
+# label/worktree until one lands.
+#
+# Naming is attempted at most SUMMARY_MAX_ATTEMPTS times, spaced by a growing
+# backoff, and only ever while a session is unnamed. It is NOT one-shot: an
+# attempt can come back with no name for reasons that have nothing to do with the
+# session (a nonzero `claude -p` exit, an empty reply, the timeout below, or a
+# rate limit from the one login every session shares), and a single attempt made
+# those transient failures permanent — the card kept showing the raw session id
+# for the rest of its life, on an arbitrary subset of sessions. Retries are
+# bounded and backed off rather than per-beat precisely because of that shared
+# login: a handful of spaced attempts costs little, re-summarizing every beat
+# would eat the working sessions' rate limits. _seed_summaries() drives the
+# retries off the transcript, so a retry still names from the session's FIRST
+# prompt no matter how many turns have passed.
 # Handed straight to `claude --model`; validated only against claude's own
 # aliases, but this is a fixed operator-set env, not free-form spawn input.
 SESSION_SUMMARY_MODEL = os.environ.get("SESSION_SUMMARY_MODEL", "haiku").strip() or "haiku"
@@ -2120,11 +5868,151 @@ except ValueError:
 SUMMARY_MAX_WORDS = 6          # cap a chatty reply so it can't bloat the card
 SUMMARY_MAX_CHARS = 48
 SUMMARY_PROMPT_CAP = 2000      # cap the task text handed to the summarizer
+SUMMARY_MAX_ATTEMPTS = 3       # naming tries before a session stays unnamed for good
+SUMMARY_RETRY_BACKOFF_SEC = 90  # base gap between tries; grows with the try count
 SUMMARY_INSTRUCTION = (
     "In 2-4 words, give a Title Case name for the coding task below "
     '(e.g. "Adding Compose Flag", "Debugging Heartbeat Parser"). '
     "Reply with ONLY the name — no quotes, no punctuation, no preamble.\n\nTask:\n"
 )
+
+# The manager runs its OWN one-shot `claude -p` helpers — session naming
+# (SUMMARY_INSTRUCTION) and Jira repo triage (JIRA_TRIAGE_INSTRUCTION) — with
+# cwd=REGISTRY_DIR (see _start_summary / _start_jira_triage). Headless or not,
+# each still writes a transcript into the shared ~/.claude/projects, so the usage
+# reconciler would otherwise adopt the manager's own machinery as a phantom repo
+# on the usage page — the registry dir's basename (".turma" in production, or a
+# "hub-agent-mgr-*" temp dir when a test/verify harness boots the manager against
+# a mkdtemp REGISTRY_DIR). These are stable leading-text signatures of those two
+# prompts, matched against a transcript's first user turn so such a transcript is
+# recognized path- and process-independently (production AND any harness), and
+# even after a prompt reword leaves older transcripts still on disk. A test pins
+# them to the instructions above so a reword can't silently break the match. See
+# _looks_like_internal_tool_prompt / SessionManager._is_internal_tool_slug (XERK-27).
+INTERNAL_TOOL_PROMPT_SIGS = (
+    "You are triaging Jira tickets",
+    "In 2-4 words, give a Title Case name",
+)
+
+
+def _looks_like_internal_tool_prompt(text):
+    """True when `text` opens with one of the manager's own `claude -p` helper
+    prompts (session naming / Jira triage) — i.e. this transcript is the agent's
+    own tooling, not a coding session, and must not surface as a repo on the usage
+    page. See INTERNAL_TOOL_PROMPT_SIGS."""
+    if not text:
+        return False
+    head = text.lstrip()
+    return any(head.startswith(sig) for sig in INTERNAL_TOOL_PROMPT_SIGS)
+
+
+# --- available-models probe + live model switching ------------------------------
+# The chat page's model menu used to be a hardcoded guess, and "Default" was all
+# it could say about the model a session was really running (XERK-33). Two reads
+# fix that, both from claude itself rather than a rate table baked here:
+#   - `claude -p "/model"` prints "Current model: <label>" and "Usage: /model
+#     <name>. Available: <aliases>…" — the login's REAL alias list and what
+#     "default" currently resolves to, probed on a slow cadence (below).
+#   - each session's transcript names the model that actually answered
+#     (_scan_model_entry), which the heartbeat carries as `modelActual`.
+# The probe is a detached one-shot like the summary/triage helpers (same shared
+# login, cwd=REGISTRY_DIR so its transcript is tombstoned as internal overhead —
+# see _is_internal_tool_slug, which also recognizes it by its command name in a
+# harness's foreign REGISTRY_DIR slug).
+MODEL_PROBE_PROMPT = "/model"
+MODELS_REFRESH_EVERY = int(os.environ.get("TURMA_MODELS_REFRESH_EVERY", "1080")
+                           or 1080)   # beats (~6h at the 20s interval)
+MODELS_RETRY_EVERY = 45               # beats (~15 min) until the first success
+MODELS_PROBE_TIMEOUT_SEC = int(
+    os.environ.get("TURMA_MODELS_PROBE_TIMEOUT_SEC", "90") or 90)
+# How long set_model waits for the /model picker to paint after opening it:
+# up to TRIES polls, WAIT_SEC apart. Runs on the command path of the heartbeat
+# loop, so the worst case (a few seconds) is bounded well under a spawn's git
+# fetch.
+MODEL_PICKER_TRIES = 10
+MODEL_PICKER_WAIT_SEC = 0.3
+# The arrow loop: one press at a time, each verified by re-reading the ❯
+# before the next (MAX_STEPS bounds a cursor that never converges). STEP_*
+# pace the per-press readback; CONFIRM_* pace the wait for the "Set model to…"
+# confirmation after `s`.
+MODEL_PICKER_MAX_STEPS = 12
+MODEL_STEP_TRIES = 8
+MODEL_STEP_WAIT_SEC = 0.12
+MODEL_CONFIRM_TRIES = 10
+MODEL_CONFIRM_WAIT_SEC = 0.2
+# What the TUI prints once a picker selection lands (session-only or saved
+# default) or is dismissed on the current model. Either wording proves the
+# picker acted and closed.
+MODEL_CONFIRM_RE = re.compile(r"Set model to\s+.+|Kept model as\s+.+")
+# How set_mode's closed loop is bounded: more presses than any real cycle has
+# modes (a wrap back to the start stops it earlier), each press's readback
+# polled STEP_TRIES × STEP_WAIT.
+MODE_CYCLE_MAX_PRESSES = 6
+MODE_STEP_TRIES = 8
+MODE_STEP_WAIT_SEC = 0.15
+
+
+def parse_model_probe(text):
+    """Parse `claude -p "/model"` output into {"available": [aliases],
+    "defaultLabel": str|None}, or None when the Available list can't be read
+    (treat as a failed attempt, never as "no models"). Tokens that aren't
+    alias-shaped — the trailing "or a full model ID." — are dropped; "default"
+    is guaranteed onto the list since picking it is always legal."""
+    text = ANSI_RE.sub("", text or "")
+    m = re.search(r"Available:\s*(.+)", text)
+    if not m:
+        return None
+    avail = []
+    for tok in m.group(1).split(","):
+        tok = tok.strip().rstrip(".").strip()
+        if tok and MODEL_ALIAS_TOKEN_RE.fullmatch(tok) and tok not in avail:
+            avail.append(tok)
+    if not avail:
+        return None
+    if "default" not in avail:
+        avail.append("default")
+    dm = re.search(r"Current model:\s*(.+)", text)
+    label = dm.group(1).strip() if dm else None
+    return {"available": avail, "defaultLabel": label or None}
+
+
+def parse_model_picker(text):
+    """Parse a pane capture of Claude Code's /model picker into its option rows.
+
+    Returns (labels, current): the row labels top-to-bottom (description column
+    stripped — it sits 2+ spaces right of the label; the ✔ current-model mark
+    dropped) and the index the ❯ cursor is on, or ([], None) when the capture
+    holds no picker. Only the region from the last "Select model" heading down
+    is read, so numbered lines in the conversation above can't parse as rows."""
+    text = ANSI_RE.sub("", text or "")
+    pos = text.rfind("Select model")
+    if pos < 0:
+        return [], None
+    rows, cur = [], None
+    for line in text[pos:].splitlines():
+        m = re.match(r"^\s*(❯\s+)?(\d+)\.\s+(.+?)\s*$", line)
+        if not m:
+            continue
+        label = re.split(r"\s{2,}", m.group(3))[0].replace("✔", "").strip()
+        if not label:
+            continue
+        rows.append(label)
+        if m.group(1):
+            cur = len(rows) - 1
+    return rows, cur
+
+
+def _picker_index_for(rows, resolved):
+    """The picker row a resolved model alias (None = default) selects, or None
+    when the picker doesn't offer it. Rows lead with the alias as a word —
+    "Default (recommended)", "Opus", "Fable ✔" — so the match is on the first
+    word, case-folded."""
+    want = (resolved or "default").lower()
+    for i, label in enumerate(rows):
+        head = label.split()[0].lower() if label.split() else ""
+        if head == want:
+            return i
+    return None
 
 
 def clean_summary(raw):
@@ -2144,6 +6032,41 @@ def clean_summary(raw):
     return capped or None
 
 
+def clean_manual_summary(raw):
+    """Reduce an operator-typed session name to a display name, or None to clear
+    it. Unlike clean_summary (which tames a chatty model reply), this keeps the
+    text the operator actually typed — only the first line, whitespace collapsed,
+    and capped to the same width the card can show. Nothing is stripped from
+    inside it: an apostrophe or a version number is a deliberate part of a name a
+    human chose, where in a model's reply it was noise."""
+    line = next((ln.strip() for ln in (raw or "").splitlines() if ln.strip()), "")
+    return " ".join(line.split())[:SUMMARY_MAX_CHARS].strip() or None
+
+
+def _summary_attempts(sess):
+    """How many naming attempts a session has already spent.
+
+    `summaryStarted` was the original one-shot boolean and still sits on records
+    persisted by an older agent (and on ones this agent wrote before the retry
+    counter existed). Read it as "one attempt spent" rather than as a permanent
+    gate, so a session an earlier attempt failed to name becomes eligible for the
+    remaining retries instead of staying stuck on its id forever."""
+    n = sess.get("summaryAttempts")
+    if isinstance(n, int):
+        return n
+    return 1 if sess.get("summaryStarted") else 0
+
+
+def _summary_due(sess, now):
+    """True when a session still wants a name: unnamed, attempts left, and past
+    the backoff a previous failed attempt set."""
+    if sess.get("summary"):
+        return False
+    if _summary_attempts(sess) >= SUMMARY_MAX_ATTEMPTS:
+        return False
+    return now >= (sess.get("summaryRetryAt") or 0)
+
+
 class SessionManager:
     """Owns the registry, the live tmux/ttyd/claude processes, and the
     heartbeat loop. Single-threaded: all mutations happen in the main loop, so
@@ -2157,15 +6080,41 @@ class SessionManager:
         # meaningful (they're all just "agent"); the physical host name (device) is
         # what the hub keys on and displays.
         self.agent_id = run(["hostname"]) or "unknown"
+        # The container's own StartedAt where docker can answer, else THIS
+        # process's start — never empty. The fallback is what puts a native host
+        # on the hub's restart-loop radar (XERK-34): the alert keys on heartbeat
+        # `startedAt` CHANGING, so a host reporting none can crash-loop under
+        # systemd's Restart=always without a single notification, and its card's
+        # Uptime reads "–". The manager's start is the honest native equivalent
+        # of a container boot — with KillMode=process each crash restarts exactly
+        # this process — and in the container the manager IS PID 1, so the two
+        # times only differ by the entrypoint's preflight anyway.
         self.started_at = run(
             ["docker", "inspect", "--format", "{{.State.StartedAt}}", self.agent_id]
-        )
+        ) or now_iso()
+        # Which coding agent this host runs, and its version. The raw string is
+        # kept alongside the parsed {name, version} purely for hubs predating
+        # `codingAgent` — the two update independently, so a new agent must not
+        # blank an old hub's header.
         self.claude_version = run(["claude", "--version"])
+        self.coding_agent = coding_agent()
+        # This build's own version (baked env / installed VERSION file), read once
+        # — it can't change without the process being replaced.
+        self.agent_version = agent_version()
         self.device = device_name()
 
         # AskUserQuestion bridge rendezvous dir (ask.py writes req files here).
         try:
             os.makedirs(QUESTIONS_DIR, exist_ok=True)
+        except OSError:
+            pass
+        # We've just (re)started, so any expected-restart hint the updater left
+        # for the PREVIOUS shutdown has served its purpose — clear it so a later
+        # SIGKILL (no handler) can't leak a stale version into a future announce
+        # (XERK-29). The hub already cleared the `updating` status the instant
+        # this boot's first heartbeat landed.
+        try:
+            os.unlink(UPDATING_FLAG_PATH)
         except OSError:
             pass
         self.registry = self._load_list(REGISTRY_PATH)  # persisted live sessions
@@ -2194,13 +6143,25 @@ class SessionManager:
         # pending_prs, which _clear_pending_prs empties after every delivered
         # heartbeat (it's a one-shot "new since last beat" delivery queue). This
         # is what _session_prs / refresh_pr_status key off, so a card's PR status
-        # survives past the beat the URL was first scraped. Deduped + capped,
-        # in-memory (a restart re-learns links as new PRs appear).
+        # survives past the beat the URL was first scraped. Deduped + capped.
         self.session_pr_urls = {}                # id -> [unique PR urls, capped]
+        # Rehydrated from the registry on boot: a running session mirrors its
+        # opened-PR links onto its own record (sess["prUrls"], saved as they grow
+        # in _session_payload), so the chips survive an AGENT restart the same way
+        # a killed session's do off its closed record. Without this the map
+        # started empty and the transcript scan primes its offsets to EOF (so it
+        # never replays the old links), which blanked a running card's PR chips on
+        # every restart until it happened to open another PR. (XERK-15)
+        for _sess in self.registry:
+            _urls = _sess.get("prUrls")
+            if _urls:
+                self.session_pr_urls[_sess["id"]] = list(_urls)
         # PR link -> compact status (state + CI checks), refreshed via `gh pr
         # view` on the PR_STATUS_REFRESH_EVERY cadence and attached to each
         # session's payload. Keyed by URL so several sessions can share one.
-        self.pr_status_cache = {}
+        # Seeded from the durable PR-status ledger so a chip keeps its state/CI
+        # pill across a restart (an ended session's PR is never re-polled).
+        self.pr_status_cache = self._load_pr_status_ledger()
         # Slow-changing git facts cached across beats (recomputed on the slow
         # USAGE_EVERY cadence, or on first sight): repo path -> repo_slow_facts,
         # session id -> {liveBranch, slow git_info, branch_sync work}.
@@ -2212,6 +6173,26 @@ class SessionManager:
         # (historyResults) — held across a failed POST, cleared only once
         # delivery succeeds, same lifecycle as pending_prs above.
         self.history_results = []
+        # Staged `subagentHistory` results (one background agent's transcript,
+        # fetched when an operator clicks a live agent-list row) — same
+        # staged-until-delivered lifecycle as history_results.
+        self.subagent_history_results = []
+        # Staged `jiraIssue` command results (one issue's description/comments,
+        # fetched on demand when an operator expands a board ticket) awaiting
+        # the next heartbeat payload — same held-across-a-failed-POST lifecycle
+        # as history_results.
+        self.jira_issue_results = []
+        # Staged `setTicketStatus` results (the outcome of a board status change,
+        # XERK-138) — each `{cmdId, key, ok, error, ...}` awaiting the next
+        # heartbeat, keyed back to the request by the command's cmdId. Same
+        # held-across-a-failed-POST lifecycle as jira_issue_results.
+        self.ticket_status_results = []
+        # Staged New-ticket (XERK-137) results: the board's create form fetches
+        # the project/type/label metadata (create_meta_results) and then POSTs a
+        # new ticket (create_ticket_results), both riding the next beat with the
+        # same held-across-a-failed-POST lifecycle as jira_issue_results.
+        self.create_meta_results = []
+        self.create_ticket_results = []
         # Archive sync: the manifest of inactive transcripts sent on the last slow
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
@@ -2222,6 +6203,20 @@ class SessionManager:
         # view is heartbeated).
         self.github = {"available": False, "login": None, "repos": []}
         self.clones = {}
+        # Extra clone sources (XERK-155), keyed by source ("azure"/"gitlab"),
+        # present only when that source's creds are configured. Each holds the
+        # last GOOD listing (repos keep their internal cloneUrl; the payload
+        # strips it) — a failed sweep records the error but never blanks the
+        # repos, for the same reason triage_gh_repos exists.
+        self.git_sources = {}
+        if azure_configured():
+            self.git_sources["azure"] = {"available": False, "repos": [], "error": None}
+        if gitlab_configured():
+            self.git_sources["gitlab"] = {"available": False, "repos": [], "error": None}
+        # Jira Cloud assigned-ticket block (refreshed on its own slow cadence
+        # or on a hub `refreshJira` command, reported every beat; stays the
+        # empty shape on unconfigured hosts).
+        self.jira = board_empty()
         # Recent per-repo prune results (merged branches + safe worktrees swept),
         # keyed by repo name, lingered briefly so the UI can show the summary.
         self.prunes = {}
@@ -2229,9 +6224,56 @@ class SessionManager:
         # + its output file live here; the finished text lands on the session
         # record). Empty when no session has a prompt to summarize.
         self.summaries = {}
+        # The login's real model list, from the `claude -p "/model"` probe:
+        # {"available": [aliases], "defaultLabel": "Fable 5", "at": iso} once a
+        # probe has succeeded, None until then (the hub falls back to its static
+        # menu). In-memory only — a restart re-probes within a beat or two.
+        self.models_info = None
+        self.models_probe = None       # the in-flight probe job, or None
+        # Sessions whose modelActual has been seeded from their transcript tail
+        # this process — the seed is a one-shot bounded read per session, for
+        # records predating the field (the per-beat scan only sees new bytes).
+        self._model_seeded = set()
+        # Cached Jira-ticket -> repo triage decisions (persisted), plus the single
+        # in-flight triage subprocess. At most one runs at a time: a backlog
+        # trickles out a batch per jira beat rather than forking N models at once
+        # against the one shared login. Both stay empty on unconfigured hosts.
+        self.triage_ledger = self._load_triage_ledger()
+        self.triage_job = None
+        # Durable transcript -> ticket attribution (persisted). Keeps the board's
+        # ticket chips answerable after the session record behind them is gone —
+        # killed, aged out of closed.json, or never in either. Backfilled from the
+        # records that still carry both, so it doesn't start empty.
+        self.ticket_ledger = self._load_ticket_ledger()
+        self._backfill_ticket_ledger()
+        # Durable transcript -> PR-links attribution (persisted). Keeps a
+        # session's PR chips answerable after the in-memory scan is lost (manager
+        # restart) and after the session record itself is gone (aged out of
+        # closed.json). Backfilled from the closed history, and re-seeds the live
+        # working set so a restart re-polls a running session's PRs rather than
+        # blanking them. See PR_LEDGER_PATH.
+        self.pr_ledger = self._load_pr_ledger()
+        self._backfill_pr_ledger()
+        # Last SUCCESSFUL gh repo sweep, held so a failed one (which blanks the
+        # github block to repos:[]) can't be mistaken for an empty org — see
+        # _start_jira_triage.
+        self.triage_gh_repos = []
+        # The repos a ticket may be assigned to on this host, recomputed each beat
+        # by _refresh_triage_candidates. It is deliberately ONE list serving two
+        # callers: the choice list the model triages from, and (heartbeated as
+        # jira.repoOptions) the options the board's manual picker offers. They must
+        # not drift — the picker exists to offer exactly what set_jira_repo will
+        # accept, and both validate against this.
+        self.triage_cands = []
         # at-least-once command de-dup: cmdIds we've already executed.
         self.acked = set()
         self.acked_order = deque(maxlen=1000)
+        # A dashboard-requested manager restart (restartAgent). Set by the
+        # command handler and consumed by run_forever, which exits for the
+        # supervisor to bring us back — but only AFTER a heartbeat carrying the
+        # command's ack reached the hub, so the still-queued command can't
+        # re-fire on the next boot and restart-loop us.
+        self._restart_pending = False
 
     # --- registry persistence ---------------------------------------------
 
@@ -2254,6 +6296,324 @@ class SessionManager:
         except OSError as e:
             log(f"registry save failed: {e}")
 
+    # --- Jira -> repo triage ----------------------------------------------
+
+    def _load_triage_ledger(self):
+        try:
+            with open(TRIAGE_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_triage_ledger(self):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = TRIAGE_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.triage_ledger, f, indent=2)
+            os.replace(tmp, TRIAGE_LEDGER_PATH)
+        except OSError as e:
+            log(f"triage ledger save failed: {e}")
+
+    def _triage_due(self, tickets, cand_fp, now, site_key):
+        """The tickets wanting a decision right now: stale, attempts left, and
+        past the backoff a previous failed attempt set. Bounded to one batch —
+        the rest come back on later beats."""
+        due = []
+        for t in tickets:
+            key = t.get("key")
+            if not key:
+                continue
+            entry = self.triage_ledger.get(_triage_key(site_key, key))
+            # An operator's own answer outranks anything the model would decide, so
+            # a manual pin is never re-triaged and never spends an attempt. It is
+            # the same rule _summary_due applies to a hand-renamed session, and the
+            # ONLY way back to auto is the operator clearing it (set_jira_repo with
+            # auto=True), which drops the entry outright.
+            if isinstance(entry, dict) and entry.get("manual"):
+                continue
+            tfp = _ticket_fingerprint(t)
+            if not _triage_stale(entry, tfp, cand_fp):
+                continue
+            attempts = _triage_attempts(entry, tfp, cand_fp)
+            if attempts >= JIRA_TRIAGE_MAX_ATTEMPTS:
+                continue
+            # The backoff is only this question's to enforce; `attempts` is 0 when
+            # the retryAt on record was armed answering a different one.
+            if attempts and now < (entry.get("retryAt") or 0):
+                continue
+            due.append(t)
+            if len(due) >= JIRA_TRIAGE_BATCH:
+                break
+        return due
+
+    def _refresh_triage_candidates(self):
+        """Recompute the repos a ticket may be assigned to on this host, and cache
+        them on `self.triage_cands`.
+
+        refresh_github blanks the block to repos:[] on ANY error, which on this
+        field alone is indistinguishable from "the org has no repos". Triaging
+        against that would drop every uncloned candidate, restale every ticket, and
+        re-run the whole board through the model twice — once when gh stumbles and
+        again when it recovers. So only a SUCCESSFUL sweep updates the candidate
+        repos; otherwise the last good list stands. A host with no gh at all never
+        sets it and triages against its cloned repos, which is the correct
+        candidate set for that host.
+
+        The same list is the operator's picker options and set_jira_repo's
+        allowlist, so a repo the board offers is by construction one this host will
+        accept.
+
+        The extra git sources (XERK-155) join the clonable tail: their listings
+        are already keep-last-good (refresh_git_sources never blanks on error),
+        so they need no gate of their own. gh first, so a cross-source name
+        collision keeps its legacy GitHub resolution."""
+        gh = self.github or {}
+        if gh.get("available"):
+            self.triage_gh_repos = list(gh.get("repos") or [])
+        clonable = list(self.triage_gh_repos)
+        for src in ("azure", "gitlab"):
+            state = self.git_sources.get(src) or {}
+            clonable.extend(dict(r, source=src)
+                            for r in state.get("repos") or [])
+        self.triage_cands = _triage_candidates(self._triage_repos(), clonable)
+        return self.triage_cands
+
+    def _start_jira_triage(self):
+        """Kick off one batch of ticket -> repo triage as a DETACHED
+        `claude -p` reaped by _poll_jira_triage. No-op when a job is already in
+        flight, when the board is off, when there are no candidate repos, or when
+        every ticket already has a fresh decision — so a settled board costs
+        nothing. Source-agnostic: it reads only the ticket text in self.jira."""
+        if not board_configured():
+            return
+        # Refreshed BEFORE the in-flight check: the board's picker reads this list
+        # every beat, and freezing it for the length of a triage job would offer
+        # the operator a stale set of repos (a just-cloned one missing) for as long
+        # as the model happened to be running.
+        cands = self._refresh_triage_candidates()
+        if self.triage_job is not None:
+            return
+        tickets = self.jira.get("tickets") or []
+        if not tickets:
+            return
+        if not cands:
+            return  # nothing to choose from; leave the tickets untriaged
+        cand_fp = _candidates_fingerprint(cands)
+        site_key = self.jira.get("siteKey")
+        batch = self._triage_due(tickets, cand_fp, time.time(), site_key)
+        if not batch:
+            return
+        out_path = os.path.join(REGISTRY_DIR, "jira-triage.out")
+        outf = None
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            outf = open(out_path, "w")
+            # Same posture as _start_summary: headless, cwd is REGISTRY_DIR (NOT a
+            # repo) and no --settings, so it never loads the session guard or
+            # explores a worktree — it decides from the candidate list in the
+            # prompt alone. The command is a list (no shell), so ticket text can't
+            # inject, and _poll_jira_triage's timeout backstops a hang.
+            proc = subprocess.Popen(
+                ["claude", "-p", "--model", JIRA_TRIAGE_MODEL,
+                 _triage_prompt(batch, cands)],
+                stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+            )
+        except Exception as e:
+            log(f"jira triage launch failed: {e}")
+            if outf is not None:
+                try:
+                    outf.close()
+                except Exception:
+                    pass
+            self._spend_triage_attempts(batch, cand_fp, site_key)
+            return
+        self.triage_job = {
+            "proc": proc, "outf": outf, "outPath": out_path,
+            "startedMono": time.time(), "batch": batch, "cands": cands,
+            "candFp": cand_fp,
+            # Pinned rather than re-read at reap time: the ledger key a decision
+            # lands under must be the one its attempt was counted under, and a job
+            # outlives the beat that started it.
+            "siteKey": site_key,
+        }
+        self._spend_triage_attempts(batch, cand_fp, site_key)
+        log(f"triaging {len(batch)} jira ticket(s) to repos via claude -p "
+            f"({JIRA_TRIAGE_MODEL}), {len(cands)} candidates")
+
+    def _spend_triage_attempts(self, batch, cand_fp, site_key):
+        """Count an attempt against each ticket in a batch and arm its backoff.
+        Armed up-front like _spend_summary_attempt: if the manager dies mid-batch
+        the job dies with it, and the persisted count is what makes the reload
+        retry once rather than loop.
+
+        Touches ONLY the attempt-run fields. Any decision already on the entry is
+        left intact and keeps rendering while this attempt runs — it is the best
+        answer available until a better one lands, and destroying it here would
+        blank the board on nothing more than a transient."""
+        for t in batch:
+            lkey = _triage_key(site_key, t.get("key"))
+            entry = dict(self.triage_ledger.get(lkey) or {})
+            tfp = _ticket_fingerprint(t)
+            prev = _triage_attempts(entry, tfp, cand_fp)
+            entry["attempts"] = prev + 1
+            entry["retryAt"] = time.time() + JIRA_TRIAGE_BACKOFF_SEC * (prev + 1)
+            entry["tryTicketFp"] = tfp
+            entry["tryCandFp"] = cand_fp
+            self.triage_ledger[lkey] = entry
+        self._prune_triage_ledger()
+        self._save_triage_ledger()
+
+    def _finish_jira_triage(self, job, results):
+        """Tear down a triage job and merge whatever it decided into the ledger.
+        A ticket the reply didn't cover keeps the attempt it spent and comes back
+        on the next beat once its backoff elapses."""
+        try:
+            if job.get("outf"):
+                job["outf"].close()
+        except Exception:
+            pass
+        try:
+            if job.get("outPath"):
+                os.remove(job["outPath"])
+        except OSError:
+            pass
+        self.triage_job = None
+        decided = 0
+        for t in job.get("batch") or []:
+            key = t.get("key")
+            if key not in results:
+                continue
+            lkey = _triage_key(job.get("siteKey"), key)
+            entry = dict(self.triage_ledger.get(lkey) or {})
+            # The operator overrode this ticket while the model was still deciding
+            # it. Their answer wins: the batch was built before the override
+            # existed, so this reply is an answer to a question that is no longer
+            # being asked. Mirrors _finish_summary declining to clobber a manual
+            # rename.
+            if entry.get("manual"):
+                continue
+            entry.update(results[key])
+            entry["decided"] = True
+            entry["at"] = now_iso()
+            # Stamp the question this decision ANSWERS (the one the batch was built
+            # from, not whatever the block says now), and close out the attempt run
+            # — a landed answer owes no more retries, and leaving the counter to
+            # accumulate across a ticket's life would eventually ban it from being
+            # re-triaged at all.
+            entry["ticketFp"] = _ticket_fingerprint(t)
+            entry["candFp"] = job.get("candFp")
+            for k in ("attempts", "retryAt", "tryTicketFp", "tryCandFp"):
+                entry.pop(k, None)
+            self.triage_ledger[lkey] = entry
+            decided += 1
+        if decided:
+            self._save_triage_ledger()
+            self._apply_triage()
+        missed = len(job.get("batch") or []) - decided
+        log(f"jira triage: decided {decided} ticket(s)"
+            + (f", {missed} unanswered (will retry)" if missed else ""))
+
+    def _poll_jira_triage(self):
+        """Reap the in-flight triage subprocess (one non-blocking poll() per beat,
+        like _poll_summaries): on clean exit merge the validated decisions; kill
+        and drop anything that overran the timeout."""
+        job = self.triage_job
+        if job is None:
+            return
+        proc = job.get("proc")
+        rc = proc.poll() if proc else 0
+        if rc is None:
+            if time.time() - job.get("startedMono", 0) > JIRA_TRIAGE_TIMEOUT_SEC:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                log("jira triage timed out")
+                self._finish_jira_triage(job, {})
+            return
+        raw = None
+        if rc == 0:
+            try:
+                with open(job.get("outPath") or "", errors="replace") as f:
+                    raw = f.read()
+            except OSError:
+                raw = None
+        else:
+            log(f"jira triage exited {rc}")
+        self._finish_jira_triage(
+            job, _parse_triage(raw, job.get("batch") or [], job.get("cands") or []))
+
+    def _triage_repos(self):
+        """The host's cloned repos as triage candidates. Reads the scan directly
+        rather than _sorted_repo_entries: triage only needs names, and the scan is
+        the cheap half (no per-repo git calls, no root pseudo-repo)."""
+        try:
+            return scan_repos()
+        except Exception as e:
+            log(f"triage repo scan failed: {e}")
+            return []
+
+    def _prune_triage_ledger(self):
+        """Bound the ledger. Entries are dropped oldest-decision-first; an
+        undecided entry (in flight or awaiting a retry) sorts newest so a prune
+        can't silently cancel work still owed.
+
+        A MANUAL entry sorts alongside those and is evicted last: an auto decision
+        the prune drops is simply recomputed on the next beat, but a pin the
+        operator typed is the one thing here that cannot be regenerated, and losing
+        it would silently hand the ticket back to the model."""
+        over = len(self.triage_ledger) - JIRA_TRIAGE_LEDGER_MAX
+        if over <= 0:
+            return
+        order = sorted(self.triage_ledger.items(),
+                       key=lambda kv: ("￿" if (kv[1] or {}).get("manual")
+                                       else (kv[1] or {}).get("at") or "￿"))
+        for lkey, _ in order[:over]:
+            self.triage_ledger.pop(lkey, None)
+
+    def _apply_triage(self):
+        """Stamp each cached decision onto its ticket in the live jira block, so
+        the guess rides the ordinary heartbeat rather than needing a channel of its
+        own. Idempotent — called after every jira refresh and every merge.
+
+        Only DECIDED entries produce a repoGuess: a ticket that hasn't been triaged
+        yet carries no key at all (the board shows no chip, which is honest — it
+        isn't "no repo fits", it's "not looked at yet"), while one the model
+        declined carries repo=None, which the board renders as the greyed
+        no-repo chip.
+
+        A `manual` decision is the operator's own and reads identically apart from
+        the flag, which the board uses to say who chose."""
+        site_key = self.jira.get("siteKey")
+        by_name = {c["name"]: c for c in (self.triage_cands or [])}
+        for t in self.jira.get("tickets") or []:
+            entry = self.triage_ledger.get(_triage_key(site_key, t.get("key")))
+            if not isinstance(entry, dict) or not entry.get("decided"):
+                t.pop("repoGuess", None)
+                continue
+            repo = entry.get("repo")
+            # Clone state is re-read from the CURRENT candidates rather than
+            # trusted from when the decision landed. Cloning a repo re-triages an
+            # auto guess (candFp moves), but a manual pin never re-triages at all,
+            # so a stored `cloned:false` would outlive the clone forever and the
+            # chip would stay dashed for good.
+            #
+            # A repo missing from the list right now keeps its stored state: the
+            # list blanks on a failed gh sweep, and absence there is not evidence a
+            # repo stopped being cloned.
+            cand = by_name.get(repo) if repo else None
+            t["repoGuess"] = {
+                "repo": repo,
+                "cloned": bool(cand.get("cloned")) if cand else bool(entry.get("cloned")),
+                "nameWithOwner": (cand or {}).get("nameWithOwner") or entry.get("nameWithOwner"),
+                "source": (cand or {}).get("source") or entry.get("source"),
+                "reason": entry.get("reason") or "",
+                "manual": bool(entry.get("manual")),
+                "at": entry.get("at"),
+            }
+
     # --- usage attribution ledger -----------------------------------------
 
     def _load_ledger(self):
@@ -2273,6 +6633,281 @@ class SessionManager:
             os.replace(tmp, USAGE_LEDGER_PATH)
         except OSError as e:
             log(f"usage ledger save failed: {e}")
+
+    # --- ticket attribution ledger -----------------------------------------
+
+    def _load_ticket_ledger(self):
+        try:
+            with open(TICKET_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_ticket_ledger(self):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = TICKET_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.ticket_ledger, f, indent=2)
+            os.replace(tmp, TICKET_LEDGER_PATH)
+        except OSError as e:
+            log(f"ticket ledger save failed: {e}")
+
+    def _remember_ticket(self, sess, save=True):
+        """Record a ticket-backed session's transcript -> ticket attribution, so
+        the board can still say which conversation worked a ticket once the
+        session record behind it is gone (see TICKET_LEDGER_PATH). Idempotent;
+        keyed by the transcript id, so a restart-clear-context adds its new
+        conversation rather than replacing the old one.
+
+        No-op for the ordinary session, which has no ticket, and for one not yet
+        launched, which has no transcript to key on. Returns whether anything
+        moved, so a bulk caller can save once.
+
+        The id is the PINNED one, falling back to the closed record's resolved
+        `transcriptId` — which is all a record written by an agent predating the
+        pin ever had (see _remember_closed)."""
+        tid = sess.get("claudeSessionId") or sess.get("transcriptId")
+        ticket = sess.get("ticket")
+        if not tid or not ticket or not ticket.get("key"):
+            return False
+        prev = self.ticket_ledger.get(tid)
+        entry = {
+            "key": ticket.get("key"),
+            "siteKey": ticket.get("siteKey"),
+            "url": ticket.get("url"),
+            "summary": ticket.get("summary"),
+            # The branch this session was TOLD to cut. The live git branch is the
+            # better label and the board prefers it, but it is only readable while
+            # the worktree exists — this is what a chip falls back to afterwards.
+            "branch": ticket.get("branch"),
+            "repo": sess.get("repo"),
+            # First-seen, not last-touched: this is the sort key _prune_ticket_ledger
+            # evicts on, and a resume must not make an old session look new and
+            # push a genuinely newer one off the end.
+            "at": (prev or {}).get("at") or now_iso(),
+        }
+        if prev == entry:
+            return False    # nothing moved; don't rewrite the file every launch
+        self.ticket_ledger[tid] = entry
+        self._prune_ticket_ledger()
+        if save:
+            self._save_ticket_ledger()
+        return True
+
+    def _prune_ticket_ledger(self):
+        """Bound the ticket ledger, oldest first. Unlike the usage ledger this is
+        NOT pruned against the transcripts on disk: a transcript can be archived
+        off this host and still be the answer to "which session worked PROJ-123",
+        and an entry is a few hundred bytes."""
+        if len(self.ticket_ledger) <= TICKET_LEDGER_MAX:
+            return
+        order = sorted(self.ticket_ledger.items(),
+                       key=lambda kv: (kv[1] or {}).get("at") or "")
+        for tid, _ in order[:len(self.ticket_ledger) - TICKET_LEDGER_MAX]:
+            self.ticket_ledger.pop(tid, None)
+
+    def _backfill_ticket_ledger(self):
+        """Adopt ticket-backed sessions that predate the ledger, from the two
+        records that already carry both a ticket and a transcript id: the live
+        registry and the closed history. Runs once at construction.
+
+        This is the same reconcile-from-what-we-have rule _reconcile_orphan_transcripts
+        applies to usage, and it is what stops the ledger starting empty on the
+        very update that makes it durable."""
+        changed = False
+        for sess in list(self.registry) + list(self.closed):
+            changed |= self._remember_ticket(sess, save=False)
+        if changed:
+            self._save_ticket_ledger()
+
+    def _load_pr_ledger(self):
+        try:
+            with open(PR_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_pr_ledger(self):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = PR_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.pr_ledger, f, indent=2)
+            os.replace(tmp, PR_LEDGER_PATH)
+        except OSError as e:
+            log(f"pr ledger save failed: {e}")
+
+    def _remember_prs(self, sess, save=True):
+        """Record a session's transcript -> PR-links attribution durably, so its
+        chips survive the in-memory scan being lost (a manager restart) and the
+        session record itself being gone (aged out of closed.json). Idempotent;
+        keyed by the transcript id, so a restart-clear-context's new conversation
+        gets its own entry rather than clobbering the old one.
+
+        The URLs are read from the live session_pr_urls (what the scan has found
+        so far); a session that has opened none, or has no transcript to key on,
+        is a no-op. Returns whether anything moved, so a bulk caller saves once.
+
+        The id is the PINNED one, falling back to a closed record's resolved
+        transcriptId — all a pre-pin record ever had (see _remember_closed)."""
+        tid = sess.get("claudeSessionId") or sess.get("transcriptId")
+        urls = self.session_pr_urls.get(sess.get("id")) or []
+        if not tid or not urls:
+            return False
+        prev = self.pr_ledger.get(tid)
+        merged = list((prev or {}).get("urls") or [])
+        moved = False
+        for u in urls:
+            if u not in merged:
+                merged.append(u)
+                moved = True
+        del merged[:-10]
+        if not moved and prev is not None:
+            return False    # nothing new; don't rewrite the file every beat
+        self.pr_ledger[tid] = {
+            "urls": merged,
+            # First-seen, not last-touched: the prune's sort key, so a session
+            # that keeps opening PRs doesn't push a genuinely older one off.
+            "at": (prev or {}).get("at") or now_iso(),
+        }
+        self._prune_pr_ledger()
+        if save:
+            self._save_pr_ledger()
+        return True
+
+    def _prune_pr_ledger(self):
+        """Bound the PR ledger, oldest first. Like the ticket ledger and unlike
+        the usage one, NOT pruned against the transcripts on disk: a transcript
+        archived off this host is still the answer to "which PRs did it open"."""
+        if len(self.pr_ledger) <= PR_LEDGER_MAX:
+            return
+        order = sorted(self.pr_ledger.items(),
+                       key=lambda kv: (kv[1] or {}).get("at") or "")
+        for tid, _ in order[:len(self.pr_ledger) - PR_LEDGER_MAX]:
+            self.pr_ledger.pop(tid, None)
+
+    def _backfill_pr_ledger(self):
+        """Seed the durable PR ledger from what's already on disk. Runs once at
+        construction, after the registry/closed history are loaded (and after
+        XERK-15's session_pr_urls rehydration, which this defers to below).
+
+        Two jobs, both the reconcile-from-what-we-have rule the other ledgers
+        follow:
+        - Fold in every closed record's own prUrls snapshot (keyed by
+          transcriptId), so a ledger added after the fact adopts the sessions
+          already ended — the ones whose chips it most needs to keep once their
+          closed record ages out of closed.json.
+        - Backfill session_pr_urls for any LIVE session the XERK-15 rehydration
+          missed — a registry record predating that mirror carries no
+          `sess["prUrls"]`, but its ledgered links (written on a prior run) still
+          name its PRs. setdefault, so XERK-15's copy stays authoritative when it
+          has one; this only fills a gap it left."""
+        changed = False
+        for rec in self.closed:
+            tid = rec.get("transcriptId") or rec.get("claudeSessionId")
+            urls = rec.get("prUrls") or []
+            if not tid or not urls:
+                continue
+            prev = self.pr_ledger.get(tid)
+            merged = list((prev or {}).get("urls") or [])
+            for u in urls:
+                if u not in merged:
+                    merged.append(u)
+            del merged[:-10]
+            if merged != ((prev or {}).get("urls") or []):
+                self.pr_ledger[tid] = {
+                    "urls": merged, "at": (prev or {}).get("at") or now_iso()}
+                changed = True
+        if changed:
+            self._prune_pr_ledger()
+            self._save_pr_ledger()
+        for sess in self.registry:
+            tid = sess.get("claudeSessionId")
+            entry = self.pr_ledger.get(tid) if tid else None
+            if entry and entry.get("urls"):
+                self.session_pr_urls.setdefault(sess["id"], list(entry["urls"]))
+
+    def _ledger_prs(self, tid):
+        """PR-status objects for a transcript's ledgered PR links, newest last —
+        the durable-side counterpart of _session_prs / _closed_prs, reading the
+        PR ledger by transcript id. This is the only channel that answers for a
+        session aged out of closed.json (the resumable scan). None when it opened
+        no PR, or predates the ledger."""
+        entry = self.pr_ledger.get(tid) if tid else None
+        urls = (entry or {}).get("urls")
+        if not urls:
+            return None
+        return [self.pr_status_cache.get(u) or {"url": u} for u in urls]
+
+    def _seed_prs(self, sess):
+        """Re-derive a resumed/migrated session's PR chips from its transcript.
+
+        A live session's chips come from session_report's incremental per-beat
+        scan, which primes a transcript's byte offset to EOF the first time it
+        sees the file (so a restarted agent never replays old PR links). That is
+        exactly wrong for a session that RESUMES an existing transcript — a
+        host-local resume-any, or a session migrated in from another agent: the
+        `gh pr create` events that opened its PRs are already in the conversation
+        the moment it launches, past the EOF the scan primes to, so the chips
+        never reappear even though the PR is right there. And session_pr_urls is
+        keyed by session id, which is freshly minted here, so nothing carries the
+        source's links either.
+
+        So scan the whole transcript once at launch, keyed like the live scan,
+        and seed session_pr_urls + the record's prUrls + the durable ledger. The
+        transcript id is preserved across a migration, so the target lands the
+        same URLs the source reported. Idempotent (dedups into whatever the live
+        scan later finds) and a no-op for a session that opened no PR."""
+        sid = sess.get("id")
+        path = _session_transcript_path(sess)
+        if not sid or not path or not os.path.isfile(path):
+            return
+        report = {"prUrls": []}
+        state = {}
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return
+        end = raw.rfind(b"\n") + 1  # only complete lines, like the live scan
+        for line in raw[:end].split(b"\n"):
+            if line.strip():
+                _scan_pr_line(line, state, report)
+        if not report["prUrls"]:
+            return
+        known = self.session_pr_urls.setdefault(sid, [])
+        grew = False
+        for url in report["prUrls"]:
+            if url not in known:
+                known.append(url)
+                grew = True
+        del known[:-10]
+        if grew:
+            sess["prUrls"] = list(known)
+            self._remember_prs(sess, save=False)
+            self.save()
+            self._save_pr_ledger()
+
+    def _save_pr_status_ledger(self):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = PR_STATUS_LEDGER_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.pr_status_cache, f, indent=2)
+            os.replace(tmp, PR_STATUS_LEDGER_PATH)
+        except OSError as e:
+            log(f"pr status ledger save failed: {e}")
+
+    def _load_pr_status_ledger(self):
+        try:
+            with open(PR_STATUS_LEDGER_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
 
     def _remember_usage(self, sess):
         """Record a session's worktree -> repo attribution so its transcript's
@@ -2336,6 +6971,36 @@ class SessionManager:
     def _running_count(self):
         return sum(1 for s in self.registry if s.get("status") == "running")
 
+    def _queued_count(self):
+        return sum(1 for s in self.registry if s.get("status") == "queued")
+
+    def _capacity_payload(self):
+        """This host's session ceiling and what is against it.
+
+        MAX_SESSIONS never used to reach the wire at all, which left the hub
+        unable to tell a host with room from one at its limit — so it routed a
+        ticket to whichever host matched FIRST and a spawn that overran the cap
+        was refused with a log line nobody reads. This is what the hub ranks
+        hosts by; everything else in the queue depends on it being here.
+
+        Cheap enough to send every beat (three counts over the registry), and it
+        has to be: capacity is exactly the fact that goes stale fastest, and a
+        stale read is what makes the hub pile work onto a host that just
+        filled up."""
+        running = self._running_count()
+        return {
+            "maxSessions": MAX_SESSIONS,
+            "running": running,
+            "queued": self._queued_count(),
+            # Never negative: MAX_SESSIONS can be lowered under a host that is
+            # already over it, and "-2 free slots" is not something the hub
+            # should have to reason about.
+            "free": max(0, MAX_SESSIONS - running),
+            # A second, orthogonal ceiling — one root session per host — so the
+            # hub can see a root spawn is blocked without inferring it.
+            "rootRunning": self._root_running(),
+        }
+
     def _root_running(self):
         """True if a root session (cwd = REPOS_ROOT) is already live. Root
         sessions share one claude project slug + RC bridge pointer, so only one
@@ -2374,7 +7039,7 @@ class SessionManager:
                 sid = fname[:-len(".jsonl")]
                 # The id is interpolated into the tmux command line; never pass
                 # through a name that isn't a plain uuid-ish token.
-                if not re.fullmatch(r"[A-Za-z0-9-]+", sid):
+                if not VALID_CLAUDE_SID_RE.fullmatch(sid):
                     continue
                 try:
                     mtime = os.stat(os.path.join(proj, fname)).st_mtime
@@ -2385,6 +7050,21 @@ class SessionManager:
         except OSError:
             return None
         return newest
+
+    def _session_transcript_id(self, sess):
+        """Claude session id of THIS session's conversation, or None if it has
+        not had one yet. See _session_transcript_path — this is the same
+        resolution, reported as an id rather than opened as a path.
+
+        Re-validated on the way out, like _latest_transcript_id: the pinned
+        branch validates the id before building a path from it, but the unpinned
+        one derives an id from a FILENAME on disk, which nothing vets. Both feed
+        callers that put it on a command line."""
+        path = _session_transcript_path(sess)
+        if not path:
+            return None
+        sid = os.path.basename(path)[:-len(".jsonl")]
+        return sid if VALID_CLAUDE_SID_RE.fullmatch(sid) else None
 
     def _ensure_guard_settings(self):
         """Write (once per manager) the Claude ``--settings`` file that wires
@@ -2431,14 +7111,42 @@ class SessionManager:
         # bypassPermissions run under root; --remote-control bridges the session
         # to claude.ai/code + mobile under its per-session display name.
         parts = ["claude"]
+        # Fix WHICH conversation this session is, on every launch. A resume joins
+        # an existing one; anything else opens a new one under an id we mint here
+        # rather than letting claude pick its own — see _session_transcript_path
+        # for why the session has to know its own transcript by name.
+        claude_sid = None
         if resume:
-            claude_sid = None
-            if resume_id and re.fullmatch(r"[A-Za-z0-9-]+", resume_id):
+            if resume_id and VALID_CLAUDE_SID_RE.fullmatch(resume_id):
                 claude_sid = resume_id  # a specific transcript from the picker
+            elif sess.get("claudeSessionId"):
+                # This session's OWN conversation, not the newest one sharing its
+                # project dir: for a root session those differ, and resuming the
+                # neighbour would hand it someone else's context. Resolved only
+                # if it's really on disk — claude errors out on an id it can't
+                # resolve, and a session killed before its first turn has none to
+                # rejoin, so it (correctly) opens a fresh one below.
+                claude_sid = self._session_transcript_id(sess)
             else:
+                # Launched by an agent predating the pin: newest-mtime is the only
+                # handle it ever had on its conversation. Keep it.
                 claude_sid = self._latest_transcript_id(sess["worktreePath"])
-            if claude_sid:
-                parts.append(f"--resume {claude_sid}")
+        if claude_sid:
+            parts.append(f"--resume {claude_sid}")
+        else:
+            # Fresh conversation (spawn, restart-clear-context, or a resume with
+            # nothing to resume). --session-id names its transcript up front, so
+            # this session is identifiable from its first byte rather than from
+            # whenever it happens to out-mtime its neighbours.
+            claude_sid = str(uuid.uuid4())
+            parts.append(f"--session-id {claude_sid}")
+        sess["claudeSessionId"] = claude_sid
+        # This session now knows which conversation it is, which is the one moment
+        # a ticket-backed one can be tied to its transcript. Every launch passes
+        # here (spawn, resume, restart-clear-context), so the ledger picks up a
+        # cleared session's new transcript too — both worked the ticket, and the
+        # board should chip both. No-op unless this session has a ticket.
+        self._remember_ticket(sess)
         parts.append(f"--remote-control '{sess['rcName']}'")
         model = sess.get("model")
         if model:
@@ -2446,6 +7154,12 @@ class SessionManager:
         # Default (unset) -> --permission-mode auto; the explicit "default" choice
         # omits the flag (claude's own manual-review default).
         perm = sess.get("permissionMode") or "auto"
+        # Remember the mode we actually launch into: it fixes which optional modes
+        # this session's live Shift+Tab cycle exposes (see perm_cycle_for), so a
+        # later live set_mode computes presses against the real cycle rather than a
+        # fixed all-modes list. Re-set on every (re)launch, so restart/resume into
+        # a switched mode updates the basis.
+        sess["launchPermissionMode"] = perm
         if perm != "default":
             parts.append(f"--permission-mode {perm}")
         # Wire the PreToolUse safety guard (blocks catastrophic / policy /
@@ -2455,6 +7169,21 @@ class SessionManager:
         settings = self._ensure_guard_settings()
         if settings:
             parts.append(f"--settings {shlex.quote(settings)}")
+        # Tell the agent to fork new work off the LATEST default branch rather
+        # than this (possibly stale) checkout — see NEW_WORK_SYSTEM_PROMPT. Rides
+        # every launch, including resume: it's session policy, not spawn state.
+        # A ticket-backed session extends that policy with the exact branch name
+        # reserved for it at spawn (TICKET_BRANCH_PROMPT) — concatenated onto the
+        # same flag rather than passed as a second one, since it's a continuation
+        # of the same policy, and the reserved name is read from the persisted
+        # record so a resume repeats the name spawn chose.
+        policy = NEW_WORK_SYSTEM_PROMPT
+        ticket = sess.get("ticket") or {}
+        if ticket.get("branch"):
+            policy += TICKET_BRANCH_PROMPT.format(
+                key=ticket.get("key") or "this session's ticket",
+                branch=ticket["branch"])
+        parts.append(f"--append-system-prompt {shlex.quote(policy)}")
         claude_cmd = " ".join(parts)
         if prompt:
             claude_cmd += f" -- {shlex.quote(prompt)}"
@@ -2488,7 +7217,19 @@ class SessionManager:
         basic auth (-c) keyed off the shared agent token as defense in depth."""
         proc = self.ttyd.get(sess["id"])
         if proc is not None and proc.poll() is None:
-            return  # already serving (e.g. restart keeps ttyd up)
+            return  # already serving (e.g. an in-process restart keeps ttyd up)
+        # Adopt a ttyd of OURS that outlived a *manager* restart: ttyd is its own
+        # daemon, so on a native in-place update (systemd KillMode=process /
+        # manager-only kill) the old ttyd keeps holding this session's stable
+        # port. Re-binding would fail; instead adopt it — its `tmux attach -t
+        # <name>` re-resolves to the (same-named) live tmux per browser
+        # connection, so it keeps serving with no rebind and no terminal blip.
+        # Gate on OUR persisted `ttydPid` still being alive (not the bare port):
+        # a fresh spawn has no ttydPid, so a port just freed by a killed session
+        # and reallocated here can't be mistaken for a survivor to adopt.
+        adopted = sess.get("ttydPid")
+        if adopted and _pid_alive(adopted) and _port_open(sess.get("ttydPort")):
+            return
         args = [
             "ttyd", "-p", str(sess["ttydPort"]), "-i", "127.0.0.1",
             "-b", f"/term/{sess['id']}", "-W", "-m", "8",
@@ -2496,13 +7237,24 @@ class SessionManager:
             "-t", "fontSize=14",
             "-t", "rendererType=canvas",
             "-t", "disableLeaveAlert=true",
+            # A mouse-tracking app (the Claude TUI is one) takes the drag, so
+            # xterm.js only makes a SELECTION when a modifier forces one — the
+            # prerequisite for copying any text out at all. That modifier is
+            # Shift everywhere except macOS, where xterm.js ignores Shift and
+            # honours Alt instead, but only with this option on; it defaults
+            # off, so a Mac operator could not select terminal text at all
+            # (XERK-7). Costs Mac's Alt+drag column-select, which is what every
+            # terminal trades it for.
+            "-t", "macOptionClickForcesSelection=true",
             "-c", f"term:{TURMA_TOKEN or 'changeme'}",
             "tmux", "attach", "-t", sess["tmuxName"],
         ]
         try:
-            self.ttyd[sess["id"]] = subprocess.Popen(
+            proc = subprocess.Popen(
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
+            self.ttyd[sess["id"]] = proc
+            sess["ttydPid"] = proc.pid  # persisted so a later manager can reap it
         except Exception as e:
             raise RuntimeError(f"ttyd launch failed: {e}")
 
@@ -2515,6 +7267,17 @@ class SessionManager:
             try:
                 proc.terminate()
             except Exception:
+                pass
+        # Also reap a ttyd we ADOPTED rather than launched (one that outlived a
+        # prior manager, so it's not in self.ttyd): the persisted pid is that same
+        # live process. Without this, stop/delete would leak the orphan and its
+        # port. Best-effort — a recycled/dead pid just fails harmlessly.
+        sess = self._find(sid)
+        pid = sess.get("ttydPid") if sess else None
+        if pid and (proc is None or proc.pid != pid):
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except (OSError, ValueError):
                 pass
 
     def _worktree_add(self, sess, base_ref=None):
@@ -2562,7 +7325,8 @@ class SessionManager:
     # --- lifecycle (executed container-side; see CONTRACT) ----------------
 
     def spawn(self, repo_name, *, prompt=None, label=None, base_ref=None,
-              model=None, permission_mode=None):
+              model=None, permission_mode=None, ticket=None, cmd_id=None,
+              await_clone=None, await_clone_owner=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
         The worktree is added in DETACHED HEAD forked off the latest default
@@ -2571,27 +7335,73 @@ class SessionManager:
         it flavors the claude.ai/code display name but agent-<id> tmux stays the
         canonical internal key. The options (base branch, model, permission mode)
         are validated below; a bad option fails the spawn cleanly as an error
-        card rather than reaching git/tmux or crashing the manager."""
-        if self._running_count() >= MAX_SESSIONS:
-            log(f"spawn refused: at MAX_SESSIONS ({MAX_SESSIONS})")
-            return
+        card rather than reaching git/tmux or crashing the manager.
+
+        ticket is the Jira ticket this session was spawned to work (spawn_ticket's
+        caller shape: key/siteKey/url/summary/branch), or None for an ordinary
+        session. It is carried on the record rather than acted on here: it names
+        the session, rides the heartbeat so the board can link ticket -> session,
+        and its reserved `branch` is what _launch_tmux tells the agent to use.
+
+        cmd_id is the hub's queued-command id. The session id is minted HERE, so
+        the hub has no handle on the session it just asked for until a later
+        beat; echoing the command id back on the record (reported as
+        `spawnCmdId`) is what lets the UI recognize its own spawn and open it.
+
+        A spawn that can't run RIGHT NOW is no longer refused: it lands as a
+        `queued` record and _drain_queue provisions it when a slot frees, the
+        clone finishes, or the root slot opens. `await_clone` (a repo name) is
+        the ticket-router's promise that this host is cloning that repo — it lets
+        the record exist before its repo does, so the session waits for the clone
+        instead of failing the unknown-repo check. See _drain_queue."""
         # A root session runs directly at REPOS_ROOT (no worktree/branch). The
         # base option doesn't apply; only one may run at a time.
         is_root = (repo_name == ROOT_REPO_NAME)
+        awaiting_clone = False
         if is_root:
-            if self._root_running():
-                log("spawn refused: a root session is already running")
-                return
             repo = {"name": ROOT_REPO_NAME, "path": REPOS_ROOT}
         else:
             repo = next((r for r in scan_repos() if r["name"] == repo_name), None)
             if not repo:
-                log(f"spawn refused: unknown repo {repo_name!r}")
-                return
+                if await_clone and repo_name == await_clone:
+                    # The repo is being cloned to THIS host on purpose — the
+                    # ticket router picked the most-available host in the org and
+                    # none had it. Let the record exist against where the clone
+                    # will land; _drain_queue waits for the .git dir to appear.
+                    repo = {"name": repo_name,
+                            "path": os.path.join(REPOS_ROOT, repo_name)}
+                    awaiting_clone = True
+                else:
+                    log(f"spawn refused: unknown repo {repo_name!r}")
+                    return
+        # Decide run-now vs queue HERE, before the record is appended, so the
+        # counts don't include the session we're about to add (a root session
+        # would otherwise see itself and always read root-busy; a capacity check
+        # would be off by one). Three orthogonal blocks, each re-checked by
+        # _drain_queue before it lets the session run:
+        #   root-busy — another root session already holds the one root slot;
+        #   capacity — the host is at MAX_SESSIONS;
+        #   awaiting-clone — the repo is being cloned to this host right now.
+        reason = None
+        if is_root and self._root_running():
+            reason = "root-busy"
+        elif self._running_count() >= MAX_SESSIONS:
+            reason = "capacity"
+        elif awaiting_clone:
+            reason = "awaiting-clone"
         sid = self._new_id()
         label = (label or "").strip() or None
         # Prefer a slugged label in the RC display name; fall back to the id.
         rc_slug = slugify(label) if label else ""
+        # A ticket-backed session already HAS a good name — the ticket's key and
+        # summary, which is what an operator scanning cards is looking for — so it
+        # is named here rather than paying a `claude -p` to derive a worse one from
+        # the (now ticket-sized) prompt we built. Cleaned like an operator-typed
+        # name, not like a model's chatty reply: every word of it is deliberate.
+        ticket_summary = None
+        if ticket and ticket.get("key"):
+            ticket_summary = clean_manual_summary(
+                f"{ticket['key']} {ticket.get('summary') or ''}")
         sess = {
             "id": sid,
             "repo": repo["name"],
@@ -2601,6 +7411,8 @@ class SessionManager:
                              else os.path.join(WORKTREES_ROOT, repo["name"], sid)),
             "branch": None,        # app owns no branch; the agent names its own
             "root": is_root,
+            # The claude conversation this session IS; pinned by _launch_tmux.
+            "claudeSessionId": None,
             "label": label,
             "rcName": f"{slugify(self.device)}-{slugify(repo['name'])}-{rc_slug or sid}",
             "tmuxName": f"agent-{sid}",
@@ -2608,23 +7420,84 @@ class SessionManager:
             "model": None,                  # resolved --model value (None = omit)
             "permissionMode": "auto",
             "baseRef": None,                # base branch the worktree forked from
-            "status": "running",
+            # A queued record has no worktree/tmux/ttyd yet — _provision_session
+            # (via _drain_queue) makes it real when it's allowed to run.
+            "status": "queued" if reason else "running",
             "createdAt": now_iso(),
             "stoppedAt": None,
             "errorMsg": None,
-            "summary": None,       # few-word task name, filled in async at spawn
+            # Few-word task name: already known for a ticket, else filled in async.
+            "summary": ticket_summary,
+            # The Jira ticket this session works, or None. Set before the try
+            # below so even a spawn that fails validation lands as an error card
+            # the board can still tie back to its ticket.
+            "ticket": ticket or None,
+            # The hub command that asked for this session, echoed back so the UI
+            # can correlate its POST with the id we just minted (see docstring).
+            "spawnCmdId": cmd_id,
         }
         self.registry.append(sess)
+        # Validate every interpolated option BEFORE anything else, so a bad model
+        # or permission mode fails the spawn cleanly whether it runs now or waits
+        # in the queue. Model and permission mode apply to root too.
         try:
-            # Validate every interpolated option BEFORE touching git/tmux. Model
-            # and permission mode apply to root too; base/worktree don't.
-            sess["model"] = resolve_model(model)
+            sess["model"] = resolve_model(model, self.models_available())
             sess["permissionMode"] = resolve_permission_mode(permission_mode)
+        except Exception as e:
+            self._set_error(sess, e)
+            return
+        # The base branch and prompt are provisioning inputs; stash them so a
+        # queued session (which resolves its base only once its repo exists, e.g.
+        # after an on-demand clone) carries them across the wait. Cleared by
+        # _provision_session.
+        sess["_pendingBaseRef"] = base_ref
+        sess["_pendingPrompt"] = prompt
+        if reason:
+            sess["queuedReason"] = reason
+            sess["queuedAt"] = now_iso()
+            # What _drain_queue waits on before provisioning (None once cloned /
+            # for a root or capacity wait), plus the owner/repo to re-clone from
+            # if the clone job is lost to a manager restart mid-clone.
+            if reason == "awaiting-clone":
+                sess["awaitClone"] = repo["name"]
+                sess["awaitCloneOwner"] = await_clone_owner
+            else:
+                sess["awaitClone"] = None
+            log(f"queued session {sid} for {repo['name']} ({reason}); "
+                f"{self._running_count()}/{MAX_SESSIONS} running, "
+                f"{self._queued_count()} queued"
+                + (f" ticket {ticket['key']}" if ticket else ""))
+            return
+        self._provision_session(sess)
+
+    def _provision_session(self, sess):
+        """Bring a session's record to life: add its worktree, launch claude +
+        ttyd, start naming it. This is the second half of a spawn — split out so
+        a session that had to WAIT (for a slot, a clone, or the root slot) starts
+        through exactly this code rather than a second, divergent path. Called by
+        spawn() when a slot is free and by _drain_queue() when one frees up."""
+        sid = sess["id"]
+        is_root = sess.get("root")
+        ticket = sess.get("ticket") or None
+        base_ref = sess.pop("_pendingBaseRef", None)
+        prompt = sess.pop("_pendingPrompt", None)
+        try:
             resolved_base = None
             if not is_root:
-                resolved_base = resolve_base_ref(repo["path"], base_ref)
+                # A ticket whose branch reservation was deferred (it queued before
+                # its repo was cloned, so there was no repo to scan for a free
+                # name) reserves it now, against the repo that now exists.
+                if ticket and not ticket.get("branch") and ticket.get("key"):
+                    ticket["branch"] = self._reserve_ticket_branch(
+                        sess["repoPath"],
+                        ticket.get("branchBase") or ticket["key"])
+                resolved_base = resolve_base_ref(sess["repoPath"], base_ref)
                 sess["baseRef"] = resolved_base
                 self._worktree_add(sess, base_ref=resolved_base)
+            sess["status"] = "running"
+            # Shed the queue markers — the record is a live session now.
+            for k in ("queuedReason", "queuedAt", "awaitClone", "awaitCloneOwner"):
+                sess.pop(k, None)
             self._launch_tmux(sess, prompt=(prompt or None))
             self._launch_ttyd(sess)
             # Record the worktree -> repo attribution so this session's token
@@ -2632,17 +7505,179 @@ class SessionManager:
             # gone — the basis of persistent host/repo usage.
             self._remember_usage(sess)
             # Name the session from its initial prompt, once, in the background
-            # (no-op when there's no prompt). Never blocks the spawn.
-            self._start_summary(sess, prompt)
+            # (no-op when there's no prompt). Never blocks the spawn. Skipped when
+            # the session already has a name (a ticket named it at spawn).
+            if not sess.get("summary"):
+                self._start_summary(sess, prompt)
             wt = os.path.basename(sess["worktreePath"])
-            log(f"spawned session {sid} for {repo['name']} on :{sess['ttydPort']} "
+            log(f"provisioned session {sid} for {sess['repo']} on :{sess['ttydPort']} "
                 + ("(root)" if is_root else
                    f"(detached worktree {wt}"
                    + (f", base {resolved_base}" if resolved_base else "")
                    + ")")
-                + (f" label {label!r}" if label else ""))
+                + (f" label {sess.get('label')!r}" if sess.get("label") else "")
+                + (f" ticket {ticket['key']}"
+                   + (f" -> branch {ticket['branch']}" if ticket.get("branch") else "")
+                   if ticket else ""))
         except Exception as e:
             self._set_error(sess, e)
+
+    def _drain_queue(self):
+        """Provision queued sessions that can run now. Runs every heartbeat.
+
+        Oldest first, and at most ONE per beat: provisioning adds a worktree and
+        launches claude against the one shared ~/.claude login — exactly the
+        contention resume_on_boot staggers — so draining a backlog all at once
+        would hammer it. The next beat takes the next one; a poke shortens the
+        wait when a kill just freed a slot.
+
+        Head-of-line is skipped, not blocking: a session still waiting on its
+        clone doesn't hold up a capacity-only one behind it."""
+        if self._running_count() >= MAX_SESSIONS:
+            return  # no slot to drain into; nothing below can change that
+        for sess in self.registry:
+            if sess.get("status") != "queued":
+                continue
+            if sess.get("root"):
+                if self._root_running():
+                    continue  # the one root slot is still taken
+            elif sess.get("awaitClone"):
+                if not os.path.isdir(os.path.join(sess["repoPath"], ".git")):
+                    job = self.clones.get(sess["awaitClone"])
+                    if job and job.get("status") == "error":
+                        # The repo will never arrive — fail the session rather
+                        # than wait forever. (A terminal clone job lingers briefly
+                        # in self.clones; this catches it before it's pruned.)
+                        self._set_error(
+                            sess, f"clone of {sess['awaitClone']} failed: "
+                                  f"{job.get('error') or 'unknown error'}")
+                    elif not job and sess.get("awaitCloneOwner"):
+                        # No job at all: the clone was lost to a manager restart
+                        # mid-flight. Re-trigger it from the owner we stored.
+                        self.clone(sess["awaitCloneOwner"])
+                    continue
+            self._provision_session(sess)
+            return  # one per beat
+
+    def _reserve_ticket_branch(self, repo_path, branch_base):
+        """The branch name a new session will be told to use, cut from
+        `branch_base` (the ticket key for Jira, a project-prefixed id for Azure —
+        see ticket_branch_base).
+
+        "Taken" is the union of two things, and it needs both:
+          - what git knows — local heads plus remote branches, after a best-effort
+            fetch, so a branch pushed for this ticket from another host (or one
+            merged and pruned locally months ago) still counts;
+          - what THIS manager has already handed out — a session that hasn't
+            branched yet owns its name without git knowing anything about it, so
+            two sessions started back-to-back on one ticket must not both be told
+            "PROJ-123".
+
+        The fetch is short-bounded like every other spawn-time fetch: this runs on
+        the main loop, and offline just means we name against what we have."""
+        run_ok(["git", "-C", repo_path, "fetch", "origin"],
+               timeout=FETCH_TIMEOUT_SEC)
+        taken = branch_names(repo_path)
+        for s in self.registry:
+            t = s.get("ticket") or {}
+            if t.get("branch") and s.get("repoPath") == repo_path:
+                taken.add(t["branch"])
+        branch = next_ticket_branch(branch_base, taken)
+        # The base is already grammar-clean, but this name reaches a command line
+        # via the system prompt and the record, so it gets the same allowlist gate
+        # as any other ref we hand out.
+        if branch and not valid_ref_name(branch):
+            return None
+        return branch
+
+    def spawn_ticket(self, issue_key, cmd_id=None, model=None):
+        """Spawn a session to work a ticket (Jira or Azure DevOps) — the board's
+        per-card start button.
+
+        `model` is the operator's per-ticket model pin (XERK-123), an alias the
+        hub carries on the command because the model choice is hub-owned durable
+        state with no agent-side ledger to read it from. None (unpinned) spawns
+        with the login's default model, exactly as before. It is validated the
+        same way a composer spawn's model is — resolve_model in spawn() — so a
+        model this host can't run fails as an error card rather than silently.
+
+        Everything is re-derived from LOCAL state rather than trusted from the
+        command: the hub only chooses which host (an online one reporting the org,
+        preferring one with the repo already cloned but falling back to the
+        most-available one, which then clones on demand), and a board that is a
+        beat or two stale must not be able to spawn against the wrong repo. So the
+        repo comes from this host's own triage ledger, and the ticket text comes
+        from a fresh fetch rather than the heartbeat's card fields.
+
+        The repo NOT being cloned here is no longer a refusal: this host was
+        chosen precisely because it could clone it, so we start the clone and
+        queue the session behind it (see spawn's await_clone). Refusals that
+        remain log and return — a bad key, no creds, no triaged repo, or a repo
+        with no known owner to clone — each one the board's button already
+        prevents. A fetch that fails raises to handle_commands, which logs and
+        acks."""
+        key = (issue_key or "").strip()
+        if not valid_issue_key(key):
+            log(f"spawnTicket refused: {key[:50]!r} is not a valid issue key")
+            return
+        # Re-checked here (the hub already targets a host reporting this org) to
+        # keep "unset creds = zero board HTTP, ever" a property of the agent rather
+        # than of hub-side targeting — same stance as refreshJira.
+        if not board_configured():
+            log(f"spawnTicket refused: no board credentials on this host ({key})")
+            return
+        site_key = board_site_key()
+        entry = self.triage_ledger.get(_triage_key(site_key, key))
+        if not isinstance(entry, dict) or not entry.get("decided") or not entry.get("repo"):
+            log(f"spawnTicket refused: {key} has no triaged repo on this host")
+            return
+        repo_name = entry["repo"]
+        # The ledger's `cloned` is as of triage time; scan_repos() is now.
+        repo = next((r for r in scan_repos() if r["name"] == repo_name), None)
+        await_clone = None
+        if not repo:
+            # The repo isn't cloned here. The hub routed this ticket to us because
+            # we're the most-available host in the org and NO host had it — so
+            # clone it on demand and let the session queue behind the clone
+            # (_drain_queue provisions it, and reserves its branch, once the .git
+            # dir lands). The owner/repo comes from the triage ledger, which
+            # recorded it when it chose the repo; without one there is nothing to
+            # clone, so refuse before spending a Jira fetch.
+            nwo = entry.get("nameWithOwner")
+            if not nwo:
+                log(f"spawnTicket refused: {key}'s repo {repo_name!r} is not "
+                    "cloned here and no owner is known to clone it")
+                return
+            job = self.clones.get(repo_name)
+            if not job or job.get("status") == "error":
+                # The ledger's source (when it has one) routes the clone to the
+                # right listing; a bare nwo still resolves by search.
+                self.clone(nwo, source=entry.get("source"))
+            await_clone = repo_name
+        # Committed to spawning now — fetch the ticket text for the prompt, and
+        # (when the repo already exists) reserve the branch name against it.
+        detail = fetch_board_issue(key)
+        branch_base = ticket_branch_base(key, detail)
+        branch = self._reserve_ticket_branch(repo["path"], branch_base) if repo else None
+        ticket = {
+            "key": key,
+            "siteKey": site_key,
+            "url": detail.get("url") or f"https://{site_key}/browse/{key}",
+            "summary": (detail.get("summary") or "")[:200],
+            # None when the name couldn't be reserved (or was deferred to the
+            # clone) — the agent then names its own branch under the ordinary
+            # policy, which is worse but not broken.
+            "branch": branch,
+        }
+        # branchBase carries the human-scannable base across a deferred
+        # (post-clone) reservation. Omitted when it just equals the key (Jira),
+        # so a Jira ticket record is byte-for-byte what it always was.
+        if branch_base != key:
+            ticket["branchBase"] = branch_base
+        self.spawn(repo_name, prompt=build_ticket_prompt(detail), ticket=ticket,
+                   model=model, cmd_id=cmd_id, await_clone=await_clone,
+                   await_clone_owner=(entry.get("nameWithOwner") if await_clone
+                                      else None))
 
     def _remember_closed(self, sess):
         """Record a killed session in the closed history so the hub can offer
@@ -2651,10 +7686,34 @@ class SessionManager:
         they just stop being offered)."""
         rec = {k: sess.get(k) for k in (
             "id", "repo", "repoPath", "worktreePath", "branch", "baseRef",
-            "rcName", "tmuxName", "createdAt", "label", "summary", "model",
-            "permissionMode", "root",
+            "rcName", "tmuxName", "createdAt", "label", "summary",
+            "summaryManual", "model", "permissionMode", "root", "ticket",
+            # Which conversation this session WAS. Carried so a resume rejoins
+            # its own rather than whatever now happens to be newest in a shared
+            # project dir (root sessions share one) — see _launch_tmux.
+            "claudeSessionId",
         )}
         rec["closedAt"] = now_iso()
+        # Snapshot the two things the live caches are about to forget, so the
+        # hub's Ended-sessions view can still show what this session did:
+        #
+        # - prUrls: the PRs it opened. session_pr_urls is keyed by session id and
+        #   dropped by _forget_session_caches moments from now, so the URLs have
+        #   to move onto the record itself. Their STATUS stays in pr_status_cache
+        #   (refresh_pr_status counts these as referenced, so it won't evict them).
+        # - transcriptId: which conversation was this session's. Resolved now,
+        #   while the worktree→slug mapping is unambiguous, rather than re-derived
+        #   later from a path that a delete/prune may since have removed.
+        #
+        # Both are persisted with the record (closed.json), so they survive a
+        # manager restart exactly as the rest of the closed history does.
+        rec["prUrls"] = list(self.session_pr_urls.get(sess["id"]) or [])
+        rec["transcriptId"] = self._session_transcript_id(sess)
+        # Also persist to the durable PR ledger, keyed by the resolved transcript
+        # id, so the chips survive this record aging out of closed.json — the one
+        # channel left reporting the session then (the resumable scan) reads its
+        # PRs from there. _session_pr_urls is still populated (forget runs next).
+        self._remember_prs(rec)
         self.closed = [c for c in self.closed if c.get("id") != rec["id"]]
         self.closed.append(rec)
         # Trim per repo, newest first (the list is in close order).
@@ -2747,7 +7806,16 @@ class SessionManager:
             "baseRef": rec.get("baseRef"),
             "root": rec.get("root"),
             "label": rec.get("label"),
-            "summary": rec.get("summary"),   # keep the auto name across resume
+            "summary": rec.get("summary"),   # keep the name across resume...
+            "summaryManual": rec.get("summaryManual"),  # ...pinned if it was typed
+            # The ticket (and its reserved branch name) survives a kill/resume:
+            # it's what this session IS, and _launch_tmux re-tells the agent the
+            # same branch name rather than reserving a fresh one.
+            "ticket": rec.get("ticket"),
+            # The conversation this session was having, so _launch_tmux rejoins
+            # THAT one. Root sessions share a project dir, so "the newest
+            # transcript here" is not the same question as "this session's".
+            "claudeSessionId": rec.get("claudeSessionId"),
             "rcName": rec.get("rcName"),
             "tmuxName": rec.get("tmuxName") or f"agent-{sid}",
             "ttydPort": self._alloc_port(),  # old port may be taken by now
@@ -2771,7 +7839,7 @@ class SessionManager:
         except Exception as e:
             self._set_error(sess, e)
 
-    def resume_transcript(self, transcript_id, cwd_hint=None):
+    def resume_transcript(self, transcript_id, cwd_hint=None, cmd_id=None):
         """Resume ANY prior Claude session by its transcript id (the "resume any
         session" picker), not just a killed Turma session in closed.json. Locate
         the transcript, read its ORIGIN cwd, re-create that worktree at the exact
@@ -2781,8 +7849,12 @@ class SessionManager:
         with cwd == the transcript's origin keeps transcript-slug == worktree-slug,
         so all per-session reporting (tail/usage/questions/summary) keeps working.
         A new Turma id/rcName/port is minted like spawn; the record moves nothing
-        out of closed.json (the picker lists transcripts, not closed records)."""
-        if not transcript_id or not re.fullmatch(r"[A-Za-z0-9-]+", transcript_id):
+        out of closed.json (the picker lists transcripts, not closed records).
+
+        cmd_id is echoed onto the record as `spawnCmdId` for the same reason as
+        in spawn(): a resume-by-transcript creates a session whose id the hub
+        can't predict, so that's the UI's only handle on the one it asked for."""
+        if not transcript_id or not VALID_CLAUDE_SID_RE.fullmatch(transcript_id):
             log(f"resumeTranscript: bad transcript id {transcript_id!r}")
             return
         # Find the transcript dir: trust the picker's cwd hint if it still holds
@@ -2799,20 +7871,36 @@ class SessionManager:
             return
         path = os.path.join(proj, transcript_id + ".jsonl")
         cwd = _transcript_cwd(path) or cwd_hint
+        self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id)
+
+    def _resume_at_cwd(self, transcript_id, cwd, *, cmd_id=None, extra=None):
+        """Launch `claude --resume <transcript_id>` cwd'd at `cwd`, the shared
+        core of resume_transcript (host-local resume-any) and import_session
+        (a session migrated in from another agent). The transcript file must
+        already be present under PROJECTS_ROOT/<slug(cwd)>/ — resume_transcript
+        located it there, import_session unpacked it there. Only a cwd under
+        REPOS_ROOT is resumable, and the origin worktree is re-created at the
+        EXACT path if missing so its slug matches the transcript and claude
+        resolves the id (see resume_transcript's docstring).
+
+        `extra` carries fields a plain resume-any has no source for but a
+        migration does — the session's ticket, name, model and mode — so the
+        moved session lands looking like its old self rather than an anonymous
+        resume. Returns the new session record, or None if it couldn't launch."""
         # Only a cwd under REPOS_ROOT is resumable here — never let a free-form
         # path reach git/tmux.
         cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
         if not cls:
-            log(f"resumeTranscript: cwd {cwd!r} not resumable on this host")
-            return
+            log(f"resume: cwd {cwd!r} not resumable on this host")
+            return None
         repo, _origin, is_root = cls
         cwd = os.path.normpath(cwd)
         if self._running_count() >= MAX_SESSIONS:
-            log(f"resumeTranscript refused: at MAX_SESSIONS ({MAX_SESSIONS})")
-            return
+            log(f"resume refused: at MAX_SESSIONS ({MAX_SESSIONS})")
+            return None
         if is_root and self._root_running():
-            log("resumeTranscript refused: a root session is already running")
-            return
+            log("resume refused: a root session is already running")
+            return None
         # One live session per cwd: two claudes in the same dir share a project
         # slug + RC bridge pointer and would collide (the same reason root is
         # single). A worktree resume gets its own dir, so this only bites a repo-
@@ -2820,12 +7908,13 @@ class SessionManager:
         if any(s.get("status") == "running"
                and os.path.normpath(s.get("worktreePath") or "") == cwd
                for s in self.registry):
-            log(f"resumeTranscript refused: a session is already running in {cwd}")
-            return
+            log(f"resume refused: a session is already running in {cwd}")
+            return None
         repo_path = REPOS_ROOT if is_root else os.path.join(REPOS_ROOT, repo)
         if not is_root and not os.path.isdir(repo_path):
-            log(f"resumeTranscript: repo {repo!r} is gone; cannot resume")
-            return
+            log(f"resume: repo {repo!r} is gone; cannot resume")
+            return None
+        extra = extra or {}
         sid = self._new_id()
         sess = {
             "id": sid,
@@ -2834,34 +7923,223 @@ class SessionManager:
             "worktreePath": cwd,
             "branch": None,
             "root": is_root,
-            "label": None,
-            "summary": None,       # seeded from the transcript on later beats
+            # The transcript being resumed IS this session's conversation;
+            # _launch_tmux pins it from resume_id.
+            "claudeSessionId": None,
+            "label": extra.get("label"),
+            # A migration carries the moved session's name/ticket/model/mode; a
+            # plain resume-any has none of these and seeds the name from the
+            # transcript on later beats.
+            "summary": extra.get("summary"),
+            "summaryManual": extra.get("summaryManual"),
+            "ticket": extra.get("ticket"),
+            "migratedFrom": extra.get("migratedFrom"),
             "rcName": f"{slugify(self.device)}-{slugify(repo)}-{sid}",
             "tmuxName": f"agent-{sid}",
             "ttydPort": self._alloc_port(),
-            "model": None,
-            "permissionMode": "auto",
+            "model": extra.get("model"),
+            "permissionMode": extra.get("permissionMode") or "auto",
             "baseRef": None,
             "status": "running",
             "createdAt": now_iso(),
             "stoppedAt": None,
             "errorMsg": None,
+            "spawnCmdId": cmd_id,
         }
         self.registry.append(sess)
         try:
-            # A deleted/pruned Turma worktree: re-add a detached one at the exact
-            # origin path so its slug matches the transcript and claude resolves
-            # the id. Repo-dir / repos-root cwds always exist, so this is skipped.
+            # A deleted/pruned Turma worktree (or a migrated session, whose
+            # worktree only ever existed on the source host): re-add a detached
+            # one at the exact origin path so its slug matches the transcript and
+            # claude resolves the id. Repo-dir / repos-root cwds always exist, so
+            # this is skipped.
             if not is_root and not os.path.isdir(cwd):
                 sess["baseRef"] = resolve_base_ref(repo_path, None)
                 self._worktree_add(sess, base_ref=sess["baseRef"])
             self._remember_usage(sess)
             self._launch_tmux(sess, resume=True, resume_id=transcript_id)
             self._launch_ttyd(sess)
+            # The transcript already holds this session's history — including any
+            # PR it opened before the resume. The per-beat scan primes past that,
+            # so re-derive the chips once here (covers migration and resume-any).
+            self._seed_prs(sess)
             log(f"resumed transcript {transcript_id} for {repo} in {cwd} "
                 f"on :{sess['ttydPort']}")
+            return sess
         except Exception as e:
             self._set_error(sess, e)
+            return None
+
+    # --- session migration across hosts (XERK-101) ------------------------
+
+    def export_session(self, session_id, migration_id):
+        """Source half of a migration: snapshot this running session's raw
+        transcript (the ONLY copy that `claude --resume` can replay — the hub's
+        archive keeps a rendered projection, not resumable bytes) and ship it to
+        the hub's migration relay, which hands it to the chosen target agent.
+
+        The snapshot is truncated to the last complete line so a turn caught
+        mid-write can't hand the target a half-JSON tail. The source session
+        keeps running until the hub confirms the target is up and queues its
+        kill, so any turn that lands after this snapshot survives on the source
+        (killed = resumable), never lost."""
+        if not migration_id or not VALID_MIGRATION_ID_RE.fullmatch(migration_id):
+            log(f"exportSession: bad migration id {migration_id!r}")
+            return
+        sess = self._find(session_id)
+        if not sess:
+            log(f"exportSession: no such session {session_id}")
+            return
+        path = _session_transcript_path(sess)
+        if not path or not os.path.isfile(path):
+            log(f"exportSession: session {session_id} has no transcript to move")
+            return
+        try:
+            blob = self._pack_transcript(path)
+        except Exception as e:
+            log(f"exportSession: pack failed for {session_id}: {e}")
+            return
+        if len(blob) > MIGRATION_BLOB_MAX:
+            log(f"exportSession: transcript bundle {len(blob)} bytes exceeds "
+                f"{MIGRATION_BLOB_MAX}; migration aborted")
+            return
+        self._migration_upload(migration_id, blob)
+
+    def import_session(self, cmd):
+        """Target half of a migration: pull the transcript bundle the source
+        shipped, unpack it under this host's PROJECTS_ROOT at the origin cwd's
+        slug, then resume it here carrying the moved session's identity. A NEW
+        Turma id/rcName/port is minted like a resume; the transcript id (hence
+        the conversation) is preserved, so the target continues in place."""
+        migration_id = cmd.get("migrationId")
+        transcript_id = cmd.get("transcriptId")
+        # The source ships its OWN absolute worktree path; remap it onto this
+        # host's REPOS_ROOT so a fleet with differing mounts (WSL-native vs
+        # container) can move sessions. Both the slug and the re-created worktree
+        # below use this localized cwd, so they stay self-consistent.
+        cwd = self._localize_migrated_cwd(cmd.get("cwd"))
+        if not migration_id or not VALID_MIGRATION_ID_RE.fullmatch(migration_id):
+            log(f"importSession: bad migration id {migration_id!r}")
+            return
+        if not transcript_id or not VALID_CLAUDE_SID_RE.fullmatch(transcript_id):
+            log(f"importSession: bad transcript id {transcript_id!r}")
+            return
+        # Classify the cwd BEFORE spending a download — a foreign path or a
+        # missing repo can't be resumed here, and the hub already vetted the org
+        # + repo, so this only trips on a genuinely inconsistent target.
+        cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
+        if not cls:
+            log(f"importSession: cwd {cwd!r} not resumable on this host")
+            return
+        blob = self._migration_download(migration_id)
+        if blob is None:
+            log(f"importSession: could not fetch bundle for {migration_id}")
+            return
+        slug_dir = os.path.join(PROJECTS_ROOT,
+                                _project_slug(os.path.normpath(cwd)))
+        try:
+            os.makedirs(slug_dir, exist_ok=True)
+            self._unpack_transcript(blob, slug_dir)
+        except Exception as e:
+            log(f"importSession: unpack failed for {migration_id}: {e}")
+            return
+        extra = {
+            "ticket": cmd.get("ticket"),
+            "summary": cmd.get("summary"),
+            "summaryManual": cmd.get("summaryManual"),
+            "label": cmd.get("label"),
+            "model": cmd.get("model"),
+            "permissionMode": cmd.get("permissionMode"),
+            "migratedFrom": cmd.get("migratedFrom"),
+        }
+        self._resume_at_cwd(transcript_id, cwd,
+                            cmd_id=cmd.get("cmdId"), extra=extra)
+
+    def _pack_transcript(self, path):
+        """Bundle a transcript file (+ its subagents/ dir, if any) into gzipped
+        tar bytes, laid out relative to the project-slug dir so the target
+        unpacks straight into PROJECTS_ROOT/<slug>/: `<id>.jsonl` and, when
+        present, `<id>/subagents/...`. The main file is truncated to its last
+        complete line."""
+        tid = os.path.basename(path)[:-len(".jsonl")]
+        with open(path, "rb") as f:
+            raw = f.read()
+        nl = raw.rfind(b"\n")
+        complete = raw[:nl + 1] if nl >= 0 else raw
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            ti = tarfile.TarInfo(name=os.path.basename(path))
+            ti.size = len(complete)
+            tar.addfile(ti, io.BytesIO(complete))
+            sub = _subagents_dir(path)
+            if os.path.isdir(sub):
+                tar.add(sub, arcname=os.path.join(tid, "subagents"))
+        return buf.getvalue()
+
+    def _unpack_transcript(self, blob, dest_dir):
+        """Extract a _pack_transcript bundle into dest_dir. A bundle crosses a
+        host boundary, so it is never trusted: each member is written by hand to
+        a path re-checked to stay inside dest_dir (no tar.extract/extractall,
+        which would honour an absolute path, a `..`, or a symlink), and only
+        regular files and directories are unpacked."""
+        root = os.path.realpath(dest_dir)
+        buf = io.BytesIO(blob)
+        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            for m in tar.getmembers():
+                parts = m.name.split("/")
+                if m.name.startswith("/") or os.path.isabs(m.name) or ".." in parts:
+                    raise ValueError(f"unsafe tar member {m.name!r}")
+                out = os.path.join(dest_dir, m.name)
+                if os.path.realpath(out) != root and \
+                        not os.path.realpath(out).startswith(root + os.sep):
+                    raise ValueError(f"tar member escapes dest {m.name!r}")
+                if m.isdir():
+                    os.makedirs(out, exist_ok=True)
+                elif m.isreg():
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                    src = tar.extractfile(m)
+                    if src is None:
+                        continue
+                    with src, open(out, "wb") as f:
+                        shutil.copyfileobj(src, f)
+                # anything else (symlink/device/fifo) is silently skipped
+
+    def _migration_upload(self, migration_id, blob):
+        """POST a transcript bundle to the hub's migration relay (octet-stream,
+        agent-authed). Best-effort: a failure leaves the migration to time out
+        hub-side rather than raising into the command loop."""
+        try:
+            headers = {"Content-Type": "application/octet-stream",
+                       "User-Agent": "hub-agent/1.0"}
+            if TURMA_TOKEN:
+                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+            url = (f"{TURMA_URL}/api/agents/"
+                   f"{urllib.parse.quote(self.device, safe='')}"
+                   f"/migrations/{urllib.parse.quote(migration_id, safe='')}/blob")
+            req = urllib.request.Request(url, data=blob, headers=headers,
+                                         method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp.read()
+            log(f"migration {migration_id}: uploaded {len(blob)} bytes")
+        except Exception as e:
+            log(f"migration upload failed for {migration_id}: {e}")
+
+    def _migration_download(self, migration_id):
+        """GET a transcript bundle from the hub's migration relay. Returns the
+        raw bytes, or None on any failure."""
+        try:
+            headers = {"User-Agent": "hub-agent/1.0"}
+            if TURMA_TOKEN:
+                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+            url = (f"{TURMA_URL}/api/agents/"
+                   f"{urllib.parse.quote(self.device, safe='')}"
+                   f"/migrations/{urllib.parse.quote(migration_id, safe='')}/blob")
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except Exception as e:
+            log(f"migration download failed for {migration_id}: {e}")
+            return None
 
     def restart(self, sid):
         """Clear context: kill claude/tmux in place, drop the bridge pointer, and
@@ -2878,6 +8156,9 @@ class SessionManager:
             self._kill_tmux(sess)          # ends the current claude
             self.sess_state.pop(sid, None)  # fresh freshness/PR tracking
             self._clear_question_files(sid)  # drop any question the old claude was blocked on
+            # A message queued for the pre-restart conversation is contextually
+            # gone with it — never re-inject it into the fresh one (XERK-47).
+            sess.pop("pendingInputs", None)
             self._launch_tmux(sess)         # drops bridge-pointer + new claude
             self._launch_ttyd(sess)         # (re)ensure ttyd if it had died
             sess["errorMsg"] = None
@@ -2936,59 +8217,427 @@ class SessionManager:
         text = text[:INPUT_MAX_CHARS]
         # Name a still-unnamed session (bare/quick spawn or repos-root, where the
         # spawn-time summary was a no-op for lack of an initial prompt) from its
-        # first typed prompt — this message is our next chance. One-shot, gated on
-        # summaryStarted so it fires once and never on later turns.
-        if (not sess.get("summary") and not sess.get("summaryStarted")
+        # first typed prompt — this message is our next chance. Deliberately the
+        # FIRST attempt only: this is a fast path that saves waiting a beat for
+        # _seed_summaries, and later attempts belong there, where the transcript
+        # still names the session from its first prompt rather than from whatever
+        # turn happens to be typed when a retry comes due.
+        if (not sess.get("summary") and _summary_attempts(sess) == 0
                 and sid not in self.summaries):
             self._start_summary(sess, text)
         tmux_name = sess["tmuxName"]
         run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
         run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+        # Record it on the session's outbox so _poll_pending_inputs can confirm it
+        # landed and re-send it if a compaction drops it (XERK-47). `attempts:1`
+        # counts this first type; a resend needs a fresh compaction to fire again.
+        pend = sess.setdefault("pendingInputs", [])
+        pend.append({"text": text, "at": time.time(), "attempts": 1})
+        del pend[:-PENDING_INPUT_MAX]
+        self.save()
 
-    def set_model(self, sid, model):
-        """Switch a running session's model live by typing `/model <name>` into
-        its Claude TUI — the CLI applies it immediately (no picker). `default`
-        (or blank) resets to claude's own default model. Validation reuses
-        resolve_model, so only an allowlisted alias/`default` ever reaches the
-        pane, and the resolved value is stored back on the record so the
-        heartbeat/UI reflect the new model."""
+    def _poll_pending_inputs(self):
+        """Confirm each session's recently-sent messages landed and re-send any a
+        compaction dropped (XERK-47). See _pending_scan and the send_input outbox.
+
+        Runs every beat but short-circuits on a session with an empty outbox, so a
+        settled fleet pays one dict lookup per session. For a session that has an
+        outbox: read its transcript once, then for each queued message —
+          - drop it once it appears as a genuine user turn (delivered);
+          - leave it while it is still in the live queue (in-flight, will land);
+          - once a NEW compaction has happened since it was sent AND the pane has
+            settled to idle (so anything the compaction was going to keep has
+            already been consumed — this is what makes the resend duplicate-safe),
+            re-type it, up to PENDING_INPUT_MAX_ATTEMPTS, one resend per beat;
+          - drop it if it ages past PENDING_INPUT_TTL_SEC never having landed
+            (lost to something other than a compaction — out of this fix's scope).
+        """
+        now = time.time()
+        for sess in self.registry:
+            pend = sess.get("pendingInputs")
+            if not pend:
+                continue
+            if sess.get("status") != "running":
+                # Nothing to type into, and the record is meaningless once the
+                # session ends — drop it.
+                sess.pop("pendingInputs", None)
+                self.save()
+                continue
+            path = _session_transcript_path(sess)
+            if not path or not os.path.exists(path):
+                continue
+            delivered, queued, compactions = _pending_scan(path)
+            tmux_name = sess.get("tmuxName")
+            # Only judge a message "lost" once the pane is settled: True=busy,
+            # False=idle, None=unknown (uncapturable) — treat anything but a
+            # confirmed idle as "wait", so a transient capture failure or an
+            # in-progress turn never triggers a resend.
+            idle = _pane_busy(tmux_name) is False
+            keep, changed, resent = [], False, False
+            for item in pend:
+                text = (item.get("text") or "")
+                stripped = text.strip()
+                if "compactBase" not in item:
+                    # Baseline the compaction count the FIRST time we see this
+                    # message, and persist it now: a resend fires only when the
+                    # count rises above this, so a restart that lost an unsaved
+                    # baseline (re-taken post-compaction) would miss the resend.
+                    item["compactBase"] = compactions
+                    changed = True
+                base = item["compactBase"]
+                if stripped in delivered:
+                    changed = True          # landed — reap it
+                    continue
+                if stripped in queued:
+                    keep.append(item)       # in-flight — leave it
+                    continue
+                if compactions > base and idle:
+                    # A compaction fired since this was sent and the pane is idle,
+                    # yet it is neither a delivered turn nor still queued: the
+                    # compaction ate it. Re-send (bounded), one per beat.
+                    if item.get("attempts", 1) >= PENDING_INPUT_MAX_ATTEMPTS:
+                        changed = True
+                        log(f"gave up re-sending a compaction-dropped message "
+                            f"in session {sess['id']}")
+                        continue
+                    if resent:
+                        keep.append(item)   # already re-sent one this beat
+                        continue
+                    run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
+                    run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+                    item["attempts"] = item.get("attempts", 1) + 1
+                    item["compactBase"] = compactions  # only a NEWER compaction re-loses it
+                    item["at"] = now
+                    resent = changed = True
+                    keep.append(item)
+                    log(f"re-sent a message dropped by compaction in "
+                        f"session {sess['id']}")
+                    continue
+                if now - item.get("at", now) > PENDING_INPUT_TTL_SEC:
+                    changed = True          # never landed, no compaction — give up
+                    log(f"pending message expired unconfirmed in "
+                        f"session {sess['id']}")
+                    continue
+                keep.append(item)           # still in-flight (busy, or awaiting a beat)
+            if changed:
+                trimmed = keep[-PENDING_INPUT_MAX:]
+                if trimmed:
+                    sess["pendingInputs"] = trimmed
+                else:
+                    sess.pop("pendingInputs", None)
+                self.save()
+
+    def interrupt(self, sid):
+        """Stop a running session's in-flight turn without ending the session:
+        send Escape to its Claude TUI — exactly the key an operator sitting at
+        the live terminal would press. Claude Code cancels the generation or
+        tool call in flight and drops back to the prompt with the conversation
+        intact, so the session stays running and can be typed at again. This is
+        the gentle counterpart to kill (which ends the session) and restart
+        (which clears its context).
+
+        Deliberately NOT gated on paneBusy: that read is up to a beat stale by
+        the time the operator clicks Stop, and Escape into an idle pane is
+        harmless (it clears whatever is half-typed on the input line), so
+        refusing on a stale idle read would break the case the button is for."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
-        resolved = resolve_model(model)  # None for default, else alias; raises on junk
+        run(["tmux", "send-keys", "-t", sess["tmuxName"], "Escape"])
+        log(f"interrupted session {sid}")
+
+    def answer_pane_prompt(self, sid, number):
+        """Answer the blocking choice dialog a session's TUI is showing (a tool
+        permission request or a plan approval — see parse_pane_prompt) by typing
+        its option digit, exactly the key an operator at the live terminal would
+        press. This is what makes the dialog answerable from the chat page
+        instead of only from the raw terminal.
+
+        The pane is RE-READ first and the number checked against what is
+        actually on screen right now. That is the whole safety property: the
+        heartbeat a click was made against is up to a beat stale, and by the
+        time it lands the dialog may be gone — typing a bare digit into a live
+        composer would silently prepend a stray character to the operator's next
+        message. So a stale answer is dropped rather than sent."""
+        sess = self._find(sid)
+        if not sess or sess.get("status") != "running":
+            return
+        try:
+            number = int(number)
+        except (TypeError, ValueError):
+            return
+        prompt = parse_pane_prompt(_capture_pane(sess.get("tmuxName")))
+        if not prompt:
+            log(f"pane-prompt answer for {sid} dropped: no dialog on screen")
+            return
+        if not any(o["number"] == number for o in prompt["options"]):
+            log(f"pane-prompt answer {number} for {sid} dropped: not an option")
+            return
+        run(["tmux", "send-keys", "-t", sess["tmuxName"], str(number)])
+        log(f"answered pane prompt for session {sid}: option {number}")
+
+    def set_summary(self, sid, summary):
+        """Rename a session: replace the auto-generated few-word name the card
+        leads with by one the operator typed. Works on a stopped session too (the
+        name is presentational — no process is touched), and is persisted like the
+        auto name, so it survives beats, restart and resume.
+
+        A manual name pins the card: `summaryManual` stops _finish_summary from
+        clobbering it should a naming job still be in flight, and _summary_due
+        already declines to start new ones while a session has any name. A blank
+        rename clears the name — the card falls back to the label/worktree, and
+        auto-naming resumes if the session still has attempts left, which is the
+        only way back to it."""
+        sess = self._find(sid)
+        if not sess:
+            return
+        name = clean_manual_summary(summary)
+        sess["summary"] = name
+        sess["summaryManual"] = bool(name)
+        if name:
+            sess.pop("summaryRetryAt", None)
+        self.save()
+        log(f"renamed session {sid} -> {name!r}" if name
+            else f"cleared name of session {sid}")
+
+    def set_model(self, sid, model):
+        """Switch a running session's model live — for THIS SESSION ONLY — by
+        driving Claude Code's /model picker: open it, arrow to the chosen row,
+        and press `s` ("use this session only").
+
+        It used to type `/model <name>`, which looks equivalent and isn't: the
+        argument form ALSO saves the pick as the login-wide default for new
+        sessions, and every session on the host shares that one login — so
+        switching one session's model silently changed what "Default" meant for
+        every future session on every host (XERK-33). The picker's `s` is the
+        only session-scoped switch the CLI exposes, so the picker is driven for
+        real: capture the pane, find the target row and the ❯ cursor, press the
+        arrows between them. A pane the picker never appears on, or a picker
+        with no row for the target (the bracketed 1M aliases have none), is
+        Escaped out of and logged — the record keeps the real model, and the
+        heartbeat corrects the UI's optimistic guess.
+
+        Two reliability fixes ride along: the input line is cleared (C-u)
+        first, so a half-typed operator prompt can't fuse with the command into
+        garbage; and a FRESH busy read gates the whole thing — typed into a
+        mid-turn pane the command would only be queued as a prompt, so it is
+        refused (log-only) rather than misfired. Unlike interrupt(), which
+        tolerates a stale idle read because Escape is harmless, this path types
+        into the pane, so it checks the pane NOW rather than trusting the
+        beat-old paneBusy."""
+        sess = self._find(sid)
+        if not sess or sess.get("status") != "running":
+            return
+        # None for default, else a validated alias (static or probed); raises on
+        # junk. The alias never reaches a command line here (the picker is
+        # arrow-driven), but the same allowlist keeps the two paths honest.
+        resolved = resolve_model(model, self.models_available())
         arg = resolved or "default"
         tmux_name = sess["tmuxName"]
-        run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", f"/model {arg}"])
+        if _pane_busy(tmux_name):
+            # DEFER, don't drop: the click used to be refused log-only here,
+            # which read as the button doing nothing. The pending pick is
+            # persisted, heartbeated (so the chip can say it's switching), and
+            # applied by _apply_pending_switches on the first idle beat.
+            sess["pendingModel"] = arg
+            self.save()
+            log(f"set model of {sid} -> {arg}: turn in flight; deferred until idle")
+            return
+        sess.pop("pendingModel", None)
+        run(["tmux", "send-keys", "-t", tmux_name, "C-u"])
+        run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", "/model"])
         run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
-        sess["model"] = resolved
-        self.save()
-        log(f"set model of {sid} -> {arg}")
+        rows, cur = [], None
+        for _ in range(MODEL_PICKER_TRIES):
+            time.sleep(MODEL_PICKER_WAIT_SEC)
+            rows, cur = parse_model_picker(_capture_pane(tmux_name) or "")
+            if rows:
+                break
+        if not rows or cur is None:
+            # No picker appeared (or no cursor to navigate from): back out.
+            # The pane was idle a moment ago, so Escape lands on the prompt (or
+            # closes a half-painted picker) and destroys nothing.
+            run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+            log(f"set model of {sid} -> {arg}: /model picker did not appear")
+            self.save()
+            return
+        # Arrow toward the target ONE press at a time, re-reading the ❯ before
+        # the next. The old burst of abs(target-cur) presses trusted every key
+        # to land exactly once — a dropped or doubled key put the cursor one
+        # row off and `s` then silently selected the WRONG model. Here a
+        # dropped key just means the next read still shows the gap (press
+        # again), and a doubled one flips the press direction; MAX_STEPS bounds
+        # a cursor that never converges.
+        steps = 0
+        while True:
+            target = _picker_index_for(rows, resolved)
+            if target is None:
+                run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+                log(f"set model of {sid} -> {arg}: picker offers no such row "
+                    f"({', '.join(rows)})")
+                self.save()
+                return
+            if cur == target:
+                break
+            if steps >= MODEL_PICKER_MAX_STEPS:
+                run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+                log(f"set model of {sid} -> {arg}: cursor never reached the row "
+                    f"(at {cur} after {steps} presses)")
+                self.save()
+                return
+            run(["tmux", "send-keys", "-t", tmux_name,
+                 "Down" if target > cur else "Up"])
+            steps += 1
+            rows, cur = self._await_picker_step(tmux_name, rows, cur)
+            if not rows or cur is None:
+                run(["tmux", "send-keys", "-t", tmux_name, "Escape"])
+                log(f"set model of {sid} -> {arg}: picker vanished mid-navigation")
+                self.save()
+                return
+        run(["tmux", "send-keys", "-t", tmux_name, "-l", "s"])
+        # The record updates only on the TUI's own confirmation — "Set model
+        # to X for this session only" (or "Kept model as X" when the row was
+        # already current). Unconfirmed, the record keeps the old value and the
+        # transcript scan's modelActual settles what the chip shows either way.
+        if self._await_model_confirmation(tmux_name):
+            sess["model"] = resolved
+            self.save()
+            log(f"set model of {sid} -> {arg} (session only, confirmed)")
+        else:
+            self.save()
+            log(f"set model of {sid} -> {arg}: selection sent but no "
+                f"confirmation read; record unchanged (modelActual will settle it)")
+
+    def _await_picker_step(self, tmux_name, rows, prev_cur):
+        """Poll the picker after an arrow press until the ❯ moves off prev_cur,
+        returning the fresh (rows, cur). On timeout returns the LAST read even
+        if unmoved — the caller's loop just presses again, bounded by
+        MAX_STEPS — and ([], None) when the picker is gone entirely."""
+        for _ in range(MODEL_STEP_TRIES):
+            time.sleep(MODEL_STEP_WAIT_SEC)
+            rows, cur = parse_model_picker(_capture_pane(tmux_name) or "")
+            if not rows:
+                return [], None
+            if cur is not None and cur != prev_cur:
+                return rows, cur
+        return rows, cur
+
+    def _await_model_confirmation(self, tmux_name):
+        """Whether the picker's selection visibly landed: poll for the TUI's
+        own "Set model to…"/"Kept model as…" line (MODEL_CONFIRM_RE)."""
+        for _ in range(MODEL_CONFIRM_TRIES):
+            time.sleep(MODEL_CONFIRM_WAIT_SEC)
+            cap = _capture_pane(tmux_name)
+            if cap and MODEL_CONFIRM_RE.search(cap):
+                return True
+        return False
+
+    def _apply_pending_switches(self):
+        """Apply model switches that arrived while their session's pane was
+        mid-turn (set_model defers them as sess['pendingModel']). Runs each
+        beat; set_model re-defers if a new turn has started, so a pick chases
+        the first idle moment instead of being dropped."""
+        for sess in list(self.registry):
+            pend = sess.get("pendingModel")
+            if not pend or sess.get("status") != "running":
+                continue
+            if _pane_busy(sess["tmuxName"]):
+                continue
+            sess.pop("pendingModel", None)
+            try:
+                self.set_model(sess["id"], pend)
+            except Exception as e:
+                log(f"deferred model switch for {sess['id']} failed: {e}")
+                self.save()
 
     def set_mode(self, sid, mode):
-        """Switch a running session's permission mode live by injecting the right
-        number of Shift+Tab presses to cycle it from its current mode to the
-        target over PERM_CYCLE. Best-effort — Claude Code exposes no direct
-        set-mode command, and the cycle's actual contents depend on the launch
-        flags, so an off-cycle current/target is a no-op and a present-but-shifted
-        cycle may land nearby. The target (validated) is stored optimistically so
-        the UI reflects the intent."""
+        """Switch a running session's permission mode live as a CLOSED LOOP:
+        press Shift+Tab (BTab), read the footer's mode marker back
+        (parse_pane_mode), repeat until the target reads back or the cycle
+        wraps to where it started.
+
+        It used to compute a press count against `perm_cycle_for`'s guessed
+        cycle — but the real cycle is account- AND model-dependent (auto joins
+        it when the account enables it, even on a bypass-launched session where
+        the guess says it's absent, and drops out for models that can't do
+        auto), and the record's idea of "current" goes stale the moment the
+        operator cycles by hand in the terminal. Every one of those made a
+        computed count land on the wrong mode. Reading the marker after each
+        press needs none of that knowledge: the loop stops ON the target, a
+        wrap back to the start proves the target isn't in this session's cycle
+        (a logged no-op), and what's STORED is always what was read, so the
+        record can't lie.
+
+        No busy gate, deliberately: BTab types nothing into the input line and
+        the TUI cycles modes mid-generation (verified live), with the marker
+        staying visible throughout. Falls back to the old computed presses only
+        when the marker can't be read at all (a TUI wording this parser
+        predates)."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
         target = resolve_permission_mode(mode)  # validated enum; raises on junk
+        tmux_name = sess["tmuxName"]
+        cur = parse_pane_mode(_capture_pane(tmux_name))
+        if cur is None:
+            self._set_mode_blind(sess, target)
+            return
+        start, presses = cur, 0
+        while cur != target and presses < MODE_CYCLE_MAX_PRESSES:
+            run(["tmux", "send-keys", "-t", tmux_name, "BTab"])
+            presses += 1
+            nxt = self._await_mode_step(tmux_name, cur)
+            if nxt is None:
+                log(f"set mode of {sid}: marker unreadable after {presses} "
+                    f"presses; keeping last read {cur!r}")
+                break
+            cur = nxt
+            if cur == start:
+                break  # full wrap: the target isn't in this session's cycle
+        sess["permissionMode"] = cur  # what was READ, not what was wanted
+        self.save()
+        if cur == target:
+            log(f"set mode of {sid} -> {target} ({presses} Shift+Tab, read back)")
+        else:
+            log(f"set mode of {sid}: {target} not reached (cycle read back "
+                f"{cur!r} after {presses} presses); record keeps the real mode")
+
+    def _await_mode_step(self, tmux_name, prev):
+        """Poll the pane after a BTab until its mode marker reads differently
+        from `prev` (the repaint landed), returning the new mode — or None when
+        it never reads back (pane gone / marker wording changed mid-flight).
+        A press that shows the SAME mode after the wait window reads as None
+        too: with every real cycle ≥3 modes, BTab can never map a mode to
+        itself, so an unmoved marker means the read is not to be trusted."""
+        for _ in range(MODE_STEP_TRIES):
+            time.sleep(MODE_STEP_WAIT_SEC)
+            nxt = parse_pane_mode(_capture_pane(tmux_name))
+            if nxt and nxt != prev:
+                return nxt
+        return None
+
+    def _set_mode_blind(self, sess, target):
+        """The pre-closed-loop fallback for a pane whose mode marker can't be
+        read: presses computed against perm_cycle_for's guessed cycle from the
+        record's stored mode. Kept only for TUIs whose footer wording this
+        build's parser doesn't know; wrong whenever the guess is (see
+        set_mode's docstring), which is why it is no longer the primary path."""
+        sid = sess["id"]
         current = sess.get("permissionMode") or "auto"
         if current == target:
             return
-        if current not in PERM_CYCLE or target not in PERM_CYCLE:
-            log(f"set mode of {sid}: {current}->{target} not both on cycle; skipping")
+        cycle = perm_cycle_for(sess.get("launchPermissionMode"))
+        if current not in cycle or target not in cycle:
+            log(f"set mode of {sid}: {current}->{target} not both reachable in "
+                f"cycle {cycle}; skipping")
             return
-        presses = (PERM_CYCLE.index(target) - PERM_CYCLE.index(current)) % len(PERM_CYCLE)
+        presses = (cycle.index(target) - cycle.index(current)) % len(cycle)
         tmux_name = sess["tmuxName"]
         for _ in range(presses):
             run(["tmux", "send-keys", "-t", tmux_name, "BTab"])
         sess["permissionMode"] = target
         self.save()
-        log(f"set mode of {sid} -> {target} ({presses} Shift+Tab)")
+        log(f"set mode of {sid} -> {target} ({presses} Shift+Tab, blind)")
 
     def _question_paths(self, sid):
         """(req, ans) rendezvous file paths for a session's pending question."""
@@ -3047,28 +8696,47 @@ class SessionManager:
                 continue  # a live bridge may still own it
             self._clear_question_files(sid)
 
-    def answer_question(self, sid, option_index, custom):
+    def answer_question(self, sid, option_index, custom, option_indices=None):
         """Answer a session's pending AskUserQuestion by dropping the answer file
         the ask.py bridge is polling for. option_index is 0-based into the
         question's options (or -1 for a free-text / "Other" answer carried in
-        custom). Only writes when a request file is actually pending, so a stray
-        answer for a session with no live question is a no-op. Written
-        atomically (temp + replace) so the blocked hook never reads a partial."""
+        custom); option_indices is the multiSelect equivalent (a list of picks).
+        Only writes when a request file is actually pending, so a stray answer
+        for a session with no live question is a no-op. Written atomically
+        (temp + replace) so the blocked hook never reads a partial."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
         req_path, ans_path = self._question_paths(sid)
         if not os.path.exists(req_path):
             return  # nothing waiting on this session
+        # A multiSelect answer carries a list of picks; a single-select one a
+        # lone index. Sanitize the list and prefer it when non-empty.
+        idxs = None
+        if isinstance(option_indices, list):
+            idxs = []
+            for v in option_indices:
+                try:
+                    n = int(v)
+                except (TypeError, ValueError):
+                    continue
+                if n >= 0 and n not in idxs:
+                    idxs.append(n)
         try:
             idx = int(option_index)
         except (TypeError, ValueError):
             idx = -1
-        answer = {"optionIndex": idx}
-        if isinstance(custom, str) and custom.strip():
+        has_text = isinstance(custom, str) and bool(custom.strip())
+        answer = {}
+        if idxs is not None and idxs:
+            answer["optionIndices"] = idxs
+            answer["optionIndex"] = idxs[0]  # compat for a single-answer reader
+        else:
+            answer["optionIndex"] = idx
+            if idx < 0 and not has_text:
+                return  # no option and no text — nothing to answer with
+        if has_text:
             answer["custom"] = custom[:INPUT_MAX_CHARS]
-        elif idx < 0:
-            return  # no option and no text — nothing to answer with
         try:
             tmp = f"{ans_path}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -3084,19 +8752,305 @@ class SessionManager:
         stages an empty result instead of raising — a poison sessionId must
         not take down the heartbeat loop."""
         sess = self._find(sid)
-        path = _newest_transcript_path(sess["worktreePath"]) if sess else None
+        path = _session_transcript_path(sess) if sess else None
         if not path:
             self.history_results.append(
-                {"sessionId": sid, "entries": [], "truncated": False}
+                {"sessionId": sid, "entries": [], "truncated": False,
+                 "queued": []}
             )
             return
-        entries, byte_capped = _history_entries(path)
+        entries, byte_capped, queued = _history_entries(path)
         truncated = byte_capped or len(entries) > HISTORY_MAX_MSGS
         self.history_results.append({
             "sessionId": sid,
             "entries": entries[-HISTORY_MAX_MSGS:],
             "truncated": truncated,
+            # Still-queued prompts (typed mid-turn, not yet consumed) so the
+            # chat's /history fallback shows them like the live tail does.
+            "queued": queued,
         })
+
+    def _stage_subagent_history(self, sid, agent_type, label):
+        """Handle a {type:"subagentHistory"} command: resolve the clicked pane
+        agent-list row (type + label) to its background-agent transcript and
+        stage a bounded read for the next heartbeat (subagentHistoryResults).
+        The row key (sessionId+type+label) is echoed back so the hub can match
+        the delivery to the outstanding request. Any miss (unknown session,
+        unresolved agent, absent file) stages an empty result rather than
+        raising — a poison row must not take down the heartbeat loop."""
+        result = {"sessionId": sid, "type": agent_type or "",
+                  "label": label or "", "entries": [], "truncated": False}
+        sess = self._find(sid)
+        main = _session_transcript_path(sess) if sess else None
+        path = _resolve_subagent(main, agent_type, label) if main else None
+        if not path:
+            self.subagent_history_results.append(result)
+            return
+        # Subagents take no operator input, so their queued list is dropped.
+        entries, byte_capped, _ = _history_entries(path)
+        result["entries"] = entries[-HISTORY_MAX_MSGS:]
+        result["truncated"] = byte_capped or len(entries) > HISTORY_MAX_MSGS
+        self.subagent_history_results.append(result)
+
+    def set_jira_repo(self, issue_key, repo, auto=False, site_key=None):
+        """Handle a {type:"setJiraRepo"} command: the operator's own answer to
+        "which repo does this ticket belong in", overriding the model's guess.
+
+        Three outcomes, matching the three the board can ask for:
+          auto=True     -> drop the entry entirely, releasing the pin. The ticket
+                           re-triages from scratch on a later beat with a FULL
+                           attempt budget, which is what "use the AI guess again"
+                           has to mean — reusing a spent budget could leave a
+                           cleared ticket permanently unguessed.
+          repo=None     -> a manual "no repo fits" (the muted chip). Explicit, and
+                           deliberately distinct from auto=True: the operator
+                           asserting nothing fits is an ANSWER, not an absence.
+          repo="<name>" -> pin that repo.
+
+        The name is allowlist-checked against this host's own candidates, exactly
+        like the model's reply in _parse_triage, and the recorded repo/cloned/
+        nameWithOwner are read off the CANDIDATE — never off the request. The
+        operator is more trustworthy than the model, but the request still arrives
+        over HTTP, and a value that only ever renders as a chip has no business
+        being anything but a name this host already knows.
+
+        An unknown repo is refused rather than recorded: a name this host can't
+        offer is one its picker never showed, so it is a bug or a stale client, and
+        recording it would paint a chip for a repo that doesn't exist here."""
+        k = (issue_key or "").strip()
+        if not valid_issue_key(k):
+            log(f"setJiraRepo: ignoring bad issue key {k[:50]!r}")
+            return
+        mine = self.jira.get("siteKey")
+        if not mine:
+            log(f"setJiraRepo: no board org on this host, ignoring {k}")
+            return
+        # The hub routes by siteKey, so a mismatch means the command reached the
+        # wrong host. Filing it under our own org would corrupt a ledger key that
+        # another host's board is reading.
+        if site_key and site_key != mine:
+            log(f"setJiraRepo: {k} is for {site_key!r}, not this host's {mine!r}")
+            return
+        lkey = _triage_key(mine, k)
+        if auto:
+            if self.triage_ledger.pop(lkey, None) is None:
+                return
+            self._save_triage_ledger()
+            self._apply_triage()
+            log(f"setJiraRepo: {k} released back to auto triage")
+            return
+        entry = {"decided": True, "manual": True, "at": now_iso(), "reason": ""}
+        if repo is None:
+            entry.update({"repo": None, "cloned": False, "nameWithOwner": None})
+        else:
+            cand = next((c for c in (self.triage_cands or [])
+                         if c.get("name") == repo), None)
+            if cand is None:
+                log(f"setJiraRepo: refusing non-candidate repo {str(repo)[:80]!r} for {k}")
+                return
+            entry.update({"repo": cand["name"], "cloned": bool(cand.get("cloned")),
+                          "nameWithOwner": cand.get("nameWithOwner"),
+                          "source": cand.get("source")})
+        self.triage_ledger[lkey] = entry
+        self._prune_triage_ledger()
+        self._save_triage_ledger()
+        self._apply_triage()
+        log(f"setJiraRepo: {k} -> {entry['repo'] or 'no repo'} (manual)")
+
+    def _jira_payload(self):
+        """The jira block as it ships: what the poll returned, plus the repo
+        choices the board's manual picker offers (`repoOptions`).
+
+        Composed here rather than stamped onto self.jira because collect_jira
+        builds fresh dicts on every poll — the same reason _apply_triage has to
+        re-stamp the guesses. It stays out of collect_jira itself, which owns only
+        what Jira told us; repos are this host's knowledge, not Jira's.
+
+        Only the name and clone state ride: the picker labels a repo and marks
+        whether it's here, and the candidates' descriptions (up to 200 × 120 chars)
+        would be dead weight on every beat for a tooltip nobody reads. An
+        unconfigured host has no board and ships nothing extra."""
+        if not self.jira.get("configured"):
+            return self.jira
+        opts = [{"name": c["name"], "cloned": bool(c.get("cloned")),
+                 "nameWithOwner": c.get("nameWithOwner"),
+                 "source": c.get("source")}
+                for c in (self.triage_cands or [])]
+        return dict(self.jira, repoOptions=opts)
+
+    def _stage_jira_issue(self, key):
+        """Handle a {type:"jiraIssue"} command: fetch that issue's full detail
+        and stage it for the next heartbeat payload (jiraIssueResults). Every
+        failure path stages a result carrying an `error` rather than raising —
+        the board is waiting on this key, so it needs an answer either way, and
+        a poison key must not take down the heartbeat loop."""
+        k = (key or "").strip()
+        if not valid_issue_key(k):
+            self.jira_issue_results.append(
+                {"key": k[:50], "issue": None, "error": "not a valid issue key"})
+            return
+        if not board_configured():
+            self.jira_issue_results.append(
+                {"key": k, "issue": None, "error": "no board credentials on this host"})
+            return
+        try:
+            issue = fetch_board_issue(k)
+            self.jira_issue_results.append({"key": k, "issue": issue, "error": None})
+        except Exception as e:
+            log(f"board issue fetch failed for {k}: {e}")
+            self.jira_issue_results.append(
+                {"key": k, "issue": None, "error": str(e)[:200]})
+
+    def set_board_status(self, cmd_id, issue_key, value, category=None):
+        """Handle a {type:"setTicketStatus"} command: push a status change to the
+        configured board (Jira/Azure) — the one thing Turma writes back to a
+        board (XERK-138). The outcome is staged keyed by the command's cmdId so
+        the panel that requested it can poll for its own answer.
+
+        The target is either an exact option `value` (the detail panel's picker)
+        or a board `category` — todo/inprogress/review/done — the operator
+        dropped a card onto (XERK-141). Either way it is re-validated against a
+        FRESH read of the available options, never trusted from the client (the
+        same stance set_jira_repo takes against the repo picker): the request
+        arrives over HTTP, and the board's own workflow, not the browser, decides
+        what a ticket can move to. A `category` is resolved to a transition HERE,
+        against that fresh read, so a drag never carries a stale transition id.
+
+        On success it also re-fetches the issue and stages it into
+        jira_issue_results, so the hub's issue cache carries the new status +
+        the transitions available FROM it, and the panel's re-read is instant."""
+        k = (issue_key or "").strip()
+        result = {"cmdId": cmd_id, "key": k[:50], "ok": False, "error": None}
+
+        def stage(err=None, **extra):
+            if err is not None:
+                result["error"] = err
+            result.update(extra)
+            self.ticket_status_results.append(result)
+
+        if not valid_issue_key(k):
+            return stage("not a valid issue key")
+        if not board_configured():
+            return stage("no board credentials on this host")
+        v = str(value or "").strip()
+        col = str(category or "").strip().lower()
+        if not v and not col:
+            return stage("no status given")
+        try:
+            opts = board_status_options(k)
+        except Exception as e:
+            log(f"status options fetch failed for {k}: {e}")
+            return stage(f"couldn't read available statuses: {str(e)[:150]}")
+        # A drop names a column; resolve it to a concrete transition against the
+        # fresh options before the exact-id validation below runs unchanged.
+        if not v:
+            match = _status_option_for_column(opts, col)
+            if match is None:
+                label = _COLUMN_LABEL.get(col, col or "there")
+                return stage(f"nothing can move it to {label}")
+            v = match["id"]
+        match = next((o for o in opts if o.get("id") == v), None)
+        if match is None:
+            return stage("that status is no longer an available change")
+        try:
+            apply_board_status(k, v)
+        except Exception as e:
+            log(f"status change failed for {k}: {e}")
+            return stage(str(e)[:200])
+        # Refresh the cached detail so the panel's re-read shows the new status
+        # and the transitions now available from it (best-effort: the change
+        # already landed, so a failed re-read doesn't fail the command).
+        try:
+            issue = fetch_board_issue(k)
+            self.jira_issue_results.append({"key": k, "issue": issue, "error": None})
+        except Exception as e:
+            log(f"post-change issue re-fetch failed for {k}: {e}")
+        log(f"setTicketStatus: {k} -> {match['name']}")
+        stage(ok=True, status=match["name"], statusCategory=match["category"])
+
+    # --- New-ticket creation (XERK-137) -----------------------------------
+    # The board's create form. Two staged results, same fail-into-`error`
+    # discipline as _stage_jira_issue (the form is waiting on an answer either
+    # way): the metadata a form open needs, and the outcome of a create POST.
+
+    def _stage_create_meta(self, project):
+        """Handle a {type:"boardCreateMeta"} command. With no `project`, stage the
+        project + label choices (createMetaResults, no `project` key); with one,
+        stage that project's issue/work-item types (a `project`-keyed result). A
+        failure stages the same shape carrying an `error`."""
+        proj = (project or "").strip()
+        if not board_configured():
+            self.create_meta_results.append(
+                {"project": proj or None,
+                 "error": "no board credentials on this host"})
+            return
+        try:
+            if proj:
+                self.create_meta_results.append(
+                    {"project": proj, "types": board_issue_types(proj), "error": None})
+            else:
+                meta = board_create_meta()
+                self.create_meta_results.append({
+                    "project": None,
+                    "projects": meta.get("projects") or [],
+                    "labels": meta.get("labels") or [],
+                    "source": meta.get("source"),
+                    "error": None,
+                })
+        except Exception as e:
+            log(f"board create meta failed ({proj or 'projects'}): {e}")
+            self.create_meta_results.append(
+                {"project": proj or None, "error": str(e)[:200]})
+
+    def _stage_create_ticket(self, cmd):
+        """Handle a {type:"createTicket"} command: create the ticket and stage the
+        outcome keyed by the command's cmdId (so the hub can hand the created key
+        back to the one client that submitted it). Validated defensively even
+        though the hub already checked — this is the only thing between a request
+        and a write to the tracker."""
+        cid = cmd.get("cmdId")
+        summary = (cmd.get("summary") or "").strip()[:CREATE_TITLE_MAX_CHARS]
+        project = (cmd.get("project") or "").strip()
+        issue_type = (cmd.get("issueType") or "").strip()
+        description = (cmd.get("description") or "")[:CREATE_DESC_MAX_CHARS]
+        labels = [str(l).strip() for l in (cmd.get("labels") or [])
+                  if str(l).strip()][:CREATE_LABELS_MAX]
+
+        def fail(msg):
+            self.create_ticket_results.append(
+                {"cmdId": cid, "key": None, "url": None, "error": msg})
+
+        # A ticket that lands UNASSIGNED is a success the operator must still be
+        # told about: the board filters on the tracker user, so it is created
+        # and then invisible there, which reads exactly like a create that
+        # didn't happen.
+        unassigned_warning = (
+            "created, but it couldn't be assigned to you, so it won't show on "
+            "your board — set AZDO_USER to your Azure identity"
+            if board_source() == "azure" else
+            "created, but it couldn't be assigned to you, so it won't show on "
+            "your board")
+
+        if not board_configured():
+            return fail("no board credentials on this host")
+        if not summary:
+            return fail("a title is required")
+        if not project:
+            return fail("a project is required")
+        if not issue_type:
+            return fail("an issue type is required")
+        try:
+            created = create_board_issue(project, issue_type, summary,
+                                         description, labels)
+            self.create_ticket_results.append(
+                {"cmdId": cid, "key": created.get("key"),
+                 "url": created.get("url"), "error": None,
+                 "warning": None if created.get("assigned")
+                            else unassigned_warning})
+            log(f"created ticket {created.get('key')} in {project}")
+        except Exception as e:
+            log(f"ticket creation failed in {project}: {e}")
+            fail(str(e)[:300])
 
     # --- durable archive sync ---------------------------------------------
     # Ship every INACTIVE session's transcript to the hub so history is durable
@@ -3112,6 +9066,18 @@ class SessionManager:
         for s in self.registry:
             if s.get("status") != "running":
                 continue
+            wt = s.get("worktreePath") or (REPOS_ROOT if s.get("root") else None)
+            if wt:
+                slugs.add(_project_slug(wt))
+        return slugs
+
+    def _carded_slugs(self):
+        """Project slugs backing ANY registry session, running or stopped — the
+        ones that already have a session card of their own, with its own Start.
+        _resumable_report skips these so the picker never offers to resume a
+        session the hub is already showing."""
+        slugs = set()
+        for s in self.registry:
             wt = s.get("worktreePath") or (REPOS_ROOT if s.get("root") else None)
             if wt:
                 slugs.add(_project_slug(wt))
@@ -3166,6 +9132,39 @@ class SessionManager:
                 return (rel[0], "repo dir", False)
         return None
 
+    def _localize_migrated_cwd(self, cwd):
+        """Remap a migrated session's origin worktree path from the SOURCE host's
+        REPOS_ROOT onto THIS host's, so a fleet whose hosts mount their git root
+        at DIFFERENT paths (a WSL-native agent at /home/<user>/git vs a container
+        at /mnt/data/Docker/git) can still move sessions between them.
+
+        XERK-101 originally assumed one shared REPOS_ROOT across the fleet, so it
+        handed the target the source's absolute worktree path verbatim — which
+        `_resumable_cwd_class` then rejected as foreign whenever the mounts
+        differed, wedging every such migration in `importing` forever.
+
+        A migration is always a worktree session (the hub's /migrate guard
+        rejects root), so the path always ends `.../.turma/worktrees/<repo>/<dir>`
+        — a REPOS_ROOT-independent tail that rebuilds under the LOCAL
+        WORKTREES_ROOT. Returns the local-equivalent path, or the input unchanged
+        when it already sits under this host's REPOS_ROOT (the same-mount fleet,
+        untouched) or carries no recognizable worktree tail (left for the caller
+        to reject as foreign)."""
+        if not cwd:
+            return cwd
+        norm = os.path.normpath(cwd)
+        local_root = os.path.normpath(REPOS_ROOT)
+        if norm == local_root or norm.startswith(local_root + os.sep):
+            return norm  # already under this host's REPOS_ROOT — nothing to remap
+        marker = os.sep + os.path.join(".turma", "worktrees") + os.sep
+        idx = norm.find(marker)
+        if idx < 0:
+            return cwd  # not a worktree path we recognize; caller rejects it
+        rel = norm[idx + len(marker):].split(os.sep)
+        if len(rel) != 2 or not rel[0] or not rel[1]:
+            return cwd  # not <repo>/<dir>; leave it for the caller to reject
+        return os.path.join(WORKTREES_ROOT, rel[0], rel[1])
+
     def _find_transcript_dir(self, transcript_id):
         """The PROJECTS_ROOT/<slug> dir holding <transcript_id>.jsonl, or None —
         used to resume a picked transcript whose slug the caller didn't pin."""
@@ -3193,14 +9192,13 @@ class SessionManager:
         RESUMABLE_PER_REPO per repo to bound the heartbeat; the summary read is
         deferred until after the cap so it's paid only for the survivors.
 
-        Returns repo-name -> [{transcriptId, cwd, repo, root, origin, summary,
-        endedTs}] newest-first."""
-        # Slugs already represented by a session card (running or stopped).
-        carded = set()
-        for s in self.registry:
-            wt = s.get("worktreePath") or (REPOS_ROOT if s.get("root") else None)
-            if wt:
-                carded.add(_project_slug(wt))
+        Returns repo-name -> [{transcriptId, cwd, repo, root, origin, slug,
+        summary, endedTs}] newest-first."""
+        # Slugs already represented by a session card (running or stopped). This
+        # is the scan-time cut; because the scan is cached across the slow beats
+        # between refreshes, _sorted_repo_entries() re-applies it against
+        # registry every beat — see the filter there.
+        carded = self._carded_slugs()
         repo_names = {r["name"] for r in scan_repos()}
         # slug -> a real worktree path the ledger recorded, so a transcript whose
         # own cwd we can't read still classifies when the ledger keyed its path.
@@ -3225,7 +9223,7 @@ class SessionManager:
             for fname in names:
                 tid = fname[:-len(".jsonl")]
                 # The id is interpolated onto the tmux command line at resume.
-                if not re.fullmatch(r"[A-Za-z0-9-]+", tid):
+                if not VALID_CLAUDE_SID_RE.fullmatch(tid):
                     continue
                 path = os.path.join(proj, fname)
                 cwd = _transcript_cwd(path)
@@ -3246,21 +9244,43 @@ class SessionManager:
                     "repo": repo,
                     "root": root,
                     "origin": origin,
-                    "slug": slug,          # dropped below; picks the summary source
+                    # Reported, not dropped: it picks the summary source below,
+                    # and _sorted_repo_entries()'s per-beat carded filter keys on it.
+                    "slug": slug,
                     "mtime": mtime,        # dropped below; sort/cap key
                 })
         sess_meta = self._session_meta_by_slug()
         for repo, lst in by_repo.items():
+            # Cap by mtime (a cheap stat, already in hand) so the accurate
+            # last-message read below is paid only for the survivors. mtime can
+            # be inflated by a file copy, but that only ever KEEPS a transcript
+            # that a truthful key would have dropped — never the reverse — so the
+            # cap stays a safe superset; the hub sorts the survivors by endedTs.
             lst.sort(key=lambda e: e["mtime"], reverse=True)
             del lst[RESUMABLE_PER_REPO:]
             for e in lst:
+                path = os.path.join(PROJECTS_ROOT, e["slug"], e["transcriptId"] + ".jsonl")
                 sm = sess_meta.get(e["slug"], {})
-                e["summary"] = sm.get("summary") or _first_user_text(
-                    os.path.join(PROJECTS_ROOT, e["slug"], e["transcriptId"] + ".jsonl"))
-                e["endedTs"] = time.strftime(
+                e["summary"] = sm.get("summary") or _first_user_text(path)
+                # The last new message's own timestamp, not the file mtime — see
+                # _last_activity_ts. Falls back to mtime only when the transcript
+                # carries no timestamped entry.
+                e["endedTs"] = _last_activity_ts(path) or time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(e["mtime"]))
+                # Which Jira ticket this conversation was spawned to work, or None
+                # for the ordinary session. This scan is re-derived from the
+                # transcripts on disk, which know nothing of tickets, so it is the
+                # durable ledger that re-attaches the two — and this is the only
+                # channel still reporting a session once its record has aged out
+                # of closed.json (see TICKET_LEDGER_PATH).
+                e["ticket"] = self.ticket_ledger.get(e["transcriptId"])
+                # The PRs this conversation opened, from the durable PR ledger —
+                # same story as the ticket above. This scan is the only channel
+                # still reporting a session once its closed record has aged out,
+                # so without the ledger its PR chips would be lost for good (a
+                # resumable row has no record to have snapshotted them onto).
+                e["prs"] = self._ledger_prs(e["transcriptId"])
                 e.pop("mtime", None)
-                e.pop("slug", None)
         return by_repo
 
     def _archive_manifest(self):
@@ -3274,6 +9294,8 @@ class SessionManager:
         slug_attr = {}
         for wt, m in (self.usage_ledger or {}).items():
             m = m or {}
+            if m.get("internal"):
+                continue  # the manager's own claude -p helper, never archived (XERK-27)
             slug = m.get("slug") or _project_slug(wt)
             slug_attr[slug] = {
                 "repo": m.get("repo") or "?",
@@ -3306,14 +9328,21 @@ class SessionManager:
                     "worktree": attr["worktree"],
                     "size": st.st_size,
                     "mtime": st.st_mtime,
-                    "endedTs": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime)),
+                    "path": path,
                     "createdAt": sm.get("createdAt"),
                     "summary": sm.get("summary"),
                 })
         out.sort(key=lambda m: m["mtime"], reverse=True)
         out = out[:ARCHIVE_MANIFEST_MAX]
         for m in out:
-            m.pop("mtime", None)  # internal sort key; not part of the payload
+            # The last new message's own timestamp, not the file mtime (XERK-73) —
+            # the archive orders and dates its rows by this, so a synced/restored
+            # transcript with an inflated mtime must not read as recently ended.
+            # Paid only for the capped survivors. Falls back to mtime.
+            m["endedTs"] = _last_activity_ts(m["path"]) or time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(m["mtime"]))
+            m.pop("mtime", None)   # internal sort key; not part of the payload
+            m.pop("path", None)
         return out
 
     def _archive_deltas(self, archive_have):
@@ -3371,8 +9400,11 @@ class SessionManager:
                     if text is None and not blocks:
                         continue
                     entries.append({
-                        "uuid": entry.get("uuid"),
-                        "role": entry.get("type"),
+                        # _entry_id, not the raw uuid: a pr-link entry has none,
+                        # and the archived row's synthesized id must match the
+                        # live feeds' so the viewer keys cards the same way.
+                        "uuid": _entry_id(entry),
+                        "role": _entry_role(entry),
                         "ts": entry.get("timestamp"),
                         "text": text or "",
                         "blocks": blocks or [],
@@ -3416,6 +9448,89 @@ class SessionManager:
         except Exception as e:
             log(f"github refresh failed: {e}")
             self.github = {"available": False, "login": None, "repos": []}
+        self.refresh_git_sources()
+
+    def refresh_git_sources(self):
+        """Refresh the extra clone sources' listings (XERK-155), on the same
+        cadence as the gh sweep. Keep-last-good per source: a failed sweep
+        records the error but leaves the previous repos standing — a transient
+        must not blank the board's uncloned candidates (the same reason
+        _refresh_triage_candidates only updates from a successful gh sweep)."""
+        collectors = {"azure": collect_azure_repos, "gitlab": collect_gitlab_repos}
+        for src, state in self.git_sources.items():
+            try:
+                state["repos"] = collectors[src]()
+                state["available"] = True
+                state["error"] = None
+            except Exception as e:
+                state["error"] = str(e)[:200]
+                log(f"{src} repo listing failed: {e}")
+
+    def _git_sources_payload(self):
+        """The heartbeat's `gitSources` block (XERK-155): the EXTRA clone
+        sources beyond GitHub — clients render the legacy `github` block as the
+        GitHub section and append these, so the repo list is never carried
+        twice. cloneUrl is stripped: the hub and clients identify a repo by
+        (source, nameWithOwner) and the agent re-resolves the URL from its own
+        cached listing at clone time, so no URL ever round-trips."""
+        labels = {"azure": normalize_azure_site(AZDO_URL) or "Azure DevOps",
+                  "gitlab": gitlab_host() or "GitLab"}
+        users = {"azure": AZDO_USER or None, "gitlab": None}
+        out = []
+        for src in ("azure", "gitlab"):
+            state = self.git_sources.get(src)
+            if not state:
+                continue
+            out.append({
+                "source": src, "label": labels[src],
+                "available": bool(state.get("available")),
+                "user": users[src], "error": state.get("error"),
+                "repos": [
+                    {k: v for k, v in dict(r, source=src).items()
+                     if k != "cloneUrl"}
+                    for r in state.get("repos") or []],
+            })
+        return out
+
+    def _resolve_clone_source(self, spec, source=None):
+        """Resolve a requested repo to (source, listing entry): the exact
+        (source, nameWithOwner) the UI's picker sent, or a bare nameWithOwner
+        from an older hub / the triage ledger — searched github first (the
+        legacy meaning of a bare owner/repo), then each extra source in a fixed
+        order so a cross-source name collision resolves deterministically.
+        (None, None) when nothing in the cached listings matches."""
+        spec = (spec or "").strip().strip("/")
+        if spec.endswith(".git"):
+            spec = spec[:-len(".git")]
+        order = [source] if source else ["github", "azure", "gitlab"]
+        for src in order:
+            if src == "github":
+                for r in (self.github or {}).get("repos") or []:
+                    if r.get("nameWithOwner") == spec:
+                        return "github", r
+            else:
+                for r in (self.git_sources.get(src) or {}).get("repos") or []:
+                    if r.get("nameWithOwner") == spec:
+                        return src, r
+        return None, None
+
+    def refresh_jira(self):
+        """Refresh the cached assigned-tickets block from the configured source
+        (Jira or Azure DevOps). Fail-open the pr_status way, not the github-block
+        way: a fetch error KEEPS the prior tickets/fetchedAt and only records the
+        error string, so a transient hiccup degrades the board to stale-but-shown
+        (with the error surfaced) rather than blanking it until the next slow beat."""
+        try:
+            self.jira = collect_board()
+        except Exception as e:
+            log(f"board refresh failed: {e}")
+            prev = dict(self.jira)
+            prev["error"] = _board_error_summary(e)
+            self.jira = prev
+        # Re-stamp cached repo guesses onto the freshly-collected tickets: a
+        # collect_jira() builds new ticket dicts, so without this every beat that
+        # refreshed would blank the board's repo chips until the next triage.
+        self._apply_triage()
 
     def refresh_pr_status(self):
         """Refresh cached state + CI checks for the PRs live sessions opened, via
@@ -3424,7 +9539,13 @@ class SessionManager:
         PR_STATUS_MAX so a host with many PRs never stalls the beat), but a
         stopped session keeps its last-known status — cache entries are pruned
         only when NO session (running or not) references them anymore, so a
-        killed session's card still shows the merged/closed state it reached."""
+        killed session's card still shows the merged/closed state it reached.
+
+        "No session" spans the closed history too: a killed session is dropped
+        from the registry but keeps its own `prUrls` snapshot (_remember_closed),
+        and the hub's Ended-sessions view renders those chips. Without counting
+        them as referenced, the very act of killing a session would evict the PR
+        status its ended card is about to show."""
         if not self.github.get("available"):
             return
         referenced, wanted, seen = set(), [], set()
@@ -3437,13 +9558,31 @@ class SessionManager:
                 if url not in seen:
                     seen.add(url)
                     wanted.append(url)
+        # Closed records are never re-polled — same rule as a stopped session,
+        # whose last-known status is what its card has always shown.
+        for rec in self.closed:
+            referenced.update(rec.get("prUrls") or [])
+        # Every ledgered PR too: an ended session aged out of closed.json is
+        # reported only through the resumable scan, which reads its links from
+        # the ledger — so its last-known status has to survive this sweep the
+        # same way a killed session's does, or its ended card shows a bare link.
+        for entry in self.pr_ledger.values():
+            referenced.update((entry or {}).get("urls") or [])
+        changed = False
         for url in list(self.pr_status_cache):
             if url not in referenced:
                 del self.pr_status_cache[url]
+                changed = True
         for url in wanted[:PR_STATUS_MAX]:
             st = pr_status(url)
             if st is not None:
                 self.pr_status_cache[url] = st
+                changed = True
+        # Persist the refreshed status so the pill survives a restart. An ended
+        # session's PR is never re-polled, so without this its state/CI degrades
+        # to a bare link the moment the in-memory cache is lost.
+        if changed:
+            self._save_pr_status_ledger()
 
     def _session_prs(self, sid):
         """The PR-status objects for a session's known PR links, newest last
@@ -3455,60 +9594,157 @@ class SessionManager:
             return None
         return [self.pr_status_cache.get(u) or {"url": u} for u in urls]
 
-    def clone(self, repo_spec):
-        """Clone a GitHub repo into REPOS_ROOT so it joins the scanned repo list.
+    def _poll_pr_comments(self):
+        """Deliver new PR review activity into the RUNNING session that opened
+        the PR (XERK-49): a reply asking for corrections is typed into that
+        session so the agent continues the work, with no operator relaying it.
+
+        Only running sessions, only their OWN PRs (`session_pr_urls`, the same
+        map the status pill reads). Delivery goes through send_input, so it
+        inherits the whole compose path — the compaction-survival outbox
+        (XERK-47) if the message lands mid-turn, and the queue if a turn is in
+        flight — exactly like an operator typing the correction by hand.
+
+        Each PR carries a per-session `prCommentBase` seen-key set. The FIRST
+        time a PR is seen its whole current comment set is baselined silently:
+        the session shouldn't re-litigate history (or, on the beat this feature
+        deploys, every existing comment on every open PR). After that, only keys
+        that are NEW *and* not the agent's own writing are delivered. The
+        session's own comments are still folded into the seen-set so they are
+        never mistaken for someone else's on a later beat.
+
+        Best-effort and bounded: skipped without a gh login, capped at
+        PR_COMMENTS_MAX PRs per beat, and a fetch failure leaves that PR's
+        baseline untouched (a gh error is not evidence the comments vanished)."""
+        if not PR_COMMENTS_DELIVER or not self.github.get("available"):
+            return
+        self_login = self.github.get("login") or ""
+        polled = 0
+        for sess in self.registry:
+            if sess.get("status") != "running":
+                continue
+            urls = self.session_pr_urls.get(sess["id"]) or []
+            if not urls:
+                continue
+            base = sess.get("prCommentBase")
+            if not isinstance(base, dict):
+                base = {}
+            changed = False
+            for url in urls:
+                if polled >= PR_COMMENTS_MAX:
+                    break
+                polled += 1
+                events = _pr_comment_events(url, self_login)
+                if events is None:
+                    continue                       # fetch failed — keep baseline
+                seen = set(base.get(url) or [])
+                first = url not in base
+                fresh = [e for e in events
+                         if e["key"] not in seen and not e["is_self"]]
+                # Fold EVERY current key (self-authored included) into the seen
+                # set — a first sighting baselines them all; later beats only add
+                # the newcomers. Cap newest-kept so a chatty PR can't grow it
+                # without bound.
+                keys = [e["key"] for e in events]
+                merged = list(seen) + [k for k in keys if k not in seen]
+                base[url] = merged[-PR_COMMENTS_SEEN_MAX:]
+                changed = True
+                if first or not fresh:
+                    continue
+                msg = _pr_comment_message(url, fresh)
+                if msg:
+                    self.send_input(sess["id"], msg)
+            if changed:
+                sess["prCommentBase"] = base
+                self.save()
+
+    def clone(self, repo_spec, source=None):
+        """Clone a repo into REPOS_ROOT so it joins the scanned repo list.
 
         Launched as a DETACHED subprocess and reaped by _poll_clones on later
         beats — `git clone` can take minutes and must never block the heartbeat
-        loop (a blocked loop would make the hub mark the host offline). The spec
-        is validated to a bare owner/repo first; the dest is that repo name
-        directly under REPOS_ROOT and must not already exist. Auth (private
-        repos) rides the system git credential helper (`gh auth git-credential`,
-        configured in the image)."""
+        loop (a blocked loop would make the hub mark the host offline).
+
+        The spec is resolved against the cached source listings first
+        (_resolve_clone_source), so a listed Azure DevOps or GitLab repo clones
+        from the URL its own API reported — never one built from the request.
+        Anything unlisted falls back to the legacy free-text GitHub path,
+        validated to a bare owner/repo. Auth: GitHub rides the system git
+        credential helper (`gh auth git-credential`), Azure DevOps the
+        extraHeader wired at boot (--wire-azure-git), GitLab the host's mounted
+        ~/.ssh key (its listing URLs are ssh). The dest is the repo name
+        directly under REPOS_ROOT and must not already exist."""
         raw = (repo_spec or "").strip()
-        try:
-            owner_repo = normalize_github_repo(raw)
-        except ValueError as e:
+        src, entry = self._resolve_clone_source(raw, source)
+        if entry:
+            name = entry["name"]
+            url = (f"https://github.com/{entry['nameWithOwner']}.git"
+                   if src == "github" else entry.get("cloneUrl"))
+            repo_id = entry["nameWithOwner"]
+        elif source and source != "github":
+            # An explicit non-GitHub source has no free-text form: the clone
+            # URL only exists in that source's listing, so an unlisted repo is
+            # a refusal, not a guess.
             key = slugify(raw) or "clone"
             self.clones[key] = {
-                "name": key, "repo": raw, "status": "error", "error": str(e),
+                "name": key, "repo": raw, "status": "error",
+                "error": f"{raw!r} is not in the {source} repo listing",
                 "startedAt": now_iso(), "startedMono": time.time(),
                 "proc": None, "logf": None, "logPath": None,
             }
-            log(f"clone refused: {e}")
+            log(f"clone refused: {raw!r} not listed for source {source!r}")
             return
-        name = owner_repo.split("/")[1]
-        dest = os.path.join(REPOS_ROOT, name)
+        else:
+            try:
+                repo_id = normalize_github_repo(raw)
+            except ValueError as e:
+                key = slugify(raw) or "clone"
+                self.clones[key] = {
+                    "name": key, "repo": raw, "status": "error", "error": str(e),
+                    "startedAt": now_iso(), "startedMono": time.time(),
+                    "proc": None, "logf": None, "logPath": None,
+                }
+                log(f"clone refused: {e}")
+                return
+            src = "github"
+            name = repo_id.split("/")[1]
+            url = f"https://github.com/{repo_id}.git"
         job = {
-            "name": name, "repo": owner_repo, "status": "cloning", "error": None,
-            "startedAt": now_iso(), "startedMono": time.time(),
+            "name": name, "repo": repo_id, "status": "cloning", "error": None,
+            "source": src, "startedAt": now_iso(), "startedMono": time.time(),
             "proc": None, "logf": None,
             "logPath": os.path.join(REGISTRY_DIR, f"clone-{slugify(name)}.log"),
         }
         self.clones[name] = job
+        dest = os.path.join(REPOS_ROOT, name)
         if os.path.exists(dest):
             job["status"] = "error"
             job["error"] = f"'{name}' already exists under the repos root"
             job["startedMono"] = time.time()
             log(f"clone refused: {job['error']}")
             return
-        url = f"https://github.com/{owner_repo}.git"
+        # Headless: never let git or ssh sit on a prompt — a missing credential
+        # or unknown host key should fail fast into the job's error, which the
+        # UI shows, rather than hang until CLONE_TIMEOUT_SEC reaps it.
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        if url.startswith(("git@", "ssh://")):
+            env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             logf = open(job["logPath"], "w")
             proc = subprocess.Popen(
                 ["git", "clone", "--", url, dest],
-                stdout=logf, stderr=subprocess.STDOUT,
+                stdout=logf, stderr=subprocess.STDOUT, env=env,
             )
         except Exception as e:
             job["status"] = "error"
             job["error"] = str(e)
             job["startedMono"] = time.time()
-            log(f"clone launch failed for {owner_repo}: {e}")
+            log(f"clone launch failed for {repo_id}: {e}")
             return
         job["proc"] = proc
         job["logf"] = logf
-        log(f"cloning {owner_repo} into {dest}")
+        log(f"cloning {repo_id} ({src}) into {dest}")
 
     def _clone_log_tail(self, job):
         try:
@@ -3569,22 +9805,25 @@ class SessionManager:
         return [
             {"name": j.get("name"), "repo": j.get("repo"),
              "status": j.get("status"), "error": j.get("error"),
-             "startedAt": j.get("startedAt")}
+             "source": j.get("source"), "startedAt": j.get("startedAt")}
             for j in self.clones.values()
         ]
 
     # --- session activity summaries ----------------------------------------
 
     def _start_summary(self, sess, prompt):
-        """Kick off a one-shot `claude -p` (Haiku) to name a session from its
-        initial prompt, as a DETACHED subprocess reaped by _poll_summaries.
-        No-op when there's no prompt to summarize (bare spawns, repos-root).
-        Best-effort: any launch failure just leaves the session unnamed."""
+        """Kick off a `claude -p` (Haiku) to name a session from its initial
+        prompt, as a DETACHED subprocess reaped by _poll_summaries. No-op when
+        there's no prompt to summarize (bare spawns, repos-root) — that costs no
+        attempt, since there was nothing to name yet. Best-effort: a launch
+        failure spends an attempt and schedules the next one, so a transient
+        failure doesn't leave the session unnamed for good."""
         prompt = (prompt or "").strip()
         if not prompt:
             return
         sid = sess["id"]
         out_path = os.path.join(REGISTRY_DIR, f"summary-{slugify(sid)}.out")
+        outf = None
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             outf = open(out_path, "w")
@@ -3600,21 +9839,43 @@ class SessionManager:
             )
         except Exception as e:
             log(f"summary launch failed for {sid}: {e}")
+            if outf is not None:
+                try:
+                    outf.close()
+                except Exception:
+                    pass
+            self._spend_summary_attempt(sess)
             return
         self.summaries[sid] = {
             "proc": proc, "outf": outf, "outPath": out_path,
             "startedMono": time.time(),
         }
-        # One-shot: mark that this session has had its (only) naming attempt, so
-        # the first-typed-prompt path in send_input never re-summarizes — even if
-        # this attempt yields no name (shared-login rate limits, #summary).
-        sess["summaryStarted"] = True
-        log(f"summarizing session {sid} via claude -p ({SESSION_SUMMARY_MODEL})")
+        self._spend_summary_attempt(sess)
+        attempts = _summary_attempts(sess)
+        log(f"summarizing session {sid} via claude -p ({SESSION_SUMMARY_MODEL}), "
+            f"attempt {attempts}/{SUMMARY_MAX_ATTEMPTS}")
+
+    def _spend_summary_attempt(self, sess):
+        """Count a naming attempt against a session and arm the backoff for the
+        next one. Persisted, so a manager restart mid-attempt can neither lose the
+        count (and retry forever) nor skip the retries still owed."""
+        sess["summaryAttempts"] = _summary_attempts(sess) + 1
+        sess["summaryStarted"] = True  # kept for older readers of the registry
+        # Armed up-front rather than on failure: if the manager dies while this
+        # attempt is in flight the job is lost with it, and the backoff is what
+        # makes the reload retry once instead of immediately.
+        sess["summaryRetryAt"] = (
+            time.time() + SUMMARY_RETRY_BACKOFF_SEC * sess["summaryAttempts"]
+        )
+        self.save()
 
     def _finish_summary(self, sid, job, summary):
         """Tear down a summary job's file handle + temp output and, if we got a
         name, store it on the session record (persisted so it survives beats,
-        restarts, and resume)."""
+        restarts, and resume). With no name, leave the session for the retry the
+        attempt counter still owes it (_seed_summaries picks it back up once the
+        backoff elapses) — an empty reply, a nonzero exit or a rate limit is a
+        property of the attempt, not of the session."""
         try:
             if job.get("outf"):
                 job["outf"].close()
@@ -3629,10 +9890,20 @@ class SessionManager:
         sess = self._find(sid)
         if sess is None:
             return  # killed/deleted while summarizing — nothing to name
+        if sess.get("summaryManual"):
+            return  # operator renamed it mid-flight; their name wins
         if summary:
             sess["summary"] = summary
+            sess.pop("summaryRetryAt", None)
             self.save()
             log(f"named session {sid}: {summary!r}")
+            return
+        attempts = _summary_attempts(sess)
+        if attempts >= SUMMARY_MAX_ATTEMPTS:
+            log(f"giving up naming session {sid} after {attempts} attempts")
+        else:
+            log(f"summary attempt {attempts} for {sid} produced no name; "
+                f"retrying in ~{SUMMARY_RETRY_BACKOFF_SEC * attempts}s")
 
     def _seed_summaries(self):
         """Name any running, still-unnamed session from the first user message in
@@ -3644,18 +9915,24 @@ class SessionManager:
         which goes straight to the tmux pane and never reaches send_input — so the
         send_input trigger alone never fires for the most common flow. Reading the
         transcript catches the first prompt no matter how it was entered (terminal,
-        glasses/compose-bar input, or a resumed session). One-shot per session,
-        gated exactly like the send_input path (`summary`/`summaryStarted`/in-flight)
-        so it launches `claude -p` at most once; until a first prompt lands it just
-        finds nothing and retries next beat, and once a name is set it's skipped."""
+        glasses/compose-bar input, or a resumed session).
+
+        This is also where a failed naming attempt gets retried, for a session
+        spawned WITH an initial prompt just as much as a bare one: the transcript
+        holds that same first prompt, so re-reading it is all a retry needs. Gated
+        by _summary_due (unnamed + attempts left + past the backoff) plus the
+        in-flight check, so at most SUMMARY_MAX_ATTEMPTS `claude -p` calls ever run
+        for a session and they stay spaced out. Until a first prompt lands it finds
+        nothing, spends no attempt, and looks again next beat."""
+        now = time.time()
         for sess in self.registry:
             if sess.get("status") != "running":
                 continue
-            if sess.get("summary") or sess.get("summaryStarted"):
+            if not _summary_due(sess, now):
                 continue
             if sess["id"] in self.summaries:
                 continue
-            path = _newest_transcript_path(sess["worktreePath"])
+            path = _session_transcript_path(sess)
             if not path:
                 continue
             text = _first_user_text(path)
@@ -3685,7 +9962,127 @@ class SessionManager:
                         raw = f.read()
                 except OSError:
                     raw = None
+            else:
+                log(f"summary for {sid} exited {rc}")
             self._finish_summary(sid, job, clean_summary(raw))
+
+    # --- available-models probe --------------------------------------------
+
+    def _start_models_probe(self):
+        """Kick off the `claude -p "/model"` probe (see parse_model_probe) as a
+        DETACHED subprocess reaped by _poll_models_probe — the same shape as the
+        summary/triage helpers: cwd=REGISTRY_DIR (its transcript is internal
+        overhead, tombstoned off the usage page), no --settings, argv list.
+        No-op while one is already in flight."""
+        if self.models_probe:
+            return
+        out_path = os.path.join(REGISTRY_DIR, "models-probe.out")
+        outf = None
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            outf = open(out_path, "w")
+            proc = subprocess.Popen(
+                ["claude", "-p", MODEL_PROBE_PROMPT],
+                stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+            )
+        except Exception as e:
+            log(f"models probe launch failed: {e}")
+            if outf is not None:
+                try:
+                    outf.close()
+                except Exception:
+                    pass
+            return
+        self.models_probe = {"proc": proc, "outf": outf, "outPath": out_path,
+                             "startedMono": time.time()}
+
+    def _poll_models_probe(self):
+        """Reap a finished models probe: parse its output into models_info, or
+        log and leave the previous read standing (an unparseable/failed run is a
+        property of the attempt — never downgrade a good list over it). Kills a
+        probe that overran its timeout, like _poll_summaries."""
+        job = self.models_probe
+        if not job:
+            return
+        proc = job.get("proc")
+        rc = proc.poll() if proc else 1
+        if rc is None:
+            if time.time() - job.get("startedMono", 0) > MODELS_PROBE_TIMEOUT_SEC:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                log("models probe timed out")
+                self._finish_models_probe(job, None)
+            return
+        raw = None
+        if rc == 0:
+            try:
+                with open(job.get("outPath") or "", errors="replace") as f:
+                    raw = f.read()
+            except OSError:
+                raw = None
+        else:
+            log(f"models probe exited {rc}")
+        self._finish_models_probe(job, raw)
+
+    def _finish_models_probe(self, job, raw):
+        try:
+            if job.get("outf"):
+                job["outf"].close()
+        except Exception:
+            pass
+        try:
+            os.unlink(job.get("outPath") or "")
+        except OSError:
+            pass
+        self.models_probe = None
+        parsed = parse_model_probe(raw) if raw else None
+        if parsed:
+            self.models_info = {**parsed, "at": now_iso()}
+            log(f"models probe: {', '.join(parsed['available'])}"
+                + (f" (default {parsed['defaultLabel']})"
+                   if parsed.get("defaultLabel") else ""))
+        elif raw is not None:
+            log("models probe output unparseable; keeping previous list")
+
+    def models_available(self):
+        """The probed alias list, or () before the first successful probe —
+        the `extra` allowlist resolve_model/set_model accept beyond the static
+        MODEL_ALIASES."""
+        return tuple((self.models_info or {}).get("available") or ())
+
+    def _seed_model_actual(self, sess):
+        """One-shot: the newest actual-model signal already IN a session's
+        transcript, for a record that predates the field (the per-beat scan
+        primes to EOF, so history never replays through it). Bounded to the
+        transcript's last 64 KiB — an assistant turn sits within that in any
+        conversation that has one."""
+        path = _session_transcript_path(sess)
+        if not path:
+            return None
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - (64 << 10)))
+                raw = f.read()
+        except OSError:
+            return None
+        tmp = {"modelActual": None}
+        # Skip the first fragment of a mid-entry start; fold the rest in order
+        # so the newest signal wins, exactly like the live scan.
+        lines = raw.split(b"\n")
+        for line in (lines[1:] if size > (64 << 10) else lines):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                _scan_model_entry(entry, tmp)
+        return tmp["modelActual"]
 
     # --- prune merged branches + safe worktrees ----------------------------
 
@@ -3819,8 +10216,20 @@ class SessionManager:
     # --- boot auto-resume --------------------------------------------------
 
     def resume_on_boot(self):
-        """Relaunch running sessions whose worktree survived — continuing their
-        prior conversation, not a fresh context; demote the rest."""
+        """Bring running sessions back under management. Two paths:
+
+        * ADOPT — the session's claude tmux is STILL ALIVE. tmux is its own
+          daemon, so it (and the running claude, mid-turn included) survives a
+          restart of just THIS manager process — the native in-place-update case
+          (systemd KillMode=process, or a manager-only kill). Re-launching would
+          `tmux kill-session` the live claude and abort its turn, so instead we
+          leave it untouched and only re-ensure the ttyd bridge. This is what lets
+          an agent update itself without stopping active sessions.
+        * RELAUNCH — the tmux is gone (the whole process tree died, e.g. a Docker
+          container restart, a host reboot, or a crash). Then we relaunch with
+          --resume, continuing the prior CONVERSATION (not a fresh context).
+
+        Either way, a session whose worktree vanished is demoted to stopped."""
         for sess in self.registry:
             if sess.get("status") != "running":
                 continue  # stopped stays stopped (kept for usage; resumable)
@@ -3830,6 +10239,13 @@ class SessionManager:
                 log(f"resume: worktree gone for {sess['id']}, marking stopped")
                 continue
             try:
+                if self._tmux_alive(sess.get("tmuxName")):
+                    # Adopt: claude keeps running; just re-ensure the ttyd (adopts
+                    # a surviving one by port, else relaunches). No launch stagger
+                    # — nothing contends on the shared login, we started no claude.
+                    self._launch_ttyd(sess)
+                    log(f"adopted live session {sess['id']} on :{sess['ttydPort']}")
+                    continue
                 self._launch_tmux(sess, resume=True)
                 self._launch_ttyd(sess)
                 log(f"resumed session {sess['id']} on :{sess['ttydPort']}")
@@ -3866,7 +10282,11 @@ class SessionManager:
                         base_ref=cmd.get("baseRef"),
                         model=cmd.get("model"),
                         permission_mode=cmd.get("permissionMode"),
+                        cmd_id=cid,
                     )
+                elif ctype == "spawnTicket":
+                    self.spawn_ticket(cmd.get("issueKey"), cmd_id=cid,
+                                      model=cmd.get("model"))
                 elif ctype == "kill":
                     self.kill(cmd.get("sessionId"))
                 elif ctype == "start":
@@ -3877,11 +10297,20 @@ class SessionManager:
                     self.resume(cmd.get("sessionId"))
                 elif ctype == "resumeTranscript":
                     self.resume_transcript(
-                        cmd.get("transcriptId"), cmd.get("cwd"))
+                        cmd.get("transcriptId"), cmd.get("cwd"), cmd_id=cid)
+                elif ctype == "exportSession":
+                    self.export_session(
+                        cmd.get("sessionId"), cmd.get("migrationId"))
+                elif ctype == "importSession":
+                    self.import_session(cmd)
                 elif ctype == "delete":
                     self.delete(cmd.get("sessionId"))
                 elif ctype == "input":
                     self.send_input(cmd.get("sessionId"), cmd.get("text") or "")
+                elif ctype == "interrupt":
+                    self.interrupt(cmd.get("sessionId"))
+                elif ctype == "setSummary":
+                    self.set_summary(cmd.get("sessionId"), cmd.get("summary"))
                 elif ctype == "setModel":
                     self.set_model(cmd.get("sessionId"), cmd.get("model"))
                 elif ctype == "setMode":
@@ -3891,13 +10320,52 @@ class SessionManager:
                         cmd.get("sessionId"),
                         cmd.get("optionIndex"),
                         cmd.get("custom"),
+                        cmd.get("optionIndices"),
                     )
+                elif ctype == "answerPanePrompt":
+                    self.answer_pane_prompt(
+                        cmd.get("sessionId"), cmd.get("optionNumber"))
                 elif ctype == "history":
                     self._stage_history(cmd.get("sessionId"))
+                elif ctype == "subagentHistory":
+                    self._stage_subagent_history(
+                        cmd.get("sessionId"), cmd.get("agentType"), cmd.get("label"))
+                elif ctype == "jiraIssue":
+                    self._stage_jira_issue(cmd.get("issueKey"))
+                elif ctype == "setTicketStatus":
+                    self.set_board_status(
+                        cid, cmd.get("issueKey"), cmd.get("value"),
+                        cmd.get("category"))
+                elif ctype == "boardCreateMeta":
+                    self._stage_create_meta(cmd.get("project"))
+                elif ctype == "createTicket":
+                    self._stage_create_ticket(cmd)
+                elif ctype == "setJiraRepo":
+                    self.set_jira_repo(
+                        cmd.get("issueKey"), cmd.get("repo"),
+                        auto=bool(cmd.get("auto")), site_key=cmd.get("siteKey"))
                 elif ctype == "clone":
-                    self.clone(cmd.get("repo"))
+                    self.clone(cmd.get("repo"), source=cmd.get("source"))
                 elif ctype == "prune":
                     self.prune_repo(cmd.get("repo"))
+                elif ctype == "refreshJira":
+                    # The board's manual refresh. Re-checking configured() here
+                    # (the hub already targets configured hosts) keeps the
+                    # "unset env = zero Jira HTTP calls, ever" guarantee a
+                    # property of the agent rather than of hub-side targeting.
+                    # Runs inline like the scheduled poll it short-circuits, so
+                    # it costs the beat exactly what that poll already does, and
+                    # handle_commands' immediate follow-up beat carries the
+                    # fresh block straight back.
+                    if board_configured():
+                        self.refresh_jira()
+                elif ctype == "restartAgent":
+                    # The dashboard's "Restart agent" button (XERK-157). We only
+                    # arm a flag here — the actual exit happens in run_forever
+                    # once this command's ack has been delivered to the hub, so
+                    # the command is off the queue before we go and can't
+                    # re-fire on boot.
+                    self.request_restart()
                 else:
                     log(f"unknown command type {ctype!r} (cmdId {cid})")
             except Exception as e:
@@ -3998,7 +10466,7 @@ class SessionManager:
         shape identifies, read from the session's own recorded cwd (Claude Code
         stamps `cwd` on transcript entries). The cwd is the real, un-slugified
         working dir, so its final path segment names the repo far better than
-        the lossy project slug can (…/personal/ClaudeHUD -> "ClaudeHUD"). Splits
+        the lossy project slug can (…/personal/Widget -> "Widget"). Splits
         on both separators, since a shared ~/.claude login also carries the
         operator's own dev-machine sessions with Windows paths. Returns None when
         no entry within a bounded head-scan records a cwd."""
@@ -4016,15 +10484,136 @@ class SessionManager:
         name = re.split(r"[\\/]+", str(cwd).strip().rstrip("\\/"))[-1]
         return name or None
 
+    def _is_internal_tool_slug(self, slug):
+        """True when a PROJECTS_ROOT slug holds the manager's OWN internal
+        `claude -p` helper transcripts (session naming + Jira triage) rather than
+        a real coding session — see INTERNAL_TOOL_PROMPT_SIGS for why they leak
+        into ~/.claude/projects and must be kept off the usage page (XERK-27).
+
+        The REPOS_ROOT slug is never internal: it is the root pseudo-repo's
+        shared project dir, holding EVERY root session's transcript, and this
+        check reads only the newest one — a root session in which the operator
+        typed nothing but /model reads exactly like the models probe, and one
+        such transcript must not tombstone the whole root history (XERK-147).
+
+        Those helpers run with cwd=REGISTRY_DIR, so in production every one lands
+        under the registry dir's own slug — matched here directly, with no
+        transcript read. A test/verify harness that boots the manager against a
+        temp REGISTRY_DIR writes the identical one-shots into the SHARED
+        ~/.claude/projects under a different slug (…-tmp-hub-agent-mgr-<rand>),
+        so fall back to the prompt signature of the newest transcript, which is
+        path- and process-independent. This is the one carve-out to the usage
+        ledger's 'every transcript on the box counts' rule: the agent's own
+        overhead is not a repo."""
+        if slug == _project_slug(REPOS_ROOT):
+            return False
+        if slug == _project_slug(REGISTRY_DIR):
+            return True
+        proj = os.path.join(PROJECTS_ROOT, slug)
+        try:
+            files = [f for f in os.listdir(proj) if f.endswith(".jsonl")]
+        except OSError:
+            return False
+        if not files:
+            return False
+        newest = max(files,
+                     key=lambda f: os.path.getmtime(os.path.join(proj, f)))
+        newest_path = os.path.join(proj, newest)
+        first = _first_user_text(newest_path)
+        if _looks_like_internal_tool_prompt(first):
+            return True
+        # The models probe's prompt IS a slash command ("/model"), which
+        # _first_user_text deliberately skips — so its transcript has no genuine
+        # user text at all. Recognize it by its first (and only) command; a real
+        # session that OPENS with /model goes on to carry genuine prompts, which
+        # makes `first` non-None and keeps it counted.
+        return first is None and _first_command_name(newest_path) == MODEL_PROBE_PROMPT
+
+    def _sanitize_internal_tool_entries(self):
+        """Retire ledger entries that actually point at the manager's own internal
+        `claude -p` helper transcripts (see _is_internal_tool_slug). Earlier builds
+        adopted them as phantom repos on the usage page — ".turma", "hub-agent-mgr-*"
+        (XERK-27) — so flip any such surviving entry to an `internal` tombstone,
+        which repo_usage_report and _archive_manifest skip. Already-tombstoned
+        entries are passed over, so the signature read is paid at most once each
+        rather than every usage beat. Runs before _reconcile_orphan_transcripts,
+        which tombstones the same shape as it first encounters it."""
+        changed = False
+        for path, meta in list(self.usage_ledger.items()):
+            meta = meta or {}
+            if meta.get("internal"):
+                continue
+            slug = meta.get("slug") or _project_slug(path)
+            # Cheap outs before the per-entry transcript read: a recorded git
+            # remote or a worktree-shaped slug is a real session beyond doubt — the
+            # manager's cwd=REGISTRY_DIR helpers are neither — so only genuinely
+            # ambiguous (remote-less, non-worktree) entries pay the signature read,
+            # and it's paid at most once each (the survivor becomes a tombstone).
+            if meta.get("remote") or _repo_from_worktree_slug(slug):
+                continue
+            if self._is_internal_tool_slug(slug):
+                self.usage_ledger[path] = {"internal": True, "slug": slug}
+                changed = True
+        if changed:
+            self._save_ledger()
+
+    def _sanitize_junk_repo_entries(self):
+        """Fold ledger entries whose repo names nothing real into the root
+        bucket (XERK-147). Earlier builds attributed an orphan transcript by its
+        worktree-shaped slug or its cwd's last path segment UNVALIDATED, so the
+        usage page grew phantom repos: "<worktree>-…-scratchpad" (a claude run
+        inside a session's scratchpad dir, whose slugified cwd embeds
+        "-worktrees-" and false-matches _repo_from_worktree_slug), "tmp",
+        "repo", "repos", "root", "(other)". A stored name now only stands when
+        the entry records a git remote (a real repo beyond doubt, even if since
+        deleted from this host) or names a repo this host scans; anything else
+        is re-attributed to ROOT_REPO_NAME, per the rule that usage belongs to
+        a repo or to root — never to a phantom.
+
+        Also lifts an `internal` tombstone off the REPOS_ROOT slug: before
+        _is_internal_tool_slug's root guard, one /model-only root session
+        tombstoned the whole root history, and the tombstone persists until
+        retired here.
+
+        Skipped entirely when the repo scan comes back empty — an unreadable
+        REPOS_ROOT (or a fresh box) must not permanently fold every real repo's
+        history into root."""
+        known = {r["name"] for r in scan_repos()}
+        if not known:
+            return
+        root_slug = _project_slug(REPOS_ROOT)
+        changed = False
+        for path, meta in list(self.usage_ledger.items()):
+            meta = meta or {}
+            slug = meta.get("slug") or _project_slug(path)
+            if meta.get("internal"):
+                if slug == root_slug:
+                    self.usage_ledger[path] = {
+                        "repo": ROOT_REPO_NAME, "remote": "", "slug": slug}
+                    changed = True
+                continue
+            repo = meta.get("repo")
+            if repo == ROOT_REPO_NAME or repo in known or meta.get("remote"):
+                continue
+            self.usage_ledger[path] = {
+                "repo": ROOT_REPO_NAME, "remote": "", "slug": slug}
+            changed = True
+        if changed:
+            self._save_ledger()
+
     def _reconcile_orphan_transcripts(self):
         """Adopt EVERY transcript sitting in PROJECTS_ROOT that no ledger entry
-        covers, so persistent usage/cost reflects every session on disk — not
+        covers, so persistent token usage reflects every session on disk — not
         only sessions in the live registry or the last-5 closed history that
         _backfill_ledger sees. A session killed long ago (its card gone, its
         worktree maybe surviving) or one predating _remember_usage would
         otherwise silently drop out of the totals, since repo_usage_report only
-        folds slugs the ledger names. Nothing is excluded — an unattributable
-        transcript still counts under OTHER_REPO_NAME rather than being dropped.
+        folds slugs the ledger names. A REAL session is never excluded — an
+        unattributable one still counts, folded into the root bucket rather
+        than being dropped (XERK-147). The single carve-out is the manager's OWN
+        internal `claude -p` helper transcripts (_is_internal_tool_slug), which
+        are its overhead, not a repo; those are tombstoned so they never surface
+        on the usage page (XERK-27).
 
         Attribution, most precise first:
           1. slug matches a worktree still on disk -> exact repo + git remote,
@@ -4038,8 +10627,13 @@ class SessionManager:
           3. neither of those (a bare `claude` run, or the operator's own
              dev-machine session on the shared login) -> repo read from the
              transcript's recorded cwd (_repo_from_transcript_cwd).
-          4. still nothing (no cwd recorded) -> bucketed under OTHER_REPO_NAME
-             so it always counts.
+          4. still nothing -> bucketed under ROOT_REPO_NAME so it always counts.
+        Cases 2 and 3 only stand when the derived name matches a repo this host
+        scans: both are lossy heuristics, and unvalidated they invented phantom
+        repos on the usage page — a scratchpad cwd (/tmp/claude-0/<slugified
+        worktree cwd>/…) embeds "-worktrees-" once slugified and false-matches
+        the slug shape, and a cwd tail can be "tmp"/"repo"/"repos" (XERK-147).
+        A miss falls through to case 4 rather than minting a name.
         New entries are persisted and keyed so _prune_ledger removes them once
         the transcript dir finally disappears."""
         try:
@@ -4048,7 +10642,8 @@ class SessionManager:
             return
         known = {(m or {}).get("slug") or _project_slug(p)
                  for p, m in self.usage_ledger.items()}
-        existing = None  # built lazily — the listdirs aren't free
+        existing = None      # built lazily — the listdirs aren't free
+        repo_names = None    # likewise (a scan_repos listdir + .git checks)
         added = False
         for slug in names:
             proj = os.path.join(PROJECTS_ROOT, slug)
@@ -4058,6 +10653,17 @@ class SessionManager:
                 if not any(f.endswith(".jsonl") for f in os.listdir(proj)):
                     continue  # no transcript here — nothing to attribute
             except OSError:
+                continue
+            # The manager's own summary/triage `claude -p` is never worktree-shaped
+            # (its cwd is REGISTRY_DIR), so a worktree slug skips the signature read
+            # below and goes straight to attribution. A match is tombstoned — kept
+            # off usage + archive and, now in the ledger, never re-evaluated (it
+            # lands in `known` next beat).
+            if _repo_from_worktree_slug(slug) is None \
+                    and self._is_internal_tool_slug(slug):
+                self.usage_ledger[proj] = {"internal": True, "slug": slug}
+                known.add(slug)
+                added = True
                 continue
             if existing is None:
                 existing = self._existing_worktree_attrib()
@@ -4074,11 +10680,16 @@ class SessionManager:
                 known.add(slug)
                 added = True
                 continue
-            # slug shape (case 2), then the recorded cwd (case 3), then the
-            # catch-all (case 4) — either way it's adopted, nothing is dropped.
-            repo = (_repo_from_worktree_slug(slug)
-                    or self._repo_from_transcript_cwd(proj)
-                    or OTHER_REPO_NAME)
+            # slug shape (case 2), then the recorded cwd (case 3), each accepted
+            # only when it names a repo this host scans, then the root catch-all
+            # (case 4) — either way it's adopted, nothing is dropped.
+            if repo_names is None:
+                repo_names = {r["name"] for r in scan_repos()}
+            repo = _repo_from_worktree_slug(slug)
+            if repo not in repo_names:
+                repo = self._repo_from_transcript_cwd(proj)
+            if repo not in repo_names:
+                repo = ROOT_REPO_NAME
             remote = ""
             repo_dir = os.path.join(REPOS_ROOT, repo)
             if os.path.isdir(repo_dir):
@@ -4103,6 +10714,8 @@ class SessionManager:
         appended since the last beat) via _fold_slug, so it no longer re-reads
         every transcript from scratch."""
         self._backfill_ledger()
+        self._sanitize_internal_tool_entries()
+        self._sanitize_junk_repo_entries()
         self._reconcile_orphan_transcripts()
         self._prune_ledger()
         try:
@@ -4158,20 +10771,55 @@ class SessionManager:
             try:
                 st = self.sess_state.setdefault(sid, {})
                 signals = session_report(sess["worktreePath"], st, sess.get("tmuxName"),
-                                         session_id=sess.get("id"))
+                                         session_id=sess.get("id"),
+                                         claude_sid=sess.get("claudeSessionId"))
                 pend = self.pending_prs.setdefault(sid, [])
                 pend.extend(signals.pop("prUrls"))
                 del pend[:-10]
                 signals["newPrUrls"] = list(pend)
                 # Also remember them persistently: pending_prs is cleared on the
                 # next delivered beat, so the durable PR-status feature reads from
-                # session_pr_urls instead (deduped, newest-last, capped).
+                # session_pr_urls instead (deduped, newest-last, capped). Mirror
+                # the same list onto the session record and save when it grows, so
+                # the chips survive an agent restart (rehydrated in __init__) —
+                # not just across beats. (XERK-15)
                 if pend:
                     known = self.session_pr_urls.setdefault(sid, [])
+                    grew = False
                     for url in pend:
                         if url not in known:
                             known.append(url)
+                            grew = True
                     del known[:-10]
+                    if grew:
+                        sess["prUrls"] = list(known)
+                        self.save()
+                    # Also record to the durable transcriptId-keyed PR ledger.
+                    # sess["prUrls"] above (XERK-15) only survives while the
+                    # registry record does; the ledger is what carries the chips
+                    # into a session's ENDED life — reported then only by the
+                    # resumable scan, past closed.json's cap. (XERK-13)
+                    self._remember_prs(sess)
+                # The model that actually answered (or a live /model switch's
+                # confirmation), persisted on the record so the chip survives
+                # beats and restarts. The per-beat scan only sees new bytes, so
+                # a record predating the field seeds once from the tail.
+                actual = signals.pop("modelActual", None)
+                if (not actual and not sess.get("modelActual")
+                        and sid not in self._model_seeded):
+                    actual = self._seed_model_actual(sess)
+                self._model_seeded.add(sid)
+                if actual and actual != sess.get("modelActual"):
+                    sess["modelActual"] = actual
+                    self.save()
+                # Reconcile the stored permission mode to the one the TUI's
+                # footer really shows (the operator can cycle by hand in the
+                # live terminal, which no command ever reports) — so the mode
+                # chip, and any restart's --permission-mode, follow the truth.
+                ma = signals.get("modeActual")
+                if ma and ma != sess.get("permissionMode"):
+                    sess["permissionMode"] = ma
+                    self.save()
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
@@ -4186,11 +10834,39 @@ class SessionManager:
             "rcName": sess["rcName"],
             "restartCount": sess.get("restartCount", 0),  # bumps on clear-context restart
             "label": sess.get("label"),
-            "summary": sess.get("summary"),   # few-word auto task name (or None)
+            "summary": sess.get("summary"),   # few-word task name (or None)
+            # The Jira ticket this session was spawned to work — {key, siteKey,
+            # url, summary, branch} — or None. The board reverse-indexes it to
+            # link a ticket to its sessions; the session card links back out.
+            "ticket": sess.get("ticket"),
+            # The hub command that created this session (spawn / resumeTranscript),
+            # so the UI that issued it can find the id the agent minted and open
+            # the session. None for sessions predating the echo, or restored ones.
+            "spawnCmdId": sess.get("spawnCmdId"),
             "model": sess.get("model"),
+            # The model REALLY answering, read from the transcript (a model id
+            # like "claude-opus-4-8", or a switch confirmation's display label
+            # like "Sonnet 5") — what the chat chip shows instead of "Default".
+            # None until the session's first assistant turn.
+            "modelActual": sess.get("modelActual"),
+            # A model pick that arrived mid-turn, waiting for the first idle
+            # beat (_apply_pending_switches). The chip shows it as in-flight
+            # rather than looking like a dropped click. Absent when none.
+            "pendingModel": sess.get("pendingModel"),
             "permissionMode": sess.get("permissionMode"),
+            # The permission modes this session's live Shift+Tab cycle can reach
+            # (base modes + whichever optional it was launched into) — the hub's
+            # mode selector offers only these, since a switch to any other mode is
+            # a no-op agent-side. Launch-dependent; see perm_cycle_for / set_mode.
+            "permissionModes": perm_cycle_for(sess.get("launchPermissionMode")),
             "baseRef": sess.get("baseRef"),
             "status": sess.get("status"),
+            # Why a `queued` session is waiting (capacity / awaiting-clone /
+            # root-busy) and since when — so the card can say "waiting for a
+            # slot" rather than looking like a stuck spawn. Absent (None) for any
+            # session that isn't queued.
+            "queuedReason": sess.get("queuedReason"),
+            "queuedAt": sess.get("queuedAt"),
             "ttydPort": sess.get("ttydPort"),
             "createdAt": sess.get("createdAt"),
             "stoppedAt": sess.get("stoppedAt"),
@@ -4205,13 +10881,32 @@ class SessionManager:
             # pr_status_cache). Kept even after the session stops, as long as the
             # session record survives. None until it opens a PR.
             "prs": self._session_prs(sid),
+            # Which conversation this session is having: the hub opens it
+            # read-only from the archive once the session has ENDED, and points
+            # the live tail at it (rather than at whatever shares its project
+            # dir) while it runs.
+            #
+            # Reported whether running or not. Free for a pinned session, which
+            # already knows its id; an unpinned one (an agent predating the pin)
+            # costs a listdir to guess at, and the hot path now pays that every
+            # beat on purpose. It's the id the hub's Ended list dedupes on, and a
+            # RUNNING session is the one case where a duplicate is intolerable:
+            # the durable side of that list is a transcript scan that's minutes
+            # stale by design, so without this there is nothing to recognise a
+            # just-resumed session by and it shows as running and ended at once.
+            #
+            # Deliberately not _session_transcript_id, which answers None until
+            # the file exists: the pinned id is the conversation this session
+            # WILL have, and the hub needs it before the first turn lands.
+            "transcriptId": (sess.get("claudeSessionId")
+                             or self._latest_transcript_id(sess["worktreePath"])),
             "session": signals,                      # running only; null otherwise
         }
 
     def _closed_payload(self):
-        """Killed-but-resumable sessions for the hub's per-repo Resume picker,
-        newest first. Already capped at CLOSED_PER_REPO per repo, so this can
-        never balloon the heartbeat."""
+        """Killed-but-resumable sessions for the hub's per-repo Resume picker and
+        its Ended-sessions list, newest first. Already capped at CLOSED_PER_REPO
+        per repo, so this can never balloon the heartbeat."""
         return [
             {
                 "id": c.get("id"),
@@ -4222,11 +10917,43 @@ class SessionManager:
                 "rcName": c.get("rcName"),
                 "label": c.get("label"),
                 "summary": c.get("summary"),
+                # Whether that summary is an operator's own rename rather than a
+                # generated name. Carried for the same reason the live payload
+                # carries it: it decides how the board labels this session's chip,
+                # and the label must not change just because the session was
+                # killed.
+                "summaryManual": c.get("summaryManual"),
                 "createdAt": c.get("createdAt"),
                 "closedAt": c.get("closedAt"),
+                # The Jira ticket this session was spawned to work. _remember_closed
+                # has always snapshotted it onto the record, but it never reached
+                # the wire, so the board — which reverse-indexes session.ticket to
+                # chip a ticket with its sessions — lost the link the moment the
+                # session was killed, and could only ever answer "which session is
+                # working PROJ-123", never "which one worked it".
+                "ticket": c.get("ticket"),
+                # The conversation this session had, so the Ended-sessions view
+                # can open it read-only from the hub's archive. Absent on records
+                # written by an agent predating the snapshot (see _remember_closed).
+                "transcriptId": c.get("transcriptId"),
+                # Its PRs, resolved through the same status cache a live card
+                # reads — so an ended session's chips carry the state/CI rollup
+                # they reached, not a bare link. None when it opened none, which
+                # matches the live payload's "no PRs" shape.
+                "prs": self._closed_prs(c),
             }
             for c in reversed(self.closed)
         ]
+
+    def _closed_prs(self, rec):
+        """PR-status objects for a closed record's snapshotted PR links, in the
+        order they were scraped — the closed-history counterpart of
+        _session_prs, reading the record instead of the live session_pr_urls
+        (which kill() drops). None when the session opened no PR."""
+        urls = rec.get("prUrls")
+        if not urls:
+            return None
+        return [self.pr_status_cache.get(u) or {"url": u} for u in urls]
 
     def _repo_activity(self):
         """repo-name -> newest session-activity ISO ts, the "used" half of the
@@ -4280,9 +11007,19 @@ class SessionManager:
         entries.sort(key=lambda e: e.get("lastActivity") or "", reverse=True)
         out = [root_repo_entry()] + entries
         # Attach each repo's resumable-session list (cached; refreshed on the slow
-        # cadence in _refresh_repo_usage) for the "Resume any session" picker.
+        # cadence in _refresh_repo_usage) for the "Resume any session" picker and
+        # the hub's Ended-sessions list.
+        #
+        # The cut against carded slugs is re-applied here, every beat, rather than
+        # trusted from the scan: the scan is minutes stale by design, so between
+        # refreshes it still lists a session that has since been resumed and is
+        # running right now. Reporting that would offer "Resume" for a live
+        # session and, on the hub, show it in both the Active and Ended lists at
+        # once. The registry is current every beat, so this is where the answer is.
+        carded = self._carded_slugs()
         for e in out:
-            e["resumable"] = self.resumable.get(e["name"], [])
+            e["resumable"] = [r for r in self.resumable.get(e["name"], [])
+                              if r.get("slug") not in carded]
         return out
 
     def _log_tail(self, beat, light):
@@ -4326,6 +11063,25 @@ class SessionManager:
         # gh calls); clone jobs are reaped every beat (cheap poll()s).
         if not light and beat % GITHUB_REFRESH_EVERY == 0:
             self.refresh_github()
+        # Assigned tickets (Jira or Azure DevOps) on their own slow cadence; the
+        # configured() guard keeps unconfigured hosts at zero board HTTP calls forever.
+        if not light and beat % JIRA_REFRESH_EVERY == 0 and board_configured():
+            self.refresh_jira()
+        # Ticket -> repo triage. Attempted every beat rather than on the slow jira
+        # cadence: it's one batch in flight at a time, so a freshly-polled board
+        # would otherwise take an hour of 10-minute beats to classify instead of a
+        # few minutes. Both calls no-op immediately on a settled board (nothing
+        # stale) and on an unconfigured host (no tickets), so the steady-state cost
+        # is a fingerprint check.
+        # Both halves are wrapped, not just the start: this runs on the heartbeat
+        # path of the PID-1 manager, and a repo chip is never worth taking the
+        # host's sessions down for.
+        if not light:
+            try:
+                self._poll_jira_triage()
+                self._start_jira_triage()
+            except Exception as e:
+                log(f"jira triage failed: {e}")
         # PR state + CI checks for the links live sessions opened, on a faster
         # cadence than the github block so a card's merge/CI status stays live.
         if not light and beat % PR_STATUS_REFRESH_EVERY == 0:
@@ -4333,8 +11089,22 @@ class SessionManager:
                 self.refresh_pr_status()
             except Exception as e:
                 log(f"pr status refresh failed: {e}")
+        # New review activity on a session's PR is typed back into that session
+        # so a reply asking for corrections continues the work (XERK-49). Own
+        # cadence + per-beat cap; wrapped, because a PR comment is never worth
+        # taking the host's sessions down for.
+        if not light and PR_COMMENTS_DELIVER and (
+                beat % PR_COMMENTS_REFRESH_EVERY == 0):
+            try:
+                self._poll_pr_comments()
+            except Exception as e:
+                log(f"pr comment poll failed: {e}")
         self._poll_clones()
         self._poll_prunes()
+        # Start any queued session that can now run — a freed slot, a finished
+        # on-demand clone, or the root slot opening. One per beat; see the method.
+        if not light:
+            self._drain_queue()
         # Drop AskUserQuestion rendezvous files left behind by a turn that died
         # outside our kill/restart cleanup, so a long-answered/abandoned question
         # can't keep showing as pending on the card.
@@ -4344,6 +11114,23 @@ class SessionManager:
         # reap any finished naming subprocess.
         self._seed_summaries()
         self._poll_summaries()
+        # Confirm recently-sent messages landed, and re-send any a compaction
+        # dropped (XERK-47). Cheap on a settled fleet — it short-circuits on any
+        # session with an empty outbox.
+        self._poll_pending_inputs()
+        # Probe the login's real model list on its own slow cadence (beat 0
+        # covers boot), retrying faster until the first success so the hub's
+        # model menu isn't a static guess for hours after a restart.
+        if not light and (beat % MODELS_REFRESH_EVERY == 0 or (
+                self.models_info is None and beat % MODELS_RETRY_EVERY == 0)):
+            self._start_models_probe()
+        self._poll_models_probe()
+        # Apply model switches deferred while their session was mid-turn.
+        if not light:
+            try:
+                self._apply_pending_switches()
+            except Exception as e:
+                log(f"pending switch drain failed: {e}")
 
         payload = {
             # `device` (the physical host name) is the hub's identity key; agentId
@@ -4351,10 +11138,26 @@ class SessionManager:
             "agentId": self.agent_id,
             "device": self.device,
             "startedAt": self.started_at,
+            "agentVersion": self.agent_version,
+            "codingAgent": self.coding_agent,
             "claudeVersion": self.claude_version,
+            # Health of the shared subscription login: present/needsLogin/
+            # expiringSoon + the refresh-token expiry the hub alerts on when the
+            # login lapses (XERK-98). Read fresh each beat — it's a tiny JSON
+            # read and this is the fact that decides whether sessions can run.
+            "claudeAuth": claude_auth_status(),
+            # The login's real model list + what "default" currently resolves
+            # to, from the models probe. None until the first successful probe;
+            # the hub's model menu falls back to its static list then.
+            "models": self.models_info,
             "memory": memory_usage(),
             "logTail": self._log_tail(beat, light),
             "reposRoot": REPOS_ROOT,
+            # Session ceiling + what's against it, so the hub can rank hosts by
+            # free slots (ticket routing) and show a queued session's wait. Cheap
+            # enough to send every beat, and it has to be: capacity is the fact
+            # that goes stale fastest.
+            "capacity": self._capacity_payload(),
             "repos": self._sorted_repo_entries(refresh),
             "sessions": [self._session_payload(s, refresh) for s in self.registry],
             "closedSessions": self._closed_payload(),
@@ -4366,6 +11169,13 @@ class SessionManager:
             # GitHub clone-into-root: availability + clonable repos for the hub's
             # clone control, and any in-flight/recent clone jobs.
             "github": self.github,
+            # Extra clone sources beyond GitHub (XERK-155): Azure DevOps /
+            # GitLab listings, rendered by clients as sections beside the
+            # github block's repos. [] on a host with neither configured.
+            "gitSources": self._git_sources_payload(),
+            # Jira Cloud assigned tickets (user-scoped creds); the hub's /board
+            # merges these across hosts by siteKey into one cross-org Kanban.
+            "jira": self._jira_payload(),
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),
@@ -4375,6 +11185,16 @@ class SessionManager:
         # something to report.
         if self.history_results:
             payload["historyResults"] = list(self.history_results)
+        if self.subagent_history_results:
+            payload["subagentHistoryResults"] = list(self.subagent_history_results)
+        if self.jira_issue_results:
+            payload["jiraIssueResults"] = list(self.jira_issue_results)
+        if self.ticket_status_results:
+            payload["ticketStatusResults"] = list(self.ticket_status_results)
+        if self.create_meta_results:
+            payload["createMetaResults"] = list(self.create_meta_results)
+        if self.create_ticket_results:
+            payload["createTicketResults"] = list(self.create_ticket_results)
         # Archive sync manifest on the slow cadence: the inactive transcripts the
         # hub could pull. Remember it by id so the reply's archiveHave cursors map
         # back to each one for the delta push (in run_forever).
@@ -4409,10 +11229,116 @@ class SessionManager:
                 reply = json.loads(resp.read().decode() or "{}")
             self._clear_pending_prs()  # delivered
             self.history_results.clear()  # delivered — same lifecycle
+            self.subagent_history_results.clear()  # delivered — same lifecycle
+            self.jira_issue_results.clear()  # delivered — same lifecycle
+            self.ticket_status_results.clear()  # delivered — same lifecycle
+            self.create_meta_results.clear()  # delivered — same lifecycle
+            self.create_ticket_results.clear()  # delivered — same lifecycle
             return reply if isinstance(reply, dict) else {}
         except Exception as e:
             log(f"heartbeat failed: {e}")
             return None
+
+    def _read_updating_flag(self):
+        """Consume the native updater's hint file (reason + target version) if it
+        left one just before triggering our restart. Returns (reason, version),
+        both None when absent/garbled — a container update leaves no file, so a
+        missing one just means a generic restart with no known version."""
+        try:
+            with open(UPDATING_FLAG_PATH) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return None, None
+        if not isinstance(d, dict):
+            return None, None
+        return d.get("reason"), d.get("version")
+
+    def _announce_updating(self, reason="restart", version=None):
+        """Tell the hub we're going down for an EXPECTED restart, so it renders an
+        `updating` status rather than treating the coming heartbeat silence as an
+        unexpected outage (XERK-29). Fire-and-forget with a short timeout: we're
+        on the shutdown path and must never block the exit if the hub is slow or
+        unreachable. The hub drops the status the instant we heartbeat from the
+        far side, so no one has to clear it."""
+        if not TURMA_URL:
+            return
+        try:
+            body = {"reason": reason or "restart"}
+            if version:
+                body["version"] = version
+            headers = {"Content-Type": "application/json", "User-Agent": "hub-agent/1.0"}
+            if TURMA_TOKEN:
+                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+            url = (f"{TURMA_URL}/api/agents/"
+                   f"{urllib.parse.quote(self.device, safe='')}/updating")
+            req = urllib.request.Request(
+                url, data=json.dumps(body).encode(), headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=UPDATING_ANNOUNCE_TIMEOUT_SEC) as resp:
+                resp.read()
+            log(f"announced updating to hub (reason={reason or 'restart'}"
+                f"{', v' + version if version else ''})")
+        except Exception as e:
+            log(f"updating announce failed (continuing shutdown): {e}")
+
+    def request_restart(self):
+        """Arm a dashboard-requested manager restart (restartAgent command). We
+        do NOT restart inline in handle_commands: run_forever calls
+        _restart_if_delivered once the ack for this command has reached the hub,
+        so the command leaves the queue before we exit and can't re-fire on the
+        next boot (a restart loop)."""
+        self._restart_pending = True
+        log("restartAgent: queued; will restart once the ack reaches the hub")
+
+    def _restart_if_delivered(self, delivered):
+        """Perform an armed restart, but only once `delivered` says a heartbeat
+        carrying the command's ack (in `ackedCommands`) reached the hub — which
+        means the hub has dropped the command from this host's queue. Exiting
+        before that risks the still-queued command re-firing on boot."""
+        if self._restart_pending and delivered:
+            self._restart_pending = False
+            self._perform_restart()
+
+    def _perform_restart(self):
+        """Bring the manager back the way a SIGTERM restart (XERK-29) does, but
+        triggered from the dashboard rather than the supervisor. Announce the
+        expected downtime so the coming heartbeat gap reads as `updating` (not an
+        outage), then hand off to whatever will restart us:
+
+        - **Under systemd** (`INVOCATION_ID` set) — a clean exit is enough;
+          `Restart=always` brings us back. KillMode=process keeps the sessions.
+        - **In a container** — likewise; Docker's restart policy recreates us
+          (there's no turma-agentctl to call).
+        - **Native without systemd** (turma-agentctl/nohup) — there is NO
+          supervisor to restart us on exit, so we relaunch through the ctl
+          script (detached so it outlives us). It SIGTERMs this manager, which
+          `_handle_shutdown` turns into the announce + exit, then starts a fresh
+          one that re-adopts the live sessions."""
+        self._announce_updating("restart")
+        under_systemd = bool(os.environ.get("INVOCATION_ID"))
+        ctl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "bin", "turma-agentctl")
+        if not under_systemd and os.path.isfile(ctl):
+            try:
+                subprocess.Popen([ctl, "restart"], start_new_session=True,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                log("restartAgent: handed off to turma-agentctl restart")
+                return  # the ctl script will SIGTERM us
+            except Exception as e:
+                log(f"restartAgent: turma-agentctl handoff failed ({e}); exiting")
+        log("restartAgent: exiting for the supervisor to restart us")
+        raise SystemExit(0)
+
+    def _handle_shutdown(self, signum, frame):
+        """SIGTERM/SIGINT: we're being stopped for a restart we can't heartbeat
+        through — a container recreate on an image update, or the native updater's
+        `systemctl restart`. Announce it as EXPECTED (XERK-29), then exit so the
+        supervisor (systemd / Docker) brings us back. Sessions survive natively
+        (KillMode=process) and are re-adopted on boot; a container recreate takes
+        the whole stack down, which is exactly the outage this status explains."""
+        reason, version = self._read_updating_flag()
+        self._announce_updating(reason or "restart", version)
+        raise SystemExit(0)
 
     def run_forever(self):
         log(
@@ -4425,6 +11351,12 @@ class SessionManager:
         # can poke; run_forever is the main thread, where signal handlers must
         # be set.
         signal.signal(signal.SIGUSR1, lambda *_: _poke.set())
+        # SIGTERM/SIGINT = the supervisor is restarting us (an update swapping
+        # files, or a container recreate). Announce it to the hub as an EXPECTED
+        # restart before we go silent (XERK-29), then exit for the supervisor to
+        # bring us back. Must be set on the main thread, like SIGUSR1 above.
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+        signal.signal(signal.SIGINT, self._handle_shutdown)
         self.resume_on_boot()
         beat = 0
         while True:
@@ -4434,6 +11366,10 @@ class SessionManager:
             _poke.clear()
             reply = self.post(self.build_payload(beat))
             beat += 1
+            # If a prior beat armed a restart but couldn't confirm its ack
+            # reached the hub, this successful beat just carried the ack
+            # (ackedCommands rides every payload), so it's now safe to restart.
+            self._restart_if_delivered(reply is not None)
             if reply is not None:
                 # Push archive deltas the hub asked for (byte cursors on the reply).
                 # Best-effort: a sync hiccup must never disrupt the beat loop.
@@ -4452,6 +11388,10 @@ class SessionManager:
                     beat += 1
                     if reply2 is not None:
                         self.handle_commands(reply2.get("commands"))
+                    # A restartAgent just acked this beat restarts here — the
+                    # follow-up heartbeat above delivered its ack, so we don't
+                    # wait a whole interval for the top-of-loop check.
+                    self._restart_if_delivered(reply2 is not None)
             # Interruptible sleep: returns immediately if a poke arrived, else
             # after the normal interval.
             _poke.wait(INTERVAL)
@@ -4467,6 +11407,25 @@ if __name__ == "__main__":
     # module-level boot logs that also land on stdout.
     if "--print-device" in sys.argv:
         print("DEVICE_NAME=" + device_name())
+        sys.exit(0)
+    if "--wire-azure-git" in sys.argv:
+        # entrypoint.sh calls this once at boot (as root, before the privilege
+        # drop, since it writes --system git config) so plain git can push to a
+        # non-GitHub Azure DevOps org using the PAT the board already has.
+        # Non-fatal and secret-safe: it logs the host, never the token, and any
+        # failure just leaves git unwired.
+        cfg = azure_git_auth_config()
+        if cfg:
+            key, value = cfg
+            try:
+                subprocess.run(["git", "config", "--system", key, value],
+                               check=True)
+                site = normalize_azure_site(AZDO_URL) or azure_base()
+                print(f"[entrypoint] git: Azure DevOps auth wired for {site} "
+                      "(http.extraHeader)")
+            except Exception as e:  # pragma: no cover - best effort
+                print(f"[entrypoint] git: Azure DevOps auth NOT wired ({e})",
+                      file=sys.stderr)
         sys.exit(0)
     try:
         main()

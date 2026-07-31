@@ -27,8 +27,7 @@ function loadCloneModule() {
     document: {
       getElementById: (id) => els.get(id) || null,
       querySelector: () => null,
-      // Back captureCloneScroll's `.clone-list` sweep with the fake registry.
-      querySelectorAll: (sel) => sel === ".clone-list" ? [...els.values()].filter((e) => e.__cloneList) : [],
+      querySelectorAll: () => [],
       addEventListener() {},
       get activeElement() { return null; },
       createElement: () => ({ style: {}, dataset: {}, classList: { add() {}, remove() {} }, setAttribute() {}, appendChild() {} }),
@@ -39,32 +38,34 @@ function loadCloneModule() {
     setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
     location: { pathname: "/", href: "" },
     matchMedia: () => ({ matches: false, addEventListener() {} }),
+    // The header's org filter (org.js) — a real dependency of the page now that
+    // every list is scoped by it. Stubbed as the identity scope ("all orgs"), so
+    // these tests see the whole fabricated fleet.
+    TurmaOrg: { get: () => "", filter: (a) => a || [], update() {}, subscribe() {}, sse() {} },
   };
   g.window = g; g.globalThis = g;
 
   // Expose the pieces we test and give the test a way to observe post()/render()
   // and seed `cache`, then evaluate under the stubs.
   const exportTail = `
-    ;globalThis.__clone = { cloneBar, clonePick, clonePickCount, cloneRepo, cloneSearch, cloneText, updateCloneButton, cloneToggle, captureCloneScroll, restoreCloneScroll, cloneDraft, cloneOpen, hostId };
+    ;globalThis.__clone = { cloneBar, cloneSources, clonePick, clonePickCount, cloneRepo, cloneSearch, cloneText, updateCloneButton, cloneToggle, cloneDraft, cloneOpen, hostId };
     globalThis.__setRender = (f) => { render = f; };
     globalThis.__setPost = (f) => { post = f; };
     globalThis.__setCache = (c) => { cache = c; };
   `;
   const fn = new Function(
     "localStorage", "document", "window", "EventSource", "fetch",
-    "setInterval", "clearInterval", "setTimeout", "clearTimeout", "location", "matchMedia", "globalThis",
+    "setInterval", "clearInterval", "setTimeout", "clearTimeout", "location", "matchMedia", "TurmaOrg", "globalThis",
     src + exportTail
   );
   fn(g.localStorage, g.document, g.window, g.EventSource, g.fetch,
-     g.setInterval, g.clearInterval, g.setTimeout, g.clearTimeout, g.location, g.matchMedia, g);
+     g.setInterval, g.clearInterval, g.setTimeout, g.clearTimeout, g.location, g.matchMedia, g.TurmaOrg, g);
 
   const api = g.__clone;
   const posts = [];
   g.__setRender(() => {});                       // suppress DOM re-render side-effects
   g.__setPost((url, body) => { posts.push({ url, body }); return Promise.resolve(); });
-  // Register a fake .clone-list element so capture/restoreCloneScroll see it.
-  const addCloneList = (id, scrollTop) => { const e = { id, scrollTop, __cloneList: true }; els.set(id, e); return e; };
-  return { ...api, posts, els, addCloneList, setCache: g.__setCache };
+  return { ...api, posts, els, setCache: g.__setCache };
 }
 
 // The section is collapsed by default; picker-content tests expand it first.
@@ -136,10 +137,10 @@ test("clonePick / clonePickCount: accumulate selections plus the free-text box",
   const a = sampleAgent();
   m.setCache({ agents: [a] });
   assert.equal(m.clonePickCount(a.key), 0);
-  m.clonePick(a.key, "me/alpha", true);
-  m.clonePick(a.key, "org/gamma", true);
+  m.clonePick(a.key, "github|me/alpha", true);
+  m.clonePick(a.key, "github|org/gamma", true);
   assert.equal(m.clonePickCount(a.key), 2, "two checked");
-  m.clonePick(a.key, "org/gamma", false);
+  m.clonePick(a.key, "github|org/gamma", false);
   assert.equal(m.clonePickCount(a.key), 1, "unchecking removes it");
   m.cloneText(a.key, "foo/bar");
   assert.equal(m.clonePickCount(a.key), 2, "free-text counts as one more");
@@ -156,16 +157,16 @@ test("updateCloneButton: reflects the live count on the button + count span", ()
   const cnt = { textContent: "" };
   m.els.set("clone-btn-" + hid, btn);
   m.els.set("clone-count-" + hid, cnt);
-  m.clonePick(a.key, "me/alpha", true);       // clonePick calls updateCloneButton
+  m.clonePick(a.key, "github|me/alpha", true);  // clonePick calls updateCloneButton
   assert.equal(btn.textContent, "Clone");
   assert.equal(btn.disabled, false);
   assert.equal(cnt.textContent, "1 selected");
-  m.clonePick(a.key, "me/beta", true);
+  m.clonePick(a.key, "github|me/beta", true);
   assert.equal(btn.textContent, "Clone 2");
   assert.equal(cnt.textContent, "2 selected");
   // Clearing all selections re-disables the button.
-  m.clonePick(a.key, "me/alpha", false);
-  m.clonePick(a.key, "me/beta", false);
+  m.clonePick(a.key, "github|me/alpha", false);
+  m.clonePick(a.key, "github|me/beta", false);
   assert.equal(btn.disabled, true);
   assert.equal(cnt.textContent, "");
 });
@@ -174,12 +175,17 @@ test("cloneRepo: fires one POST per selected repo plus the free-text box, then c
   const m = loadCloneModule();
   const a = sampleAgent();
   m.setCache({ agents: [a] });
-  m.clonePick(a.key, "me/alpha", true);
-  m.clonePick(a.key, "org/gamma", true);
+  m.clonePick(a.key, "github|me/alpha", true);
+  m.clonePick(a.key, "github|org/gamma", true);
   m.cloneText(a.key, "foo/bar");
   m.cloneRepo(a.key);
   assert.equal(m.posts.length, 3, "one clone POST per selection + free-text");
   assert.deepEqual(m.posts.map((p) => p.body.repo).sort(), ["foo/bar", "me/alpha", "org/gamma"]);
+  // Picks carry the source of the listing they came from; free text stays
+  // source-less (the legacy GitHub meaning).
+  const bySrc = Object.fromEntries(m.posts.map((p) => [p.body.repo, p.body.source]));
+  assert.equal(bySrc["me/alpha"], "github");
+  assert.equal(bySrc["foo/bar"], undefined);
   assert.ok(m.posts.every((p) => p.url === "/api/agents/host1/clone"), "all hit the clone endpoint");
   assert.deepEqual(m.cloneDraft.get(a.key), {}, "draft cleared after cloning");
 });
@@ -192,23 +198,11 @@ test("cloneRepo: no selection and empty box is a no-op", () => {
   assert.equal(m.posts.length, 0);
 });
 
-test("capture/restoreCloneScroll: preserve the list's scroll across a re-render", () => {
-  const m = loadCloneModule();
-  // A list scrolled partway down before the poll's innerHTML swap.
-  m.addCloneList("clone-list-host1", 140);
-  const snap = m.captureCloneScroll();
-  assert.deepEqual(snap, [{ id: "clone-list-host1", top: 140 }]);
-  // The swap recreates the element at scrollTop 0; restore puts it back.
-  const fresh = m.addCloneList("clone-list-host1", 0);
-  m.restoreCloneScroll(snap);
-  assert.equal(fresh.scrollTop, 140, "scroll position reapplied after re-render");
-});
-
-test("captureCloneScroll: ignores lists sitting at the top (no snapshot needed)", () => {
-  const m = loadCloneModule();
-  m.addCloneList("clone-list-host1", 0);
-  assert.deepEqual(m.captureCloneScroll(), []);
-});
+// Preserving an open clone-list's scroll across the poll's innerHTML swap moved
+// out of index.html's bespoke captureCloneScroll into the shared
+// TurmaNav.preserveScroll (XERK-35) — index.html's render() now wraps the
+// #groups swap in it, and the id-anchored capture/restore contract (which is
+// exactly this .clone-list-across-re-render case) is pinned in nav.test.js.
 
 test("cloneBar: a host with no GitHub creds renders greyed out with no picker", () => {
   const m = loadCloneModule();
@@ -220,4 +214,93 @@ test("cloneBar: a host with no GitHub creds renders greyed out with no picker", 
   const html = m.cloneBar(bare);
   assert.match(html, /cloning unavailable/);
   assert.ok(!html.includes('type="checkbox"'), "no picker when creds are absent");
+});
+
+// --- XERK-155: multiple git sources ------------------------------------------
+
+// A host reporting extra sources beside GitHub (the agent's gitSources block).
+function multiSourceAgent() {
+  const a = sampleAgent();
+  a.gitSources = [
+    { source: "azure", label: "dev.azure.com/xerk", available: true, user: "mal",
+      repos: [{ name: "Api", nameWithOwner: "Proj/Api", isPrivate: true, source: "azure" }] },
+    { source: "gitlab", label: "gitlab.example.com", available: true, user: null,
+      repos: [{ name: "app", nameWithOwner: "grp/sub/app", isPrivate: true, source: "gitlab" }] },
+  ];
+  return a;
+}
+
+test("cloneSources: github block plus each gitSources entry, tagged by source", () => {
+  const m = loadCloneModule();
+  const srcs = m.cloneSources(multiSourceAgent());
+  assert.deepEqual(srcs.map((s) => s.source), ["github", "azure", "gitlab"]);
+  assert.ok(srcs[0].repos.every((r) => r.source === "github"));
+  assert.equal(srcs[1].label, "dev.azure.com/xerk");
+  // An agent predating gitSources still renders its github-only bar.
+  const legacy = m.cloneSources(sampleAgent());
+  assert.deepEqual(legacy.map((s) => s.source), ["github"]);
+  // No creds at all: the github placeholder carries the unavailable state.
+  const bare = m.cloneSources({ key: "h2", github: { available: false } });
+  assert.equal(bare.length, 1);
+  assert.equal(bare[0].available, false);
+});
+
+test("cloneBar: multiple sources render a generic label and per-source group headings", () => {
+  const m = loadCloneModule();
+  const a = multiSourceAgent();
+  m.setCache({ agents: [a] });
+  expand(m, a.key);
+  const html = m.cloneBar(a);
+  assert.match(html, /Clone a repo/, "generic header with several sources");
+  assert.ok(!html.includes("Clone from GitHub"), "GitHub-only wording gone");
+  assert.match(html, /clone-src/, "group headings present");
+  assert.match(html, /dev\.azure\.com\/xerk/);
+  assert.match(html, /gitlab\.example\.com/);
+  assert.match(html, /Proj\/Api/);
+  assert.match(html, /grp\/sub\/app/);
+  assert.equal((html.match(/type="checkbox"/g) || []).length, 6, "4 github + 1 azure + 1 gitlab");
+  // Picks are keyed source|nameWithOwner so the POST knows the listing.
+  assert.match(html, /clonePick\('host1','azure\|Proj\/Api'/);
+});
+
+test("cloneBar: a single-source host keeps its flat list (no group headings)", () => {
+  const m = loadCloneModule();
+  const a = sampleAgent();
+  m.setCache({ agents: [a] });
+  expand(m, a.key);
+  const html = m.cloneBar(a);
+  assert.match(html, /Clone from GitHub/);
+  assert.ok(!html.includes("clone-src"), "no headings for one source");
+});
+
+test("cloneRepo: an azure pick POSTs its source", () => {
+  const m = loadCloneModule();
+  const a = multiSourceAgent();
+  m.setCache({ agents: [a] });
+  m.clonePick(a.key, "azure|Proj/Api", true);
+  m.cloneRepo(a.key);
+  assert.equal(m.posts.length, 1);
+  assert.deepEqual(m.posts[0].body, { repo: "Proj/Api", source: "azure" });
+});
+
+test("cloneBar: a single non-GitHub source names itself in the header (no 'Clone from GitHub')", () => {
+  const m = loadCloneModule();
+  const a = {
+    key: "glhost", online: true, repos: [],
+    github: { available: false, login: null, repos: [] },
+    gitSources: [
+      { source: "gitlab", label: "gitlab.example.com", available: true, user: null,
+        repos: [{ name: "app", nameWithOwner: "grp/app", isPrivate: true, source: "gitlab" }] },
+    ],
+  };
+  m.setCache({ agents: [a] });
+  expand(m, a.key);
+  const html = m.cloneBar(a);
+  assert.match(html, /Clone from gitlab\.example\.com/, "header names the real source");
+  assert.ok(!html.includes("Clone from GitHub"), "never claims GitHub");
+  assert.ok(!html.includes("clone-src"), "single source keeps the flat list");
+  // And when that lone source has no usable creds yet, the note names it too.
+  a.gitSources[0].available = false;
+  const off = m.cloneBar(a);
+  assert.match(off, /No gitlab\.example\.com credentials on this host/);
 });

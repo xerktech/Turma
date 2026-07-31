@@ -1,8 +1,6 @@
 // Background/foreground lifecycle glue for the Even Hub bridge backend.
 //
-// Two independent pieces, ported from ClaudeHUD's `plugin/src/state.ts` and
-// `plugin/src/main.ts` (§4/§5 of its CLAUDE.md, the background-state and
-// handle-input skills):
+// Two independent pieces:
 //
 //  1. A tiny background-state registry. The SDK (0.0.10) doesn't ship
 //     `setBackgroundState`/`onBackgroundRestore` helpers — the host instead
@@ -162,9 +160,9 @@ export function snapshotFromState(state: AppState): AppSnapshot {
 
 // Registers the App's exporter/restorer pair. Call once, right after
 // constructing the App and BEFORE `app.start()` — so a foreground migration
-// that races the boot sequence still finds both handlers installed (mirrors
-// ClaudeHUD's "register before onEvenHubEvent" rule; app.start() is what
-// subscribes the display's onEvenHubEvent listener). Both the exporter and
+// that races the boot sequence still finds both handlers installed (the
+// "register before onEvenHubEvent" rule; app.start() is what subscribes the
+// display's onEvenHubEvent listener). Both the exporter and
 // the restorer are safe to fire before start(): they only read/patch
 // AppState, which exists from construction.
 export function installLifecycle(app: App): void {

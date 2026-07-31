@@ -2,9 +2,7 @@
 //
 // Normalizes raw `bridge.onEvenHubEvent` payloads into the app's four-gesture
 // `InputEvent` vocabulary (tap/doubleTap/scrollUp/scrollDown) plus lifecycle
-// notifications, per the handle-input skill and ClaudeHUD's
-// `plugin/src/input/router.ts` (the ported reference — same event-routing
-// rules, adapted to this package's InputEvent shape):
+// notifications, per the handle-input skill:
 //
 //   - `sysEvent.eventType` 0/undefined -> single click (tap).
 //   - `sysEvent.eventType` 3 -> double click (doubleTap).
@@ -137,8 +135,8 @@ export interface RouterHandlers {
   // never go through tap dedup and are dispatched here instead, ungated.
   onAudioFrame?: (pcm: Uint8Array) => void;
   // Overrides the tap-dedup gate; defaults to `tryConsumeTap` from
-  // even-toolkit/gestures (matches ClaudeHUD's choice). Tests can inject a
-  // pass-through so every synthetic tap gets through deterministically.
+  // even-toolkit/gestures. Tests can inject a pass-through so every synthetic
+  // tap gets through deterministically.
   tapDedup?: TapDedup;
 }
 

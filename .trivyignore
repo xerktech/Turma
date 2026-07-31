@@ -6,11 +6,80 @@
 # not a mute button. Revisit entries when the upstream fix reaches our base image.
 
 # CVE-2026-39822 — Go stdlib os.Root symlink-following / directory-traversal.
-# Present only in bundled third-party Go binaries (docker CLI 29.6.1 and gh
-# 2.96.0), both compiled with Go 1.26.4; the fix is Go 1.25.12 / 1.26.5. Both
-# are already the newest upstream releases (docker 29.6.1 2026-06-26, gh 2.96.0
-# 2026-07-02), so DOCKER_CLI_VERSION / GH_VERSION can't be bumped yet — they'll
-# pick up the patched toolchain on their next rebuild. Not first-party code and
-# not reachable via attacker-controlled symlinks in this container. The expiry
-# forces a revisit: bump the pins once upstream ships Go-1.26.5+ rebuilds.
+# Present only in bundled third-party Go binaries (docker CLI 29.6.1, gh 2.96.0
+# and terraform 1.15.8), compiled with Go 1.26.4 / 1.25.10; the fix is Go
+# 1.25.12 / 1.26.5. All three are already the newest upstream releases (docker
+# 29.6.1 2026-06-26, gh 2.96.0 2026-07-02, terraform 1.15.8), so
+# DOCKER_CLI_VERSION / GH_VERSION / TERRAFORM_VERSION can't be bumped yet —
+# they'll pick up the patched toolchain on their next rebuild. Not first-party
+# code and not reachable via attacker-controlled symlinks in this container. The
+# expiry forces a revisit: bump the pins once upstream ships Go-1.26.5+ rebuilds.
 CVE-2026-39822 exp:2026-10-10
+
+# CVE-2026-27145 / CVE-2026-42504 — Go stdlib DoS: unbounded work parsing a
+# crafted x509 DNS name / MIME header. Both reach us only through terraform
+# 1.15.8's own Go 1.25.10 build (fix: Go 1.25.11+), and 1.15.8 IS the latest
+# terraform, so TERRAFORM_VERSION has nothing to bump to — the next HashiCorp
+# release built on a patched toolchain clears both. Third-party, and a DoS
+# against a CLI that a session runs by hand against certs and metadata it
+# already chose to fetch: the blast radius is that one terraform invocation.
+# Expiry forces the revisit.
+CVE-2026-27145 exp:2026-10-10
+CVE-2026-42504 exp:2026-10-10
+
+# GHSA-hrxh-6v49-42gf — HIGH gRPC-Go xDS RBAC / HTTP/2 vulnerability (fixed in
+# grpc-go 1.82.1). Embedded in TWO bundled third-party Go binaries — gh 2.96.0
+# (grpc v1.81.1) and terraform 1.15.8 (grpc v1.80.0) — not first-party code and
+# not independently patchable, since grpc is compiled into each binary. Both are
+# already the newest upstream releases (see the Go-toolchain entries above), so
+# GH_VERSION / TERRAFORM_VERSION have nothing to bump to; the next upstream
+# release built against grpc 1.82.1+ clears it. The vulnerable path is a gRPC
+# xDS/RBAC server, which neither the gh nor terraform CLI runs here. Expiry
+# forces the revisit.
+GHSA-hrxh-6v49-42gf exp:2026-10-10
+
+# GHSA-537c-gmf6-5ccf — the cryptography wheel bundles a vulnerable OpenSSL.
+# From azure-cli's OWN vendored python (/opt/az, cryptography 46.0.7; fixed in
+# 48.0.1), not anything this repo installs — az ships and pins that tree itself,
+# so the only lever here is AZURE_CLI_VERSION, and 2.88.0 is already the newest
+# package Microsoft publishes for bookworm. Revisit on the expiry: a later
+# azure-cli vendoring cryptography 48+ clears it with a pin bump.
+GHSA-537c-gmf6-5ccf exp:2026-10-10
+
+# CVE-2026-47302 / -47304 / -50525 / -50527 / -50648 — HIGH .NET
+# (System.Security.Cryptography.Xml 10.0.6) DoS / security-feature-bypass CVEs,
+# all fixed in dotnet 10.0.10 / 9.0.18 / 8.0.4. From azure-cli's OWN vendored
+# .NET runtime, not anything this repo installs — az bundles and pins that tree
+# itself, so the only lever is AZURE_CLI_VERSION, and 2.88.0 is already the
+# newest package Microsoft publishes for bookworm (same story as GHSA-537c
+# above). Not first-party code; the blast radius is the `az` CLI a session runs
+# by hand. Revisit on the expiry: a later azure-cli bundling patched .NET clears
+# them with a pin bump.
+CVE-2026-47302 exp:2026-10-10
+CVE-2026-47304 exp:2026-10-10
+CVE-2026-50525 exp:2026-10-10
+CVE-2026-50527 exp:2026-10-10
+CVE-2026-50648 exp:2026-10-10
+
+# CVE-2026-56852 — HIGH infinite loop in golang.org/x/text's norm.Iter on
+# crafted input (fixed in x/text 0.39.0). Present only in bundled third-party
+# Go binaries — gh 2.96.0 (x/text 0.38.0) and terraform 1.15.8 (0.37.0) — where
+# x/text is compiled in, not independently patchable. Both are already the
+# newest upstream releases (gh 2.96.0 2026-07-02, terraform 1.15.8 latest
+# stable), so GH_VERSION / TERRAFORM_VERSION have nothing to bump to; the next
+# upstream release built against x/text 0.39+ clears it. Not first-party code,
+# and a DoS against a CLI a session runs by hand on input it chose. The expiry
+# forces the revisit: bump the pins once upstream ships x/text-0.39+ rebuilds.
+CVE-2026-56852 exp:2026-10-10
+
+# CVE-2026-14257 — HIGH ReDoS/DoS in brace-expansion through 5.0.7 (fixed in
+# 5.0.8). Present ONLY in the npm bundled inside the node base image
+# (/usr/local/lib/node_modules/npm/node_modules/brace-expansion), a transitive
+# dep of npm itself. NPM_VERSION already pins npm ahead of the base image to
+# clear such findings, but even the latest npm (12.0.1) still vendors
+# brace-expansion 5.0.7 — there is nothing to bump to yet. Not first-party: the
+# hub runs zero npm deps (node-core only) and never invokes npm at runtime, so
+# the vulnerable regex is unreachable in this image. Revisit on the expiry: the
+# first npm release vendoring brace-expansion 5.0.8+ clears it with an
+# NPM_VERSION bump.
+CVE-2026-14257 exp:2026-10-25

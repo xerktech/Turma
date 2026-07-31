@@ -5,26 +5,42 @@ name: code-scan
 #   - Semgrep  : SAST over the JS/Python code, Dockerfiles, and secret patterns
 #   - hadolint : Dockerfile best-practice/quality lint (both Dockerfiles)
 #   - ShellCheck: shell correctness for entrypoint.sh
-#   - tests    : behavioral unit tests for agent/hub-agent.py (stdlib unittest)
-#                and turma/server.js (built-in node:test) — see agent/tests/
-#                and turma/tests/
+#   - tests    : behavioral unit tests for agent/hub-agent.py (stdlib unittest),
+#                turma/server.js (built-in node:test), and the release scripts
+#                (.github/scripts) — see agent/tests/, turma/tests/, and
+#                .github/scripts/tests/
 # Findings block the PR. Runs on open AND on later pushes to the PR (default
 # pull_request types) so every commit is re-checked.
 #
-# Runs on the home-lab self-hosted runners ([self-hosted, linux]). Notes that
-# shape these jobs (see the sibling SwitchBoard repo, which established the
-# pattern): the runner has no passwordless sudo (install CLIs to
-# $HOME/.local/bin), cannot auth to ghcr.io (so hadolint's Docker action is
-# swapped for the release binary), and has no GitHub Advanced Security (so
-# there is no code-scanning API to upload SARIF to — findings live in the job
-# log + exit codes). setup-python + pip and Docker actions do work here.
+# Runs on GitHub-hosted `ubuntu-latest`. These four jobs do well under two
+# minutes of work each and need no warm docker cache and no big disk, so the only
+# thing self-hosting bought them was a queue: the box is a 3-job concurrency cap
+# and these were measured waiting up to 26 minutes to do 48 seconds of work.
+# Hosted gives 20 concurrent jobs at 4 dedicated vCPU. It also lifts the
+# constraints the box imposed — a hosted runner has passwordless sudo, node/npm
+# preinstalled, and can authenticate to ghcr.io.
+#
+# This was the first workflow moved; every workflow in the repo now runs hosted,
+# image builds included (their layer cache is `type=gha`, which is GitHub-side
+# and moves with the job — see turma-agent-image-scan.yml for the disk story).
 on:
   pull_request:
     branches: [main]
     paths:
       - "agent/**"
       - "turma/**"
-      - ".github/workflows/code-scan.yml"
+      - ".github/scripts/**"
+      # Every workflow, not just this one: Semgrep's shell-injection rules read
+      # the workflows themselves, so scoping this to code-scan.yml meant a
+      # `run:` step interpolating ${{ }} could land in any OTHER workflow
+      # without the gate that exists to catch it ever running. One did — see the
+      # Resolve flags step in release.yml. Workflow edits are rare, so the wider
+      # trigger costs little.
+      - ".github/workflows/**"
+      # The CLAUDE.md size gate lives in the tests job below, and the PR that
+      # pushes the file over its limit is usually a docs-only PR — without this
+      # path the gate would never run on the change it exists to catch.
+      - "CLAUDE.md"
 
 concurrency:
   group: code-scan-${{ github.ref }}
@@ -36,16 +52,25 @@ permissions:
 jobs:
   semgrep:
     name: Semgrep SAST
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      # pip's HTTP cache, so semgrep's wheels aren't re-fetched every run. Keyed
+      # on this file because that's what pins the install; a plain restore-key
+      # fallback still gives a warm-ish cache when the key misses.
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-semgrep-${{ runner.os }}-${{ hashFiles('.github/workflows/code-scan.yml') }}
+          restore-keys: |
+            pip-semgrep-${{ runner.os }}-
       - name: Install Semgrep
-        run: pip install --no-cache-dir semgrep
+        run: pip install semgrep
       # p/default = high-signal security+correctness rules for JS/Python; the
       # extra packs add Dockerfile and hardcoded-secret coverage. --error makes
       # any finding fail the job; findings print to the job log.
@@ -57,8 +82,15 @@ jobs:
       #     SHA (this repo's convention across all workflows).
       #   - using-http-server: the hub serves plain HTTP on purpose — TLS is
       #     terminated at the Cloudflare tunnel, behind HTTP Basic auth.
-      #   - missing-user-entrypoint: the containers must run as root (full host
-      #     access for the RC listener / docker socket).
+      #   - missing-user-entrypoint: the images deliberately carry no USER
+      #     directive. The agent resolves its run-as identity at RUNTIME instead
+      #     (entrypoint.sh: PUID/PGID, else the owner of REPOS_ROOT) and setprivs
+      #     down to it, because the right uid is the host's — a property of the
+      #     mounted git root, unknowable at build time. A baked USER couldn't
+      #     express that, and the entrypoint needs root briefly anyway (create
+      #     the user, join the docker-sock group, reclaim root-owned leftovers).
+      #     Semgrep only sees the Dockerfile, so it can't see the drop; the
+      #     identity block is covered by agent/tests/test_entrypoint.sh instead.
       #   - dynamic-urllib-use-detected: the URL is TURMA_URL from the trusted
       #     compose env, not attacker-controlled input.
       # Everything else stays blocking, so new injection/secret/unsafe-eval
@@ -77,15 +109,15 @@ jobs:
 
   hadolint:
     name: Hadolint
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
       - uses: actions/checkout@v7
+      # The release binary rather than hadolint-action: the action pulls
+      # ghcr.io/hadolint/hadolint, and this job used to run where ghcr auth
+      # wasn't possible. On a hosted runner the action would work — but the
+      # binary is a 2 MB curl with no image pull, so it stays the cheaper path.
       - name: Install hadolint
-        # hadolint-action pulls ghcr.io/hadolint/hadolint, which this
-        # self-hosted runner cannot authenticate to; install the release
-        # binary instead (no-sudo pattern).
         run: |
           set -euo pipefail
           VERSION=2.14.0
@@ -102,22 +134,19 @@ jobs:
 
   shellcheck:
     name: ShellCheck
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
       - uses: actions/checkout@v7
       # Finds every shell script in the repo and lints per its shebang
-      # (entrypoint.sh is #!/bin/sh). Fails the job on any finding. This action
-      # runs a downloaded binary (no ghcr.io pull), so it works on the runner.
+      # (entrypoint.sh is #!/bin/sh). Fails the job on any finding.
       - uses: ludeeus/action-shellcheck@2.0.0
 
   tests:
     name: Unit tests
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
       - uses: actions/checkout@v7
       # Same setup-python the Semgrep job already relies on; the tests are
       # stdlib unittest only (no pip installs — mirrors the image's no-pip
@@ -125,13 +154,76 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      # Node 24 to match the agent/turma images' base. This used to run in a
+      # throwaway node:24-alpine container because the self-hosted runner had no
+      # node on PATH; a hosted runner has node, so setup-node pins the version
+      # directly and skips the image pull. node:test is built in; the tests have
+      # zero npm dependencies, so there is nothing to install.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      # CLAUDE.md is loaded into EVERY session's context on every host, so its
+      # size is a token cost the whole fleet pays on every run, and past Claude
+      # Code's 150k-character limit it stops loading in full at all. The file's
+      # own "Editing This File" rule has always said to stay under that; the rule
+      # went unenforced and the file drifted 23% past it, which is why this gate
+      # exists. Characters, not bytes (the file is full of multibyte glyphs) —
+      # locally the same number is `wc -m CLAUDE.md`.
+      - name: CLAUDE.md size limit
+        run: |
+          limit=150000
+          size=$(python3 -c "print(len(open('CLAUDE.md', encoding='utf-8').read()))")
+          echo "CLAUDE.md is ${size} characters (limit ${limit})"
+          if [ "$size" -ge "$limit" ]; then
+            echo "::error file=CLAUDE.md::CLAUDE.md is ${size} characters, at or over the ${limit} limit. Consolidate before adding — see the 'Editing This File' section."
+            exit 1
+          fi
       - name: Python unit tests (agent/hub-agent.py)
         run: python3 -m unittest discover -s agent/tests -p "test_*.py" -v
-      # node/npm aren't on the self-hosted runner, so run the Node suite in a
-      # throwaway node:24-alpine container (Docker Hub pull — the runner can't
-      # auth to ghcr.io), same pattern as the build workflow's version lookup.
-      # node:test is built in; the tests have zero npm dependencies.
-      - name: Node unit tests (turma/server.js + agent/tunnel-agent.js)
-        run: |
-          docker run --rm -v "$GITHUB_WORKSPACE":/workspace -w /workspace node:24-alpine \
-            sh -c 'node --test turma/tests/*.test.js agent/tests/*.test.js'
+      - name: Node unit tests (turma/server.js + agent/tunnel-agent.js + release scripts)
+        run: node --test turma/tests/*.test.js agent/tests/*.test.js .github/scripts/tests/*.test.js
+      # entrypoint.sh is PID 1 and decides which uid every session runs as —
+      # i.e. whether files land in the mounted git root owned by the host user
+      # or by root. ShellCheck only covers its syntax, so this builds the real
+      # entrypoint onto the real base image and asserts the resolved identity
+      # across root-owned / user-owned / PUID-override roots. Drives docker
+      # directly, which a hosted runner provides.
+      - name: Entrypoint identity tests (agent/entrypoint.sh)
+        run: ./agent/tests/test_entrypoint.sh
+      # The native updater is the only runtime consumer of the release tag
+      # scheme and runs on deployed hosts; ShellCheck covers its syntax, this
+      # covers its decision (component-version vs tag comparison, carried-release
+      # no-op, checksum refusal, legacy fallback). Pure shell + a gh stub.
+      - name: Native updater tests (agent/native/turma-agent-update)
+        run: ./agent/tests/test_turma_agent_update.sh
+      # bootstrap.sh is the README's curl|bash front door, so it runs off main
+      # on hosts with no checkout — a bug there has no deployed copy to fix.
+      # Covers its resolution decision (carried assets, newest build) and its
+      # refusal to install unverified bits. Pure shell + a curl stub.
+      - name: Native bootstrap tests (agent/native/bootstrap.sh)
+        run: ./agent/tests/test_bootstrap.sh
+      # The native launcher supervises the reverse tunnel, which every web
+      # terminal rides. Its failure mode is silent and permanent — the host still
+      # heartbeats, so it reads ONLINE while every session reads "terminal
+      # offline" — so nothing surfaces a regression here until an operator
+      # notices. Covers the respawn, the missing-node heal, and the manager pid
+      # the tunnel's poke signals. Pure shell + node/python3 stubs.
+      - name: Native launcher tests (agent/native/turma-agent)
+        run: ./agent/tests/test_turma_agent.sh
+      # turma-agentctl is the non-systemd process controller for WSL-without-
+      # logind hosts — the exact hosts where XDG_RUNTIME_DIR is set but points at
+      # a /run/user/<uid> logind never created. Its failure was silent: a broken
+      # runtime dir made stop/restart unable to read the pid they kill, so they
+      # left the old manager running and spawned a second (two managers double-
+      # heartbeating the hub). Covers the fallback to ~/.turma, the pidfile
+      # round-trip, and that a usable runtime dir is still honoured. Shell + sleep
+      # stubs.
+      - name: Native controller tests (agent/native/turma-agentctl)
+        run: ./agent/tests/test_turma_agentctl.sh
+      # install.sh's sudo probe gates every apt prerequisite, and a wrong "no"
+      # is silent: it skips node behind one warning while the install still
+      # reports success, leaving a host that reads online with every session
+      # reading "terminal offline". Covers the piped-quickstart prompt, the
+      # unattended no-hang, NOPASSWD, and a declined password. Shell + sudo stubs.
+      - name: Native installer sudo-probe tests (agent/native/install.sh)
+        run: ./agent/tests/test_install_sudo.sh

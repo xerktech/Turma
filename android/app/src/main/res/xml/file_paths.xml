@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider paths for the in-app updater (XERK-11): exposes the downloaded
+     APK under getCacheDir()/updates via a content:// URI the system installer
+     can read. -->
+<paths>
+    <cache-path name="updates" path="updates/" />
+</paths>

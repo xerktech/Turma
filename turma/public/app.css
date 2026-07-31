@@ -85,6 +85,14 @@
 
 /* ---- Base ---------------------------------------------------------------- */
 * { box-sizing: border-box; }
+
+/* Always reserve the scrollbar's gutter, so the viewport a page centres in does
+   not depend on whether that page happens to be long enough to scroll. Without
+   it the dashboard (the one page that always overflows) centred its header in a
+   15px-narrower window than board/usage/sessions, sitting 7.5px left of theirs —
+   the shared header's own markup was identical, it was the column that moved. */
+html { scrollbar-gutter: stable; }
+
 body {
   margin: 0;
   background: var(--page);
@@ -95,12 +103,137 @@ body {
 }
 h1, h2, h3 { font-family: var(--font-display); }
 
-.wrap { max-width: var(--wrap); margin: 0 auto; padding: 24px 20px 48px; }
+/* The page's content column. Its top padding lives on .site-header-in above,
+   which sits outside .wrap so the header can be full-bleed. */
+.wrap { max-width: var(--wrap); margin: 0 auto; padding: 0 20px 48px; }
 
-header { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; margin-bottom: 20px; }
 h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
-header .sub { color: var(--muted); font-size: 13px; }
-header .spacer { flex: 1; }
+
+/* ---- Site header: identical on every page, built by nav.js ---------------
+   Full-bleed, with its row capped at --wrap and centred, so it lands in the
+   same 1180px column as a page's content and reads identically everywhere —
+   including sessions.html, whose shell below is full-bleed while its header
+   row is not. Page-specific text lives only in the #hdrSub/#hdrMeta slots; an
+   unfilled slot collapses so it costs no gap. The centring depends on the
+   scrollbar gutter reserved above — see `html` in Base.
+   The gap below is a MARGIN, not padding, so it still collapses with the first
+   content element's own margin exactly as the old in-.wrap header did. */
+.site-header { flex: none; margin-bottom: 20px; }
+.site-header-in {
+  max-width: var(--wrap); margin: 0 auto; padding: 24px 20px 0;
+  display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap;
+}
+.site-header .sub { color: var(--muted); font-size: 13px; }
+.site-header .sub:empty { display: none; }
+.site-header .spacer { flex: 1; }
+
+/* ---- New ticket (#hdrNewTicket, built by newticket.js) -------------------
+   The tracker's one write control, in the chrome so a ticket can be created
+   from any page (XERK-150) — it moved out of the board toolbar. A filled accent
+   pill, so the primary action reads as primary beside the quiet org filter.
+   Collapses to nothing until the fleet reports an org to create against, like
+   the org slot below. */
+.site-header .newticket-slot:empty { display: none; }
+.newticket-btn {
+  font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
+  color: #fff; background: var(--accent); border: 1px solid var(--accent);
+  border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; flex: none;
+}
+.newticket-btn svg { width: 13px; height: 13px; flex: none; }
+.newticket-btn:hover { filter: brightness(1.06); }
+
+/* ---- Org filter (#hdrOrg, built by org.js) -------------------------------
+   The one org-scoping control, in the chrome because every page obeys it
+   (XERK-62) — it replaced the board-only chip strip. Collapses to nothing when
+   no host reports a tracker org, like the .sub slots above. */
+.site-header .org-slot:empty { display: none; }
+.org-filter { position: relative; display: inline-flex; }
+.org-btn {
+  font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
+  color: var(--ink-2); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 999px;
+  display: inline-flex; align-items: center; gap: 7px;
+  --org: var(--muted);
+}
+.org-btn:hover { color: var(--ink); }
+.org-btn.scoped { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.org-btn .org-dot { display: none; }
+.org-btn.scoped .org-dot { display: block; width: 9px; height: 9px; border-radius: 50%; background: var(--org); flex: none; }
+.org-btn .org-chev { color: var(--muted); font-size: 10px; }
+/* The menu. Right-aligned under the button (on desktop the button sits at the
+   right edge of the header row, so a left-aligned panel would hang off-screen).
+   The phone override below flips that — see the media query. */
+.org-menu {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 50;
+  min-width: 220px; max-width: calc(100vw - 24px); max-height: 60vh; overflow-y: auto;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow-md);
+  padding: 4px; display: flex; flex-direction: column; gap: 2px;
+}
+/* One row per org: the scope pick, and the org's auto-start switch (XERK-41) —
+   the two segments the board's chips carried, laid out as a list row. A button
+   can't nest a button, so the row is a plain container. */
+.org-row {
+  display: flex; align-items: stretch; border-radius: 999px; overflow: hidden;
+  --org: var(--muted);
+}
+.org-row:hover { background: color-mix(in srgb, var(--ink) 6%, transparent); }
+.org-row.active { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.org-row-main {
+  font: inherit; font-size: 12.5px; padding: 6px 10px; cursor: pointer;
+  color: var(--ink-2); background: transparent; border: none; text-align: left;
+  display: inline-flex; align-items: center; gap: 7px; flex: 1; min-width: 0;
+}
+.org-row-main .org-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--org); flex: none; }
+.org-row-main .org-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.org-row-main:hover { color: var(--ink); }
+.org-row.active .org-row-main { color: var(--accent); font-weight: 600; }
+.org-row-main .chip-n { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.org-row-main .chip-stale { color: var(--warning); font-size: 11px; }
+/* The color-chip segment (XERK-145): the org's current dot, opening the swatch
+   strip below its row. Divided from the pick like the auto segment. */
+.org-chip-color {
+  font: inherit; padding: 5px 9px; cursor: pointer;
+  color: var(--muted); background: transparent;
+  border: none; border-left: 1px solid var(--border); border-radius: 0;
+  display: inline-flex; align-items: center; flex: none;
+}
+.org-chip-color .org-color-dot {
+  width: 9px; height: 9px; border-radius: 50%; background: var(--org); flex: none;
+  box-shadow: 0 0 0 1px var(--border);
+}
+.org-chip-color:hover .org-color-dot, .org-chip-color[aria-expanded="true"] .org-color-dot {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+/* The swatch strip an org row expands into: one swatch per palette slot, plus
+   the "auto" release back to the hash-assigned color. */
+.org-swatch-row {
+  display: flex; align-items: center; gap: 6px; padding: 4px 10px 6px;
+}
+.org-swatch {
+  width: 16px; height: 16px; border-radius: 50%; cursor: pointer; padding: 0;
+  background: var(--org); border: 1px solid var(--border); flex: none;
+}
+.org-swatch:hover { box-shadow: 0 0 0 2px var(--accent); }
+.org-swatch.picked { box-shadow: 0 0 0 2px var(--accent); }
+.org-swatch-auto {
+  font: inherit; font-size: 11px; padding: 1px 8px; cursor: pointer;
+  color: var(--muted); background: transparent;
+  border: 1px solid var(--border); border-radius: 999px; flex: none;
+}
+.org-swatch-auto:hover { color: var(--ink); }
+.org-swatch-auto.picked { color: var(--accent); border-color: var(--accent); }
+/* The auto-start toggle segment, divided from the pick by an inner border. */
+.org-chip-auto {
+  font: inherit; font-size: 11px; padding: 5px 10px; cursor: pointer;
+  color: var(--muted); background: transparent;
+  border: none; border-left: 1px solid var(--border); border-radius: 0;
+  display: inline-flex; align-items: center; gap: 5px; flex: none;
+}
+.org-chip-auto:hover:not(:disabled) { color: var(--ink); }
+.org-chip-auto .org-auto-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+.org-chip-auto.on { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.org-chip-auto.on .org-auto-dot { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
 
 /* Global focus: keyboard users get a clear accent ring; mouse clicks don't. */
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -185,17 +318,20 @@ input:focus, textarea:focus, select:focus {
 .pr-badge.pr-closed { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent); background: color-mix(in srgb, var(--critical) 10%, transparent); }
 .pr-badge.pr-closed .pr-dot { background: var(--critical); }
 .pr-badge.pr-draft  { color: var(--muted); }
-.pr-badge .pr-checks { font-weight: 700; font-size: 11px; }
-.pr-badge .pr-checks.passing { color: var(--good); }
-.pr-badge .pr-checks.failing { color: var(--critical); }
-.pr-badge .pr-checks.pending { color: var(--warning); }
+/* The merge-readiness mark: CI *and* mergeability, not CI alone (see
+   _merge_ready in hub-agent.py) — hence "ready/blocked", not "passing/failing". */
+.pr-badge .pr-ready { font-weight: 700; font-size: 11px; }
+.pr-badge .pr-ready.ready { color: var(--good); }
+.pr-badge .pr-ready.blocked { color: var(--critical); }
+.pr-badge .pr-ready.pending { color: var(--warning); }
 .pr-list { display: flex; flex-wrap: wrap; gap: 6px; }
 
 /* ---- Status "lights" — glowing dots (the Lumen points-of-light motif) ---- */
 .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .dot.online,  .dot.working { background: var(--good);     box-shadow: 0 0 8px color-mix(in srgb, var(--good) 75%, transparent); }
-.dot.waiting               { background: var(--warning);  box-shadow: 0 0 8px color-mix(in srgb, var(--warning) 75%, transparent); }
+.dot.waiting,
+.dot.updating              { background: var(--warning);  box-shadow: 0 0 8px color-mix(in srgb, var(--warning) 75%, transparent); }
 .dot.offline               { background: var(--critical);  box-shadow: 0 0 7px color-mix(in srgb, var(--critical) 55%, transparent); }
 .dot.idle                  { background: var(--muted); }
 
@@ -209,8 +345,335 @@ input:focus, textarea:focus, select:focus {
 button:disabled .spin { border-top-color: var(--ink-2); }
 
 /* ---- Elevated surfaces (page-specific layout stays inline; look here) ----- */
-.tile, .host-card, .scard, .stopped-row, .host-block, .chart-card {
+.tile, .host-card, .scard, .stopped-row, .host-block, .chart-card, .kanban-card {
   box-shadow: var(--shadow-sm);
+}
+
+/* ---- Jira board (/board) -------------------------------------------------- */
+/* Board toolbar: just the refresh button now, pinned right — the org chips it
+   used to run alongside became the header's org filter (XERK-62), and the New
+   ticket button moved into the header too (XERK-150). */
+.board-bar { display: flex; align-items: flex-start; justify-content: flex-end; gap: 10px; margin: 2px 0 14px; }
+.board-refresh {
+  font: inherit; font-size: 12.5px; padding: 5px 12px; cursor: pointer;
+  color: var(--ink-2); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 999px;
+  display: inline-flex; align-items: center; gap: 6px; flex: none;
+}
+.board-refresh svg { width: 13px; height: 13px; flex: none; }
+.board-refresh:hover:not(:disabled) { color: var(--ink); }
+.board-refresh:disabled { cursor: default; color: var(--muted); }
+.board-refresh.busy svg { animation: board-spin 0.9s linear infinite; }
+@keyframes board-spin { to { transform: rotate(360deg); } }
+/* Respect a reduced-motion preference: the label still says "Refreshing…". */
+@media (prefers-reduced-motion: reduce) {
+  .board-refresh.busy svg { animation: none; }
+}
+
+.kanban-cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; align-items: start; }
+.kanban-col { min-width: 0; }
+.kanban-col .kc-head {
+  font-weight: 600; font-size: 13px; color: var(--ink-2);
+  padding: 2px 4px 8px; display: flex; align-items: center; gap: 8px;
+}
+.kanban-col .kc-count {
+  color: var(--muted); font-weight: 400; font-size: 11.5px;
+  font-variant-numeric: tabular-nums; background: var(--page);
+  border: 1px solid var(--hairline); border-radius: 999px; padding: 1px 7px;
+}
+.kanban-col .kc-list { display: flex; flex-direction: column; gap: 8px; }
+.kanban-col .kc-none { color: var(--muted); font-size: 12px; text-align: center; padding: 18px 0; border: 1px dashed var(--hairline); border-radius: var(--radius-md); }
+.kanban-done .kanban-card { opacity: 0.72; }
+
+.kanban-card {
+  /* Subtle, opaque org tint (XERK-142): --org (var(--sN), set inline per card)
+     mixed a little way into --surface, so the card's org reads at a glance without
+     the colour overwhelming it. Falls back to plain surface when no org is set. */
+  background: color-mix(in srgb, var(--org, var(--surface)) 12%, var(--surface));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md); padding: 9px 11px 10px;
+}
+.kanban-card .kc-top { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+.kanban-card .kc-key { font-family: var(--font-mono); font-weight: 600; color: var(--accent); text-decoration: none; }
+.kanban-card .kc-key:hover { text-decoration: underline; }
+.kanban-card .kc-type { color: var(--muted); }
+.kanban-card .kc-age { color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+.kanban-card .kc-summary { font-size: 13px; color: var(--ink); margin: 4px 0 7px; line-height: 1.35; overflow-wrap: anywhere; }
+.kanban-card .kc-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 7px; font-size: 11px; }
+.jira-status {
+  display: inline-flex; align-items: center; padding: 1.5px 8px;
+  border-radius: 999px; font-weight: 600; font-size: 11px; color: var(--ink-2);
+  border: 1px solid var(--border); background: var(--page);
+}
+/* Shared with the ticket detail panel, which reuses the card's pills. */
+.kc-prio { color: var(--muted); }
+.kc-prio.prio-high { color: var(--critical); font-weight: 600; }
+.kc-prio.prio-low { color: var(--muted); }
+.kc-due { color: var(--muted); }
+.kc-due.overdue { color: var(--critical); font-weight: 600; }
+/* The agent's triaged repo for a ticket. Cloned repos read as solid/actionable;
+   an uncloned one is dashed (it's a real answer, but you'd clone it first); "no
+   repo" recedes to muted — it's the absence of a suggestion, not a suggestion. */
+/* inline-block, NOT inline-flex: as a flex item of .kc-meta this blockifies, and
+   text-overflow can only ellipsise a block's text — inside a flex container the
+   name is anonymous flex content and gets hard-cut mid-letter instead. */
+.kc-repo {
+  display: inline-block; vertical-align: middle;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--page);
+  color: var(--ink-2); font-family: var(--font-mono); font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Only the card is tight enough to need the cap; the detail panel has room. */
+.kanban-card .kc-repo { max-width: 15ch; }
+.kc-repo.kc-repo-uncloned { border-style: dashed; color: var(--muted); }
+.kc-repo.kc-repo-none {
+  border: 0; background: none; padding: 0; color: var(--muted);
+  font-style: italic; font-family: var(--font-sans);
+}
+/* Start-a-session-on-this-ticket, and the sessions it started. Both sit in
+   .kc-meta between the repo chip and the org, i.e. before the margin-left:auto
+   that pins .kc-org right. */
+.kc-start {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--page);
+  color: var(--ink-2); font: inherit; font-size: 10.5px; line-height: 1.5;
+  cursor: pointer; white-space: nowrap;
+}
+.kc-start:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.kc-start:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+/* Not cloned / no online host: the ticket has a repo, so the button stays put
+   and says why rather than vanishing. */
+.kc-start:disabled { opacity: .5; cursor: not-allowed; }
+/* Once the ticket has a session, starting ANOTHER is the rare case — shrink it
+   to a "+" so it stops competing with the session chips for the card's width. */
+.kc-start.kc-start-more { padding: 1px 6px; font-weight: 600; color: var(--muted); }
+.kc-start.kc-start-busy { color: var(--muted); border-style: dashed; cursor: default; }
+.kc-start-err {
+  color: var(--critical); font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 22ch;
+}
+/* A session working this ticket. Same chip metrics as .kc-repo so a card's meta
+   row reads as one family; the dot carries the run state. */
+.kc-sess {
+  display: inline-flex; align-items: center; gap: 5px; vertical-align: middle;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--page);
+  color: var(--ink-2); font-family: var(--font-mono); font-size: 10.5px;
+  text-decoration: none; max-width: 22ch;
+}
+/* The name ellipsises on its own element, not on .kc-sess: text-overflow can
+   only clip a BLOCK's text, and inside the flex chip a bare label would be
+   anonymous flex content and get hard-cut mid-letter. Same trap as .kc-repo. */
+.kc-sess .kc-sess-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kc-sess:hover { border-color: var(--accent); color: var(--accent); }
+.kc-sess-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--good); flex: none; }
+.kc-sess.kc-sess-off { color: var(--muted); }
+.kc-sess.kc-sess-off .kc-sess-dot { background: var(--muted); }
+.kc-sess.kc-sess-err { color: var(--critical); border-color: var(--critical); }
+.kc-sess.kc-sess-err .kc-sess-dot { background: var(--critical); }
+.kc-org {
+  display: inline-flex; align-items: center; gap: 5px;
+  color: var(--muted); font-family: var(--font-mono); font-size: 10.5px;
+  --org: var(--muted);
+}
+.kanban-card .kc-org { margin-left: auto; }
+.kc-org::before { content: ""; width: 8px; height: 8px; border-radius: 2px; background: var(--org); flex: none; }
+.kc-note { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+.kc-note.kc-err { color: var(--warning); }
+
+/* The whole card opens the detail panel (the kc-key link still goes to Jira). */
+.kanban-card[role="button"] { cursor: pointer; }
+.kanban-card[role="button"]:hover { border-color: var(--accent); }
+.kanban-card[role="button"]:focus-visible {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+/* Drag-and-drop status change (XERK-141). Tap-and-hold a card, drag it onto
+   another status column, and it moves there. A floating ghost follows the
+   pointer, the source card dims, and the drop-target column lights up. */
+.kc-moving { color: var(--muted); font-size: 10.5px; font-style: italic; }
+.kc-move-err { color: var(--critical); font-size: 10.5px; }
+.kanban-card.kc-moving-card { opacity: .6; }
+.kanban-card.kc-drag-src { opacity: .3; }
+.kanban-col.kc-drop-into {
+  outline: 2px dashed var(--accent); outline-offset: 4px;
+  border-radius: var(--radius-md); background: var(--focus-ring);
+}
+.kc-ghost {
+  position: fixed; left: 0; top: 0; z-index: 60; margin: 0; pointer-events: none;
+  opacity: .96; box-shadow: 0 10px 26px rgba(0, 0, 0, .35); transition: none;
+}
+/* While a drag is active kill text selection, and let the captured card own the
+   gesture (touch-action:none) rather than scrolling the column strip under it. */
+body.kc-drag-on { user-select: none; -webkit-user-select: none; }
+body.kc-drag-on .kanban-card { touch-action: none; }
+
+@media (max-width: 900px) {
+  .kanban-cols { grid-template-columns: repeat(2, 1fr); }
+}
+/* On phones lay the status columns out as a horizontally-scrollable strip you
+   swipe through, and give each its own vertical scroll — rather than collapsing
+   them into one long stacked list (XERK-24). With four columns, fitting them all
+   across a ~390px screen would crush the cards, so instead each column keeps a
+   comfortable readable width and the row scrolls sideways with scroll-snap; a
+   peek of the next column signals that it swipes.
+   Each column's card list scrolls vertically, capped to roughly a viewport minus
+   the header/toolbar/bottom-nav chrome. The estimate is deliberately rough —
+   being a little off only trades a touch of page scroll for a touch of unused
+   height, never a broken layout — and the `min-height` floor keeps a list usable
+   in landscape, where a full 100dvh is short. The `vh` line is the fallback for
+   browsers without `dvh`. `align-items: start` (from the base rule) carries over
+   to the flex row, so shorter columns pin to the top instead of stretching. */
+@media (max-width: 560px) {
+  .kanban-cols {
+    display: flex; gap: 10px; padding-bottom: 4px;
+    overflow-x: auto; overscroll-behavior-x: contain;
+    scroll-snap-type: x proximity;
+  }
+  .kanban-col {
+    flex: 0 0 82%; min-width: 0; scroll-snap-align: start;
+    display: flex; flex-direction: column;
+  }
+  .kanban-col .kc-head { padding: 2px 2px 6px; }
+  .kanban-col .kc-list {
+    overflow-y: auto; overscroll-behavior: contain; padding-right: 2px;
+    min-height: 96px;
+    max-height: calc(100vh - 210px);
+    max-height: calc(100dvh - 210px);
+  }
+}
+
+/* ---- Expanded ticket detail (board) ------------------------------------- */
+.td-backdrop {
+  position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,0.5);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 40px 20px; overflow-y: auto;
+}
+.td-backdrop[hidden] { display: none; }
+body.td-open { overflow: hidden; }
+.td-panel {
+  width: 100%; max-width: 760px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md); padding: 18px 20px 20px;
+  max-height: calc(100vh - 80px); overflow-y: auto;
+}
+.td-head { display: flex; align-items: center; gap: 10px; }
+.td-crumbs { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
+.td-crumbs .kc-key { font-family: var(--font-mono); font-weight: 600; color: var(--accent); text-decoration: none; }
+.td-crumbs .kc-key:hover { text-decoration: underline; }
+.td-crumbs .kc-type { color: var(--muted); }
+.td-close {
+  margin-left: auto; flex: none; background: none; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--muted); cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 6px 9px;
+}
+.td-close:hover { color: var(--ink); border-color: var(--accent); }
+.td-summary {
+  font-family: var(--font-display); font-size: 19px; font-weight: 600;
+  line-height: 1.3; margin: 10px 0 14px; overflow-wrap: anywhere;
+}
+.td-fields {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 8px 16px; margin: 0 0 16px; padding: 12px 0;
+  border-top: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline);
+}
+.td-field { min-width: 0; font-size: 12px; }
+.td-field dt { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+.td-field dd { margin: 2px 0 0; color: var(--ink); overflow-wrap: anywhere; }
+.td-dim { color: var(--muted); }
+/* The Repo row's manual override (see repoFieldHtml/repoPickerHtml in board.js).
+   "Change" is a quiet text button, not a filled one: the row's job is to report
+   the triaged repo, and the edit affordance sits beside that value rather than
+   competing with it. */
+.td-edit {
+  background: none; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--muted); cursor: pointer; font-size: 10.5px; line-height: 1;
+  padding: 2px 6px; font-family: inherit;
+}
+.td-edit:hover { color: var(--ink); border-color: var(--accent); }
+/* The picker replaces the row in place, so it wraps within the same grid cell
+   rather than widening it — .td-fields is auto-fill and a rigid child would
+   reflow every other field. */
+.td-repo-edit { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 2px; }
+.td-repo-select {
+  flex: 1 1 100%; min-width: 0; max-width: 100%;
+  background: var(--page); color: var(--ink); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: 11px;
+  padding: 3px 4px;
+}
+.td-err-inline { color: var(--warning); font-size: 10.5px; }
+.td-label {
+  display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 10.5px;
+  color: var(--ink-2); background: var(--page); border: 1px solid var(--border);
+}
+.td-section { margin-bottom: 18px; }
+.td-section h3 {
+  font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 0 8px;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.td-section p { margin: 0 0 8px; font-size: 13px; line-height: 1.5; color: var(--ink); overflow-wrap: anywhere; }
+.td-section a { color: var(--accent); }
+.td-none { color: var(--muted); font-size: 13px; font-style: italic; }
+.td-note { color: var(--muted); font-size: 12px; margin: 6px 0; }
+.td-note.td-err { color: var(--warning); }
+.td-comment { border-top: 1px solid var(--hairline); padding: 10px 0 2px; }
+.td-comment:first-of-type { border-top: 0; padding-top: 0; }
+.td-chead { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+.td-cauthor { font-weight: 600; color: var(--ink-2); }
+.td-cwhen { color: var(--muted); font-size: 11px; margin-left: auto; }
+.td-cbody p { font-size: 13px; }
+.td-foot { border-top: 1px solid var(--hairline); padding-top: 12px; font-size: 13px; }
+.td-foot a { color: var(--accent); text-decoration: none; }
+.td-foot a:hover { text-decoration: underline; }
+/* New-ticket form (XERK-137). Reuses the detail panel's backdrop/panel chrome;
+   these style the form's own rows, inputs and actions. */
+.cf-panel { max-width: 560px; }
+.cf-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.cf-head h2 {
+  font-family: var(--font-display); font-size: 18px; font-weight: 600; margin: 0;
+}
+.cf-head .td-close { margin-left: auto; }
+.cf-body { display: flex; flex-direction: column; gap: 12px; padding: 12px 0; }
+.cf-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.cf-field > span {
+  color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em;
+}
+.cf-static { font-size: 13px; color: var(--ink); }
+.cf-field select, .cf-field input, .cf-field textarea {
+  width: 100%; box-sizing: border-box; background: var(--page); color: var(--ink);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-family: inherit; font-size: 13px; padding: 7px 8px;
+}
+.cf-field textarea { resize: vertical; min-height: 90px; line-height: 1.4; }
+.cf-field select:focus, .cf-field input:focus, .cf-field textarea:focus {
+  outline: none; border-color: var(--accent);
+}
+.cf-note { color: var(--muted); font-size: 12px; }
+.cf-note.cf-err { color: var(--warning); }
+.cf-actions {
+  display: flex; justify-content: flex-end; gap: 8px;
+  border-top: 1px solid var(--hairline); padding-top: 14px; margin-top: 4px;
+}
+.cf-btn {
+  font: inherit; font-size: 12.5px; padding: 6px 14px; cursor: pointer;
+  color: var(--ink-2); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 999px;
+}
+.cf-btn:hover:not(:disabled) { color: var(--ink); border-color: var(--accent); }
+.cf-btn.cf-primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+.cf-btn.cf-primary:hover:not(:disabled) { filter: brightness(1.06); color: #fff; }
+.cf-btn:disabled { cursor: default; opacity: 0.5; }
+.cf-done { font-size: 14px; color: var(--ink); padding: 14px 0; line-height: 1.5; }
+.cf-done a { color: var(--accent); }
+/* A ticket created but not assigned: still a success, so it sits in the same
+   confirmation line rather than the error slot — just marked. */
+.cf-warn { color: var(--warning); }
+
+@media (max-width: 600px) {
+  .td-backdrop { padding: 0; }
+  .td-panel { max-width: none; min-height: 100vh; max-height: none; border: 0; border-radius: 0; }
 }
 
 /* ---- Shared bits --------------------------------------------------------- */
@@ -253,9 +716,19 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 
 /* ---- Responsive: phone bottom nav + roomier touch targets ---------------- */
 @media (max-width: 600px) {
-  .wrap { padding: 16px 12px 40px; }
-  header { gap: 8px 12px; margin-bottom: 16px; }
+  .wrap { padding: 0 12px 40px; }
+  .site-header { margin-bottom: 16px; }
+  .site-header-in { padding: 16px 12px 0; gap: 8px 12px; }
   .nav-tabs { display: none; }
+  /* The header's flex spacer keeps the org button at the right edge of its row,
+     but it wraps to the LEFT of a new row when the header content is wide — so
+     anchoring the popover to either edge of the button risks it hanging off
+     screen (a right-growing panel off a right-edge button forces a sideways
+     scroll to reach the auto toggles). Drop it below the whole header instead,
+     spanning the viewport, so it's always fully in view wherever the button sat. */
+  .org-filter { position: static; }
+  .site-header-in { position: relative; }
+  .org-menu { left: 12px; right: 12px; top: calc(100% + 4px); max-width: none; }
   .bottom-nav {
     display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
     background: color-mix(in srgb, var(--surface) 88%, transparent);

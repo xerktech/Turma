@@ -2,11 +2,16 @@ name: glasses-ci
 
 # Typecheck + test + build gate for the glasses client on PRs to main.
 # Path-filtered to glasses/** so it only runs when that package changes.
-# Runs on the home-lab self-hosted runners ([self-hosted, linux]); npm isn't
-# on the runner, so the whole npm workflow (install/typecheck/test/build)
-# runs inside a throwaway node:24-alpine container (Docker Hub pull — the
-# runner can't auth to ghcr.io), same pattern as code-scan.yml's Node test
-# job and turma-agent-image.yml's version-lookup step.
+#
+# Runs on GitHub-hosted `ubuntu-latest`: this is a plain npm install/typecheck/
+# test/build with no docker cache to keep warm and nothing big on disk, so
+# self-hosting it only bought it a place in the queue behind the image builds.
+# It used to run the whole npm workflow inside a throwaway node:24-alpine
+# container purely because the self-hosted box had no npm on PATH — a hosted
+# runner has node, so setup-node pins the version directly and the image pull
+# and container indirection both go away. That also lets setup-node's built-in
+# cache keep ~/.npm warm across runs, which the disposable container could never
+# do (it died with the cache inside it).
 on:
   pull_request:
     branches: [main]
@@ -24,12 +29,24 @@ permissions:
 jobs:
   build:
     name: Typecheck, test, build
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: glasses
     steps:
-      - name: Reset workspace ownership
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/workspace busybox chown -R "$(id -u):$(id -g)" /workspace 2>/dev/null || true
       - uses: actions/checkout@v7
-      - name: Install, typecheck, test, build (glasses/)
-        run: |
-          docker run --rm -v "$GITHUB_WORKSPACE":/workspace -w /workspace/glasses node:24-alpine \
-            sh -c 'npm ci --no-audit --no-fund && npm run typecheck && npm test && npm run build'
+      # Node 24 to match the image base the glasses client is developed against.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: glasses/package-lock.json
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build

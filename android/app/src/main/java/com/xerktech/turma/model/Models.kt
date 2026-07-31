@@ -15,54 +15,448 @@ import kotlinx.serialization.json.JsonElement
 data class AgentsResponse(
     val now: Long = 0,
     val agents: List<AgentInfo> = emptyList(),
+    // Ticket -> pinned host (XERK-38), keyed "<siteKey>/<issueKey>": which
+    // agent a ticket's sessions spawn on, when the operator overrode the hub's
+    // most-available routing. Hub-owned and durable; absent on older hubs.
+    val ticketAgents: Map<String, TicketAgentPin> = emptyMap(),
+    // Per-org auto-start opt-in (XERK-41), keyed by siteKey, value always true
+    // (presence = enabled). The hub-owned switch on each board org chip; hub-only
+    // (no agent flag). Absent on older hubs.
+    val autoStartOrgs: Map<String, Boolean> = emptyMap(),
+    // Ticket -> pinned MODEL (XERK-123), keyed "<siteKey>/<issueKey>": which model
+    // a ticket's session runs, when the operator overrode the login's default.
+    // Hub-owned and durable like ticketAgents; absent on older hubs.
+    val ticketModels: Map<String, TicketModelPin> = emptyMap(),
+    // Manual org-color pins (XERK-145), keyed by siteKey, value the palette slot
+    // 1..8 (presence = pinned). Hub-owned and durable; absent on older hubs.
+    val orgColors: Map<String, Int> = emptyMap(),
+    // Whether the hub can deliver mobile push at all — FCM configured (XERK-152).
+    // Hub-wide, not per-agent. When false, every alert is silently dropped, so
+    // the Dashboard shows a "push is off" banner. Defaults true so an older hub
+    // (no such field) never false-alarms; a real hub always reports it.
+    val pushEnabled: Boolean = true,
+)
+
+/** One ticket->agent pin (the web board's Agent row; hub ticket-agents store). */
+@Serializable
+data class TicketAgentPin(val host: String = "", val at: Long = 0)
+
+/** One ticket->model pin (the web board's Model row; hub ticket-models store). */
+@Serializable
+data class TicketModelPin(val model: String = "", val at: Long = 0)
+
+/**
+ * The host login's real model list, probed from the CLI (hub-agent models
+ * block, XERK-33): the aliases this login can run + what "Default" resolves to.
+ * Null on an agent predating the probe (the ticket model picker falls back to
+ * the static family aliases then).
+ */
+@Serializable
+data class ModelsInfo(
+    val available: List<String> = emptyList(),
+    val defaultLabel: String = "",
+    val at: String = "",
+)
+
+@Serializable
+data class CodingAgent(val name: String = "", val version: String = "")
+
+/**
+ * Health of the host's shared Claude subscription login (hub-agent
+ * claude_auth_status, XERK-98). `needsLogin` is the urgent state (lapsed or
+ * missing — sessions can't authenticate); `expiringSoon` is the proactive one.
+ * `refreshExpiresAt` is the refresh-token expiry in epoch ms.
+ */
+@Serializable
+data class ClaudeAuth(
+    val present: Boolean = false,
+    val needsLogin: Boolean = false,
+    val expiringSoon: Boolean = false,
+    val refreshExpiresAt: Long? = null,
 )
 
 @Serializable
 data class AgentInfo(
     val key: String = "",
     val device: String = "",
+    // The coding agent this host runs + this Turma agent build's version, both
+    // shown in the host header (web index.html codingAgent()/agentVersion).
+    val claudeVersion: String = "",
+    val agentVersion: String = "",
+    val codingAgent: CodingAgent? = null,
+    // Shared Claude login health (XERK-98); null on an older agent.
+    val claudeAuth: ClaudeAuth? = null,
     val lastSeen: Long = 0,
-    val startedAt: Long = 0,
+    // ISO-8601 string on the wire (agent's now_iso()), NOT epoch — the hub, web
+    // client, and glasses all treat it as a string. Typing it Long made
+    // kotlinx.serialization throw on the whole /api/agents payload.
+    val startedAt: String = "",
     val online: Boolean = false,
     val terminalOnline: Boolean = false,
+    // Set (non-null) during an ANNOUNCED update restart (XERK-29): the host is
+    // briefly silent on purpose, so this reads as "updating", not an outage.
+    val updating: UpdatingInfo? = null,
     val repos: List<RepoInfo> = emptyList(),
     val sessions: List<SessionInfo> = emptyList(),
+    // The login's probed model list (XERK-33), for the ticket model picker's
+    // options; null on an agent predating the probe.
+    val models: ModelsInfo? = null,
     val usage: UsageInfo? = null,
     val repoUsage: List<RepoUsage> = emptyList(),
     val github: GithubInfo? = null,
+    // Extra clone sources beside GitHub (XERK-155): the agent's Azure DevOps /
+    // GitLab listings. Empty on an agent predating the block.
+    val gitSources: List<GitSourceInfo> = emptyList(),
     val clones: List<CloneInfo> = emptyList(),
     val commands: List<CommandInfo> = emptyList(),
+    val jira: JiraBlock? = null,
+    // Killed-but-resumable sessions (hub-agent _closed_payload) — the web's
+    // "Ended sessions" list.
+    val closedSessions: List<ClosedSessionInfo> = emptyList(),
+    // This host's session ceiling and what is against it (hub-agent
+    // _capacity_payload). `maxSessions` is a PER-AGENT cap, summed across an org's
+    // hosts for the dashboard's session-count tile (XERK-72). Null on a
+    // pre-capacity agent.
+    val capacity: Capacity? = null,
+)
+
+/** A host's session ceiling and live counts (hub-agent `_capacity_payload`). */
+@Serializable
+data class Capacity(
+    val maxSessions: Int = 0,
+    val running: Int = 0,
+    val queued: Int = 0,
+    val free: Int = 0,
+    val rootRunning: Boolean = false,
+)
+
+/** An announced in-progress update restart (XERK-29); present only during the grace window. */
+@Serializable
+data class UpdatingInfo(
+    val version: String = "",
+    val until: Long = 0,
+)
+
+@Serializable
+data class ClosedSessionInfo(
+    val id: String = "",
+    val repo: String = "",
+    val branch: String = "",
+    val root: Boolean = false,
+    val summary: String = "",
+    // Whether [summary] is an operator's own rename rather than a generated
+    // name — it decides the board chip's label precedence (a human's name wins
+    // over the branch), and must not change just because the session was killed.
+    val summaryManual: Boolean = false,
+    val label: String = "",
+    val createdAt: String = "",
+    val closedAt: String = "",
+    // The Jira ticket this session worked, snapshotted onto the closed record
+    // (hub-agent _closed_payload → {key, siteKey, url, summary, branch}); null
+    // when the session had no ticket. Was mistyped as a plain String, so decoding
+    // the WHOLE /api/agents payload threw for any host with a killed ticket-backed
+    // session — hiding every such host from the fleet (only the per-host SSE push,
+    // which decodes hosts one at a time, kept the ticket-free ones visible).
+    val ticket: TicketRef? = null,
+    // The conversation this session had, so the Ended-sessions view can open it
+    // read-only from the hub's archive (GET /api/archive/<transcriptId>). Blank on
+    // records written by an agent predating the snapshot (_closed_payload); the
+    // card then falls back to Resume-only (no click-to-review).
+    val transcriptId: String = "",
+    // PR-status objects this session opened, same shape/type as SessionInfo.prs —
+    // rendered as chips on the ended card and the read-only review's stage bar.
+    val prs: List<PrInfo> = emptyList(),
+)
+
+/** A session's Jira ticket link (SessionInfo/ClosedSessionInfo `ticket`). */
+@Serializable
+data class TicketRef(
+    val key: String = "",
+    val siteKey: String = "",
+    val url: String = "",
+    val summary: String = "",
+    val branch: String? = null,
+)
+
+// ---- Jira board (the agent's `jira` heartbeat block; see hub-agent collect_jira) --
+
+@Serializable
+data class JiraBlock(
+    val available: Boolean = false,
+    val configured: Boolean = false,
+    val site: String = "",
+    val siteKey: String = "",
+    val user: String = "",
+    val fetchedAt: String = "",
+    val error: String? = null,
+    val truncated: Boolean = false,
+    // The operator's org-label override (agent BOARD_ORG_NAME); "" falls back to
+    // the siteKey-derived name. Presentational only — see core.orgName.
+    val orgName: String = "",
+    // Which tracker this org is ("jira" | "azure"), so the New-ticket form words
+    // its label field (labels vs tags) and splits labels per source (XERK-137).
+    // Older agents omit it; core.mergeSites defaults it to "jira".
+    val source: String = "",
+    val tickets: List<JiraTicket> = emptyList(),
+    // The repos the board's manual "Change" picker offers — exactly what the
+    // agent's set_jira_repo allowlists, so the two can't drift (hub-agent
+    // _triage_candidates → jira.repoOptions).
+    val repoOptions: List<RepoOption> = emptyList(),
+)
+
+@Serializable
+data class RepoOption(
+    val name: String = "",
+    val cloned: Boolean = false,
+    val nameWithOwner: String? = null,
+    val description: String = "",
+)
+
+@Serializable
+data class JiraTicket(
+    val key: String = "",
+    val url: String = "",
+    val summary: String = "",
+    val status: String = "",
+    val statusCategory: String = "", // todo | inprogress | done
+    val priority: String = "",
+    val type: String = "",
+    val project: String = "",
+    val projectName: String = "",
+    val labels: List<String> = emptyList(),
+    val updated: String = "",
+    val created: String = "",
+    val dueDate: String? = null,
+    val parentKey: String? = null,
+    val repoGuess: RepoGuess? = null,
+)
+
+@Serializable
+data class RepoGuess(
+    val repo: String? = null,
+    val cloned: Boolean = false,
+    val nameWithOwner: String? = null,
+    val reason: String = "",
+    val at: String = "",
+    // The operator pinned this repo by hand (vs. the model's guess). A manual pin
+    // has no `reason` and preselects in the picker; see board.js repoFieldHtml.
+    val manual: Boolean = false,
+)
+
+/** On-demand issue detail (GET /api/jira/<siteKey>/<key>); kept lenient. */
+@Serializable
+data class JiraIssueDetail(
+    val key: String = "",
+    val summary: String = "",
+    val status: String = "",
+    val statusCategory: String = "",
+    val priority: String = "",
+    val type: String = "",
+    val description: String = "",
+    val assignee: String = "",
+    val reporter: String = "",
+    val labels: List<String> = emptyList(),
+    val comments: List<JiraComment> = emptyList(),
+    val commentTotal: Int = 0,
+    val parentKey: String? = null,
+    val url: String = "",
+    // The statuses this ticket can be moved to right now (XERK-138), from the
+    // board's own workflow (Jira transitions / Azure states). `id` is what a
+    // change submits (transition id / state name); empty when the row is not
+    // changeable (older agent, or a source that couldn't enumerate them).
+    val statusOptions: List<StatusOption> = emptyList(),
+    val error: String? = null,
+    val stale: Boolean = false,
+)
+
+/** One available status change (XERK-138): id submits it, name is shown. */
+@Serializable
+data class StatusOption(
+    val id: String = "",
+    val name: String = "",
+    val category: String = "", // todo | inprogress | done
+)
+
+/**
+ * The GET /api/jira/<siteKey>/<key> response envelope: the hub wraps the issue
+ * under `issue` (plus `fetchedAt`/`stale`), or returns `{error}`, or 202
+ * `{pending}` while the owning host fetches it on demand. Decoding the top-level
+ * body straight into [JiraIssueDetail] silently loses every field (the issue is
+ * nested), so the envelope is unwrapped explicitly — see BoardViewModel.fetchIssue.
+ */
+@Serializable
+data class JiraIssueEnvelope(
+    val issue: JiraIssueDetail? = null,
+    val error: String? = null,
+    val stale: Boolean = false,
+    val pending: Boolean = false,
+)
+
+/** POST .../status reply: the queued command id to poll the outcome by. */
+@Serializable
+data class StatusChangePost(
+    val ok: Boolean = false,
+    val cmdId: String = "",
+    val host: String = "",
+    val error: String? = null,
+)
+
+/** GET .../status?cmdId reply: pending until the agent reports the outcome. */
+@Serializable
+data class StatusChangeResult(
+    val pending: Boolean = false,
+    val ok: Boolean = false,
+    val error: String? = null,
+    val status: String? = null,
+    val statusCategory: String? = null,
+)
+
+// New-ticket creation (XERK-137). The board's create form fetches the metadata on
+// demand (projects/types/labels), then POSTs a new ticket and polls the outcome.
+
+@Serializable
+data class CreateProject(val key: String = "", val name: String = "")
+
+@Serializable
+data class CreateType(val id: String = "", val name: String = "")
+
+/**
+ * GET /api/jira/<siteKey>/create-meta[?project=]: 202 {pending} while the host
+ * fetches; else {projects, labels, source} (no project) or {types} (a project),
+ * or {error}. Kept lenient like [JiraIssueEnvelope].
+ */
+@Serializable
+data class CreateMetaEnvelope(
+    val projects: List<CreateProject> = emptyList(),
+    val labels: List<String> = emptyList(),
+    val source: String = "",
+    val types: List<CreateType> = emptyList(),
+    val error: String? = null,
+    val pending: Boolean = false,
+)
+
+/** POST /api/jira/<siteKey>/tickets body. */
+@Serializable
+data class CreateTicketRequest(
+    val project: String,
+    val issueType: String,
+    val summary: String,
+    val description: String = "",
+    val labels: List<String> = emptyList(),
+)
+
+/** POST /api/jira/<siteKey>/tickets reply: {ok, cmdId, host} or {error}. */
+@Serializable
+data class CreateTicketResponse(
+    val ok: Boolean = false,
+    val cmdId: String = "",
+    val host: String = "",
+    val error: String? = null,
+)
+
+/** GET /api/jira/<siteKey>/tickets/<cmdId>: {key,url} / {error} / 202 {pending}. */
+@Serializable
+data class CreateResultEnvelope(
+    val key: String? = null,
+    val url: String? = null,
+    val error: String? = null,
+    // A create that succeeded but landed unassigned — a success the sheet still
+    // has to mention, since the board filters on the tracker user.
+    val warning: String? = null,
+    val pending: Boolean = false,
+)
+
+@Serializable
+data class JiraComment(
+    val author: String = "",
+    val body: String = "",
+    val created: String = "",
 )
 
 @Serializable
 data class RepoInfo(
     val name: String = "",
     val root: Boolean = false,
-    val lastActivity: Long = 0,
+    // ISO-8601 string (agent ranks repos by comparing these as strings), not epoch.
+    val lastActivity: String = "",
     val resumable: List<ResumableInfo> = emptyList(),
 )
 
+/**
+ * One transcript from the agent's per-repo resumable scan (`_resumable_report`),
+ * the DURABLE ended-sessions channel: re-derived every slow beat from the
+ * transcripts on disk, so it outlives the registry, closed.json's cap, and an
+ * agent wipe. Wire shape: {transcriptId, cwd, repo, root, origin, slug, summary,
+ * endedTs, ticket, prs}. (It previously declared `ts`/`source` fields that are
+ * not on the wire and decoded nothing.)
+ */
 @Serializable
 data class ResumableInfo(
     val transcriptId: String = "",
     val cwd: String = "",
+    val repo: String = "",
+    val root: Boolean = false,
     val summary: String = "",
-    val label: String = "",
-    val ts: Long = 0,
-    val source: String = "",
+    // The last message's own transcript timestamp (ISO-8601) — the ended list's
+    // sort key (XERK-73); falls back agent-side to file mtime.
+    val endedTs: String = "",
+    // The Jira ticket this conversation worked, from the agent's durable
+    // transcript→ticket ledger; null for an ordinary session.
+    val ticket: TicketRef? = null,
+    // The PRs this conversation opened, from the agent's durable PR ledger —
+    // the only channel still carrying them once the closed record aged out.
+    val prs: List<PrInfo> = emptyList(),
 )
 
 @Serializable
 data class GithubInfo(
-    val ok: Boolean = false,
+    // The agent's collect_github() names this key `available` — decoding it as
+    // anything else silently defaults to false on every host, which reads as
+    // "no GitHub credentials" and kills the clone bar outright (XERK-126).
+    val available: Boolean = false,
     val login: String = "",
-    val repos: List<String> = emptyList(),
+    // Wire sends objects ({nameWithOwner, name, isPrivate, ...}), not bare
+    // strings — the agent's collect_github()/_gh_clonable_repos().
+    val repos: List<GithubRepo> = emptyList(),
 )
 
 @Serializable
+data class GithubRepo(
+    val nameWithOwner: String = "",
+    val name: String = "",
+    val description: String = "",
+    val isPrivate: Boolean = false,
+    val updatedAt: String = "",
+)
+
+/**
+ * One EXTRA clone source's block (agent `_git_sources_payload`, XERK-155):
+ * an Azure DevOps org/collection or a GitLab host whose clonable repos the
+ * agent lists beside the GitHub ones. `source` routes a pick's clone POST;
+ * `label` is the section heading; `user` (nullable on the wire) names the
+ * account where the source knows one. Repos share the GithubRepo shape.
+ */
+@Serializable
+data class GitSourceInfo(
+    val source: String = "",
+    val label: String = "",
+    val available: Boolean = false,
+    val user: String = "",
+    val repos: List<GithubRepo> = emptyList(),
+)
+
+/**
+ * One clone job the agent reported (its `_clones_payload`): `repo` is the
+ * owner/repo spec as asked for, `name` the bare repo dir it lands in, and
+ * `status` one of cloning/done/error, `error` carrying the reason for the last.
+ */
+@Serializable
 data class CloneInfo(
     val repo: String = "",
+    val name: String = "",
     val status: String = "",
+    val error: String = "",
+    val startedAt: String = "",
 )
 
 @Serializable
@@ -91,12 +485,51 @@ data class SessionInfo(
     val usage: UsageInfo? = null,
     val prs: List<PrInfo> = emptyList(),
     val session: LiveSignals? = null,
+    // The Jira ticket this session was spawned to work (hub-agent
+    // _session_payload `ticket`); the board reverse-indexes it into per-ticket
+    // session chips. Null for an ordinary session.
+    val ticket: TicketRef? = null,
+    // The hub command that created this session (spawn / spawnTicket /
+    // resumeTranscript) — what the board's start sweep matches its optimistic
+    // pending against. "" for sessions predating the echo.
+    val spawnCmdId: String = "",
+    // The conversation this session is having — the id the Ended list dedupes
+    // on and the ended read-only view opens by. "" from an older agent.
+    val transcriptId: String = "",
+    val createdAt: String = "",
+    val stoppedAt: String = "",
+    val errorMsg: String = "",
+    // Why a `queued` session is waiting (capacity / awaiting-clone / root-busy)
+    // and since when; "" for any session that isn't queued.
+    val queuedReason: String = "",
+    val queuedAt: String = "",
+    // Bumps on a "Restart (clear context)" — the completion signal the
+    // dashboard's optimistic restart pending clears on.
+    val restartCount: Int = 0,
+    // The live branch's relation to its base/origin — the work-risk line.
+    val work: WorkInfo? = null,
 )
 
 @Serializable
 data class GitState(
     val repoName: String = "",
     val branch: String = "",
+    // Uncommitted-change count from `git status --porcelain` in the worktree.
+    val dirtyFiles: Int = 0,
+)
+
+/**
+ * "Is this work safe yet?" facts for a session's branch (hub-agent
+ * branch_sync_info): commits past the base branch, whether the branch was ever
+ * pushed, and commits not yet on origin. Every field degrades to null (branch
+ * not born yet, no origin, unfetchable counts) rather than lying with a zero.
+ */
+@Serializable
+data class WorkInfo(
+    val baseRef: String? = null,
+    val aheadOfBase: Int? = null,
+    val pushed: Boolean? = null,
+    val aheadOfRemote: Int? = null,
 )
 
 /** The live TUI probe on a running session (`session.session`); null when stopped. */
@@ -109,8 +542,22 @@ data class LiveSignals(
     val bridgeAttached: Boolean = false,
     val question: String = "",
     val questionOptions: List<String> = emptyList(),
+    // Rich AskUserQuestion picker (hub-agent session_report): option cards with
+    // descriptions/previews, a header chip, n-of-N progress, and multiSelect.
+    val questionOptionsRich: List<QuestionOption> = emptyList(),
+    val questionHeader: String = "",
+    val questionIndex: Int? = null,
+    val questionTotal: Int? = null,
+    val questionMulti: Boolean = false,
     val newPrUrls: List<String> = emptyList(),
     val tail: List<TailEntry> = emptyList(),
+)
+
+@Serializable
+data class QuestionOption(
+    val label: String = "",
+    val description: String = "",
+    val preview: String = "",
 )
 
 @Serializable
@@ -119,22 +566,57 @@ data class PrInfo(
     val number: Int = 0,
     val state: String = "",
     val title: String = "",
+    /** The CI rollup alone: passing / failing / pending / "". */
     val checks: String = "",
+    /** GitHub's own mergeability: MERGEABLE / CONFLICTING / UNKNOWN / "". */
+    val mergeable: String = "",
+    /**
+     * Merge readiness — CI *and* mergeability together (_merge_ready in
+     * hub-agent.py): ready / blocked / pending / "". Empty from an agent
+     * predating the field, which reports [checks] alone.
+     */
+    val ready: String = "",
 )
 
 @Serializable
 data class UsageInfo(
     val today: UsageBucket = UsageBucket(),
+    /** Rolling 7 UTC days ending today, pre-sliced agent-side. */
+    val week: UsageBucket = UsageBucket(),
     val totals: UsageBucket = UsageBucket(),
-    val unpricedModels: List<String> = emptyList(),
+    /**
+     * Per-day buckets, "YYYY-MM-DD" (UTC) -> bucket, the last ~60 days
+     * (hub-agent HISTORY_DAYS) — what the usage page's 30-day stacked daily
+     * chart is built from. Empty from an agent predating the field.
+     */
+    val days: Map<String, UsageBucket> = emptyMap(),
+    /** ISO timestamp of the newest transcript entry counted into this block. */
+    val lastActivity: String = "",
+    /** Per-model token counts, biggest consumer first. */
+    val models: List<ModelUsage> = emptyList(),
 )
 
+/**
+ * One window's token counts. The names match the wire exactly (`input`,
+ * `output`, …) — they were `inputTokens`/`outputTokens` without a @SerialName,
+ * so they never decoded and every figure read zero.
+ */
 @Serializable
 data class UsageBucket(
-    val cost: Double = 0.0,
-    val unpriced: Boolean = false,
-    val inputTokens: Long = 0,
-    val outputTokens: Long = 0,
+    val input: Long = 0,
+    val output: Long = 0,
+    val cacheWrite: Long = 0,
+    val cacheRead: Long = 0,
+) {
+    val total: Long get() = input + output + cacheWrite + cacheRead
+}
+
+@Serializable
+data class ModelUsage(
+    val model: String = "",
+    val today: UsageBucket = UsageBucket(),
+    val week: UsageBucket = UsageBucket(),
+    val totals: UsageBucket = UsageBucket(),
 )
 
 @Serializable
@@ -154,7 +636,7 @@ data class TailEntry(
     val uuid: String = "",
     val role: String = "",
     val text: String = "",
-    val ts: Long = 0,
+    val ts: String = "", // ISO-8601 timestamp from the transcript entry, not epoch
     val blocks: List<Block> = emptyList(),
 ) {
     val key: String get() = id.ifEmpty { uuid }
@@ -219,10 +701,28 @@ data class TailFrame(
 @Serializable
 data class TurnStatus(
     val verb: String = "",
-    val up: Long = 0,
-    val down: Long = 0,
-    val elapsed: Long = 0,
+    // Token counters and elapsed are DISPLAY STRINGS on the wire ("1.2k", "340",
+    // "12s", or "" when absent) — parsePaneStatus in tunnel-agent.js scrapes them
+    // straight off the TUI, it does not emit numbers. Typing them as Long made
+    // decodeFromString<TailFrame> throw on every real status frame (coerceInputValues
+    // won't turn "1.2k"/"" into a Long), and LiveTail swallows that exception and
+    // drops the WHOLE turn frame — so the status footer never rendered.
+    val up: String = "",
+    val down: String = "",
+    val elapsed: String = "",
     val hint: String = "",
+    // The live agent-manager list scraped from the pane (parseAgentList in
+    // tunnel-agent.js): "main" plus each background subagent. Present only when the
+    // TUI's agent list is expanded below the input box; absent otherwise.
+    val agents: List<AgentRow> = emptyList(),
+)
+
+/** One row of the pane's live agent list: {sel,type,label} (tunnel-agent.js). */
+@Serializable
+data class AgentRow(
+    val sel: Boolean = false,
+    val type: String = "",
+    val label: String = "",
 )
 
 @Serializable
@@ -278,7 +778,7 @@ data class SearchMatch(
     val host: String = "",
     val summary: String = "",
     val role: String = "",
-    val ts: Long = 0,
+    val ts: String = "", // ISO-8601 timestamp, not epoch
     val uuid: String = "",
     val snippet: String = "",
 )
@@ -296,10 +796,9 @@ data class ArchiveSession(
     val repo: String = "",
     val worktree: String = "",
     val summary: String = "",
-    val createdAt: Long = 0,
-    val endedTs: Long = 0,
+    val createdAt: String = "", // ISO-8601 (archive.js stores TEXT), not epoch
+    val endedTs: String = "",
     val msgCount: Int = 0,
-    val cost: Double = 0.0,
 )
 
 @Serializable
@@ -308,7 +807,7 @@ data class ArchiveTranscript(
     val repo: String = "",
     val host: String = "",
     val summary: String = "",
-    val endedTs: Long = 0,
-    val createdAt: Long = 0,
+    val endedTs: String = "", // ISO-8601 (archive.js stores TEXT), not epoch
+    val createdAt: String = "",
     val entries: List<TailEntry> = emptyList(),
 )

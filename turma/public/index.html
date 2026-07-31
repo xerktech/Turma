@@ -26,10 +26,17 @@
   /* Hosts stack full-width — each expands into a repo → session tree. */
   .hosts { display: flex; flex-direction: column; gap: 16px; }
   .host-card {
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    /* Subtle, opaque org tint (XERK-142): --org (var(--sN), set inline per host)
+       mixed a little into --surface, so a host's org reads at a glance the same way
+       it does on the board. No org (host without tracker creds) → plain surface. */
+    background: color-mix(in srgb, var(--org, var(--surface)) 12%, var(--surface));
+    border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 16px; display: flex; flex-direction: column; gap: 12px;
   }
   .host-card.offline { opacity: 0.62; }
+  /* An expected update in progress: legible, not greyed like an outage, with a
+     warm accent so it reads as transient rather than dead (XERK-29). */
+  .host-card.updating { opacity: 0.9; border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
   .host-card.collapsed { gap: 0; }
   .host-top { display: flex; align-items: center; gap: 10px; }
   /* The name + caret toggle the host card open/closed; keep the status chip out
@@ -37,8 +44,30 @@
   .host-name { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
     cursor: pointer; background: none; border: 0; padding: 0; text-align: left; color: inherit; font: inherit; }
   .host-name h3 { font-size: 15px; margin: 0; font-weight: 600; word-break: break-all; }
+  /* The host's Jira org, alongside the hostname: a descriptor of the row, not a
+     second name for it, so it reads lighter than the hostname it follows. */
+  .host-name h3 .host-org { color: var(--muted); font-weight: 500; }
   .host-name .caret { color: var(--muted); font-size: 11px; flex-shrink: 0; transition: transform 0.15s; }
   .host-card.collapsed .host-name .caret { transform: rotate(-90deg); }
+  /* Claude subscription-login health chip (XERK-98) — only ever rendered when
+     it needs action, so its presence alone flags a host that can't run. Red
+     when the login has lapsed, amber when it's about to. */
+  .host-auth { font-size: 11px; padding: 2px 8px; border-radius: 20px; white-space: nowrap;
+    border: 1px solid; flex-shrink: 0; }
+  .host-auth.req { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent);
+    background: color-mix(in srgb, var(--critical) 10%, transparent); }
+  .host-auth.warn { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+    background: color-mix(in srgb, var(--warning) 10%, transparent); }
+  /* "Restart agent" button (XERK-157) sits in the header beside the status chip;
+     keep it from being squeezed when the row is tight. */
+  .host-restart { flex-shrink: 0; }
+  /* Hub-wide "push is off" warning bar (XERK-152), above the tiles. */
+  .push-warn { display: flex; gap: 8px; align-items: baseline; margin-bottom: 14px;
+    padding: 9px 13px; border-radius: 8px; font-size: 13px; color: var(--warning);
+    border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+    background: color-mix(in srgb, var(--warning) 10%, transparent); }
+  .push-warn b { color: var(--ink); font-weight: 600; }
+  .push-warn code { font-family: var(--font-mono); font-size: 12px; }
   .host-meta { display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 13px; color: var(--ink-2); }
   .host-meta .m-label { color: var(--muted); }
   .host-meta b { color: var(--ink); font-weight: 600; }
@@ -156,6 +185,14 @@
   .clone-opt.here { color: var(--muted); cursor: default; }
   .clone-opt.here:hover { background: none; }
   .clone-list-empty { padding: 8px 9px; font-size: 12.5px; color: var(--muted); }
+  /* Source group heading inside the list (only when a host reports more than
+     one clone source — GitHub / Azure DevOps / GitLab, XERK-155). */
+  .clone-src {
+    padding: 5px 9px 3px; font-size: 11px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em;
+    border-bottom: 1px solid var(--hairline); background: var(--page);
+    position: sticky; top: 0;
+  }
   .clone-count { font-size: 12px; color: var(--ink-2); }
   .clone-job {
     display: flex; align-items: center; gap: 8px; margin-top: 8px;
@@ -197,12 +234,11 @@
 
   .usage {
     border-top: 1px solid var(--hairline); padding-top: 8px;
-    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;
+    display: flex; align-items: baseline; gap: 8px;
   }
   .usage .u-label { color: var(--muted); font-size: 11px; }
   .usage .u-value { font-family: var(--font-display); font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .usage .u-sub { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-  .unpriced { color: var(--warning); cursor: help; }
 
   .sess-working { color: var(--good); }
   .sess-wait { color: var(--warning); }
@@ -245,44 +281,29 @@
 </style>
 </head>
 <body>
+<header class="site-header" id="siteHeader" data-page="dashboard" data-sub="Session hosts"></header>
 <div class="wrap">
-  <header>
-    <a class="wordmark" href="/"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
-    <span class="sub">Session hosts</span>
-    <span class="spacer"></span>
-    <nav class="nav-tabs">
-      <a href="/" class="active">Dashboard</a>
-      <a href="/sessions">Sessions</a>
-      <a href="/history">History</a>
-      <a href="#" class="signout" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;">Sign out</a>
-    </nav>
-    <span class="sub" id="refreshed"></span>
-  </header>
-
+  <!-- Shown only when the hub has no FCM credential, so a disabled mobile-push
+       config is visible here instead of silently dropping every alert (XERK-152). -->
+  <div id="pushWarn"></div>
   <div class="tiles" id="tiles"></div>
   <div id="groups"></div>
-  <div class="footer">Cost figures are API-equivalent estimates computed from transcript token counts — sessions run on the shared subscription, so this is relative load, not a bill. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply, and only one may run per host at a time. "Clone from GitHub" pulls a repo (from the host's GitHub login) into the repos root so it joins the list and can host sessions — greyed out on hosts without GitHub credentials. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
 </div>
 
-<nav class="bottom-nav">
-  <a href="/" class="active">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-    Dashboard
-  </a>
-  <a href="/sessions">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
-    Sessions
-  </a>
-  <a href="/history">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/></svg>
-    History
-  </a>
-</nav>
+<nav class="bottom-nav" id="bottomNav"></nav>
+<!-- For TurmaBoard.orgName: the host rows name each host's Jira org, and that
+     siteKey -> org-name rule is the board's, so the dashboard borrows it rather
+     than growing a second copy to drift from. org.js reads the same vocabulary
+     for the header's org filter, and needs nav.js's #hdrOrg slot to exist. -->
+<script src="/board.js"></script>
+<script src="/nav.js"></script>
+<script src="/org.js"></script>
+<script src="/newticket.js"></script>
 
 <script>
 const $tiles = document.getElementById("tiles");
 const $groups = document.getElementById("groups");
-const $refreshed = document.getElementById("refreshed");
+const $pushWarn = document.getElementById("pushWarn");
 
 // The tree re-renders every 5s. These module-level stores survive re-render so
 // open panels and in-progress two-click actions are not lost mid-poll.
@@ -449,6 +470,11 @@ function restoreComposerFocus(f) {
 const pending = new Map();
 const PENDING_TTL_MS = 45000;
 const RESTART_TTL_MS = 15000;
+// A whole-agent restart (XERK-157) takes longer than a single session's restart:
+// a container recreate rebuilds the stack, so give the "Restarting…" spinner a
+// generous fallback before it gives up (it normally clears on the new manager's
+// first beat — a changed startedAt).
+const RESTART_AGENT_TTL_MS = 120000;
 function pendKey(kind, host, x) { return kind + "::" + host + "::" + x; }
 function setPending(key, val) { pending.set(key, { ...val, at: Date.now() }); }
 function sessPending(host, id) {
@@ -470,7 +496,9 @@ function reconcilePending(agents) {
     index.set(a.key + "::" + s.id, s);
   }
   for (const [key, p] of pending) {
-    if (t - p.at > (p.kind === "restart" ? RESTART_TTL_MS : PENDING_TTL_MS)) { pending.delete(key); continue; }
+    const ttl = p.kind === "restart" ? RESTART_TTL_MS
+      : p.kind === "restartAgent" ? RESTART_AGENT_TTL_MS : PENDING_TTL_MS;
+    if (t - p.at > ttl) { pending.delete(key); continue; }
     if (p.kind === "spawn") {
       if ((counts.get(p.host + "::" + p.repo) || 0) > p.baseline) pending.delete(key);
     } else if (p.kind === "clone") {
@@ -486,6 +514,13 @@ function reconcilePending(agents) {
       const a = byHost.get(p.host);
       const r = a && (a.prunes || []).find(x => x.repo === p.repo);
       if (r && r.at !== p.prevAt) pending.delete(key);
+    } else if (p.kind === "restartAgent") {
+      // Done once a fresh manager has beaten in — its startedAt differs from the
+      // one showing when we queued the restart. If startedAt wasn't captured (an
+      // older agent), the RESTART_AGENT_TTL_MS timeout is the fallback.
+      const a = byHost.get(p.host);
+      if (a && p.startedAt != null && a.startedAt != null && a.startedAt !== p.startedAt)
+        pending.delete(key);
     } else {
       const s = index.get(p.host + "::" + p.id);
       // kill now removes the record entirely (keeping only the branch), so like
@@ -515,14 +550,6 @@ function fmtTokens(n) {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
   return String(n);
 }
-function fmtCost(c) { return c == null ? "–" : "$" + c.toFixed(2); }
-// ⚠ next to a cost figure that includes usage from models the agent's pricing
-// table doesn't know (counted at $0.00, so the figure is understated).
-function unpricedMark(bucket, u) {
-  if (!bucket || !bucket.unpriced) return "";
-  const who = (u?.unpricedModels || []).join(", ");
-  return ` <span class="unpriced" title="Understated — includes unpriced model(s)${who ? ": " + esc(who) : ""}">⚠</span>`;
-}
 function fmtBytes(b) {
   if (b == null) return "–";
   const units = ["B", "KiB", "MiB", "GiB"];
@@ -546,6 +573,64 @@ function uptime(startedAt, now) {
   if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
   return Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h";
 }
+// The coding agent a host runs, for its header's "Agent" row: "Claude Code
+// 2.1.211". The agent reports {name, version} so the hub never has to guess
+// which CLI a host launched (the image is agent-generic by design).
+//
+// An older agent reports only the raw `claude --version` string — "2.1.211
+// (Claude Code)" — which is parsed to the same shape here rather than rendered
+// as-is, since under a label it read "Claude Code 2.1.211 (Claude Code)". An
+// unparseable string is shown whole beside the only agent such a build can be
+// running; the name is worth more than the reply's exact shape.
+function codingAgent(a) {
+  const c = a.codingAgent;
+  if (c && c.version) return `${c.name || "Claude Code"} ${c.version}`;
+  const raw = (a.claudeVersion || "").trim();
+  if (!raw) return "–";
+  const m = raw.match(/^(\S+)\s+\((.+)\)$/);
+  return m ? `${m[2]} ${m[1]}` : `Claude Code ${raw}`;
+}
+// Claude subscription-login health chip for a host header (XERK-98): a red chip
+// when the login has lapsed (sessions can't authenticate) and an amber one when
+// it's about to. Nothing when the login is healthy, or when an older agent
+// reports no block — the chip only appears when it's asking for action.
+function claudeAuthBadge(a) {
+  const ca = a.claudeAuth;
+  if (!ca) return "";
+  if (ca.needsLogin)
+    return `<span class="host-auth req" title="Run 'claude /login' on this host — sessions can't authenticate until then">🔑 Login required</span>`;
+  if (ca.expiringSoon) {
+    const when = ca.refreshExpiresAt ? ` in ${ago(ca.refreshExpiresAt - Date.now())}` : "";
+    return `<span class="host-auth warn" title="Claude login expiring — re-login soon with 'claude /login'">🔑 Login expires${when}</span>`;
+  }
+  return "";
+}
+// "Restart agent" button for a host header (XERK-157) — restarts the manager
+// process, e.g. after fixing an expired Claude login, without SSHing in. Only
+// offered on a LIVE host that isn't already restarting: an offline host has no
+// heartbeat to carry the command, and an `updating` one is already on its way
+// back. Arm/confirm first — it briefly takes the whole host's control plane down
+// (running sessions are re-adopted on boot, but it's still a fleet-level action).
+function restartBtn(a) {
+  if (!a.online || a.updating) return "";
+  if (pending.has(pendKey("restartAgent", a.key, "_")))
+    return `<button class="host-restart btn-sm" disabled title="Restarting the agent…"><span class="spin"></span> Restarting…</button>`;
+  const armed = confirming.has("ra::" + a.key);
+  return `<button class="host-restart btn-sm${armed ? " confirm" : ""}"`
+    + ` title="Restart this host's agent (running sessions are re-adopted)"`
+    + ` onclick="restartHost('${esc(a.key)}')">${armed ? "Confirm restart" : "↻ Restart"}</button>`;
+}
+// Board (Jira/Azure DevOps) reachability chip for a host header (XERK-156): a red
+// pill when the configured tracker's last poll failed — most often because the
+// board is only reachable over VPN and the host is off it, but any poll failure
+// (auth, rate-limit, 5xx) shows here with the reason as its tooltip. Mirrors
+// claudeAuthBadge: nothing when the board is healthy, unconfigured, or the host
+// is offline (its offline state already implies nothing is reachable).
+function boardHealthBadge(a) {
+  const j = a.jira;
+  if (!a.online || !j || !j.configured || !j.error) return "";
+  return `<span class="host-auth req" title="${esc(j.error)}">📋 Board unreachable</span>`;
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -554,10 +639,23 @@ function esc(s) {
 function totalTokens(u) {
   return u ? u.input + u.output + u.cacheWrite + u.cacheRead : null;
 }
+// Fold several hosts' `models` arrays into one, biggest consumer first — the
+// same model runs on many hosts, so it has to merge by name rather than
+// concatenate. Ignores nullish entries (an agent too old to report the block).
+function mergeModels(lists) {
+  const by = new Map();
+  for (const list of lists) {
+    for (const m of list || []) by.set(m.model, (by.get(m.model) || 0) + totalTokens(m.totals));
+  }
+  return [...by.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([model]) => ({ model }));
+}
+// `models` is [{model, ...}], biggest consumer first.
 function shortModels(models) {
   if (!models || !models.length) return "–";
   return models.slice(0, 2).map(m =>
-    m.replace(/^claude-/, "").replace(/-\d{8}$/, "")
+    m.model.replace(/^claude-/, "").replace(/-\d{8}$/, "")
   ).join(", ");
 }
 // git@host:owner/repo(.git) -> https link; plain name otherwise.
@@ -611,11 +709,32 @@ function sessBranch(s) {
   return (b && b !== "HEAD") ? b : "detached";
 }
 
-// GitHub-style PR status pill: state colour + #number + a trailing CI-check
-// mark (✓ passing / ✗ failing / ● pending). `pr` is the agent's compact status
-// ({url, number, title, state, checks}) or a bare {url} before the first status
-// refresh. Returns "" for a falsy pr. Kept in sync with the copy in
-// sessions.html and the footer chip in chat.js.
+// The PR's merge-readiness verdict ('ready'/'blocked'/'pending'/""), which the
+// agent derives from CI *and* mergeability together (_merge_ready in
+// hub-agent.py) — green CI on a conflicting branch is not a PR that can land.
+// An agent predating the field reports the CI half alone, so fall back to that
+// rather than dropping the mark. Kept in sync with the copies in sessions.html
+// and chat.js.
+function prReady(pr) {
+  return pr.ready || { passing: "ready", failing: "blocked", pending: "pending" }[pr.checks] || "";
+}
+// What that mark is saying, spelled out for its tooltip: the CI rollup, plus —
+// for a PR that could still land — whether GitHub says it merges. "" when the
+// agent knows neither.
+function prReadyTitle(pr) {
+  const state = String(pr.state || "").toUpperCase();
+  const parts = [];
+  if (pr.checks) parts.push("CI " + pr.checks);
+  if (pr.mergeable && (state === "OPEN" || state === "DRAFT"))
+    parts.push(pr.mergeable === "CONFLICTING" ? "merge conflict"
+      : pr.mergeable === "MERGEABLE" ? "no conflicts" : "mergeability unknown");
+  return parts.join(" · ");
+}
+// GitHub-style PR status pill: state colour + #number + a trailing
+// merge-readiness mark (✓ ready / ✗ blocked / ● pending). `pr` is the agent's
+// compact status ({url, number, title, state, checks, mergeable, ready}) or a
+// bare {url} before the first status refresh. Returns "" for a falsy pr. Kept
+// in sync with the copy in sessions.html and the footer chip in chat.js.
 function prBadgeHtml(pr) {
   if (!pr) return "";
   const url = pr.url || "";
@@ -624,9 +743,9 @@ function prBadgeHtml(pr) {
   const state = String(pr.state || "").toUpperCase();
   const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
   const label = state ? state[0] + state.slice(1).toLowerCase() : "";
-  const checks = pr.checks;
-  const mark = checks === "passing" ? "✓" : checks === "failing" ? "✗" : checks === "pending" ? "●" : "";
-  const chk = mark ? ` <span class="pr-checks ${checks}" title="CI ${esc(checks)}">${mark}</span>` : "";
+  const ready = prReady(pr);
+  const mark = ready === "ready" ? "✓" : ready === "blocked" ? "✗" : ready === "pending" ? "●" : "";
+  const chk = mark ? ` <span class="pr-ready ${ready}" title="${esc(prReadyTitle(pr))}">${mark}</span>` : "";
   return `<a class="pr-badge ${cls}" href="${esc(url)}" target="_blank" rel="noopener" title="${esc(pr.title || url)}">`
     + `<span class="pr-dot"></span>${esc(num)}${label ? " " + esc(label) : ""}${chk}</a>`;
 }
@@ -644,6 +763,13 @@ function liveState(sess, host, now) {
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   if (s.question)
     return { label: "waiting for your answer", cls: "sess-wait", question: s.question, busy: true };
+  // A blocking TUI dialog (tool permission / plan approval) is the same thing
+  // for the operator, and MUST be checked before the working read: while one is
+  // up the pane shows no interrupt hint, so paneBusy reads false and the
+  // session would otherwise be labelled plain "idle" while it waits on a human.
+  if (s.panePrompt && s.panePrompt.prompt)
+    return { label: "waiting for your answer", cls: "sess-wait",
+             question: s.panePrompt.prompt, busy: true };
   const working = s.paneBusy != null
     ? (host.online && s.paneBusy)
     : (host.online && age < 90 * 1000);
@@ -657,7 +783,22 @@ function liveState(sess, host, now) {
 }
 
 function agentState(a, now) {
+  // An announced update in progress reads as "updating", not the outage-looking
+  // "offline" the silent-heartbeat gap would otherwise show (XERK-29). The hub
+  // only sets it while the host is actually silent, so it never masks a live one.
+  if (a.updating) return "updating";
   return a.online ? "online" : "offline";
+}
+
+// Human text for why a queued session hasn't started — the agent's queuedReason
+// (capacity / awaiting-clone / root-busy), with a generic fallback for an agent
+// that reported a reason we don't recognize.
+function queuedReasonText(reason) {
+  return ({
+    "capacity": "queued — waiting for a free session slot",
+    "awaiting-clone": "queued — cloning the repo first",
+    "root-busy": "queued — waiting for the repos-root slot",
+  })[reason] || "queued — waiting to start";
 }
 
 function tile(label, value, hint) {
@@ -667,67 +808,105 @@ function tile(label, value, hint) {
 }
 
 function render(data) {
-  const { now, agents } = data;
-  reconcilePending(agents);
-  $refreshed.textContent = "updated " + new Date(now).toLocaleTimeString();
+  const { now } = data;
+  // Hub-wide push health (XERK-152): when the hub has no FCM credential every
+  // mobile alert is silently dropped, so say so here rather than leaving the
+  // operator to guess why the phone went quiet. Strict === false so an older hub
+  // (no such field) or a partial SSE delta never false-alarms; it's hub-wide, so
+  // it sits above the tiles and ignores the org filter and the empty-fleet case.
+  $pushWarn.innerHTML = data.pushEnabled === false
+    ? `<span>🔕</span><span><b>Mobile push is off.</b> The hub has no FCM credential
+       (<code>FCM_SERVICE_ACCOUNT_JSON</code> unset), so Android notifications aren't
+       being sent. Set it on the hub and redeploy to restore them.</span>`
+    : "";
+  // Pending commands are reconciled against the WHOLE fleet, not the scoped
+  // view: a spawn fired before the operator narrowed to another org must still
+  // be retired when its host reports, or it hangs "starting…" forever.
+  reconcilePending(data.agents || []);
+  // Everything below is the fleet as scoped by the header's org filter
+  // (XERK-62). A host polls exactly one org, so scoping the agent list scopes
+  // the tiles, the host cards, their repos and their sessions in one move.
+  TurmaOrg.update(data);
+  TurmaNewTicket.update(data);
+  const agents = TurmaOrg.filter(data.agents || []);
+  // Org card tints come from the full fleet's org set, not the scoped one, so a
+  // host card's colour is the same whether or not its org is the filtered-to one.
+  refreshOrgColors(data.agents || []);
 
   // Aggregate across every session on every host.
   const sess = agents.flatMap(a => (a.sessions || []).map(s => ({ s, host: a })));
   const online = agents.filter(a => a.online);
   const running = sess.filter(x => x.s.status === "running");
   const waiting = sess.filter(x => x.s.status === "running" && x.s.session && x.s.session.question);
-  const tokToday = sess.reduce((t, x) => t + (totalTokens(x.s.usage?.today) || 0), 0);
-  const costToday = sess.reduce((t, x) => t + (x.s.usage?.today?.cost || 0), 0);
-  const costAll = sess.reduce((t, x) => t + (x.s.usage?.totals?.cost || 0), 0);
-  // Any unpriced usage in the mix means the $ tiles are understated — say so.
-  const unpToday = sess.some(x => x.s.usage?.today?.unpriced);
-  const unpAll = sess.some(x => x.s.usage?.totals?.unpriced);
-  const unpModels = [...new Set(sess.flatMap(x => x.s.usage?.unpricedModels || []))].join(", ");
+  // Token tiles read each host's persistent `usage` block — which the agent
+  // aggregates from EVERY transcript on the box — rather than summing the live
+  // session list, so killed, deleted and pruned work still counts toward the
+  // fleet's totals. An older agent that reports no such block falls back to the
+  // sessions it does report (understating, but only for that host).
+  const fleetTokens = (w) => agents.reduce((t, a) => t + (a.usage
+    ? (totalTokens(a.usage[w]) || 0)
+    : (a.sessions || []).reduce((n, s) => n + (totalTokens(s.usage?.[w]) || 0), 0)), 0);
+  const models = shortModels(mergeModels(agents.map(a => a.usage?.models)));
+  // MAX_SESSIONS is a PER-AGENT ceiling (agent capacity.maxSessions), so the cap
+  // for the current selection is the SUM across the scoped hosts — an org with
+  // several agents can run more than one host's worth. Only hosts that report the
+  // capacity block count; if none do (a pre-capacity fleet) the ceiling is unknown
+  // and we show the running count alone rather than a misleading "/ 0".
+  const capHosts = agents.filter(a => a.capacity && typeof a.capacity.maxSessions === "number");
+  const maxSessions = capHosts.reduce((t, a) => t + a.capacity.maxSessions, 0);
+  const runningValue = capHosts.length ? `${running.length} / ${maxSessions}` : String(running.length);
 
   $tiles.innerHTML =
     tile("Hosts online", `${online.length} / ${agents.length}`,
          [...new Set(agents.map(a => a.device))].join(", ") || "no devices yet") +
-    tile("Running sessions", String(running.length), sess.length + " total") +
+    tile("Running sessions", runningValue, sess.length + " total") +
     tile("Waiting on you", String(waiting.length), "sessions with a question") +
-    tile("Tokens today", fmtTokens(tokToday), "all sessions, incl. cache") +
-    tile("Est. cost today", fmtCost(costToday) + (unpToday ? " ⚠" : ""),
-         unpToday ? "understated — unpriced: " + unpModels : "API-equivalent") +
-    tile("Est. cost all-time", fmtCost(costAll) + (unpAll ? " ⚠" : ""),
-         unpAll ? "understated — unpriced: " + unpModels : "API-equivalent");
+    tile("Tokens today", fmtTokens(fleetTokens("today")), "all sessions, incl. cache") +
+    tile("Tokens this week", fmtTokens(fleetTokens("week")), "last 7 days (UTC)") +
+    tile("Tokens all-time", fmtTokens(fleetTokens("totals")),
+         models === "–" ? "every session ever" : "mostly " + models);
 
   if (!agents.length) {
-    $groups.innerHTML = `<div class="empty">No hosts have reported yet.<br>
-      Containers running the agent image heartbeat here automatically.</div>`;
+    // Distinguish an empty fleet from one the org filter has narrowed to
+    // nothing — otherwise a scoped-out dashboard reads as "no agents at all".
+    $groups.innerHTML = (data.agents || []).length
+      ? `<div class="empty">No hosts report this org.<br>
+         Pick another org (or “All orgs”) in the header to see the rest of the fleet.</div>`
+      : `<div class="empty">No hosts have reported yet.<br>
+         Containers running the agent image heartbeat here automatically.</div>`;
     return;
   }
 
   // One container per host, so each agent IS a host — render them as a flat
   // list of host cards keyed/titled by host name (no container-name layer).
-  // Preserve focus/caret in an open composer, and the clone list's scroll
-  // position, across the full innerHTML swap (a background poll re-render would
-  // otherwise reset a mid-scroll selection to the top).
+  // Preserve focus/caret in an open composer across the full innerHTML swap, and
+  // wrap the swap in preserveScroll so a background poll re-render can't reset
+  // the page scroll or a mid-selection scroll inside an open clone-repo list (a
+  // scrolled `.clone-list`, id-keyed, is captured by preserveScroll).
   const focus = captureComposerFocus();
-  const scrolls = captureCloneScroll();
-  $groups.innerHTML = `<div class="hosts">${agents.map(a => hostCard(a, now)).join("")}</div>`;
+  TurmaNav.preserveScroll($groups, () => {
+    $groups.innerHTML = `<div class="hosts">${agents.map(a => hostCard(a, now)).join("")}</div>`;
+  });
   restoreComposerFocus(focus);
-  restoreCloneScroll(scrolls);
 }
 
-// The clone repo picker is a scrollable list; the 5s poll's innerHTML swap
-// recreates it and would jump it back to the top mid-selection. Snapshot each
-// open list's scrollTop (keyed by its host id) and reapply it after the swap.
-function captureCloneScroll() {
-  const out = [];
-  for (const el of document.querySelectorAll(".clone-list")) {
-    if (el.id && el.scrollTop) out.push({ id: el.id, top: el.scrollTop });
-  }
-  return out;
+// Org tint (XERK-142): a host card is subtly background-coloured by the org it
+// polls, so a host's org reads at a glance — the same tint, from the same
+// orgColorMap, the board paints its ticket cards with. Built over the WHOLE fleet
+// (not the org-filtered view) so an org keeps its colour regardless of the filter.
+let orgColorByKey = new Map();
+function refreshOrgColors(agents) {
+  // Manual pins (XERK-145) come through TurmaOrg — its map is fed by both the
+  // poll payload and the orgColors SSE event, so a pin repaints at once.
+  orgColorByKey = window.TurmaBoard.orgColorMap(
+    (agents || []).map(a => (a.jira && a.jira.siteKey) || ""),
+    window.TurmaOrg.orgColors());
 }
-function restoreCloneScroll(list) {
-  for (const s of (list || [])) {
-    const el = document.getElementById(s.id);
-    if (el) el.scrollTop = s.top;
-  }
+// Inline style setting --org for a host card; empty for a host with no org (leaves
+// it on plain --surface). The card CSS color-mixes --org into --surface.
+function orgTintStyle(a) {
+  const c = orgColorByKey.get((a.jira && a.jira.siteKey) || "");
+  return c ? ` style="--org:${c}"` : "";
 }
 
 function hostCard(a, now) {
@@ -753,7 +932,8 @@ function hostCard(a, now) {
   const collapsed = collapsedHosts.has(a.key);
   const body = collapsed ? "" : `
     <div class="host-meta">
-      <span><span class="m-label">Claude Code</span> <b>${esc(a.claudeVersion || "–")}</b></span>
+      <span><span class="m-label">Agent</span> <b>${esc(codingAgent(a))}</b></span>
+      <span><span class="m-label">Turma</span> <b>${esc(a.agentVersion || "–")}</b></span>
       <span><span class="m-label">Memory</span> <b>${esc(mem)}</b></span>
       <span><span class="m-label">Uptime</span> <b>${esc(uptime(a.startedAt, now))}</b> · last seen ${esc(ago(now - a.lastSeen))}</span>
       <span><span class="m-label">Repos root</span> <span class="path">${esc(a.reposRoot || "–")}</span></span>
@@ -764,7 +944,7 @@ function hostCard(a, now) {
         ontoggle="logToggle('${esc(a.key)}', this.open)">
       <summary>Container log (tail)</summary><pre>${esc(a.logTail)}</pre>
     </details>` : ""}
-    ${a.online ? "" : `<div class="actions">
+    ${(a.online || a.updating) ? "" : `<div class="actions">
       <button onclick="removeHost('${esc(a.key)}')">Remove host</button>
     </div>`}`;
 
@@ -774,14 +954,32 @@ function hostCard(a, now) {
     ? `<span class="status" style="color:var(--muted);font-size:12px">${runCount} running · ${sessions.length} total</span>`
     : "";
 
-  return `<div class="host-card ${a.online ? "" : "offline"} ${collapsed ? "collapsed" : ""}">
+  // The org whose Jira this host polls, alongside its name — a host with no Jira
+  // creds reports no siteKey and just shows its name, so the suffix is only ever
+  // there when it says something.
+  const org = window.TurmaBoard.orgName(a.jira && a.jira.siteKey,
+                                        a.jira && a.jira.orgName);
+
+  // While updating, the card keeps its normal weight (not the greyed-out
+  // `offline` look the outage used to give it) and the header explains it's an
+  // expected, brief downtime rather than a crash (XERK-29).
+  const cardState = a.updating ? "updating" : (a.online ? "" : "offline");
+  const statusTitle = a.updating
+    ? `Agent is updating${a.updating.version ? " to " + a.updating.version : ""} — expected brief downtime, not an outage`
+    : "";
+
+  return `<div class="host-card ${cardState} ${collapsed ? "collapsed" : ""}"${orgTintStyle(a)}>
     <div class="host-top">
       <button class="host-name" onclick="hostToggle('${esc(a.key)}')"
           aria-expanded="${collapsed ? "false" : "true"}" title="${collapsed ? "Expand" : "Collapse"} host">
-        <span class="caret">▼</span><h3>${esc(a.key)}</h3>
+        <span class="caret">▼</span>
+        <h3>${esc(a.key)}${org ? ` <span class="host-org">- ${esc(org)}</span>` : ""}</h3>
       </button>
       ${collapsedMeta}
-      <span class="status"><span class="dot ${dot}"></span>${esc(state)}</span>
+      ${boardHealthBadge(a)}
+      ${claudeAuthBadge(a)}
+      ${restartBtn(a)}
+      <span class="status"${statusTitle ? ` title="${esc(statusTitle)}"` : ""}><span class="dot ${dot}"></span>${esc(state)}</span>
     </div>${body}
   </div>`;
 }
@@ -789,17 +987,43 @@ function hostCard(a, now) {
 // DOM-safe host id for the clone control's field ids.
 function hostId(key) { return key.replace(/[^A-Za-z0-9]/g, "_"); }
 
-// "Clone from GitHub" control for a host — a collapsible section (collapsed by
-// default; cloneOpen tracks which hosts are expanded). Its header toggles the
-// body: when the host has usable GitHub creds the body offers a searchable,
-// multi-select checkbox list of the login's repos (already-present ones
-// disabled) plus a free-text owner/repo box, and queues a clone into REPOS_ROOT
-// for each selected repo; they then join the scan and become spawnable. With no
-// creds the body is a greyed-out note. In-flight / recent clone jobs (reported
-// by the agent) show below the section — visible even while it's collapsed — with
-// an optimistic row per clone just fired but not yet echoed back.
-function cloneBar(a) {
+// The host's clone sources (XERK-155): the legacy `github` block as the GitHub
+// section plus every extra source the agent reports in `gitSources` (Azure
+// DevOps, GitLab). Each repo is tagged with its source, and a pick's key is
+// "<source>|<nameWithOwner>" — '|' can't appear in either — so the POST can say
+// which listing the pick came from. An agent predating gitSources reports none
+// and the bar renders exactly as it always did.
+function cloneSources(a) {
   const gh = a.github || {};
+  const out = [];
+  if (gh.available || !(a.gitSources || []).length) {
+    out.push({ source: "github", label: "GitHub", user: gh.login || null,
+               available: !!gh.available,
+               repos: (gh.repos || []).map(r => ({ ...r, source: "github" })) });
+  }
+  for (const s of a.gitSources || []) {
+    if (!s || !s.source) continue;
+    out.push({ source: s.source, label: s.label || s.source, user: s.user || null,
+               available: !!s.available,
+               repos: (s.repos || []).map(r => ({ ...r, source: s.source })) });
+  }
+  return out;
+}
+
+// Clone control for a host — a collapsible section (collapsed by default;
+// cloneOpen tracks which hosts are expanded). Its header toggles the body: when
+// the host has a usable clone source the body offers a searchable,
+// multi-select checkbox list of each source's repos (already-present ones
+// disabled) plus a free-text owner/repo box (GitHub), and queues a clone into
+// REPOS_ROOT for each selected repo; they then join the scan and become
+// spawnable. With no creds the body is a greyed-out note. In-flight / recent
+// clone jobs (reported by the agent) show below the section — visible even
+// while it's collapsed — with an optimistic row per clone just fired but not
+// yet echoed back.
+function cloneBar(a) {
+  const sources = cloneSources(a);
+  const avail = sources.some(s => s.available);
+  const multi = sources.length > 1;
   const hid = hostId(a.key);
   const open = cloneOpen.has(a.key);
   const clones = a.clones || [];
@@ -817,52 +1041,77 @@ function cloneBar(a) {
     .map(p => `<div class="clone-job"><span class="spin"></span> Cloning <b>${esc(p.repo)}</b>…</div>`)
     .join("");
 
+  // With one source the header names it — "Clone from GitHub" / "Clone from
+  // gitlab.example.com" — so a GitLab- or Azure-only host never claims GitHub;
+  // several sources make it generic and the labels move into the list.
+  const one = sources[0] || {};
+  const label = multi
+    ? "Clone a repo"
+    : `Clone from ${esc(one.label || "GitHub")}${one.user ? ` <span class="clone-note">as ${esc(one.user)}</span>` : ""}`;
   const header = `<button class="clone-toggle" aria-expanded="${open}"
       title="${open ? "Collapse" : "Expand"} clone panel" onclick="cloneToggle('${esc(a.key)}')">
     <span class="caret">▼</span>
-    <span class="clone-label">Clone from GitHub${gh.login ? ` <span class="clone-note">as ${esc(gh.login)}</span>` : ""}</span>
+    <span class="clone-label">${label}</span>
   </button>`;
 
   // Body only renders while expanded — keeps the collapsed row cheap and, since
   // the poll re-render then emits no picker, there's nothing to scroll-reset.
-  const inner = !open ? "" : (!gh.available
-    ? `<div class="clone-body"><span class="clone-note">No GitHub credentials on this host — cloning unavailable.</span></div>`
-    : cloneBody(a, gh, hid));
+  const inner = !open ? "" : (!avail
+    ? `<div class="clone-body"><span class="clone-note">${multi
+        ? "No usable git-source credentials on this host — cloning unavailable."
+        : `No ${esc(one.label || "GitHub")} credentials on this host — cloning unavailable.`}</span></div>`
+    : cloneBody(a, sources, hid));
 
-  return `<div class="clone-bar${open ? "" : " collapsed"}${gh.available ? "" : " disabled"}">
+  return `<div class="clone-bar${open ? "" : " collapsed"}${avail ? "" : " disabled"}">
     ${header}${inner}
   </div>${jobRows}${optimistic}`;
 }
 
-// The expanded picker: search box + scrollable multi-select list, a free-text
-// owner/repo box, and the Clone button/count. Split out of cloneBar so the
-// collapsed path stays a one-liner.
-function cloneBody(a, gh, hid) {
+// The expanded picker: search box + scrollable multi-select list (grouped by
+// source when there is more than one), a free-text owner/repo box (GitHub), and
+// the Clone button/count. Split out of cloneBar so the collapsed path stays a
+// one-liner.
+function cloneBody(a, sources, hid) {
   const existing = new Set((a.repos || []).map(r => r.name));
   const d = cloneDraft.get(a.key) || {};
   const picks = d.picks || {};
   const dis = a.online ? "" : "disabled";
-  const repos = gh.repos || [];
+  const avail = sources.filter(s => s.available);
+  const multi = sources.length > 1;
+  const total = avail.reduce((n, s) => n + s.repos.length, 0);
   // Filter the checkbox list by the search box (matches owner/repo, case-insensitive).
   const q = (d.search || "").trim().toLowerCase();
-  const shown = q ? repos.filter(r => r.nameWithOwner.toLowerCase().includes(q)) : repos;
-  const rows = shown.map(r => {
-    const here = existing.has(r.name);
-    const checked = picks[r.nameWithOwner] ? " checked" : "";
-    return `<label class="clone-opt${here ? " here" : ""}">
-      <input type="checkbox"${checked}${here || dis ? " disabled" : ""}
-        onchange="clonePick('${esc(a.key)}','${esc(r.nameWithOwner)}',this.checked)">
-      <span>${esc(r.nameWithOwner)}${r.isPrivate ? " 🔒" : ""}${here ? " · already here" : ""}</span>
-    </label>`;
+  let shownTotal = 0;
+  const groups = avail.map(s => {
+    const shown = q ? s.repos.filter(r => r.nameWithOwner.toLowerCase().includes(q)) : s.repos;
+    shownTotal += shown.length;
+    const rows = shown.map(r => {
+      const here = existing.has(r.name);
+      const pickKey = r.source + "|" + r.nameWithOwner;
+      const checked = picks[pickKey] ? " checked" : "";
+      return `<label class="clone-opt${here ? " here" : ""}">
+        <input type="checkbox"${checked}${here || dis ? " disabled" : ""}
+          onchange="clonePick('${esc(a.key)}','${esc(pickKey)}',this.checked)">
+        <span>${esc(r.nameWithOwner)}${r.isPrivate ? " 🔒" : ""}${here ? " · already here" : ""}</span>
+      </label>`;
+    }).join("");
+    if (!rows) return "";
+    // A group heading only when several sources report — a GitHub-only host
+    // keeps its flat list.
+    const head = multi
+      ? `<div class="clone-src">${esc(s.label)}${s.user ? ` <span class="clone-note">as ${esc(s.user)}</span>` : ""}</div>`
+      : "";
+    return head + rows;
   }).join("");
-  // The scrollable list only appears when the login reported repos. Its inner
+  const ghSrc = sources.find(s => s.source === "github") || {};
+  // The scrollable list only appears when a source reported repos. Its inner
   // message covers "search matched nothing" vs "no repos discovered at all".
-  const listInner = repos.length === 0
-    ? `<div class="clone-list-empty">No repos found${gh.login ? ` for ${esc(gh.login)}` : ""} — type an <code>owner/repo</code> below to clone.</div>`
-    : shown.length === 0
+  const listInner = total === 0
+    ? `<div class="clone-list-empty">No repos found${ghSrc.user ? ` for ${esc(ghSrc.user)}` : ""} — type an <code>owner/repo</code> below to clone.</div>`
+    : shownTotal === 0
     ? `<div class="clone-list-empty">No repos match “${esc(d.search || "")}”.</div>`
-    : rows;
-  const searchBox = repos.length
+    : groups;
+  const searchBox = total
     ? `<input id="clone-search-${hid}" class="clone-search" type="text" placeholder="Search repos…"
         value="${esc(d.search || "")}" ${dis} oninput="cloneSearch('${esc(a.key)}',this.value)">`
     : "";
@@ -979,6 +1228,25 @@ function repoBlock(a, repo, sessList, now) {
   </details>`;
 }
 
+// The composer's model choices: the curated aliases the host's login actually
+// has (from the agent's probed `models` block — kept in sync with chat.js's
+// modelOpts, the same rule for the live chat menu), falling back to the static
+// four for a host that hasn't probed yet. A remembered pick that has left the
+// list is carried back in so the select can't silently misreport it.
+function modelChoices(a, remembered) {
+  const KNOWN = ["default", "opus", "fable", "sonnet", "haiku"];
+  const avail = a && a.models && Array.isArray(a.models.available) ? a.models.available : null;
+  const aliases = avail && avail.length
+    ? KNOWN.filter(m => m === "default" || avail.includes(m))
+    : ["default", "opus", "sonnet", "haiku"];
+  if (remembered && remembered !== "default" && !aliases.includes(remembered)) aliases.push(remembered);
+  const dflt = a && a.models && a.models.defaultLabel;
+  return aliases.map(m => ({
+    value: m,
+    label: m === "default" && dflt ? `Default (${dflt})` : m[0].toUpperCase() + m.slice(1),
+  }));
+}
+
 // The "New session" composer panel (#11 task, #13 label, #12 options). Task
 // first (autofocused, Cmd/Ctrl+Enter submits); options are a collapsed nested
 // disclosure that defaults to today's behavior. Field values that are text
@@ -1026,7 +1294,7 @@ function composer(a, repo, rk, spawning) {
         <div>
           <label>Model</label>
           <select id="${cid(rk, "model")}" onchange="onOptChange('${esc(rk)}','${rn}')">
-            ${opt("default", "Default", selModel)}${opt("opus", "Opus", selModel)}${opt("sonnet", "Sonnet", selModel)}${opt("haiku", "Haiku", selModel)}
+            ${modelChoices(a, selModel).map(m => opt(m.value, m.label, selModel)).join("")}
           </select>
         </div>
         <div>
@@ -1081,13 +1349,18 @@ function sessCard(a, s, now) {
     actions =
       (canAttach
         ? `<button class="primary btn-sm" onclick="location.href='/sessions?session=${encodeURIComponent(s.id)}'">Attach ▸</button>`
-        : `<button class="btn-sm" disabled title="Terminal tunnel offline">Attach</button>`) +
+        : `<button class="btn-sm" disabled title="${a.updating ? "Host is updating — terminal will return shortly" : "Terminal tunnel offline"}">Attach</button>`) +
       `<button class="btn-sm ${confirming.has(rKey) ? "confirm" : ""}" onclick="sessRestart('${key}','${id}')">${confirming.has(rKey) ? "Confirm restart" : "Restart"}</button>` +
       // Stop the session and drop it from the hub — but KEEP its worktree on
       // disk (uncommitted work survives) and its usage history, so it stays
       // resumable. Delete (which removes the worktree) only appears on already-
       // stopped/errored cards below.
       `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? esc(killConfirm) : "Kill"}</button>`;
+  } else if (st === "queued") {
+    // Waiting for a slot / clone / the root slot. It has no worktree yet, so the
+    // only thing to do is cancel it — Kill drops the queued record.
+    actions =
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" onclick="sessKill('${key}','${id}')">${confirming.has(kKey) ? "Confirm cancel" : "Cancel"}</button>`;
   } else {
     // stopped or error: offer Start (needs host online + worktree recoverable) + Delete.
     actions =
@@ -1123,7 +1396,9 @@ function sessCard(a, s, now) {
       <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
       ${killing
         ? `<dt>State</dt><dd><b class="sess-dying">shutting down…</b></dd>`
-        : live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>` : ""}
+        : live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>`
+        : st === "queued" ? `<dt>State</dt><dd><b class="sess-queued">${esc(queuedReasonText(s.queuedReason))}</b>${s.queuedAt ? " · " + esc(ago(now - Date.parse(s.queuedAt))) : ""}</dd>`
+        : ""}
       ${live && live.question ? `<dt>Question</dt><dd>${esc(live.question)}</dd>` : ""}
       ${st === "error" && s.errorMsg ? `<dt>Error</dt><dd class="errmsg">${esc(s.errorMsg)}</dd>` : ""}
       ${prs}
@@ -1131,12 +1406,9 @@ function sessCard(a, s, now) {
       <dt>Activity</dt><dd>${u?.lastActivity ? esc(ago(now - Date.parse(u.lastActivity))) : "–"}${u ? " · " + esc(shortModels(u.models)) : ""}</dd>
     </dl>
     <div class="usage">
-      <div><div class="u-label">Tokens today</div><div class="u-value">${fmtTokens(totalTokens(u?.today))}</div>
-           <div class="u-sub">${fmtTokens(u?.today?.output)} out</div></div>
-      <div><div class="u-label">Est. today</div><div class="u-value">${fmtCost(u?.today?.cost)}${unpricedMark(u?.today, u)}</div>
-           <div class="u-sub">API-equiv.</div></div>
-      <div><div class="u-label">All-time</div><div class="u-value">${fmtCost(u?.totals?.cost)}${unpricedMark(u?.totals, u)}</div>
-           <div class="u-sub">${fmtTokens(totalTokens(u?.totals))} tokens</div></div>
+      <div class="u-label">Tokens</div>
+      <div class="u-value" title="all tokens this session (input + output + cache), from the transcript — persists across kill/resume">${fmtTokens(totalTokens(u?.totals))}</div>
+      <div class="u-sub">${fmtTokens(u?.totals?.output)} out</div>
     </div>
     <div class="sess-actions">${actions}</div>
   </div>`;
@@ -1144,12 +1416,26 @@ function sessCard(a, s, now) {
 
 // ---- actions → endpoints ---------------------------------------------------
 function enc(s) { return encodeURIComponent(s); }
+// Returns the parsed JSON reply (or null if it isn't JSON) — the spawn/resume
+// endpoints answer with the queued command's `cmdId`, which followToSessions()
+// hands the sessions page so it can open the session that command creates.
 async function post(url, body) {
-  await fetch(url, body
+  const res = await fetch(url, body
     ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
     : { method: "POST" });
+  let out = null;
+  try { out = await res.json(); } catch { /* not JSON — nothing to correlate */ }
   refresh();
   fastPoll();
+  return out;
+}
+// Starting or resuming a session is a "go work in it" action, so hand off to the
+// sessions page and let it open the session. The id doesn't exist yet — the
+// agent mints it — so we pass the queued command's `cmdId` and the sessions page
+// matches it against the `spawnCmdId` the new session reports. A resume of a
+// KILLED session keeps its id, so that path deep-links by id directly instead.
+function followToSessions(cmdId) {
+  if (cmdId) location.href = `/sessions?spawn=${enc(cmdId)}`;
 }
 async function del(url) { await fetch(url, { method: "DELETE" }); refresh(); fastPoll(); }
 
@@ -1168,6 +1454,19 @@ function twoClick(actionKey, doIt) {
 
 function removeHost(key)  { del(`/api/agents/${enc(key)}`); }
 
+// Restart a host's agent manager (XERK-157). Arm/confirm first, then POST; the
+// pending state captures the current startedAt so reconcilePending can clear the
+// "Restarting…" spinner the moment a fresh manager beats in (a changed
+// startedAt) rather than waiting out the TTL.
+function restartHost(key) {
+  twoClick("ra::" + key, () => {
+    const host = (cache.agents || []).find(a => a.key === key);
+    busy(pendKey("restartAgent", key, "_"),
+      { kind: "restartAgent", host: key, startedAt: host ? host.startedAt : null },
+      () => post(`/api/agents/${enc(key)}/restart`));
+  });
+}
+
 // Mark an action pending and re-render immediately (instant feedback), then fire
 // it. `busy` de-dupes so a queued command can't be double-sent from the same
 // button before the next poll clears it.
@@ -1177,22 +1476,30 @@ function busy(key, val, run) {
   render(cache);
   run();
 }
-// Clone the selected GitHub repos into a host's REPOS_ROOT. Every checked repo
-// plus a non-empty free-text owner/repo box is queued as its own clone (the
-// endpoint takes one repo at a time). Each dest name (last path segment, sans
-// .git) keys an optimistic pending row that clears when the agent reports the
-// clone or the repo appears in the scan.
+// Clone the selected repos into a host's REPOS_ROOT. Every checked repo plus a
+// non-empty free-text owner/repo box (always GitHub) is queued as its own clone
+// (the endpoint takes one repo at a time). A pick's key is
+// "<source>|<nameWithOwner>" (see cloneSources), so the POST carries the source
+// the pick came from; the free-text box sends no source, keeping the legacy
+// GitHub meaning. Each dest name (last path segment, sans .git) keys an
+// optimistic pending row that clears when the agent reports the clone or the
+// repo appears in the scan.
 function cloneRepo(key) {
   const d = cloneDraft.get(key) || {};
-  const specs = Object.keys(d.picks || {});
+  const specs = Object.keys(d.picks || {}).map(k => {
+    const i = k.indexOf("|");
+    return i < 0 ? { repo: k, source: null }
+                 : { repo: k.slice(i + 1), source: k.slice(0, i) };
+  });
   const free = (d.text || "").trim();
-  if (free) specs.push(free);
+  if (free) specs.push({ repo: free, source: null });
   if (!specs.length) return;
   for (const spec of specs) {
-    const name = spec.replace(/\.git$/, "").replace(/\/+$/, "").split("/").pop();
+    const name = spec.repo.replace(/\.git$/, "").replace(/\/+$/, "").split("/").pop();
     if (!name) continue;
-    busy(pendKey("clone", key, name), { kind: "clone", host: key, name, repo: spec },
-      () => post(`/api/agents/${enc(key)}/clone`, { repo: spec }));
+    const body = spec.source ? { repo: spec.repo, source: spec.source } : { repo: spec.repo };
+    busy(pendKey("clone", key, name), { kind: "clone", host: key, name, repo: spec.repo },
+      () => post(`/api/agents/${enc(key)}/clone`, body));
   }
   cloneDraft.set(key, {}); // clear search/picks/box; progress shows as clone-job rows
   render(cache);
@@ -1229,7 +1536,8 @@ function startSession(key, repo) {
   composerDraft.delete(rk);
   const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
-    () => post(`/api/agents/${enc(key)}/sessions`, body));
+    () => post(`/api/agents/${enc(key)}/sessions`, body)
+      .then(r => followToSessions(r && r.cmdId)));
 }
 function sessStart(key, id) {
   busy(pendKey("start", key, id), { kind: "start", host: key, id },
@@ -1239,7 +1547,9 @@ function sessStart(key, id) {
 // branch with its prior conversation. Not destructive, so no arm/confirm.
 function resumeSession(key, id) {
   busy(pendKey("resume", key, id), { kind: "resume", host: key, id },
-    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/resume`));
+    // A killed session keeps its id, so the sessions page can wait on it by id.
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/resume`)
+      .then(() => { location.href = `/sessions?session=${enc(id)}`; }));
 }
 // Resume ANY prior Claude session by its transcript id (the broadened picker,
 // repo.resumable). The origin cwd is looked up from cached state (kept out of
@@ -1256,7 +1566,8 @@ function resumeTranscript(key, transcriptId) {
   }
   const baseline = a ? (a.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("resume", key, transcriptId), { kind: "spawn", host: key, repo, baseline },
-    () => post(`/api/agents/${enc(key)}/transcripts/${enc(transcriptId)}/resume`, { cwd }));
+    () => post(`/api/agents/${enc(key)}/transcripts/${enc(transcriptId)}/resume`, { cwd })
+      .then(r => followToSessions(r && r.cmdId)));
 }
 // The destructive three still arm/confirm first; the pending state begins only
 // once confirmed (inside doIt), so it reflects a real in-flight command.
@@ -1341,6 +1652,20 @@ function connectSSE() {
     catch { return; }
     bgRender();
   });
+  // An org's color pin changed (XERK-145): org.js owns the live map; patching
+  // this page's cache keeps the next render's TurmaOrg.update(cache) from
+  // regressing the pins to the stale copy the initial poll fetched.
+  es.addEventListener("orgColors", (e) => {
+    let oc;
+    try { oc = JSON.parse(e.data); } catch { return; }
+    if (!cache) return;   // org.js already took the event; nothing painted yet
+    cache.orgColors = oc;
+    bgRender();
+  });
+  // The header's per-org auto-start switches (XERK-41) ride the same socket —
+  // org.js takes its own event off this page's EventSource rather than opening
+  // a second one.
+  TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;
     // The browser auto-retries an open stream; only re-create one it gave up on.
@@ -1366,6 +1691,10 @@ function fastPoll() {
   }, 500);
 }
 
+// The org scope lives in the header and applies to every page (XERK-62);
+// a change there repaints this one straight away rather than waiting for
+// the next beat.
+TurmaOrg.subscribe(() => render(cache));
 refresh();
 connectSSE();
 // Fallback poll: slower now that SSE carries live updates, and skipped entirely

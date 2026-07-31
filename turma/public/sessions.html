@@ -30,15 +30,16 @@
     overflow: hidden; overscroll-behavior: none;
   }
 
-  /* Full-width header bar (overrides the shared centred header block). */
-  .app-header {
-    flex: none; margin: 0; padding: 12px 18px;
-    border-bottom: 1px solid var(--hairline); background: var(--surface);
-  }
+  /* The shared .site-header (app.css) renders here unchanged — same centred
+     1180px row as every other page. The shell below is capped at the same
+     --wrap and centred (margin auto on the cross axis of the column body), so
+     the whole page — chrome AND content — lands in the same 1180px column as
+     dashboard/board/usage rather than filling the window edge to edge. Below
+     --wrap the cap is inert, so the phone layout (max-width:820px) is untouched. */
 
-  .sess-shell { flex: 1; display: flex; min-height: 0; }
+  .sess-shell { flex: 1; display: flex; min-height: 0; width: 100%; max-width: var(--wrap); margin: 0 auto; }
 
-  /* ---- Left sidebar: new-session picker, active list, stopped list --------- */
+  /* ---- Left sidebar: new-session picker, active list, ended list ----------- */
   .sidebar {
     width: 340px; flex: none; border-right: 1px solid var(--hairline);
     overflow-y: auto; padding: 14px 14px 24px; display: flex; flex-direction: column; gap: 6px;
@@ -53,17 +54,40 @@
   /* Session card: the auto task name leads; the 5-digit id + repo sit small below. */
   button.s-card {
     display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left;
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    /* Subtle, opaque org tint (XERK-142): --org (set inline on .s-card-wrap by
+       orgTintStyle) mixed a little into --surface, so a session's org reads at a
+       glance the same way it does on the board. No org set → plain surface. */
+    background: color-mix(in srgb, var(--org, var(--surface)) 12%, var(--surface));
+    border: 1px solid var(--border); border-radius: var(--radius-md);
     padding: 10px 12px; cursor: pointer; font: inherit; color: var(--ink);
   }
   button.s-card:hover:not(:disabled) { border-color: var(--accent); }
   button.s-card:disabled { cursor: default; opacity: 0.6; }
-  .s-card.cur { border-color: var(--accent); background: var(--accent-soft); }
+  /* Selected: a thicker accent border, but KEEP the org tint as the fill (XERK-142)
+     rather than washing it to accent-soft — the org colour still has to read on the
+     open card. box-sizing:border-box (app.css) means the 2px border adds no layout
+     shift. Mirrors the Android selected card's 2dp border over the tint. */
+  .s-card.cur { border-color: var(--accent); border-width: 2px; }
+  /* A queued session card is a static <div>, not a selecting <button> (no pane to
+     attach to yet), so it needs the card's flex layout spelled out here. It gets
+     a dashed border + amber dot to read as "about to start", distinct from both a
+     live card and a muted ended one. */
+  .s-card.queued {
+    display: flex; align-items: flex-start; gap: 10px; width: 100%;
+    background: color-mix(in srgb, var(--org, var(--surface)) 12%, var(--surface));
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-md); padding: 10px 72px 10px 12px; color: var(--ink);
+  }
+  .s-card.queued .dot { background: var(--warning); box-shadow: none; }
+  .s-card-wrap > .s-dots { font-size: 11.5px; font-weight: 600; }
   .s-card .dot { margin-top: 4px; }
   .s-card .body { flex: 1; min-width: 0; }
   .s-card .title { font-weight: 600; font-size: 14px; line-height: 1.3; overflow-wrap: anywhere; }
   .s-card .meta { color: var(--muted); font-size: 11.5px; margin-top: 2px; overflow-wrap: anywhere; }
   .s-card .meta .id { font-family: var(--font-mono); }
+  /* The Jira ticket this session works — the key alone, since the card's meta
+     line is already dense and the chat footer carries the linked chip. */
+  .s-card .meta .s-ticket { font-family: var(--font-mono); color: var(--accent); }
   .s-card .state { font-size: 12px; margin-top: 4px; color: var(--ink-2); }
   .s-card .state.working { color: var(--good); }
   .s-card .state.waiting { color: var(--warning); font-weight: 600; }
@@ -81,21 +105,107 @@
   .s-card .state-row .pr-list { flex: 0 1 auto; min-width: 0; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
   .s-card .state-row .pr-badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 
-  /* Stopped sessions: compact rows with a Start button. */
-  .stopped-row {
-    display: flex; align-items: center; gap: 10px;
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
-    padding: 9px 12px;
+  /* Per-card overflow menu (⋯ → Rename / Kill). The trigger and its popover are
+     SIBLINGS of button.s-card, absolutely positioned over its top-right corner —
+     the card is itself a <button>, and a nested button is invalid HTML the parser
+     hoists out. The card's right padding keeps its text clear of the trigger. */
+  .s-card-wrap { position: relative; }
+  .s-card-wrap button.s-card { padding-right: 36px; }
+  .s-dots {
+    position: absolute; top: 5px; right: 5px; z-index: 2;
+    background: none; border: 0; border-radius: 6px; cursor: pointer;
+    color: var(--muted); font-size: 15px; line-height: 1; padding: 4px 7px;
   }
-  .stopped-row .body { flex: 1; min-width: 0; }
-  .stopped-row .title { font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
-  .stopped-row .meta { color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
-  .stopped-row .meta .id { font-family: var(--font-mono); }
-  .stopped-row .err { color: var(--critical); font-size: 11.5px; }
+  .s-dots:hover, .s-dots.open { background: var(--hairline); color: var(--ink); }
+  .s-menu {
+    position: absolute; top: 30px; right: 5px; z-index: 6; min-width: 150px;
+    display: flex; flex-direction: column; padding: 4px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); box-shadow: var(--shadow-md);
+  }
+  .s-menu button {
+    background: none; border: 0; border-radius: 5px; cursor: pointer;
+    text-align: left; font: inherit; font-size: 12.5px; color: var(--ink); padding: 7px 9px;
+  }
+  .s-menu button:hover { background: var(--accent-soft); }
+  .s-menu button.danger { color: var(--critical); font-weight: 600; }
+  .s-menu button.danger.armed { background: var(--critical); color: #fff; }
+  .s-menu-head {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+    color: var(--muted); padding: 6px 9px 3px;
+  }
+  .s-menu-empty { font-size: 12px; color: var(--muted); padding: 6px 9px; }
+  /* "Moving to <host>…" hint on a source card while its migration is in flight. */
+  .s-moving {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11.5px; color: var(--accent); margin-top: 4px;
+  }
+  /* A transient bottom-centre notice (a failed move, today). */
+  .toast {
+    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+    z-index: 50; max-width: min(92vw, 480px);
+    background: var(--critical); color: #fff; font-size: 13px;
+    padding: 10px 16px; border-radius: var(--radius-md); box-shadow: var(--shadow-md);
+    opacity: 0; pointer-events: none; transition: opacity .2s;
+  }
+  .toast.show { opacity: 1; }
 
-  details.stopped-wrap summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; padding: 2px 0; }
-  details.stopped-wrap summary:hover { color: var(--ink-2); }
-  details.stopped-wrap .s-list { gap: 8px; margin-top: 8px; }
+  /* Inline rename field, opened from the menu; replaces the card while editing. */
+  .s-rename {
+    display: flex; gap: 6px; align-items: center;
+    background: var(--surface); border: 1px solid var(--accent);
+    border-radius: var(--radius-md); padding: 9px 10px;
+  }
+  .s-rename input {
+    flex: 1; min-width: 0; font: inherit; font-size: 13px; padding: 6px 8px;
+    border-radius: 6px; border: 1px solid var(--border);
+    background: var(--field); color: var(--ink);
+  }
+
+  /* Ended sessions (killed, or exited on their own): the same clickable card as
+     a live session — clicking one opens its conversation read-only on the stage
+     — with a Resume button as an absolutely-positioned SIBLING, exactly like the
+     live card's ⋯ trigger and for the same reason (the card is a <button>, and a
+     nested button is invalid HTML the parser hoists out). */
+  .s-card.ended .dot { background: none; border: 1.5px solid var(--muted); box-sizing: border-box; }
+  .s-card-wrap.ended-wrap button.s-card { padding-right: 78px; }
+  .s-resume {
+    position: absolute; top: 7px; right: 6px; z-index: 2;
+    font: inherit; font-size: 11.5px; font-weight: 600; padding: 4px 10px;
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--surface); color: var(--ink-2); cursor: pointer;
+  }
+  .s-resume:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .s-resume:disabled { opacity: 0.6; cursor: default; }
+  .s-card .err { color: var(--critical); font-size: 11.5px; margin-top: 3px; overflow-wrap: anywhere; }
+
+  /* The section heading IS the disclosure control — there is nothing else in
+     this section to click, so a separate "show / hide" line below it was a
+     second target for the one action. The <h2> stays for the heading semantics
+     (and so it reads identically to Active/Idle) and goes inline, because a
+     block child would push the summary's marker onto its own line. Its vertical
+     margins go with it, so the summary carries them instead — matching what the
+     <h2> resolves to in the sibling sections, where each one is `:first-of-type`
+     inside its own container. */
+  details.ended-wrap-sec summary { cursor: pointer; user-select: none; margin: 4px 0 8px; }
+  details.ended-wrap-sec summary h2 { display: inline; margin: 0; }
+  details.ended-wrap-sec summary:hover h2 { color: var(--ink); }
+  details.ended-wrap-sec .s-list { gap: 8px; }
+
+  /* The ended-session stage bar carries what the live chat's bar can't offer a
+     session that is over: its PRs (clickable here — the stage is not a button),
+     and Resume. There is deliberately no Terminal toggle and no compose box:
+     nothing is running to attach a pty to or to type at. */
+  .term-bar .tr-prs { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+  .term-bar .tr-prs .pr-badge { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+  .term-bar .resume-btn {
+    font: inherit; font-size: 12px; font-weight: 600; padding: 4px 12px;
+    border: 1px solid var(--accent); border-radius: var(--radius-sm);
+    background: var(--accent); color: #fff; cursor: pointer; white-space: nowrap;
+  }
+  .term-bar .resume-btn:hover:not(:disabled) { filter: brightness(1.07); }
+  .term-bar .resume-btn:disabled { opacity: 0.65; cursor: default; }
+  .term-bar .resume-btn[hidden], .term-bar .tr-prs[hidden] { display: none; }
 
   /* New-session picker (top of the sidebar): each online host, its repos as spawn buttons. */
   details.spawn-wrap > summary {
@@ -174,10 +284,10 @@
     font-size: 16px; line-height: 1; padding: 4px; display: none;
   }
   .searchbox.has-q .clr { display: block; }
-  /* While a query is active, #searchResults overlays the live/stopped lists. */
+  /* While a query is active, #searchResults overlays the live/ended lists. */
   #searchResults { display: none; }
   body.searching #searchResults { display: block; }
-  body.searching #active, body.searching #idle, body.searching #stopped,
+  body.searching #active, body.searching #idle, body.searching #ended,
   body.searching #spawn { display: none; }
   .sr-hint { color: var(--muted); font-size: 12px; padding: 6px 2px; }
   .sr-group { margin: 10px 0 4px; }
@@ -222,6 +332,52 @@
     background: var(--page); font-weight: 600; }
   .tr-msg .md-table tbody tr:nth-child(even) td,
   .thought-body .md-table tbody tr:nth-child(even) td { background: var(--page); }
+  /* Fenced code blocks (chat.js renderProse()). The surrounding bubble is
+     pre-wrap (and the thinking trace italic), so the block re-asserts pre +
+     upright mono and scrolls itself horizontally rather than wrapping code or
+     stretching the layout — same deal as .md-table above.
+
+     A `pre` that doesn't wrap has a min-content width of its longest line, and
+     a shrink-to-fit box won't size below that — so on a narrow viewport a long
+     code line pushed the whole bubble (and .tr-scroll with it) sideways instead
+     of scrolling inside the block. Giving the code-carrying box a DEFINITE
+     width takes it out of shrink-to-fit sizing entirely, so there's no
+     min-content floor to defeat and the overflow lands on the block's own
+     scroller. min(760px, 100%) keeps the bubble's usual cap on a wide screen.
+
+     Scoped with :has() so ordinary bubbles keep hugging their text — a bubble
+     carrying a code block goes full width, which is the conventional look.
+
+     Do NOT do this by making the box a grid/flex container (a minmax(0, 1fr)
+     track floors the contribution at 0 and looks right at first): that turns
+     every child into a block-level item, so inline `code` chips and links get
+     torn onto their own full-width lines mid-sentence. Nor by capping the code
+     itself (width:0 / contain:inline-size) — that drops the block out of the
+     bubble's width entirely, so it scrolls on a wide screen where it'd fit. */
+  .tr-msg:has(.md-code), .thought:has(.md-code) { width: min(760px, 100%); }
+  .tr-msg .md-code, .thought-body .md-code, .compact-body .md-code {
+    margin: 6px 0; padding: 8px 10px; background: var(--page);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    max-width: 100%; overflow-x: auto; white-space: pre; overflow-wrap: normal;
+    font-style: normal; font-size: 11.5px; line-height: 1.45; color: var(--ink); }
+  .tr-msg .md-code code, .thought-body .md-code code, .compact-body .md-code code {
+    font-family: var(--font-mono); }
+  /* Language tag, when the fence carried one (```hcl). Outside the <code>, so it
+     stays out of a copied selection. */
+  .tr-msg .md-code[data-lang]::before, .thought-body .md-code[data-lang]::before,
+  .compact-body .md-code[data-lang]::before {
+    content: attr(data-lang); display: block; margin-bottom: 5px;
+    font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase;
+    letter-spacing: 0.05em; color: var(--muted); }
+  /* Inline `code` spans (chat.js renderInline()). Sized in em so the chip tracks
+     whatever it's set in (bubble, cell, thinking trace), and upright since the
+     thinking trace is italic. `anywhere` because an inline span is the one code
+     surface that can't scroll — a long `path/to/thing` has to break somewhere. */
+  .tr-msg .md-code-inline, .thought-body .md-code-inline, .compact-body .md-code-inline,
+  .md-table .md-code-inline {
+    font-family: var(--font-mono); font-size: 0.88em; font-style: normal;
+    background: var(--page); border: 1px solid var(--border); border-radius: 4px;
+    padding: 0.1em 0.35em; overflow-wrap: anywhere; }
   /* Auto-linkified URLs in chat bubbles + thinking traces (chat.js linkify()). */
   .tr-msg a, .thought-body a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
   .tr-msg a:hover, .thought-body a:hover { text-decoration: none; }
@@ -281,10 +437,28 @@
   .chat-status .tok { color: var(--muted); white-space: nowrap; }
   .chat-status .tok.up { color: var(--accent); }
   /* Claude Code's rotating tip / active-task footer — de-emphasized, aligned
-     under the verb (past the spinner), clipped to one line so it never crowds
-     the composer. */
+     under the verb (past the spinner). Each row is clipped to one line so it
+     never crowds the composer; an active-task checklist renders as one such row
+     per to-do item, stacking below the verb. */
   .chat-status .cc-hint { padding-left: 21px; color: var(--muted); font-size: 11.5px;
     line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Live agent-manager list scraped from the pane: the parent "main" plus each
+     background subagent. A subagent row is a button that opens its transcript;
+     "main" is a plain marker. */
+  .chat-status .cc-agents { display: flex; flex-direction: column; gap: 2px; padding-left: 21px; }
+  .chat-status .cc-agents-hd { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--muted); margin-top: 2px; }
+  .chat-status .cc-agent { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
+    padding: 2px 4px; border: 0; border-radius: 5px; background: none; color: var(--ink-2);
+    font: inherit; font-size: 11.5px; cursor: pointer; }
+  .chat-status button.cc-agent:hover { background: var(--surface-2, rgba(127,127,127,0.12)); color: var(--ink); }
+  .chat-status .cc-agent.main { cursor: default; }
+  .chat-status .cc-agent .dot { width: 8px; height: 8px; flex: none; border-radius: 50%;
+    border: 1.5px solid var(--muted); }
+  .chat-status .cc-agent .dot.sel { background: var(--accent); border-color: var(--accent); }
+  .chat-status .cc-agent .atype { font-weight: 600; color: var(--ink); flex: none; }
+  .chat-status .cc-agent .alabel { color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
 
   /* Tool-use / tool-result action card (collapsible). */
   .action-card { align-self: flex-start; max-width: 760px; width: 100%; font-size: 12.5px;
@@ -314,6 +488,93 @@
   .action-card.err pre.tool-result { border-color: var(--critical); }
   .action-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0; padding: 2px 0; text-align: left; }
   .action-card .trunc:hover { text-decoration: underline; }
+  /* The tool's human description arg (Bash/Agent/…), beside the raw argument. */
+  .action-card .tool-desc { color: var(--muted); font-size: 11px; font-style: italic; flex: none;
+    max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* An Edit call's reviewable change: the replaced text (−, red) over its
+     replacement (+, green) — the diff the terminal shows for an edit. */
+  .action-card .tool-diff { display: flex; flex-direction: column; gap: 4px; }
+  .action-card .tool-diff pre.diff-old { background: color-mix(in srgb, var(--critical) 7%, var(--page));
+    border-color: color-mix(in srgb, var(--critical) 35%, var(--border)); }
+  .action-card .tool-diff pre.diff-new { background: color-mix(in srgb, var(--good) 8%, var(--page));
+    border-color: color-mix(in srgb, var(--good) 35%, var(--border)); }
+  /* An ExitPlanMode plan, rendered as prose (it's markdown the operator was
+     asked to approve, not a raw argument). */
+  .action-card .tool-plan { padding: 8px 11px; border: 1px solid var(--border);
+    border-radius: var(--radius-sm); background: var(--page); overflow-wrap: anywhere; font-size: 12.5px;
+    white-space: pre-wrap; }
+
+  /* Slash command the operator ran (/compact, /clear, …), with its output folded
+     in when it produced any. Sits on the operator's side like the bubble it
+     replaces, but reads as a chip rather than speech. */
+  .cmd-card { align-self: flex-end; max-width: 760px; font-size: 12px; border: 1px dashed var(--border);
+    border-radius: var(--radius-md); background: var(--surface); overflow: hidden; }
+  .cmd-card, .cmd-card > summary { display: flex; align-items: center; gap: 7px; padding: 5px 10px; }
+  .cmd-card > summary { list-style: none; cursor: pointer; user-select: none; padding: 5px 10px; }
+  .cmd-card > summary::-webkit-details-marker { display: none; }
+  .cmd-card > summary:hover { color: var(--accent); }
+  .cmd-card.err { border-color: var(--critical); }
+  .cmd-card .cmd-glyph { color: var(--muted); font-size: 11px; line-height: 1; flex: none; }
+  .cmd-card .cmd-name { font-weight: 600; color: var(--ink-2);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .cmd-card .cmd-args { color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; min-width: 0; }
+  /* `details` lays its body out as a flex child of the card; keep the two rows stacked. */
+  .cmd-card[open] { display: block; }
+  .cmd-card .cmd-body { padding: 0 10px 8px; }
+  .cmd-card pre { margin: 0; padding: 7px 9px; background: var(--page); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;
+    max-height: 240px; overflow: auto; }
+  .cmd-card.err pre { border-color: var(--critical); }
+  .cmd-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0;
+    padding: 2px 0; text-align: left; }
+  .cmd-card .trunc:hover { text-decoration: underline; }
+
+  /* The model's own post-compaction summary. Stored as a user turn, shown on the
+     assistant's side (it's the model's writing) and collapsed — it's long, and
+     it's context rather than conversation. */
+  .compact-card { align-self: flex-start; max-width: 760px; width: 100%; color: var(--muted); font-size: 12.5px; }
+  .compact-card > summary { list-style: none; cursor: pointer; user-select: none; color: var(--muted);
+    padding: 5px 0; border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); }
+  .compact-card > summary::-webkit-details-marker { display: none; }
+  .compact-card > summary:hover { color: var(--accent); }
+  .compact-card .compact-body { margin-top: 6px; padding: 9px 12px; border-left: 2px solid var(--border);
+    color: var(--ink-2); overflow-wrap: anywhere; }
+  .compact-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0;
+    padding: 2px 0; text-align: left; }
+  .compact-card .trunc:hover { text-decoration: underline; }
+
+  /* The model's "while you were away" recap — same collapsed, assistant-side
+     shape as the compaction summary (it's the model's writing about the
+     conversation, not conversation itself). */
+  .away-card { align-self: flex-start; max-width: 760px; width: 100%; color: var(--muted); font-size: 12.5px; }
+  .away-card > summary { list-style: none; cursor: pointer; user-select: none; color: var(--muted);
+    padding: 5px 0; border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); }
+  .away-card > summary::-webkit-details-marker { display: none; }
+  .away-card > summary:hover { color: var(--accent); }
+  .away-card .away-body { margin-top: 6px; padding: 9px 12px; border-left: 2px solid var(--border);
+    color: var(--ink-2); overflow-wrap: anywhere; }
+  .away-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0;
+    padding: 2px 0; text-align: left; }
+  .away-card .trunc:hover { text-decoration: underline; }
+
+  /* "[Request interrupted by user]" — a statement about the turn, not the
+     operator talking: a centred, muted marker rather than a user bubble. */
+  .chat-interrupt { align-self: center; color: var(--muted); font-size: 11.5px;
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 12px; }
+
+  /* "Opened PR #N" — Claude Code's own pr-link record, an inline linked marker
+     at the point in the conversation where the PR landed. The compaction
+     marker (.chat-compact-mark) reuses .chat-interrupt's pill. */
+  .chat-pr-mark { align-self: center; color: var(--muted); font-size: 11.5px;
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 12px; }
+  .chat-pr-mark a { color: var(--accent); text-decoration: none; }
+  .chat-pr-mark a:hover { text-decoration: underline; }
+
+  /* A prompt typed mid-turn, still waiting in Claude Code's queue: a dimmed,
+     dashed user bubble labelled "queued" until its real user turn lands. */
+  .tr-msg.queued { opacity: 0.65; background: transparent; border: 1px dashed var(--border); }
 
   /* Collapsed thinking trace. */
   .thought { align-self: flex-start; max-width: 760px; color: var(--muted); font-size: 12.5px; }
@@ -330,13 +591,36 @@
     color: var(--muted); cursor: pointer; }
   .verbosity .seg button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 
-  /* Pending-question chips. */
-  .chat-question { border-top: 1px solid var(--border); padding: 10px 12px; background: var(--accent-soft); }
+  /* Pending-question picker (native render of Claude Code's AskUserQuestion). */
+  .chat-question { border-top: 1px solid var(--border); padding: 10px 12px; background: var(--accent-soft);
+    max-height: 46vh; overflow-y: auto; }
+  .chat-question .q-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .chat-question .q-chip { font-size: 10.5px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase;
+    padding: 2px 8px; border-radius: 999px; background: var(--accent); color: #fff; }
+  .chat-question .q-progress { font-size: 11px; color: var(--muted); }
   .chat-question .q-text { font-size: 13px; color: var(--ink); margin-bottom: 8px; }
-  .chat-question .q-opts { display: flex; flex-wrap: wrap; gap: 6px; }
-  .chat-question .q-opt { font: inherit; font-size: 12.5px; padding: 5px 12px; border-radius: 999px;
+  .chat-question .q-opts { display: flex; flex-direction: column; gap: 6px; }
+  .chat-question .q-opt-card { border: 1px solid var(--border); border-radius: var(--radius-md);
+    background: var(--surface); padding: 8px 10px; }
+  .chat-question .q-opt-head { display: flex; align-items: center; gap: 8px; }
+  .chat-question .q-opt-label { flex: 1; font-size: 12.5px; color: var(--ink); }
+  .chat-question .q-opts-multi .q-opt-label { cursor: pointer; }
+  .chat-question .q-check { margin: 0; cursor: pointer; }
+  .chat-question .q-opt-pick { font: inherit; font-size: 12px; padding: 4px 12px; border-radius: 999px;
     border: 1px solid var(--accent); background: var(--surface); color: var(--accent); cursor: pointer; }
-  .chat-question .q-opt:hover { background: var(--accent); color: #fff; }
+  .chat-question .q-opt-pick:hover { background: var(--accent); color: #fff; }
+  /* The option the TUI's own cursor is on, for a pane-scraped dialog. */
+  .chat-question .q-opt-pick.sel { background: var(--accent); color: #fff; }
+  /* A pane dialog's context (the command being asked about, or the plan). */
+  .chat-question .q-pane-detail { margin: 0 0 8px; max-height: 180px; }
+  .chat-question .q-opt-desc { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+  .chat-question .q-prev-wrap { margin-top: 6px; }
+  .chat-question .q-prev-wrap summary { font-size: 11px; color: var(--accent); cursor: pointer; }
+  .chat-question .q-prev { margin: 6px 0 0; padding: 8px 10px; border-radius: var(--radius-sm);
+    background: var(--page); border: 1px solid var(--border); font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 11.5px; line-height: 1.45; color: var(--ink); white-space: pre; overflow-x: auto; }
+  .chat-question .q-submit { margin-top: 8px; font: inherit; font-size: 12.5px; font-weight: 600;
+    padding: 6px 16px; border-radius: 999px; border: 0; background: var(--accent); color: #fff; cursor: pointer; }
   .chat-question .q-hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
 
   .chat-compose { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border); background: var(--surface); }
@@ -344,12 +628,32 @@
   .chat-compose textarea { flex: 1; resize: none; font: inherit; font-size: 13.5px; line-height: 1.5;
     padding: 8px 11px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--page); color: var(--ink); }
 
+  /* The split compose bar (chat.js: updateComposeAction).
+     Send never morphs: a message sent mid-turn QUEUES (rendered as a dimmed
+     "queued" bubble), so the button that talks stays available while the agent
+     works. Stop is its own button beside it, shown only during a turn.
+     Warning- rather than critical-coloured: Stop interrupts, it doesn't
+     destroy (that's Kill). */
+  button.compose-action { min-width: 84px; }
+  button.primary.compose-stop { background: var(--warning); border-color: var(--warning);
+    color: #1a1200; min-width: 84px; }
+  button.compose-stop[hidden] { display: none; }
+
   /* Live agent-mode (left) / model (right) selectors under the text box; the
-     PR status chip (when present) rides just left of the model on the right. */
+     ticket chip and PR status chip (when present) ride just left of the model on
+     the right — the ticket the work came from, then the PR it went to. */
   .chat-compose-opts { display: flex; justify-content: space-between; gap: 8px; }
   .cc-right { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .cc-right .pr-badge { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
   .cc-pr { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+  .cc-ticket { display: flex; align-items: center; min-width: 0; }
+  .jira-chip {
+    display: inline-flex; align-items: center; padding: 2.5px 9px;
+    border: 1px solid var(--border); border-radius: 999px; background: var(--page);
+    font-family: var(--font-mono); font-size: 11px; color: var(--accent);
+    text-decoration: none; white-space: nowrap;
+  }
+  .jira-chip:hover { border-color: var(--accent); }
   .cc-opt { position: relative; }
   .cc-btn { font: inherit; font-size: 11.5px; padding: 4px 10px; border-radius: 999px;
     border: 1px solid var(--border); background: var(--page); color: var(--ink-2); cursor: pointer;
@@ -372,7 +676,8 @@
   .cc-hint { display: block; font-size: 10px; color: var(--muted); padding: 4px 10px 2px; }
   .chat-empty { color: var(--muted); font-size: 13px; padding: 24px; text-align: center; }
   .term-bar .seg-toggle { font: inherit; font-size: 11px; padding: 3px 10px; border-radius: var(--radius-sm);
-    border: 1px solid var(--border); background: var(--surface); color: var(--ink-2); cursor: pointer; }
+    border: 1px solid var(--border); background: var(--surface); color: var(--ink-2); cursor: pointer;
+    white-space: nowrap; }
   .term-bar .seg-toggle:hover { border-color: var(--accent); color: var(--accent); }
 
   /* ---- Responsive: stack to list → full-screen terminal on phones/tablets -- */
@@ -390,37 +695,21 @@
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .term-bar .back-btn { display: inline-flex; }
-    /* Collapse the back button to just "‹" on mobile so the whole header row
-       (back, verbosity, Terminal, Kill) fits without wrapping to a second row. */
+    /* Collapse the back button to just "‹" on mobile to buy the row width back. */
     .term-bar .back-btn .back-label { display: none; }
     body.showing-term .sidebar { display: none; }
-    body.showing-term .app-header { display: none; }
+    body.showing-term .site-header { display: none; }
     body.showing-term .bottom-nav { display: none; }
     body.showing-term .stage { display: flex; }
     body.showing-term { padding-bottom: 0; }
   }
-  @media (max-width: 600px) {
-    .app-header { padding: 12px 14px; }
-  }
   @media (pointer: coarse) {
-    details.stopped-wrap summary, details.spawn-wrap > summary { padding-top: 6px; padding-bottom: 6px; }
+    details.ended-wrap-sec summary, details.spawn-wrap > summary { padding-top: 6px; padding-bottom: 6px; }
   }
 </style>
 </head>
 <body>
-  <header class="app-header">
-    <a class="wordmark" href="/"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
-    <span class="sub">Sessions</span>
-    <span class="sub" id="counts"></span>
-    <span class="spacer"></span>
-    <nav class="nav-tabs">
-      <a href="/">Dashboard</a>
-      <a href="/sessions" class="active">Sessions</a>
-      <a href="/history">History</a>
-      <a href="#" class="signout" onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;">Sign out</a>
-    </nav>
-    <span class="sub" id="refreshed"></span>
-  </header>
+  <header class="site-header" id="siteHeader" data-page="sessions" data-sub="Sessions"></header>
 
   <div class="sess-shell">
     <aside class="sidebar">
@@ -431,22 +720,25 @@
       </div>
       <div id="searchResults"></div>
       <div id="spawn"></div>
+      <div id="queued"></div>
       <div id="active"></div>
       <div id="idle"></div>
-      <div id="stopped"></div>
+      <div id="ended"></div>
     </aside>
 
     <main class="stage" id="stage">
       <div class="stage-empty" id="stageEmpty">
-        <div class="big">No session attached</div>
-        <div class="hint">Pick a running session to attach to its live terminal, or search the box on the left to find and read any ended session's transcript — history is kept even after a session is killed or its host goes offline. Managing sessions (restart, kill, delete) and host controls live on the Dashboard.</div>
+        <div class="big" id="stageEmptyBig">No session attached</div>
+        <div class="hint" id="stageEmptyHint">Pick a running session to attach to its live terminal, or search the box on the left to find and read any ended session's transcript — history is kept even after a session is killed or its host goes offline. Managing sessions (restart, kill, delete) and host controls live on the Dashboard.</div>
       </div>
       <div class="transcript-pane" id="transcriptPane" hidden>
         <div class="term-bar">
-          <button class="back-btn" onclick="backToList()">‹<span class="back-label"> Sessions</span></button>
+          <button class="back-btn" onclick="transcriptBack()">‹<span class="back-label" id="trBackLabel"> Sessions</span></button>
           <span class="t-title"><span class="name" id="trTitle"></span> · <span class="path" id="trPath"></span></span>
           <span class="spacer"></span>
+          <span class="tr-prs" id="trPrs" hidden></span>
           <span class="verbosity" id="trVerbosity"></span>
+          <button class="resume-btn" id="trResume" hidden onclick="resumeCurrentEnded()">Resume</button>
         </div>
         <div class="tr-scroll" id="trScroll"></div>
       </div>
@@ -469,7 +761,8 @@
           <div class="chat-compose-row">
             <textarea id="chatInput" rows="1" placeholder="Message the agent"
               oninput="autoGrowChatInput()" onkeydown="chatInputKey(event)"></textarea>
-            <button class="primary" id="chatSend" onclick="sendChatInput()">Send</button>
+            <button class="primary compose-stop" id="chatStop" onclick="chatComposeStop()" hidden>◼ Stop</button>
+            <button class="primary compose-action" id="chatSend" onclick="chatComposeAction()">Send</button>
           </div>
           <!-- Live per-session selectors: agent (permission) mode on the left,
                model on the right. Buttons that open a dropdown; picking one
@@ -493,38 +786,40 @@
         <div class="term-compose">
           <textarea id="termInput" rows="1" placeholder="Message the agent"
             oninput="autoGrowTermInput()" onkeydown="termInputKey(event)"></textarea>
-          <button class="primary" id="termSend" onclick="sendTermInput()">Send</button>
+          <button class="primary compose-stop" id="termStop" onclick="termComposeStop()" hidden>◼ Stop</button>
+          <button class="primary compose-action" id="termSend" onclick="termComposeAction()">Send</button>
         </div>
       </div>
     </main>
   </div>
 
-<nav class="bottom-nav">
-  <a href="/">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-    Dashboard
-  </a>
-  <a href="/sessions" class="active">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
-    Sessions
-  </a>
-  <a href="/history">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/></svg>
-    History
-  </a>
-</nav>
+<nav class="bottom-nav" id="bottomNav"></nav>
+<!-- board.js owns the org vocabulary (mergeSites/orgName/orgColorMap) the
+     header's org filter reads; nav.js must build the #hdrOrg slot before
+     org.js mounts into it. -->
+<script src="/board.js"></script>
+<script src="/nav.js"></script>
+<script src="/org.js"></script>
+<script src="/newticket.js"></script>
 
 <script>
 const $active = document.getElementById("active");
 const $idle = document.getElementById("idle");
-const $stopped = document.getElementById("stopped");
+const $ended = document.getElementById("ended");
 const $spawn = document.getElementById("spawn");
-const $counts = document.getElementById("counts");
-const $refreshed = document.getElementById("refreshed");
+const $queued = document.getElementById("queued");
+const $sidebar = document.querySelector(".sidebar");
+// The header slot nav.js mounts for this page's running/waiting counts.
+// See public/nav.js.
+const $counts = document.getElementById("hdrMeta");
 
 // Open/closed state of the collapsible sections survives the 5s re-render.
-let stoppedOpen = false;
+// Ended sessions start collapsed: they're history, and the list only grows.
+let endedOpen = false;
 let spawnOpen = false;
+// The ended session currently open on the stage (its `.cur` highlight + what
+// the pane's Resume button acts on), or null.
+let endedViewId = null;
 
 // "New session" composer state (ported from the dashboard):
 // - composerOpen:  "host::repo" whose composer panel is open
@@ -535,6 +830,194 @@ let spawnOpen = false;
 const composerOpen = new Set();
 const optionsOpen = new Set();
 const composerDraft = new Map();
+
+// Per-card ⋯ menu state. Like the composer's, it lives here rather than in the
+// DOM because every poll / SSE beat re-renders the card list from scratch — an
+// open menu, an armed Kill or a half-typed rename would otherwise vanish under
+// the operator mid-interaction.
+// - menuOpenId:  session id whose ⋯ menu is open (at most one)
+// - killArmedId: session id whose menu Kill is armed — arm-then-confirm, same as
+//                the chat/terminal bars, so a mis-click can't kill a session
+// - renameId / renameDraft: the session being renamed, and the text typed so far
+// - renameOptimistic: id -> {text, at}, the name we asked the agent for, shown
+//   until it reports that name back (or the TTL expires, so a rename that never
+//   lands — dead host, lost command — can't pin a name the session doesn't have)
+let menuOpenId = null;
+let killArmedId = null;
+let killArmTimer = null;
+let renameId = null;
+let renameDraft = "";
+const renameOptimistic = new Map();
+const KILL_ARM_MS = 3500;
+// DOM id of a card's rename field (see captureFieldFocus for the "ren-" prefix).
+function renFieldId(id) { return "ren-" + String(id).replace(/[^A-Za-z0-9]/g, "_"); }
+
+// ---- move a session to another agent (XERK-101) -----------------------------
+// - moveOpenId: session id whose ⋯ menu is showing the target-host picker
+// - pendingMigration: the migrationId we're following; once its importCmdId is
+//   known we hand off to the normal followSpawn wait so the stage follows the
+//   session onto its new host (the target mints a NEW id, like a resume).
+let moveOpenId = null;
+let pendingMigration = null;
+let pendingMigrationFollowed = false;
+
+function siteKeyOfAgent(a) { return (a && a.jira && a.jira.siteKey) || ""; }
+
+// Org tint (XERK-142): a session card is subtly background-coloured by the org its
+// host polls, so which org a session belongs to reads at a glance — the same tint,
+// from the same orgColorMap, the board paints its ticket cards with. Built over the
+// WHOLE fleet's org set (not the header-filtered view) so an org keeps its colour
+// regardless of the current filter, matching board.js's use of the full org set.
+let orgColorByKey = new Map();
+function refreshOrgColors(agents) {
+  // Manual pins (XERK-145) come through TurmaOrg — its map is fed by both the
+  // poll payload and the orgColors SSE event, so a pin repaints at once.
+  orgColorByKey = window.TurmaBoard.orgColorMap((agents || []).map(siteKeyOfAgent),
+    window.TurmaOrg.orgColors());
+}
+// Inline style setting --org for a card wrap; empty for a host with no org (leaves
+// the card on plain --surface). The card CSS color-mixes --org into --surface.
+function orgTintStyle(a) {
+  const c = orgColorByKey.get(siteKeyOfAgent(a));
+  return c ? ` style="--org:${c}"` : "";
+}
+// The online hosts a running session could move to: same org, a different host,
+// with the session's repo already cloned (the hub requires it — the target
+// resumes off that repo's default branch).
+function eligibleMoveTargets(a, s) {
+  const org = siteKeyOfAgent(a);
+  return (cache.agents || []).filter(x =>
+    x.key !== a.key && x.online && siteKeyOfAgent(x) === org &&
+    (x.repos || []).some(r => r && r.name === s.repo));
+}
+// Is this session mid-move? (Shown as a "moving…" hint on its card so the
+// operator sees the export/relay step before the stage follows it over.)
+function migrationFor(host, id) {
+  return (cache.migrations || []).find(m =>
+    m.srcHost === host && m.srcSessionId === id &&
+    (m.phase === "exporting" || m.phase === "importing")) || null;
+}
+function openMove(ev, id) { ev.stopPropagation(); moveOpenId = id; render(cache); }
+function closeMove(ev) { if (ev) ev.stopPropagation(); moveOpenId = null; render(cache); }
+async function moveTo(ev, srcHost, id, targetHost) {
+  ev.stopPropagation();
+  moveOpenId = null;
+  menuOpenId = null;
+  render(cache);
+  const out = await post(`/api/agents/${enc(srcHost)}/sessions/${enc(id)}/migrate`,
+    { host: targetHost });
+  if (out && out.migrationId) {
+    pendingMigration = out.migrationId;
+    pendingMigrationFollowed = false;
+  } else {
+    toast(out && out.error ? "Move failed: " + out.error : "Move failed");
+  }
+}
+// Advance a followed migration each render: hand off to followSpawn the moment
+// the target's importSession command id is known, and surface a failure.
+function advanceMigrationFollow() {
+  if (!pendingMigration) return;
+  const m = (cache.migrations || []).find(x => x.id === pendingMigration);
+  if (!m) { pendingMigration = null; pendingMigrationFollowed = false; return; }
+  if (m.phase === "failed") {
+    pendingMigration = null; pendingMigrationFollowed = false;
+    toast("Move failed: " + (m.error || "migration failed"));
+    return;
+  }
+  if (m.importCmdId && !pendingMigrationFollowed) {
+    pendingMigrationFollowed = true;
+    followSpawn(m.importCmdId); // the target session comes up under this cmdId
+  }
+  if (m.phase === "done") pendingMigration = null;
+}
+// A tiny non-blocking toast (migration is the only caller today).
+let toastTimer = null;
+function toast(msg) {
+  let el = document.getElementById("toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "toast";
+    el.className = "toast";
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.classList.add("show");
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 6000);
+}
+
+function toggleCardMenu(ev, id) {
+  ev.stopPropagation();  // the card behind the ⋯ must not take the click
+  menuOpenId = menuOpenId === id ? null : id;
+  disarmCardKill();
+  render(cache);
+}
+// Any click outside an open menu dismisses it (the menu itself stops the event).
+function closeCardMenu() {
+  if (menuOpenId === null && moveOpenId === null) return;
+  menuOpenId = null;
+  moveOpenId = null;
+  disarmCardKill();
+  render(cache);
+}
+document.addEventListener("click", closeCardMenu);
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  if (renameId) cancelRename();
+  else closeCardMenu();
+});
+
+function disarmCardKill() {
+  killArmedId = null;
+  if (killArmTimer) { clearTimeout(killArmTimer); killArmTimer = null; }
+}
+function cardKill(ev, host, id) {
+  ev.stopPropagation();
+  if (killArmedId !== id) {
+    killArmedId = id;
+    if (killArmTimer) clearTimeout(killArmTimer);
+    killArmTimer = setTimeout(() => { disarmCardKill(); render(cache); }, KILL_ARM_MS);
+    render(cache);
+    return;
+  }
+  disarmCardKill();
+  menuOpenId = null;
+  // The card disappears on the beat that reports the kill; nothing optimistic to
+  // paint in the meantime, so just close the menu.
+  render(cache);
+  post(`/api/agents/${enc(host)}/sessions/${enc(id)}/kill`);
+}
+
+// Rename swaps the card for an inline field seeded with the current name. The
+// name is looked up from `cache` rather than passed through the onclick — a
+// user-typed name can contain the quotes that inlining it would break on.
+function startRename(ev, id) {
+  ev.stopPropagation();
+  const s = findSession(id);
+  menuOpenId = null;
+  disarmCardKill();
+  renameId = id;
+  renameDraft = s ? sessName(s) : "";
+  render(cache);
+  const el = document.getElementById(renFieldId(id));
+  if (el) { el.focus(); el.select(); }
+}
+function cancelRename() {
+  renameId = null;
+  renameDraft = "";
+  render(cache);
+}
+function submitRename(host, id) {
+  const summary = renameDraft.trim();
+  renameId = null;
+  renameDraft = "";
+  // A rename is a queued command: it only lands on the agent's next heartbeat
+  // (seconds away), so paint the new name now — otherwise the card sits there
+  // with its old name and reads as a rename that did nothing.
+  renameOptimistic.set(id, { text: summary, at: Date.now() });
+  render(cache);
+  post(`/api/agents/${enc(host)}/sessions/${enc(id)}/summary`, { summary });
+}
 // DOM id for a composer field, derived from the (host::repo) key + field name.
 function cid(rk, field) { return "cmp-" + field + "-" + rk.replace(/[^A-Za-z0-9]/g, "_"); }
 function optStoreKey(repo) { return "turma.composer." + repo; }
@@ -566,21 +1049,49 @@ function onOptionsToggle(rkey, repo, open) {
   if (open) optionsOpen.add(rkey); else optionsOpen.delete(rkey);
   const o = loadOpts(repo); o.optionsExpanded = open; saveOpts(repo, o);
 }
-// Capture/restore focus + caret across the spawn-panel innerHTML swap so typing
-// in an open composer survives the poll / SSE re-render.
-function captureComposerFocus() {
+// Capture/restore focus + caret across render()'s innerHTML swaps so typing in
+// an open composer ("cmp-" fields) or a card's rename box ("ren-") survives the
+// poll / SSE re-render.
+function captureFieldFocus() {
   const el = document.activeElement;
-  if (!el || !el.id || !el.id.startsWith("cmp-")) return null;
+  if (!el || !el.id || !/^(cmp|ren)-/.test(el.id)) return null;
   const f = { id: el.id };
   try { f.start = el.selectionStart; f.end = el.selectionEnd; } catch { /* selects have none */ }
   return f;
 }
-function restoreComposerFocus(f) {
+function restoreFieldFocus(f) {
   if (!f) return;
   const el = document.getElementById(f.id);
   if (!el) return;
-  el.focus();
+  // preventScroll: refocusing must not yank the sidebar around — we restore the
+  // scroll offset ourselves, and the field is already where the operator left it.
+  el.focus({ preventScroll: true });
   if (f.start != null) { try { el.setSelectionRange(f.start, f.end); } catch { /* not a text field */ } }
+}
+// The Task box's drag-to-resize handle writes an inline height the browser owns,
+// so the next innerHTML swap would drop it and snap the box back to min-height.
+// Snapshot each open composer's height before the swap and re-emit it as markup,
+// keyed by (host::repo) like composerDraft, so a dragged size survives the
+// re-render — and even a close/reopen of the same repo's composer.
+// A textarea's own scroll offset is browser state on the element, not markup, so
+// the swap drops that too: a Task box holding more text than it shows snapped
+// back to its first line on every beat, mid-sentence. Restoring the caret isn't
+// enough — a caret can sit off-screen — so the offset is carried over itself.
+const composerHeight = new Map(); // "host::repo" -> inline height, e.g. "160px"
+const composerScroll = new Map(); // "host::repo" -> textarea scrollTop, e.g. 48
+function captureComposerHeights() {
+  for (const el of document.querySelectorAll(".composer textarea[data-rk]")) {
+    if (el.style.height) composerHeight.set(el.dataset.rk, el.style.height);
+    composerScroll.set(el.dataset.rk, el.scrollTop || 0);
+  }
+}
+// Runs after the swap, on the fresh boxes; scrollTop clamps itself to the new
+// content, so a shrunken draft just lands at the bottom rather than out of range.
+function restoreComposerScrolls() {
+  for (const el of document.querySelectorAll(".composer textarea[data-rk]")) {
+    const y = composerScroll.get(el.dataset.rk);
+    if (y) el.scrollTop = y;
+  }
 }
 // Persist the composer's option selects as this repo's last-used prefs.
 function onOptChange(rk, repo) {
@@ -611,7 +1122,9 @@ function composer(a, repo, rk, spawning) {
   return `<div class="composer">
     <div>
       <label>Task</label>
-      <textarea id="${cid(rk, "task")}" placeholder="Describe the task, or leave blank to start an empty session."
+      <textarea id="${cid(rk, "task")}" data-rk="${esc(rk)}"
+        ${composerHeight.has(rk) ? `style="height:${esc(composerHeight.get(rk))}"` : ""}
+        placeholder="Describe the task, or leave blank to start an empty session."
         oninput="draftSet('${esc(rk)}','task',this.value)"
         onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();${submit};}">${esc(d.task || "")}</textarea>
     </div>
@@ -667,6 +1180,12 @@ function reconcilePending(agents) {
     const rk = a.key + "::" + s.repo;
     counts.set(rk, (counts.get(rk) || 0) + 1);
     index.set(a.key + "::" + s.id, s);
+    // Drop a rename overlay once the agent reports the name we asked for.
+    const o = renameOptimistic.get(s.id);
+    if (o && (s.summary || "") === o.text) renameOptimistic.delete(s.id);
+  }
+  for (const [id, o] of renameOptimistic) {
+    if (t - o.at > PENDING_TTL_MS) renameOptimistic.delete(id);
   }
   for (const [key, p] of pending) {
     if (t - p.at > PENDING_TTL_MS) { pending.delete(key); continue; }
@@ -693,11 +1212,30 @@ function esc(s) {
   })[c]);
 }
 
-// GitHub-style PR status pill: state colour + #number + a CI-check mark. Kept in
-// sync with the copies in index.html and (as a compact chip) chat.js. Rendered
-// as a non-link <span> here because the session card is itself a <button> (a
-// nested <a> would be invalid and get hoisted out); the dashboard/footer copies
-// link to the PR.
+// The PR's merge-readiness verdict ('ready'/'blocked'/'pending'/""), derived
+// agent-side from CI *and* mergeability together (_merge_ready in
+// hub-agent.py) — green CI on a conflicting branch is not a PR that can land.
+// An agent predating the field reports the CI half alone, so fall back to that
+// rather than dropping the mark. Kept in sync with index.html and chat.js.
+function prReady(pr) {
+  return pr.ready || { passing: "ready", failing: "blocked", pending: "pending" }[pr.checks] || "";
+}
+// What that mark is saying, for its tooltip: the CI rollup, plus — for a PR
+// that could still land — whether GitHub says it merges.
+function prReadyTitle(pr) {
+  const state = String(pr.state || "").toUpperCase();
+  const parts = [];
+  if (pr.checks) parts.push("CI " + pr.checks);
+  if (pr.mergeable && (state === "OPEN" || state === "DRAFT"))
+    parts.push(pr.mergeable === "CONFLICTING" ? "merge conflict"
+      : pr.mergeable === "MERGEABLE" ? "no conflicts" : "mergeability unknown");
+  return parts.join(" · ");
+}
+// GitHub-style PR status pill: state colour + #number + a merge-readiness mark.
+// Kept in sync with the copies in index.html and (as a compact chip) chat.js.
+// Rendered as a non-link <span> here because the session card is itself a
+// <button> (a nested <a> would be invalid and get hoisted out); the
+// dashboard/footer copies link to the PR.
 function prBadgeHtml(pr) {
   if (!pr) return "";
   const url = pr.url || "";
@@ -706,9 +1244,9 @@ function prBadgeHtml(pr) {
   const state = String(pr.state || "").toUpperCase();
   const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
   const label = state ? state[0] + state.slice(1).toLowerCase() : "";
-  const checks = pr.checks;
-  const mark = checks === "passing" ? "✓" : checks === "failing" ? "✗" : checks === "pending" ? "●" : "";
-  const chk = mark ? ` <span class="pr-checks ${checks}" title="CI ${esc(checks)}">${mark}</span>` : "";
+  const ready = prReady(pr);
+  const mark = ready === "ready" ? "✓" : ready === "blocked" ? "✗" : ready === "pending" ? "●" : "";
+  const chk = mark ? ` <span class="pr-ready ${ready}" title="${esc(prReadyTitle(pr))}">${mark}</span>` : "";
   return `<span class="pr-badge ${cls}" title="${esc(pr.title || url)}">`
     + `<span class="pr-dot"></span>${esc(num)}${label ? " " + esc(label) : ""}${chk}</span>`;
 }
@@ -721,6 +1259,13 @@ function prBadgeHtml(pr) {
 function liveState(sess, host, now) {
   const s = sess.session;
   if (s && s.question) return { kind: "waiting", label: "waiting for your answer", question: s.question };
+  // A blocking TUI dialog (tool permission / plan approval) is the same thing
+  // for the operator. Checked ahead of the transcript/paneBusy reads because
+  // neither can see it: nothing about the dialog reaches the transcript, and
+  // while it is up the pane shows no interrupt hint — so the card would read
+  // "idle" for a session that is actually waiting on a human.
+  if (s && s.panePrompt && s.panePrompt.prompt)
+    return { kind: "waiting", label: "waiting for your answer", question: s.panePrompt.prompt };
   if (!s || s.transcriptAgeSec == null) return { kind: "idle", label: "no transcript yet" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   const working = s.paneBusy != null
@@ -734,51 +1279,188 @@ function liveState(sess, host, now) {
 // Running sessions sorted attention-first: waiting on you, then working, then
 // idle; freshest activity first within each group.
 const KIND_ORDER = { waiting: 0, working: 1, idle: 2 };
+// A session is "ended" if it is over but still resumable, and that covers three
+// records the agent reports through different channels:
+//
+//  - KILLED ("closed"): killed from the hub, so the agent DROPPED its registry
+//    record and moved it to the closed history (a.closedSessions). Its worktree
+//    and conversation survive; `resume` brings it back under the same id.
+//  - STOPPED: its claude exited on its own (or errored), so the record stays in
+//    a.sessions with a non-running status; `start` relaunches it in place.
+//  - RESUMABLE: a transcript from the agent's per-repo `resumable` scan, with no
+//    registry record of any kind behind it. `resumeTranscript` relaunches it at
+//    its own origin cwd, under a NEW session id.
+//
+// The operator drew no such distinction — all three are "a session I'm done
+// with, for now" — so they land in one list, sorted by when they ended, newest
+// first. `kind` is what the row's Resume button dispatches on, and the only
+// place the shapes are told apart after this.
+//
+// The third channel is what makes the list DURABLE and complete. The first two
+// are read out of ~/.turma (sessions.json / closed.json), whose durability is the
+// host's to provide — a container that doesn't bind-mount it has it on the image's
+// writable layer, which an agent update recreates, emptying this list. And even
+// where it IS mounted, closed.json is capped at 5 per repo, so it was never the
+// whole history on any host. `resumable` is re-derived every slow beat from the
+// transcripts under ~/.claude/projects (a bind mount) plus each transcript's own
+// recorded cwd, so it survives that wipe and carries every prior session, not the
+// newest few.
+function endedEntry(a, s, kind) {
+  const endedAt = kind === "closed" ? s.closedAt
+    : kind === "resumable" ? s.endedTs
+    : s.stoppedAt;
+  return {
+    a, s, kind,
+    id: s.id,
+    // Sort key. A record with no timestamp (an older agent's closed.json, a
+    // session stopped before stoppedAt was written) sorts oldest rather than
+    // NaN-ing its way to an arbitrary spot in the list.
+    endedMs: Date.parse(endedAt || "") || 0,
+    endedAt,
+  };
+}
+// Shape one `repo.resumable` transcript into the session-like record the rest of
+// the ended list reads. It has no session id of its own — the registry either
+// forgot it or never knew it — so the row is keyed on its transcript, which is
+// the only identity it has and the one resumeTranscript takes.
+function resumableSession(t) {
+  return {
+    id: "t:" + t.transcriptId,
+    transcriptId: t.transcriptId,
+    repo: t.repo,
+    root: !!t.root,
+    summary: t.summary,
+    worktreePath: t.cwd,
+    endedTs: t.endedTs,   // the sort key — endedEntry reads it off this record
+    // The PRs this conversation opened, from the agent's durable PR ledger (see
+    // PR_LEDGER_PATH). This channel is the only one still reporting a session
+    // once its closed record has aged out, so this is what keeps an ended
+    // session's chips alive past that — the dedupe below still lets a live
+    // closed record win when one is around, carrying its own re-polled status.
+    prs: t.prs || null,
+  };
+}
 function collect(agents, now) {
-  const running = [], stopped = [];
-  for (const a of agents) for (const s of (a.sessions || [])) {
-    if (s.status === "running") {
-      running.push({ a, s, live: liveState(s, a, now) });
-    } else {
-      stopped.push({ a, s });
+  const running = [], queued = [], ended = [];
+  // <host>::<transcriptId> of every session a registry-backed record covers.
+  // A killed session is reported through BOTH channels by construction — its
+  // closed record, and (once the slow scan catches up) its transcript in
+  // `resumable` — so the two have to collapse to one row. The record wins: it
+  // knows what the scan can't, namely the PRs it opened, when it was really
+  // killed, and that `resume` can have it back under its original id.
+  const carded = new Set();
+  const key = (a, tid) => a.key + "::" + tid;
+  for (const a of agents) {
+    for (const s of (a.sessions || [])) {
+      if (s.status === "running") running.push({ a, s, live: liveState(s, a, now) });
+      // A queued session is upcoming, not ended — it has a record but no worktree
+      // yet, and provisions when a slot frees / its clone lands (see the agent's
+      // _drain_queue). Its own section, above the live sessions.
+      else if (s.status === "queued") queued.push({ a, s });
+      else ended.push(endedEntry(a, s, "stopped"));
+      if (s.transcriptId) carded.add(key(a, s.transcriptId));
+    }
+    for (const c of (a.closedSessions || [])) {
+      ended.push(endedEntry(a, c, "closed"));
+      if (c.transcriptId) carded.add(key(a, c.transcriptId));
+    }
+  }
+  // Second pass, so a resumable row is only ever a fallback for a session no
+  // record above already speaks for.
+  for (const a of agents) {
+    for (const r of (a.repos || [])) {
+      for (const t of (r.resumable || [])) {
+        if (!t.transcriptId || carded.has(key(a, t.transcriptId))) continue;
+        carded.add(key(a, t.transcriptId));   // repos can report a shared origin
+        ended.push(endedEntry(a, resumableSession(t), "resumable"));
+      }
     }
   }
   running.sort((x, y) =>
     (KIND_ORDER[x.live.kind] - KIND_ORDER[y.live.kind]) ||
     ((y.s.session?.transcriptAgeSec == null ? -1 : -y.s.session.transcriptAgeSec) -
      (x.s.session?.transcriptAgeSec == null ? -1 : -x.s.session.transcriptAgeSec)));
-  stopped.sort((x, y) => (x.a.key + x.s.id).localeCompare(y.a.key + y.s.id));
-  return { running, stopped };
+  // Most recently ended first — the one you just killed is the one you're most
+  // likely to want back. Ties (same-second kills, or two undated records) fall
+  // back to the id so the order is at least stable across beats.
+  ended.sort((x, y) => (y.endedMs - x.endedMs) || String(x.id).localeCompare(String(y.id)));
+  // Oldest-queued first — FIFO, the order the agent's _drain_queue will start them.
+  queued.sort((x, y) => String(x.s.queuedAt || "").localeCompare(String(y.s.queuedAt || "")));
+  return { running, queued, ended };
+}
+// The ended entry for a session id, whatever channel reported it.
+function findEnded(id) {
+  const { ended } = collect(cache.agents || [], cache.now || Date.now());
+  return ended.find(e => e.id === id) || null;
 }
 
-// The prominent, human-friendly name for a session: the agent's auto task
-// summary first, then an explicit label, then the worktree dir, and only the
-// raw id as a last resort. This is what leads every card — the 5-digit id is
-// demoted to a small secondary tag.
+// The same list, found by CONVERSATION rather than by entry id — what the board's
+// ticket chips deep-link on (/sessions?ended=<transcriptId>). The transcript id is
+// the one handle all three ended channels share and the one this list already
+// dedupes on; an entry `id` is not, since a resumable row's is a synthesised
+// "t:<transcriptId>" while a killed one's is the session's own.
+function findEndedByTranscript(tid) {
+  if (!tid) return null;
+  const { ended } = collect(cache.agents || [], cache.now || Date.now());
+  return ended.find(e => e.s && e.s.transcriptId === tid) || null;
+}
+
+// A session's name: whatever the agent reports (auto-generated at spawn, or one
+// the operator typed over it via the card's ⋯ → Rename), with a just-submitted
+// rename painted over it until the agent confirms. "" (a cleared name) is a real
+// answer here — it means fall through to the label/worktree, not "no override".
+function sessName(s) {
+  const o = renameOptimistic.get(s.id);
+  return (o ? o.text : s.summary) || "";
+}
+
+// The prominent, human-friendly name for a session: its name first, then an
+// explicit label, then the worktree dir, and only the raw id as a last resort.
+// This is what leads every card — the 5-digit id is demoted to a small
+// secondary tag.
 function sessTitle(s) {
-  if (s.summary) return s.summary;
+  const name = sessName(s);
+  if (name) return name;
   if (s.label) return s.label;
   if (s.root) return "⌂ Repos root";
   const wt = String(s.worktreePath || "").split("/").filter(Boolean).pop();
   return wt || s.id;
 }
 
-// Worktree dir name + the live branch the agent named for its work ("detached"
-// until it branches). The app itself creates no branch, so s.branch is unused.
+// Repo + the live branch the agent named for its work ("detached" until it
+// branches) — the session header's meta line (XERK-121), matching the Android
+// chat header (core/Sessions.kt sessionHeaderMeta). Prefixed with the host by
+// each header's caller, so the whole line reads "host · repo · branch". The app
+// itself creates no branch, so s.branch is unused.
 function sessMeta(s) {
   if (s.root) return "repos root";
-  const wt = String(s.worktreePath || "").split("/").filter(Boolean).pop();
+  // "detached" is a READING of the agent's git report, not the absence of one.
+  // A session recovered from the transcript scan has no git block at all — we
+  // don't know what it was on — so it says nothing rather than asserting a
+  // detached HEAD it was never told about.
   const b = s.git && s.git.branch;
-  const branch = (b && b !== "HEAD") ? b : "detached";
-  return [wt, branch].filter(Boolean).join(" · ");
+  const branch = s.git ? ((b && b !== "HEAD") ? b : "detached") : null;
+  return [s.repo, branch].filter(Boolean).join(" · ");
 }
 
 function render(data) {
-  const { now, agents } = data;
-  reconcilePending(agents);
-  $refreshed.textContent = "updated " + new Date(now).toLocaleTimeString();
+  const { now } = data;
+  // Against the WHOLE fleet: a command fired before the operator narrowed to
+  // another org still has to be retired when its host reports.
+  reconcilePending(data.agents || []);
+  // The sidebar lists — and the "+ New session" host picker — are scoped to the
+  // header's org filter (XERK-62); a host polls exactly one org, so scoping the
+  // agent list scopes every list built from it. Deliberately NOT applied to
+  // findSession/sessionHit, which read `cache` directly: an open session must
+  // not be torn off the stage because its org was filtered out of the sidebar.
+  TurmaOrg.update(data);
+  TurmaNewTicket.update(data);
+  const agents = TurmaOrg.filter(data.agents || []);
+  // Org card tints come from the full fleet's org set, not the scoped one, so a
+  // card's colour is the same whether or not its org is the filtered-to one.
+  refreshOrgColors(data.agents || []);
 
-  const { running, stopped } = collect(agents, now);
+  const { running, queued, ended } = collect(agents, now);
   const waiting = running.filter(x => x.live.kind === "waiting").length;
   $counts.textContent = running.length + " running" + (waiting ? " · " + waiting + " waiting on you" : "");
 
@@ -789,8 +1471,15 @@ function render(data) {
   const idle = running.filter(x => x.live.kind === "idle");
 
   const hosts = agents.filter(a => a.online && (a.repos || []).length);
-  // Preserve focus/caret in an open composer across the innerHTML swap.
-  const focus = captureComposerFocus();
+  // Preserve focus/caret (in an open composer or a card's rename box), the
+  // dragged Task-box height, and the sidebar's scroll offset across the
+  // innerHTML swaps below. The scroll offset matters because emptying a panel
+  // shrinks the sidebar's content, and the browser clamps scrollTop to the new
+  // (shorter) scroll range — refilling it doesn't undo the clamp, so every
+  // poll/SSE beat used to jump a scrolled sidebar back to the top.
+  const focus = captureFieldFocus();
+  captureComposerHeights();
+  const scrollTop = $sidebar ? $sidebar.scrollTop : 0;
   $spawn.innerHTML = `
     <details class="spawn-wrap" ${spawnOpen ? "open" : ""} ontoggle="spawnOpen = this.open">
       <summary>+ New session <span class="chev">▾</span></summary>
@@ -800,7 +1489,14 @@ function render(data) {
           : `<div class="empty" style="padding:20px 0">No online hosts with repos.</div>`
       }</div>
     </details>`;
-  restoreComposerFocus(focus);
+
+  // Queued sessions: waiting for a slot, a clone, or the root slot. Above the
+  // live lists — they're the work about to start. Cancelable but not attachable
+  // (there's no pane yet).
+  $queued.innerHTML = queued.length
+    ? `<h2>Queued <span class="count">${queued.length}</span></h2>
+       <div class="s-list">${queued.map(x => queuedCard(x)).join("")}</div>`
+    : "";
 
   $active.innerHTML = `<h2>Active <span class="count">${active.length}</span></h2>` +
     (active.length
@@ -813,13 +1509,24 @@ function render(data) {
        <div class="s-list">${idle.map(x => activeCard(x)).join("")}</div>`
     : "";
 
-  $stopped.innerHTML = stopped.length
-    ? `<h2>Stopped <span class="count">${stopped.length}</span></h2>
-       <details class="stopped-wrap" ${stoppedOpen ? "open" : ""} ontoggle="stoppedOpen = this.open">
-         <summary>Show / hide stopped sessions</summary>
-         <div class="s-list">${stopped.map(x => stoppedRow(x)).join("")}</div>
+  // Ended sessions: collapsed by default (they're history, not the work at
+  // hand), and re-collapsing on its own would fight the operator, so the open
+  // state rides `endedOpen` across the beat re-render like every other panel.
+  $ended.innerHTML = ended.length
+    ? `<details class="ended-wrap-sec" ${endedOpen ? "open" : ""} ontoggle="endedOpen = this.open">
+         <summary><h2>Ended sessions <span class="count">${ended.length}</span></h2></summary>
+         <div class="s-list">${ended.map(x => endedRow(x)).join("")}</div>
        </details>`
     : "";
+
+  // All the panels are back. Focus first — the rename box lives in the card
+  // lists, so it only exists now, and focusing it can itself scroll the sidebar
+  // — then undo any clamp the swaps (or that focus) caused.
+  restoreFieldFocus(focus);
+  // After the focus, whose setSelectionRange scrolls the box to the caret: the
+  // offset the operator was actually looking at is the one that should win.
+  restoreComposerScrolls();
+  if ($sidebar && scrollTop && $sidebar.scrollTop !== scrollTop) $sidebar.scrollTop = scrollTop;
 
   // If the attached session vanished (killed elsewhere, host offline), drop the
   // stage back to the empty prompt.
@@ -827,45 +1534,178 @@ function render(data) {
     const still = running.find(x => x.s.id === currentId && x.a.terminalOnline);
     if (!still) clearStage();
     else if ((viewMode === "chat" || viewMode === "terminal") && window.TurmaChat) {
-      // Refresh the chat header + pending-question region from the new heartbeat.
-      TurmaChat.onPoll(still.s);
+      // Refresh the chat header + pending-question region from the new
+      // heartbeat; the host payload rides along so the model menu tracks the
+      // agent's probed `models` block rather than open()'s snapshot.
+      TurmaChat.onPoll(still.s, still.a);
     }
   }
 
+  advanceMigrationFollow(); // hand a followed move off to the spawn wait below
   tryPendingSelect(); // deep-linked ?session=<id> — open it once it's running
 }
 
-function activeCard({ a, s, live }) {
-  const attachable = a.terminalOnline;
-  const cur = s.id === currentId;
-  const meta = `<span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}`;
-  return `<button class="s-card ${cur ? "cur" : ""}" ${attachable ? "" : "disabled"}
-      onclick="selectSession('${esc(s.id)}')"
-      ${attachable ? "" : 'title="Terminal tunnel offline"'}>
-    <span class="dot ${live.kind}"></span>
-    <span class="body">
-      <div class="title">${esc(sessTitle(s))}</div>
-      <div class="meta">${meta}</div>
-      <div class="state-row">
-        <div class="state ${live.kind}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
-        ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
-      </div>
-      ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
-    </span>
-  </button>`;
+// Human text for why a queued session hasn't started yet.
+function queuedReasonText(reason) {
+  return ({
+    "capacity": "waiting for a free session slot",
+    "awaiting-clone": "cloning the repo first",
+    "root-busy": "waiting for the repos-root slot",
+  })[reason] || "waiting to start";
+}
+// The stage headline while a followed spawn is sitting in the queue.
+function queuedStageText(s) {
+  return "Queued — " + queuedReasonText(s.queuedReason);
 }
 
-function stoppedRow({ a, s }) {
-  const starting = pending.has(pendKey("start", a.key, s.id));
-  return `<div class="stopped-row">
-    <span class="body">
-      <div class="title">${esc(sessTitle(s))}</div>
-      <div class="meta"><span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}</div>
-      ${s.status === "error" && s.errorMsg ? `<div class="err">${esc(s.errorMsg)}</div>` : ""}
-    </span>
-    <button class="primary btn-sm" ${a.online && !starting ? "" : "disabled"}
-        onclick="sessStart('${esc(a.key)}','${esc(s.id)}')">
-      ${starting ? '<span class="spin"></span>' : "Start"}
+// A queued session card: not attachable (no pane yet), so the whole thing is a
+// plain block rather than a selecting <button>. Cancel drops the queued record
+// (the same kill path, armed-then-confirmed via the ⋯ menu on live cards — here
+// a single inline arm/confirm keeps it simple).
+function queuedCard({ a, s }) {
+  const armed = killArmedId === s.id;
+  const ticket = s.ticket?.key ? ` · <span class="s-ticket">${esc(s.ticket.key)}</span>` : "";
+  const meta = `<span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}${ticket}`;
+  const since = s.queuedAt ? " · " + esc(ago(Date.now() - Date.parse(s.queuedAt))) : "";
+  return `<div class="s-card-wrap"${orgTintStyle(a)}>
+    <div class="s-card queued">
+      <span class="dot queued"></span>
+      <span class="body">
+        <div class="title">${esc(sessTitle(s))}</div>
+        <div class="meta">${meta}</div>
+        <div class="state-row">
+          <div class="state">${esc(queuedReasonText(s.queuedReason))}${since}</div>
+        </div>
+      </span>
+    </div>
+    <button class="s-dots" title="Cancel queued session" aria-label="Cancel queued session"
+        onclick="cardKill(event,'${esc(a.key)}','${esc(s.id)}')">${armed ? "Confirm" : "Cancel"}</button>
+  </div>`;
+}
+
+function activeCard({ a, s, live }) {
+  if (renameId === s.id) return renameCard(a, s);
+  const attachable = a.terminalOnline;
+  const cur = s.id === currentId;
+  // The ticket this session works, when it was started from the board. A plain
+  // span, not a link out to Jira: the whole card is a <button>, which can't
+  // legally hold one — the chat footer's chip is where the ticket is clickable.
+  const ticket = s.ticket?.key ? ` · <span class="s-ticket">${esc(s.ticket.key)}</span>` : "";
+  const meta = `<span class="id">${esc(s.id)}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}${ticket}`;
+  // A move in progress: show where it's going until the stage follows it over.
+  const mig = migrationFor(a.key, s.id);
+  const moving = mig
+    ? `<div class="s-moving"><span class="spin"></span> Moving to ${esc(mig.targetHost)}…</div>` : "";
+  return `<div class="s-card-wrap"${orgTintStyle(a)}>
+    <button class="s-card ${cur ? "cur" : ""}" ${attachable ? "" : "disabled"}
+        onclick="selectSession('${esc(s.id)}')"
+        ${attachable ? "" : 'title="Terminal tunnel offline"'}>
+      <span class="dot ${live.kind}"></span>
+      <span class="body">
+        <div class="title">${esc(sessTitle(s))}</div>
+        <div class="meta">${meta}</div>
+        <div class="state-row">
+          <div class="state ${live.kind}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
+          ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
+        </div>
+        ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
+        ${moving}
+      </span>
+    </button>
+    <button class="s-dots ${menuOpenId === s.id ? "open" : ""}" title="Session actions"
+        aria-label="Session actions" onclick="toggleCardMenu(event,'${esc(s.id)}')">⋯</button>
+    ${menuOpenId === s.id ? cardMenu(a, s) : ""}
+  </div>`;
+}
+
+// The card's ⋯ menu: rename the session (the name the card leads with) or kill
+// it. Kill arms on the first click and fires on the second, so the menu can be
+// browsed without consequence. Reachable on a card whose terminal tunnel is
+// offline too — the card is un-attachable then, but renaming is local to the
+// registry and a kill still rides the heartbeat.
+function cardMenu(a, s) {
+  if (moveOpenId === s.id) return moveMenu(a, s);
+  const armed = killArmedId === s.id;
+  const targets = eligibleMoveTargets(a, s);
+  return `<div class="s-menu" onclick="event.stopPropagation()">
+    <button onclick="startRename(event,'${esc(s.id)}')">Rename…</button>
+    ${targets.length ? `<button onclick="openMove(event,'${esc(s.id)}')">Move to another agent…</button>` : ""}
+    <button class="danger ${armed ? "armed" : ""}"
+        onclick="cardKill(event,'${esc(a.key)}','${esc(s.id)}')">
+      ${armed ? "Confirm kill" : "Kill session"}
+    </button>
+  </div>`;
+}
+// The ⋯ menu showing the target-host picker for a move. Each online same-org
+// host that has the repo is a one-click destination (see eligibleMoveTargets).
+function moveMenu(a, s) {
+  const targets = eligibleMoveTargets(a, s);
+  return `<div class="s-menu" onclick="event.stopPropagation()">
+    <div class="s-menu-head">Move to…</div>
+    ${targets.length
+      ? targets.map(t => `<button onclick="moveTo(event,'${esc(a.key)}','${esc(s.id)}','${esc(t.key)}')">${esc(t.device || t.key)}</button>`).join("")
+      : `<div class="s-menu-empty">No eligible agent.</div>`}
+    <button onclick="closeMove(event)">Cancel</button>
+  </div>`;
+}
+
+// The card while it's being renamed. Enter saves, Escape cancels, an empty save
+// clears the name back to the label/worktree fallback. The text lives in
+// renameDraft so the re-render can't wipe it mid-type.
+function renameCard(a, s) {
+  const done = `submitRename('${esc(a.key)}','${esc(s.id)}')`;
+  return `<div class="s-rename" onclick="event.stopPropagation()">
+    <input id="${renFieldId(s.id)}" value="${esc(renameDraft)}" maxlength="48"
+      placeholder="${esc(sessMeta(s) || s.id)}" aria-label="Session name"
+      oninput="renameDraft = this.value"
+      onkeydown="if(event.key==='Enter'){event.preventDefault();${done};}">
+    <button class="primary btn-sm" onclick="${done}">Save</button>
+    <button class="btn-sm" onclick="cancelRename()">Cancel</button>
+  </div>`;
+}
+
+// What the row shows where a session card shows its id. A session id is 5 hex
+// chars; a resumable row is keyed on a 36-char transcript UUID instead, which
+// would swamp the meta line, so it's shortened to the same visual weight. It's a
+// label, not a handle — the row still dispatches on the full e.id.
+function endedRowId(e) {
+  return e.kind === "resumable"
+    ? String(e.s.transcriptId || "").slice(0, 8)
+    : e.id;
+}
+// One ended session. The card body is a button that opens its conversation
+// read-only on the stage; Resume sits beside it (a sibling, not a child — see
+// the .s-resume CSS) and brings the session back to life. Resume needs the host
+// to be ONLINE (it rides the heartbeat as a command); reading the history does
+// not (the hub archived it), so the card stays clickable on a dead host.
+function endedRow(e) {
+  const { a, s, kind } = e;
+  const resuming = pending.has(pendKey("start", a.key, e.id));
+  const cur = e.id === endedViewId;
+  const when = e.endedMs ? ago(Date.now() - e.endedMs) : "";
+  // A resumable row is a bare transcript: nothing recorded WHY it ended, only
+  // that it did, so it says the one thing that's true of all of them.
+  const state = (kind === "closed" ? "killed"
+    : kind === "resumable" ? "ended"
+    : (s.status === "error" ? "failed" : "stopped"))
+    + (when ? " " + when : "");
+  return `<div class="s-card-wrap ended-wrap"${orgTintStyle(a)}>
+    <button class="s-card ended ${cur ? "cur" : ""}" onclick="openEndedSession('${esc(e.id)}')">
+      <span class="dot"></span>
+      <span class="body">
+        <div class="title">${esc(sessTitle(s))}</div>
+        <div class="meta"><span class="id">${esc(endedRowId(e))}</span> · ${esc(s.repo || "?")} · ${esc(a.device || a.key)}</div>
+        <div class="state-row">
+          <div class="state">${esc(state)}</div>
+          ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeHtml).join("")}</span>` : ""}
+        </div>
+        ${s.status === "error" && s.errorMsg ? `<div class="err">${esc(s.errorMsg)}</div>` : ""}
+      </span>
+    </button>
+    <button class="s-resume" ${a.online && !resuming ? "" : "disabled"}
+        ${a.online ? "" : 'title="Host offline"'}
+        onclick="resumeEnded(event,'${esc(e.id)}')">
+      ${resuming ? '<span class="spin"></span>' : "Resume"}
     </button>
   </div>`;
 }
@@ -892,12 +1732,18 @@ function hostBlock(a) {
 
 // ---- actions → endpoints ----------------------------------------------------
 function enc(s) { return encodeURIComponent(s); }
+// Returns the parsed JSON reply (or null if it isn't JSON) — the spawn/resume
+// endpoints answer with the queued command's `cmdId`, which awaitSpawn() needs
+// to recognize the session the agent mints for it.
 async function post(url, body) {
-  await fetch(url, body
+  const res = await fetch(url, body
     ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
     : { method: "POST" });
+  let out = null;
+  try { out = await res.json(); } catch { /* not JSON — nothing to correlate */ }
   refresh();
   fastPoll();
+  return out;
 }
 function busy(key, val, run) {
   if (pending.has(key)) return;
@@ -928,13 +1774,59 @@ function startSession(key, repo) {
   saveOpts(repo, { baseRef, model, permissionMode: perm, optionsExpanded: optionsOpen.has(rk) });
   composerOpen.delete(rk);
   composerDraft.delete(rk);
+  composerHeight.delete(rk);
+  composerScroll.delete(rk);
   const baseline = host ? (host.sessions || []).filter(s => s.repo === repo).length : 0;
   busy(pendKey("spawn", key, repo), { kind: "spawn", host: key, repo, baseline },
-    () => post(`/api/agents/${enc(key)}/sessions`, body));
+    // Open the new session on the stage as soon as the agent reports it.
+    () => post(`/api/agents/${enc(key)}/sessions`, body)
+      .then(r => followSpawn(r && r.cmdId)));
 }
-function sessStart(key, id) {
-  busy(pendKey("start", key, id), { kind: "start", host: key, id },
-    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/start`));
+// Bring an ended session back. The endpoint depends on which channel reported
+// it (see endedEntry): a KILLED session was dropped from the registry and comes
+// back via `resume` (same id, same worktree, its conversation resumed); a merely
+// stopped one still has its record and just needs `start`; and one recovered by
+// the transcript scan has no record at all, so `resumeTranscript` relaunches it
+// at its own origin cwd — re-creating that dir if a delete/prune removed it —
+// under a NEW id the agent mints. Either way the agent reports it running on a
+// following beat, which is what drops it out of the ended list: the list is
+// derived, so there is nothing here to remove.
+function resumeEnded(ev, id) {
+  if (ev) ev.stopPropagation();
+  const e = findEnded(id);
+  if (!e || !e.a.online) return;
+  // Resuming is an intent to work in it, so hand off to the live session the way
+  // spawning does. A resumed transcript lands under an id only the agent knows,
+  // so that one follows the queued command's cmdId (like a spawn); the other two
+  // keep their own id and can take the plain by-id wait.
+  pendingSpawn = null;
+  followedSpawn = false;
+  pendingSelect = e.kind === "resumable" ? null : id;
+  // Only drop the stage if it's showing the very session being resumed; a
+  // Resume clicked from the sidebar must not clear something else being read.
+  if (endedViewId === id) clearStage();
+  const url = e.kind === "resumable"
+    ? `/api/agents/${enc(e.a.key)}/transcripts/${enc(e.s.transcriptId)}/resume`
+    : `/api/agents/${enc(e.a.key)}/sessions/${enc(id)}/${e.kind === "closed" ? "resume" : "start"}`;
+  // The origin cwd the row was built from; the agent re-validates it and won't
+  // take a path outside its repos root.
+  const body = e.kind === "resumable" ? { cwd: e.s.worktreePath || "" } : null;
+  // What clears the row's spinner. The by-id wait can't see a resumed transcript
+  // — it arrives under an id that didn't exist when the button was clicked — so
+  // that one watches its repo's session count grow instead, the same signal the
+  // dashboard's Resume picker uses.
+  const val = e.kind === "resumable"
+    ? { kind: "spawn", host: e.a.key, repo: e.s.repo,
+        baseline: (e.a.sessions || []).filter(s => s.repo === e.s.repo).length }
+    : { kind: "start", host: e.a.key, id };
+  busy(pendKey("start", e.a.key, id), val,
+    () => post(url, body).then(r => {
+      if (e.kind === "resumable") followSpawn(r && r.cmdId);
+    }));
+}
+// The ended-session pane's own Resume button.
+function resumeCurrentEnded() {
+  if (endedViewId) resumeEnded(null, endedViewId);
 }
 
 // ---- inline live terminal on the main stage ---------------------------------
@@ -948,20 +1840,108 @@ const $chatPane = document.getElementById("chatPane");
 const $transcriptPane = document.getElementById("transcriptPane");
 const $stageEmpty = document.getElementById("stageEmpty");
 let currentId = null;
-let viewMode = null; // "chat" | "terminal" | "transcript" | null — what the stage shows
+let viewMode = null; // "chat" | "terminal" | "transcript" | "subagent" | null — what the stage shows
+// When a subagent transcript is open (clicked from a live session's agent list),
+// this holds the live session id to return to, so the transcript pane's Back
+// button reopens the session rather than dropping to the list.
+let subagentReturn = null;
 let viewPushed = false; // a history entry the back button will consume (mobile)
 // Deep link: the dashboard's "Attach" links here as /sessions?session=<id>. We
 // hold the requested id until that session shows up as running in a heartbeat,
 // then open it once (clearing the pending id so a later kill/reselect isn't
 // undone). Survives the async /api/agents load and any SSE-delivered arrival.
-let pendingSelect = new URLSearchParams(location.search).get("session");
+const params = new URLSearchParams(location.search);
+let pendingSelect = params.get("session");
+// Deep link to an ENDED session's read-only view, keyed by its conversation:
+// /sessions?ended=<transcriptId>, which the board's ticket chips use for any
+// session that isn't running. Separate from ?session=, whose wait only ever
+// resolves a RUNNING session — pointing a killed session at that one parks the
+// stage on "Opening session…" indefinitely. Held until the ended list reports the
+// transcript (a killed session is in the very next heartbeat; one recovered by
+// the transcript scan can take a slow beat), then opened once.
+let pendingEnded = params.get("ended");
+const pendingEndedAt = Date.now();
+// Bounded, unlike the by-id wait: the board only ever chips a transcript it saw
+// in this same fleet payload, so failing to find one means the host dropped out
+// between the click and this load. Fall back to the ordinary empty stage.
+const ENDED_FOLLOW_MS = 30000;
+// Follow a session we just started, whose id we don't know yet. The agent mints
+// the id, so a spawn/resume POST can only answer with the queued command's
+// `cmdId`; the session it creates reports that back as `spawnCmdId` on a later
+// beat, and that's what we match on. Set either by the dashboard handing us
+// /sessions?spawn=<cmdId> or by this page's own startSession.
+// Give up after SPAWN_FOLLOW_MS so a spawn the agent refused (at MAX_SESSIONS,
+// unknown repo) can't hijack a selection the operator makes minutes later.
+const SPAWN_FOLLOW_MS = 90000;
+let pendingSpawn = params.get("spawn");
+let pendingSpawnAt = Date.now();
+let followedSpawn = !!pendingSpawn; // sticky: keeps the wait worded as a start
+function followSpawn(cmdId) {
+  if (!cmdId) return;
+  pendingSpawn = cmdId;
+  pendingSpawnAt = Date.now();
+  followedSpawn = true;
+}
+// Resolve a followed spawn into the id the agent minted, then fall through to
+// the ordinary by-id wait — a session is reported before its terminal tunnel is
+// up, so sessionHit() may still need a beat or two either way.
 function tryPendingSelect() {
-  if (!pendingSelect) return;
-  if (sessionHit(pendingSelect)) {
-    const id = pendingSelect;
-    pendingSelect = null;
-    selectSession(id);
+  if (pendingEnded) {
+    const e = findEndedByTranscript(pendingEnded);
+    if (e) {
+      const id = e.id;
+      pendingEnded = null;
+      stageWaiting(null);
+      openEndedSession(id);
+      return;
+    }
+    if (Date.now() - pendingEndedAt <= ENDED_FOLLOW_MS) {
+      stageWaiting("Opening session…");
+      return;
+    }
+    pendingEnded = null;   // gave up; fall through to the ordinary stage
   }
+  if (pendingSpawn) {
+    if (Date.now() - pendingSpawnAt > SPAWN_FOLLOW_MS) pendingSpawn = null;
+    else {
+      for (const a of (cache.agents || [])) {
+        const s = (a.sessions || []).find(x => x.spawnCmdId === pendingSpawn);
+        if (s) { pendingSpawn = null; pendingSelect = s.id; break; }
+      }
+    }
+  }
+  // Waiting on either the agent to report the spawn, or on a known-id session
+  // to come up. Say which rather than sit on the "No session attached" copy,
+  // which reads as if the spawn went nowhere.
+  if (pendingSpawn || (pendingSelect && !sessionHit(pendingSelect))) {
+    // A followed spawn that landed in the queue (host full, or cloning its repo)
+    // says so rather than "Starting…", which reads as if it were already
+    // launching. It flips to the live session the moment it provisions.
+    const sel = pendingSelect ? findSession(pendingSelect) : null;
+    if (sel && sel.status === "queued") stageWaiting(queuedStageText(sel));
+    else stageWaiting(followedSpawn ? "Starting your session…" : "Opening session…");
+    return;
+  }
+  if (!pendingSelect) { stageWaiting(null); return; }
+  const id = pendingSelect;
+  pendingSelect = null;
+  stageWaiting(null);
+  selectSession(id);
+}
+// Swap the idle stage's headline for a spinner + `label` while we wait on a
+// session we were sent here to open. Only ever touches the idle stage — a
+// session already on it wins, so this can't stomp what's being read.
+const EMPTY_BIG = "No session attached";
+let stageWaitingOn = null;
+function stageWaiting(label) {
+  if (currentId) label = null;
+  if (label === stageWaitingOn) return;
+  stageWaitingOn = label;
+  const big = document.getElementById("stageEmptyBig");
+  const hint = document.getElementById("stageEmptyHint");
+  if (!big || !hint) return;
+  big.innerHTML = label ? '<span class="spin"></span> ' + esc(label) : esc(EMPTY_BIG);
+  hint.hidden = !!label;
 }
 const isNarrow = () => window.matchMedia("(max-width: 820px)").matches;
 
@@ -985,6 +1965,16 @@ function setFrame(id, s, a) {
   const inp = document.getElementById("termInput");
   if (inp) { inp.value = ""; autoGrowTermInput(); }
 }
+// The last-reported record for a session, whatever its state — unlike
+// sessionHit() this doesn't require the host's terminal tunnel, since renaming
+// touches the registry rather than the session's pane.
+function findSession(id) {
+  for (const a of (cache.agents || [])) {
+    const s = (a.sessions || []).find(x => x.id === id);
+    if (s) return s;
+  }
+  return null;
+}
 function sessionHit(id) {
   const now = cache.now || Date.now();
   const { running } = collect(cache.agents || [], now);
@@ -996,11 +1986,24 @@ function sessionHit(id) {
 function selectSession(id) {
   const hit = sessionHit(id);
   if (!hit) return;
-  // Already viewing this session in chat — clicking it again should be a no-op,
-  // not tear down and rebuild the live tail (which reads as a page reload).
-  if (id === currentId && viewMode === "chat") return;
+  // An explicit pick wins over anything we were waiting to open, so a spawn
+  // that lands mid-read can't yank the operator off the session they chose.
+  pendingSpawn = null;
+  pendingSelect = null;
+  pendingEnded = null;
+  followedSpawn = false;
+  // Already viewing this session in chat — don't tear down and rebuild the live
+  // tail (which reads as a page reload). On DESKTOP the stage is always visible
+  // beside the list, so this is the intended do-nothing. On MOBILE, though,
+  // "backing out" only HIDES the stage — currentId/viewMode stay put so the tail
+  // stays warm, and the sidebar card is tappable again — so a re-tap must
+  // re-reveal that warm stage rather than no-op (or the session becomes
+  // unopenable once you've left it). enterStage() is idempotent and gated on
+  // isNarrow(), so it re-reveals on mobile and no-ops on desktop (XERK-17).
+  if (id === currentId && viewMode === "chat") { enterStage(); return; }
   currentId = id;
   viewMode = "chat";
+  resetEndedBar();   // leaving any ended-session view (incl. one just resumed)
   $termPane.hidden = true;
   $transcriptPane.hidden = true;
   $stageEmpty.hidden = true;
@@ -1010,15 +2013,46 @@ function selectSession(id) {
   enterStage();
   render(cache); // refresh the .cur highlight
 }
+// The chat and terminal panes each have their own compose box, but a half-typed
+// message is ONE draft: toggling views to check something in the terminal (or
+// coming back) must not eat it (XERK-122). Each toggle MOVES the text across —
+// the source is cleared, so the two boxes can never disagree about what's still
+// pending, and whichever box you can see holds the whole draft.
+// Focus follows only a non-empty draft: focusing an empty box would pop the soft
+// keyboard on a phone for someone who just wanted to look at the terminal.
+function carryDraft(fromId, toId) {
+  const src = document.getElementById(fromId), dst = document.getElementById(toId);
+  if (!src || !dst) return;
+  const text = src.value;
+  src.value = "";
+  dst.value = text;
+  growCompose(fromId); growCompose(toId);
+  if (!text.trim()) return;
+  dst.focus();
+  // Caret at the end, so the next keystroke continues the sentence.
+  try { dst.selectionStart = dst.selectionEnd = dst.value.length; } catch {}
+}
+// The two boxes auto-grow through different owners: the terminal's is local, the
+// chat's belongs to the chat engine (chat.js publishes autoGrowChatInput).
+function growCompose(id) {
+  if (id === "termInput") autoGrowTermInput();
+  else if (typeof window.autoGrowChatInput === "function") window.autoGrowChatInput();
+}
 // Swap the chat view for the raw ttyd terminal (debugging), keeping the chat's
 // live tail warm underneath so returning is instant.
 function chatToTerminal() {
   if (!currentId) return;
   const hit = sessionHit(currentId);
+  // setFrame() clears the terminal's box (it's opening a session's terminal), so
+  // the draft has to be carried across after it, not before.
   setFrame(currentId, hit ? hit.s : null, hit ? hit.a : null);
   viewMode = "terminal";
   $chatPane.hidden = true;
   $termPane.hidden = false;
+  // LAST, once the pane is actually shown: focus() on a still-`hidden` textarea
+  // is a silent no-op, which lands the draft in a box the operator then has to
+  // tap before they can keep typing.
+  carryDraft("chatInput", "termInput");
 }
 function terminalToChat() {
   if (!currentId) return;
@@ -1027,6 +2061,7 @@ function terminalToChat() {
   $termPane.hidden = true;
   $chatPane.hidden = false;
   disarmTermKill();
+  carryDraft("termInput", "chatInput"); // after the swap — see chatToTerminal()
   if (window.TurmaChat) TurmaChat.repaint();
 }
 // Push one mobile history entry the back button consumes, and reveal the stage.
@@ -1039,6 +2074,8 @@ function enterStage() {
 function clearStage() {
   currentId = null;
   currentTranscriptId = null;
+  subagentReturn = null;
+  resetEndedBar();
   navFrame("about:blank"); // tear down any live session's WebSocket
   if (window.TurmaChat) { TurmaChat.close(); TurmaChat.closeStatic(); } // stop the chat live tail + clear the archived view
   viewMode = null;
@@ -1091,6 +2128,19 @@ function killCurrentTerminal() {
   if (viewPushed) { viewPushed = false; history.back(); }
   clearStage();
 }
+// The terminal's compose bar mirrors the chat's split: Send ALWAYS sends —
+// mid-turn it queues, which the chat renders as a dimmed "queued" bubble — and
+// the separate ◼ Stop beside it interrupts the turn. Both stop buttons defer
+// to the chat engine: it holds the live pane status (the ~1s busy read) and
+// paints every .compose-stop button on the page, and its tail stays warm
+// underneath the terminal toggle — so the two bars can't disagree about
+// whether the turn is still running.
+function termComposeAction() {
+  sendTermInput();
+}
+function termComposeStop() {
+  if (window.TurmaChat) TurmaChat.stop();
+}
 // Same arm-then-confirm Kill, from the chat header.
 let chatKillArmed = false, chatKillTimer = null;
 function disarmChatKill() {
@@ -1127,6 +2177,11 @@ document.addEventListener("keydown", (e) => {
 function autoGrowTermInput() {
   const inp = document.getElementById("termInput");
   if (!inp) return;
+  // Same hidden-textarea guard as chat.js autoGrow (XERK-149): scrollHeight is 0
+  // when the pane is `.term-pane[hidden]` (chat view) or the stage is hidden on a
+  // phone, and growCompose runs this mid carryDraft — pinning height:0px would
+  // squish the box below one line until a refresh. Skip while not laid out.
+  if (inp.offsetParent === null) return;
   inp.style.height = "auto";
   inp.style.height = Math.min(inp.scrollHeight, 160) + "px";
 }
@@ -1136,12 +2191,11 @@ function termInputKey(e) {
 async function sendTermInput() {
   const id = currentId;
   const inp = document.getElementById("termInput");
-  const btn = document.getElementById("termSend");
   if (!id || !inp) return;
   const text = inp.value;
   if (!text.trim()) return;
   const key = hostKeyForSession(id);
-  if (!key) { if (btn) { btn.textContent = "host offline"; setTimeout(() => btn.textContent = "Send", 2000); } return; }
+  if (!key) { composeFailed("host offline"); return; }
   // Clear + refocus immediately so typing the next message never waits on the
   // POST; restore the text if the send fails so nothing is silently lost.
   inp.value = "";
@@ -1156,8 +2210,13 @@ async function sendTermInput() {
     fastPoll();
   } catch {
     if (!inp.value.trim()) { inp.value = text; autoGrowTermInput(); }
-    if (btn) { btn.textContent = "Send failed"; setTimeout(() => btn.textContent = "Send", 2000); }
+    composeFailed("Send failed");
   }
+}
+// Transient failure text on the compose button. Routed through the chat engine
+// so its own ~1s repaint doesn't wipe the message a beat after it appears.
+function composeFailed(text) {
+  if (window.TurmaChat && TurmaChat.actionFailed) TurmaChat.actionFailed(text);
 }
 
 // ---- durable, searchable ended-session history ------------------------------
@@ -1220,10 +2279,110 @@ function renderSearch() {
     </div>`).join("");
 }
 
+// Clickable PR pill for the STAGE. Identical to prBadgeHtml above but rendered
+// as a real <a>: that copy has to be an inert <span> because it lives inside the
+// session card's <button>, and this one doesn't — an ended session's PR is often
+// the whole reason you opened it, so it links out to GitHub.
+function prBadgeLinkHtml(pr) {
+  const span = prBadgeHtml(pr);
+  if (!span) return "";
+  const url = pr && pr.url ? pr.url : "";
+  return span
+    .replace(/^<span /, `<a href="${esc(url)}" target="_blank" rel="noopener" `)
+    .replace(/<\/span>$/, "</a>");
+}
+
+// Open an ENDED session read-only on the stage: its conversation (from the hub's
+// durable archive, so it works even for an offline host), its PRs, and a Resume
+// button. Deliberately reuses the archive/subagent transcript pane, which is
+// exactly the surface an ended session should get — scrollable history, a
+// verbosity control, and NO terminal toggle or compose box, because there is no
+// live pty to attach to and nothing to type at.
+async function openEndedSession(id) {
+  const e = findEnded(id);
+  if (!e) return;
+  // An explicit pick wins over anything we were waiting to open.
+  pendingSpawn = null;
+  pendingSelect = null;
+  pendingEnded = null;
+  followedSpawn = false;
+  endedViewId = id;
+  currentId = null;
+  currentTranscriptId = null;
+  subagentReturn = null;
+  trHighlight = null;
+  viewMode = "ended";
+  document.getElementById("trBackLabel").textContent = " Sessions";
+  document.getElementById("trTitle").textContent = sessTitle(e.s);
+  document.getElementById("trPath").textContent =
+    [(e.a.device || e.a.key), sessMeta(e.s), e.endedMs ? "ended " + ago(Date.now() - e.endedMs) : ""]
+      .filter(Boolean).join(" · ");
+  const $prs = document.getElementById("trPrs");
+  $prs.innerHTML = (e.s.prs || []).map(prBadgeLinkHtml).join("");
+  $prs.hidden = !(e.s.prs && e.s.prs.length);
+  const $res = document.getElementById("trResume");
+  $res.hidden = false;
+  $res.disabled = !e.a.online;
+  $res.title = e.a.online ? "Bring this session back" : "Host offline";
+  document.getElementById("trScroll").innerHTML = `<div class="tr-empty">Loading conversation…</div>`;
+  // Leave any live chat + clear a prior archived view's verbosity control.
+  if (window.TurmaChat) { TurmaChat.close(); TurmaChat.closeStatic(); }
+  $chatPane.hidden = true;
+  $termPane.hidden = true;
+  $stageEmpty.hidden = true;
+  $transcriptPane.hidden = false;
+  navFrame("about:blank"); // ensure no live-terminal WebSocket lingers
+  disarmTermKill();
+  enterStage();
+  render(cache);   // refresh the .cur highlight on the ended list
+  const tid = e.s.transcriptId;
+  if (!tid) {
+    // An older agent's record, or a session that never wrote a transcript.
+    document.getElementById("trScroll").innerHTML =
+      `<div class="tr-empty">No conversation recorded for this session.</div>`;
+    return;
+  }
+  let t;
+  try {
+    const r = await fetch(`/api/archive/${enc(tid)}`);
+    if (r.status === 401) return void (location.href = "/login");
+    if (!r.ok) throw new Error(String(r.status));
+    t = await r.json();
+  } catch {
+    if (endedViewId !== id) return;
+    // The agent ships ended transcripts to the archive on its slow usage
+    // cadence, so a just-killed session is legitimately not there yet. Say that,
+    // rather than the flat "unavailable" that reads as history lost.
+    document.getElementById("trScroll").innerHTML =
+      `<div class="tr-empty">This session's conversation hasn't reached the archive yet — it syncs within a few minutes of ending. Resume still works.</div>`;
+    return;
+  }
+  if (endedViewId !== id) return; // superseded by another click
+  if (!window.TurmaChat || !TurmaChat.renderStatic) return;
+  TurmaChat.renderStatic({
+    entries: t.entries || [],
+    scrollEl: document.getElementById("trScroll"),
+    verbHost: document.getElementById("trVerbosity"),
+    transcriptId: tid,
+  });
+}
+
 let trHighlight = null; // { uuid } for a search-driven open (else null)
+// The PR chips + Resume button belong to the ended-session view alone; the
+// archive and subagent views share this pane, so each open clears them.
+function resetEndedBar() {
+  endedViewId = null;
+  const $prs = document.getElementById("trPrs");
+  const $res = document.getElementById("trResume");
+  if ($prs) { $prs.hidden = true; $prs.innerHTML = ""; }
+  if ($res) { $res.hidden = true; }
+}
 async function openTranscript(id, title, hi) {
+  resetEndedBar();
   currentTranscriptId = id;
   trHighlight = hi || null;
+  subagentReturn = null; // an archive open -> Back goes to the list
+  document.getElementById("trBackLabel").textContent = " Sessions";
   currentId = null;
   disarmTermKill();
   document.getElementById("trTitle").textContent = title || id;
@@ -1252,6 +2411,84 @@ async function openTranscript(id, title, hi) {
   }
   if (currentTranscriptId !== id) return; // superseded by another click
   renderTranscript(t);
+}
+
+// Open one live background agent's transcript in the read-only transcript pane,
+// clicked from the current session's pane agent-list (chat.js -> here). Reuses
+// the archive viewer's stage + chat engine; Back returns to the live session
+// (subagentReturn) rather than the sessions list. type+label identify the row
+// (see the /subagents/history endpoint); a virtual id keeps verbosity scoped.
+async function openSubagentView(type, label) {
+  const liveId = currentId;
+  const key = liveId && hostKeyForSession(liveId);
+  if (!key) return;
+  resetEndedBar();
+  const vid = "subagent::" + liveId + "::" + type + "::" + label;
+  currentTranscriptId = vid;
+  trHighlight = null;
+  subagentReturn = liveId;   // Back reopens the session, not the list
+  viewMode = "subagent";
+  document.getElementById("trBackLabel").textContent = " Session";
+  document.getElementById("trTitle").textContent = type;
+  document.getElementById("trPath").textContent = label || "background agent";
+  document.getElementById("trScroll").innerHTML = `<div class="tr-empty">Loading agent transcript…</div>`;
+  if (window.TurmaChat) TurmaChat.closeStatic(); // leave the live tail running underneath
+  $chatPane.hidden = true;
+  $termPane.hidden = true;
+  $stageEmpty.hidden = true;
+  $transcriptPane.hidden = false;
+  enterStage();
+  renderSearch();
+  const qs = `type=${enc(type)}&label=${enc(label || "")}`;
+  const url = `/api/agents/${enc(key)}/sessions/${enc(liveId)}/subagents/history?${qs}`;
+  // The agent fetches on demand: a cache miss 202s until the next heartbeat
+  // delivers it. Poll a bounded number of times, then give up gracefully.
+  for (let i = 0; i < 12; i++) {
+    let r;
+    try { r = await fetch(url); } catch { break; }
+    if (r.status === 401) return void (location.href = "/login");
+    if (currentTranscriptId !== vid) return; // superseded by another click
+    if (r.status === 200) {
+      let t; try { t = await r.json(); } catch { break; }
+      if (currentTranscriptId !== vid) return;
+      if (window.TurmaChat && TurmaChat.renderStatic) {
+        TurmaChat.renderStatic({
+          entries: t.entries || [],
+          scrollEl: document.getElementById("trScroll"),
+          verbHost: document.getElementById("trVerbosity"),
+          transcriptId: vid,
+        });
+      }
+      return;
+    }
+    if (r.status !== 202) break;
+    await new Promise((res) => setTimeout(res, 1200));
+  }
+  if (currentTranscriptId === vid) {
+    document.getElementById("trScroll").innerHTML =
+      `<div class="tr-empty">Agent transcript unavailable.</div>`;
+  }
+}
+window.openSubagentView = openSubagentView;
+
+// The transcript pane's Back button: return to the live session it was opened
+// from (a subagent view), else fall back to the sessions list (archive view).
+function transcriptBack() {
+  const back = subagentReturn;
+  subagentReturn = null;
+  document.getElementById("trBackLabel").textContent = " Sessions";
+  if (back != null) {
+    if (window.TurmaChat) TurmaChat.closeStatic();
+    $transcriptPane.hidden = true;
+    viewMode = null;      // force selectSession to re-enter the chat view
+    currentTranscriptId = null;
+    // The session may have ended while its agent transcript was open — reopen it
+    // if it's still running, otherwise drop to the empty stage.
+    if (sessionHit(back)) selectSession(back);
+    else clearStage();
+    return;
+  }
+  backToList();
 }
 // Render an archived transcript through the SAME chat engine the live view uses
 // (chat.js), so a past session's bubbles, tool-action cards, thinking traces,
@@ -1327,6 +2564,20 @@ function connectSSE() {
     catch { return; }
     render(cache);
   });
+  // An org's color pin changed (XERK-145): org.js owns the live map; patching
+  // this page's cache keeps the next render's TurmaOrg.update(cache) from
+  // regressing the pins to the stale copy the initial poll fetched.
+  es.addEventListener("orgColors", (e) => {
+    let oc;
+    try { oc = JSON.parse(e.data); } catch { return; }
+    if (!cache) return;   // org.js already took the event; nothing painted yet
+    cache.orgColors = oc;
+    render(cache);
+  });
+  // The header's per-org auto-start switches (XERK-41) ride the same socket —
+  // org.js takes its own event off this page's EventSource rather than opening
+  // a second one.
+  TurmaOrg.sse(es);
   es.onerror = () => {
     sseOk = false;
     if (es.readyState === EventSource.CLOSED) {
@@ -1349,6 +2600,10 @@ function fastPoll() {
   }, 500);
 }
 
+// The org scope lives in the header and applies to every page (XERK-62);
+// a change there repaints this one straight away rather than waiting for
+// the next beat.
+TurmaOrg.subscribe(() => render(cache));
 refresh();
 connectSSE();
 // Fallback poll: slower now that SSE carries live updates, skipped while healthy.

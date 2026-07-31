@@ -4,12 +4,15 @@
 //
 // TURMA_TEST makes server.js export its internals instead of binding the
 // production port; the HTTP tests listen on an ephemeral port themselves.
-// notify()'s outbound ntfy POST is captured by stubbing globalThis.fetch, so
-// the alert tests observe exactly which notifications each beat fires.
+// notify() fans every alert out to registered devices via push.sendFcm; the
+// alert tests stub push.sendFcm to record exactly which notifications each beat
+// fires (server.js calls it as `push.sendFcm`, so replacing the property on the
+// shared module object intercepts every fan-out).
 
 "use strict";
 
 const os = require("os");
+const vm = require("vm");
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
@@ -24,8 +27,11 @@ process.env.TURMA_USER = "hubuser";
 process.env.TURMA_PASSWORD = "hubpass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.TURMA_TRIGGER_TOKEN = "triggertok"; // programmatic /api/trigger bearer
-process.env.NTFY_URL = "http://ntfy.test"; // enables notify(); fetch is stubbed
-process.env.COST_ALERT_USD = "50";
+// Control-channel liveness, wound right down so the beat/drop is testable in ms
+// rather than the 30s/90s the fleet runs. No other test opens a real
+// /agent/control socket, so nothing else feels these.
+process.env.CONTROL_PING_EVERY_MS = "50";
+process.env.CONTROL_DEAD_AFTER_MS = "400";
 process.env.STATE_FILE = path.join(
   os.tmpdir(),
   `turma-test-state-${process.pid}.json`
@@ -33,6 +39,22 @@ process.env.STATE_FILE = path.join(
 process.env.DEVICES_FILE = path.join(
   os.tmpdir(),
   `turma-test-devices-${process.pid}.json`
+);
+process.env.TICKET_AGENTS_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-ticket-agents-${process.pid}.json`
+);
+process.env.AUTOSTART_ORGS_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-autostart-orgs-${process.pid}.json`
+);
+process.env.TICKET_MODELS_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-ticket-models-${process.pid}.json`
+);
+process.env.ORG_COLORS_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-org-colors-${process.pid}.json`
 );
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
 process.env.ARCHIVE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "turma-test-archive-"));
@@ -52,28 +74,49 @@ process.env.WHISPER_API_KEY = "whisperkey";
 process.env.WHISPER_LANGUAGE = "en";
 process.env.WHISPER_TIMEOUT_MS = "30000";
 
-// Capture ntfy pushes synchronously (notify() calls global fetch). Individual
-// tests below stub globalThis.fetch to exercise transcribePcm/the audio WS,
-// then must call restoreFetch() to put this capturing stub back.
-const notifications = [];
-function ntfyFetchStub(url, opts) {
-  notifications.push({ url, title: opts.headers.Title, body: opts.body, headers: opts.headers });
+// A benign default global fetch. notify() no longer touches it (it fans out via
+// push.sendFcm, stubbed below); only transcribePcm/the audio WS use it, and
+// those tests install their own stub, then call restoreFetch() to put this back.
+function defaultFetchStub() {
   return Promise.resolve({ ok: true });
 }
-globalThis.fetch = ntfyFetchStub;
+globalThis.fetch = defaultFetchStub;
 function restoreFetch() {
-  globalThis.fetch = ntfyFetchStub;
+  globalThis.fetch = defaultFetchStub;
 }
-const titles = () => notifications.map((n) => n.title);
+
+// Capture notifications at the FCM fan-out boundary. server.js calls
+// `push.sendFcm(...)`, so replacing that property on the shared module object
+// records every alert synchronously (the recorder runs before the returned
+// promise resolves). Its {title, body, data} mirror what a real device would
+// receive.
+const push = require("../push.js");
+const notifications = [];
+push.sendFcm = (tokens, { title, body, data = {} } = {}) => {
+  notifications.push({ tokens, title, body, data });
+  return Promise.resolve({ sent: tokens.length, dead: [] });
+};
+// Real alerts carry a title; retractions (XERK-154) are title-less data-only
+// messages, so titles() naturally excludes them and dismisses() reads their key.
+const titles = () => notifications.filter((n) => n.title != null).map((n) => n.title);
+const dismisses = () => notifications.filter((n) => n.data?.action === "dismiss").map((n) => n.data.notifKey);
 
 const hub = require("../server.js");
+// notify() no-ops when no device is registered; register one so the alert tests
+// see the fan-out. Real fan-out/pruning is exercised separately below.
+hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
   server, agents, queueCommand, findSession,
   wsAccept, wsEncode, wsParser, channelDuplex,
-  heartbeatAlerts, sessionWorking,
+  heartbeatAlerts, prAlertDecision, sessionWorking,
   userAuthorized, agentAuthorized, agentWsAuthorized, triggerAuthorized, fmtDur,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
+  TERM_OSC52_JS,
+  autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
+  autoStopped, autoStartOrgs, setAutoStartOrg,
+  orgColors, setOrgColor,
+  migrations, advanceMigrations,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -321,6 +364,103 @@ test("fmtDur buckets", () => {
   assert.equal(fmtDur(2 * 3600 * 1000), "2h");
 });
 
+// ---- OSC 52 clipboard bridge ---------------------------------------------------
+// TERM_OSC52_JS is a string injected into ttyd's page, so exercise it the way the
+// browser does: run it against a fake window.term and read what it hands the
+// clipboard. See the constant in server.js for why the bridge exists at all.
+
+const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
+
+function runOsc52({ withTerm = true, reject = false } = {}) {
+  const writes = [];
+  const timers = [];
+  let handler = null;
+  const term = {
+    parser: { registerOscHandler: (id, fn) => { if (id === 52) handler = fn; } },
+  };
+  const sandbox = {
+    window: { term: withTerm ? term : undefined },
+    navigator: {
+      clipboard: {
+        writeText: (t) => {
+          writes.push(t);
+          return reject ? Promise.reject(new Error("denied")) : Promise.resolve();
+        },
+      },
+    },
+    // Node's own atob, not a Buffer stand-in: both implement the same spec —
+    // one char per decoded BYTE, and a throw on invalid input, which
+    // Buffer.from(s, "base64") silently swallows instead.
+    atob,
+    TextDecoder,
+    setTimeout: (fn) => { timers.push(fn); return 0; },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(TERM_OSC52_JS, sandbox);
+  return {
+    writes,
+    sandbox,
+    term,
+    fire: (data) => handler(data),
+    handled: () => !!handler,
+    tick: () => timers.splice(0).forEach((f) => f()),
+  };
+}
+
+test("OSC 52 bridge copies both tmux's and an app's payload shape", () => {
+  const t = runOsc52();
+  // An app addresses the clipboard by name; tmux sends an EMPTY selection.
+  assert.equal(t.fire("c;" + b64("from-the-app")), true);
+  assert.equal(t.fire(";" + b64("from-tmux")), true);
+  assert.deepEqual(t.writes, ["from-the-app", "from-tmux"]);
+});
+
+test("OSC 52 bridge decodes UTF-8 rather than pasting mojibake", () => {
+  const t = runOsc52();
+  t.fire("c;" + b64("héllo → wörld ✓"));
+  assert.deepEqual(t.writes, ["héllo → wörld ✓"]);
+});
+
+test("OSC 52 bridge is write-only: a read request is never answered", () => {
+  const t = runOsc52();
+  // "?" asks the terminal to REPLY with the clipboard — answering would hand
+  // any program in the pane whatever the operator last copied.
+  assert.equal(t.fire("c;?"), true);
+  assert.deepEqual(t.writes, []);
+});
+
+test("OSC 52 bridge ignores an empty payload instead of wiping the clipboard", () => {
+  const t = runOsc52();
+  // tmux emits this when copy-mode copies an empty selection.
+  assert.equal(t.fire(";"), true);
+  assert.deepEqual(t.writes, []);
+});
+
+test("OSC 52 bridge waits for ttyd's terminal to exist", () => {
+  // Injected into <head>, so window.term won't exist for another beat or two.
+  const t = runOsc52({ withTerm: false });
+  assert.equal(t.handled(), false, "nothing to register on yet");
+  t.sandbox.window.term = t.term;   // ttyd's bundle boots
+  t.tick();
+  assert.equal(t.handled(), true);
+  t.fire("c;" + b64("late"));
+  assert.deepEqual(t.writes, ["late"]);
+});
+
+test("OSC 52 bridge swallows a refused clipboard write", async () => {
+  // Rejects when the document isn't focused or permission is denied; an
+  // unhandled rejection here would surface inside xterm.js's parser.
+  const t = runOsc52({ reject: true });
+  assert.equal(t.fire("c;" + b64("nope")), true);
+  await new Promise((r) => setImmediate(r));   // let the rejection settle
+});
+
+test("OSC 52 bridge survives a malformed payload", () => {
+  const t = runOsc52();
+  assert.equal(t.fire("c;!!!not-base64!!!"), true);
+  assert.deepEqual(t.writes, []);
+});
+
 test("sessionWorking: transcript freshness plus heartbeat staleness", () => {
   const now = Date.now();
   assert.equal(sessionWorking({ session: null }, now, now), false);
@@ -369,6 +509,55 @@ test("alerts: offline recovery fires once and clears the marker", () => {
   assert.deepEqual(titles(), []);
 });
 
+test("alerts: claude login-required fires once, restores once (XERK-98)", () => {
+  const beat = makeHost();
+  const now = Date.now();
+  notifications.length = 0;
+  // Lapsed login: the urgent edge fires once, high priority, routed to host.
+  beat({ device: "truenas", claudeAuth: { needsLogin: true } }, now);
+  assert.deepEqual(titles(), ["Claude login required on truenas"]);
+  assert.equal(notifications[0].data.priority, "high");
+  assert.equal(notifications[0].data.host, "host1"); // routed by agent key, like every host alert
+  notifications.length = 0;
+  beat({ device: "truenas", claudeAuth: { needsLogin: true } }, now + 20000); // still lapsed: quiet
+  assert.deepEqual(titles(), []);
+  // Operator logs in: the restore fires once and re-arms the edge.
+  beat({ device: "truenas", claudeAuth: { needsLogin: false } }, now + 40000);
+  assert.deepEqual(titles(), ["Claude login restored on truenas"]);
+  notifications.length = 0;
+  beat({ device: "truenas", claudeAuth: { needsLogin: false } }, now + 60000);
+  assert.deepEqual(titles(), []);
+  beat({ device: "truenas", claudeAuth: { needsLogin: true } }, now + 80000); // lapses again: fires again
+  assert.deepEqual(titles(), ["Claude login required on truenas"]);
+});
+
+test("alerts: claude login-expiring warns once, superseded by needsLogin (XERK-98)", () => {
+  const beat = makeHost();
+  const now = Date.now();
+  notifications.length = 0;
+  const soon = { needsLogin: false, expiringSoon: true, refreshExpiresAt: now + 2 * 24 * 3600 * 1000 };
+  beat({ device: "truenas", claudeAuth: soon }, now);
+  assert.deepEqual(titles(), ["Claude login expiring on truenas"]);
+  assert.equal(notifications[0].data.priority, "default");
+  notifications.length = 0;
+  beat({ device: "truenas", claudeAuth: soon }, now + 20000); // still expiring: quiet
+  assert.deepEqual(titles(), []);
+  // It fully lapses — the hard edge fires, and recovering from THAT must not
+  // re-fire a stale "expiring" warning.
+  beat({ device: "truenas", claudeAuth: { needsLogin: true } }, now + 40000);
+  assert.deepEqual(titles(), ["Claude login required on truenas"]);
+  notifications.length = 0;
+  beat({ device: "truenas", claudeAuth: { needsLogin: false, expiringSoon: false } }, now + 60000);
+  assert.deepEqual(titles(), ["Claude login restored on truenas"]); // restore only, no expiring re-fire
+});
+
+test("alerts: no claude-login alert when the agent reports no block (older agent)", () => {
+  const beat = makeHost();
+  notifications.length = 0;
+  beat({ device: "truenas" }); // no claudeAuth key at all
+  assert.deepEqual(titles(), []);
+});
+
 test("alerts: restart loop needs 3 boots in 10m, then holds off 30m", () => {
   const beat = makeHost();
   const t0 = Date.now();
@@ -378,36 +567,10 @@ test("alerts: restart loop needs 3 boots in 10m, then holds off 30m", () => {
   assert.deepEqual(titles(), []); // two boots: still quiet
   beat({ startedAt: "boot-3" }, t0 + 120 * 1000);
   assert.deepEqual(titles(), ["host1 restart loop"]);
-  assert.equal(notifications[0].headers.Priority, "urgent");
+  assert.equal(notifications[0].data.priority, "urgent");
   notifications.length = 0;
   beat({ startedAt: "boot-4" }, t0 + 180 * 1000); // inside the 30m holdoff
   assert.deepEqual(titles(), []);
-});
-
-test("alerts: daily cost threshold sums sessions, fires once per day", () => {
-  const beat = makeHost();
-  const sessions = [
-    { id: "s1", usage: { today: { cost: 30 } } },
-    { id: "s2", usage: { today: { cost: 25 } } }, // 55 >= threshold 50
-  ];
-  notifications.length = 0;
-  beat({ sessions });
-  assert.deepEqual(titles(), ["host1 cost alert"]);
-  assert.match(notifications[0].body, /\$55\.00/);
-  notifications.length = 0;
-  beat({ sessions }); // same UTC day: no re-fire
-  assert.deepEqual(titles(), []);
-});
-
-test("alerts: daily cost prefers host-level usage (counts killed sessions)", () => {
-  const beat = makeHost();
-  // The host-level `usage` block is aggregated from ALL transcripts, so it
-  // exceeds the threshold even though the live sessions list is empty (their
-  // work was killed). The alert must use it rather than summing live sessions.
-  notifications.length = 0;
-  beat({ sessions: [], usage: { today: { cost: 72.5 } } });
-  assert.deepEqual(titles(), ["host1 cost alert"]);
-  assert.match(notifications[0].body, /\$72\.50/);
 });
 
 test("alerts: question fires on new text only, re-arms when cleared", () => {
@@ -429,21 +592,200 @@ test("alerts: question fires on new text only, re-arms when cleared", () => {
   assert.deepEqual(titles(), ["nas-repo-s1 has a question"]);
 });
 
-test("alerts: PR created fires once per URL (persisted prSeen)", () => {
+test("alerts: a retraction is withheld from a build that lacks dismiss support (XERK-154)", () => {
+  // An older app registered before it understood dismisses — it must still get
+  // the alert, but a dismiss would show as a blank notification on it.
+  hub.registerDevice("legacy-nofeat", "android"); // no features declared
   const beat = makeHost();
-  const url = "https://github.com/xerktech/Turma/pull/34";
-  const withPrs = (urls) => ({
-    sessions: [{ id: "s1", rcName: "nas-repo-s1", session: { newPrUrls: urls } }],
+  const withQ = (q) => ({ sessions: [{ id: "sL", rcName: "r", session: q ? { question: q } : {} }] });
+  notifications.length = 0;
+  beat(withQ("Ship it?"));
+  assert.ok(notifications[0].tokens.includes("legacy-nofeat"), "the alert itself reaches every device");
+  notifications.length = 0;
+  beat(withQ(null)); // answered -> dismiss
+  const d = notifications.find((n) => n.data?.action === "dismiss");
+  assert.ok(d, "a dismiss was sent");
+  assert.ok(d.tokens.includes("capture-device"), "to the dismiss-capable device");
+  assert.ok(!d.tokens.includes("legacy-nofeat"), "but withheld from the legacy one");
+  hub.unregisterDevice("legacy-nofeat"); // keep the shared registry clean for other tests
+});
+
+test("alerts: answering a question retracts its notification (XERK-154)", () => {
+  const beat = makeHost();
+  const withQ = (q) => ({
+    sessions: [{ id: "s1", rcName: "nas-repo-s1", session: q ? { question: q } : {} }],
   });
   notifications.length = 0;
-  beat(withPrs([url]));
-  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
-  assert.equal(notifications[0].headers.Click, url);
+  beat(withQ("Deploy to prod?"));
+  assert.deepEqual(titles(), ["nas-repo-s1 has a question"]);
+  assert.equal(notifications[0].data.notifKey, "question:host1:s1"); // posted under a stable key
   notifications.length = 0;
-  beat(withPrs([url])); // agent re-delivered it: still only once
+  beat(withQ(null)); // answered from the desktop: retract, no new alert
   assert.deepEqual(titles(), []);
-  beat(withPrs(["https://github.com/xerktech/Turma/pull/35"]));
+  assert.deepEqual(dismisses(), ["question:host1:s1"]);
+  notifications.length = 0;
+  beat(withQ(null)); // still no question: the retract fired once, on the edge
+  assert.deepEqual(dismisses(), []);
+});
+
+// ---- PR alerts held until CI is green (XERK-153) ---------------------------
+
+const PR_URL = "https://github.com/xerktech/Turma/pull/34";
+const MIN = 60 * 1000;
+
+// One beat's worth of a session that has opened `urls` and whose PR statuses
+// currently read `prs`. `newPrUrls` is the per-beat scrape; `prs` is the
+// slower-cadence status the agent attaches to the session record.
+const prBeat = (urls, prs) => ({
+  sessions: [{
+    id: "s1", rcName: "nas-repo-s1",
+    prs: prs || null,
+    session: { newPrUrls: urls },
+  }],
+});
+
+test("alerts: PR alert waits for the CI rollup to come back green", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  notifications.length = 0;
+  // Scraped out of the transcript, but the agent hasn't fetched its status yet:
+  // the URL alone says nothing about CI, so nothing fires.
+  beat(prBeat([PR_URL]), t0);
+  assert.deepEqual(titles(), []);
+  // First status refresh lands, checks still queued.
+  beat(prBeat([], [{ url: PR_URL, checks: "pending" }]), t0 + MIN);
+  assert.deepEqual(titles(), []);
+  // Green.
+  beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + 2 * MIN);
   assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.equal(notifications[0].data.click, PR_URL);
+  assert.match(notifications[0].body, /All checks passed/);
+  assert.match(notifications[0].body, new RegExp(PR_URL.replace(/[/.]/g, "\\$&")));
+  // Still green on later beats: fires once, like every other alert.
+  notifications.length = 0;
+  beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + 3 * MIN);
+  assert.deepEqual(titles(), []);
+});
+
+test("alerts: a PR with no CI fires on its own, once the empty rollup holds", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  notifications.length = 0;
+  beat(prBeat([PR_URL]), t0);
+  // `checks: null` on a fetched status means "no checks at all" — but a
+  // brand-new PR reads that way too while its workflows register, so the
+  // verdict has to hold before it counts.
+  beat(prBeat([], [{ url: PR_URL, checks: null }]), t0 + MIN);
+  assert.deepEqual(titles(), []);
+  beat(prBeat([], [{ url: PR_URL, checks: null }]), t0 + 3 * MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.match(notifications[0].body, /No CI configured/);
+});
+
+test("alerts: an empty rollup that turns into real checks isn't 'no CI'", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  notifications.length = 0;
+  beat(prBeat([PR_URL]), t0);
+  beat(prBeat([], [{ url: PR_URL, checks: null }]), t0 + MIN);      // workflows not registered yet
+  beat(prBeat([], [{ url: PR_URL, checks: "pending" }]), t0 + 2 * MIN); // they register
+  beat(prBeat([], [{ url: PR_URL, checks: "pending" }]), t0 + 4 * MIN); // past the no-CI grace
+  assert.deepEqual(titles(), []);
+  beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + 5 * MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.match(notifications[0].body, /All checks passed/);
+});
+
+test("alerts: failing CI stays quiet, then fires when the fix goes green", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  notifications.length = 0;
+  beat(prBeat([PR_URL]), t0);
+  beat(prBeat([], [{ url: PR_URL, checks: "failing" }]), t0 + MIN);
+  assert.deepEqual(titles(), []);
+  // Red for well past the age-out backstop: still silent, because the session
+  // is expected to push a fix rather than the operator to be pinged.
+  beat(prBeat([], [{ url: PR_URL, checks: "failing" }]), t0 + 60 * MIN);
+  assert.deepEqual(titles(), []);
+  beat(prBeat([], [{ url: PR_URL, checks: "pending" }]), t0 + 61 * MIN); // re-run after a push
+  assert.deepEqual(titles(), []);
+  beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + 62 * MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+});
+
+test("alerts: a PR whose CI verdict never arrives fires on the backstop", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  notifications.length = 0;
+  // A host with no `gh` login never fills the status in, so the wait would
+  // otherwise hold forever and the alert be lost outright.
+  beat(prBeat([PR_URL]), t0);
+  beat(prBeat([], [{ url: PR_URL }]), t0 + 10 * MIN); // bare link, no `checks` key
+  assert.deepEqual(titles(), []);
+  beat(prBeat([], [{ url: PR_URL }]), t0 + 31 * MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.match(notifications[0].body, /CI state unknown/);
+});
+
+test("alerts: PR fires once per URL and tracks several PRs independently", () => {
+  const beat = makeHost();
+  const other = "https://github.com/xerktech/Turma/pull/35";
+  const t0 = Date.now();
+  notifications.length = 0;
+  beat(prBeat([PR_URL]), t0);
+  beat(prBeat([PR_URL, other], [{ url: PR_URL, checks: "passing" },
+                                { url: other, checks: "pending" }]), t0 + MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]); // only the green one
+  assert.equal(notifications[0].data.click, PR_URL);
+  notifications.length = 0;
+  // The agent re-delivers an already-alerted URL: still only the once.
+  beat(prBeat([PR_URL], [{ url: PR_URL, checks: "passing" },
+                         { url: other, checks: "passing" }]), t0 + 2 * MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.equal(notifications[0].data.click, other);
+});
+
+for (const finalState of ["MERGED", "CLOSED"]) {
+  test(`alerts: a ${finalState} PR retracts its notification (XERK-154)`, () => {
+    const beat = makeHost();
+    const t0 = Date.now();
+    notifications.length = 0;
+    beat(prBeat([PR_URL]), t0);
+    beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + MIN); // the alert fires
+    assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+    assert.equal(notifications.at(-1).data.notifKey, `pr:${PR_URL}`);
+    notifications.length = 0;
+    // Operator resolves it on their computer; the agent reports the new state.
+    beat(prBeat([], [{ url: PR_URL, checks: "passing", state: finalState }]), t0 + 2 * MIN);
+    assert.deepEqual(titles(), []); // no new alert
+    assert.deepEqual(dismisses(), [`pr:${PR_URL}`]);
+    notifications.length = 0;
+    beat(prBeat([], [{ url: PR_URL, checks: "passing", state: finalState }]), t0 + 3 * MIN);
+    assert.deepEqual(dismisses(), []); // retracted once, on the edge
+  });
+}
+
+test("prAlertDecision: the verdict table, and its sticky markers", () => {
+  const now = Date.now();
+  // No status fetched yet is never "no CI" — hold.
+  assert.equal(prAlertDecision({ at: now }, undefined, now), null);
+  assert.equal(prAlertDecision({ at: now }, { url: PR_URL }, now), null);
+  assert.equal(prAlertDecision({ at: now }, { url: PR_URL, checks: "pending" }, now), null);
+  assert.equal(prAlertDecision({ at: now }, { url: PR_URL, checks: "passing" }, now),
+    "All checks passed");
+  // `checks: null` arms the no-CI timer rather than firing immediately.
+  const noCi = { at: now };
+  assert.equal(prAlertDecision(noCi, { url: PR_URL, checks: null }, now), null);
+  assert.equal(noCi.noCiAt, now);
+  assert.equal(prAlertDecision(noCi, { url: PR_URL, checks: null }, now + 3 * MIN),
+    "No CI configured");
+  // Failing is sticky, and immunizes the wait against the age-out backstop.
+  const red = { at: now };
+  assert.equal(prAlertDecision(red, { url: PR_URL, checks: "failing" }, now), null);
+  assert.equal(red.red, true);
+  assert.equal(prAlertDecision(red, { url: PR_URL, checks: "pending" }, now + 60 * MIN), null);
+  // An unresolved wait ages out instead of being lost.
+  assert.equal(prAlertDecision({ at: now }, undefined, now + 31 * MIN), "CI state unknown");
 });
 
 test("alerts: turn finished fires on the working->idle edge only", () => {
@@ -463,6 +805,29 @@ test("alerts: turn finished fires on the working->idle edge only", () => {
   notifications.length = 0;
   beat(sess(620), now + 40000); // stays idle: edge already fired
   assert.deepEqual(titles(), []);
+});
+
+test("alerts: replying to a finished turn retracts its notification (XERK-154)", () => {
+  const beat = makeHost();
+  const sess = (ageSec, busy) => ({
+    sessions: [{
+      id: "s1", rcName: "nas-repo-s1",
+      session: { paneBusy: busy, transcriptAgeSec: ageSec, lastRole: "assistant", lastHasToolUse: false },
+    }],
+  });
+  const now = Date.now();
+  notifications.length = 0;
+  beat(sess(0, true), now);            // working
+  beat(sess(600, false), now + 20000); // went idle: turn finished
+  assert.deepEqual(titles(), ["nas-repo-s1 finished its turn"]);
+  assert.equal(notifications.at(-1).data.notifKey, "turn:host1:s1");
+  notifications.length = 0;
+  beat(sess(0, true), now + 40000);    // operator replied: working again
+  assert.deepEqual(titles(), []);
+  assert.deepEqual(dismisses(), ["turn:host1:s1"]);
+  notifications.length = 0;
+  beat(sess(10, true), now + 60000);   // stays working: retracted once, on the edge
+  assert.deepEqual(dismisses(), []);
 });
 
 test("alerts: no turn-finished when idle entry is a pending tool call", () => {
@@ -558,6 +923,44 @@ test("http: heartbeat auth (bearer or user basic, nothing else)", async () => {
   );
 });
 
+// ---- Jira board page + heartbeat block ----------------------------------------
+
+test("http: /board page and /board.js are user-gated like the rest of the UI", async () => {
+  assert.equal((await request("GET", "/board")).status, 401);
+  assert.equal((await request("GET", "/board", { headers: agentHeaders })).status, 401);
+  const page = await request("GET", "/board", { headers: userHeaders });
+  assert.equal(page.status, 200);
+  assert.match(page.raw, /kanban|TurmaBoard/i);
+  // board.js rides the static-asset allowlist (same treatment as chat.js).
+  const js = await request("GET", "/board.js", { headers: userHeaders });
+  assert.equal(js.status, 200);
+  assert.match(js.raw, /mergeSites/);
+});
+
+test("http: a heartbeat's jira block round-trips verbatim to /api/agents", async () => {
+  const jira = {
+    available: true,
+    site: "myorg.atlassian.net",
+    siteKey: "myorg.atlassian.net",
+    user: "me@x.com",
+    fetchedAt: "2026-07-14T12:00:00Z",
+    error: null,
+    truncated: false,
+    tickets: [{ key: "PROJ-1", url: "https://myorg.atlassian.net/browse/PROJ-1",
+                summary: "Test", status: "In Review", statusCategory: "inprogress",
+                priority: "High", type: "Bug", project: "PROJ", labels: [],
+                updated: "2026-07-14T11:00:00Z" }],
+  };
+  assert.equal(
+    (await request("POST", "/api/heartbeat", { body: { device: "jira-host", jira }, headers: agentHeaders })).status,
+    200
+  );
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = res.body.agents.find((a) => a.key === "jira-host");
+  assert.ok(rec, "heartbeated host is served");
+  assert.deepEqual(rec.jira, jira);
+});
+
 // ---- mobile push device registry ----------------------------------------------
 
 test("http: /api/devices register + unregister is user-authed", async () => {
@@ -587,9 +990,9 @@ test("http: /api/devices register + unregister is user-authed", async () => {
 });
 
 test("notify(): FCM fan-out prunes dead tokens, keeps live ones", () => {
-  // With no FCM service account configured, push.sendFcm is a no-op, so notify
-  // fanning out must not throw and must not touch the registry. pruneDevices is
-  // exercised directly for the dead-token contract.
+  // pruneDevices is the registry side of the fan-out: sendFcm reports dead
+  // tokens (404 UNREGISTERED) and notify() prunes them. Exercised directly here
+  // for the dead-token contract, independent of any send.
   hub.registerDevice("live", "android");
   hub.registerDevice("stale", "android");
   hub.pruneDevices(["stale"]);
@@ -597,6 +1000,83 @@ test("notify(): FCM fan-out prunes dead tokens, keeps live ones", () => {
   assert.ok(tokens.includes("live"));
   assert.ok(!tokens.includes("stale"));
   hub.unregisterDevice("live");
+});
+
+test("http: /api/agents carries pushEnabled reflecting FCM config (XERK-152)", async () => {
+  // The dashboard's "mobile push is off" banner keys off this one flag, so the
+  // hub must report its true push health. Default in tests: no FCM service
+  // account → fcmEnabled() false → the operator sees push is disabled.
+  const off = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.strictEqual(off.body.pushEnabled, false, "push reported disabled when FCM unconfigured");
+
+  // Configure a (fake but well-shaped) service account and force a cache rebuild
+  // via a heartbeat (publishAgent invalidates the memoized payload); the flag
+  // flips to true — exactly the difference between XERK-152's broken and fixed
+  // deployments.
+  push._setServiceAccount({ private_key: "k", client_email: "a@b", project_id: "p", token_uri: "https://t" });
+  await request("POST", "/api/heartbeat", { body: { device: "push-host" }, headers: agentHeaders });
+  const on = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.strictEqual(on.body.pushEnabled, true, "push reported enabled when FCM configured");
+
+  // Restore the unconfigured state so later tests see push off, and reset the
+  // stubbed sendFcm the suite installed at load (untouched here, but be explicit).
+  push._setServiceAccount(null);
+  await request("POST", "/api/heartbeat", { body: { device: "push-host" }, headers: agentHeaders });
+});
+
+// ---- updating status (XERK-29) -----------------------------------------------
+
+test("http: /updating shows an expected restart as `updating`, not `offline`", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "upd-host" }, headers: agentHeaders });
+
+  // Agent-authed like the heartbeat: no creds is rejected.
+  assert.equal(
+    (await request("POST", "/api/agents/upd-host/updating", { body: { reason: "update" } })).status,
+    401,
+  );
+  // A host the hub has never seen has no record to hang the status on.
+  assert.equal(
+    (await request("POST", "/api/agents/ghost/updating", { body: {}, headers: agentHeaders })).status,
+    404,
+  );
+  // The announce lands.
+  const ok = await request("POST", "/api/agents/upd-host/updating",
+    { body: { reason: "update", version: "9.9.9" }, headers: agentHeaders });
+  assert.equal(ok.status, 200);
+
+  // /api/agents is memoized; the endpoints invalidate it, but a direct mutation
+  // of the record below does not, so drop the cache before each read.
+  const recOf = async () => {
+    hub.invalidateAgentsCache();
+    return (await request("GET", "/api/agents", { headers: userHeaders })).body.agents
+      .find((a) => a.key === "upd-host");
+  };
+
+  // While the host is still heartbeating it's plainly `online` — the status is
+  // only meaningful once it goes silent, so it's suppressed here.
+  let rec = await recOf();
+  assert.equal(rec.online, true);
+  assert.equal(rec.updating, null);
+
+  // Simulate the heartbeat gap the restart causes: silent, but within the grace
+  // window it surfaces as `updating` (carrying the reason/version), not offline.
+  agents["upd-host"].lastSeen = Date.now() - 2 * 60 * 1000;
+  rec = await recOf();
+  assert.equal(rec.online, false);
+  assert.ok(rec.updating, "updating surfaces while silent within grace");
+  assert.equal(rec.updating.reason, "update");
+  assert.equal(rec.updating.version, "9.9.9");
+
+  // Past the grace window a stuck update correctly falls through to offline.
+  agents["upd-host"].updating.until = Date.now() - 1;
+  rec = await recOf();
+  assert.equal(rec.online, false);
+  assert.equal(rec.updating, null);
+
+  // A heartbeat from the far side clears the flag outright (the record rebuild
+  // drops it), so a recovered host is never stuck showing `updating`.
+  await request("POST", "/api/heartbeat", { body: { device: "upd-host" }, headers: agentHeaders });
+  assert.equal(agents["upd-host"].updating, undefined);
 });
 
 // ---- archive: agent-push ingest + heartbeat cursors + search/browse/view -------
@@ -717,6 +1197,20 @@ test("http: unauthenticated HTML navigation redirects to /login (no Basic popup)
   // A deep link carries a next= so login can bounce back to it.
   const deep = await request("GET", "/sessions", { headers: { accept: "text/html" } });
   assert.equal(deep.headers.location, "/login?next=%2Fsessions");
+});
+
+test("http: /usage serves the page and /history redirects to it", async () => {
+  for (const p of ["/usage", "/usage.html"]) {
+    const res = await request("GET", p, { headers: userHeaders });
+    assert.equal(res.status, 200, p);
+    assert.match(res.headers["content-type"], /text\/html/);
+  }
+  // The page was /history before it went token-only; old bookmarks must land.
+  for (const p of ["/history", "/history.html"]) {
+    const res = await request("GET", p, { headers: userHeaders });
+    assert.equal(res.status, 301, p);
+    assert.equal(res.headers.location, "/usage");
+  }
 });
 
 test("http: command queue rides the reply until acked", async () => {
@@ -916,6 +1410,30 @@ test("http: clone route queues a clone command; validates repo and host", async 
   assert.equal(ghost.status, 404);
 });
 
+test("http: clone route carries a valid source through and refuses an unknown one (XERK-155)", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ device: "hclsrc" });
+
+  // A picked gitlab repo rides as {type:"clone", repo, source}.
+  const ok = await request("POST", "/api/agents/hclsrc/clone", {
+    body: { repo: "grp/sub/app", source: "gitlab" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+  const res = await beat({ device: "hclsrc" });
+  assert.deepEqual(res.body.commands, [
+    { type: "clone", repo: "grp/sub/app", source: "gitlab", cmdId: ok.body.cmdId },
+  ]);
+
+  // A source outside the known set is refused before anything is queued.
+  const bad = await request("POST", "/api/agents/hclsrc/clone", {
+    body: { repo: "a/b", source: "sourceforge" }, headers: userHeaders,
+  });
+  assert.equal(bad.status, 400);
+  const res2 = await beat({ device: "hclsrc", ackedCommands: [ok.body.cmdId] });
+  assert.deepEqual(res2.body.commands, []);
+});
+
 test("http: prune route queues a prune command per repo; validates host", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
@@ -936,6 +1454,100 @@ test("http: prune route queues a prune command per repo; validates host", async 
     body: {}, headers: userHeaders,
   });
   assert.equal(ghost.status, 404);
+});
+
+test("http: restart route queues one restartAgent; collapses a mashed button", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ device: "hra" });
+
+  // A valid restart rides the next reply as a bare {type:"restartAgent"}.
+  const ok = await request("POST", "/api/agents/hra/restart", { body: {}, headers: userHeaders });
+  assert.equal(ok.status, 200);
+
+  // A second press while the first is still unacked reuses the same cmdId — one
+  // restart, not a queue of them.
+  const again = await request("POST", "/api/agents/hra/restart", { body: {}, headers: userHeaders });
+  assert.equal(again.status, 200);
+  assert.equal(again.body.cmdId, ok.body.cmdId);
+
+  const res = await beat({ device: "hra" });
+  assert.deepEqual(res.body.commands, [
+    { type: "restartAgent", cmdId: ok.body.cmdId },
+  ]);
+
+  // Unknown host -> 404; and the browser login is required (no agent token, no
+  // anonymous access).
+  const ghost = await request("POST", "/api/agents/ghost/restart", { body: {}, headers: userHeaders });
+  assert.equal(ghost.status, 404);
+  const noauth = await request("POST", "/api/agents/hra/restart", { body: {} });
+  assert.equal(noauth.status, 401);
+});
+
+test("http: jira refresh fans out to configured hosts only, and dedupes", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+
+  // Three shapes the fan-out has to tell apart: a healthy configured host, a
+  // configured host whose polls fail (available=false, siteKey=null — the one a
+  // manual retry is FOR), and a host with no Jira at all.
+  await beat({ device: "jok", jira: { configured: true, available: true, siteKey: "a.atlassian.net" } });
+  await beat({ device: "jerr", jira: { configured: true, available: false, siteKey: null, error: "HTTP Error 503" } });
+  await beat({ device: "joff", jira: { configured: false, available: false, siteKey: null } });
+
+  const ok = await request("POST", "/api/jira/refresh", { body: {}, headers: userHeaders });
+  assert.equal(ok.status, 200);
+  // Membership, not equality: the suite's agents map is shared, so other tests'
+  // hosts legitimately show up in a fleet-wide fan-out.
+  assert.ok(ok.body.hosts.includes("jok"), "healthy configured host targeted");
+  assert.ok(ok.body.hosts.includes("jerr"), "failing configured host targeted");
+  assert.ok(!ok.body.hosts.includes("joff"), "unconfigured host NOT targeted");
+  assert.ok(ok.body.queued.includes("jok") && ok.body.queued.includes("jerr"));
+
+  for (const host of ["jok", "jerr"]) {
+    const res = await beat({ device: host });
+    assert.deepEqual(
+      res.body.commands.map((c) => c.type), ["refreshJira"],
+      `${host} should hold exactly one refreshJira`);
+  }
+  // The unconfigured host is left alone entirely.
+  const off = await beat({ device: "joff" });
+  assert.deepEqual(off.body.commands, []);
+});
+
+test("http: jira refresh collapses a mashed button into one poll per host", async () => {
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ device: "jmash", jira: { configured: true, available: true, siteKey: "a.atlassian.net" } });
+
+  const first = await request("POST", "/api/jira/refresh", { body: {}, headers: userHeaders });
+  assert.ok(first.body.queued.includes("jmash"));
+  // Second click while the first is still unacked: still reported as targeted,
+  // but nothing new queued — else each click costs a full re-poll.
+  const second = await request("POST", "/api/jira/refresh", { body: {}, headers: userHeaders });
+  assert.ok(second.body.hosts.includes("jmash"), "still targeted (a refresh is in flight)");
+  assert.ok(!second.body.queued.includes("jmash"), "but not re-queued");
+
+  const res = await beat({ device: "jmash" });
+  assert.equal(res.body.commands.filter((c) => c.type === "refreshJira").length, 1);
+});
+
+test("http: jira refresh targets pre-`configured` agents on siteKey alone", async () => {
+  // An agent predating the `configured` field reports only a siteKey; it must
+  // stay refreshable rather than silently dropping out of the fan-out.
+  const beat = (payload) =>
+    request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
+  await beat({ device: "jold", jira: { available: true, siteKey: "old.atlassian.net" } });
+
+  const ok = await request("POST", "/api/jira/refresh", { body: {}, headers: userHeaders });
+  assert.ok(ok.body.hosts.includes("jold"));
+  const res = await beat({ device: "jold" });
+  assert.deepEqual(res.body.commands.map((c) => c.type), ["refreshJira"]);
+});
+
+test("http: jira refresh requires the user login", async () => {
+  const r = await request("POST", "/api/jira/refresh", { body: {} });
+  assert.equal(r.status, 401);
 });
 
 test("http: transcript-resume route queues a resumeTranscript command with the cwd hint", async () => {
@@ -1100,6 +1712,34 @@ test("http: input endpoint 404s unknown host and requires user auth", async () =
   assert.equal(noAuth.status, 401);
 });
 
+// ---- session interrupt endpoint --------------------------------------------------
+
+test("http: interrupt endpoint queues an interrupt command that rides the next heartbeat", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hx1" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/hx1/sessions/sess1/interrupt", {
+    headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.ok(res.body.cmdId);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "hx1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "interrupt", sessionId: "sess1", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: interrupt endpoint 404s unknown host and requires user auth", async () => {
+  const unknownHost = await request("POST", "/api/agents/ghost/sessions/sess1/interrupt", {
+    headers: userHeaders,
+  });
+  assert.equal(unknownHost.status, 404);
+
+  await request("POST", "/api/heartbeat", { body: { device: "hx2" }, headers: agentHeaders });
+  const noAuth = await request("POST", "/api/agents/hx2/sessions/sess1/interrupt", {});
+  assert.equal(noAuth.status, 401);
+});
+
 // ---- session live model / mode endpoints ----------------------------------------
 
 test("http: model endpoint queues a setModel command that rides the next heartbeat", async () => {
@@ -1113,6 +1753,21 @@ test("http: model endpoint queues a setModel command that rides the next heartbe
   assert.deepEqual(beat.body.commands, [
     { type: "setModel", sessionId: "sess1", model: "sonnet", cmdId: res.body.cmdId },
   ]);
+});
+
+test("http: model endpoint rejects a malformed model before it can queue", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hm1b" }, headers: agentHeaders });
+  for (const model of ["so nnet", "x;rm -rf", "a".repeat(61)]) {
+    const res = await request("POST", "/api/agents/hm1b/sessions/sess1/model", {
+      body: { model }, headers: userHeaders,
+    });
+    assert.equal(res.status, 400, model);
+  }
+  // The bracketed probe aliases are shaped fine — the agent decides if they're real.
+  const ok = await request("POST", "/api/agents/hm1b/sessions/sess1/model", {
+    body: { model: "sonnet[1m]" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
 });
 
 test("http: mode endpoint queues a setMode command that rides the next heartbeat", async () => {
@@ -1153,6 +1808,52 @@ test("http: model/mode endpoints reject missing value, 404 unknown host, require
   assert.equal(noAuth.status, 401);
 });
 
+// ---- session rename endpoint -----------------------------------------------------
+
+test("http: summary endpoint queues a setSummary command that rides the next heartbeat", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hs1" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/hs1/sessions/sess1/summary", {
+    body: { summary: "Named By Hand" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "hs1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "setSummary", sessionId: "sess1", summary: "Named By Hand", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: summary endpoint forwards a blank rename (clears the name), caps length, needs auth", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hs2" }, headers: agentHeaders });
+
+  // Blank is a real instruction here — it clears the name — so it queues rather
+  // than 400ing the way the input endpoint's empty text does.
+  const clear = await request("POST", "/api/agents/hs2/sessions/sess1/summary", {
+    body: { summary: "" }, headers: userHeaders,
+  });
+  assert.equal(clear.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "hs2" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "setSummary", sessionId: "sess1", summary: "", cmdId: clear.body.cmdId },
+  ]);
+
+  const tooLong = await request("POST", "/api/agents/hs2/sessions/sess1/summary", {
+    body: { summary: "x".repeat(201) }, headers: userHeaders,
+  });
+  assert.equal(tooLong.status, 400);
+  assert.deepEqual(tooLong.body, { error: "summary too long" });
+
+  const ghost = await request("POST", "/api/agents/ghost/sessions/sess1/summary", {
+    body: { summary: "hi" }, headers: userHeaders,
+  });
+  assert.equal(ghost.status, 404);
+
+  const noAuth = await request("POST", "/api/agents/hs2/sessions/sess1/summary", {
+    body: { summary: "hi" },
+  });
+  assert.equal(noAuth.status, 401);
+});
+
 // ---- session answer endpoint -----------------------------------------------------
 
 test("http: answer endpoint queues an answerQuestion command with the option pick", async () => {
@@ -1166,6 +1867,20 @@ test("http: answer endpoint queues an answerQuestion command with the option pic
   const beat = await request("POST", "/api/heartbeat", { body: { device: "ha1" }, headers: agentHeaders });
   assert.deepEqual(beat.body.commands, [
     { type: "answerQuestion", sessionId: "sess1", optionIndex: 2, cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: answer endpoint carries a multiSelect optionIndices list", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "ha1b" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/ha1b/sessions/sess1/answer", {
+    body: { optionIndex: -1, optionIndices: [0, 2, "bad", -1] }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "ha1b" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "answerQuestion", sessionId: "sess1", optionIndex: -1,
+      optionIndices: [0, 2], cmdId: res.body.cmdId },  // non-int / negative filtered out
   ]);
 });
 
@@ -1183,6 +1898,34 @@ test("http: answer endpoint carries free-text custom and defaults optionIndex to
   ]);
 });
 
+test("http: pane-prompt endpoint queues answerPanePrompt with the displayed number", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "pp1" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/pp1/sessions/sess1/pane-prompt", {
+    body: { optionNumber: 2 }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "pp1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "answerPanePrompt", sessionId: "sess1", optionNumber: 2, cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: pane-prompt endpoint rejects a number no dialog key could carry", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "pp2" }, headers: agentHeaders });
+  // The answer is delivered by typing the digit, so 0, 10+ and non-integers
+  // are not answerable and are refused before they reach the queue.
+  for (const optionNumber of [0, 10, -1, 1.5, "2", null]) {
+    const res = await request("POST", "/api/agents/pp2/sessions/sess1/pane-prompt", {
+      body: { optionNumber }, headers: userHeaders,
+    });
+    assert.equal(res.status, 400);
+  }
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "pp2" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, []);
+});
+
 test("http: answer endpoint rejects an empty answer and over-long custom", async () => {
   await request("POST", "/api/heartbeat", { body: { device: "ha3" }, headers: agentHeaders });
 
@@ -1190,7 +1933,7 @@ test("http: answer endpoint rejects an empty answer and over-long custom", async
     body: {}, headers: userHeaders,
   });
   assert.equal(empty.status, 400);
-  assert.deepEqual(empty.body, { error: "optionIndex or custom required" });
+  assert.deepEqual(empty.body, { error: "optionIndex, optionIndices or custom required" });
 
   const long = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
     body: { custom: "a".repeat(4001) }, headers: userHeaders,
@@ -1246,7 +1989,8 @@ test("http: heartbeat historyResults populate the cache; GET returns 200 while f
     body: {
       device: "hh2",
       historyResults: [
-        { sessionId: "s1", entries: [{ id: "1", role: "user", text: "hi" }], truncated: false },
+        { sessionId: "s1", entries: [{ id: "1", role: "user", text: "hi" }], truncated: false,
+          queued: ["still waiting"] },
       ],
     },
     headers: agentHeaders,
@@ -1256,6 +2000,9 @@ test("http: heartbeat historyResults populate the cache; GET returns 200 while f
   assert.equal(res.status, 200);
   assert.deepEqual(res.body.entries, [{ id: "1", role: "user", text: "hi" }]);
   assert.equal(res.body.truncated, false);
+  // Still-queued prompts ride the cache; an agent predating the field (the
+  // other historyResults cases above/below) normalises to [].
+  assert.deepEqual(res.body.queued, ["still waiting"]);
   assert.ok(res.body.fetchedAt);
 });
 
@@ -1324,6 +2071,1580 @@ test("http: history cache eviction — capped at 8 sessions, oldest fetchedAt ev
   assert.equal(keys.length, 8, "cache should be capped at 8 sessions");
   assert.ok(!keys.includes("s1"), "oldest session (s1) should have been evicted");
   assert.ok(keys.includes("s9"), "newest session (s9) should remain");
+});
+
+// ---- subagent (background-agent) transcript endpoint ------------------------
+
+test("http: subagent-history 202s on cache miss, single-flight per (session,type,label)", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "sh1" }, headers: agentHeaders });
+
+  const q = "/api/agents/sh1/sessions/s1/subagents/history?type=Explore&label=Map%20the%20code";
+  const first = await request("GET", q, { headers: userHeaders });
+  assert.equal(first.status, 202);
+  assert.ok(first.body.cmdId);
+
+  // Same row again -> reuse the outstanding command (no duplicate).
+  const second = await request("GET", q, { headers: userHeaders });
+  assert.equal(second.body.cmdId, first.body.cmdId);
+
+  // A different label is a distinct row -> a distinct command.
+  const other = await request(
+    "GET", "/api/agents/sh1/sessions/s1/subagents/history?type=Explore&label=Other", { headers: userHeaders });
+  assert.notEqual(other.body.cmdId, first.body.cmdId);
+
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "sh1" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Map the code", cmdId: first.body.cmdId },
+    { type: "subagentHistory", sessionId: "s1", agentType: "Explore", label: "Other", cmdId: other.body.cmdId },
+  ]);
+});
+
+test("http: subagent-history requires a type", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "sh2" }, headers: agentHeaders });
+  const res = await request(
+    "GET", "/api/agents/sh2/sessions/s1/subagents/history?label=x", { headers: userHeaders });
+  assert.equal(res.status, 400);
+});
+
+test("http: heartbeat subagentHistoryResults populate the cache; GET returns 200 while fresh", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "sh3" }, headers: agentHeaders });
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "sh3",
+      subagentHistoryResults: [
+        { sessionId: "s1", type: "Explore", label: "Map the code",
+          entries: [{ id: "1", role: "assistant", text: "done" }], truncated: false },
+      ],
+    },
+    headers: agentHeaders,
+  });
+
+  const res = await request(
+    "GET", "/api/agents/sh3/sessions/s1/subagents/history?type=Explore&label=Map%20the%20code",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.entries, [{ id: "1", role: "assistant", text: "done" }]);
+});
+
+test("http: /api/agents does not serialize the subagentHistory cache", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "sh4" }, headers: agentHeaders });
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "sh4",
+      subagentHistoryResults: [
+        { sessionId: "s1", type: "Explore", label: "x", entries: [], truncated: false },
+      ],
+    },
+    headers: agentHeaders,
+  });
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  for (const a of list.body.agents) {
+    assert.ok(!("subagentHistory" in a), `agent ${a.key} leaked its subagentHistory cache`);
+  }
+});
+
+// ---- board ticket detail endpoint -------------------------------------------
+// GET /api/jira/<siteKey>/<issueKey>: the board's expanded ticket view. The hub
+// holds no Jira creds, so it routes to a host reporting that org and rides the
+// heartbeat command path (same shape as session history).
+
+const jiraBeat = (device, siteKey, extra = {}) =>
+  request("POST", "/api/heartbeat", {
+    body: { device, jira: { available: true, siteKey, user: `${device}@x.com`, tickets: [] }, ...extra },
+    headers: agentHeaders,
+  });
+
+test("http: ticket detail returns 202 pending on cache miss, single-flight on repeat GET", async () => {
+  await jiraBeat("jd1", "org1.atlassian.net");
+
+  const first = await request("GET", "/api/jira/org1.atlassian.net/ENG-42", { headers: userHeaders });
+  assert.equal(first.status, 202);
+  assert.equal(first.body.pending, true);
+  assert.ok(first.body.cmdId);
+
+  // A second viewer (or a re-open) must not queue a duplicate fetch.
+  const second = await request("GET", "/api/jira/org1.atlassian.net/ENG-42", { headers: userHeaders });
+  assert.equal(second.status, 202);
+  assert.equal(second.body.cmdId, first.body.cmdId);
+
+  // A DIFFERENT issue is its own command, though.
+  const other = await request("GET", "/api/jira/org1.atlassian.net/ENG-43", { headers: userHeaders });
+  assert.notEqual(other.body.cmdId, first.body.cmdId);
+
+  const beat = await jiraBeat("jd1", "org1.atlassian.net");
+  assert.deepEqual(beat.body.commands, [
+    { type: "jiraIssue", issueKey: "ENG-42", cmdId: first.body.cmdId },
+    { type: "jiraIssue", issueKey: "ENG-43", cmdId: other.body.cmdId },
+  ]);
+});
+
+test("http: heartbeat jiraIssueResults populate the cache; GET returns 200 while fresh", async () => {
+  await jiraBeat("jd2", "org2.atlassian.net");
+  await request("GET", "/api/jira/org2.atlassian.net/ENG-1", { headers: userHeaders }); // queue it
+
+  const issue = { key: "ENG-1", summary: "Fix it", description: "why", comments: [] };
+  await jiraBeat("jd2", "org2.atlassian.net", {
+    jiraIssueResults: [{ key: "ENG-1", issue, error: null }],
+  });
+
+  const res = await request("GET", "/api/jira/org2.atlassian.net/ENG-1", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.issue, issue);
+  assert.ok(res.body.fetchedAt);
+});
+
+test("http: a ticket the host couldn't fetch caches its error rather than re-queueing forever", async () => {
+  await jiraBeat("jd3", "org3.atlassian.net");
+  await jiraBeat("jd3", "org3.atlassian.net", {
+    jiraIssueResults: [{ key: "ENG-9", issue: null, error: "HTTP Error 404: Not Found" }],
+  });
+
+  const res = await request("GET", "/api/jira/org3.atlassian.net/ENG-9", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.error, "HTTP Error 404: Not Found");
+  assert.equal(res.body.issue, undefined);
+  // The board polls while a ticket is open; a doomed fetch must not re-queue.
+  assert.equal((agents.jd3.commands || []).length, 0);
+});
+
+test("http: stale cached ticket detail (>1 minute) is re-queued instead of served", async () => {
+  await jiraBeat("jd4", "org4.atlassian.net");
+  await jiraBeat("jd4", "org4.atlassian.net", {
+    jiraIssueResults: [{ key: "ENG-2", issue: { key: "ENG-2" }, error: null }],
+  });
+  assert.ok(agents.jd4.jiraIssues["ENG-2"]);
+  agents.jd4.jiraIssues["ENG-2"].fetchedAt = Date.now() - 2 * 60 * 1000; // fudge stale
+
+  const res = await request("GET", "/api/jira/org4.atlassian.net/ENG-2", { headers: userHeaders });
+  assert.equal(res.status, 202);
+  assert.equal(res.body.pending, true);
+});
+
+test("http: ticket detail 404s an org no host reports", async () => {
+  const res = await request("GET", "/api/jira/nobody.atlassian.net/ENG-1", { headers: userHeaders });
+  assert.equal(res.status, 404);
+});
+
+// POST/GET /api/jira/<siteKey>/<issueKey>/status — the board's one write path
+// (XERK-138): queue a status change on an online host, poll its outcome by cmdId.
+
+test("http: a status change queues setTicketStatus on the org's online host", async () => {
+  await jiraBeat("js1", "s1.atlassian.net");
+  const res = await request("POST", "/api/jira/s1.atlassian.net/ENG-5/status",
+    { body: { value: "31" }, headers: userHeaders });
+  assert.equal(res.status, 202);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.host, "js1");
+
+  const beat = await jiraBeat("js1", "s1.atlassian.net");
+  assert.deepEqual(beat.body.commands, [
+    { type: "setTicketStatus", issueKey: "ENG-5", value: "31", category: "", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: a drag drops a target column, queued for the agent to resolve", async () => {
+  await jiraBeat("jsd", "sd.atlassian.net");
+  const res = await request("POST", "/api/jira/sd.atlassian.net/ENG-5/status",
+    { body: { category: "done" }, headers: userHeaders });
+  assert.equal(res.status, 202);
+  assert.equal(res.body.ok, true);
+  const beat = await jiraBeat("jsd", "sd.atlassian.net");
+  // The column rides the command; the agent resolves it to a real transition.
+  assert.deepEqual(beat.body.commands, [
+    { type: "setTicketStatus", issueKey: "ENG-5", value: "", category: "done", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: a status change is single-flight per ticket", async () => {
+  await jiraBeat("js2", "s2.atlassian.net");
+  const first = await request("POST", "/api/jira/s2.atlassian.net/ENG-5/status",
+    { body: { value: "31" }, headers: userHeaders });
+  const second = await request("POST", "/api/jira/s2.atlassian.net/ENG-5/status",
+    { body: { value: "41" }, headers: userHeaders });
+  assert.equal(second.body.cmdId, first.body.cmdId);
+  const beat = await jiraBeat("js2", "s2.atlassian.net");
+  assert.equal(beat.body.commands.length, 1);   // no duplicate queued
+});
+
+test("http: a status change needs an online host and a value", async () => {
+  await jiraBeat("js3", "s3.atlassian.net");
+  const noVal = await request("POST", "/api/jira/s3.atlassian.net/ENG-5/status",
+    { body: {}, headers: userHeaders });
+  assert.equal(noVal.status, 400);
+  const badKey = await request("POST", "/api/jira/s3.atlassian.net/12ab/status",
+    { body: { value: "31" }, headers: userHeaders });
+  assert.equal(badKey.status, 400);
+  const noOrg = await request("POST", "/api/jira/nobody.atlassian.net/ENG-5/status",
+    { body: { value: "31" }, headers: userHeaders });
+  assert.equal(noOrg.status, 404);
+});
+
+test("http: an offline-only org refuses a status change with 503", async () => {
+  await jiraBeat("js4", "s4.atlassian.net");
+  agents.js4.lastSeen = Date.now() - 10 * 60 * 1000;   // fudge offline
+  const res = await request("POST", "/api/jira/s4.atlassian.net/ENG-5/status",
+    { body: { value: "31" }, headers: userHeaders });
+  assert.equal(res.status, 503);
+  assert.equal((agents.js4.commands || []).length, 0);
+});
+
+test("http: GET status polls the outcome by cmdId", async () => {
+  await jiraBeat("js5", "s5.atlassian.net");
+  const post = await request("POST", "/api/jira/s5.atlassian.net/ENG-5/status",
+    { body: { value: "31" }, headers: userHeaders });
+  const cmdId = post.body.cmdId;
+
+  // Before the agent reports back, the poll is pending.
+  const pending = await request("GET",
+    `/api/jira/s5.atlassian.net/ENG-5/status?cmdId=${cmdId}`, { headers: userHeaders });
+  assert.equal(pending.status, 200);
+  assert.equal(pending.body.pending, true);
+
+  // The agent's heartbeat carries the outcome keyed by cmdId.
+  await jiraBeat("js5", "s5.atlassian.net", {
+    ticketStatusResults: [{ cmdId, key: "ENG-5", ok: true, error: null,
+      status: "Done", statusCategory: "done" }],
+  });
+  const done = await request("GET",
+    `/api/jira/s5.atlassian.net/ENG-5/status?cmdId=${cmdId}`, { headers: userHeaders });
+  assert.equal(done.body.ok, true);
+  assert.equal(done.body.status, "Done");
+  assert.equal(done.body.statusCategory, "done");
+});
+
+test("http: a failed status change surfaces its error to the poll", async () => {
+  await jiraBeat("js6", "s6.atlassian.net");
+  await jiraBeat("js6", "s6.atlassian.net", {
+    ticketStatusResults: [{ cmdId: "cx", key: "ENG-5", ok: false,
+      error: "403 forbidden", status: null, statusCategory: null }],
+  });
+  const res = await request("GET",
+    "/api/jira/s6.atlassian.net/ENG-5/status?cmdId=cx", { headers: userHeaders });
+  assert.equal(res.body.ok, false);
+  assert.equal(res.body.error, "403 forbidden");
+});
+
+test("http: status results never leak into the /api/agents payload", async () => {
+  await jiraBeat("js7", "s7.atlassian.net", {
+    ticketStatusResults: [{ cmdId: "cy", key: "ENG-5", ok: true, status: "Done" }],
+  });
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  for (const a of list.body.agents) {
+    assert.ok(!("statusResults" in a), `agent ${a.key} leaked its statusResults cache`);
+  }
+});
+
+// New-ticket create flow (XERK-137): create-meta (projects/labels + per-project
+// types), the create POST, and the create-outcome poll. The hub routes to the
+// org's online host and rides the same heartbeat command/result path as detail.
+
+test("http: create-meta returns 202 then serves projects/labels once the host reports", async () => {
+  await jiraBeat("cm1", "cm1.atlassian.net");
+  const first = await request("GET", "/api/jira/cm1.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(first.status, 202);
+  assert.ok(first.body.cmdId);
+  // Single-flight: a second form open reuses the queued command.
+  const again = await request("GET", "/api/jira/cm1.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(again.body.cmdId, first.body.cmdId);
+
+  const beat = await jiraBeat("cm1", "cm1.atlassian.net", {
+    createMetaResults: [{ project: null, projects: [{ key: "ENG", name: "Eng" }],
+                          labels: ["turma"], source: "jira", error: null }],
+  });
+  assert.deepEqual(beat.body.commands, [{ type: "boardCreateMeta", cmdId: first.body.cmdId }]);
+
+  const res = await request("GET", "/api/jira/cm1.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.projects, [{ key: "ENG", name: "Eng" }]);
+  assert.deepEqual(res.body.labels, ["turma"]);
+  assert.equal(res.body.source, "jira");
+});
+
+test("http: create-meta ?project= fetches that project's issue types", async () => {
+  await jiraBeat("cm2", "cm2.atlassian.net");
+  const q = await request("GET", "/api/jira/cm2.atlassian.net/create-meta?project=ENG", { headers: userHeaders });
+  assert.equal(q.status, 202);
+  const beat = await jiraBeat("cm2", "cm2.atlassian.net", {
+    createMetaResults: [{ project: "ENG", types: [{ id: "1", name: "Task" }], error: null }],
+  });
+  assert.deepEqual(beat.body.commands, [{ type: "boardCreateMeta", project: "ENG", cmdId: q.body.cmdId }]);
+  const res = await request("GET", "/api/jira/cm2.atlassian.net/create-meta?project=ENG", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.types, [{ id: "1", name: "Task" }]);
+});
+
+test("http: create-meta 404s an org nobody reports and 503s when its host is offline", async () => {
+  const none = await request("GET", "/api/jira/nobody-cm.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(none.status, 404);
+  await jiraBeat("cm3", "cm3.atlassian.net");
+  agents.cm3.lastSeen = Date.now() - 90 * 1000; // go offline
+  const off = await request("GET", "/api/jira/cm3.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(off.status, 503);
+});
+
+test("http: creating a ticket validates, queues createTicket, and polls the outcome", async () => {
+  await jiraBeat("ct1", "ct1.atlassian.net");
+  const post = (body) => request("POST", "/api/jira/ct1.atlassian.net/tickets", { body, headers: userHeaders });
+  // Each required field is enforced.
+  assert.equal((await post({ project: "ENG", issueType: "1" })).status, 400);
+  assert.equal((await post({ summary: "Hi", issueType: "1" })).status, 400);
+  assert.equal((await post({ summary: "Hi", project: "ENG" })).status, 400);
+
+  const res = await post({ project: "ENG", issueType: "1", summary: "New thing",
+                           description: "do it", labels: ["a", "b"] });
+  assert.equal(res.status, 200);
+  assert.ok(res.body.cmdId);
+  assert.equal(res.body.host, "ct1");
+
+  const beat = await jiraBeat("ct1", "ct1.atlassian.net");
+  assert.deepEqual(beat.body.commands, [{
+    type: "createTicket", project: "ENG", issueType: "1", summary: "New thing",
+    description: "do it", labels: ["a", "b"], cmdId: res.body.cmdId,
+  }]);
+
+  // Pending until the agent reports the outcome.
+  const pending = await request("GET", `/api/jira/ct1.atlassian.net/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(pending.status, 202);
+
+  await jiraBeat("ct1", "ct1.atlassian.net", {
+    createTicketResults: [{ cmdId: res.body.cmdId, key: "ENG-100",
+                            url: "https://ct1.atlassian.net/browse/ENG-100", error: null }],
+  });
+  const done = await request("GET", `/api/jira/ct1.atlassian.net/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(done.status, 200);
+  assert.equal(done.body.key, "ENG-100");
+  assert.match(done.body.url, /ENG-100/);
+});
+
+test("http: an unassigned create rides back as a warning beside the key (XERK-151)", async () => {
+  // A ticket the tracker wouldn't assign is created and then invisible on the
+  // board (which filters on the tracker user), so the success has to say so.
+  await jiraBeat("ct5", "ct5.atlassian.net");
+  const res = await request("POST", "/api/jira/ct5.atlassian.net/tickets", {
+    body: { project: "ENG", issueType: "1", summary: "Orphan" }, headers: userHeaders,
+  });
+  await jiraBeat("ct5", "ct5.atlassian.net", {
+    createTicketResults: [{ cmdId: res.body.cmdId, key: "ENG-7", url: "u",
+                            error: null, warning: "created, but it couldn't be assigned to you" }],
+  });
+  const done = await request("GET", `/api/jira/ct5.atlassian.net/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(done.status, 200);
+  assert.equal(done.body.key, "ENG-7");
+  assert.match(done.body.warning, /couldn't be assigned/);
+  assert.equal(done.body.error, undefined);
+});
+
+test("http: an assigned create reports no warning", async () => {
+  await jiraBeat("ct6", "ct6.atlassian.net");
+  const res = await request("POST", "/api/jira/ct6.atlassian.net/tickets", {
+    body: { project: "ENG", issueType: "1", summary: "Fine" }, headers: userHeaders,
+  });
+  await jiraBeat("ct6", "ct6.atlassian.net", {
+    createTicketResults: [{ cmdId: res.body.cmdId, key: "ENG-8", url: "u", error: null }],
+  });
+  const done = await request("GET", `/api/jira/ct6.atlassian.net/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(done.body.key, "ENG-8");
+  assert.equal(done.body.warning, null);
+});
+
+test("http: a create failure is reported to the poller as an error", async () => {
+  await jiraBeat("ct2", "ct2.atlassian.net");
+  const res = await request("POST", "/api/jira/ct2.atlassian.net/tickets", {
+    body: { project: "ENG", issueType: "1", summary: "Boom" }, headers: userHeaders,
+  });
+  await jiraBeat("ct2", "ct2.atlassian.net", {
+    createTicketResults: [{ cmdId: res.body.cmdId, key: null, url: null, error: "Jira 400: bad field" }],
+  });
+  const done = await request("GET", `/api/jira/ct2.atlassian.net/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(done.status, 200);
+  assert.equal(done.body.error, "Jira 400: bad field");
+});
+
+test("http: creating a ticket 404s an org nobody reports", async () => {
+  const res = await request("POST", "/api/jira/nobody-ct.atlassian.net/tickets", {
+    body: { project: "E", issueType: "1", summary: "x" }, headers: userHeaders,
+  });
+  assert.equal(res.status, 404);
+});
+
+test("http: the create caches are stripped from the /api/agents payload", async () => {
+  await jiraBeat("cm4", "cm4.atlassian.net", {
+    createMetaResults: [{ project: null, projects: [{ key: "E", name: "E" }], labels: [], source: "jira", error: null }],
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = res.body.agents.find((a) => a.key === "cm4");
+  assert.ok(rec);
+  assert.equal(rec.createMeta, undefined);
+  assert.equal(rec.createTypes, undefined);
+  assert.equal(rec.createResults, undefined);
+});
+
+// ---- proven capability gaps (XERK-151) --------------------------------------
+// An agent that predates a board write feature ACKS its command and stages
+// nothing, so the routes waiting on a staged result used to 202 until the client
+// timed out ("the host didn't answer in time"). The ack with no result is the
+// evidence; these cover asserting the gap, refusing on it, and clearing it.
+
+// Ack `cmdIds` on a beat, optionally carrying the results that would prove the
+// agent handled them.
+const ackBeat = (device, siteKey, cmdIds, extra = {}) =>
+  jiraBeat(device, siteKey, { ackedCommands: cmdIds, ...extra });
+
+test("http: an acked boardCreateMeta that staged nothing proves the agent is too old", async () => {
+  await jiraBeat("gap1", "gap1.atlassian.net", { agentVersion: "0.5.38" });
+  const first = await request("GET", "/api/jira/gap1.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(first.status, 202);
+
+  // The beat that DELIVERS the command concludes nothing — it hasn't been taken.
+  await jiraBeat("gap1", "gap1.atlassian.net", { agentVersion: "0.5.38" });
+  const still = await request("GET", "/api/jira/gap1.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(still.status, 202, "an undelivered command must not read as a gap");
+
+  // Acked, with no createMetaResults: the agent doesn't implement it.
+  await ackBeat("gap1", "gap1.atlassian.net", [first.body.cmdId], { agentVersion: "0.5.38" });
+  const res = await request("GET", "/api/jira/gap1.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.match(res.body.error, /too old to offer the New-ticket options/);
+  assert.match(res.body.error, /v0\.5\.38/);
+  // ...and it stops queueing commands the host will only swallow.
+  const beat = await jiraBeat("gap1", "gap1.atlassian.net", { agentVersion: "0.5.38" });
+  assert.deepEqual(beat.body.commands, []);
+});
+
+test("http: a boardCreateMeta that DID stage its result asserts no gap", async () => {
+  await jiraBeat("gap2", "gap2.atlassian.net", { agentVersion: "0.6.1" });
+  const first = await request("GET", "/api/jira/gap2.atlassian.net/create-meta", { headers: userHeaders });
+  await ackBeat("gap2", "gap2.atlassian.net", [first.body.cmdId], {
+    agentVersion: "0.6.1",
+    createMetaResults: [{ project: null, projects: [{ key: "ENG", name: "Eng" }],
+                          labels: [], source: "azure", error: null }],
+  });
+  const res = await request("GET", "/api/jira/gap2.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.error, undefined);
+  assert.deepEqual(res.body.projects, [{ key: "ENG", name: "Eng" }]);
+});
+
+test("http: the per-project type fetch proves its gap on its own project", async () => {
+  await jiraBeat("gap3", "gap3.atlassian.net", { agentVersion: "0.5.38" });
+  const q = await request("GET", "/api/jira/gap3.atlassian.net/create-meta?project=ENG", { headers: userHeaders });
+  await ackBeat("gap3", "gap3.atlassian.net", [q.body.cmdId], { agentVersion: "0.5.38" });
+  const res = await request("GET", "/api/jira/gap3.atlassian.net/create-meta?project=ENG", { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.match(res.body.error, /too old/);
+});
+
+test("http: an updated agent earns the feature back on its version change", async () => {
+  await jiraBeat("gap4", "gap4.atlassian.net", { agentVersion: "0.5.38" });
+  const first = await request("GET", "/api/jira/gap4.atlassian.net/create-meta", { headers: userHeaders });
+  await ackBeat("gap4", "gap4.atlassian.net", [first.body.cmdId], { agentVersion: "0.5.38" });
+  assert.match(
+    (await request("GET", "/api/jira/gap4.atlassian.net/create-meta", { headers: userHeaders })).body.error,
+    /too old/);
+
+  await jiraBeat("gap4", "gap4.atlassian.net", { agentVersion: "0.6.1" });
+  const res = await request("GET", "/api/jira/gap4.atlassian.net/create-meta", { headers: userHeaders });
+  assert.equal(res.status, 202, "a version change re-probes rather than refusing on old evidence");
+});
+
+test("http: creating a ticket is refused on a proven createTicket gap", async () => {
+  await jiraBeat("gap5", "gap5.atlassian.net", { agentVersion: "0.5.38" });
+  const body = { project: "ENG", issueType: "1", summary: "New thing" };
+  const post = await request("POST", "/api/jira/gap5.atlassian.net/tickets", { body, headers: userHeaders });
+  assert.equal(post.status, 200);
+  await ackBeat("gap5", "gap5.atlassian.net", [post.body.cmdId], { agentVersion: "0.5.38" });
+
+  const again = await request("POST", "/api/jira/gap5.atlassian.net/tickets", { body, headers: userHeaders });
+  assert.equal(again.status, 409);
+  assert.match(again.body.error, /too old to create tickets/);
+});
+
+test("http: a status change is refused on a proven setTicketStatus gap", async () => {
+  await jiraBeat("gap6", "gap6.atlassian.net", { agentVersion: "0.5.38" });
+  const body = { value: "31" };
+  const post = await request("POST", "/api/jira/gap6.atlassian.net/ENG-1/status", { body, headers: userHeaders });
+  assert.equal(post.status, 202);
+  await ackBeat("gap6", "gap6.atlassian.net", [post.body.cmdId], { agentVersion: "0.5.38" });
+
+  const again = await request("POST", "/api/jira/gap6.atlassian.net/ENG-1/status", { body, headers: userHeaders });
+  assert.equal(again.status, 409);
+  assert.match(again.body.error, /too old to change a ticket's status/);
+});
+
+test("http: the gap bookkeeping is stripped from /api/agents but the gaps are not", async () => {
+  await jiraBeat("gap7", "gap7.atlassian.net", { agentVersion: "0.5.38" });
+  const first = await request("GET", "/api/jira/gap7.atlassian.net/create-meta", { headers: userHeaders });
+  await ackBeat("gap7", "gap7.atlassian.net", [first.body.cmdId], { agentVersion: "0.5.38" });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = res.body.agents.find((a) => a.key === "gap7");
+  assert.equal(rec.resultWaits, undefined);
+  assert.ok(rec.unsupported.boardCreateMeta, "the proven gap is worth reading off the fleet payload");
+});
+
+// POST /api/jira/<siteKey>/<issueKey>/repo — the operator's manual repo override.
+// Writes to the AGENT's triage ledger via the heartbeat command path; nothing
+// here writes to Jira, which stays pull-only.
+
+const setRepo = (site, key, body) =>
+  request("POST", `/api/jira/${site}/${key}/repo`, { body, headers: userHeaders });
+
+test("http: setting a ticket's repo queues setJiraRepo on the org's host", async () => {
+  await jiraBeat("jr1", "r1.atlassian.net");
+  const res = await setRepo("r1.atlassian.net", "ENG-7", { repo: "Turma" });
+  assert.equal(res.status, 202);
+  assert.equal(res.body.ok, true);
+  assert.deepEqual(res.body.hosts, ["jr1"]);
+
+  const beat = await jiraBeat("jr1", "r1.atlassian.net");
+  assert.deepEqual(beat.body.commands, [{
+    type: "setJiraRepo", siteKey: "r1.atlassian.net", issueKey: "ENG-7",
+    repo: "Turma", auto: false, cmdId: res.body.cmdId,
+  }]);
+});
+
+test("http: {repo:null} and {auto:true} are carried as the distinct answers they are", async () => {
+  await jiraBeat("jr2", "r2.atlassian.net");
+  await setRepo("r2.atlassian.net", "ENG-1", { repo: null });
+  await setRepo("r2.atlassian.net", "ENG-2", { auto: true });
+  const beat = await jiraBeat("jr2", "r2.atlassian.net");
+  const [none, auto] = beat.body.commands;
+  assert.equal(none.repo, null);
+  assert.equal(none.auto, false);   // an explicit "nothing fits" IS a decision
+  assert.equal(auto.auto, true);    // "let the model decide" releases the pin
+});
+
+test("http: a body with neither repo nor auto is a 400, not a silent decline", async () => {
+  // A lost field must never paint a confident "no repo fits" chip.
+  await jiraBeat("jr3", "r3.atlassian.net");
+  const res = await setRepo("r3.atlassian.net", "ENG-1", {});
+  assert.equal(res.status, 400);
+  assert.equal((agents.jr3.commands || []).length, 0);
+});
+
+test("http: setting a repo rejects a bad issue key or repo name before routing", async () => {
+  await jiraBeat("jr4", "r4.atlassian.net");
+  for (const bad of ["..%2F..%2Fsecret", "12ab", "ENG-"]) {
+    const res = await setRepo("r4.atlassian.net", bad, { repo: "Turma" });
+    assert.equal(res.status, 400, `${bad} should be rejected`);
+  }
+  for (const bad of ["../etc", "a b", "x;y", 42, {}]) {
+    const res = await setRepo("r4.atlassian.net", "ENG-1", { repo: bad });
+    assert.equal(res.status, 400, `${JSON.stringify(bad)} should be rejected`);
+  }
+  assert.equal((agents.jr4.commands || []).length, 0);
+});
+
+test("http: setting a repo fans out to every host reporting the org", async () => {
+  // The ledger is per-host but the board merges hosts by siteKey, so pinning on
+  // only one would flicker as the merge picked a different host's block.
+  await jiraBeat("jr5a", "r5.atlassian.net");
+  await jiraBeat("jr5b", "r5.atlassian.net");
+  const res = await setRepo("r5.atlassian.net", "ENG-1", { repo: "Turma" });
+  assert.equal(res.status, 202);
+  assert.deepEqual(res.body.hosts.sort(), ["jr5a", "jr5b"]);
+  assert.equal((agents.jr5a.commands || []).length, 1);
+  assert.equal((agents.jr5b.commands || []).length, 1);
+});
+
+test("http: an offline host of the org is still queued the pin", async () => {
+  // Commands are queued and at-least-once, so it takes the pin when it returns.
+  // Skipping it would let it come back reporting the model's old guess and — with
+  // the freshest block winning the merge — silently revert the override.
+  await jiraBeat("jr6a", "r6.atlassian.net");
+  await jiraBeat("jr6b", "r6.atlassian.net");
+  agents.jr6b.lastSeen = Date.now() - 10 * 60 * 1000;
+  const res = await setRepo("r6.atlassian.net", "ENG-1", { repo: "Turma" });
+  assert.equal(res.status, 202);
+  assert.deepEqual(res.body.hosts.sort(), ["jr6a", "jr6b"]);
+  assert.deepEqual(res.body.online, ["jr6a"]);
+  assert.equal((agents.jr6b.commands || []).length, 1, "the offline host is queued too");
+});
+
+test("http: setting a repo 404s only when NO host reports the org", async () => {
+  const res = await setRepo("nobody.atlassian.net", "ENG-1", { repo: "Turma" });
+  assert.equal(res.status, 404);
+});
+
+test("http: setting a ticket's repo requires the user login", async () => {
+  await jiraBeat("jr7", "r7.atlassian.net");
+  const res = await request("POST", "/api/jira/r7.atlassian.net/ENG-1/repo", {
+    body: { repo: "Turma" },
+  });
+  assert.equal(res.status, 401);
+  assert.equal((agents.jr7.commands || []).length, 0);
+});
+
+test("http: ticket detail rejects a non-issue-key path segment before routing", async () => {
+  await jiraBeat("jd5", "org5.atlassian.net");
+  for (const bad of ["..%2F..%2Fsecret", "ENG-42%3Fx%3D1", "12ab", "ENG-", "ENG%2042"]) {
+    const res = await request("GET", `/api/jira/org5.atlassian.net/${bad}`, { headers: userHeaders });
+    assert.equal(res.status, 400, `${bad} should be rejected`);
+  }
+  assert.equal((agents.jd5.commands || []).length, 0);
+});
+
+test("http: an Azure work-item id (numeric key, slash siteKey) routes like a Jira key (XERK-43)", async () => {
+  // Azure DevOps siteKeys carry an org path ("dev.azure.com/org7") and work-item
+  // ids are bare integers — both must route, not 400, through the same endpoints.
+  const site = "dev.azure.com/org7";
+  await jiraBeat("azd", site, { jira: { available: true, source: "azure", siteKey: site, user: "u", tickets: [] } });
+  const res = await request("GET", `/api/jira/${encodeURIComponent(site)}/1234`, { headers: userHeaders });
+  assert.equal(res.status, 202, "a numeric key is a valid Azure id, not a bad key");
+  assert.equal((agents.azd.commands || []).length, 1);
+  assert.equal(agents.azd.commands[0].issueKey, "1234");
+});
+
+test("http: ticket detail prefers an ONLINE host of the org; offline-only serves its cache", async () => {
+  await jiraBeat("jdOff", "org6.atlassian.net", {
+    jiraIssueResults: [{ key: "ENG-7", issue: { key: "ENG-7", summary: "stale copy" }, error: null }],
+  });
+  await jiraBeat("jdOn", "org6.atlassian.net");
+  agents.jdOff.lastSeen = Date.now() - 10 * 60 * 1000; // offline
+  agents.jdOff.jiraIssues["ENG-7"].fetchedAt = Date.now() - 10 * 60 * 1000;
+
+  // The online host is asked, even though only the offline one has a copy.
+  const res = await request("GET", "/api/jira/org6.atlassian.net/ENG-7", { headers: userHeaders });
+  assert.equal(res.status, 202);
+  assert.equal((agents.jdOn.commands || []).length, 1);
+  assert.equal((agents.jdOff.commands || []).length, 0, "an offline host must not be queued");
+
+  // With the org's only host offline, its last copy beats leaving the panel
+  // spinning on a command that will never be delivered.
+  delete agents.jdOn;
+  const stale = await request("GET", "/api/jira/org6.atlassian.net/ENG-7", { headers: userHeaders });
+  assert.equal(stale.status, 200);
+  assert.equal(stale.body.issue.summary, "stale copy");
+  assert.equal(stale.body.stale, true);
+});
+
+test("http: an offline host with nothing cached says so rather than queueing", async () => {
+  await jiraBeat("jd7", "org7.atlassian.net");
+  agents.jd7.lastSeen = Date.now() - 10 * 60 * 1000;
+  const res = await request("GET", "/api/jira/org7.atlassian.net/ENG-1", { headers: userHeaders });
+  assert.equal(res.status, 503);
+  assert.match(res.body.error, /offline/);
+  assert.equal((agents.jd7.commands || []).length, 0);
+});
+
+test("http: ticket detail requires the user login", async () => {
+  await jiraBeat("jd8", "org8.atlassian.net");
+  const res = await request("GET", "/api/jira/org8.atlassian.net/ENG-1");
+  assert.equal(res.status, 401);
+});
+
+// POST /api/jira/<siteKey>/<issueKey>/session: the board card's start button.
+// The hub's whole job is ROUTING — finding the one host that has both the org's
+// Jira creds and the ticket's repo — since it's the only party that sees the
+// whole fleet. It sends only the issue key; the agent re-derives the rest.
+
+// A host reporting `site`, with `repos` cloned, and `key` triaged to `repo`.
+const ticketBeat = (device, site, { repo = "Turma", repos = ["Turma"], key = "ENG-5",
+                                    cloned = true, fetchedAt = "2026-07-14T12:00:00Z" } = {}) =>
+  request("POST", "/api/heartbeat", {
+    body: {
+      device,
+      repos: repos.map((name) => ({ name, path: `/git/${name}` })),
+      jira: {
+        available: true, configured: true, siteKey: site, user: `${device}@x.com`,
+        fetchedAt,
+        tickets: [{ key, summary: "Fix it", repoGuess: repo ? { repo, cloned } : null }],
+      },
+    },
+    headers: agentHeaders,
+  });
+
+test("http: starting a ticket session queues spawnTicket on the org's host", async () => {
+  await ticketBeat("ts1", "t1.atlassian.net");
+  const res = await request("POST", "/api/jira/t1.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.host, "ts1");
+  assert.equal(res.body.repo, "Turma");
+  assert.ok(res.body.cmdId);
+  // Only the key travels: the agent re-derives repo, ticket text and branch from
+  // its own state, so a stale board can't aim a spawn at the wrong repo.
+  assert.deepEqual(agents.ts1.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: the ticket spawn rides the heartbeat like any other command", async () => {
+  await ticketBeat("ts2", "t2.atlassian.net");
+  const res = await request("POST", "/api/jira/t2.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  const beat = await ticketBeat("ts2", "t2.atlassian.net");
+  assert.deepEqual(beat.body.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: a mashed start button is single-flighted into one spawn", async () => {
+  // Two sessions on one ticket is a real feature, but a double-click isn't how
+  // you ask for it.
+  await ticketBeat("ts3", "t3.atlassian.net");
+  const first = await request("POST", "/api/jira/t3.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  const second = await request("POST", "/api/jira/t3.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(second.body.cmdId, first.body.cmdId);
+  assert.equal(agents.ts3.commands.length, 1);
+});
+
+test("http: the host must have the ticket's repo, not just the org's creds", async () => {
+  // Two hosts share the org; only one has the repo. Routing on siteKey alone
+  // would spawn on a host that would just log a refusal nobody sees.
+  await ticketBeat("tsCreds", "t4.atlassian.net", { repos: ["Other"] });
+  await ticketBeat("tsRepo", "t4.atlassian.net", { repos: ["Turma"] });
+  const res = await request("POST", "/api/jira/t4.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.host, "tsRepo");
+  assert.equal((agents.tsCreds.commands || []).length, 0);
+});
+
+test("http: no online host has the repo -> routes anyway and clones on demand", async () => {
+  // The old refusal is gone: the ticket routes to the most-available org host,
+  // which clones the repo and queues the session behind it (see spawn_ticket).
+  await ticketBeat("ts5", "t5.atlassian.net", { repos: ["Other"] });
+  const res = await request("POST", "/api/jira/t5.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.host, "ts5");
+  assert.equal(res.body.needsClone, true);
+  assert.deepEqual(agents.ts5.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: among org hosts with the repo, the most available one wins", async () => {
+  // The splitting rule: N sessions on one org spread across its hosts instead of
+  // stacking on whichever registered first.
+  await ticketBeat("tsBusy", "tSplit.atlassian.net");
+  await ticketBeat("tsFree", "tSplit.atlassian.net");
+  agents.tsBusy.capacity = { maxSessions: 6, running: 5, queued: 0, free: 1 };
+  agents.tsFree.capacity = { maxSessions: 6, running: 1, queued: 0, free: 5 };
+  const res = await request("POST", "/api/jira/tSplit.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.body.host, "tsFree");
+  assert.equal((agents.tsBusy.commands || []).length, 0);
+});
+
+test("http: a spawn already queued to a host lowers its availability", async () => {
+  // Availability subtracts in-flight spawn commands, so two tickets clicked
+  // between beats split instead of both landing on the same host.
+  await ticketBeat("tsA", "tSplit2.atlassian.net", { key: "ENG-5" });
+  await ticketBeat("tsB", "tSplit2.atlassian.net", { key: "ENG-6" });
+  agents.tsA.capacity = { maxSessions: 6, running: 0, queued: 0, free: 6 };
+  agents.tsB.capacity = { maxSessions: 6, running: 0, queued: 0, free: 6 };
+  // First ticket: a tie, insertion order gives tsA.
+  const one = await request("POST", "/api/jira/tSplit2.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(one.body.host, "tsA");
+  // Second ticket before any beat reflects the first: tsA now has a pending
+  // spawn, so the second goes to tsB.
+  const two = await request("POST", "/api/jira/tSplit2.atlassian.net/ENG-6/session",
+    { headers: userHeaders });
+  assert.equal(two.body.host, "tsB");
+});
+
+test("http: an offline host is never queued a spawn — it 503s instead", async () => {
+  // Unlike the read-only GET, which happily serves an offline host's cache: a
+  // spawn landing whenever the host next wakes is a surprise, not a feature.
+  await ticketBeat("ts6", "t6.atlassian.net");
+  agents.ts6.lastSeen = Date.now() - 10 * 60 * 1000;
+  const res = await request("POST", "/api/jira/t6.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 503);
+  assert.match(res.body.error, /offline/);
+  assert.equal((agents.ts6.commands || []).length, 0);
+});
+
+test("http: an untriaged ticket 409s rather than guessing a repo", async () => {
+  await ticketBeat("ts7", "t7.atlassian.net", { repo: null });
+  const res = await request("POST", "/api/jira/t7.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /triaged/);
+  assert.equal((agents.ts7.commands || []).length, 0);
+});
+
+test("http: an unknown org 404s", async () => {
+  const res = await request("POST", "/api/jira/nobody.atlassian.net/ENG-1/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 404);
+});
+
+// POST /api/jira/<siteKey>/<issueKey>/agent — the operator's manual agent pin
+// (XERK-38): which HOST a ticket's sessions spawn on. Hub-owned (routing is the
+// hub's job) and durable (its own /data file), unlike the /repo override's
+// agent-ledger fan-out — so the save is an authoritative 200, not a 202.
+
+const setAgent = (site, key, body) =>
+  request("POST", `/api/jira/${site}/${key}/agent`, { body, headers: userHeaders });
+
+test("http: pinning a ticket's agent stores it; {auto:true} releases it", async () => {
+  await jiraBeat("taA", "taSite.atlassian.net");
+  await jiraBeat("taB", "taSite.atlassian.net");
+  const res = await setAgent("taSite.atlassian.net", "ENG-1", { host: "taB" });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.host, "taB");
+  assert.equal(hub.ticketAgents["taSite.atlassian.net/ENG-1"].host, "taB");
+
+  const rel = await setAgent("taSite.atlassian.net", "ENG-1", { auto: true });
+  assert.equal(rel.status, 200);
+  assert.equal(rel.body.host, null);
+  assert.ok(!("taSite.atlassian.net/ENG-1" in hub.ticketAgents));
+});
+
+test("http: the pin rides the /api/agents payload for the board to render", async () => {
+  await jiraBeat("taPay", "taPay.atlassian.net");
+  await setAgent("taPay.atlassian.net", "ENG-3", { host: "taPay" });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(res.body.ticketAgents["taPay.atlassian.net/ENG-3"].host, "taPay");
+});
+
+test("http: pinning validates the key, body, and host before storing", async () => {
+  await jiraBeat("taV", "taV.atlassian.net");
+  await jiraBeat("taOther", "taOtherOrg.atlassian.net");
+  assert.equal((await setAgent("taV.atlassian.net", "12ab", { host: "taV" })).status, 400);
+  assert.equal((await setAgent("taV.atlassian.net", "ENG-1", {})).status, 400);
+  assert.equal((await setAgent("taV.atlassian.net", "ENG-1", { host: 42 })).status, 400);
+  // A host of a DIFFERENT org is not on this org's picker; nor is a stranger.
+  assert.equal((await setAgent("taV.atlassian.net", "ENG-1", { host: "taOther" })).status, 400);
+  assert.equal((await setAgent("taV.atlassian.net", "ENG-1", { host: "ghost" })).status, 400);
+  // An org nobody reports at all.
+  assert.equal((await setAgent("nobody.atlassian.net", "ENG-1", { host: "taV" })).status, 404);
+  assert.ok(!("taV.atlassian.net/ENG-1" in hub.ticketAgents));
+});
+
+test("http: an offline org host can still be pinned — the pin is about future spawns", async () => {
+  await jiraBeat("taOffline", "taOff.atlassian.net");
+  agents.taOffline.lastSeen = Date.now() - 10 * 60 * 1000;
+  const res = await setAgent("taOff.atlassian.net", "ENG-1", { host: "taOffline" });
+  assert.equal(res.status, 200);
+  assert.equal(hub.ticketAgents["taOff.atlassian.net/ENG-1"].host, "taOffline");
+});
+
+test("http: pinning a ticket's agent requires the user login", async () => {
+  await jiraBeat("taAuth", "taAuth.atlassian.net");
+  const res = await request("POST", "/api/jira/taAuth.atlassian.net/ENG-1/agent",
+    { body: { host: "taAuth" } });
+  assert.equal(res.status, 401);
+  assert.ok(!("taAuth.atlassian.net/ENG-1" in hub.ticketAgents));
+});
+
+test("http: a pinned ticket spawns on its pinned agent, not the most available", async () => {
+  await ticketBeat("tpBusy", "tPin.atlassian.net");
+  await ticketBeat("tpFree", "tPin.atlassian.net");
+  agents.tpBusy.capacity = { maxSessions: 6, running: 5, queued: 0, free: 1 };
+  agents.tpFree.capacity = { maxSessions: 6, running: 1, queued: 0, free: 5 };
+  await setAgent("tPin.atlassian.net", "ENG-5", { host: "tpBusy" });
+  const res = await request("POST", "/api/jira/tPin.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.host, "tpBusy");
+  assert.equal((agents.tpFree.commands || []).length, 0);
+});
+
+test("http: a spawn refuses — never reroutes — when the pinned agent is offline", async () => {
+  // Routing elsewhere would contradict the one thing the pin asserts; the board
+  // renders the reason beside a live retry button, and the panel shows the pin.
+  await ticketBeat("tpOffA", "tPinOff.atlassian.net");
+  await ticketBeat("tpOffB", "tPinOff.atlassian.net");
+  await setAgent("tPinOff.atlassian.net", "ENG-5", { host: "tpOffB" });
+  agents.tpOffB.lastSeen = Date.now() - 10 * 60 * 1000;
+  const res = await request("POST", "/api/jira/tPinOff.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 503);
+  assert.match(res.body.error, /pinned/);
+  assert.equal((agents.tpOffA.commands || []).length, 0);
+  assert.equal((agents.tpOffB.commands || []).length, 0);
+});
+
+test("http: a pin to a host that left the fleet is a clear 409", async () => {
+  await ticketBeat("tpGoneA", "tPinGone.atlassian.net");
+  await ticketBeat("tpGoneB", "tPinGone.atlassian.net");
+  await setAgent("tPinGone.atlassian.net", "ENG-5", { host: "tpGoneB" });
+  delete agents.tpGoneB;   // pruned after a week offline, or renamed
+  const res = await request("POST", "/api/jira/tPinGone.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /pinned/);
+  assert.equal((agents.tpGoneA.commands || []).length, 0);
+});
+
+test("http: a pinned agent without the repo clones on demand, like any routed host", async () => {
+  await ticketBeat("tpHasRepo", "tPinClone.atlassian.net", { repos: ["Turma"] });
+  await ticketBeat("tpNoRepo", "tPinClone.atlassian.net", { repos: ["Other"] });
+  await setAgent("tPinClone.atlassian.net", "ENG-5", { host: "tpNoRepo" });
+  const res = await request("POST", "/api/jira/tPinClone.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.host, "tpNoRepo");
+  assert.equal(res.body.needsClone, true);
+});
+
+test("ticket-agent pins survive a hub restart (read back from their own file)", () => {
+  // "Persistent" is the point of the feature: the pin has its own durable file
+  // on /data rather than riding the best-effort state.json.
+  const file = path.join(os.tmpdir(), `turma-test-ta-persist-${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify({
+    "o.atlassian.net/ENG-1": { host: "h1", at: 123 } }));
+  try {
+    const mod = freshServerModule((env) => { env.TICKET_AGENTS_FILE = file; });
+    assert.equal(mod.ticketAgents["o.atlassian.net/ENG-1"].host, "h1");
+  } finally {
+    fs.unlinkSync(file);
+  }
+});
+
+// POST /api/jira/<siteKey>/<issueKey>/model — the operator's per-ticket model
+// pin (XERK-123). Hub-owned durable state like the /agent pin; the model rides
+// the spawnTicket command the hub already routes.
+
+const setModel = (site, key, body) =>
+  request("POST", `/api/jira/${site}/${key}/model`, { body, headers: userHeaders });
+
+// A jira host that ALSO probed a model list, so orgModelAliases has more than the
+// static family aliases to offer.
+const modelBeat = (device, siteKey, available) =>
+  request("POST", "/api/heartbeat", {
+    body: { device, jira: { available: true, siteKey, user: `${device}@x.com`, tickets: [] },
+      models: { available, defaultLabel: "Sonnet 5", at: "2026-07-14T12:00:00Z" } },
+    headers: agentHeaders,
+  });
+
+test("http: pinning a ticket's model stores it; {auto:true} releases it", async () => {
+  await jiraBeat("tmA", "tmSite.atlassian.net");
+  const res = await setModel("tmSite.atlassian.net", "ENG-1", { model: "opus" });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.model, "opus");
+  assert.equal(hub.ticketModels["tmSite.atlassian.net/ENG-1"].model, "opus");
+
+  const rel = await setModel("tmSite.atlassian.net", "ENG-1", { auto: true });
+  assert.equal(rel.status, 200);
+  assert.equal(rel.body.model, null);
+  assert.ok(!("tmSite.atlassian.net/ENG-1" in hub.ticketModels));
+});
+
+test("http: {model:\"default\"} releases the pin, same as {auto:true}", async () => {
+  await jiraBeat("tmDef", "tmDef.atlassian.net");
+  await setModel("tmDef.atlassian.net", "ENG-1", { model: "opus" });
+  const rel = await setModel("tmDef.atlassian.net", "ENG-1", { model: "default" });
+  assert.equal(rel.status, 200);
+  assert.equal(rel.body.model, null);
+  assert.ok(!("tmDef.atlassian.net/ENG-1" in hub.ticketModels));
+});
+
+test("http: the model pin rides the /api/agents payload for the board to render", async () => {
+  await jiraBeat("tmPay", "tmPay.atlassian.net");
+  await setModel("tmPay.atlassian.net", "ENG-3", { model: "haiku" });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(res.body.ticketModels["tmPay.atlassian.net/ENG-3"].model, "haiku");
+});
+
+test("http: a model pin only accepts an alias the org offers", async () => {
+  await jiraBeat("tmV", "tmV.atlassian.net");
+  // A static family alias is always offerable.
+  assert.equal((await setModel("tmV.atlassian.net", "ENG-1", { model: "sonnet" })).status, 200);
+  // A model no host probed (and not a static alias) is refused.
+  assert.equal((await setModel("tmV.atlassian.net", "ENG-1", { model: "gpt-4" })).status, 400);
+  // A bracketed live-switch alias is never a spawn model, even if probed.
+  await modelBeat("tmVProbe", "tmVProbe.atlassian.net", ["opus[1m]"]);
+  assert.equal((await setModel("tmVProbe.atlassian.net", "ENG-1", { model: "opus[1m]" })).status, 400);
+  // A malformed body, and an org nobody reports.
+  assert.equal((await setModel("tmV.atlassian.net", "12ab", { model: "opus" })).status, 400);
+  assert.equal((await setModel("nobody.atlassian.net", "ENG-1", { model: "opus" })).status, 404);
+});
+
+test("http: a probed non-static alias becomes offerable once a host reports it", async () => {
+  await modelBeat("tmProbe", "tmProbe.atlassian.net", ["fable", "opus", "default"]);
+  const res = await setModel("tmProbe.atlassian.net", "ENG-1", { model: "fable" });
+  assert.equal(res.status, 200);
+  assert.equal(hub.ticketModels["tmProbe.atlassian.net/ENG-1"].model, "fable");
+});
+
+test("http: pinning a ticket's model requires the user login", async () => {
+  await jiraBeat("tmAuth", "tmAuth.atlassian.net");
+  const res = await request("POST", "/api/jira/tmAuth.atlassian.net/ENG-1/model",
+    { body: { model: "opus" } });
+  assert.equal(res.status, 401);
+  assert.ok(!("tmAuth.atlassian.net/ENG-1" in hub.ticketModels));
+});
+
+test("http: a model-pinned ticket carries the model on its spawnTicket command", async () => {
+  await ticketBeat("tmSpawn", "tmSpawn.atlassian.net");
+  await setModel("tmSpawn.atlassian.net", "ENG-5", { model: "opus" });
+  const res = await request("POST", "/api/jira/tmSpawn.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.status, 200);
+  assert.deepEqual(agents.tmSpawn.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", model: "opus", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("http: an unpinned ticket spawns with no model on the command (unchanged)", async () => {
+  await ticketBeat("tmNone", "tmNone.atlassian.net");
+  const res = await request("POST", "/api/jira/tmNone.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.deepEqual(agents.tmNone.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("ticket-model pins survive a hub restart (read back from their own file)", () => {
+  const file = path.join(os.tmpdir(), `turma-test-tm-persist-${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify({
+    "o.atlassian.net/ENG-1": { model: "opus", at: 123 } }));
+  try {
+    const mod = freshServerModule((env) => { env.TICKET_MODELS_FILE = file; });
+    assert.equal(mod.ticketModels["o.atlassian.net/ENG-1"].model, "opus");
+  } finally {
+    fs.unlinkSync(file);
+  }
+});
+
+test("http: the freshest reporting block decides the repo", async () => {
+  // board.js merges on freshest-block-wins, so the hub must resolve against the
+  // same copy the operator actually clicked.
+  await ticketBeat("tsOld", "t8.atlassian.net",
+    { repo: "Stale", repos: ["Stale", "Fresh"], fetchedAt: "2026-07-14T10:00:00Z" });
+  await ticketBeat("tsNew", "t8.atlassian.net",
+    { repo: "Fresh", repos: ["Stale", "Fresh"], fetchedAt: "2026-07-14T12:00:00Z" });
+  const res = await request("POST", "/api/jira/t8.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.equal(res.body.repo, "Fresh");
+});
+
+test("http: a start rejects a non-issue-key path segment before routing", async () => {
+  await ticketBeat("ts9", "t9.atlassian.net");
+  for (const bad of ["..%2F..%2Fsecret", "ENG-42%3Fx%3D1", "12ab", "ENG-", "ENG%2042"]) {
+    const res = await request("POST", `/api/jira/t9.atlassian.net/${bad}/session`,
+      { headers: userHeaders });
+    assert.equal(res.status, 400, `${bad} should be rejected`);
+  }
+  assert.equal((agents.ts9.commands || []).length, 0);
+});
+
+test("http: starting a ticket session requires the user login", async () => {
+  await ticketBeat("ts10", "t10.atlassian.net");
+  const res = await request("POST", "/api/jira/t10.atlassian.net/ENG-5/session");
+  assert.equal(res.status, 401);
+  assert.equal((agents.ts10.commands || []).length, 0);
+});
+
+// ---- auto-start To Do tickets (XERK-32) ---------------------------------------
+// An org opts in via the HUB's per-org auto-start toggle (XERK-41 made this
+// hub-only — no agent flag). The hub then starts a session for every To Do ticket
+// with a repo assigned that has no session yet, routing each via the same
+// splitting the manual Start button uses — so an org's work spreads across ALL its
+// agents.
+
+// A host reporting `site`, `repos` cloned, and a ticket list. The default ticket
+// is a To Do ticket already triaged to Turma. `autoStart:true` (the default)
+// also flips the org's HUB toggle on, since the opt-in is hub-only now.
+const asBeat = async (device, site, {
+  autoStart = true, repos = ["Turma"], capacity,
+  sessions = [], closedSessions = [],
+  tickets = [{ key: "ENG-5", summary: "Fix it", statusCategory: "todo",
+               repoGuess: { repo: "Turma", cloned: true } }],
+  fetchedAt = "2026-07-14T12:00:00Z",
+} = {}) => {
+  const r = await request("POST", "/api/heartbeat", {
+    body: {
+      device,
+      repos: repos.map((name) => ({ name, path: `/git/${name}` })),
+      sessions, closedSessions,
+      ...(capacity ? { capacity } : {}),
+      jira: { available: true, configured: true, siteKey: site,
+              user: `${device}@x.com`, fetchedAt, tickets },
+    },
+    headers: agentHeaders,
+  });
+  if (autoStart) setAutoStartOrg(site, true);
+  return r;
+};
+
+// Clear both the per-sweep once-guard and the hub opt-in map so each sweep test
+// starts from a clean slate (no org left opted in by a prior test).
+const resetAutoStart = () => {
+  autoStarted.clear();
+  for (const k of Object.keys(autoStartOrgs)) delete autoStartOrgs[k];
+};
+
+test("auto-start: a To Do ticket with a repo is queued once the org opts in", async () => {
+  resetAutoStart();
+  await asBeat("asHost", "as1.atlassian.net");
+  autoStartSweep();
+  assert.deepEqual((agents.asHost.commands || []).map((c) => [c.type, c.issueKey]),
+    [["spawnTicket", "ENG-5"]]);
+});
+
+test("auto-start: does nothing until the org is opted in (off by default)", async () => {
+  resetAutoStart();
+  await asBeat("asOff", "as2.atlassian.net", { autoStart: false });
+  autoStartSweep();
+  assert.equal((agents.asOff.commands || []).length, 0);
+});
+
+test("auto-start: only To Do tickets, and only ones with a repo assigned", async () => {
+  resetAutoStart();
+  await asBeat("asFilter", "as3.atlassian.net", {
+    tickets: [
+      { key: "ENG-1", statusCategory: "inprogress",
+        repoGuess: { repo: "Turma", cloned: true } },        // not To Do
+      { key: "ENG-2", statusCategory: "todo", repoGuess: null }, // untriaged
+      { key: "ENG-3", statusCategory: "todo",
+        repoGuess: { repo: null, cloned: false } },           // "no repo fits"
+      { key: "ENG-4", statusCategory: "todo",
+        repoGuess: { repo: "Turma", cloned: true } },         // eligible
+    ],
+  });
+  autoStartSweep();
+  assert.deepEqual((agents.asFilter.commands || []).map((c) => c.issueKey), ["ENG-4"]);
+});
+
+test("auto-start: skips a ticket that already has a session (started manually or before)", async () => {
+  resetAutoStart();
+  // The ticket already carries a live session and a killed one — either alone is
+  // enough to say "already started", so the hub must not open a second.
+  await asBeat("asDup", "as4.atlassian.net", {
+    sessions: [{ id: "s1", transcriptId: "t-live",
+                 ticket: { key: "ENG-5", siteKey: "as4.atlassian.net" } }],
+  });
+  autoStartSweep();
+  assert.equal((agents.asDup.commands || []).length, 0);
+
+  // Same for a ticket whose only session was killed (in closedSessions): a
+  // deliberate kill must not be resurrected by auto-start.
+  autoStarted.clear();
+  await asBeat("asDup2", "as5.atlassian.net", {
+    closedSessions: [{ id: "s2", transcriptId: "t-killed",
+                       ticket: { key: "ENG-5", siteKey: "as5.atlassian.net" } }],
+  });
+  autoStartSweep();
+  assert.equal((agents.asDup2.commands || []).length, 0);
+});
+
+test("auto-start: a resumable-only session (durable, survives restart) still counts as started", async () => {
+  resetAutoStart();
+  await asBeat("asResume", "as6.atlassian.net", {
+    repos: ["Turma"],
+  });
+  // The durable channel: a transcript the resumable scan re-derived, with no
+  // registry record behind it. startedTicketKeys must read it too.
+  agents.asResume.repos[0].resumable = [
+    { transcriptId: "t-old", ticket: { key: "ENG-5", siteKey: "as6.atlassian.net" } },
+  ];
+  autoStartSweep();
+  assert.equal((agents.asResume.commands || []).length, 0);
+});
+
+// XERK-61: a spawnTicket the agent acked but that produced no session is a
+// FAILED attempt, not a completed one — the agent acks a refusal and a mid-spawn
+// exception exactly like a success. So the sweep retries it, bounded and backed
+// off, instead of dropping the ticket for the hub's lifetime.
+test("auto-start: an acked spawn that left no session is retried, not dropped", async () => {
+  resetAutoStart();
+  await asBeat("asRetry", "as7.atlassian.net");
+  autoStartSweep();
+  assert.equal((agents.asRetry.commands || []).length, 1);
+
+  // The agent took the command and produced nothing (a refusal, or a Jira fetch
+  // that blew up). Immediately after, the backoff holds the retry off.
+  agents.asRetry.commands = [];
+  autoStartSweep();
+  assert.equal((agents.asRetry.commands || []).length, 0,
+    "the retry waits out its backoff rather than re-queuing every 15s");
+
+  // Once the backoff has elapsed, the ticket is tried again.
+  autoStarted.get("as7.atlassian.net\x00ENG-5").nextAt = 0;
+  autoStartSweep();
+  assert.deepEqual((agents.asRetry.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal(autoStarted.get("as7.atlassian.net\x00ENG-5").attempts, 2);
+});
+
+test("auto-start: retries never give up — a ticket keeps being tried, backing off to a steady ceiling", async () => {
+  // XERK-109: the earlier bounded-budget behaviour blacklisted a ticket for the
+  // hub's lifetime once it had flaked a handful of times, so a transiently-blocked
+  // ticket never started even after its condition cleared and every visible
+  // condition was met. The cap is gone; retries only slow down, they never stop.
+  resetAutoStart();
+  await asBeat("asBudget", "as7b.atlassian.net");
+  const k = "as7b.atlassian.net\x00ENG-5";
+  // Every attempt is acked and leaves no session. Far more rounds than the old
+  // budget would have allowed — the attempt counter settles at the backoff
+  // ceiling instead of climbing without bound.
+  for (let i = 0; i < 20; i++) {
+    agents.asBudget.commands = [];
+    const e = autoStarted.get(k);
+    if (e) e.nextAt = 0;      // pretend the backoff has elapsed
+    autoStartSweep();
+    assert.deepEqual((agents.asBudget.commands || []).map((c) => c.issueKey),
+      ["ENG-5"], "the ticket is retried on every eligible sweep, never abandoned");
+  }
+  assert.equal(autoStarted.get(k).attempts, 5,
+    "the counter settles at the backoff ceiling (AUTO_START_BACKOFF_STEPS)");
+  // The steady-state retry is spaced by the max backoff, so a still-stuck ticket
+  // re-queues at most once per ceiling interval rather than every sweep.
+  agents.asBudget.commands = [];
+  autoStartSweep();  // nextAt is now ~10min out, so this sweep must NOT re-queue
+  assert.equal((agents.asBudget.commands || []).length, 0,
+    "within the ceiling backoff the retry holds off");
+});
+
+test("auto-start: a session appearing ends the retries and forgets the attempts", async () => {
+  resetAutoStart();
+  await asBeat("asWon", "as7c.atlassian.net");
+  autoStartSweep();
+  const k = "as7c.atlassian.net\x00ENG-5";
+  assert.equal(autoStarted.get(k).attempts, 1);
+  // The spawn worked: the session (queued or running) reports its ticket back.
+  agents.asWon.commands = [];
+  agents.asWon.sessions = [{ id: "s1", status: "queued", transcriptId: "t1",
+    ticket: { key: "ENG-5", siteKey: "as7c.atlassian.net" } }];
+  autoStartSweep();
+  assert.equal((agents.asWon.commands || []).length, 0);
+  assert.ok(!autoStarted.has(k), "the attempt record is dropped, not left to grow");
+});
+
+test("auto-start: a ticket that flaked past the old budget still self-heals once the block clears (XERK-109)", async () => {
+  resetAutoStart();
+  await asBeat("asHeal", "as7e.atlassian.net");
+  const k = "as7e.atlassian.net\x00ENG-5";
+  // Flake far more times than the old 4-attempt budget would have tolerated —
+  // the hub used to have permanently given up by now.
+  for (let i = 0; i < 8; i++) {
+    agents.asHeal.commands = [];
+    const e = autoStarted.get(k);
+    if (e) e.nextAt = 0;
+    autoStartSweep();
+  }
+  assert.ok((agents.asHeal.commands || []).some((c) => c.issueKey === "ENG-5"),
+    "still retrying after the old budget would have blacklisted it");
+  // Now the transient condition clears and the spawn finally takes: the session
+  // reports its ticket, and auto-start settles for good.
+  agents.asHeal.commands = [];
+  agents.asHeal.sessions = [{ id: "s1", status: "running", transcriptId: "t1",
+    ticket: { key: "ENG-5", siteKey: "as7e.atlassian.net" } }];
+  autoStartSweep();
+  assert.equal((agents.asHeal.commands || []).length, 0);
+  assert.ok(!autoStarted.has(k), "the attempt record is dropped once it starts");
+});
+
+test("auto-start: an offline org spends no attempt (the failure isn't the ticket's)", async () => {
+  resetAutoStart();
+  await asBeat("asDown", "as7d.atlassian.net");
+  agents.asDown.lastSeen = Date.now() - 10 * 60 * 1000;  // offline
+  autoStartSweep();
+  assert.equal((agents.asDown.commands || []).length, 0);
+  assert.ok(!autoStarted.has("as7d.atlassian.net\x00ENG-5"));
+  // The host returns: the ticket starts on the very next sweep, with its full
+  // budget intact rather than sitting out a backoff it never earned.
+  agents.asDown.lastSeen = Date.now();
+  autoStartSweep();
+  assert.deepEqual((agents.asDown.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("auto-start: an in-flight spawnTicket (e.g. a manual click) is not doubled", async () => {
+  resetAutoStart();
+  await asBeat("asInflight", "as8.atlassian.net");
+  // A spawnTicket already queued by the /session route sits on the host.
+  queueCommand("asInflight", { type: "spawnTicket", issueKey: "ENG-5" });
+  autoStartSweep();
+  assert.equal((agents.asInflight.commands || []).filter(
+    (c) => c.type === "spawnTicket").length, 1);
+});
+
+test("auto-start: work spreads across ALL the org's agents (routes by availability)", async () => {
+  // The two-agents case: the ORG is opted in (hub-only), and the session routes
+  // by availability across BOTH its hosts — landing on the more-available one.
+  resetAutoStart();
+  await asBeat("asBusy", "as9.atlassian.net", {
+    capacity: { maxSessions: 6, running: 5, queued: 0, free: 1 } });   // opts as9 in
+  await asBeat("asFree", "as9.atlassian.net", {
+    autoStart: false, capacity: { maxSessions: 6, running: 1, queued: 0, free: 5 } });
+  autoStartSweep();
+  // Routed to the most-available host, proving auto-start uses the same
+  // fleet-wide splitting as the manual button.
+  assert.deepEqual((agents.asFree.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal((agents.asBusy.commands || []).length, 0);
+});
+
+test("auto-start: honors a ticket's pinned agent over availability", async () => {
+  resetAutoStart();
+  await asBeat("asPinBusy", "asPin.atlassian.net",
+    { capacity: { maxSessions: 6, running: 5, queued: 0, free: 1 } });
+  await asBeat("asPinFree", "asPin.atlassian.net",
+    { capacity: { maxSessions: 6, running: 1, queued: 0, free: 5 } });
+  await setAgent("asPin.atlassian.net", "ENG-5", { host: "asPinBusy" });
+  autoStartSweep();
+  assert.deepEqual((agents.asPinBusy.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal((agents.asPinFree.commands || []).length, 0);
+});
+
+test("auto-start: a pinned agent that's offline retries later, never reroutes", async () => {
+  resetAutoStart();
+  await asBeat("asPinOffA", "asPinOff.atlassian.net");
+  await asBeat("asPinOffB", "asPinOff.atlassian.net");
+  await setAgent("asPinOff.atlassian.net", "ENG-5", { host: "asPinOffB" });
+  agents.asPinOffB.lastSeen = Date.now() - 10 * 60 * 1000;
+  autoStartSweep();
+  // Not rerouted around the pin, and left UNrecorded so a later sweep retries.
+  assert.equal((agents.asPinOffA.commands || []).length, 0);
+  assert.equal((agents.asPinOffB.commands || []).length, 0);
+  assert.ok(!autoStarted.has("asPinOff.atlassian.net\x00ENG-5"));
+  // The pinned host comes back — the next sweep spawns there.
+  agents.asPinOffB.lastSeen = Date.now();
+  autoStartSweep();
+  assert.deepEqual((agents.asPinOffB.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+test("auto-start: an org with every host offline queues nothing until one returns", async () => {
+  resetAutoStart();
+  await asBeat("asStale", "as10.atlassian.net");        // opts the org in
+  agents.asStale.lastSeen = Date.now() - 10 * 60 * 1000; // offline
+  // The opt-in is durable hub state, so the org stays "on"...
+  assert.equal(orgsWithAutoStart().has("as10.atlassian.net"), true);
+  // ...but with no online host to route to, the sweep queues nothing.
+  autoStartSweep();
+  assert.equal((agents.asStale.commands || []).length, 0);
+  // The host returns — the next sweep spawns there.
+  agents.asStale.lastSeen = Date.now();
+  autoStartSweep();
+  assert.deepEqual((agents.asStale.commands || []).map((c) => c.issueKey), ["ENG-5"]);
+});
+
+// ---- per-org auto-start opt-in from the hub (XERK-41) -------------------------
+
+test("auto-start: the hub-side org toggle is the ONLY opt-in", async () => {
+  resetAutoStart();
+  // A reporting host is not enough — the org is off until the hub toggle is set.
+  await asBeat("asHub", "ashub.atlassian.net", { autoStart: false });
+  assert.equal(orgsWithAutoStart().has("ashub.atlassian.net"), false);
+  autoStartSweep();
+  assert.equal((agents.asHub.commands || []).length, 0);
+  // The toggle drives the sweep.
+  setAutoStartOrg("ashub.atlassian.net", true);
+  assert.equal(orgsWithAutoStart().has("ashub.atlassian.net"), true);
+  autoStartSweep();
+  assert.deepEqual((agents.asHub.commands || []).map((c) => [c.type, c.issueKey]),
+    [["spawnTicket", "ENG-5"]]);
+  setAutoStartOrg("ashub.atlassian.net", false); // leave global state clean
+});
+
+test("POST /api/jira/<site>/autostart flips the opt-in and rides the payload", async () => {
+  await asBeat("asApi", "asapi.atlassian.net", { autoStart: false });
+
+  // Enable it.
+  let r = await request("POST", "/api/jira/asapi.atlassian.net/autostart",
+    { body: { enabled: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true, enabled: true });
+  assert.equal(autoStartOrgs["asapi.atlassian.net"], true);
+
+  // It rides the fleet payload as a top-level bool map.
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.autoStartOrgs["asapi.atlassian.net"], true);
+
+  // Disable it — the key is removed (presence = enabled).
+  r = await request("POST", "/api/jira/asapi.atlassian.net/autostart",
+    { body: { enabled: false }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal("asapi.atlassian.net" in autoStartOrgs, false);
+});
+
+test("POST /api/jira/<site>/autostart rejects a bad body and an unknown org", async () => {
+  await asBeat("asApi2", "asapi2.atlassian.net", { autoStart: false });
+  // Missing/!boolean enabled.
+  let r = await request("POST", "/api/jira/asapi2.atlassian.net/autostart",
+    { body: {}, headers: userHeaders });
+  assert.equal(r.status, 400);
+  r = await request("POST", "/api/jira/asapi2.atlassian.net/autostart",
+    { body: { enabled: "yes" }, headers: userHeaders });
+  assert.equal(r.status, 400);
+  // An org no host reports can't be toggled (no phantom entries).
+  r = await request("POST", "/api/jira/nobody.atlassian.net/autostart",
+    { body: { enabled: true }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal("nobody.atlassian.net" in autoStartOrgs, false);
+});
+
+// ---- manual org colors (XERK-145) -------------------------------------------
+
+test("POST /api/jira/<site>/color pins the slot, rides the payload, releases on auto", async () => {
+  await asBeat("ocApi", "ocapi.atlassian.net", { autoStart: false });
+
+  // Pin slot 3.
+  let r = await request("POST", "/api/jira/ocapi.atlassian.net/color",
+    { body: { slot: 3 }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true, slot: 3 });
+  assert.equal(orgColors["ocapi.atlassian.net"], 3);
+
+  // It rides the fleet payload as a top-level siteKey -> slot map.
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.orgColors["ocapi.atlassian.net"], 3);
+
+  // Release back to auto — the key is removed (presence = pinned).
+  r = await request("POST", "/api/jira/ocapi.atlassian.net/color",
+    { body: { auto: true }, headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { ok: true, slot: null });
+  assert.equal("ocapi.atlassian.net" in orgColors, false);
+});
+
+test("POST /api/jira/<site>/color rejects a bad slot and an unknown org", async () => {
+  await asBeat("ocApi2", "ocapi2.atlassian.net", { autoStart: false });
+  // Out-of-range, non-integer, or missing slot without auto.
+  for (const body of [{}, { slot: 0 }, { slot: 9 }, { slot: 2.5 }, { slot: "3" }, { auto: false }]) {
+    const r = await request("POST", "/api/jira/ocapi2.atlassian.net/color",
+      { body, headers: userHeaders });
+    assert.equal(r.status, 400, JSON.stringify(body));
+  }
+  // An org no host reports can't be pinned (no phantom entries).
+  const r = await request("POST", "/api/jira/nobody.atlassian.net/color",
+    { body: { slot: 3 }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal("nobody.atlassian.net" in orgColors, false);
+});
+
+test("POST /api/jira/<site>/color needs the user login", async () => {
+  await asBeat("ocApi3", "ocapi3.atlassian.net", { autoStart: false });
+  const r = await request("POST", "/api/jira/ocapi3.atlassian.net/color",
+    { body: { slot: 3 } });
+  assert.equal(r.status, 401);
+  assert.equal("ocapi3.atlassian.net" in orgColors, false);
+});
+
+test("POST /api/jira/<site>/autostart needs the user login", async () => {
+  await asBeat("asApi3", "asapi3.atlassian.net", { autoStart: false });
+  const r = await request("POST", "/api/jira/asapi3.atlassian.net/autostart",
+    { body: { enabled: true } });
+  assert.equal(r.status, 401);
+  assert.equal("asapi3.atlassian.net" in autoStartOrgs, false);
+});
+
+// ---- auto-stop a session when its ticket moves to Done (XERK-45, XERK-161) ----
+// The lifecycle counterpart to auto-start. A human moving a ticket to Done is the
+// "work finished" signal; the kill ends the session cleanly (resumable,
+// worktree/PRs kept) and frees its MAX_SESSIONS slot. UNLIKE auto-start this is
+// UNCONDITIONAL — NOT gated on the per-org "auto" opt-in (which governs only
+// auto-STARTING work), so a Done ticket retires its session in every org.
+
+// A Done ticket already being worked by a live session on the reporting host.
+const doneBeat = (device, site, {
+  status = "running", key = "ENG-9", ticketSite = site,
+  statusCategory = "done", extraSessions = [],
+} = {}) =>
+  asBeat(device, site, {
+    tickets: [{ key, summary: "Shipped", statusCategory,
+                repoGuess: { repo: "Turma", cloned: true } }],
+    sessions: [{ id: "sd1", status, ticket: { key, siteKey: ticketSite } },
+               ...extraSessions],
+  });
+
+test("auto-stop: a Done ticket's live session is killed", async () => {
+  autoStopped.clear();
+  await doneBeat("apHost", "ap1.atlassian.net");
+  autoStopSweep();
+  assert.deepEqual((agents.apHost.commands || []).map((c) => [c.type, c.sessionId]),
+    [["kill", "sd1"]]);
+});
+
+test("auto-stop: kills a Done ticket's session even when 'auto' is OFF (XERK-161)", async () => {
+  // The per-org "auto" opt-in governs only auto-STARTING work; a human moving a
+  // ticket to Done must always retire its session, whatever the toggle says.
+  autoStopped.clear();
+  await asBeat("apOff", "ap2.atlassian.net", {
+    autoStart: false,
+    tickets: [{ key: "ENG-9", statusCategory: "done",
+                repoGuess: { repo: "Turma", cloned: true } }],
+    sessions: [{ id: "sd1", status: "running",
+                 ticket: { key: "ENG-9", siteKey: "ap2.atlassian.net" } }],
+  });
+  assert.equal(orgsWithAutoStart().has("ap2.atlassian.net"), false, "org must be opted OUT");
+  autoStopSweep();
+  assert.deepEqual((agents.apOff.commands || []).map((c) => [c.type, c.sessionId]),
+    [["kill", "sd1"]]);
+});
+
+test("auto-stop: only Done tickets — an active ticket's session keeps running", async () => {
+  autoStopped.clear();
+  await doneBeat("apActive", "ap3.atlassian.net", { statusCategory: "inprogress" });
+  autoStopSweep();
+  assert.equal((agents.apActive.commands || []).length, 0);
+});
+
+test("auto-stop: only LIVE sessions — a stopped/error one is not killed", async () => {
+  autoStopped.clear();
+  await doneBeat("apStop", "ap4.atlassian.net", {
+    status: "stopped",
+    extraSessions: [{ id: "sd-err", status: "error",
+                      ticket: { key: "ENG-9", siteKey: "ap4.atlassian.net" } }],
+  });
+  autoStopSweep();
+  assert.equal((agents.apStop.commands || []).length, 0);
+});
+
+test("auto-stop: a queued session for an already-Done ticket is cancelled", async () => {
+  autoStopped.clear();
+  await doneBeat("apQ", "ap5.atlassian.net", { status: "queued" });
+  autoStopSweep();
+  assert.deepEqual((agents.apQ.commands || []).map((c) => [c.type, c.sessionId]),
+    [["kill", "sd1"]]);
+});
+
+test("auto-stop: kills EVERY live session on the Done ticket (two branches / restart)", async () => {
+  autoStopped.clear();
+  await doneBeat("apMany", "ap6.atlassian.net", {
+    extraSessions: [{ id: "sd2", status: "running",
+                      ticket: { key: "ENG-9", siteKey: "ap6.atlassian.net" } }],
+  });
+  autoStopSweep();
+  assert.deepEqual((agents.apMany.commands || []).map((c) => c.sessionId).sort(),
+    ["sd1", "sd2"]);
+});
+
+test("auto-stop: fires each session at most once, across repeated sweeps", async () => {
+  autoStopped.clear();
+  await doneBeat("apOnce", "ap7.atlassian.net");
+  autoStopSweep();
+  autoStopSweep();
+  assert.equal((agents.apOnce.commands || []).filter((c) => c.type === "kill").length, 1);
+});
+
+test("http: /api/agents does not serialize the jiraIssues cache (served only by /api/jira)", async () => {
+  await jiraBeat("jd9", "org9.atlassian.net", {
+    jiraIssueResults: [{ key: "ENG-1", issue: { key: "ENG-1", description: "x".repeat(500) }, error: null }],
+  });
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  for (const a of list.body.agents) {
+    assert.ok(!("jiraIssues" in a), `agent ${a.key} leaked its ticket cache into /api/agents`);
+  }
+  // The `jira` block itself (the board's tickets) still ships, though.
+  const rec = list.body.agents.find((a) => a.key === "jd9");
+  assert.equal(rec.jira.siteKey, "org9.atlassian.net");
+});
+
+test("http: ticket cache eviction — older than 10 minutes dropped, capped at 40 issues", async () => {
+  await jiraBeat("jdA", "orgA.atlassian.net", {
+    jiraIssueResults: [{ key: "OLD-1", issue: { key: "OLD-1" }, error: null }],
+  });
+  agents.jdA.jiraIssues["OLD-1"].fetchedAt = Date.now() - 11 * 60 * 1000;
+  await jiraBeat("jdA", "orgA.atlassian.net"); // any ingest re-sweeps
+  assert.equal(agents.jdA.jiraIssues["OLD-1"], undefined);
+
+  for (let i = 1; i <= 41; i++) {
+    await jiraBeat("jdA", "orgA.atlassian.net", {
+      jiraIssueResults: [{ key: `E-${i}`, issue: { key: `E-${i}` }, error: null }],
+    });
+  }
+  const keys = Object.keys(agents.jdA.jiraIssues);
+  assert.equal(keys.length, 40, "cache should be capped at 40 issues");
+  assert.ok(!keys.includes("E-1"), "oldest issue should have been evicted");
+  assert.ok(keys.includes("E-41"), "newest issue should remain");
 });
 
 // ---- pcmToWav ------------------------------------------------------------------
@@ -1421,6 +3742,33 @@ test("transcribePcm: language is passed through when present", async () => {
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: "hi", language: "en" }) });
   const result = await transcribePcm(Buffer.from([1]));
   assert.deepEqual(result, { text: "hi", language: "en" });
+  restoreFetch();
+});
+
+test("transcribePcm: WHISPER_LANGUAGE default sends the language hint", async () => {
+  let form;
+  globalThis.fetch = async (_url, opts) => {
+    form = opts.body;
+    return { ok: true, json: async () => ({ text: "hi" }) };
+  };
+  await transcribePcm(Buffer.from([1]));
+  assert.equal(form.get("language"), "en");
+  restoreFetch();
+});
+
+test("transcribePcm: empty WHISPER_LANGUAGE omits the hint (auto-detect)", async () => {
+  // A multilingual model (Parakeet) auto-detects when no language is pinned. An
+  // explicit empty WHISPER_LANGUAGE must OMIT the field — `??` lets "" through,
+  // where `||` would fall back to the "en" default and force English.
+  let form;
+  globalThis.fetch = async (_url, opts) => {
+    form = opts.body;
+    return { ok: true, json: async () => ({ text: "hola", language: "es" }) };
+  };
+  const auto = freshServerModule((env) => { env.WHISPER_LANGUAGE = ""; });
+  const result = await auto.transcribePcm(Buffer.from([1]));
+  assert.equal(form.has("language"), false);
+  assert.deepEqual(result, { text: "hola", language: "es" });
   restoreFetch();
 });
 
@@ -1823,6 +4171,7 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
       {
         id: "ls1",
         worktreePath: "/wt/ls1",
+        transcriptId: "conv-ls1",
         session: { tail: [{ id: "c1", role: "assistant", text: "cached" }] },
       },
     ],
@@ -1845,10 +4194,15 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
   assert.equal(seed.type, "tail");
   assert.deepEqual(seed.entries, [{ id: "c1", role: "assistant", text: "cached" }]);
 
-  // 2. The agent was told to start tailing, with the worktree path.
+  // 2. The agent was told to start tailing, with everything it needs to find
+  //    the transcript: the worktree path (-> the project dir) and the id naming
+  //    this session's own conversation inside it. Root sessions share one
+  //    project dir, so without the id the agent tails the newest transcript
+  //    there — the previous root session's (XERK-6).
   const watch = await nextTextJson(ctrlFrames, 0);
   assert.equal(watch.watch, "ls1");
   assert.equal(watch.worktreePath, "/wt/ls1");
+  assert.equal(watch.transcriptId, "conv-ls1");
 
   // 3. A tail delta the agent pushes on the control channel reaches the live
   //    client — including the rich `blocks` the native chat UI renders. The hub
@@ -1864,15 +4218,25 @@ test("live WS: seeds cached tail, watches via the control channel, fans out delt
   const relayed = await nextTextJson(liveFrames, 1);
   assert.equal(relayed.type, "tail");
   assert.deepEqual(relayed.entries, delta.entries);
+  // An agent predating the queued field: the hub normalises to [].
+  assert.deepEqual(relayed.queued, []);
+
+  // 3a. Still-queued prompts (typed mid-turn; foldQueueOp in tunnel-agent.js)
+  //     ride beside the entries and reach the live client.
+  ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify(
+    { tail: "ls1", entries: delta.entries, queued: ["also do X"] }))));
+  const queuedFrame = await nextTextJson(liveFrames, 2);
+  assert.equal(queuedFrame.type, "tail");
+  assert.deepEqual(queuedFrame.queued, ["also do X"]);
 
   // 3b. A live `turn` delta (in-progress assistant text from the TUI) is fanned
   //     out too, including the empty-string clear on completion.
   ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({ turn: "ls1", text: "streaming…" }))));
-  const turn = await nextTextJson(liveFrames, 2);
+  const turn = await nextTextJson(liveFrames, 3);
   assert.equal(turn.type, "turn");
   assert.equal(turn.text, "streaming…");
   ctrl.socket.write(maskedFrame(0x1, Buffer.from(JSON.stringify({ turn: "ls1", text: "" }))));
-  const cleared = await nextTextJson(liveFrames, 3);
+  const cleared = await nextTextJson(liveFrames, 4);
   assert.equal(cleared.type, "turn");
   assert.equal(cleared.text, "");
 
@@ -1892,7 +4256,8 @@ test("live WS: a control channel connecting after watchers exist re-arms their w
     lastSeen: Date.now(),
     commands: [],
     history: {},
-    sessions: [{ id: "rs1", worktreePath: "/wt/rs1", session: { tail: [] } }],
+    sessions: [{ id: "rs1", worktreePath: "/wt/rs1", transcriptId: "conv-rs1",
+      session: { tail: [] } }],
   };
 
   // Watcher attaches while the tunnel is offline (no control channel yet).
@@ -1900,16 +4265,63 @@ test("live WS: a control channel connecting after watchers exist re-arms their w
   const live = await wsConnect(`/live/rehost/rs1?auth=${token}`);
   assert.match(live.statusLine, /^HTTP\/1\.1 101/);
 
-  // Now the tunnel connects — it must be told to watch the already-attached session.
+  // Now the tunnel connects — it must be told to watch the already-attached
+  // session, and re-armed with the same target a first watch would carry.
   const ctrl = await wsConnect(`/agent/control?name=rehost&token=agenttok`);
   const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
   const watch = await nextTextJson(ctrlFrames, 0);
   assert.equal(watch.watch, "rs1");
   assert.equal(watch.worktreePath, "/wt/rs1");
+  assert.equal(watch.transcriptId, "conv-rs1");
 
   live.socket.destroy();
   ctrl.socket.destroy();
   delete agents.rehost;
+});
+
+test("live WS: a watched session whose transcript MOVES is re-armed onto the new one", async () => {
+  // "Restart (clear context)" relaunches claude on a fresh transcript. A watch
+  // is otherwise sent once and held for its lifetime, so without a re-arm the
+  // agent keeps tailing a file the session will never write to again and the
+  // chat freezes on the pre-restart conversation.
+  const beat = (transcriptId) => request("POST", "/api/heartbeat", {
+    body: {
+      device: "movehost",
+      sessions: [{ id: "ms1", worktreePath: "/wt/ms1", transcriptId, session: { tail: [] } }],
+    },
+    headers: agentHeaders,
+  });
+  await beat("conv-one");
+
+  const ctrl = await wsConnect(`/agent/control?name=movehost&token=agenttok`);
+  const ctrlFrames = collectFrames(ctrl.socket, ctrl.leftover);
+  const token = await issueToken();
+  const live = await wsConnect(`/live/movehost/ms1?auth=${token}`);
+  assert.match(live.statusLine, /^HTTP\/1\.1 101/);
+
+  // finally, not a tail of straight-line destroys: an open socket keeps the
+  // run's event loop alive, so a failing assertion here would hang the suite
+  // instead of reporting itself.
+  try {
+    const first = await nextTextJson(ctrlFrames, 0);
+    assert.equal(first.transcriptId, "conv-one");
+
+    // A beat reporting the same transcript is not a move — nothing is re-sent.
+    await beat("conv-one");
+    // The restart lands: a new conversation, so the watch follows it.
+    await beat("conv-two");
+    // Frame 1 is the SECOND control frame ever sent. Asserting the move landed
+    // there is also what proves the unchanged beat above sent nothing: had it
+    // re-armed, this would read conv-one.
+    const rearm = await nextTextJson(ctrlFrames, 1);
+    assert.equal(rearm.watch, "ms1");
+    assert.equal(rearm.worktreePath, "/wt/ms1");
+    assert.equal(rearm.transcriptId, "conv-two");
+  } finally {
+    live.socket.destroy();
+    ctrl.socket.destroy();
+    delete agents.movehost;
+  }
 });
 
 // ---- /api/agents ETag + 304 (FIX 3/#9) --------------------------------------
@@ -1917,17 +4329,28 @@ test("live WS: a control channel connecting after watchers exist re-arms their w
 test("/api/agents: emits an ETag; unchanged If-None-Match -> 304; state change re-etags", async () => {
   await request("POST", "/api/heartbeat", { body: { device: "etag-host" }, headers: agentHeaders });
 
-  const first = await request("GET", "/api/agents", { headers: userHeaders });
-  assert.equal(first.status, 200);
+  // Earlier tests' torn-down control sockets surface as ASYNC close events
+  // ("tunnel gone: …" → publishAgent → invalidateAgentsCache) that can land
+  // between this test's two GETs; the rebuilt body embeds a fresh `now`, so a
+  // stray invalidation re-etags with no real state change and the 304 reads
+  // 200. Retry until two consecutive GETs agree — the world has settled — then
+  // assert the invariant: absent state changes, revalidation 304s.
+  let first, notMod;
+  for (let i = 0; i < 10; i++) {
+    first = await request("GET", "/api/agents", { headers: userHeaders });
+    assert.equal(first.status, 200);
+    notMod = await request("GET", "/api/agents", {
+      headers: { ...userHeaders, "if-none-match": first.headers.etag },
+    });
+    if (notMod.status === 304) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
   const etag = first.headers.etag;
   assert.ok(etag, "no ETag on /api/agents");
   // no-cache (not no-store) so the browser keeps the body + revalidates.
   assert.match(first.headers["cache-control"], /no-cache/);
 
   // Same ETag echoed back -> cheap 304, empty body.
-  const notMod = await request("GET", "/api/agents", {
-    headers: { ...userHeaders, "if-none-match": etag },
-  });
   assert.equal(notMod.status, 304);
   assert.equal(notMod.raw, "");
   assert.equal(notMod.headers.etag, etag);
@@ -2025,4 +4448,270 @@ test("SSE /api/events: pushes a `removed` event when a host is deleted", async (
 
   req.destroy();
   res.destroy();
+});
+
+// ---- agent control channel: liveness ---------------------------------------
+// The hub half of the wedged-tunnel fix. The agent cannot see a protocol ping
+// (Node's built-in WebSocket handles 0x9 internally and exposes no ping event),
+// so the hub must also beat an app-level {ping} it CAN see — that frame is the
+// whole reason a restarted hub no longer strands every terminal. The 0x9 stays
+// for Cloudflare's idle timeout and for the pong that proves the agent is live.
+
+const CONTROL_PATH = "/agent/control?name=livehost&token=agenttok";
+
+// Wait for a frame matching `pred`, or resolve null. Frames arrive on a beat,
+// so this polls the array collectFrames fills rather than racing a single read.
+const waitFrame = (frames, pred, ms = 2000) =>
+  new Promise((resolve) => {
+    const t = setInterval(() => {
+      const hit = frames.find(pred);
+      if (hit) {
+        clearInterval(t);
+        clearTimeout(k);
+        resolve(hit);
+      }
+    }, 10);
+    const k = setTimeout(() => {
+      clearInterval(t);
+      resolve(null);
+    }, ms);
+  });
+
+const jsonFrame = (f) => {
+  if (f.op !== 0x1) return null;
+  try { return JSON.parse(f.payload.toString("utf8")); } catch { return null; }
+};
+
+test("control WS: hub beats an app-level {ping} the agent can actually see", async () => {
+  const { socket, statusLine, leftover } = await wsConnect(CONTROL_PATH);
+  try {
+    assert.match(statusLine, /101/);
+    const frames = collectFrames(socket, leftover);
+    // The app-level ping: a text frame, because the protocol ping below is
+    // invisible to the agent's WebSocket client.
+    const ping = await waitFrame(frames, (f) => jsonFrame(f) && jsonFrame(f).ping);
+    assert.ok(ping, "hub never sent an app-level {ping} — agents cannot detect a dead hub without it");
+    // And the protocol ping is still there (Cloudflare idle timeout + pong).
+    assert.ok(await waitFrame(frames, (f) => f.op === 0x9), "hub stopped sending the protocol ping");
+  } finally {
+    socket.destroy();
+  }
+});
+
+test("control WS: a channel that never pongs is dropped, so terminalOnline stops lying", async () => {
+  const { socket, leftover } = await wsConnect(CONTROL_PATH);
+  try {
+    collectFrames(socket, leftover);
+    // This raw socket answers nothing — a half-open channel to a host that died
+    // without a FIN. The hub must reap it rather than keep reporting the host's
+    // terminal as online while every Attach hangs.
+    const closed = await new Promise((resolve) => {
+      socket.on("close", () => resolve(true));
+      setTimeout(() => resolve(false), 3000);
+    });
+    assert.ok(closed, "hub kept a silent (half-open) control channel forever");
+  } finally {
+    socket.destroy();
+  }
+});
+
+test("control WS: a channel that pongs is kept past the dead-after window", async () => {
+  const { socket, leftover } = await wsConnect(CONTROL_PATH);
+  try {
+    // Mirror what a real agent's WebSocket does for free: auto-pong every ping.
+    // Client->server frames must be masked, so encode by hand.
+    const parse = wsParser((op) => {
+      if (op !== 0x9) return;
+      const mask = Buffer.from([1, 2, 3, 4]);
+      socket.write(Buffer.concat([Buffer.from([0x80 | 0xa, 0x80]), mask]));
+    });
+    if (leftover && leftover.length) parse(leftover);
+    socket.on("data", parse);
+    const closed = await new Promise((resolve) => {
+      socket.on("close", () => resolve(true));
+      // Well past CONTROL_DEAD_AFTER_MS: a ponging peer must survive.
+      setTimeout(() => resolve(false), 1500);
+    });
+    assert.ok(!closed, "hub dropped a live channel that was answering its pings");
+  } finally {
+    socket.destroy();
+  }
+});
+
+// ---- session migration across hosts (XERK-101) --------------------------------
+// Move a running session from one agent to another in the same org. The hub
+// orchestrates: exportSession on the source, a raw-transcript relay through the
+// hub, importSession on the target, then a kill of the source once it's up.
+
+// Seed a host reporting a running, worktree-backed session `s1` on `repo`, in
+// org `site`. Fields are exactly what the /migrate endpoint validates.
+const migHost = (device, site, {
+  session = "s1", repo = "Turma", repos = ["Turma"], status = "running",
+  root = false, transcriptId = "trans-" + device, extraSessions = [],
+} = {}) =>
+  request("POST", "/api/heartbeat", {
+    body: {
+      device,
+      repos: repos.map((name) => ({ name, path: `/git/${name}` })),
+      jira: { available: true, configured: true, siteKey: site, user: `${device}@x.com`, tickets: [] },
+      sessions: [
+        {
+          id: session, status, root, repo, transcriptId,
+          worktreePath: `/git/.turma/worktrees/${repo}/${session}`,
+          model: "opus", permissionMode: "auto", summary: "Fix the logs",
+          ticket: { key: "ENG-9", siteKey: site, url: "u", summary: "Fix the logs", branch: "ENG-9" },
+        },
+        ...extraSessions,
+      ],
+    },
+    headers: agentHeaders,
+  });
+
+// A raw-body request (the JSON `request` helper can't carry an octet-stream).
+function requestRaw(method, pathName, { body, headers } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(baseUrl + pathName, { method, headers }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const buf = Buffer.concat(chunks);
+        let parsed = null;
+        try { parsed = JSON.parse(buf.toString()); } catch {}
+        resolve({ status: res.statusCode, body: parsed, buf, headers: res.headers });
+      });
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+const migrate = (host, session, body) =>
+  request("POST", `/api/agents/${host}/sessions/${session}/migrate`,
+    { body, headers: userHeaders });
+
+test("migrate: rejects a bad source, target, or org mismatch", async () => {
+  await migHost("mSrc", "m1.atlassian.net");
+  await migHost("mTgt", "m1.atlassian.net");
+  await migHost("mOther", "m2.atlassian.net"); // a different org
+
+  // unknown session
+  assert.equal((await migrate("mSrc", "nope", { host: "mTgt" })).status, 404);
+  // no target / same host
+  assert.equal((await migrate("mSrc", "s1", { host: "" })).status, 400);
+  assert.equal((await migrate("mSrc", "s1", { host: "mSrc" })).status, 400);
+  // unknown target
+  assert.equal((await migrate("mSrc", "s1", { host: "ghost" })).status, 404);
+  // different org
+  assert.equal((await migrate("mSrc", "s1", { host: "mOther" })).status, 409);
+});
+
+test("migrate: rejects a root session and one with no conversation yet", async () => {
+  await migHost("mRoot", "mr.atlassian.net", { root: true });
+  await migHost("mRootTgt", "mr.atlassian.net");
+  assert.equal((await migrate("mRoot", "s1", { host: "mRootTgt" })).status, 409);
+
+  await migHost("mFresh", "mf.atlassian.net", { transcriptId: null });
+  await migHost("mFreshTgt", "mf.atlassian.net");
+  assert.equal((await migrate("mFresh", "s1", { host: "mFreshTgt" })).status, 409);
+});
+
+test("migrate: rejects a target that lacks the repo cloned", async () => {
+  await migHost("mHas", "mrepo.atlassian.net", { repos: ["Turma"] });
+  await migHost("mLacks", "mrepo.atlassian.net", { repos: ["Other"] });
+  const r = await migrate("mHas", "s1", { host: "mLacks" });
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /clone it there first/);
+});
+
+test("migrate: full move — export, relay, import, then kill the source", async () => {
+  await migHost("mgA", "mg.atlassian.net");
+  await migHost("mgB", "mg.atlassian.net");
+
+  // 1. Start the move: exportSession queued on the source, migration exporting.
+  const r = await migrate("mgA", "s1", { host: "mgB" });
+  assert.equal(r.status, 200);
+  const mid = r.body.migrationId;
+  assert.ok(mid);
+  assert.deepEqual(agents.mgA.commands, [
+    { type: "exportSession", sessionId: "s1", migrationId: mid, cmdId: agents.mgA.commands[0].cmdId },
+  ]);
+  assert.equal(migrations.get(mid).phase, "exporting");
+
+  // 2. The source uploads the raw transcript bundle -> importSession on target.
+  const blob = Buffer.from("PRETEND-GZIP-TAR-BYTES");
+  const up = await requestRaw("POST", `/api/agents/mgA/migrations/${mid}/blob`,
+    { body: blob, headers: { authorization: "Bearer agenttok", "content-type": "application/octet-stream" } });
+  assert.equal(up.status, 200);
+  const m = migrations.get(mid);
+  assert.equal(m.phase, "importing");
+  const imp = agents.mgB.commands.find((c) => c.type === "importSession");
+  assert.ok(imp);
+  assert.equal(imp.migrationId, mid);
+  assert.equal(imp.transcriptId, "trans-mgA");
+  assert.equal(imp.cwd, "/git/.turma/worktrees/Turma/s1");
+  assert.equal(imp.repo, "Turma");
+  assert.equal(imp.model, "opus");
+  assert.equal(imp.ticket.key, "ENG-9");
+  assert.equal(imp.migratedFrom.host, "mgA");
+  assert.equal(m.importCmdId, imp.cmdId);
+
+  // 3. The target agent pulls the bundle back (byte-identical).
+  const dl = await requestRaw("GET", `/api/agents/mgB/migrations/${mid}/blob`,
+    { headers: { authorization: "Bearer agenttok" } });
+  assert.equal(dl.status, 200);
+  assert.equal(dl.headers["content-type"], "application/octet-stream");
+  assert.ok(blob.equals(dl.buf));
+
+  // 4. The target session comes up (spawnCmdId === importCmdId) -> the hub kills
+  //    the source and finishes the migration on that heartbeat.
+  await migHost("mgB", "mg.atlassian.net", {
+    extraSessions: [{ id: "new1", status: "running", root: false, repo: "Turma",
+      transcriptId: "trans-mgA", worktreePath: "/git/.turma/worktrees/Turma/s1",
+      spawnCmdId: m.importCmdId }],
+  });
+  const after = migrations.get(mid);
+  assert.equal(after.phase, "done");
+  assert.equal(after.targetSessionId, "new1");
+  assert.ok(agents.mgA.commands.some((c) => c.type === "kill" && c.sessionId === "s1"),
+    "source session should be killed once the target is up");
+  // The blob is freed on handoff.
+  assert.equal(after.blob, null);
+});
+
+test("migrate: a second move of the same session is single-flighted", async () => {
+  await migHost("sfA", "sf.atlassian.net");
+  await migHost("sfB", "sf.atlassian.net");
+  const first = await migrate("sfA", "s1", { host: "sfB" });
+  assert.equal(first.status, 200);
+  const second = await migrate("sfA", "s1", { host: "sfB" });
+  assert.equal(second.status, 409);
+  assert.match(second.body.error, /already being moved/);
+});
+
+test("migrate: a stalled move times out and frees its blob", async () => {
+  await migHost("toA", "to.atlassian.net");
+  await migHost("toB", "to.atlassian.net");
+  const r = await migrate("toA", "s1", { host: "toB" });
+  const m = migrations.get(r.body.migrationId);
+  m.startedAt = Date.now() - 10 * 60 * 1000; // well past MIGRATE_TIMEOUT_MS
+  advanceMigrations();
+  assert.equal(m.phase, "failed");
+  assert.match(m.error, /timed out/);
+  assert.equal(m.blob, null);
+});
+
+test("migrate: the blob relay rejects an unauthenticated caller", async () => {
+  await migHost("auA", "au.atlassian.net");
+  await migHost("auB", "au.atlassian.net");
+  const r = await migrate("auA", "s1", { host: "auB" });
+  const mid = r.body.migrationId;
+  // No credentials, and a bad bearer token, are both refused (like the
+  // heartbeat, the user login also works — but nothing unauthenticated does).
+  const anon = await requestRaw("POST", `/api/agents/auA/migrations/${mid}/blob`,
+    { body: Buffer.from("x") });
+  assert.equal(anon.status, 401);
+  const badTok = await requestRaw("POST", `/api/agents/auA/migrations/${mid}/blob`,
+    { body: Buffer.from("x"), headers: { authorization: "Bearer nope" } });
+  assert.equal(badTok.status, 401);
 });

@@ -5,18 +5,130 @@ set -e
 # the Python session manager (hub-agent.py) scans REPOS_ROOT and multiplexes N
 # worktree-backed Claude sessions, each with its own tmux (agent-<id>) + ttyd
 # (127.0.0.1:<port>, base /term/<id>), created/killed from the Turma UI.
-# This entrypoint just does the Claude creds preflight, starts the reverse
-# tunnel, and then hands off to the manager as the long-lived foreground
-# process. The container stays up with ZERO sessions (no more "session ends ->
-# PID 1 exits -> container restarts" loop; restart/clear-context is now a
-# per-session op the manager performs).
+# This entrypoint resolves the identity to run as, does the Claude creds
+# preflight, starts the reverse tunnel, and then hands off to the manager as the
+# long-lived foreground process. The container stays up with ZERO sessions (no
+# more "session ends -> PID 1 exits -> container restarts" loop;
+# restart/clear-context is now a per-session op the manager performs).
 
 # Which coding agent this container runs. Selected by the AGENT env var (set
-# per-stack in DockerOps). Defaults to claude; only claude is wired up today
-# (it reuses the host's login via the /root/.claude bind mount and is the only
-# agent the manager knows how to Remote-Control). The other agents are still
-# installed in the image for future use.
+# per-stack in DockerOps). Defaults to claude, and claude is the ONLY agent
+# installed or supported: it reuses the host's login via the /root/.claude bind
+# mount and is the only agent the manager knows how to Remote-Control
+# (hub-agent.py launches `claude` unconditionally — it never reads AGENT).
+# The image used to also carry codex/copilot/opencode against a dispatch that
+# was never built; they were dropped rather than keep shipping 959 MB of
+# binaries nothing could reach. All this var still does is gate the claude
+# credential preflight below, so a non-claude value skips that check and then
+# gets a claude session anyway. Wire up real dispatch here (and re-add the
+# install in agent/Dockerfile) if a second agent is ever supported.
 AGENT="${AGENT:-claude}"
+
+# --- Run-as identity (agent-agnostic) --------------------------------------
+# Everything this container produces lands in bind-mounted HOST directories: the
+# git root (worktree checkouts and every file a session edits) and the Claude
+# login (~/.claude transcripts + settings). Running as root means all of it is
+# written back root-owned, and the operator can't touch their own repo or
+# settings without sudo. So run as the uid/gid that OWNS the git root — by
+# definition the host user whose repos these are.
+#
+# Auto-detected from REPOS_ROOT's owner, so no per-host config is needed:
+#   * root-owned git root (the TrueNAS stack)   -> 0:0, we stay root as before
+#   * user-owned git root (WSL / a desktop)     -> that uid:gid, we drop to it
+# PUID/PGID in the compose env override the detection if a host needs something
+# else; PUID=0 forces the old always-root behaviour.
+REPOS_ROOT="${REPOS_ROOT:-/mnt/data/Docker/git}"
+export REPOS_ROOT
+PUID="${PUID:-$(stat -c %u "$REPOS_ROOT" 2>/dev/null || echo 0)}"
+PGID="${PGID:-$(stat -c %g "$REPOS_ROOT" 2>/dev/null || echo 0)}"
+
+RUN_USER=root
+DROP_PRIV=no
+
+# Gate on PUID alone: uid 0 IS root whatever the gid says, so a PUID=0 host stays
+# on the byte-for-byte original path and PGID is moot there.
+if [ "$PUID" = "0" ]; then
+  echo "[entrypoint] identity: root — nothing to drop (REPOS_ROOT is root-owned, or PUID=0 forces it)"
+else
+  DROP_PRIV=yes
+  # Reuse whatever passwd/group entry already claims these ids and only create
+  # one when the id is genuinely free — the node base image ships node:node at
+  # 1000:1000, which is exactly where a WSL/desktop host user usually lands.
+  RUN_GROUP="$(getent group "$PGID" | cut -d: -f1)"
+  if [ -z "$RUN_GROUP" ]; then
+    RUN_GROUP=agent
+    groupadd -g "$PGID" "$RUN_GROUP"
+  fi
+  RUN_USER="$(getent passwd "$PUID" | cut -d: -f1)"
+  if [ -z "$RUN_USER" ]; then
+    RUN_USER=agent
+    useradd -u "$PUID" -g "$PGID" -M -d /root -s /bin/sh "$RUN_USER"
+  else
+    usermod -g "$PGID" -d /root "$RUN_USER"
+  fi
+
+  # HOME stays /root: every bind mount targets /root/.claude, /root/.claude.json
+  # and /root/.config/gh, and hub-agent.py resolves ~/.turma and
+  # /root/.claude/projects off it. Moving HOME would mean re-plumbing all of that
+  # plus the DockerOps compose, so instead give /root to the run-as user.
+  # Deliberately NOT recursive: /root's children are the host's own bind mounts,
+  # already correctly owned host-side, and recursing would rewrite the
+  # operator's real ~/.claude wholesale.
+  export HOME=/root
+  export USER="$RUN_USER"
+  export LOGNAME="$RUN_USER"
+  chown "$PUID:$PGID" /root
+
+  # The docker socket: `docker` CLI backs the container self-inspect behind the
+  # device-name probe and log tail, plus the hub-initiated restart. Root got that
+  # for free; a dropped user needs to be in the group that owns the socket.
+  # NOTE: on a host where the socket is root:root this joins group 0 — broad, but
+  # it is the only way to keep those features working once we're not root.
+  DOCKER_SOCK=/var/run/docker.sock
+  if [ -S "$DOCKER_SOCK" ]; then
+    SOCK_GID="$(stat -c %g "$DOCKER_SOCK")"
+    SOCK_GROUP="$(getent group "$SOCK_GID" | cut -d: -f1)"
+    if [ -z "$SOCK_GROUP" ]; then
+      SOCK_GROUP=dockersock
+      groupadd -g "$SOCK_GID" "$SOCK_GROUP"
+    fi
+    usermod -aG "$SOCK_GROUP" "$RUN_USER"
+    echo "[entrypoint] docker socket: joined ${SOCK_GROUP}(${SOCK_GID})"
+  fi
+
+  # Self-heal the legacy root-owned files. Everything written before this image
+  # learned to drop privileges is still root-owned on the host — which is the
+  # very breakage this exists to end, and it does NOT fix itself, because the
+  # operator can no longer chown what they no longer own. Reclaim it here, once:
+  # after the first boot this is a scan that finds nothing. -h so a symlink is
+  # retargeted rather than followed out of the tree.
+  echo "[entrypoint] identity: ${RUN_USER}(${PUID}:${PGID}) — reclaiming root-owned leftovers..."
+  for p in "$REPOS_ROOT" /root/.claude /root/.claude.json /root/.turma \
+           /root/.aws /root/.azure /root/.terraform.d; do
+    [ -e "$p" ] || continue
+    find "$p" -uid 0 -exec chown -h "$PUID:$PGID" {} + 2>/dev/null || true
+  done
+  echo "[entrypoint] identity: ${RUN_USER}(${PUID}:${PGID}) ready"
+fi
+
+# Run a command as the resolved identity. A plain pass-through when we stayed
+# root, so the TrueNAS stack executes byte-for-byte the same commands as before.
+run_as() {
+  if [ "$DROP_PRIV" = "no" ]; then
+    "$@"
+  else
+    setpriv --reuid "$PUID" --regid "$PGID" --init-groups "$@"
+  fi
+}
+
+# exec form of run_as — replaces this shell, for the final long-lived process.
+exec_as() {
+  if [ "$DROP_PRIV" = "no" ]; then
+    exec "$@"
+  else
+    exec setpriv --reuid "$PUID" --regid "$PGID" --init-groups "$@"
+  fi
+}
 
 # --- Claude-only preflight -------------------------------------------------
 # Reuse the host's subscription login. Remote Control requires a subscription
@@ -53,11 +165,13 @@ fi
 #   * Windows hosts keep it in Credential Manager, which this container can't
 #     read; the mounted dir must be seeded FROM WITHIN THIS CONTAINER (never a
 #     host script) — see the seed command printed below.
+# Probed as the run-as identity, not root, so what it reports is what the
+# sessions will actually get.
 # Non-fatal: we log the state (and the fix) but still start the manager, so
 # sessions that don't touch private git keep working.
 if command -v gh >/dev/null 2>&1; then
-  if gh auth status >/dev/null 2>&1; then
-    echo "[entrypoint] gh: authenticated as $(gh api user -q .login 2>/dev/null || echo '?')"
+  if run_as gh auth status >/dev/null 2>&1; then
+    echo "[entrypoint] gh: authenticated as $(run_as gh api user -q .login 2>/dev/null || echo '?')"
   else
     echo "[entrypoint] gh: NOT authenticated — private git ops and 'gh pr create' will fail."
     echo "[entrypoint]   Seed/refresh the token from WITHIN this container (the host keyring"
@@ -65,6 +179,102 @@ if command -v gh >/dev/null 2>&1; then
     echo "[entrypoint]     docker exec -it $(hostname) gh auth login --hostname github.com"
   fi
 fi
+
+# --- Non-GitHub git creds preflight (agent-agnostic) -----------------------
+# github.com authenticates through gh (above); every OTHER git host (GitLab,
+# Bitbucket, Azure DevOps, self-hosted) authenticates through the `store` helper
+# wired in the Dockerfile, which reads the host's own cached git credentials from
+# an OPTIONAL bind mount at /root/.git-credentials. For an org that doesn't use
+# GitHub this is how private clone/fetch/push works at all.
+# Non-fatal and presence-only, exactly like the cloud creds below: a host that
+# mounts none is supported (it just has no non-GitHub git auth). The file is a
+# sound marker on its own — nothing in this image creates it by merely running
+# (unlike ~/.azure), so its existence means the host really seeded it.
+if [ -s /root/.git-credentials ]; then
+  echo "[entrypoint] git: non-GitHub creds mounted at /root/.git-credentials"
+else
+  echo "[entrypoint] git: no cached non-GitHub creds (/root/.git-credentials) — github.com still works via gh"
+fi
+
+# --- Azure DevOps git auth (XERK-54) ---------------------------------------
+# When the board is pointed at an Azure DevOps org (AZDO_URL + AZDO_TOKEN), the
+# agent already holds a PAT — so reuse it for plain git instead of mounting the
+# host's creds. hub-agent.py wires a URL-scoped http.extraHeader (--system, hence
+# run as root here, BEFORE the privilege drop) so clone/fetch/push against the
+# ADO host authenticate with no mount and no credential helper — the counterpart
+# of github.com going through gh. extraHeader (not proactiveAuth) because the
+# image's git predates proactiveAuth; see azure_git_auth_config(). Non-fatal and
+# secret-safe: it logs the host, never the token.
+if [ -n "${AZDO_URL:-}" ] && [ -n "${AZDO_TOKEN:-}" ]; then
+  python3 /usr/local/bin/hub-agent.py --wire-azure-git || true
+fi
+
+# --- Cloud CLI creds preflight (agent-agnostic) ----------------------------
+# terraform, az and aws are installed in every image, but their credentials are
+# the HOST's, reused through bind mounts exactly like claude (/root/.claude) and
+# gh (/root/.config/gh):
+#   /root/.aws          aws  — config + credentials
+#   /root/.azure        az   — azureProfile.json + the MSAL token cache
+#   /root/.terraform.d  terraform — credentials.tfrc.json (Terraform Cloud)
+# A host with none of them mounted is a SUPPORTED configuration, not an error:
+# the CLIs stay on PATH and unauthenticated, which is all a host that never
+# touches a cloud needs. So this block only ever logs — it is not fatal, it
+# creates nothing, and it must never idle the container the way the claude
+# preflight above does, because a missing ~/.azure says nothing about whether
+# this host can run sessions.
+#
+# Deliberately a presence check rather than `aws sts get-caller-identity` /
+# `az account show`: those are slow (the aws one is a network round trip with
+# its own retry budget) and would tax boot on every host — most of them — to
+# report what the mount's absence already says. A stale/expired token is the
+# CLI's problem to report at the point of use, in the session, where the agent
+# can actually see the error and re-login.
+env_creds_set() {
+  for v in "$@"; do
+    eval "val=\${$v:-}"
+    [ -n "$val" ] && return 0
+  done
+  return 1
+}
+
+# cloud_creds <label> <cli> <store> <marker>... — report where (if anywhere)
+# this CLI's credentials come from. Silent for a CLI that isn't installed, so an
+# image that drops one doesn't log about it.
+#
+# Keyed on a marker FILE that only a real login leaves behind, never on the store
+# directory existing: each CLI creates its OWN store the first time it runs at
+# all. `az version` alone writes a whole /root/.azure — including an empty
+# azureProfile.json, which is why even that isn't a marker — and `terraform
+# version` writes /root/.terraform.d. So on any host where a session has ever run
+# one of these, a directory check reports creds that aren't there.
+cloud_creds() {
+  label="$1"; cli="$2"; store="$3"; shift 3
+  command -v "$cli" >/dev/null 2>&1 || return 0
+  for marker in "$@"; do
+    if [ -e "$marker" ]; then
+      echo "[entrypoint] ${label}: host creds mounted at ${store}"
+      return 0
+    fi
+  done
+  echo "[entrypoint] ${label}: installed; no creds on this device (${store}) — ignoring"
+}
+
+# aws also authenticates straight from AWS_* env creds with no ~/.aws at all, so
+# a host set up that way must not be reported as credential-less. az has no
+# equivalent (its env vars only feed `az login --service-principal`, an explicit
+# command) and terraform's Terraform Cloud token can also arrive as a
+# TF_TOKEN_<host> var whose name is per-host and so not probed here. Provider
+# creds (AWS_*, ARM_*) are the provider's business, not ours.
+if command -v aws >/dev/null 2>&1 \
+   && env_creds_set AWS_ACCESS_KEY_ID AWS_PROFILE AWS_ROLE_ARN; then
+  echo "[entrypoint] aws: credentials from the environment"
+else
+  cloud_creds "aws" aws /root/.aws /root/.aws/credentials /root/.aws/config
+fi
+cloud_creds "az" az /root/.azure \
+  /root/.azure/msal_token_cache.json /root/.azure/service_principal_entries.json
+cloud_creds "terraform" terraform /root/.terraform.d \
+  /root/.terraform.d/credentials.tfrc.json
 
 # --- Host identity (agent-agnostic) ----------------------------------------
 # The hub keys each agent by its physical host name (device). A container can't
@@ -75,7 +285,7 @@ fi
 # SMB probe runs at most once). An explicit DEVICE_NAME from the compose still
 # wins. The sed pulls the DEVICE_NAME= line out of the manager's boot logs.
 if [ -z "${DEVICE_NAME:-}" ]; then
-  DEVICE_NAME="$(python3 /usr/local/bin/hub-agent.py --print-device 2>/dev/null | sed -n 's/^DEVICE_NAME=//p' | tail -n1)"
+  DEVICE_NAME="$(run_as python3 /usr/local/bin/hub-agent.py --print-device 2>/dev/null | sed -n 's/^DEVICE_NAME=//p' | tail -n1)"
   export DEVICE_NAME
   echo "[entrypoint] resolved device name: ${DEVICE_NAME:-<unresolved>}"
 fi
@@ -85,12 +295,29 @@ fi
 # OUTBOUND WebSocket to TURMA_URL so the hub can reach this container's per-session
 # ttyds from any network/host. The hub tells it which port to bridge per data
 # channel (see agent/tunnel-agent.js + turma/server.js).
-node /usr/local/bin/tunnel-agent.js &
+#
+# SUPERVISED, like the native launcher's --tunnel-supervisor and for the tail
+# end of the same reason (XERK-34): the tunnel dying while the manager lives is
+# the one failure that reads as a perfectly healthy host — the heartbeat (a
+# separate HTTP POST) keeps the card green while every session on it says
+# "terminal offline". Fire-and-forget made a tunnel PROCESS death (an uncaught
+# exception — socket-level failures self-heal via its own reconnect loop) stick
+# until someone restarted the whole container. No node check inside the loop,
+# unlike the native supervisor's: node is a baked image layer here, not an apt
+# prerequisite that can be missing.
+TUNNEL_RETRY_SEC="${TUNNEL_RETRY_SEC:-10}"
+(
+  while :; do
+    run_as node /usr/local/bin/tunnel-agent.js || true
+    echo "[entrypoint] tunnel-agent exited; restarting in ${TUNNEL_RETRY_SEC}s"
+    sleep "$TUNNEL_RETRY_SEC"
+  done
+) &
 
 # Session manager + heartbeat, in the FOREGROUND as the container's long-lived
 # process. It owns the persisted registry (~/.turma/sessions.json), scans
 # REPOS_ROOT for repos, auto-resumes running sessions, executes hub commands
 # (spawn/kill/start/restart/delete), and heartbeats repos[]+sessions[] to the
 # hub. exec so it becomes the main process (clean signal handling / restarts).
-echo "Starting Turma session manager (REPOS_ROOT=${REPOS_ROOT:-/mnt/data/Docker/git})..."
-exec python3 /usr/local/bin/hub-agent.py
+echo "Starting Turma session manager (REPOS_ROOT=${REPOS_ROOT})..."
+exec_as python3 /usr/local/bin/hub-agent.py

@@ -1,0 +1,22 @@
+[Unit]
+Description=Turma per-host agent (native)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# Optional (leading '-'): the launcher also sources this file, and a missing
+# config shouldn't wedge the unit before the install is finished.
+EnvironmentFile=-%h/.config/turma-agent/turma-agent.env
+ExecStart=%h/.local/share/turma-agent/bin/turma-agent
+Restart=always
+RestartSec=5
+# CRITICAL for zero-downtime updates: signal ONLY the manager (the main process)
+# on stop/restart. The default (control-group) would SIGKILL the whole cgroup —
+# the tmux server, every session's claude, the ttyd bridges, and the tunnel —
+# on every restart. With KillMode=process a `systemctl --user restart` replaces
+# just hub-agent.py; boot then re-adopts the still-running sessions.
+KillMode=process
+
+[Install]
+WantedBy=default.target

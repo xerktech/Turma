@@ -48,12 +48,23 @@ npm run dev         # in another — Vite dev server, DOM backend
 `npm run dev` opens a keyboard-driven DOM stand-in for the glasses display:
 arrow keys scroll, Enter taps, Escape double-taps (back).
 
-The hub URL is hardcoded (`DEFAULT_HUB_URL` in `src/config.ts`) so the phone
-login page only asks for a username and password, exactly like the web
-dashboard's login. For local dev, `VITE_HUB_URL` overrides that target (e.g.
-to point at the mock-hub or a LAN hub), and `VITE_HUB_USER` /
+The hub URL is entered on the phone login page, alongside the username and
+password — the hub is self-hosted, so the app ships no default host. It is
+persisted with the credentials (`BridgeStorage` survives Even app restarts), so
+it is typed **once per device** and prefilled from then on, including across a
+sign-out (which clears the credentials but keeps the hub). A scheme-less host
+like `turma.example.com` is fine — `normalizeHubUrl` adds the `https://`.
+
+For local dev, `VITE_HUB_URL` still overrides the target (e.g. to point at the
+mock-hub or a LAN hub) and takes precedence over anything stored on the device,
+so a stored value can't hijack `npm run dev`. `VITE_HUB_USER` /
 `VITE_HUB_PASSWORD` prefill the credentials — set them in a `.env.local` Vite
 picks up before running `npm run dev`.
+
+Note the hub you enter must still be listed in `app.json`'s `network`
+whitelist: the Even WebView enforces it at the network layer, and it is fixed
+at pack time. The login field makes the app forkable (package it with your own
+host), not able to reach an arbitrary hub at runtime.
 
 ## Simulator
 
@@ -86,8 +97,11 @@ Whisper endpoint is derived as `${LITELLM_URL}/audio/transcriptions`:
   URL above).
 - `WHISPER_API_KEY` — override the STT bearer token (optional; defaults to
   `LITELLM_API_KEY`).
-- `WHISPER_MODEL` — model name passed to the Whisper server (optional).
-- `WHISPER_LANGUAGE` — default `en`.
+- `WHISPER_MODEL` — model name passed to the Whisper server (optional). This is
+  also the LiteLLM alias the gateway routes on (e.g. `voxtral`, `parakeet`).
+- `WHISPER_LANGUAGE` — language hint sent with the audio; default `en`. Set it to
+  an **empty string** to omit the hint entirely, letting a multilingual model
+  (e.g. Parakeet) auto-detect the language.
 - `WHISPER_TIMEOUT_MS` — default `30000`.
 
 Set these in DockerOps' compose file alongside the hub's existing env
@@ -112,7 +126,7 @@ Before `npm run pack`, edit `app.json`'s `permissions[].whitelist` (the
 layer, so a stale entry means the packaged app simply can't reach your hub.
 
 ```sh
-npm run pack   # builds dist/ and packages it + app.json into ../turma-hud.ehpk
+npm run pack   # builds dist/ and packages it + app.json into ../turma.ehpk
 npx evenhub qr # sideload: generates a QR code the Even app scans to install
 ```
 
@@ -137,19 +151,37 @@ command, so the built `.ehpk` is uploaded through the web portal.
 2. **Make `app.json` submission-ready.** Bump `version`; confirm
    `min_app_version` / `min_sdk_version`; and — most important — make sure the
    `network` permission `whitelist` lists your real hub host for **both**
-   `https://` and `wss://` (currently `https://turma.xerktech.com` and
-   `wss://turma.xerktech.com`). Reviewers enforce this whitelist at the WebView
+   `https://` and `wss://` (e.g. `https://<your-hub-host>` and
+   `wss://<your-hub-host>`). Reviewers enforce this whitelist at the WebView
    network layer, so a stale entry means the app can't reach the hub during
    review.
 3. **Build + pack** exactly as for sideload:
 
    ```sh
    npm run build   # tsc + vite → dist/
-   npm run pack    # evenhub pack app.json dist -o ../turma-hud.ehpk
+   npm run pack    # evenhub pack app.json dist -o ../turma.ehpk
    ```
 
-4. **Upload the `.ehpk` in the developer portal** and create/update the app
-   entry. This is the step the CLI does not cover.
+4. **Upload the `.ehpk` to the developer portal.** `evenhub` itself has no
+   `publish`/`submit` command, so `scripts/evenhub-publish.mjs` drives the
+   portal's own draft + create-version API (the two calls the portal web UI
+   makes by hand) — dependency-free, authenticated by a stored `evenhub login`
+   credential or `EVENHUB_EMAIL` / `EVENHUB_PASSWORD`:
+
+   ```sh
+   npm run publish:hub -- --changelog 'Private build'   # packs then uploads
+   ```
+
+   The release pipeline runs this automatically: every release that rebuilds the
+   glasses component packs and uploads its `.ehpk` to the portal from the
+   `build-glasses` job in `.github/workflows/release.yml` — the portal, not the
+   GitHub release, is the app's distribution channel — authenticated by the
+   `EVENHUB_EMAIL` / `EVENHUB_PASSWORD` repository secrets (see `RELEASING.md`).
+   Publishing skips versions the portal already has, so retried release runs are
+   safe. `EVENHUB_BASE_URL` overrides the portal host (default
+   `https://hub.evenrealities.com`). The portal API is unofficial —
+   reverse-engineered from the CLI and portal traffic — so treat breakage after
+   an Even Hub update as expected.
 5. **Manual review.** Every submission goes through a manual review against Even
    Hub's [App Submission & QA checklist](https://hub.evenrealities.com/docs/reference/app-submission);
    anything that fails is returned with a rejection note. The recommended
@@ -168,13 +200,15 @@ portal:
 - **Public** — after passing review, listed in the Even Hub store for anyone to
   install (shown under "Public" plugins).
 
-**For Turma HUD specifically, the private/beta lane is the realistic one.**
-The app is single-user and self-hosted: the hub URL is hardcoded
-(`DEFAULT_HUB_URL` in `src/config.ts`), it sits behind HTTP Basic auth, and the
+**For Turma specifically, the private/beta lane is the realistic one.**
+The app is single-user and self-hosted: it sits behind HTTP Basic auth, and the
 `app.json` `network` whitelist is pinned to one host. A public installer has no
 reachable hub and no credentials, so a public store listing wouldn't be usable.
-Going genuinely public would first require making the hub URL user-configurable
-at login and loosening/parameterizing the `network` whitelist accordingly.
+The hub URL is now user-configurable at login (it used to be hardcoded), which
+was half of what going genuinely public needs; the remaining half is the
+`network` whitelist, which the WebView enforces and which is fixed at pack
+time — a build can only reach the hosts it was packaged for, whatever the
+login page accepts.
 
 ## Testing the hub audio path without glasses
 
@@ -189,9 +223,9 @@ to exercise the whole STT path without hardware.
 ## On-hardware QA checklist
 
 - Whitelist edited to your hub host and the app sideloads/opens OK.
-- Signed in via the phone login page (matches the web dashboard's login —
-  username + password; the hub URL is hardcoded in `src/config.ts`) and the
-  glasses-display mirror appears.
+- Signed in via the phone login page (hub URL + username + password) and the
+  glasses-display mirror appears. The hub URL must match a host in the
+  `app.json` whitelist above, and should be prefilled on any later sign-in.
 - Session list matches the web dashboard.
 - Each lifecycle action (spawn/kill/start/restart/resume) shows queued (…)
   then converges within ~40s.

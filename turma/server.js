@@ -12,10 +12,11 @@
 //      (the tmux/Claude TUI). The hub then proxies the browser's /term traffic
 //      through that data channel. See the reverse-tunnel section below.
 //
-// It also pushes edge-triggered alerts to the self-hosted ntfy (grafana.yaml)
-// on the `agents` topic: container offline/recovered, crash loops, daily
-// cost threshold, turn finished / question waiting for input, and PR created.
-// Set NTFY_URL (plus NTFY_USER/NTFY_PASS) to enable; unset disables alerts.
+// It also pushes edge-triggered alerts to the Android client via Firebase Cloud
+// Messaging (turma/push.js): container offline/recovered, crash loops, turn
+// finished / question waiting for input, and PR created. Set
+// FCM_SERVICE_ACCOUNT_JSON to enable; unset disables push (the alert bus becomes
+// a no-op). Devices register their FCM token via POST /api/devices.
 //
 // stdlib only — no npm dependencies (the agent dials with Node's built-in
 // WebSocket; the hub hand-rolls the WebSocket *server* framing with `crypto`).
@@ -36,11 +37,96 @@ const push = require("./push.js");
 const PORT = parseInt(process.env.PORT || "8300", 10);
 const STATE_FILE = process.env.STATE_FILE || "/data/state.json";
 const DEVICES_FILE = process.env.DEVICES_FILE || "/data/devices.json";
+// Ticket -> agent pins (XERK-38): which HOST a ticket's sessions spawn on,
+// chosen by the operator in the board's ticket detail panel. Unlike the repo
+// override (an agent-ledger fan-out — triage is agent state), the host choice
+// is a ROUTING input, and routing is the hub's job because only the hub sees
+// the whole fleet — so the pin lives here, on the same durable /data volume as
+// the archive, rather than riding any one agent's ~/.turma.
+const TICKET_AGENTS_FILE = process.env.TICKET_AGENTS_FILE || "/data/ticket-agents.json";
+// Tickets come and go while pins are only ever set by hand, so the map is
+// bounded rather than reconciled: past the cap the oldest pin is evicted.
+const TICKET_AGENTS_MAX = 500;
+// Ticket -> model pins (XERK-123): which MODEL a ticket's session runs, chosen
+// by the operator in the board's ticket detail panel. Like the agent pin (and
+// unlike the repo override) this is hub-owned durable state on /data: the model
+// is carried on the spawnTicket command the hub already routes, so the hub is
+// the one party that has to remember it. The alias ("opus"/"sonnet"/…) the agent
+// resolves at spawn, never a raw model id.
+const TICKET_MODELS_FILE = process.env.TICKET_MODELS_FILE || "/data/ticket-models.json";
+const TICKET_MODELS_MAX = 500;
+// Per-org auto opt-in (XERK-41): which Jira orgs let the board drive their whole
+// session lifecycle — auto-START a session for every To Do ticket that has a repo
+// (XERK-41), and auto-STOP a session when its ticket moves to Done (XERK-45; see
+// autoStopSweep). This is the SOLE control — it's a hub setting the operator flips
+// from the board's org chip, so it can be turned on and off without redeploying an
+// agent, and there is no agent-side flag (the original agent env TICKET_AUTO_START
+// was removed). Hub-owned for the same reason the agent-pin above is: the decision
+// and the routing are the hub's job (only it sees the whole fleet). Durable on the
+// /data volume, not the best-effort state.json, because the opt-in must survive a
+// hub restart.
+const AUTOSTART_ORGS_FILE = process.env.AUTOSTART_ORGS_FILE || "/data/autostart-orgs.json";
+// Manual org-color pins (XERK-145): siteKey -> palette slot 1..8, the operator's
+// override of the hash-assigned org color. Hub-owned durable state like the
+// auto-start opt-in (same reasons: per-org, tiny, must survive a restart, and
+// shared by web + android through the fleet payload + its own SSE event).
+const ORG_COLORS_FILE = process.env.ORG_COLORS_FILE || "/data/org-colors.json";
+const ORG_COLOR_SLOTS = 8; // categorical palette --s1..--s8 (app.css / TurmaColors.series)
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
+// An agent about to restart for an EXPECTED reason (an image update recreating
+// its container, or the native updater swapping files) POSTs /updating just
+// before it goes silent, so the coming heartbeat gap reads as `updating` rather
+// than an unexpected-outage `offline` (XERK-29). We hold that status for this
+// grace window; if the agent never comes back within it the update is stuck and
+// the host correctly falls through to offline (and alerts).
+const UPDATING_GRACE_MS = Number(process.env.UPDATING_GRACE_MS) || 5 * 60 * 1000;
+// Control-channel liveness. A heartbeat is a fresh HTTP POST and so proves
+// nothing about the tunnel: the two die independently, and a host whose tunnel
+// is wedged still reports `online` while every Attach on it reads "terminal
+// offline". Both ends therefore prove the channel rather than assume it.
+const CONTROL_PING_EVERY_MS = Number(process.env.CONTROL_PING_EVERY_MS) || 30 * 1000;
+const CONTROL_DEAD_AFTER_MS = Number(process.env.CONTROL_DEAD_AFTER_MS) || 90 * 1000; // 3 missed beats
 const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
 const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted first
+// Board ticket detail (description + comments), fetched on demand from the host
+// that owns the org's Jira creds. Cached briefly so reopening a ticket, or two
+// dashboards viewing one, doesn't re-hit Jira; kept much shorter-lived than a
+// transcript because a ticket is edited by other people while you read it.
+const JIRA_ISSUE_FRESH_MS = 60 * 1000; // serve a cached issue under this age
+const JIRA_ISSUE_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
+const JIRA_ISSUE_MAX = 40; // cap per-host cache; oldest fetchedAt evicted first
+
+// New-ticket create metadata + results (XERK-137), cached per host like the
+// issue detail above. Project/type/label meta changes rarely, so it's served for
+// longer; a create RESULT is kept just long enough for the submitting client to
+// poll it back (the created ticket then shows on the board via the normal poll).
+const CREATE_META_FRESH_MS = 5 * 60 * 1000; // serve cached create-meta under this age
+const CREATE_META_MAX_AGE_MS = 30 * 60 * 1000; // evict meta/type cache entries older
+const CREATE_TYPES_MAX = 40; // cap the per-project type cache; oldest evicted
+const CREATE_RESULT_MAX_AGE_MS = 10 * 60 * 1000; // evict a create result older than this
+const CREATE_RESULT_MAX = 40; // cap the per-cmdId create-result cache
+
+// A command an agent doesn't implement is ACKED, not refused (hub-agent.py's
+// handle_commands logs `unknown command type` and acks so a poison command
+// can't be retried forever). So a host running an agent that PREDATES a board
+// write feature is indistinguishable from a merely slow one: the routes that
+// wait on a staged result 202 forever and the client gives up with "the host
+// didn't answer in time" (XERK-151 — an ADO host on agent v0.5.38, which has
+// no boardCreateMeta, so the New-ticket form's project list never loaded).
+//
+// The ack IS the evidence. These commands stage their result inside the same
+// handle_commands call, so the result rides the SAME beat as the ack: an ack
+// carrying no result means the agent did not handle the command, and the route
+// can say so in a beat or two instead of hanging. Version-free by design — the
+// agent proves what it can do rather than the hub keeping a version table.
+const RESULT_WAIT_MAX_MS = 5 * 60 * 1000; // forget a wait whose command never got acked
+// A proven gap is re-probed this often. The precise signal that an agent grew
+// the feature is its version CHANGING (below), which clears every gap at once;
+// this is the backstop for the update that doesn't move the string — a dev
+// build, a same-version reinstall, or a gap recorded from a one-off ack.
+const UNSUPPORTED_TTL_MS = 30 * 60 * 1000;
 
 // Single-user auth: TURMA_USER/TURMA_PASSWORD gate the UI and browser API. The
 // browser signs in through a real login form (/login -> POST /api/login) and
@@ -81,12 +167,6 @@ const SESSION_KEY =
 // token — one credential per agent container for heartbeat, tunnel, and ttyd.
 const TTYD_AUTH = "Basic " + Buffer.from(`term:${TURMA_AGENT_TOKEN || "changeme"}`).toString("base64");
 
-const NTFY_URL = (process.env.NTFY_URL || "").replace(/\/$/, "");
-const NTFY_TOPIC = process.env.NTFY_TOPIC || "agents";
-const NTFY_USER = process.env.NTFY_USER || "";
-const NTFY_PASS = process.env.NTFY_PASS || "";
-const COST_ALERT_USD = parseFloat(process.env.COST_ALERT_USD || "75");
-
 // ---- LiteLLM backend (OpenAI-compatible: Whisper STT) -----------------------
 // Whisper STT is served by a LiteLLM instance's `/v1` base: LITELLM_URL points
 // at it and Whisper hits `${LITELLM_URL}/audio/transcriptions` with LITELLM_API_KEY.
@@ -103,7 +183,12 @@ const WHISPER_URL =
   process.env.WHISPER_URL || (LITELLM_URL ? `${LITELLM_URL}/audio/transcriptions` : "");
 const WHISPER_MODEL = process.env.WHISPER_MODEL || "";
 const WHISPER_API_KEY = process.env.WHISPER_API_KEY || LITELLM_API_KEY;
-const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || "en";
+// The `language` hint pins the transcription to a language. Default "en", but an
+// explicit empty WHISPER_LANGUAGE OMITS the hint so the STT model auto-detects —
+// `??` (not `||`) is what lets "" through, since "" is falsy. Needed for
+// multilingual ASR like Parakeet-tdt-0.6b-v3, whose auto language detection a
+// forced `language=en` would silently defeat.
+const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE ?? "en";
 const WHISPER_TIMEOUT_MS = parseInt(process.env.WHISPER_TIMEOUT_MS || "30000", 10);
 
 // A session counts as "working" while its transcript was written to within
@@ -113,6 +198,24 @@ const WORKING_WINDOW_MS = 90 * 1000;
 // before we conclude anything from a freshly-loaded (possibly stale) state.
 const BOOT_AT = Date.now();
 const BOOT_GRACE_MS = 90 * 1000;
+
+// A PR alert is held until that PR's CI is green (XERK-153), so these two
+// windows are what stop "held" from meaning "lost".
+//
+// A PR that genuinely has NO CI has to alert on creation, but a just-opened one
+// reports an empty check rollup for a beat or two before its workflows
+// register — indistinguishable from a repo with no CI at all. So "no CI" only
+// counts once it has held for this long (a couple of the agent's ~60s PR-status
+// refreshes), which is also the floor on how fast a CI-less repo's PR alerts.
+const PR_NO_CI_GRACE_MS = 2 * 60 * 1000;
+// Backstop for a PR whose CI verdict never arrives: an agent with no `gh`
+// login never fills in the status at all, and a session stopped mid-run freezes
+// its PRs at whatever they last read. Neither is a reason to lose the alert
+// entirely, so an inconclusive wait fires anyway once it ages out. A wait that
+// went FAILING is exempt — staying quiet on red is the point of the feature.
+const PR_ALERT_MAX_WAIT_MS = 30 * 60 * 1000;
+// Per-session ceiling on both PR bookkeeping lists (newest kept).
+const PR_ALERT_MAX_TRACKED = 20;
 
 // Keyed by the host name (`device`), value = last heartbeat payload +
 // bookkeeping. One container per host, so the host name is the stable identity.
@@ -163,7 +266,7 @@ function prune() {
 
 // ---- mobile push device registry -------------------------------------------
 // FCM tokens the Android client has registered (POST /api/devices). notify()
-// fans every alert out to these in addition to ntfy. Persisted next to
+// fans every alert out to these. Persisted next to
 // STATE_FILE, same best-effort pattern (losing it just means devices re-register
 // on their next app launch). Each entry: {token, platform, addedAt, seenAt}.
 let devices = [];
@@ -186,14 +289,20 @@ function scheduleDeviceSave() {
   }, 5 * 1000);
   devSaveTimer.unref();
 }
-function registerDevice(token, platform) {
+function registerDevice(token, platform, features) {
   const now = Date.now();
+  // What this app build can do (XERK-154). Only a build that declares "dismiss"
+  // is sent retractions — an older one has no handler for them and would render
+  // the data-only dismiss as a blank "Turma" notification. Omitted on re-register
+  // keeps the stored set (an old app can't erase a newer one's capabilities).
+  const caps = Array.isArray(features) ? features.filter((f) => typeof f === "string") : null;
   const existing = devices.find((d) => d.token === token);
   if (existing) {
     existing.platform = platform || existing.platform;
+    if (caps) existing.features = caps;
     existing.seenAt = now;
   } else {
-    devices.push({ token, platform: platform || "android", addedAt: now, seenAt: now });
+    devices.push({ token, platform: platform || "android", features: caps || [], addedAt: now, seenAt: now });
   }
   scheduleDeviceSave();
 }
@@ -213,6 +322,252 @@ function listDevices() {
   return devices;
 }
 
+// ---- ticket -> agent pins (XERK-38) ----------------------------------------
+// The operator's own answer to which HOST a ticket's sessions spawn on,
+// overriding findTicketHost's most-available pick. Keyed "<siteKey>/<issueKey>"
+// (the agent-side ledgers key the same way); each entry {host, at}. Rarely
+// used, but "persistent" is the point of it: the choice must survive a hub
+// restart, which is why it has its own file on /data rather than riding the
+// best-effort state.json (whose loss is documented as harmless).
+let ticketAgents = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(TICKET_AGENTS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ticketAgents = parsed;
+} catch {
+  /* first boot or no volume mounted */
+}
+let taSaveTimer = null;
+function scheduleTicketAgentsSave() {
+  if (taSaveTimer) return;
+  taSaveTimer = setTimeout(() => {
+    taSaveTimer = null;
+    fs.mkdir(path.dirname(TICKET_AGENTS_FILE), { recursive: true }, () => {
+      fs.writeFile(TICKET_AGENTS_FILE, JSON.stringify(ticketAgents), (err) => {
+        if (err) console.error(`ticket-agents save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  taSaveTimer.unref();
+}
+function ticketAgentPin(siteKey, issueKey) {
+  const p = ticketAgents[`${siteKey}/${issueKey}`];
+  return p && typeof p.host === "string" && p.host ? p : null;
+}
+// Set or clear (host=null) a ticket's pinned host. The caller has already
+// validated the host against the fleet; this just owns the map's bookkeeping.
+function setTicketAgent(siteKey, issueKey, host) {
+  const k = `${siteKey}/${issueKey}`;
+  if (!host) delete ticketAgents[k];
+  else {
+    ticketAgents[k] = { host, at: Date.now() };
+    const keys = Object.keys(ticketAgents);
+    if (keys.length > TICKET_AGENTS_MAX) {
+      keys.sort((a, b) => (ticketAgents[a].at || 0) - (ticketAgents[b].at || 0));
+      for (const old of keys.slice(0, keys.length - TICKET_AGENTS_MAX)) {
+        delete ticketAgents[old];
+      }
+    }
+  }
+  scheduleTicketAgentsSave();
+  // The pin rides the /api/agents payload (and its own SSE event), so open
+  // boards must see the change without waiting out an ETag match.
+  invalidateAgentsCache();
+  sseBroadcast("ticketAgents", ticketAgents);
+}
+
+// ---- ticket -> model pins (XERK-123) ---------------------------------------
+// The operator's own answer to which MODEL a ticket's session runs, overriding
+// the login's default. Keyed "<siteKey>/<issueKey>" like the agent pin; each
+// entry {model, at} where `model` is a plain alias. Hub-owned and durable for
+// the same reason the agent pin is: the model is delivered on the spawnTicket
+// command the hub routes, so the hub must remember the choice across a restart.
+let ticketModels = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(TICKET_MODELS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ticketModels = parsed;
+} catch {
+  /* first boot or no volume mounted */
+}
+let tmSaveTimer = null;
+function scheduleTicketModelsSave() {
+  if (tmSaveTimer) return;
+  tmSaveTimer = setTimeout(() => {
+    tmSaveTimer = null;
+    fs.mkdir(path.dirname(TICKET_MODELS_FILE), { recursive: true }, () => {
+      fs.writeFile(TICKET_MODELS_FILE, JSON.stringify(ticketModels), (err) => {
+        if (err) console.error(`ticket-models save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  tmSaveTimer.unref();
+}
+function ticketModelPin(siteKey, issueKey) {
+  const p = ticketModels[`${siteKey}/${issueKey}`];
+  return p && typeof p.model === "string" && p.model ? p : null;
+}
+// Set or clear (model=null) a ticket's pinned model. The caller has already
+// validated the alias against the org's offered models; this just owns the
+// map's bookkeeping and eviction.
+function setTicketModel(siteKey, issueKey, model) {
+  const k = `${siteKey}/${issueKey}`;
+  if (!model) delete ticketModels[k];
+  else {
+    ticketModels[k] = { model, at: Date.now() };
+    const keys = Object.keys(ticketModels);
+    if (keys.length > TICKET_MODELS_MAX) {
+      keys.sort((a, b) => (ticketModels[a].at || 0) - (ticketModels[b].at || 0));
+      for (const old of keys.slice(0, keys.length - TICKET_MODELS_MAX)) {
+        delete ticketModels[old];
+      }
+    }
+  }
+  scheduleTicketModelsSave();
+  invalidateAgentsCache();
+  sseBroadcast("ticketModels", ticketModels);
+}
+
+// The set of model aliases a ticket may be pinned to for an org: the aliases the
+// org's hosts actually probed available, unioned across every reporting host,
+// dropped to the non-bracketed ones (a bracketed "[1m]" alias is a live-switch
+// affordance the agent's resolve_model rejects for a spawn command line), plus
+// the static family aliases every login can name. "default" is always legal (it
+// releases the pin, so it never reaches this allowlist). Empty aliases beyond the
+// static set only when no host has probed yet.
+const STATIC_MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"];
+function orgModelAliases(siteKey) {
+  const set = new Set(STATIC_MODEL_ALIASES);
+  for (const a of Object.values(agents)) {
+    if (!a || !a.jira || a.jira.siteKey !== siteKey) continue;
+    const avail = a.models && Array.isArray(a.models.available) ? a.models.available : [];
+    for (const m of avail) {
+      if (typeof m === "string" && m && m !== "default" &&
+          /^[a-z0-9.-]{1,40}$/.test(m)) {
+        set.add(m);
+      }
+    }
+  }
+  return set;
+}
+
+// ---- per-org auto-start opt-in (XERK-41) -----------------------------------
+// The set of Jira orgs the operator has switched auto-start ON for, keyed by
+// siteKey with the value simply `true` (presence = enabled; disabling deletes
+// the key). Unlike the ticket->agent pins there's no eviction cap: orgs are
+// bounded by how many Jira sites the operator connects (a handful), not by the
+// churn of tickets. See AUTOSTART_ORGS_FILE for why it's durable and hub-owned.
+let autoStartOrgs = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(AUTOSTART_ORGS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) if (v) autoStartOrgs[k] = true;
+  }
+} catch {
+  /* first boot or no volume mounted */
+}
+let asSaveTimer = null;
+function scheduleAutoStartSave() {
+  if (asSaveTimer) return;
+  asSaveTimer = setTimeout(() => {
+    asSaveTimer = null;
+    fs.mkdir(path.dirname(AUTOSTART_ORGS_FILE), { recursive: true }, () => {
+      fs.writeFile(AUTOSTART_ORGS_FILE, JSON.stringify(autoStartOrgs), (err) => {
+        if (err) console.error(`autostart-orgs save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  asSaveTimer.unref();
+}
+// Flip an org's hub-side auto-start opt-in. The caller has already validated the
+// siteKey is one the fleet actually reports; this owns the map's bookkeeping.
+function setAutoStartOrg(siteKey, enabled) {
+  if (enabled) autoStartOrgs[siteKey] = true;
+  else delete autoStartOrgs[siteKey];
+  scheduleAutoStartSave();
+  // Rides the /api/agents payload (and its own SSE event), like the agent pins,
+  // so open boards reflect the toggle without waiting out an ETag match.
+  invalidateAgentsCache();
+  sseBroadcast("autoStartOrgs", autoStartOrgs);
+}
+
+// ---- manual org colors (XERK-145) ------------------------------------------
+// The operator's per-org palette pins, keyed by siteKey with the value the slot
+// number (1..8). Loaded like the auto-start opt-in: only well-formed entries
+// survive a read, so a hand-edited or corrupt file degrades to auto colors.
+let orgColors = {};
+try {
+  const parsed = JSON.parse(fs.readFileSync(ORG_COLORS_FILE, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) {
+      if (Number.isInteger(v) && v >= 1 && v <= ORG_COLOR_SLOTS) orgColors[k] = v;
+    }
+  }
+} catch {
+  /* first boot or no volume mounted */
+}
+let ocSaveTimer = null;
+function scheduleOrgColorsSave() {
+  if (ocSaveTimer) return;
+  ocSaveTimer = setTimeout(() => {
+    ocSaveTimer = null;
+    fs.mkdir(path.dirname(ORG_COLORS_FILE), { recursive: true }, () => {
+      fs.writeFile(ORG_COLORS_FILE, JSON.stringify(orgColors), (err) => {
+        if (err) console.error(`org-colors save failed: ${err.message}`);
+      });
+    });
+  }, 5 * 1000);
+  ocSaveTimer.unref();
+}
+// Pin an org's palette slot, or release it back to auto (slot = null). The
+// caller has validated the siteKey and the slot range; this owns the map.
+function setOrgColor(siteKey, slot) {
+  if (slot) orgColors[siteKey] = slot;
+  else delete orgColors[siteKey];
+  scheduleOrgColorsSave();
+  invalidateAgentsCache();
+  sseBroadcast("orgColors", orgColors);
+}
+
+// ---- session migration across hosts (XERK-101) -----------------------------
+// Move a running session from one agent to another in the same org (e.g. to the
+// host that has the container whose logs the conversation needs). The hub can't
+// touch a worktree, and agents are outbound-only, so a migration is composed
+// from agent commands + a hub-brokered relay of the one thing `claude --resume`
+// needs and the archive doesn't keep — the RAW transcript bytes:
+//   1. exportSession -> source host packs its transcript and POSTs it here;
+//   2. the blob lands -> importSession queued on the target, which pulls it,
+//      unpacks it, recreates the worktree off the repo's default branch, and
+//      resumes the same conversation there;
+//   3. target session comes up -> the source session is KILLED (kept, so its
+//      worktree/uncommitted work stays resumable on the origin as a fallback).
+// State is in-memory and short-lived (the blob rides in the record); a hub
+// restart mid-migration aborts it, leaving the source session intact.
+const migrations = new Map(); // migrationId -> record (see startMigration)
+const MIGRATE_TIMEOUT_MS = Number(process.env.MIGRATE_TIMEOUT_MS) || 5 * 60 * 1000;
+const MIGRATE_DONE_KEEP_MS = 30 * 1000; // keep a done/failed record briefly so UI can observe
+const MIGRATIONS_MAX = 40; // backstop against unbounded growth
+// Upload cap for the relay: a hair above the agent's own 64 MiB pack limit so a
+// legitimate at-cap bundle isn't rejected for framing overhead.
+const MIGRATE_BLOB_MAX = (1 << 26) + (1 << 20); // 65 MiB
+
+// The wire shape (blob stripped) the /api/agents payload and SSE carry, so the
+// UI can follow a migration to its new host and surface a failure.
+function serializeMigration(m) {
+  return {
+    id: m.id, srcHost: m.srcHost, srcSessionId: m.srcSessionId,
+    targetHost: m.targetHost, siteKey: m.siteKey, repo: m.repo,
+    transcriptId: m.transcriptId, phase: m.phase, error: m.error || null,
+    importCmdId: m.importCmdId || null, targetSessionId: m.targetSessionId || null,
+    at: m.at,
+  };
+}
+function migrationList() {
+  return Array.from(migrations.values()).map(serializeMigration);
+}
+function publishMigrations() {
+  invalidateAgentsCache();
+  sseBroadcast("migrations", migrationList());
+}
+
 // ---- /api/agents payload cache + SSE fanout ---------------------------------
 // The dashboard fleet payload is polled by every browser but changes only on a
 // heartbeat ingest or a state mutation (a command queued, a host removed, a
@@ -228,15 +583,26 @@ const sseClients = new Set(); // open /api/events response streams
 function invalidateAgentsCache() { agentsCache = null; }
 
 // One agent record shaped exactly as /api/agents returns it: the (potentially
-// large) history cache stripped, plus the two time/tunnel-derived live flags.
+// large) on-demand caches (session history, Jira issue detail) stripped — each
+// has its own route — plus the two time/tunnel-derived live flags.
 // Shared by the fleet payload and the SSE per-agent push so both stay in
 // lockstep.
 function serializeAgent(key, agent, now) {
-  const { history, ...a } = agent;
+  // `resultWaits` is per-command bookkeeping with timestamps (XERK-151) — pure
+  // internal state, stripped like the caches. `unsupported` is NOT: it's a tiny,
+  // rarely-changing map of what this host's agent can't do, worth reading.
+  const { history, subagentHistory, jiraIssues, statusResults,
+          createMeta, createTypes, createResults, resultWaits, ...a } = agent;
+  const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
   return {
     key,
     ...a,
-    online: now - (a.lastSeen || 0) < OFFLINE_AFTER_MS,
+    online,
+    // An expected restart in progress (XERK-29): only meaningful while the host
+    // is actually silent — a host that came back is just `online` again, and its
+    // heartbeat rebuild already dropped the stored flag — and only until the
+    // grace window lapses, past which a stuck update falls through to `offline`.
+    updating: !online && a.updating && now < a.updating.until ? a.updating : null,
     // Only true when this container's reverse tunnel is live right now.
     terminalOnline: !!controlChannels[key],
   };
@@ -248,7 +614,22 @@ function buildAgentsCache() {
   const now = Date.now();
   const list = Object.entries(agents).map(([key, a]) => serializeAgent(key, a, now));
   list.sort((x, y) => (x.device + x.key).localeCompare(y.device + y.key));
-  const body = JSON.stringify({ now, agents: list });
+  // ticketAgents (the ticket->host pins) and autoStartOrgs (the per-org
+  // auto-start opt-in, XERK-41) ride the same payload: both are tiny,
+  // board-scoped, and hub-owned, so this is their one read channel (plus their
+  // own SSE events for open boards).
+  const body = JSON.stringify({
+    now, agents: list, ticketAgents, ticketModels, autoStartOrgs, orgColors,
+    // In-flight (and just-settled) session migrations, so the Sessions page can
+    // follow a moved session onto its new host and surface a failure (XERK-101).
+    migrations: migrationList(),
+    // Whether the hub can actually deliver mobile push (FCM configured). Surfaced
+    // so a disabled/misconfigured push is VISIBLE on the dashboard instead of
+    // silently swallowing every alert — the failure mode of XERK-152, whose only
+    // prior signal was a boot log line. Hub-wide, not per-agent; constant for the
+    // process's life (the service account is parsed once at startup).
+    pushEnabled: push.fcmEnabled(),
+  });
   const etag = '"' + crypto.createHash("sha1").update(body).digest("base64") + '"';
   agentsCache = { body, etag };
   return agentsCache;
@@ -301,6 +682,103 @@ function queueCommand(key, cmd) {
   return cmdId;
 }
 
+// An agent's org, or "" if it reports none — the one predicate that partitions
+// the fleet (see org.js siteKeyOf). A migration may only cross hosts that share
+// this, so two hosts of one Jira org can trade sessions but no session ever
+// leaves its org (or leaks between an org host and an org-less one).
+function siteKeyOf(a) {
+  return (a && a.jira && a.jira.siteKey) || "";
+}
+
+// Begin a migration: queue exportSession on the source and record the pending
+// move. The caller validated the source session + target host; this owns the
+// bookkeeping. Returns the migration record.
+function startMigration(srcHost, s, targetHost) {
+  // Bound the map: drop the oldest settled record if we're at the cap (an
+  // in-flight one is never evicted — that would strand a live handoff).
+  if (migrations.size >= MIGRATIONS_MAX) {
+    let oldest = null;
+    for (const m of migrations.values()) {
+      if (m.phase === "done" || m.phase === "failed") {
+        if (!oldest || m.at < oldest.at) oldest = m;
+      }
+    }
+    if (oldest) migrations.delete(oldest.id);
+  }
+  const id = crypto.randomBytes(8).toString("hex");
+  const m = {
+    id, srcHost, srcSessionId: s.id, targetHost,
+    siteKey: siteKeyOf(agents[srcHost]), repo: s.repo,
+    // The agent reports a session's pinned conversation id as `transcriptId`
+    // (it never sends a `claudeSessionId` field) — that is the id
+    // `claude --resume` needs on the target.
+    transcriptId: s.transcriptId,
+    // Metadata the moved session should keep — the hub has it all from the
+    // heartbeat, so the source only ships the raw transcript.
+    meta: {
+      model: s.model || null,
+      permissionMode: s.permissionMode || null,
+      summary: s.summary || null,
+      summaryManual: s.summaryManual || null,
+      label: s.label || null,
+      ticket: s.ticket || null,
+    },
+    phase: "exporting", // exporting -> importing -> done | failed
+    blob: null, importCmdId: null, targetSessionId: null,
+    error: null, startedAt: Date.now(), at: Date.now(),
+  };
+  migrations.set(id, m);
+  queueCommand(srcHost, { type: "exportSession", sessionId: s.id, migrationId: id });
+  publishMigrations();
+  return m;
+}
+
+// Drive every in-flight migration one step (called from the target's heartbeat
+// for a fast handoff, and from the sweep interval for timeouts/cleanup). Pure
+// bookkeeping over `migrations` + the fleet — safe to call often.
+function advanceMigrations() {
+  const now = Date.now();
+  for (const m of migrations.values()) {
+    // The target session reported itself up (its spawnCmdId is the importCmdId
+    // the hub minted): hand off — kill the source (kept, resumable) and finish.
+    if (m.phase === "importing" && m.importCmdId) {
+      const a = agents[m.targetHost];
+      const up = a && (a.sessions || []).find(
+        (s) => s.spawnCmdId === m.importCmdId && s.status === "running");
+      if (up) {
+        m.targetSessionId = up.id;
+        m.phase = "done";
+        m.error = null;
+        m.blob = null;
+        m.at = now;
+        if (agents[m.srcHost]) {
+          queueCommand(m.srcHost, { type: "kill", sessionId: m.srcSessionId });
+        }
+        publishMigrations();
+        continue;
+      }
+    }
+    // A move that never completed: fail it so the UI stops waiting. The source
+    // session was never killed, so nothing is lost — the operator retries.
+    if ((m.phase === "exporting" || m.phase === "importing") &&
+        now - m.startedAt > MIGRATE_TIMEOUT_MS) {
+      m.phase = "failed";
+      m.error = "migration timed out";
+      m.blob = null;
+      m.at = now;
+      publishMigrations();
+      continue;
+    }
+    // Retire a settled record after a short grace so open UIs can observe the
+    // terminal state before it disappears.
+    if ((m.phase === "done" || m.phase === "failed") &&
+        now - m.at > MIGRATE_DONE_KEEP_MS) {
+      migrations.delete(m.id);
+      publishMigrations();
+    }
+  }
+}
+
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
 // into the host's per-session cache, then bound its memory: drop entries older
 // than HISTORY_MAX_AGE_MS and cap the cache at HISTORY_MAX_SESSIONS, evicting
@@ -310,7 +788,8 @@ function ingestHistory(agent, historyResults) {
   const now = Date.now();
   for (const r of historyResults || []) {
     if (!r || !r.sessionId) continue;
-    agent.history[r.sessionId] = { entries: r.entries, truncated: r.truncated, fetchedAt: now };
+    agent.history[r.sessionId] = { entries: r.entries, truncated: r.truncated,
+      queued: Array.isArray(r.queued) ? r.queued : [], fetchedAt: now };
   }
   for (const [sessionId, h] of Object.entries(agent.history)) {
     if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.history[sessionId];
@@ -322,6 +801,336 @@ function ingestHistory(agent, historyResults) {
       .slice(0, over)
       .forEach(([sessionId]) => delete agent.history[sessionId]);
   }
+}
+
+// The cache key for one background agent's transcript (see the {type:
+// "subagentHistory"} command): a session can run several agents of the same
+// type, so the short description/label disambiguates them. NUL-separated
+// because neither field can contain it.
+function subagentKey(sessionId, type, label) {
+  return String(sessionId) + "\0" + String(type || "") + "\0" + String(label || "");
+}
+
+// Same lifecycle as ingestHistory, keyed by (session,type,label) — merges the
+// agent's `subagentHistoryResults`, then evicts by age and caps the cache.
+function ingestSubagentHistory(agent, results) {
+  const now = Date.now();
+  for (const r of results || []) {
+    if (!r || !r.sessionId) continue;
+    agent.subagentHistory[subagentKey(r.sessionId, r.type, r.label)] =
+      { entries: r.entries, truncated: r.truncated, fetchedAt: now };
+  }
+  for (const [k, h] of Object.entries(agent.subagentHistory)) {
+    if (now - h.fetchedAt > HISTORY_MAX_AGE_MS) delete agent.subagentHistory[k];
+  }
+  const over = Object.keys(agent.subagentHistory).length - HISTORY_MAX_SESSIONS;
+  if (over > 0) {
+    Object.entries(agent.subagentHistory)
+      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
+      .slice(0, over)
+      .forEach(([k]) => delete agent.subagentHistory[k]);
+  }
+}
+
+// Merge the agent's on-demand Jira issue deliveries (heartbeat
+// `jiraIssueResults`) into the host's per-issue cache, bounded the same way as
+// ingestHistory. A result carrying an `error` is cached too — otherwise the
+// board would re-queue a doomed fetch (a deleted issue, a permissions wall) on
+// every poll for as long as the ticket stays open.
+function ingestJiraIssues(agent, jiraIssueResults) {
+  const now = Date.now();
+  for (const r of jiraIssueResults || []) {
+    if (!r || !r.key) continue;
+    agent.jiraIssues[r.key] = { issue: r.issue || null, error: r.error || null, fetchedAt: now };
+  }
+  for (const [key, e] of Object.entries(agent.jiraIssues)) {
+    if (now - e.fetchedAt > JIRA_ISSUE_MAX_AGE_MS) delete agent.jiraIssues[key];
+  }
+  const over = Object.keys(agent.jiraIssues).length - JIRA_ISSUE_MAX;
+  if (over > 0) {
+    Object.entries(agent.jiraIssues)
+      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
+      .slice(0, over)
+      .forEach(([key]) => delete agent.jiraIssues[key]);
+  }
+}
+
+// Merge the agent's board-status-change outcomes (heartbeat `ticketStatusResults`,
+// XERK-138) into a per-cmdId cache, so the panel that fired a change can poll
+// GET .../status?cmdId for its own answer. Keyed by cmdId (not issueKey) so two
+// changes to one ticket don't clobber each other's result, and bounded oldest-
+// first exactly like the issue cache.
+function ingestStatusResults(agent, ticketStatusResults) {
+  const now = Date.now();
+  for (const r of ticketStatusResults || []) {
+    if (!r || !r.cmdId) continue;
+    agent.statusResults[r.cmdId] = {
+      key: r.key || null, ok: !!r.ok, error: r.error || null,
+      status: r.status || null, statusCategory: r.statusCategory || null,
+      at: now,
+    };
+  }
+  for (const [id, e] of Object.entries(agent.statusResults)) {
+    if (now - e.at > JIRA_ISSUE_MAX_AGE_MS) delete agent.statusResults[id];
+  }
+  const over = Object.keys(agent.statusResults).length - JIRA_ISSUE_MAX;
+  if (over > 0) {
+    Object.entries(agent.statusResults)
+      .sort((a, b) => a[1].at - b[1].at)
+      .slice(0, over)
+      .forEach(([id]) => delete agent.statusResults[id]);
+  }
+}
+
+// Merge the agent's New-ticket create metadata (heartbeat `createMetaResults`,
+// XERK-137) into the host caches. Two shapes ride the one deque, told apart by
+// a `project` key: a project-keyed result carries that project's issue TYPES; a
+// project-less result carries the org's project + label list. A result carrying
+// an `error` is cached too (a doomed fetch mustn't re-queue every poll).
+function ingestCreateMeta(agent, results) {
+  const now = Date.now();
+  for (const r of results || []) {
+    if (!r) continue;
+    if (r.project) {
+      agent.createTypes[r.project] = {
+        types: r.types || [], error: r.error || null, fetchedAt: now,
+      };
+    } else {
+      agent.createMeta = {
+        projects: r.projects || [], labels: r.labels || [],
+        source: r.source || null, error: r.error || null, fetchedAt: now,
+      };
+    }
+  }
+  for (const [k, e] of Object.entries(agent.createTypes)) {
+    if (now - e.fetchedAt > CREATE_META_MAX_AGE_MS) delete agent.createTypes[k];
+  }
+  const over = Object.keys(agent.createTypes).length - CREATE_TYPES_MAX;
+  if (over > 0) {
+    Object.entries(agent.createTypes)
+      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
+      .slice(0, over)
+      .forEach(([k]) => delete agent.createTypes[k]);
+  }
+}
+
+// Merge the agent's create OUTCOMES (heartbeat `createTicketResults`) into the
+// host cache, keyed by the create command's cmdId — the correlation handle the
+// submitting client polls with (GET /api/jira/<siteKey>/tickets/<cmdId>).
+function ingestCreateResults(agent, results) {
+  const now = Date.now();
+  for (const r of results || []) {
+    if (!r || !r.cmdId) continue;
+    agent.createResults[r.cmdId] = {
+      key: r.key || null, url: r.url || null, error: r.error || null,
+      // A create that succeeded but couldn't be assigned: a success the client
+      // still has to say something about, since the board won't show it.
+      warning: r.warning || null, fetchedAt: now,
+    };
+  }
+  for (const [k, e] of Object.entries(agent.createResults)) {
+    if (now - e.fetchedAt > CREATE_RESULT_MAX_AGE_MS) delete agent.createResults[k];
+  }
+  const over = Object.keys(agent.createResults).length - CREATE_RESULT_MAX;
+  if (over > 0) {
+    Object.entries(agent.createResults)
+      .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)
+      .slice(0, over)
+      .forEach(([k]) => delete agent.createResults[k]);
+  }
+}
+
+// --- Proven capability gaps (XERK-151) ---------------------------------------
+// Record that `cmdId` is a command whose whole answer is a staged result, so the
+// beat that acks it can decide whether the agent actually implements it. `extra`
+// carries whatever resultLanded needs to find that result (the project, for a
+// per-project boardCreateMeta).
+function awaitResult(agent, cmdId, kind, extra) {
+  agent.resultWaits = agent.resultWaits || {};
+  agent.resultWaits[cmdId] = { kind, at: Date.now(), ...(extra || {}) };
+}
+
+// Did the beat that acked this command also carry its staged result? The create
+// meta/type caches aren't cmdId-keyed (the agent stages them by shape), so they
+// are matched on being REFRESHED since the command was queued; the two per-cmdId
+// caches are matched by id. An unknown kind reads as landed — a capability gap
+// is only ever asserted from positive evidence.
+function resultLanded(agent, cmdId, wait) {
+  if (wait.kind === "boardCreateMeta") {
+    const e = wait.project
+      ? (agent.createTypes || {})[wait.project]
+      : agent.createMeta;
+    return !!e && e.fetchedAt >= wait.at;
+  }
+  if (wait.kind === "createTicket") return !!(agent.createResults || {})[cmdId];
+  if (wait.kind === "setTicketStatus") return !!(agent.statusResults || {})[cmdId];
+  return true;
+}
+
+// Settle every awaited command this beat acked (i.e. that has just left the
+// queue). Runs AFTER the ingests, so `next` already holds anything the beat
+// carried. A landed result also CLEARS the gap — an agent must be able to earn
+// a feature back the moment it demonstrably has it.
+//
+// A version change wipes every gap up front: an update is the one event that
+// makes what this host can do genuinely unknown again, and re-proving a gap
+// costs a single command.
+function resolveResultWaits(prev, next, commands) {
+  if ((prev.agentVersion || null) !== (next.agentVersion || null)) next.unsupported = {};
+  const waits = next.resultWaits;
+  if (!waits) return;
+  const queued = new Set((commands || []).map((c) => c.cmdId));
+  const now = Date.now();
+  for (const [cmdId, w] of Object.entries(waits)) {
+    if (queued.has(cmdId)) {
+      // Still undelivered (an offline host's queue, or a beat that crossed it).
+      // Nothing is concluded from a command the agent hasn't taken yet.
+      if (now - w.at > RESULT_WAIT_MAX_MS) delete waits[cmdId];
+      continue;
+    }
+    delete waits[cmdId];
+    if (resultLanded(next, cmdId, w)) delete next.unsupported[w.kind];
+    else next.unsupported[w.kind] = now;
+  }
+}
+
+// The operator-facing reason a host can't serve a request, or "" when it can.
+// `what` completes "…is too old to <what>". A gap past its TTL reads as absent,
+// so the next request re-probes rather than refusing on old evidence forever.
+function agentGapError(agent, kind, what) {
+  const at = ((agent || {}).unsupported || {})[kind];
+  if (!at || Date.now() - at > UNSUPPORTED_TTL_MS) return "";
+  const v = agent.agentVersion ? ` (v${agent.agentVersion})` : "";
+  // Semicolon, not a dash: every caller renders this inside its own
+  // "Couldn't load projects — <error>" sentence.
+  return `this host's Turma agent${v} is too old to ${what}; update the agent`;
+}
+
+// An issue key is interpolated into an agent REST path, so it's allowlist-checked
+// before it reaches a URL — the same "nothing free-form" stance the agent takes.
+// Two grammars, because the board carries two ticket sources: Jira's PROJECT-123
+// keys and Azure DevOps' bare-integer work-item ids.
+function isIssueKey(k) {
+  return /^[A-Za-z][A-Za-z0-9_]*-[0-9]+$/.test(k) || /^[0-9]+$/.test(k);
+}
+
+// Which HOST should answer for a Jira org (siteKey): a host whose `jira` block
+// reports that site — preferring an ONLINE one, since an offline host's queued
+// command would sit undelivered until it returns. null when no host covers the
+// org (or the only ones that do are offline, and `requireOnline`).
+function findJiraHost(siteKey, requireOnline) {
+  const now = Date.now();
+  let stale = null;
+  for (const [key, a] of Object.entries(agents)) {
+    if (!a.jira || a.jira.siteKey !== siteKey) continue;
+    if (now - (a.lastSeen || 0) < OFFLINE_AFTER_MS) return key;
+    stale = stale || key;
+  }
+  return requireOnline ? null : stale;
+}
+
+// The repo an org's board says a ticket belongs in, as triaged by whichever host
+// reported it (see the Jira -> repo triage section in hub-agent.py). null when no
+// host reports the ticket, or none has triaged it yet, or the model declined it.
+// The FRESHEST reporting block wins, matching how board.js merges the same
+// tickets for display — the hub must resolve against what the operator clicked.
+function ticketRepo(siteKey, issueKey) {
+  let best = null, bestAt = "";
+  for (const a of Object.values(agents)) {
+    if (!a.jira || a.jira.siteKey !== siteKey) continue;
+    const t = (a.jira.tickets || []).find((x) => x && x.key === issueKey);
+    if (!t || !t.repoGuess || !t.repoGuess.repo) continue;
+    const at = String(a.jira.fetchedAt || "");
+    if (!best || at > bestAt) { best = t.repoGuess.repo; bestAt = at; }
+  }
+  return best;
+}
+
+// How many more sessions a host can take RIGHT NOW, as the hub sees it — the
+// basis for splitting work across the agents of one org. Starts from the
+// agent-reported `capacity.free` (MAX_SESSIONS minus running) and subtracts what
+// the hub itself has already committed but the host hasn't reflected yet: its
+// queued sessions, and the spawn/spawnTicket commands sitting in its queue since
+// its last heartbeat. Without that subtraction, four tickets clicked between two
+// beats would all read the same stale `free` and pile onto one host.
+//
+// An agent predating the capacity block reports no ceiling, so its headroom is
+// unknowable; it scores below any capacity-reporting host (which, once a fleet
+// runs this build, is all of them) but stays eligible so a mixed fleet still
+// routes. Can go negative (more committed than free) — that's fine, it's a
+// sortable score, not a count.
+function pendingSpawnCount(a) {
+  return (a.commands || []).filter(
+    (c) => c && (c.type === "spawn" || c.type === "spawnTicket")).length;
+}
+function hostAvailability(a) {
+  const c = a.capacity;
+  if (!c || typeof c.free !== "number") {
+    // Unknown ceiling: rank only by what we've queued onto it, well below any
+    // host that reports real free slots.
+    return -1000 - pendingSpawnCount(a);
+  }
+  return c.free - (c.queued || 0) - pendingSpawnCount(a);
+}
+
+// Which HOST should run a ticket's session, splitting load across the org's
+// agents. Among the ONLINE hosts reporting the org:
+//   - prefer one that already has the repo cloned;
+//   - if NONE has it, fall back to any of them — the agent clones the repo on
+//     demand and queues the session behind the clone (see spawn_ticket);
+//   - within the chosen group, pick the MOST AVAILABLE (hostAvailability), so N
+//     sessions on one org spread across its hosts instead of stacking on the
+//     first match. A host that's momentarily full is still a valid target — the
+//     session simply queues there — so this never fails for lack of a free slot.
+//
+// Online is required rather than preferred (unlike the read-only GET above, which
+// serves an offline host's cache): a spawn queued onto a sleeping host would land
+// whenever it next wakes, which is a surprise, not a feature.
+//
+// A manual pin (ticketAgents, set from the ticket detail panel — XERK-38) is
+// authoritative when one exists for the issue: the operator named the machine,
+// so the availability ranking never overrides it. It is honored, not worked
+// around: a pinned host that's offline (or gone from the org) is an ERROR with
+// the pin in the message, never a silent fallback to another host — routing
+// elsewhere would contradict the one thing the pin asserts. The auto-start
+// sweep treats that error like any no-host result (retry next sweep,
+// unrecorded), so a pinned host that's briefly down just delays the spawn.
+// Returns {host, needsClone} | {error, status}.
+function findTicketHost(siteKey, repo, issueKey) {
+  const now = Date.now();
+  let anyOrg = false, anyOnline = false;
+  const cloned = [], uncloned = [];
+  for (const [key, a] of Object.entries(agents)) {
+    if (!a.jira || a.jira.siteKey !== siteKey) continue;
+    anyOrg = true;
+    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    anyOnline = true;
+    if ((a.repos || []).some((r) => r && r.name === repo)) cloned.push(key);
+    else uncloned.push(key);
+  }
+  if (!anyOrg) return { status: 404, error: "no host reports that Jira org" };
+  const pin = issueKey ? ticketAgentPin(siteKey, issueKey) : null;
+  if (pin) {
+    const a = agents[pin.host];
+    if (!a || !a.jira || a.jira.siteKey !== siteKey) {
+      return { status: 409, error:
+        `this ticket is pinned to agent "${pin.host}", which no longer reports that Jira org` };
+    }
+    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) {
+      return { status: 503, error:
+        `this ticket is pinned to agent "${pin.host}", which is offline` };
+    }
+    return { host: pin.host,
+      needsClone: !(a.repos || []).some((r) => r && r.name === repo) };
+  }
+  if (!anyOnline) {
+    return { status: 503, error: "every host reporting that Jira org is offline" };
+  }
+  const pool = cloned.length ? cloned : uncloned;
+  const needsClone = cloned.length === 0;
+  // Most available first; insertion order breaks ties (stable, deterministic).
+  pool.sort((x, y) => hostAvailability(agents[y]) - hostAvailability(agents[x]));
+  return { host: pool[0], needsClone };
 }
 
 // Which HOST owns a given sessionId, and that session's ttyd port. Sessions are
@@ -347,6 +1156,27 @@ function readBody(req) {
       }
     });
     req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
+
+// Collect a request body as raw bytes (for the binary migration relay, which
+// readBody's 1 MiB string cap would truncate). Rejects past `cap` so a huge or
+// runaway upload can't exhaust the hub's memory.
+function readRawBody(req, cap) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let len = 0;
+    req.on("data", (c) => {
+      len += c.length;
+      if (len > cap) {
+        reject(new Error("body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
 }
@@ -502,37 +1332,25 @@ function agentWsAuthorized(url, req) {
   return agentAuthorized(req);
 }
 
-// ---- ntfy push alerts -------------------------------------------------------
+// ---- push alerts (Firebase Cloud Messaging) ---------------------------------
+// The single alert bus. Every edge-triggered alert (host offline/recovered,
+// restart loop, question waiting, PR created, turn finished) funnels through
+// notify(), which fans it out to every registered mobile device via FCM. A
+// no-op when FCM is unconfigured or no device has registered, and best-effort:
+// a push failure only logs, never breaks the beat. tags/priority/click/route
+// ride as data so the app picks the notification channel and deep-links a tap to
+// the exact session or host.
 function notify(title, message, opts = {}) {
-  if (!NTFY_URL) return;
-  const headers = {
-    Title: title,
-    Tags: opts.tags || "robot",
-    Priority: opts.priority || "default",
-  };
-  if (opts.click) headers.Click = opts.click;
-  if (NTFY_USER)
-    headers.Authorization =
-      "Basic " + Buffer.from(`${NTFY_USER}:${NTFY_PASS}`).toString("base64");
-  fetch(`${NTFY_URL}/${NTFY_TOPIC}`, { method: "POST", body: message, headers })
-    .then((r) => {
-      if (!r.ok) console.error(`ntfy ${r.status} for "${title}"`);
-    })
-    .catch((e) => console.error(`ntfy failed: ${e.message}`));
-  pushFcm(title, message, opts);
-}
-
-// Fan an alert out to registered mobile devices via FCM. Independent of ntfy
-// (either can be configured without the other) and best-effort: a push failure
-// only logs. tags/priority/click/route ride as data so the app can pick the
-// notification channel and deep-link a tap to the exact session or host.
-function pushFcm(title, message, opts = {}) {
   const tokens = listDevices();
   if (!tokens.length) return; // no registered devices; also skips when FCM off
   const data = {
     tags: opts.tags || "",
     priority: opts.priority || "default",
   };
+  // A stable per-notification key so a later beat can retract this exact alert
+  // once its subject is addressed (XERK-154, dismiss() below). The app posts the
+  // notification under it and cancels by it; alerts sharing a key collapse.
+  if (opts.notifKey) data.notifKey = opts.notifKey;
   if (opts.click) data.click = opts.click;
   if (opts.route) {
     if (opts.route.host) data.host = opts.route.host;
@@ -542,6 +1360,28 @@ function pushFcm(title, message, opts = {}) {
     .sendFcm(tokens.map((d) => d.token), { title, body: message, data })
     .then((r) => pruneDevices(r.dead))
     .catch((e) => console.error(`fcm fan-out failed: ${e.message}`));
+}
+
+// Retract an already-delivered notification once the thing it flagged has been
+// addressed elsewhere — a merged/closed PR, an answered question, a resumed
+// turn (XERK-154). A data-only FCM message the app recognises by
+// `action:"dismiss"` and cancels by the same `notifKey` the original alert
+// carried. Best-effort and a no-op with no devices / FCM off, exactly like
+// notify(); carries no title/body, so it shows nothing itself.
+function dismiss(notifKey) {
+  if (!notifKey) return;
+  // Only devices whose app build declared "dismiss" support — a retraction is a
+  // data-only message an older build would show as a blank notification instead
+  // of cancelling (XERK-154). Withheld devices simply keep the stale alert until
+  // the app updates, which is strictly better than a blank one.
+  const tokens = listDevices()
+    .filter((d) => Array.isArray(d.features) && d.features.includes("dismiss"))
+    .map((d) => d.token);
+  if (!tokens.length) return;
+  push
+    .sendFcm(tokens, { data: { action: "dismiss", notifKey } })
+    .then((r) => pruneDevices(r.dead))
+    .catch((e) => console.error(`fcm dismiss failed: ${e.message}`));
 }
 
 function fmtDur(ms) {
@@ -563,6 +1403,45 @@ function sessionWorking(session, lastSeen, now) {
   const age = s?.transcriptAgeSec;
   if (age == null) return false;
   return age * 1000 + Math.max(0, now - (lastSeen || 0)) < WORKING_WINDOW_MS;
+}
+
+// Should a held PR alert fire yet (XERK-153)? `w` is that PR's wait record
+// ({at} when first seen, plus the sticky markers this advances), `status` the
+// PR-status object the agent reports for that URL on this beat, if any.
+//
+// A PR alert used to fire the instant the agent scraped the URL out of the
+// transcript, which is the moment the work is LEAST ready to look at: CI hasn't
+// run. So the alert now waits for the CI rollup to come back green, and the
+// interesting cases are the ones that aren't green:
+//
+//   - No status yet. `checks` is absent until the agent's PR-status refresh has
+//     fetched this PR at least once, so absence means "not looked at", never
+//     "no CI". Hold.
+//   - `checks: null` — the PR really has no checks. Fire, but only once it has
+//     held for PR_NO_CI_GRACE_MS (see there): a brand-new PR looks exactly like
+//     this while GitHub registers its workflows.
+//   - `failing`. Stay quiet, permanently: the session that opened the PR is
+//     expected to fix it and push again, and the alert is for the PR being
+//     ready, not for every round trip through red. Sticky, so the age-out
+//     backstop can't leak an alert for a PR that is known-broken.
+//   - `pending`, or anything inconclusive, until PR_ALERT_MAX_WAIT_MS. Hold,
+//     then fire regardless — the wait is meant to delay the alert, not to lose
+//     it to a host whose `gh` can't answer.
+//
+// Returns the body prefix to send, or null to keep holding. Mutates `w`.
+function prAlertDecision(w, status, now) {
+  const known = !!status && "checks" in status;
+  const checks = known ? status.checks : undefined;
+  if (checks === "failing") w.red = true;
+  if (checks === "passing") return "All checks passed";
+  if (known && checks == null) {
+    w.noCiAt = w.noCiAt || now;
+    if (now - w.noCiAt >= PR_NO_CI_GRACE_MS) return "No CI configured";
+  } else {
+    delete w.noCiAt; // checks appeared (or vanished): it isn't a CI-less PR
+  }
+  if (!w.red && now - (w.at || now) >= PR_ALERT_MAX_WAIT_MS) return "CI state unknown";
+  return null;
 }
 
 // Alert checks that key off a fresh heartbeat. `next.alerts` is per-agent
@@ -600,21 +1479,48 @@ function heartbeatAlerts(key, prev, next) {
     }
   }
 
-  // Daily cost threshold (API-equivalent estimate), once per UTC day. Prefer the
-  // host-level `usage` block, which the agent aggregates from ALL transcripts —
-  // so killed/deleted sessions still count. Fall back to summing live sessions
-  // for agents that predate that block.
-  const cost = next.usage
-    ? (next.usage.today?.cost || 0)
-    : (next.sessions || []).reduce((sum, s) => sum + (s.usage?.today?.cost || 0), 0);
-  const day = new Date(now).toISOString().slice(0, 10);
-  if (cost >= COST_ALERT_USD && alerts.costDay !== day) {
-    alerts.costDay = day;
-    notify(`${key} cost alert`, `Est. $${cost.toFixed(2)} today (threshold $${COST_ALERT_USD})`, {
-      tags: "moneybag",
-      priority: "high",
-      route: { host: key },
-    });
+  // Claude login health (XERK-98): the agent reports the shared subscription
+  // login's refresh-token expiry. `needsLogin` (lapsed/missing) is the urgent
+  // edge — the host keeps heartbeating but its sessions and headless probes
+  // can't authenticate until someone runs `claude /login` there. `expiringSoon`
+  // is the proactive nudge before that happens. Both edge-trigger once and
+  // clear on recovery, mirroring the offline/online pair. Guarded so an older
+  // agent that reports no block fires nothing.
+  const ca = next.claudeAuth;
+  if (ca) {
+    if (ca.needsLogin) {
+      if (!alerts.claudeLoginAt) {
+        alerts.claudeLoginAt = now;
+        notify(`Claude login required${where}`, `Run 'claude /login' on ${key} — sessions can't authenticate until then.`, {
+          tags: "key",
+          priority: "high",
+          route: { host: key },
+        });
+      }
+      // The hard state supersedes the soft one, so a lapsed login never also
+      // carries a stale "expiring soon" marker to re-fire on recovery.
+      delete alerts.claudeExpiringAt;
+    } else {
+      if (alerts.claudeLoginAt) {
+        delete alerts.claudeLoginAt;
+        notify(`Claude login restored${where}`, `${key} is authenticated again.`, {
+          tags: "green_circle",
+          route: { host: key },
+        });
+      }
+      if (ca.expiringSoon) {
+        if (!alerts.claudeExpiringAt) {
+          alerts.claudeExpiringAt = now;
+          const when = ca.refreshExpiresAt ? ` (expires ${fmtDur(ca.refreshExpiresAt - now)} from now)` : "";
+          notify(`Claude login expiring${where}`, `Re-login soon on ${key}${when} — run 'claude /login'.`, {
+            tags: "key",
+            route: { host: key },
+          });
+        }
+      } else {
+        delete alerts.claudeExpiringAt;
+      }
+    }
   }
 
   // Per-session events from each session's transcript probe. Bookkeeping is
@@ -629,17 +1535,63 @@ function heartbeatAlerts(key, prev, next) {
     const s = session.session || {}; // null for stopped sessions
 
     const route = { host: key, sessionId: session.id };
+    const questionKey = `question:${key}:${session.id}`;
     if (s.question && s.question !== sa.lastQuestion) {
       sa.lastQuestion = s.question;
-      notify(`${label} has a question`, s.question, { tags: "question", priority: "high", route });
+      notify(`${label} has a question`, s.question, { tags: "question", priority: "high", route, notifKey: questionKey });
     }
-    if (!s.question) delete sa.lastQuestion;
+    if (!s.question) {
+      // Answered/cleared elsewhere (e.g. from the desktop) — retract the
+      // phone's now-stale question notification (XERK-154). The guard fires the
+      // dismiss once, on the edge, not every quiet beat.
+      if (sa.lastQuestion) dismiss(questionKey);
+      delete sa.lastQuestion;
+    }
 
+    // A new PR goes into a per-session wait list rather than alerting straight
+    // away, and leaves it when its CI settles (prAlertDecision). `prSeen` keeps
+    // its old meaning — URLs already alerted — so PRs an older hub announced
+    // don't re-fire after this upgrade.
+    const wait = (sa.prWait = sa.prWait || {});
     for (const url of s.newPrUrls || []) {
-      const seen = sa.prSeen || [];
-      if (seen.includes(url)) continue;
-      sa.prSeen = [...seen, url].slice(-20);
-      notify(`${label} created a PR`, url, { tags: "rocket", click: url, route });
+      if ((sa.prSeen || []).includes(url)) continue;
+      if (!wait[url]) wait[url] = { at: now };
+    }
+    // Statuses ride the session record (session.prs), not the per-beat signals:
+    // they're refreshed on the agent's slower PR cadence and persist between.
+    const prStatus = new Map();
+    for (const p of session.prs || []) if (p && p.url) prStatus.set(p.url, p);
+    for (const url of Object.keys(wait)) {
+      const note = prAlertDecision(wait[url], prStatus.get(url), now);
+      if (!note) continue;
+      delete wait[url];
+      sa.prSeen = [...(sa.prSeen || []), url].slice(-PR_ALERT_MAX_TRACKED);
+      notify(`${label} created a PR`, `${note} · ${url}`, { tags: "rocket", click: url, route, notifKey: `pr:${url}` });
+    }
+    // Retract a delivered PR alert once the PR has been merged or closed — the
+    // reason to look at it on the phone is gone (XERK-154). `prSeen` holds the
+    // URLs already alerted; `prDismissed` remembers which we've retracted so the
+    // dismiss fires once on the state edge, not every beat, and is bounded like
+    // prSeen. The PR state rides session.prs (prStatus), refreshed on the
+    // agent's PR cadence, so a merge done from the desktop lands within a beat.
+    sa.prDismissed = sa.prDismissed || [];
+    for (const url of sa.prSeen || []) {
+      const st = prStatus.get(url);
+      const done = st && (st.state === "MERGED" || st.state === "CLOSED");
+      if (done && !sa.prDismissed.includes(url)) {
+        sa.prDismissed = [...sa.prDismissed, url].slice(-PR_ALERT_MAX_TRACKED);
+        dismiss(`pr:${url}`);
+      }
+    }
+    // Bound the wait list the way prSeen is bounded: a PR whose CI never
+    // resolves ages out via the backstop, but a host that somehow outruns that
+    // must not grow this without limit. Oldest-first.
+    const waiting = Object.keys(wait);
+    if (waiting.length > PR_ALERT_MAX_TRACKED) {
+      waiting
+        .sort((a, b) => (wait[a].at || 0) - (wait[b].at || 0))
+        .slice(0, waiting.length - PR_ALERT_MAX_TRACKED)
+        .forEach((url) => delete wait[url]);
     }
 
     // Turn finished: was working, transcript went quiet, and the newest entry
@@ -647,10 +1599,19 @@ function heartbeatAlerts(key, prev, next) {
     // still mid-turn / already alerted above). A beat that just recovered from
     // an offline period skips this — "back online" already covers it and the
     // working->idle edge across the gap is stale.
+    const turnKey = `turn:${key}:${session.id}`;
     const working = sessionWorking(session, next.lastSeen, now);
     if (sa.wasWorking && !working && !recovered && s.lastRole === "assistant" && !s.lastHasToolUse) {
       const repo = session.git?.repoName ? ` · ${session.git.repoName}@${session.git.branch}` : "";
-      notify(`${label} finished its turn`, `Waiting for input${repo}`, { tags: "checkered_flag", route });
+      notify(`${label} finished its turn`, `Waiting for input${repo}`, { tags: "checkered_flag", route, notifKey: turnKey });
+      sa.turnAlerted = true;
+    }
+    // The "finished its turn — waiting for input" notice is addressed the moment
+    // the session is working again (the operator replied), so retract it
+    // (XERK-154). Fires once on the idle->working edge via the turnAlerted flag.
+    if (working && sa.turnAlerted) {
+      dismiss(turnKey);
+      delete sa.turnAlerted;
     }
     sa.wasWorking = working;
   }
@@ -669,7 +1630,11 @@ setInterval(() => {
   if (now - BOOT_AT < BOOT_GRACE_MS) return;
   for (const [key, a] of Object.entries(agents)) {
     const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
-    if (online || a.alerts?.offlineAt) continue;
+    // An announced update in progress isn't an outage — hold the offline alert
+    // until its grace window lapses. If the update gets stuck the host crosses
+    // to genuinely-offline once `until` passes and this fires as normal (XERK-29).
+    const updating = a.updating && now < a.updating.until;
+    if (online || updating || a.alerts?.offlineAt) continue;
     a.alerts = a.alerts || {};
     a.alerts.offlineAt = now;
     const where = a.device ? ` on ${a.device}` : "";
@@ -685,9 +1650,260 @@ setInterval(() => {
   }
 }, 15 * 1000).unref();
 
+// ---- auto-start To Do tickets (XERK-32) ------------------------------------
+// Opt-in PER ORG via the hub's own per-org toggle (autoStartOrgs, XERK-41 —
+// hub-only, no agent flag). When an org is toggled on, the hub starts a session
+// for every "To Do" ticket that has a repo — by the model's triage or a manual
+// pin — and doesn't already have one.
+//
+// The DECISION and the ROUTING live here, not on the agent, for the reason the
+// manual Start button already does (see the /session route): only the hub sees
+// the whole fleet, so only it can spread an org's sessions across ALL its agents
+// via findTicketHost rather than piling them on one host.
+//
+// The whole point is to never open a SECOND session for work already started —
+// by an operator's click, a prior auto-start, or anything else. Three guards, in
+// increasing strength:
+//   - autoStarted: a per-ticket ATTEMPT record, bounded and backed off (see
+//     below). This is what stops a spawn the agent legitimately REFUSES (e.g. an
+//     uncloneable repo) from being re-queued every 15s forever — a refusal leaves
+//     no session to see.
+//   - startedTicketKeys(): the durable guard — a ticket carrying a session on ANY
+//     channel (live, killed, or the resumable scan that outlives a restart) is
+//     already handled, whether it was started manually or automatically.
+//   - an in-flight spawnTicket on some org host, for the window before that
+//     session first heartbeats back.
+const AUTO_START_EVERY_MS = 15 * 1000;
+
+// Auto-start RETRIES until it succeeds, backing off but NEVER giving up (XERK-61
+// added the retry; XERK-109 removed the give-up). Queuing a spawnTicket is not
+// evidence that a session started: the agent acks every command it takes,
+// including ones it refuses outright (no triaged repo on THAT host, no owner to
+// clone with) and ones that simply blow up mid-spawn (a Jira fetch that times
+// out, a git failure) — handle_commands logs and acks those exactly like a
+// success, and nothing reports the outcome back. Treating "queued once" as
+// "started" made such a failure permanent, which is what "sometimes it starts and
+// sometimes it doesn't, with every condition met" looks like from the board.
+//
+// XERK-61's first fix retried a failed attempt on a growing backoff, but it CAPPED
+// the retries and gave up after a handful — so a ticket that flaked a few times for
+// a purely transient reason (Jira briefly down, the shared login momentarily
+// unavailable, a git hiccup) stayed blacklisted for the hub's lifetime even once
+// the condition cleared and every visible condition was met. That is the XERK-109
+// report. So the cap is gone: the backoff climbs to a ceiling and HOLDS there, and
+// the sweep keeps trying indefinitely. A genuinely-stuck ticket therefore re-queues
+// at most once per ceiling interval (cheap — the agent refuses an impossible spawn
+// before it ever fetches Jira), while a transiently-blocked one self-heals on the
+// first sweep after its condition returns.
+//
+// The retry gate is EVIDENCE, in the same order the sweep already checks it: a
+// session for the ticket (on any channel) ends the attempts for good and drops the
+// record, an in-flight command means we're still waiting, and only a ticket still
+// session-less with nothing in flight past its backoff is tried again.
+const AUTO_START_RETRY_MS = 60 * 1000;      // after attempt 1; doubles each time
+const AUTO_START_RETRY_MAX_MS = 10 * 60 * 1000;   // backoff ceiling; retries never stop
+// Doublings before the backoff reaches its ceiling (1→2→4→8→10min). The attempt
+// counter is capped here so it settles into a steady once-per-ceiling retry rather
+// than climbing without bound on a ticket that never manages to start.
+const AUTO_START_BACKOFF_STEPS = 5;
+// "<siteKey>\x00<issueKey>" -> { attempts, nextAt }. Entries are dropped the
+// moment the ticket is seen to have a session, so this stays as small as the set
+// of tickets currently failing to start.
+const autoStarted = new Map();
+
+// When to try again after `attempts` failed attempts: 1min, 2min, 4min, 8min, then
+// held at AUTO_START_RETRY_MAX_MS (10min) for good.
+function autoStartRetryAt(now, attempts) {
+  return now + Math.min(AUTO_START_RETRY_MS * 2 ** (attempts - 1),
+    AUTO_START_RETRY_MAX_MS);
+}
+
+// siteKeys whose org is opted in to auto-start (XERK-41). The opt-in is HUB-ONLY:
+// it's the hub's own durable per-org toggle (autoStartOrgs), set from the board —
+// there is no agent-side flag. No onlineness gate here (it's hub state, not a host
+// report); the sweep still only acts on orgs with a live reporting block and routes
+// through findTicketHost, which needs an online host anyway, so a toggled-on org
+// with every host down simply no-ops.
+function orgsWithAutoStart() {
+  return new Set(Object.keys(autoStartOrgs).filter((k) => autoStartOrgs[k]));
+}
+
+// Every ticket that already has a session, on any channel — the durable
+// dedup key for auto-start. Mirrors board.js's ticketSessionIndex: a ticket is
+// "started" if any host's live/stopped registry (a.sessions), its killed history
+// (a.closedSessions), or a repo's resumable scan (a.repos[].resumable) carries a
+// session whose `ticket` names it. Keyed "<siteKey>\x00<key>" like the routing
+// helpers, so a lookup is a plain Set membership test.
+function startedTicketKeys() {
+  const keys = new Set();
+  const add = (s) => {
+    const t = s && s.ticket;
+    if (t && t.key) keys.add((t.siteKey || "") + "\x00" + t.key);
+  };
+  for (const a of Object.values(agents)) {
+    for (const s of a.sessions || []) add(s);
+    for (const c of a.closedSessions || []) add(c);
+    for (const r of a.repos || []) for (const t of r.resumable || []) add(t);
+  }
+  return keys;
+}
+
+function autoStartSweep() {
+  const orgs = orgsWithAutoStart();
+  if (!orgs.size) return;
+  const now = Date.now();
+  const started = startedTicketKeys();
+  for (const siteKey of orgs) {
+    // The freshest reporting block owns the ticket list and its repo guesses, the
+    // same copy ticketRepo/mergeSites resolve against — so the hub auto-starts on
+    // what the board would show, not a lagging host's older view.
+    let block = null, bestAt = "";
+    for (const a of Object.values(agents)) {
+      if (!a.jira || a.jira.siteKey !== siteKey) continue;
+      const at = String(a.jira.fetchedAt || "");
+      if (!block || at > bestAt) { block = a.jira; bestAt = at; }
+    }
+    for (const t of (block && block.tickets) || []) {
+      if (!t || !t.key) continue;
+      if (t.statusCategory !== "todo") continue;      // only "To Do" tickets
+      const repo = ticketRepo(siteKey, t.key);         // a repo must be assigned
+      if (!repo) continue;
+      const k = siteKey + "\x00" + t.key;
+      // A session exists on some channel — the work is under way (or was, and
+      // was deliberately killed). Done with this ticket for good; drop any
+      // attempt record so the map only ever holds tickets still failing.
+      if (started.has(k)) { autoStarted.delete(k); continue; }
+      // A spawnTicket already riding some org host's queue: the agent hasn't
+      // taken it yet, so there is nothing to conclude about it either way.
+      const inFlight = Object.values(agents).some((a) =>
+        a.jira && a.jira.siteKey === siteKey &&
+        (a.commands || []).some((c) => c.type === "spawnTicket" && c.issueKey === t.key));
+      if (inFlight) continue;
+      // Nothing in flight and still no session: the last attempt (if any) was
+      // taken and produced nothing. Retry it once its backoff has elapsed — the
+      // backoff is the ONLY gate now, so a ticket blocked by a transient failure
+      // recovers on its own the moment the block clears (XERK-109).
+      const prior = autoStarted.get(k);
+      if (prior && now < prior.nextAt) continue;
+      const { host } = findTicketHost(siteKey, repo, t.key);
+      // No online host to route to right now (the org's hosts are down, or the
+      // ticket's pinned agent is) — spend no attempt, so the next sweep retries
+      // immediately once a host is back rather than sitting out a backoff for a
+      // failure that was never the ticket's fault.
+      if (!host) continue;
+      const mpin = ticketModelPin(siteKey, t.key);   // XERK-123, see /session
+      queueCommand(host, { type: "spawnTicket", issueKey: t.key,
+        ...(mpin ? { model: mpin.model } : {}) });
+      // Grow the backoff toward its ceiling; the counter is capped there so it
+      // settles into a steady once-per-ceiling retry instead of climbing forever.
+      const attempts = Math.min((prior ? prior.attempts : 0) + 1,
+        AUTO_START_BACKOFF_STEPS);
+      autoStarted.set(k, { attempts, nextAt: autoStartRetryAt(now, attempts) });
+      if (attempts > 1) {
+        console.log(`auto-start: retrying ${t.key} on ${host} — the previous `
+          + "spawnTicket was acked but left no session (backing off, but the hub "
+          + "keeps trying so it recovers once the block clears)");
+      }
+    }
+  }
+}
+// The lifecycle counterpart to autoStartSweep (XERK-45): when a ticket moves to
+// Done, stop the session(s) working it.
+//
+// UNLIKE auto-start, this is UNCONDITIONAL — it is NOT gated on the per-org
+// "auto" opt-in (orgsWithAutoStart), which governs ONLY whether the hub
+// auto-STARTS work (XERK-161). A ticket only reaches Done by a HUMAN moving it
+// (the board is pull-only — no session writes to Jira), so it's a deliberate
+// "this work is finished" signal that should always retire its session, whatever
+// the org's auto-start preference. So this sweep runs for EVERY org that reports
+// a board block. It can only ever touch a session that was spawned to WORK a
+// ticket (s.ticket is set) whose key now reads Done on the board — a
+// manually-started session carries no ticket and is never affected.
+//
+// The hub KILLS the session rather than merely interrupting it: a kill ends the
+// session cleanly — it moves to the Ended list with its worktree, conversation
+// and PR chips intact and still resumable, and frees the MAX_SESSIONS slot. An
+// interrupt would only cancel the in-flight turn and leave the session running
+// idle, still holding that slot with nothing to do.
+//
+// The DECISION and ROUTING live here for the same reason auto-start's do: only
+// the hub sees the whole fleet. The tickets (and which is Done) come from each
+// org's freshest jira block, but a session can live on ANY host, so the sweep
+// scans the whole fleet and routes each kill to the host that owns the session —
+// the kill command is keyed on the sessionId the agent minted.
+//
+// Guard: autoStopped fires the kill for a given session at most once per hub
+// lifetime. A kill drops the session's registry record within a beat or two, but
+// it's still reported in that window, so the set stops a duplicate kill riding
+// every 15s sweep until the record clears. It needs no durability — unlike
+// auto-start's dedup (which stops a REFUSED spawn re-queuing forever), a
+// re-issued kill of an already-dead session is a harmless no-op the agent
+// ignores, and a still-live session re-derives into the sweep on its own.
+const autoStopped = new Set(); // "<host>\x00<sessionId>" already auto-stopped
+
+function autoStopSweep() {
+  // The set of now-Done tickets across EVERY reporting org — no opt-in gate —
+  // each taken from that org's freshest block, the same copy the board renders,
+  // so the hub stops on what the board shows, not a lagging host's view.
+  const freshest = new Map(); // siteKey -> { block, at }
+  for (const a of Object.values(agents)) {
+    const j = a && a.jira;
+    if (!j || !j.siteKey) continue;
+    const at = String(j.fetchedAt || "");
+    const cur = freshest.get(j.siteKey);
+    if (!cur || at > cur.at) freshest.set(j.siteKey, { block: j, at });
+  }
+  const doneKeys = new Set(); // "<siteKey>\x00<issueKey>"
+  for (const { block } of freshest.values()) {
+    for (const t of block.tickets || []) {
+      if (t && t.key && t.statusCategory === "done") {
+        doneKeys.add(block.siteKey + "\x00" + t.key);
+      }
+    }
+  }
+  if (!doneKeys.size) return;
+  for (const [host, a] of Object.entries(agents)) {
+    for (const s of a.sessions || []) {
+      // Only a LIVE session holds a slot and is worth stopping. A stopped/error
+      // session already ended; a killed one is gone from a.sessions entirely.
+      // A queued session (its ticket already Done before it ever ran) is killed
+      // too — that's its Cancel path, and running it would be pointless.
+      if (s.status !== "running" && s.status !== "queued") continue;
+      const t = s.ticket;
+      if (!t || !t.key) continue;
+      if (!doneKeys.has((t.siteKey || "") + "\x00" + t.key)) continue;
+      const dk = host + "\x00" + s.id;
+      if (autoStopped.has(dk)) continue;
+      queueCommand(host, { type: "kill", sessionId: s.id });
+      autoStopped.add(dk);
+    }
+  }
+}
+
+// Don't act on freshly-loaded (possibly stale) state right after a hub boot, the
+// same reason the offline sweep waits: let agents re-report first. (The opt-in map
+// loads from disk at boot, but the sweeps only act on orgs with a live reporting
+// block and route through findTicketHost, so they no-op until a host re-heartbeats
+// anyway — this is belt-and-suspenders, kept out of the sweeps themselves so they
+// stay pure, directly-callable units.)
+setInterval(() => {
+  if (Date.now() - BOOT_AT < BOOT_GRACE_MS) return;
+  autoStartSweep();
+  autoStopSweep();
+}, AUTO_START_EVERY_MS).unref();
+
+// Migration timeouts + settled-record cleanup (the fast handoff runs on the
+// target's heartbeat; this is the fallback that fails a stuck move and retires a
+// done one). Runs regardless of boot grace — a migration is only ever created
+// after boot, by an explicit operator action.
+setInterval(() => {
+  if (migrations.size) advanceMigrations();
+}, 10 * 1000).unref();
+
 const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
-const HISTORY = fs.readFileSync(path.join(__dirname, "public", "history.html"));
+const USAGE = fs.readFileSync(path.join(__dirname, "public", "usage.html"));
 const SESSIONS = fs.readFileSync(path.join(__dirname, "public", "sessions.html"));
+const BOARD = fs.readFileSync(path.join(__dirname, "public", "board.html"));
 const LOGIN = fs.readFileSync(path.join(__dirname, "public", "login.html"));
 
 // Branded static assets: the shared stylesheet, self-hosted UI fonts (Inter +
@@ -703,6 +1919,10 @@ const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 const STATIC_ASSETS = {
   "/app.css":              { body: fs.readFileSync(path.join(__dirname, "public", "app.css")),             type: "text/css; charset=utf-8",                  cache: "public, max-age=300" },
   "/chat.js":              { body: fs.readFileSync(path.join(__dirname, "public", "chat.js")),             type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
+  "/board.js":             { body: fs.readFileSync(path.join(__dirname, "public", "board.js")),            type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
+  "/nav.js":               { body: fs.readFileSync(path.join(__dirname, "public", "nav.js")),              type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
+  "/org.js":               { body: fs.readFileSync(path.join(__dirname, "public", "org.js")),              type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
+  "/newticket.js":         { body: fs.readFileSync(path.join(__dirname, "public", "newticket.js")),        type: "text/javascript; charset=utf-8",           cache: "public, max-age=300" },
   "/favicon.svg":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.svg")),         type: "image/svg+xml",                            cache: IMMUTABLE_CACHE },
   "/favicon.ico":          { body: fs.readFileSync(path.join(__dirname, "public", "favicon.ico")),         type: "image/x-icon",                             cache: IMMUTABLE_CACHE },
   "/favicon-16.png":       { body: fs.readFileSync(path.join(__dirname, "public", "favicon-16.png")),      type: "image/png",                                cache: IMMUTABLE_CACHE },
@@ -752,6 +1972,48 @@ const TERM_TOUCH_SCROLL =
   "deltaMode:0,bubbles:true,cancelable:true}));}},{passive:false});" +
   "addEventListener('touchend',function(){y=null;},{passive:false});" +
   "})();</script>";
+
+// Clipboard bridge injected into ttyd's page: the half of "copy out of the
+// terminal" that lives in the browser (XERK-7). A copy made inside the session
+// travels out as an OSC 52 escape, and xterm.js PARSES OSC 52 but ships no
+// handler for one — the sequence arrives and nothing happens — so a copy landed
+// in the tab and went no further, pasteable inside the terminal and nowhere
+// else. ttyd exposes its xterm instance as window.term, so registering the
+// handler it lacks is all the hub has to do. The agent's tmux.conf holds the
+// other half: tmux only emits OSC 52 when the outer terminfo advertises Ms.
+//
+// This is injected into <head>, so window.term won't exist for another beat or
+// two — hence the retry rather than a single read at parse time.
+const TERM_OSC52_JS =
+  "(function(){" +
+  "function wire(){" +
+  "var t=window.term;" +
+  "if(!t||!t.parser)return setTimeout(wire,50);" +
+  "t.parser.registerOscHandler(52,function(data){" +
+  // "<selection>;<payload>" — but tmux sends an EMPTY selection (";<payload>")
+  // where a bare app sends "c;<payload>", so split at the first ';' rather than
+  // matching a selection name we'd only have to enumerate.
+  "var i=data.indexOf(';');var b64=i<0?data:data.slice(i+1);" +
+  // "?" is a clipboard READ request, and this bridge is deliberately write-only:
+  // answering one would hand any program running in the pane the operator's
+  // whole clipboard. An empty payload is tmux copying an empty selection —
+  // dropped rather than written, so a stray one can't wipe the clipboard.
+  "if(b64==='?'||b64==='')return true;" +
+  "try{" +
+  "var bin=atob(b64);" +
+  // OSC 52 carries base64 of UTF-8 BYTES; atob yields one char per byte, so the
+  // bytes have to be decoded back or anything non-ASCII pastes as mojibake.
+  "var text=new TextDecoder().decode(Uint8Array.from(bin,function(c){" +
+  "return c.charCodeAt(0);}));" +
+  // Rejects if the document isn't focused or the permission is refused. Nothing
+  // to fall back to, and throwing here would land inside xterm.js's parser, so
+  // swallow it: the operator is left exactly where this fix found them.
+  "navigator.clipboard.writeText(text).catch(function(){});" +
+  "}catch(e){}" +
+  "return true;" +
+  "});}" +
+  "wire();})();";
+const TERM_OSC52_CLIPBOARD = "<script>" + TERM_OSC52_JS + "</script>";
 
 // ---- minimal WebSocket server framing (RFC 6455) ----------------------------
 // We only need enough to carry an opaque byte stream (the agent's ttyd TCP
@@ -952,11 +2214,43 @@ function openChannel(name, port) {
 // best-effort: if the control channel is offline the glasses simply keep
 // getting the (slower) heartbeat tail via the poll.
 
-// The session's worktree path as last reported on a heartbeat — what the agent
-// needs to locate the transcript. null if the session isn't known.
-function worktreePathFor(host, sessionId) {
+// Where the agent should look for a session's transcript, as last reported on a
+// heartbeat: its worktree path (which resolves to the project dir) plus the
+// transcript id naming its own conversation within that dir. The id matters for
+// repos-root sessions, whose project dir is shared by every root session ever
+// run — without it the agent tails whichever transcript there is newest, which
+// is the previous session's (XERK-6). null if the session isn't known;
+// transcriptId is null for an agent predating the pin, which leaves it on the
+// newest-mtime rule it always used.
+function watchTargetFor(host, sessionId) {
   const sess = (agents[host]?.sessions || []).find((s) => s.id === sessionId);
-  return sess?.worktreePath || null;
+  if (!sess?.worktreePath) return null;
+  return { worktreePath: sess.worktreePath, transcriptId: sess.transcriptId || null };
+}
+
+// A watched session's conversation MOVED — "Restart (clear context)" relaunches
+// claude on a fresh transcript — so re-arm the agent's tail onto the new one.
+//
+// A watch is otherwise sent once (on first watcher / control reconnect) and the
+// agent holds that target for the life of the watch, so without this the tail
+// stays pinned to a file the restarted session will never write to again: it
+// reports no deltas, and the chat sits frozen on the pre-restart conversation
+// with nothing to correct it (the /history poll only runs while the socket is
+// DOWN, and this one is healthy). Naming the transcript is what introduced the
+// need — the newest-mtime rule this replaced rolled onto the new file by itself.
+function rearmMovedWatches(host, prev, next) {
+  const cc = controlChannels[host];
+  const watched = liveClients[host];
+  if (!cc || !watched) return;
+  const before = new Map((prev?.sessions || []).map((s) => [s.id, s.transcriptId || null]));
+  for (const sess of next?.sessions || []) {
+    if (!watched[sess.id] || !sess.worktreePath) continue;
+    const now = sess.transcriptId || null;
+    // Only on a real move. An agent predating the pin reports null every beat,
+    // which is not a move — and re-arming on every beat would be a no-op anyway.
+    if (!before.has(sess.id) || before.get(sess.id) === now) continue;
+    cc.sendWatch(sess.id, { worktreePath: sess.worktreePath, transcriptId: now });
+  }
 }
 
 // Send one JSON text frame to a single live subscriber socket (best-effort).
@@ -1030,9 +2324,9 @@ async function proxyTerm(req, res, name, port) {
         upRes.on("data", (c) => chunks.push(c));
         upRes.on("end", () => {
           let html = Buffer.concat(chunks).toString("utf8");
-          // Insert the @font-face + touch-scroll shim before </head> (fall
-          // back to prepending).
-          const inject = TERM_FONT_STYLE + TERM_TOUCH_SCROLL;
+          // Insert the @font-face + touch-scroll shim + clipboard bridge before
+          // </head> (fall back to prepending).
+          const inject = TERM_FONT_STYLE + TERM_TOUCH_SCROLL + TERM_OSC52_CLIPBOARD;
           html = html.includes("</head>")
             ? html.replace("</head>", inject + "</head>")
             : inject + html;
@@ -1121,12 +2415,29 @@ const server = http.createServer(async (req, res) => {
       req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
       parts[3] === "archive" && parts.length === 5;
 
+    // The expected-restart signal is agent-pushed (bearer token) like the
+    // heartbeat: the agent fires it as it goes down, before it could ever hold
+    // a user login (XERK-29).
+    const isUpdatingSignal =
+      req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+      parts[3] === "updating" && parts.length === 4;
+
     // The programmatic trigger endpoint carries its own bearer-token auth (or a
     // user login), so it's gated by triggerAuthorized instead of the
     // browser-only userAuthorized gate below.
     const isTrigger = req.method === "POST" && url.pathname === "/api/trigger";
 
-    if (url.pathname === "/api/heartbeat" || isArchiveIngest) {
+    // The migration transcript relay is agent-pushed/pulled (bearer token) like
+    // the heartbeat/archive — a source agent POSTs the bundle, the target agent
+    // GETs it (XERK-101). The user-triggered /migrate endpoint that starts it
+    // all rides the normal user login below.
+    const isMigrationBlob =
+      (req.method === "POST" || req.method === "GET") &&
+      parts[0] === "api" && parts[1] === "agents" &&
+      parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6;
+
+    if (url.pathname === "/api/heartbeat" || isArchiveIngest || isUpdatingSignal ||
+        isMigrationBlob) {
       if (!agentAuthorized(req)) return json(res, 401, { error: "unauthorized" });
     } else if (isTrigger) {
       if (!triggerAuthorized(req)) return json(res, 401, { error: "unauthorized" });
@@ -1189,14 +2500,28 @@ const server = http.createServer(async (req, res) => {
       return res.end(INDEX);
     }
 
-    if (req.method === "GET" && (url.pathname === "/history" || url.pathname === "/history.html")) {
+    if (req.method === "GET" && (url.pathname === "/usage" || url.pathname === "/usage.html")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      return res.end(HISTORY);
+      return res.end(USAGE);
+    }
+
+    // The page was /history until it dropped cost and became token-only. Keep
+    // old bookmarks and the Android client's deep links working.
+    if (req.method === "GET" && (url.pathname === "/history" || url.pathname === "/history.html")) {
+      res.writeHead(301, { Location: "/usage" });
+      return res.end();
     }
 
     if (req.method === "GET" && (url.pathname === "/sessions" || url.pathname === "/sessions.html")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       return res.end(SESSIONS);
+    }
+
+    // Unified Jira Kanban across every agent's org (the agents' `jira`
+    // heartbeat blocks; merging happens client-side in board.js).
+    if (req.method === "GET" && (url.pathname === "/board" || url.pathname === "/board.html")) {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(BOARD);
     }
 
     // Web font for the live terminal (referenced by the @font-face proxyTerm
@@ -1217,7 +2542,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Mobile push device registry. The Android client registers its FCM token
-    // here so hub alerts (notify()) also fan out to it; it unregisters on
+    // here so hub alerts (notify()) fan out to it; it unregisters on
     // sign-out. User-authed like the rest of the browser API (the gate above
     // already enforced it). Unregister takes the token as a query param, not a
     // path segment, because FCM tokens can contain `/`.
@@ -1226,7 +2551,8 @@ const server = http.createServer(async (req, res) => {
       const token = typeof body.token === "string" ? body.token.trim() : "";
       if (!token) return json(res, 400, { error: "token required" });
       const platform = typeof body.platform === "string" ? body.platform : "android";
-      registerDevice(token, platform);
+      const features = Array.isArray(body.features) ? body.features : undefined;
+      registerDevice(token, platform, features);
       return json(res, 200, { ok: true });
     }
     if (req.method === "DELETE" && url.pathname === "/api/devices") {
@@ -1302,6 +2628,26 @@ const server = http.createServer(async (req, res) => {
       // stored on the record verbatim.
       const historyResults = payload.historyResults;
       delete payload.historyResults;
+      // On-demand background-agent transcripts the agent fetched since the last
+      // beat (see the {type:"subagentHistory"} command); cached like history.
+      const subagentHistoryResults = payload.subagentHistoryResults;
+      delete payload.subagentHistoryResults;
+      // On-demand Jira issue detail the agent fetched since the last beat (see
+      // the {type:"jiraIssue"} command); cached below, like historyResults.
+      const jiraIssueResults = payload.jiraIssueResults;
+      delete payload.jiraIssueResults;
+      // Outcomes of board status changes the agent applied since the last beat
+      // (the {type:"setTicketStatus"} command, XERK-138); cached by cmdId below
+      // so the panel that asked can poll for its own answer.
+      const ticketStatusResults = payload.ticketStatusResults;
+      delete payload.ticketStatusResults;
+      // New-ticket create metadata + outcomes the agent produced since the last
+      // beat (see the {type:"boardCreateMeta"|"createTicket"} commands, XERK-137);
+      // cached below like jiraIssueResults, off the persisted record.
+      const createMetaResults = payload.createMetaResults;
+      delete payload.createMetaResults;
+      const createTicketResults = payload.createTicketResults;
+      delete payload.createTicketResults;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -1325,14 +2671,76 @@ const server = http.createServer(async (req, res) => {
         // Per-session history cache (see the /history route); survives across
         // beats like the rest of agent state.
         history: prev.history || {},
+        // Per-(session,type,label) background-agent transcript cache (see the
+        // /subagents/history route); like `history`, survives across beats.
+        subagentHistory: prev.subagentHistory || {},
+        // Per-issue Jira detail cache (see the /api/jira route); like `history`,
+        // survives across beats.
+        jiraIssues: prev.jiraIssues || {},
+        // Per-cmdId board-status-change outcome cache (see the /status route,
+        // XERK-138); survives across beats like `jiraIssues`.
+        statusResults: prev.statusResults || {},
+        // New-ticket create caches (XERK-137): the org's project/label metadata,
+        // per-project issue types, and per-cmdId create outcomes. Like the other
+        // on-demand caches, they survive across beats and are stripped from the
+        // fleet payload (served by their own routes).
+        createMeta: prev.createMeta || null,
+        createTypes: prev.createTypes || {},
+        createResults: prev.createResults || {},
+        // Commands awaiting a staged result, and the capability gaps their acks
+        // have proved (XERK-151). Both survive across beats like the caches
+        // above; `unsupported` is what the board routes refuse on.
+        resultWaits: prev.resultWaits || {},
+        unsupported: prev.unsupported || {},
       });
       ingestHistory(next, historyResults);
+      ingestSubagentHistory(next, subagentHistoryResults);
+      ingestJiraIssues(next, jiraIssueResults);
+      ingestStatusResults(next, ticketStatusResults);
+      ingestCreateMeta(next, createMetaResults);
+      ingestCreateResults(next, createTicketResults);
+      // Ordered after every ingest above: an ack settles against what this same
+      // beat delivered, which is the whole basis of the gap detection.
+      resolveResultWaits(prev, next, commands);
       heartbeatAlerts(key, prev, next);
+      rearmMovedWatches(key, prev, next);
+      // A migration finishes the instant its target session heartbeats in — do
+      // the handoff (kill source, mark done) now rather than waiting out the
+      // sweep interval (XERK-101). Cheap: a no-op unless a migration is live.
+      if (migrations.size) advanceMigrations();
       scheduleSave();
       // A fresh beat landed — refresh the memoized fleet payload and push the
       // updated record to open dashboards so the UI reflects it near-instantly.
       publishAgent(key);
       return json(res, 200, archiveHave ? { commands, archiveHave } : { commands });
+    }
+
+    // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart
+    // (an image update recreating its container, or the native self-updater) just
+    // before it stops heartbeating, so the coming silence renders as `updating`
+    // rather than an unexpected-outage `offline` (XERK-29). Agent-authed above,
+    // like the heartbeat/archive. Body: {reason, version}. The status auto-clears
+    // the instant the host heartbeats again (the beat rebuilds the record without
+    // it) or once the grace window lapses on a stuck update.
+    if (isUpdatingSignal) {
+      const key = decodeURIComponent(parts[2]);
+      const a = agents[key];
+      // Only a host we already know can be "updating" — an unknown key has no
+      // record to hang the status on and nothing to suppress an alert for.
+      if (!a) return json(res, 404, { error: "unknown host" });
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const now = Date.now();
+      a.updating = {
+        at: now,
+        until: now + UPDATING_GRACE_MS,
+        reason: typeof body.reason === "string" ? body.reason.slice(0, 40) : "restart",
+        version: typeof body.version === "string" ? body.version.slice(0, 40) : null,
+      };
+      scheduleSave();
+      // Refresh the memoized fleet payload (its `updating`/`online` flags just
+      // changed) and push the transition to open dashboards immediately.
+      publishAgent(key);
+      return json(res, 200, { ok: true });
     }
 
     // POST /api/agents/<host>/archive/<transcriptId> — an agent pushing one delta
@@ -1354,6 +2762,74 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         return json(res, 500, { error: e.message });
       }
+    }
+
+    // POST /api/agents/<host>/migrations/<id>/blob — the SOURCE agent uploading
+    // a migrated session's raw transcript bundle. Agent-authed above. Body is
+    // the raw gzipped tar; storing it advances the migration to `importing` and
+    // queues importSession on the target (XERK-101).
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
+      const id = decodeURIComponent(parts[4]);
+      const m = migrations.get(id);
+      if (!m) return json(res, 404, { error: "unknown migration" });
+      if (m.phase !== "exporting")
+        return json(res, 409, { error: "migration not awaiting a bundle" });
+      let blob;
+      try {
+        blob = await readRawBody(req, MIGRATE_BLOB_MAX);
+      } catch (e) {
+        m.phase = "failed"; m.error = "transcript bundle too large"; m.at = Date.now();
+        publishMigrations();
+        return json(res, 413, { error: e.message });
+      }
+      if (!blob.length) return json(res, 400, { error: "empty bundle" });
+      m.blob = blob;
+      m.phase = "importing";
+      m.at = Date.now();
+      // Hand the target everything it needs to resume the moved session as its
+      // old self: the transcript id + origin cwd (so `claude --resume` resolves)
+      // plus the carried-over identity. Its spawnCmdId is this importCmdId, which
+      // is how advanceMigrations recognizes the target session coming up.
+      const src = agents[m.srcHost];
+      const s = src && (src.sessions || []).find((x) => x.id === m.srcSessionId);
+      const cwd = s && s.worktreePath;
+      if (!cwd) {
+        m.phase = "failed"; m.error = "source session gone"; m.blob = null; m.at = Date.now();
+        publishMigrations();
+        return json(res, 409, { error: "source session gone" });
+      }
+      m.importCmdId = queueCommand(m.targetHost, {
+        type: "importSession",
+        migrationId: id,
+        transcriptId: m.transcriptId,
+        cwd,
+        repo: m.repo,
+        model: m.meta.model,
+        permissionMode: m.meta.permissionMode,
+        summary: m.meta.summary,
+        summaryManual: m.meta.summaryManual,
+        label: m.meta.label,
+        ticket: m.meta.ticket,
+        migratedFrom: { host: m.srcHost, sessionId: m.srcSessionId, at: Date.now() },
+      });
+      publishMigrations();
+      return json(res, 200, { ok: true });
+    }
+
+    // GET /api/agents/<host>/migrations/<id>/blob — the TARGET agent pulling the
+    // bundle to unpack + resume. Agent-authed above.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6) {
+      const id = decodeURIComponent(parts[4]);
+      const m = migrations.get(id);
+      if (!m || !m.blob) return json(res, 404, { error: "no bundle" });
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": m.blob.length,
+        "Cache-Control": "no-store",
+      });
+      return res.end(m.blob);
     }
 
     // GET /api/search?q=&repo=&host=&limit= — instant hub-local full-text search
@@ -1394,18 +2870,27 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, t);
     }
 
-    // POST /api/agents/<host>/clone — queue a GitHub clone into the host's
-    // repos root. Body: {repo} (owner/repo or a GitHub URL); the agent validates
-    // and clones it (gated on the host actually having GitHub creds — the UI
-    // greys the control out otherwise). The new repo joins the scan and becomes
-    // spawnable once the clone lands.
+    // POST /api/agents/<host>/clone — queue a clone into the host's repos
+    // root. Body: {repo, source?} — repo is owner/repo or a GitHub URL, and
+    // source ("github"/"azure"/"gitlab", XERK-155) says which listing the pick
+    // came from; the agent resolves the clone URL against its OWN cached
+    // listing for that source, so nothing here is more than routing. Omitted
+    // source keeps the legacy free-text GitHub meaning. The new repo joins the
+    // scan and becomes spawnable once the clone lands.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts[3] === "clone" && parts.length === 4) {
       const key = decodeURIComponent(parts[2]);
       if (!agents[key]) return json(res, 404, { error: "unknown agent" });
       const body = JSON.parse((await readBody(req)) || "{}");
       if (!body.repo) return json(res, 400, { error: "repo required" });
-      const cmdId = queueCommand(key, { type: "clone", repo: String(body.repo) });
+      const cmd = { type: "clone", repo: String(body.repo) };
+      if (body.source != null) {
+        if (!["github", "azure", "gitlab"].includes(body.source)) {
+          return json(res, 400, { error: "unknown clone source" });
+        }
+        cmd.source = body.source;
+      }
+      const cmdId = queueCommand(key, cmd);
       return json(res, 200, { ok: true, cmdId });
     }
 
@@ -1421,6 +2906,51 @@ const server = http.createServer(async (req, res) => {
       if (!repo) return json(res, 400, { error: "repo required" });
       const cmdId = queueCommand(key, { type: "prune", repo });
       return json(res, 200, { ok: true, cmdId });
+    }
+
+    // POST /api/agents/<host>/restart — restart the host's agent MANAGER from
+    // the dashboard (XERK-157), e.g. after fixing an expired Claude login. The
+    // agent exits for its supervisor (systemd Restart=always / Docker restart
+    // policy / turma-agentctl) to bring it back; running sessions are re-adopted
+    // on boot. The agent announces the expected downtime so the coming beat gap
+    // reads as `updating`, not an outage. Collapse a mashed button: don't queue
+    // a second restart while one is already unacked in flight.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "restart" && parts.length === 4) {
+      const key = decodeURIComponent(parts[2]);
+      if (!agents[key]) return json(res, 404, { error: "unknown agent" });
+      const pending = (agents[key].commands || []).find((c) => c.type === "restartAgent");
+      const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "restartAgent" });
+      return json(res, 200, { ok: true, cmdId });
+    }
+
+    // POST /api/jira/refresh — the /board page's manual refresh: re-poll Jira
+    // now rather than waiting out each agent's slow cadence (30 beats). It fans
+    // out across hosts because the board is a MERGE of every host's block —
+    // refreshing a single org would leave the rest of one board stale under a
+    // button that reads "Refresh".
+    //
+    // Targets `configured` (creds present), not `available` (a poll has
+    // succeeded): a host whose polls are failing reports available=false, and
+    // that is precisely the host a manual retry is for. `|| siteKey` keeps
+    // agents predating the `configured` field targetable on the only evidence
+    // they report. Hosts with no Jira at all are skipped, so an unconfigured
+    // fleet gets no commands (the agent re-checks anyway).
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts[2] === "refresh" && parts.length === 3) {
+      const hosts = Object.keys(agents).filter((k) => {
+        const j = agents[k] && agents[k].jira;
+        return !!j && (j.configured === true || !!j.siteKey);
+      });
+      // Collapse a mashed button: a host already holding an unacked refresh
+      // would otherwise run one full re-poll per click. `hosts` still reports
+      // it as targeted (a refresh IS in flight for it), while `queued` names
+      // only what this call actually enqueued.
+      const queued = hosts.filter(
+        (k) => !(agents[k].commands || []).some((c) => c.type === "refreshJira")
+      );
+      for (const k of queued) queueCommand(k, { type: "refreshJira" });
+      return json(res, 200, { ok: true, hosts, queued });
     }
 
     // POST /api/agents/<host>/transcripts/<transcriptId>/resume — resume ANY
@@ -1509,6 +3039,55 @@ const server = http.createServer(async (req, res) => {
         const cmdId = queueCommand(key, { type: parts[5], sessionId });
         return json(res, 200, { ok: true, cmdId });
       }
+      // POST /api/agents/<host>/sessions/<id>/interrupt -> stop the turn a
+      // running session has in flight (the agent sends Escape to its TUI). The
+      // session survives with its conversation intact — this is the gentle
+      // sibling of kill/restart, so it takes no body and needs no confirmation.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "interrupt") {
+        const cmdId = queueCommand(key, { type: "interrupt", sessionId });
+        return json(res, 200, { ok: true, cmdId });
+      }
+      // POST /api/agents/<srcHost>/sessions/<id>/migrate -> move a running
+      // session to another agent in the SAME org (XERK-101). Body: {host}, the
+      // target. The hub orchestrates: exportSession on the source, the blob
+      // relay, importSession on the target, then a kill of the source once the
+      // target is up. Returns {migrationId}; the UI follows the move via the
+      // `migrations` payload (its importCmdId feeds the normal followSpawn).
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "migrate") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const target = typeof body.host === "string" ? body.host : "";
+        const src = agents[key];
+        const s = (src.sessions || []).find((x) => x.id === sessionId);
+        if (!s) return json(res, 404, { error: "unknown session" });
+        if (s.status !== "running")
+          return json(res, 409, { error: "only a running session can be moved" });
+        if (s.root)
+          return json(res, 409, { error: "a repos-root session has no worktree to move" });
+        if (!s.transcriptId)
+          return json(res, 409, { error: "this session has no conversation to move yet" });
+        if (!target || target === key)
+          return json(res, 400, { error: "a different target host is required" });
+        const tgt = agents[target];
+        if (!tgt) return json(res, 404, { error: "unknown target host" });
+        if (siteKeyOf(src) !== siteKeyOf(tgt))
+          return json(res, 409, { error: "the target agent is in a different org" });
+        if (Date.now() - (tgt.lastSeen || 0) >= OFFLINE_AFTER_MS)
+          return json(res, 503, { error: "the target agent is offline" });
+        if (!(tgt.repos || []).some((r) => r && r.name === s.repo))
+          return json(res, 409, {
+            error: `the target agent doesn't have "${s.repo}" cloned — clone it there first`,
+          });
+        // Single-flight: don't start a second move of the same session while one
+        // is already exporting/importing (a double-click must not fan out).
+        for (const m of migrations.values()) {
+          if (m.srcHost === key && m.srcSessionId === sessionId &&
+              (m.phase === "exporting" || m.phase === "importing")) {
+            return json(res, 409, { error: "this session is already being moved" });
+          }
+        }
+        const m = startMigration(key, s, target);
+        return json(res, 200, { ok: true, migrationId: m.id });
+      }
       // POST /api/agents/<host>/sessions/<id>/input -> forward free-text input
       // to a running session (typing a message into the session). Body: {text}.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "input") {
@@ -1520,14 +3099,30 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/model -> switch a running
-      // session's model live (agent types `/model <name>`). Body: {model}, one
-      // of the composer's allowlisted aliases (default/opus/sonnet/haiku); the
-      // agent re-validates before it reaches the pane.
+      // session's model live, for that session only (the agent drives the
+      // /model picker's session-only path). Body: {model}, an alias from the
+      // host's probed `models.available` (or the static fallback set); the
+      // agent re-validates against its own allowlist before any key is pressed
+      // — this check only rejects the plainly malformed.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "model") {
         const body = JSON.parse((await readBody(req)) || "{}");
         const model = typeof body.model === "string" ? body.model : "";
         if (!model) return json(res, 400, { error: "model required" });
+        if (model.length > 60 || !/^[a-z0-9.[\]-]+$/i.test(model))
+          return json(res, 400, { error: "invalid model" });
         const cmdId = queueCommand(key, { type: "setModel", sessionId, model });
+        return json(res, 200, { ok: true, cmdId });
+      }
+      // POST /api/agents/<host>/sessions/<id>/summary -> rename a session (the
+      // few-word name its card leads with, normally auto-generated at spawn).
+      // Body: {summary}; an empty/blank one clears the name back to the
+      // label/worktree fallback. Purely presentational, so it's allowed on a
+      // stopped session too; the agent caps the length it stores.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "summary") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const summary = typeof body.summary === "string" ? body.summary : "";
+        if (summary.length > 200) return json(res, 400, { error: "summary too long" });
+        const cmdId = queueCommand(key, { type: "setSummary", sessionId, summary });
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/mode -> switch a running session's
@@ -1542,21 +3137,41 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/answer -> answer a pending
-      // AskUserQuestion. Body: {optionIndex} (0-based option pick) and/or
-      // {custom} (free-text / "Other" answer). The agent drops the answer file
-      // the ask.py bridge is blocked on. optionIndex -1 (or omitted) means a
-      // pure free-text answer; a valid answer needs at least one of the two.
+      // AskUserQuestion. Body: {optionIndex} (0-based single pick), or
+      // {optionIndices} (a list, for a multiSelect question), and/or {custom}
+      // (free-text / "Other" answer). The agent drops the answer file the ask.py
+      // bridge is blocked on. No option and no text means nothing to answer with.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "answer") {
         const body = JSON.parse((await readBody(req)) || "{}");
         const optionIndex = Number.isInteger(body.optionIndex) ? body.optionIndex : -1;
+        const optionIndices = Array.isArray(body.optionIndices)
+          ? body.optionIndices.filter((n) => Number.isInteger(n) && n >= 0)
+          : null;
         const custom = typeof body.custom === "string" ? body.custom : "";
-        if (optionIndex < 0 && !custom.trim()) {
-          return json(res, 400, { error: "optionIndex or custom required" });
+        const hasPick = optionIndex >= 0 || (optionIndices && optionIndices.length > 0);
+        if (!hasPick && !custom.trim()) {
+          return json(res, 400, { error: "optionIndex, optionIndices or custom required" });
         }
         if (custom.length > 4000) return json(res, 400, { error: "custom too long" });
         const cmd = { type: "answerQuestion", sessionId, optionIndex };
+        if (optionIndices && optionIndices.length) cmd.optionIndices = optionIndices;
         if (custom) cmd.custom = custom;
         const cmdId = queueCommand(key, cmd);
+        return json(res, 200, { ok: true, cmdId });
+      }
+      // POST /api/agents/<host>/sessions/<id>/pane-prompt -> answer the blocking
+      // choice dialog the session's TUI is showing (a tool-permission request or
+      // a plan approval, reported as session.panePrompt). Body: {optionNumber},
+      // the 1-based number the dialog itself displays — the agent types that
+      // digit, and re-reads the pane first so a click made against a stale beat
+      // is dropped rather than typed into a live composer.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "pane-prompt") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const optionNumber = Number.isInteger(body.optionNumber) ? body.optionNumber : 0;
+        if (optionNumber < 1 || optionNumber > 9) {
+          return json(res, 400, { error: "optionNumber 1-9 required" });
+        }
+        const cmdId = queueCommand(key, { type: "answerPanePrompt", sessionId, optionNumber });
         return json(res, 200, { ok: true, cmdId });
       }
       // GET /api/agents/<host>/sessions/<id>/history -> that session's recent
@@ -1570,12 +3185,37 @@ const server = http.createServer(async (req, res) => {
           return json(res, 200, {
             entries: cached.entries,
             truncated: cached.truncated,
+            queued: cached.queued || [],
             fetchedAt: cached.fetchedAt,
           });
         }
         const pending = (agents[key].commands || [])
           .find((c) => c.type === "history" && c.sessionId === sessionId);
         const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "history", sessionId });
+        return json(res, 202, { pending: true, cmdId });
+      }
+      // GET /api/agents/<host>/sessions/<id>/subagents/history?type=&label= ->
+      // the transcript of one live background agent the session spawned (the
+      // pane agent-list row identifies it by type + short description). Same
+      // fresh-cache / queue-and-202 / single-flight shape as /history.
+      if (req.method === "GET" && parts.length === 7 &&
+          parts[5] === "subagents" && parts[6] === "history") {
+        const agentType = (url.searchParams.get("type") || "").trim();
+        const label = (url.searchParams.get("label") || "").trim();
+        if (!agentType) return json(res, 400, { error: "type required" });
+        const cached = (agents[key].subagentHistory || {})[subagentKey(sessionId, agentType, label)];
+        if (cached && Date.now() - cached.fetchedAt < HISTORY_FRESH_MS) {
+          return json(res, 200, {
+            entries: cached.entries,
+            truncated: cached.truncated,
+            fetchedAt: cached.fetchedAt,
+          });
+        }
+        const pending = (agents[key].commands || []).find(
+          (c) => c.type === "subagentHistory" && c.sessionId === sessionId &&
+            c.agentType === agentType && (c.label || "") === label);
+        const cmdId = pending ? pending.cmdId
+          : queueCommand(key, { type: "subagentHistory", sessionId, agentType, label });
         return json(res, 202, { pending: true, cmdId });
       }
       // DELETE /api/agents/<host>/sessions/<id>
@@ -1592,6 +3232,470 @@ const server = http.createServer(async (req, res) => {
       invalidateAgentsCache();
       sseBroadcast("removed", { key });
       return json(res, 200, { ok: true });
+    }
+
+    // GET /api/jira/<siteKey>/create-meta[?project=<p>] -> the New-ticket form's
+    // choices (XERK-137). Without ?project: the org's project list + existing
+    // labels to suggest. With ?project: that project's creatable issue/work-item
+    // types. Routes to an ONLINE host reporting the org (the metadata is a live
+    // tracker fetch), rides the same {command -> staged result -> poll} path as
+    // the issue detail above, and is served from cache when fresh. Placed ahead
+    // of the <issueKey> route so "create-meta" isn't rejected as a bad key.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "create-meta") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const project = (url.searchParams.get("project") || "").trim();
+      const key = findJiraHost(siteKey, true);
+      if (!key) {
+        return findJiraHost(siteKey, false)
+          ? json(res, 503, { error: "no online host reports that org" })
+          : json(res, 404, { error: "no host reports that org" });
+      }
+      const a = agents[key];
+      const cached = project
+        ? (a.createTypes || {})[project]
+        : a.createMeta;
+      if (cached && Date.now() - cached.fetchedAt < CREATE_META_FRESH_MS) {
+        if (cached.error) return json(res, 200, { error: cached.error });
+        return json(res, 200, project
+          ? { types: cached.types }
+          : { projects: cached.projects, labels: cached.labels, source: cached.source });
+      }
+      // An agent that has already proved it doesn't implement this command would
+      // ack the next one just as silently, so say so instead of 202-ing until
+      // the client times out (XERK-151). Errors ride a 200 here, as a cached
+      // fetch error does — that's the shape both clients read the message from.
+      const gap = agentGapError(a, "boardCreateMeta", "offer the New-ticket options");
+      if (gap) return json(res, 200, { error: gap });
+      // Single-flight: reuse an already-queued fetch for the same (project|meta).
+      const pending = (a.commands || []).find(
+        (c) => c.type === "boardCreateMeta" && (c.project || "") === project);
+      const cmdId = pending
+        ? pending.cmdId
+        : queueCommand(key, { type: "boardCreateMeta", ...(project ? { project } : {}) });
+      if (!pending) awaitResult(a, cmdId, "boardCreateMeta", project ? { project } : null);
+      return json(res, 202, { pending: true, cmdId });
+    }
+
+    // POST /api/jira/<siteKey>/tickets -> create a new ticket on the org's board
+    // (XERK-137). Body: {project, issueType, summary, description?, labels?[]}.
+    //
+    // The board's first WRITE path to the tracker. Like the /session route the
+    // hub's job is ROUTING: the create runs agent-side (only the host holds the
+    // tracker creds), so this validates the inputs, routes to an ONLINE host
+    // reporting the org, and queues the create command. The agent creates the
+    // issue and stages the outcome keyed by this command's cmdId, which the
+    // client polls back at GET /api/jira/<siteKey>/tickets/<cmdId>.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "tickets") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const summary = typeof body.summary === "string" ? body.summary.trim() : "";
+      const project = typeof body.project === "string" ? body.project.trim() : "";
+      const issueType = typeof body.issueType === "string" ? body.issueType.trim() : "";
+      const description = typeof body.description === "string" ? body.description : "";
+      const labels = Array.isArray(body.labels)
+        ? body.labels.filter((l) => typeof l === "string" && l.trim())
+            .map((l) => l.trim()).slice(0, 20)
+        : [];
+      if (!summary) return json(res, 400, { error: "a title is required" });
+      if (!project) return json(res, 400, { error: "a project is required" });
+      if (!issueType) return json(res, 400, { error: "an issue type is required" });
+      const key = findJiraHost(siteKey, true);
+      if (!key) {
+        return findJiraHost(siteKey, false)
+          ? json(res, 503, { error: "no online host reports that org" })
+          : json(res, 404, { error: "no host reports that org" });
+      }
+      // Refuse rather than queue a create this agent can't run (XERK-151); the
+      // client would otherwise poll the outcome until it timed out.
+      const gap = agentGapError(agents[key], "createTicket", "create tickets");
+      if (gap) return json(res, 409, { error: gap });
+      const cmdId = queueCommand(key, {
+        type: "createTicket", project, issueType, summary, description, labels,
+      });
+      awaitResult(agents[key], cmdId, "createTicket");
+      return json(res, 200, { ok: true, cmdId, host: key });
+    }
+
+    // GET /api/jira/<siteKey>/tickets/<cmdId> -> poll a create's outcome
+    // (XERK-137). Searches every host reporting the org for the create result
+    // (the create was routed to one, but which one is the client's to not know):
+    // 200 with {key,url} on success, 200 with {error} on a create failure, 202
+    // while the agent hasn't reported the outcome yet.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[3] === "tickets") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const cmdId = decodeURIComponent(parts[4]);
+      let found = null, host = null;
+      for (const [k, a] of Object.entries(agents)) {
+        if (!a.jira || a.jira.siteKey !== siteKey) continue;
+        host = host || k;
+        const r = (a.createResults || {})[cmdId];
+        if (r) { found = r; break; }
+      }
+      if (!host) return json(res, 404, { error: "no host reports that org" });
+      if (found) {
+        return json(res, 200, found.error
+          ? { error: found.error }
+          : { key: found.key, url: found.url, warning: found.warning || null });
+      }
+      if (Date.now() - (agents[host].lastSeen || 0) >= OFFLINE_AFTER_MS) {
+        return json(res, 503, { error: "the host went offline before the ticket was created" });
+      }
+      return json(res, 202, { pending: true });
+    }
+
+    // GET /api/jira/<siteKey>/<issueKey> -> one ticket's full detail
+    // (description + comments) for the board's expanded view. The hub holds no
+    // Jira creds — they're per-host, user-scoped env — so this routes to a host
+    // reporting that org and rides the same {command -> staged result -> next
+    // beat} path as session history: a fresh cached issue is served outright,
+    // otherwise a fetch is queued (single-flight per key) and reported pending
+    // for the client to poll. Read-only; nothing here writes to Jira.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "jira" && parts.length === 4) {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      // Fall back to an offline host's cache: its last fetch of this ticket is
+      // still worth showing (the board already shows its stale tickets), even
+      // though we can't queue a refresh for it.
+      const key = findJiraHost(siteKey, true) || findJiraHost(siteKey, false);
+      if (!key) return json(res, 404, { error: "no host reports that Jira org" });
+      const cached = (agents[key].jiraIssues || {})[issueKey];
+      if (cached && Date.now() - cached.fetchedAt < JIRA_ISSUE_FRESH_MS) {
+        return json(res, 200, cached.error
+          ? { error: cached.error, fetchedAt: cached.fetchedAt }
+          : { issue: cached.issue, fetchedAt: cached.fetchedAt });
+      }
+      if (Date.now() - (agents[key].lastSeen || 0) >= OFFLINE_AFTER_MS) {
+        // Offline: a queued command would never be delivered, so answer with
+        // whatever we last got rather than leaving the client polling forever.
+        if (cached) {
+          return json(res, 200, cached.error
+            ? { error: cached.error, fetchedAt: cached.fetchedAt, stale: true }
+            : { issue: cached.issue, fetchedAt: cached.fetchedAt, stale: true });
+        }
+        return json(res, 503, { error: `host ${key} is offline` });
+      }
+      const pending = (agents[key].commands || [])
+        .find((c) => c.type === "jiraIssue" && c.issueKey === issueKey);
+      const cmdId = pending ? pending.cmdId : queueCommand(key, { type: "jiraIssue", issueKey });
+      return json(res, 202, { pending: true, cmdId });
+    }
+
+    // POST /api/jira/<siteKey>/<issueKey>/status — change a ticket's status and
+    // push it to the board (XERK-138). Body is one of:
+    //   {value}    — the transition id (Jira) / state name (Azure) the operator
+    //                picked from the detail's statusOptions (the panel picker);
+    //   {category} — the board COLUMN a card was dropped onto (XERK-141:
+    //                todo/inprogress/review/done), which the agent resolves to a
+    //                transition against a fresh read of the available options.
+    // A drag carries the column rather than a transition id because the board
+    // card never loaded the ticket's transitions — only the detail panel does.
+    //
+    // This is the ONE thing Turma writes back to a board, so unlike the read-only
+    // ticket GET it REQUIRES an online host: a queued write sitting on a sleeping
+    // agent would land whenever it woke — a surprise, not a feature. The hub's
+    // job is only routing + delivery; the agent re-reads the available options
+    // and applies only a target still on offer, so `value` is passed through
+    // (checked as a non-empty string) rather than allowlisted here — the board's
+    // own workflow, not this endpoint, decides what a ticket can move to.
+    //
+    // The outcome rides back on the heartbeat keyed by the queued cmdId; the
+    // client polls the GET below for it. Single-flight per ticket, like the
+    // spawnTicket route: a double-click must not fire two changes.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "status") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const value = typeof body.value === "string" ? body.value.trim() : "";
+      const category = typeof body.category === "string" ? body.category.trim() : "";
+      if (!value && !category) return json(res, 400, { error: "body needs {value} or {category}" });
+      if (!findJiraHost(siteKey, false)) {
+        return json(res, 404, { error: "no host reports that org" });
+      }
+      const key = findJiraHost(siteKey, true);
+      if (!key) return json(res, 503, { error: "no online host reports that org" });
+      // Same refusal as the create route: an agent predating XERK-138 acks this
+      // and stages nothing, which the panel/drag would poll out to a timeout.
+      const gap = agentGapError(agents[key], "setTicketStatus", "change a ticket's status");
+      if (gap) return json(res, 409, { error: gap });
+      const pending = (agents[key].commands || [])
+        .find((c) => c.type === "setTicketStatus" && c.issueKey === issueKey);
+      const cmdId = pending ? pending.cmdId
+        : queueCommand(key, { type: "setTicketStatus", issueKey, value, category });
+      if (!pending) awaitResult(agents[key], cmdId, "setTicketStatus");
+      return json(res, 202, { ok: true, cmdId, host: key });
+    }
+
+    // GET /api/jira/<siteKey>/<issueKey>/status?cmdId=<id> — poll the outcome of
+    // a status change queued by the POST above (XERK-138). {pending:true} until
+    // the agent's heartbeat carries the result for that cmdId, then {ok, error,
+    // status, statusCategory}. Keyed by cmdId so it answers the specific change
+    // the client made, not a stale prior one on the same ticket.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "status") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const cmdId = url.searchParams.get("cmdId");
+      if (!cmdId) return json(res, 400, { error: "cmdId required" });
+      const key = findJiraHost(siteKey, true) || findJiraHost(siteKey, false);
+      if (!key) return json(res, 404, { error: "no host reports that org" });
+      const r = (agents[key].statusResults || {})[cmdId];
+      if (!r) return json(res, 200, { pending: true });
+      return json(res, 200, {
+        ok: r.ok, error: r.error, status: r.status,
+        statusCategory: r.statusCategory,
+      });
+    }
+
+    // POST /api/jira/<siteKey>/<issueKey>/session -> start a session to work
+    // this ticket (the board card's start button).
+    //
+    // The hub's whole job here is ROUTING — picking the one host that can do the
+    // work — because it's the only party that sees the whole fleet. It sends just
+    // the issue key: the agent re-derives the repo, the ticket text and the branch
+    // name from its own local state, so a board that's a beat or two stale can't
+    // spawn against a repo the ticket has since been re-triaged away from.
+    //
+    // That re-derivation is also what makes a manual override (the /repo route
+    // below) authoritative here for free: the agent reads its own ledger, where a
+    // pin outranks the model, so a ticket the operator re-assigned spawns in the
+    // repo THEY chose without this route knowing the override exists.
+    //
+    // The reply is the queued cmdId, which the agent echoes back on the session it
+    // mints as `spawnCmdId` — the same correlation handle the composer's spawn
+    // uses, since the session id doesn't exist yet at POST time.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "session") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      // Org first, then the repo: an org nobody reports has no ticket to be
+      // untriaged, and answering "no triaged repo yet" for it would send the
+      // operator looking for a triage problem they don't have.
+      if (!findJiraHost(siteKey, false)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      const repo = ticketRepo(siteKey, issueKey);
+      // The button is only enabled on a triaged, cloned ticket, so this is a
+      // stale board (or a hand-rolled POST) rather than a normal path.
+      if (!repo) {
+        return json(res, 409, { error: "that ticket has no triaged repo yet" });
+      }
+      const { host, error, status, needsClone } = findTicketHost(siteKey, repo, issueKey);
+      if (!host) return json(res, status, { error });
+      // Single-flight per ticket, like the jiraIssue fetch above: a double-click
+      // (or a click while the first spawn is still riding the queue) must not
+      // start two sessions on one ticket.
+      const pending = (agents[host].commands || [])
+        .find((c) => c.type === "spawnTicket" && c.issueKey === issueKey);
+      // The operator's model pin (XERK-123) rides the command the hub already
+      // routes — the agent has no per-ticket ledger of its own to read it from.
+      // Omitted when unpinned, so a ticket with no model choice spawns exactly as
+      // it always did (the agent's default model).
+      const mpin = ticketModelPin(siteKey, issueKey);
+      const cmdId = pending ? pending.cmdId
+        : queueCommand(host, { type: "spawnTicket", issueKey,
+            ...(mpin ? { model: mpin.model } : {}) });
+      // needsClone tells the board the chosen host doesn't have the repo yet, so
+      // it will clone on demand and the session starts queued behind the clone.
+      return json(res, 200, { ok: true, cmdId, host, repo, needsClone });
+    }
+
+    // POST /api/jira/<siteKey>/<issueKey>/repo — the operator's own answer to
+    // which repo a ticket belongs in, overriding the agent's guess.
+    // Body: {repo:"<name>"} to pin one, {repo:null} for "no repo fits", or
+    // {auto:true} to release the pin back to the model.
+    //
+    // This writes to the AGENT's triage ledger, not to Jira — the board stays
+    // pull-only with respect to Jira itself; nothing here touches the issue.
+    //
+    // It fans out to EVERY host reporting that org, not just the one findJiraHost
+    // would pick for a read. The ledger is per-host while the board merges hosts
+    // by siteKey (freshest block wins), so pinning on only one host would leave
+    // the override flickering in and out as the merge picked a different host's
+    // block. The repo name is allowlist-checked host-side against that host's own
+    // candidates; a host that can't offer it declines and logs, which is why this
+    // reports what it queued rather than claiming success for the fleet.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "repo") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const auto = body.auto === true;
+      // `repo` absent and auto unset is a malformed request, not a decline —
+      // "no repo fits" must be an explicit null, exactly as _parse_triage
+      // requires of the model. Conflating them would let a body that lost a
+      // field silently paint a "no repo" chip.
+      if (!auto && !("repo" in body)) {
+        return json(res, 400, { error: "body needs {repo} or {auto:true}" });
+      }
+      const repo = auto ? null : body.repo;
+      if (!auto && repo !== null &&
+          !(typeof repo === "string" && /^[A-Za-z0-9._-]+$/.test(repo))) {
+        return json(res, 400, { error: "not a repo name" });
+      }
+      // Every host reporting the org, INCLUDING offline ones. Commands are queued
+      // and at-least-once, so an offline host takes the pin whenever it returns —
+      // which is the point: a host that misses it comes back reporting the model's
+      // old guess, and (with the freshest block winning the merge) can silently
+      // revert an override the operator already made. Landing late beats never
+      // landing. `setJiraRepo` is idempotent, so a delayed delivery is harmless.
+      //
+      // `online` is still what the BOARD gates its Change control on — an operator
+      // watching wants the pin to show up now, not in an hour — but that is a UI
+      // judgement about feedback, not a reason to let the fleet diverge.
+      const hosts = Object.keys(agents).filter(
+        (k) => agents[k] && agents[k].jira && agents[k].jira.siteKey === siteKey);
+      if (!hosts.length) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      const online = hosts.filter(
+        (k) => Date.now() - (agents[k].lastSeen || 0) < OFFLINE_AFTER_MS);
+      let cmdId = null;
+      for (const k of hosts) {
+        cmdId = queueCommand(k, { type: "setJiraRepo", siteKey, issueKey, repo, auto });
+      }
+      return json(res, 202, { ok: true, hosts, online, cmdId });
+    }
+
+    // POST /api/jira/<siteKey>/<issueKey>/agent — pin which HOST this ticket's
+    // sessions spawn on, overriding findTicketHost's most-available pick
+    // (XERK-38). Body: {host:"<agent key>"} to pin, {auto:true} to release back
+    // to automatic routing.
+    //
+    // Unlike the /repo override above this does NOT fan out to the agents: the
+    // pin is a routing input, routing happens here on the hub (the only party
+    // that sees the whole fleet), and the store is the hub's own durable
+    // ticket-agents file. So the save is authoritative the moment it returns —
+    // a 200, not the /repo route's 202-on-queue.
+    //
+    // The host must currently report the org, but need not be ONLINE: the pin
+    // is a persistent choice about future spawns, and pinning a host that's
+    // momentarily asleep is a valid answer (the spawn itself still requires it
+    // online, in findTicketHost). What it must not be is a name this org's
+    // picker never offered — hence the allowlist against the fleet.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "agent") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const auto = body.auto === true;
+      if (!auto && !(typeof body.host === "string" && body.host)) {
+        return json(res, 400, { error: "body needs {host} or {auto:true}" });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      if (!auto) {
+        const a = agents[body.host];
+        if (!a || !a.jira || a.jira.siteKey !== siteKey) {
+          return json(res, 400, { error: "that agent does not report this Jira org" });
+        }
+      }
+      setTicketAgent(siteKey, issueKey, auto ? null : body.host);
+      return json(res, 200, { ok: true, host: auto ? null : body.host });
+    }
+
+    // POST /api/jira/<siteKey>/<issueKey>/model — pin which MODEL this ticket's
+    // session runs with (XERK-123). Body: {model:"<alias>"} to pin, {auto:true}
+    // (or {model:"default"}) to release back to the login's default model.
+    //
+    // Hub-owned durable state exactly like the /agent pin: the model is carried
+    // on the spawnTicket command the hub routes, so this is authoritative the
+    // moment it returns (a 200, not a queued 202). The alias must be one the
+    // org's hosts actually offer — the same allowlist the composer's model menu
+    // is built from — so the pin can't name a model no session could run; the
+    // agent still re-validates it host-side (resolve_model) before launch.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 5 && parts[4] === "model") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const issueKey = decodeURIComponent(parts[3]);
+      if (!isIssueKey(issueKey)) {
+        return json(res, 400, { error: "not a valid issue key" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const raw = typeof body.model === "string" ? body.model.trim().toLowerCase() : "";
+      // "default" is the release value in model's clothing — treat it as {auto},
+      // so the picker's "Default" option and an explicit {auto:true} land the same
+      // "drop the pin" outcome rather than storing a "default" alias to resolve.
+      const auto = body.auto === true || raw === "default" || raw === "";
+      if (!auto && typeof body.model !== "string") {
+        return json(res, 400, { error: "body needs {model} or {auto:true}" });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      if (!auto && !orgModelAliases(siteKey).has(raw)) {
+        return json(res, 400, { error: "that model is not offered by this org" });
+      }
+      setTicketModel(siteKey, issueKey, auto ? null : raw);
+      return json(res, 200, { ok: true, model: auto ? null : raw });
+    }
+
+    // POST /api/jira/<siteKey>/autostart — flip an org's auto-start opt-in
+    // (XERK-41). Body: {enabled:true|false}. Hub-owned durable state, so — like
+    // the /agent pin and unlike the /repo override — the save is authoritative
+    // the moment it returns (a 200, nothing rides a heartbeat). The org must be
+    // one the fleet actually reports, so a toggle can't invent a phantom org;
+    // the host need NOT be online (the opt-in is a persistent choice, and the
+    // sweep gates the actual spawn on a live host itself).
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "autostart") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      if (typeof body.enabled !== "boolean") {
+        return json(res, 400, { error: "body needs {enabled:true|false}" });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      setAutoStartOrg(siteKey, body.enabled);
+      return json(res, 200, { ok: true, enabled: body.enabled });
+    }
+
+    // POST /api/jira/<siteKey>/color — pin an org's palette color (XERK-145).
+    // Body: {slot: 1..8} to pin, {auto:true} to release back to the
+    // hash-assigned color. Hub-owned durable state like /autostart: the save is
+    // authoritative on return, the org must be one the fleet reports (no
+    // phantom orgs), and the host need not be online (a color is a persistent
+    // presentation choice, nothing rides a heartbeat).
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "jira" &&
+        parts.length === 4 && parts[3] === "color") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const auto = body.auto === true;
+      if (!auto && !(Number.isInteger(body.slot) && body.slot >= 1 && body.slot <= ORG_COLOR_SLOTS)) {
+        return json(res, 400, { error: `body needs {slot:1..${ORG_COLOR_SLOTS}} or {auto:true}` });
+      }
+      if (!Object.values(agents).some(
+        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      setOrgColor(siteKey, auto ? null : body.slot);
+      return json(res, 200, { ok: true, slot: auto ? null : body.slot });
     }
 
     // Terminal proxy: /term/<sessionId>/… -> the ttyd of the host that owns
@@ -1636,9 +3740,10 @@ server.on("upgrade", async (req, socket, head) => {
       // Tell the agent which ttyd port to bridge this data channel to (per
       // session); it defaults to 7681 if the port is ever absent.
       sendOpen: (ch, port) => send(0x1, JSON.stringify({ open: ch, port })),
-      // Start/stop the agent's live tail of one session's transcript. worktreePath
-      // is where the agent looks up the transcript (see tunnel-agent.js).
-      sendWatch: (sessionId, worktreePath) => send(0x1, JSON.stringify({ watch: sessionId, worktreePath })),
+      // Start/stop the agent's live tail of one session's transcript. See
+      // watchTargetFor for what the agent needs to locate it.
+      sendWatch: (sessionId, target) =>
+        send(0x1, JSON.stringify({ watch: sessionId, ...target })),
       sendUnwatch: (sessionId) => send(0x1, JSON.stringify({ unwatch: sessionId })),
       // Nudge the agent to heartbeat NOW so a just-queued command is delivered
       // in that beat's reply instead of waiting up to a whole TURMA_INTERVAL.
@@ -1652,10 +3757,39 @@ server.on("upgrade", async (req, socket, head) => {
     // has live watchers for — re-arm each so an agent restart / control-channel
     // flap doesn't silently stop the live stream to already-attached glasses.
     for (const sessionId of Object.keys(liveClients[name] || {})) {
-      const wp = worktreePathFor(name, sessionId);
-      if (wp) controlChannels[name].sendWatch(sessionId, wp);
+      const target = watchTargetFor(name, sessionId);
+      if (target) controlChannels[name].sendWatch(sessionId, target);
     }
-    const ping = setInterval(() => send(0x9, Buffer.alloc(0)), 30000); // beat CF idle timeout
+    // Liveness, in both directions — the channel is proven, never assumed.
+    //
+    // The protocol ping (0x9) beats Cloudflare's idle timeout and is what every
+    // agent auto-pongs (Node's built-in WebSocket answers it internally), so the
+    // returning 0xa is a liveness signal we get from OLD agents for free — it is
+    // how we spot a half-open channel to a host that died without a FIN, which we
+    // would otherwise keep reporting as `terminalOnline` while every Attach on it
+    // hung until openChannel's timeout.
+    //
+    // The app-level {ping} is the same beat in a frame the AGENT can see: that
+    // same internal handling means a browser-style WebSocket surfaces no ping
+    // event and offers no ping method, so a protocol ping is invisible to it and
+    // the agent has no way to notice we are gone. This text frame is the one
+    // liveness signal its onmessage can observe. Agents predating it ignore an
+    // unknown key and are unaffected.
+    let lastSeen = Date.now();
+    const ping = setInterval(() => {
+      const idle = Date.now() - lastSeen;
+      if (idle > CONTROL_DEAD_AFTER_MS) {
+        // Nothing (not even a pong) for 3 beats: the peer is gone and this
+        // socket is half-open. Destroy it so `terminalOnline` tells the truth
+        // and the agent's own reconnect isn't racing a channel we still hold.
+        console.log(`tunnel silent for ${Math.round(idle / 1000)}s; dropping: ${name}`);
+        try { socket.destroy(); } catch {}
+        cleanup();
+        return;
+      }
+      send(0x9, Buffer.alloc(0));
+      send(0x1, JSON.stringify({ ping: Date.now() }));
+    }, CONTROL_PING_EVERY_MS);
     // The agent pushes live deltas back on this same channel: committed
     // transcript entries as `{tail: sessionId, entries}`, and the in-progress
     // assistant turn scraped from the TUI as `{turn: sessionId, text, status}`
@@ -1664,12 +3798,18 @@ server.on("upgrade", async (req, socket, head) => {
     // status clears it once the turn completes and the committed tail owns it).
     // Everything else it sends we ignore.
     const parse = wsParser((op, payload) => {
+      // ANY frame proves the peer is alive — including the 0xa pong, which is
+      // the only thing an idle agent sends back and which we otherwise ignore.
+      lastSeen = Date.now();
       if (op === 0x8) return socket.end();
       if (op !== 0x1) return;
       let msg;
       try { msg = JSON.parse(payload.toString("utf8")); } catch { return; }
       if (msg && msg.tail && Array.isArray(msg.entries)) {
-        liveFanout(name, msg.tail, { type: "tail", entries: msg.entries });
+        // `queued` = still-queued prompts typed mid-turn (foldQueueOp in
+        // tunnel-agent.js); absent from agents predating it.
+        liveFanout(name, msg.tail, { type: "tail", entries: msg.entries,
+          queued: Array.isArray(msg.queued) ? msg.queued : [] });
       } else if (msg && msg.turn && typeof msg.text === "string") {
         liveFanout(name, msg.turn, { type: "turn", text: msg.text, status: msg.status || null });
       }
@@ -1742,8 +3882,8 @@ server.on("upgrade", async (req, socket, head) => {
 
     // First watcher for this session -> ask the agent to start tailing it.
     if (first) {
-      const wp = worktreePathFor(host, sessionId);
-      if (wp && controlChannels[host]) controlChannels[host].sendWatch(sessionId, wp);
+      const target = watchTargetFor(host, sessionId);
+      if (target && controlChannels[host]) controlChannels[host].sendWatch(sessionId, target);
     }
 
     const ping = setInterval(() => {
@@ -1910,6 +4050,7 @@ if (process.env.TURMA_TEST) {
   module.exports = {
     server,
     agents,
+    invalidateAgentsCache,
     queueCommand,
     findSession,
     wsAccept,
@@ -1917,6 +4058,7 @@ if (process.env.TURMA_TEST) {
     wsParser,
     channelDuplex,
     heartbeatAlerts,
+    prAlertDecision,
     sessionWorking,
     userAuthorized,
     agentAuthorized,
@@ -1927,6 +4069,7 @@ if (process.env.TURMA_TEST) {
     issueSessionToken,
     sessionTokenValid,
     fmtDur,
+    TERM_OSC52_JS,
     pcmToWav,
     transcribePcm,
     issueWsToken,
@@ -1935,6 +4078,25 @@ if (process.env.TURMA_TEST) {
     unregisterDevice,
     listDevices,
     pruneDevices,
+    autoStartSweep,
+    autoStopSweep,
+    startedTicketKeys,
+    orgsWithAutoStart,
+    autoStarted,
+    autoStopped,
+    autoStartOrgs,
+    setAutoStartOrg,
+    orgColors,
+    setOrgColor,
+    ticketAgents,
+    ticketModels,
+    ticketModelPin,
+    setTicketModel,
+    orgModelAliases,
+    findTicketHost,
+    migrations,
+    advanceMigrations,
+    siteKeyOf,
   };
 } else {
   if (!TURMA_PASSWORD) console.warn("WARNING: TURMA_USER/TURMA_PASSWORD not set — UI is unauthenticated");
@@ -1942,11 +4104,11 @@ if (process.env.TURMA_TEST) {
   if (!TURMA_TRIGGER_TOKEN) console.warn("WARNING: TURMA_TRIGGER_TOKEN not set — POST /api/trigger accepts only the user login (no dedicated token)");
   server.listen(PORT, () => {
     console.log(`turma listening on :${PORT}`);
-    console.log(
-      NTFY_URL
-        ? `ntfy alerts -> ${NTFY_URL}/${NTFY_TOPIC} (cost threshold $${COST_ALERT_USD}/day)`
-        : "ntfy alerts disabled (NTFY_URL not set)"
-    );
+    if (push.fcmEnabled()) console.log("FCM push alerts -> Android devices");
+    // A warning, not an info line: a hub running without FCM delivers ZERO mobile
+    // notifications (every notify() is a no-op), and that has silently bitten us
+    // before (XERK-152). Loud enough to notice beside the other startup WARNINGs.
+    else console.warn("WARNING: FCM push alerts disabled (FCM_SERVICE_ACCOUNT_JSON not set) — no mobile notifications will be sent");
     console.log(
       WHISPER_URL ? `whisper STT -> ${WHISPER_URL}` : "whisper STT disabled (LITELLM_URL/WHISPER_URL not set)"
     );

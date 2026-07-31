@@ -1,0 +1,1088 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turma — Board</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="site-header" id="siteHeader" data-page="board"
+        data-sub="Ticket board · assigned tickets across orgs"></header>
+<div class="wrap">
+  <div class="board-bar">
+    <button id="refresh" class="board-refresh" title="Re-poll Jira on every connected host now">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+      <span id="refreshLabel">Refresh</span>
+    </button>
+  </div>
+  <div id="board"></div>
+  <div class="td-backdrop" id="detailBackdrop" hidden>
+    <div class="td-panel" id="detailPanel" role="dialog" aria-modal="true" aria-label="Ticket detail"></div>
+  </div>
+  <div class="footer">Each host agent polls its org's tracker — Jira Cloud (<code>JIRA_SITE</code> / <code>JIRA_EMAIL</code> / <code>JIRA_TOKEN</code>) or a self-hosted/cloud Azure DevOps board (<code>AZDO_URL</code> / <code>AZDO_TOKEN</code>) in the agent's env — for tickets assigned to that user, active work plus the last two weeks of Done, and the board unifies every host's report into one Kanban (hosts sharing an org collapse into one board, deduped by issue key). Columns follow the tracker's universal status categories, with an In Review column carved out for review/testing statuses; each card's pill shows the org's own status name. The header's org filter scopes this board — and every other page — to one org; each org is labelled from its site unless the agent sets <code>BOARD_ORG_NAME</code>. The board reads the tracker; the one write it makes is creating a ticket via the New ticket button.</div>
+</div>
+
+<nav class="bottom-nav" id="bottomNav"></nav>
+<!-- board.js first: it owns the org vocabulary (mergeSites/orgName/orgColorMap)
+     that org.js's header control reads, and nav.js must have built the #hdrOrg
+     slot before org.js mounts into it. -->
+<script src="/board.js"></script>
+<script src="/nav.js"></script>
+<script src="/org.js"></script>
+<script src="/newticket.js"></script>
+
+<script>
+const B = window.TurmaBoard;
+const $board = document.getElementById("board");
+
+// The org scope is no longer this page's to own — it lives in the header and
+// applies to every page (XERK-62). The board just reads it each render and
+// re-renders when the operator changes it.
+window.TurmaOrg.subscribe(() => { if (cache) render(cache); });
+
+function esc(s) { return B.esc(s); }
+
+// The merged view the last render drew, so a card click can find its ticket
+// (and its org color) without re-merging.
+let lastSites = [], lastAllKeys = [];
+
+// Deep link: /board?ticket=<key>[&site=<siteKey>] opens that ticket's detail
+// panel — the session page's ticket chips link here rather than out to Jira
+// (XERK-16). One-shot: it waits for the ticket's org to report (a session can
+// outlive its host being briefly offline), opens on the first render that can
+// resolve it, and strips the params so closing the panel or reloading doesn't
+// reopen it. `site` is optional — without it any org carrying the key wins.
+let deepLink = (() => {
+  const p = new URLSearchParams(location.search);
+  const key = p.get("ticket");
+  return key ? { key, site: p.get("site") || "" } : null;
+})();
+
+function consumeDeepLink() {
+  if (!deepLink) return;
+  const { key, site } = deepLink;
+  const found = lastSites.find(s =>
+    (!site || s.siteKey === site) && s.tickets.some(t => t.key === key));
+  if (!found) return;                    // its org hasn't reported yet
+  deepLink = null;
+  history.replaceState(null, "", location.pathname);
+  openDetail(key, found.siteKey, null);
+}
+
+// The per-org auto-start switch (XERK-41) moved with the org chips into the
+// header menu — see org.js's setAutoStart, which owns the optimistic flip, the
+// POST and the rollback for every page.
+
+function render(data) {
+  // Ahead of the empty-board early-return below, so a refresh still resolves on
+  // a fleet whose blocks are all unavailable (hoisted; `pending` is live by the
+  // time anything renders).
+  checkRefreshDone();
+  const sites = B.mergeSites(data.agents || []);
+  lastSites = sites; lastAllKeys = sites.map(s => s.siteKey);
+  refreshOpenTicket();
+  consumeDeepLink();
+  // The header's org control and New-ticket button are fed the same beat every
+  // page feeds them, so the org menu (org list, ticket counts, staleness, auto
+  // switches) and the create button's visibility track the fleet.
+  TurmaOrg.update(data);
+  TurmaNewTicket.update(data);
+  if (!sites.length) {
+    $board.innerHTML = `<div class="empty">No tickets reported yet. Connect an org by setting <code>JIRA_SITE</code>/<code>JIRA_EMAIL</code>/<code>JIRA_TOKEN</code> (Jira) or <code>AZDO_URL</code>/<code>AZDO_TOKEN</code> (Azure DevOps) in an agent's environment.</div>`;
+    return;
+  }
+  const allKeys = lastAllKeys;
+  // The scope the header control is on. It's a siteKey (or "" for every org),
+  // already self-healed against orgs nobody reports.
+  const orgFilter = TurmaOrg.get();
+
+  const sessionIndex = B.ticketSessionIndex(data.agents || []);
+  const activeMoves = sweepMoves(sites);
+  // A grid swap mid-drag would tear the card out from under the finger and drop
+  // the column highlight every beat; the drag ghost + highlight live outside the
+  // grid (on <body>), so we simply leave the grid as-is until the drag ends —
+  // `cache` stays current, and drag-end repaints with the fresh data + override.
+  if (dragActive()) return;
+  // The board innerHTML-replaces every beat (SSE ~1s / 15s poll), which would
+  // otherwise reset the scroll each time — on phones the columns are a
+  // horizontally-scrollable strip (.kanban-cols) whose swipe kept snapping back
+  // to the first column a few seconds in (XERK-35), and each column list
+  // (.kc-list) scrolls vertically too. preserveScroll keeps both across the swap.
+  TurmaNav.preserveScroll($board, () => {
+    $board.innerHTML = B.boardHtml(sites, orgFilter, {
+      allKeys, sessionIndex, starts: sweepStarts(data.agents || [], sessionIndex),
+      moves: activeMoves,
+      // Manual org-color pins (XERK-145), via TurmaOrg so the SSE event and the
+      // poll feed one map.
+      orgColors: TurmaOrg.orgColors(),
+    });
+  });
+}
+
+// --- Start a session on a ticket -------------------------------------------
+// The card's start button POSTs to the hub, which routes the spawn to a host
+// holding both the org's Jira creds and the ticket's repo; the agent mints the
+// session id a beat or two later. Between the POST and that beat there's a gap
+// with nothing to link to, which the `pending` state covers.
+//
+// The press is acknowledged INSTANTLY — the pending state is set and painted
+// synchronously on pointerdown, before the POST is even sent, so the button
+// becomes "⏳ starting…" the moment it's pressed rather than after the ~5s
+// round trip. `cmdId`/`host` fill in when the POST replies; a pending with no
+// cmdId yet is the "clicked, not yet acknowledged by the hub" state, which
+// sweepStarts holds rather than mistaking for done.
+//
+// Pending is then cleared by EVIDENCE, not a timer: either a session reporting
+// this spawn's cmdId shows up (the card gains a real chip), or the command,
+// once we've actually SEEN it in the host's queue, clears from it — which is
+// what covers a spawn the agent REFUSED, whose ack is the only signal a board
+// that never sees a session would ever get. The timeout is just the backstop
+// for a host that stops beating mid-spawn.
+//
+// A failed POST parks the reason on the ticket instead of throwing a dialog, so
+// it renders on the card that caused it (same inline-.err convention as the
+// dashboard's clone/prune notes) and clears on the next attempt.
+const START_TIMEOUT_MS = 60000;
+// "<siteKey>\x00<key>" -> {pending, cmdId, host, at, sawCmd} | {error}
+const starts = new Map();
+
+function startKey(siteKey, key) { return (siteKey || "") + "\x00" + key; }
+
+function sweepStarts(agents, sessionIndex) {
+  const now = Date.now();
+  for (const [k, p] of [...starts]) {
+    if (!p.pending) continue;              // an error sits until the next click
+    const [siteKey, issueKey] = k.split("\x00");
+    const sessions = B.ticketSessionsOf(sessionIndex, siteKey, issueKey);
+    const host = (agents || []).find(a => a.key === p.host);
+    const cmd = !!host && (host.commands || []).some(c => c && c.cmdId === p.cmdId);
+    p.ageMs = now - p.at;
+    switch (B.startSweepVerdict(p, sessions, cmd, !!host, START_TIMEOUT_MS)) {
+      case "clear": starts.delete(k); break;
+      case "error": starts.set(k, { error: "the host didn't start it in time" }); break;
+      // "hold": leave the pending as-is (verdict may have set p.sawCmd).
+    }
+  }
+  return starts;
+}
+
+async function startSession(issueKey, siteKey) {
+  const k = startKey(siteKey, issueKey);
+  if (starts.get(k)?.pending) return;
+  // Paint the acknowledgement NOW, before the fetch — this overwrites any
+  // previous failure note too. cmdId/host arrive with the POST reply.
+  starts.set(k, { pending: true, cmdId: null, host: null, at: Date.now(), sawCmd: false });
+  if (cache) render(cache);
+  const fail = (error) => { starts.set(k, { error }); if (cache) render(cache); };
+  let r, body = {};
+  try {
+    // keepalive lets the POST outlive the page: "click start, then go to the
+    // next thing" is the whole point of this flow, and without it navigating
+    // away (or the spawn handoff below) aborts the request in flight and the
+    // session never starts — the ticket's headline complaint.
+    r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(issueKey)}/session`,
+                    { method: "POST", keepalive: true });
+  } catch { return void fail("the hub is unreachable"); }
+  if (r.status === 401) return void (location.href = "/login");
+  try { body = await r.json(); } catch { /* non-JSON error body */ }
+  if (!r.ok) return void fail(body.error || `HTTP ${r.status}`);
+  starts.set(k, { pending: true, cmdId: body.cmdId, host: body.host, at: Date.now(), sawCmd: false });
+  if (cache) render(cache);
+}
+
+// --- Drag a card into another column to change its status (XERK-141) --------
+// "Tap and hold" a card, drag it onto another status column, and the ticket
+// moves there. The drop reuses the whole XERK-138 status-change machinery — it
+// POSTs the target COLUMN (the card never loaded the ticket's transitions; the
+// agent resolves the column to a real status against a fresh read) and polls
+// the queued command's outcome by cmdId.
+//
+// An optimistic `moves` override lands the card in the dropped column at once
+// and HOLDS it there across the ~1s repaints: the change is on the tracker
+// within a beat, but the board's own ticket list only reflects it on the next
+// (slow) Jira/Azure poll — the exact lag the detail panel documents — so
+// without the hold the card would snap back to its old column until then.
+// Keyed like `starts`. Entry shapes:
+//   {category, pending:true, cmdId, host, at}  — POST/poll in flight
+//   {category, settled:true, settledAt, at}    — landed; held until the poll catches up
+//   {category, error, at}                      — failed; shown briefly, then reverts
+const moves = new Map();
+const MOVE_SETTLE_MS = 120000;   // backstop: hold a landed move this long if the poll never reports it
+const MOVE_ERROR_TTL = 6000;     // show a failed move on the card this long, then revert it
+
+function sweepMoves(sites) {
+  const now = Date.now();
+  for (const [k, m] of [...moves]) {
+    const [siteKey, key] = k.split("\x00");
+    const site = (sites || []).find(s => s.siteKey === siteKey);
+    const t = site && site.tickets.find(x => x.key === key);
+    if (!t) { moves.delete(k); continue; }   // ticket left the board (reassigned/gone)
+    if (B.moveSweepVerdict(m, B.categoryOf(t), now, MOVE_SETTLE_MS, MOVE_ERROR_TTL) === "clear") {
+      moves.delete(k);
+    }
+  }
+  return moves;
+}
+
+function settleMove(k) {
+  const m = moves.get(k);
+  if (!m) return;
+  moves.set(k, { category: m.category, settled: true, settledAt: Date.now(), at: m.at });
+  if (cache) render(cache);
+  // The change is on the tracker, but the board's ticket LIST only reflects it
+  // on the next Jira/Azure poll (the agent's set_board_status refreshes the
+  // issue cache, not the board list). Nudge that poll now so the card's REAL
+  // status catches up in a beat or two and the override releases cleanly,
+  // rather than the optimistic overlay lingering until the slow poll cadence.
+  fetch("/api/jira/refresh", { method: "POST", keepalive: true }).catch(() => {});
+}
+function failMove(k, error) {
+  const m = moves.get(k);
+  moves.set(k, { category: m ? m.category : "", error, at: Date.now() });
+  if (cache) render(cache);
+}
+
+// Kick off a status change to `category` for a dropped card: optimistic paint,
+// POST, then poll the cmdId outcome — the drag counterpart of saveStatus.
+async function moveTo(siteKey, key, category) {
+  const k = startKey(siteKey, key);
+  if (moves.get(k)?.pending) return;   // one drag at a time per ticket
+  moves.set(k, { category, pending: true, cmdId: null, host: null, at: Date.now() });
+  if (cache) render(cache);            // the card jumps to the new column now
+
+  let cmdId = "", err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(key)}/status`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ category }), keepalive: true });
+    if (r.status === 401) return void (location.href = "/login");
+    let d = {};
+    try { d = await r.json(); } catch { /* non-JSON error body */ }
+    if (!r.ok) err = d.error || `HTTP ${r.status}`;
+    else { cmdId = d.cmdId; if (moves.get(k)?.pending) moves.get(k).cmdId = cmdId; }
+  } catch { err = "the hub is unreachable"; }
+  if (err) return void failMove(k, err);
+
+  const deadline = Date.now() + 60000;
+  let delay = 600;
+  while (moves.get(k)?.pending && Date.now() < deadline) {
+    let d = {};
+    try {
+      const r = await fetch(
+        `/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(key)}/status?cmdId=${encodeURIComponent(cmdId)}`);
+      if (r.status === 401) return void (location.href = "/login");
+      d = await r.json();
+    } catch { return void failMove(k, "the hub is unreachable"); }
+    if (d && d.pending) { await sleep(delay); delay = Math.min(delay * 1.5, 3000); continue; }
+    if (d && d.ok) return void settleMove(k);
+    return void failMove(k, (d && d.error) || "the change didn't take");
+  }
+  if (moves.get(k)?.pending) failMove(k, "the host didn't confirm in time");
+}
+
+// The pointer-driven drag itself. Touch has no native HTML5 drag, and the board
+// is a scrollable strip of scrollable columns, so this is built on pointer
+// events: a press ARMS a long-press timer; moving before it fires is a scroll
+// and disarms it; holding still fires it and enters drag mode (from then on we
+// own the gesture and preventDefault stops scrolling). Mouse works the same.
+let drag = null;
+const LONG_PRESS_MS = 300;
+const DRAG_ARM_CANCEL_PX = 10;   // moved this far before the timer fires = a scroll
+const EDGE_SCROLL_PX = 48;       // auto-scroll the column strip within this of an edge
+let lastDragEndAt = 0;           // suppresses the click a finished drag would synthesize
+
+function dragActive() { return !!(drag && drag.active); }
+
+function armDrag(e) {
+  if (e.button != null && e.button !== 0) return;      // primary button / touch only
+  if (e.target.closest(CARD_OWN)) return;              // leave the card's own controls alone
+  const card = e.target.closest(".kanban-card");
+  if (!card) return;
+  disarmDrag();
+  drag = {
+    pointerId: e.pointerId, card,
+    siteKey: card.dataset.site, key: card.dataset.key,
+    fromCat: card.closest(".kanban-col")?.dataset.cat || "",
+    startX: e.clientX, startY: e.clientY,
+    ghost: null, active: false, targetCat: null, targetCol: null,
+    timer: setTimeout(() => beginDrag(), LONG_PRESS_MS),
+  };
+}
+
+function beginDrag() {
+  if (!drag) return;
+  drag.active = true;
+  drag.timer = null;
+  try { drag.card.setPointerCapture(drag.pointerId); } catch { /* card may be gone */ }
+  if (navigator.vibrate) { try { navigator.vibrate(15); } catch { /* unsupported */ } }
+  document.body.classList.add("kc-drag-on");
+  drag.card.classList.add("kc-drag-src");
+  drag.ghost = makeGhost(drag.card, drag.startX, drag.startY);
+  highlightColAt(drag.startX, drag.startY);
+}
+
+function makeGhost(card, x, y) {
+  const r = card.getBoundingClientRect();
+  const g = card.cloneNode(true);
+  g.classList.add("kc-ghost");
+  g.style.width = r.width + "px";
+  g.style.left = "0"; g.style.top = "0";
+  g.dataset.ox = (x - r.left); g.dataset.oy = (y - r.top);
+  document.body.appendChild(g);
+  positionGhost(g, x, y);
+  return g;
+}
+function positionGhost(g, x, y) {
+  g.style.transform = `translate(${x - g.dataset.ox}px, ${y - g.dataset.oy}px)`;
+}
+
+function highlightColAt(x, y) {
+  if (drag.ghost) drag.ghost.style.pointerEvents = "none";
+  const el = document.elementFromPoint(x, y);
+  const col = el && el.closest && el.closest(".kanban-col");
+  if (col === drag.targetCol) return;
+  if (drag.targetCol) drag.targetCol.classList.remove("kc-drop-into");
+  drag.targetCol = col || null;
+  drag.targetCat = col ? col.dataset.cat : null;
+  // Only light up a column the ticket would actually move TO (not its own).
+  if (col && drag.targetCat && drag.targetCat !== drag.fromCat) col.classList.add("kc-drop-into");
+}
+
+function edgeScroll(x) {
+  const strip = $board.querySelector(".kanban-cols");
+  if (!strip || strip.scrollWidth <= strip.clientWidth) return;
+  const rect = strip.getBoundingClientRect();
+  if (x < rect.left + EDGE_SCROLL_PX) strip.scrollLeft -= 18;
+  else if (x > rect.right - EDGE_SCROLL_PX) strip.scrollLeft += 18;
+}
+
+function onDragMove(e) {
+  if (!drag || e.pointerId !== drag.pointerId) return;
+  if (!drag.active) {
+    const moved = Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY);
+    if (moved > DRAG_ARM_CANCEL_PX) disarmDrag();   // it's a scroll, not a hold
+    return;
+  }
+  e.preventDefault();                                // the gesture is ours now
+  positionGhost(drag.ghost, e.clientX, e.clientY);
+  highlightColAt(e.clientX, e.clientY);
+  edgeScroll(e.clientX);
+}
+
+function onDragEnd(e) {
+  if (!drag || e.pointerId !== drag.pointerId) return;
+  const wasActive = drag.active;
+  const { siteKey, key, fromCat, targetCat } = drag;
+  teardownDrag();
+  if (!wasActive) return;                            // a tap, not a drag → click opens the panel
+  lastDragEndAt = Date.now();
+  if (targetCat && targetCat !== fromCat) moveTo(siteKey, key, targetCat);
+  else if (cache) render(cache);                     // dropped on its own column → just repaint
+}
+
+// Clear an ARMED-but-not-yet-active drag (a scroll won).
+function disarmDrag() {
+  if (!drag) return;
+  if (drag.timer) clearTimeout(drag.timer);
+  drag = null;
+}
+// Tear down an active drag's DOM (ghost, highlight, capture, classes).
+function teardownDrag() {
+  if (!drag) return;
+  if (drag.timer) clearTimeout(drag.timer);
+  if (drag.active) {
+    try { drag.card.releasePointerCapture(drag.pointerId); } catch { /* card may be gone */ }
+    drag.card.classList.remove("kc-drag-src");
+    if (drag.targetCol) drag.targetCol.classList.remove("kc-drop-into");
+    if (drag.ghost) drag.ghost.remove();
+    document.body.classList.remove("kc-drag-on");
+  }
+  drag = null;
+}
+
+$board.addEventListener("pointerdown", armDrag);
+$board.addEventListener("pointermove", onDragMove);
+window.addEventListener("pointerup", onDragEnd);
+window.addEventListener("pointercancel", onDragEnd);
+
+// ---- Expanded ticket detail --------------------------------------------
+// A card click opens the panel immediately, painted from the card's own
+// heartbeat fields, and fills in description + comments once the on-demand
+// fetch lands (GET /api/jira/<siteKey>/<key>: 200 with the issue if the hub has
+// a fresh copy, else 202 while the owning host fetches it on its next beat —
+// so we poll). `openSeq` invalidates an in-flight fetch whose panel has since
+// been closed or replaced.
+const $backdrop = document.getElementById("detailBackdrop");
+const $panel = document.getElementById("detailPanel");
+let openTicketState = null, openSeq = 0, lastFocus = null;
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function paintDetail() {
+  const s = openTicketState;
+  if (!s) return;
+  const site = lastSites.find(x => x.siteKey === s.siteKey);
+  const agentPin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
+  const modelPin = B.modelPinOf(cache && cache.ticketModels, s.siteKey, s.key);
+  // What the Agent/Model rows are showing, so refreshOpenTicket can repaint only
+  // when a pin actually moved (same story as the repoGuess `shown` fingerprint).
+  s.agentPinShown = agentPin ? agentPin.host : "";
+  s.modelPinShown = modelPin ? modelPin.model : "";
+  $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
+    color: B.orgColor(s.siteKey, lastAllKeys, TurmaOrg.orgColors()),
+    siteKey: s.siteKey,
+    error: s.error,
+    // The override rides the heartbeat, so it needs a live host to reach; an
+    // offline org's ticket is still readable, just not re-assignable.
+    canEdit: !!(site && site.online),
+    editing: s.editing,
+    repoError: s.repoError,
+    repoOptions: (site && site.repoOptions) || [],
+    // The agent pin is hub-owned (no heartbeat round-trip), so its Change
+    // control needs no online gate — the hub is reachable if this page is.
+    agentPin,
+    agentEditing: s.agentEditing,
+    agentError: s.agentError,
+    hostOptions: (site && site.hostOptions) || [],
+    // The model pin is hub-owned too (XERK-123); its options are the org's
+    // probed model list off the merged site block.
+    modelPin,
+    modelEditing: s.modelEditing,
+    modelError: s.modelError,
+    models: (site && site.models) || null,
+    // The status change writes back to Jira/Azure via the heartbeat command
+    // path, so — like the Repo override, unlike the hub-owned agent/model pins —
+    // it needs an online host AND the fetched detail (its statusOptions) to be
+    // editable. The optimistic target is held while the change is in flight.
+    statusEditing: s.statusEditing,
+    statusError: s.statusError,
+    statusPending: s.statusPending,
+    canChangeStatus: !!(site && site.online && s.detail &&
+      Array.isArray(s.detail.statusOptions) && s.detail.statusOptions.length),
+  });
+  if (s.editing) {
+    const sel = $panel.querySelector("[data-repo-select]");
+    if (sel) sel.focus();
+  }
+  if (s.agentEditing) {
+    const sel = $panel.querySelector("[data-agent-select]");
+    if (sel) sel.focus();
+  }
+  if (s.modelEditing) {
+    const sel = $panel.querySelector("[data-model-select]");
+    if (sel) sel.focus();
+  }
+  if (s.statusEditing) {
+    const sel = $panel.querySelector("[data-status-select]");
+    if (sel) sel.focus();
+  }
+}
+
+// How long a saved repo keeps its optimistic paint before the heartbeat's word is
+// taken as final. Two-ish beats: the command has to reach the host and its next
+// block has to come back carrying the pin.
+const REPO_SETTLE_MS = 45000;
+
+// Re-point an open panel at the rebuilt ticket each beat. `mergeSites` builds
+// fresh objects every render, so the panel would otherwise keep rendering the
+// snapshot it opened with — forever.
+//
+// This is what lets the truth reassert itself after a manual repo save. The paint
+// is optimistic and the hub 202s on QUEUE, so the agent can still refuse the pin
+// (a stale board offering a repo it no longer has) with nothing to report back;
+// without re-reading, the panel would insist on a pin that never landed until it
+// was closed and reopened.
+//
+// Within REPO_SETTLE_MS of a save the optimistic value is re-applied over the
+// beat's, since the command legitimately hasn't landed yet and reverting to the
+// old guess for a beat or two would read as the save failing. After that the
+// heartbeat wins, whatever it says.
+//
+// It repaints ONLY when something it renders actually changed: the panel is
+// innerHTML-replaced, so an unconditional repaint every beat would throw away the
+// scroll position of anyone reading a long description. And it never repaints
+// while the picker is open — a beat must not swap the select out mid-edit.
+function refreshOpenTicket() {
+  const s = openTicketState;
+  if (!s) return;
+  const site = lastSites.find(x => x.siteKey === s.siteKey);
+  const fresh = site && site.tickets.find(t => t.key === s.key);
+  if (!fresh) return;
+  if (s.repoPendingUntil && Date.now() < s.repoPendingUntil) {
+    if (s.repoPending) fresh.repoGuess = s.repoPending;
+    else delete fresh.repoGuess;
+  } else {
+    s.repoPendingUntil = 0;
+  }
+  const shown = (g) => (g ? `${g.repo}|${!!g.cloned}|${!!g.manual}` : "");
+  // The agent pin isn't a ticket field — it lives on cache.ticketAgents — so
+  // its "did what we render change" check compares against what paintDetail
+  // last drew rather than against the rebuilt ticket.
+  const pin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
+  const mpin = B.modelPinOf(cache && cache.ticketModels, s.siteKey, s.key);
+  const changed = shown(fresh.repoGuess) !== shown(s.ticket.repoGuess) ||
+    (pin ? pin.host : "") !== (s.agentPinShown || "") ||
+    (mpin ? mpin.model : "") !== (s.modelPinShown || "");
+  s.ticket = fresh;
+  // No picker may be swapped out from under an operator mid-edit.
+  if (changed && !s.editing && !s.agentEditing && !s.modelEditing &&
+      !s.statusEditing) paintDetail();
+}
+
+// The operator's own answer to which HOST the ticket's sessions spawn on
+// (XERK-38). No optimistic-settle machinery like saveRepo's: the pin is
+// hub-owned and the POST response is authoritative, so on success the local
+// copy of ticketAgents is just updated and repainted — the SSE broadcast keeps
+// every OTHER open board in step.
+async function saveAgent(value) {
+  const s = openTicketState;
+  if (!s) return;
+  const body = value === "__auto__" ? { auto: true } : { host: value };
+  s.agentEditing = false;
+  s.agentError = "";
+  let ok = false, err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/agent`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    ok = r.ok;
+    if (!ok) {
+      let d = {};
+      try { d = await r.json(); } catch { /* non-JSON error body */ }
+      err = d.error || `HTTP ${r.status}`;
+    }
+  } catch { err = "the hub is unreachable"; }
+  if (ok) {
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    const ta = cache.ticketAgents || (cache.ticketAgents = {});
+    const k = `${s.siteKey}/${s.key}`;
+    if (body.auto) delete ta[k];
+    else ta[k] = { host: body.host, at: Date.now() };
+  } else if (openTicketState === s) {
+    s.agentError = err;
+  }
+  if (openTicketState === s) paintDetail();
+}
+
+// The operator's own answer to which MODEL the ticket's session runs (XERK-123).
+// Same posture as saveAgent: the pin is hub-owned and the POST response is
+// authoritative, so on success the local ticketModels copy is updated and
+// repainted — the SSE broadcast keeps every OTHER open board in step. No
+// optimistic-settle machinery (that's saveRepo's, for the heartbeat round-trip).
+async function saveModel(value) {
+  const s = openTicketState;
+  if (!s) return;
+  const body = value === "__default__" ? { auto: true } : { model: value };
+  s.modelEditing = false;
+  s.modelError = "";
+  let ok = false, err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/model`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    ok = r.ok;
+    if (!ok) {
+      let d = {};
+      try { d = await r.json(); } catch { /* non-JSON error body */ }
+      err = d.error || `HTTP ${r.status}`;
+    }
+  } catch { err = "the hub is unreachable"; }
+  if (ok) {
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    const tm = cache.ticketModels || (cache.ticketModels = {});
+    const k = `${s.siteKey}/${s.key}`;
+    if (body.auto) delete tm[k];
+    else tm[k] = { model: body.model, at: Date.now() };
+  } else if (openTicketState === s) {
+    s.modelError = err;
+  }
+  if (openTicketState === s) paintDetail();
+}
+
+// The operator's own repo answer. Painted optimistically: the pin only becomes
+// real on the agent's next beat (the command rides the heartbeat reply), and the
+// board would otherwise sit showing the model's old guess for a full interval
+// after a Save that worked. A failure repaints from the real state and says so.
+async function saveRepo(value) {
+  const s = openTicketState;
+  if (!s) return;
+  const body = value === "__auto__" ? { auto: true }
+    : value === "__none__" ? { repo: null }
+    : { repo: value };
+  s.editing = false;
+  s.repoError = "";
+  const prev = s.ticket.repoGuess;
+  let guess = null;
+  if (!body.auto) {
+    const opt = ((lastSites.find(x => x.siteKey === s.siteKey) || {}).repoOptions || [])
+      .find(o => o.name === body.repo);
+    guess = {
+      repo: body.repo, cloned: !!(opt && opt.cloned),
+      nameWithOwner: (opt && opt.nameWithOwner) || null,
+      reason: "", manual: true, at: null,
+    };
+  }
+  // Held against the next couple of beats by refreshOpenTicket, which would
+  // otherwise revert this to the model's old guess the moment a heartbeat lands —
+  // the command hasn't reached the host yet, so the block legitimately still
+  // carries the old answer, and a flicker back would read as the save failing.
+  s.repoPending = guess;
+  s.repoPendingUntil = Date.now() + REPO_SETTLE_MS;
+  if (guess) s.ticket.repoGuess = guess;
+  else delete s.ticket.repoGuess;
+  paintDetail();
+  let ok = false, err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/repo`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    ok = r.ok;
+    if (!ok) {
+      let d = {};
+      try { d = await r.json(); } catch { /* non-JSON error body */ }
+      err = d.error || `HTTP ${r.status}`;
+    }
+  } catch { err = "the hub is unreachable"; }
+  if (!ok && openTicketState === s) {
+    // The optimistic paint was a lie; take it back, and stop holding it against
+    // the heartbeat — nothing is coming.
+    s.repoPending = null;
+    s.repoPendingUntil = 0;
+    if (prev) s.ticket.repoGuess = prev; else delete s.ticket.repoGuess;
+    s.repoError = err;
+    paintDetail();
+  }
+}
+
+// Push a status change to the board (XERK-138). Unlike the repo/agent/model
+// pins this writes back to Jira/Azure: the hub queues a command on an online
+// host, the agent applies it, and the outcome rides back keyed by the queued
+// cmdId, which we poll. The pill shows the optimistic target while in flight; on
+// success we re-fetch the detail (the new status brings new available options),
+// on failure we revert the pill and show why.
+async function saveStatus(value) {
+  const s = openTicketState;
+  if (!s) return;
+  const opt = ((s.detail && s.detail.statusOptions) || [])
+    .find(o => String(o.id) === String(value));
+  s.statusEditing = false;
+  s.statusError = "";
+  s.statusPending = (opt && opt.name) || value;   // shown in the pill meanwhile
+  paintDetail();
+
+  let cmdId = "", err = "";
+  try {
+    const r = await fetch(
+      `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/status`,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ value }) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    let d = {};
+    try { d = await r.json(); } catch { /* non-JSON error body */ }
+    if (!r.ok) err = d.error || `HTTP ${r.status}`;
+    else cmdId = d.cmdId;
+  } catch { err = "the hub is unreachable"; }
+
+  // Poll the outcome by cmdId. The agent applies the change on its next beat and
+  // reports back; the host beats every ~20s, so give it a couple of shots.
+  if (cmdId) {
+    const deadline = Date.now() + 60000;
+    let delay = 600;
+    while (openTicketState === s && Date.now() < deadline) {
+      let d = {};
+      try {
+        const r = await fetch(
+          `/api/jira/${encodeURIComponent(s.siteKey)}/${encodeURIComponent(s.key)}/status?cmdId=${encodeURIComponent(cmdId)}`);
+        if (r.status === 401) { location.href = "/login"; return; }
+        d = await r.json();
+      } catch { err = "the hub is unreachable"; break; }
+      if (d && d.pending) {
+        await sleep(delay);
+        delay = Math.min(delay * 1.5, 3000);
+        continue;
+      }
+      if (d && d.ok) { err = ""; break; }
+      err = (d && d.error) || "the change didn't take";
+      break;
+    }
+    if (openTicketState === s && !err && Date.now() >= deadline) {
+      err = "the host didn't confirm in time";
+    }
+  }
+
+  if (openTicketState !== s) return;   // panel closed or another ticket opened
+  if (err) {
+    s.statusPending = null;
+    s.statusError = err;
+    paintDetail();
+    return;
+  }
+  // The change landed. Re-fetch the detail so the pill and the (now different)
+  // available options reflect the new status.
+  s.statusPending = null;
+  const alive = () => openTicketState === s;
+  const d = await fetchDetail(s.siteKey, s.key, alive);
+  if (!alive()) return;
+  if (d.issue) { s.detail = d.issue; s.error = null; }
+  paintDetail();
+}
+
+function closeDetail() {
+  openSeq++;               // abandon any in-flight fetch for this panel
+  openTicketState = null;
+  $backdrop.hidden = true;
+  $panel.replaceChildren();
+  document.body.classList.remove("td-open");
+  if (lastFocus && document.contains(lastFocus)) lastFocus.focus();
+  lastFocus = null;
+}
+
+async function fetchDetail(siteKey, key, alive) {
+  const url = `/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(key)}`;
+  const deadline = Date.now() + 45000;   // the host beats every ~20s; 2 shots
+  let delay = 600;
+  while (alive() && Date.now() < deadline) {
+    let r;
+    try { r = await fetch(url); }
+    catch { return { error: "the hub is unreachable" }; }
+    if (r.status === 401) { location.href = "/login"; return {}; }
+    if (r.status === 202) {              // queued on the host — wait for its beat
+      await sleep(delay);
+      delay = Math.min(delay * 1.5, 3000);
+      continue;
+    }
+    let d = {};
+    try { d = await r.json(); } catch { /* non-JSON error body */ }
+    if (!r.ok) return { error: d.error || `HTTP ${r.status}` };
+    return d;
+  }
+  return alive() ? { error: "the host didn't answer in time" } : {};
+}
+
+async function openDetail(key, siteKey, fromEl) {
+  const site = lastSites.find(s => s.siteKey === siteKey);
+  const ticket = site && site.tickets.find(t => t.key === key);
+  if (!ticket) return;
+  const mySeq = ++openSeq;
+  const alive = () => openSeq === mySeq;
+  lastFocus = fromEl || null;
+  openTicketState = { key, siteKey, ticket, detail: null, error: null };
+  paintDetail();
+  $backdrop.hidden = false;
+  document.body.classList.add("td-open");
+  $panel.scrollTop = 0;
+  const close = $panel.querySelector(".td-close");
+  if (close) close.focus();
+
+  const d = await fetchDetail(siteKey, key, alive);
+  if (!alive()) return;                  // closed, or another ticket opened
+  openTicketState.detail = d.issue || null;
+  openTicketState.error = d.issue ? null : (d.error || "the host reported no issue");
+  paintDetail();
+}
+
+// Delegated: the board re-renders on every beat, so per-card listeners would be
+// re-bound constantly (and leak). The card's own interactive children are left
+// alone — kc-key is the deliberate way out to Jira, kc-sess into the session —
+// and kc-start does its own thing below instead of opening the panel.
+const CARD_OWN = ".kc-key, .kc-sess, .kc-start";
+
+// The start button acts on POINTERDOWN, not click, and this is load-bearing:
+// the board innerHTML-replaces on every heartbeat beat, so a press that
+// straddles a beat has its button destroyed between mousedown and mouseup and
+// the browser synthesizes NO click — the press vanished and nothing was queued
+// (the ticket's "click start and the session won't start"). pointerdown fires
+// on the press itself, before any re-render can move the target out from under
+// it, and startSession paints the acknowledgement synchronously. The keyboard
+// path stays on click below (a <button> turns Enter/Space into a click, which
+// no re-render can swallow the way it swallows a mouse gesture).
+function startFrom(el) {
+  const btn = el.closest(".kc-start[data-start]");
+  if (!btn || btn.disabled) return false;
+  const card = btn.closest(".kanban-card");
+  if (card) startSession(btn.dataset.start, card.dataset.site);
+  return true;
+}
+$board.addEventListener("pointerdown", (e) => {
+  if (e.button != null && e.button !== 0) return;   // primary button only
+  if (startFrom(e.target)) e.preventDefault();       // don't also focus/select
+});
+$board.addEventListener("click", (e) => {
+  // A just-finished drag synthesizes a click on the captured card; swallow it so
+  // dropping a card doesn't also open its detail panel (XERK-141).
+  if (Date.now() - lastDragEndAt < 400) { lastDragEndAt = 0; return; }
+  // Keyboard activation (and a mouse fallback if pointerdown was missed); the
+  // pending guard in startSession makes a double-fire a no-op.
+  if (e.target.closest(".kc-start[data-start]")) { startFrom(e.target); return; }
+  if (e.target.closest(CARD_OWN)) return;
+  const card = e.target.closest(".kanban-card");
+  if (card) openDetail(card.dataset.key, card.dataset.site, card);
+});
+$board.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  // A focused button/link handles its own keying; only the card itself needs
+  // Enter/Space taught to it (it's a div with role=button).
+  if (e.target.closest(CARD_OWN)) return;
+  const card = e.target.closest(".kanban-card");
+  if (!card) return;
+  e.preventDefault();                    // Space would scroll the page
+  openDetail(card.dataset.key, card.dataset.site, card);
+});
+$panel.addEventListener("click", (e) => {
+  if (e.target.closest(".td-close")) return closeDetail();
+  if (!openTicketState) return;
+  if (e.target.closest("[data-repo-edit]")) {
+    openTicketState.editing = true;
+    openTicketState.repoError = "";   // a new attempt clears the old complaint
+    return paintDetail();
+  }
+  if (e.target.closest("[data-repo-cancel]")) {
+    openTicketState.editing = false;
+    return paintDetail();
+  }
+  if (e.target.closest("[data-agent-edit]")) {
+    openTicketState.agentEditing = true;
+    openTicketState.agentError = "";  // a new attempt clears the old complaint
+    return paintDetail();
+  }
+  if (e.target.closest("[data-agent-cancel]")) {
+    openTicketState.agentEditing = false;
+    return paintDetail();
+  }
+  if (e.target.closest("[data-model-edit]")) {
+    openTicketState.modelEditing = true;
+    openTicketState.modelError = "";  // a new attempt clears the old complaint
+    return paintDetail();
+  }
+  if (e.target.closest("[data-model-cancel]")) {
+    openTicketState.modelEditing = false;
+    return paintDetail();
+  }
+  if (e.target.closest("[data-status-edit]")) {
+    openTicketState.statusEditing = true;
+    openTicketState.statusError = "";   // a new attempt clears the old complaint
+    return paintDetail();
+  }
+  if (e.target.closest("[data-status-cancel]")) {
+    openTicketState.statusEditing = false;
+    return paintDetail();
+  }
+});
+// Choosing an option IS the save — the dropdown is the setting, so picking a repo
+// answers the question the row asked and there is nothing left to confirm.
+//
+// The regression this fixes: the picker used to need a separate Save, and closing
+// the panel — the ordinary way to leave a ticket — discarded the choice without a
+// word, snapping the row back to the model's guess. A control that looks like it
+// commits on pick must commit on pick.
+//
+// A re-pick of the value already showing saves nothing: it's not a change, and
+// firing a fleet-wide command to restate the current answer would be noise. It
+// still closes the picker, which is what a pick means.
+$panel.addEventListener("change", (e) => {
+  if (!openTicketState) return;
+  // The agent picker follows the repo picker's contract: a pick IS the save, a
+  // re-pick of the current answer saves nothing but still closes the picker.
+  const asel = e.target.closest("[data-agent-select]");
+  if (asel) {
+    const pin = B.agentPinOf(cache && cache.ticketAgents,
+      openTicketState.siteKey, openTicketState.key);
+    if (asel.value === B.agentPickerValue(pin)) {
+      openTicketState.agentEditing = false;
+      return paintDetail();
+    }
+    return void saveAgent(asel.value);
+  }
+  // The model picker follows the same contract (XERK-123).
+  const msel = e.target.closest("[data-model-select]");
+  if (msel) {
+    const pin = B.modelPinOf(cache && cache.ticketModels,
+      openTicketState.siteKey, openTicketState.key);
+    if (msel.value === B.modelPickerValue(pin)) {
+      openTicketState.modelEditing = false;
+      return paintDetail();
+    }
+    return void saveModel(msel.value);
+  }
+  // The status picker follows the same contract; its "keep current" first
+  // option is the no-op (XERK-138).
+  const ssel = e.target.closest("[data-status-select]");
+  if (ssel) {
+    if (ssel.value === B.statusPickerValue()) {
+      openTicketState.statusEditing = false;
+      return paintDetail();
+    }
+    return void saveStatus(ssel.value);
+  }
+  const sel = e.target.closest("[data-repo-select]");
+  if (!sel) return;
+  if (sel.value === B.repoPickerValue(openTicketState.ticket)) {
+    openTicketState.editing = false;
+    return paintDetail();
+  }
+  saveRepo(sel.value);
+});
+$backdrop.addEventListener("click", (e) => { if (e.target === $backdrop) closeDetail(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && openTicketState) closeDetail(); });
+
+// --- Manual refresh ---------------------------------------------------------
+// The board is a merge of every host's Jira block, so the button re-polls the
+// whole fleet (POST /api/jira/refresh queues a refreshJira per configured
+// host). The round trip is queue -> agent's next beat -> Jira -> beat back, so
+// instead of guessing a delay we hold the busy state until the fleet's records
+// say it actually ran; render() calls back in as SSE/poll deliver them.
+const $refresh = document.getElementById("refresh");
+const $refreshLabel = document.getElementById("refreshLabel");
+const REFRESH_TIMEOUT_MS = 45000;
+let pending = null; // { hosts, mark, saw, timer } while a refresh is in flight
+
+function setRefresh(busy, label) {
+  $refresh.classList.toggle("busy", busy);
+  $refresh.disabled = busy;
+  $refreshLabel.textContent = label;
+}
+
+function endRefresh(label) {
+  if (pending) { clearTimeout(pending.timer); pending = null; }
+  setRefresh(false, label);
+  // Let the outcome sit long enough to read, then go back to a plain button —
+  // unless another refresh has since started.
+  if (label !== "Refresh") {
+    setTimeout(() => { if (!pending) setRefresh(false, "Refresh"); }, 2500);
+  }
+}
+
+function checkRefreshDone() {
+  if (!pending || !cache) return;
+  const list = cache.agents || [];
+  if (B.jiraRefreshPending(list, pending.hosts)) { pending.saw = true; return; }
+  // Done when either we watched the command land and clear, or — if the ack
+  // beat us to the first render and we never caught it in flight — the
+  // freshness watermark moved. Together these close the race in both
+  // directions; the timeout covers a host that simply never beats.
+  if (!pending.saw && B.newestFetchedAt(list) <= pending.mark) return;
+  endRefresh(B.jiraRefreshFailed(list, pending.hosts) ? "Refresh failed" : "Updated");
+}
+
+$refresh.addEventListener("click", async () => {
+  if (pending) return;
+  const mark = cache ? B.newestFetchedAt(cache.agents || []) : "";
+  setRefresh(true, "Refreshing…");
+  let r;
+  try { r = await fetch("/api/jira/refresh", { method: "POST" }); }
+  catch { return void endRefresh("Refresh failed"); }
+  if (r.status === 401) return void (location.href = "/login");
+  if (!r.ok) return void endRefresh("Refresh failed");
+  let body = {};
+  try { body = await r.json(); } catch { /* fall through to the host check */ }
+  const hosts = body.hosts || [];
+  // No Jira-configured host: nothing will ever land, so say so now rather than
+  // spin for the full timeout.
+  if (!hosts.length) return void endRefresh("No Jira hosts");
+  pending = { hosts, mark, saw: false,
+              timer: setTimeout(() => endRefresh("Timed out"), REFRESH_TIMEOUT_MS) };
+  checkRefreshDone(); // a beat may have landed during the round trip
+});
+
+let cache = null, etag = null;
+async function refresh() {
+  try {
+    const r = await fetch("/api/agents", { headers: etag ? { "If-None-Match": etag } : {} });
+    if (r.status === 401) return void (location.href = "/login");
+    if (r.status === 304) return;
+    etag = r.headers.get("ETag");
+    cache = await r.json();
+  } catch { /* keep last render */ }
+  if (cache) render(cache);
+}
+
+// Live push: same SSE pattern as the other pages — patch the cached agent
+// record and re-render (debounced); the 15s poll stays as a fallback only.
+let sseOk = false, sseBackoff = 2000, renderTimer = null;
+function scheduleRender() {
+  if (renderTimer) return;
+  renderTimer = setTimeout(() => { renderTimer = null; if (cache) render(cache); }, 1000);
+}
+function applyAgent(rec) {
+  if (!cache) cache = { now: Date.now(), agents: [] };
+  const list = cache.agents || (cache.agents = []);
+  const i = list.findIndex(a => a.key === rec.key);
+  if (i >= 0) list[i] = rec; else list.push(rec);
+}
+function connectSSE() {
+  let es;
+  try { es = new EventSource("/api/events"); }
+  catch { setTimeout(connectSSE, sseBackoff); return; }
+  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  es.addEventListener("agent", (e) => {
+    try { applyAgent(JSON.parse(e.data)); } catch { return; }
+    scheduleRender();
+  });
+  es.addEventListener("removed", (e) => {
+    try { const { key } = JSON.parse(e.data); if (cache) cache.agents = (cache.agents || []).filter(a => a.key !== key); }
+    catch { return; }
+    scheduleRender();
+  });
+  // A ticket->agent pin changed (this browser's own save already painted; this
+  // is what keeps every OTHER open board in step). The event carries the whole
+  // map — it's tiny — so there's no patch bookkeeping.
+  es.addEventListener("ticketAgents", (e) => {
+    let ta;
+    try { ta = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.ticketAgents = ta;
+    scheduleRender();
+  });
+  // A ticket->model pin changed (XERK-123) — same tiny-whole-map pattern.
+  es.addEventListener("ticketModels", (e) => {
+    let tm;
+    try { tm = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.ticketModels = tm;
+    scheduleRender();
+  });
+  // An org's color pin changed (XERK-145) — same tiny-whole-map pattern. org.js
+  // owns the live map; this patch keeps THIS page's cache in step, else the next
+  // render's TurmaOrg.update(cache) would regress the pins to the stale copy the
+  // initial poll fetched (SSE-healthy pages never re-poll).
+  es.addEventListener("orgColors", (e) => {
+    let oc;
+    try { oc = JSON.parse(e.data); } catch { return; }
+    if (!cache) cache = { now: Date.now(), agents: [] };
+    cache.orgColors = oc;
+    scheduleRender();
+  });
+  // An org's auto-start opt-in changed (XERK-41) — same tiny-whole-map pattern
+  // as ticketAgents; keeps every open page's switches in step. The switches live
+  // in the header menu now, so org.js takes that event off this page's socket
+  // rather than opening a second one.
+  TurmaOrg.sse(es);
+  es.onerror = () => {
+    sseOk = false;
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(connectSSE, sseBackoff);
+      sseBackoff = Math.min(sseBackoff * 2, 30000);
+    }
+  };
+}
+
+refresh();
+connectSSE();
+setInterval(() => { if (!sseOk) refresh(); }, 15000);
+</script>
+</body>
+</html>
