@@ -1213,6 +1213,52 @@ test("http: /usage serves the page and /history redirects to it", async () => {
   }
 });
 
+test("http: an old agent's bare-string usage models are coerced on ingest", async () => {
+  // Agents predating the token-only usage rewrite report `usage.models` as a
+  // list of model-name STRINGS, not [{model, totals, …}]. Every client walks
+  // that list, and one such host used to take the whole fleet down with it —
+  // the dashboard's shortModels() read `m.model` off a string, threw mid-render,
+  // and left NO host cards at all (so "All orgs" showed nothing while filtering
+  // to any single org still worked, since that excluded the old host). The
+  // coercion happens once, here at the hub's ingest boundary, so web, Android
+  // and glasses all see the current shape.
+  const legacy = { totals: { input: 1, output: 2, cacheWrite: 0, cacheRead: 0 },
+                   models: ["claude-opus-5", "<synthetic>", ""] };
+  assert.equal(
+    (await request("POST", "/api/heartbeat", {
+      body: {
+        device: "legacy-usage-host",
+        usage: legacy,
+        repoUsage: [{ repo: "Turma", usage: { models: ["claude-fable-5"] } }],
+        sessions: [{ id: "s1", repo: "Turma", status: "running",
+                     usage: { models: ["claude-haiku-4-5-20251001"] } }],
+      },
+      headers: agentHeaders,
+    })).status,
+    200
+  );
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = res.body.agents.find((a) => a.key === "legacy-usage-host");
+  assert.deepEqual(rec.usage.models, [{ model: "claude-opus-5" }, { model: "<synthetic>" }]);
+  assert.deepEqual(rec.repoUsage[0].usage.models, [{ model: "claude-fable-5" }]);
+  assert.deepEqual(rec.sessions[0].usage.models, [{ model: "claude-haiku-4-5-20251001" }]);
+  // The rest of the block rides through untouched.
+  assert.deepEqual(rec.usage.totals, legacy.totals);
+});
+
+test("http: a current agent's per-model usage is left exactly as reported", async () => {
+  const models = [{ model: "claude-opus-5", totals: { input: 3, output: 4, cacheWrite: 5, cacheRead: 6 },
+                    today: { input: 1, output: 0, cacheWrite: 0, cacheRead: 0 },
+                    week: { input: 2, output: 0, cacheWrite: 0, cacheRead: 0 } }];
+  await request("POST", "/api/heartbeat", {
+    body: { device: "modern-usage-host", usage: { models } },
+    headers: agentHeaders,
+  });
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = res.body.agents.find((a) => a.key === "modern-usage-host");
+  assert.deepEqual(rec.usage.models, models);
+});
+
 test("http: command queue rides the reply until acked", async () => {
   const beat = (payload) =>
     request("POST", "/api/heartbeat", { body: payload, headers: agentHeaders });
