@@ -237,6 +237,10 @@ const liveClients = {};
 // for the first heartbeat interval; losing it is harmless) -------------------
 try {
   agents = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  // Records written before the ingest-side coercion below (and any host that is
+  // OFFLINE, so no beat will ever rewrite its record) still carry the legacy
+  // per-model usage shape — normalize what we load, not just what arrives.
+  for (const a of Object.values(agents)) normalizeUsage(a);
   console.log(`loaded ${Object.keys(agents).length} agents from ${STATE_FILE}`);
 } catch {
   /* first boot or no volume mounted */
@@ -777,6 +781,37 @@ function advanceMigrations() {
       publishMigrations();
     }
   }
+}
+
+// Normalize an agent's per-model usage lists to the current wire shape.
+//
+// A usage block's `models` is [{model, totals, today, week}], but agents built
+// before the token-only usage rewrite report it as a bare list of model-name
+// STRINGS. Every client walks that list — and one host on an old build must not
+// be able to break the others: the dashboard's shortModels() read `m.model` off
+// a string, threw mid-render, and left the fleet list EMPTY, so "All orgs"
+// showed nothing while any single org still rendered. Android is stricter
+// still: kotlinx refuses a string where ModelUsage is declared, failing the
+// whole /api/agents decode.
+//
+// So the coercion happens once, at the hub's ingest boundary, rather than in
+// each of the three clients (none of which then needs a release to survive an
+// old host). A name-less entry is DROPPED — it can't be rendered or merged by
+// name, and carries no windows worth keeping.
+function normalizeModelUsage(usage) {
+  if (!usage || !Array.isArray(usage.models)) return;
+  usage.models = usage.models
+    .map((m) => (typeof m === "string" ? { model: m } : m))
+    .filter((m) => m && typeof m.model === "string" && m.model);
+}
+
+// Every place a usage block rides the heartbeat: the host-wide aggregate, the
+// per-repo ones, and each live session's own.
+function normalizeUsage(payload) {
+  if (!payload || typeof payload !== "object") return;
+  normalizeModelUsage(payload.usage);
+  for (const r of payload.repoUsage || []) normalizeModelUsage(r && r.usage);
+  for (const s of payload.sessions || []) normalizeModelUsage(s && s.usage);
 }
 
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
@@ -2612,6 +2647,9 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/heartbeat") {
       const payload = JSON.parse((await readBody(req)) || "{}");
+      // Coerce an old agent's per-model usage lists to the current shape before
+      // anything (the record, the cache, every client) sees them.
+      normalizeUsage(payload);
       // Identity is the physical host name (`device`); with one container per
       // host the container name is no longer meaningful. agentId is a last-resort
       // fallback if the host name couldn't be read.

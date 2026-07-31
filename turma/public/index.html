@@ -645,17 +645,29 @@ function totalTokens(u) {
 function mergeModels(lists) {
   const by = new Map();
   for (const list of lists) {
-    for (const m of list || []) by.set(m.model, (by.get(m.model) || 0) + totalTokens(m.totals));
+    for (const m of list || []) {
+      const name = modelName(m);
+      if (name) by.set(name, (by.get(name) || 0) + totalTokens(m.totals));
+    }
   }
   return [...by.entries()]
     .sort((a, b) => b[1] - a[1])
     .map(([model]) => ({ model }));
 }
+// A model entry's name. The hub coerces an old agent's bare-string entries to
+// {model} on ingest, so this is the belt to that braces: a nameless entry must
+// return "" rather than throw, because these lists are read INSIDE the host-card
+// map — one bad entry there aborted the whole render and left the dashboard
+// listing no hosts at all (which is what "All orgs" showing nothing was).
+function modelName(m) {
+  return typeof m === "string" ? m : (m && typeof m.model === "string" ? m.model : "");
+}
 // `models` is [{model, ...}], biggest consumer first.
 function shortModels(models) {
-  if (!models || !models.length) return "–";
-  return models.slice(0, 2).map(m =>
-    m.model.replace(/^claude-/, "").replace(/-\d{8}$/, "")
+  const named = (models || []).map(modelName).filter(Boolean);
+  if (!named.length) return "–";
+  return named.slice(0, 2).map(n =>
+    n.replace(/^claude-/, "").replace(/-\d{8}$/, "")
   ).join(", ");
 }
 // git@host:owner/repo(.git) -> https link; plain name otherwise.
