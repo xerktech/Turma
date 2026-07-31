@@ -1023,10 +1023,26 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `CreateTicketSheet`): `source` on `JiraBlock`/`BoardSite`, the create endpoints in `net/HubApi.kt`, and
   the pure `createLabelWord`/`splitLabels`/`classifyCreateMeta`/`classifyCreateResult` ports in
   `core/Board.kt`.
+- **A rejected write carries the TRACKER's own explanation** (XERK-151): every Jira/Azure request goes
+  through `_board_urlopen`, which re-raises a `urllib` `HTTPError` with `_http_error_detail` — the
+  response BODY, which urllib's own string discards, leaving every refusal reading "HTTP Error 400: Bad
+  Request" with no way to tell a missing field from a bad identity from a workflow rule. Reads `message`
+  (Azure), `errorMessages`/`errors` (Jira), else strips a proxy's HTML; capped `BOARD_ERROR_MAX_CHARS`.
+- **A description goes in the field its TYPE has**: `_azure_description_field` over the cached
+  `_azure_type_fields` prefers `System.Description`, falling back to `Microsoft.VSTS.TCM.ReproSteps` —
+  what the Agile/Scrum **Bug** has instead, having no `System.Description` at all. Patching an absent
+  field fails the whole create, so it is looked up, not assumed; an unreadable list falls back to
+  `System.Description`, and a type with neither is created with no description rather than not at all.
+- **Self-assignment cannot cost the operator the ticket**: `create_azure_issue` retries ONCE unassigned,
+  since an identity the collection can't resolve (`AZDO_USER` holding the board's display LABEL, a PAT
+  owner with no account on a self-hosted server) is otherwise fatal — the item then lands outside the
+  board's `@Me` filter, still reachable by the returned url. **The FIRST error propagates** if the retry
+  fails too: it names the real problem, while the retry only proves the assignee wasn't it.
 - **Any new shared `/*.js` must be registered in `server.js`'s `STATIC_ASSETS`** (it's an allowlist, not
   a directory serve) AND loaded by each page after `org.js` — a missing entry 404s and takes the module
   (and every page's render) down. `newticket.test.js` guards both.
-- Tests: `TestCreateJiraIssue`/`TestCreateAzureIssue`/`TestStageCreateMeta`/`TestStageCreateTicket` in
+- Tests: `TestCreateJiraIssue`/`TestCreateAzureIssue` (+ retry-unassigned, description-field),
+  `TestHttpErrorDetail`, `TestAzureDescriptionField`, `TestStageCreateMeta`/`TestStageCreateTicket` in
   `test_hub_agent.py`; `server.test.js`; `createFormHtml`/`createProjectOptions`/`createTypeOptions` in
   `board.test.js`; `newticket.test.js`; android `BoardTest.kt`.
 
