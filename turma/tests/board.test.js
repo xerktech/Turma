@@ -1740,6 +1740,33 @@ test("createFormHtml: azure wording, and a complete form enables submit", () => 
   assert.doesNotMatch(html, /data-cf-submit="1" disabled/);
 });
 
+test("createFormHtml: a created ticket confirms, and an unassigned one warns (XERK-151)", () => {
+  const base = {
+    sites: [{ siteKey: "dev.azure.com/o", orgName: "", online: true }],
+    siteKey: "dev.azure.com/o", source: "azure", meta: {}, types: {},
+    values: {}, busy: false, error: "",
+  };
+  const ok = createFormHtml({ ...base, created: { key: "42", url: "http://x/42" } });
+  assert.match(ok, /Ticket created/);
+  assert.match(ok, /next poll/);
+  assert.doesNotMatch(ok, /cf-warn/);
+
+  // Created but unassigned: still a success, so it stays in the confirmation
+  // line — the board just won't show it, which the operator must be told.
+  const warn = createFormHtml({
+    ...base,
+    created: { key: "42", url: "http://x/42", warning: "couldn't be assigned to you" },
+  });
+  assert.match(warn, /cf-warn/);
+  assert.match(warn, /be assigned to you/);          // apostrophe arrives escaped
+  assert.doesNotMatch(warn, /next poll/);
+  // The warning is escaped like any agent-supplied text.
+  const evil = createFormHtml({
+    ...base, created: { key: "42", url: "", warning: '<img src=x onerror=alert(1)>' },
+  });
+  assert.doesNotMatch(evil, /<img/);
+});
+
 test("createFormHtml: loading and error states per row", () => {
   const loading = createFormHtml({
     sites: [{ siteKey: "o", orgName: "", online: true }], siteKey: "o", source: "jira",

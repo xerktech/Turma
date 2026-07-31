@@ -922,7 +922,10 @@ function ingestCreateResults(agent, results) {
   for (const r of results || []) {
     if (!r || !r.cmdId) continue;
     agent.createResults[r.cmdId] = {
-      key: r.key || null, url: r.url || null, error: r.error || null, fetchedAt: now,
+      key: r.key || null, url: r.url || null, error: r.error || null,
+      // A create that succeeded but couldn't be assigned: a success the client
+      // still has to say something about, since the board won't show it.
+      warning: r.warning || null, fetchedAt: now,
     };
   }
   for (const [k, e] of Object.entries(agent.createResults)) {
@@ -3332,7 +3335,7 @@ const server = http.createServer(async (req, res) => {
       if (found) {
         return json(res, 200, found.error
           ? { error: found.error }
-          : { key: found.key, url: found.url });
+          : { key: found.key, url: found.url, warning: found.warning || null });
       }
       if (Date.now() - (agents[host].lastSeen || 0) >= OFFLINE_AFTER_MS) {
         return json(res, 503, { error: "the host went offline before the ticket was created" });

@@ -360,6 +360,9 @@ data class CreateResultEnvelope(
     val key: String? = null,
     val url: String? = null,
     val error: String? = null,
+    // A create that succeeded but landed unassigned — a success the sheet still
+    // has to mention, since the board filters on the tracker user.
+    val warning: String? = null,
     val pending: Boolean = false,
 )
 

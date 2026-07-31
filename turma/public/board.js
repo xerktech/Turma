@@ -1279,7 +1279,9 @@
           <h2>Ticket created</h2>
           <button class="td-close" type="button" data-cf-close="1" aria-label="Close">✕</button>
         </div>
-        <div class="cf-done">Created ${link}. It'll appear on the board on the next poll.</div>
+        <div class="cf-done">Created ${link}. ${s.created.warning
+          ? `<span class="cf-warn">⚠ ${esc(s.created.warning)}.</span>`
+          : "It'll appear on the board on the next poll."}</div>
         <div class="cf-actions">
           <button type="button" class="cf-btn" data-cf-another="1">Create another</button>
           <button type="button" class="cf-btn cf-primary" data-cf-close="1">Done</button>

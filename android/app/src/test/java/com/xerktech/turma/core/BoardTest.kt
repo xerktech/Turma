@@ -625,6 +625,12 @@ class BoardTest {
     @Test fun `classifyCreateResult distinguishes pending, created, and error`() {
         assertEquals(CreateResultFetch.Pending, classifyCreateResult(202, null))
         assertEquals(CreateResultFetch.Created("ENG-9", "u"), classifyCreateResult(200, CreateResultEnvelope(key = "ENG-9", url = "u")))
+        // XERK-151: created but unassigned is a success carrying a warning — the
+        // board filters on the tracker user, so it lands invisible there.
+        assertEquals(
+            CreateResultFetch.Created("ENG-9", "u", "couldn't be assigned"),
+            classifyCreateResult(200, CreateResultEnvelope(key = "ENG-9", url = "u", warning = "couldn't be assigned")),
+        )
         assertTrue(classifyCreateResult(200, CreateResultEnvelope(error = "bad field")) is CreateResultFetch.Error)
         assertTrue(classifyCreateResult(500, null) is CreateResultFetch.Error)
         // A 200 with neither key nor error is an error, not a false success.

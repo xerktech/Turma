@@ -985,8 +985,11 @@ private fun CreateTicketSheet(
             ) {
                 Text("Ticket created", style = MaterialTheme.typography.titleMedium)
                 Text(
-                    "Created ${done.key}. It'll appear on the board on the next poll.",
+                    if (done.warning.isNotBlank()) "Created ${done.key}. \u26a0 ${done.warning}."
+                    else "Created ${done.key}. It'll appear on the board on the next poll.",
                     style = MaterialTheme.typography.bodyMedium,
+                    color = if (done.warning.isNotBlank()) TurmaColors.warning
+                            else Color.Unspecified,
                 )
                 if (done.url.isNotBlank()) {
                     GhostButton("Open ${done.key} ↗", onClick = { uriHandler.openUri(done.url) })

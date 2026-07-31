@@ -225,7 +225,7 @@
     if (createState !== s) return;         // closed while the create was in flight
     s.busy = false;
     if (out.error) { s.error = out.error; return void paintCreate(); }
-    s.created = { key: out.key, url: out.url };
+    s.created = { key: out.key, url: out.url, warning: out.warning || "" };
     paintCreate();
   }
 

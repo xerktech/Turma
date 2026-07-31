@@ -9507,7 +9507,8 @@ class TestCreateJiraIssue(unittest.TestCase):
         self.assertEqual(f["assignee"], {"id": "acc-1"})
         self.assertEqual(f["description"]["type"], "doc")
         self.assertEqual(out, {"key": "ENG-99",
-                               "url": "https://myorg.atlassian.net/browse/ENG-99"})
+                               "url": "https://myorg.atlassian.net/browse/ENG-99",
+                               "assigned": True})
 
     def test_omits_optional_fields_when_empty(self):
         captured = {}
@@ -9727,7 +9728,7 @@ class TestCreateAzureIssue(unittest.TestCase):
         with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
                                  AZDO_TOKEN="p", AZDO_USER=""), \
              self._has_description(), \
-             mock.patch.object(ha, "_azure_self", lambda: None), \
+             mock.patch.object(ha, "_azure_identities", lambda: []), \
              mock.patch.object(ha, "azure_create_workitem", fc):
             ha.create_azure_issue("P", "Task", "T", "<script>", [])
         desc = [o for o in captured["ops"]
@@ -9739,7 +9740,7 @@ class TestCreateAzureIssue(unittest.TestCase):
         with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
                                  AZDO_TOKEN="p"), \
              self._has_description(), \
-             mock.patch.object(ha, "_azure_self", lambda: None), \
+             mock.patch.object(ha, "_azure_identities", lambda: []), \
              mock.patch.object(ha, "azure_create_workitem", lambda p, w, o: {}):
             with self.assertRaises(RuntimeError):
                 ha.create_azure_issue("P", "Task", "T", "", [])
@@ -9755,7 +9756,7 @@ class TestCreateAzureIssue(unittest.TestCase):
                                  AZDO_TOKEN="p", AZDO_USER=""), \
              mock.patch.object(ha, "_azure_description_field",
                                lambda s, p, w: "Microsoft.VSTS.TCM.ReproSteps"), \
-             mock.patch.object(ha, "_azure_self", lambda: None), \
+             mock.patch.object(ha, "_azure_identities", lambda: []), \
              mock.patch.object(ha, "azure_create_workitem", fc):
             ha.create_azure_issue("P", "Bug", "T", "steps", [])
         paths = [o["path"] for o in captured["ops"]]
@@ -9772,63 +9773,158 @@ class TestCreateAzureIssue(unittest.TestCase):
         with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
                                  AZDO_TOKEN="p", AZDO_USER=""), \
              mock.patch.object(ha, "_azure_description_field", lambda s, p, w: None), \
-             mock.patch.object(ha, "_azure_self", lambda: None), \
+             mock.patch.object(ha, "_azure_identities", lambda: []), \
              mock.patch.object(ha, "azure_create_workitem", fc):
             out = ha.create_azure_issue("P", "Odd", "T", "dropped", [])
         self.assertEqual(out["key"], "6")
         self.assertEqual([o["path"] for o in captured["ops"]],
                          ["/fields/System.Title"])
 
-    def test_retries_unassigned_when_the_identity_is_rejected(self):
-        """Self-assignment is best-effort by contract, so an identity the
-        collection can't resolve must not cost the operator the whole ticket."""
+    def test_falls_through_the_identity_ladder(self):
+        """The identity a collection accepts is unguessable (email / DOMAIN\\user
+        / display name), so a rejected one must move to the next candidate, not
+        straight to unassigned — an unassigned item misses the board's @Me."""
+        tries = []
+
+        def fc(p, w, ops):
+            tries.append(ops)
+            who = [o["value"] for o in ops if o["path"].endswith("AssignedTo")]
+            if who and who[0] != "DOMAIN\\me":
+                raise ha.BoardHttpError("HTTP 400: TF401320: Rule Error", 400)
+            return {"id": 9}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p"), \
+             self._has_description(), \
+             mock.patch.object(ha, "_azure_identities",
+                               lambda: ["Board Label", "DOMAIN\\me"]), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            out = ha.create_azure_issue("P", "Task", "T", "d", [])
+        self.assertEqual(out["key"], "9")
+        self.assertTrue(out["assigned"])
+        self.assertEqual(len(tries), 2)
+
+    def test_unassigned_is_the_last_resort_and_is_reported(self):
         tries = []
 
         def fc(p, w, ops):
             tries.append(ops)
             if any(o["path"].endswith("AssignedTo") for o in ops):
-                raise RuntimeError("HTTP 400: TF401320: Rule Error for field "
-                                   "Assigned To")
+                raise ha.BoardHttpError("HTTP 400: TF401320: Rule Error", 400)
             return {"id": 9}
 
         with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
-                                 AZDO_TOKEN="p", AZDO_USER="Board Label"), \
+                                 AZDO_TOKEN="p"), \
              self._has_description(), \
+             mock.patch.object(ha, "_azure_identities", lambda: ["a", "b"]), \
              mock.patch.object(ha, "azure_create_workitem", fc):
             out = ha.create_azure_issue("P", "Task", "T", "d", [])
         self.assertEqual(out["key"], "9")
-        self.assertEqual(len(tries), 2)
-        self.assertFalse(any(o["path"].endswith("AssignedTo") for o in tries[1]))
+        self.assertFalse(out["assigned"])          # drives the client's warning
+        self.assertEqual(len(tries), 3)
+        self.assertFalse(any(o["path"].endswith("AssignedTo") for o in tries[2]))
 
-    def test_keeps_the_first_error_when_the_retry_fails_too(self):
-        """The retry only proves the assignee wasn't the problem; the original
-        rejection is the one that says what is."""
+    def test_keeps_the_first_error_when_every_attempt_fails(self):
+        """A later attempt only proves that identity didn't work either; the
+        first rejection is the one that names the real problem."""
         def fc(p, w, ops):
-            raise RuntimeError("HTTP 400: TF401326: missing required field Area")
+            raise ha.BoardHttpError(
+                "HTTP 400: TF401326: missing required field Area", 400)
 
         with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
-                                 AZDO_TOKEN="p", AZDO_USER="me@x"), \
+                                 AZDO_TOKEN="p"), \
              self._has_description(), \
+             mock.patch.object(ha, "_azure_identities", lambda: ["me@x"]), \
              mock.patch.object(ha, "azure_create_workitem", fc):
             with self.assertRaises(RuntimeError) as cm:
                 ha.create_azure_issue("P", "Task", "T", "d", [])
         self.assertIn("missing required field Area", str(cm.exception))
 
-    def test_no_retry_when_there_was_no_assignee(self):
+    def test_an_unrefused_failure_is_never_retried(self):
+        """A 4xx proves nothing was created; a timeout or 5xx does not, so
+        re-sending could duplicate the work item."""
+        for boom in (ha.BoardHttpError("HTTP 503: busy", 503),
+                     TimeoutError("timed out")):
+            tries = []
+
+            def fc(p, w, ops, _b=boom):
+                tries.append(ops)
+                raise _b
+
+            with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                     AZDO_TOKEN="p"), \
+                 self._has_description(), \
+                 mock.patch.object(ha, "_azure_identities", lambda: ["a", "b"]), \
+                 mock.patch.object(ha, "azure_create_workitem", fc):
+                with self.assertRaises(Exception):
+                    ha.create_azure_issue("P", "Task", "T", "d", [])
+            self.assertEqual(len(tries), 1, f"retried after {boom!r}")
+
+    def test_no_ladder_means_one_unassigned_attempt(self):
         tries = []
 
         def fc(p, w, ops):
             tries.append(ops)
-            raise RuntimeError("HTTP 400: something else")
+            raise ha.BoardHttpError("HTTP 400: something else", 400)
 
         with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
                                  AZDO_TOKEN="p", AZDO_USER=""), \
              self._has_description(), \
-             mock.patch.object(ha, "_azure_self", lambda: None), \
+             mock.patch.object(ha, "_azure_identities", lambda: []), \
              mock.patch.object(ha, "azure_create_workitem", fc):
             with self.assertRaises(RuntimeError):
                 ha.create_azure_issue("P", "Task", "T", "d", [])
         self.assertEqual(len(tries), 1)
+
+
+class TestAzureIdentities(unittest.TestCase):
+    """The candidates tried as System.AssignedTo, best first."""
+
+    def _conn(self):
+        return {"authenticatedUser": {
+            "properties": {"Account": {"$value": "DOMAIN\\me"}},
+            "uniqueName": "me@corp.com", "providerDisplayName": "Me Myself",
+            "id": "guid-1"}}
+
+    def _fresh(self):
+        return mock.patch.object(ha, "_AZDO_ME", {"names": [], "tried": False})
+
+    def test_operator_setting_leads_then_connection_data(self):
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER="Board Label"), \
+             self._fresh(), \
+             mock.patch.object(ha, "azure_req", return_value=self._conn()):
+            self.assertEqual(ha._azure_identities(),
+                             ["Board Label", "DOMAIN\\me", "me@corp.com",
+                              "Me Myself", "guid-1"])
+
+    def test_deduped_when_the_setting_is_already_a_candidate(self):
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER="me@corp.com"), \
+             self._fresh(), \
+             mock.patch.object(ha, "azure_req", return_value=self._conn()):
+            got = ha._azure_identities()
+        self.assertEqual(got[0], "me@corp.com")
+        self.assertEqual(len(got), len(set(got)))
+
+    def test_a_failed_probe_is_retried_not_cached(self):
+        """Marking the probe tried up-front turned one transient failure into a
+        process that never self-assigned again."""
+        calls = []
+
+        def flaky(path, params, body=None):
+            calls.append(path)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            return self._conn()
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER=""), \
+             self._fresh(), mock.patch.object(ha, "azure_req", flaky):
+            self.assertEqual(ha._azure_identities(), [])
+            self.assertIn("DOMAIN\\me", ha._azure_identities())
+            ha._azure_identities()
+        self.assertEqual(len(calls), 2)            # cached after the success
 
 
 class TestAzureCreateMeta(unittest.TestCase):
@@ -9938,11 +10034,25 @@ class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         with self._cfg(), mock.patch.object(
                 ha, "create_board_issue",
-                return_value={"key": "ENG-5", "url": "u"}) as f:
+                return_value={"key": "ENG-5", "url": "u", "assigned": True}) as f:
             sm._stage_create_ticket(self._cmd())
         f.assert_called_once_with("ENG", "1", "Hi", "d", ["a"])
         self.assertEqual(sm.create_ticket_results[0],
-                         {"cmdId": "c1", "key": "ENG-5", "url": "u", "error": None})
+                         {"cmdId": "c1", "key": "ENG-5", "url": "u", "error": None,
+                          "warning": None})
+
+    def test_unassigned_create_succeeds_but_warns(self):
+        """The board filters on the tracker user, so an unassigned ticket is
+        created and then invisible there — that has to be said out loud."""
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "create_board_issue",
+                return_value={"key": "ENG-6", "url": "u", "assigned": False}):
+            sm._stage_create_ticket(self._cmd())
+        out = sm.create_ticket_results[0]
+        self.assertEqual(out["key"], "ENG-6")
+        self.assertIsNone(out["error"])
+        self.assertIn("couldn't be assigned", out["warning"])
 
     def test_missing_title_fails_without_creating(self):
         sm = self.make_manager()
