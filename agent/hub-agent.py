@@ -4036,6 +4036,65 @@ def normalize_jira_site(raw):
     return r.strip(".").lower()
 
 
+# --- Tracker HTTP --------------------------------------------------------------
+# Every Jira and Azure DevOps request funnels through _board_urlopen so a
+# rejection reads the same wherever it surfaces (a block's `error`, a staged
+# command result, the New-ticket dialog).
+BOARD_ERROR_MAX_CHARS = 200
+
+
+def _http_error_detail(err):
+    """A failed tracker request as text an operator can act on.
+
+    urllib's HTTPError stringifies to just "HTTP Error 400: Bad Request" and
+    DISCARDS the response body — but that body is the only place either tracker
+    says why: a field the work-item type doesn't have, an identity the
+    collection can't resolve, a workflow rule. Without it every rejected write
+    reads as the same unactionable sentence, with nothing to act on and no way
+    to tell two unrelated failures apart.
+    """
+    code = getattr(err, "code", None) or "?"
+    body = ""
+    try:
+        body = (err.read() or b"").decode("utf-8", "replace")
+    except Exception:
+        pass
+    msg = ""
+    try:
+        parsed = json.loads(body) if body.strip() else None
+        if isinstance(parsed, dict):
+            # Azure DevOps says {"message": ...}; Jira says {"errorMessages":
+            # [...]} and/or a per-field {"errors": {field: why}}.
+            msg = str(parsed.get("message") or "").strip()
+            if not msg:
+                msg = "; ".join(str(m) for m in (parsed.get("errorMessages") or []))
+            errors = parsed.get("errors")
+            if not msg and isinstance(errors, dict):
+                msg = "; ".join(f"{k}: {v}" for k, v in errors.items())
+    except Exception:
+        pass
+    if not msg:
+        # Not JSON: an HTML error page from a proxy or IIS in front of a
+        # self-hosted server. Strip the markup so the sentence inside survives.
+        msg = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", body)
+        msg = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", msg)).strip()
+    msg = msg[:BOARD_ERROR_MAX_CHARS].strip()
+    return f"HTTP {code}: {msg}" if msg else f"HTTP {code}"
+
+
+def _board_urlopen(req):
+    """Send one prepared tracker request and parse its JSON reply ({} when the
+    body is empty — a Jira transition answers 204). An HTTP error is re-raised
+    carrying the server's own explanation; everything else (DNS, TLS, timeout)
+    propagates untouched, since urllib already stringifies those usefully."""
+    try:
+        with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
+            raw = resp.read().decode()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(_http_error_detail(e)) from e
+    return json.loads(raw) if raw.strip() else {}
+
+
 def jira_req(path, params, body=None):
     """One authenticated request against the configured Jira Cloud site, parsed
     JSON out. GET when `body` is None, else a JSON POST — the board's status
@@ -4060,9 +4119,7 @@ def jira_req(path, params, body=None):
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers,
                                  method="POST" if body is not None else "GET")
-    with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
-        raw = resp.read().decode()
-        return json.loads(raw) if raw.strip() else {}
+    return _board_urlopen(req)
 
 
 def jira_get(path, params):
@@ -4084,8 +4141,7 @@ def jira_post(path, body):
         "Content-Type": "application/json",
         "User-Agent": "turma-agent/1.0",
     }, method="POST")
-    with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
-        return json.loads(resp.read().decode() or "{}")
+    return _board_urlopen(req)
 
 
 def _shape_issue(issue, site_key):
@@ -4605,9 +4661,7 @@ def azure_req(path, params, body=None, method=None, content_type="application/js
     req = urllib.request.Request(
         url, data=data, headers=headers,
         method=method or ("POST" if body is not None else "GET"))
-    with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
-        raw = resp.read().decode()
-        return json.loads(raw) if raw.strip() else {}
+    return _board_urlopen(req)
 
 
 def _azure_states(site_key, project, wtype):
@@ -4923,6 +4977,54 @@ def fetch_azure_issue(key):
 # uses the PAT owner's identity from the connection-data endpoint so the new item
 # lands on the board (which filters by @Me).
 _AZDO_ME = {"name": None, "tried": False}
+_AZDO_FIELD_CACHE = {}
+
+# Where a work-item type keeps its long description. Most types use
+# System.Description, but the Agile and Scrum process templates give Bug
+# Microsoft.VSTS.TCM.ReproSteps INSTEAD, and no System.Description at all — and a
+# patch naming a field the type doesn't have is rejected outright, so the whole
+# create fails rather than the description being dropped. Ordered by preference;
+# the first one the type actually has wins.
+AZDO_DESCRIPTION_FIELDS = ("System.Description", "Microsoft.VSTS.TCM.ReproSteps")
+
+
+def _azure_type_fields(site_key, project, wtype):
+    """The field reference names a (project, work-item type) accepts, cached like
+    _azure_states. An empty set means "couldn't ask" (the lookup failed, or the
+    args were incomplete), which callers read as unknown rather than as none."""
+    ck = ("fields", site_key, project or "", wtype or "")
+    if ck in _AZDO_FIELD_CACHE:
+        return _AZDO_FIELD_CACHE[ck]
+    out = set()
+    if project and wtype:
+        try:
+            data = azure_req(
+                f"/{urllib.parse.quote(project)}/_apis/wit/workItemTypes/"
+                f"{urllib.parse.quote(wtype)}/fields", {})
+            for f in data.get("value") or []:
+                ref = str(f.get("referenceName") or "").strip()
+                if ref:
+                    out.add(ref)
+        except Exception as e:
+            log(f"azure field list failed for {project}/{wtype}: {e}")
+    _AZDO_FIELD_CACHE[ck] = out
+    return out
+
+
+def _azure_description_field(site_key, project, wtype):
+    """The field to put a new work item's description in, or None to send none.
+
+    Falls back to System.Description when the field list is unknown — the old
+    unconditional behaviour, and right for every type that has it. Returning
+    None only happens when the type demonstrably has neither field, where
+    dropping the text beats losing the ticket to a 400."""
+    fields = _azure_type_fields(site_key, project, wtype)
+    if not fields:
+        return AZDO_DESCRIPTION_FIELDS[0]
+    for ref in AZDO_DESCRIPTION_FIELDS:
+        if ref in fields:
+            return ref
+    return None
 
 
 def _azure_self():
@@ -4960,8 +5062,7 @@ def azure_create_workitem(project, wtype, ops):
         "Content-Type": "application/json-patch+json",
         "User-Agent": "turma-agent/1.0",
     }, method="POST")
-    with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
-        return json.loads(resp.read().decode() or "{}")
+    return _board_urlopen(req)
 
 
 def azure_create_meta():
@@ -5005,17 +5106,40 @@ def create_azure_issue(project, wtype, title, description, tags):
     base = azure_base()
     ops = [{"op": "add", "path": "/fields/System.Title", "value": title}]
     if description:
-        # System.Description is HTML; escape the plain text and keep line breaks.
-        body_html = html.escape(str(description)).replace("\n", "<br>")
-        ops.append({"op": "add", "path": "/fields/System.Description",
-                    "value": body_html})
+        field = _azure_description_field(site_key, project, wtype)
+        if field:
+            # The description field is HTML; escape the plain text, keep breaks.
+            body_html = html.escape(str(description)).replace("\n", "<br>")
+            ops.append({"op": "add", "path": f"/fields/{field}",
+                        "value": body_html})
+        else:
+            log(f"azure type {wtype!r} has no description field; "
+                "creating without one")
     if tags:
         ops.append({"op": "add", "path": "/fields/System.Tags",
                     "value": "; ".join(tags)})
     me = _azure_self()
     if me:
         ops.append({"op": "add", "path": "/fields/System.AssignedTo", "value": me})
-    data = azure_create_workitem(project, wtype, ops)
+    try:
+        data = azure_create_workitem(project, wtype, ops)
+    except Exception as first:
+        # Self-assignment is best-effort BY CONTRACT, so it must not be able to
+        # cost the operator their ticket: an identity this collection can't
+        # resolve (AZDO_USER holding the board's display LABEL, a PAT owner with
+        # no account on a self-hosted server) is rejected, and retrying without
+        # it lands the item — just outside the board's own @Me filter, which the
+        # returned url still reaches. Keep the FIRST error if the retry fails
+        # too: that one describes the real problem, the retry only confirms the
+        # assignee wasn't it.
+        if not me:
+            raise
+        log(f"azure create failed ({first}); retrying unassigned")
+        ops = [o for o in ops if o["path"] != "/fields/System.AssignedTo"]
+        try:
+            data = azure_create_workitem(project, wtype, ops)
+        except Exception:
+            raise first from None
     wid = data.get("id")
     if wid is None:
         raise RuntimeError("Azure returned no work-item id")

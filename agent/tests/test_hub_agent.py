@@ -24,6 +24,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+import urllib.request
 from collections import deque
 from unittest import mock
 
@@ -9572,7 +9573,129 @@ class TestJiraIssueTypes(unittest.TestCase):
             self.assertEqual(ha.jira_issue_types("ENG"), [{"id": "1", "name": "Task"}])
 
 
+class TestHttpErrorDetail(unittest.TestCase):
+    """A rejected tracker request must carry the SERVER's explanation: urllib
+    stringifies an HTTPError to "HTTP Error 400: Bad Request" and drops the body,
+    which is the only place either tracker says what was actually wrong."""
+
+    def _err(self, body, code=400):
+        return urllib.error.HTTPError(
+            "http://x", code, "Bad Request", {},
+            io.BytesIO(body.encode() if isinstance(body, str) else body))
+
+    def test_azure_message(self):
+        detail = ha._http_error_detail(self._err(json.dumps(
+            {"message": "TF401326: Work item type Bug does not have field "
+                        "System.Description."})))
+        self.assertIn("HTTP 400", detail)
+        self.assertIn("does not have field System.Description", detail)
+
+    def test_jira_error_messages_and_field_errors(self):
+        self.assertIn("summary is required", ha._http_error_detail(self._err(
+            json.dumps({"errorMessages": ["summary is required"]}))))
+        detail = ha._http_error_detail(self._err(
+            json.dumps({"errorMessages": [], "errors": {"project": "no such"}})))
+        self.assertIn("project: no such", detail)
+
+    def test_html_body_is_stripped_to_its_sentence(self):
+        detail = ha._http_error_detail(self._err(
+            "<html><style>b{}</style><body><h1>Access denied</h1></body></html>",
+            code=403))
+        self.assertIn("HTTP 403", detail)
+        self.assertIn("Access denied", detail)
+        self.assertNotIn("<", detail)
+        self.assertNotIn("b{}", detail)
+
+    def test_empty_body_still_names_the_code(self):
+        self.assertEqual(ha._http_error_detail(self._err("")), "HTTP 400")
+
+    def test_capped(self):
+        detail = ha._http_error_detail(self._err(json.dumps({"message": "x" * 900})))
+        self.assertLessEqual(len(detail), ha.BOARD_ERROR_MAX_CHARS + 20)
+
+    def test_board_urlopen_raises_with_the_detail(self):
+        def boom(req, timeout=None):
+            raise self._err(json.dumps({"message": "TF401320: Rule Error"}))
+
+        with mock.patch.object(ha.urllib.request, "urlopen", boom):
+            with self.assertRaises(RuntimeError) as cm:
+                ha._board_urlopen(urllib.request.Request("http://x"))
+        self.assertIn("TF401320: Rule Error", str(cm.exception))
+
+    def test_board_urlopen_parses_empty_body_as_empty_dict(self):
+        class _Resp:
+            def read(self):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with mock.patch.object(ha.urllib.request, "urlopen",
+                               lambda req, timeout=None: _Resp()):
+            self.assertEqual(ha._board_urlopen(urllib.request.Request("http://x")), {})
+
+
+class TestAzureDescriptionField(unittest.TestCase):
+    """The Agile/Scrum Bug keeps its description in ReproSteps and has no
+    System.Description, and patching a field a type doesn't have fails the whole
+    create — so the field is looked up rather than assumed."""
+
+    def _fields(self, *refs):
+        return {"value": [{"referenceName": r} for r in refs]}
+
+    def test_bug_without_description_uses_repro_steps(self):
+        with mock.patch.object(ha, "_AZDO_FIELD_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", return_value=self._fields(
+                 "System.Title", "Microsoft.VSTS.TCM.ReproSteps")):
+            self.assertEqual(ha._azure_description_field("s", "P", "Bug"),
+                             "Microsoft.VSTS.TCM.ReproSteps")
+
+    def test_description_wins_when_the_type_has_it(self):
+        with mock.patch.object(ha, "_AZDO_FIELD_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", return_value=self._fields(
+                 "System.Description", "Microsoft.VSTS.TCM.ReproSteps")):
+            self.assertEqual(ha._azure_description_field("s", "P", "Task"),
+                             "System.Description")
+
+    def test_unknown_field_list_falls_back_to_description(self):
+        def boom(*a, **k):
+            raise RuntimeError("403")
+
+        with mock.patch.object(ha, "_AZDO_FIELD_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", boom):
+            self.assertEqual(ha._azure_description_field("s", "P", "Bug"),
+                             "System.Description")
+
+    def test_neither_field_means_send_none(self):
+        with mock.patch.object(ha, "_AZDO_FIELD_CACHE", {}), \
+             mock.patch.object(ha, "azure_req",
+                               return_value=self._fields("System.Title")):
+            self.assertIsNone(ha._azure_description_field("s", "P", "Odd"))
+
+    def test_cached_per_project_and_type(self):
+        calls = []
+
+        def req(path, params, body=None):
+            calls.append(path)
+            return self._fields("System.Description")
+
+        with mock.patch.object(ha, "_AZDO_FIELD_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            ha._azure_description_field("s", "P", "Bug")
+            ha._azure_description_field("s", "P", "Bug")
+            ha._azure_description_field("s", "P", "Task")
+        self.assertEqual(len(calls), 2)
+
+
 class TestCreateAzureIssue(unittest.TestCase):
+    def _has_description(self):
+        """The common case: the type carries System.Description."""
+        return mock.patch.object(
+            ha, "_azure_description_field", lambda s, p, w: "System.Description")
+
     def test_builds_json_patch_ops(self):
         seen = {}
 
@@ -9582,6 +9705,7 @@ class TestCreateAzureIssue(unittest.TestCase):
 
         with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
                                  AZDO_TOKEN="p", AZDO_USER="me@x"), \
+             self._has_description(), \
              mock.patch.object(ha, "azure_create_workitem", fake_create):
             out = ha.create_azure_issue("Proj", "Bug", "Title", "l1\nl2", ["t1", "t2"])
         ops = {o["path"]: o["value"] for o in seen["ops"]}
@@ -9602,6 +9726,7 @@ class TestCreateAzureIssue(unittest.TestCase):
 
         with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
                                  AZDO_TOKEN="p", AZDO_USER=""), \
+             self._has_description(), \
              mock.patch.object(ha, "_azure_self", lambda: None), \
              mock.patch.object(ha, "azure_create_workitem", fc):
             ha.create_azure_issue("P", "Task", "T", "<script>", [])
@@ -9613,10 +9738,97 @@ class TestCreateAzureIssue(unittest.TestCase):
     def test_missing_id_raises(self):
         with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
                                  AZDO_TOKEN="p"), \
+             self._has_description(), \
              mock.patch.object(ha, "_azure_self", lambda: None), \
              mock.patch.object(ha, "azure_create_workitem", lambda p, w, o: {}):
             with self.assertRaises(RuntimeError):
                 ha.create_azure_issue("P", "Task", "T", "", [])
+
+    def test_description_goes_to_the_field_the_type_actually_has(self):
+        captured = {}
+
+        def fc(p, w, ops):
+            captured["ops"] = ops
+            return {"id": 5}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER=""), \
+             mock.patch.object(ha, "_azure_description_field",
+                               lambda s, p, w: "Microsoft.VSTS.TCM.ReproSteps"), \
+             mock.patch.object(ha, "_azure_self", lambda: None), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            ha.create_azure_issue("P", "Bug", "T", "steps", [])
+        paths = [o["path"] for o in captured["ops"]]
+        self.assertIn("/fields/Microsoft.VSTS.TCM.ReproSteps", paths)
+        self.assertNotIn("/fields/System.Description", paths)
+
+    def test_type_with_no_description_field_still_creates(self):
+        captured = {}
+
+        def fc(p, w, ops):
+            captured["ops"] = ops
+            return {"id": 6}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER=""), \
+             mock.patch.object(ha, "_azure_description_field", lambda s, p, w: None), \
+             mock.patch.object(ha, "_azure_self", lambda: None), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            out = ha.create_azure_issue("P", "Odd", "T", "dropped", [])
+        self.assertEqual(out["key"], "6")
+        self.assertEqual([o["path"] for o in captured["ops"]],
+                         ["/fields/System.Title"])
+
+    def test_retries_unassigned_when_the_identity_is_rejected(self):
+        """Self-assignment is best-effort by contract, so an identity the
+        collection can't resolve must not cost the operator the whole ticket."""
+        tries = []
+
+        def fc(p, w, ops):
+            tries.append(ops)
+            if any(o["path"].endswith("AssignedTo") for o in ops):
+                raise RuntimeError("HTTP 400: TF401320: Rule Error for field "
+                                   "Assigned To")
+            return {"id": 9}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER="Board Label"), \
+             self._has_description(), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            out = ha.create_azure_issue("P", "Task", "T", "d", [])
+        self.assertEqual(out["key"], "9")
+        self.assertEqual(len(tries), 2)
+        self.assertFalse(any(o["path"].endswith("AssignedTo") for o in tries[1]))
+
+    def test_keeps_the_first_error_when_the_retry_fails_too(self):
+        """The retry only proves the assignee wasn't the problem; the original
+        rejection is the one that says what is."""
+        def fc(p, w, ops):
+            raise RuntimeError("HTTP 400: TF401326: missing required field Area")
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER="me@x"), \
+             self._has_description(), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            with self.assertRaises(RuntimeError) as cm:
+                ha.create_azure_issue("P", "Task", "T", "d", [])
+        self.assertIn("missing required field Area", str(cm.exception))
+
+    def test_no_retry_when_there_was_no_assignee(self):
+        tries = []
+
+        def fc(p, w, ops):
+            tries.append(ops)
+            raise RuntimeError("HTTP 400: something else")
+
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER=""), \
+             self._has_description(), \
+             mock.patch.object(ha, "_azure_self", lambda: None), \
+             mock.patch.object(ha, "azure_create_workitem", fc):
+            with self.assertRaises(RuntimeError):
+                ha.create_azure_issue("P", "Task", "T", "d", [])
+        self.assertEqual(len(tries), 1)
 
 
 class TestAzureCreateMeta(unittest.TestCase):
