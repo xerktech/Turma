@@ -3526,11 +3526,12 @@ test("POST /api/jira/<site>/autostart needs the user login", async () => {
   assert.equal("asapi3.atlassian.net" in autoStartOrgs, false);
 });
 
-// ---- auto-stop a session when its ticket moves to Done (XERK-45) --------------
-// The lifecycle counterpart to auto-start: the SAME per-org "auto" opt-in that
-// starts a To Do ticket's session KILLS a session once its ticket reaches Done. A
-// human moving a ticket to Done is the "work finished" signal; the kill ends the
-// session cleanly (resumable, worktree/PRs kept) and frees its MAX_SESSIONS slot.
+// ---- auto-stop a session when its ticket moves to Done (XERK-45, XERK-161) ----
+// The lifecycle counterpart to auto-start. A human moving a ticket to Done is the
+// "work finished" signal; the kill ends the session cleanly (resumable,
+// worktree/PRs kept) and frees its MAX_SESSIONS slot. UNLIKE auto-start this is
+// UNCONDITIONAL — NOT gated on the per-org "auto" opt-in (which governs only
+// auto-STARTING work), so a Done ticket retires its session in every org.
 
 // A Done ticket already being worked by a live session on the reporting host.
 const doneBeat = (device, site, {
@@ -3544,7 +3545,7 @@ const doneBeat = (device, site, {
                ...extraSessions],
   });
 
-test("auto-stop: a Done ticket's live session is killed once the org opts in", async () => {
+test("auto-stop: a Done ticket's live session is killed", async () => {
   autoStopped.clear();
   await doneBeat("apHost", "ap1.atlassian.net");
   autoStopSweep();
@@ -3552,7 +3553,9 @@ test("auto-stop: a Done ticket's live session is killed once the org opts in", a
     [["kill", "sd1"]]);
 });
 
-test("auto-stop: does nothing while the flag is off (the default)", async () => {
+test("auto-stop: kills a Done ticket's session even when 'auto' is OFF (XERK-161)", async () => {
+  // The per-org "auto" opt-in governs only auto-STARTING work; a human moving a
+  // ticket to Done must always retire its session, whatever the toggle says.
   autoStopped.clear();
   await asBeat("apOff", "ap2.atlassian.net", {
     autoStart: false,
@@ -3561,8 +3564,10 @@ test("auto-stop: does nothing while the flag is off (the default)", async () => 
     sessions: [{ id: "sd1", status: "running",
                  ticket: { key: "ENG-9", siteKey: "ap2.atlassian.net" } }],
   });
+  assert.equal(orgsWithAutoStart().has("ap2.atlassian.net"), false, "org must be opted OUT");
   autoStopSweep();
-  assert.equal((agents.apOff.commands || []).length, 0);
+  assert.deepEqual((agents.apOff.commands || []).map((c) => [c.type, c.sessionId]),
+    [["kill", "sd1"]]);
 });
 
 test("auto-stop: only Done tickets — an active ticket's session keeps running", async () => {

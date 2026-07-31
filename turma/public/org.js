@@ -138,7 +138,7 @@
         ` title="Change this org's color"><span class="org-color-dot" aria-hidden="true"></span></button>` +
         `<button type="button" class="org-chip-auto${on ? " on" : ""}" data-org-auto="${esc(s.siteKey)}"` +
         ` aria-pressed="${on ? "true" : "false"}"` +
-        ` title="Auto: start To Do tickets, stop Done sessions — ${on ? "ON, click to turn off" : "OFF, click to turn on"}">` +
+        ` title="Auto-start a session for every To Do ticket with a repo — ${on ? "ON, click to turn off" : "OFF, click to turn on"} (Done tickets always kill their session)">` +
         `<span class="org-auto-dot" aria-hidden="true"></span>auto</button></div>`);
       if (colorFor === s.siteKey) {
         // orgSlotPin validates (0-based or null); the strip marks the 1-based slot.
