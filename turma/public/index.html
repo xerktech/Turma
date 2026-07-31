@@ -750,8 +750,8 @@ function prReadyTitle(pr) {
 function prBadgeHtml(pr) {
   if (!pr) return "";
   const url = pr.url || "";
-  const m = url.match(/\/pull\/(\d+)/);
-  const num = pr.number ? "#" + pr.number : (m ? "#" + m[1] : "PR");
+  const m = url.match(/\/pull\/(\d+)|\/-\/merge_requests\/(\d+)/);
+  const num = pr.number ? "#" + pr.number : (m ? "#" + (m[1] || m[2]) : "PR");
   const state = String(pr.state || "").toUpperCase();
   const cls = { OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" }[state] || "";
   const label = state ? state[0] + state.slice(1).toLowerCase() : "";

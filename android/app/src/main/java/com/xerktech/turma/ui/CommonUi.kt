@@ -217,6 +217,18 @@ fun prReady(pr: PrInfo): String = pr.ready.ifEmpty {
 }
 
 /**
+ * The pill's "#<number>" label. A bare `{url}` chip (no status fetched yet)
+ * falls back to the number in the URL — GitHub `/pull/<n>` or GitLab
+ * `/-/merge_requests/<n>` (XERK-162) — else a plain "PR", mirroring the web
+ * renderers' fallback.
+ */
+fun prNumberLabel(pr: PrInfo): String {
+    if (pr.number != 0) return "#${pr.number}"
+    val m = Regex("""/pull/(\d+)|/-/merge_requests/(\d+)""").find(pr.url) ?: return "PR"
+    return "#" + m.groupValues[1].ifEmpty { m.groupValues[2] }
+}
+
+/**
  * GitHub-style PR pill: state color + #number + a ✓/✗/● merge-readiness mark.
  * Tapping it opens the PR in the system's default external browser (ACTION_VIEW
  * via LocalUriHandler) — never an in-app WebView.
@@ -246,7 +258,7 @@ fun PrBadge(pr: PrInfo, modifier: Modifier = Modifier) {
             .padding(horizontal = 8.dp, vertical = 3.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text("#${pr.number}", color = stateColor, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+        Text(prNumberLabel(pr), color = stateColor, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         if (check.first.isNotEmpty()) Text("  ${check.first}", color = check.second, fontSize = 12.sp)
     }
 }
