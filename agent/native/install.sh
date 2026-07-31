@@ -438,6 +438,8 @@ info "  2) Log in to Claude on this host if you haven't:  claude /login"
 info "  3) (optional) gh auth login   — for private git and 'gh pr create'."
 if systemd_user_ok; then
   info "  4) It's running under systemd:  systemctl --user status turma-agent"
+elif systemd_system_ok; then
+  info "  4) It's running under systemd (system):  systemctl status turma-agent"
 else
   info "  4) Start it:  $PREFIX/bin/turma-agentctl start"
 fi
