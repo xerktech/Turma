@@ -4082,6 +4082,17 @@ def _http_error_detail(err):
     return f"HTTP {code}: {msg}" if msg else f"HTTP {code}"
 
 
+class BoardHttpError(RuntimeError):
+    """A tracker request the server REFUSED, carrying its status. The code is
+    what lets a caller tell "rejected, nothing happened" (4xx) from "we don't
+    know what happened" (a timeout, a 5xx) — the difference between a retry that
+    is safe and one that can duplicate a write."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
 def _board_urlopen(req):
     """Send one prepared tracker request and parse its JSON reply ({} when the
     body is empty — a Jira transition answers 204). An HTTP error is re-raised
@@ -4091,8 +4102,16 @@ def _board_urlopen(req):
         with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
             raw = resp.read().decode()
     except urllib.error.HTTPError as e:
-        raise RuntimeError(_http_error_detail(e)) from e
+        raise BoardHttpError(_http_error_detail(e), getattr(e, "code", None)) from e
     return json.loads(raw) if raw.strip() else {}
+
+
+def _write_was_refused(err):
+    """Whether a failed write provably changed NOTHING, so re-sending it can't
+    duplicate anything. Only a 4xx says that: the server parsed the request and
+    declined it. A timeout or a 5xx may have applied the write anyway."""
+    code = getattr(err, "code", None)
+    return isinstance(code, int) and 400 <= code < 500
 
 
 def jira_req(path, params, body=None):
@@ -4507,7 +4526,8 @@ def create_jira_issue(project, issue_type, summary, description, labels):
     key = data.get("key")
     if not key:
         raise RuntimeError("Jira returned no issue key")
-    return {"key": key, "url": f"https://{site_key}/browse/{key}"}
+    return {"key": key, "url": f"https://{site_key}/browse/{key}",
+            "assigned": bool(acct)}
 
 
 # --- Azure DevOps work-item polling --------------------------------------------
@@ -4976,7 +4996,7 @@ def fetch_azure_issue(key):
 # "Labels" map to System.Tags (a `;`-joined string, not an array), and self-assign
 # uses the PAT owner's identity from the connection-data endpoint so the new item
 # lands on the board (which filters by @Me).
-_AZDO_ME = {"name": None, "tried": False}
+_AZDO_ME = {"names": [], "tried": False}
 _AZDO_FIELD_CACHE = {}
 
 # Where a work-item type keeps its long description. Most types use
@@ -5027,24 +5047,44 @@ def _azure_description_field(site_key, project, wtype):
     return None
 
 
-def _azure_self():
-    """The PAT owner's assignable identity (uniqueName, cached best-effort), so a
-    created work item can be self-assigned. AZDO_USER wins if the operator set it;
-    else it's read from the connection-data endpoint. None on failure — the item
-    is then created unassigned."""
+def _azure_identities():
+    """Every identity string worth trying as `System.AssignedTo`, best first.
+
+    There is no single spelling that works everywhere: Services wants an email,
+    a self-hosted collection usually wants `DOMAIN\\user`, and some accept only
+    the display name or the guid. Rather than guess one and lose the assignment
+    when it's the wrong one, offer them in order and let the create fall through
+    (`create_azure_issue`).
+
+    `AZDO_USER` leads because it is the operator saying so explicitly — but it
+    is documented as (and `_azure_org_user` uses it as) the board's display
+    LABEL, so it is frequently NOT an assignable identity, and the connection
+    data behind it is what `@Me` resolves to in the board's own WIQL. That is
+    why it is a candidate rather than the answer."""
+    out = []
     if AZDO_USER:
-        return AZDO_USER
-    if _AZDO_ME["tried"]:
-        return _AZDO_ME["name"]
-    _AZDO_ME["tried"] = True
-    try:
-        data = azure_req("/_apis/connectionData", {})
-        au = data.get("authenticatedUser") or {}
-        props = (au.get("properties") or {}).get("Account") or {}
-        _AZDO_ME["name"] = props.get("$value") or au.get("uniqueName") or None
-    except Exception as e:
-        log(f"azure connection-data lookup failed: {e}")
-    return _AZDO_ME["name"]
+        out.append(AZDO_USER)
+    if not _AZDO_ME["tried"]:
+        try:
+            data = azure_req("/_apis/connectionData", {})
+            au = data.get("authenticatedUser") or {}
+            props = (au.get("properties") or {}).get("Account") or {}
+            _AZDO_ME["names"] = [str(v).strip() for v in (
+                props.get("$value"), au.get("uniqueName"), au.get("mailAddress"),
+                au.get("providerDisplayName"), au.get("id"),
+            ) if str(v or "").strip()]
+            # Cache only a SUCCESSFUL probe: marking it tried up-front turns one
+            # transient failure into a process that never self-assigns again.
+            _AZDO_ME["tried"] = True
+        except Exception as e:
+            log(f"azure connection-data lookup failed: {e}")
+    out.extend(_AZDO_ME["names"])
+    seen, ordered = set(), []
+    for name in out:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
 
 
 def azure_create_workitem(project, wtype, ops):
@@ -5118,32 +5158,40 @@ def create_azure_issue(project, wtype, title, description, tags):
     if tags:
         ops.append({"op": "add", "path": "/fields/System.Tags",
                     "value": "; ".join(tags)})
-    me = _azure_self()
-    if me:
-        ops.append({"op": "add", "path": "/fields/System.AssignedTo", "value": me})
-    try:
-        data = azure_create_workitem(project, wtype, ops)
-    except Exception as first:
-        # Self-assignment is best-effort BY CONTRACT, so it must not be able to
-        # cost the operator their ticket: an identity this collection can't
-        # resolve (AZDO_USER holding the board's display LABEL, a PAT owner with
-        # no account on a self-hosted server) is rejected, and retrying without
-        # it lands the item — just outside the board's own @Me filter, which the
-        # returned url still reaches. Keep the FIRST error if the retry fails
-        # too: that one describes the real problem, the retry only confirms the
-        # assignee wasn't it.
-        if not me:
-            raise
-        log(f"azure create failed ({first}); retrying unassigned")
-        ops = [o for o in ops if o["path"] != "/fields/System.AssignedTo"]
+    # Try each candidate identity, then unassigned. Self-assignment is
+    # best-effort BY CONTRACT, so it must never cost the operator the ticket —
+    # but an item created unassigned falls outside the board's own @Me filter,
+    # so silently giving up on the first rejection is nearly as bad. Only a
+    # REFUSED write (4xx) is retried: after a timeout the create may have
+    # landed, and re-sending would duplicate it.
+    data, assigned, first = None, None, None
+    for me in _azure_identities() + [None]:
+        attempt = list(ops)
+        if me:
+            attempt.append({"op": "add", "path": "/fields/System.AssignedTo",
+                            "value": me})
         try:
-            data = azure_create_workitem(project, wtype, ops)
-        except Exception:
-            raise first from None
+            data = azure_create_workitem(project, wtype, attempt)
+            assigned = me
+            break
+        except Exception as e:
+            # Keep the FIRST error: it describes the real problem, where a later
+            # one only says the identity after it didn't work either.
+            first = first if first is not None else e
+            if not _write_was_refused(e):
+                raise first from None
+            if me is not None:
+                log(f"azure create rejected assignee {me!r} ({e})")
+    if data is None:
+        raise first
+    if assigned is None:
+        log(f"azure work item in {project} created UNASSIGNED "
+            "(no identity this collection accepts)")
     wid = data.get("id")
     if wid is None:
         raise RuntimeError("Azure returned no work-item id")
-    return {"key": str(wid), "url": _azure_item_url(base, project, wid)}
+    return {"key": str(wid), "url": _azure_item_url(base, project, wid),
+            "assigned": bool(assigned)}
 
 
 # --- Board source dispatch -----------------------------------------------------
@@ -8972,6 +9020,17 @@ class SessionManager:
             self.create_ticket_results.append(
                 {"cmdId": cid, "key": None, "url": None, "error": msg})
 
+        # A ticket that lands UNASSIGNED is a success the operator must still be
+        # told about: the board filters on the tracker user, so it is created
+        # and then invisible there, which reads exactly like a create that
+        # didn't happen.
+        unassigned_warning = (
+            "created, but it couldn't be assigned to you, so it won't show on "
+            "your board — set AZDO_USER to your Azure identity"
+            if board_source() == "azure" else
+            "created, but it couldn't be assigned to you, so it won't show on "
+            "your board")
+
         if not board_configured():
             return fail("no board credentials on this host")
         if not summary:
@@ -8985,7 +9044,9 @@ class SessionManager:
                                          description, labels)
             self.create_ticket_results.append(
                 {"cmdId": cid, "key": created.get("key"),
-                 "url": created.get("url"), "error": None})
+                 "url": created.get("url"), "error": None,
+                 "warning": None if created.get("assigned")
+                            else unassigned_warning})
             log(f"created ticket {created.get('key')} in {project}")
         except Exception as e:
             log(f"ticket creation failed in {project}: {e}")

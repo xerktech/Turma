@@ -456,8 +456,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Optional. With user-scoped Jira Cloud creds (`JIRA_SITE`/`JIRA_EMAIL`/`JIRA_TOKEN`), the agent
   heartbeats the tickets assigned to that user, polled slow (`collect_jira`: active work plus a bounded
   window of recently-Done, two capped queries), shaped by `_shape_issue`.
-- Unset creds = feature off (zero Jira HTTP, `available:False`). Read-only but for the one
-  operator-driven status change (XERK-138): issue search, issue GET, and a transitions POST.
+- Unset creds = feature off (zero Jira HTTP, `available:False`). Reads issues; the only writes are the
+  operator's own — a create (XERK-137) and a transitions POST (XERK-138).
 - **On-demand issue detail.** Description/comment bodies are too big to heartbeat per ticket, so a
   `{type:"jiraIssue", issueKey}` command (allowlist-checked against the `PROJECT-123` grammar) makes
   `_stage_jira_issue` call `fetch_jira_issue`; the result rides the next beat as `jiraIssueResults`.
@@ -479,8 +479,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   `valid_issue_key()` are the source-dispatch shims every gate goes through; everything downstream is
   source-agnostic and reads `self.jira` unchanged.
 - **Self-hosted is the point.** `AZDO_URL` is any base — `https://tfs.company.com/DefaultCollection` or
-  `https://dev.azure.com/org`. PAT auth is Basic with empty username (`:PAT`). Read-only but for the
-  status change: WIQL search, work-item GET, states GET, System.State PATCH.
+  `https://dev.azure.com/org`. PAT auth is Basic with empty username (`:PAT`). Reads WIQL, work items,
+  states/fields; the only writes are the operator's own — a create and a System.State PATCH.
 - **siteKey keeps the org/collection PATH** (`normalize_azure_site` → `dev.azure.com/myorg`), unlike the
   Jira host-only key, else every cloud org merges into one board. Percent-encoded into
   `/api/jira/<siteKey>/...`. `board.js`/`Board.kt` `orgName` takes the last path segment for a slashed
@@ -1005,37 +1005,35 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - The **"New ticket"** button opens a modal to create a ticket (title, description, labels) on an org's
   tracker — source-agnostic across Jira and Azure DevOps, hidden until an org reports. It lives in the
   **shared site header** (`newticket.js` → nav.js's `#hdrNewTicket` slot, XERK-150), not the board
-  toolbar — button, modal and fetch/poll wiring all in `newticket.js`, fed the beat by
-  `TurmaNewTicket.update(data)`, form HTML in `board.js`. It routes to an **ONLINE** host of the org,
-  reusing the `{command → staged result → poll}` pattern:
+  toolbar; it is fed the beat by `TurmaNewTicket.update(data)`, with the form HTML in `board.js`. It
+  routes to an **ONLINE** host of the org, reusing the `{command → staged result → poll}` pattern:
   - `GET /api/jira/<siteKey>/create-meta` (`boardCreateMeta`) → the org's projects + existing labels/tags;
     `?project=<p>` → that project's creatable types. Cascade (project then types) so no meta call fans
-    across every project. Cached per host (`createMeta`/`createTypes`), 202-polled.
+    across every project. Cached per host, 202-polled.
   - `POST /api/jira/<siteKey>/tickets` (`createTicket`) → the agent creates and stages
-    `{cmdId, key, url, error}`; client polls `GET .../tickets/<cmdId>` (cached `createResults`). All three
+    `{cmdId, key, url, error, warning}`; polled at `GET .../tickets/<cmdId>` (`createResults`). All three
     caches are stripped from the fleet payload.
-- The new ticket **self-assigns to the tracker user** (Jira `accountId` via `/myself`; Azure
-  `System.AssignedTo` via `AZDO_USER`/connection-data) so it lands on the board — best-effort. Agent
+- The new ticket **self-assigns to the tracker user** (Jira `accountId` via `/myself`; Azure a LADDER
+  of candidates, below) so it lands on the board — best-effort, and reported. Agent
   dispatch: `create_board_issue`/`board_create_meta`/`board_issue_types` (`create_jira_issue` POSTs
   `/rest/api/3/issue`, plain-text→ADF via `_text_to_adf`; `create_azure_issue` POSTs a JSON-Patch work
   item, `;`-joined `System.Tags`). Jira labels split on whitespace+commas (spaces forbidden), Azure tags
   on commas.
-- Android has the same feature (a ＋ action in the shared `ScreenHeader`/`NewTicketAction` →
-  `CreateTicketSheet`): `source` on `JiraBlock`/`BoardSite`, the create endpoints in `net/HubApi.kt`,
-  and the `createLabelWord`/`splitLabels`/`classifyCreateMeta`/`classifyCreateResult` ports in
-  `core/Board.kt`.
-- **A refusal carries the tracker's own words; an Azure create bends to the TYPE** (XERK-151):
-  `_board_urlopen`/`_http_error_detail` keep the body urllib's `HTTPError` drops (else every refusal
-  reads "HTTP Error 400: Bad Request", whatever the cause); the description goes in the field the type
-  HAS (`_azure_description_field`: the Agile/Scrum **Bug** has ReproSteps, not Description);
-  `create_azure_issue` retries ONCE unassigned, keeping the FIRST error.
+- Android has the same feature (＋ in the shared `ScreenHeader` → `CreateTicketSheet`): `source` on
+  `JiraBlock`/`BoardSite`, the endpoints in `net/HubApi.kt`, the
+  `createLabelWord`/`splitLabels`/`classifyCreateMeta`/`classifyCreateResult` ports in `core/Board.kt`.
+- **A refusal carries the tracker's own words; a create bends to the TYPE and IDENTITY** (XERK-151): `_board_urlopen`/`_http_error_detail` keep the body urllib's `HTTPError` drops (else every
+  refusal reads "HTTP Error 400: Bad Request"); the description goes in the field the type HAS
+  (`_azure_description_field`: the Agile/Scrum **Bug** has ReproSteps, not Description); and assignment
+  walks a **ladder**, no one spelling working everywhere — `_azure_identities` (`AZDO_USER`, as often a
+  display LABEL as an identity, then connection-data's account/uniqueName/name), then unassigned,
+  keeping the FIRST error. Re-sent only after a 4xx (proof nothing was created); an unassigned success
+  stages a `warning` both clients render, since the board's `@Me` filter hides it.
 - **Any new shared `/*.js` must be registered in `server.js`'s `STATIC_ASSETS`** (it's an allowlist, not
-  a directory serve) AND loaded by each page after `org.js` — a missing entry 404s and takes the module
-  (and every page's render) down. `newticket.test.js` guards both.
-- Tests: `TestCreateJiraIssue`/`TestCreateAzureIssue`, `TestHttpErrorDetail`,
-  `TestAzureDescriptionField`, `TestStageCreateMeta`/`TestStageCreateTicket` in
-  `test_hub_agent.py`; `server.test.js`; `createFormHtml`/`createProjectOptions`/`createTypeOptions` in
-  `board.test.js`; `newticket.test.js`; android `BoardTest.kt`.
+  a directory serve) AND loaded by each page after `org.js` — a missing entry 404s and takes the
+  module, and every page's render, down. `newticket.test.js` guards both.
+- Tests: `TestCreateAzureIssue`/`TestAzureIdentities`/`TestHttpErrorDetail` in `test_hub_agent.py`;
+  `server.test.js`; `createFormHtml` in `board.test.js`; `newticket.test.js`; android `BoardTest.kt`.
 
 #### Repo chips
 
@@ -1304,11 +1302,11 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `handle_commands` call, so it rides the SAME beat as the ack — an ack with no result means the agent
   didn't handle it. Version-free by design; no version table to drift.
 - `awaitResult`/`resolveResultWaits` record and settle each queued command, writing
-  `agent.unsupported[kind]`. The three waiting routes then refuse with `agentGapError` rather than queue
-  — create-meta `200 {error}` (the shape both clients read a message from), create/status `409`, which
-  Android's `hubError()` reads out of Retrofit's `errorBody()`.
+  `agent.unsupported[kind]`; the three waiting routes then refuse with `agentGapError` rather than queue
+  — create-meta `200 {error}` (the shape both clients read a message from), create/status `409` (which
+  Android reads via `hubError()`).
 - A gap **clears** on a result landing, `agentVersion` CHANGING, or `UNSUPPORTED_TTL_MS` (the backstop for
-  an update that doesn't move the version string). Never conclude anything from a command still in the
+  an update that doesn't move the version). Never conclude anything from a command still in the
   queue: it hasn't been taken yet. `resultWaits` is stripped from the fleet payload; `unsupported` rides
   it. Tests: `turma/tests/server.test.js`.
 
@@ -1532,8 +1530,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 ### Notifications
 
-- The hub pushes edge-triggered alerts to the **Android client via FCM** — the sole transport (XERK-10
-  removed the ntfy path): host offline/recovered, restart loop, per-session turn finished / question
+- The hub pushes edge-triggered alerts to the **Android client via FCM**, the sole transport:
+  host offline/recovered, restart loop, per-session turn finished / question
   waiting / PR created, and Claude login required/expiring/restored.
 - **A PR alert waits for that PR's CI to go green** (XERK-153) — never fire on the URL being scraped.
   A new URL enters a per-session wait list (`alerts.sessions[id].prWait`) that `prAlertDecision` re-judges

@@ -667,6 +667,9 @@ body.td-open { overflow: hidden; }
 .cf-btn:disabled { cursor: default; opacity: 0.5; }
 .cf-done { font-size: 14px; color: var(--ink); padding: 14px 0; line-height: 1.5; }
 .cf-done a { color: var(--accent); }
+/* A ticket created but not assigned: still a success, so it sits in the same
+   confirmation line rather than the error slot — just marked. */
+.cf-warn { color: var(--warning); }
 
 @media (max-width: 600px) {
   .td-backdrop { padding: 0; }

@@ -741,7 +741,11 @@ fun classifyCreateMeta(code: Int, body: CreateMetaEnvelope?, wantTypes: Boolean)
 /** The outcome of a create POST, polled by cmdId. */
 sealed interface CreateResultFetch {
     object Pending : CreateResultFetch
-    data class Created(val key: String, val url: String) : CreateResultFetch
+    data class Created(
+        val key: String,
+        val url: String,
+        val warning: String = "",
+    ) : CreateResultFetch
     data class Error(val message: String) : CreateResultFetch
 }
 
@@ -749,6 +753,7 @@ fun classifyCreateResult(code: Int, body: CreateResultEnvelope?): CreateResultFe
     code == 202 || body?.pending == true -> CreateResultFetch.Pending
     body == null -> CreateResultFetch.Error("HTTP $code")
     body.error != null -> CreateResultFetch.Error(body.error)
-    !body.key.isNullOrBlank() -> CreateResultFetch.Created(body.key, body.url.orEmpty())
+    !body.key.isNullOrBlank() ->
+        CreateResultFetch.Created(body.key, body.url.orEmpty(), body.warning.orEmpty())
     else -> CreateResultFetch.Error("the host reported no ticket")
 }

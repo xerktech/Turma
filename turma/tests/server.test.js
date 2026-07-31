@@ -2416,6 +2416,37 @@ test("http: creating a ticket validates, queues createTicket, and polls the outc
   assert.match(done.body.url, /ENG-100/);
 });
 
+test("http: an unassigned create rides back as a warning beside the key (XERK-151)", async () => {
+  // A ticket the tracker wouldn't assign is created and then invisible on the
+  // board (which filters on the tracker user), so the success has to say so.
+  await jiraBeat("ct5", "ct5.atlassian.net");
+  const res = await request("POST", "/api/jira/ct5.atlassian.net/tickets", {
+    body: { project: "ENG", issueType: "1", summary: "Orphan" }, headers: userHeaders,
+  });
+  await jiraBeat("ct5", "ct5.atlassian.net", {
+    createTicketResults: [{ cmdId: res.body.cmdId, key: "ENG-7", url: "u",
+                            error: null, warning: "created, but it couldn't be assigned to you" }],
+  });
+  const done = await request("GET", `/api/jira/ct5.atlassian.net/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(done.status, 200);
+  assert.equal(done.body.key, "ENG-7");
+  assert.match(done.body.warning, /couldn't be assigned/);
+  assert.equal(done.body.error, undefined);
+});
+
+test("http: an assigned create reports no warning", async () => {
+  await jiraBeat("ct6", "ct6.atlassian.net");
+  const res = await request("POST", "/api/jira/ct6.atlassian.net/tickets", {
+    body: { project: "ENG", issueType: "1", summary: "Fine" }, headers: userHeaders,
+  });
+  await jiraBeat("ct6", "ct6.atlassian.net", {
+    createTicketResults: [{ cmdId: res.body.cmdId, key: "ENG-8", url: "u", error: null }],
+  });
+  const done = await request("GET", `/api/jira/ct6.atlassian.net/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(done.body.key, "ENG-8");
+  assert.equal(done.body.warning, null);
+});
+
 test("http: a create failure is reported to the poller as an error", async () => {
   await jiraBeat("ct2", "ct2.atlassian.net");
   const res = await request("POST", "/api/jira/ct2.atlassian.net/tickets", {
