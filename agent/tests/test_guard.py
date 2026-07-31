@@ -101,6 +101,8 @@ POLICY_BLOCKED = [
     "gh pr merge 123",
     "gh pr merge --squash --auto",
     "gh pr merge 7 --admin",
+    "glab mr merge 123",
+    "glab mr merge --squash --yes",
 ]
 
 POLICY_OK = [
@@ -110,6 +112,8 @@ POLICY_OK = [
     "git push --force origin feature/login",
     "gh pr create --title t --body b",
     "gh pr view 12",
+    "glab mr create --fill",
+    "glab mr view 12",
     "git merge feature/x",  # local branch merge is fine
 ]
 

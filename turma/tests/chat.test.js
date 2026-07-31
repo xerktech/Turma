@@ -686,6 +686,20 @@ test("prFooterChip: derives #number from the URL when absent, no mark when unkno
   assert.doesNotMatch(html, /pr-ready/);
 });
 
+// XERK-162: a GitLab merge request is a chip exactly like a PR — same badge,
+// same states — and a bare {url} still derives its number pre-status.
+test("prFooterChip: a GitLab MR chips like a PR", () => {
+  const html = prFooterChip({ prs: [
+    { url: "https://gitlab.example.com/grp/app/-/merge_requests/12" },
+    { url: "https://gitlab.example.com/grp/app/-/merge_requests/13", number: 13,
+      state: "OPEN", checks: "passing", mergeable: "MERGEABLE", ready: "ready" },
+  ] });
+  assert.match(html, /#12/);                        // number from the MR URL
+  assert.match(html, /#13 Open/);
+  assert.match(html, /pr-ready ready/);
+  assert.match(html, /href="https:\/\/gitlab\.example\.com\/grp\/app\/-\/merge_requests\/12"/);
+});
+
 // The mark answers "can this land", not "is CI green": a conflicting branch
 // merges nowhere however clean its checks are, so it reads ✗ and says why.
 test("prFooterChip: a merge conflict blocks the mark despite green CI", () => {

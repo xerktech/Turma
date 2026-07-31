@@ -336,57 +336,59 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 
 #### PR status
 
-- The state (Open/Draft/Merged/Closed), CI rollup (passing/failing/pending), and mergeability
-  (`mergeable`: MERGEABLE/CONFLICTING/UNKNOWN) of every PR a session opened. Fetched via `gh pr view`
+- State (Open/Draft/Merged/Closed), CI rollup (passing/failing/pending) and mergeability
+  (MERGEABLE/CONFLICTING/UNKNOWN) of every PR a session opened. Fetched via `gh pr view`
   (`pr_status`/`_summarize_pr`/`_check_class`) on the `PR_STATUS_REFRESH_EVERY` cadence.
 - The card's **single ✓/✗/● mark is merge READINESS, not CI** (`ready`, from `_merge_ready`): a conflict
-  blocks on its own, and a ✓ requires GitHub to have affirmatively said MERGEABLE — the UNKNOWN a
-  just-opened PR reports is `pending`. Conflicts are only asked about while a PR could still land: a
-  MERGED/CLOSED one reports CI alone; a PR with **no checks** keeps its no-mark unless it CONFLICTS.
-  - `checks`/`checkCounts` stay pure CI beside it. All four renderers (`index.html`, `sessions.html`,
-    `chat.js`, android's `PrBadge`) read `ready` and fall back to the CI half for older agents. Tests:
-    `TestPrStatus`, `prFooterChip` in `turma/tests/chat.test.js`.
-- Cached by URL in `pr_status_cache`, attached as `session.prs`; kept after the session stops.
-- **The link set is durable across an agent restart** (XERK-15): a running session mirrors
-  `session_pr_urls` onto its record (`sess["prUrls"]`, saved as it grows in `_session_payload`) and
-  rehydrates the in-memory map on boot. Tests: `test_prs_survive_agent_restart` in
-  `TestRefreshPrStatus`.
-- **XERK-13 extends that durability to ENDED sessions and to the status pill**, keyed by transcript id so
-  it outlives the registry/closed record. Two durable ledgers beside the ticket one:
-  - `pr-sessions.json` (`PR_LEDGER_PATH`, `transcriptId -> {urls, at}`): written whenever the scan finds
-    a URL (`_remember_prs`, and on kill from `_remember_closed`), backfilled from closed history. Its
-    consumer is the **resumable scan** — the only channel still reporting a session once its closed record
-    ages out — which attaches `prs` via `_ledger_prs`. On boot it also `setdefault`-backfills
-    `session_pr_urls` for a pre-mirror live record.
+  blocks on its own, and a ✓ requires an affirmative MERGEABLE — a just-opened PR's UNKNOWN is `pending`.
+  Conflicts only matter while a PR could still land: MERGED/CLOSED reports CI alone; a PR with **no
+  checks** keeps its no-mark unless it CONFLICTS.
+  - `checks`/`checkCounts` stay pure CI beside it. All four renderers (web ×3, android's `PrBadge`)
+    read `ready`, falling back to the CI half for older agents.
+- Cached by URL in `pr_status_cache`, attached as `session.prs`; kept after the session stops. **Durable
+  across an agent restart** (XERK-15): a running session mirrors `session_pr_urls` onto its record
+  (`prUrls`) and rehydrates the map on boot (`test_prs_survive_agent_restart`).
+- **XERK-13 extends that durability to ENDED sessions and to the pill**, keyed by transcript id so it
+  outlives the registry/closed record — two durable ledgers beside the ticket one:
+  - `pr-sessions.json` (`PR_LEDGER_PATH`, `transcriptId -> {urls, at}`): written when the scan finds a
+    URL (`_remember_prs`; on kill via `_remember_closed`), backfilled from closed history. Consumed by
+    the **resumable scan** (the only channel left once a closed record ages out) via `_ledger_prs`;
+    boot backfills `session_pr_urls` for a pre-mirror live record.
   - `pr-status.json` (`PR_STATUS_LEDGER_PATH`, `url -> status`): `refresh_pr_status` persists the cache
-    and `pr_status_cache` seeds from it at boot — an ended session is never re-polled, so without this
-    its chip degrades to a bare link. Ledgered URLs count as `referenced`.
-  - Tests: `TestPrLedger`, `TestResumableReport`, `turma/tests/sessions.test.js`.
+    and seeds it back at boot — an ended session is never re-polled, so without this its chip degrades
+    to a bare link. Ledgered URLs count as `referenced`. Tests: `TestPrLedger`, `TestResumableReport`,
+    `turma/tests/sessions.test.js`.
 - **Which PRs are "a session's"** is decided by `_scan_pr_line`, deliberately narrow: a URL counts only
-  when it comes back in a **`gh pr create` call's own `tool_result`**, the one event that says this
-  session OPENED that PR. The call and its result are separate entries, routinely in different beats, so
-  pending tool_use ids carry across beats in the scan state (capped); the scan parses whole JSONL lines.
-  - Cost: a PR opened another way (a subagent's transcript, an MCP GitHub tool, the web UI) gets no chip.
+  when it comes back in a **creating call's own `tool_result`** — `gh pr create`; for a GitLab MR
+  (XERK-162) `glab mr create` or a `git push -o merge_request.create` (`MR_URL_RE`) — the one event
+  that says this session OPENED it. Call and result are separate entries, often in different beats —
+  pending tool_use ids carry across beats (capped); the scan parses whole JSONL lines.
+  - Cost: a PR opened another way (a subagent's transcript, an MCP tool, the web UI) gets no chip.
     Widen by teaching `_scan_pr_line` another creation event — never by scanning loose text again.
-- Tests: `agent/tests/test_hub_agent.py` (`TestPrStatus`, `TestRefreshPrStatus`, `TestSessionReport`).
+- **An MR then answers everywhere a PR does (XERK-162)**: `pr_status`/`_pr_comment_events` dispatch an
+  MR URL to the configured GitLab's API in the same shapes (`mr_status`/`_mr_comment_events`), each URL
+  polled only through the source that can answer it (`_pr_source_ok`; unreachable → bare link chip).
+  The guard denies `glab mr merge`; the image bundles a pinned `glab`. Tests: `TestMrStatus`,
+  `TestMrCommentEvents`.
+- Tests: `TestPrStatus`, `TestRefreshPrStatus`, `TestSessionReport`, `prFooterChip` in `chat.test.js`.
 
 #### PR comment delivery (XERK-49)
 
 - **A reply asking for corrections on a session's PR is typed back into the session that opened it.**
-  `_poll_pr_comments` runs on the PR cadence (`PR_COMMENTS_REFRESH_EVERY`), for **running sessions
-  only**, over their OWN PRs (`session_pr_urls`), through **`send_input`** — inheriting the
-  compaction-survival outbox (XERK-47) and Claude Code's queue if a turn is in flight.
-- `_pr_comment_events(url, self_login)` gathers **three channels**: conversation comments and review
-  bodies from one `gh pr view --json comments,reviews`, plus inline review-thread comments from
-  `gh api repos/<o>/<r>/pulls/<n>/comments`. A bare approve is dropped; each event normalizes to
-  `{key, author, body, kind, loc, is_self}`, keyed on GitHub's stable id.
+  `_poll_pr_comments` runs on the PR cadence, for **running sessions only**, over their OWN PRs
+  (`session_pr_urls`), through **`send_input`**, inheriting the compaction-survival outbox (XERK-47)
+  and the queue if a turn is in flight.
+- `_pr_comment_events(url, self_login)` gathers **three channels** — conversation comments + review
+  bodies (`gh pr view --json comments,reviews`) + inline review-thread comments
+  (`gh api .../pulls/<n>/comments`); an MR's one notes call covers all three (`_mr_comment_events`,
+  system notes dropped). A bare approve is dropped; each event normalizes to
+  `{key, author, body, kind, loc, is_self}`, keyed on a stable id.
 - **Baseline-on-first-sight, then deliver only new + not-self.** A PR's whole comment set is recorded
-  silently the first beat it's seen (`prCommentBase`, per-PR seen-key set, capped
-  `PR_COMMENTS_SEEN_MAX`); after that only NEW keys that are not the agent's own (`is_self` via
-  `viewerDidAuthor`, else a login compare against `github.login`) are typed in.
-- Best-effort and bounded: skipped without a gh login, capped at `PR_COMMENTS_MAX` PRs per beat, and a
-  fetch failure (`_pr_comment_events` → None) leaves the baseline UNTOUCHED. Disable with
-  `TURMA_PR_COMMENTS=0`. Only the session that OPENED the PR receives it, only while running.
+  silently the first beat it's seen (`prCommentBase`, capped `PR_COMMENTS_SEEN_MAX`); after that only
+  NEW keys not the agent's own (`viewerDidAuthor`, else a login compare) are typed in.
+- Best-effort and bounded: `PR_COMMENTS_MAX` PRs per beat, gated per-URL like the status sweep; a
+  fetch failure (→ None) leaves the baseline UNTOUCHED. Disable with `TURMA_PR_COMMENTS=0`. Only the
+  OPENING session receives it, only while running.
 - Tests: `TestPrCommentEvents`, `TestPrCommentMessage`, `TestPollPrComments`.
 
 ### Expected-restart "updating" status (XERK-29)

@@ -71,6 +71,11 @@ ENV LANG=C.UTF-8 \
 ARG DOCKER_CLI_VERSION=29.6.2
 # GitHub CLI — used by Claude for PRs/issues and as git's credential helper.
 ARG GH_VERSION=2.96.0
+# GitLab CLI — gh's counterpart for GitLab-hosted repos (XERK-162), so a
+# session can open merge requests the standard way. Auths itself from the
+# GITLAB_TOKEN env the agent already carries for its GitLab source (glab reads
+# it natively; the host comes from the repo's git remote).
+ARG GLAB_VERSION=1.111.0
 # ttyd — serves the in-container tmux session (the live Claude TUI) over the web
 # so the Turma can attach to it. Static single-file binary.
 ARG TTYD_VERSION=1.7.7
@@ -96,6 +101,8 @@ RUN apt-get update \
       | tar -xz --strip-components=1 -C /usr/local/bin docker/docker \
  && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
       | tar -xz --strip-components=2 -C /usr/local/bin "gh_${GH_VERSION}_linux_amd64/bin/gh" \
+ && curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_amd64.tar.gz" \
+      | tar -xz --strip-components=1 -C /usr/local/bin bin/glab \
  && curl -fsSL "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64" \
       -o /usr/local/bin/ttyd && chmod +x /usr/local/bin/ttyd \
  && mkdir -p /opt/powershell \

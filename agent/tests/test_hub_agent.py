@@ -992,6 +992,61 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         write_jsonl(path, [self.tool_result("t9", f"{self.PR1}\n")])
         self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
 
+    MR1 = "https://gitlab.example.com/grp/sub/app/-/merge_requests/12"
+
+    def test_glab_mr_create_result_is_this_sessions_mr(self):
+        """XERK-162: a GitLab MR opened via `glab mr create` chips exactly like
+        a `gh pr create` PR — the create call's own tool_result is the
+        attribution event."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        write_jsonl(path, [
+            self.pr_create_call("g1", cmd="glab mr create --fill"),
+            self.tool_result("g1", f"{self.MR1}\n"),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [self.MR1])
+
+    def test_push_option_mr_create_counts(self):
+        """`git push -o merge_request.create` is the other way a session opens
+        an MR (no glab needed) — the MR URL in the push's own output counts."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        out = ("remote:\nremote: View merge request for xerk-1:\n"
+               f"remote:   {self.MR1}\nremote:\n")
+        write_jsonl(path, [
+            self.pr_create_call(
+                "p1", cmd="git push -o merge_request.create origin HEAD"),
+            self.tool_result("p1", out),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [self.MR1])
+
+    def test_plain_push_mr_hint_is_not_a_created_mr(self):
+        """A plain `git push` prints GitLab's "to create a merge request …
+        visit …/merge_requests/new" hint (and, on later pushes, the existing
+        MR's link) — neither is an MR THIS push opened."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        out = ("remote: To create a merge request for xerk-1, visit:\n"
+               "remote:   https://gitlab.example.com/grp/sub/app/-/merge_requests/new?merge_request%5Bsource_branch%5D=xerk-1\n"
+               f"remote: View merge request for xerk-1:\nremote:   {self.MR1}\n")
+        write_jsonl(path, [
+            self.pr_create_call("p2", cmd="git push origin HEAD"),
+            self.tool_result("p2", out),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [])
+
     def test_partial_line_is_reread_whole_next_beat(self):
         """The offset stops at the last newline, so an entry still being written
         is parsed once, whole — not lost as two unparseable halves."""
@@ -4688,6 +4743,69 @@ class TestPrCommentMessage(unittest.TestCase):
             [{"author": "a", "body": "x" * 5000, "kind": "comment", "loc": None}])
         self.assertLessEqual(len(msg), ha.PR_COMMENTS_BODY_CAP + 200)
 
+    def test_names_a_gitlab_mr_the_gitlab_way(self):
+        msg = ha._pr_comment_message(
+            "https://gitlab.example.com/grp/app/-/merge_requests/12",
+            [{"author": "alice", "body": "rename it", "kind": "comment",
+              "loc": None}])
+        self.assertIn("!12", msg)
+        self.assertIn("MR", msg)
+        self.assertIn("@alice", msg)
+
+
+class TestMrCommentEvents(unittest.TestCase):
+    """XERK-162: _mr_comment_events answers _pr_comment_events' exact contract
+    from GitLab's notes API."""
+
+    MR = "https://gitlab.example.com/grp/app/-/merge_requests/12"
+
+    def _configured(self):
+        return mock.patch.multiple(
+            ha, GITLAB_URL="https://gitlab.example.com", GITLAB_TOKEN="tok")
+
+    def _events(self, notes, user={"username": "bot"}):
+        def fake_get(path):
+            return user if path == "user" else notes
+        ha._GITLAB_SELF["username"] = None
+        with self._configured(), \
+                mock.patch.object(ha, "_gitlab_get", side_effect=fake_get):
+            return ha._pr_comment_events(self.MR, "ghlogin-unused")
+
+    def test_notes_map_to_events_and_system_notes_drop(self):
+        events = self._events([
+            {"id": 1, "system": True, "body": "added 1 commit",
+             "author": {"username": "alice"}},
+            {"id": 2, "system": False, "body": "rename the flag",
+             "author": {"username": "alice"}},
+            {"id": 3, "system": False, "body": "off by one",
+             "author": {"username": "carol"},
+             "type": "DiffNote",
+             "position": {"new_path": "x.py", "new_line": 12}},
+            {"id": 4, "system": False, "body": "on it",
+             "author": {"username": "bot"}},
+        ])
+        self.assertEqual([e["key"] for e in events], ["2", "3", "4"])
+        self.assertEqual(events[0]["kind"], "comment")
+        self.assertEqual(events[1]["kind"], "inline")
+        self.assertEqual(events[1]["loc"], "x.py:12")
+        # The token's own user is baselined but never delivered.
+        self.assertEqual([e["is_self"] for e in events], [False, False, True])
+
+    def test_hard_failure_is_none_not_empty(self):
+        ha._GITLAB_SELF["username"] = None
+        with self._configured(), \
+                mock.patch.object(ha, "_gitlab_get", return_value=None):
+            self.assertIsNone(ha._pr_comment_events(self.MR, ""))
+
+    def test_empty_mr_returns_empty_not_none(self):
+        self.assertEqual(self._events([]), [])
+
+    def test_foreign_gitlab_mr_is_none(self):
+        ha._GITLAB_SELF["username"] = None
+        with self._configured():
+            self.assertIsNone(ha._pr_comment_events(
+                "https://other.tld/g/a/-/merge_requests/9", ""))
+
 
 class TestPollPrComments(ManagerMixin, unittest.TestCase):
     """_poll_pr_comments types new PR review activity into the running session
@@ -7918,6 +8036,126 @@ class TestPrStatus(unittest.TestCase):
             self.assertIsNone(ha.pr_status("https://github.com/o/r/pull/7"))
 
 
+class TestMrStatus(unittest.TestCase):
+    """XERK-162: GitLab merge-request status answers in _summarize_pr's exact
+    shape, so every chip renderer treats an MR like a PR."""
+
+    MR = "https://gitlab.example.com/grp/sub/app/-/merge_requests/12"
+
+    def _configured(self):
+        return mock.patch.multiple(
+            ha, GITLAB_URL="https://gitlab.example.com", GITLAB_TOKEN="tok")
+
+    def test_mr_url_parts_under_configured_base(self):
+        with self._configured():
+            self.assertEqual(ha._mr_url_parts(self.MR),
+                             ("grp/sub/app", "12"))
+
+    def test_mr_url_parts_subpath_install(self):
+        with mock.patch.multiple(ha, GITLAB_URL="https://host.tld/gitlab",
+                                 GITLAB_TOKEN="tok"):
+            self.assertEqual(
+                ha._mr_url_parts(
+                    "https://host.tld/gitlab/grp/app/-/merge_requests/3"),
+                ("grp/app", "3"))
+
+    def test_mr_url_parts_foreign_host_or_unconfigured(self):
+        # A foreign GitLab (no credential) and an unconfigured host both
+        # resolve to None — the chip stays a bare link.
+        with self._configured():
+            self.assertIsNone(ha._mr_url_parts(
+                "https://other.gitlab.tld/g/a/-/merge_requests/1"))
+        with mock.patch.multiple(ha, GITLAB_URL="", GITLAB_TOKEN=""):
+            self.assertIsNone(ha._mr_url_parts(self.MR))
+
+    def test_mr_check_class(self):
+        self.assertEqual(ha._mr_check_class("success"), "pass")
+        self.assertEqual(ha._mr_check_class("skipped"), "pass")
+        self.assertEqual(ha._mr_check_class("failed"), "fail")
+        self.assertEqual(ha._mr_check_class("canceled"), "fail")
+        for s in ("created", "pending", "running", "manual", "scheduled"):
+            self.assertEqual(ha._mr_check_class(s), "pending")
+        self.assertIsNone(ha._mr_check_class(None))
+        self.assertIsNone(ha._mr_check_class("weird_new_enum"))
+
+    def test_summarize_open_passing_mergeable(self):
+        out = ha._summarize_mr({
+            "iid": 12, "title": "Add flag", "state": "opened", "draft": False,
+            "web_url": self.MR,
+            "head_pipeline": {"status": "success"},
+            "detailed_merge_status": "mergeable",
+        })
+        self.assertEqual(out["state"], "OPEN")
+        self.assertEqual(out["number"], 12)
+        self.assertEqual(out["checks"], "passing")
+        self.assertEqual(out["checkCounts"], {"pass": 1, "fail": 0, "pending": 0})
+        self.assertEqual(out["mergeable"], "MERGEABLE")
+        self.assertEqual(out["ready"], "ready")
+
+    def test_summarize_states_and_draft(self):
+        self.assertEqual(ha._summarize_mr({"state": "merged"})["state"], "MERGED")
+        self.assertEqual(ha._summarize_mr({"state": "closed"})["state"], "CLOSED")
+        self.assertEqual(ha._summarize_mr({"state": "locked"})["state"], "OPEN")
+        self.assertEqual(
+            ha._summarize_mr({"state": "opened", "draft": True})["state"], "DRAFT")
+        # draft only rewrites OPEN, as isDraft does for a PR.
+        self.assertEqual(
+            ha._summarize_mr({"state": "merged", "draft": True})["state"], "MERGED")
+
+    def test_summarize_conflict_blocks_and_unknown_is_unproven(self):
+        conflicted = ha._summarize_mr({
+            "state": "opened", "detailed_merge_status": "conflict",
+            "head_pipeline": {"status": "success"},
+        })
+        self.assertEqual(conflicted["mergeable"], "CONFLICTING")
+        self.assertEqual(conflicted["ready"], "blocked")
+        # Any other detailed status (checking, need_rebase, not_approved …) is
+        # UNKNOWN — green CI alone must not claim ✓.
+        checking = ha._summarize_mr({
+            "state": "opened", "detailed_merge_status": "checking",
+            "head_pipeline": {"status": "success"},
+        })
+        self.assertEqual(checking["mergeable"], "UNKNOWN")
+        self.assertEqual(checking["ready"], "pending")
+
+    def test_summarize_legacy_merge_status_fallback(self):
+        old = ha._summarize_mr({"state": "opened", "merge_status": "can_be_merged"})
+        self.assertEqual(old["mergeable"], "MERGEABLE")
+        older = ha._summarize_mr({"state": "opened",
+                                  "merge_status": "cannot_be_merged"})
+        self.assertEqual(older["mergeable"], "CONFLICTING")
+
+    def test_summarize_no_pipeline_no_checks(self):
+        out = ha._summarize_mr({"state": "opened", "head_pipeline": None})
+        self.assertIsNone(out["checks"])
+        self.assertIsNone(out["checkCounts"])
+
+    def test_pr_status_dispatches_mr_url_to_gitlab_not_gh(self):
+        with self._configured(), \
+                mock.patch.object(ha, "_gitlab_get", return_value={
+                    "iid": 12, "state": "opened", "web_url": self.MR}) as gl, \
+                mock.patch.object(ha, "run") as run:
+            out = ha.pr_status(self.MR)
+        run.assert_not_called()
+        self.assertEqual(out["number"], 12)
+        # The project path is URL-encoded into the API path.
+        self.assertIn("projects/grp%2Fsub%2Fapp/merge_requests/12",
+                      gl.call_args[0][0])
+
+    def test_mr_status_none_when_unreachable(self):
+        with mock.patch.multiple(ha, GITLAB_URL="", GITLAB_TOKEN=""):
+            self.assertIsNone(ha.pr_status(self.MR))
+        with self._configured(), \
+                mock.patch.object(ha, "_gitlab_get", return_value=None):
+            self.assertIsNone(ha.pr_status(self.MR))
+
+    def test_mr_status_keeps_input_url_when_payload_lacks_one(self):
+        with self._configured(), \
+                mock.patch.object(ha, "_gitlab_get",
+                                  return_value={"iid": 12, "state": "opened"}):
+            self.assertEqual(ha.pr_status(self.MR)["url"], self.MR)
+
+
 class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
     """The manager's slow-cadence PR status refresh + per-session attachment."""
 
@@ -7934,6 +8172,34 @@ class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
             sm.refresh_pr_status()
         pr.assert_not_called()
         self.assertEqual(sm.pr_status_cache, {})
+
+    def test_gh_less_gitlab_host_still_refreshes_its_mrs(self):
+        """XERK-162: a host with no gh login but a configured GitLab polls its
+        MRs — and only them; the github URL it can't answer for is skipped
+        (keeping its last-known status) rather than burning a doomed gh call."""
+        mr = "https://gitlab.example.com/grp/app/-/merge_requests/5"
+        gh_url = "https://github.com/o/r/pull/1"
+        sm = self._running_session("s1", [gh_url, mr])
+        sm.github = {"available": False}
+        with mock.patch.multiple(ha, GITLAB_URL="https://gitlab.example.com",
+                                 GITLAB_TOKEN="tok"), \
+                mock.patch.object(ha, "pr_status",
+                                  return_value={"url": mr, "state": "OPEN"}) as pr:
+            sm.refresh_pr_status()
+        pr.assert_called_once_with(mr)
+        self.assertEqual(sm.pr_status_cache[mr]["state"], "OPEN")
+
+    def test_foreign_gitlab_mr_is_not_polled(self):
+        # An MR on a GitLab this host holds no credential for can never answer;
+        # don't spend the beat's budget asking.
+        mr = "https://other.tld/g/a/-/merge_requests/9"
+        sm = self._running_session("s1", [mr])
+        sm.github = {"available": True}
+        with mock.patch.multiple(ha, GITLAB_URL="https://gitlab.example.com",
+                                 GITLAB_TOKEN="tok"), \
+                mock.patch.object(ha, "pr_status") as pr:
+            sm.refresh_pr_status()
+        pr.assert_not_called()
 
     def test_fetches_and_caches(self):
         url = "https://github.com/o/r/pull/1"

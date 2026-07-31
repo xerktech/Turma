@@ -20,9 +20,10 @@ categories.
    patterns) — the exact command only, never a blanket grant.
 
 2. **policy** — PR-workflow rules, enforced hard (no override): pushing to or
-   deleting ``main``/``master`` directly, and merging any pull request
-   (``gh pr merge``). Work lands via a PR the agent opens but never self-merges.
-   Denied with a reason the agent self-corrects from.
+   deleting ``main``/``master`` directly, and merging any pull/merge request
+   (``gh pr merge``, ``glab mr merge``). Work lands via a PR/MR the agent
+   opens but never self-merges. Denied with a reason the agent self-corrects
+   from.
 
 3. **attribution** — ``git commit`` / PR commands carrying AI self-attribution
    (``Co-Authored-By: ... Claude``/``Anthropic``, ``Generated with Claude``,
@@ -352,6 +353,11 @@ def policy_reason(command: str) -> str | None:
         if prog in ("gh", "hub") and "pr" in rest and "merge" in rest:
             return (
                 "you must not merge pull requests — open the PR and leave "
+                "merging to a human reviewer"
+            )
+        if prog == "glab" and "mr" in rest and "merge" in rest:
+            return (
+                "you must not merge merge requests — open the MR and leave "
                 "merging to a human reviewer"
             )
         if (

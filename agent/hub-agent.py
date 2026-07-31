@@ -1505,12 +1505,21 @@ def repo_usage_report(ledger, fold_slug):
 
 
 PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+# A GitLab merge request's URL, on any GitLab host (XERK-162): the `/-/`
+# namespace separator plus `merge_requests/<n>` is the discriminator, and the
+# leading path segments cover nested groups and a subpath install alike. A
+# plain `git push`'s "to create a merge request … visit" hint ends in
+# /merge_requests/new, which the \d+ deliberately doesn't match.
+MR_URL_RE = re.compile(r"https://[\w.-]+(?::\d+)?(?:/[\w.-]+)+/-/merge_requests/\d+")
 
-# The Bash command that OPENS a pull request. `gh pr create` prints the new PR's
-# URL as its own output, and that pairing — this command, this output — is the
-# only thing in a transcript that says the session opened the PR rather than
-# merely looked at one. See _scan_pr_line.
-PR_CREATE_RE = re.compile(r"\bgh\s+pr\s+create\b")
+# The Bash commands that OPEN a pull/merge request. `gh pr create` (and its
+# GitLab counterparts — `glab mr create`, or a `git push` carrying the
+# `merge_request.create` push option) prints the new PR/MR's URL as its own
+# output, and that pairing — this command, this output — is the only thing in
+# a transcript that says the session opened the PR rather than merely looked
+# at one. See _scan_pr_line.
+PR_CREATE_RE = re.compile(
+    r"\bgh\s+pr\s+create\b|\bglab\s+mr\s+create\b|\bmerge_request\.create\b")
 # Unresolved `gh pr create` tool_use ids remembered per session between beats.
 # Capped: a call whose result never lands (the turn was interrupted, the pane
 # died) must not grow the set for the life of the session.
@@ -1628,7 +1637,10 @@ def pr_status(url):
     <url>`. Returns the compact status dict, or None on any failure (gh accepts
     the full URL, so this works from any cwd as long as the login can see the
     repo). Best-effort and network-cheap — one gh call, capped by run()'s
-    timeout."""
+    timeout. A GitLab merge-request URL dispatches to mr_status, which answers
+    in the same shape (XERK-162)."""
+    if MR_URL_RE.match(str(url or "")):
+        return mr_status(url)
     raw = run(["gh", "pr", "view", url, "--json",
                "number,title,state,isDraft,url,statusCheckRollup,mergeable"])
     if not raw:
@@ -1640,7 +1652,108 @@ def pr_status(url):
     return _summarize_pr(data)
 
 
+def _mr_url_parts(url):
+    """(project_path, iid) when `url` is a merge-request URL under the
+    configured GITLAB_URL, else None. Prefix-matched against gitlab_base() so a
+    GitLab installed under a subpath still resolves its project path; an MR on
+    any OTHER GitLab host stays None — this host holds no credential for it,
+    so its chip renders as a bare link, like a PR gh can't see."""
+    base = gitlab_base()
+    if not base or not gitlab_configured():
+        return None
+    u = str(url or "")
+    if not u.startswith(base + "/"):
+        return None
+    m = re.match(r"(.+?)/-/merge_requests/(\d+)$", u[len(base) + 1:])
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _mr_check_class(status):
+    """Map a GitLab head-pipeline status to 'pass' | 'fail' | 'pending' | None,
+    mirroring _check_class's buckets: skipped is a non-blocking pass, canceled
+    blocks like a failure, and anything still moving — or waiting on a human
+    (manual) — is pending."""
+    s = str(status or "").lower()
+    if s in ("success", "skipped"):
+        return "pass"
+    if s in ("failed", "canceled", "cancelled"):
+        return "fail"
+    if s in ("created", "waiting_for_resource", "preparing", "pending",
+             "running", "manual", "scheduled"):
+        return "pending"
+    return None
+
+
+def _summarize_mr(data):
+    """Condense a GitLab merge-request API payload into the SAME compact status
+    dict _summarize_pr builds, so every renderer treats an MR chip exactly like
+    a PR chip (XERK-162). GitLab's vocabulary maps as: state opened→OPEN
+    (draft→DRAFT), merged→MERGED, closed→CLOSED, locked→OPEN (a transient
+    in-between); the head pipeline is the whole CI rollup (GitLab exposes no
+    per-check rollup on the MR itself), one entry classed by _mr_check_class;
+    mergeability comes from detailed_merge_status ("mergeable"→MERGEABLE,
+    "conflict"→CONFLICTING, anything else UNKNOWN — unproven is not proven,
+    exactly the discipline _merge_ready applies to GitHub's UNKNOWN), with the
+    older merge_status can/cannot_be_merged as the fallback vocabulary."""
+    raw_state = str(data.get("state") or "").lower()
+    state = {"opened": "OPEN", "locked": "OPEN", "merged": "MERGED",
+             "closed": "CLOSED"}.get(raw_state, raw_state.upper())
+    draft = bool(data.get("draft") or data.get("work_in_progress"))
+    state = "DRAFT" if draft and state == "OPEN" else state
+    counts = {"pass": 0, "fail": 0, "pending": 0}
+    pipeline = data.get("head_pipeline") or data.get("pipeline")
+    cls = _mr_check_class((pipeline or {}).get("status")) if isinstance(
+        pipeline, dict) else None
+    if cls:
+        counts[cls] += 1
+    total = counts["pass"] + counts["fail"] + counts["pending"]
+    checks = None
+    if total:
+        checks = ("failing" if counts["fail"]
+                  else "pending" if counts["pending"] else "passing")
+    detailed = str(data.get("detailed_merge_status") or "").lower()
+    legacy = str(data.get("merge_status") or "").lower()
+    if detailed == "mergeable" or (not detailed and legacy == "can_be_merged"):
+        mergeable = "MERGEABLE"
+    elif detailed == "conflict" or (not detailed and legacy == "cannot_be_merged"):
+        mergeable = "CONFLICTING"
+    else:
+        mergeable = "UNKNOWN"
+    return {
+        "url": data.get("web_url"),
+        "number": data.get("iid"),
+        "title": (data.get("title") or "")[:120],
+        "state": state,
+        "checks": checks,
+        "checkCounts": counts if total else None,
+        "mergeable": mergeable,
+        "ready": _merge_ready(state, checks, mergeable),
+    }
+
+
+def mr_status(url):
+    """pr_status for a GitLab merge request: state, head-pipeline rollup and
+    mergeability from the configured GitLab's REST API — the MR counterpart of
+    `gh pr view`, answering in the identical compact shape. None when the MR
+    isn't under GITLAB_URL (no credential for a foreign GitLab) or on any
+    fetch failure."""
+    parts = _mr_url_parts(url)
+    if not parts:
+        return None
+    proj, iid = parts
+    data = _gitlab_get(
+        f"projects/{urllib.parse.quote(proj, safe='')}/merge_requests/{iid}")
+    if not isinstance(data, dict):
+        return None
+    out = _summarize_mr(data)
+    out["url"] = out["url"] or url
+    return out
+
+
 PR_URL_PARTS_RE = re.compile(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)")
+MR_URL_IID_RE = re.compile(r"/-/merge_requests/(\d+)")
 
 
 def _pr_comment_events(url, self_login):
@@ -1663,7 +1776,12 @@ def _pr_comment_events(url, self_login):
 
     Returns the event list (possibly empty — a real PR with no comments), or
     None on a hard fetch failure so the caller leaves the baseline untouched
-    rather than treating "gh errored" as "every prior comment vanished"."""
+    rather than treating "gh errored" as "every prior comment vanished".
+
+    A GitLab merge-request URL dispatches to _mr_comment_events, which answers
+    in the same event shape (XERK-162)."""
+    if MR_URL_RE.match(str(url or "")):
+        return _mr_comment_events(url)
     raw = run(["gh", "pr", "view", url, "--json", "comments,reviews"])
     if not raw:
         return None
@@ -1738,6 +1856,49 @@ def _pr_comment_events(url, self_login):
     return [e for e in events if e["key"]]
 
 
+def _mr_comment_events(url):
+    """_pr_comment_events for a GitLab merge request: every human note on the
+    MR from one notes-API call — GitLab's notes cover both the conversation
+    and inline diff notes (a `position` marks the latter, mapped to the same
+    'inline' kind + file:line loc the GitHub channel emits). GitLab's own
+    bookkeeping notes (`system: true` — "added 1 commit", approvals) are
+    dropped; is_self compares the author against the token's own username.
+    Same contract: the event list, or None on a hard fetch failure so the
+    caller keeps its baseline."""
+    parts = _mr_url_parts(url)
+    if not parts:
+        return None
+    proj, iid = parts
+    notes = _gitlab_get(
+        f"projects/{urllib.parse.quote(proj, safe='')}/merge_requests/{iid}"
+        f"/notes?per_page=100&order_by=created_at&sort=asc")
+    if not isinstance(notes, list):
+        return None
+    self_user = _gitlab_self_username() or ""
+    events = []
+    for n in notes:
+        if not isinstance(n, dict) or n.get("system"):
+            continue
+        body = str(n.get("body") or "").strip()
+        if not body:
+            continue
+        author = str((n.get("author") or {}).get("username") or "")
+        pos = n.get("position") if isinstance(n.get("position"), dict) else None
+        loc = None
+        if pos:
+            loc = pos.get("new_path") or pos.get("old_path") or None
+            line = pos.get("new_line") or pos.get("old_line")
+            if loc and line:
+                loc = f"{loc}:{line}"
+        events.append({
+            "key": str(n.get("id") or ""),
+            "author": author, "body": body,
+            "kind": "inline" if pos else "comment", "loc": loc,
+            "is_self": bool(self_user) and author == self_user,
+        })
+    return [e for e in events if e["key"]]
+
+
 def _pr_comment_message(url, events):
     """Fold new PR comments into the single free-text message typed into the
     session (XERK-49). send_input collapses newlines to spaces, so this is built
@@ -1747,9 +1908,11 @@ def _pr_comment_message(url, events):
     if not events:
         return ""
     m = PR_URL_PARTS_RE.search(url or "")
-    num = f"#{m.group(3)}" if m else ""
-    parts = [f"New review activity on the PR {num} you opened ({url}). "
-             f"Address it and update the PR — continue in this session:"]
+    mm = MR_URL_IID_RE.search(url or "") if not m else None
+    num = f"#{m.group(3)}" if m else f"!{mm.group(1)}" if mm else ""
+    what = "MR" if mm else "PR"
+    parts = [f"New review activity on the {what} {num} you opened ({url}). "
+             f"Address it and update the {what} — continue in this session:"]
     for e in events:
         who = f"@{e['author']}" if e.get("author") else "someone"
         tag = e.get("kind") or "comment"
@@ -2249,8 +2412,9 @@ def _scan_pr_line(raw, state, report):
     """Fold one appended transcript line into a session's PR-URL scan.
 
     Attribution is deliberately narrow: a URL counts only when it comes back in
-    a `gh pr create` call's OWN tool_result — i.e. the session literally opened
-    that PR. A PR link reaches a transcript a dozen other ways (`gh pr
+    a PR/MR-creating call's OWN tool_result (`gh pr create`, `glab mr create`,
+    or a `git push` carrying the `merge_request.create` push option — see
+    PR_CREATE_RE) — i.e. the session literally opened that PR. A PR link reaches a transcript a dozen other ways (`gh pr
     list`/`view`/`checks` output, a link the operator pasted, the model quoting
     a PR another session opened), and taking any of those as "this session's
     PR" is what used to hang a chip — and fire a "created a PR" alert — on the
@@ -2286,11 +2450,13 @@ def _scan_pr_entry(entry, state, report):
                 calls.append(block["id"])
                 del calls[:-PR_CALLS_MAX]
         elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
-            for m in PR_URL_RE.finditer(_tool_result_text(block.get("content"))):
-                url = m.group(0)
-                if url not in seen:
-                    seen.add(url)
-                    report["prUrls"].append(url)
+            text = _tool_result_text(block.get("content"))
+            for rx in (PR_URL_RE, MR_URL_RE):
+                for m in rx.finditer(text):
+                    url = m.group(0)
+                    if url not in seen:
+                        seen.add(url)
+                        report["prUrls"].append(url)
 
 
 # The confirmation line Claude Code prints (and transcribes as local-command
@@ -3860,6 +4026,37 @@ def gitlab_base():
 def gitlab_host():
     """The bare host of GITLAB_URL — the source's UI label."""
     return re.sub(r"^[a-zA-Z][\w.+-]*://", "", gitlab_base()).split("/")[0]
+
+
+def _gitlab_get(path):
+    """GET one GitLab REST path (relative to /api/v4/) with the configured
+    token; parsed JSON, or None on any failure. The quiet best-effort shape
+    the MR status/comment pollers need — unlike collect_gitlab_repos, whose
+    raise carries the error into the git-sources block."""
+    try:
+        req = urllib.request.Request(
+            f"{gitlab_base()}/api/v4/{path}",
+            headers={"PRIVATE-TOKEN": GITLAB_TOKEN,
+                     "Accept": "application/json",
+                     "User-Agent": "turma-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=JIRA_TIMEOUT_SEC) as resp:
+            return json.loads(resp.read().decode() or "null")
+    except Exception:
+        return None
+
+
+# The token's own GitLab username, cached after the first successful probe —
+# the MR counterpart of the gh login compare in _pr_comment_events. A failed
+# probe stays None and retries on a later poll.
+_GITLAB_SELF = {"username": None}
+
+
+def _gitlab_self_username():
+    if _GITLAB_SELF["username"] is None:
+        data = _gitlab_get("user")
+        if isinstance(data, dict) and data.get("username"):
+            _GITLAB_SELF["username"] = str(data["username"])
+    return _GITLAB_SELF["username"]
 
 
 def collect_gitlab_repos():
@@ -9545,8 +9742,13 @@ class SessionManager:
         from the registry but keeps its own `prUrls` snapshot (_remember_closed),
         and the hub's Ended-sessions view renders those chips. Without counting
         them as referenced, the very act of killing a session would evict the PR
-        status its ended card is about to show."""
-        if not self.github.get("available"):
+        status its ended card is about to show.
+
+        GitLab merge requests refresh through the same sweep (XERK-162): each
+        URL is polled only through the source that can answer for it
+        (_pr_source_ok), so a gh-less GitLab host still refreshes its MRs and
+        a GitLab-less host doesn't burn beats on MRs it can't see."""
+        if not self.github.get("available") and not gitlab_configured():
             return
         referenced, wanted, seen = set(), [], set()
         for sess in self.registry:
@@ -9555,7 +9757,7 @@ class SessionManager:
             if sess.get("status") != "running":
                 continue
             for url in urls:
-                if url not in seen:
+                if url not in seen and self._pr_source_ok(url):
                     seen.add(url)
                     wanted.append(url)
         # Closed records are never re-polled — same rule as a stopped session,
@@ -9583,6 +9785,15 @@ class SessionManager:
         # to a bare link the moment the in-memory cache is lost.
         if changed:
             self._save_pr_status_ledger()
+
+    def _pr_source_ok(self, url):
+        """Whether THIS host can fetch status/comments for a PR/MR url: a
+        GitLab merge request needs the configured GITLAB_URL to cover it,
+        anything else needs the gh login. What can't be fetched keeps its
+        last-known status (or a bare link chip) rather than costing calls."""
+        if MR_URL_RE.match(str(url or "")):
+            return _mr_url_parts(url) is not None
+        return bool(self.github.get("available"))
 
     def _session_prs(self, sid):
         """The PR-status objects for a session's known PR links, newest last
@@ -9613,10 +9824,13 @@ class SessionManager:
         session's own comments are still folded into the seen-set so they are
         never mistaken for someone else's on a later beat.
 
-        Best-effort and bounded: skipped without a gh login, capped at
-        PR_COMMENTS_MAX PRs per beat, and a fetch failure leaves that PR's
-        baseline untouched (a gh error is not evidence the comments vanished)."""
-        if not PR_COMMENTS_DELIVER or not self.github.get("available"):
+        Best-effort and bounded: each URL polls only through the source that
+        can answer for it (_pr_source_ok — gh for PRs, the configured GitLab
+        for MRs, XERK-162), capped at PR_COMMENTS_MAX PRs per beat, and a fetch
+        failure leaves that PR's baseline untouched (a fetch error is not
+        evidence the comments vanished)."""
+        if not PR_COMMENTS_DELIVER or (
+                not self.github.get("available") and not gitlab_configured()):
             return
         self_login = self.github.get("login") or ""
         polled = 0
@@ -9631,6 +9845,8 @@ class SessionManager:
                 base = {}
             changed = False
             for url in urls:
+                if not self._pr_source_ok(url):
+                    continue
                 if polled >= PR_COMMENTS_MAX:
                     break
                 polled += 1
