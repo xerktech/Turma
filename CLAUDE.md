@@ -671,7 +671,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   inherit the login shell's PATH, so claude at the prefix install.sh blesses (`npm config set prefix
   ~/.local`) is otherwise unreachable and every session dies on exec. A missing claude is a **loud,
   log-only** warning at start; install-time `have claude` checks pass in the login shell and cannot catch
-  this. Tests: `agent/tests/test_turma_agent.sh`.
+  this.
 - The config is **validated before it is sourced**, and a bad one **idles** rather than exiting:
   - The launcher `.`-sources the env file, so a non-assignment line RUNS (a YAML-style `JIRA_SITE: "x"`
     exits 127 and under `set -e` takes the launcher down). The check is anchored on the `=` directly
@@ -679,7 +679,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   - **Idling, never `exit 1`.** To systemd an exit is indistinguishable from one worth restarting in 5s
     — the exit IS the loop. `--preflight` is the one exception (exits 1). Nothing is sourced then.
   - The report carries **line numbers and key names, never values** (`chmod 600`, holds
-    `TURMA_TOKEN`/`JIRA_TOKEN`). Tests: `agent/tests/test_turma_agent.sh`.
+    `TURMA_TOKEN`/`JIRA_TOKEN`).
 - The tunnel is **supervised** here, re-exec'd as `turma-agent --tunnel-supervisor` (a respawn loop),
   because a native install is the only place its runtime can be MISSING — node is an apt prereq, not a
   baked layer. (The container has its own simpler respawn loop in `entrypoint.sh`, XERK-34.)
@@ -687,7 +687,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     within one `TUNNEL_RETRY_SEC`; fire-and-forget makes a missing node silent AND permanent.
   - The supervisor's pkill key is PREFIX-scoped like `tunnel-agent.js`'s; the launcher reaps the
     supervisor BEFORE the tunnel (else the old loop respawns the just-killed tunnel), and
-    `turma-agentctl stop` reaps it too. Tests: `agent/tests/test_turma_agent.sh`.
+    `turma-agentctl stop` reaps it too. PATH, config and supervisor tests:
+    `agent/tests/test_turma_agent.sh`.
 - The launcher exports **`TURMA_MANAGER_PID=$$`**, which `exec` makes the manager's own pid, so the
   tunnel's poke (`pokeHeartbeat`) signals the right process. Its PID-1 fallback is right only in the
   container. Tests: `pokeHeartbeat` in `agent/tests/tunnel-agent.test.js`.
@@ -1004,9 +1005,9 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - The **"New ticket"** button opens a modal to create a ticket (title, description, labels) on an org's
   tracker — source-agnostic across Jira and Azure DevOps, hidden until an org reports. It lives in the
   **shared site header** (`newticket.js` → nav.js's `#hdrNewTicket` slot, XERK-150), not the board
-  toolbar; the button, modal and fetch/poll wiring live in `newticket.js`, fed the beat via
-  `TurmaNewTicket.update(data)`, with the form HTML in `board.js`. It routes to an **ONLINE** host of the
-  org, reusing the `{command → staged result → poll}` pattern:
+  toolbar — button, modal and fetch/poll wiring all in `newticket.js`, fed the beat by
+  `TurmaNewTicket.update(data)`, form HTML in `board.js`. It routes to an **ONLINE** host of the org,
+  reusing the `{command → staged result → poll}` pattern:
   - `GET /api/jira/<siteKey>/create-meta` (`boardCreateMeta`) → the org's projects + existing labels/tags;
     `?project=<p>` → that project's creatable types. Cascade (project then types) so no meta call fans
     across every project. Cached per host (`createMeta`/`createTypes`), 202-polled.
@@ -1020,29 +1021,19 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   item, `;`-joined `System.Tags`). Jira labels split on whitespace+commas (spaces forbidden), Azure tags
   on commas.
 - Android has the same feature (a ＋ action in the shared `ScreenHeader`/`NewTicketAction` →
-  `CreateTicketSheet`): `source` on `JiraBlock`/`BoardSite`, the create endpoints in `net/HubApi.kt`, and
-  the pure `createLabelWord`/`splitLabels`/`classifyCreateMeta`/`classifyCreateResult` ports in
+  `CreateTicketSheet`): `source` on `JiraBlock`/`BoardSite`, the create endpoints in `net/HubApi.kt`,
+  and the `createLabelWord`/`splitLabels`/`classifyCreateMeta`/`classifyCreateResult` ports in
   `core/Board.kt`.
-- **A rejected write carries the TRACKER's own explanation** (XERK-151): every Jira/Azure request goes
-  through `_board_urlopen`, which re-raises a `urllib` `HTTPError` with `_http_error_detail` — the
-  response BODY, which urllib's own string discards, leaving every refusal reading "HTTP Error 400: Bad
-  Request" with no way to tell a missing field from a bad identity from a workflow rule. Reads `message`
-  (Azure), `errorMessages`/`errors` (Jira), else strips a proxy's HTML; capped `BOARD_ERROR_MAX_CHARS`.
-- **A description goes in the field its TYPE has**: `_azure_description_field` over the cached
-  `_azure_type_fields` prefers `System.Description`, falling back to `Microsoft.VSTS.TCM.ReproSteps` —
-  what the Agile/Scrum **Bug** has instead, having no `System.Description` at all. Patching an absent
-  field fails the whole create, so it is looked up, not assumed; an unreadable list falls back to
-  `System.Description`, and a type with neither is created with no description rather than not at all.
-- **Self-assignment cannot cost the operator the ticket**: `create_azure_issue` retries ONCE unassigned,
-  since an identity the collection can't resolve (`AZDO_USER` holding the board's display LABEL, a PAT
-  owner with no account on a self-hosted server) is otherwise fatal — the item then lands outside the
-  board's `@Me` filter, still reachable by the returned url. **The FIRST error propagates** if the retry
-  fails too: it names the real problem, while the retry only proves the assignee wasn't it.
+- **A refusal carries the tracker's own words; an Azure create bends to the TYPE** (XERK-151):
+  `_board_urlopen`/`_http_error_detail` keep the body urllib's `HTTPError` drops (else every refusal
+  reads "HTTP Error 400: Bad Request", whatever the cause); the description goes in the field the type
+  HAS (`_azure_description_field`: the Agile/Scrum **Bug** has ReproSteps, not Description);
+  `create_azure_issue` retries ONCE unassigned, keeping the FIRST error.
 - **Any new shared `/*.js` must be registered in `server.js`'s `STATIC_ASSETS`** (it's an allowlist, not
   a directory serve) AND loaded by each page after `org.js` — a missing entry 404s and takes the module
   (and every page's render) down. `newticket.test.js` guards both.
-- Tests: `TestCreateJiraIssue`/`TestCreateAzureIssue` (+ retry-unassigned, description-field),
-  `TestHttpErrorDetail`, `TestAzureDescriptionField`, `TestStageCreateMeta`/`TestStageCreateTicket` in
+- Tests: `TestCreateJiraIssue`/`TestCreateAzureIssue`, `TestHttpErrorDetail`,
+  `TestAzureDescriptionField`, `TestStageCreateMeta`/`TestStageCreateTicket` in
   `test_hub_agent.py`; `server.test.js`; `createFormHtml`/`createProjectOptions`/`createTypeOptions` in
   `board.test.js`; `newticket.test.js`; android `BoardTest.kt`.
 
@@ -1307,25 +1298,19 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 #### When a host's agent is too old for a write (XERK-151)
 
-- An agent **acks** a command it doesn't implement (so a poison command can't retry forever), so without
-  this a host predating a board write feature is indistinguishable from a slow one and the routes waiting
-  on a staged result 202 forever.
-- **The ack IS the evidence.** These commands stage their result inside the same `handle_commands` call,
-  so the result rides the SAME beat as the ack — an ack carrying no result means the agent didn't handle
-  it. Deliberately version-free: no version table can drift.
-- `awaitResult` records a queued command; `resolveResultWaits` settles it on the beat that acks it (after
-  every ingest), writing `agent.unsupported[kind] = at`. `resultLanded` matches per-cmdId caches by id,
-  and the create meta/type caches (not cmdId-keyed) on being refreshed since the command was queued.
-- The three board routes that wait on a staged result then refuse with `agentGapError` instead of
-  queueing — create-meta as `200 {error}` (the shape both clients read a message from), the create and
-  status POSTs as `409 {error}`.
-- A gap **clears** when a result lands, when `agentVersion` CHANGES, or after `UNSUPPORTED_TTL_MS` — the
-  backstop for an update that doesn't move the version string. Never conclude anything from a command
-  still in the queue: it hasn't been taken yet.
-- `resultWaits` is stripped from the fleet payload (per-command bookkeeping); `unsupported` rides it.
-- Android's `hubError()` reads the `{error}` out of Retrofit's `errorBody()`, so a refusing POST shows the
-  hub's message instead of a bare "HTTP 409".
-- Tests: `turma/tests/server.test.js`.
+- An agent **acks** a command it doesn't implement (a poison command must not retry forever), so a host
+  predating a board write feature reads as a slow one and the routes waiting on a staged result 202
+  forever. **The ack IS the evidence**: these commands stage their result inside the same
+  `handle_commands` call, so it rides the SAME beat as the ack — an ack with no result means the agent
+  didn't handle it. Version-free by design; no version table to drift.
+- `awaitResult`/`resolveResultWaits` record and settle each queued command, writing
+  `agent.unsupported[kind]`. The three waiting routes then refuse with `agentGapError` rather than queue
+  — create-meta `200 {error}` (the shape both clients read a message from), create/status `409`, which
+  Android's `hubError()` reads out of Retrofit's `errorBody()`.
+- A gap **clears** on a result landing, `agentVersion` CHANGING, or `UNSUPPORTED_TTL_MS` (the backstop for
+  an update that doesn't move the version string). Never conclude anything from a command still in the
+  queue: it hasn't been taken yet. `resultWaits` is stripped from the fleet payload; `unsupported` rides
+  it. Tests: `turma/tests/server.test.js`.
 
 #### Refresh button
 
