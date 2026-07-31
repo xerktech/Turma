@@ -72,6 +72,18 @@ CVE-2026-50648 exp:2026-10-10
 # forces the revisit: bump the pins once upstream ships x/text-0.39+ rebuilds.
 CVE-2026-56852 exp:2026-10-10
 
+# CVE-2026-46602 / CVE-2026-46604 — HIGH DoS in golang.org/x/image's TIFF
+# decoder: unbounded allocation / panic on a crafted image (fixed in x/image
+# 0.43.0). Present only in the bundled glab CLI (GLAB_VERSION 1.111.0), where
+# x/image v0.20.0 is compiled in as an INDIRECT dep — not independently
+# patchable. 1.111.0 is the newest upstream release (2026-07-30) and even
+# glab's main branch still pins x/image v0.20.0, so GLAB_VERSION has nothing to
+# bump to. Not first-party code, and a DoS against a CLI a session runs by hand
+# — glab never decodes attacker-supplied TIFFs here. The expiry forces the
+# revisit: bump GLAB_VERSION once upstream ships an x/image-0.43+ rebuild.
+CVE-2026-46602 exp:2026-10-25
+CVE-2026-46604 exp:2026-10-25
+
 # CVE-2026-14257 — HIGH ReDoS/DoS in brace-expansion through 5.0.7 (fixed in
 # 5.0.8). Present ONLY in the npm bundled inside the node base image
 # (/usr/local/lib/node_modules/npm/node_modules/brace-expansion), a transitive
