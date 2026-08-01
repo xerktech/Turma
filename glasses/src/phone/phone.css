@@ -91,7 +91,8 @@
 .ph-signout:hover { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent); }
 
 /* ---- Sessions list ---- */
-.ph-body { flex: 1; overflow: auto; padding: 14px 12px calc(14px + env(safe-area-inset-bottom)); }
+.ph-body { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 14px 12px calc(14px + env(safe-area-inset-bottom)); }
+.ph-card-meta, .ph-card-title { min-width: 0; overflow-wrap: anywhere; }
 .ph-list { display: flex; flex-direction: column; gap: 18px; }
 .ph-section { display: flex; flex-direction: column; gap: 8px; }
 .ph-section-label {
@@ -103,11 +104,30 @@
 
 .ph-card {
   display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left;
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  /* Org tint (XERK-142): the session's org colour mixed 12% into the surface, so
+     a card reads its org at a glance — the same as the board/web/Android. */
+  background: color-mix(in srgb, var(--org, var(--surface)) 12%, var(--surface));
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
   padding: 10px 12px; cursor: pointer; font: inherit; color: var(--ink);
 }
 .ph-card:hover { border-color: var(--accent); }
 .ph-card.cur { border-color: var(--accent); border-width: 2px; }
+.ph-ticket { font-family: var(--font-mono); color: var(--accent); }
+.ph-state-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-top: 4px; }
+.ph-state-row .ph-state { margin-top: 0; flex: 1 1 auto; min-width: 0; }
+.ph-pr-list { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; justify-content: flex-end; min-width: 0; }
+/* Queued: dashed, static, with an inline Cancel. */
+.ph-queued { border-style: dashed; cursor: default; }
+.ph-queued .ph-dot.st-waiting { box-shadow: none; }
+.ph-cancel {
+  flex: none; align-self: center; font: inherit; font-size: 12px; color: var(--critical);
+  background: none; border: 1px solid color-mix(in srgb, var(--critical) 40%, transparent);
+  border-radius: 8px; padding: 6px 12px; cursor: pointer;
+}
+/* Ended: muted, non-interactive. */
+.ph-ended { cursor: default; opacity: 0.72; }
+.ph-ended .ph-dot.st-stopped { background: none; border: 1.5px solid var(--muted); }
+.ph-ended-section .ph-section-label { color: var(--muted); }
 .ph-card-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .ph-card-title { font-weight: 600; font-size: 14px; line-height: 1.3; overflow-wrap: anywhere; }
 .ph-card-meta { color: var(--muted); font-size: 11.5px; margin-top: 2px; overflow-wrap: anywhere; }

@@ -61,6 +61,33 @@ describe("phone render", () => {
     expect(html).not.toContain("bravo");
   });
 
+  it("cards carry org tint, PR chips, a ticket chip, and Queued/Ended sections", () => {
+    const st = state({
+      agents: [
+        agent({ key: "h1", jira: { siteKey: "acme.atlassian.net" }, sessions: [
+          session({ id: "sw", summary: "working one", session: signals({ paneBusy: true }), prs: [{ url: "https://github.com/o/r/pull/42", number: 42, state: "Open", ready: "ready" }], ticket: { key: "ACME-9" } }),
+          session({ id: "sq", status: "queued", queuedReason: "capacity", summary: "queued one" }),
+        ], closedSessions: [{ id: "sk", repo: "web", summary: "killed one" } as never] }),
+      ],
+    });
+    const html = sessionsBodyHtml(st);
+    // Org tint: the card carries a --org custom property.
+    expect(html).toMatch(/--org:var\(--s\d\)/);
+    // PR chip + readiness mark.
+    expect(html).toContain("pr-badge");
+    expect(html).toContain("#42");
+    expect(html).toMatch(/pr-ready ready/);
+    // Ticket chip.
+    expect(html).toContain("ACME-9");
+    // Sections.
+    expect(html).toContain("Active");
+    expect(html).toContain("Queued");
+    expect(html).toContain("Ended");
+    expect(html).toContain("waiting for a free session slot"); // queued reason
+    expect(html).toMatch(/data-cancel="sq"/);
+    expect(html).toContain("killed one");
+  });
+
   it("a session card carries its enter hooks and status", () => {
     const st = state({ agents: [agent({ sessions: [session({ id: "sX", summary: "do a thing", session: signals({ paneBusy: true }) })] })] });
     const html = sessionsBodyHtml(st);

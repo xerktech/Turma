@@ -9,9 +9,10 @@
 // surface-left), and a Material bottom nav. Phase 1 ships Sessions + the session
 // view; Board is a placeholder tab (Phase 2).
 import type { AppState } from "../app.ts";
-import type { AgentInfo, SessionInfo } from "../types.ts";
+import type { AgentInfo, PrInfo, SessionInfo } from "../types.ts";
 import { filterAgents, liveState, sessionName, siteKeyOf, type LiveState } from "../sessions.ts";
 import { LIVE_TURN_ID } from "../render.ts";
+import { Board } from "../vendor/engines.ts";
 
 export type PhoneTab = "sessions" | "board";
 
@@ -76,57 +77,148 @@ const STATE_LABEL: Record<LiveState, string> = {
 
 // ---- Sessions list --------------------------------------------------------
 
-// device · repo · branch — the web card's meta line.
+// device · repo · branch — the web card's meta line, ticket key appended.
 function metaLine(hostLabel: string, s: SessionInfo): string {
   const parts = [esc(hostLabel), esc(s.repo)];
   const branch = s.branch || s.label;
   if (branch && branch !== s.repo) parts.push(`<span class="ph-mono">${esc(branch)}</span>`);
-  return parts.join(" · ");
+  let html = parts.join(" · ");
+  if (s.ticket?.key) html += ` · <span class="ph-ticket">${esc(s.ticket.key)}</span>`;
+  return html;
 }
 
-function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, current: boolean): string {
+// The GitHub-style PR pill (ported from sessions.html prBadgeHtml/prReady): state
+// colour + #number + a ✓/✗/● merge-readiness mark. Uses the .pr-badge CSS bundled
+// via chat.css (extracted from app.css), so it matches the web/Android exactly.
+function prReady(pr: PrInfo): string {
+  return pr.ready || ({ passing: "ready", failing: "blocked", pending: "pending" } as Record<string, string>)[pr.checks ?? ""] || "";
+}
+function prBadgeHtml(pr: PrInfo): string {
+  const url = pr.url || "";
+  const m = url.match(/\/pull\/(\d+)|\/-\/merge_requests\/(\d+)/);
+  const num = pr.number ? "#" + pr.number : m ? "#" + (m[1] || m[2]) : "PR";
+  const state = String(pr.state || "").toUpperCase();
+  const cls = ({ OPEN: "pr-open", DRAFT: "pr-draft", MERGED: "pr-merged", CLOSED: "pr-closed" } as Record<string, string>)[state] || "";
+  const label = state ? state[0] + state.slice(1).toLowerCase() : "";
+  const ready = prReady(pr);
+  const mark = ready === "ready" ? "✓" : ready === "blocked" ? "✗" : ready === "pending" ? "●" : "";
+  const chk = mark ? ` <span class="pr-ready ${ready}">${mark}</span>` : "";
+  return `<span class="pr-badge ${cls}"><span class="pr-dot"></span>${esc(num)}${label ? " " + esc(label) : ""}${chk}</span>`;
+}
+
+function prChips(s: SessionInfo): string {
+  const prs = s.prs ?? [];
+  if (!prs.length) return "";
+  return `<span class="ph-pr-list">${prs.map((p) => prBadgeHtml(p)).join("")}</span>`;
+}
+
+const QUEUED_REASON: Record<string, string> = {
+  capacity: "waiting for a free session slot",
+  "awaiting-clone": "cloning the repo first",
+  "root-busy": "waiting for the repos-root slot",
+};
+
+function orgTintStyle(colorMap: Map<string, string>, siteKey: string): string {
+  const c = siteKey ? colorMap.get(siteKey) : "";
+  return c ? ` style="--org:${c}"` : "";
+}
+
+function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, current: boolean, tint: string): string {
   const st = liveState(s);
   const name = sessionName(s);
   const q = s.session?.question;
+  const stateRow =
+    `<span class="ph-state-row">` +
+    `<span class="ph-state st-${st}">${STATE_LABEL[st]}</span>` +
+    prChips(s) +
+    `</span>`;
   return (
-    `<button class="ph-card ph-sess${current ? " cur" : ""}" data-enter="${esc(s.id)}" data-host="${esc(hostKey)}">` +
+    `<button class="ph-card ph-sess${current ? " cur" : ""}"${tint} data-enter="${esc(s.id)}" data-host="${esc(hostKey)}">` +
     `<span class="ph-dot st-${st}" aria-hidden="true"></span>` +
     `<span class="ph-card-body">` +
     `<span class="ph-card-title">${esc(name)}</span>` +
     `<span class="ph-card-meta">${metaLine(hostLabel, s)}</span>` +
-    `<span class="ph-state st-${st}">${STATE_LABEL[st]}</span>` +
+    stateRow +
     (st === "waiting" && q ? `<span class="ph-card-q">${esc(q)}</span>` : "") +
     `</span>` +
     `</button>`
   );
 }
 
-interface Row { hostKey: string; hostLabel: string; s: SessionInfo; }
+// A queued session (no worktree yet) — a static, dashed card showing why it's
+// waiting, with an arm-then-confirm Cancel.
+function queuedCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, tint: string): string {
+  const reason = QUEUED_REASON[s.queuedReason ?? ""] || "waiting to start";
+  return (
+    `<div class="ph-card ph-queued"${tint}>` +
+    `<span class="ph-dot st-waiting" aria-hidden="true"></span>` +
+    `<span class="ph-card-body">` +
+    `<span class="ph-card-title">${esc(sessionName(s))}</span>` +
+    `<span class="ph-card-meta">${esc(hostLabel)} · ${esc(s.repo)}${s.ticket?.key ? " · " + `<span class="ph-ticket">${esc(s.ticket.key)}</span>` : ""}</span>` +
+    `<span class="ph-state">${esc(reason)}</span>` +
+    `</span>` +
+    `<button class="ph-cancel" data-cancel="${esc(s.id)}" data-host="${esc(hostKey)}">Cancel</button>` +
+    `</div>`
+  );
+}
+
+// An ended (killed/stopped) session — a muted, non-entering row with its PR chips.
+function endedCardHtml(hostLabel: string, s: SessionInfo, tint: string): string {
+  return (
+    `<div class="ph-card ph-ended"${tint}>` +
+    `<span class="ph-dot st-stopped" aria-hidden="true"></span>` +
+    `<span class="ph-card-body">` +
+    `<span class="ph-card-title">${esc(sessionName(s))}</span>` +
+    `<span class="ph-card-meta">${esc(hostLabel)} · ${esc(s.repo)}${s.ticket?.key ? " · " + `<span class="ph-ticket">${esc(s.ticket.key)}</span>` : ""}</span>` +
+    prChips(s) +
+    `</span>` +
+    `</div>`
+  );
+}
+
+interface Row { hostKey: string; hostLabel: string; s: SessionInfo; siteKey: string; }
 
 export function sessionsBodyHtml(state: AppState): string {
   const agents = filterAgents(state.agents, state.orgFilter);
   const curId = state.screen === "session" ? state.session?.sessionId : null;
-  const rows: Row[] = [];
+  // Org colours over the WHOLE fleet (not the filtered view) so a card's tint is
+  // stable regardless of the filter — the same rule the web/Android use.
+  const allKeys = [...new Set(state.agents.map(siteKeyOf).filter(Boolean))];
+  const colorMap = Board.orgColorMap(allKeys);
+
+  const running: Row[] = [];
+  const queued: Row[] = [];
+  const ended: Row[] = [];
   for (const a of agents) {
     const hostLabel = a.device ?? a.key;
-    for (const s of a.sessions ?? []) rows.push({ hostKey: a.key, hostLabel, s });
+    const siteKey = siteKeyOf(a);
+    for (const s of a.sessions ?? []) {
+      const row = { hostKey: a.key, hostLabel, s, siteKey };
+      if (s.status === "queued") queued.push(row);
+      else if (s.status === "running") running.push(row);
+      else ended.push(row); // stopped / error records still in the registry
+    }
+    for (const s of a.closedSessions ?? []) ended.push({ hostKey: a.key, hostLabel, s: s as unknown as SessionInfo, siteKey });
   }
-  // Group by live state — Active (working/waiting) then Idle — like the web
-  // sidebar's sections, sorting newest-active first within each.
-  const active = rows.filter((r) => ["working", "waiting"].includes(liveState(r.s)));
-  const idle = rows.filter((r) => !["working", "waiting"].includes(liveState(r.s)));
+  const active = running.filter((r) => ["working", "waiting"].includes(liveState(r.s)));
+  const idle = running.filter((r) => !["working", "waiting"].includes(liveState(r.s)));
   const byCreated = (a: Row, b: Row) => (b.s.createdAt ?? "").localeCompare(a.s.createdAt ?? "");
-  active.sort(byCreated);
-  idle.sort(byCreated);
+  [active, idle, queued, ended].forEach((l) => l.sort(byCreated));
 
-  const section = (label: string, list: Row[]): string =>
+  const tintOf = (r: Row): string => orgTintStyle(colorMap, r.siteKey);
+  const section = (label: string, list: Row[], render: (r: Row) => string, cls = ""): string =>
     list.length
-      ? `<div class="ph-section"><div class="ph-section-label">${label} <span class="ph-count">${list.length}</span></div>` +
-        list.map((r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId)).join("") +
+      ? `<div class="ph-section${cls ? " " + cls : ""}"><div class="ph-section-label">${label} <span class="ph-count">${list.length}</span></div>` +
+        list.map(render).join("") +
         `</div>`
       : "";
 
-  const body = section("Active", active) + section("Idle", idle);
+  const body =
+    section("Active", active, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r))) +
+    section("Idle", idle, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r))) +
+    section("Queued", queued, (r) => queuedCardHtml(r.hostKey, r.hostLabel, r.s, tintOf(r))) +
+    section("Ended", ended.slice(0, 20), (r) => endedCardHtml(r.hostLabel, r.s, tintOf(r)), "ph-ended-section");
+
   return `<div class="ph-list">${body || `<div class="ph-empty">No sessions${state.orgFilter ? " in this org" : ""}.</div>`}</div>`;
 }
 

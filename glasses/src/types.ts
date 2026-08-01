@@ -47,7 +47,7 @@ export interface LiveSignals {
   newPrUrls: string[];
 }
 
-export type SessionStatus = "running" | "stopped" | "error";
+export type SessionStatus = "running" | "stopped" | "error" | "queued";
 
 export interface UsagePeriod {
   input?: number;
@@ -80,6 +80,24 @@ export interface SessionInfo {
   errorMsg?: string | null;
   usage?: UsageSummary | null;
   session: LiveSignals | null;
+  // Card chips (XERK-171 full parity): the PR status pills a session opened, the
+  // Jira/Azure ticket it works, and — for a queued session — why it's waiting.
+  prs?: PrInfo[] | null;
+  ticket?: { key?: string; siteKey?: string; url?: string; [key: string]: unknown } | null;
+  queuedReason?: string | null;
+  [key: string]: unknown;
+}
+
+// A PR's status as the agent reports it (hub-agent.py `pr_status`). Rendered as
+// the GitHub-style pill (state colour + #number + ✓/✗/● readiness mark).
+export interface PrInfo {
+  url?: string;
+  number?: number;
+  state?: string; // Open | Draft | Merged | Closed
+  checks?: string | null; // passing | failing | pending
+  ready?: string | null; // ready | blocked | pending
+  mergeable?: string | null;
+  title?: string;
   [key: string]: unknown;
 }
 

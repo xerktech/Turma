@@ -163,6 +163,8 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
       if (host) void ensureHistory(host, id);
       return;
     }
+    const cancel = t.closest<HTMLElement>("[data-cancel]");
+    if (cancel) { void client.sessionAction(cancel.dataset.host!, cancel.dataset.cancel!, "kill").catch(() => {}); return; }
     const tab = t.closest<HTMLElement>("[data-tab]");
     if (tab) { view.tab = tab.dataset.tab as PhoneTab; view.inSession = false; orgOpen = false; paint(); return; }
     if (t.closest("[data-back]")) { view.inSession = false; view.menu = "closed"; paint(); return; }
