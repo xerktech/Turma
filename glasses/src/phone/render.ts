@@ -43,24 +43,37 @@ export function esc(s: unknown): string {
   );
 }
 
-// The org label for a siteKey — the site host minus the Jira suffix, or the last
-// path segment of a slashed (Azure collection) key. Presentational only; the
-// value routed on stays the full siteKey.
-export function orgLabel(siteKey: string): string {
+// Each org's manual name override (the agent's BOARD_ORG_NAME, stamped on the
+// jira block as `orgName`), keyed by siteKey — so the phone shows the operator's
+// chosen name, not the derived default.
+function orgOverrides(state: AppState): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const a of state.agents) {
+    const key = siteKeyOf(a);
+    const o = a.jira?.orgName;
+    if (key && o && !m.has(key)) m.set(key, o);
+  }
+  return m;
+}
+
+// The org label for a siteKey, via board.js's own orgName: the manual override
+// wins, else the site host minus the Jira suffix / the last path segment of an
+// Azure collection key. Value routed on stays the full siteKey.
+export function orgLabel(siteKey: string, override?: string | null): string {
   if (!siteKey) return "All orgs";
-  if (siteKey.includes("/")) return siteKey.split("/").filter(Boolean).pop() || siteKey;
-  return siteKey.replace(/\.atlassian\.net$/, "");
+  return Board.orgName(siteKey, override);
 }
 
 // The distinct orgs the fleet reports, for the header filter menu.
 export function orgOptions(state: AppState): { key: string; label: string }[] {
+  const overrides = orgOverrides(state);
   const seen = new Set<string>();
   const out: { key: string; label: string }[] = [];
   for (const a of state.agents) {
     const key = siteKeyOf(a);
     if (!key || seen.has(key)) continue;
     seen.add(key);
-    out.push({ key, label: orgLabel(key) });
+    out.push({ key, label: orgLabel(key, overrides.get(key)) });
   }
   out.sort((x, y) => x.label.localeCompare(y.label));
   return out;
@@ -184,7 +197,7 @@ export function sessionsBodyHtml(state: AppState): string {
   // Org colours over the WHOLE fleet (not the filtered view) so a card's tint is
   // stable regardless of the filter — the same rule the web/Android use.
   const allKeys = [...new Set(state.agents.map(siteKeyOf).filter(Boolean))];
-  const colorMap = Board.orgColorMap(allKeys);
+  const colorMap = Board.orgColorMap(allKeys, state.orgColors);
 
   const running: Row[] = [];
   const queued: Row[] = [];
@@ -309,7 +322,7 @@ function orgMenuHtml(state: AppState, open: boolean): string {
   const opts = orgOptions(state);
   if (opts.length === 0) return "";
   const cur = state.orgFilter;
-  const label = cur ? orgLabel(cur) : "All orgs";
+  const label = cur ? orgLabel(cur, orgOverrides(state).get(cur)) : "All orgs";
   const items = [{ key: "", label: "All orgs" }, ...opts]
     .map((o) => `<button class="ph-org-item${o.key === cur ? " cur" : ""}" data-org="${esc(o.key)}">${esc(o.label)}</button>`)
     .join("");
@@ -343,7 +356,7 @@ export function boardBodyHtml(state: AppState, moves: Map<string, unknown> = new
     sessionIndex,
     starts: new Map(),
     moves,
-    orgColors: {},
+    orgColors: state.orgColors,
   });
   // The detail modal (filled + shown by the controller on a card tap).
   const modal = `<div class="td-backdrop" id="ph-detail" hidden><div class="td-panel" id="ph-detail-panel"></div></div>`;

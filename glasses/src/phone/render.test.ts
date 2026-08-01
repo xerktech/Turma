@@ -31,10 +31,24 @@ function state(patch: Partial<AppState> = {}): AppState {
 }
 
 describe("phone render", () => {
-  it("orgLabel strips the Jira suffix and takes the last segment of a slashed key", () => {
+  it("orgLabel uses the manual name override, else derives from the siteKey", () => {
     expect(orgLabel("acme.atlassian.net")).toBe("acme");
     expect(orgLabel("dev.azure.com/myorg")).toBe("myorg");
     expect(orgLabel("")).toBe("All orgs");
+    expect(orgLabel("acme.atlassian.net", "Acme Corp")).toBe("Acme Corp"); // BOARD_ORG_NAME wins
+  });
+
+  it("orgOptions shows the manual org name from the agent's jira block", () => {
+    const st = state({ agents: [agent({ key: "a", jira: { siteKey: "acme.atlassian.net", orgName: "Acme Corp" } })] });
+    expect(orgOptions(st)).toEqual([{ key: "acme.atlassian.net", label: "Acme Corp" }]);
+  });
+
+  it("card tints honour the hub's org-colour pins (matching the web/Android)", () => {
+    const st = state({
+      orgColors: { "acme.atlassian.net": 5 }, // pinned to slot 5
+      agents: [agent({ key: "a", jira: { siteKey: "acme.atlassian.net" }, sessions: [session({ id: "s1", summary: "x" })] })],
+    });
+    expect(sessionsBodyHtml(st)).toContain("--org:var(--s5)");
   });
 
   it("orgOptions lists each reporting org once, sorted", () => {

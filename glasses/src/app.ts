@@ -159,6 +159,9 @@ export interface AppState {
   // agents list above is left intact so a session already in view is never
   // dropped from under the user when its org leaves the filter.
   orgFilter: string;
+  // The hub's manual org-colour pins (siteKey -> slot), so the phone's card tints
+  // match the web/Android (XERK-171). Empty until the first poll carries it.
+  orgColors: Record<string, number>;
   sessionRefs: SessionRef[];
   transcripts: Record<string, TranscriptBuffer>;
   // Typewriter state for the focused session's newest transcript entry (see
@@ -193,6 +196,7 @@ export function createInitialState(now: number): AppState {
     pollErrorActive: false,
     agents: [],
     orgFilter: "",
+    orgColors: {},
     sessionRefs: [],
     transcripts: {},
     reveal: emptyReveal(),
@@ -694,6 +698,7 @@ export class App {
         ...this.state,
         now,
         agents: res.agents,
+        orgColors: res.orgColors ?? {},
         sessionRefs,
         transcripts,
         pending,
