@@ -51,6 +51,22 @@ export function sessionName(s: SessionInfo): string {
   return summary || s.id.slice(0, 6);
 }
 
+// The tracker org a host belongs to — a host with no tracker creds reports no
+// jira block and belongs to no org (empty key). Mirrors the web dashboard's
+// org.js `siteKeyOf`, the pure half of the phone-side org filter (XERK-171).
+export function siteKeyOf(agent: AgentInfo): string {
+  return (agent.jira && agent.jira.siteKey) || "";
+}
+
+// The fleet scoped to one org. An empty key ("all orgs") is the identity. The
+// phone's org filter (owned by the embedded web pages) drives this so the
+// glasses home list shows the same org the phone does. Mirrors org.js's
+// `filterAgents`.
+export function filterAgents(agents: AgentInfo[], key: string): AgentInfo[] {
+  if (!key) return agents;
+  return agents.filter((a) => siteKeyOf(a) === key);
+}
+
 // Flattens every host's sessions into one list, hosts sorted by device name
 // (falling back to the host key), sessions within a host sorted by
 // createdAt (missing createdAt sorts first).

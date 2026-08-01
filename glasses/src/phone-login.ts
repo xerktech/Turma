@@ -84,10 +84,14 @@ function showError(els: PhoneLoginElements, msg: string): void {
   els.error.classList.add("show");
 }
 
-// Reveals the signed-in view and points the dashboard iframe at the hub.
+// Reveals the signed-in view and points the dashboard iframe at the dedicated
+// Even phone companion (XERK-171): the hub's Sessions page in embed mode
+// (`?embed=glasses`), which nav.js trims to just Sessions + Board and which
+// glasses-embed.js bridges to the glasses. Starts on Sessions; the in-page tab
+// switches to Board, both staying embedded.
 function showDashboard(els: PhoneLoginElements, config: Config): void {
   els.appUser.textContent = config.user;
-  els.dashboard.src = `${hubBase(config)}/`;
+  els.dashboard.src = `${hubBase(config)}/sessions?embed=glasses`;
   els.login.hidden = true;
   els.app.hidden = false;
 }

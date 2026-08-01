@@ -1603,12 +1603,13 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 ## `glasses/` — Even Realities G2 smart-glasses client
 
-- Vite + TypeScript, Vitest; an Even Hub plugin. Sessions list, scrollable transcript, `AskUserQuestion`
-  answering, spawn/kill/resume, and G2-mic dictation via the hub's `/audio` endpoint.
-- While the session screen is open it opens the hub's `/live` WebSocket (`live.ts`) and renders growing
-  text with a **streaming typewriter reveal** (`reveal.ts`): small deltas type in, a large chunk snaps in
-  immediately. Falls back to the 6s poll if the live socket can't connect. See `glasses/README.md` for
-  dev/simulator/packaging/QA details.
+- Vite + TypeScript, Vitest; an Even Hub plugin. An open session screen tails the hub's `/live`
+  WebSocket (`live.ts`) with a **streaming typewriter reveal** (`reveal.ts`), else the 6s poll. See
+  `glasses/README.md` for dev/packaging/QA and the phone-companion bridge.
+- **Even phone companion (XERK-171):** the plugin's PHONE screen is the hub's Sessions + Board pages in
+  `?embed=glasses` mode (`nav.js` trims the nav), synced to the glasses `App` over **postMessage**
+  (`glasses-embed.js`/`phone-bridge.ts`): **ENTER syncs, LEAVE doesn't** — entering a session or the org
+  filter on either side follows on the other, echo-guarded.
 
 ## `android/` — native Android client
 

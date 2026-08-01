@@ -154,6 +154,11 @@ export interface AppState {
   pollErrorActive: boolean;
 
   agents: AgentInfo[];
+  // The org (siteKey) the home session list is scoped to, "" = every org. Set
+  // by the phone-side org filter through setOrgFilter() (XERK-171); the full
+  // agents list above is left intact so a session already in view is never
+  // dropped from under the user when its org leaves the filter.
+  orgFilter: string;
   sessionRefs: SessionRef[];
   transcripts: Record<string, TranscriptBuffer>;
   // Typewriter state for the focused session's newest transcript entry (see
@@ -187,6 +192,7 @@ export function createInitialState(now: number): AppState {
     flashUntil: 0,
     pollErrorActive: false,
     agents: [],
+    orgFilter: "",
     sessionRefs: [],
     transcripts: {},
     reveal: emptyReveal(),
@@ -224,6 +230,12 @@ export interface AppOptions {
   liveTail?: LiveTailLike;
   now?: () => number;
   pollMs?: number;
+  // Fired whenever the session screen ENTERS a session — a genuine new/changed
+  // session, never a same-session repaint and never on leaving (XERK-171). The
+  // phone bridge uses it to pull the embedded web view to the same session the
+  // glasses just entered. Leaving is deliberately not signalled, so backing out
+  // on the glasses doesn't move the phone.
+  onEnterSession?: (hostKey: string, sessionId: string) => void;
 }
 
 // The controller: owns AppState, drives the HubClient on a poll loop, reacts
@@ -235,6 +247,7 @@ export class App {
   private readonly liveTail: LiveTailLike;
   private readonly now: () => number;
   private readonly pollMs: number;
+  private readonly onEnterSession?: (hostKey: string, sessionId: string) => void;
 
   private state: AppState;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -254,6 +267,7 @@ export class App {
     this.liveTail = opts.liveTail ?? new NoopLiveTail();
     this.now = opts.now ?? (() => Date.now());
     this.pollMs = opts.pollMs ?? 6000;
+    this.onEnterSession = opts.onEnterSession;
     this.state = createInitialState(this.now());
   }
 
@@ -350,6 +364,46 @@ export class App {
     this.setState({ screen, session });
   }
 
+  // ---- phone bridge (XERK-171) -----------------------------------------
+  // The phone-side companion (the embedded web Sessions/Board pages) and the
+  // glasses App run in the same WebView, so these three are the whole in-process
+  // link between them — no network round-trip.
+
+  // The session the glasses screen is currently showing, or null. Lets the
+  // bridge answer "are we already here?" so a pull-to-session doesn't bounce.
+  currentSessionId(): string | null {
+    return this.state.screen === "session" ? this.state.session?.sessionId ?? null : null;
+  }
+
+  // Scope the home session list to one org (siteKey; "" = every org), driven by
+  // the phone's org filter. Only the list is scoped — a session already open on
+  // the glasses is untouched (findSession reads the full agents list), matching
+  // the web dashboard's one-way org scoping.
+  setOrgFilter(siteKey: string): void {
+    const next = siteKey || "";
+    if (next === this.state.orgFilter) return;
+    // The scoped list may be shorter — send the cursor home so it can't point
+    // past the end of the newly narrowed list.
+    this.setState({ orgFilter: next, home: { cursor: 0 } });
+  }
+
+  // Pull the glasses into a session the phone just opened. Resolves the host
+  // from the live fleet by session id (fleet-unique), so the phone need only
+  // send the id. A no-op when that session is already the one on screen — the
+  // guard that keeps a phone→glasses→phone echo from looping (paired with the
+  // web bridge ignoring an enter for the session it already shows). Unknown ids
+  // (not in this poll's fleet yet) are ignored rather than entering a blank
+  // screen. Leaving is never signalled here — only the phone tells us to enter.
+  enterSession(sessionId: string, hostKeyHint?: string): void {
+    if (!sessionId) return;
+    if (this.currentSessionId() === sessionId) return;
+    const host =
+      this.state.agents.find((a) => (a.sessions ?? []).some((s) => s.id === sessionId))?.key ??
+      hostKeyHint;
+    if (!host) return;
+    this.setState({ screen: "session", session: newSessionState(host, sessionId) });
+  }
+
   private schedulePoll(delayMs: number, prefetched?: Promise<AgentsResponse>): void {
     // While paused, only keep polling inside a post-mutation grace window.
     if (this.paused && this.now() >= this.graceUntil) return;
@@ -411,6 +465,10 @@ export class App {
     if (same) return;
 
     if (inSession) {
+      // A genuine enter (from home, from a switch, or driven by the phone) — not
+      // a same-session repaint (the `same` early-return above) and not a leave.
+      // The phone bridge mirrors this into the embedded web view (XERK-171).
+      this.onEnterSession?.(cur!.hostKey, cur!.sessionId);
       this.startLiveTail(cur!.hostKey, cur!.sessionId);
       // The existing buffer is history, not a live stream — show it in full,
       // and let only subsequent growth type in. Any live turn from a previous

@@ -4,7 +4,7 @@
 import type { AppState, ReplyScreenState, SessionScreenState } from "./app.ts";
 import { bottomBoxLines, inputBoxBody, menuBox, sheetBody, statusLabel, type MicState } from "./input-box.ts";
 import { DISPLAY_LINES, LINE_WIDTH_PX } from "./layout.ts";
-import { glyph, liveState, sessionName } from "./sessions.ts";
+import { filterAgents, glyph, liveState, sessionName } from "./sessions.ts";
 import { measureDefault, measureGeneration, wrapText } from "./text-wrap.ts";
 import type { AgentInfo, SessionInfo } from "./types.ts";
 
@@ -155,10 +155,19 @@ export interface HomeRow {
 // sessionRefs cache) so render() only ever needs one source of truth — a
 // plain AppState fixture with `agents` set is always renderable, matching
 // the brief's requirement.
+// The fleet as the home screen shows it: scoped to the phone's org filter
+// (XERK-171), so filtering orgs on the phone narrows the glasses session list
+// too. The full state.agents is kept intact for session lookups (a session you
+// are already IN must not vanish because its org left the filter — the web
+// dashboard's org.js scopes the list the same one-way).
+function homeAgents(state: AppState): AgentInfo[] {
+  return filterAgents(state.agents, state.orgFilter);
+}
+
 function homeHeaderText(state: AppState): string {
   let working = 0;
   let waiting = 0;
-  for (const agent of state.agents) {
+  for (const agent of homeAgents(state)) {
     if (!agent.online) continue;
     for (const session of agent.sessions ?? []) {
       const s = liveState(session);
@@ -171,7 +180,7 @@ function homeHeaderText(state: AppState): string {
 
 export function buildHomeRows(state: AppState): HomeRow[] {
   const rows: HomeRow[] = [];
-  const hosts = [...state.agents].sort((a, b) => (a.device ?? a.key).localeCompare(b.device ?? b.key));
+  const hosts = [...homeAgents(state)].sort((a, b) => (a.device ?? a.key).localeCompare(b.device ?? b.key));
   for (const agent of hosts) {
     const device = agent.device ?? agent.key;
     if (!agent.online) {

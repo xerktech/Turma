@@ -56,32 +56,51 @@
 
   const SIGNOUT = "fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;";
 
-  function tabsHtml(active) {
-    const tabs = PAGES.map(p =>
-      `<a href="${p.href}"${p.id === active ? ' class="active"' : ""}>${esc(p.label)}</a>`
+  // The dedicated Even phone companion (XERK-171) embeds only these two pages,
+  // in an Even Hub WebView, so — when `?embed=glasses` is on the URL — the nav
+  // is trimmed to Sessions + Board, every link carries the flag forward so
+  // switching tabs stays embedded, and Sign out is dropped (the plugin's own
+  // bar owns that). The org filter + New ticket slots stay (both are required
+  // on the phone). Everything else on every non-embedded page is unchanged.
+  const EMBED = "glasses";
+  const EMBED_PAGES = ["sessions", "board"];
+  function embedPages(embed) {
+    return embed ? PAGES.filter(p => EMBED_PAGES.includes(p.id)) : PAGES;
+  }
+  function href(p, embed) {
+    return embed ? `${p.href}?embed=${EMBED}` : p.href;
+  }
+  function isEmbedded(search) {
+    try { return new URLSearchParams(search || "").get("embed") === EMBED; }
+    catch { return false; }
+  }
+
+  function tabsHtml(active, embed) {
+    const tabs = embedPages(embed).map(p =>
+      `<a href="${href(p, embed)}"${p.id === active ? ' class="active"' : ""}>${esc(p.label)}</a>`
     ).join("\n      ");
     return `<nav class="nav-tabs">
-      ${tabs}
-      <a href="#" class="signout" onclick="${SIGNOUT}">Sign out</a>
+      ${tabs}${embed ? "" : `
+      <a href="#" class="signout" onclick="${SIGNOUT}">Sign out</a>`}
     </nav>`;
   }
 
   // The header's inner row. Capped and centred by .site-header-in (app.css) so
   // it lines up with each page's own content column.
-  function siteHeaderHtml(active, sub) {
+  function siteHeaderHtml(active, sub, embed) {
     return `<div class="site-header-in">
-    <a class="wordmark" href="/"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
+    <a class="wordmark" href="${embed ? href(PAGES.find(p => p.id === "sessions"), embed) : "/"}"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
     <span class="sub" id="hdrSub">${esc(sub ?? "")}</span>
     <span class="sub" id="hdrMeta"></span>
     <span class="spacer"></span>
     <span class="newticket-slot" id="hdrNewTicket"></span>
     <span class="org-slot" id="hdrOrg"></span>
-    ${tabsHtml(active)}
+    ${tabsHtml(active, embed)}
   </div>`;
   }
 
-  function bottomNavHtml(active) {
-    return PAGES.map(p => `<a href="${p.href}"${p.id === active ? ' class="active"' : ""}>
+  function bottomNavHtml(active, embed) {
+    return embedPages(embed).map(p => `<a href="${href(p, embed)}"${p.id === active ? ' class="active"' : ""}>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"${p.join ? " " + p.join : ""}>${p.icon}</svg>
     ${esc(p.label)}
   </a>`).join("\n  ");
@@ -93,9 +112,11 @@
     const header = doc.getElementById("siteHeader");
     if (!header) return;
     const active = header.dataset.page || "";
-    header.innerHTML = siteHeaderHtml(active, header.dataset.sub || "");
+    const embed = isEmbedded(typeof location !== "undefined" ? location.search : "");
+    if (embed && typeof document !== "undefined" && document.body) document.body.classList.add("embed-glasses");
+    header.innerHTML = siteHeaderHtml(active, header.dataset.sub || "", embed);
     const bottom = doc.getElementById("bottomNav");
-    if (bottom) bottom.innerHTML = bottomNavHtml(active);
+    if (bottom) bottom.innerHTML = bottomNavHtml(active, embed);
   }
 
   // Every page repaints by replacing a container's innerHTML on each heartbeat
@@ -152,7 +173,7 @@
     if (window.scrollX !== winX || window.scrollY !== winY) window.scrollTo(winX, winY);
   }
 
-  const api = { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, esc, preserveScroll };
+  const api = { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, esc, preserveScroll, isEmbedded, embedPages };
   if (typeof window !== "undefined") window.TurmaNav = api;
   // Guarded on `document`, not `window`: a test can put a stand-in on a fake
   // global `window` before requiring this and still drive mount() itself.

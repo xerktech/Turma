@@ -801,6 +801,10 @@
 <script src="/nav.js"></script>
 <script src="/org.js"></script>
 <script src="/newticket.js"></script>
+<!-- The Even phone companion (XERK-171) embeds this page with ?embed=glasses;
+     inert on every ordinary load. Loaded after org.js — it reads TurmaOrg, and
+     drives (and is driven by) window.TurmaEmbed which the page script publishes. -->
+<script src="/glasses-embed.js"></script>
 
 <script>
 const $active = document.getElementById("active");
@@ -2012,7 +2016,27 @@ function selectSession(id) {
   if (window.TurmaChat) TurmaChat.open(hit.a.key, id, hit.s, hit.a);
   enterStage();
   render(cache); // refresh the .cur highlight
+  // Tell the Even phone companion a session was ENTERED here so the glasses
+  // follow (XERK-171). Fires for a user tap and for our own openSession alike;
+  // the plugin drops the echo of an open it drove. The re-tap early-return above
+  // never reaches here, so re-revealing a warm stage isn't re-signalled. Guarded
+  // for environments without the DOM event API (the unit-test window shim).
+  if (typeof CustomEvent === "function" && typeof window.dispatchEvent === "function") {
+    window.dispatchEvent(new CustomEvent("turma:session-open", { detail: { host: hit.a.key, id } }));
+  }
 }
+// The Even phone companion bridge (glasses-embed.js) reaches the session view
+// through this tiny published surface — `currentId()` answers "are we already
+// here?" (the anti-echo guard) and `openSession(id)` opens a session the glasses
+// entered, reusing the ?session= wait so a not-yet-running session still lands.
+window.TurmaEmbed = {
+  currentId: () => currentId,
+  openSession: (id) => {
+    pendingSpawn = null; pendingEnded = null; followedSpawn = false;
+    pendingSelect = id;
+    tryPendingSelect();
+  },
+};
 // The chat and terminal panes each have their own compose box, but a half-typed
 // message is ONE draft: toggling views to check something in the terminal (or
 // coming back) must not eat it (XERK-122). Each toggle MOVES the text across —
