@@ -222,6 +222,20 @@ export class HubClient {
     return this.request<{ ok: boolean }>("/api/jira/refresh", { method: "POST" });
   }
 
+  // Flip an org's hub-side auto-start opt-in (the org menu's "auto" toggle,
+  // XERK-41). Same endpoint the web org.js POSTs; the hub is authoritative on
+  // return and its next heartbeat carries the settled `autoStartOrgs`.
+  setAutoStart(siteKey: string, enabled: boolean): Promise<{ ok: boolean }> {
+    return this.request<{ ok: boolean }>(
+      `/api/jira/${encodeURIComponent(siteKey)}/autostart`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      }
+    );
+  }
+
   // New-ticket create flow (the shared "New ticket" control). All three are the
   // same endpoints the web newticket.js uses; 202 = "still fetching", polled by
   // the caller.

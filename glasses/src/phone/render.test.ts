@@ -194,6 +194,23 @@ describe("phone render", () => {
     expect(html).toContain("data-signout");
   });
 
+  it("the open org menu carries a per-org auto-start toggle reflecting the hub's opt-in", () => {
+    const st = state({
+      autoStartOrgs: { "acme.atlassian.net": true }, // acme opted in, beta not
+      agents: [
+        agent({ key: "a", jira: { siteKey: "acme.atlassian.net" } }),
+        agent({ key: "b", jira: { siteKey: "beta.atlassian.net" } }),
+      ],
+    });
+    const html = phoneHtml(st, VIEW(), true); // orgOpen -> menu rendered
+    // Each real org row has an auto toggle; "All orgs" does not.
+    expect(html).toMatch(/data-org-auto="acme\.atlassian\.net"/);
+    expect(html).toMatch(/data-org-auto="beta\.atlassian\.net"/);
+    // acme is ON, beta is OFF.
+    expect(html).toMatch(/class="ph-org-auto on" data-org-auto="acme\.atlassian\.net" aria-pressed="true"/);
+    expect(html).toMatch(/class="ph-org-auto" data-org-auto="beta\.atlassian\.net" aria-pressed="false"/);
+  });
+
   it("phoneHtml overlays the session view (no shell) when inSession and a session is focused", () => {
     const st = state({
       screen: "session",

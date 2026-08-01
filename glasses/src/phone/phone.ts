@@ -408,6 +408,18 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
       view.menu = "closed"; view.inSession = false; paint(); return;
     }
     if (t.closest("[data-org-toggle]")) { orgOpen = !orgOpen; paint(); return; }
+    // Per-org auto-start toggle (XERK-41): flip optimistically, POST, roll back
+    // on failure. The menu stays OPEN so several orgs can be toggled in a row.
+    const orgAuto = t.closest<HTMLElement>("[data-org-auto]");
+    if (orgAuto) {
+      const site = orgAuto.dataset.orgAuto || "";
+      if (site) {
+        const enabled = !last.autoStartOrgs[site];
+        app.setAutoStartOrg(site, enabled);
+        void client.setAutoStart(site, enabled).catch(() => app.setAutoStartOrg(site, !enabled));
+      }
+      return;
+    }
     const org = t.closest<HTMLElement>("[data-org]");
     if (org) { app.setOrgFilter(org.dataset.org || ""); orgOpen = false; paint(); return; }
     const answer = t.closest<HTMLElement>("[data-answer]");

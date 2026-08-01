@@ -36,7 +36,7 @@ function sessionState(id: string, host: string): AppState {
 describe("phone controller", () => {
   let root: HTMLElement;
   let client: Record<string, ReturnType<typeof vi.fn>>;
-  let app: { getState: () => AppState; enterSession: ReturnType<typeof vi.fn>; setOrgFilter: ReturnType<typeof vi.fn> };
+  let app: { getState: () => AppState; enterSession: ReturnType<typeof vi.fn>; setOrgFilter: ReturnType<typeof vi.fn>; setAutoStartOrg: ReturnType<typeof vi.fn> };
   let handle: ReturnType<typeof mountPhone>;
   let onSignOut: ReturnType<typeof vi.fn>;
   let state: AppState;
@@ -64,13 +64,22 @@ describe("phone controller", () => {
       createMeta: vi.fn(async (_s: string, project?: string) => ({ status: 200 as const, body: project ? { types: [{ id: "10001", name: "Task" }] } : { projects: [{ key: "ACME" }], labels: [], source: "jira" } })),
       createTicket: vi.fn(async () => ({ ok: true, cmdId: "cc" })),
       createResult: vi.fn(async () => ({ status: 200 as const, body: { key: "ACME-99", url: "https://x/ACME-99" } })),
+      setAutoStart: vi.fn(async () => ({ ok: true })),
     };
-    // A fake App whose enter/setOrgFilter synchronously push the new state to the
-    // phone, exactly as the real App's setState→repaint→onState does.
+    // A fake App whose enter/setOrgFilter/setAutoStartOrg synchronously push the
+    // new state to the phone, exactly as the real App's setState→repaint→onState does.
     app = {
       getState: () => state,
       enterSession: vi.fn((id: string, host?: string) => { state = sessionState(id, host ?? "host-a"); handle.render(state); }),
       setOrgFilter: vi.fn((k: string) => { state = { ...state, orgFilter: k }; handle.render(state); }),
+      setAutoStartOrg: vi.fn((site: string, enabled: boolean) => {
+        const prev = !!state.autoStartOrgs[site];
+        const next = { ...state.autoStartOrgs };
+        if (enabled) next[site] = true; else delete next[site];
+        state = { ...state, autoStartOrgs: next };
+        handle.render(state);
+        return prev;
+      }),
     };
     onSignOut = vi.fn();
     handle = mountPhone({ root, app: app as never, client: client as never, onSignOut: onSignOut as unknown as () => void });
@@ -122,6 +131,18 @@ describe("phone controller", () => {
     // The list re-scoped to that org.
     expect(root.textContent).toContain("bravo");
     expect(root.textContent).not.toContain("alpha");
+  });
+
+  it("the org menu's auto toggle flips the org's auto-start and POSTs it (optimistically)", () => {
+    root.querySelector<HTMLElement>("[data-org-toggle]")!.click();
+    const auto = root.querySelector<HTMLElement>('[data-org-auto="globex.atlassian.net"]')!;
+    expect(auto.classList.contains("on")).toBe(false); // off to start
+    auto.click();
+    // Optimistic local flip + the hub POST, and the menu stays open.
+    expect(app.setAutoStartOrg).toHaveBeenCalledWith("globex.atlassian.net", true);
+    expect(client.setAutoStart).toHaveBeenCalledWith("globex.atlassian.net", true);
+    expect(root.querySelector<HTMLElement>('[data-org-auto="globex.atlassian.net"]')!.classList.contains("on")).toBe(true);
+    expect(app.setOrgFilter).not.toHaveBeenCalled(); // clicking auto is not a scope pick
   });
 
   it("Send delivers the compose text through the shared HubClient and clears it", () => {
