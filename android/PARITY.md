@@ -111,7 +111,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Split compose bar (XERK-33).** Send now ALWAYS sends (mid-turn it queues); a separate
   warning-coloured Stop appears beside it while a turn runs, suppressed during a pending question. Was
   a single button that morphed into Stop — on a phone (no Enter key) that made mid-turn queueing
-  impossible. `ui/ChatScreen.kt`.
+  impossible. `ui/ChatScreen.kt`. The terminal screen's input bar carries the same split (XERK-177,
+  web `termComposeStop`); with no live tail of its own its busy read is the heartbeat's `paneBusy`.
+  `ui/TerminalScreen.kt`.
 - **Host "updating" status (XERK-29).** A host in an announced update restart shows an "updating →
   <version>" pill instead of the outage-looking "offline". `model/Models.kt` + `ui/FleetScreen.kt`.
 - **Kill from the chat/terminal header + New session from the Sessions page (XERK-44).** A shared

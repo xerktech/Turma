@@ -23,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -32,6 +33,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -206,13 +208,39 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
         // half-typed message, the same contract the web's view toggle keeps.
         val draft = remember(host, sessionId) { container.drafts.of(host, sessionId) }
         val text by draft.collectAsStateWithLifecycle()
+        // ◼ Stop mirrors the chat footer's (XERK-177): the terminal screen keeps
+        // no live tail of its own, so busy is the heartbeat's paneBusy — the chat
+        // screen's fallback signal. Suppressed while a question is pending
+        // (XERK-21: the pane is showing the picker; an accidental interrupt would
+        // destroy it), and briefly after a tap (the heartbeat takes a beat to
+        // read the turn as over; if it outlives the suppression the interrupt
+        // didn't take and Stop comes back — web chat.js STOP_SUPPRESS_MS).
+        val fleet by container.fleet.state.collectAsStateWithLifecycle()
+        val live = fleet.agents.firstOrNull { it.key == host }
+            ?.sessions?.firstOrNull { it.id == sessionId }?.session
+        var stopPending by remember { mutableStateOf(false) }
+        LaunchedEffect(stopPending) {
+            if (stopPending) {
+                kotlinx.coroutines.delay(4000)
+                stopPending = false
+            }
+        }
         TerminalInputBar(
             text = text,
+            busy = live != null && live.paneBusy == true && live.question.isBlank() && !stopPending,
             onText = { draft.value = it },
             onSend = {
                 val body = draft.value
                 draft.value = ""
                 scope.launch { runCatching { container.client.api.sendInput(host, sessionId, InputRequest(body)) } }
+            },
+            onStop = {
+                stopPending = true
+                scope.launch {
+                    // A failed interrupt gives Stop back right away (web stop()).
+                    runCatching { container.client.api.interruptSession(host, sessionId) }
+                        .onFailure { stopPending = false }
+                }
             },
         )
       }
@@ -221,9 +249,17 @@ fun TerminalScreen(host: String, sessionId: String, onBack: () -> Unit) {
 
 /** A compose input on the terminal page — types the text into the session (same
  *  `input` endpoint the chat uses), so you needn't tap into the ttyd WebView.
- *  Stateless: the draft it edits is the session's shared one (see DraftStore). */
+ *  Stateless: the draft it edits is the session's shared one (see DraftStore).
+ *  Mirrors the chat footer's split bar: Send ALWAYS sends (mid-turn it queues),
+ *  and a separate warning-coloured ◼ Stop appears beside it while a turn runs. */
 @Composable
-private fun TerminalInputBar(text: String, onText: (String) -> Unit, onSend: () -> Unit) {
+private fun TerminalInputBar(
+    text: String,
+    busy: Boolean,
+    onText: (String) -> Unit,
+    onSend: () -> Unit,
+    onStop: () -> Unit,
+) {
     Row(
         Modifier.fillMaxWidth().padding(8.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -236,10 +272,15 @@ private fun TerminalInputBar(text: String, onText: (String) -> Unit, onSend: () 
             modifier = Modifier.weight(1f),
             maxLines = 4,
         )
+        if (busy) {
+            IconButton(onClick = onStop) {
+                Icon(Icons.Filled.Stop, "Stop turn", tint = com.xerktech.turma.ui.theme.TurmaColors.waiting)
+            }
+        }
         IconButton(
             onClick = { if (text.isNotBlank()) onSend() },
             enabled = text.isNotBlank(),
-        ) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
+        ) { Icon(Icons.AutoMirrored.Filled.Send, if (busy) "Send (queues mid-turn)" else "Send") }
     }
 }
 
