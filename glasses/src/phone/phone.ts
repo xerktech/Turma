@@ -7,11 +7,12 @@
 // (history via getHistory + live deltas via App.onRichTail).
 import "./phone.css";
 import "../vendor/chat.css";
+import "../vendor/board.css";
 import type { App, AppState } from "../app.ts";
 import type { HubClient } from "../hub-client.ts";
 import type { TailEntry } from "../types.ts";
 import { phoneHtml, transcriptEntries, type PhoneTab, type PhoneView, type VerbosityPreset } from "./render.ts";
-import { Chat, renderTranscript, type RichEntry, type Verbosity } from "../vendor/engines.ts";
+import { Board, Chat, renderTranscript, type BoardSite, type RichEntry, type Verbosity } from "../vendor/engines.ts";
 
 export interface PhoneHandle {
   render(state: AppState): void;
@@ -43,6 +44,9 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
   const buffers = new Map<string, RichEntry[]>();
   const historyDone = new Set<string>();
   const termPlanted = new Set<string>();
+  // The open board ticket detail (its rendered HTML is cached so a poll repaint
+  // re-shows it without re-fetching), or null.
+  let detail: { site: string; key: string; html: string } | null = null;
 
   function focused(): { host: string; id: string } | null {
     if (last.screen === "session" && last.session) return { host: last.session.hostKey, id: last.session.sessionId };
@@ -128,8 +132,46 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
       fillTranscript();
       void ensureTerminal();
       updateStop();
+    } else if (view.tab === "board" && detail) {
+      // Re-show the open ticket detail across the ~1s board repaint.
+      const back = root.querySelector<HTMLElement>("#ph-detail");
+      const panel = root.querySelector<HTMLElement>("#ph-detail-panel");
+      if (back && panel) { panel.innerHTML = detail.html; back.hidden = false; }
     }
   }
+
+  // ---- board ticket detail -------------------------------------------------
+  // The read-only ticket detail via board.js's detailHtml. Its inline field
+  // pickers (Change → status/repo/agent/model) aren't wired yet, so the "Change"
+  // buttons are stripped rather than shipped inert; wiring them is the next step.
+  const closeBtn = `<button class="td-close" aria-label="Close">✕</button>`;
+  function stripPickers(html: string): string {
+    return html.replace(/<button[^>]*class="td-edit"[^>]*>[^<]*<\/button>/g, "");
+  }
+  function openDetail(site: string, key: string): void {
+    detail = { site, key, html: `${closeBtn}<div class="td-note">Loading ${key}…</div>` };
+    paint();
+    void (async () => {
+      for (let attempt = 0; attempt < 8; attempt++) {
+        let res;
+        try { res = await client.jiraDetail(site, key); } catch { detail = { site, key, html: `${closeBtn}<div class="td-note td-err">Couldn't load ${key}.</div>` }; paint(); return; }
+        if (detail?.key !== key) return; // closed / switched
+        if (res.status === 200) {
+          const ticket = boardTicket(site, key);
+          detail = { site, key, html: stripPickers(Board.detailHtml(ticket ?? { key }, res.body, { now: last.now })) };
+          paint();
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 900));
+      }
+    })();
+  }
+  function boardTicket(site: string, key: string): Record<string, unknown> | undefined {
+    const sites: BoardSite[] = Board.mergeSites(last.agents as unknown[]);
+    const s = sites.find((x) => x.siteKey === site);
+    return s?.tickets.find((t) => t.key === key) as Record<string, unknown> | undefined;
+  }
+  function closeDetail(): void { detail = null; const back = root.querySelector<HTMLElement>("#ph-detail"); if (back) back.hidden = true; }
 
   function updateStop(): void {
     // Show Stop while the focused session is working (paneBusy), like the web.
@@ -195,6 +237,28 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
     if (answer) { const f = focused(); if (f) void client.answerQuestion(f.host, f.id, { optionIndex: Number(answer.dataset.answer) }).catch(() => {}); return; }
     if (t.closest("[data-send]")) { send(); return; }
     if (t.closest("[data-signout]")) { onSignOut?.(); return; }
+
+    // ---- board ----
+    if (t.closest("[data-board-refresh]")) { void client.jiraRefresh().catch(() => {}); return; }
+    const start = t.closest<HTMLElement>(".kc-start[data-start]");
+    if (start) {
+      const key = start.dataset.start!;
+      const site = start.closest<HTMLElement>("[data-site]")?.dataset.site || t.closest<HTMLElement>("[data-key]")?.dataset.site;
+      if (site) void client.startTicket(site, key).catch(() => {});
+      return;
+    }
+    const sessLink = t.closest<HTMLAnchorElement>("a.kc-sess");
+    if (sessLink) {
+      e.preventDefault();
+      const m = (sessLink.getAttribute("href") || "").match(/[?&]session=([^&]+)/);
+      if (m) { app.enterSession(decodeURIComponent(m[1]!)); view.tab = "sessions"; view.inSession = true; closeDetail(); paint(); }
+      return;
+    }
+    if (t.closest(".td-close")) { closeDetail(); paint(); return; }
+    if (t.closest("#ph-detail") && !t.closest("#ph-detail-panel")) { closeDetail(); paint(); return; } // backdrop
+    const card = t.closest<HTMLElement>(".kanban-card[data-key]");
+    if (card && view.tab === "board") { openDetail(card.dataset.site || "", card.dataset.key!); return; }
+
     if (orgOpen && !t.closest(".ph-org")) { orgOpen = false; paint(); return; }
     if (view.menu !== "closed" && !t.closest(".ph-kebab-wrap")) { view.menu = "closed"; paint(); }
   });

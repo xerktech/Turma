@@ -323,8 +323,29 @@ function orgMenuHtml(state: AppState, open: boolean): string {
   );
 }
 
-export function boardPlaceholderHtml(): string {
-  return `<div class="ph-empty">Board — coming next.</div>`;
+// The Kanban board, rendered by the vendored board.js exactly as the web/Android
+// show it (columns, org-coloured cards, repo/session chips, start buttons). The
+// controller wires the clicks (open detail, start session, refresh) and fills the
+// detail modal. `orgColors` pins aren't wired yet (empty), and starts/moves
+// optimistic overrides are the controller's job — passed empty here.
+export function boardBodyHtml(state: AppState): string {
+  const sites = Board.mergeSites(state.agents as unknown[]);
+  const refresh = `<div class="ph-board-bar"><button class="ph-refresh" data-board-refresh="1">↻ Refresh</button></div>`;
+  if (!sites.length) {
+    return `${refresh}<div class="ph-empty">No tickets yet. Connect an org's tracker (Jira / Azure DevOps) on an agent.</div>`;
+  }
+  const sessionIndex = Board.ticketSessionIndex(state.agents as unknown[]);
+  const board = Board.boardHtml(sites, state.orgFilter, {
+    allKeys: sites.map((s) => s.siteKey),
+    now: state.now,
+    sessionIndex,
+    starts: new Map(),
+    moves: new Map(),
+    orgColors: {},
+  });
+  // The detail modal (filled + shown by the controller on a card tap).
+  const modal = `<div class="td-backdrop" id="ph-detail" hidden><div class="td-panel" id="ph-detail-panel"></div></div>`;
+  return `${refresh}<div class="ph-board">${board}</div>${modal}`;
 }
 
 const TAB_LABEL: Record<PhoneTab, string> = { sessions: "Sessions", board: "Board" };
@@ -347,7 +368,7 @@ export function phoneHtml(state: AppState, view: PhoneView, orgOpen: boolean): s
   if (view.inSession && state.screen === "session" && state.session) {
     return sessionViewHtml(state, view.verbosity, view.showTerminal, view.menu);
   }
-  const body = view.tab === "sessions" ? sessionsBodyHtml(state) : boardPlaceholderHtml();
+  const body = view.tab === "sessions" ? sessionsBodyHtml(state) : boardBodyHtml(state);
   return (
     `<div class="ph-shell">` +
     `<header class="ph-header">` +

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createInitialState, newSessionState, type AppState } from "../app.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "../types.ts";
 import {
+  boardBodyHtml,
   orgLabel,
   orgOptions,
   phoneHtml,
@@ -123,6 +124,21 @@ describe("phone render", () => {
     expect(html).toContain("data-term-toggle"); // terminal toggle
     expect(html).toMatch(/data-verb="verbose"/); // verbosity control
     expect(html).toMatch(/data-back/);
+  });
+
+  it("boardBodyHtml renders the kanban (via board.js) with a ticket, a refresh, and a detail modal", () => {
+    const st = state({
+      agents: [
+        agent({ key: "h1", jira: { available: true, siteKey: "acme.atlassian.net", user: "me", fetchedAt: "2026-08-01T00:00:00Z",
+          tickets: [{ key: "ACME-1", summary: "Fix the thing", statusCategory: "todo", status: "To Do", updated: "2026-08-01T00:00:00Z", project: "ACME" }] } }),
+      ],
+    });
+    const html = boardBodyHtml(st);
+    expect(html).toContain("kanban-cols");
+    expect(html).toContain("Fix the thing");
+    expect(html).toContain("ACME-1");
+    expect(html).toMatch(/data-board-refresh/);
+    expect(html).toContain('id="ph-detail"'); // the detail modal container
   });
 
   it("phoneHtml shows the shell (header org menu + bottom nav) on the sessions tab", () => {

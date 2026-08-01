@@ -180,6 +180,48 @@ export class HubClient {
     return this.request<{ token: string; expiresInSec: number }>("/api/ws-token");
   }
 
+  // ---- Board (Jira/Azure) — same endpoints the web board.html uses ----------
+
+  // A ticket's full detail (description, comments, statusOptions). 202 means the
+  // agent is still fetching it — the caller polls, like the web board.
+  async jiraDetail(
+    siteKey: string,
+    key: string
+  ): Promise<{ status: 200; body: Record<string, unknown> } | { status: 202; body: { pending: true; cmdId: string } }> {
+    const path = `/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(key)}`;
+    const res = await this.fetchFn(this.url(path), { headers: this.headers() });
+    if (!res.ok) throw new HttpError(res.status, `hub request failed: ${res.status} ${path}`);
+    const body = await res.json();
+    return res.status === 202 ? { status: 202, body } : { status: 200, body };
+  }
+
+  private jiraPost(siteKey: string, key: string, action: string, body: unknown): Promise<QueuedResponse> {
+    return this.request<QueuedResponse>(
+      `/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(key)}/${action}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+    );
+  }
+
+  // Start a session on a ticket (the card's start button).
+  startTicket(siteKey: string, key: string): Promise<QueuedResponse> {
+    return this.request<QueuedResponse>(`/api/jira/${encodeURIComponent(siteKey)}/${encodeURIComponent(key)}/session`, { method: "POST" });
+  }
+  setTicketStatus(siteKey: string, key: string, body: { value?: string; category?: string }): Promise<QueuedResponse> {
+    return this.jiraPost(siteKey, key, "status", body);
+  }
+  setTicketRepo(siteKey: string, key: string, body: unknown): Promise<QueuedResponse> {
+    return this.jiraPost(siteKey, key, "repo", body);
+  }
+  setTicketAgent(siteKey: string, key: string, body: unknown): Promise<QueuedResponse> {
+    return this.jiraPost(siteKey, key, "agent", body);
+  }
+  setTicketModel(siteKey: string, key: string, body: unknown): Promise<QueuedResponse> {
+    return this.jiraPost(siteKey, key, "model", body);
+  }
+  jiraRefresh(): Promise<{ ok: boolean }> {
+    return this.request<{ ok: boolean }>("/api/jira/refresh", { method: "POST" });
+  }
+
   // Interrupt the in-flight turn (web "◼ Stop") — leaves the session + conversation
   // intact. No body.
   interrupt(host: string, id: string): Promise<QueuedResponse> {
