@@ -9170,6 +9170,22 @@ class TestCollectAzure(unittest.TestCase):
         self.assertFalse(block["available"])
         self.assertEqual(block["source"], "azure")
         self.assertEqual(block["tickets"], [])
+        self.assertIsNone(block["siteKey"])  # nothing configured -> no identity
+
+    def test_configured_empty_carries_local_identity(self):
+        # A configured-but-never-polled Azure org still knows WHO it is from
+        # local config, so the empty block carries its siteKey/orgName — that's
+        # what keeps a configured-but-unreachable org visible on the board and
+        # org filters instead of vanishing until its first successful poll.
+        with mock.patch.object(ha, "AZDO_URL", "https://dev.azure.com/MyOrg/"), \
+             mock.patch.object(ha, "AZDO_TOKEN", "t"), \
+             mock.patch.object(ha, "BOARD_ORG_NAME", "My Org"):
+            block = ha.azure_empty()
+        self.assertTrue(block["configured"])
+        self.assertFalse(block["available"])
+        self.assertEqual(block["siteKey"], "dev.azure.com/myorg")
+        self.assertEqual(block["site"], "dev.azure.com/myorg")
+        self.assertEqual(block["orgName"], "My Org")
 
     def _fake_req(self, items):
         def req(path, params, body=None):
@@ -10391,6 +10407,9 @@ class TestRefreshJira(ManagerMixin, unittest.TestCase):
         # very FIRST poll fails must still advertise configured=True, or the hub
         # filters it out of the fan-out and the button can never retry the one
         # host that's actually broken. (This is the real 503-at-boot case.)
+        # It must ALSO carry its locally-derived siteKey so the failing org shows
+        # up on the board / org filters instead of vanishing — `available` is the
+        # only field that then distinguishes it from a healthy org.
         with mock.patch.object(ha, "JIRA_SITE", "s.atlassian.net"), \
              mock.patch.object(ha, "JIRA_EMAIL", "e@x.com"), \
              mock.patch.object(ha, "JIRA_TOKEN", "t"):
@@ -10399,8 +10418,8 @@ class TestRefreshJira(ManagerMixin, unittest.TestCase):
                                    side_effect=RuntimeError("HTTP Error 503")):
                 sm.refresh_jira()
         self.assertTrue(sm.jira["configured"])
-        self.assertFalse(sm.jira["available"])   # indistinguishable from "off"...
-        self.assertIsNone(sm.jira["siteKey"])    # ...on every field but the flag
+        self.assertFalse(sm.jira["available"])   # creds != a successful poll
+        self.assertEqual(sm.jira["siteKey"], "s.atlassian.net")  # still visible
         self.assertIn("503", sm.jira["error"])
 
     def test_success_after_failure_clears_error(self):
