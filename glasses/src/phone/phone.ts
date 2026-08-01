@@ -112,7 +112,9 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
 
   // ---- paint ---------------------------------------------------------------
   function paint(): void {
+    if (drag) return; // a live board drag owns the DOM — don't yank the card
     if (view.inSession && !focused()) view.inSession = false;
+    sweepMoves();
 
     const inp = root.querySelector<HTMLTextAreaElement>("#ph-input");
     const hadFocus = inp && document.activeElement === inp;
@@ -120,7 +122,7 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
     const selStart = inp ? inp.selectionStart : 0;
     const selEnd = inp ? inp.selectionEnd : 0;
 
-    root.innerHTML = phoneHtml(last, view, orgOpen);
+    root.innerHTML = phoneHtml(last, view, orgOpen, moves);
 
     const inp2 = root.querySelector<HTMLTextAreaElement>("#ph-input");
     if (inp2) {
@@ -285,6 +287,52 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
     void loadMeta();
   }
   function closeCreate(): void { create = null; const back = root.querySelector<HTMLElement>("#ph-create"); if (back) back.hidden = true; }
+
+  // ---- board drag-drop (move a ticket's status between columns) -------------
+  // Optimistic-move overrides keyed "<site>\x00<key>", held until the poll
+  // reflects the move (moveSweepVerdict), passed to boardHtml so the card stays
+  // in its dropped column meanwhile. A long-press starts the drag (a plain drag
+  // is a scroll); the ghost lives on <body> and paint() skips repaints while a
+  // drag is live, so the card isn't yanked from under the finger.
+  interface MoveOverride { category: string; pending?: boolean; settled?: boolean; settledAt?: number; error?: boolean; at: number; }
+  const moves = new Map<string, MoveOverride>();
+  const moveKey = (site: string, key: string): string => `${site}\x00${key}`;
+  let press: { card: HTMLElement; site: string; key: string; srcCat: string; x: number; y: number } | null = null;
+  let pressTimer: ReturnType<typeof setTimeout> | null = null;
+  let drag: { site: string; key: string; srcCat: string; ghost: HTMLElement; overCat: string | null } | null = null;
+  let suppressClick = false;
+
+  function sweepMoves(): void {
+    if (!moves.size) return;
+    const sites: BoardSite[] = Board.mergeSites(last.agents as unknown[]);
+    const byKey = new Map<string, unknown>();
+    for (const s of sites) for (const t of s.tickets) byKey.set(moveKey(s.siteKey, t.key), t);
+    const now = Date.now();
+    for (const [k, move] of [...moves]) {
+      const t = byKey.get(k);
+      const realCat = t ? String(Board.categoryOf(t)) : move.category;
+      if (Board.moveSweepVerdict(move, realCat, now, 12000, 6000) === "clear") moves.delete(k);
+    }
+  }
+  function moveTo(site: string, key: string, category: string): void {
+    const k = moveKey(site, key);
+    moves.set(k, { category, pending: true, at: Date.now() });
+    paint();
+    void client.setTicketStatus(site, key, { category })
+      .then(() => { const m = moves.get(k); if (m) { m.pending = false; m.settled = true; m.settledAt = Date.now(); } void client.jiraRefresh().catch(() => {}); })
+      .catch(() => { const m = moves.get(k); if (m) { m.error = true; m.at = Date.now(); } });
+  }
+  function endDrag(dropCat: string | null): void {
+    if (!drag) return;
+    drag.ghost.remove();
+    root.querySelectorAll(".kc-drop-into").forEach((el) => el.classList.remove("kc-drop-into"));
+    const esc = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(drag.key) : drag.key.replace(/["\\]/g, "\\$&");
+    root.querySelector(`.kanban-card[data-key="${esc}"]`)?.classList.remove("kc-drag-src");
+    const { site, key, srcCat } = drag;
+    drag = null;
+    if (dropCat && dropCat !== srcCat) { suppressClick = true; moveTo(site, key, dropCat); }
+    else paint();
+  }
   // A field picker's <select> changed — decode to the POST body (board.html's
   // rules), fire the write, close the picker, and re-fetch to show the result.
   function savePicker(field: DetailEdit, value: string): void {
@@ -396,7 +444,11 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
     }
     if (t.closest("[data-status-cancel],[data-repo-cancel],[data-agent-cancel],[data-model-cancel]") && detail) { detail.edit = ""; renderDetail(); return; }
     const card = t.closest<HTMLElement>(".kanban-card[data-key]");
-    if (card && view.tab === "board") { openDetail(card.dataset.site || "", card.dataset.key!); return; }
+    if (card && view.tab === "board") {
+      if (suppressClick) { suppressClick = false; return; } // the click a just-completed drag synthesizes
+      openDetail(card.dataset.site || "", card.dataset.key!);
+      return;
+    }
 
     if (orgOpen && !t.closest(".ph-org")) { orgOpen = false; paint(); return; }
     if (view.menu !== "closed" && !t.closest(".ph-kebab-wrap")) { view.menu = "closed"; paint(); }
@@ -442,6 +494,59 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
       send();
     }
   });
+
+  // ---- board drag-drop pointer gestures ----
+  function positionGhost(g: HTMLElement, x: number, y: number): void { g.style.left = `${x}px`; g.style.top = `${y - 14}px`; }
+  function columnAt(x: number, y: number): { el: HTMLElement | null; cat: string | null } {
+    const under = document.elementFromPoint(x, y) as HTMLElement | null;
+    const col = under?.closest<HTMLElement>("[data-cat]") || null;
+    return { el: col, cat: col?.dataset.cat || null };
+  }
+  root.addEventListener("pointerdown", (e) => {
+    if (view.tab !== "board" || view.inSession || drag) return;
+    const pe = e as PointerEvent;
+    const card = (e.target as HTMLElement).closest<HTMLElement>(".kanban-card[data-key]");
+    if (!card || (e.target as HTMLElement).closest("a,button,select")) return; // let links/chips work
+    const srcCat = card.closest<HTMLElement>("[data-cat]")?.dataset.cat || "";
+    press = { card, site: card.dataset.site || "", key: card.dataset.key!, srcCat, x: pe.clientX, y: pe.clientY };
+    if (pressTimer) clearTimeout(pressTimer);
+    pressTimer = setTimeout(() => {
+      pressTimer = null;
+      if (!press) return;
+      const ghost = press.card.cloneNode(true) as HTMLElement;
+      ghost.classList.add("kc-ghost");
+      ghost.style.width = `${press.card.offsetWidth}px`;
+      document.body.appendChild(ghost);
+      positionGhost(ghost, press.x, press.y);
+      press.card.classList.add("kc-drag-src");
+      drag = { site: press.site, key: press.key, srcCat: press.srcCat, ghost, overCat: null };
+    }, 220);
+  });
+  root.addEventListener("pointermove", (e) => {
+    const pe = e as PointerEvent;
+    if (drag) {
+      pe.preventDefault();
+      positionGhost(drag.ghost, pe.clientX, pe.clientY);
+      const { el, cat } = columnAt(pe.clientX, pe.clientY);
+      if (cat !== drag.overCat) {
+        root.querySelectorAll(".kc-drop-into").forEach((n) => n.classList.remove("kc-drop-into"));
+        if (el && cat && cat !== drag.srcCat) el.classList.add("kc-drop-into");
+        drag.overCat = cat;
+      }
+      return;
+    }
+    // Not yet dragging: a move beyond a small threshold is a scroll — cancel the long-press.
+    if (press && pressTimer && (Math.abs(pe.clientX - press.x) > 10 || Math.abs(pe.clientY - press.y) > 10)) {
+      clearTimeout(pressTimer); pressTimer = null; press = null;
+    }
+  }, { passive: false });
+  function releasePointer(e: Event): void {
+    if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+    if (drag) { const pe = e as PointerEvent; endDrag(columnAt(pe.clientX, pe.clientY).cat); }
+    press = null;
+  }
+  root.addEventListener("pointerup", releasePointer);
+  root.addEventListener("pointercancel", () => { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } if (drag) endDrag(null); press = null; });
 
   function send(): void {
     const inp = root.querySelector<HTMLTextAreaElement>("#ph-input");

@@ -328,7 +328,7 @@ function orgMenuHtml(state: AppState, open: boolean): string {
 // controller wires the clicks (open detail, start session, refresh) and fills the
 // detail modal. `orgColors` pins aren't wired yet (empty), and starts/moves
 // optimistic overrides are the controller's job — passed empty here.
-export function boardBodyHtml(state: AppState): string {
+export function boardBodyHtml(state: AppState, moves: Map<string, unknown> = new Map()): string {
   const sites = Board.mergeSites(state.agents as unknown[]);
   const bar = `<div class="ph-board-bar"><button class="ph-newticket" data-new-ticket="1">+ New ticket</button><button class="ph-refresh" data-board-refresh="1">↻ Refresh</button></div>`;
   // The create modal (filled + shown by the controller on New ticket).
@@ -342,7 +342,7 @@ export function boardBodyHtml(state: AppState): string {
     now: state.now,
     sessionIndex,
     starts: new Map(),
-    moves: new Map(),
+    moves,
     orgColors: {},
   });
   // The detail modal (filled + shown by the controller on a card tap).
@@ -364,13 +364,13 @@ function bottomNavHtml(view: PhoneView): string {
   return `<nav class="ph-nav">${tabs}</nav>`;
 }
 
-export function phoneHtml(state: AppState, view: PhoneView, orgOpen: boolean): string {
+export function phoneHtml(state: AppState, view: PhoneView, orgOpen: boolean, moves: Map<string, unknown> = new Map()): string {
   // The session view overlays whichever tab and has its own header, so the shell
   // header + bottom nav are hidden while it's up.
   if (view.inSession && state.screen === "session" && state.session) {
     return sessionViewHtml(state, view.verbosity, view.showTerminal, view.menu);
   }
-  const body = view.tab === "sessions" ? sessionsBodyHtml(state) : boardBodyHtml(state);
+  const body = view.tab === "sessions" ? sessionsBodyHtml(state) : boardBodyHtml(state, moves);
   return (
     `<div class="ph-shell">` +
     `<header class="ph-header">` +

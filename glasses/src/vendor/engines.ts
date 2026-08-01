@@ -57,6 +57,9 @@ interface BoardEngine {
   detailHtml(ticket: unknown, detail: unknown, opts: Record<string, unknown>): string;
   mergeSites(agents: unknown[]): BoardSite[];
   categoryOf(ticket: unknown): string;
+  // Drag-drop optimistic-move sweep: "clear" once the poll reflects the move,
+  // else "hold" (board.js).
+  moveSweepVerdict(move: unknown, realCat: string, now: number, settleMs: number, errorTtlMs: number): string;
   ticketSort(a: unknown, b: unknown): number;
   orgColorMap(allKeys: string[], pins?: Record<string, number>): Map<string, string>;
   orgColor(siteKey: string, allKeys?: string[] | null, pins?: Record<string, number>): string;
