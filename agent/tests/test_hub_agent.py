@@ -5964,6 +5964,9 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
         self.assertFalse(sm.history_results[0]["truncated"])
 
     def test_truncated_true_when_exceeding_history_max_msgs(self):
+        # All 10 entries here are operator messages, so the XERK-186 exemption
+        # folds the 7 the entry cap cut right back in: truncated reports the
+        # cut, but no operator message is lost to it.
         sm = self.make_manager()
         sess = self._running_session(sm)
         proj = self._proj_dir()
@@ -5974,8 +5977,72 @@ class TestHistoryCommand(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "HISTORY_MAX_MSGS", 3):
             sm._stage_history(sess["id"])
         result = sm.history_results[0]
-        self.assertEqual([e["id"] for e in result["entries"]], ["u7", "u8", "u9"])
+        self.assertEqual([e["id"] for e in result["entries"]],
+                         [f"u{i}" for i in range(10)])
         self.assertTrue(result["truncated"])
+
+    def test_entry_cap_evicts_tool_traffic_not_operator_messages(self):
+        # XERK-186: the entry cap drops old assistant/tool turns, but every
+        # operator message survives — in file order, ahead of the window.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        lines = [{"uuid": "op1", "type": "user", "message": {"content": "do the thing"}}]
+        for i in range(10):
+            lines.append({"uuid": f"a{i}", "type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": f"t{i}", "name": "Bash",
+                 "input": {"command": f"cmd {i}"}}]}})
+            lines.append({"uuid": f"r{i}", "type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": f"t{i}", "content": f"out {i}"}]}})
+        lines.append({"uuid": "op2", "type": "user", "message": {"content": "now fix it"}})
+        write_jsonl(os.path.join(proj, "t.jsonl"), lines)
+        with mock.patch.object(ha, "HISTORY_MAX_MSGS", 4):
+            sm._stage_history(sess["id"])
+        result = sm.history_results[0]
+        ids = [e["id"] for e in result["entries"]]
+        # op1 was evicted by the cap and folded back in ahead of the window
+        # (= the last 4 entries); op2 is inside the window and not duplicated.
+        self.assertEqual(ids, ["op1", "r8", "a9", "r9", "op2"])
+        self.assertTrue(result["truncated"])
+
+    def test_byte_cap_folds_operator_messages_back_in(self):
+        # XERK-186: an operator message cut off by the 4 MiB byte window is
+        # recovered by the full-file operator scan.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        path = os.path.join(proj, "t.jsonl")
+        write_jsonl(path, [
+            {"uuid": "old-op", "type": "user", "message": {"content": "the first ask"}},
+            {"uuid": "a1", "type": "assistant",
+             "message": {"content": [{"type": "text", "text": "working on it"}]}},
+        ])
+        # Simulate the byte window: the tail read only sees the assistant line.
+        with open(path) as f:
+            tail_line = f.readlines()[1].strip().encode()
+        with mock.patch.object(ha, "_read_tail_lines", lambda p, n: [tail_line]):
+            with mock.patch("os.path.getsize", return_value=(1 << 22) + 1):
+                sm._stage_history(sess["id"])
+        result = sm.history_results[0]
+        self.assertEqual([e["id"] for e in result["entries"]], ["old-op", "a1"])
+        self.assertTrue(result["truncated"])
+
+    def test_operator_exempt_set_is_capped_newest_first(self):
+        # HISTORY_USER_MSGS bounds the folded-back set, keeping the newest.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        proj = self._proj_dir()
+        write_jsonl(os.path.join(proj, "t.jsonl"), [
+            {"uuid": f"u{i}", "type": "user", "message": {"content": f"msg {i}"}}
+            for i in range(6)
+        ])
+        with mock.patch.object(ha, "HISTORY_MAX_MSGS", 2), \
+             mock.patch.object(ha, "HISTORY_USER_MSGS", 3):
+            sm._stage_history(sess["id"])
+        result = sm.history_results[0]
+        # window = u4,u5; exempt olds capped to newest 3 of u0..u3 = u1,u2,u3
+        self.assertEqual([e["id"] for e in result["entries"]],
+                         ["u1", "u2", "u3", "u4", "u5"])
 
     def test_empty_transcript_file(self):
         sm = self.make_manager()

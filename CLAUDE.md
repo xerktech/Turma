@@ -39,7 +39,7 @@ One agent container per host, not one fixed-repo container per session.
 
 ### Hosts and repos
 
-- One agent container per physical host, mounted at a git root (`REPOS_ROOT`, e.g.
+- Mounted at a git root (`REPOS_ROOT`, e.g.
   `/mnt/data/Docker/git`), scanned one level deep for git repos. Alongside them it advertises a
   **repos-root pseudo-repo** (`ROOT_REPO_NAME`, shown as "⌂ Repos root").
 
@@ -122,7 +122,7 @@ One agent container per host, not one fixed-repo container per session.
 
 ### Kill, resume, delete
 
-- Sessions are spawned/killed/started/restarted/deleted from the hub. **Killing** drops the registry
+- **Killing** drops the registry
   record but KEEPS its worktree (uncommitted work survives), conversation, and token-usage history
   (transcripts live under `~/.claude/projects`, keyed by worktree path), moving it to the Sessions page's
   **Ended sessions** list.
@@ -176,10 +176,6 @@ One agent container per host, not one fixed-repo container per session.
 - Tests: `TestMigrateSession` (agent), `server.test.js`, the Move cases in
   `sessions.test.js`, `eligibleMoveTargets` in android `SessionsTest`.
 
-## Repository Structure
-
-Top level: `agent/`, `turma/`, `glasses/`, `android/`, `.github/workflows/`. Each is detailed below.
-
 ## `agent/` — per-host headless agent image
 
 Currently Claude Code; the name is agent-generic so it can host other agents later.
@@ -221,6 +217,11 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     - Tests: `TestPendingScan`, `TestPollPendingInputs`, `TestSendInput`.
 - `interrupt` — sends a single Escape to the tmux pane, cancelling the in-flight generation/tool call
   with session and conversation intact. Deliberately NOT gated on `paneBusy`. Tests: `TestInterrupt`.
+- **Operator messages are exempt from the `history` window** (XERK-186): the read stays bounded
+  (last 4 MiB + `HISTORY_MAX_MSGS`, capped inside `_history_entries`; callers must not re-slice), but
+  on any cut every user-authored text turn in the whole transcript folds back in ahead of the window
+  (id-deduped, `HISTORY_USER_MSGS` backstop) — tool traffic otherwise evicts them.
+  Tests: `TestHistoryCommand`.
 - `setSummary` — rename a session; see "Session activity summaries".
 - `setModel` — switch a running session's model live, **for that session only** (XERK-33).
   - `set_model` drives Claude Code's /model picker — clear the input line (C-u), open it, parse rows +
@@ -458,8 +459,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Optional. With user-scoped Jira Cloud creds (`JIRA_SITE`/`JIRA_EMAIL`/`JIRA_TOKEN`), the agent
   heartbeats the tickets assigned to that user, polled slow (`collect_jira`: active work plus a bounded
   window of recently-Done, two capped queries), shaped by `_shape_issue`.
-- Unset creds = feature off (zero Jira HTTP, `available:False`). Reads issues; the only writes are the
-  operator's own — a create (XERK-137) and a transitions POST (XERK-138).
+- Unset creds = feature off (zero Jira HTTP, `available:False`); writes only the operator's own create
+  (XERK-137) and transition (XERK-138).
 - **On-demand issue detail.** Description/comment bodies are too big to heartbeat per ticket, so a
   `{type:"jiraIssue", issueKey}` command (allowlist-checked against the `PROJECT-123` grammar) makes
   `_stage_jira_issue` call `fetch_jira_issue`; the result rides the next beat as `jiraIssueResults`.
@@ -482,7 +483,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   source-agnostic and reads `self.jira` unchanged.
 - **Self-hosted is the point.** `AZDO_URL` is any base — `https://tfs.company.com/DefaultCollection` or
   `https://dev.azure.com/org`. PAT auth is Basic with empty username (`:PAT`). Reads WIQL, work items,
-  states/fields; the only writes are the operator's own — a create and a System.State PATCH.
+  states/fields; writes only the operator's own create and System.State PATCH.
 - **siteKey keeps the org/collection PATH** (`normalize_azure_site` → `dev.azure.com/myorg`), unlike the
   Jira host-only key, else every cloud org merges into one board. Percent-encoded into
   `/api/jira/<siteKey>/...`. `board.js`/`Board.kt` `orgName` takes the last path segment for a slashed
@@ -1712,7 +1713,6 @@ GHCR image builds and PR gates — see Build & Deploy.
 - The `push: main` trigger is **path-filtered to the four component source dirs**, restating `changes.js`'s
   `PREFIX_MAP` (a workflow trigger can't call into JS; a test asserts the two match). A docs-only merge
   cuts no release.
-- `agent-emulator-image.yml` builds the opt-in `:emulator` agent tier on demand — not a release component.
 
 ### Deployment (DockerOps, not here)
 
@@ -1721,8 +1721,7 @@ GHCR image builds and PR gates — see Build & Deploy.
   `TURMA_TOKEN`/`TURMA_AGENT_TOKEN`, the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`), basic-auth.
   Its `mem_limit`/`cpus`/`pids_limit` are sized against `MAX_SESSIONS`. No pricing/cost env — usage is
   counted in tokens per model name, so there is no rate table.
-- Editing image content here + pushing rebuilds the image; changing how it's run (or adding a host) means
-  editing that compose file in DockerOps.
+- Changing how it's RUN (or adding a host) is a DockerOps compose edit; image content edits land here.
 - The hub's `/data` volume (home to `state.json`) also holds the **durable session archive**
   (`/data/archive/` — files + a `node:sqlite` FTS index), which must be a persisted volume. Overridable
   via `ARCHIVE_DIR`/`ARCHIVE_DB`.
