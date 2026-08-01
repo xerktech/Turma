@@ -69,6 +69,7 @@ fun ArchiveScreen(onBack: () -> Unit, vm: ArchiveViewModel = viewModel()) {
             OutlinedTextField(
                 value = ui.query, onValueChange = vm::onQuery,
                 label = { Text("Search ended sessions") },
+                keyboardOptions = SentenceCapsKeyboard,
                 singleLine = true, modifier = Modifier.fillMaxWidth().padding(12.dp),
             )
             if (ui.openLoading || ui.searching) CircularProgressIndicator(Modifier.padding(12.dp))

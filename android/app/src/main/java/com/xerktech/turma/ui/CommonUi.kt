@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
@@ -34,6 +35,7 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -142,6 +144,15 @@ private const val ARM_MS = 3500L
 
 // ---- fields ----------------------------------------------------------------
 
+/**
+ * Keyboard options for prose text fields — auto-capitalize the first letter of
+ * each sentence (XERK-166). This matches mobile browsers, which default
+ * `<input>`/`<textarea>` to `autocapitalize="sentences"` on the web UI; Compose
+ * defaults to [KeyboardCapitalization.None], so Android needs it set explicitly.
+ * Structured/identifier fields (the login URL/username/password) opt out.
+ */
+val SentenceCapsKeyboard = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences)
+
 /** Text field styled to the web `.field`: field-fill, hairline border, accent focus. */
 @Composable
 fun TurmaField(
@@ -158,6 +169,7 @@ fun TurmaField(
         label = { Text(label) },
         singleLine = singleLine,
         visualTransformation = visualTransformation,
+        keyboardOptions = SentenceCapsKeyboard,
         modifier = modifier,
         shape = RoundedCornerShape(11.dp),
         colors = OutlinedTextFieldDefaults.colors(

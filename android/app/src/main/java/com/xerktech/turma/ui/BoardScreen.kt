@@ -1049,16 +1049,19 @@ private fun CreateTicketSheet(
             OutlinedTextField(
                 summary, { summary = it },
                 label = { Text("Title") }, singleLine = true,
+                keyboardOptions = SentenceCapsKeyboard,
                 modifier = Modifier.fillMaxWidth(),
             )
             OutlinedTextField(
                 description, { description = it },
                 label = { Text("Description (optional)") }, minLines = 3, maxLines = 8,
+                keyboardOptions = SentenceCapsKeyboard,
                 modifier = Modifier.fillMaxWidth(),
             )
             OutlinedTextField(
                 labels, { labels = it },
                 label = { Text("${createLabelWord(source, true)}s — comma-separated (optional)") },
+                keyboardOptions = SentenceCapsKeyboard,
                 singleLine = true, modifier = Modifier.fillMaxWidth(),
             )
 
