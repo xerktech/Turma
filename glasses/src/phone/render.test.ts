@@ -138,7 +138,28 @@ describe("phone render", () => {
     expect(html).toContain("Fix the thing");
     expect(html).toContain("ACME-1");
     expect(html).toMatch(/data-board-refresh/);
+    expect(html).toMatch(/data-new-ticket/);
     expect(html).toContain('id="ph-detail"'); // the detail modal container
+    expect(html).toContain('id="ph-create"'); // the create modal container
+  });
+
+  it("a drag move override places the ticket in the dropped column", () => {
+    const st = state({
+      agents: [
+        agent({ key: "h1", jira: { available: true, siteKey: "acme.atlassian.net", user: "me", fetchedAt: "2026-08-01T00:00:00Z",
+          tickets: [{ key: "ACME-1", summary: "Move me", statusCategory: "todo", status: "To Do", updated: "2026-08-01T00:00:00Z", project: "ACME" }] } }),
+      ],
+    });
+    // No override: the card sits under To Do.
+    const plain = boardBodyHtml(st);
+    const todoIdx = plain.indexOf("To Do");
+    const inprogIdx = plain.indexOf("In Progress");
+    expect(plain.indexOf("Move me")).toBeGreaterThan(todoIdx);
+    expect(plain.indexOf("Move me")).toBeLessThan(inprogIdx);
+    // With a move override to done, the card renders in the Done column.
+    const moves = new Map<string, unknown>([["acme.atlassian.net\x00ACME-1", { category: "done", pending: true, at: 0 }]]);
+    const moved = boardBodyHtml(st, moves);
+    expect(moved.indexOf("Move me")).toBeGreaterThan(moved.indexOf("Done"));
   });
 
   it("phoneHtml shows the shell (header org menu + bottom nav) on the sessions tab", () => {

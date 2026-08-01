@@ -217,6 +217,27 @@ describe("phone controller", () => {
     expect(root.textContent).toContain("ACME-99"); // the created-ticket confirmation
   });
 
+  it("long-press dragging a card to another column moves its status via setTicketStatus", () => {
+    vi.useFakeTimers();
+    try {
+      state = { ...homeState(), agents: [agent({ key: "host-a", online: true, jira: { available: true, siteKey: "acme.atlassian.net", user: "me", fetchedAt: "2026-08-01T00:00:00Z",
+        tickets: [{ key: "ACME-1", summary: "Move me", statusCategory: "todo", status: "To Do", updated: "2026-08-01T00:00:00Z", project: "ACME" }] } })] };
+      handle.render(state);
+      root.querySelector<HTMLElement>('[data-tab="board"]')!.click();
+      const card = root.querySelector<HTMLElement>('.kanban-card[data-key="ACME-1"]')!;
+      const doneCol = root.querySelector<HTMLElement>('[data-cat="done"]')!;
+      (document as unknown as { elementFromPoint: () => Element }).elementFromPoint = () => doneCol;
+      const pe = (type: string, x: number, y: number): MouseEvent => new MouseEvent(type, { clientX: x, clientY: y, bubbles: true, cancelable: true });
+      card.dispatchEvent(pe("pointerdown", 10, 10));
+      vi.advanceTimersByTime(230); // the long-press fires -> a drag starts
+      root.dispatchEvent(pe("pointermove", 300, 50));
+      root.dispatchEvent(pe("pointerup", 300, 50));
+      expect(client.setTicketStatus).toHaveBeenCalledWith("acme.atlassian.net", "ACME-1", { category: "done" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("the sign-out affordance calls back out", () => {
     root.querySelector<HTMLElement>("[data-signout]")!.click();
     expect(onSignOut).toHaveBeenCalledTimes(1);
