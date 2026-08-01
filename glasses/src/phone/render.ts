@@ -43,40 +43,25 @@ export function esc(s: unknown): string {
   );
 }
 
-// Each org's manual name override (the agent's BOARD_ORG_NAME, stamped on the
-// jira block as `orgName`), keyed by siteKey — so the phone shows the operator's
-// chosen name, not the derived default.
-function orgOverrides(state: AppState): Map<string, string> {
-  const m = new Map<string, string>();
-  for (const a of state.agents) {
-    const key = siteKeyOf(a);
-    const o = a.jira?.orgName;
-    if (key && o && !m.has(key)) m.set(key, o);
-  }
-  return m;
-}
-
 // The org label for a siteKey, via board.js's own orgName: the manual override
-// wins, else the site host minus the Jira suffix / the last path segment of an
-// Azure collection key. Value routed on stays the full siteKey.
+// (BOARD_ORG_NAME) wins, else the site host minus the Jira suffix / the last path
+// segment of an Azure collection key. Value routed on stays the full siteKey.
 export function orgLabel(siteKey: string, override?: string | null): string {
   if (!siteKey) return "All orgs";
   return Board.orgName(siteKey, override);
 }
 
-// The distinct orgs the fleet reports, for the header filter menu.
-export function orgOptions(state: AppState): { key: string; label: string }[] {
-  const overrides = orgOverrides(state);
-  const seen = new Set<string>();
-  const out: { key: string; label: string }[] = [];
-  for (const a of state.agents) {
-    const key = siteKeyOf(a);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push({ key, label: orgLabel(key, overrides.get(key)) });
-  }
-  out.sort((x, y) => x.label.localeCompare(y.label));
-  return out;
+export interface OrgOption { key: string; label: string; count: number; online: boolean; }
+
+// The orgs the fleet reports, for the header filter — derived from board.js's
+// `mergeSites`, exactly like the web's org.js. That is SOURCE-AGNOSTIC, so both
+// Jira and Azure DevOps orgs appear (the direct `agent.jira.siteKey` read this
+// replaces missed the ADO org), and each org carries its own name + ticket count.
+export function orgOptions(state: AppState): OrgOption[] {
+  const sites = Board.mergeSites(state.agents as unknown[]);
+  return sites
+    .map((s) => ({ key: s.siteKey, label: Board.orgName(s.siteKey, (s.orgName as string | undefined) ?? null), count: (s.tickets || []).length, online: !!s.online }))
+    .sort((a, b) => a.label.localeCompare(b.label));
 }
 
 // The one-word state shown on a card, matching the web card's `.state` label.
@@ -318,19 +303,40 @@ export function sessionViewHtml(state: AppState, verbosity: VerbosityPreset, sho
 
 // ---- Shell ----------------------------------------------------------------
 
+// The header org filter — matched to the web's org.js menu: a scoping button
+// carrying the current org's colour dot, opening a menu of "All orgs" + one row
+// per org (colour dot + name + ticket-count chip + an offline marker). Orgs come
+// from mergeSites (ADO included) and colours from board.js's orgColorMap honouring
+// the hub's manual pins, so the phone's dots match the web/Android exactly.
 function orgMenuHtml(state: AppState, open: boolean): string {
   const opts = orgOptions(state);
   if (opts.length === 0) return "";
   const cur = state.orgFilter;
-  const label = cur ? orgLabel(cur, orgOverrides(state).get(cur)) : "All orgs";
-  const items = [{ key: "", label: "All orgs" }, ...opts]
-    .map((o) => `<button class="ph-org-item${o.key === cur ? " cur" : ""}" data-org="${esc(o.key)}">${esc(o.label)}</button>`)
-    .join("");
+  const colorMap = Board.orgColorMap(opts.map((o) => o.key), state.orgColors);
+  const total = opts.reduce((n, o) => n + o.count, 0);
+  const curOpt = cur ? opts.find((o) => o.key === cur) : null;
+  const curLabel = cur ? (curOpt?.label || orgLabel(cur)) : "All orgs";
+  const curColor = cur ? colorMap.get(cur) || "" : "";
+
+  const row = (key: string, label: string, count: number, online: boolean): string => {
+    const color = key ? colorMap.get(key) || "" : "";
+    return (
+      `<button class="ph-org-item${key === cur ? " cur" : ""}" data-org="${esc(key)}">` +
+      (key ? `<span class="ph-org-dot" style="--org:${color}"></span>` : `<span class="ph-org-dot ph-org-dot-all"></span>`) +
+      `<span class="ph-org-name">${esc(label)}</span>` +
+      `<span class="ph-org-count">${count}</span>` +
+      (key && !online ? `<span class="ph-org-off">offline</span>` : "") +
+      `</button>`
+    );
+  };
+  const items = row("", "All orgs", total, true) +
+    opts.map((o) => row(o.key, o.label, o.count, o.online)).join("");
+
   return (
     `<div class="ph-org">` +
     `<button class="ph-org-btn${cur ? " scoped" : ""}" data-org-toggle="1">` +
-    (cur ? `<span class="ph-org-dot"></span>` : "") +
-    `${esc(label)} <span class="ph-chev">▾</span></button>` +
+    (cur && curColor ? `<span class="ph-org-dot" style="--org:${curColor}"></span>` : "") +
+    `<span class="ph-org-btn-label">${esc(curLabel)}</span> <span class="ph-chev">▾</span></button>` +
     (open ? `<div class="ph-org-menu">${items}</div>` : "") +
     `</div>`
   );

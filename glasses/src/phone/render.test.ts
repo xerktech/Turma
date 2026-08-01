@@ -40,7 +40,17 @@ describe("phone render", () => {
 
   it("orgOptions shows the manual org name from the agent's jira block", () => {
     const st = state({ agents: [agent({ key: "a", jira: { siteKey: "acme.atlassian.net", orgName: "Acme Corp" } })] });
-    expect(orgOptions(st)).toEqual([{ key: "acme.atlassian.net", label: "Acme Corp" }]);
+    expect(orgOptions(st)).toEqual([{ key: "acme.atlassian.net", label: "Acme Corp", count: 0, online: true }]);
+  });
+
+  it("orgOptions includes an Azure DevOps org (mergeSites is source-agnostic)", () => {
+    const st = state({
+      agents: [
+        agent({ key: "a", jira: { source: "azure", siteKey: "dev.azure.com/myorg", orgName: "My Org",
+          tickets: [{ key: "1" }, { key: "2" }] } }),
+      ],
+    });
+    expect(orgOptions(st)).toEqual([{ key: "dev.azure.com/myorg", label: "My Org", count: 2, online: true }]);
   });
 
   it("card tints honour the hub's org-colour pins (matching the web/Android)", () => {

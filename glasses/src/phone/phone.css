@@ -71,22 +71,31 @@
   background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
   padding: 6px 12px; cursor: pointer;
 }
-.ph-org-btn.scoped { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.ph-org-btn.scoped { color: var(--ink); border-color: var(--border); font-weight: 600; }
 .ph-org-btn .ph-chev { color: var(--muted); font-size: 10px; }
-.ph-org-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); flex: none; }
+.ph-org-btn-label { max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ph-org-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--org, var(--accent)); flex: none; }
+.ph-org-dot-all { background: linear-gradient(135deg, var(--s1), var(--s5)); }
 .ph-org-menu {
   position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;
-  min-width: 190px; max-height: 62vh; overflow: auto;
+  min-width: 210px; max-height: 62vh; overflow: auto;
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--radius-md); box-shadow: 0 8px 24px rgba(0,0,0,0.18); padding: 6px;
 }
 .ph-org-item {
-  display: block; width: 100%; text-align: left; font: inherit; font-size: 13px;
-  color: var(--ink); background: none; border: 0; border-radius: 7px;
-  padding: 9px 10px; cursor: pointer;
+  display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
+  font: inherit; font-size: 13px; color: var(--ink); background: none; border: 0;
+  border-radius: 7px; padding: 9px 10px; cursor: pointer;
 }
 .ph-org-item:hover { background: color-mix(in srgb, var(--ink) 6%, transparent); }
-.ph-org-item.cur { color: var(--accent); font-weight: 600; }
+.ph-org-item.cur { font-weight: 600; }
+.ph-org-item .ph-org-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ph-org-item .ph-org-count {
+  flex: none; min-width: 20px; text-align: center; font-size: 11px; font-weight: 600;
+  color: var(--muted); background: color-mix(in srgb, var(--ink) 8%, transparent);
+  border-radius: 999px; padding: 1px 7px;
+}
+.ph-org-item .ph-org-off { flex: none; font-size: 10px; color: var(--warning, #d08700); text-transform: uppercase; letter-spacing: 0.04em; }
 
 .ph-signout {
   display: inline-grid; place-items: center;
