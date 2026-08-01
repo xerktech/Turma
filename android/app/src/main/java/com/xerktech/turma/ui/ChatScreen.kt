@@ -525,6 +525,7 @@ private fun ChatFooter(
             OutlinedTextField(
                 value = draft, onValueChange = onDraft,
                 placeholder = { Text("Message…") },
+                keyboardOptions = SentenceCapsKeyboard,
                 modifier = Modifier.weight(1f),
                 maxLines = 4,
             )

@@ -66,15 +66,17 @@ fun SpawnDialog(
                     OutlinedTextField(
                         prompt, { prompt = it },
                         label = { Text("Initial task prompt (optional)") },
+                        keyboardOptions = SentenceCapsKeyboard,
                         modifier = Modifier.weight(1f),
                     )
                     VoiceButton(onText = { prompt = listOf(prompt, it).filter { s -> s.isNotBlank() }.joinToString(" ") })
                 }
-                OutlinedTextField(label, { label = it }, label = { Text("Label (optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(label, { label = it }, label = { Text("Label (optional)") }, keyboardOptions = SentenceCapsKeyboard, singleLine = true, modifier = Modifier.fillMaxWidth())
                 if (!isRoot) {
                     OutlinedTextField(
                         baseRef, { baseRef = it },
                         label = { Text("Base branch (default: repo default)") },
+                        keyboardOptions = SentenceCapsKeyboard,
                         singleLine = true, modifier = Modifier.fillMaxWidth(),
                     )
                 }
@@ -350,6 +352,7 @@ private fun ClonePicker(
             OutlinedTextField(
                 search, { search = it },
                 label = { Text("Search repos…") }, singleLine = true,
+                keyboardOptions = SentenceCapsKeyboard,
                 enabled = agent.online, modifier = Modifier.fillMaxWidth(),
             )
         }
@@ -415,6 +418,7 @@ private fun ClonePicker(
             OutlinedTextField(
                 free, { free = it },
                 label = { Text("or owner/repo") }, singleLine = true,
+                keyboardOptions = SentenceCapsKeyboard,
                 enabled = agent.online, modifier = Modifier.weight(1f),
             )
             TextButton(

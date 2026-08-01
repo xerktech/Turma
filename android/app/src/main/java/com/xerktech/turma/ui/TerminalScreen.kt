@@ -232,6 +232,7 @@ private fun TerminalInputBar(text: String, onText: (String) -> Unit, onSend: () 
             value = text,
             onValueChange = onText,
             placeholder = { Text("Type into the terminal…") },
+            keyboardOptions = SentenceCapsKeyboard,
             modifier = Modifier.weight(1f),
             maxLines = 4,
         )
