@@ -89,8 +89,8 @@ describe("phone render", () => {
     });
     const html = sessionViewHtml(st);
     expect(html).toContain("Pick one");
-    expect(html).toMatch(/data-answer="0"[^>]*>1\. A/);
-    expect(html).toMatch(/data-answer="1"[^>]*>2\. B/);
+    expect(html).toMatch(/data-answer="0"[\s\S]*?>1<\/span>A/);
+    expect(html).toMatch(/data-answer="1"[\s\S]*?>2<\/span>B/);
     expect(html).toContain('id="ph-input"');
     expect(html).toMatch(/data-back/);
   });
