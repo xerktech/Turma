@@ -4195,10 +4195,11 @@ JIRA_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
 # contract: the hub always sees every field, never a partial dict.
 #
 # `configured` is creds-present, which is NOT the same as `available` (a
-# successful poll). A host whose very first poll failed looks identical to an
-# unconfigured one on every other field — both are available=False/siteKey=None
-# — so this is the only thing that lets the hub aim a manual refresh at the
-# configured-but-failing host that most needs the retry.
+# successful poll). It is what lets the hub aim a manual refresh at the
+# configured-but-failing host that most needs the retry. A configured block also
+# carries its locally-derived `siteKey` (see jira_empty/azure_empty), so a
+# failing org is still visible on the board and org filters — `available` is what
+# tells the two apart, not the presence of a siteKey.
 JIRA_EMPTY = {"available": False, "configured": False, "source": "jira",
               "site": None, "siteKey": None, "user": None, "fetchedAt": None,
               "error": None, "truncated": False, "tickets": []}
@@ -4216,9 +4217,23 @@ def jira_configured():
 def jira_empty():
     """The off/never-polled block, stamped with whether creds are present. The
     creds are read once at import, so `configured` is fixed for the process —
-    every later block (success or fail-open) carries it forward unchanged."""
+    every later block (success or fail-open) carries it forward unchanged.
+
+    A CONFIGURED org's identity (`site`/`siteKey`, and the operator's `orgName`
+    override) is derivable from local config alone — no successful poll needed —
+    so it is stamped here too. That is what makes a configured-but-unreachable
+    org (its very first poll failing, e.g. a self-hosted host behind a downed
+    VPN) still appear on the board and in every org filter, as an errored,
+    zero-ticket org, instead of vanishing until a poll finally succeeds. The
+    siteKey is byte-identical to the one a successful poll produces, so nothing
+    churns when it recovers."""
     block = dict(JIRA_EMPTY)
     block["configured"] = jira_configured()
+    if block["configured"]:
+        site = normalize_jira_site(JIRA_SITE)
+        block["site"] = site
+        block["siteKey"] = site
+        block["orgName"] = BOARD_ORG_NAME or None
     return block
 
 
@@ -4794,9 +4809,17 @@ def azure_configured():
 
 def azure_empty():
     """The off/never-polled Azure block, stamped with whether creds are present —
-    the counterpart of jira_empty(), same full-schema contract."""
+    the counterpart of jira_empty(), same full-schema contract. A configured org
+    carries its locally-derived identity (site/siteKey/orgName) even before a
+    successful poll, so a configured-but-unreachable Azure org still shows up on
+    the board and org filters instead of vanishing (see jira_empty)."""
     block = dict(AZDO_EMPTY)
     block["configured"] = azure_configured()
+    if block["configured"]:
+        site = normalize_azure_site(AZDO_URL)
+        block["site"] = site
+        block["siteKey"] = site
+        block["orgName"] = BOARD_ORG_NAME or None
     return block
 
 
