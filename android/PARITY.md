@@ -82,6 +82,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   with a floating ghost card in `ui/BoardScreen.kt`. The pure logic is unit-tested and the app compiles
   (`assembleDebug`); the gesture itself has no instrumented test (no emulator in CI, like every other
   Compose interaction here).
+- **Drag edge auto-scroll (XERK-179).** While a card is dragged, holding it near the board's left/right
+  edge scrolls the column strip under the finger, so an off-screen column is reachable — the XERK-141
+  port had skipped web `board.html`'s `edgeScroll` and a phone-width board couldn't drop past the
+  visible columns. A per-frame loop in `ui/BoardScreen.kt` (scrolls while the finger holds still, where
+  the web steps per pointermove) drives `core/Board.kt` `edgeScrollStep` (48dp zones, speed ramping
+  with depth), re-resolving the drop column as the columns move. Tested in `BoardTest`.
 - **On-demand ticket detail loads (XERK-83).** The detail sheet fetched once and returned null on the
   hub's 202-while-fetching, so a first click spun "Loading details…" forever; it also decoded the
   `{issue, fetchedAt}` envelope's top level straight into `JiraIssueDetail`, blanking every field on a
