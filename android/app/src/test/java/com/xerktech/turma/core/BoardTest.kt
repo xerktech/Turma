@@ -582,6 +582,31 @@ class BoardTest {
         assertEquals(SweepVerdict.CLEAR, moveSweepVerdict(m, "todo", 7_001, 120_000, 6_000))
     }
 
+    // ---- drag edge auto-scroll (XERK-179): parity with board.html edgeScroll ----
+
+    @Test fun `edgeScrollStep is zero in the middle and full-speed at the edges`() {
+        // Strip 0..1000, 48px zones, 20px max step.
+        assertEquals(0f, edgeScrollStep(500f, 0f, 1000f, 48f, 20f))
+        assertEquals(0f, edgeScrollStep(48f, 0f, 1000f, 48f, 20f))    // on the inner boundary
+        assertEquals(0f, edgeScrollStep(952f, 0f, 1000f, 48f, 20f))
+        assertEquals(-20f, edgeScrollStep(0f, 0f, 1000f, 48f, 20f))   // hard left
+        assertEquals(20f, edgeScrollStep(1000f, 0f, 1000f, 48f, 20f)) // hard right
+    }
+
+    @Test fun `edgeScrollStep ramps with depth into the zone`() {
+        assertEquals(-10f, edgeScrollStep(24f, 0f, 1000f, 48f, 20f))  // halfway into the left zone
+        assertEquals(10f, edgeScrollStep(976f, 0f, 1000f, 48f, 20f))  // halfway into the right zone
+    }
+
+    @Test fun `edgeScrollStep clamps past the strip and needs room for two zones`() {
+        // A pointer past the strip edge (the finger can wander off it) caps at max.
+        assertEquals(-20f, edgeScrollStep(-100f, 0f, 1000f, 48f, 20f))
+        assertEquals(20f, edgeScrollStep(1100f, 0f, 1000f, 48f, 20f))
+        // A strip too narrow for two distinct zones never scrolls, nor a zero zone.
+        assertEquals(0f, edgeScrollStep(10f, 0f, 90f, 48f, 20f))
+        assertEquals(0f, edgeScrollStep(10f, 0f, 1000f, 0f, 20f))
+    }
+
     // ---- New-ticket creation (XERK-137): parity with board.js/board.html ----
 
     @Test fun `mergeSites carries the tracker source off the freshest block, defaulting jira`() {

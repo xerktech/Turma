@@ -100,6 +100,27 @@ fun moveSweepVerdict(move: MoveState, realCat: String, now: Long, settleMs: Long
     return SweepVerdict.HOLD
 }
 
+/**
+ * How far to auto-scroll the column strip this frame while a dragged card
+ * hovers near its left/right edge — board.html `edgeScroll` (XERK-179): a phone
+ * can't show every column, and once the long-press drag owns the gesture a
+ * swipe can't scroll the strip, so the strip slides under the held card
+ * instead. [x] is the pointer, [left]/[right] the strip's bounds, all in one
+ * coordinate space. Speed ramps linearly from 0 at a zone's inner edge to
+ * [maxStep] at the strip edge (the web scrolls a fixed step per pointermove;
+ * this runs per frame, so it also scrolls while the finger holds still — the
+ * gesture the ticket asks for). 0 outside the zones, or when the strip is too
+ * narrow for two distinct zones.
+ */
+fun edgeScrollStep(x: Float, left: Float, right: Float, edge: Float, maxStep: Float): Float {
+    if (edge <= 0f || right - left <= edge * 2) return 0f
+    return when {
+        x < left + edge -> -maxStep * ((left + edge - x) / edge).coerceAtMost(1f)
+        x > right - edge -> maxStep * ((x - (right - edge)) / edge).coerceAtMost(1f)
+        else -> 0f
+    }
+}
+
 data class BoardSite(
     val siteKey: String,
     val site: String,

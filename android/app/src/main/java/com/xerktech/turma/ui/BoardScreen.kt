@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -48,6 +49,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import android.widget.Toast
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -61,6 +63,7 @@ import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -86,6 +89,7 @@ import com.xerktech.turma.core.ageStr
 import com.xerktech.turma.core.boardColumnOf
 import com.xerktech.turma.core.categoryOf
 import com.xerktech.turma.core.createLabelWord
+import com.xerktech.turma.core.edgeScrollStep
 import com.xerktech.turma.core.filterSites
 import com.xerktech.turma.core.mergeSites
 import com.xerktech.turma.core.orgColorMap
@@ -114,6 +118,11 @@ private data class DragState(
     val size: IntSize,
     val overCat: String?,
 )
+
+/** Edge auto-scroll while dragging (XERK-179): zone width (web EDGE_SCROLL_PX)
+ *  and the scroll speed at the strip's very edge. */
+private val DRAG_EDGE_ZONE = 48.dp
+private val DRAG_EDGE_MAX_SPEED = 1000.dp // per second, at full zone depth
 
 @Composable
 fun BoardScreen(
@@ -180,12 +189,37 @@ fun BoardScreen(
             // its new column until the board's own poll catches up.
             var drag by remember { mutableStateOf<DragState?>(null) }
             val colBounds = remember { mutableStateMapOf<String, Rect>() }
-            var boxOrigin by remember { mutableStateOf(Offset.Zero) }
+            var boxBounds by remember { mutableStateOf(Rect.Zero) }
+            val hScroll = rememberScrollState()
+            // Auto-scroll the strip while the drag hovers near an edge (XERK-179,
+            // board.html edgeScroll): the long-press drag owns the gesture, so the
+            // strip must scroll itself for a card to reach an off-screen column —
+            // the columns slide under the held finger. A frame loop rather than a
+            // per-move step, so it keeps scrolling while the finger holds still;
+            // each column re-reports its bounds as it moves, so the drop target is
+            // re-resolved even though the pointer itself hasn't moved.
+            val density = LocalDensity.current
+            LaunchedEffect(drag != null) {
+                if (drag == null) return@LaunchedEffect
+                val edgePx = with(density) { DRAG_EDGE_ZONE.toPx() }
+                val speedPx = with(density) { DRAG_EDGE_MAX_SPEED.toPx() }
+                var last = 0L
+                while (drag != null) {
+                    val now = withFrameNanos { it }
+                    val dt = if (last == 0L) 0f else (now - last) / 1_000_000_000f
+                    last = now
+                    val d = drag ?: break
+                    val step = edgeScrollStep(d.pointer.x, boxBounds.left, boxBounds.right, edgePx, speedPx * dt)
+                    if (step != 0f) hScroll.scrollBy(step)
+                    val over = colBounds.entries.firstOrNull { it.value.contains(d.pointer) }?.key
+                    if (over != d.overCat) drag = d.copy(overCat = over)
+                }
+            }
             Box(
-                Modifier.fillMaxSize().onGloballyPositioned { boxOrigin = it.positionInWindow() },
+                Modifier.fillMaxSize().onGloballyPositioned { boxBounds = it.boundsInWindow() },
             ) {
                 Row(
-                    Modifier.fillMaxSize().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
+                    Modifier.fillMaxSize().horizontalScroll(hScroll).padding(horizontal = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     for ((cat, title) in BOARD_CATEGORIES) {
@@ -234,7 +268,7 @@ fun BoardScreen(
                 }
                 // The floating ghost of the card being dragged, following the finger.
                 drag?.let { d ->
-                    val local = d.pointer - boxOrigin
+                    val local = d.pointer - boxBounds.topLeft
                     TurmaCard(
                         Modifier
                             .width(280.dp)
