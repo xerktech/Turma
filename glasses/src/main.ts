@@ -23,9 +23,9 @@ import { HubAudioDictation, PromptDictation } from "./dictation.ts";
 import type { Dictation } from "./dictation.ts";
 import { HubClient } from "./hub-client.ts";
 import { LiveTail } from "./live.ts";
-import { createPhoneBridge, type PhoneBridge } from "./phone-bridge.ts";
 import { BridgeStorage, BrowserStorage, type KeyValueStorage } from "./storage.ts";
-import { initPhoneLogin } from "./phone-login.ts";
+import { initPhoneLogin, signOut } from "./phone-login.ts";
+import { mountPhone, type PhoneHandle } from "./phone/phone.ts";
 import { pretextMeasure, setDefaultMeasure } from "./text-wrap.ts";
 import { installLifecycle, onAbnormalOrSystemExit, onForegroundEnter, onForegroundExit } from "./lifecycle.ts";
 
@@ -66,16 +66,17 @@ async function main(): Promise<void> {
 }
 
 async function mainDom(): Promise<void> {
-  // Dev/browser path: the signed-in view shows the green-text glasses mirror
-  // (#glasses-display) rather than the embedded dashboard iframe.
+  // Dev/browser path: the glasses render to the green-text corner mirror
+  // (#glasses-display); the native phone UI mounts into #phone just like on the
+  // device, so the whole companion is exercisable in the browser.
   document.body.classList.add("backend-dom");
   const storage = new BrowserStorage();
   await boot(storage, new DomDisplay(), () => new PromptDictation());
 }
 
 async function mainBridge(bridge: ResolvedBridge): Promise<void> {
-  // Device path: the glasses render via the SDK, and the phone's signed-in
-  // view embeds the real hub dashboard (#dashboard iframe).
+  // Device path: the glasses render via the SDK, and the phone screen is the
+  // native companion (mounted by boot()).
   document.body.classList.add("backend-bridge");
   // These three are independent (two lazy bridge-path-only module imports —
   // audio.ts is Task 7's real G2-mic dictation, both structural-only like
@@ -92,18 +93,13 @@ async function mainBridge(bridge: ResolvedBridge): Promise<void> {
   const storage: KeyValueStorage = new BridgeStorage(bridge);
 
   const display = new EvenHubDisplay(bridge);
-  // Phone companion bridge (XERK-171): the App's onEnterSession is passed into
-  // boot() below, but the bridge that consumes it can only be built once boot()
-  // hands back the App — a late-bound ref closes that loop. onEnterSession only
-  // fires after app.start(), by which point phoneBridge is set.
-  let phoneBridge: PhoneBridge | null = null;
   // Lifecycle handlers MUST be registered before app.start() — start() is
   // what subscribes the display's onEvenHubEvent listener, and the host may
   // call __getStateSnapshot/__restoreState (or deliver FOREGROUND_EXIT) as
   // soon as events go live. Registering afterwards would silently drop
   // anything that fires during the boot window (the "register before
   // onEvenHubEvent" rule) — hence the beforeStart hook.
-  const app = await boot(
+  await boot(
     storage,
     display,
     (client, config) =>
@@ -138,30 +134,8 @@ async function mainBridge(bridge: ResolvedBridge): Promise<void> {
             return;
         }
       });
-    },
-    (hostKey, sessionId) => phoneBridge?.notifyEnterSession(hostKey, sessionId)
+    }
   );
-
-  // The embedded phone view lives in the #dashboard iframe (phone-login.ts owns
-  // its src). Bridge its postMessages to the App and back: the page tells us a
-  // session was opened / the org filter changed; we tell the page when the
-  // glasses enter a session. The iframe's origin IS the hub (phone-login points
-  // it at the hub URL), so we can both target that exact origin on the way out
-  // and REJECT any message that didn't come from it on the way in — no wildcard,
-  // no trusting a `source` tag alone.
-  const frame = document.getElementById("dashboard") as HTMLIFrameElement | null;
-  const hubOrigin = (): string | null => {
-    try { return frame?.src ? new URL(frame.src).origin : null; } catch { return null; }
-  };
-  phoneBridge = createPhoneBridge(app, (msg) => {
-    const origin = hubOrigin();
-    if (origin) frame?.contentWindow?.postMessage(msg, origin);
-  });
-  window.addEventListener("message", (e) => {
-    const origin = hubOrigin();
-    if (!origin || e.origin !== origin) return; // only the embedded hub page is trusted
-    phoneBridge?.handleMessage(e.data);
-  });
 }
 
 // Shared wiring for both backends: load config, start the phone-side
@@ -175,13 +149,9 @@ async function boot(
   storage: KeyValueStorage,
   display: GlassesDisplay,
   makeDictation: (client: HubClient, config: Config) => Dictation,
-  beforeStart?: (app: App) => void,
-  // Bridge path only: fired when the glasses ENTER a session, so the embedded
-  // phone view can follow (XERK-171). Undefined on the DOM dev path (no iframe).
-  onEnterSession?: (hostKey: string, sessionId: string) => void
+  beforeStart?: (app: App) => void
 ): Promise<App> {
   const config = await loadConfig(storage);
-  void initPhoneLogin(storage);
 
   const client = new HubClient({ config });
   const dictation = makeDictation(client, config);
@@ -191,7 +161,28 @@ async function boot(
   // (agent tunnel offline, dev mock hub with no /live route) the app falls back
   // to the poll unchanged.
   const liveTail = new LiveTail({ hubClient: client, hubUrl: config.hubUrl });
-  const app = new App({ client, display, dictation, liveTail, pollMs: config.pollMs, onEnterSession });
+
+  // The native phone companion (XERK-171) renders from the App's state and drives
+  // it in-process. It's mounted only once the user is signed in (onSignedIn), so
+  // it's late-bound here; the App's onState/onEnterSession fan out to it once it
+  // exists (both fire only after app.start(), i.e. after sign-in has mounted it).
+  let phone: PhoneHandle | null = null;
+  const app = new App({
+    client,
+    display,
+    dictation,
+    liveTail,
+    pollMs: config.pollMs,
+    onState: (state) => phone?.render(state),
+    onEnterSession: (hostKey, sessionId) => phone?.enterFromGlasses(hostKey, sessionId),
+  });
+
+  void initPhoneLogin(storage, () => {
+    const root = document.getElementById("phone");
+    if (root && !phone) {
+      phone = mountPhone({ root, app, client, onSignOut: () => void signOut(storage) });
+    }
+  });
 
   beforeStart?.(app);
   await app.start();

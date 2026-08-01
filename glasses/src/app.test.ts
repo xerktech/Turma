@@ -1611,8 +1611,10 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
     });
   });
 
-  // ---- phone companion bridge (XERK-171) ------------------------------------
-  describe("phone bridge", () => {
+  // ---- phone companion App API (XERK-171) -----------------------------------
+  // The native phone UI drives these in-process (setOrgFilter/enterSession) and
+  // follows onEnterSession; no bridge, no postMessage.
+  describe("phone companion App API", () => {
     function jiraAgent(key: string, siteKey: string, sessions: SessionInfo[]): AgentInfo {
       return agent({ key, device: key, jira: { siteKey }, sessions });
     }

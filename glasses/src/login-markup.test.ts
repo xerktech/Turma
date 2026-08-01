@@ -58,8 +58,8 @@ describe("login markup", () => {
     // A missing id throws at boot, inside a `void initPhoneLogin(...)` whose
     // rejection is silent — the form then falls back to a native GET submit.
     for (const id of [
-      "login", "app", "dashboard", "login-form", "hub-url", "hub-user",
-      "hub-password", "login-submit", "login-error", "sign-out", "app-user",
+      "login", "app", "login-form", "hub-url", "hub-user",
+      "hub-password", "login-submit", "login-error",
     ]) {
       expect(html, `missing id="${id}"`).toContain(`id="${id}"`);
     }

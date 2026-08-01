@@ -79,41 +79,26 @@
 
   .foot { margin-top: 20px; color: var(--muted); font-size: 11.5px; text-align: center; }
 
-  /* Signed-in view: a slim bar plus the real hub dashboard embedded as a
-     full-bleed iframe (bridge/device path), or the green-text glasses mirror
-     (DOM dev path). Hidden until the user authenticates. */
+  /* Signed-in view: the dedicated native phone companion (XERK-171) fills the
+     screen (the phone UI mounts itself position:fixed inset:0 into #phone). On
+     the DOM dev path a small green-text mirror of what the GLASSES are rendering
+     floats in the corner, so both surfaces are visible while developing. Hidden
+     until the user authenticates. */
   #app[hidden] { display: none; }
-  #app {
-    position: fixed; inset: 0; display: flex; flex-direction: column;
-    background: var(--page);
-  }
-  .bar {
-    flex: none; display: flex; align-items: center; justify-content: space-between;
-    gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--border);
-    background: var(--surface);
-  }
-  .bar .who { color: var(--ink-2); font-size: 12.5px; }
-  .bar .who b { color: var(--ink); font-weight: 650; }
-  .bar button {
-    margin: 0; width: auto; color: var(--accent); background: none;
-    border: 1px solid var(--border); border-radius: 8px;
-    padding: 6px 12px; font-size: 12.5px; font-weight: 600;
-  }
-  .bar button:hover { filter: none; background: rgba(42,120,214,0.08); }
+  #phone { position: fixed; inset: 0; }
 
-  /* The embedded dashboard — shown on the device (bridge) path. */
-  #dashboard { flex: 1; width: 100%; border: 0; display: none; }
-  body.backend-bridge #dashboard { display: block; }
-
-  /* The glasses text mirror — shown on the DOM dev path (npm run dev). */
-  #glasses-display {
-    display: none; margin: 12px;
+  /* The glasses text mirror — dev only (npm run dev), a small corner overlay
+     ABOVE the phone UI so you can watch the glasses follow the phone. */
+  #glasses-display { display: none; }
+  body.backend-dom #glasses-display {
+    display: block; position: fixed; right: 10px; bottom: 10px; z-index: 1000;
+    max-width: 46vw; max-height: 40vh; overflow: auto; opacity: 0.92;
     background: #000; color: #7fffb0;
-    font-family: "Courier New", monospace; font-size: 14px; line-height: 1.3;
-    padding: 12px; white-space: pre; outline: none;
+    font-family: "Courier New", monospace; font-size: 11px; line-height: 1.3;
+    padding: 10px; white-space: pre; outline: none;
     border-radius: 10px; border: 1px solid var(--border);
+    box-shadow: 0 6px 20px rgba(0,0,0,0.4);
   }
-  body.backend-dom #glasses-display { display: block; }
 </style>
 
 <!-- Login card — matches the web dashboard's login page, plus a hub URL field
@@ -153,16 +138,11 @@
   <div class="foot">Even Realities G2 · Single-user access</div>
 </div>
 
-<!-- Signed-in view, shown after a successful login: the real hub dashboard
-     embedded as a full-bleed iframe (device path), or the glasses text mirror
-     (DOM dev path). The iframe relies on the hub's SameSite=None; Partitioned
-     session cookie set during sign-in. -->
+<!-- Signed-in view: the dedicated native phone companion (XERK-171) mounts into
+     #phone. On the DOM dev path #glasses-display shows a small corner mirror of
+     what the glasses are rendering, so the phone→glasses sync is visible. -->
 <section id="app" hidden>
-  <div class="bar">
-    <span class="who">Signed in as <b id="app-user"></b></span>
-    <button id="sign-out" type="button">Sign out</button>
-  </div>
-  <iframe id="dashboard" title="Turma dashboard"></iframe>
+  <div id="phone"></div>
   <div id="glasses-display" tabindex="0"></div>
 </section>
 
