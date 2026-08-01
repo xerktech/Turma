@@ -151,6 +151,25 @@ describe("phone controller", () => {
     expect(root.querySelector(".ph-nav")).toBeTruthy(); // left the session view after kill
   });
 
+  it("the Board tab renders the kanban and a card tap opens the ticket detail (via HubClient.jiraDetail)", async () => {
+    state = { ...homeState(), agents: [agent({ key: "host-a", jira: { available: true, siteKey: "acme.atlassian.net", user: "me", fetchedAt: "2026-08-01T00:00:00Z",
+      tickets: [{ key: "ACME-1", summary: "Fix login", statusCategory: "todo", status: "To Do", updated: "2026-08-01T00:00:00Z", project: "ACME" }] } })] };
+    client.jiraDetail = vi.fn(async () => ({ status: 200 as const, body: { key: "ACME-1", summary: "Fix login", status: "To Do", statusCategory: "todo", type: "Task", description: "do it", comments: [], url: "https://x/ACME-1" } }));
+    client.jiraRefresh = vi.fn(async () => ({ ok: true }));
+    handle.render(state);
+    root.querySelector<HTMLElement>('[data-tab="board"]')!.click();
+    expect(root.querySelector(".kanban-cols")).toBeTruthy();
+    expect(root.textContent).toContain("Fix login");
+    // Refresh
+    root.querySelector<HTMLElement>("[data-board-refresh]")!.click();
+    expect(client.jiraRefresh).toHaveBeenCalled();
+    // Card tap -> detail fetch + panel shown
+    root.querySelector<HTMLElement>('.kanban-card[data-key="ACME-1"]')!.click();
+    expect(client.jiraDetail).toHaveBeenCalledWith("acme.atlassian.net", "ACME-1");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(root.querySelector<HTMLElement>("#ph-detail")!.hidden).toBe(false);
+  });
+
   it("the sign-out affordance calls back out", () => {
     root.querySelector<HTMLElement>("[data-signout]")!.click();
     expect(onSignOut).toHaveBeenCalledTimes(1);

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createInitialState, newSessionState, type AppState } from "../app.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "../types.ts";
 import {
+  boardBodyHtml,
   orgLabel,
   orgOptions,
   phoneHtml,
@@ -61,6 +62,33 @@ describe("phone render", () => {
     expect(html).not.toContain("bravo");
   });
 
+  it("cards carry org tint, PR chips, a ticket chip, and Queued/Ended sections", () => {
+    const st = state({
+      agents: [
+        agent({ key: "h1", jira: { siteKey: "acme.atlassian.net" }, sessions: [
+          session({ id: "sw", summary: "working one", session: signals({ paneBusy: true }), prs: [{ url: "https://github.com/o/r/pull/42", number: 42, state: "Open", ready: "ready" }], ticket: { key: "ACME-9" } }),
+          session({ id: "sq", status: "queued", queuedReason: "capacity", summary: "queued one" }),
+        ], closedSessions: [{ id: "sk", repo: "web", summary: "killed one" } as never] }),
+      ],
+    });
+    const html = sessionsBodyHtml(st);
+    // Org tint: the card carries a --org custom property.
+    expect(html).toMatch(/--org:var\(--s\d\)/);
+    // PR chip + readiness mark.
+    expect(html).toContain("pr-badge");
+    expect(html).toContain("#42");
+    expect(html).toMatch(/pr-ready ready/);
+    // Ticket chip.
+    expect(html).toContain("ACME-9");
+    // Sections.
+    expect(html).toContain("Active");
+    expect(html).toContain("Queued");
+    expect(html).toContain("Ended");
+    expect(html).toContain("waiting for a free session slot"); // queued reason
+    expect(html).toMatch(/data-cancel="sq"/);
+    expect(html).toContain("killed one");
+  });
+
   it("a session card carries its enter hooks and status", () => {
     const st = state({ agents: [agent({ sessions: [session({ id: "sX", summary: "do a thing", session: signals({ paneBusy: true }) })] })] });
     const html = sessionsBodyHtml(st);
@@ -96,6 +124,21 @@ describe("phone render", () => {
     expect(html).toContain("data-term-toggle"); // terminal toggle
     expect(html).toMatch(/data-verb="verbose"/); // verbosity control
     expect(html).toMatch(/data-back/);
+  });
+
+  it("boardBodyHtml renders the kanban (via board.js) with a ticket, a refresh, and a detail modal", () => {
+    const st = state({
+      agents: [
+        agent({ key: "h1", jira: { available: true, siteKey: "acme.atlassian.net", user: "me", fetchedAt: "2026-08-01T00:00:00Z",
+          tickets: [{ key: "ACME-1", summary: "Fix the thing", statusCategory: "todo", status: "To Do", updated: "2026-08-01T00:00:00Z", project: "ACME" }] } }),
+      ],
+    });
+    const html = boardBodyHtml(st);
+    expect(html).toContain("kanban-cols");
+    expect(html).toContain("Fix the thing");
+    expect(html).toContain("ACME-1");
+    expect(html).toMatch(/data-board-refresh/);
+    expect(html).toContain('id="ph-detail"'); // the detail modal container
   });
 
   it("phoneHtml shows the shell (header org menu + bottom nav) on the sessions tab", () => {
