@@ -52,7 +52,7 @@ object PushRegistrar {
 
     private fun sendToken(container: AppContainer, token: String) {
         container.appScope.launch {
-            runCatching { container.client.api.registerDevice(DeviceRequest(token = token)) }
+            runCatching { container.client.api.registerDevice(DeviceRequest(token = token, features = listOf("dismiss"))) }
                 .onFailure { Log.w(TAG, "device register failed: ${it.message}") }
         }
     }
