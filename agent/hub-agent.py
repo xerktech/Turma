@@ -300,6 +300,15 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # (independent of the per-heartbeat TAIL_MSGS above).
 INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "4000"))
 HISTORY_MAX_MSGS = int(os.environ.get("SESSION_HISTORY_MSGS", "200"))
+# Operator messages are EXEMPT from the history window (XERK-186): a
+# tool-heavy session fills HISTORY_MAX_MSGS with tool_use/tool_result turns in
+# minutes, evicting the few messages the operator actually typed — measured
+# over this host's corpus, 43 of 57 interactive transcripts lost operator
+# messages from the on-open view (worst case 1 of 48 shown). _history_entries
+# folds every operator text turn in the WHOLE transcript back into its reply,
+# so the chat always shows every message the operator sent. This cap bounds
+# only that exempt set (newest first), a payload backstop, not a window.
+HISTORY_USER_MSGS = int(os.environ.get("SESSION_HISTORY_USER_MSGS", "200"))
 
 # Transcript parsing is the expensive part; refresh each session's usage every N
 # heartbeats — but staggered (see _usage_slot) so they don't all reparse on the
@@ -2994,14 +3003,91 @@ def _pending_scan(path):
     return delivered, _queued_display(queued), compactions
 
 
+def _history_row(entry):
+    """One parsed transcript entry -> the history feed's row shape, or None to
+    drop it. Rich path: widens inclusion beyond _entry_text — a turn that
+    carries only tool_result blocks (text is None) still has renderable blocks
+    and is kept, so the chat UI can show tool output. transcript_tail keeps the
+    old drop-when-None rule (heartbeat/archive stay lean)."""
+    text = _entry_text(entry)
+    blocks = _entry_blocks(entry, BLOCK_CAPS_FULL)
+    if text is None and not blocks:
+        return None
+    return {
+        "id": _entry_id(entry),
+        "role": _entry_role(entry),
+        "text": (text or "")[:TAIL_MSG_CHARS_FULL],
+        "blocks": blocks or [],
+    }
+
+
+def _is_operator_row(row):
+    """True when a history row renders as an operator (blue) bubble in the
+    chat: user role with at least one text block. This is the same test the
+    web/android/glasses builders apply (a text block on a user entry becomes a
+    user message bubble), so what this keeps is exactly what the operator sees
+    as "a message I sent"."""
+    if row.get("role") != "user":
+        return False
+    return any(b.get("t") == "text" for b in row.get("blocks") or [])
+
+
+# Cheap byte prefilter for the operator-message scan: only `user` entries can
+# be operator messages, and Claude Code writes compact JSON — but test fixtures
+# and any re-serialized transcript may carry a space, so match both spellings.
+# False positives just cost one json.loads; false negatives would hide a
+# message, so the marker must stay a superset of real user lines.
+_USER_LINE_MARKERS = (b'"type":"user"', b'"type": "user"')
+
+
+def _operator_entries(path):
+    """Every operator-authored text message in the WHOLE transcript, oldest
+    first, as _history_row rows (XERK-186).
+
+    The windowed history read below cuts old entries wholesale, and in a
+    tool-heavy session the few messages the operator typed are exactly what a
+    byte/entry window evicts first — the transcript is dominated by
+    tool_use/tool_result traffic. Operator prose is rare (~1% of entries over
+    this host's corpus) and small, so re-reading the whole file for it is
+    affordable for an on-demand call: the byte prefilter skips every
+    non-user line without parsing it (~17ms for an 8 MB transcript)."""
+    rows = []
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                if not any(m in raw for m in _USER_LINE_MARKERS):
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict) or entry.get("type") != "user":
+                    continue
+                row = _history_row(entry)
+                if row is not None and _is_operator_row(row):
+                    rows.append(row)
+    except OSError:
+        return []
+    return rows
+
+
 def _history_entries(path):
     """On-demand `history` read of a transcript: bounded to the last 4 MiB
     (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
-    ~128 KB, tolerant JSONL parse, entries mapped through _entry_text (no
-    duplicated entry->text logic). Returns (entries, byte_capped, queued) —
-    entries oldest first; byte_capped is True when the file is bigger than the
-    4 MiB window, i.e. older content was cut off before parsing even started;
-    queued is the still-queued prompt texts (see _fold_queue_op)."""
+    ~128 KB, tolerant JSONL parse, entries mapped through _history_row (no
+    duplicated entry->text logic). Returns (entries, truncated, queued) —
+    entries oldest first, already capped to the last HISTORY_MAX_MSGS;
+    truncated is True when older content was cut (the file outgrew the byte
+    window, or the entry cap dropped entries); queued is the still-queued
+    prompt texts (see _fold_queue_op).
+
+    One exemption from the window (XERK-186): OPERATOR MESSAGES. Whenever the
+    window cut anything, every operator text turn older than the window is
+    folded back in ahead of it (deduped by id, newest HISTORY_USER_MSGS kept),
+    so however much tool traffic a session generates, the chat can always show
+    every message the operator sent. File order is preserved: any operator row
+    not in the window precedes it in the file, and the scan reads oldest
+    first."""
     read_cap = 1 << 22
     try:
         byte_capped = os.path.getsize(path) > read_cap
@@ -3019,21 +3105,17 @@ def _history_entries(path):
         if entry.get("type") == "queue-operation":
             _fold_queue_op(entry, queued)
             continue
-        text = _entry_text(entry)
-        blocks = _entry_blocks(entry, BLOCK_CAPS_FULL)
-        # Rich path widens inclusion beyond _entry_text: a turn that carries only
-        # tool_result blocks (text is None) still has renderable blocks and is
-        # kept, so the chat UI can show tool output. transcript_tail keeps the
-        # old drop-when-None rule (heartbeat/archive stay lean).
-        if text is None and not blocks:
-            continue
-        entries.append({
-            "id": _entry_id(entry),
-            "role": _entry_role(entry),
-            "text": (text or "")[:TAIL_MSG_CHARS_FULL],
-            "blocks": blocks or [],
-        })
-    return entries, byte_capped, _queued_display(queued)
+        row = _history_row(entry)
+        if row is not None:
+            entries.append(row)
+    truncated = byte_capped or len(entries) > HISTORY_MAX_MSGS
+    window = entries[-HISTORY_MAX_MSGS:]
+    if truncated:
+        shown = {row["id"] for row in window if row.get("id")}
+        older = [row for row in _operator_entries(path)
+                 if row.get("id") and row["id"] not in shown]
+        window = older[-HISTORY_USER_MSGS:] + window
+    return window, truncated, _queued_display(queued)
 
 
 # The Task tool's result text carries the spawned agent's id ("agentId: <id>"),
@@ -8979,11 +9061,12 @@ class SessionManager:
                  "queued": []}
             )
             return
-        entries, byte_capped, queued = _history_entries(path)
-        truncated = byte_capped or len(entries) > HISTORY_MAX_MSGS
+        # _history_entries caps internally (operator messages exempt, XERK-186)
+        # — re-slicing here would evict the exempt rows it folded back in.
+        entries, truncated, queued = _history_entries(path)
         self.history_results.append({
             "sessionId": sid,
-            "entries": entries[-HISTORY_MAX_MSGS:],
+            "entries": entries,
             "truncated": truncated,
             # Still-queued prompts (typed mid-turn, not yet consumed) so the
             # chat's /history fallback shows them like the live tail does.
@@ -9007,9 +9090,9 @@ class SessionManager:
             self.subagent_history_results.append(result)
             return
         # Subagents take no operator input, so their queued list is dropped.
-        entries, byte_capped, _ = _history_entries(path)
-        result["entries"] = entries[-HISTORY_MAX_MSGS:]
-        result["truncated"] = byte_capped or len(entries) > HISTORY_MAX_MSGS
+        entries, truncated, _ = _history_entries(path)
+        result["entries"] = entries
+        result["truncated"] = truncated
         self.subagent_history_results.append(result)
 
     def set_jira_repo(self, issue_key, repo, auto=False, site_key=None):
