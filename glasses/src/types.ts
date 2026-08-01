@@ -133,13 +133,17 @@ export interface AgentInfo {
   // is read here — it's what the phone-side org filter partitions the fleet by
   // (XERK-171), matching the web dashboard's org.js `siteKeyOf`. The real block
   // carries far more (tickets, status, …), ignored via the index signature.
-  jira?: { siteKey?: string | null; [key: string]: unknown } | null;
+  jira?: { siteKey?: string | null; orgName?: string | null; [key: string]: unknown } | null;
   [key: string]: unknown; // startedAt, memory, logTail, reposRoot, ...
 }
 
 export interface AgentsResponse {
   now: number;
   agents: AgentInfo[];
+  // Top-level fleet state the board reads (XERK-171): the hub's manual org-colour
+  // pins (siteKey -> palette slot 1..8), so a card's tint matches the web/Android
+  // exactly. The plugin used to drop this, which made its colours diverge.
+  orgColors?: Record<string, number>;
 }
 
 // GET .../sessions/<id>/history — the "resolved" 200 response.
