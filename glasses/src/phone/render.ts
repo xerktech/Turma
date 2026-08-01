@@ -3,10 +3,11 @@
 // so the phone renders the SAME fleet the glasses do, in the same process. The
 // controller (phone.ts) turns these strings into DOM and wires the clicks.
 //
-// This is the dedicated Even phone interface the ticket asks for: Sessions +
-// Board, driving the glasses in-process (a tap calls App.enterSession directly —
-// no iframe, no postMessage). Phase 1 ships Sessions + the session view; Board
-// is a placeholder tab filled in Phase 2.
+// The look is matched 1:1 to the Turma mobile app (Android / mobile web): the
+// same Inter/Space-Grotesk fonts, the warm-paper palette, glowing status dots,
+// flat hairline cards, iMessage-style chat bubbles (user accent-right, agent
+// surface-left), and a Material bottom nav. Phase 1 ships Sessions + the session
+// view; Board is a placeholder tab (Phase 2).
 import type { AppState } from "../app.ts";
 import type { AgentInfo, SessionInfo } from "../types.ts";
 import { filterAgents, liveState, sessionName, siteKeyOf, type LiveState } from "../sessions.ts";
@@ -22,6 +23,12 @@ export interface PhoneView {
   inSession: boolean;
 }
 
+// nav.js's own tab icons, so the bottom nav matches the web/Android glyphs.
+const TAB_ICON: Record<PhoneTab, string> = {
+  sessions: `<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/>`,
+  board: `<rect x="3" y="3" width="5" height="18" rx="1"/><rect x="9.5" y="3" width="5" height="12" rx="1"/><rect x="16" y="3" width="5" height="15" rx="1"/>`,
+};
+
 export function esc(s: unknown): string {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string
@@ -30,8 +37,7 @@ export function esc(s: unknown): string {
 
 // The org label for a siteKey — the site host minus the Jira suffix, or the last
 // path segment of a slashed (Azure collection) key. Presentational only; the
-// value routed on stays the full siteKey. (A fuller port lives in Phase 2's
-// board core; this is enough for the filter menu.)
+// value routed on stays the full siteKey.
 export function orgLabel(siteKey: string): string {
   if (!siteKey) return "All orgs";
   if (siteKey.includes("/")) return siteKey.split("/").filter(Boolean).pop() || siteKey;
@@ -52,9 +58,10 @@ export function orgOptions(state: AppState): { key: string; label: string }[] {
   return out;
 }
 
+// The one-word state shown on a card, matching the web card's `.state` label.
 const STATE_LABEL: Record<LiveState, string> = {
   working: "working",
-  waiting: "waiting",
+  waiting: "waiting for your answer",
   idle: "idle",
   stopped: "stopped",
   error: "error",
@@ -62,46 +69,58 @@ const STATE_LABEL: Record<LiveState, string> = {
 
 // ---- Sessions list --------------------------------------------------------
 
-function sessionCardHtml(hostKey: string, s: SessionInfo, current: boolean): string {
+// device · repo · branch — the web card's meta line.
+function metaLine(hostLabel: string, s: SessionInfo): string {
+  const parts = [esc(hostLabel), esc(s.repo)];
+  const branch = s.branch || s.label;
+  if (branch && branch !== s.repo) parts.push(`<span class="ph-mono">${esc(branch)}</span>`);
+  return parts.join(" · ");
+}
+
+function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, current: boolean): string {
   const st = liveState(s);
   const name = sessionName(s);
-  const sub = s.branch || s.label || s.repo;
+  const q = s.session?.question;
   return (
     `<button class="ph-card ph-sess${current ? " cur" : ""}" data-enter="${esc(s.id)}" data-host="${esc(hostKey)}">` +
     `<span class="ph-dot st-${st}" aria-hidden="true"></span>` +
     `<span class="ph-card-body">` +
     `<span class="ph-card-title">${esc(name)}</span>` +
-    `<span class="ph-card-sub">${esc(s.repo)}${sub && sub !== s.repo ? " · " + esc(sub) : ""}</span>` +
-    `</span>` +
+    `<span class="ph-card-meta">${metaLine(hostLabel, s)}</span>` +
     `<span class="ph-state st-${st}">${STATE_LABEL[st]}</span>` +
+    (st === "waiting" && q ? `<span class="ph-card-q">${esc(q)}</span>` : "") +
+    `</span>` +
     `</button>`
   );
 }
 
+interface Row { hostKey: string; hostLabel: string; s: SessionInfo; }
+
 export function sessionsBodyHtml(state: AppState): string {
   const agents = filterAgents(state.agents, state.orgFilter);
-  const hosts = [...agents].sort((a, b) => (a.device ?? a.key).localeCompare(b.device ?? b.key));
   const curId = state.screen === "session" ? state.session?.sessionId : null;
-  const blocks: string[] = [];
-  let total = 0;
-  for (const host of hosts) {
-    const sessions = [...(host.sessions ?? [])].sort((a, b) =>
-      (a.createdAt ?? "").localeCompare(b.createdAt ?? "")
-    );
-    if (!host.online && sessions.length === 0) continue;
-    total += sessions.length;
-    const cards = sessions.map((s) => sessionCardHtml(host.key, s, s.id === curId)).join("");
-    blocks.push(
-      `<div class="ph-host">` +
-      `<div class="ph-host-name">${esc(host.device ?? host.key)}${host.online ? "" : " · offline"}</div>` +
-      (cards || `<div class="ph-empty-row">No sessions</div>`) +
-      `</div>`
-    );
+  const rows: Row[] = [];
+  for (const a of agents) {
+    const hostLabel = a.device ?? a.key;
+    for (const s of a.sessions ?? []) rows.push({ hostKey: a.key, hostLabel, s });
   }
-  if (total === 0) {
-    blocks.push(`<div class="ph-empty">No sessions${state.orgFilter ? " in this org" : ""}.</div>`);
-  }
-  return `<div class="ph-list">${blocks.join("")}</div>`;
+  // Group by live state — Active (working/waiting) then Idle — like the web
+  // sidebar's sections, sorting newest-active first within each.
+  const active = rows.filter((r) => ["working", "waiting"].includes(liveState(r.s)));
+  const idle = rows.filter((r) => !["working", "waiting"].includes(liveState(r.s)));
+  const byCreated = (a: Row, b: Row) => (b.s.createdAt ?? "").localeCompare(a.s.createdAt ?? "");
+  active.sort(byCreated);
+  idle.sort(byCreated);
+
+  const section = (label: string, list: Row[]): string =>
+    list.length
+      ? `<div class="ph-section"><div class="ph-section-label">${label} <span class="ph-count">${list.length}</span></div>` +
+        list.map((r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId)).join("") +
+        `</div>`
+      : "";
+
+  const body = section("Active", active) + section("Idle", idle);
+  return `<div class="ph-list">${body || `<div class="ph-empty">No sessions${state.orgFilter ? " in this org" : ""}.</div>`}</div>`;
 }
 
 // ---- Session view (the focused session) -----------------------------------
@@ -116,7 +135,6 @@ export function sessionEntries(state: AppState): { id: string; role: string; tex
   const out = buf.map((e) => ({ id: e.id, role: e.role, text: e.text }));
   const live = state.liveTurn;
   if (live && live.sessionId === s.sessionId && live.text) {
-    // Supersede a trailing assistant entry the live turn is still growing.
     out.push({ id: LIVE_TURN_ID, role: "assistant", text: live.text });
   }
   return out;
@@ -124,11 +142,7 @@ export function sessionEntries(state: AppState): { id: string; role: string; tex
 
 function bubbleHtml(role: string, text: string): string {
   const mine = role === "user";
-  return (
-    `<div class="ph-bubble ${mine ? "me" : "them"}">` +
-    `<div class="ph-bubble-txt">${esc(text)}</div>` +
-    `</div>`
-  );
+  return `<div class="ph-bubble ${mine ? "me" : "them"}">${esc(text)}</div>`;
 }
 
 export function sessionViewHtml(state: AppState): string {
@@ -136,6 +150,7 @@ export function sessionViewHtml(state: AppState): string {
   if (!s) return `<div class="ph-empty">Session ended.</div>`;
   const live = findSession(state, s.hostKey, s.sessionId);
   const title = live ? sessionName(live) : s.sessionId.slice(0, 6);
+  const sub = live ? [s.hostKey, live.repo, live.branch].filter(Boolean).join(" · ") : s.hostKey;
   const question = live?.session?.question ?? null;
   const options = live?.session?.questionOptions ?? [];
 
@@ -146,9 +161,7 @@ export function sessionViewHtml(state: AppState): string {
 
   const questionBox = question
     ? `<div class="ph-question"><div class="ph-question-q">${esc(question)}</div>` +
-      options
-        .map((o, i) => `<button class="ph-opt" data-answer="${i}">${i + 1}. ${esc(o)}</button>`)
-        .join("") +
+      options.map((o, i) => `<button class="ph-opt" data-answer="${i}"><span class="ph-opt-n">${i + 1}</span>${esc(o)}</button>`).join("") +
       `</div>`
     : "";
 
@@ -156,9 +169,10 @@ export function sessionViewHtml(state: AppState): string {
     `<div class="ph-session">` +
     `<div class="ph-session-head">` +
     `<button class="ph-back" data-back="1" aria-label="Back">‹</button>` +
-    `<span class="ph-session-title">${esc(title)}</span>` +
+    `<span class="ph-session-titles"><span class="ph-session-title">${esc(title)}</span>` +
+    `<span class="ph-session-sub ph-mono">${esc(sub)}</span></span>` +
     `</div>` +
-    `<div class="ph-transcript" id="ph-transcript">${bubbles || `<div class="ph-empty">No messages yet.</div>`}</div>` +
+    `<div class="ph-transcript" id="ph-transcript">${bubbles || `<div class="ph-empty">No messages yet. Say something below to get the agent going.</div>`}</div>` +
     questionBox +
     `<div class="ph-compose">` +
     `<textarea class="ph-input" id="ph-input" rows="1" placeholder="Message…"></textarea>` +
@@ -170,27 +184,40 @@ export function sessionViewHtml(state: AppState): string {
 
 // ---- Shell ----------------------------------------------------------------
 
-function orgMenuHtml(state: AppState): string {
+function orgMenuHtml(state: AppState, open: boolean): string {
   const opts = orgOptions(state);
+  if (opts.length === 0) return "";
   const cur = state.orgFilter;
   const label = cur ? orgLabel(cur) : "All orgs";
-  if (opts.length === 0) return "";
   const items = [{ key: "", label: "All orgs" }, ...opts]
-    .map(
-      (o) =>
-        `<button class="ph-org-item${o.key === cur ? " cur" : ""}" data-org="${esc(o.key)}">${esc(o.label)}</button>`
-    )
+    .map((o) => `<button class="ph-org-item${o.key === cur ? " cur" : ""}" data-org="${esc(o.key)}">${esc(o.label)}</button>`)
     .join("");
   return (
     `<div class="ph-org">` +
-    `<button class="ph-org-btn" data-org-toggle="1">${esc(label)} ▾</button>` +
-    `<div class="ph-org-menu" hidden>${items}</div>` +
+    `<button class="ph-org-btn${cur ? " scoped" : ""}" data-org-toggle="1">` +
+    (cur ? `<span class="ph-org-dot"></span>` : "") +
+    `${esc(label)} <span class="ph-chev">▾</span></button>` +
+    (open ? `<div class="ph-org-menu">${items}</div>` : "") +
     `</div>`
   );
 }
 
 export function boardPlaceholderHtml(): string {
   return `<div class="ph-empty">Board — coming next.</div>`;
+}
+
+const TAB_LABEL: Record<PhoneTab, string> = { sessions: "Sessions", board: "Board" };
+
+function bottomNavHtml(view: PhoneView): string {
+  const tabs = (["sessions", "board"] as PhoneTab[])
+    .map(
+      (t) =>
+        `<button class="ph-tab${view.tab === t ? " active" : ""}" data-tab="${t}">` +
+        `<span class="ph-tab-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${TAB_ICON[t]}</svg></span>` +
+        `<span class="ph-tab-label">${TAB_LABEL[t]}</span></button>`
+    )
+    .join("");
+  return `<nav class="ph-nav">${tabs}</nav>`;
 }
 
 export function phoneHtml(state: AppState, view: PhoneView, orgOpen: boolean): string {
@@ -200,21 +227,19 @@ export function phoneHtml(state: AppState, view: PhoneView, orgOpen: boolean): s
     return sessionViewHtml(state);
   }
   const body = view.tab === "sessions" ? sessionsBodyHtml(state) : boardPlaceholderHtml();
-  const orgMenu = orgMenuHtml(state).replace('class="ph-org-menu" hidden', orgOpen ? 'class="ph-org-menu"' : 'class="ph-org-menu" hidden');
   return (
     `<div class="ph-shell">` +
     `<header class="ph-header">` +
-    `<span class="ph-title">Turma</span>` +
+    `<span class="ph-title">${TAB_LABEL[view.tab]}</span>` +
     `<span class="ph-header-right">` +
-    orgMenu +
-    `<button class="ph-signout" data-signout="1" title="Sign out" aria-label="Sign out">⎋</button>` +
+    orgMenuHtml(state, orgOpen) +
+    `<button class="ph-signout" data-signout="1" title="Sign out" aria-label="Sign out">` +
+    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>` +
+    `</button>` +
     `</span>` +
     `</header>` +
     `<main class="ph-body">${body}</main>` +
-    `<nav class="ph-nav">` +
-    `<button class="ph-tab${view.tab === "sessions" ? " active" : ""}" data-tab="sessions">Sessions</button>` +
-    `<button class="ph-tab${view.tab === "board" ? " active" : ""}" data-tab="board">Board</button>` +
-    `</nav>` +
+    bottomNavHtml(view) +
     `</div>`
   );
 }
