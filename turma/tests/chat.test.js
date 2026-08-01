@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -960,6 +960,47 @@ test("renderProse: a fenced block becomes a <pre> tagged with its language", () 
 
 test("renderProse: a fence with no info string omits data-lang", () => {
   assert.match(renderProse("```\nplain\n```"), /<pre class="md-code"><code>plain<\/code><\/pre>/);
+});
+
+test("renderProse: a fenced block carries a copy button in a positioning wrapper (XERK-183)", () => {
+  const html = renderProse("```\nplain\n```");
+  // The wrapper is the positioning context; the button sits OUTSIDE the <pre>
+  // so it never enters a copied selection.
+  assert.match(html, /<div class="md-code-wrap"><button class="md-copy"[^>]*><svg[^]*?<\/button><pre class="md-code">/);
+  assert.match(html, /aria-label="Copy code"/);
+});
+
+test("copyCodeClick: a .md-copy click copies the <code> text and flashes copied (XERK-183)", async () => {
+  // Node's global navigator has no clipboard, so this exercises the
+  // hidden-textarea execCommand fallback (the path older/webview clients hit).
+  const btnClasses = new Set();
+  const code = { textContent: "npm ci\nnpm test" };
+  const wrap = { querySelector: (sel) => (sel === "pre.md-code code" ? code : null) };
+  const btn = {
+    closest: (sel) => (sel === ".md-code-wrap" ? wrap : null),
+    classList: { add: (c) => btnClasses.add(c), remove: (c) => btnClasses.delete(c) },
+  };
+  let prevented = false, copiedValue = null;
+  const e = { target: { closest: (sel) => (sel === ".md-copy" ? btn : null) }, preventDefault: () => { prevented = true; } };
+  const ta = { style: {}, setAttribute() {}, select() { copiedValue = this.value; } };
+  global.document = {
+    createElement: () => ta,
+    execCommand: (cmd) => cmd === "copy",
+    body: { appendChild() {}, removeChild() {} },
+  };
+  try {
+    const handled = copyCodeClick(e);
+    assert.equal(handled, true);
+    assert.equal(prevented, true);
+    await Promise.resolve(); await Promise.resolve(); // let the clipboard promise settle
+    assert.equal(copiedValue, "npm ci\nnpm test");
+    assert.ok(btnClasses.has("copied"));
+  } finally { clearDom(); }
+});
+
+test("copyCodeClick: a click outside a .md-copy is ignored (XERK-183)", () => {
+  const e = { target: { closest: () => null }, preventDefault: () => { throw new Error("should not prevent"); } };
+  assert.equal(copyCodeClick(e), false);
 });
 
 test("renderProse: code body is escaped and never linkified", () => {

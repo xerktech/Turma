@@ -89,6 +89,22 @@ describe("phone controller", () => {
     expect(root.querySelector(".ph-nav")).toBeFalsy(); // shell hidden in the session view
   });
 
+  it("clicking a code block's copy button copies via the root listener (XERK-183)", async () => {
+    root.querySelector<HTMLElement>('[data-enter="s1"]')!.click(); // into a session view
+    const scroller = root.querySelector<HTMLElement>("#ph-transcript")!;
+    // A rendered code block as chat.js renderCode emits it (byte-shared).
+    scroller.innerHTML =
+      '<div class="md-code-wrap"><button class="md-copy"><svg></svg></button>' +
+      '<pre class="md-code"><code>npm ci\nnpm test</code></pre></div>';
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(globalThis.navigator, "clipboard", { value: { writeText }, configurable: true });
+    const btn = root.querySelector<HTMLElement>(".md-copy")!;
+    btn.click();
+    await Promise.resolve(); await Promise.resolve(); // let the clipboard promise + flash settle
+    expect(writeText).toHaveBeenCalledWith("npm ci\nnpm test");
+    expect(btn.classList.contains("copied")).toBe(true);
+  });
+
   it("Back leaves the phone's session view WITHOUT touching the glasses", () => {
     root.querySelector<HTMLElement>('[data-enter="s1"]')!.click();
     expect(root.querySelector("#ph-transcript")).toBeTruthy();

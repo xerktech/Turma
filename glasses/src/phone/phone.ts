@@ -367,6 +367,9 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
   root.addEventListener("click", (e) => {
     const t = e.target as HTMLElement;
 
+    // Code-block copy button (XERK-183) — the web's own handler, reused verbatim.
+    if (Chat.copyCodeClick(e)) return;
+
     const enter = t.closest<HTMLElement>("[data-enter]");
     if (enter) {
       const id = enter.dataset.enter!;

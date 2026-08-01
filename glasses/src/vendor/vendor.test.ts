@@ -51,6 +51,17 @@ describe("vendored engines", () => {
     expect(html).not.toMatch(/action-card/);
   });
 
+  it("chat.js renders a copy button on a fenced code block (XERK-183)", () => {
+    const html = renderTranscript(
+      [{ id: "a1", role: "assistant", blocks: [{ t: "text", text: "```sh\nnpm ci\n```" }] }],
+      { preset: "verbose", show: { thinking: true, tools: true, outputs: true } }
+    );
+    expect(html).toContain('class="md-code-wrap"');
+    expect(html).toContain('class="md-copy"');
+    // Chat.copyCodeClick is exposed so the phone's root listener can delegate to it.
+    expect(typeof Chat.copyCodeClick).toBe("function");
+  });
+
   it("board.js merges sites and assigns unique org colors", () => {
     const agents = [
       { key: "h1", jira: { siteKey: "acme.atlassian.net", available: true, fetchedAt: "2026-08-01T00:00:00Z", tickets: [{ key: "A-1", summary: "x", statusCategory: "todo", updated: "2026-08-01T00:00:00Z" }] } },

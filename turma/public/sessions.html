@@ -369,6 +369,25 @@
     content: attr(data-lang); display: block; margin-bottom: 5px;
     font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase;
     letter-spacing: 0.05em; color: var(--muted); }
+  /* Copy-to-clipboard button, pinned to the top-right of every code block
+     (XERK-183). The wrapper is the positioning context so the button stays put
+     while the <code> scrolls horizontally beneath it; it carries a background so
+     code behind it stays legible. A .copied state swaps the clipboard glyph for
+     a check (see chat.js copyCodeClick). */
+  .md-code-wrap { position: relative; }
+  .md-code-wrap .md-copy {
+    position: absolute; top: 5px; right: 5px; z-index: 1;
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; padding: 0; cursor: pointer;
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--surface); color: var(--muted);
+    opacity: 0.72; transition: opacity 0.12s, color 0.12s; }
+  .md-code-wrap .md-copy:hover { opacity: 1; color: var(--ink); }
+  .md-code-wrap .md-copy .ic-check { display: none; }
+  .md-code-wrap .md-copy.copied { opacity: 1; color: var(--good); border-color: color-mix(in srgb, var(--good) 55%, var(--border)); }
+  .md-code-wrap .md-copy.copied .ic-copy { display: none; }
+  .md-code-wrap .md-copy.copied .ic-check { display: block; }
+  .md-code-wrap .md-copy.failed { opacity: 1; color: var(--critical); border-color: color-mix(in srgb, var(--critical) 55%, var(--border)); }
   /* Inline `code` spans (chat.js renderInline()). Sized in em so the chip tracks
      whatever it's set in (bubble, cell, thinking trace), and upright since the
      thinking trace is italic. `anywhere` because an inline span is the one code

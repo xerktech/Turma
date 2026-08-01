@@ -43,6 +43,9 @@ interface ChatEngine {
   buildItems(entries: RichEntry[]): unknown[];
   itemsToHtml(items: unknown[]): string;
   renderProse(text: string): string;
+  // Delegated code-block copy handler (XERK-183): true when it handled a
+  // .md-copy click, so the phone's shared root listener can early-out.
+  copyCodeClick(e: Event): boolean;
   prettyModel(model: string | null | undefined): string;
   // The web's own transcript merge (id-keyed, richer/longer copy wins) so the
   // phone accumulates history + live deltas exactly as the web does.
