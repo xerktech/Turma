@@ -339,9 +339,6 @@ those are marked `[MODEL]`.
   decodes the field away today, so such a session still reads idle with no way to answer. Port:
   `panePrompt` onto the session model, the waiting state in `core/Sessions.kt`, and the picker in
   `ChatScreen`/`ChatViewModel` beside the existing question sheet.
-- P3 **Terminal compose Stop.** XERK-33 also split the terminal compose bar; Android's
-  `ui/TerminalScreen.kt` bar still only sends (it's a separate WebView screen with no live busy read).
-
 ### Usage
 - P2 **Table-view state persistence (XERK-31).** The web keeps the usage table open + the page put
   across SSE re-renders. Moot until Android grows a usage table view (see the Usage P1 above).
