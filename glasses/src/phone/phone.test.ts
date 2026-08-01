@@ -54,6 +54,13 @@ describe("phone controller", () => {
       getHistory: vi.fn(async () => ({ status: 200 as const, body: { entries: [], truncated: false, fetchedAt: 0 } })),
       loginForCookie: vi.fn(async () => {}),
       termUrl: vi.fn((id: string) => `http://hub/term/${id}/`),
+      jiraDetail: vi.fn(async () => ({ status: 200 as const, body: {} })),
+      jiraRefresh: vi.fn(async () => ({ ok: true })),
+      startTicket: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      setTicketStatus: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      setTicketRepo: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      setTicketAgent: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      setTicketModel: vi.fn(async () => ({ ok: true, cmdId: "c" })),
     };
     // A fake App whose enter/setOrgFilter synchronously push the new state to the
     // phone, exactly as the real App's setState→repaint→onState does.
@@ -168,6 +175,24 @@ describe("phone controller", () => {
     expect(client.jiraDetail).toHaveBeenCalledWith("acme.atlassian.net", "ACME-1");
     await new Promise((r) => setTimeout(r, 10));
     expect(root.querySelector<HTMLElement>("#ph-detail")!.hidden).toBe(false);
+  });
+
+  it("the detail-panel status picker saves a change via HubClient.setTicketStatus", async () => {
+    state = { ...homeState(), agents: [agent({ key: "host-a", online: true, jira: { available: true, siteKey: "acme.atlassian.net", user: "me", fetchedAt: "2026-08-01T00:00:00Z",
+      tickets: [{ key: "ACME-1", summary: "Fix login", statusCategory: "todo", status: "To Do", updated: "2026-08-01T00:00:00Z", project: "ACME" }] } })] };
+    client.jiraDetail = vi.fn(async () => ({ status: 200 as const, body: { key: "ACME-1", summary: "Fix login", status: "To Do", statusCategory: "todo", type: "Task", url: "https://x/ACME-1",
+      statusOptions: [{ id: "11", name: "To Do", category: "todo" }, { id: "31", name: "Done", category: "done" }] } }));
+    handle.render(state);
+    root.querySelector<HTMLElement>('[data-tab="board"]')!.click();
+    root.querySelector<HTMLElement>('.kanban-card[data-key="ACME-1"]')!.click();
+    await new Promise((r) => setTimeout(r, 10));
+    // Open the status picker, pick "Done".
+    root.querySelector<HTMLElement>("[data-status-edit]")!.click();
+    const sel = root.querySelector<HTMLSelectElement>("[data-status-select]")!;
+    expect(sel).toBeTruthy();
+    sel.value = "31";
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(client.setTicketStatus).toHaveBeenCalledWith("acme.atlassian.net", "ACME-1", { value: "31" });
   });
 
   it("the sign-out affordance calls back out", () => {
