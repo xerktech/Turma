@@ -175,6 +175,7 @@ async function boot(
     pollMs: config.pollMs,
     onState: (state) => phone?.render(state),
     onEnterSession: (hostKey, sessionId) => phone?.enterFromGlasses(hostKey, sessionId),
+    onRichTail: (sessionId, entries) => phone?.richTail(sessionId, entries),
   });
 
   void initPhoneLogin(storage, () => {

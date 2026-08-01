@@ -18,9 +18,16 @@ export type PhoneTab = "sessions" | "board";
 // Which surface the phone is showing. `inSession` overlays the focused session
 // view (App.state.session) over whichever tab; it is separate from the glasses'
 // own screen — leaving it here never moves the glasses (XERK-171).
+// The ⋯ session-actions menu state (closed, the menu, an inline rename field, or
+// the armed "Confirm kill"). Kept on the view so the pure render draws it.
+export type SessionMenu = "closed" | "open" | "renaming" | "killArm";
+
 export interface PhoneView {
   tab: PhoneTab;
   inSession: boolean;
+  verbosity: VerbosityPreset;
+  showTerminal: boolean;
+  menu: SessionMenu;
 }
 
 // nav.js's own tab icons, so the bottom nav matches the web/Android glyphs.
@@ -125,27 +132,29 @@ export function sessionsBodyHtml(state: AppState): string {
 
 // ---- Session view (the focused session) -----------------------------------
 
-// The entries to show for the focused session: the committed transcript buffer
-// plus the in-progress live turn appended as the newest assistant bubble (so the
-// phone streams as the App's liveTurn grows, repaint by repaint).
-export function sessionEntries(state: AppState): { id: string; role: string; text: string }[] {
-  const s = state.session;
-  if (!s) return [];
-  const buf = state.transcripts[s.sessionId]?.entries ?? [];
-  const out = buf.map((e) => ({ id: e.id, role: e.role, text: e.text }));
-  const live = state.liveTurn;
-  if (live && live.sessionId === s.sessionId && live.text) {
-    out.push({ id: LIVE_TURN_ID, role: "assistant", text: live.text });
+// The rich transcript entries the vendored chat.js engine renders: the phone's
+// own history+live buffer (blocks intact) plus the in-progress live turn as a
+// trailing streaming assistant entry. Built by the controller (it owns the
+// buffer); shaped here so it stays testable.
+export function transcriptEntries(
+  buffer: { id?: string; role: string; text?: string; blocks?: unknown[] }[],
+  liveTurn: { sessionId: string; text: string } | null,
+  sessionId: string
+): { id?: string; role: string; text?: string; blocks?: unknown[] }[] {
+  const out = buffer.slice();
+  if (liveTurn && liveTurn.sessionId === sessionId && liveTurn.text) {
+    out.push({ id: LIVE_TURN_ID, role: "assistant", text: liveTurn.text });
   }
   return out;
 }
 
-function bubbleHtml(role: string, text: string): string {
-  const mine = role === "user";
-  return `<div class="ph-bubble ${mine ? "me" : "them"}">${esc(text)}</div>`;
-}
+export type VerbosityPreset = "concise" | "normal" | "verbose";
 
-export function sessionViewHtml(state: AppState): string {
+// The session-view SHELL. The transcript container (#ph-transcript / .chat-scroll)
+// is filled by the controller with the vendored engine's HTML, and the terminal
+// pane (#ph-term) is revealed on the Terminal toggle. Both are in the shell so
+// the toggle is a class flip, not a re-render.
+export function sessionViewHtml(state: AppState, verbosity: VerbosityPreset, showTerminal: boolean, menu: SessionMenu): string {
   const s = state.session;
   if (!s) return `<div class="ph-empty">Session ended.</div>`;
   const live = findSession(state, s.hostKey, s.sessionId);
@@ -154,30 +163,50 @@ export function sessionViewHtml(state: AppState): string {
   const question = live?.session?.question ?? null;
   const options = live?.session?.questionOptions ?? [];
 
-  const bubbles = sessionEntries(state)
-    .filter((e) => e.text.trim())
-    .map((e) => bubbleHtml(e.role, e.text))
-    .join("");
-
   const questionBox = question
     ? `<div class="ph-question"><div class="ph-question-q">${esc(question)}</div>` +
       options.map((o, i) => `<button class="ph-opt" data-answer="${i}"><span class="ph-opt-n">${i + 1}</span>${esc(o)}</button>`).join("") +
       `</div>`
     : "";
 
+  const presets: VerbosityPreset[] = ["concise", "normal", "verbose"];
+  const verbBtns = presets
+    .map((p) => `<button class="ph-verb${p === verbosity ? " on" : ""}" data-verb="${p}">${p[0]!.toUpperCase()}${p.slice(1)}</button>`)
+    .join("");
+
+  // The ⋯ actions menu: Rename (→ inline field) / Kill (→ arm-then-confirm).
+  const curName = live ? sessionName(live) : "";
+  const menuHtml =
+    menu === "open"
+      ? `<div class="ph-sess-menu"><button data-menu-rename="1">Rename…</button><button class="danger" data-menu-kill="1">Kill</button></div>`
+      : menu === "renaming"
+        ? `<div class="ph-sess-menu ph-rename"><input id="ph-rename" value="${esc(curName)}" placeholder="Session name"><div class="ph-rename-row"><button data-menu-cancel="1">Cancel</button><button class="primary" data-menu-save="1">Save</button></div></div>`
+        : menu === "killArm"
+          ? `<div class="ph-sess-menu"><button class="danger armed" data-menu-kill-confirm="1">Confirm kill</button><button data-menu-cancel="1">Cancel</button></div>`
+          : "";
+
   return (
-    `<div class="ph-session">` +
+    `<div class="ph-session${showTerminal ? " show-term" : ""}">` +
     `<div class="ph-session-head">` +
     `<button class="ph-back" data-back="1" aria-label="Back">‹</button>` +
     `<span class="ph-session-titles"><span class="ph-session-title">${esc(title)}</span>` +
     `<span class="ph-session-sub ph-mono">${esc(sub)}</span></span>` +
+    `<button class="ph-term-toggle${showTerminal ? " on" : ""}" data-term-toggle="1" title="Terminal">${showTerminal ? "Chat" : "Terminal ▸"}</button>` +
+    `<span class="ph-kebab-wrap"><button class="ph-kebab" data-sess-menu="1" title="Actions">⋯</button>${menuHtml}</span>` +
     `</div>` +
-    `<div class="ph-transcript" id="ph-transcript">${bubbles || `<div class="ph-empty">No messages yet. Say something below to get the agent going.</div>`}</div>` +
+    // Chat pane
+    `<div class="ph-chat-pane">` +
+    `<div class="ph-verbbar">${verbBtns}</div>` +
+    `<div class="chat-scroll" id="ph-transcript"></div>` +
     questionBox +
     `<div class="ph-compose">` +
     `<textarea class="ph-input" id="ph-input" rows="1" placeholder="Message…"></textarea>` +
+    `<button class="ph-stop" data-stop="1" hidden>◼ Stop</button>` +
     `<button class="ph-send" data-send="1">Send</button>` +
     `</div>` +
+    `</div>` +
+    // Terminal pane (iframe filled by the controller on first reveal)
+    `<div class="ph-term-pane"><iframe id="ph-term" title="Terminal"></iframe></div>` +
     `</div>`
   );
 }
@@ -224,7 +253,7 @@ export function phoneHtml(state: AppState, view: PhoneView, orgOpen: boolean): s
   // The session view overlays whichever tab and has its own header, so the shell
   // header + bottom nav are hidden while it's up.
   if (view.inSession && state.screen === "session" && state.session) {
-    return sessionViewHtml(state);
+    return sessionViewHtml(state, view.verbosity, view.showTerminal, view.menu);
   }
   const body = view.tab === "sessions" ? sessionsBodyHtml(state) : boardPlaceholderHtml();
   return (

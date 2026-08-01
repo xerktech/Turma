@@ -198,6 +198,59 @@
   font-size: 11px; font-weight: 700;
 }
 
+/* Session-view header extras + chat/terminal panes */
+.ph-term-toggle, .ph-kebab {
+  flex: none; font: inherit; font-size: 12.5px; color: var(--ink-2);
+  background: var(--field); border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 10px; cursor: pointer;
+}
+.ph-kebab { font-size: 16px; line-height: 1; padding: 5px 9px; }
+.ph-term-toggle.on { color: var(--accent); border-color: var(--accent); }
+.ph-session-head .ph-session-titles { flex: 1; }
+
+.ph-chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.ph-session.show-term .ph-chat-pane { display: none; }
+.ph-term-pane { display: none; flex: 1; min-height: 0; background: #0d0d0d; }
+.ph-session.show-term .ph-term-pane { display: flex; }
+.ph-term-pane iframe { flex: 1; width: 100%; border: 0; }
+
+/* Verbosity segmented control */
+.ph-verbbar { flex: none; display: flex; gap: 6px; padding: 8px 12px 4px; }
+.ph-verb {
+  font: inherit; font-size: 11px; padding: 3px 12px; border-radius: 999px;
+  background: var(--surface); border: 1px solid var(--border); color: var(--muted); cursor: pointer;
+}
+.ph-verb.on { background: var(--accent-soft); border-color: transparent; color: var(--accent); font-weight: 600; }
+
+.ph-stop {
+  flex: none; font: inherit; font-weight: 600; font-size: 13px;
+  color: #1a1200; background: var(--warning); border: 0; border-radius: var(--radius-sm);
+  padding: 10px 14px; cursor: pointer;
+}
+
+/* ⋯ session actions menu (Rename / Kill) */
+.ph-kebab-wrap { position: relative; flex: none; }
+.ph-sess-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; min-width: 170px;
+  display: flex; flex-direction: column; padding: 4px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+}
+.ph-sess-menu button {
+  font: inherit; font-size: 13px; text-align: left; color: var(--ink);
+  background: none; border: 0; border-radius: 6px; padding: 9px 10px; cursor: pointer;
+}
+.ph-sess-menu button:hover { background: var(--accent-soft); }
+.ph-sess-menu button.danger { color: var(--critical); font-weight: 600; }
+.ph-sess-menu button.danger.armed { background: var(--critical); color: #fff; }
+.ph-sess-menu button.primary { color: #fff; background: var(--accent); font-weight: 600; }
+.ph-sess-menu.ph-rename { min-width: 220px; gap: 8px; padding: 10px; }
+.ph-sess-menu.ph-rename input {
+  font: inherit; font-size: 13px; color: var(--ink); background: var(--field);
+  border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px;
+}
+.ph-rename-row { display: flex; gap: 8px; justify-content: flex-end; }
+
 /* Compose */
 .ph-compose {
   flex: none; display: flex; align-items: flex-end; gap: 8px;
