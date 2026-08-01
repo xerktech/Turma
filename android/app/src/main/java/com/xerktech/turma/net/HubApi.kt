@@ -333,10 +333,15 @@ data class ResumeRequest(val cwd: String = "")
 @Serializable
 data class DeviceRequest(
     val token: String,
-    val platform: String = "android",
     // Capabilities this build supports, so the hub only sends messages it can
     // handle. "dismiss" = it cancels a notification on an {action:"dismiss"}
     // message (XERK-154); without it the hub withholds those, since an older
     // build would render one as a blank notification.
-    val features: List<String> = listOf("dismiss"),
+    //
+    // NOT defaulted, on purpose: TurmaJson has encodeDefaults=false, so a field
+    // left at its default is DROPPED from the request body — a defaulted
+    // features would never reach the hub, which would then treat this build as
+    // dismiss-incapable and retract nothing. A required field always serializes.
+    val features: List<String>,
+    val platform: String = "android",
 )
