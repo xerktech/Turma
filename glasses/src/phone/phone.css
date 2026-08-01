@@ -1,0 +1,173 @@
+/* Native phone companion styles (XERK-171). Uses the same palette variables the
+   login card / web dashboard use (declared on :root in index.html), so the phone
+   app looks of a piece with the mobile web UI, light and dark. */
+
+.ph-shell,
+.ph-session {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--page);
+  color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* Header */
+.ph-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.ph-title { font-weight: 700; font-size: 16px; letter-spacing: -0.01em; }
+.ph-header-right { display: flex; align-items: center; gap: 8px; }
+.ph-signout {
+  font: inherit; font-size: 16px; line-height: 1; color: var(--muted);
+  background: var(--field); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 9px; cursor: pointer;
+}
+.ph-signout:hover { color: var(--critical); }
+
+/* Org filter */
+.ph-org { position: relative; }
+.ph-org-btn {
+  font: inherit; font-weight: 600; font-size: 13px;
+  color: var(--ink-2); background: var(--field);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 10px; cursor: pointer;
+}
+.ph-org-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;
+  min-width: 180px; max-height: 60vh; overflow: auto;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,0.18);
+  padding: 6px;
+}
+.ph-org-item {
+  display: block; width: 100%; text-align: left;
+  font: inherit; font-size: 13px; color: var(--ink);
+  background: none; border: 0; border-radius: 7px;
+  padding: 9px 10px; cursor: pointer;
+}
+.ph-org-item:hover { background: rgba(127,127,127,0.10); }
+.ph-org-item.cur { color: var(--accent); font-weight: 650; }
+
+/* Body / list */
+.ph-body { flex: 1; overflow: auto; padding: 12px; }
+.ph-list { display: flex; flex-direction: column; gap: 16px; }
+.ph-host { display: flex; flex-direction: column; gap: 8px; }
+.ph-host-name {
+  font-size: 11.5px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--muted); padding: 0 2px;
+}
+.ph-empty, .ph-empty-row {
+  color: var(--muted); font-size: 13px; padding: 20px 4px; text-align: center;
+}
+
+/* Cards */
+.ph-card {
+  display: flex; align-items: center; gap: 12px; width: 100%; text-align: left;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 12px; padding: 12px 14px; cursor: pointer;
+  font: inherit; color: var(--ink);
+}
+.ph-card.cur { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(42,120,214,0.20); }
+.ph-card-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.ph-card-title {
+  font-weight: 600; font-size: 14.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ph-card-sub {
+  color: var(--muted); font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Status dot + pill */
+.ph-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--muted); }
+.ph-state {
+  flex: none; font-size: 11px; font-weight: 650; text-transform: lowercase;
+  padding: 3px 8px; border-radius: 999px; color: var(--ink-2);
+  background: rgba(127,127,127,0.12);
+}
+.st-working { background: #2a9d55; }
+.st-waiting { background: #d98a1f; }
+.st-idle    { background: var(--muted); }
+.st-stopped { background: #8a8a8a; }
+.st-error   { background: var(--critical); }
+.ph-state.st-working { background: rgba(42,157,85,0.16); color: #2a9d55; }
+.ph-state.st-waiting { background: rgba(217,138,31,0.16); color: #b8760f; }
+.ph-state.st-error   { background: rgba(208,59,59,0.16); color: var(--critical); }
+
+/* Bottom nav */
+.ph-nav {
+  flex: none; display: flex; border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+.ph-tab {
+  flex: 1; font: inherit; font-weight: 600; font-size: 13px;
+  color: var(--muted); background: none; border: 0;
+  padding: 14px 0; cursor: pointer;
+}
+.ph-tab.active { color: var(--accent); }
+
+/* Session view */
+.ph-session-head {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px; border-bottom: 1px solid var(--border); background: var(--surface);
+}
+.ph-back {
+  font: inherit; font-size: 22px; line-height: 1; color: var(--accent);
+  background: none; border: 0; padding: 2px 8px; cursor: pointer;
+}
+.ph-session-title {
+  font-weight: 650; font-size: 15px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ph-transcript {
+  flex: 1; overflow: auto; padding: 14px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.ph-bubble { display: flex; }
+.ph-bubble.me { justify-content: flex-end; }
+.ph-bubble-txt {
+  max-width: 82%; white-space: pre-wrap; word-break: break-word;
+  padding: 9px 12px; border-radius: 14px; font-size: 14px;
+}
+.ph-bubble.me .ph-bubble-txt { background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+.ph-bubble.them .ph-bubble-txt { background: var(--surface); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+
+/* Pending question */
+.ph-question {
+  flex: none; border-top: 1px solid var(--border); background: var(--surface);
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 8px;
+}
+.ph-question-q { font-weight: 600; font-size: 13.5px; }
+.ph-opt {
+  font: inherit; text-align: left; font-size: 13.5px; color: var(--ink);
+  background: var(--field); border: 1px solid var(--border);
+  border-radius: 9px; padding: 10px 12px; cursor: pointer;
+}
+.ph-opt:hover { border-color: var(--accent); }
+
+/* Compose */
+.ph-compose {
+  flex: none; display: flex; align-items: flex-end; gap: 8px;
+  padding: 10px 12px; border-top: 1px solid var(--border); background: var(--surface);
+}
+.ph-input {
+  flex: 1; resize: none; font: inherit; font-size: 14px; color: var(--ink);
+  background: var(--field); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 12px; max-height: 120px;
+}
+.ph-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(42,120,214,0.18); }
+.ph-send {
+  flex: none; font: inherit; font-weight: 650; font-size: 14px; color: #fff;
+  background: var(--accent); border: 0; border-radius: 10px;
+  padding: 11px 16px; cursor: pointer;
+}
+.ph-send:disabled { opacity: 0.5; cursor: default; }

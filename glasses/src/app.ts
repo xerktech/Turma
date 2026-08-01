@@ -232,10 +232,14 @@ export interface AppOptions {
   pollMs?: number;
   // Fired whenever the session screen ENTERS a session — a genuine new/changed
   // session, never a same-session repaint and never on leaving (XERK-171). The
-  // phone bridge uses it to pull the embedded web view to the same session the
-  // glasses just entered. Leaving is deliberately not signalled, so backing out
-  // on the glasses doesn't move the phone.
+  // native phone UI uses it to pull its own view to the same session the glasses
+  // just entered. Leaving is deliberately not signalled, so backing out on the
+  // glasses doesn't move the phone.
   onEnterSession?: (hostKey: string, sessionId: string) => void;
+  // Fired after every glasses repaint with the fresh AppState, so the native
+  // phone UI (which renders from the same state, in the same process) repaints
+  // in lockstep — no second poll, no cross-origin bridge (XERK-171).
+  onState?: (state: AppState) => void;
 }
 
 // The controller: owns AppState, drives the HubClient on a poll loop, reacts
@@ -248,6 +252,7 @@ export class App {
   private readonly now: () => number;
   private readonly pollMs: number;
   private readonly onEnterSession?: (hostKey: string, sessionId: string) => void;
+  private readonly onState?: (state: AppState) => void;
 
   private state: AppState;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -268,6 +273,7 @@ export class App {
     this.now = opts.now ?? (() => Date.now());
     this.pollMs = opts.pollMs ?? 6000;
     this.onEnterSession = opts.onEnterSession;
+    this.onState = opts.onState;
     this.state = createInitialState(this.now());
   }
 
@@ -577,6 +583,12 @@ export class App {
 
   private repaint(): void {
     this.display.render(render(this.state));
+    // The native phone UI (XERK-171) renders from the same App state, in the
+    // same process, so every glasses repaint also hands it the fresh state.
+    // Guarded so a listener throwing never breaks the glasses render.
+    if (this.onState) {
+      try { this.onState(this.state); } catch { /* the phone UI's own paint */ }
+    }
   }
 
   private flash(text: string): void {

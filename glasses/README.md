@@ -68,51 +68,46 @@ host), not able to reach an arbitrary hub at runtime.
 
 ## Phone companion (Sessions + Board, synced to the glasses) — XERK-171
 
-Once signed in, the phone screen is a **dedicated companion**, not the whole web
-dashboard: `phone-login.ts` points the `#dashboard` iframe at
-`/sessions?embed=glasses`, and `nav.js` — seeing `?embed=glasses` on the URL —
-trims the nav to just **Sessions** and **Board**, carries the flag on every link
-so tab switches stay embedded, drops Sign out (the plugin's own bar owns it), and
-keeps the **org filter** and **New ticket** controls (both required on the phone).
-Ordinary (non-embedded) loads of those pages are unchanged — the embed flag is an
-optional argument, so nothing leaks onto the normal dashboard.
+Once signed in, the phone screen is a **dedicated NATIVE interface** (`src/phone/`)
+— Sessions and Board, laid out to feel like the mobile app — **not** the hub's web
+UI. An earlier attempt embedded the hub's own Sessions/Board pages in a
+cross-origin iframe and bridged them to the glasses over `postMessage`; that could
+never sync reliably in the Even WebView (the cross-origin hop doesn't deliver), so
+the phone is now built natively in the plugin and drives the glasses **in-process**.
 
-The G2 display keeps rendering in parallel via the SDK (`App` in `app.ts`). The
-plugin and the embedded page share one WebView, but the page is a **cross-origin
-iframe** (the hub is a different origin), so the two talk over `postMessage`,
-brokered by the plugin's in-process link to the glasses `App`. The bridge is two
-files sharing one message contract:
+The key to why it syncs: the phone UI and the glasses `App` (`app.ts`) run in the
+**same JS context**, so there is no boundary to cross. The phone renders from the
+`App`'s already-polled fleet state and calls `App` methods directly:
 
-- `turma/public/glasses-embed.js` — the web half, loaded after `org.js` on
-  Sessions/Board, **inert unless `?embed=glasses`**.
-- `glasses/src/phone-bridge.ts` — the plugin half (`createPhoneBridge`), wired in
-  `main.ts` on the bridge path; the App's `onEnterSession` feeds it.
+- `App.onState(state)` — fired on every glasses repaint; the phone re-renders from
+  the same `state` (one poll feeds both surfaces). `phone/phone.ts` is the
+  controller, `phone/render.ts` the pure HTML builders.
+- A tap on a session card → `App.enterSession(id)` (the glasses enter it too).
+- The header org filter → `App.setOrgFilter(siteKey)` (scopes the glasses home
+  list, applied in `buildHomeRows`/`homeHeaderText`).
+- Prompts / question answers → straight through the shared `HubClient`
+  (`sendInput` / `answerQuestion`).
 
-Messages: page→plugin `session-open{host,id}` / `org{key}` / `ready`; plugin→page
-`enter-session{id}`.
+Behaviour the ticket asks for — **entering a session syncs, leaving does not**:
 
-The behaviour the ticket asks for — **entering a session syncs, leaving does
-not**:
+- Enter a session on the phone → the glasses enter it. Enter one on the glasses →
+  `App.onEnterSession` fires (only on a genuine enter, in `syncSession`, past the
+  same-session guard) and the phone's `enterFromGlasses` pulls its view in.
+- Backing out on either side moves neither: the phone's Back just hides its own
+  session view (it never calls `App`), and `onEnterSession` never fires on leave.
+- A phone→glasses→phone open can't loop — `App.enterSession` no-ops when the
+  glasses are already on that session.
 
-- Open a session on the phone → the glasses enter it (`session-open` →
-  `App.enterSession`). Open one on the glasses → the phone opens it
-  (`App.onEnterSession` → `enter-session`; in-place on Sessions, else a
-  `/sessions?…&session=` deep link when the phone is on Board).
-- Backing out of a session on either side signals nothing: the page never emits
-  on close, and `App.onEnterSession` fires only on a genuine enter (in
-  `syncSession`, past the same-session guard).
-- The header **org filter scopes the glasses session list too** (`org` →
-  `App.setOrgFilter`, applied in `buildHomeRows`/`homeHeaderText` only, so a
-  session already open on the glasses is never ejected from under you).
+The signed-in view is `#phone` (the native UI) in `index.html`; there is no more
+dashboard iframe. On the DOM dev path (`npm run dev`) a small green mirror of what
+the **glasses** are rendering floats in the corner, so you can watch the glasses
+follow the phone. Board is a placeholder tab today — Phase 2 fills it in with the
+full kanban.
 
-A phone→glasses→phone open can't loop: `App.enterSession` no-ops when the glasses
-are already on that session, and `glasses-embed.js`'s `planIncoming` ignores an
-`enter-session` for the session already on screen — two idempotent guards.
-
-Tests: `src/phone-bridge.test.ts`, the `phone bridge` block in `src/app.test.ts`,
-`turma/tests/glasses-embed.test.js`, and the embed cases in
-`turma/tests/nav.test.js`. Android has no glasses, so there is no parity
-counterpart.
+Tests: `src/phone/render.test.ts` (pure builders), `src/phone/phone.test.ts` (the
+controller, under jsdom), and the `phone companion App API` block in
+`src/app.test.ts` (`enterSession`/`setOrgFilter`/`onEnterSession`/`onState`).
+Android has no glasses, so there is no parity counterpart.
 
 ## Simulator
 
@@ -275,12 +270,13 @@ to exercise the whole STT path without hardware.
   glasses-display mirror appears. The hub URL must match a host in the
   `app.json` whitelist above, and should be prefilled on any later sign-in.
 - Session list matches the web dashboard.
-- Phone companion (XERK-171): the phone screen shows only the Sessions and Board
-  tabs (no Dashboard/Usage/Sign out), with the org filter and New ticket working.
-  Opening a session on the phone pulls the glasses into it, and opening one on
+- Phone companion (XERK-171): the phone screen is the native UI with a Sessions
+  and a Board tab, a header org filter, and sign-out. Opening a session on the
+  phone pulls the glasses into it (watch the glasses follow), and opening one on
   the glasses opens it on the phone; backing out of a session on one side leaves
   the other where it is. Changing the org filter on the phone narrows the glasses
-  session list to that org.
+  session list to that org. Typing a prompt / answering a question on the phone
+  reaches the session. (Board is a placeholder until Phase 2.)
 - Each lifecycle action (spawn/kill/start/restart/resume) shows queued (…)
   then converges within ~40s.
 - No header line on the session screen — the transcript runs to the top of

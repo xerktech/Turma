@@ -1605,11 +1605,11 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 - Vite + TypeScript, Vitest; an Even Hub plugin. An open session screen tails the hub's `/live`
   WebSocket (`live.ts`) with a **streaming typewriter reveal** (`reveal.ts`), else the 6s poll. See
-  `glasses/README.md` for dev/packaging/QA and the phone-companion bridge.
-- **Even phone companion (XERK-171):** the plugin's PHONE screen is the hub's Sessions + Board pages in
-  `?embed=glasses` mode (`nav.js` trims the nav), synced to the glasses `App` over **postMessage**
-  (`glasses-embed.js`/`phone-bridge.ts`): **ENTER syncs, LEAVE doesn't** — entering a session or the org
-  filter on either side follows on the other, echo-guarded.
+  `glasses/README.md` for dev/packaging/QA.
+- **Even phone companion (XERK-171):** the PHONE screen is a NATIVE Sessions + Board UI (`src/phone/`), not
+  the hub's web pages. It renders from `App` state, drives it in-process (no iframe/postMessage) — a tap is
+  `App.enterSession`, the org filter `App.setOrgFilter`. **ENTER syncs, LEAVE doesn't**: entering on one
+  pulls the other in (`App.onEnterSession`); org filter scopes the list too. Board is Phase 2.
 
 ## `android/` — native Android client
 

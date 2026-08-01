@@ -11,7 +11,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, preserveScroll, isEmbedded, embedPages } = require("../public/nav.js");
+const { PAGES, siteHeaderHtml, bottomNavHtml, tabsHtml, mount, preserveScroll } = require("../public/nav.js");
 
 const PUBLIC = path.join(__dirname, "..", "public");
 const PAGE_FILES = ["index.html", "sessions.html", "board.html", "usage.html"];
@@ -31,47 +31,6 @@ test("nav: exactly one tab is marked active, and only the named one", () => {
   // An unknown/absent page (e.g. a page that forgot data-page) simply lights
   // nothing up rather than throwing or defaulting to Dashboard.
   assert.equal((tabsHtml("").match(/class="active"/g) || []).length, 0);
-});
-
-// The dedicated Even phone companion (XERK-171) embeds only Sessions + Board.
-test("nav (embed): isEmbedded detects the ?embed=glasses flag", () => {
-  assert.equal(isEmbedded("?embed=glasses"), true);
-  assert.equal(isEmbedded("?a=1&embed=glasses"), true);
-  assert.equal(isEmbedded("?embed=other"), false);
-  assert.equal(isEmbedded(""), false);
-});
-
-test("nav (embed): the tab list is trimmed to Sessions + Board, links stay embedded, no Sign out", () => {
-  assert.deepEqual(embedPages(true).map(p => p.id), ["sessions", "board"]);
-  const html = tabsHtml("sessions", true);
-  const hrefs = [...html.matchAll(/<a href="([^"]+)"/g)].map(m => m[1]);
-  assert.deepEqual(hrefs, ["/sessions?embed=glasses", "/board?embed=glasses"]);
-  assert.doesNotMatch(html, /Sign out/);
-  assert.doesNotMatch(html, /Dashboard/);
-  assert.doesNotMatch(html, /Usage/);
-  // The active tab still lights up.
-  assert.match(html, /<a href="\/sessions\?embed=glasses" class="active">/);
-});
-
-test("nav (embed): the bottom nav is trimmed to the same two, links embedded", () => {
-  const html = bottomNavHtml("board", true);
-  const hrefs = [...html.matchAll(/<a href="([^"]+)"/g)].map(m => m[1]);
-  assert.deepEqual(hrefs, ["/sessions?embed=glasses", "/board?embed=glasses"]);
-});
-
-test("nav (embed): the header keeps the org + new-ticket slots (both required on the phone)", () => {
-  const html = siteHeaderHtml("sessions", "", true);
-  assert.match(html, /id="hdrOrg"/);
-  assert.match(html, /id="hdrNewTicket"/);
-  // The wordmark points back into the embedded app, not the (hidden) dashboard.
-  assert.match(html, /class="wordmark" href="\/sessions\?embed=glasses"/);
-});
-
-test("nav: the un-embedded header/nav are unchanged (no embed flag leaks in)", () => {
-  assert.doesNotMatch(tabsHtml("sessions"), /embed=glasses/);
-  assert.match(tabsHtml("sessions"), /Sign out/);
-  assert.doesNotMatch(bottomNavHtml("usage"), /embed=glasses/);
-  assert.deepEqual(embedPages(false).map(p => p.id), PAGES.map(p => p.id));
 });
 
 test("nav: the header is identical across pages apart from the active tab and the sub slot", () => {
