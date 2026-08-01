@@ -256,6 +256,23 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   `splitLabels` (Jira on whitespace+commas, Azure on commas), and the `classifyCreateMeta`/
   `classifyCreateResult` 202-poll classifiers — JVM-tested in `BoardTest` against the board.js behaviour.
 
+## Done (XERK-169 — markdown in chat bubbles)
+
+- **Prose objects (tables, code, inline code, links) now render in the chat.** The bubble and thinking
+  trace rendered raw text — a GFM table showed its pipes, a fenced block its backticks, a URL was
+  inert — while the web runs both through `chat.js renderProse`. Ported that pipeline to a pure,
+  JVM-tested parser `core/Prose.kt` (`parseProse` → fenced code lifted out first, then GFM tables, then
+  inline code spans + links, mirroring `renderProse`/`renderTables`/`renderInline`/`linkify` line for
+  line; locked to chat.test.js's vectors in `core/ProseTest.kt`). `ui/TranscriptView.kt` renders the
+  typed tree natively: paragraphs with inline-code chips (mono, tinted) and tappable links
+  (`LinkAnnotation.Url` → external browser), fenced blocks as a bordered mono box that scrolls
+  horizontally, and tables as a bordered equal-column grid (header emphasis, zebra rows, per-column
+  alignment). A bubble carrying a table/code block widens to full width (the web's `:has(.md-code)`
+  widening). Applies everywhere `ChatItemView` renders — live chat, archive, and ended views.
+- **Mobile-idiomatic table difference:** the web scrolls a wide table horizontally inside the bubble;
+  Android uses equal-weight columns that fill the bubble width and wrap long cells, which reads better
+  on a phone than a sideways-scrolling grid.
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
