@@ -14,15 +14,21 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -31,6 +37,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -51,6 +58,7 @@ import com.xerktech.turma.core.ChatItem
 import com.xerktech.turma.core.ProseBlock
 import com.xerktech.turma.core.Span
 import com.xerktech.turma.core.parseProse
+import kotlinx.coroutines.delay
 
 /** Shared renderers for one transcript item — used by live chat + the archive. */
 @Composable
@@ -178,31 +186,70 @@ private fun spansToAnnotated(spans: List<Span>, codeBg: Color, linkColor: Color,
 
 @Composable
 private fun ProseCode(block: ProseBlock.Code, fontSize: TextUnit, color: Color) {
-    Column(
-        Modifier.fillMaxWidth()
-            .clip(RoundedCornerShape(6.dp))
-            .background(color.copy(alpha = 0.06f))
-            .border(1.dp, color.copy(alpha = 0.22f), RoundedCornerShape(6.dp))
-            .padding(horizontal = 8.dp, vertical = 6.dp),
-    ) {
-        if (block.lang.isNotBlank()) {
+    // A copy button pinned to the top-right corner of the block (XERK-183),
+    // matching the web/phone chat views. The Box is the positioning context; the
+    // code Column keeps right padding so a long first line doesn't run under it.
+    Box(Modifier.fillMaxWidth()) {
+        Column(
+            Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(6.dp))
+                .background(color.copy(alpha = 0.06f))
+                .border(1.dp, color.copy(alpha = 0.22f), RoundedCornerShape(6.dp))
+                .padding(start = 8.dp, top = 6.dp, bottom = 6.dp, end = 34.dp),
+        ) {
+            if (block.lang.isNotBlank()) {
+                Text(
+                    block.lang.uppercase(),
+                    fontSize = scaledSp(9f),
+                    fontFamily = FontFamily.Monospace,
+                    color = color.copy(alpha = 0.6f),
+                    modifier = Modifier.padding(bottom = 4.dp),
+                )
+            }
+            // white-space: pre + overflow-x: auto — no wrap, scroll horizontally.
             Text(
-                block.lang.uppercase(),
-                fontSize = scaledSp(9f),
+                block.body,
+                Modifier.horizontalScroll(rememberScrollState()),
+                fontSize = fontSize * 0.9f,
+                lineHeight = fontSize * 1.25f,
                 fontFamily = FontFamily.Monospace,
-                color = color.copy(alpha = 0.6f),
-                modifier = Modifier.padding(bottom = 4.dp),
+                color = color,
+                softWrap = false,
             )
         }
-        // white-space: pre + overflow-x: auto — no wrap, scroll horizontally.
-        Text(
-            block.body,
-            Modifier.horizontalScroll(rememberScrollState()),
-            fontSize = fontSize * 0.9f,
-            lineHeight = fontSize * 1.25f,
-            fontFamily = FontFamily.Monospace,
-            color = color,
-            softWrap = false,
+        CopyButton(
+            text = block.body,
+            tint = color,
+            modifier = Modifier.align(Alignment.TopEnd).padding(4.dp),
+        )
+    }
+}
+
+// Small clipboard button used by ProseCode. Copies `text` and flashes a check
+// for ~1.2s, mirroring the web's .md-copy button.
+@Composable
+private fun CopyButton(text: String, tint: Color, modifier: Modifier = Modifier) {
+    val clipboard = LocalClipboardManager.current
+    var copied by remember { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) { delay(1200); copied = false }
+    }
+    Box(
+        modifier
+            .size(24.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .background(tint.copy(alpha = 0.10f))
+            .clickable {
+                clipboard.setText(AnnotatedString(text))
+                copied = true
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
+            contentDescription = "Copy code",
+            tint = if (copied) MaterialTheme.colorScheme.primary else tint.copy(alpha = 0.7f),
+            modifier = Modifier.size(15.dp),
         )
     }
 }

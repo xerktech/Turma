@@ -276,9 +276,68 @@
     const m = /^\s*(`{3,})[ \t]*$/.exec(line);
     return !!m && m[1].length >= open.length;
   }
+  // Copy-to-clipboard button planted in the top-right of every fenced code
+  // block (XERK-183). Two inline SVGs — the check is revealed by CSS only while
+  // .md-copy.copied is set (see sessions.html / vendor/chat.css). The button
+  // sits OUTSIDE the <pre>, so it (like the language ::before label) never lands
+  // in a copied text selection, and the click handler reads the <code> text, not
+  // the <pre>. Rendered pure so the phone companion's vendored engine shows it too.
+  const MD_COPY_BTN =
+    '<button class="md-copy" type="button" aria-label="Copy code" title="Copy code">' +
+    '<svg class="ic-copy" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<rect x="9" y="9" width="13" height="13" rx="2"/>' +
+    '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
+    '<svg class="ic-check" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" ' +
+    'stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M20 6L9 17l-5-5"/></svg></button>';
   function renderCode(lang, body) {
-    return '<pre class="md-code"' + (lang ? ' data-lang="' + esc(lang) + '"' : "") +
-      "><code>" + esc(body) + "</code></pre>";
+    return '<div class="md-code-wrap">' + MD_COPY_BTN +
+      '<pre class="md-code"' + (lang ? ' data-lang="' + esc(lang) + '"' : "") +
+      "><code>" + esc(body) + "</code></pre></div>";
+  }
+  // Write `text` to the system clipboard, resolving on success. Prefers the
+  // async Clipboard API (available over the hub's https tunnel and in the phone
+  // webview) and falls back to a hidden-textarea execCommand copy.
+  function writeClipboard(text) {
+    if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "-1000px";
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        if (ok) resolve(); else reject(new Error("execCommand copy failed"));
+      } catch (err) { reject(err); }
+    });
+  }
+  // Delegated handler for the code-block copy button. One listener per transcript
+  // container (the live scroll, the static/archive scroll, and the phone's root)
+  // routes through this. Returns true when it handled a .md-copy click, so a
+  // shared listener can early-out. Flashes .copied/.failed on the button; a later
+  // repaint may clear the class sooner, which is harmless.
+  function copyCodeClick(e) {
+    const t = e && e.target;
+    const btn = t && t.closest && t.closest(".md-copy");
+    if (!btn) return false;
+    e.preventDefault();
+    const wrap = btn.closest(".md-code-wrap");
+    const code = wrap && wrap.querySelector("pre.md-code code");
+    const text = code ? (code.textContent || "") : "";
+    const flash = function (cls) {
+      btn.classList.remove("copied", "failed");
+      btn.classList.add(cls);
+      setTimeout(function () { try { btn.classList.remove(cls); } catch (_) {} }, 1200);
+    };
+    writeClipboard(text).then(function () { flash("copied"); }, function () { flash("failed"); });
+    return true;
   }
   function renderProse(text) {
     const s = String(text == null ? "" : text);
@@ -1664,6 +1723,7 @@
     if (!scroll || scroll.dataset.wired) return;
     scroll.dataset.wired = "1";
     scroll.addEventListener("click", (e) => {
+      if (copyCodeClick(e)) return;
       const b = e.target.closest && e.target.closest(".trunc[data-eid]");
       if (b) { e.preventDefault(); expandEntry(b.getAttribute("data-eid")); }
     });
@@ -1759,6 +1819,8 @@
   function wireStaticDelegation() {
     if (!stScroll || stScroll.dataset.wired) return;
     stScroll.dataset.wired = "1";
+    // Code-block copy button (XERK-183) — the static/archive/subagent views.
+    stScroll.addEventListener("click", copyCodeClick);
     // `toggle` doesn't bubble; capture it to remember each card's open state so a
     // verbosity re-render doesn't snap the reader's opened cards shut.
     stScroll.addEventListener("toggle", (e) => {
@@ -1844,7 +1906,7 @@
   // in the browser (no `module`); the browser path uses window.TurmaChat above.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, prFooterChip,
+      mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
       isBusy, updateComposeAction, isToolBullet,
