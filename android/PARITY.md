@@ -111,7 +111,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Split compose bar (XERK-33).** Send now ALWAYS sends (mid-turn it queues); a separate
   warning-coloured Stop appears beside it while a turn runs, suppressed during a pending question. Was
   a single button that morphed into Stop — on a phone (no Enter key) that made mid-turn queueing
-  impossible. `ui/ChatScreen.kt`.
+  impossible. `ui/ChatScreen.kt`. The terminal screen's input bar carries the same split (XERK-177,
+  web `termComposeStop`); with no live tail of its own its busy read is the heartbeat's `paneBusy`.
+  `ui/TerminalScreen.kt`.
 - **Host "updating" status (XERK-29).** A host in an announced update restart shows an "updating →
   <version>" pill instead of the outage-looking "offline". `model/Models.kt` + `ui/FleetScreen.kt`.
 - **Kill from the chat/terminal header + New session from the Sessions page (XERK-44).** A shared
@@ -337,9 +339,6 @@ those are marked `[MODEL]`.
   decodes the field away today, so such a session still reads idle with no way to answer. Port:
   `panePrompt` onto the session model, the waiting state in `core/Sessions.kt`, and the picker in
   `ChatScreen`/`ChatViewModel` beside the existing question sheet.
-- P3 **Terminal compose Stop.** XERK-33 also split the terminal compose bar; Android's
-  `ui/TerminalScreen.kt` bar still only sends (it's a separate WebView screen with no live busy read).
-
 ### Usage
 - P2 **Table-view state persistence (XERK-31).** The web keeps the usage table open + the page put
   across SSE re-renders. Moot until Android grows a usage table view (see the Usage P1 above).
