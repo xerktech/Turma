@@ -89,6 +89,26 @@ sha256sum, since it runs before `install.sh` has installed anything — includin
 python3, which is why it reads the release stream with grep rather than a JSON
 parser.
 
+### Appliance hosts (TrueNAS SCALE and kin)
+
+Hosts with a **present-but-disabled apt** (TrueNAS shims `apt-get` to an
+"is disabled" stub), a **noexec `/tmp`**, and **root as the operating user**
+are supported:
+
+- apt failures are non-fatal — the installer names what's missing and moves on;
+  node falls back to the official nodejs.org tarball (into the prefix, like the
+  static ttyd) and `bootstrap.sh` runs `install.sh` through bash so noexec
+  `/tmp` doesn't matter.
+- Run it as root directly (no sudo dance — root *is* the user there). With no
+  systemd **user** bus for root, the service lands as **system units**
+  (`systemctl status turma-agent`), same zero-downtime `KillMode=process`
+  semantics; the updater restarts through the same scope.
+- Set `IS_SANDBOX=1` in the config if sessions should be able to use
+  `bypassPermissions` (Claude Code refuses it under root otherwise), and mind
+  that a TrueNAS OS upgrade builds a fresh boot environment that can drop the
+  `/etc` pieces (system units, `/etc/tmux.conf`) — re-run the installer after
+  upgrading; prefix, config, and state all survive.
+
 ## Configure
 
 Edit `~/.config/turma-agent/turma-agent.env` (created `chmod 600` — it holds a

@@ -77,6 +77,13 @@ SUDO=""
 if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
 
 # ---- prerequisites --------------------------------------------------------
+# Appliance distros can ship a PRESENT-but-disabled apt: TrueNAS SCALE replaces
+# apt-get with a /usr/local/bin shim that prints "Package management tools are
+# disabled" and exits 1 (the real binary has its exec bit stripped). So `have
+# apt-get` passes, and under `set -e` the first apt call used to kill the whole
+# install. Every apt call below is therefore non-fatal: warn and carry on, the
+# same posture as having no apt at all — the missing tools get named, and the
+# installer stays idempotent so they can be provided another way and re-run.
 ensure_apt_pkgs() {
   have apt-get || { warn "no apt-get — install manually: git tmux ripgrep ncurses-term python3 curl"; return 0; }
   if ! have_sudo && [ "$(id -u)" != 0 ]; then
@@ -85,32 +92,71 @@ ensure_apt_pkgs() {
     return 0
   fi
   info "apt: ensuring git tmux ripgrep ncurses-term python3 curl ca-certificates"
-  $SUDO apt-get update -y
-  $SUDO apt-get install -y --no-install-recommends \
-    git tmux ripgrep ncurses-term python3 curl ca-certificates
+  if ! $SUDO apt-get update -y \
+     || ! $SUDO apt-get install -y --no-install-recommends \
+          git tmux ripgrep ncurses-term python3 curl ca-certificates; then
+    warn "apt-get failed (disabled on this host? e.g. TrueNAS) — continuing."
+    warn "  Ensure these exist some other way: git tmux ripgrep ncurses-term python3 curl"
+  fi
+}
+
+# No-apt fallback: the official nodejs.org linux tarball, unpacked into
+# $PREFIX/node with the binary symlinked into $PREFIX/bin — which the launcher
+# already puts on PATH (it must: that is also where a static ttyd lands). The
+# exact version is resolved from the latest-v<major>.x SHASUMS256.txt (a dead
+# hardcoded patch version would strand the install), and the tarball is
+# verified against that same file. .tar.gz, not .xz — gzip is everywhere, xz
+# isn't. Glibc hosts only, like NodeSource; a musl host gets the warning path.
+node_tarball_install() {
+  local arch base sums tarball
+  case "$(uname -m)" in
+    x86_64) arch=x64 ;; aarch64) arch=arm64 ;;
+    *) warn "no nodejs.org tarball for arch $(uname -m)"; return 1 ;;
+  esac
+  base="https://nodejs.org/dist/latest-v${NODE_MAJOR_MIN}.x"
+  sums="$(mktemp)"
+  curl -fsSL -o "$sums" "$base/SHASUMS256.txt" || { rm -f "$sums"; return 1; }
+  tarball="$(grep -o "node-v[0-9.]*-linux-${arch}\.tar\.gz" "$sums" | head -n1)"
+  [ -n "$tarball" ] || { rm -f "$sums"; return 1; }
+  info "installing ${tarball%.tar.gz} -> $PREFIX/node (nodejs.org tarball)"
+  curl -fsSL -o "$sums.tgz" "$base/$tarball" || { rm -f "$sums" "$sums.tgz"; return 1; }
+  grep " $tarball\$" "$sums" | sed "s| $tarball\$| $sums.tgz|" | sha256sum -c - >/dev/null \
+    || { warn "checksum mismatch on $tarball"; rm -f "$sums" "$sums.tgz"; return 1; }
+  rm -rf "$PREFIX/node"
+  mkdir -p "$PREFIX/node" "$PREFIX/bin"
+  tar -xzf "$sums.tgz" -C "$PREFIX/node" --strip-components=1
+  ln -sf "$PREFIX/node/bin/node" "$PREFIX/bin/node"
+  rm -f "$sums" "$sums.tgz"
 }
 
 ensure_node() {
   if [ "$(node_major)" -ge "$NODE_MAJOR_MIN" ]; then
     info "node $(node -v) OK"; return 0
   fi
-  if have_sudo || [ "$(id -u)" = 0 ]; then
+  if { have_sudo || [ "$(id -u)" = 0 ]; } && have apt-get; then
     info "installing Node ${NODE_MAJOR_MIN}.x (NodeSource)"
     # Download the setup script to a file and run it as a separate step rather
     # than piping curl straight into a shell (avoids the pipe-to-shell foot-gun;
-    # the file could also be inspected/checksummed if ever needed).
+    # the file could also be inspected/checksummed if ever needed). Non-fatal:
+    # on a disabled-apt appliance (TrueNAS) both steps fail — fall through to
+    # the tarball below instead of dying under set -e.
     local ns; ns="$(mktemp)"
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_MIN}.x" -o "$ns"
-    $SUDO -E bash "$ns"
+    if curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_MIN}.x" -o "$ns" \
+       && $SUDO -E bash "$ns" && $SUDO apt-get install -y nodejs; then
+      rm -f "$ns"; return 0
+    fi
     rm -f "$ns"
-    $SUDO apt-get install -y nodejs
+    warn "NodeSource/apt install failed — trying the nodejs.org tarball instead"
+  fi
+  if node_tarball_install; then
+    return 0
   else
     # Worth more than a one-line warning: node is what runs the reverse tunnel,
     # so an install that lands without it leaves every session on this host
     # reading "terminal offline" in the UI, while the host itself reads online.
     # The agent now retries for node rather than needing a restart, so saying so
     # here is what turns a mystery into a two-minute fix.
-    warn "node >= ${NODE_MAJOR_MIN} is MISSING and could not be installed (no sudo)."
+    warn "node >= ${NODE_MAJOR_MIN} is MISSING and could not be installed."
     warn "  Without it the reverse tunnel cannot run, so every session on this host"
     warn "  will read 'terminal offline' in the UI. Install it, either:"
     warn "    sudo apt-get install -y nodejs   (or re-run this installer with sudo available)"
@@ -233,6 +279,24 @@ _render_unit() {  # <src> <dst>
       "$1" >"$2"
 }
 
+# System-scope variant, for a root install with no user bus (TrueNAS-style
+# appliance): default.target is a user-manager target, and a system service
+# gets NO $HOME (the launcher's config/default paths all hang off it), so both
+# are rendered in explicitly.
+_render_system_unit() {  # <src> <dst>
+  _render_unit "$1" /dev/stdout \
+    | sed -e "s|WantedBy=default.target|WantedBy=multi-user.target|" \
+          -e "/^\[Service\]/a\\
+Environment=HOME=$HOME" >"$2"
+}
+
+# Root on a systemd host usually has no per-user manager (nothing ever logs
+# root in through logind — `systemctl --user` just says "Failed to connect to
+# bus"). The agent should still be a supervised service there, not a nohup
+# orphan, so it lands as SYSTEM units instead.
+systemd_system_ok() { [ -d /run/systemd/system ] && [ "$(id -u)" = 0 ]; }
+SYS_UNIT_DIR=/etc/systemd/system
+
 install_service() {
   if systemd_user_ok; then
     info "systemd user manager detected — installing units"
@@ -261,6 +325,18 @@ install_service() {
       fi
     fi
     info "service: systemctl --user status turma-agent"
+  elif systemd_system_ok; then
+    info "no user bus, running as root — installing SYSTEM units"
+    _render_system_unit "$SELF_DIR/turma-agent.service"        "$SYS_UNIT_DIR/turma-agent.service"
+    _render_system_unit "$SELF_DIR/turma-agent-update.service" "$SYS_UNIT_DIR/turma-agent-update.service"
+    cp "$SELF_DIR/turma-agent-update.timer"                    "$SYS_UNIT_DIR/turma-agent-update.timer"
+    systemctl daemon-reload
+    systemctl enable --now turma-agent.service
+    systemctl enable --now turma-agent-update.timer
+    # Same re-run semantics as the user branch: replace a running manager
+    # (KillMode=process keeps the live sessions), leave a just-started one be.
+    systemctl try-restart turma-agent.service
+    info "service: systemctl status turma-agent"
   else
     warn "no systemd user bus (WSL without [boot] systemd=true) — using the nohup fallback"
     info "start it with:  $PREFIX/bin/turma-agentctl start"
@@ -302,7 +378,9 @@ do_verify() {
     echo "  config: MISSING ($CFG)"; ok=1
   fi
   { [ -f /etc/tmux.conf ] || [ -f "$HOME/.tmux.conf" ]; } && echo "  tmux.conf: reachable" || echo "  tmux.conf: none (colors may degrade)"
-  systemd_user_ok && echo "  service: systemd user" || echo "  service: nohup fallback (turma-agentctl)"
+  if systemd_user_ok; then echo "  service: systemd user"
+  elif systemd_system_ok; then echo "  service: systemd system"
+  else echo "  service: nohup fallback (turma-agentctl)"; fi
   [ -f "$HOME/.claude/.credentials.json" ] && echo "  claude login: present" || echo "  claude login: MISSING (run: claude /login)"
   return $ok
 }
@@ -314,6 +392,11 @@ do_uninstall() {
     systemctl --user disable --now turma-agent-update.timer 2>/dev/null || true
     rm -f "$UNIT_DIR/turma-agent.service" "$UNIT_DIR/turma-agent-update.service" "$UNIT_DIR/turma-agent-update.timer"
     systemctl --user daemon-reload 2>/dev/null || true
+  elif systemd_system_ok && [ -f "$SYS_UNIT_DIR/turma-agent.service" ]; then
+    systemctl disable --now turma-agent.service 2>/dev/null || true
+    systemctl disable --now turma-agent-update.timer 2>/dev/null || true
+    rm -f "$SYS_UNIT_DIR/turma-agent.service" "$SYS_UNIT_DIR/turma-agent-update.service" "$SYS_UNIT_DIR/turma-agent-update.timer"
+    systemctl daemon-reload 2>/dev/null || true
   else
     [ -x "$PREFIX/bin/turma-agentctl" ] && "$PREFIX/bin/turma-agentctl" stop 2>/dev/null || true
   fi
@@ -355,6 +438,8 @@ info "  2) Log in to Claude on this host if you haven't:  claude /login"
 info "  3) (optional) gh auth login   — for private git and 'gh pr create'."
 if systemd_user_ok; then
   info "  4) It's running under systemd:  systemctl --user status turma-agent"
+elif systemd_system_ok; then
+  info "  4) It's running under systemd (system):  systemctl status turma-agent"
 else
   info "  4) Start it:  $PREFIX/bin/turma-agentctl start"
 fi

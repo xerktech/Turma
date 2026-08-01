@@ -73,6 +73,9 @@ tar xzf "$asset"
 
 # The tarball is flat: install.sh sits beside hub-agent.py, which is the layout
 # its own source-probe expects. Hand off; it prints the next steps (config,
-# claude login, service).
-chmod +x install.sh
-exec ./install.sh "$@"
+# claude login, service). Invoked THROUGH bash, not ./install.sh: mktemp -d
+# lands on /tmp, and on appliance hosts (TrueNAS) /tmp is mounted noexec, where
+# exec'ing the file dies with "Permission denied" but an interpreter reading it
+# does not. install.sh never executes anything else from this dir — everything
+# it runs, it first copies into the prefix.
+exec bash ./install.sh "$@"

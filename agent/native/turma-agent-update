@@ -202,9 +202,14 @@ install_payload() {  # <tgz> <version>
     >"$HOME/.turma/updating.json" 2>/dev/null || true
 
   # Restart just the manager. KillMode=process / manager-only kill keeps
-  # tmux/claude/ttyd alive; the new manager adopts them.
+  # tmux/claude/ttyd alive; the new manager adopts them. Three scopes, matching
+  # install.sh's install_service: user units, system units (a root install with
+  # no user bus — TrueNAS-style appliance), or the pidfile fallback.
   if [ -d /run/systemd/system ] && systemctl --user show-environment >/dev/null 2>&1; then
     systemctl --user restart turma-agent || logmsg "systemctl restart failed"
+  elif [ -d /run/systemd/system ] && [ "$(id -u)" = 0 ] \
+       && [ -f /etc/systemd/system/turma-agent.service ]; then
+    systemctl restart turma-agent || logmsg "systemctl restart failed"
   else
     "$PREFIX/bin/turma-agentctl" restart || logmsg "turma-agentctl restart failed"
   fi
