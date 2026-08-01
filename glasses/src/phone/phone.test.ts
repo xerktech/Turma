@@ -35,7 +35,7 @@ function sessionState(id: string, host: string): AppState {
 
 describe("phone controller", () => {
   let root: HTMLElement;
-  let client: { sendInput: ReturnType<typeof vi.fn>; answerQuestion: ReturnType<typeof vi.fn> };
+  let client: Record<string, ReturnType<typeof vi.fn>>;
   let app: { getState: () => AppState; enterSession: ReturnType<typeof vi.fn>; setOrgFilter: ReturnType<typeof vi.fn> };
   let handle: ReturnType<typeof mountPhone>;
   let onSignOut: ReturnType<typeof vi.fn>;
@@ -45,7 +45,16 @@ describe("phone controller", () => {
     document.body.innerHTML = '<div id="phone"></div>';
     root = document.getElementById("phone") as HTMLElement;
     state = homeState();
-    client = { sendInput: vi.fn(async () => ({ ok: true, cmdId: "c" })), answerQuestion: vi.fn(async () => ({ ok: true, cmdId: "c" })) };
+    client = {
+      sendInput: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      answerQuestion: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      interrupt: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      setSummary: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      sessionAction: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      getHistory: vi.fn(async () => ({ status: 200 as const, body: { entries: [], truncated: false, fetchedAt: 0 } })),
+      loginForCookie: vi.fn(async () => {}),
+      termUrl: vi.fn((id: string) => `http://hub/term/${id}/`),
+    };
     // A fake App whose enter/setOrgFilter synchronously push the new state to the
     // phone, exactly as the real App's setState→repaint→onState does.
     app = {
@@ -66,13 +75,13 @@ describe("phone controller", () => {
   it("tapping a session enters it in-process and shows the session view", () => {
     root.querySelector<HTMLElement>('[data-enter="s1"]')!.click();
     expect(app.enterSession).toHaveBeenCalledWith("s1", "host-a");
-    expect(root.querySelector(".ph-transcript")).toBeTruthy();
+    expect(root.querySelector("#ph-transcript")).toBeTruthy();
     expect(root.querySelector(".ph-nav")).toBeFalsy(); // shell hidden in the session view
   });
 
   it("Back leaves the phone's session view WITHOUT touching the glasses", () => {
     root.querySelector<HTMLElement>('[data-enter="s1"]')!.click();
-    expect(root.querySelector(".ph-transcript")).toBeTruthy();
+    expect(root.querySelector("#ph-transcript")).toBeTruthy();
     root.querySelector<HTMLElement>("[data-back]")!.click();
     // Back to the list; nothing was pushed to the App (leaving doesn't sync).
     expect(root.querySelector(".ph-nav")).toBeTruthy();
@@ -113,7 +122,7 @@ describe("phone controller", () => {
     state = sessionState("s2", "host-b");
     handle.render(state);
     handle.enterFromGlasses("host-b", "s2");
-    expect(root.querySelector(".ph-transcript")).toBeTruthy();
+    expect(root.querySelector("#ph-transcript")).toBeTruthy();
   });
 
   it("the compose draft survives a poll repaint (render with unchanged state)", () => {
@@ -123,6 +132,23 @@ describe("phone controller", () => {
     inp.focus();
     handle.render(state); // a ~1s poll repaint
     expect(root.querySelector<HTMLTextAreaElement>("#ph-input")!.value).toBe("half-typed");
+  });
+
+  it("the ⋯ menu renames via setSummary and kills via sessionAction (arm-then-confirm)", () => {
+    root.querySelector<HTMLElement>('[data-enter="s1"]')!.click();
+    // Rename
+    root.querySelector<HTMLElement>("[data-sess-menu]")!.click();
+    root.querySelector<HTMLElement>("[data-menu-rename]")!.click();
+    root.querySelector<HTMLInputElement>("#ph-rename")!.value = "New name";
+    root.querySelector<HTMLElement>("[data-menu-save]")!.click();
+    expect(client.setSummary).toHaveBeenCalledWith("host-a", "s1", "New name");
+    // Kill: arm then confirm
+    root.querySelector<HTMLElement>("[data-sess-menu]")!.click();
+    root.querySelector<HTMLElement>("[data-menu-kill]")!.click();
+    expect(client.sessionAction).not.toHaveBeenCalled(); // armed, not fired
+    root.querySelector<HTMLElement>("[data-menu-kill-confirm]")!.click();
+    expect(client.sessionAction).toHaveBeenCalledWith("host-a", "s1", "kill");
+    expect(root.querySelector(".ph-nav")).toBeTruthy(); // left the session view after kill
   });
 
   it("the sign-out affordance calls back out", () => {
@@ -135,6 +161,6 @@ describe("phone controller", () => {
     // Now filter to a different org — the session view stays (leaving is one-way).
     state = { ...sessionState("s1", "host-a"), orgFilter: "globex.atlassian.net" };
     handle.render(state);
-    expect(root.querySelector(".ph-transcript")).toBeTruthy();
+    expect(root.querySelector("#ph-transcript")).toBeTruthy();
   });
 });

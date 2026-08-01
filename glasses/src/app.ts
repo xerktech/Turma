@@ -240,6 +240,10 @@ export interface AppOptions {
   // phone UI (which renders from the same state, in the same process) repaints
   // in lockstep — no second poll, no cross-origin bridge (XERK-171).
   onState?: (state: AppState) => void;
+  // Fired with the focused session's RAW live-tail entries (rich blocks intact),
+  // for the phone's full-transcript render (XERK-171). The glasses' own buffer
+  // gets the concise-flattened copy separately.
+  onRichTail?: (sessionId: string, entries: TailEntry[]) => void;
 }
 
 // The controller: owns AppState, drives the HubClient on a poll loop, reacts
@@ -253,6 +257,7 @@ export class App {
   private readonly pollMs: number;
   private readonly onEnterSession?: (hostKey: string, sessionId: string) => void;
   private readonly onState?: (state: AppState) => void;
+  private readonly onRichTail?: (sessionId: string, entries: TailEntry[]) => void;
 
   private state: AppState;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -274,6 +279,7 @@ export class App {
     this.pollMs = opts.pollMs ?? 6000;
     this.onEnterSession = opts.onEnterSession;
     this.onState = opts.onState;
+    this.onRichTail = opts.onRichTail;
     this.state = createInitialState(this.now());
   }
 
@@ -508,6 +514,10 @@ export class App {
   // race).
   private onLiveTail(_hostKey: string, sessionId: string, entries: TailEntry[]): void {
     if (this.state.screen !== "session" || this.state.session?.sessionId !== sessionId) return;
+    // Forward the RAW entries (with their rich blocks) to the phone UI before the
+    // glasses' concise flattening, so the phone renders the full transcript
+    // (tool cards, thinking, code) through the vendored chat.js engine (XERK-171).
+    this.onRichTail?.(sessionId, entries);
     const beforeLen = this.sessionContentLength(_hostKey, sessionId);
     const existing = this.state.transcripts[sessionId] ?? emptyBuffer();
     const merged = mergeTail(existing, entries);

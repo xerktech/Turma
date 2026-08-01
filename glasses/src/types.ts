@@ -14,6 +14,13 @@ export interface TailEntry {
   id: string;
   role: string;
   text: string;
+  // The rich per-entry blocks the hub's /live + /history already deliver
+  // (thinking, tool_use/tool_result, code, pr_link, interrupt, …; see
+  // hub-agent.py `_entry_blocks`). The glasses flatten to `text`; the native
+  // phone UI (XERK-171) keeps these and renders them through the vendored
+  // chat.js engine for full transcript parity. Untyped payload — the engine
+  // reads the shapes.
+  blocks?: { t: string; [key: string]: unknown }[];
 }
 
 // Per-running-session live signals (`hub-agent.py:session_report`), attached

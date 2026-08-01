@@ -5,11 +5,13 @@ import {
   orgLabel,
   orgOptions,
   phoneHtml,
-  sessionEntries,
+  transcriptEntries,
   sessionsBodyHtml,
   sessionViewHtml,
   type PhoneView,
 } from "./render.ts";
+
+const VIEW = (o: Partial<PhoneView> = {}): PhoneView => ({ tab: "sessions", inSession: false, verbosity: "normal", showTerminal: false, menu: "closed", ...o });
 
 function signals(o: Partial<LiveSignals> = {}): LiveSignals {
   return {
@@ -68,37 +70,37 @@ describe("phone render", () => {
     expect(html).toContain("st-working");
   });
 
-  it("sessionEntries appends the growing live turn as the newest assistant bubble", () => {
-    const st = state({
-      screen: "session",
-      session: newSessionState("host-a", "s1"),
-      transcripts: { s1: { entries: [{ id: "u1", role: "user", text: "hi" }] } },
-      liveTurn: { sessionId: "s1", text: "typing…" },
-    });
-    const entries = sessionEntries(st);
+  it("transcriptEntries appends the growing live turn as the newest assistant entry", () => {
+    const entries = transcriptEntries(
+      [{ id: "u1", role: "user", text: "hi" }],
+      { sessionId: "s1", text: "typing…" },
+      "s1"
+    );
     expect(entries.map((e) => e.text)).toEqual(["hi", "typing…"]);
     expect(entries[1]?.role).toBe("assistant");
   });
 
-  it("sessionViewHtml renders a pending question with numbered options and a compose box", () => {
+  it("sessionViewHtml renders a pending question, a compose box, a transcript container and the terminal/verbosity controls", () => {
     const st = state({
       screen: "session",
       session: newSessionState("host-a", "s1"),
       agents: [agent({ sessions: [session({ id: "s1", session: signals({ question: "Pick one", questionOptions: ["A", "B"] }) })] })],
       transcripts: {},
     });
-    const html = sessionViewHtml(st);
+    const html = sessionViewHtml(st, "normal", false, "closed");
     expect(html).toContain("Pick one");
     expect(html).toMatch(/data-answer="0"[\s\S]*?>1<\/span>A/);
     expect(html).toMatch(/data-answer="1"[\s\S]*?>2<\/span>B/);
     expect(html).toContain('id="ph-input"');
+    expect(html).toContain('id="ph-transcript"'); // filled by the controller with chat.js output
+    expect(html).toContain("data-term-toggle"); // terminal toggle
+    expect(html).toMatch(/data-verb="verbose"/); // verbosity control
     expect(html).toMatch(/data-back/);
   });
 
   it("phoneHtml shows the shell (header org menu + bottom nav) on the sessions tab", () => {
     const st = state({ agents: [agent({ jira: { siteKey: "acme.atlassian.net" } })] });
-    const view: PhoneView = { tab: "sessions", inSession: false };
-    const html = phoneHtml(st, view, false);
+    const html = phoneHtml(st, VIEW(), false);
     expect(html).toMatch(/data-tab="sessions"[^>]*class="ph-tab active"|class="ph-tab active"[^>]*data-tab="sessions"/);
     expect(html).toContain("data-org-toggle");
     expect(html).toContain("data-signout");
@@ -110,14 +112,14 @@ describe("phone render", () => {
       session: newSessionState("host-a", "s1"),
       agents: [agent({ sessions: [session({ id: "s1" })] })],
     });
-    const html = phoneHtml(st, { tab: "sessions", inSession: true }, false);
+    const html = phoneHtml(st, VIEW({ inSession: true }), false);
     expect(html).toContain("ph-transcript");
     expect(html).not.toContain("ph-nav"); // the shell nav is hidden in the session view
   });
 
   it("phoneHtml falls back to the shell if inSession but the glasses left the session", () => {
     const st = state({ screen: "home", session: null, agents: [agent()] });
-    const html = phoneHtml(st, { tab: "sessions", inSession: true }, false);
+    const html = phoneHtml(st, VIEW({ inSession: true }), false);
     expect(html).toContain("ph-nav");
   });
 });

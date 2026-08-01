@@ -48,7 +48,35 @@ export class HubClient {
   }
 
   private url(path: string): string {
-    return `${this.config.hubUrl.replace(/\/$/, "")}${path}`;
+    return `${this.hubBase()}${path}`;
+  }
+
+  // The hub origin without a trailing slash — for the terminal iframe URL.
+  hubBase(): string {
+    return this.config.hubUrl.replace(/\/$/, "");
+  }
+
+  // The raw ttyd terminal URL (reverse-tunnelled, keyed by session id — the hub
+  // routes by id, not host+id; matches the Android app). Needs the session
+  // cookie planted first (loginForCookie).
+  termUrl(sessionId: string): string {
+    return `${this.hubBase()}/term/${encodeURIComponent(sessionId)}/`;
+  }
+
+  // Plant the hub's session cookie so the cross-origin terminal iframe (and its
+  // wss socket) authenticate. POSTs /api/login with the stored credentials and
+  // `credentials:"include"`, exactly as the web login does. Best-effort.
+  async loginForCookie(): Promise<void> {
+    try {
+      await this.fetchFn(this.url("/api/login"), {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: this.config.user, password: this.config.password }),
+      });
+    } catch {
+      /* offline / blocked — the iframe falls back to the hub's own login */
+    }
   }
 
   private headers(extra?: Record<string, string>): Record<string, string> {
@@ -150,5 +178,27 @@ export class HubClient {
 
   wsToken(): Promise<{ token: string; expiresInSec: number }> {
     return this.request<{ token: string; expiresInSec: number }>("/api/ws-token");
+  }
+
+  // Interrupt the in-flight turn (web "◼ Stop") — leaves the session + conversation
+  // intact. No body.
+  interrupt(host: string, id: string): Promise<QueuedResponse> {
+    return this.request<QueuedResponse>(
+      `/api/agents/${encodeURIComponent(host)}/sessions/${encodeURIComponent(id)}/interrupt`,
+      { method: "POST" }
+    );
+  }
+
+  // Rename a session (web ⋯ → Rename). A blank summary clears the name back to
+  // the auto/label fallback.
+  setSummary(host: string, id: string, summary: string): Promise<QueuedResponse> {
+    return this.request<QueuedResponse>(
+      `/api/agents/${encodeURIComponent(host)}/sessions/${encodeURIComponent(id)}/summary`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ summary }),
+      }
+    );
   }
 }
