@@ -330,9 +330,11 @@ function orgMenuHtml(state: AppState, open: boolean): string {
 // optimistic overrides are the controller's job — passed empty here.
 export function boardBodyHtml(state: AppState): string {
   const sites = Board.mergeSites(state.agents as unknown[]);
-  const refresh = `<div class="ph-board-bar"><button class="ph-refresh" data-board-refresh="1">↻ Refresh</button></div>`;
+  const bar = `<div class="ph-board-bar"><button class="ph-newticket" data-new-ticket="1">+ New ticket</button><button class="ph-refresh" data-board-refresh="1">↻ Refresh</button></div>`;
+  // The create modal (filled + shown by the controller on New ticket).
+  const create = `<div class="td-backdrop" id="ph-create" hidden><div class="td-panel cf-panel" id="ph-create-panel"></div></div>`;
   if (!sites.length) {
-    return `${refresh}<div class="ph-empty">No tickets yet. Connect an org's tracker (Jira / Azure DevOps) on an agent.</div>`;
+    return `${bar}<div class="ph-empty">No tickets yet. Connect an org's tracker (Jira / Azure DevOps) on an agent.</div>${create}`;
   }
   const sessionIndex = Board.ticketSessionIndex(state.agents as unknown[]);
   const board = Board.boardHtml(sites, state.orgFilter, {
@@ -345,7 +347,7 @@ export function boardBodyHtml(state: AppState): string {
   });
   // The detail modal (filled + shown by the controller on a card tap).
   const modal = `<div class="td-backdrop" id="ph-detail" hidden><div class="td-panel" id="ph-detail-panel"></div></div>`;
-  return `${refresh}<div class="ph-board">${board}</div>${modal}`;
+  return `${bar}<div class="ph-board">${board}</div>${modal}${create}`;
 }
 
 const TAB_LABEL: Record<PhoneTab, string> = { sessions: "Sessions", board: "Board" };

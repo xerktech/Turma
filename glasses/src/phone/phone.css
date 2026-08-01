@@ -102,6 +102,21 @@
 .ph-section-label .ph-count { font-weight: 400; }
 .ph-empty { color: var(--muted); font-size: 13.5px; padding: 40px 16px; text-align: center; }
 
+/* Board bar (New ticket + Refresh) */
+.ph-board-bar { display: flex; gap: 8px; justify-content: flex-end; margin-bottom: 12px; }
+.ph-newticket {
+  font: inherit; font-size: 12.5px; font-weight: 600; color: #fff;
+  background: var(--accent); border: 1px solid var(--accent); border-radius: 999px;
+  padding: 6px 14px; cursor: pointer;
+}
+.ph-newticket:hover { filter: brightness(1.06); }
+.ph-refresh {
+  font: inherit; font-size: 12.5px; color: var(--ink-2);
+  background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
+  padding: 6px 12px; cursor: pointer;
+}
+.ph-refresh:hover { color: var(--ink); }
+
 .ph-card {
   display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left;
   /* Org tint (XERK-142): the session's org colour mixed 12% into the surface, so

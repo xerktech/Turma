@@ -222,6 +222,38 @@ export class HubClient {
     return this.request<{ ok: boolean }>("/api/jira/refresh", { method: "POST" });
   }
 
+  // New-ticket create flow (the shared "New ticket" control). All three are the
+  // same endpoints the web newticket.js uses; 202 = "still fetching", polled by
+  // the caller.
+  async createMeta(
+    siteKey: string,
+    project?: string
+  ): Promise<{ status: 200; body: Record<string, unknown> } | { status: 202; body: Record<string, unknown> }> {
+    const q = project ? `?project=${encodeURIComponent(project)}` : "";
+    const path = `/api/jira/${encodeURIComponent(siteKey)}/create-meta${q}`;
+    const res = await this.fetchFn(this.url(path), { headers: this.headers() });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok && res.status !== 202) throw new HttpError(res.status, (body as { error?: string }).error || `HTTP ${res.status}`);
+    return res.status === 202 ? { status: 202, body } : { status: 200, body };
+  }
+  createTicket(siteKey: string, body: { project: string; issueType: string; summary: string; description?: string; labels?: string[] }): Promise<QueuedResponse> {
+    return this.request<QueuedResponse>(`/api/jira/${encodeURIComponent(siteKey)}/tickets`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+  async createResult(
+    siteKey: string,
+    cmdId: string
+  ): Promise<{ status: 200; body: Record<string, unknown> } | { status: 202; body: Record<string, unknown> }> {
+    const path = `/api/jira/${encodeURIComponent(siteKey)}/tickets/${encodeURIComponent(cmdId)}`;
+    const res = await this.fetchFn(this.url(path), { headers: this.headers() });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok && res.status !== 202) throw new HttpError(res.status, (body as { error?: string }).error || `HTTP ${res.status}`);
+    return res.status === 202 ? { status: 202, body } : { status: 200, body };
+  }
+
   // Interrupt the in-flight turn (web "◼ Stop") — leaves the session + conversation
   // intact. No body.
   interrupt(host: string, id: string): Promise<QueuedResponse> {
