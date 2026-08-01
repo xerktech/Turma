@@ -11,8 +11,9 @@ import "../vendor/board.css";
 import type { App, AppState } from "../app.ts";
 import type { HubClient } from "../hub-client.ts";
 import type { TailEntry } from "../types.ts";
+import { siteKeyOf } from "../sessions.ts";
 import { phoneHtml, transcriptEntries, type PhoneTab, type PhoneView, type VerbosityPreset } from "./render.ts";
-import { Board, Chat, renderTranscript, type BoardSite, type RichEntry, type Verbosity } from "../vendor/engines.ts";
+import { Board, Chat, renderTranscript, splitLabels, type BoardSite, type RichEntry, type Verbosity } from "../vendor/engines.ts";
 
 export interface PhoneHandle {
   render(state: AppState): void;
@@ -45,8 +46,10 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
   const historyDone = new Set<string>();
   const termPlanted = new Set<string>();
   // The open board ticket detail (its rendered HTML is cached so a poll repaint
-  // re-shows it without re-fetching), or null.
-  let detail: { site: string; key: string; html: string } | null = null;
+  // re-shows it without re-fetching), or null. `edit` is which field's inline
+  // picker is open (status/repo/agent/model), `body` the fetched issue.
+  type DetailEdit = "" | "status" | "repo" | "agent" | "model";
+  let detail: { site: string; key: string; body: Record<string, unknown> | null; edit: DetailEdit } | null = null;
 
   function focused(): { host: string; id: string } | null {
     if (last.screen === "session" && last.session) return { host: last.session.hostKey, id: last.session.sessionId };
@@ -132,46 +135,169 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
       fillTranscript();
       void ensureTerminal();
       updateStop();
-    } else if (view.tab === "board" && detail) {
-      // Re-show the open ticket detail across the ~1s board repaint.
-      const back = root.querySelector<HTMLElement>("#ph-detail");
-      const panel = root.querySelector<HTMLElement>("#ph-detail-panel");
-      if (back && panel) { panel.innerHTML = detail.html; back.hidden = false; }
+    } else if (view.tab === "board") {
+      if (detail) renderDetail(); // re-show the open ticket detail across the ~1s board repaint
+      if (create) renderCreate(); // re-show the open create modal
     }
   }
 
-  // ---- board ticket detail -------------------------------------------------
-  // The read-only ticket detail via board.js's detailHtml. Its inline field
-  // pickers (Change → status/repo/agent/model) aren't wired yet, so the "Change"
-  // buttons are stripped rather than shipped inert; wiring them is the next step.
+  // ---- board ticket detail (via board.js detailHtml, editable pickers) ------
   const closeBtn = `<button class="td-close" aria-label="Close">✕</button>`;
-  function stripPickers(html: string): string {
-    return html.replace(/<button[^>]*class="td-edit"[^>]*>[^<]*<\/button>/g, "");
-  }
-  function openDetail(site: string, key: string): void {
-    detail = { site, key, html: `${closeBtn}<div class="td-note">Loading ${key}…</div>` };
-    paint();
-    void (async () => {
-      for (let attempt = 0; attempt < 8; attempt++) {
-        let res;
-        try { res = await client.jiraDetail(site, key); } catch { detail = { site, key, html: `${closeBtn}<div class="td-note td-err">Couldn't load ${key}.</div>` }; paint(); return; }
-        if (detail?.key !== key) return; // closed / switched
-        if (res.status === 200) {
-          const ticket = boardTicket(site, key);
-          detail = { site, key, html: stripPickers(Board.detailHtml(ticket ?? { key }, res.body, { now: last.now })) };
-          paint();
-          return;
-        }
-        await new Promise((r) => setTimeout(r, 900));
-      }
-    })();
-  }
   function boardTicket(site: string, key: string): Record<string, unknown> | undefined {
     const sites: BoardSite[] = Board.mergeSites(last.agents as unknown[]);
     const s = sites.find((x) => x.siteKey === site);
     return s?.tickets.find((t) => t.key === key) as Record<string, unknown> | undefined;
   }
+  // The opts board.js's detailHtml needs to render the field pickers editable and
+  // in the right editing state. Agent/model pins aren't threaded yet (the fields
+  // read Auto/Default; a pick still works), so those are left undefined.
+  function detailOpts(): Record<string, unknown> {
+    const sites: BoardSite[] = Board.mergeSites(last.agents as unknown[]);
+    const site = sites.find((s) => s.siteKey === detail!.site);
+    const body = detail!.body || {};
+    const hasOnline = last.agents.some((a) => a.online && siteKeyOf(a) === detail!.site);
+    const statusOptions = (body.statusOptions as unknown[]) || [];
+    return {
+      now: last.now,
+      canChangeStatus: hasOnline && statusOptions.length > 0,
+      canEdit: true,
+      statusOptions,
+      repoOptions: site?.repoOptions || [],
+      hostOptions: site?.hostOptions || [],
+      models: site?.models || {},
+      editing: detail!.edit === "repo",
+      statusEditing: detail!.edit === "status",
+      agentEditing: detail!.edit === "agent",
+      modelEditing: detail!.edit === "model",
+    };
+  }
+  function detailInner(): string {
+    if (!detail) return "";
+    if (!detail.body) return `${closeBtn}<div class="td-note">Loading ${detail.key}…</div>`;
+    const t = boardTicket(detail.site, detail.key) ?? { key: detail.key };
+    return Board.detailHtml(t, detail.body, detailOpts());
+  }
+  function renderDetail(): void {
+    const back = root.querySelector<HTMLElement>("#ph-detail");
+    const panel = root.querySelector<HTMLElement>("#ph-detail-panel");
+    if (back && panel && detail) { panel.innerHTML = detailInner(); back.hidden = false; }
+  }
+  async function fetchDetail(site: string, key: string): Promise<void> {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      let res;
+      try { res = await client.jiraDetail(site, key); } catch { if (detail?.key === key) { detail.body = { error: true }; renderDetail(); } return; }
+      if (detail?.key !== key) return;
+      if (res.status === 200) { detail.body = res.body; renderDetail(); return; }
+      await new Promise((r) => setTimeout(r, 900));
+    }
+  }
+  function openDetail(site: string, key: string): void {
+    detail = { site, key, body: null, edit: "" };
+    paint();
+    void fetchDetail(site, key);
+  }
   function closeDetail(): void { detail = null; const back = root.querySelector<HTMLElement>("#ph-detail"); if (back) back.hidden = true; }
+
+  // ---- New ticket create flow (board.js createFormHtml, ported from the web's
+  // newticket.js orchestration: org -> project -> type cascade, submit + poll) --
+  interface CreateState { siteKey: string; source: string; values: Record<string, string>; meta?: Record<string, unknown>; types?: Record<string, unknown>; created?: Record<string, unknown>; busy?: boolean; error?: string; }
+  let create: CreateState | null = null;
+  let createSeq = 0;
+  function renderCreate(): void {
+    const back = root.querySelector<HTMLElement>("#ph-create");
+    const panel = root.querySelector<HTMLElement>("#ph-create-panel");
+    if (!back || !panel || !create) return;
+    const sites: BoardSite[] = Board.mergeSites(last.agents as unknown[]);
+    panel.innerHTML = Board.createFormHtml({ sites, siteKey: create.siteKey, source: create.source, values: create.values, meta: create.meta, types: create.types, created: create.created, busy: create.busy, error: create.error });
+    back.hidden = false;
+  }
+  function syncCreate(): void {
+    if (!create) return;
+    const g = (sel: string): string | undefined => root.querySelector<HTMLInputElement | HTMLTextAreaElement>(sel)?.value;
+    const s = g("[data-cf-summary]"); if (s !== undefined) create.values.summary = s;
+    const d = g("[data-cf-desc]"); if (d !== undefined) create.values.description = d;
+    const l = g("[data-cf-labels]"); if (l !== undefined) create.values.labels = l;
+  }
+  async function loadMeta(): Promise<void> {
+    const seq = ++createSeq, site = create!.siteKey;
+    const alive = (): boolean => createSeq === seq && create?.siteKey === site;
+    create!.meta = {}; renderCreate();
+    for (let i = 0; i < 20 && alive(); i++) {
+      let res; try { res = await client.createMeta(site); } catch (e) { if (alive()) { create!.meta = { error: (e as Error).message }; renderCreate(); } return; }
+      if (!alive()) return;
+      if (res.status === 200) {
+        const d = res.body as { projects?: { key: string }[]; labels?: unknown[]; source?: string };
+        create!.meta = { projects: d.projects || [], labels: d.labels || [] };
+        if (d.source) create!.source = d.source;
+        if ((d.projects || []).length === 1) { create!.values.project = d.projects![0]!.key; renderCreate(); return void loadTypes(); }
+        renderCreate(); return;
+      }
+      await new Promise((r) => setTimeout(r, 800));
+    }
+  }
+  async function loadTypes(): Promise<void> {
+    const project = create!.values.project; if (!project) return;
+    const seq = ++createSeq, site = create!.siteKey;
+    const alive = (): boolean => createSeq === seq && create?.siteKey === site && create?.values.project === project;
+    create!.types = {}; renderCreate();
+    for (let i = 0; i < 20 && alive(); i++) {
+      let res; try { res = await client.createMeta(site, project); } catch (e) { if (alive()) { create!.types = { error: (e as Error).message }; renderCreate(); } return; }
+      if (!alive()) return;
+      if (res.status === 200) {
+        const d = res.body as { types?: { id: string }[] };
+        const types = d.types || [];
+        create!.types = { types };
+        if (types.length === 1) create!.values.issueType = types[0]!.id;
+        renderCreate(); return;
+      }
+      await new Promise((r) => setTimeout(r, 800));
+    }
+  }
+  async function submitCreate(): Promise<void> {
+    const s = create; if (!s || s.busy) return;
+    syncCreate();
+    const v = s.values;
+    if (!v.project || !v.issueType || !(v.summary || "").trim()) return;
+    s.busy = true; s.error = ""; renderCreate();
+    const labels = splitLabels(v.labels, s.source);
+    let cmd; try { cmd = await client.createTicket(s.siteKey, { project: v.project, issueType: v.issueType, summary: (v.summary || "").trim(), description: v.description, labels }); }
+    catch (e) { if (create === s) { s.busy = false; s.error = (e as Error).message; renderCreate(); } return; }
+    for (let i = 0; i < 40 && create === s; i++) {
+      let res; try { res = await client.createResult(s.siteKey, cmd.cmdId); } catch (e) { if (create === s) { s.busy = false; s.error = (e as Error).message; renderCreate(); } return; }
+      if (create !== s) return;
+      if (res.status === 200) {
+        const d = res.body as { key?: string; url?: string; error?: string; warning?: string };
+        s.busy = false;
+        if (d.error) { s.error = d.error; renderCreate(); return; }
+        s.created = { key: d.key, url: d.url, warning: d.warning || "" };
+        renderCreate(); return;
+      }
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    if (create === s) { s.busy = false; s.error = "the create didn't complete in time"; renderCreate(); }
+  }
+  function openCreate(): void {
+    const sites: BoardSite[] = Board.mergeSites(last.agents as unknown[]);
+    const first = sites.find((s) => s.siteKey === last.orgFilter) || sites[0];
+    if (!first) return;
+    create = { siteKey: first.siteKey, source: (first.source as string) || "jira", values: {} };
+    paint();
+    void loadMeta();
+  }
+  function closeCreate(): void { create = null; const back = root.querySelector<HTMLElement>("#ph-create"); if (back) back.hidden = true; }
+  // A field picker's <select> changed — decode to the POST body (board.html's
+  // rules), fire the write, close the picker, and re-fetch to show the result.
+  function savePicker(field: DetailEdit, value: string): void {
+    if (!detail) return;
+    const { site, key } = detail;
+    if (field === "status") { if (value !== "__keep__") void client.setTicketStatus(site, key, { value }).catch(() => {}); }
+    else if (field === "repo") void client.setTicketRepo(site, key, value === "__auto__" ? { auto: true } : value === "__none__" ? { repo: null } : { repo: value }).catch(() => {});
+    else if (field === "agent") void client.setTicketAgent(site, key, value === "__auto__" ? { auto: true } : { host: value }).catch(() => {});
+    else if (field === "model") void client.setTicketModel(site, key, value === "__default__" ? { auto: true } : { model: value }).catch(() => {});
+    detail.edit = "";
+    renderDetail();
+    setTimeout(() => { if (detail?.key === key) void fetchDetail(site, key); }, 1200);
+  }
 
   function updateStop(): void {
     // Show Stop while the focused session is working (paneBusy), like the web.
@@ -240,6 +366,12 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
 
     // ---- board ----
     if (t.closest("[data-board-refresh]")) { void client.jiraRefresh().catch(() => {}); return; }
+    // New ticket create modal.
+    if (t.closest("[data-new-ticket]")) { openCreate(); return; }
+    if (t.closest("[data-cf-close]")) { closeCreate(); return; }
+    if (t.closest("[data-cf-submit]")) { void submitCreate(); return; }
+    if (t.closest("[data-cf-another]") && create) { create.created = undefined; create.values = {}; renderCreate(); void loadMeta(); return; }
+    if (t.closest("#ph-create") && !t.closest("#ph-create-panel")) { closeCreate(); return; } // backdrop
     const start = t.closest<HTMLElement>(".kc-start[data-start]");
     if (start) {
       const key = start.dataset.start!;
@@ -256,6 +388,13 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
     }
     if (t.closest(".td-close")) { closeDetail(); paint(); return; }
     if (t.closest("#ph-detail") && !t.closest("#ph-detail-panel")) { closeDetail(); paint(); return; } // backdrop
+    // Detail-panel field pickers: Change opens the inline <select>, Cancel closes.
+    const editBtn = t.closest<HTMLElement>("[data-status-edit],[data-repo-edit],[data-agent-edit],[data-model-edit]");
+    if (editBtn && detail) {
+      detail.edit = editBtn.hasAttribute("data-status-edit") ? "status" : editBtn.hasAttribute("data-repo-edit") ? "repo" : editBtn.hasAttribute("data-agent-edit") ? "agent" : "model";
+      renderDetail(); return;
+    }
+    if (t.closest("[data-status-cancel],[data-repo-cancel],[data-agent-cancel],[data-model-cancel]") && detail) { detail.edit = ""; renderDetail(); return; }
     const card = t.closest<HTMLElement>(".kanban-card[data-key]");
     if (card && view.tab === "board") { openDetail(card.dataset.site || "", card.dataset.key!); return; }
 
@@ -265,7 +404,36 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
 
   root.addEventListener("input", (e) => {
     const el = e.target as HTMLElement;
-    if (el.id === "ph-input") autoGrow(el as HTMLTextAreaElement);
+    if (el.id === "ph-input") { autoGrow(el as HTMLTextAreaElement); return; }
+    // Create-modal text fields: sync into state + toggle the submit button live
+    // (no re-render, so typing keeps focus), like the web's newticket.js.
+    if (create && el.closest?.("[data-cf-summary],[data-cf-desc],[data-cf-labels]")) {
+      syncCreate();
+      const btn = root.querySelector<HTMLButtonElement>("[data-cf-submit]");
+        const v = create.values;
+      if (btn) btn.disabled = !(v.project && v.issueType && (v.summary || "").trim()) || !!create.busy;
+    }
+  });
+  // A detail-panel picker <select> changed → save it (picking IS the save, the
+  // web's contract). Each option's value is decoded to the POST body in savePicker.
+  root.addEventListener("change", (e) => {
+    const el = e.target as HTMLElement;
+    // Create-modal cascade selects.
+    if (create) {
+      const org = el.closest?.("[data-cf-org]") as HTMLSelectElement | null;
+      if (org) { create.siteKey = org.value; create.values = {}; create.types = undefined; void loadMeta(); return; }
+      const proj = el.closest?.("[data-cf-project]") as HTMLSelectElement | null;
+      if (proj) { create.values.project = proj.value; create.values.issueType = ""; void loadTypes(); return; }
+      const typ = el.closest?.("[data-cf-type]") as HTMLSelectElement | null;
+      if (typ) { create.values.issueType = typ.value; return; }
+    }
+    // Detail-panel field pickers.
+    if (!detail) return;
+    const map: [string, DetailEdit][] = [["data-status-select", "status"], ["data-repo-select", "repo"], ["data-agent-select", "agent"], ["data-model-select", "model"]];
+    for (const [attr, field] of map) {
+      const sel = el.closest?.(`[${attr}]`) as HTMLSelectElement | null;
+      if (sel) { savePicker(field, sel.value); return; }
+    }
   });
   root.addEventListener("keydown", (e) => {
     const el = e.target as HTMLElement;

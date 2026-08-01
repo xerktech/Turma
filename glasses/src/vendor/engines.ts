@@ -64,8 +64,23 @@ interface BoardEngine {
   ticketSessionIndex(agents: unknown[]): Map<string, unknown[]>;
   ticketSessionsOf(idx: Map<string, unknown[]>, siteKey: string, key: string): unknown[];
   ageStr(iso: string, now?: number): string;
+  createFormHtml(state: Record<string, unknown>): string;
   SLOTS: number;
   [key: string]: unknown;
+}
+
+// Ported from newticket.js (NOT on board.js): split a labels/tags string. Jira
+// splits on whitespace+commas; Azure tags on commas only (a tag can hold spaces).
+// Deduped, capped at 20 — matches the web exactly (newticket.test's rules).
+export function splitLabels(raw: string | undefined, source: string): string[] {
+  const parts = source === "azure" ? String(raw || "").split(",") : String(raw || "").split(/[,\s]+/);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const part of parts) {
+    const p = part.trim();
+    if (p && !seen.has(p)) { seen.add(p); out.push(p); }
+  }
+  return out.slice(0, 20);
 }
 
 export interface BoardSite {

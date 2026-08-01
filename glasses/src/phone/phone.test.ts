@@ -54,6 +54,16 @@ describe("phone controller", () => {
       getHistory: vi.fn(async () => ({ status: 200 as const, body: { entries: [], truncated: false, fetchedAt: 0 } })),
       loginForCookie: vi.fn(async () => {}),
       termUrl: vi.fn((id: string) => `http://hub/term/${id}/`),
+      jiraDetail: vi.fn(async () => ({ status: 200 as const, body: {} })),
+      jiraRefresh: vi.fn(async () => ({ ok: true })),
+      startTicket: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      setTicketStatus: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      setTicketRepo: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      setTicketAgent: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      setTicketModel: vi.fn(async () => ({ ok: true, cmdId: "c" })),
+      createMeta: vi.fn(async (_s: string, project?: string) => ({ status: 200 as const, body: project ? { types: [{ id: "10001", name: "Task" }] } : { projects: [{ key: "ACME" }], labels: [], source: "jira" } })),
+      createTicket: vi.fn(async () => ({ ok: true, cmdId: "cc" })),
+      createResult: vi.fn(async () => ({ status: 200 as const, body: { key: "ACME-99", url: "https://x/ACME-99" } })),
     };
     // A fake App whose enter/setOrgFilter synchronously push the new state to the
     // phone, exactly as the real App's setState→repaint→onState does.
@@ -168,6 +178,43 @@ describe("phone controller", () => {
     expect(client.jiraDetail).toHaveBeenCalledWith("acme.atlassian.net", "ACME-1");
     await new Promise((r) => setTimeout(r, 10));
     expect(root.querySelector<HTMLElement>("#ph-detail")!.hidden).toBe(false);
+  });
+
+  it("the detail-panel status picker saves a change via HubClient.setTicketStatus", async () => {
+    state = { ...homeState(), agents: [agent({ key: "host-a", online: true, jira: { available: true, siteKey: "acme.atlassian.net", user: "me", fetchedAt: "2026-08-01T00:00:00Z",
+      tickets: [{ key: "ACME-1", summary: "Fix login", statusCategory: "todo", status: "To Do", updated: "2026-08-01T00:00:00Z", project: "ACME" }] } })] };
+    client.jiraDetail = vi.fn(async () => ({ status: 200 as const, body: { key: "ACME-1", summary: "Fix login", status: "To Do", statusCategory: "todo", type: "Task", url: "https://x/ACME-1",
+      statusOptions: [{ id: "11", name: "To Do", category: "todo" }, { id: "31", name: "Done", category: "done" }] } }));
+    handle.render(state);
+    root.querySelector<HTMLElement>('[data-tab="board"]')!.click();
+    root.querySelector<HTMLElement>('.kanban-card[data-key="ACME-1"]')!.click();
+    await new Promise((r) => setTimeout(r, 10));
+    // Open the status picker, pick "Done".
+    root.querySelector<HTMLElement>("[data-status-edit]")!.click();
+    const sel = root.querySelector<HTMLSelectElement>("[data-status-select]")!;
+    expect(sel).toBeTruthy();
+    sel.value = "31";
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(client.setTicketStatus).toHaveBeenCalledWith("acme.atlassian.net", "ACME-1", { value: "31" });
+  });
+
+  it("New ticket opens the create modal, cascades org→project→type, and creates via HubClient", async () => {
+    state = { ...homeState(), agents: [agent({ key: "host-a", online: true, jira: { available: true, siteKey: "acme.atlassian.net", user: "me", fetchedAt: "2026-08-01T00:00:00Z", tickets: [] } })] };
+    handle.render(state);
+    root.querySelector<HTMLElement>('[data-tab="board"]')!.click();
+    root.querySelector<HTMLElement>("[data-new-ticket]")!.click();
+    await new Promise((r) => setTimeout(r, 30)); // loadMeta -> lone project auto-selects -> loadTypes -> lone type
+    expect(client.createMeta).toHaveBeenCalled();
+    expect(root.querySelector<HTMLElement>("#ph-create")!.hidden).toBe(false);
+    // Fill the summary and submit.
+    const sum = root.querySelector<HTMLInputElement>("[data-cf-summary]");
+    expect(sum).toBeTruthy();
+    sum!.value = "Do the thing";
+    sum!.dispatchEvent(new Event("input", { bubbles: true })); // enables the submit button, like typing
+    root.querySelector<HTMLElement>("[data-cf-submit]")!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(client.createTicket).toHaveBeenCalledWith("acme.atlassian.net", expect.objectContaining({ project: "ACME", issueType: "10001", summary: "Do the thing" }));
+    expect(root.textContent).toContain("ACME-99"); // the created-ticket confirmation
   });
 
   it("the sign-out affordance calls back out", () => {
