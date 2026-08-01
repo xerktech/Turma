@@ -144,6 +144,9 @@ export interface AgentsResponse {
   // pins (siteKey -> palette slot 1..8), so a card's tint matches the web/Android
   // exactly. The plugin used to drop this, which made its colours diverge.
   orgColors?: Record<string, number>;
+  // The hub's per-org auto-start opt-in (XERK-41): siteKey -> true when the org
+  // auto-starts a session for every To Do ticket with a repo. Presence = enabled.
+  autoStartOrgs?: Record<string, boolean>;
 }
 
 // GET .../sessions/<id>/history — the "resolved" 200 response.

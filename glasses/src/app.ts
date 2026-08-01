@@ -162,6 +162,10 @@ export interface AppState {
   // The hub's manual org-colour pins (siteKey -> slot), so the phone's card tints
   // match the web/Android (XERK-171). Empty until the first poll carries it.
   orgColors: Record<string, number>;
+  // The hub's per-org auto-start opt-in (siteKey -> true, XERK-41), driving the
+  // org menu's "auto" toggle. Flipped optimistically by setAutoStartOrg, then
+  // reconciled from the next poll. Empty until the first poll carries it.
+  autoStartOrgs: Record<string, boolean>;
   sessionRefs: SessionRef[];
   transcripts: Record<string, TranscriptBuffer>;
   // Typewriter state for the focused session's newest transcript entry (see
@@ -197,6 +201,7 @@ export function createInitialState(now: number): AppState {
     agents: [],
     orgFilter: "",
     orgColors: {},
+    autoStartOrgs: {},
     sessionRefs: [],
     transcripts: {},
     reveal: emptyReveal(),
@@ -401,6 +406,20 @@ export class App {
     // The scoped list may be shorter — send the cursor home so it can't point
     // past the end of the newly narrowed list.
     this.setState({ orgFilter: next, home: { cursor: 0 } });
+  }
+
+  // Optimistically set an org's auto-start opt-in (siteKey -> enabled), so the
+  // org menu's "auto" toggle responds instantly; the controller POSTs to the hub
+  // and calls this again to roll back on failure. The next poll reconciles from
+  // the hub's authoritative `autoStartOrgs`. Returns the prior value for rollback.
+  setAutoStartOrg(siteKey: string, enabled: boolean): boolean {
+    const prev = !!this.state.autoStartOrgs[siteKey];
+    if (prev === enabled) return prev;
+    const next = { ...this.state.autoStartOrgs };
+    if (enabled) next[siteKey] = true;
+    else delete next[siteKey];
+    this.setState({ autoStartOrgs: next });
+    return prev;
   }
 
   // Pull the glasses into a session the phone just opened. Resolves the host
@@ -699,6 +718,7 @@ export class App {
         now,
         agents: res.agents,
         orgColors: res.orgColors ?? {},
+        autoStartOrgs: res.autoStartOrgs ?? {},
         sessionRefs,
         transcripts,
         pending,

@@ -305,9 +305,11 @@ export function sessionViewHtml(state: AppState, verbosity: VerbosityPreset, sho
 
 // The header org filter — matched to the web's org.js menu: a scoping button
 // carrying the current org's colour dot, opening a menu of "All orgs" + one row
-// per org (colour dot + name + ticket-count chip + an offline marker). Orgs come
-// from mergeSites (ADO included) and colours from board.js's orgColorMap honouring
-// the hub's manual pins, so the phone's dots match the web/Android exactly.
+// per org (colour dot + name + ticket-count chip + an offline marker + the
+// per-org auto-start "auto" toggle, XERK-41). Orgs come from mergeSites (ADO
+// included) and colours from board.js's orgColorMap honouring the hub's manual
+// pins, so the phone's dots match the web/Android exactly. The scope pick and
+// the auto toggle are separate targets on one row (data-org vs data-org-auto).
 function orgMenuHtml(state: AppState, open: boolean): string {
   const opts = orgOptions(state);
   if (opts.length === 0) return "";
@@ -320,13 +322,23 @@ function orgMenuHtml(state: AppState, open: boolean): string {
 
   const row = (key: string, label: string, count: number, online: boolean): string => {
     const color = key ? colorMap.get(key) || "" : "";
+    const autoOn = !!(key && state.autoStartOrgs[key]);
     return (
-      `<button class="ph-org-item${key === cur ? " cur" : ""}" data-org="${esc(key)}">` +
-      (key ? `<span class="ph-org-dot" style="--org:${color}"></span>` : `<span class="ph-org-dot ph-org-dot-all"></span>`) +
+      `<div class="ph-org-row${key === cur ? " cur" : ""}"${key ? ` style="--org:${color}"` : ""}>` +
+      `<button class="ph-org-item" data-org="${esc(key)}">` +
+      (key ? `<span class="ph-org-dot"></span>` : `<span class="ph-org-dot ph-org-dot-all"></span>`) +
       `<span class="ph-org-name">${esc(label)}</span>` +
       `<span class="ph-org-count">${count}</span>` +
       (key && !online ? `<span class="ph-org-off">offline</span>` : "") +
-      `</button>`
+      `</button>` +
+      // The auto-start toggle (XERK-41): only real orgs, never "All orgs".
+      (key
+        ? `<button class="ph-org-auto${autoOn ? " on" : ""}" data-org-auto="${esc(key)}"` +
+          ` aria-pressed="${autoOn ? "true" : "false"}"` +
+          ` title="Auto-start a session for every To Do ticket with a repo">` +
+          `<span class="ph-org-auto-dot"></span>auto</button>`
+        : "") +
+      `</div>`
     );
   };
   const items = row("", "All orgs", total, true) +
