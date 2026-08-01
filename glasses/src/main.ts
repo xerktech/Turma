@@ -23,6 +23,7 @@ import { HubAudioDictation, PromptDictation } from "./dictation.ts";
 import type { Dictation } from "./dictation.ts";
 import { HubClient } from "./hub-client.ts";
 import { LiveTail } from "./live.ts";
+import { createPhoneBridge, type PhoneBridge } from "./phone-bridge.ts";
 import { BridgeStorage, BrowserStorage, type KeyValueStorage } from "./storage.ts";
 import { initPhoneLogin } from "./phone-login.ts";
 import { pretextMeasure, setDefaultMeasure } from "./text-wrap.ts";
@@ -91,13 +92,18 @@ async function mainBridge(bridge: ResolvedBridge): Promise<void> {
   const storage: KeyValueStorage = new BridgeStorage(bridge);
 
   const display = new EvenHubDisplay(bridge);
+  // Phone companion bridge (XERK-171): the App's onEnterSession is passed into
+  // boot() below, but the bridge that consumes it can only be built once boot()
+  // hands back the App — a late-bound ref closes that loop. onEnterSession only
+  // fires after app.start(), by which point phoneBridge is set.
+  let phoneBridge: PhoneBridge | null = null;
   // Lifecycle handlers MUST be registered before app.start() — start() is
   // what subscribes the display's onEvenHubEvent listener, and the host may
   // call __getStateSnapshot/__restoreState (or deliver FOREGROUND_EXIT) as
   // soon as events go live. Registering afterwards would silently drop
   // anything that fires during the boot window (the "register before
   // onEvenHubEvent" rule) — hence the beforeStart hook.
-  await boot(
+  const app = await boot(
     storage,
     display,
     (client, config) =>
@@ -132,8 +138,20 @@ async function mainBridge(bridge: ResolvedBridge): Promise<void> {
             return;
         }
       });
-    }
+    },
+    (hostKey, sessionId) => phoneBridge?.notifyEnterSession(hostKey, sessionId)
   );
+
+  // The embedded phone view lives in the #dashboard iframe (phone-login.ts owns
+  // its src). Bridge its postMessages to the App and back: the page tells us a
+  // session was opened / the org filter changed; we tell the page when the
+  // glasses enter a session. Posted with "*" because the plugin can't know the
+  // hub's origin ahead of time; both ends validate the message's `source` tag.
+  const frame = document.getElementById("dashboard") as HTMLIFrameElement | null;
+  phoneBridge = createPhoneBridge(app, (msg) => {
+    frame?.contentWindow?.postMessage(msg, "*");
+  });
+  window.addEventListener("message", (e) => phoneBridge?.handleMessage(e.data));
 }
 
 // Shared wiring for both backends: load config, start the phone-side
@@ -147,7 +165,10 @@ async function boot(
   storage: KeyValueStorage,
   display: GlassesDisplay,
   makeDictation: (client: HubClient, config: Config) => Dictation,
-  beforeStart?: (app: App) => void
+  beforeStart?: (app: App) => void,
+  // Bridge path only: fired when the glasses ENTER a session, so the embedded
+  // phone view can follow (XERK-171). Undefined on the DOM dev path (no iframe).
+  onEnterSession?: (hostKey: string, sessionId: string) => void
 ): Promise<App> {
   const config = await loadConfig(storage);
   void initPhoneLogin(storage);
@@ -160,7 +181,7 @@ async function boot(
   // (agent tunnel offline, dev mock hub with no /live route) the app falls back
   // to the poll unchanged.
   const liveTail = new LiveTail({ hubClient: client, hubUrl: config.hubUrl });
-  const app = new App({ client, display, dictation, liveTail, pollMs: config.pollMs });
+  const app = new App({ client, display, dictation, liveTail, pollMs: config.pollMs, onEnterSession });
 
   beforeStart?.(app);
   await app.start();

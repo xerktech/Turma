@@ -131,7 +131,7 @@ describe("initPhoneLogin", () => {
     expect(els.login.hidden).toBe(true);
     expect(els.app.hidden).toBe(false);
     expect(els.appUser.textContent).toBe("u");
-    expect(els.dashboard.src).toBe(`${HUB}/`);
+    expect(els.dashboard.src).toBe(`${HUB}/sessions?embed=glasses`);
   });
 
   it("still shows the dashboard iframe when the cookie refresh fails (offline)", async () => {
@@ -142,7 +142,7 @@ describe("initPhoneLogin", () => {
     await initPhoneLogin(fakeStorage(storedCreds()), els, fetchThrows, vi.fn());
     await flushMicrotasks();
     expect(els.app.hidden).toBe(false);
-    expect(els.dashboard.src).toBe(`${HUB}/`);
+    expect(els.dashboard.src).toBe(`${HUB}/sessions?embed=glasses`);
   });
 
   it("posts /api/login with the typed hub URL, persists it with the creds, then reloads on a good sign-in", async () => {

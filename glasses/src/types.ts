@@ -104,6 +104,11 @@ export interface AgentInfo {
   repos: RepoInfo[];
   sessions: SessionInfo[];
   closedSessions: ClosedSessionInfo[];
+  // The tracker org this host polls (a host polls exactly one). Only `siteKey`
+  // is read here — it's what the phone-side org filter partitions the fleet by
+  // (XERK-171), matching the web dashboard's org.js `siteKeyOf`. The real block
+  // carries far more (tickets, status, …), ignored via the index signature.
+  jira?: { siteKey?: string | null; [key: string]: unknown } | null;
   [key: string]: unknown; // startedAt, memory, logTail, reposRoot, ...
 }
 

@@ -1610,4 +1610,123 @@ describe("session screen: transcript-focus gestures (Task 4)", () => {
       expect(display.lines.some((l) => l.includes("newest line here"))).toBe(true);
     });
   });
+
+  // ---- phone companion bridge (XERK-171) ------------------------------------
+  describe("phone bridge", () => {
+    function jiraAgent(key: string, siteKey: string, sessions: SessionInfo[]): AgentInfo {
+      return agent({ key, device: key, jira: { siteKey }, sessions });
+    }
+
+    it("setOrgFilter scopes the home session list to one org", async () => {
+      const client = fakeClient({
+        listAgents: vi.fn(async () => ({
+          now: Date.now(),
+          agents: [
+            jiraAgent("host-a", "acme.atlassian.net", [session({ id: "sa", summary: "alpha" })]),
+            jiraAgent("host-b", "globex.atlassian.net", [session({ id: "sb", summary: "bravo" })]),
+          ],
+        })),
+      });
+      const app = makeApp(client);
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Unfiltered: both hosts' sessions are on the home list.
+      expect(display.lines.some((l) => l.includes("alpha"))).toBe(true);
+      expect(display.lines.some((l) => l.includes("bravo"))).toBe(true);
+
+      app.setOrgFilter("acme.atlassian.net");
+      expect(display.lines.some((l) => l.includes("alpha"))).toBe(true);
+      expect(display.lines.some((l) => l.includes("bravo"))).toBe(false);
+      // The header counts only the scoped fleet too.
+      expect(display.lines[0]).toBe("TURMA 1 run · 0 ask");
+
+      // "" reopens every org.
+      app.setOrgFilter("");
+      expect(display.lines.some((l) => l.includes("bravo"))).toBe(true);
+    });
+
+    it("a session you are IN survives its org leaving the filter", async () => {
+      const client = fakeClient({
+        listAgents: vi.fn(async () => ({
+          now: Date.now(),
+          agents: [jiraAgent("host-b", "globex.atlassian.net", [session({ id: "sb" })])],
+        })),
+      });
+      const app = makeApp(client);
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      app.enterSession("sb");
+      expect(app.getState().screen).toBe("session");
+      // Filtering to a different org empties the LIST but doesn't eject the open
+      // session (findSession reads the full agents list) — one-way scoping.
+      app.setOrgFilter("acme.atlassian.net");
+      expect(app.getState().screen).toBe("session");
+      expect(app.currentSessionId()).toBe("sb");
+    });
+
+    it("enterSession enters the session and resolves its host by id", async () => {
+      const client = fakeClient({
+        listAgents: vi.fn(async () => ({
+          now: Date.now(),
+          agents: [agent({ key: "host-z", sessions: [session({ id: "s9" })] })],
+        })),
+      });
+      const app = makeApp(client);
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      app.enterSession("s9");
+      expect(app.getState().screen).toBe("session");
+      expect(app.getState().session).toEqual(newSessionState("host-z", "s9"));
+    });
+
+    it("enterSession ignores an unknown id (no blank session screen)", async () => {
+      const app = makeApp(fakeClient());
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      app.enterSession("nope");
+      expect(app.getState().screen).toBe("home");
+    });
+
+    it("onEnterSession fires on a genuine enter — from a tap and from enterSession — but NOT on leave", async () => {
+      const entered: string[] = [];
+      const client = fakeClient({
+        listAgents: vi.fn(async () => ({
+          now: Date.now(),
+          agents: [agent({ sessions: [session({ id: "s1" }), session({ id: "s2", createdAt: "2026-01-02T00:00:00Z" })] })],
+        })),
+      });
+      const app = new App({
+        client: client as unknown as HubClient,
+        display,
+        dictation,
+        now: () => Date.now(),
+        pollMs: 6000,
+        onEnterSession: (_h, id) => entered.push(id),
+      });
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Enter via a home tap (cursor snapped to the first session row).
+      display.emit({ type: "tap" });
+      expect(app.getState().screen).toBe("session");
+      expect(entered).toEqual(["s1"]);
+
+      // Leave back to home — no signal on leaving.
+      display.emit({ type: "doubleTap" });
+      expect(app.getState().screen).toBe("home");
+      expect(entered).toEqual(["s1"]);
+
+      // Programmatic enter (the phone driving it) signals the switch.
+      app.enterSession("s2");
+      expect(entered).toEqual(["s1", "s2"]);
+
+      // Re-entering the SAME session is a no-op — no duplicate signal, the guard
+      // that breaks a phone<->glasses echo.
+      app.enterSession("s2");
+      expect(entered).toEqual(["s1", "s2"]);
+    });
+  });
 });
