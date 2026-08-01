@@ -60,6 +60,11 @@
   // ---- imperative half ------------------------------------------------------
 
   function toParent(msg) {
+    // Target "*" is unavoidable here: the parent is the Even Hub WebView host,
+    // whose origin (a host-defined/app scheme) an embedded page cannot know or
+    // predict. The payload is non-sensitive (a session id / org key), never a
+    // credential, and the page can't choose its own embedder.
+    // nosemgrep: javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration
     try { parent.postMessage(Object.assign({ source: FROM_PAGE }, msg), "*"); }
     catch { /* no parent / blocked — the app just won't sync until it can */ }
   }
@@ -85,7 +90,12 @@
       if (d.id) toParent({ type: "session-open", host: d.host, id: d.id });
     });
 
-    // The plugin (glasses drove an enter) -> open it here.
+    // The plugin (glasses drove an enter) -> open it here. Origin can't be
+    // validated: the sender is the Even Hub WebView host, whose origin an
+    // embedded page cannot know. Messages are gated on the `source` tag instead,
+    // and the only effect is opening one of THIS app's own session ids — no DOM
+    // is built from the payload, so there is no XSS sink to exploit.
+    // nosemgrep: javascript.browser.security.insufficient-postmessage-origin-validation.insufficient-postmessage-origin-validation
     window.addEventListener("message", (e) => {
       const api = embedApi();
       const cur = api && api.currentId ? api.currentId() : null;

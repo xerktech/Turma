@@ -145,13 +145,23 @@ async function mainBridge(bridge: ResolvedBridge): Promise<void> {
   // The embedded phone view lives in the #dashboard iframe (phone-login.ts owns
   // its src). Bridge its postMessages to the App and back: the page tells us a
   // session was opened / the org filter changed; we tell the page when the
-  // glasses enter a session. Posted with "*" because the plugin can't know the
-  // hub's origin ahead of time; both ends validate the message's `source` tag.
+  // glasses enter a session. The iframe's origin IS the hub (phone-login points
+  // it at the hub URL), so we can both target that exact origin on the way out
+  // and REJECT any message that didn't come from it on the way in — no wildcard,
+  // no trusting a `source` tag alone.
   const frame = document.getElementById("dashboard") as HTMLIFrameElement | null;
+  const hubOrigin = (): string | null => {
+    try { return frame?.src ? new URL(frame.src).origin : null; } catch { return null; }
+  };
   phoneBridge = createPhoneBridge(app, (msg) => {
-    frame?.contentWindow?.postMessage(msg, "*");
+    const origin = hubOrigin();
+    if (origin) frame?.contentWindow?.postMessage(msg, origin);
   });
-  window.addEventListener("message", (e) => phoneBridge?.handleMessage(e.data));
+  window.addEventListener("message", (e) => {
+    const origin = hubOrigin();
+    if (!origin || e.origin !== origin) return; // only the embedded hub page is trusted
+    phoneBridge?.handleMessage(e.data);
+  });
 }
 
 // Shared wiring for both backends: load config, start the phone-side
