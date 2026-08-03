@@ -36,21 +36,36 @@ quality if that model displaces the resident cue model. Run 2026-08-03.
 
 ## Coding-agent results
 
-| task | Qwen3.6-27B BF16 | Laguna XS 2.1 BF16 |
-|---|---|---|
-| turma-fix-01 (JS linkify bug) | **PASS** 6.6 min | **PASS** 6.2 min |
-| turma-fix-02 (Py transcript slug) | fail ×2 (investigate-only stall) | fail ×3 (timeout) |
-| tenir-fix-01 (Py resumed-session audio) | fail (wrong localization) | fail ×2 (stall) |
-| tenir-fix-02 (TS live-transcript drop) | fail ×2 (stall) | fail @64K → **PASS** @128K, 14 min |
-| turma-feat-01 (JS kanban In Review) | fail ×2 (stall) | fail ×2 (near miss on retry) |
-| tenir-feat-01 (Py music timeout) | fail (timeout; right files) | fail ×2 |
-| turma-testwrite-01 (JS regression tests) | **PASS** 4.6 min | **PASS** 2.3 min |
-| bench-yaml-01 (compose parametrize) | **PASS** 4.1 min | **PASS** 1.0 min |
-| **Solved** | **3/8** (retries 0/3) | **3/8 first pass, 4/8 with 128K retry** |
+| task | Qwen3.6-27B BF16 | Laguna XS 2.1 BF16 | gpt-oss:120b (added 08-03) |
+|---|---|---|---|
+| turma-fix-01 (JS linkify bug) | **PASS** 6.6 min | **PASS** 6.2 min | **PASS** 1.5 min |
+| turma-fix-02 (Py transcript slug) | fail ×2 (investigate-only stall) | fail ×3 (timeout) | fail ×2 (abandon; retry engaged, near miss) |
+| tenir-fix-01 (Py resumed-session audio) | fail (wrong localization) | fail ×2 (stall) | fail (near miss)¹ |
+| tenir-fix-02 (TS live-transcript drop) | fail ×2 (stall) | fail @64K → **PASS** @128K, 14 min | **PASS** 1.1 min |
+| turma-feat-01 (JS kanban In Review) | fail ×2 (stall) | fail ×2 (near miss on retry) | fail ×2 (abandon; retry engaged, near miss) |
+| tenir-feat-01 (Py music timeout) | fail (timeout; right files) | fail ×2 | fail (25 s near miss) |
+| turma-testwrite-01 (JS regression tests) | **PASS** 4.6 min | **PASS** 2.3 min | **PASS** 0.9 min |
+| bench-yaml-01 (compose parametrize) | **PASS** 4.1 min | **PASS** 1.0 min | fail (near miss ×2) |
+| **Solved** | **3/8** (retries 0/3) | **3/8 first pass, 4/8 with 128K retry** | **3/8** (retries 0/2, both engaged) |
+
+¹ gpt-oss solved tenir-fix-01 cleanly (35 s, validation green) in an aborted
+warm-up pass and missed it in the official pass — real run-to-run variance in
+both directions.
 
 Process metrics: Qwen completed the branch+commit delivery contract on **3/3**
-of its solves; Laguna on only **2/5** solve-or-near runs (it routinely skips
-the commit step). Laguna is 2–4× faster per solved task (MoE, 3B active).
+of its solves; Laguna on only **2/5** solve-or-near runs; **gpt-oss on 0/8**
+(it repeatedly *claimed* the commit was made without doing it). Laguna is
+2–4× faster per solved task than Qwen (MoE, 3B active); **gpt-oss is another
+~4× faster still** — its whole 8-task pass took ~6 minutes of wall clock
+versus multi-hour passes for both candidates.
+
+gpt-oss's failure shape is unique: it makes one fast, surgical,
+correctly-localized edit (right files on 7 of 8 tasks) and declares done
+without running tests or iterating — so its misses are near-misses at speed,
+where the candidates' misses are stalls and timeouts. Two harness notes:
+its sessions initially died instantly (reasoning-only turns ending the
+OpenCode loop) until `reasoningEffort` was set in the provider options, and
+~25% of session starts still abandon instantly (a retry re-engages).
 
 Failure modes, from the transcripts:
 
@@ -99,28 +114,31 @@ Laguna's full-replay mean was 32.7 s/call — it thinks ~2K characters before
 every cue attempt, which is unusable for the serialized per-session cue loop
 regardless of quality. Ollama does not honor think:false for Laguna (probe still produced 3,060 chars of reasoning and returned empty content) — the thinking cost is intrinsic to serving it on Ollama, and long thinking can starve the 600-token cue budget entirely.
 
-## Recommendation
+## Recommendation (revised after the gpt-oss coding run)
 
-1. **Coding agent for the Turma OpenCode build-out: Laguna XS 2.1**, served
-   with a ≥128K context window. It matches Qwen's solve count at a fraction
-   of the latency, wins the only retry-recoverable task, and is the only
-   candidate whose failures improved with a config change rather than a
-   capability wall. Two required harness settings: declare the full context in
-   the OpenCode model config (compaction collisions killed sessions at 64K),
-   and add an instruction nudge to always finish with branch+commit (it skips
-   the delivery contract that Qwen reliably honors).
-2. **Neither candidate should replace gpt-oss:120b for Tenir cues or
-   translation.** Both are ~8× quieter with 4–5× the wrong-rate, and
-   translation cues disappear entirely. Keep `Tenir-Ollama-Cue` as-is.
-3. **They can't co-reside**: gpt-oss (65 GB resident) + either candidate
-   (55–67 GB) exceeds the 96 GB card. Options, in order of preference:
-   (a) run the coding model on-demand with Ollama keep-alive unpinned and
-   accept a ~60 s cold-load when a coding session starts while cues idle;
-   (b) run Laguna at a smaller quant (q8_0 is 36 GB — would co-reside with
-   gpt-oss at ~101 GB… still over; nvfp4 at 19 GB fits with ~12 GB headroom)
-   and re-run this benchmark at that quant before committing; (c) a second
-   GPU. Note 3(a) means cue outages during long coding sessions — the same
-   trade this eval measured.
+1. **Leading option — one model for everything: gpt-oss:120b.** It equals
+   both candidates' solve count (3/8), is ~4–25× faster per task, and is the
+   only model on the box that also delivers cue + translation quality. It
+   would serve coding and cues from the SAME resident instance — no VRAM
+   conflict, no cue outages during coding sessions. Deployment change:
+   raise `OLLAMA_CONTEXT_LENGTH` on `tenir-gpu.yaml` from 16384 to 65536
+   (measured ~69 GB with the STT co-tenants still fitting; validate with a
+   quick cue replay per the compose's own pinning policy). Required OpenCode
+   config: `reasoningEffort` set in provider options (without it sessions die
+   instantly), an instruction nudge to actually run tests and commit (it
+   skipped the delivery contract on 8/8 runs and sometimes claims a commit it
+   didn't make — the Turma wrapper should verify `git log` after each
+   session), and a one-retry policy for instant-abandon session starts
+   (~25% of starts).
+2. **If a dedicated coding model is still wanted: Laguna XS 2.1 at ≥128K
+   context** — matches Qwen's solves at much lower latency and its one extra
+   solve came from a config fix, not luck. But it cannot co-reside with
+   gpt-oss at BF16 (test nvfp4/19 GB first), and its slow, unstoppable
+   thinking disqualifies it for cues.
+3. **Neither candidate replaces gpt-oss for Tenir cues or translation.**
+   Both are ~8× quieter with 4–5× the wrong-rate, and translation cues
+   disappear entirely. Keep `Tenir-Ollama-Cue` on gpt-oss regardless of the
+   coding choice.
 4. Honest caveats: 8 tasks is a small n; solve rates near 3/8 have wide error
    bars — but the qualitative failure modes (Qwen's loop-loss, Laguna's
    context hunger) were consistent across retries, and the cue verdict
