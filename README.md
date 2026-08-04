@@ -1,5 +1,8 @@
 # Turma
 
+**Turma** — /TUR-mah/, like the start of *terminal* — from the Latin *turma*, "a cavalry squadron": a small
+troop of riders that fights as one unit.
+
 Run a fleet of [Claude Code](https://claude.ai/code) agents across your own
 machines, and drive them from one dashboard — in a browser, on your phone, or on
 a pair of smart glasses.
