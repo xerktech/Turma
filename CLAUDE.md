@@ -298,19 +298,18 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 #### Live-session signals
 
 - `paneBusy` — a working/idle read, the **primary** activity signal (transcript freshness is the
-  fallback, used only when it is `null`). `_pane_busy` captures the tmux pane and looks for Claude Code's
-  "esc to interrupt" hint, accurate through a long silent tool call unlike transcript-mtime.
+  `null` fallback). `_pane_busy` captures the tmux pane and looks for Claude Code's "esc to
+  interrupt" hint, accurate through a long silent tool call unlike transcript-mtime.
   `true`/`false`/`null`; markers overridable via `TURMA_PANE_BUSY_MARKERS`.
   - **Busy is read from three shapes, not the full hint alone** (XERK-130): a narrow pane ellipsizes the
     hint. `_busy_from_capture` also accepts the mode line's truncated remnant (`PANE_BUSY_TRUNC_RE`,
     glyph-anchored) and the column-0 spinner line (`PANE_SPINNER_RE`, requiring the gerund's ellipsis so
     an idle pane's completed-turn line can't fake busy). Mirrored in `tunnel-agent.js`'s `paneShowsBusy`.
     Tests: `TestPaneBusy`, `agent/tests/tunnel-agent.test.js`.
-  - **Busy→idle flicker is suppressed at the source** (`_stable_pane_busy`, XERK-42): the TUI's spinner
-    repaint leaves a sub-frame gap that reads idle mid-turn, costing a whole `TURMA_INTERVAL` (20s) of
-    false idle and a bogus push. A busy read is trusted instantly; an idle read is re-confirmed once
-    after `TURMA_PANE_IDLE_CONFIRM_SEC` (0.2s, 0 disables), only on the busy→idle EDGE. The last stable
-    read rides `sess_state`. Tests: `TestStablePaneBusy`.
+  - **Busy→idle flicker is suppressed at the source** (`_stable_pane_busy`, XERK-42): the spinner
+    repaint's sub-frame gap reads idle mid-turn (20s of false idle + a bogus push). Busy is trusted
+    instantly; idle re-confirms once after `TURMA_PANE_IDLE_CONFIRM_SEC` (0.2s, 0 disables), only on
+    the busy→idle EDGE; the stable read rides `sess_state`. Tests: `TestStablePaneBusy`.
 - `modeActual` — the permission mode the TUI is REALLY in, off the footer's mode marker ("⏸ manual mode
   on" / "⏵⏵ accept edits on" / "⏸ plan mode on" / "⏵⏵ auto mode on" / "⏵⏵ bypass permissions on";
   glyph-anchored so quoted text can't match — `parse_pane_mode`, read beside the stable busy in
@@ -772,21 +771,23 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 
 - The control channel also carries the session's **live working footer** scraped from the tmux pane
   (`parsePaneLiveTurn` → `{turn,text,status}`): the in-progress assistant text plus
-  `status = {verb, up/down token counters, elapsed, hint}`. When Claude's agent-manager list is expanded
-  it also carries `status.agents[]` (`parseAgentList`: one `{sel,type,label}` row per live agent).
-- A single-frame **busy→idle blip is held one poll** before the bar clears (`liveTurnDecision`, XERK-42):
-  the spinner-repaint gap that flickers `paneBusy` can make one 1s capture read "not generating"
-  mid-turn. When the previous poll was generating and this one isn't, the frame is skipped one tick; if
-  the next poll is still idle the turn really ended. Busy is never held. Tests: `liveTurnDecision` in
-  `agent/tests/tunnel-agent.test.js`.
+  `status = {verb, up/down token counters, elapsed, hint}`; an expanded agent-manager list adds
+  `status.agents[]` (`parseAgentList`: one `{sel,type,label}` row per live agent).
+- **Prose-shaped tool-activity summaries ("Running 1 shell command…"/"Ran 1 shell command") are
+  stripped off the streamed text's tail POST-REFLOW** (`stripActivityTail` — narrow panes wrap
+  mid-clause): each Running→Ran flip re-typed the bubble.
+- A single-frame **busy→idle blip is held one poll** before the bar clears (`liveTurnDecision`,
+  XERK-42): the spinner repaint can make one 1s capture read "not generating" mid-turn, so the first
+  idle frame after a busy one is skipped; a second idle frame confirms and clears. Busy is never
+  held.
 - **Clicking a subagent row opens that background agent's own transcript**: a
   `{type:"subagentHistory", sessionId, agentType, label}` command resolves the row to its
   `subagents/agent-<id>.jsonl` via the main transcript's Task `tool_use` + its result text
   (`agentId: <id>`) — `_resolve_subagent`/`_stage_subagent_history`, matching type + description (exact,
   else a prefix; a trailing pane-ellipsis "…" is stripped first, XERK-130). The result rides the next
   beat as `subagentHistoryResults`.
-- Tests: `TestResolveSubagent`, `TestStageSubagentHistory`, `parseAgentList` in
-  `agent/tests/tunnel-agent.test.js`.
+- Tests: `TestResolveSubagent`, `TestStageSubagentHistory`; `parseAgentList`, `liveTurnDecision`,
+  `stripActivityTail` in `agent/tests/tunnel-agent.test.js`.
 
 ### Transcript entry blocks
 

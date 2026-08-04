@@ -95,3 +95,32 @@ CVE-2026-46604 exp:2026-10-25
 # first npm release vendoring brace-expansion 5.0.8+ clears it with an
 # NPM_VERSION bump.
 CVE-2026-14257 exp:2026-10-25
+
+# CVE-2026-69152 — HIGH DoS in brace-expansion through 5.0.7 (unbounded
+# intermediate arrays; fixed in 5.0.9). Same vendored copy as CVE-2026-14257
+# above (npm's own node_modules inside the node base image), same story:
+# checked 2026-08-04, the newest npm (12.0.2) still vendors brace-expansion
+# 5.0.7, so NPM_VERSION has nothing to bump to and the regex is unreachable
+# here (npm never runs at runtime). Revisit on the expiry: the first npm
+# vendoring 5.0.9+ clears it with an NPM_VERSION bump.
+CVE-2026-69152 exp:2026-10-25
+
+# CVE-2026-69192 — HIGH in ip-address 10.2.0 (fixed in 10.3.1), a transitive
+# dep (via socks) of the npm bundled inside the node base image
+# (/usr/local/lib/node_modules/npm/node_modules/ip-address). Checked
+# 2026-08-04: the newest npm (12.0.2) still vendors ip-address 10.2.0, so
+# NPM_VERSION has nothing to bump to. Not first-party and unreachable at
+# runtime — npm's SOCKS-proxy path never runs in this image. Revisit on the
+# expiry: the first npm vendoring 10.3.1+ clears it with an NPM_VERSION bump.
+CVE-2026-69192 exp:2026-10-25
+
+# CVE-2026-69247 / CVE-2026-69249 — HIGH CVEs in python cryptography 46.0.7
+# (fixed in 50.0.0 / 49.0.0). From azure-cli's OWN vendored python tree
+# (/opt/az, same as GHSA-537c-gmf6-5ccf above), not anything this repo
+# installs. Checked 2026-08-04: the newest bookworm package (2.89.0) still
+# vendors cryptography 46.0.7, so AZURE_CLI_VERSION has nothing to bump to.
+# Not first-party; the blast radius is the `az` CLI a session runs by hand.
+# Revisit on the expiry: an azure-cli vendoring cryptography 49+/50+ clears
+# both with a pin bump.
+CVE-2026-69247 exp:2026-10-25
+CVE-2026-69249 exp:2026-10-25
