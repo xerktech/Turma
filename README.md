@@ -1,6 +1,6 @@
 # Turma
 
-**Turma** — /TOOR-mah/ — from the Latin *turma*, "a cavalry squadron": a small
+**Turma** — /TUR-mah/, like the start of *terminal* — from the Latin *turma*, "a cavalry squadron": a small
 troop of riders that fights as one unit.
 
 Run a fleet of [Claude Code](https://claude.ai/code) agents across your own
