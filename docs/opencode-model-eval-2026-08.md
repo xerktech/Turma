@@ -197,6 +197,37 @@ bring-up on WSL2.
    active listening hours — measured cue p50 stays in the 6–8 s band there,
    vs 13 s at 6 coders. Agents idle between tool calls cost nothing; the cap
    only needs to bound simultaneous generations.
-3. Re-test vLLM when vllm#31085 lands: paged KV + continuous batching is the
-   real fix for many-agent concurrency, and it would also unlock per-request
-   reasoning-effort control without template hacks.
+3. ~~Re-test vLLM when vllm#31085 lands~~ — corrected 2026-08-04: #31085 is
+   a dead end (its companion PR #31089 was closed unmerged; maintainers treat
+   Marlin as the intended SM120 path, so the actual stock-vLLM bug is the
+   Marlin load-time OOM — the 96 GB/SM120 repro belongs on vllm#30135 or
+   #33155, not #31085).
+
+### The CUTLASS fork test (2026-08-04)
+
+The community workaround — `christopherowen/spark-vllm-mxfp4-docker` rebuilt
+with `FLASHINFER_CUDA_ARCH_LIST="12.0f"` (single arch, the make-or-break
+detail), served with `--mxfp4-backend CUTLASS --mxfp4-layers moe,qkv,o,lm_head
+--attention-backend FLASHINFER --kv-cache-dtype fp8 --enforce-eager` — **does
+load and serve gpt-oss-120b on this card**: first vLLM to do so here. 90 GB
+at 64K ctx / 32 seqs; harmony parsing correct (valid JSON cues, reasoning in
+its own channel); survived the whole benchmark, no illegal-memory-access
+crashes. Same workload-shaped scenarios as the Ollama run:
+
+| scenario | Ollama (0.32.5) | vLLM fork (CUTLASS) |
+|---|---|---|
+| cue call, idle | **4.6 s** | 8.4 s |
+| 4 concurrent cues (p50) | 25.5 s | **8.5 s** |
+| 8 concurrent cues (p50) | 31.8 s | **6–8 s** |
+| 6 coding streams, aggregate | 112 tok/s | **304 tok/s** |
+| cue p50 under 6 coders | 13.3 s | **8.6 s** |
+
+Reading: the fork's continuous batching scales (~flat latency to 8 streams,
+3× aggregate throughput) where llama.cpp collapses — but eager-mode
+single-stream decode is ~2× slower than Ollama, and cues run alone most of
+the day. At the current fleet scale (≤3 concurrent coding generations) the
+two are roughly a wash, so **Ollama stays the shipped stack** (official
+image, pinned, zero build maintenance). The fork is the validated escape
+hatch: flip to it when the coding fleet regularly runs >3–4 simultaneous
+generations. It is a locally-built dev-branch image (v0.1.dev12770) — pin
+the built image by digest and re-run the cue replay before ever shipping it.
