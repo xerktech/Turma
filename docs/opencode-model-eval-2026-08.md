@@ -231,3 +231,110 @@ image, pinned, zero build maintenance). The fork is the validated escape
 hatch: flip to it when the coding fleet regularly runs >3–4 simultaneous
 generations. It is a locally-built dev-branch image (v0.1.dev12770) — pin
 the built image by digest and re-run the cue replay before ever shipping it.
+
+## Optimization iteration (2026-08-04)
+
+A second pass over the shipped stack (Ollama 0.32.5, one resident
+gpt-oss:120b serving cues + translation + OpenCode) asking: what makes the
+coding agent better *without* taxing cue latency? Findings, in decreasing
+order of consequence.
+
+### What OpenCode requests actually run with (sampler audit)
+
+Reading the runner's per-request sampler dumps in the container logs:
+
+- Ollama's `/v1` surface honors the OpenAI sampling fields (`temperature`,
+  `top_p`, `frequency_penalty`, `presence_penalty`) but **silently ignores
+  Ollama-native ones** (`repeat_penalty`, `top_k`, `min_p`). Every `/v1`
+  request — cues, translations, coding — runs with the model defaults
+  `repeat_penalty=1.1, top_k=40` baked in, non-overridable per request.
+- OpenCode sends `temperature: 0` by default, so the whole August bench ran
+  greedy + repeat-penalty — not the gpt-oss model-card recipe (temp 1.0).
+- **Tested: the model-card recipe does NOT transfer to this stack.** With
+  `"agent": {"build": {"temperature": 1.0}}`, the agent degraded sharply:
+  hallucinated tool names, a malformed diff-literal edit (wrote `+`-prefixed
+  patch lines into a file), 15–30 s rush-sessions, 0/4 tasks solved vs 2/4
+  for the same tasks at temp 0. Plausible mechanism: the non-removable
+  repeat_penalty distorts logits; greedy argmax usually still lands on the
+  right token, but temp-1.0 sampling turns the distortion into errors.
+  **Keep OpenCode's temp-0 default when serving through Ollama `/v1`.**
+
+### Declared-context mismatch (bug, fixed)
+
+The eval config declared `"limit": {"context": 131072}` while the server
+runs 65536. OpenCode triggers compaction off the *declared* limit, so a
+session crossing 64K would be silently truncated server-side instead of
+compacted. Fixed to 65536 in the shipped config. Compaction is affordable:
+prefill measures ~6,100 tok/s, so a worst-case 60K re-prefill costs ~10 s.
+
+### Prefix caching: already solved, nothing to tune
+
+Ollama 0.32.5's runner does LCP slot selection with idle-slot state
+save/restore. Measured on prod: a growing agent conversation pays
+~0.6–1.0 s/turn out to 21K tokens (only the newest chunk prefills), and
+four interleaved sessions don't thrash each other's slots. Agent loops are
+cheap on this stack.
+
+### Serving variants tested and rejected (eval window; prod restored after)
+
+- **`OLLAMA_KV_CACHE_TYPE=q8_0` + ctx 131072 × 8 slots**: fits (87.2 GB —
+  q8 halves per-token KV, so double context costs the same ~19 GB), loads,
+  cue JSON + ES→EN translation sanity pass, idle cue latency identical
+  (4.6 s). But it taxes the guardrail metric: worst-case cue latency under
+  6 coding streams 21–23 s across 3 reps vs ≤16.7 s on f16, and coding
+  aggregate 97–132 vs 154–168 tok/s. **Not shipped.** Revisit only if
+  coding sessions regularly hit the 64K ceiling — and gate on a full cue
+  replay (numerics change).
+- **`num_batch` 2048**: prefill 5,700–5,800 tok/s vs ~6,100 at the default
+  512. Dead end.
+- DockerOps PR #132 records both rejections next to the knobs they concern.
+
+### Why gpt-oss never committed (transcript forensics)
+
+Baseline transcripts show the delivery-contract failures are not
+disobedience: sessions die on hallucinated tool calls (`search`, `node`,
+`git`) — the model invents a tool, gets an invalid-tool error, then emits a
+reasoning-only turn, which ends a non-interactive `opencode run`. Two
+mitigations were built and measured:
+
+1. an instructions file (`OPENCODE_CONTRACT.md`) that enumerates the exact
+   tool set and routes every command through bash, plus the delivery
+   contract;
+2. an orchestrator-style **delivery nudge**: if the session ends without a
+   commit, `opencode run --continue "finish the delivery contract"` once.
+
+### Bench: optimized configs vs baseline (same 8 tasks, attempt-level)
+
+| config | attempts | solved | committed | instant abandons |
+|---|---|---|---|---|
+| baseline (temp 0, no contract) | 14 | 4 (29%) | **0** | 4 |
+| temp 1.0 (model-card recipe) | 4 | 0 | 0 | 1 |
+| contract v1 (prose only) | 8 | 1 | 0 | 2 |
+| **contract v2 (tool list) + nudge** | 16 | 5 (31%) | **8 (50%)** | 2 |
+
+Solve rate is model-capability-bound (~30% however configured — per-attempt
+variance is high; the same task flips between solve/fail/abandon across
+identical runs). What the optimization actually buys: **delivery-contract
+compliance 0% → 50%**, fewer instant abandons, and no cue-latency cost
+(bench load is the production coding load the concurrency section already
+budgets for). Even nudged sessions still sometimes die one step short
+(observed: branch created, then a hallucinated `git` tool call kills the
+session before commit) — so the Turma orchestrator should loop the nudge
+until delivered or N attempts, not fire it once.
+
+### Shipped configuration
+
+Committed at the repo root:
+
+- `opencode.json` — provider `local` → `http://localhost:9402/v1`,
+  gpt-oss:120b with `reasoningEffort: medium`, declared context 65536
+  (matching the server), no temperature override, instructions
+  `["CLAUDE.md", "OPENCODE_CONTRACT.md"]`.
+- `OPENCODE_CONTRACT.md` — unattended-run contract: exact tool list, every
+  command via bash, always end with branch + commit, never end a turn with
+  a question.
+
+Orchestrator guidance for the build-out: cap concurrently *generating*
+coding sessions at ~2–3 (per the concurrency physics above), and after each
+`opencode run`, verify delivery (`git log base..HEAD`) and `--continue`-nudge
+until the commit exists (bounded retries).
