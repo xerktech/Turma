@@ -729,6 +729,114 @@ test("parsePaneLiveTurn: an idle narrow pane (completed-turn line, no hint) stay
   assert.deepEqual(parsePaneLiveTurn(pane), { generating: false, text: "", status: null });
 });
 
+// Claude Code ≥2.1 paints its collapsed tool-activity summary as prose-shaped
+// lines inside the assistant ● block ("Running 1 shell command…", "Ran 1 shell
+// command", "Reading 1 file, listing 1 directory, running 1 shell command…").
+// Left in the streamed text they mutate the block's tail every repaint and the
+// chat clients retype the whole bubble from 0 over and over. Fixture lines are
+// verbatim captures from Claude Code v2.1.209.
+test("parsePaneLiveTurn: an in-flight shell command's activity line is stripped from the prose", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  const pane = [
+    "❯ Now write one paragraph about clouds, and while writing it run this in the foreground",
+    "",
+    "● Clouds are among the most familiar and yet most quietly dramatic features of the sky.",
+    "",
+    "  Now running the foreground command:",
+    "",
+    "  Running 1 shell command…",
+    "  ⎿  $ python3 -c 'import time; time.sleep(50)' (3s)",
+    "     (ctrl+b ctrl+b (twice) to run in background)",
+    "",
+    "✶ Boogieing… (14s · ↓ 577 tokens)",
+    "  ⎿  Tip: Running multiple Claude sessions? Use /color and /rename to tell them apart at a glance.",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt · ← for agents",
+  ].join("\n");
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.generating, true);
+  assert.equal(r.text,
+    "Clouds are among the most familiar and yet most quietly dramatic features of the sky. Now running the foreground command:");
+});
+
+test("parsePaneLiveTurn: a completed command's past-tense summary is stripped too", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  // The same block flips "Running 1 shell command…" -> "Ran 1 shell command"
+  // when the call finishes; without the strip that flip alone re-typed the
+  // whole bubble (Running->Ran is not a prefix relation either way).
+  const pane = [
+    "❯ Say one short sentence about the weather, then run this exact command",
+    "",
+    "● It's a calm, clear day with mild temperatures.",
+    "",
+    "  Ran 1 shell command",
+    "",
+    "✢ Tempering… (2s · ↓ 93 tokens)",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt · ← for agents",
+  ].join("\n");
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.generating, true);
+  assert.equal(r.text, "It's a calm, clear day with mild temperatures.");
+});
+
+test("parsePaneLiveTurn: an activity-only ● bullet yields no prose (tool renders as a card)", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  // With no prose yet in the turn, the activity summary gets its own bullet —
+  // including the comma-joined multi-tool form. It must not stream as prose.
+  const pane = [
+    "❯ Read the file /etc/hostname, then list the files in /tmp, then say done",
+    "",
+    "● Reading 1 file, listing 1 directory, running 1 shell command…",
+    "  ⎿  $ ls -la /tmp",
+    "",
+    "✶ Boogieing… (4s · ↓ 187 tokens)",
+    RULE,
+    "❯ ",
+    RULE,
+    "  ⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt · ← for agents",
+  ].join("\n");
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.generating, true);
+  assert.equal(r.text, "");
+});
+
+test("parsePaneLiveTurn: a narrow pane wrapping an activity clause mid-word still strips it", () => {
+  const { parsePaneLiveTurn } = require("../tunnel-agent.js");
+  // The strip runs on the REFLOWED text, so a phone-width pane hard-wrapping
+  // the clause across physical lines can't hide it from a per-line matcher.
+  const pane = [
+    "❯ run the release check",
+    "● Kicking off the release check now.",
+    "",
+    "  Running 1 shell",
+    "  command…",
+    NARROW_RULE,
+    "❯ ",
+    NARROW_RULE,
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to inte…",
+  ].join("\n");
+  const r = parsePaneLiveTurn(pane);
+  assert.equal(r.generating, true);
+  assert.equal(r.text, "Kicking off the release check now.");
+});
+
+test("stripActivityTail: clause vocabulary and ordinary prose", () => {
+  const { stripActivityTail } = require("../tunnel-agent.js");
+  // Stacked clauses strip iteratively; pluralized counts match.
+  assert.equal(stripActivityTail("Done. Ran 1 shell command Running 2 shell commands…"), "Done.");
+  assert.equal(stripActivityTail("Read 1 file, listed 1 directory, ran 1 shell command"), "");
+  // Ordinary prose tails survive: no count, lowercase verb, or trailing
+  // punctuation all fail the clause shape.
+  assert.equal(stripActivityTail("The tide rises and falls."), "The tide rises and falls.");
+  assert.equal(stripActivityTail("I ate 3 apples"), "I ate 3 apples");
+  assert.equal(stripActivityTail("Ran 1 shell command."), "Ran 1 shell command.");
+});
+
 // liveTurnDecision holds a single busy->idle blip for one poll so a mid-repaint
 // capture can't flicker the pinned working bar off (the live counterpart of
 // hub-agent.py's _stable_pane_busy for the heartbeat's paneBusy).

@@ -744,6 +744,33 @@ function cleanHint(l) {
   return String(l == null ? "" : l).trim().replace(/^[⌊⌞└⎿⎣]\s*/, "").trim();
 }
 
+// Claude Code (≥2.1) paints its collapsed tool-activity summary as prose-shaped
+// lines inside the assistant ● block — indented under the prose while a call
+// runs ("  Running 1 shell command…"), past-tense once it finishes ("  Ran 1
+// shell command"), or as the block's own bullet when the turn has no prose yet
+// ("● Reading 1 file, listing 1 directory, running 1 shell command…"). No glyph
+// marks them, so the block scan reflows them INTO the streamed text, where
+// every Running→Ran flip and count tick mutates the block's tail; the chat
+// clients read that as a genuinely different prose block and retype it from 0
+// — the "previous text adds and removes over and over" flicker. They are
+// activity ABOUT the turn (the transcript's tool_use owns the real rendering),
+// so strip them off the reflowed text's tail: one-or-more comma-joined
+// "<Verb> <count> <noun words>" clauses, optionally ellipsized. Matched on the
+// REFLOWED text, not per physical line, so a narrow pane wrapping mid-clause
+// can't hide one. Biased toward matching like chat.js's isToolBullet: a false
+// strip only trims the live preview's tail (the committed transcript still
+// renders the prose in full), while a missed clause brings the flicker back.
+const PANE_ACTIVITY_TAIL_RE =
+  /(?:^|\s)[A-Z][a-z]+ \d+ [a-z]+(?: [a-z]+){0,2}(?:, [a-z]+ \d+ [a-z]+(?: [a-z]+){0,2})*(?:…|\.\.\.)?$/;
+function stripActivityTail(text) {
+  let t = text;
+  for (;;) {
+    const next = t.replace(PANE_ACTIVITY_TAIL_RE, "").trim();
+    if (next === t) return t;
+    t = next;
+  }
+}
+
 // An active-task checklist item Claude Code paints beneath the spinner: an
 // optional tree connector then a to-do status glyph (done ✓ / active ■ /
 // pending □). Only the first item carries the connector; the rest are bare, so
@@ -906,7 +933,7 @@ function parsePaneLiveTurn(pane) {
   }
   // Reflow the TUI's hard-wrapped lines into flowing text; the glasses re-wrap,
   // and the transcript delivers the authoritative structure on completion.
-  const text = block.join(" ").replace(/\s+/g, " ").trim();
+  const text = stripActivityTail(block.join(" ").replace(/\s+/g, " ").trim());
   return { generating: true, text, status };
 }
 
@@ -1264,5 +1291,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, parseAgentList, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, parseAgentList, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
 }
