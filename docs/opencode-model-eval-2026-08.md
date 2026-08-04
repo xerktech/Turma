@@ -151,3 +151,52 @@ regardless of quality. Ollama does not honor think:false for Laguna (probe still
 - Bench harness: `bench/run_bench.py`, `bench/tasks.json` (8 verified tasks),
   `bench/METHOD.md`
 - Session-history taxonomy: mined 2026-08-03 from `~/.claude/projects`
+
+## Serving architecture for the shared gpt-oss instance (added 2026-08-04)
+
+Question: with cues, translation, and many concurrent coding agents on one
+model, what should serve it — vLLM, Ollama, dedicated llama.cpp, or other?
+(The STT models have moved off this host; the GPU is fully gpt-oss's.)
+
+**vLLM: still cannot load this model on this card — re-verified today.**
+vLLM 0.26.0 selects the `MARLIN` MXFP4 MoE backend for SM120 and the
+load-time repack transiently OOMs the 96 GB card, exactly as in July
+(DockerOps #104–#108). The community SM120 recipe
+(`FLASHINFER_CUDA_ARCH_LIST=12.0f` + `--enforce-eager`) and the MoE-backend
+override envs were both tried; the envs are unknown to this build and Marlin
+is still chosen. Blocked upstream on vllm#31085 (SM120 native NVFP4 MoE
+kernel selection). vLLM serves *non-MXFP4* models fine here (the Qwen cue
+replay ran on it), so it stays the tool for other HF models.
+
+**Ollama concurrency, measured** (eval instance, ctx 65536, 8 parallel
+slots, 85 GB loaded — comfortable on the now-dedicated card):
+
+| scenario | result |
+|---|---|
+| cue-sized call, idle | 4.6 s |
+| 8 concurrent cue calls | p50 31.8 s |
+| 6 concurrent coding streams | ~112 tok/s aggregate |
+| cue latency under 6 active coders | p50 13.3 s (3× idle) |
+
+Aggregate throughput is flat (~120 tok/s) regardless of concurrency —
+llama.cpp gets no real batching gain on this MoE (decode is bound by
+streaming 65 GB of weights), so every active coding agent directly taxes cue
+latency. A dedicated llama.cpp (`llama-server`) container is the same engine
+with the same ceiling; it buys slot metrics and finer knobs, not throughput,
+and loses Ollama's operational fit (existing compose, LiteLLM alias, model
+management). TRT-LLM/SGLang have the same SM120 kernel gap or a much heavier
+bring-up on WSL2.
+
+**Recommendation: keep Ollama, tuned for multi-tenant use.**
+
+1. In `tenir-gpu.yaml`: `OLLAMA_CONTEXT_LENGTH=65536`,
+   `OLLAMA_NUM_PARALLEL=8`, keep `OLLAMA_KEEP_ALIVE=-1` and the pinned image.
+   Quality at this config is already validated — the August cue-replay
+   baseline ran on 0.32.5 at 65536 ctx and reproduced the July scorecard.
+2. Cap concurrently *generating* coding agents (Turma-side) at ~2–3 during
+   active listening hours — measured cue p50 stays in the 6–8 s band there,
+   vs 13 s at 6 coders. Agents idle between tool calls cost nothing; the cap
+   only needs to bound simultaneous generations.
+3. Re-test vLLM when vllm#31085 lands: paged KV + continuous batching is the
+   real fix for many-agent concurrency, and it would also unlock per-request
+   reasoning-effort control without template hacks.
