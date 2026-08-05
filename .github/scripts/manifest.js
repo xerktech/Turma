@@ -56,6 +56,8 @@ function freshComponent(component, version, tag, opts) {
         release_tag: tag,
         built: true,
       };
+    case "foverlay":
+      return { version, kind: "asset", asset: `turma-foverlay-v${version}.zip`, release_tag: tag, built: true };
     default:
       throw new Error(`unknown component ${component}`);
   }

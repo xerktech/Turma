@@ -1,0 +1,357 @@
+/* Transcript + tool-card styles for the vendored chat.js engine (XERK-171).
+   Extracted VERBATIM from turma/public/sessions.html + app.css so the phone
+   renders exactly what the web/Android show. Keep in sync when those move.
+   (Uses the design tokens declared in phone.css :root.) */
+
+/* ---- transcript bubbles, tool cards, thinking, code, marks (sessions.html) ---- */
+.tr-scroll { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.tr-msg { max-width: 760px; padding: 9px 13px; border-radius: var(--radius-md); font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tr-msg.user { align-self: flex-end; background: var(--accent-soft); color: var(--ink); }
+.tr-msg.assistant { align-self: flex-start; background: var(--surface); border: 1px solid var(--border); color: var(--ink); }
+.tr-msg .role { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 3px; }
+.tr-msg mark { background: var(--accent-soft); color: var(--accent); padding: 0 1px; border-radius: 2px; }
+/* Markdown tables (chat.js renderProse()). display:block + overflow-x lets a
+   wide table scroll inside the bubble instead of stretching the layout; the
+   surrounding bubble is pre-wrap, so reset table cells to normal wrapping. */
+.tr-msg .md-table, .thought-body .md-table {
+  display: block; overflow-x: auto; max-width: 100%; margin: 6px 0;
+  border-collapse: collapse; font-size: 12.5px; white-space: normal; }
+.tr-msg .md-table th, .tr-msg .md-table td,
+.thought-body .md-table th, .thought-body .md-table td {
+  border: 1px solid var(--border); padding: 4px 9px; text-align: left; vertical-align: top; }
+.tr-msg .md-table th, .thought-body .md-table th {
+  background: var(--page); font-weight: 600; }
+.tr-msg .md-table tbody tr:nth-child(even) td,
+.thought-body .md-table tbody tr:nth-child(even) td { background: var(--page); }
+/* Fenced code blocks (chat.js renderProse()). The surrounding bubble is
+   pre-wrap (and the thinking trace italic), so the block re-asserts pre +
+   upright mono and scrolls itself horizontally rather than wrapping code or
+   stretching the layout — same deal as .md-table above.
+
+   A `pre` that doesn't wrap has a min-content width of its longest line, and
+   a shrink-to-fit box won't size below that — so on a narrow viewport a long
+   code line pushed the whole bubble (and .tr-scroll with it) sideways instead
+   of scrolling inside the block. Giving the code-carrying box a DEFINITE
+   width takes it out of shrink-to-fit sizing entirely, so there's no
+   min-content floor to defeat and the overflow lands on the block's own
+   scroller. min(760px, 100%) keeps the bubble's usual cap on a wide screen.
+
+   Scoped with :has() so ordinary bubbles keep hugging their text — a bubble
+   carrying a code block goes full width, which is the conventional look.
+
+   Do NOT do this by making the box a grid/flex container (a minmax(0, 1fr)
+   track floors the contribution at 0 and looks right at first): that turns
+   every child into a block-level item, so inline `code` chips and links get
+   torn onto their own full-width lines mid-sentence. Nor by capping the code
+   itself (width:0 / contain:inline-size) — that drops the block out of the
+   bubble's width entirely, so it scrolls on a wide screen where it'd fit. */
+.tr-msg:has(.md-code), .thought:has(.md-code) { width: min(760px, 100%); }
+.tr-msg .md-code, .thought-body .md-code, .compact-body .md-code {
+  margin: 6px 0; padding: 8px 10px; background: var(--page);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  max-width: 100%; overflow-x: auto; white-space: pre; overflow-wrap: normal;
+  font-style: normal; font-size: 11.5px; line-height: 1.45; color: var(--ink); }
+.tr-msg .md-code code, .thought-body .md-code code, .compact-body .md-code code {
+  font-family: var(--font-mono); }
+/* Language tag, when the fence carried one (```hcl). Outside the <code>, so it
+   stays out of a copied selection. */
+.tr-msg .md-code[data-lang]::before, .thought-body .md-code[data-lang]::before,
+.compact-body .md-code[data-lang]::before {
+  content: attr(data-lang); display: block; margin-bottom: 5px;
+  font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--muted); }
+/* Copy-to-clipboard button in the top-right of every code block (XERK-183).
+   The wrapper is the positioning context so the button stays put while the
+   <code> scrolls beneath it; .copied swaps the clipboard glyph for a check. */
+.md-code-wrap { position: relative; }
+.md-code-wrap .md-copy {
+  position: absolute; top: 5px; right: 5px; z-index: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; padding: 0; cursor: pointer;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--muted);
+  opacity: 0.72; transition: opacity 0.12s, color 0.12s; }
+.md-code-wrap .md-copy:hover { opacity: 1; color: var(--ink); }
+.md-code-wrap .md-copy .ic-check { display: none; }
+.md-code-wrap .md-copy.copied { opacity: 1; color: var(--good); border-color: color-mix(in srgb, var(--good) 55%, var(--border)); }
+.md-code-wrap .md-copy.copied .ic-copy { display: none; }
+.md-code-wrap .md-copy.copied .ic-check { display: block; }
+.md-code-wrap .md-copy.failed { opacity: 1; color: var(--critical); border-color: color-mix(in srgb, var(--critical) 55%, var(--border)); }
+/* Inline `code` spans (chat.js renderInline()). Sized in em so the chip tracks
+   whatever it's set in (bubble, cell, thinking trace), and upright since the
+   thinking trace is italic. `anywhere` because an inline span is the one code
+   surface that can't scroll — a long `path/to/thing` has to break somewhere. */
+.tr-msg .md-code-inline, .thought-body .md-code-inline, .compact-body .md-code-inline,
+.md-table .md-code-inline {
+  font-family: var(--font-mono); font-size: 0.88em; font-style: normal;
+  background: var(--page); border: 1px solid var(--border); border-radius: 4px;
+  padding: 0.1em 0.35em; overflow-wrap: anywhere; }
+/* Auto-linkified URLs in chat bubbles + thinking traces (chat.js linkify()). */
+.tr-msg a, .thought-body a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
+.tr-msg a:hover, .thought-body a:hover { text-decoration: none; }
+.tr-msg.hit { box-shadow: 0 0 0 2px var(--accent); }
+.tr-msg.flash { animation: hitFlash 1.6s ease-out 1; }
+@keyframes hitFlash {
+  0%, 15% { background: var(--accent); color: #fff; }
+  100% { }
+}
+.tr-msg.assistant.hit { border-color: var(--accent); }
+.tr-empty { color: var(--muted); font-size: 13px; padding: 24px; text-align: center; }
+
+/* ---- Right stage: native chat view of a LIVE session --------------------- */
+.chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--page); }
+.chat-pane[hidden] { display: none; }
+/* Positioned so the floating "jump to latest" pill can hover at the bottom of
+   the scroll region — just above the status/question/compose stack — without
+   taking layout space or covering the text input. */
+.chat-scroll-wrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.chat-scroll { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.jump-bottom { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 20;
+  font: inherit; font-size: 12px; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--ink); cursor: pointer; box-shadow: 0 4px 16px #0006;
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.jump-bottom:hover { border-color: var(--accent); color: var(--accent); }
+.jump-bottom[hidden] { display: none; }
+/* Keep each message/tool card at its natural size: in a flex column, children
+   default to flex-shrink:1, so a growing transcript would squash the existing
+   cards to fit instead of scrolling. Pin them so the container scrolls. */
+.chat-scroll > *, .tr-scroll > * { flex-shrink: 0; }
+/* Text bubbles reuse the transcript bubble system: user right, agent left.
+   In the live chat, agent output is borderless/background-free and tighter
+   so it reads as flat prose; user input keeps its bubble. The archived
+   transcript view (.tr-scroll) renders through the same chat.js engine, so it
+   gets the identical look. */
+.chat-scroll .tr-msg.assistant, .tr-scroll .tr-msg.assistant { border: none; background: none; padding: 2px 0; }
+.chat-scroll .tr-msg.assistant.hit, .tr-scroll .tr-msg.assistant.hit { box-shadow: none; }
+.chat-scroll .tr-msg .role, .tr-scroll .tr-msg .role { display: none; }
+.chat-scroll .tr-msg.assistant.streaming::after {
+  content: "▍"; margin-left: 1px; color: var(--accent); animation: caret 1s steps(1) infinite;
+}
+@keyframes caret { 50% { opacity: 0; } }
+
+/* Pinned working-status bar — the spinner + gerund verb + live token up/down
+   counters that Claude Code shows at the bottom of the terminal. A sibling of
+   the scroll (not part of the message stream), so it stays put instead of
+   flickering in and out of the streamed bubble. */
+.chat-status { display: flex; flex-direction: column; gap: 4px; padding: 7px 14px;
+  border-top: 1px solid var(--border); background: var(--surface); color: var(--ink-2); font-size: 12.5px; }
+.chat-status[hidden] { display: none; }
+.chat-status .cc-row { display: flex; align-items: center; gap: 10px; }
+.chat-status .cc-spin { width: 11px; height: 11px; flex: none; border: 2px solid var(--border);
+  border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+.chat-status .verb { font-weight: 600; color: var(--ink); }
+.chat-status .toks { display: inline-flex; align-items: center; gap: 8px; margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+.chat-status .tok { color: var(--muted); white-space: nowrap; }
+.chat-status .tok.up { color: var(--accent); }
+/* Claude Code's rotating tip / active-task footer — de-emphasized, aligned
+   under the verb (past the spinner). Each row is clipped to one line so it
+   never crowds the composer; an active-task checklist renders as one such row
+   per to-do item, stacking below the verb. */
+.chat-status .cc-hint { padding-left: 21px; color: var(--muted); font-size: 11.5px;
+  line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Live agent-manager list scraped from the pane: the parent "main" plus each
+   background subagent. A subagent row is a button that opens its transcript;
+   "main" is a plain marker. */
+.chat-status .cc-agents { display: flex; flex-direction: column; gap: 2px; padding-left: 21px; }
+.chat-status .cc-agents-hd { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--muted); margin-top: 2px; }
+.chat-status .cc-agent { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
+  padding: 2px 4px; border: 0; border-radius: 5px; background: none; color: var(--ink-2);
+  font: inherit; font-size: 11.5px; cursor: pointer; }
+.chat-status button.cc-agent:hover { background: var(--surface-2, rgba(127,127,127,0.12)); color: var(--ink); }
+.chat-status .cc-agent.main { cursor: default; }
+.chat-status .cc-agent .dot { width: 8px; height: 8px; flex: none; border-radius: 50%;
+  border: 1.5px solid var(--muted); }
+.chat-status .cc-agent .dot.sel { background: var(--accent); border-color: var(--accent); }
+.chat-status .cc-agent .atype { font-weight: 600; color: var(--ink); flex: none; }
+.chat-status .cc-agent .alabel { color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+
+/* Tool-use / tool-result action card (collapsible). */
+.action-card { align-self: flex-start; max-width: 760px; width: 100%; font-size: 12.5px;
+  border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); overflow: hidden; }
+.action-card > summary { list-style: none; cursor: pointer; user-select: none; padding: 7px 11px;
+  display: flex; align-items: center; gap: 8px; color: var(--ink-2); }
+.action-card > summary::-webkit-details-marker { display: none; }
+.action-card > summary:hover { color: var(--accent); }
+.action-card .tool-name { font-weight: 600; color: var(--ink); }
+.action-card .tool-arg { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.action-card .tool-dot { width: 7px; height: 7px; border-radius: 999px; background: var(--muted); flex: none; }
+.action-card.ok .tool-dot { background: var(--good); }
+.action-card.err .tool-dot { background: var(--critical); }
+/* Background-task (task-notification) card: a diamond glyph + accent name so it
+   reads as a completed background agent, not a plain tool call. */
+.action-card .tool-glyph { color: var(--accent); font-size: 10px; line-height: 1; flex: none; }
+.action-card.task.err .tool-glyph { color: var(--critical); }
+.action-card.task .tool-name { color: var(--accent); font-weight: 600; }
+.action-card.task.err .tool-name { color: var(--critical); }
+.action-card .tool-body { padding: 0 11px 10px; display: flex; flex-direction: column; gap: 8px; }
+.action-card .tool-block { }
+.action-card .tool-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 3px; }
+.action-card pre { margin: 0; padding: 8px 10px; background: var(--page); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+  line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; }
+.action-card.err pre.tool-result { border-color: var(--critical); }
+.action-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0; padding: 2px 0; text-align: left; }
+.action-card .trunc:hover { text-decoration: underline; }
+/* The tool's human description arg (Bash/Agent/…), beside the raw argument. */
+.action-card .tool-desc { color: var(--muted); font-size: 11px; font-style: italic; flex: none;
+  max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* An Edit call's reviewable change: the replaced text (−, red) over its
+   replacement (+, green) — the diff the terminal shows for an edit. */
+.action-card .tool-diff { display: flex; flex-direction: column; gap: 4px; }
+.action-card .tool-diff pre.diff-old { background: color-mix(in srgb, var(--critical) 7%, var(--page));
+  border-color: color-mix(in srgb, var(--critical) 35%, var(--border)); }
+.action-card .tool-diff pre.diff-new { background: color-mix(in srgb, var(--good) 8%, var(--page));
+  border-color: color-mix(in srgb, var(--good) 35%, var(--border)); }
+/* An ExitPlanMode plan, rendered as prose (it's markdown the operator was
+   asked to approve, not a raw argument). */
+.action-card .tool-plan { padding: 8px 11px; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); background: var(--page); overflow-wrap: anywhere; font-size: 12.5px;
+  white-space: pre-wrap; }
+
+/* Slash command the operator ran (/compact, /clear, …), with its output folded
+   in when it produced any. Sits on the operator's side like the bubble it
+   replaces, but reads as a chip rather than speech. */
+.cmd-card { align-self: flex-end; max-width: 760px; font-size: 12px; border: 1px dashed var(--border);
+  border-radius: var(--radius-md); background: var(--surface); overflow: hidden; }
+.cmd-card, .cmd-card > summary { display: flex; align-items: center; gap: 7px; padding: 5px 10px; }
+.cmd-card > summary { list-style: none; cursor: pointer; user-select: none; padding: 5px 10px; }
+.cmd-card > summary::-webkit-details-marker { display: none; }
+.cmd-card > summary:hover { color: var(--accent); }
+.cmd-card.err { border-color: var(--critical); }
+.cmd-card .cmd-glyph { color: var(--muted); font-size: 11px; line-height: 1; flex: none; }
+.cmd-card .cmd-name { font-weight: 600; color: var(--ink-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.cmd-card .cmd-args { color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; min-width: 0; }
+/* `details` lays its body out as a flex child of the card; keep the two rows stacked. */
+.cmd-card[open] { display: block; }
+.cmd-card .cmd-body { padding: 0 10px 8px; }
+.cmd-card pre { margin: 0; padding: 7px 9px; background: var(--page); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 240px; overflow: auto; }
+.cmd-card.err pre { border-color: var(--critical); }
+.cmd-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0;
+  padding: 2px 0; text-align: left; }
+.cmd-card .trunc:hover { text-decoration: underline; }
+
+/* The model's own post-compaction summary. Stored as a user turn, shown on the
+   assistant's side (it's the model's writing) and collapsed — it's long, and
+   it's context rather than conversation. */
+.compact-card { align-self: flex-start; max-width: 760px; width: 100%; color: var(--muted); font-size: 12.5px; }
+.compact-card > summary { list-style: none; cursor: pointer; user-select: none; color: var(--muted);
+  padding: 5px 0; border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); }
+.compact-card > summary::-webkit-details-marker { display: none; }
+.compact-card > summary:hover { color: var(--accent); }
+.compact-card .compact-body { margin-top: 6px; padding: 9px 12px; border-left: 2px solid var(--border);
+  color: var(--ink-2); overflow-wrap: anywhere; }
+.compact-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0;
+  padding: 2px 0; text-align: left; }
+.compact-card .trunc:hover { text-decoration: underline; }
+
+/* The model's "while you were away" recap — same collapsed, assistant-side
+   shape as the compaction summary (it's the model's writing about the
+   conversation, not conversation itself). */
+.away-card { align-self: flex-start; max-width: 760px; width: 100%; color: var(--muted); font-size: 12.5px; }
+.away-card > summary { list-style: none; cursor: pointer; user-select: none; color: var(--muted);
+  padding: 5px 0; border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); }
+.away-card > summary::-webkit-details-marker { display: none; }
+.away-card > summary:hover { color: var(--accent); }
+.away-card .away-body { margin-top: 6px; padding: 9px 12px; border-left: 2px solid var(--border);
+  color: var(--ink-2); overflow-wrap: anywhere; }
+.away-card .trunc { color: var(--accent); font-size: 11px; cursor: pointer; background: none; border: 0;
+  padding: 2px 0; text-align: left; }
+.away-card .trunc:hover { text-decoration: underline; }
+
+/* "[Request interrupted by user]" — a statement about the turn, not the
+   operator talking: a centred, muted marker rather than a user bubble. */
+.chat-interrupt { align-self: center; color: var(--muted); font-size: 11.5px;
+  border: 1px solid var(--border); border-radius: 999px; padding: 2px 12px; }
+
+/* "Opened PR #N" — Claude Code's own pr-link record, an inline linked marker
+   at the point in the conversation where the PR landed. The compaction
+   marker (.chat-compact-mark) reuses .chat-interrupt's pill. */
+.chat-pr-mark { align-self: center; color: var(--muted); font-size: 11.5px;
+  border: 1px solid var(--border); border-radius: 999px; padding: 2px 12px; }
+.chat-pr-mark a { color: var(--accent); text-decoration: none; }
+.chat-pr-mark a:hover { text-decoration: underline; }
+
+/* A prompt typed mid-turn, still waiting in Claude Code's queue: a dimmed,
+   dashed user bubble labelled "queued" until its real user turn lands. */
+.tr-msg.queued { opacity: 0.65; background: transparent; border: 1px dashed var(--border); }
+
+/* Collapsed thinking trace. */
+.thought { align-self: flex-start; max-width: 760px; color: var(--muted); font-size: 12.5px; }
+.thought > summary { list-style: none; cursor: pointer; user-select: none; color: var(--muted); }
+.thought > summary::-webkit-details-marker { display: none; }
+.thought > summary:hover { color: var(--accent); }
+.thought .thought-body { margin-top: 4px; padding: 8px 11px; border-left: 2px solid var(--border);
+  color: var(--ink-2); font-style: italic; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* keyframes (sessions.html) */
+@keyframes hitFlash {
+  0%, 15% { background: var(--accent); color: #fff; }
+  100% { }
+}
+@keyframes caret { 50% { opacity: 0; } }
+
+/* ---- status pills + PR badges + status dots (app.css) ---- */
+.badge {
+  font-size: 11px; padding: 2px 8px; border-radius: 20px;
+  border: 1px solid var(--border); color: var(--ink-2); white-space: nowrap;
+}
+.badge.running { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); background: color-mix(in srgb, var(--good) 10%, transparent); }
+.badge.stopped { color: var(--muted); }
+.badge.error { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent); background: color-mix(in srgb, var(--critical) 10%, transparent); }
+/* Optimistic "being taken down" badge — shown the instant a kill is confirmed,
+   before the agent has acted. Its inline spinner spins in the critical hue. */
+.badge.stopping { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent); background: color-mix(in srgb, var(--critical) 10%, transparent); display: inline-flex; align-items: center; gap: 5px; }
+.badge.stopping .spin { width: 9px; height: 9px; border-width: 2px; border-top-color: var(--critical); }
+
+/* ---- PR status pill — GitHub-style state + CI-check rollup ---------------
+   Rendered on the dashboard/session cards and (compact) in the chat footer.
+   `prBadgeHtml()` in the page scripts builds the markup; colours track the PR
+   state, the trailing ✓/✗/● reflects the CI-check rollup. */
+.pr-badge {
+  display: inline-flex; align-items: center; gap: 5px; text-decoration: none;
+  font-size: 11px; padding: 2px 8px; border-radius: 20px; white-space: nowrap;
+  border: 1px solid var(--border); color: var(--ink-2);
+}
+.pr-badge:hover { filter: brightness(1.08); }
+.pr-badge .pr-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--muted); }
+.pr-badge.pr-open   { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); background: color-mix(in srgb, var(--good) 10%, transparent); }
+.pr-badge.pr-open   .pr-dot { background: var(--good); }
+.pr-badge.pr-merged { color: var(--s5); border-color: color-mix(in srgb, var(--s5) 45%, transparent); background: color-mix(in srgb, var(--s5) 12%, transparent); }
+.pr-badge.pr-merged .pr-dot { background: var(--s5); }
+.pr-badge.pr-closed { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent); background: color-mix(in srgb, var(--critical) 10%, transparent); }
+.pr-badge.pr-closed .pr-dot { background: var(--critical); }
+.pr-badge.pr-draft  { color: var(--muted); }
+/* The merge-readiness mark: CI *and* mergeability, not CI alone (see
+   _merge_ready in hub-agent.py) — hence "ready/blocked", not "passing/failing". */
+.pr-badge .pr-ready { font-weight: 700; font-size: 11px; }
+.pr-badge .pr-ready.ready { color: var(--good); }
+.pr-badge .pr-ready.blocked { color: var(--critical); }
+.pr-badge .pr-ready.pending { color: var(--warning); }
+.pr-list { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* ---- Status "lights" — glowing dots (the Lumen points-of-light motif) ---- */
+.status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.dot.online,  .dot.working { background: var(--good);     box-shadow: 0 0 8px color-mix(in srgb, var(--good) 75%, transparent); }
+.dot.waiting,
+.dot.updating              { background: var(--warning);  box-shadow: 0 0 8px color-mix(in srgb, var(--warning) 75%, transparent); }
+.dot.offline               { background: var(--critical);  box-shadow: 0 0 7px color-mix(in srgb, var(--critical) 55%, transparent); }
+.dot.idle                  { background: var(--muted); }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---- phone overrides: keep the agent message BUBBLED (Android look) rather
+   than the web live-chat's borderless prose; hide role labels. ---- */
+.chat-scroll .tr-msg.assistant { border: 1px solid var(--border); background: var(--surface-2); padding: 9px 13px; }
+.chat-scroll .tr-msg.assistant.streaming::after { content: "▍"; margin-left: 1px; color: var(--accent); animation: caret 1s steps(1) infinite; }
+.chat-scroll .tr-msg .role { display: none; }
+.chat-scroll { padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.chat-scroll > * { flex-shrink: 0; }

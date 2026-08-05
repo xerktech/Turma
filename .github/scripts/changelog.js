@@ -20,8 +20,9 @@ const COMPONENT_HEADING = {
   "agent-native": "Agent",
   glasses: "Glasses",
   android: "Android",
+  foverlay: "Foverlay",
 };
-const HEADING_ORDER = ["Hub", "Agent", "Glasses", "Android", "Other"];
+const HEADING_ORDER = ["Hub", "Agent", "Glasses", "Android", "Foverlay", "Other"];
 
 // Component -> row label for the release-notes summary table.
 const COMPONENT_LABEL = {
@@ -30,8 +31,9 @@ const COMPONENT_LABEL = {
   "agent-native": "Agent (native)",
   glasses: "Glasses (Even Hub)",
   android: "Android",
+  foverlay: "Foverlay (miniapp .zip)",
 };
-const TABLE_ORDER = ["turma", "agent-image", "agent-native", "glasses", "android"];
+const TABLE_ORDER = ["turma", "agent-image", "agent-native", "glasses", "android", "foverlay"];
 
 // First line, trimmed, internal whitespace collapsed — a PR title or commit
 // subject that somehow carries a newline can't break a markdown bullet/table.
@@ -136,6 +138,8 @@ const INSTALL_DETAILS = [
   "- **Glasses**: published to the Even Hub developer portal (no release asset);",
   "  promote the build there, then update the app from the Even phone app.",
   "- **Android** (`.apk`): download below and install (enable \"install unknown apps\"). Debug-signed.",
+  "- **Foverlay** (`.zip`): the Turma miniapp for the Foverlay app — bundled into the",
+  "  Foverlay app's `mobile/assets/miniapps/` in the Foverlay repo.",
   "",
   "Carried components are unchanged since the version shown; their artifact name reflects the",
   "build it actually is. `manifest.json` (attached) is the machine-readable source of truth.",

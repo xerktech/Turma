@@ -13,6 +13,7 @@ test("componentsForPath maps top-level dirs; agent/** fans out to both agent com
   assert.deepEqual(C.componentsForPath("agent/native/install.sh"), ["agent-image", "agent-native"]);
   assert.deepEqual(C.componentsForPath("glasses/src/app.ts"), ["glasses"]);
   assert.deepEqual(C.componentsForPath("android/app/build.gradle.kts"), ["android"]);
+  assert.deepEqual(C.componentsForPath("foverlay/src/background/index.ts"), ["foverlay"]);
 });
 
 test("componentsForPath returns [] for non-component paths (-> Other, never a build)", () => {
@@ -31,6 +32,7 @@ test("detectChanges unions components across the diff", () => {
     "agent-native": false,
     glasses: false,
     android: true,
+    foverlay: false,
   });
 });
 

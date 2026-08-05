@@ -1,9 +1,10 @@
 name: release
 
 # The unified release pipeline: ONE v<MAJOR>.<MINOR>.<PATCH> tag per release,
-# carrying ALL five components (turma image, agent image, glasses .ehpk, android
-# .apk, native agent tarball) + a changelog. Replaces the five per-component
-# release/build workflows. See RELEASING.md and .github/scripts/README.md.
+# carrying ALL six components (turma image, agent image, glasses .ehpk, android
+# .apk, native agent tarball, foverlay miniapp .zip) + a changelog. Replaces the
+# per-component release/build workflows. See RELEASING.md and
+# .github/scripts/README.md.
 #
 # Model:
 #   - PATCH is derived from the existing v* tags (max+1), never committed — so
@@ -21,10 +22,10 @@ name: release
 # release / commit is created. It's the break-glass diagnostic — keep it.
 #
 # Triggers:
-#   - push: main   — the auto patch release. Path-filtered to the four component
+#   - push: main   — the auto patch release. Path-filtered to the five component
 #     source dirs, because a release whose every component is CARRIED publishes
 #     nothing new: a docs-only or .github-only merge would still mint a tag and
-#     re-attach the previous release's five assets verbatim. Changing the release
+#     re-attach the previous release's assets verbatim. Changing the release
 #     machinery itself is therefore NOT a trigger — rehearse those with a
 #     dry_run dispatch, and they take effect on the next real component merge.
 #   - workflow_dispatch — manual minor/major, force_all, and the dry_run
@@ -37,6 +38,7 @@ on:
       - "agent/**"
       - "glasses/**"
       - "android/**"
+      - "foverlay/**"
   workflow_dispatch:
     inputs:
       release_type:
@@ -91,6 +93,7 @@ jobs:
       build_agent_native: ${{ steps.plan.outputs.build_agent_native }}
       build_glasses: ${{ steps.plan.outputs.build_glasses }}
       build_android: ${{ steps.plan.outputs.build_android }}
+      build_foverlay: ${{ steps.plan.outputs.build_foverlay }}
       dry_run: ${{ steps.flags.outputs.dry_run }}
       sha: ${{ github.sha }}
     steps:
@@ -458,13 +461,51 @@ jobs:
             turma-agent-native-v${{ needs.plan.outputs.version }}.tar.gz.sha256
           if-no-files-found: error
 
+  # ------------------------------------------------------ build: foverlay -----
+  # GitHub-hosted: a bun install/build + a stdlib pack script, nothing to cache.
+  # Builds the Foverlay bundled-miniapp port of the glasses client and uploads
+  # the flat miniapp zip as a release asset (the Foverlay repo bundles it into
+  # its mobile app's assets).
+  build-foverlay:
+    needs: [plan, bump]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.bump.result != 'failure'
+      && needs.plan.outputs.build_foverlay == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.22"
+      # Stamp the unified version into miniapp.json before packing — mirroring
+      # the glasses app.json stamp: only the manifest is touched (pack reads the
+      # version there; package.json stays at its committed 0.0.0).
+      - name: Stamp version, install, build, pack
+        working-directory: foverlay
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync("miniapp.json"));j.version=process.env.VERSION;fs.writeFileSync("miniapp.json",JSON.stringify(j,null,2)+"\n")'
+          bun install --frozen-lockfile
+          bun run build
+          node scripts/pack.mjs --out "$GITHUB_WORKSPACE/turma-foverlay-v${VERSION}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-foverlay
+          path: turma-foverlay-v${{ needs.plan.outputs.version }}.zip
+          if-no-files-found: error
+
   # --------------------------------------------------------------- publish ----
   # Runs last. Assembles manifest.json + release notes, carries unchanged assets
   # forward, and (unless dry_run) creates the tag + release. Runs unless a build
   # that was SUPPOSED to run failed (a skipped/carried component is fine).
   publish:
     needs:
-      [plan, bump, build-turma-image, build-agent-image, build-glasses, build-android, build-agent-native]
+      [plan, bump, build-turma-image, build-agent-image, build-glasses, build-android, build-agent-native, build-foverlay]
     if: >-
       !cancelled() && needs.plan.result == 'success'
       && needs.bump.result != 'failure'
@@ -473,6 +514,7 @@ jobs:
       && needs.build-glasses.result != 'failure'
       && needs.build-android.result != 'failure'
       && needs.build-agent-native.result != 'failure'
+      && needs.build-foverlay.result != 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -487,12 +529,12 @@ jobs:
         with:
           node-version: "24"
       # Collect the built release assets into dist/ (flattened). The Android
-      # .apk and native tarball are the only asset-* producers now (the .ehpk
-      # ships to the Even Hub portal from build-glasses), so only download when
-      # one of them actually built — a zero-match pattern must not be able to
-      # fail a hub/agent-image/glasses-only release.
+      # .apk, native tarball, and foverlay zip are the only asset-* producers
+      # now (the .ehpk ships to the Even Hub portal from build-glasses), so only
+      # download when one of them actually built — a zero-match pattern must not
+      # be able to fail a hub/agent-image/glasses-only release.
       - uses: actions/download-artifact@v4
-        if: needs.plan.outputs.build_android == 'true' || needs.plan.outputs.build_agent_native == 'true'
+        if: needs.plan.outputs.build_android == 'true' || needs.plan.outputs.build_agent_native == 'true' || needs.plan.outputs.build_foverlay == 'true'
         with:
           pattern: asset-*
           path: dist

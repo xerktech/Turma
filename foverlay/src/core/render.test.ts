@@ -1,0 +1,793 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import { createInitialState, newSessionState, type AppState } from "./app.ts";
+import { render, sessionContentLines, SESSION_SCROLL_STEP, type ScreenModel } from "./render.ts";
+import { charMeasure, setDefaultMeasure, type Measure } from "./text-wrap.ts";
+import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
+
+const NOW = 1_700_000_000_000;
+
+function signals(overrides: Partial<LiveSignals> = {}): LiveSignals {
+  return {
+    bridgeAttached: true,
+    transcriptAgeSec: null,
+    lastRole: null,
+    lastHasToolUse: false,
+    question: null,
+    questionOptions: [],
+    tail: [],
+    newPrUrls: [],
+    ...overrides,
+  };
+}
+
+function session(overrides: Partial<SessionInfo> = {}): SessionInfo {
+  return {
+    id: "sess-0001",
+    repo: "myrepo",
+    status: "running",
+    session: null,
+    createdAt: "2026-01-01T00:00:00Z",
+    ...overrides,
+  };
+}
+
+function agent(overrides: Partial<AgentInfo> = {}): AgentInfo {
+  return {
+    key: "host-a",
+    device: "host-a",
+    online: true,
+    repos: [],
+    sessions: [],
+    closedSessions: [],
+    ...overrides,
+  };
+}
+
+function base(overrides: Partial<AppState> = {}): AppState {
+  return { ...createInitialState(NOW), ...overrides };
+}
+
+// Every non-session screen renders {type:"lines"}; this unwraps it (and
+// fails loudly if a test accidentally points it at the session screen).
+function asLines(model: ScreenModel): string[] {
+  if (model.type !== "lines") throw new Error(`expected a "lines" ScreenModel, got "${model.type}"`);
+  return model.lines;
+}
+
+function asSession(model: ScreenModel) {
+  if (model.type !== "session") throw new Error(`expected a "session" ScreenModel, got "${model.type}"`);
+  return model;
+}
+
+describe("render: home", () => {
+  it("shows the run/ask header, grouped hosts (incl. an offline one), and the trailing menu rows", () => {
+    const agents: AgentInfo[] = [
+      agent({
+        key: "alpha",
+        device: "alpha",
+        sessions: [
+          session({ id: "s-work", repo: "repoA", session: signals({ transcriptAgeSec: 5 }) }),
+          session({ id: "s-ask", repo: "repoB", status: "running", session: signals({ question: "pick one" }) }),
+          session({ id: "s-idle", repo: "repoC", status: "running", session: signals({ transcriptAgeSec: 999 }) }),
+        ],
+      }),
+      agent({ key: "beta", device: "beta", online: false }),
+    ];
+    const state = base({ agents, home: { cursor: 0 } });
+
+    const model = render(state);
+    expect(model.type).toBe("lines");
+    const lines = asLines(model);
+
+    expect(lines[0]).toBe("TURMA 1 run · 1 ask");
+    expect(lines).toContain("> alpha");
+    // Rows are <repo>-<name>; the host (alpha) is the header above, not repeated.
+    expect(lines.some((l) => l.includes("! repoA-"))).toBe(true);
+    expect(lines.some((l) => l.includes("? repoB-"))).toBe(true);
+    expect(lines.some((l) => l.includes("- repoC-"))).toBe(true);
+    expect(lines.some((l) => l.includes("alpha·"))).toBe(false);
+    expect(lines).toContain("  beta offline");
+    expect(lines).toContain("  + New session");
+    // Foverlay port: the 7-line canvas windows 6 rows, so the trailing
+    // Settings row sits one past the cursor-0 window; scrolling the cursor to
+    // it slides it into view (same single-window behaviour, smaller window).
+    const atEnd = asLines(render(base({ agents, home: { cursor: 6 } })));
+    expect(atEnd).toContain("> Settings");
+  });
+
+  it("shows the agent-generated summary as each session's name, falling back to the short id when unnamed", () => {
+    const agents: AgentInfo[] = [
+      agent({
+        key: "alpha",
+        device: "alpha",
+        sessions: [
+          session({ id: "s-named", repo: "repoA", summary: "Adding Compose Flag" }),
+          session({ id: "abcdef123456", repo: "repoB", summary: null }),
+        ],
+      }),
+    ];
+    const lines = asLines(render(base({ agents, home: { cursor: 0 } })));
+
+    // Named session shows <repo>-<summary>, not its id.
+    expect(lines.some((l) => l.includes("repoA-Adding Compose Flag"))).toBe(true);
+    expect(lines.some((l) => l.includes("s-named"))).toBe(false);
+    // Unnamed session falls back to <repo>-<first 6 chars of id>.
+    expect(lines.some((l) => l.includes("repoB-abcdef"))).toBe(true);
+  });
+
+  it("marks a cursor'd session row with '>' and renders its glyph as pending overlay", () => {
+    const agents: AgentInfo[] = [
+      agent({ sessions: [session({ id: "s1", session: signals({ transcriptAgeSec: 1 }) })] }),
+    ];
+    // Row 0 = host header (non-selectable), row 1 = the session.
+    const state = base({ agents, home: { cursor: 1 }, pending: { s1: { at: NOW } } });
+
+    const lines = asLines(render(state));
+    expect(lines.some((l) => l.startsWith("> … myrepo-"))).toBe(true);
+  });
+
+  it("windows a long row list into one scrollable page — no p/N footer, cursor stays visible", () => {
+    const sessions = Array.from({ length: 12 }, (_, i) =>
+      session({ id: `s${i}`, repo: `repo${i}`, session: signals({ transcriptAgeSec: 999 }) })
+    );
+    const agents: AgentInfo[] = [agent({ sessions })];
+    // rows = [hostHeader, s0..s11, newSession, settings] = 15 rows total,
+    // more than the DISPLAY_LINES-1 = 6 content lines can show at once.
+    const state = base({ agents, home: { cursor: 0 } });
+
+    const lines = asLines(render(state));
+    expect(lines[0]).toBe("TURMA 0 run · 0 ask");
+    // Never split into pages: no "p/N" footer, ever.
+    expect(lines.some((l) => /^p\d+\/\d+$/.test(l))).toBe(false);
+    // Header + one full window of content (DISPLAY_LINES-1 rows) = DISPLAY_LINES.
+    expect(lines.length).toBe(7);
+
+    // The cursor is always in the rendered window, wherever it sits in the list.
+    const state2 = base({ agents, home: { cursor: 14 } }); // settings row, at the very end
+    const lines2 = asLines(render(state2));
+    expect(lines2.some((l) => /^p\d+\/\d+$/.test(l))).toBe(false);
+    expect(lines2.some((l) => l === "> Settings")).toBe(true);
+    // A mid-list cursor is also windowed in — the list scrolled to follow it.
+    const state3 = base({ agents, home: { cursor: 7 } }); // s6 (rows: header=0, s0=1, ...)
+    const lines3 = asLines(render(state3));
+    expect(lines3.some((l) => l.startsWith("> "))).toBe(true);
+  });
+
+  it("shows a flash message in place of the header", () => {
+    const state = base({ flash: "hub unreachable", flashUntil: NOW + 1000 });
+    expect(asLines(render(state))[0]).toBe("hub unreachable");
+  });
+
+  it("does not show an expired flash", () => {
+    const state = base({ flash: "hub unreachable", flashUntil: NOW - 1000 });
+    expect(asLines(render(state))[0]).toBe("TURMA 0 run · 0 ask");
+  });
+});
+
+describe("render: session", () => {
+  it("returns a session ScreenModel with no header line and an input-mode bottom bar when no question is pending", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+    });
+
+    const model = asSession(render(state));
+
+    // No header: the first (and only) transcript line is the content itself,
+    // not "host-a·myrepo" or similar.
+    expect(model.transcriptLines[0]).toBe("» hi");
+    expect(model.transcriptLines.some((l) => l.includes("host-a"))).toBe(false);
+    expect(model.bottom.mode).toBe("input");
+  });
+
+  it("shows a sheet-mode bottom bar with numbered options and a Dictate answer row when a question is pending", () => {
+    const s = session({ id: "s1", session: signals({ question: "Deploy now?", questionOptions: ["Yes", "No"] }) });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [] } },
+    });
+
+    const model = asSession(render(state));
+
+    expect(model.bottom.mode).toBe("sheet");
+    if (model.bottom.mode !== "sheet") throw new Error("unreachable");
+    expect(model.bottom.options).toEqual(["Yes", "No"]);
+    expect(model.bottom.lines.some((l) => l.includes("1. Yes"))).toBe(true);
+    expect(model.bottom.lines.some((l) => l.includes("2. No"))).toBe(true);
+    // Foverlay port: the 3-line box windows the sheet — the trailing Dictate
+    // answer row scrolls into view as the selection moves onto it.
+    const atEnd = asSession(
+      render(base({
+        screen: "session",
+        agents,
+        session: { ...newSessionState("host-a", "s1"), selected: 2 },
+        transcripts: { s1: { entries: [] } },
+      }))
+    );
+    expect(atEnd.bottom.mode).toBe("sheet");
+    expect(atEnd.bottom.lines.some((l) => l.includes("> 3. Dictate answer…"))).toBe(true);
+  });
+
+  it("shows the merged transcript and PR urls at the newest end, without duplicating the pending question (Task 6: the sheet owns it)", () => {
+    const s = session({
+      id: "s1",
+      repo: "myrepo",
+      session: signals({ question: "Deploy now?", newPrUrls: ["https://github.com/x/y/pull/1"] }),
+    });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: {
+        s1: {
+          entries: [
+            { id: "1", role: "user", text: "hello" },
+            { id: "2", role: "assistant", text: "hi there" },
+          ],
+        },
+      },
+    });
+
+    const model = asSession(render(state));
+
+    expect(model.transcriptLines.some((l) => l.includes("» hello"))).toBe(true);
+    expect(model.transcriptLines.some((l) => l.includes("hi there"))).toBe(true);
+    // The question renders once — in the sheet, not the transcript.
+    expect(model.transcriptLines.some((l) => l.includes("Deploy now?"))).toBe(false);
+    expect(model.transcriptLines.some((l) => l.includes("https://github.com/x/y/pull/1"))).toBe(true);
+    expect(model.bottom.mode).toBe("sheet");
+    expect(model.bottom.lines.some((l) => l.includes("Deploy now?"))).toBe(true);
+  });
+
+  it("marks the operator's own turns with a '»' chevron and the agent's with a '·' dot, so the two are distinct", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: {
+        s1: {
+          entries: [
+            { id: "1", role: "user", text: "run the tests" },
+            { id: "2", role: "assistant", text: "all green" },
+          ],
+        },
+      },
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines).toContain("» run the tests");
+    expect(model.transcriptLines).toContain("· all green");
+    // The agent reply never carries the user's chevron.
+    expect(model.transcriptLines.some((l) => l === "» all green")).toBe(false);
+  });
+
+  it("renders no line for a turn that concise-ingest reduced to empty (a pure tool-call turn)", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    // The buffer stores the post-strip text; a tool-only assistant turn lands as "".
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: {
+        s1: {
+          entries: [
+            { id: "1", role: "user", text: "go" },
+            { id: "2", role: "assistant", text: "" },
+            { id: "3", role: "assistant", text: "done" },
+          ],
+        },
+      },
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines).toEqual(["» go", "· done"]);
+  });
+
+  it("hang-indents a wrapped turn so continuation lines align under the marker's text column", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    // Long enough to wrap across more than one line at the ~560px width.
+    const long = "the quick brown fox jumps over the lazy dog and then keeps on running past the barn";
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "assistant", text: long }] } },
+    });
+
+    const lines = asSession(render(state)).transcriptLines;
+    expect(lines.length).toBeGreaterThan(1); // it wrapped
+    // First line opens with the role marker; every continuation line opens with
+    // the matching 2-space indent (not the marker, and not flush-left).
+    expect(lines[0]!.startsWith("· ")).toBe(true);
+    for (const cont of lines.slice(1)) {
+      expect(cont.startsWith("  ")).toBe(true);
+      expect(cont.startsWith("· ")).toBe(false);
+    }
+  });
+
+  it("shows the live status in the empty input box, but hides it once a draft is typed", () => {
+    const s = session({ id: "s1", session: signals({ transcriptAgeSec: 1 }) }); // working
+    const agents = [agent({ sessions: [s] })];
+
+    const empty = asSession(
+      render(base({ screen: "session", agents, session: newSessionState("host-a", "s1"), transcripts: { s1: { entries: [] } } }))
+    );
+    expect(empty.bottom.status).toBe("Working");
+
+    const typed = asSession(
+      render(
+        base({
+          screen: "session",
+          agents,
+          session: { ...newSessionState("host-a", "s1"), draft: "some answer" },
+          transcripts: { s1: { entries: [] } },
+        })
+      )
+    );
+    expect(typed.bottom.mode).toBe("input");
+    expect(typed.bottom.status).toBe("");
+  });
+
+  it("still shows the mic indicator while dictating even with a draft present", () => {
+    const s = session({ id: "s1", session: signals({ transcriptAgeSec: 1 }) });
+    const agents = [agent({ sessions: [s] })];
+    const model = asSession(
+      render(
+        base({
+          screen: "session",
+          agents,
+          session: { ...newSessionState("host-a", "s1"), draft: "half a sentence", mic: "recording" },
+          transcripts: { s1: { entries: [] } },
+        })
+      )
+    );
+    expect(model.bottom.status).toBe("[REC]");
+  });
+
+  it("hides the status when a question sheet fills the box", () => {
+    const s = session({ id: "s1", session: signals({ question: "Deploy now?", questionOptions: ["Yes", "No"], transcriptAgeSec: 1 }) });
+    const agents = [agent({ sessions: [s] })];
+    const model = asSession(
+      render(base({ screen: "session", agents, session: newSessionState("host-a", "s1"), transcripts: { s1: { entries: [] } } }))
+    );
+    expect(model.bottom.mode).toBe("sheet");
+    expect(model.bottom.status).toBe("");
+  });
+
+  it("pages a long transcript, showing only the bottom-anchored window at offset 0", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const entries = Array.from({ length: 20 }, (_, i) => ({
+      id: String(i),
+      role: i % 2 === 0 ? "user" : "assistant",
+      text: `line ${i}`,
+    }));
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries } },
+    });
+
+    const model = asSession(render(state));
+    // No header line now; the input bottom bar (empty draft, unfocused) is 1
+    // line, so the transcript area is DISPLAY_LINES - 1 = 6.
+    expect(model.transcriptLines.length).toBe(6);
+    expect(model.transcriptLines[model.transcriptLines.length - 1]).toContain("line 19");
+    expect(model.transcriptLines.join("\n")).not.toContain("line 0\n");
+  });
+
+  it("shows the loading-earlier indicator while history is being fetched", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: { ...newSessionState("host-a", "s1"), offset: 999 },
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+      loadingHistory: { s1: true },
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines).toContain("· loading earlier ·");
+  });
+
+  it("shows a truncated-history marker at the very top when the buffer's hasMore is true", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: {
+        s1: {
+          entries: [
+            { id: "1", role: "user", text: "hello" },
+            { id: "2", role: "assistant", text: "hi there" },
+          ],
+          hasMore: true,
+        },
+      },
+    });
+
+    const model = asSession(render(state));
+    // No header now: the marker must be the very first transcript line.
+    expect(model.transcriptLines[0]).toBe("· earlier history truncated ·");
+    expect(model.transcriptLines.indexOf("· earlier history truncated ·")).toBeLessThan(
+      model.transcriptLines.findIndex((l) => l.includes("hello"))
+    );
+  });
+
+  it("does not show the truncated marker when hasMore is false (real top) or undefined (never fetched)", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const falseState = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }], hasMore: false } },
+    });
+    const undefinedState = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+    });
+
+    expect(asSession(render(falseState)).transcriptLines.some((l) => l.includes("truncated"))).toBe(false);
+    expect(asSession(render(undefinedState)).transcriptLines.some((l) => l.includes("truncated"))).toBe(false);
+  });
+
+  // ---- flash surfacing (Task 5 carry-forward: the session screen has no
+  // header of its own to show it, unlike every other screen) -------------
+
+  it("surfaces an active flash as a transient top line of the transcript", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+      flash: "✓ queued — agent picks up in ~20s",
+      flashUntil: NOW + 1000,
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines[0]).toContain("✓ queued");
+    expect(model.transcriptLines.some((l) => l.includes("hi"))).toBe(true);
+  });
+
+  it("does not show an expired flash on the session screen", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "session",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      transcripts: { s1: { entries: [{ id: "1", role: "user", text: "hi" }] } },
+      flash: "✓ queued — agent picks up in ~20s",
+      flashUntil: NOW - 1,
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines.some((l) => l.includes("queued"))).toBe(false);
+    expect(model.transcriptLines[0]).toBe("» hi");
+  });
+});
+
+describe("SESSION_SCROLL_STEP", () => {
+  it("is 2", () => {
+    expect(SESSION_SCROLL_STEP).toBe(2);
+  });
+});
+
+describe("render: actions", () => {
+  it("renders the running-session menu as an overlay: Back first (cursor 0), no Send/Clear/Answer/Restart when there's no draft", () => {
+    const s = session({ id: "s1", session: signals({ question: "pick" }) });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "actions",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
+    });
+
+    const model = asSession(render(state));
+    expect(model.bottom.mode).toBe("menu");
+    const box = model.bottom.lines;
+    expect(box).toContain("> Back");
+    expect(box).toContain("  End this session");
+    expect(box.some((l) => l.includes("Delete"))).toBe(false);
+    expect(box.some((l) => l.includes("Restart"))).toBe(false);
+    expect(box.some((l) => l.includes("Answer question"))).toBe(false);
+    expect(box.some((l) => l.includes("Send"))).toBe(false);
+    expect(box.some((l) => l.includes("Clear"))).toBe(false);
+  });
+
+  it("keeps the session transcript visible behind the menu", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "actions",
+      agents,
+      session: newSessionState("host-a", "s1"),
+      actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
+      transcripts: { s1: { entries: [{ id: "e1", role: "assistant", text: "behind the menu" }] } },
+    });
+
+    const model = asSession(render(state));
+    expect(model.transcriptLines.some((l) => l.includes("behind the menu"))).toBe(true);
+    expect(model.bottom.mode).toBe("menu");
+  });
+
+  it("prepends Send/Clear/Dictate more after Back once the session's bottom-box draft has text", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "actions",
+      agents,
+      session: { ...newSessionState("host-a", "s1"), draft: "deploy the fix" },
+      actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
+    });
+
+    const box = asSession(render(state)).bottom.lines;
+    expect(box).toContain("> Back");
+    expect(box).toContain("  Send");
+    expect(box).toContain("  Clear");
+    expect(box).toContain("  Dictate more");
+    // Foverlay port: MENU_MAX_LINES is 5 on the 7-line canvas, so the 5-row
+    // menu windows to 4 rows + title — End this session scrolls into view as
+    // the cursor moves onto it.
+    const atEnd = asSession(
+      render(base({
+        screen: "actions",
+        agents,
+        session: { ...newSessionState("host-a", "s1"), draft: "deploy the fix" },
+        actions: { hostKey: "host-a", sessionId: "s1", cursor: 4 },
+      }))
+    ).bottom.lines;
+    expect(atEnd).toContain("> End this session");
+  });
+
+  it("ignores another session's draft (Send/Clear only reflect the actions target's own session)", () => {
+    const s = session({ id: "s1" });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "actions",
+      agents,
+      session: { ...newSessionState("host-a", "other-session"), draft: "unrelated draft" },
+      actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
+    });
+
+    const box = asSession(render(state)).bottom.lines;
+    expect(box.some((l) => l.includes("Send"))).toBe(false);
+    expect(box.some((l) => l.includes("Clear"))).toBe(false);
+  });
+
+  it("shows Back/Start (no Delete, no Kill, no Restart) when the session is stopped", () => {
+    const s = session({ id: "s1", status: "stopped", session: null });
+    const agents = [agent({ sessions: [s] })];
+    const state = base({
+      screen: "actions",
+      agents,
+      actions: { hostKey: "host-a", sessionId: "s1", cursor: 0 },
+    });
+
+    const box = asSession(render(state)).bottom.lines;
+    expect(box).toContain("> Back");
+    expect(box).toContain("  Start");
+    expect(box.some((l) => l.includes("Delete"))).toBe(false);
+    expect(box.some((l) => l.includes("Kill"))).toBe(false);
+    expect(box.some((l) => l.includes("End this session"))).toBe(false);
+    expect(box.some((l) => l.includes("Restart"))).toBe(false);
+  });
+});
+
+describe("render: reply", () => {
+  it("shows the listening indicator", () => {
+    const state = base({
+      screen: "reply",
+      reply: {
+        target: { kind: "session", hostKey: "host-a", sessionId: "s1", back: "session" },
+        phase: "listening",
+        text: "",
+        cursor: 0,
+      },
+    });
+    expect(asLines(render(state))).toContain("● listening… (tap=done)");
+  });
+
+  it("shows the preview text, char count, and Send/Redo/Cancel buttons", () => {
+    const state = base({
+      screen: "reply",
+      reply: {
+        target: { kind: "session", hostKey: "host-a", sessionId: "s1", back: "session" },
+        phase: "preview",
+        text: "deploy it",
+        cursor: 0,
+      },
+    });
+    const lines = asLines(render(state));
+    expect(lines.some((l) => l.includes("deploy it"))).toBe(true);
+    expect(lines).toContain("9 chars");
+    expect(lines).toContain("> Send");
+    expect(lines).toContain("  Redo");
+    expect(lines).toContain("  Cancel");
+  });
+
+  it("shows only Redo/Cancel and the reason when dictation is unavailable", () => {
+    const state = base({
+      screen: "reply",
+      reply: {
+        target: { kind: "session", hostKey: "host-a", sessionId: "s1", back: "session" },
+        phase: "unavailable",
+        text: "",
+        reason: "whisper not configured",
+        cursor: 0,
+      },
+    });
+    const lines = asLines(render(state));
+    expect(lines.some((l) => l.includes("whisper not configured"))).toBe(true);
+    expect(lines).toContain("> Redo");
+    expect(lines).toContain("  Cancel");
+    expect(lines.some((l) => l.includes("Send"))).toBe(false);
+  });
+});
+
+describe("render: confirm", () => {
+  it("renders the end-session confirmation as a menu overlay with Cancel preselected", () => {
+    const state = base({
+      screen: "confirm",
+      confirm: { action: { kind: "kill", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 0 },
+    });
+    const model = asSession(render(state));
+    expect(model.bottom.mode).toBe("menu");
+    expect(model.bottom.lines[0]).toBe("End session sess-0?");
+    expect(model.bottom.lines).toContain("> Cancel");
+    expect(model.bottom.lines).toContain("  Confirm");
+  });
+
+  it("honors the cursor selection on the confirmation menu", () => {
+    const state = base({
+      screen: "confirm",
+      confirm: { action: { kind: "kill", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 1 },
+    });
+    const model = asSession(render(state));
+    expect(model.bottom.lines[0]).toBe("End session sess-0?");
+    expect(model.bottom.lines).toContain("  Cancel");
+    expect(model.bottom.lines).toContain("> Confirm");
+  });
+
+  it("names the session in the confirmation prompt when it has a summary", () => {
+    const s = session({ id: "sess-0001", summary: "Adding Compose Flag" });
+    const state = base({
+      screen: "confirm",
+      agents: [agent({ key: "host-a", sessions: [s] })],
+      confirm: { action: { kind: "kill", hostKey: "host-a", sessionId: "sess-0001" }, cursor: 0 },
+    });
+    const model = asSession(render(state));
+    expect(model.bottom.lines[0]).toBe("End session Adding Compose Flag?");
+  });
+});
+
+describe("render: newRepo", () => {
+  it("lists repos without Resume rows even when a repo has closed sessions", () => {
+    const agents: AgentInfo[] = [
+      agent({
+        key: "host-a",
+        repos: [{ name: "repoA", path: "/repos/repoA" }, { name: "repoB", path: "/repos/repoB" }],
+        closedSessions: [
+          { id: "closed-1", repo: "repoA", label: "old-fix", createdAt: null, closedAt: null },
+        ],
+      }),
+    ];
+    const state = base({
+      screen: "newRepo",
+      agents,
+      newRepo: { hostKey: "host-a", cursor: 1 },
+    });
+
+    const lines = asLines(render(state));
+    expect(lines).toContain("  repoA");
+    expect(lines).toContain("> repoB");
+    expect(lines.some((l) => l.includes("Resume"))).toBe(false);
+  });
+});
+
+describe("render: settings", () => {
+  it("shows host online/offline counts", () => {
+    const agents = [agent({ key: "a", online: true }), agent({ key: "b", online: false })];
+    const state = base({ screen: "settings", agents, settings: { cursor: 0 } });
+    const lines = asLines(render(state));
+    expect(lines).toContain("1/2 hosts online");
+  });
+});
+
+describe("render: transcript wrap memoization (Fix 1)", () => {
+  // These tests swap the module-level default measure to a counting stand-in;
+  // restore the real charMeasure afterwards so nothing else sees the counter.
+  afterEach(() => setDefaultMeasure(charMeasure));
+
+  it("serves committed entries from cache and re-wraps only on text or measure change", () => {
+    let calls = 0;
+    const counting: Measure = (s) => {
+      calls++;
+      return charMeasure(s);
+    };
+    setDefaultMeasure(counting); // also bumps the measure generation
+
+    const longText = "the quick brown fox jumps over the lazy dog ".repeat(4);
+    const stateFor = (text: string) =>
+      base({
+        screen: "session",
+        session: null, // no reveal slicing — the entry wraps in full
+        transcripts: { s1: { entries: [{ id: "e1", role: "assistant", text }] } },
+      });
+
+    const first = sessionContentLines(stateFor(longText), "host-a", "s1");
+    const afterFirst = calls;
+    expect(afterFirst).toBeGreaterThan(0);
+    expect(first.length).toBeGreaterThan(1); // wrapped across several lines
+
+    // Same text again -> entirely a cache hit, no new measuring.
+    const second = sessionContentLines(stateFor(longText), "host-a", "s1");
+    expect(second).toEqual(first);
+    expect(calls).toBe(afterFirst);
+
+    // The entry's text grows (streaming append) -> that entry re-wraps.
+    sessionContentLines(stateFor(longText + " and some more words here"), "host-a", "s1");
+    expect(calls).toBeGreaterThan(afterFirst);
+    const afterGrow = calls;
+
+    // A measure/font swap (setDefaultMeasure bumps the generation) invalidates
+    // the cache so a wrap computed under the old metric can't be served.
+    setDefaultMeasure(counting);
+    sessionContentLines(stateFor(longText), "host-a", "s1");
+    expect(calls).toBeGreaterThan(afterGrow);
+  });
+
+  it("re-wraps the revealing prefix each tick but keeps older entries cached", () => {
+    let calls = 0;
+    const counting: Measure = (s) => {
+      calls++;
+      return charMeasure(s);
+    };
+    setDefaultMeasure(counting);
+
+    const older = "older committed assistant entry that wraps ".repeat(3);
+    const live = "streaming live turn text that grows over ticks and wraps too";
+    const stateFor = (shown: number) =>
+      base({
+        screen: "session",
+        session: newSessionState("host-a", "s1"),
+        reveal: { entryId: "__live", shown },
+        liveTurn: { sessionId: "s1", text: live },
+        transcripts: { s1: { entries: [{ id: "e-old", role: "assistant", text: older }] } },
+      });
+
+    sessionContentLines(stateFor(10), "host-a", "s1");
+    const afterFirst = calls;
+    // Next "tick": a different revealed prefix of the live turn -> only that
+    // prefix re-wraps; the older committed entry stays a cache hit.
+    sessionContentLines(stateFor(20), "host-a", "s1");
+    const perTick = calls - afterFirst;
+    expect(perTick).toBeGreaterThan(0); // the changed prefix did re-wrap
+    // Re-wrapping the whole buffer would cost at least the older entry's words
+    // too; a per-tick cost below that shows the older entry was cached.
+    const olderWords = older.trim().split(/\s+/).length;
+    expect(perTick).toBeLessThan(olderWords);
+  });
+});
