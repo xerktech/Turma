@@ -4,7 +4,15 @@
 import { describe, expect, it } from "bun:test";
 import { createInitialState, newSessionState, type AppState } from "../core/app.ts";
 import type { AgentInfo } from "../core/types.ts";
-import { createPhoneStateGate, hydratePhoneState, serializePhoneState } from "./phone-state.ts";
+import {
+  assembleStateChunks,
+  createPhoneStateGate,
+  hydratePhoneState,
+  nextChunkedSnapshot,
+  serializePhoneState,
+  stateChunkOf,
+  type StateChunk,
+} from "./phone-state.ts";
 
 const agents: AgentInfo[] = [
   {
@@ -218,6 +226,57 @@ describe("slimmed agents still feed the board's ticket chips", () => {
     const chips = idx.get("acme.atlassian.net" + String.fromCharCode(0) + "XERK-9");
     expect(chips?.length).toBe(1);
     expect((chips![0] as { transcriptId: string }).transcriptId).toBe("t9");
+  });
+});
+
+// The chunked state pull (XERK-215): the state must survive being sliced into
+// RPC-reply-sized pieces and reassembled — the only frame size the device's
+// host→WebView leg provably delivers.
+describe("chunked state pull", () => {
+  const bigState = (): AppState => ({ ...createInitialState(7), agents, flash: "x".repeat(40_000) });
+
+  it("round-trips a payload bigger than one chunk", () => {
+    const snap = nextChunkedSnapshot(null, bigState());
+    const size = 16 * 1024;
+    const total = Math.ceil(snap.json.length / size);
+    expect(total).toBeGreaterThan(1);
+    const chunks: StateChunk[] = [];
+    for (let seq = 0; seq < total; seq++) {
+      const c = stateChunkOf(snap, seq, size);
+      expect(c.total).toBe(total);
+      expect(c.chunk.length).toBeLessThanOrEqual(size);
+      chunks.push(c);
+    }
+    const payload = assembleStateChunks(chunks);
+    expect(payload).not.toBeNull();
+    expect(hydratePhoneState(payload!).agents).toEqual(serializePhoneState(bigState()).agents);
+  });
+
+  it("a fresh snapshot bumps v, and a mid-pull roll is rejected on assembly", () => {
+    const s1 = nextChunkedSnapshot(null, bigState());
+    const s2 = nextChunkedSnapshot(s1, bigState());
+    expect(s2.v).toBe(s1.v + 1);
+    const size = 16 * 1024;
+    const mixed = [stateChunkOf(s1, 0, size), ...Array.from({ length: stateChunkOf(s2, 0, size).total - 1 }, (_, i) => stateChunkOf(s2, i + 1, size))];
+    expect(assembleStateChunks(mixed)).toBeNull();
+  });
+
+  it("rejects an incomplete or misordered pull instead of parsing garbage", () => {
+    const snap = nextChunkedSnapshot(null, bigState());
+    const size = 16 * 1024;
+    const all = Array.from({ length: stateChunkOf(snap, 0, size).total }, (_, i) => stateChunkOf(snap, i, size));
+    expect(assembleStateChunks(all.slice(0, all.length - 1))).toBeNull();
+    const swapped = [...all];
+    [swapped[0], swapped[1]] = [swapped[1]!, swapped[0]!];
+    expect(assembleStateChunks(swapped)).toBeNull();
+    expect(assembleStateChunks([])).toBeNull();
+  });
+
+  it("a single-chunk payload still reports total 1 and assembles", () => {
+    const snap = nextChunkedSnapshot(null, createInitialState(1));
+    const c = stateChunkOf(snap, 0);
+    expect(c.total).toBe(1);
+    expect(assembleStateChunks([c])).not.toBeNull();
   });
 });
 

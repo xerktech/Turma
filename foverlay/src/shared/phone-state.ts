@@ -164,6 +164,63 @@ function sessionKeyOf(state: AppState): string {
   return state.session ? `${state.session.hostKey}\n${state.session.sessionId}` : "";
 }
 
+// ---- chunked state pull (XERK-215) -----------------------------------------
+// The host→WebView inject leg silently drops large frames on real devices:
+// every frame observed to traverse it is RPC-reply sized (~1 KB), while the
+// state broadcasts (~300 KB slimmed, ~800 KB before) never arrive. These
+// helpers split one serialized PhoneStatePayload into small RPC replies the
+// UI reassembles — the transport shape that provably works.
+
+// Small enough that a chunk's inject (with its double-JSON-escape overhead)
+// stays within the same order as the RPC replies known to get through.
+export const STATE_CHUNK_CHARS = 16 * 1024;
+
+export interface StateChunk {
+  v: number;
+  total: number;
+  seq: number;
+  chunk: string;
+}
+
+// One serialized snapshot being served out in slices. Rebuilt when a pull
+// starts over at seq 0 (or on the first request), never mid-pull, so a
+// serving cycle is internally consistent; `v` lets the puller detect a roll.
+export interface ChunkedSnapshot {
+  v: number;
+  json: string;
+}
+
+export function nextChunkedSnapshot(prev: ChunkedSnapshot | null, state: AppState): ChunkedSnapshot {
+  return { v: (prev?.v ?? 0) + 1, json: JSON.stringify(serializePhoneState(state)) };
+}
+
+export function stateChunkOf(snap: ChunkedSnapshot, seq: number, chunkChars: number = STATE_CHUNK_CHARS): StateChunk {
+  const total = Math.max(1, Math.ceil(snap.json.length / chunkChars));
+  const bounded = Math.max(0, Math.min(seq, total - 1));
+  return { v: snap.v, total, seq: bounded, chunk: snap.json.slice(bounded * chunkChars, (bounded + 1) * chunkChars) };
+}
+
+// Reassembles a pulled sequence back into the payload. Returns null when the
+// chunks don't form one consistent snapshot (a version rolled mid-pull, a
+// slice missing) — the puller just tries again next tick.
+export function assembleStateChunks(chunks: StateChunk[]): PhoneStatePayload | null {
+  if (chunks.length === 0) return null;
+  const v = chunks[0]!.v;
+  const total = chunks[0]!.total;
+  if (chunks.length !== total) return null;
+  const parts: string[] = [];
+  for (let i = 0; i < total; i++) {
+    const c = chunks[i]!;
+    if (c.v !== v || c.seq !== i) return null;
+    parts.push(c.chunk);
+  }
+  try {
+    return JSON.parse(parts.join("")) as PhoneStatePayload;
+  } catch {
+    return null;
+  }
+}
+
 export function createPhoneStateGate(): (state: AppState) => boolean {
   let prev: {
     agents: AppState["agents"];

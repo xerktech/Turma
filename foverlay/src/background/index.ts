@@ -33,7 +33,13 @@ import { MentraMicBridge } from "../audio/mic-bridge.ts";
 import { MentraDisplay } from "../display/mentra.ts";
 import { createG2Measure } from "../display/measure.ts";
 import type { BackgroundPhase, Channels } from "../shared/channels.ts";
-import { createPhoneStateGate, serializePhoneState } from "../shared/phone-state.ts";
+import {
+  createPhoneStateGate,
+  nextChunkedSnapshot,
+  serializePhoneState,
+  stateChunkOf,
+  type ChunkedSnapshot,
+} from "../shared/phone-state.ts";
 import { timeoutFetch } from "./net.ts";
 import { MentraStorage } from "./storage.ts";
 
@@ -51,6 +57,9 @@ class TurmaBackground {
   private display: MentraDisplay | null = null;
   // Serialized against overlapping config-changed RPCs / the initial start.
   private transition: Promise<void> = Promise.resolve();
+  // The snapshot currently being served to a turma:state-chunk pull; rebuilt
+  // when a pull starts at seq 0, held stable across the rest of the pull.
+  private chunkSnapshot: ChunkedSnapshot | null = null;
 
   constructor(session: Session) {
     this.session = session;
@@ -144,6 +153,7 @@ class TurmaBackground {
     this.display?.dispose();
     this.app = null;
     this.display = null;
+    this.chunkSnapshot = null;
   }
 
   private async renderSetupScreen(): Promise<void> {
@@ -211,6 +221,18 @@ class TurmaBackground {
       phase: this.phase(),
       state: this.app ? serializePhoneState(this.app.getState()) : null,
     }));
+
+    // The small-frame state pull (XERK-215) — see channels.ts. seq 0 takes a
+    // fresh snapshot; later seqs serve the SAME snapshot so the pull is
+    // internally consistent even while the App keeps polling underneath.
+    ui.handle("turma:state-chunk", ({ seq }) => {
+      const app = this.app;
+      if (!app) return { v: 0, total: 0, seq: 0, chunk: "", phase: "setup" as const };
+      if (seq === 0 || !this.chunkSnapshot) {
+        this.chunkSnapshot = nextChunkedSnapshot(this.chunkSnapshot, app.getState());
+      }
+      return { ...stateChunkOf(this.chunkSnapshot, seq), phase: "running" as const };
+    });
 
     // A freshly opened WebView gets a snapshot without asking (it also pulls
     // one via turma:get-state on bootstrap — idempotent either way).
