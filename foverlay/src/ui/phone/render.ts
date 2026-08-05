@@ -415,10 +415,19 @@ export function phoneHtml(state: AppState, view: PhoneView, orgOpen: boolean, mo
     `</button>` +
     `</span>` +
     `</header>` +
+    pollErrorBannerHtml(state) +
     `<main class="ph-body">${body}</main>` +
     bottomNavHtml(view) +
     `</div>`
   );
+}
+
+// The glasses show hub-unreachable as a transient flash; the phone needs a
+// persistent banner — without one, a failing background poll loop renders as
+// an innocuously EMPTY fleet with nothing to act on (XERK-215).
+function pollErrorBannerHtml(state: AppState): string {
+  if (!state.pollErrorActive) return "";
+  return `<div class="ph-pollerr" role="alert">Can't reach the hub — retrying…</div>`;
 }
 
 // Local copy to avoid importing app.ts's (identical) lookup and its cycle risk.

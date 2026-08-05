@@ -61,6 +61,13 @@
   border-bottom: 1px solid var(--hairline); background: var(--surface);
 }
 .ph-title { font-family: var(--font-display); font-weight: 600; font-size: 20px; letter-spacing: -0.01em; }
+/* Hub-unreachable banner (XERK-215): persistent, under the header, on both tabs. */
+.ph-pollerr {
+  flex: none; padding: 8px 16px; font-size: 13px;
+  color: var(--critical);
+  background: color-mix(in srgb, var(--critical) 10%, var(--surface));
+  border-bottom: 1px solid color-mix(in srgb, var(--critical) 30%, transparent);
+}
 .ph-header-right { display: flex; align-items: center; gap: 8px; }
 
 /* Org filter — the pill from .org-btn */

@@ -34,6 +34,7 @@ import { MentraDisplay } from "../display/mentra.ts";
 import { createG2Measure } from "../display/measure.ts";
 import type { BackgroundPhase, Channels } from "../shared/channels.ts";
 import { createPhoneStateGate, serializePhoneState } from "../shared/phone-state.ts";
+import { timeoutFetch } from "./net.ts";
 import { MentraStorage } from "./storage.ts";
 
 type Session = TypedMiniappSession<Channels>;
@@ -91,7 +92,10 @@ class TurmaBackground {
   }
 
   private async startApp(config: Config): Promise<void> {
-    const client = new HubClient({ config, fetchFn: globalThis.fetch.bind(globalThis) });
+    // timeoutFetch: the polyfill fetch can hang forever on a lost native
+    // reply, and a hung listAgents() kills the poll loop permanently — see
+    // background/net.ts (XERK-215).
+    const client = new HubClient({ config, fetchFn: timeoutFetch(globalThis.fetch.bind(globalThis)) });
     const liveTail = new LiveTail({ hubClient: client, hubUrl: config.hubUrl });
     const dictation = new HubAudioDictation({
       hubClient: client,

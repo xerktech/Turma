@@ -19,12 +19,19 @@ export function createProxyFetch(): typeof fetch {
         : input instanceof URL
           ? input.toString()
           : String((input as { url?: string })?.url ?? input);
-    const res = await mentra.request("turma:fetch", {
-      url,
-      method: init?.method ?? "GET",
-      headers: (init?.headers as Record<string, string> | undefined) ?? undefined,
-      body: typeof init?.body === "string" ? init.body : undefined,
-    });
+    // The RPC has no default timeout, and the background's own fetch can hang
+    // on a lost native reply — without a ceiling here a UI request (history,
+    // login) would hang its caller forever the same way (XERK-215).
+    const res = await mentra.request(
+      "turma:fetch",
+      {
+        url,
+        method: init?.method ?? "GET",
+        headers: (init?.headers as Record<string, string> | undefined) ?? undefined,
+        body: typeof init?.body === "string" ? init.body : undefined,
+      },
+      { timeout: 45_000 }
+    );
     const responseLike = {
       ok: res.ok,
       status: res.status,
