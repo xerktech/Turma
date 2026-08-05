@@ -14,7 +14,7 @@ export function timeoutFetch(base: typeof fetch, timeoutMs: number = HUB_FETCH_T
   const wrapped = (input: unknown, init?: RequestInit): Promise<Response> =>
     new Promise<Response>((resolve, reject) => {
       const timer = setTimeout(() => {
-        console.error(`[turma] hub fetch timed out after ${timeoutMs}ms:`, String(input));
+        console.error(`[turma] hub fetch timed out after ${timeoutMs}ms: ${String(input)}`);
         reject(new Error(`hub fetch timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       base(input as never, init).then(
