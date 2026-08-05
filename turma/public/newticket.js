@@ -47,6 +47,16 @@
     return out.slice(0, 20);
   }
 
+  // Whether closing the form now would throw away typed work (XERK-218): one of
+  // the text fields holds something and no ticket has been created yet. The
+  // created screen is never dirty — the ticket exists, so nothing typed is lost.
+  function createDirty(st) {
+    if (!st || (st.created && st.created.key)) return false;
+    const v = st.values || {};
+    return !!(String(v.summary || "").trim() ||
+      String(v.description || "").trim() || String(v.labels || "").trim());
+  }
+
   // The header button. Kept out of nav.js so the chrome stays purely structural
   // and this module owns the one thing that toggles it (the fleet reporting an
   // org). The accent-filled pill reads as the primary action beside the quiet
@@ -105,6 +115,17 @@
     if (bodyEl) bodyEl.classList.add("td-open");
     paintCreate();
     loadMeta();
+  }
+
+  // Every close gesture funnels here (XERK-218): Cancel, ✕, a backdrop click,
+  // Escape. A clean form closes at once; a dirty one arms an in-form "Discard
+  // this ticket?" row instead (arm-then-confirm, like the session cards' Kill),
+  // and a second close gesture — or its Discard button — is the confirmation.
+  function requestCloseCreate() {
+    if (!createState) return;
+    if (!createDirty(createState) || createState.confirmDiscard) return closeCreate();
+    createState.confirmDiscard = true;
+    paintCreate();
   }
 
   function closeCreate() {
@@ -288,7 +309,12 @@
     panel.addEventListener("click", (e) => {
       if (!createState) return;
       if (e.target.closest("[data-cf-close]") || e.target.closest("[data-cf-cancel]")) {
-        return closeCreate();
+        return requestCloseCreate();
+      }
+      if (e.target.closest("[data-cf-discard]")) return closeCreate();
+      if (e.target.closest("[data-cf-keep]")) {
+        createState.confirmDiscard = false;
+        return void paintCreate();
       }
       if (e.target.closest("[data-cf-another]")) {
         // Keep the org/project/type; clear the text for the next ticket.
@@ -340,11 +366,11 @@
         btn.disabled = !(v.project && v.issueType && (v.summary || "").trim()) || !!createState.busy;
       }
     });
-    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) closeCreate(); });
-    doc.addEventListener("keydown", (e) => { if (e.key === "Escape" && createState) closeCreate(); });
+    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) requestCloseCreate(); });
+    doc.addEventListener("keydown", (e) => { if (e.key === "Escape" && createState) requestCloseCreate(); });
   }
 
-  const api = { splitLabels, buttonHtml, update, mount };
+  const api = { splitLabels, buttonHtml, createDirty, update, mount };
   if (typeof window !== "undefined") window.TurmaNewTicket = api;
   // Guarded on `document`, not `window`, so a test can stand up a fake window
   // (with a TurmaBoard) before requiring this and still drive mount() itself.

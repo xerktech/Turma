@@ -665,6 +665,11 @@ body.td-open { overflow: hidden; }
 .cf-btn.cf-primary { color: #fff; background: var(--accent); border-color: var(--accent); }
 .cf-btn.cf-primary:hover:not(:disabled) { filter: brightness(1.06); color: #fff; }
 .cf-btn:disabled { cursor: default; opacity: 0.5; }
+/* The dirty-close confirmation row (XERK-218): the question fills the space the
+   right-aligned buttons leave. */
+.cf-discard-q { margin-right: auto; align-self: center; }
+.cf-btn.cf-danger { color: #fff; background: var(--critical); border-color: var(--critical); }
+.cf-btn.cf-danger:hover:not(:disabled) { filter: brightness(1.06); color: #fff; }
 .cf-done { font-size: 14px; color: var(--ink); padding: 14px 0; line-height: 1.5; }
 .cf-done a { color: var(--accent); }
 /* A ticket created but not assigned: still a success, so it sits in the same

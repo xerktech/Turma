@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -38,6 +39,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SheetValue
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -88,6 +90,7 @@ import com.xerktech.turma.core.TicketSession
 import com.xerktech.turma.core.ageStr
 import com.xerktech.turma.core.boardColumnOf
 import com.xerktech.turma.core.categoryOf
+import com.xerktech.turma.core.createDirty
 import com.xerktech.turma.core.createLabelWord
 import com.xerktech.turma.core.edgeScrollStep
 import com.xerktech.turma.core.filterSites
@@ -966,6 +969,10 @@ private fun TicketDetailSheet(
  * 202-poll as the detail sheet), a title/description/labels form worded per
  * source, then a submit that POSTs and polls the outcome. All state is local to
  * the sheet, like the web modal.
+ *
+ * Dismissal is guarded (XERK-218): while the form holds typed, un-created text,
+ * a swipe-down / back press / scrim tap / Cancel raises a "Discard this
+ * ticket?" dialog instead of silently dropping the draft.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -975,7 +982,6 @@ private fun CreateTicketSheet(
     vm: BoardViewModel,
     onDismiss: () -> Unit,
 ) {
-    val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
     val uriHandler = LocalUriHandler.current
 
@@ -993,6 +999,41 @@ private fun CreateTicketSheet(
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
     var created by remember { mutableStateOf<CreateResultFetch.Created?>(null) }
+    var confirmDiscard by remember { mutableStateOf(false) }
+
+    // An accidental swipe-down — or back press, scrim tap, Cancel — on a form
+    // holding typed text must not throw it away (XERK-218): every dismissal is
+    // gated on createDirty and raises a "Discard this ticket?" dialog instead.
+    // The delegated vars read through their remembered MutableStates, so these
+    // lambdas always see the current text.
+    fun dirty() = createDirty(summary, description, labels, created != null)
+    val sheet = rememberModalBottomSheetState(
+        skipPartiallyExpanded = true,
+        // Vetoes a dirty swipe-down before it settles hidden; the sheet springs
+        // back up under the dialog.
+        confirmValueChange = { target ->
+            if (target == SheetValue.Hidden && dirty()) { confirmDiscard = true; false } else true
+        },
+    )
+    // The dismiss paths that arrive as a plain request (back press, scrim tap,
+    // the Cancel button) go through the same gate.
+    val requestDismiss = { if (dirty()) { confirmDiscard = true } else onDismiss() }
+
+    if (confirmDiscard) {
+        AlertDialog(
+            onDismissRequest = { confirmDiscard = false },
+            title = { Text("Discard this ticket?") },
+            text = { Text("It hasn't been created yet — closing now loses what you've typed.") },
+            confirmButton = {
+                TextButton(onClick = { confirmDiscard = false; onDismiss() }) {
+                    Text("Discard", color = TurmaColors.critical)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDiscard = false }) { Text("Keep editing") }
+            },
+        )
+    }
 
     // Projects (+ labels) reload when the org changes; a lone project auto-selects.
     LaunchedEffect(siteKey) {
@@ -1010,7 +1051,7 @@ private fun CreateTicketSheet(
         (ty as? CreateMetaFetch.Types)?.types?.singleOrNull()?.let { issueType = it.id }
     }
 
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet) {
+    ModalBottomSheet(onDismissRequest = requestDismiss, sheetState = sheet) {
         val done = created
         if (done != null) {
             Column(
@@ -1102,7 +1143,7 @@ private fun CreateTicketSheet(
             if (error.isNotBlank()) ErrorRow("Couldn't create: $error")
 
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") }
+                TextButton(onClick = requestDismiss, enabled = !busy) { Text("Cancel") }
                 Spacer(Modifier.weight(1f))
                 val canSubmit = project.isNotBlank() && issueType.isNotBlank() && summary.isNotBlank() && !busy
                 PrimaryButton(

@@ -1262,7 +1262,8 @@
   }
 
   // The whole New-ticket modal body. `st` is the page's create state:
-  //   { sites, siteKey, source, meta, types, values, busy, error, created }
+  //   { sites, siteKey, source, meta, types, values, busy, error, created,
+  //     confirmDiscard }
   // where meta = {loading|error|projects,labels}, types = {loading|error|types}.
   function createFormHtml(st) {
     const s = st || {};
@@ -1343,11 +1344,20 @@
           <datalist id="cf-label-suggestions">${suggestions}</datalist></label>
       </div>
       ${s.error ? `<div class="cf-note cf-err">Couldn't create — ${esc(s.error)}</div>` : ""}
-      <div class="cf-actions">
+      ${s.confirmDiscard
+        // A dirty close was requested (XERK-218): the actions row becomes the
+        // confirmation, so the typed form can't be thrown away by one stray
+        // click — Discard is the only button that closes it.
+        ? `<div class="cf-actions">
+        <span class="cf-note cf-discard-q">Discard this ticket? It hasn't been created yet.</span>
+        <button type="button" class="cf-btn" data-cf-keep="1">Keep editing</button>
+        <button type="button" class="cf-btn cf-danger" data-cf-discard="1">Discard</button>
+      </div>`
+        : `<div class="cf-actions">
         <button type="button" class="cf-btn" data-cf-cancel="1">Cancel</button>
         <button type="button" class="cf-btn cf-primary" data-cf-submit="1"${canSubmit ? "" : " disabled"}>${
           s.busy ? "Creating…" : "Create ticket"}</button>
-      </div>`;
+      </div>`}`;
   }
 
   const api = {
