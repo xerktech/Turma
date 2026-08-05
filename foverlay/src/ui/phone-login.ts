@@ -85,6 +85,25 @@ function showLogin(els: PhoneLoginElements, config: Config): void {
   els.app.hidden = true;
 }
 
+// Re-applies the "signed out" view outside initPhoneLogin — main.ts calls this
+// on every turma:phase broadcast (which the background re-sends whenever its
+// session or the WebView binding churns, e.g. on a glasses reconnect or an app
+// switch to a password manager). The form fields are (re)filled ONLY when the
+// login card is newly revealed (e.g. right after sign-out): a broadcast can
+// land while the operator is mid-form, and rewriting the inputs then wipes
+// what they have typed (XERK-215).
+export function refreshLoginView(els: PhoneLoginElements, config: Config): void {
+  if (els.login.hidden) {
+    els.url.value = config.hubUrl;
+    els.user.value = config.user;
+    els.password.value = "";
+    els.submit.disabled = false;
+    els.submit.textContent = "Sign in";
+  }
+  els.login.hidden = false;
+  els.app.hidden = true;
+}
+
 // Clears the credentials (keeping the hub URL) and reloads back to the login card.
 export async function signOut(
   storage: KeyValueStorage,
