@@ -972,6 +972,47 @@ function captureLiveTurn(sessionId, cb) {
   );
 }
 
+// Is this scraped live text a block the transcript has ALREADY committed?
+// While a tool call runs, the TUI keeps the finished prose on screen and
+// re-paints the block area every second, alternating between rendering the
+// activity summary as its own ● bullet (-> the scrape yields "") and indented
+// under the prose bullet (-> the scrape yields the prose again). Forwarding
+// those frames verbatim makes the chat bubble clear and re-type the SAME
+// already-committed prose over and over, beside its committed copy, for the
+// whole tool run. The watcher holds the committed tail, so it can tell: a live
+// text a recent assistant entry already ends with is a re-paint of history,
+// not streaming — suppress it and both alternating states emit "".
+// The compare is on a lowercase alphanumeric SKELETON, not raw text: the pane
+// renders markdown (no **/`/list dashes, re-wrapped whitespace) while the
+// transcript keeps the raw syntax, so no text-level equality survives
+// formatting. endsWith (not ===) because the transcript entry can carry more
+// than one paragraph of which the pane block is the tail; short skeletons
+// (< COMMITTED_MIN_SKEL) must match exactly so a new block that merely opens
+// with the old one's last words isn't swallowed. Scans the last few assistant
+// entries because tool_use entries commit right behind the prose. Biased
+// toward suppressing: a false positive hides a live preview of text the
+// committed tail is already rendering.
+const COMMITTED_SCAN = 8;
+const COMMITTED_MIN_SKEL = 24;
+function textSkeleton(s) {
+  return String(s == null ? "" : s).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+function committedDupe(liveText, entries) {
+  const live = textSkeleton(liveText);
+  if (!live) return false;
+  const list = Array.isArray(entries) ? entries : [];
+  let seen = 0;
+  for (let i = list.length - 1; i >= 0 && seen < COMMITTED_SCAN; i--) {
+    const e = list[i];
+    if (!e || e.role !== "assistant") continue;
+    seen++;
+    const committed = textSkeleton(e.text);
+    if (!committed) continue;
+    if (live.length >= COMMITTED_MIN_SKEL ? committed.endsWith(live) : committed === live) return true;
+  }
+  return false;
+}
+
 function pollWatcher(sessionId) {
   const w = watchers.get(sessionId);
   if (!w) return;
@@ -1002,7 +1043,12 @@ function pollWatcher(sessionId) {
     w.liveGen = d.gen;
     w.livePending = d.pending;
     if (!d.emit) return; // holding a busy->idle blip for one poll; keep last frame
-    const text = live.generating ? live.text : "";
+    let text = live.generating ? live.text : "";
+    // A block the committed tail already carries is a TUI re-paint of history,
+    // not streaming (see committedDupe): suppress it so the tool-run
+    // alternation can't clear-and-retype the bubble beside its committed copy.
+    const tailEntries = w.tailCache && w.tailCache.result && w.tailCache.result.entries;
+    if (text && committedDupe(text, tailEntries)) text = "";
     const status = live.generating ? (live.status || null) : null;
     // NUL separator: a byte that cannot occur in pane text. Written as an
     // escape, not a literal: a raw NUL makes grep treat this whole file as
@@ -1291,5 +1337,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, parseAgentList, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, parseAgentList, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
 }
