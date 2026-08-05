@@ -40,6 +40,11 @@ export interface PhoneStatePayload {
   liveTurn: { sessionId: string; text: string } | null;
   flash: string | null;
   flashUntil: number;
+  // The App's hub-unreachable state (pollErrorActive). The glasses surface it
+  // as a flash; the phone renders a persistent banner — without this, a
+  // failing poll loop is INVISIBLE on the phone: it just looks like an empty
+  // fleet (XERK-215).
+  pollError?: boolean;
 }
 
 // The phone's transcript is fed by turma:rich-tail + on-demand history, so the
@@ -123,6 +128,7 @@ export function serializePhoneState(state: AppState): PhoneStatePayload {
     liveTurn: state.liveTurn,
     flash: state.flash,
     flashUntil: state.flashUntil,
+    pollError: state.pollErrorActive,
   };
 }
 
@@ -139,6 +145,7 @@ export function hydratePhoneState(payload: PhoneStatePayload): AppState {
     liveTurn: payload.liveTurn,
     flash: payload.flash,
     flashUntil: payload.flashUntil,
+    pollErrorActive: !!payload.pollError,
   };
 }
 
@@ -168,6 +175,7 @@ export function createPhoneStateGate(): (state: AppState) => boolean {
     liveTurn: AppState["liveTurn"];
     flash: string | null;
     flashUntil: number;
+    pollError: boolean;
   } | null = null;
   return (state: AppState): boolean => {
     const sessionKey = sessionKeyOf(state);
@@ -181,7 +189,8 @@ export function createPhoneStateGate(): (state: AppState) => boolean {
       prev.autoStartOrgs === state.autoStartOrgs &&
       prev.liveTurn === state.liveTurn &&
       prev.flash === state.flash &&
-      prev.flashUntil === state.flashUntil
+      prev.flashUntil === state.flashUntil &&
+      prev.pollError === state.pollErrorActive
     ) {
       return false;
     }
@@ -195,6 +204,7 @@ export function createPhoneStateGate(): (state: AppState) => boolean {
       liveTurn: state.liveTurn,
       flash: state.flash,
       flashUntil: state.flashUntil,
+      pollError: state.pollErrorActive,
     };
     return true;
   };

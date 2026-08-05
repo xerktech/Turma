@@ -196,6 +196,16 @@ describe("phone render", () => {
     expect(html).toContain("data-signout");
   });
 
+  it("phoneHtml shows a persistent hub-unreachable banner while polls fail (XERK-215)", () => {
+    const erroring = state({ agents: [agent()], pollErrorActive: true });
+    const html = phoneHtml(erroring, VIEW(), false);
+    expect(html).toContain("ph-pollerr");
+    expect(html).toContain("Can't reach the hub");
+    // Board tab shows it too, and a healthy state shows nothing.
+    expect(phoneHtml(erroring, VIEW({ tab: "board" }), false)).toContain("ph-pollerr");
+    expect(phoneHtml(state({ agents: [agent()] }), VIEW(), false)).not.toContain("ph-pollerr");
+  });
+
   it("the open org menu carries a per-org auto-start toggle reflecting the hub's opt-in", () => {
     const st = state({
       autoStartOrgs: { "acme.atlassian.net": true }, // acme opted in, beta not

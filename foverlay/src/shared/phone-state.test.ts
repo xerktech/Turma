@@ -77,6 +77,16 @@ describe("phone-state serialization", () => {
     expect(hydrated.session).toBeNull();
     expect(hydrated.screen).toBe("home");
   });
+
+  it("carries the hub-unreachable state so the phone can show a banner (XERK-215)", () => {
+    const erroring = { ...createInitialState(1), agents, pollErrorActive: true };
+    const hydrated = hydratePhoneState(JSON.parse(JSON.stringify(serializePhoneState(erroring))));
+    expect(hydrated.pollErrorActive).toBe(true);
+    // And an older payload without the field hydrates to false, not undefined.
+    const payload = serializePhoneState(createInitialState(1));
+    delete (payload as unknown as Record<string, unknown>).pollError;
+    expect(hydratePhoneState(payload).pollErrorActive).toBe(false);
+  });
 });
 
 // XERK-215: the raw fleet payload is hundreds of KB, and it used to cross the
@@ -233,6 +243,17 @@ describe("createPhoneStateGate", () => {
     const s1 = state();
     gate(s1);
     expect(gate({ ...s1, agents: [...s1.agents] })).toBe(true);
+  });
+
+  it("passes when the hub-unreachable state flips", () => {
+    const gate = createPhoneStateGate();
+    const s1 = state();
+    gate(s1);
+    expect(gate({ ...s1, pollErrorActive: true })).toBe(true);
+    const s2 = { ...s1, pollErrorActive: true };
+    gate(s2);
+    expect(gate({ ...s2 })).toBe(false);
+    expect(gate({ ...s2, pollErrorActive: false })).toBe(true);
   });
 
   it("passes on the changes the phone renders: screen/session, liveTurn, org fields, flash", () => {
