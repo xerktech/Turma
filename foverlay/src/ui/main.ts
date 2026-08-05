@@ -18,7 +18,7 @@ import { createInitialState, type AppState } from "../core/app.ts";
 import { isConfigured, loadConfig, type Config } from "../core/config.ts";
 import { HubClient } from "../core/hub-client.ts";
 import "../shared/channels.ts";
-import { hydratePhoneState } from "../shared/phone-state.ts";
+import { assembleStateChunks, hydratePhoneState, type StateChunk } from "../shared/phone-state.ts";
 import { initPhoneLogin, queryPhoneLoginElements, refreshLoginView, signOut } from "./phone-login.ts";
 import { mountPhone, type PhoneAppLike, type PhoneHandle } from "./phone/phone.ts";
 import { createProxyFetch } from "./proxy-fetch.ts";
@@ -39,11 +39,55 @@ let mountedConfigKey: string | null = null;
 let lastPhase: "setup" | "running" | null = null;
 let lastNudgeAt = 0;
 
+// ---- chunked state pull (XERK-215) -----------------------------------------
+// The state broadcasts (and the big get-state reply) can be silently dropped
+// by the host→WebView inject leg — on real devices only RPC-reply-sized
+// frames provably traverse it. While signed in and no broadcast is landing,
+// pull the state in small turma:state-chunk RPC slices instead. The pull
+// self-disables whenever broadcasts resume.
+const PULL_IDLE_MS = 5_000; // no broadcast for this long -> start pulling
+const PULL_EVERY_MS = 6_000; // matches the App's own poll cadence
+let lastBroadcastAt = 0;
+let pullInFlight = false;
+
+async function pullStateChunks(): Promise<void> {
+  if (pullInFlight) return;
+  pullInFlight = true;
+  try {
+    const chunks: StateChunk[] = [];
+    for (let seq = 0; ; seq++) {
+      const res = await mentra.request("turma:state-chunk", { seq }, { timeout: 10_000 });
+      lastPhase = res.phase;
+      if (res.total === 0) return; // background has no running App (setup)
+      if (chunks.length > 0 && res.v !== chunks[0]!.v) return; // snapshot rolled — retry next tick
+      chunks.push(res);
+      if (chunks.length >= res.total) break;
+      if (seq > 200) return; // hard cap: never loop unbounded on a confused peer
+    }
+    const payload = assembleStateChunks(chunks);
+    if (!payload) return;
+    lastState = hydratePhoneState(payload);
+    handle?.render(lastState);
+  } catch (err) {
+    console.warn("[turma] state pull failed:", err);
+  } finally {
+    pullInFlight = false;
+  }
+}
+
+setInterval(() => {
+  // Only while the signed-in companion is mounted and broadcasts are absent.
+  if (!handle) return;
+  if (Date.now() - lastBroadcastAt < PULL_IDLE_MS) return;
+  void pullStateChunks();
+}, PULL_EVERY_MS);
+
 const els = queryPhoneLoginElements();
 
 // ---- background -> UI observers -------------------------------------------
 
 mentra.on("turma:state", (payload) => {
+  lastBroadcastAt = Date.now();
   lastState = hydratePhoneState(payload);
   handle?.render(lastState);
 });
@@ -105,6 +149,10 @@ function mountCompanion(config: Config): void {
     onSignOut: () => void signOut(storage, proxyFetch, reload),
   });
   mountedConfigKey = key;
+  // Content now, not a poll-interval from now: if broadcasts are being
+  // dropped, the first pulled snapshot is what fills the freshly mounted
+  // companion (XERK-215).
+  if (Date.now() - lastBroadcastAt >= PULL_IDLE_MS) void pullStateChunks();
 }
 
 function unmountCompanion(): void {

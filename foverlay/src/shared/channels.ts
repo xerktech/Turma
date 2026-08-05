@@ -71,6 +71,17 @@ export interface Channels {
   "turma:cmd": Rpc<PhoneCommand, { ok: boolean }>;
   /** Hydration snapshot for a freshly opened WebView. */
   "turma:get-state": Rpc<Record<string, never>, { phase: BackgroundPhase; state: PhoneStatePayload | null }>;
+  /**
+   * The phone state pulled in SMALL slices (XERK-215). Broadcast frames and
+   * the get-state reply are hundreds of KB, and on real devices the
+   * host→WebView inject leg silently drops frames that big — every frame
+   * proven to traverse it is ~1 KB (login/storage RPC replies). When no
+   * turma:state broadcast is arriving, the UI reassembles the state from
+   * these bite-sized RPC replies instead; `v` stamps one serialized
+   * snapshot, so a pull restarts if the snapshot rolls mid-flight.
+   * seq 0 (re)serializes; total === 0 means "no running App" (setup).
+   */
+  "turma:state-chunk": Rpc<{ seq: number }, { v: number; total: number; seq: number; chunk: string; phase: BackgroundPhase }>;
 }
 
 declare global {
