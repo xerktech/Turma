@@ -902,6 +902,51 @@ test("committedDupe: only recent assistant entries count", () => {
     [old, ...filler]), false);
 });
 
+// resolveLiveText: within one turn the pane's last ● bullet swaps between
+// streaming prose, tool/activity bullets and nothing, and at a block boundary
+// the tool bullet paints BEFORE the prose's transcript entry lands — forwarded
+// verbatim, the bubble blinked out into that gap and "reappeared" once the
+// entry committed. The resolver holds uncommitted prose across those gaps and
+// releases it the moment the tail owns it.
+test("resolveLiveText: uncommitted prose is held through empty and tool-bullet frames", () => {
+  const { resolveLiveText } = require("../tunnel-agent.js");
+  const prose = "The rebase went clean — only the fix commit remains on the branch.";
+  const entries = [{ id: "1", role: "assistant", text: "Kotlin compiles clean. Now commit." }];
+  // Streaming frame emits, then the paint-gap frames keep it up.
+  assert.equal(resolveLiveText(true, prose, "", entries), prose);
+  assert.equal(resolveLiveText(true, "", prose, entries), prose);
+  assert.equal(resolveLiveText(true, "Bash(git push origin XERK-210)", prose, entries), prose);
+});
+
+test("resolveLiveText: the held prose releases the moment the transcript commits it", () => {
+  const { resolveLiveText } = require("../tunnel-agent.js");
+  const prose = "The rebase went clean — only the fix commit remains on the branch.";
+  const committed = [{ id: "2", role: "assistant", text: prose }];
+  // Empty frame + committed entry -> hand off to the committed bubble.
+  assert.equal(resolveLiveText(true, "", prose, committed), "");
+  // A TUI re-paint of the now-committed prose stays suppressed too.
+  assert.equal(resolveLiveText(true, prose, "", committed), "");
+});
+
+test("resolveLiveText: same block grows and never shrinks; a new block replaces the held one", () => {
+  const { resolveLiveText } = require("../tunnel-agent.js");
+  const entries = [];
+  assert.equal(resolveLiveText(true, "The rebase went clean — only", "The rebase went", entries),
+    "The rebase went clean — only");
+  // A shorter re-capture of the same block keeps the longer held text.
+  assert.equal(resolveLiveText(true, "The rebase went", "The rebase went clean — only", entries),
+    "The rebase went clean — only");
+  // A genuinely different prose block replaces a held one that never committed.
+  assert.equal(resolveLiveText(true, "Now watching CI to green.", "The rebase went clean", entries),
+    "Now watching CI to green.");
+});
+
+test("resolveLiveText: idle clears regardless of held state", () => {
+  const { resolveLiveText } = require("../tunnel-agent.js");
+  assert.equal(resolveLiveText(false, "anything", "held prose", []), "");
+  assert.equal(resolveLiveText(true, "", "", []), "");
+});
+
 // liveTurnDecision holds a single busy->idle blip for one poll so a mid-repaint
 // capture can't flicker the pinned working bar off (the live counterpart of
 // hub-agent.py's _stable_pane_busy for the heartbeat's paneBusy).
