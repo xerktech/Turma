@@ -1013,6 +1013,36 @@ function committedDupe(liveText, entries) {
   return false;
 }
 
+// Decide the live text to emit this frame, holding uncommitted prose across
+// the TUI's paint gaps. Within one generating turn the pane's last ● bullet
+// SWAPS every second or two — streaming prose, then a tool/activity bullet or
+// nothing at all, then prose again — and at a block boundary the tool bullet
+// paints BEFORE the transcript entry for that prose lands on disk. Forwarding
+// those frames verbatim cleared the bubble into that 1-3s gap with no committed
+// copy on screen, then the text "reappeared" when the entry committed: every
+// block boundary blinked (the appear/disappear the operator reports).
+// So the resolver only ever moves the bubble forward:
+//  - a tool-use bullet ("Bash(…)") or an already-committed text is NOT prose
+//    to stream (committedDupe: a re-paint of history);
+//  - with no prose in this frame, the previously HELD text stays up while it
+//    is still uncommitted — the moment it commits, the frame goes empty and
+//    the committed bubble takes over with no gap;
+//  - the same block grown or re-captured keeps the LONGER text (never
+//    shrinks); a genuinely different prose block replaces the held one.
+// Pure so it's unit-testable; pollWatcher threads w.heldText through it.
+const TOOL_BULLET_RE = /^[\w-]+\(/;
+function resolveLiveText(generating, captured, held, entries) {
+  if (!generating) return "";
+  let t = typeof captured === "string" ? captured : "";
+  if (TOOL_BULLET_RE.test(t)) t = "";
+  if (t && committedDupe(t, entries)) t = "";
+  if (!t) return held && !committedDupe(held, entries) ? held : "";
+  if (held && (t.startsWith(held) || held.startsWith(t))) {
+    return t.length >= held.length ? t : held;
+  }
+  return t;
+}
+
 function pollWatcher(sessionId) {
   const w = watchers.get(sessionId);
   if (!w) return;
@@ -1043,12 +1073,11 @@ function pollWatcher(sessionId) {
     w.liveGen = d.gen;
     w.livePending = d.pending;
     if (!d.emit) return; // holding a busy->idle blip for one poll; keep last frame
-    let text = live.generating ? live.text : "";
-    // A block the committed tail already carries is a TUI re-paint of history,
-    // not streaming (see committedDupe): suppress it so the tool-run
-    // alternation can't clear-and-retype the bubble beside its committed copy.
+    // See resolveLiveText: suppress re-paints of committed history, hold
+    // uncommitted prose across the TUI's paint gaps, never shrink a block.
     const tailEntries = w.tailCache && w.tailCache.result && w.tailCache.result.entries;
-    if (text && committedDupe(text, tailEntries)) text = "";
+    const text = resolveLiveText(live.generating, live.text, w.heldText || "", tailEntries);
+    w.heldText = text;
     const status = live.generating ? (live.status || null) : null;
     // NUL separator: a byte that cannot occur in pane text. Written as an
     // escape, not a literal: a raw NUL makes grep treat this whole file as
@@ -1080,6 +1109,7 @@ function startWatch(sessionId, worktreePath, transcriptId) {
   const w = { worktreePath, transcriptId: transcriptId || null,
     lastJson: null, lastTurn: "", timer: null,
     liveGen: false, livePending: false, // busy->idle blip hold; see liveTurnDecision
+    heldText: "", // uncommitted prose held across paint gaps; see resolveLiveText
     tailCache: { path: null, mtimeMs: 0, size: 0, result: [] } };
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
@@ -1337,5 +1367,5 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, parseAgentList, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, awaySummaryText, foldQueueOp, entryId, BLOCK_CAPS_LIVE };
 }
