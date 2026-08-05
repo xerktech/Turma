@@ -837,6 +837,71 @@ test("stripActivityTail: clause vocabulary and ordinary prose", () => {
   assert.equal(stripActivityTail("Ran 1 shell command."), "Ran 1 shell command.");
 });
 
+// committedDupe: while a tool call runs, the TUI keeps the finished prose on
+// screen and alternates how it paints the block area, so the scrape re-delivers
+// already-committed prose every other poll — forwarded verbatim, the chat
+// bubble clears and re-types the same text over and over beside its committed
+// copy. The watcher suppresses a live text a recent assistant entry already
+// ends with. Shapes below mirror a live repro (Claude Code v2.1.209).
+test("committedDupe: prose already committed behind a tool entry is a dupe", () => {
+  const { committedDupe } = require("../tunnel-agent.js");
+  const entries = [
+    { id: "1", role: "user", text: "Write about volcanoes then run a command" },
+    { id: "2", role: "assistant", text: "Volcanoes are vents in the crust.\n\nNow running the sleep command in the foreground and waiting for it to finish." },
+    { id: "3", role: "assistant", text: "[Bash]" },
+  ];
+  // The pane re-paints the committed prose (reflowed to spaces) while [Bash]
+  // is the newest assistant entry — the scan must look past the tool entry.
+  assert.equal(committedDupe(
+    "Volcanoes are vents in the crust. Now running the sleep command in the foreground and waiting for it to finish.",
+    entries), true);
+  // The pane block can be the TAIL of the entry (earlier paragraphs scrolled
+  // out of the block) — endsWith, not equality.
+  assert.equal(committedDupe(
+    "Now running the sleep command in the foreground and waiting for it to finish.",
+    entries), true);
+});
+
+test("committedDupe: markdown renders away in the pane but still matches", () => {
+  const { committedDupe } = require("../tunnel-agent.js");
+  // The transcript keeps the raw syntax; the pane renders it (no ** or `),
+  // so the compare runs on an alphanumeric skeleton.
+  const entries = [
+    { id: "1", role: "assistant", text: "On your **current** build, power the strap fully **off** — the `G2` should stop cycling." },
+  ];
+  assert.equal(committedDupe(
+    "On your current build, power the strap fully off — the G2 should stop cycling.",
+    entries), true);
+});
+
+test("committedDupe: genuinely new streaming prose is not suppressed", () => {
+  const { committedDupe } = require("../tunnel-agent.js");
+  const entries = [
+    { id: "1", role: "assistant", text: "The command finished. Here are two sentences about glaciers." },
+  ];
+  // A new block mid-stream (not any committed entry's tail) passes through...
+  assert.equal(committedDupe("Glaciers are rivers of ice that carve valleys", entries), false);
+  // ...and a SHORT new block that merely repeats the old entry's last words
+  // needs full equality, so it passes through too.
+  assert.equal(committedDupe("about glaciers.", entries), false);
+  // Empty live text is never a dupe (nothing to suppress).
+  assert.equal(committedDupe("", entries), false);
+  assert.equal(committedDupe("anything", null), false);
+});
+
+test("committedDupe: only recent assistant entries count", () => {
+  const { committedDupe } = require("../tunnel-agent.js");
+  // A user turn quoting the same words must not suppress the assistant echoing
+  // them back as new prose.
+  assert.equal(committedDupe("please repeat this exact sentence back to me now",
+    [{ id: "1", role: "user", text: "please repeat this exact sentence back to me now" }]), false);
+  // An entry buried past the scan window no longer suppresses.
+  const old = { id: "0", role: "assistant", text: "A very old paragraph about the weather patterns of the north." };
+  const filler = Array.from({ length: 9 }, (_, i) => ({ id: "f" + i, role: "assistant", text: "[Bash]" }));
+  assert.equal(committedDupe("A very old paragraph about the weather patterns of the north.",
+    [old, ...filler]), false);
+});
+
 // liveTurnDecision holds a single busy->idle blip for one poll so a mid-repaint
 // capture can't flicker the pinned working bar off (the live counterpart of
 // hub-agent.py's _stable_pane_busy for the heartbeat's paneBusy).

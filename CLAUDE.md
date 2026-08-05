@@ -773,19 +773,19 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   (`parsePaneLiveTurn` → `{turn,text,status}`): the in-progress assistant text plus
   `status = {verb, up/down token counters, elapsed, hint}`; an expanded agent-manager list adds
   `status.agents[]` (`parseAgentList`: one `{sel,type,label}` row per live agent).
-- **Prose-shaped tool-activity summaries ("Running 1 shell command…"/"Ran 1 shell command") are
-  stripped off the streamed text's tail POST-REFLOW** (`stripActivityTail` — narrow panes wrap
-  mid-clause): each Running→Ran flip re-typed the bubble.
+- **`turn` frames are scrubbed twice** — else the bubble re-types beside its committed copy through
+  a tool run: activity summaries ("Running/Ran 1 shell command…") strip off the REFLOWED text's tail
+  (`stripActivityTail` — narrow panes wrap mid-clause), and a text the committed tail already ends
+  with is suppressed (`committedDupe`, skeleton compare — the pane renders markdown away).
 - A single-frame **busy→idle blip is held one poll** before the bar clears (`liveTurnDecision`,
-  XERK-42): the spinner repaint can make one 1s capture read "not generating" mid-turn, so the first
-  idle frame after a busy one is skipped; a second idle frame confirms and clears. Busy is never
-  held.
+  XERK-42): a spinner-repaint gap reads idle mid-turn, so the first idle frame after a busy one is
+  skipped; a second idle frame confirms and clears. Busy is never held.
 - **Clicking a subagent row opens that background agent's own transcript**: a
   `{type:"subagentHistory", sessionId, agentType, label}` command resolves the row to its
   `subagents/agent-<id>.jsonl` via the main transcript's Task `tool_use` + its result text
   (`agentId: <id>`) — `_resolve_subagent`/`_stage_subagent_history`, matching type + description (exact,
-  else a prefix; a trailing pane-ellipsis "…" is stripped first, XERK-130). The result rides the next
-  beat as `subagentHistoryResults`.
+  else a prefix; a trailing pane-ellipsis "…" is stripped first, XERK-130). Results ride the next
+  beat (`subagentHistoryResults`).
 - Tests: `TestResolveSubagent`, `TestStageSubagentHistory`; `parseAgentList`, `liveTurnDecision`,
   `stripActivityTail` in `agent/tests/tunnel-agent.test.js`.
 
@@ -1335,16 +1335,16 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - It renders chat bubbles — **user right, agent left** — with collapsible tool-action cards (tool_use +
   its paired tool_result, error-styled) and collapsed thinking traces, the in-progress turn typing in via
   a typewriter reveal (ported from glasses `live.ts`/`transcript.ts`/`reveal.ts`).
-  - The live turn is the tmux **pane scrape's "last ● bullet"**, which is NOT monotonic (XERK-19):
-    mid-generation it SWAPS between unrelated blocks. Every `turn` frame is CLASSIFIED by `applyTurn`
-    before the reveal — the streaming bubble is only for in-progress **prose**:
-    - an empty frame or a **tool-use bullet** (`isToolBullet`: an identifier immediately followed by `(`)
-      clears the bubble; that tool renders as a committed tool-card. A missed bullet brings the flicker
-      back, so the detector leans toward matching.
-    - the **same prose block** grown or re-captured keeps the LONGER text and never shrinks
-      (`reveal.shown` holds); a **genuinely different prose block** retypes from 0.
-  - Stands in for glasses `advanceReveal`'s entryId-change snap, which the pane scrape has no id for.
-    `repaint`'s prefix check is a defensive clamp. Tests: `chat-selection.test.js`.
+  - The live turn is the tmux **pane scrape's "last ● bullet"**, NOT monotonic (XERK-19): it SWAPS
+    between unrelated blocks mid-turn. Every `turn` frame is CLASSIFIED by `applyTurn` before the
+    reveal — the streaming bubble is only for in-progress **prose**:
+    - an empty frame or a **tool-use bullet** (`isToolBullet`: identifier + `(`) clears the bubble
+      (the tool renders as a committed card); a missed bullet brings the flicker back, so it leans
+      toward matching.
+    - the **same prose block** keeps the LONGER text and never shrinks (`reveal.shown` holds); a
+      **genuinely different prose block** retypes from 0.
+  - Stands in for glasses `advanceReveal`'s entryId snap (the scrape has no id); `repaint`'s prefix
+    check is a defensive clamp. Tests: `chat-selection.test.js`.
 - Bubble prose is rendered by `renderProse` (`chat.js`): **fenced ` ``` ` blocks** become
   `<pre class="md-code">` (language chip from the info string), inline **` `code` ` spans** become
   `<code class="md-code-inline">` chips (`renderInline`), GFM **tables** become real `<table>`s, else
