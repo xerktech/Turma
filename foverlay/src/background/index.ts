@@ -33,7 +33,7 @@ import { MentraMicBridge } from "../audio/mic-bridge.ts";
 import { MentraDisplay } from "../display/mentra.ts";
 import { createG2Measure } from "../display/measure.ts";
 import type { BackgroundPhase, Channels } from "../shared/channels.ts";
-import { serializePhoneState } from "../shared/phone-state.ts";
+import { createPhoneStateGate, serializePhoneState } from "../shared/phone-state.ts";
 import { MentraStorage } from "./storage.ts";
 
 type Session = TypedMiniappSession<Channels>;
@@ -99,13 +99,20 @@ class TurmaBackground {
       recorder: new AudioRecorder({ bridge: new MentraMicBridge(this.session) }),
     });
     const display = new MentraDisplay(this.session);
+    // Per-App gate (fresh on every sign-in): onState fires on every glasses
+    // repaint — 80ms reveal ticks included — but the phone payload only
+    // changes on the fields the gate compares. Broadcasting per tick floods
+    // the WebView bridge with large payloads for nothing (XERK-215).
+    const stateGate = createPhoneStateGate();
     const app = new App({
       client,
       display,
       dictation,
       liveTail,
       pollMs: config.pollMs ?? DEFAULT_POLL_MS,
-      onState: (state) => this.session.ui.send("turma:state", serializePhoneState(state)),
+      onState: (state) => {
+        if (stateGate(state)) this.session.ui.send("turma:state", serializePhoneState(state));
+      },
       onEnterSession: (hostKey, sessionId) => this.session.ui.send("turma:enter-session", { hostKey, sessionId }),
       onRichTail: (sessionId, entries) => this.session.ui.send("turma:rich-tail", { sessionId, entries }),
     });
