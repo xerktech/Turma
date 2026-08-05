@@ -633,6 +633,17 @@ class BoardTest {
         assertEquals(listOf("a", "b"), splitLabels(" a , a ,, b ", "azure"))
     }
 
+    @Test fun `createDirty guards a close only while un-created text would be lost`() {
+        // A clean form closes freely; any text field makes it dirty (XERK-218).
+        assertEquals(false, createDirty("", "", "", created = false))
+        assertEquals(false, createDirty("  ", " ", "", created = false))
+        assertEquals(true, createDirty("t", "", "", created = false))
+        assertEquals(true, createDirty("", "d", "", created = false))
+        assertEquals(true, createDirty("", "", "l", created = false))
+        // The created screen is never dirty — the ticket exists.
+        assertEquals(false, createDirty("t", "d", "l", created = true))
+    }
+
     @Test fun `classifyCreateMeta distinguishes pending, projects, types, and error`() {
         assertEquals(CreateMetaFetch.Pending, classifyCreateMeta(202, null, wantTypes = false))
         assertEquals(CreateMetaFetch.Pending, classifyCreateMeta(200, CreateMetaEnvelope(pending = true), wantTypes = false))

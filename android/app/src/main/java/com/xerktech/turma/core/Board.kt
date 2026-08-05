@@ -738,6 +738,16 @@ fun splitLabels(raw: String, source: String): List<String> {
     return out.toList().take(20)
 }
 
+/**
+ * Whether closing the create form now would throw away typed work (XERK-218):
+ * one of the text fields holds something and no ticket has been created yet.
+ * The created screen is never dirty — the ticket exists, so nothing typed is
+ * lost. Port of newticket.js `createDirty`; a dirty close must raise a discard
+ * confirmation instead of dismissing.
+ */
+fun createDirty(summary: String, description: String, labels: String, created: Boolean): Boolean =
+    !created && (summary.isNotBlank() || description.isNotBlank() || labels.isNotBlank())
+
 /** The project/label metadata a create-meta fetch resolves to (or is still pending). */
 sealed interface CreateMetaFetch {
     object Pending : CreateMetaFetch

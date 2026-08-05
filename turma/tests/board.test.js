@@ -1767,6 +1767,26 @@ test("createFormHtml: a created ticket confirms, and an unassigned one warns (XE
   assert.doesNotMatch(evil, /<img/);
 });
 
+test("createFormHtml: a requested dirty close swaps the actions for a discard confirm (XERK-218)", () => {
+  const st = {
+    sites: [{ siteKey: "o.atlassian.net", orgName: "", online: true }],
+    siteKey: "o.atlassian.net", source: "jira",
+    meta: { projects: [{ key: "ENG", name: "Eng" }], labels: [] },
+    types: { types: [{ id: "1", name: "Task" }] },
+    values: { project: "ENG", issueType: "1", summary: "typed work", description: "", labels: "" },
+    busy: false, error: "", created: null, confirmDiscard: true,
+  };
+  const html = createFormHtml(st);
+  // The confirmation replaces Cancel/Create, so one stray click can't discard.
+  assert.match(html, /Discard this ticket\?/);
+  assert.match(html, /data-cf-keep="1"/);
+  assert.match(html, /data-cf-discard="1"/);
+  assert.doesNotMatch(html, /data-cf-cancel/);
+  assert.doesNotMatch(html, /data-cf-submit/);
+  // The form itself stays up behind it — nothing typed is lost yet.
+  assert.match(html, /typed work/);
+});
+
 test("createFormHtml: loading and error states per row", () => {
   const loading = createFormHtml({
     sites: [{ siteKey: "o", orgName: "", online: true }], siteKey: "o", source: "jira",

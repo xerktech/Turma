@@ -45,6 +45,20 @@ test("newticket: Azure tags split on commas only (a tag can carry spaces)", () =
     ["needs review", "in progress"]);
 });
 
+// ---- dirty-close guard (pure) -----------------------------------------------
+
+test("newticket: createDirty is true only while un-created text would be lost (XERK-218)", () => {
+  const st = (values, created) => ({ values, created });
+  assert.equal(NT.createDirty(null), false);
+  assert.equal(NT.createDirty(st({ summary: "", description: "", labels: "" })), false);
+  assert.equal(NT.createDirty(st({ summary: "  ", description: " ", labels: "" })), false);
+  assert.equal(NT.createDirty(st({ summary: "t" })), true);
+  assert.equal(NT.createDirty(st({ description: "d" })), true);
+  assert.equal(NT.createDirty(st({ labels: "l" })), true);
+  // The created screen is never dirty — the ticket exists, nothing is lost.
+  assert.equal(NT.createDirty(st({ summary: "t" }, { key: "T-1" })), false);
+});
+
 // ---- button markup (pure) ---------------------------------------------------
 
 test("newticket: the button carries the data hook the click handler binds on", () => {
@@ -139,6 +153,60 @@ test("newticket: clicking the button opens the form against the reporting org", 
   assert.equal(body.classList.contains("td-open"), true);
   // The form painted into the panel is the New-ticket modal.
   assert.match(panel.innerHTML, /New ticket/);
+});
+
+test("newticket: a dirty close arms the discard confirm; a clean one just closes (XERK-218)", () => {
+  const { body, button } = mountNT();
+  NT.update({ agents: [agent("h1", "acme.atlassian.net")] });
+  const backdrop = body.children[0];
+  const panel = backdrop.children[0];
+  const open = () => { for (const fn of button._listeners.click || []) fn({}); };
+  const clickBackdrop = () => {
+    for (const fn of backdrop._listeners.click || []) fn({ target: backdrop });
+  };
+  const clickPanel = (hook) => {
+    for (const fn of panel._listeners.click || []) {
+      fn({ target: { closest: (sel) => (sel.includes(hook) ? {} : null) } });
+    }
+  };
+
+  // Clean form: a backdrop click closes it outright, as before.
+  open();
+  assert.equal(backdrop.hidden, false);
+  clickBackdrop();
+  assert.equal(backdrop.hidden, true);
+
+  // Dirty form: type a title (the input listener syncs it into state)...
+  open();
+  panel.querySelector = (sel) => (sel === "[data-cf-summary]" ? { value: "draft" } : null);
+  for (const fn of panel._listeners.input || []) {
+    fn({ target: { closest: () => ({}) } });
+  }
+  // ...then a close request arms the in-form confirm instead of closing.
+  clickBackdrop();
+  assert.equal(backdrop.hidden, false);
+  assert.match(panel.innerHTML, /Discard this ticket\?/);
+  // Keep editing disarms and the form stays up.
+  clickPanel("data-cf-keep");
+  assert.equal(backdrop.hidden, false);
+  assert.doesNotMatch(panel.innerHTML, /Discard this ticket\?/);
+  // Arm again; a second close request (Escape/backdrop/Cancel) confirms it.
+  clickBackdrop();
+  assert.equal(backdrop.hidden, false);
+  clickBackdrop();
+  assert.equal(backdrop.hidden, true);
+
+  // Arm once more via Cancel, and the explicit Discard button closes too.
+  open();
+  panel.querySelector = (sel) => (sel === "[data-cf-summary]" ? { value: "draft" } : null);
+  for (const fn of panel._listeners.input || []) {
+    fn({ target: { closest: () => ({}) } });
+  }
+  clickPanel("data-cf-cancel");
+  assert.equal(backdrop.hidden, false);
+  assert.match(panel.innerHTML, /Discard this ticket\?/);
+  clickPanel("data-cf-discard");
+  assert.equal(backdrop.hidden, true);
 });
 
 // ---- wiring: every page carries it ------------------------------------------
