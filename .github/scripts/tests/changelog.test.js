@@ -44,6 +44,14 @@ test("a multi-component entry appears under each heading it touches", () => {
   assert.equal(groups.Glasses.length, 1);
 });
 
+test("a foverlay entry lands under the Foverlay heading, before Other", () => {
+  const groups = CL.groupByComponent([
+    entry({ title: "miniapp thing", components: ["foverlay"] }),
+    entry({ title: "chore", components: [] }),
+  ]);
+  assert.deepEqual(Object.keys(groups), ["Foverlay", "Other"]);
+});
+
 test("an entry matching no component is never dropped (lands in Other)", () => {
   const groups = CL.groupByComponent([entry({ title: "root README tweak", components: [] })]);
   assert.deepEqual(Object.keys(groups), ["Other"]);
@@ -72,6 +80,7 @@ test("renderComponentTable reads rebuilt/carried status straight from the manife
       "agent-native": { version: "0.3.1", kind: "asset", asset: "n.tar.gz", built: true },
       glasses: { version: "0.3.0", kind: "evenhub", package_id: "com.xerktech.turma", built: false },
       android: { version: "0.3.1", kind: "asset", asset: "a.apk", version_code: 30001, built: true },
+      foverlay: { version: "0.3.1", kind: "asset", asset: "turma-foverlay-v0.3.1.zip", built: true },
     },
   };
   const table = CL.renderComponentTable(manifest);
@@ -79,6 +88,7 @@ test("renderComponentTable reads rebuilt/carried status straight from the manife
   assert.match(table, /Agent \(image\) \| 0\.3\.0 \| carried/);
   assert.match(table, /Glasses \(Even Hub\) \| 0\.3\.0 \| carried \| `com\.xerktech\.turma` \(Even Hub portal\)/);
   assert.match(table, /code 30001/);
+  assert.match(table, /Foverlay \(miniapp \.zip\) \| 0\.3\.1 \| rebuilt \| `turma-foverlay-v0\.3\.1\.zip`/);
 });
 
 test("renderReleaseNotes handles an empty range", () => {

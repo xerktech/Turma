@@ -1,8 +1,9 @@
 # Releasing Turma
 
-One release publishes **all five components** under a single `v<MAJOR>.<MINOR>.<PATCH>`
+One release publishes **all six components** under a single `v<MAJOR>.<MINOR>.<PATCH>`
 tag: the `turma` image, the `agent` image, the glasses app, the android
-`.apk`, and the native-agent tarball. Driven by `.github/workflows/release.yml`;
+`.apk`, the native-agent tarball, and the foverlay miniapp `.zip`. Driven by
+`.github/workflows/release.yml`;
 the logic lives in `.github/scripts/` (see its README). The glasses build is
 **not a release asset**: its distribution channel is the Even Hub developer
 portal, uploaded by `build-glasses` right after packing (see "Even Hub
@@ -19,7 +20,7 @@ dev-portal publish").
 ## Patch releases (automatic)
 
 Every merge to `main` that touches a component's source (`turma/`, `agent/`,
-`glasses/`, `android/`) cuts a patch release — a merge that touches only docs or
+`glasses/`, `android/`, `foverlay/`) cuts a patch release — a merge that touches only docs or
 the release machinery does not, since every component would be carried and the
 release would publish nothing new. `plan` diffs the merge against the previous
 release tag and decides, per component, **build or carry**:
@@ -30,7 +31,7 @@ release tag and decides, per component, **build or carry**:
   portal-publishes the new glasses app and copies the previous
   `turma-android-v*.apk` / native tarball onto the release unchanged.
 
-So a release always contains all five components; carried ones simply read their
+So a release always contains all six components; carried ones simply read their
 older version. The release notes render a **rebuilt vs carried** table from the
 attached `manifest.json`, which is the machine-readable source of truth.
 
@@ -38,9 +39,10 @@ Carried **images** are referenced in the manifest at their prior `:version` tag
 (we do not retag an unchanged image to the new version — `:0.3.9` pointing at
 `0.3.4` bits would be as misleading as renaming a carried asset). `:latest` is
 already correct on a carried image, so Watchtower needs nothing. Carried
-**assets** (the `.apk` and native tarball) are copied forward under their
-**original filename**, because Android and the native updater version an install
-by the version baked *inside* the file — the name must describe the bits. A
+**assets** (the `.apk`, native tarball, and foverlay `.zip`) are copied forward
+under their **original filename**, because Android and the native updater version
+an install by the version baked *inside* the file — the name must describe the
+bits. A
 carried **glasses** component needs nothing physical: the Even Hub portal
 already holds its version, and the manifest references it (`kind: "evenhub"`).
 

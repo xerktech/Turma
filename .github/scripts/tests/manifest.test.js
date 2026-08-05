@@ -10,6 +10,7 @@ const ALL_CHANGED = {
   "agent-native": true,
   glasses: true,
   android: true,
+  foverlay: true,
 };
 
 function firstRelease() {
@@ -37,6 +38,9 @@ test("first release: every component fresh and built", () => {
   assert.equal(m.components.glasses.asset, undefined); // the portal is the channel, not a release asset
   assert.equal(m.components.android.asset, "turma-android-v0.3.0.apk");
   assert.equal(m.components.android.version_code, 30000);
+  assert.equal(m.components.foverlay.kind, "asset");
+  assert.equal(m.components.foverlay.asset, "turma-foverlay-v0.3.0.zip");
+  assert.equal(m.components.foverlay.release_tag, "v0.3.0");
   for (const c of Object.values(m.components)) assert.equal(c.built, true);
 });
 
@@ -52,7 +56,7 @@ test("carried image keeps its OLDER version and ref; never retagged to the new v
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-image": false, "agent-native": false, glasses: false, android: false },
+    changed: { turma: true, "agent-image": false, "agent-native": false, glasses: false, android: false, foverlay: false },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
@@ -70,7 +74,7 @@ test("carried asset keeps its name/version but re-points release_tag to the new 
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-image": true, "agent-native": true, glasses: true, android: false },
+    changed: { turma: true, "agent-image": true, "agent-native": true, glasses: true, android: false, foverlay: true },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
@@ -88,7 +92,7 @@ test("carried glasses keeps its older version on the portal; nothing to copy", (
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-image": true, "agent-native": true, glasses: false, android: true },
+    changed: { turma: true, "agent-image": true, "agent-native": true, glasses: false, android: true, foverlay: true },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
@@ -116,7 +120,7 @@ test("carried glasses from a pre-portal (asset-kind) manifest is normalized to e
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-image": true, "agent-native": true, glasses: false, android: true },
+    changed: { turma: true, "agent-image": true, "agent-native": true, glasses: false, android: true, foverlay: true },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
@@ -134,7 +138,7 @@ test("unchanged component absent from prev manifest throws (never emit a hole)",
       tag: "v0.3.1",
       commit: "bbb",
       releasedAt: "2026-07-17T00:00:00Z",
-      changed: { turma: true, "agent-image": true, "agent-native": true, glasses: false, android: true },
+      changed: { turma: true, "agent-image": true, "agent-native": true, glasses: false, android: true, foverlay: true },
       prevManifest: prev,
       androidVersionCode: 30001,
     }),
@@ -148,15 +152,16 @@ test("carryPlan emits copy-asset only for carried assets, not images or built on
     tag: "v0.3.1",
     commit: "bbb",
     releasedAt: "2026-07-17T00:00:00Z",
-    changed: { turma: true, "agent-image": false, "agent-native": false, glasses: false, android: false },
+    changed: { turma: true, "agent-image": false, "agent-native": false, glasses: false, android: false, foverlay: false },
     prevManifest: prev,
     androidVersionCode: 30001,
   });
   const plan = M.carryPlan(m, prev);
   const components = plan.map((a) => a.component).sort();
   // agent-image carried but it's an image, glasses lives on the Even Hub portal
-  // -> no copy action for either. native/android are the carried release assets.
-  assert.deepEqual(components, ["agent-native", "android"]);
+  // -> no copy action for either. native/android/foverlay are the carried
+  // release assets.
+  assert.deepEqual(components, ["agent-native", "android", "foverlay"]);
   const androidAction = plan.find((a) => a.component === "android");
   assert.deepEqual(androidAction, {
     component: "android",
@@ -167,6 +172,8 @@ test("carryPlan emits copy-asset only for carried assets, not images or built on
   });
   const nativeAction = plan.find((a) => a.component === "agent-native");
   assert.equal(nativeAction.sha256_asset, "turma-agent-native-v0.3.0.tar.gz.sha256");
+  const foverlayAction = plan.find((a) => a.component === "foverlay");
+  assert.equal(foverlayAction.asset, "turma-foverlay-v0.3.0.zip");
 });
 
 test("carryPlan is empty when everything was rebuilt", () => {

@@ -1,0 +1,346 @@
+/* Native phone companion styles (XERK-171), matched 1:1 to the Turma mobile app
+   (Android / mobile web). The same two bundled families the web/Android ship
+   (Inter for body, Space Grotesk for titles), the warm-paper palette, glowing
+   status dots, flat hairline cards, iMessage-style chat bubbles, and a Material
+   bottom nav. Palette + token values are copied from turma/public/app.css. */
+
+/* Bundled variable fonts (same woff2 the hub serves) — Vite rewrites these urls
+   to the packaged asset, so they load same-origin inside the Even WebView. */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("./fonts/inter-latin-wght-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 300 700;
+  src: url("./fonts/space-grotesk-latin-wght-normal.woff2") format("woff2");
+}
+
+:root {
+  --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f0efea; --field: #ffffff;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781; --hairline: #e1e0d9;
+  --border: rgba(11,11,11,0.10); --accent: #2a78d6;
+  --good: #12a312; --warning: #fab219; --critical: #d03b3b;
+  /* Org palette slots (from app.css) — used by board.js's orgColorMap to tint
+     session cards + board tickets (var(--sN) via --org). Without these the tint
+     resolves to an undefined var and no colour shows. */
+  --s1: #2a78d6; --s2: #1baf7a; --s3: #eda100; --s4: #008300;
+  --s5: #4a3aa7; --s6: #e34948; --s7: #e87ba4; --s8: #eb6834;
+  --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Space Grotesk", var(--font-sans);
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --radius-sm: 8px; --radius-md: 11px; --radius-lg: 14px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321; --field: #111110;
+    --ink: #fff; --ink-2: #c3c2b7; --muted: #898781; --hairline: #2c2c2a;
+    --border: rgba(255,255,255,0.10); --accent: #3987e5;
+    --s1: #3987e5; --s2: #199e70; --s3: #c98500; --s4: #008300;
+    --s5: #9085e9; --s6: #e66767; --s7: #d55181; --s8: #d95926;
+  }
+}
+
+.ph-shell, .ph-session {
+  position: fixed; inset: 0; display: flex; flex-direction: column;
+  background: var(--page); color: var(--ink);
+  font: 400 14px/1.5 var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- Header ---- */
+.ph-header {
+  flex: none; display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--hairline); background: var(--surface);
+}
+.ph-title { font-family: var(--font-display); font-weight: 600; font-size: 20px; letter-spacing: -0.01em; }
+.ph-header-right { display: flex; align-items: center; gap: 8px; }
+
+/* Org filter — the pill from .org-btn */
+.ph-org { position: relative; }
+.ph-org-btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  font: inherit; font-size: 12.5px; color: var(--ink-2);
+  background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
+  padding: 6px 12px; cursor: pointer;
+}
+.ph-org-btn.scoped { color: var(--ink); border-color: var(--border); font-weight: 600; }
+.ph-org-btn .ph-chev { color: var(--muted); font-size: 10px; }
+.ph-org-btn-label { max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ph-org-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--org, var(--accent)); flex: none; }
+.ph-org-dot-all { background: linear-gradient(135deg, var(--s1), var(--s5)); }
+.ph-org-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;
+  min-width: 210px; max-height: 62vh; overflow: auto;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-md); box-shadow: 0 8px 24px rgba(0,0,0,0.18); padding: 6px;
+}
+.ph-org-row { display: flex; align-items: center; border-radius: 7px; }
+.ph-org-row:hover { background: color-mix(in srgb, var(--ink) 6%, transparent); }
+.ph-org-row.cur { font-weight: 600; }
+.ph-org-item {
+  display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; text-align: left;
+  font: inherit; font-size: 13px; color: var(--ink); background: none; border: 0;
+  border-radius: 7px; padding: 9px 10px; cursor: pointer;
+}
+.ph-org-item .ph-org-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ph-org-item .ph-org-count {
+  flex: none; min-width: 20px; text-align: center; font-size: 11px; font-weight: 600;
+  color: var(--muted); background: color-mix(in srgb, var(--ink) 8%, transparent);
+  border-radius: 999px; padding: 1px 7px;
+}
+.ph-org-item .ph-org-off { flex: none; font-size: 10px; color: var(--warning, #d08700); text-transform: uppercase; letter-spacing: 0.04em; }
+/* Per-org auto-start toggle (XERK-41): a small pill that fills in when ON. */
+.ph-org-auto {
+  flex: none; display: inline-flex; align-items: center; gap: 5px; margin-right: 6px;
+  font: inherit; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--muted); background: none; border: 1px solid var(--border);
+  border-radius: 999px; padding: 3px 8px; cursor: pointer;
+}
+.ph-org-auto .ph-org-auto-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none;
+}
+.ph-org-auto.on { color: var(--good); border-color: var(--good); }
+.ph-org-auto.on .ph-org-auto-dot { background: var(--good); box-shadow: 0 0 6px color-mix(in srgb, var(--good) 70%, transparent); }
+
+.ph-signout {
+  display: inline-grid; place-items: center;
+  color: var(--ink-2); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 999px;
+  width: 34px; height: 34px; cursor: pointer;
+}
+.ph-signout svg { width: 17px; height: 17px; }
+.ph-signout:hover { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent); }
+
+/* ---- Sessions list ---- */
+.ph-body { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 14px 12px calc(14px + env(safe-area-inset-bottom)); }
+.ph-card-meta, .ph-card-title { min-width: 0; overflow-wrap: anywhere; }
+.ph-list { display: flex; flex-direction: column; gap: 18px; }
+.ph-section { display: flex; flex-direction: column; gap: 8px; }
+.ph-section-label {
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--muted); padding: 0 2px;
+}
+.ph-section-label .ph-count { font-weight: 400; }
+.ph-empty { color: var(--muted); font-size: 13.5px; padding: 40px 16px; text-align: center; }
+
+/* Board bar (New ticket + Refresh) */
+.ph-board-bar { display: flex; gap: 8px; justify-content: flex-end; margin-bottom: 12px; }
+.ph-newticket {
+  font: inherit; font-size: 12.5px; font-weight: 600; color: #fff;
+  background: var(--accent); border: 1px solid var(--accent); border-radius: 999px;
+  padding: 6px 14px; cursor: pointer;
+}
+.ph-newticket:hover { filter: brightness(1.06); }
+.ph-refresh {
+  font: inherit; font-size: 12.5px; color: var(--ink-2);
+  background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
+  padding: 6px 12px; cursor: pointer;
+}
+.ph-refresh:hover { color: var(--ink); }
+
+.ph-card {
+  display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left;
+  /* Org tint (XERK-142): the session's org colour mixed 12% into the surface, so
+     a card reads its org at a glance — the same as the board/web/Android. */
+  background: color-mix(in srgb, var(--org, var(--surface)) 12%, var(--surface));
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: 10px 12px; cursor: pointer; font: inherit; color: var(--ink);
+}
+.ph-card:hover { border-color: var(--accent); }
+.ph-card.cur { border-color: var(--accent); border-width: 2px; }
+.ph-ticket { font-family: var(--font-mono); color: var(--accent); }
+.ph-state-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-top: 4px; }
+.ph-state-row .ph-state { margin-top: 0; flex: 1 1 auto; min-width: 0; }
+.ph-pr-list { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; justify-content: flex-end; min-width: 0; }
+/* Queued: dashed, static, with an inline Cancel. */
+.ph-queued { border-style: dashed; cursor: default; }
+.ph-queued .ph-dot.st-waiting { box-shadow: none; }
+.ph-cancel {
+  flex: none; align-self: center; font: inherit; font-size: 12px; color: var(--critical);
+  background: none; border: 1px solid color-mix(in srgb, var(--critical) 40%, transparent);
+  border-radius: 8px; padding: 6px 12px; cursor: pointer;
+}
+/* Ended: muted, non-interactive. */
+.ph-ended { cursor: default; opacity: 0.72; }
+.ph-ended .ph-dot.st-stopped { background: none; border: 1.5px solid var(--muted); }
+.ph-ended-section .ph-section-label { color: var(--muted); }
+.ph-card-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.ph-card-title { font-weight: 600; font-size: 14px; line-height: 1.3; overflow-wrap: anywhere; }
+.ph-card-meta { color: var(--muted); font-size: 11.5px; margin-top: 2px; overflow-wrap: anywhere; }
+.ph-mono { font-family: var(--font-mono); }
+.ph-state { font-size: 12px; margin-top: 4px; color: var(--ink-2); }
+.ph-state.st-working { color: var(--good); }
+.ph-state.st-waiting { color: var(--warning); font-weight: 600; }
+.ph-state.st-error { color: var(--critical); }
+.ph-card-q {
+  font-size: 12px; color: var(--ink-2); margin-top: 3px;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+
+/* Glowing status dot (the web "status lights") */
+.ph-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; margin-top: 5px; background: var(--muted); }
+.ph-dot.st-working { background: var(--good); box-shadow: 0 0 8px color-mix(in srgb, var(--good) 75%, transparent); }
+.ph-dot.st-waiting { background: var(--warning); box-shadow: 0 0 8px color-mix(in srgb, var(--warning) 75%, transparent); }
+.ph-dot.st-idle { background: var(--muted); }
+.ph-dot.st-stopped { background: none; border: 1.5px solid var(--muted); }
+.ph-dot.st-error { background: var(--critical); box-shadow: 0 0 7px color-mix(in srgb, var(--critical) 55%, transparent); }
+
+/* ---- Bottom nav (Material: accent pill behind the active icon) ---- */
+.ph-nav {
+  flex: none; display: flex;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter: saturate(1.4) blur(10px);
+  border-top: 1px solid var(--hairline);
+  padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+}
+.ph-tab {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px;
+  background: none; border: 0; cursor: pointer; font: inherit; font-size: 11px;
+  color: var(--muted); padding: 4px 0 2px;
+}
+.ph-tab-icon { display: grid; place-items: center; width: 56px; height: 30px; border-radius: 999px; }
+.ph-tab-icon svg { width: 22px; height: 22px; }
+.ph-tab.active .ph-tab-icon { background: var(--accent); color: #fff; }
+.ph-tab.active .ph-tab-label { color: var(--accent); font-weight: 600; }
+
+/* ---- Session view ---- */
+.ph-session-head {
+  flex: none; display: flex; align-items: center; gap: 6px;
+  padding: 8px 12px; border-bottom: 1px solid var(--hairline); background: var(--surface);
+}
+.ph-back {
+  font: inherit; font-size: 26px; line-height: 1; color: var(--accent);
+  background: none; border: 0; padding: 0 6px; cursor: pointer;
+}
+.ph-session-titles { display: flex; flex-direction: column; min-width: 0; }
+.ph-session-title {
+  font-family: var(--font-display); font-weight: 600; font-size: 15px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ph-session-sub {
+  font-size: 11px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ph-transcript {
+  flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 16px;
+  display: flex; flex-direction: column; gap: 10px; background: var(--page);
+}
+.ph-transcript > * { flex-shrink: 0; }
+
+/* Chat bubbles — user accent-right, agent surface-left (12px radius, Android). */
+.ph-bubble {
+  max-width: 82%; padding: 9px 13px; border-radius: 12px;
+  font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.ph-bubble.me { align-self: flex-end; background: var(--accent-soft); color: var(--ink); }
+.ph-bubble.them { align-self: flex-start; background: var(--surface-2); color: var(--ink); }
+
+/* Pending question */
+.ph-question {
+  flex: none; border-top: 1px solid var(--border); background: var(--surface);
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 8px;
+}
+.ph-question-q { font-weight: 600; font-size: 13.5px; }
+.ph-opt {
+  display: flex; align-items: center; gap: 10px;
+  font: inherit; text-align: left; font-size: 13.5px; color: var(--ink);
+  background: var(--field); border: 1px solid var(--border);
+  border-radius: var(--radius-md); padding: 10px 12px; cursor: pointer;
+}
+.ph-opt:hover { border-color: var(--accent); }
+.ph-opt-n {
+  flex: none; display: grid; place-items: center; width: 20px; height: 20px;
+  border-radius: 50%; background: var(--accent-soft); color: var(--accent);
+  font-size: 11px; font-weight: 700;
+}
+
+/* Session-view header extras + chat/terminal panes */
+.ph-term-toggle, .ph-kebab {
+  flex: none; font: inherit; font-size: 12.5px; color: var(--ink-2);
+  background: var(--field); border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 10px; cursor: pointer;
+}
+.ph-kebab { font-size: 16px; line-height: 1; padding: 5px 9px; }
+.ph-term-toggle.on { color: var(--accent); border-color: var(--accent); }
+.ph-session-head .ph-session-titles { flex: 1; }
+
+.ph-chat-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.ph-session.show-term .ph-chat-pane { display: none; }
+.ph-term-pane { display: none; flex: 1; min-height: 0; background: #0d0d0d; }
+.ph-session.show-term .ph-term-pane { display: flex; }
+.ph-term-pane iframe { flex: 1; width: 100%; border: 0; }
+
+/* Verbosity segmented control */
+.ph-verbbar { flex: none; display: flex; gap: 6px; padding: 8px 12px 4px; }
+.ph-verb {
+  font: inherit; font-size: 11px; padding: 3px 12px; border-radius: 999px;
+  background: var(--surface); border: 1px solid var(--border); color: var(--muted); cursor: pointer;
+}
+.ph-verb.on { background: var(--accent-soft); border-color: transparent; color: var(--accent); font-weight: 600; }
+
+.ph-stop {
+  flex: none; font: inherit; font-weight: 600; font-size: 13px;
+  color: #1a1200; background: var(--warning); border: 0; border-radius: var(--radius-sm);
+  padding: 10px 14px; cursor: pointer;
+}
+
+/* ⋯ session actions menu (Rename / Kill) */
+.ph-kebab-wrap { position: relative; flex: none; }
+.ph-sess-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; min-width: 170px;
+  display: flex; flex-direction: column; padding: 4px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+}
+.ph-sess-menu button {
+  font: inherit; font-size: 13px; text-align: left; color: var(--ink);
+  background: none; border: 0; border-radius: 6px; padding: 9px 10px; cursor: pointer;
+}
+.ph-sess-menu button:hover { background: var(--accent-soft); }
+.ph-sess-menu button.danger { color: var(--critical); font-weight: 600; }
+.ph-sess-menu button.danger.armed { background: var(--critical); color: #fff; }
+.ph-sess-menu button.primary { color: #fff; background: var(--accent); font-weight: 600; }
+.ph-sess-menu.ph-rename { min-width: 220px; gap: 8px; padding: 10px; }
+.ph-sess-menu.ph-rename input {
+  font: inherit; font-size: 13px; color: var(--ink); background: var(--field);
+  border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px;
+}
+.ph-rename-row { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* Compose */
+.ph-compose {
+  flex: none; display: flex; align-items: flex-end; gap: 8px;
+  padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--border); background: var(--surface);
+}
+.ph-input {
+  flex: 1; resize: none; font: inherit; font-size: 13.5px; line-height: 1.5; color: var(--ink);
+  background: var(--page); border: 1px solid var(--border);
+  border-radius: var(--radius-md); padding: 9px 12px; max-height: 120px;
+}
+.ph-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+.ph-send {
+  flex: none; font: inherit; font-weight: 600; font-size: 14px; color: #fff;
+  background: var(--accent); border: 0; border-radius: var(--radius-sm);
+  padding: 10px 18px; cursor: pointer; min-width: 84px;
+}
+.ph-send:hover { filter: brightness(1.07); }
+.ph-send:disabled { opacity: 0.5; cursor: default; }
+
+/* ---- Foverlay port: Mentra WebView safe areas --------------------------- */
+/* The Mentra host injects pixel safe-area insets as --mentra-safe-* CSS vars
+   (mobile/modules/engine/src/utils/miniappGlobals.ts) — env(safe-area-inset-*)
+   is 0 inside this WebView. Pad the fixed shell's header/nav/compose so
+   content clears the status bar and the home indicator. */
+.ph-header { padding-top: calc(14px + var(--mentra-safe-top, 0px)); }
+.ph-session-head { padding-top: calc(8px + var(--mentra-safe-top, 0px)); }
+.ph-nav { padding-bottom: calc(6px + var(--mentra-safe-bottom, 0px)); }
+.ph-compose { padding-bottom: calc(10px + var(--mentra-safe-bottom, 0px)); }

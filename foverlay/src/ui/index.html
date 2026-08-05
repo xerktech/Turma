@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<title>Turma</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  /* Mirrors the web dashboard's login page (turma/public/login.html):
+     same palette, card, and light/dark handling, so the phone side of the
+     miniapp looks like the mobile web UI. (Foverlay port: the DOM dev
+     backend's #glasses-display corner mirror is not ported — the glasses
+     render in the background JSContext here.) */
+  :root {
+    --page:     #f9f9f7;
+    --surface:  #fcfcfb;
+    --ink:      #0b0b0b;
+    --ink-2:    #52514e;
+    --muted:    #898781;
+    --border:   rgba(11,11,11,0.10);
+    --critical: #d03b3b;
+    --accent:   #2a78d6;
+    --field:    #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page:    #0d0d0d;
+      --surface: #1a1a19;
+      --ink:     #ffffff;
+      --ink-2:   #c3c2b7;
+      --muted:   #898781;
+      --border:  rgba(255,255,255,0.10);
+      --accent:  #3987e5;
+      --field:   #111110;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 14px/1.45 "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    /* --mentra-safe-*: host-injected safe-area insets (Mentra WebView). */
+    padding: calc(24px + var(--mentra-safe-top, 0px)) 24px calc(24px + var(--mentra-safe-bottom, 0px));
+  }
+
+  .card {
+    width: 100%; max-width: 360px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 14px; padding: 30px 28px 26px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04), 0 12px 34px rgba(0,0,0,0.06);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .brand .mark {
+    width: 34px; height: 34px; border-radius: 9px; flex: none;
+    display: grid; place-items: center; color: #fff;
+    background: linear-gradient(135deg, var(--accent), #6f42c1);
+  }
+  .brand .mark svg { width: 19px; height: 19px; }
+  h1 { font-size: 19px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; margin: 8px 0 22px; }
+
+  form { display: flex; flex-direction: column; gap: 14px; }
+  label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--ink-2); font-weight: 600; }
+  input {
+    font: inherit; color: var(--ink); background: var(--field);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; width: 100%;
+  }
+  input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(42,120,214,0.18); }
+
+  button {
+    margin-top: 4px; font: inherit; font-weight: 650; font-size: 14px;
+    color: #fff; background: var(--accent); border: 0; border-radius: 8px;
+    padding: 11px 12px; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.06); }
+  button:disabled { opacity: 0.6; cursor: default; }
+
+  .error {
+    display: none; margin-top: 2px; font-size: 12.5px; color: var(--critical);
+    background: rgba(208,59,59,0.10); border: 1px solid rgba(208,59,59,0.28);
+    border-radius: 8px; padding: 8px 10px;
+  }
+  .error.show { display: block; }
+
+  .foot { margin-top: 20px; color: var(--muted); font-size: 11.5px; text-align: center; }
+
+  /* Signed-in view: the dedicated native phone companion (XERK-171) fills the
+     screen (the phone UI mounts itself position:fixed inset:0 into #phone).
+     Hidden until the user authenticates. */
+  #app[hidden] { display: none; }
+  #phone { position: fixed; inset: 0; }
+</style>
+</head>
+<body>
+
+<!-- Login card — matches the web dashboard's login page, plus a hub URL field
+     (the hub is self-hosted, so there is no default host to assume). The URL is
+     persisted with the credentials, so it is entered once per device and
+     prefilled on every later sign-in. -->
+<div class="card" id="login">
+  <div class="brand">
+    <span class="mark">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    </span>
+    <h1>Turma</h1>
+  </div>
+  <p class="sub">Sign in to manage your agent fleet.</p>
+
+  <div class="error" id="login-error"></div>
+
+  <form id="login-form" autocomplete="on">
+    <!-- Deliberately type="text" (not type="url") and not `required`: both hand
+         native constraint validation a veto over submit, and it rejects the
+         scheme-less "turma.example.com" a phone keyboard invites — so the
+         browser would block the form with its own bubble before config.ts's
+         `normalizeHubUrl` ever got to add the https:// for you. inputmode="url"
+         still gets the URL keyboard. Blank/typo handling is ours, in JS. -->
+    <label>Hub URL
+      <input id="hub-url" name="url" type="text" inputmode="url" autocomplete="url" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="https://turma.example.com" />
+    </label>
+    <label>Username
+      <input id="hub-user" name="username" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" autofocus required />
+    </label>
+    <label>Password
+      <input id="hub-password" name="password" type="password" autocomplete="current-password" required />
+    </label>
+    <button id="login-submit" type="submit">Sign in</button>
+  </form>
+
+  <div class="foot">Even Realities G2 · Single-user access</div>
+</div>
+
+<!-- Signed-in view: the dedicated native phone companion (XERK-171) mounts
+     into #phone. -->
+<section id="app" hidden>
+  <div id="phone"></div>
+</section>
+
+<script type="module" src="./main.ts"></script>
+</body>
+</html>
