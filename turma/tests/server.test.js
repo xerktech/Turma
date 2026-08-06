@@ -1942,11 +1942,30 @@ test("http: input endpoint rejects missing/empty/whitespace-only and over-long t
   assert.equal(whitespace.status, 400);
   assert.deepEqual(whitespace.body, { error: "text required" });
 
+  // Past the cap the refusal is a 413 carrying both numbers, so the composer can
+  // say "too long" instead of the generic "Send failed" (XERK-227).
   const long = await request("POST", "/api/agents/hi2/sessions/sess1/input", {
-    body: { text: "a".repeat(4001) }, headers: userHeaders,
+    body: { text: "a".repeat(100001) }, headers: userHeaders,
   });
-  assert.equal(long.status, 400);
-  assert.deepEqual(long.body, { error: "text too long" });
+  assert.equal(long.status, 413);
+  assert.match(long.body.error, /message too long — 100,001 characters, the limit is 100,000/);
+});
+
+test("http: input endpoint carries a pasted message far past the old 4k cap (XERK-227)", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "hi-paste" }, headers: agentHeaders });
+  // A pasted log is the case the old cap broke: the raw terminal always took
+  // one, so the chat composer must too. Newlines ride through untouched — the
+  // agent pastes the text into the pane rather than typing it key by key.
+  const text = Array.from({ length: 2000 }, (_, i) => `line ${i}: some log output`).join("\n");
+  assert.ok(text.length > 4000);
+  const res = await request("POST", "/api/agents/hi-paste/sessions/sess1/input", {
+    body: { text }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "hi-paste" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "input", sessionId: "sess1", text, cmdId: res.body.cmdId },
+  ]);
 });
 
 test("http: input endpoint 404s unknown host and requires user auth", async () => {
@@ -2184,11 +2203,18 @@ test("http: answer endpoint rejects an empty answer and over-long custom", async
   assert.equal(empty.status, 400);
   assert.deepEqual(empty.body, { error: "optionIndex, optionIndices or custom required" });
 
-  const long = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
-    body: { custom: "a".repeat(4001) }, headers: userHeaders,
+  // A pasted answer meets the same cap a typed message does — the composer routes
+  // here whenever a question is pending (XERK-227).
+  const ok = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
+    body: { custom: "a".repeat(50000) }, headers: userHeaders,
   });
-  assert.equal(long.status, 400);
-  assert.deepEqual(long.body, { error: "custom too long" });
+  assert.equal(ok.status, 200);
+
+  const long = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
+    body: { custom: "a".repeat(100001) }, headers: userHeaders,
+  });
+  assert.equal(long.status, 413);
+  assert.match(long.body.error, /answer too long — 100,001 characters, the limit is 100,000/);
 });
 
 test("http: answer endpoint 404s unknown host and requires user auth", async () => {

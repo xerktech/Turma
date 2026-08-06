@@ -1784,6 +1784,14 @@
     inp.style.height = "auto";
     inp.style.height = Math.min(inp.scrollHeight, 160) + "px";
   }
+  // The hub rejects a message past its own character cap with a 413 (XERK-227).
+  // That is the one send failure the operator can act on — the text is still in
+  // the box, it just has to be split — so it gets its own label instead of the
+  // generic "Send failed", which reads as "the hub is down".
+  const TOO_LONG = "Message too long";
+  function sendFailure(status) {
+    return status === 413 ? TOO_LONG : String(status);
+  }
   async function send() {
     const inp = $("chatInput");
     if (!inp || !hostKey || !sessionId) return;
@@ -1806,12 +1814,12 @@
         body = { text };
       }
       const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-      if (!r.ok) throw new Error(String(r.status));
+      if (!r.ok) throw new Error(sendFailure(r.status));
       if (typeof fastPoll === "function") fastPoll();
-    } catch {
+    } catch (e) {
       if (wasAnswer) { answeredQuestion = null; if (sess) updateQuestion(sess); }
       if (!inp.value.trim()) { inp.value = text; autoGrow(); }
-      actionFailed("Send failed");
+      actionFailed((e && e.message === TOO_LONG) ? TOO_LONG : "Send failed");
     }
   }
 
@@ -2007,7 +2015,7 @@
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
-      isBusy, updateComposeAction, isToolBullet,
+      isBusy, updateComposeAction, isToolBullet, sendFailure, TOO_LONG,
       // Drive the real `turn`-frame classifier (see applyTurn): the ws onmessage
       // hands it frame.text verbatim, so the flicker tests exercise it directly.
       __applyTurn: (t) => { applyTurn(t); },

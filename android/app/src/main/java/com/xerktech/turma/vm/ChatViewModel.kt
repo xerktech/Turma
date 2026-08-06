@@ -24,6 +24,7 @@ import com.xerktech.turma.net.InputRequest
 import com.xerktech.turma.net.LiveEvent
 import com.xerktech.turma.net.ModeRequest
 import com.xerktech.turma.net.ModelRequest
+import com.xerktech.turma.net.hubErrorMessage
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -296,14 +297,25 @@ class ChatViewModel(
         if (text.isEmpty()) return
         draft.value = ""
         viewModelScope.launch {
-            val ok = runCatching {
+            val sent = runCatching {
                 if (_state.value.question.isNotBlank()) {
                     client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = -1, custom = text))
                 } else {
                     client.api.sendInput(host, sessionId, InputRequest(text))
                 }
-            }.isSuccess
-            _messages.tryEmit(if (ok) "✓ sent" else "✗ hub unreachable")
+            }
+            if (sent.isSuccess) {
+                _messages.tryEmit("✓ sent")
+            } else {
+                // Put the message back rather than swallowing it — the web
+                // composer restores its box the same way — and say WHY when the
+                // hub explained itself (a paste past the character cap is
+                // fixable; "hub unreachable" would send the operator hunting for
+                // a network fault). Only if nothing has been typed since.
+                if (draft.value.isBlank()) setDraft(text)
+                val why = sent.exceptionOrNull()?.let { hubErrorMessage(it) }
+                _messages.tryEmit("✗ " + (why ?: "hub unreachable"))
+            }
             container.fleet.nudge()
         }
     }
