@@ -684,6 +684,68 @@ test("render: a URL in an assistant bubble is rendered as a clickable link", () 
   assert.match(html, /<a href="https:\/\/github\.com\/o\/r\/pull\/1" target="_blank" rel="noopener noreferrer">/);
 });
 
+// ---- SendUserFile inline previews (XERK-221) -----------------------------
+function suItems(files, caption) {
+  const block = { t: "tool_use", id: "t1", name: "SendUserFile", input: '{"files":["x"]}' };
+  if (files) block.files = files;
+  if (caption) block.caption = caption;
+  return buildItems([{ id: "a1", role: "assistant", blocks: [block] }]);
+}
+
+test("render: a SendUserFile image renders as an <img>, an SVG gets md-svg", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(suItems([
+    { name: "logo.svg", kind: "image", src: "data:image/svg+xml,%3Csvg%3E%3C/svg%3E" },
+    { name: "shot.png", kind: "image", src: "data:image/png;base64,AAAA" },
+  ])));
+  assert.match(html, /<img class="md-img md-svg" src="data:image\/svg\+xml,[^"]*" alt="logo\.svg"/);
+  assert.match(html, /<img class="md-img" src="data:image\/png;base64,AAAA" alt="shot\.png"/);
+  assert.match(html, /<figcaption>logo\.svg<\/figcaption>/);
+});
+
+test("render: a SendUserFile HTML file renders in a fully sandboxed iframe (srcdoc, esc'd)", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(suItems([
+    { name: "page.html", kind: "html", html: '<h1>Hi</h1><script>alert(1)</script>' },
+  ])));
+  assert.match(html, /<iframe class="md-embed" sandbox referrerpolicy="no-referrer"/);
+  // srcdoc is HTML-escaped, so the <script> is inert data, and sandbox (no
+  // allow-scripts) means it never executes even after the browser decodes it.
+  assert.match(html, /srcdoc="&lt;h1&gt;Hi&lt;\/h1&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;"/);
+  assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
+});
+
+test("render: a non-renderable / missing SendUserFile file is a name chip, not an image", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(suItems([
+    { name: "archive.zip", kind: "file" },
+  ])));
+  assert.match(html, /tool-file file/);
+  assert.match(html, /📎 archive\.zip/);
+  assert.doesNotMatch(html, /<img/);
+});
+
+test("render: an image src limited to data:image/http(s); a hostile scheme is dropped to no <img>", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(suItems([
+    { name: "x", kind: "image", src: "javascript:alert(1)" },
+    { name: "y", kind: "image", src: "https://ex.com/y.png" },
+  ])));
+  assert.doesNotMatch(html, /javascript:alert/);       // hostile scheme never reaches src=
+  assert.match(html, /<img class="md-img" src="https:\/\/ex\.com\/y\.png"/);
+});
+
+test("render: SendUserFile summary shows the caption / file count, not raw input JSON", () => {
+  const withCap = withVerbosity("normal", () => itemsToHtml(suItems(
+    [{ name: "a.svg", kind: "image", src: "data:image/svg+xml,x" }], "three candidates")));
+  assert.match(withCap, /three candidates/);
+  assert.doesNotMatch(withCap, /"files":/);            // raw input JSON suppressed
+  const noCapTwo = withVerbosity("normal", () => itemsToHtml(suItems([
+    { name: "a.svg", kind: "image", src: "data:image/svg+xml,x" },
+    { name: "b.svg", kind: "image", src: "data:image/svg+xml,x" }])));
+  assert.match(noCapTwo, /2 files/);
+  assert.match(withVerbosity("normal", () => itemsToHtml(suItems(
+    [{ name: "a.svg", kind: "file" }]))), /1 file[^s]/);
+  // The caption is rendered in the body too.
+  assert.match(withCap, /tool-caption/);
+});
+
 test("prFooterChip: '' when the session has no PRs", () => {
   assert.equal(prFooterChip(null), "");
   assert.equal(prFooterChip({}), "");
