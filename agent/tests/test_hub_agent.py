@@ -4528,18 +4528,39 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
             ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
         ])
 
-    def test_fallback_clips_to_a_tmux_safe_length(self):
+    def test_fallback_chunks_a_long_message_instead_of_clipping_it(self):
+        # tmux refuses a command line past ~16 KiB, so the fallback types the
+        # text in command-safe chunks — every character arrives, and only the
+        # trailing Enter submits (XERK-227).
         sm = self.make_manager()
         sess = self._running_session(sm)
         self.run_stdin_ok = False
-        sm.send_input(sess["id"], "y" * (ha.SENDKEYS_MAX_CHARS + 500))
-        self.assertEqual(len(self.run_calls[0][-1]), ha.SENDKEYS_MAX_CHARS)
+        text = "".join(chr(97 + i % 26) for i in range(ha.SENDKEYS_MAX_CHARS * 2 + 500))
+        sm.send_input(sess["id"], text)
+        typed = [c[-1] for c in self.run_calls[:-1]]
+        self.assertEqual(len(typed), 3)
+        self.assertEqual("".join(typed), text, "no character may be dropped")
+        self.assertTrue(all(len(t) <= ha.SENDKEYS_MAX_CHARS for t in typed))
+        self.assertEqual(self.run_calls[-1],
+                         ["tmux", "send-keys", "-t", "agent-abcde", "Enter"])
 
-    def test_text_capped_at_input_max_chars(self):
+    def test_message_past_the_cap_is_refused_not_truncated(self):
+        # Half a message is worse than none: the operator cannot tell a
+        # delivered stub from the whole thing, and the hub has already refused
+        # it with an error the composer shows (XERK-227).
         sm = self.make_manager()
         sess = self._running_session(sm)
         with mock.patch.object(ha, "INPUT_MAX_CHARS", 5):
             sm.send_input(sess["id"], "abcdefghij")
+        self.assertEqual(self.run_stdin_calls, [])
+        self.assertEqual(self.run_calls, [])
+        self.assertNotIn("pendingInputs", sess)
+
+    def test_a_message_at_the_cap_still_goes(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        with mock.patch.object(ha, "INPUT_MAX_CHARS", 5):
+            sm.send_input(sess["id"], "abcde")
         self.assertEqual(self.run_stdin_calls[0][1], "abcde")
 
     def test_noop_for_unknown_session(self):
@@ -6737,6 +6758,22 @@ class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
         self.assertTrue(sm.handle_commands(cmds))
         sm.answer_question.assert_called_once_with("s1", -1, None, [0, 2])
         self.assertEqual(sm.acked, {"a2"})
+
+
+class TestInputMaxCharsPayload(ManagerMixin, unittest.TestCase):
+    """The agent tells the hub how long a message it can deliver INTACT
+    (XERK-227). The hub caps a typed message at this; an agent that doesn't
+    report it is assumed to be one that would silently clip at 4k."""
+
+    def test_heartbeat_reports_the_agent_input_cap(self):
+        sm = self.make_manager()
+        payload = sm.build_payload(0)
+        self.assertEqual(payload["inputMaxChars"], ha.INPUT_MAX_CHARS)
+
+    def test_it_follows_the_configured_cap(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "INPUT_MAX_CHARS", 12345):
+            self.assertEqual(sm.build_payload(0)["inputMaxChars"], 12345)
 
 
 class TestHistoryStagingLifecycle(ManagerMixin, unittest.TestCase):

@@ -156,11 +156,11 @@ One agent container per host, multiplexing sessions across every repo it scans.
   `_resume_at_cwd`; the target reporting up (`spawnCmdId` == `importCmdId`) makes `advanceMigrations` KILL
   the source and finish. The Sessions page follows via `migrations`.
 - `_resume_at_cwd` is shared by `resume_transcript` and `import_session`. Hosts may mount `REPOS_ROOT` at
-  DIFFERENT paths, so `import_session` first `_localize_migrated_cwd`s the source's absolute worktree
-  path onto THIS host's `REPOS_ROOT` (the `.turma/worktrees/<repo>/<dir>` tail is mount-independent).
-  Both the unpack slug and the re-created worktree use that local cwd; without the remap a cross-mount
-  move wedges in `importing` forever. The tar extract guards against `..`/absolute members (untrusted —
-  it crosses a host boundary).
+  DIFFERENT paths, so `import_session` first `_localize_migrated_cwd`s the source's worktree path onto
+  THIS host's `REPOS_ROOT` (the `.turma/worktrees/<repo>/<dir>` tail is mount-independent) — both the
+  unpack slug and the re-created worktree use that local cwd, and without the remap a cross-mount move
+  wedges in `importing` forever. The tar extract guards against `..`/absolute members (untrusted — it
+  crosses a host boundary).
 - **A migrated session keeps its PR chips**, re-derived from the transcript rather than carried in the
   command: the per-beat scan PRIMES a resumed transcript's byte offset to EOF, so the `gh pr create`
   events sit past it. `_resume_at_cwd` calls `_seed_prs` once at launch to scan the whole transcript
@@ -195,7 +195,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   session (keeps its id).
 - `resumeTranscript` — resume ANY prior transcript by id. `_resumable_report()` heartbeats each repo's
   resumable list. Tests: `TestResumableReport`, `TestResumeTranscript`, `TestTranscriptCwd`.
-- `input` / `history` / `answerQuestion` — for the glasses client.
+- `input` / `history` / `answerQuestion` — the chat composer + glasses client.
   - `input`/`send_input` puts the message into the session's pane and **guarantees it survives a
     compaction** (XERK-47), which can drop one queued mid-turn: every sent message goes on the record's
     `pendingInputs` outbox, and `_poll_pending_inputs` (every beat, no-op without an outbox) makes it
@@ -206,24 +206,25 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     - it is **re-sent** only when a NEW compaction happened since it was sent (`compactBase` rose) AND
       it's neither, AND the pane has settled to idle (`_pane_busy` False, not None) — that gate makes the
       resend **duplicate-safe**. Bounded: `PENDING_INPUT_MAX_ATTEMPTS` resends, one per beat, aged out at
-      `PENDING_INPUT_TTL_SEC`; `delivered` matches by text with no timestamp filter, biased AGAINST a
-      resend;
-    - the outbox is internal (not heartbeated), cleared on restart-clear-context; a message typed
-      straight into the raw ttyd terminal bypasses `send_input` and isn't covered. Tests:
-      `TestPendingScan`, `TestPollPendingInputs`, `TestSendInput`.
-  - **The message is PASTED, not typed** (`_type_into_pane`, XERK-227): `load-buffer -` +
-    `paste-buffer -d -p` + Enter — `send-keys` carries the text as a tmux command argument, refused past
-    ~16 KiB, so a pasted log never reached the composer though the raw terminal took one. `-p` brackets
-    only for an app that asked (Claude Code does), so **newlines survive as ONE message**; control bytes
-    are stripped (`_clean_input_text`), else one ends the paste early and the rest reads as KEYSTROKES.
-    The 100k `INPUT_MAX_CHARS` caps (agent truncates, hub **413s**) are payload backstops.
-- `interrupt` — sends a single Escape to the tmux pane, cancelling the in-flight generation/tool call
-  with session and conversation intact. Deliberately NOT gated on `paneBusy`. Tests: `TestInterrupt`.
-- **Operator messages are exempt from the `history` window** (XERK-186): the read stays bounded
-  (last 4 MiB + `HISTORY_MAX_MSGS`, capped inside `_history_entries`; callers must not re-slice), but
-  on any cut every user-authored text turn in the whole transcript folds back in ahead of the window
-  (id-deduped, `HISTORY_USER_MSGS` backstop) — tool traffic otherwise evicts them.
-  Tests: `TestHistoryCommand`.
+      `PENDING_INPUT_TTL_SEC`; `delivered` matches by text alone, biased AGAINST a resend;
+    - the outbox is internal (not heartbeated), cleared on restart-clear-context; text typed straight
+      into the raw ttyd terminal bypasses `send_input` and isn't covered. Tests: `TestPendingScan`,
+      `TestPollPendingInputs`, `TestSendInput`.
+  - **PASTED, not typed** (`_type_into_pane`, XERK-227): `load-buffer -` + `paste-buffer -d -p` + Enter
+    — `send-keys` is a tmux command argument, refused past ~16 KiB, which a pasted log exceeds (the raw
+    terminal never had that limit). `-p` brackets only for an app that asked (Claude Code
+    does), so **newlines survive as ONE message**; control bytes are stripped, else one ends the paste
+    and the rest reads as KEYSTROKES. **Nothing truncates silently**: the fallback CHUNKS its send-keys,
+    the agent REFUSES past `INPUT_MAX_CHARS` (100k) and heartbeats it as **`inputMaxChars`**, and the hub
+    caps a message at the receiving host's figure (`inputCapFor`; **4k when unreported** — that agent
+    predates the paste and clips the tail untold), 413ing with `limit` → "Too long — max N".
+- `interrupt` — a single Escape to the pane: cancels the in-flight generation/tool call, session and
+  conversation intact. Deliberately NOT gated on `paneBusy`. Tests: `TestInterrupt`.
+- **Operator messages are exempt from the `history` window** (XERK-186): the read stays bounded (last
+  4 MiB + `HISTORY_MAX_MSGS`, capped inside `_history_entries`; callers must not re-slice), but on any
+  cut every user-authored text turn in the whole transcript folds back in ahead of the window
+  (id-deduped, `HISTORY_USER_MSGS` backstop) — tool traffic otherwise evicts them. Tests:
+  `TestHistoryCommand`.
 - `setSummary` — rename a session; see "Session activity summaries".
 - `setModel` — switch a running session's model live, **for that session only** (XERK-33).
   - `set_model` drives Claude Code's /model picker — clear the input line (C-u), open it, parse rows +
@@ -289,12 +290,12 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - The **shared Claude login's health** (`claudeAuth`, XERK-98) — `claude_auth_status()` reads
   `~/.claude/.credentials.json` (`CLAUDE_CREDS_PATH`) every beat:
   `{present, needsLogin, expiringSoon, expiresAt, refreshExpiresAt, subscriptionType, at}` (epoch ms).
-  The **REFRESH token** (`refreshTokenExpiresAt`) is the signal, NOT the access token: it lapses only
+  The **REFRESH token** is the signal, NOT the access token: it lapses only
   when claude hasn't refreshed inside its ~30-day window, i.e. when a human must `claude /login`.
   `needsLogin` = missing/unreadable file, no `claudeAiOauth`/access token, or a past refresh expiry;
-  `expiringSoon` = within `CLAUDE_AUTH_WARN_MS` (3d; `TURMA_CLAUDE_AUTH_WARN_SEC`). Unknown refresh
+  `expiringSoon` = within `CLAUDE_AUTH_WARN_MS` (3d). Unknown refresh
   expiry reads healthy; a MISSING login can't heartbeat, so it surfaces as the offline alert. Chip via
-  `claudeAuthBadge` (`index.html`) / `🔑` pill (`FleetScreen.kt`). Tests: `TestClaudeAuthStatus`.
+  `claudeAuthBadge` / `🔑` pill (`FleetScreen.kt`). Tests: `TestClaudeAuthStatus`.
 
 #### Live-session signals
 
@@ -440,9 +441,9 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   session where the operator typed only `/model` reads exactly like the models probe (the sanitizer lifts
   such a tombstone).
 - **No real session is excluded.** The one carve-out is the manager's OWN internal `claude -p` helpers
-  (session naming, Jira triage, models probe), which run with `cwd=REGISTRY_DIR` yet write a transcript
+  (naming, triage, models probe), which run with `cwd=REGISTRY_DIR` yet write a transcript
   into the shared `~/.claude/projects` — else the reconciler adopts the agent's overhead as a phantom
-  repo (XERK-27). `_is_internal_tool_slug` recognizes them by the registry dir's own slug, or a
+  repo (XERK-27). `_is_internal_tool_slug` knows them by the registry dir's own slug, or a
   harness's temp slug by `INTERNAL_TOOL_PROMPT_SIGS`; the models probe's prompt is a slash command (which
   `_first_user_text` skips), so it goes by `_first_command_name` = `/model`. Such a slug is
   **tombstoned** (`{internal:true}`), which `repo_usage_report`/`_archive_manifest` skip.
@@ -1574,11 +1575,10 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
   `notifKey` (`question:<host>:<id>`, `review:<host>:<id>`); `dismiss(notifKey)` sends a title-less
   `{action:"dismiss", notifKey}` FCM message (no-op with no device / FCM off), fired once per addressed
   edge: a question cleared, a session leaving Ready-for-review. App-side `Notifications.idFor` keys off
-  `notifKey`, so alert kinds coexist rather than colliding on one per-session id. **Capability-gated**:
-  `dismiss()` reaches only devices declaring `features:["dismiss"]` — an older build would render the
-  data-only message as a blank notification, so it keeps the stale alert instead. `DeviceRequest.features`
-  is **required**, since `encodeDefaults=false` drops a DEFAULTED value and the hub would then retract
-  nothing. Tests: `XERK-154` in `server.test.js`, `DeviceRequestTest.kt`.
+  `notifKey`, so alert kinds coexist instead of colliding on one per-session id. **Capability-gated** to
+  devices declaring `features:["dismiss"]` — an older build renders a data-only message as a blank
+  notification, so it keeps the stale alert; `DeviceRequest.features` is **required**, since
+  `encodeDefaults=false` drops a defaulted value and the hub would retract nothing. Tests: `XERK-154` in `server.test.js`, `DeviceRequestTest.kt`.
 - **Push health is VISIBLE, not just logged** (XERK-152): a hub without `FCM_SERVICE_ACCOUNT_JSON` silently
   delivers ZERO mobile notifications, so `buildAgentsCache` reports hub-wide **`pushEnabled` =
   `push.fcmEnabled()`** on `/api/agents` and the dashboard (`index.html` `#pushWarn`) + Android
@@ -1902,8 +1902,8 @@ Still true: no GitHub Advanced Security, so no code-scanning API — findings li
   into a persisted `summary`. Always on; tuned only by
   `SESSION_SUMMARY_MODEL`/`SESSION_SUMMARY_TIMEOUT_SEC` (45). The claude.ai/code registered name
   (`rcName`) is still fixed at spawn.
-- Tests: `TestCleanSummary`, `TestCleanManualSummary`, `TestSetSummary`, `TestSessionSummaries`,
-  `TestSummaryDue`, `TestFirstUserText`, `TestSeedSummaries`, `server.test.js`, `sessions.test.js`.
+- Tests: `TestCleanSummary`, `TestSetSummary`, `TestSessionSummaries`, `TestSummaryDue`,
+  `TestSeedSummaries`, `server.test.js`, `sessions.test.js`.
 
 #### Naming attempts
 

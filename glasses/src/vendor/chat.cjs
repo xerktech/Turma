@@ -1784,13 +1784,21 @@
     inp.style.height = "auto";
     inp.style.height = Math.min(inp.scrollHeight, 160) + "px";
   }
-  // The hub rejects a message past its own character cap with a 413 (XERK-227).
-  // That is the one send failure the operator can act on — the text is still in
-  // the box, it just has to be split — so it gets its own label instead of the
-  // generic "Send failed", which reads as "the hub is down".
+  // The hub rejects a message past the receiving host's character cap with a 413
+  // (XERK-227). That is the one send failure the operator can act on — the text
+  // is still in the box, it just has to be split — so it gets its own label
+  // instead of the generic "Send failed", which reads as "the hub is down".
+  // The cap is per host (an agent too old to paste takes far less), so the
+  // label carries the hub's `limit` when it sent one: "too long" without a
+  // number leaves the operator guessing how much to cut.
   const TOO_LONG = "Message too long";
-  function sendFailure(status) {
-    return status === 413 ? TOO_LONG : String(status);
+  function sendFailure(status, limit) {
+    if (status !== 413) return String(status);
+    const n = Number(limit);
+    return n > 0 ? `Too long — max ${n.toLocaleString()}` : TOO_LONG;
+  }
+  function isTooLong(msg) {
+    return msg === TOO_LONG || /^Too long — max /.test(msg || "");
   }
   async function send() {
     const inp = $("chatInput");
@@ -1814,12 +1822,15 @@
         body = { text };
       }
       const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-      if (!r.ok) throw new Error(sendFailure(r.status));
+      if (!r.ok) {
+        const err = await r.json().catch(() => null);
+        throw new Error(sendFailure(r.status, err && err.limit));
+      }
       if (typeof fastPoll === "function") fastPoll();
     } catch (e) {
       if (wasAnswer) { answeredQuestion = null; if (sess) updateQuestion(sess); }
       if (!inp.value.trim()) { inp.value = text; autoGrow(); }
-      actionFailed((e && e.message === TOO_LONG) ? TOO_LONG : "Send failed");
+      actionFailed(isTooLong(e && e.message) ? e.message : "Send failed");
     }
   }
 
@@ -1993,7 +2004,9 @@
 
   if (typeof window !== "undefined") {
     window.TurmaChat = { open, close, repaint: repaintPublic, onPoll, renderStatic: openStatic, closeStatic,
-      isBusy, stop, actionFailed };
+      // sendFailure/isTooLong are shared with the terminal composer so the two
+      // compose bars word a refusal identically (XERK-227).
+      isBusy, stop, actionFailed, sendFailure, isTooLong };
     // Global handlers referenced by the chat pane's inline HTML attributes.
     window.autoGrowChatInput = autoGrow;
     // Enter always sends, exactly like the button: a queued message is a
@@ -2015,7 +2028,7 @@
       mergeTail, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll, tick,
-      isBusy, updateComposeAction, isToolBullet, sendFailure, TOO_LONG,
+      isBusy, updateComposeAction, isToolBullet, sendFailure, isTooLong, TOO_LONG,
       // Drive the real `turn`-frame classifier (see applyTurn): the ws onmessage
       // hands it frame.text verbatim, so the flicker tests exercise it directly.
       __applyTurn: (t) => { applyTurn(t); },
