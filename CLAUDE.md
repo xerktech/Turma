@@ -153,11 +153,11 @@ One agent container per host, multiplexing sessions across every repo it scans.
   rides git; uncommitted work stays on the source (KILLED, so resumable).
 - The hub can't touch a worktree and agents are outbound-only, so a migration is composed hub-side from
   agent commands + a hub-brokered relay of the **RAW transcript bytes** (what `claude --resume` needs and
-  the archive lacks): `exportSession` packs the transcript (`+ subagents/`, truncated to its last
-  complete line) and POSTs the gzip-tar to `POST /api/agents/<host>/migrations/<id>/blob`; that queues
-  `importSession` on the target (recording `importCmdId`), which unpacks it under the origin cwd's slug
-  and resumes via `_resume_at_cwd`; the target reporting up (its `spawnCmdId` == `importCmdId`) makes
-  `advanceMigrations` KILL the source and finish. The Sessions page follows via `migrations`.
+  the archive lacks): `exportSession` packs the transcript (`+ subagents/`, truncated to its last complete
+  line) and POSTs the gzip-tar to `POST /api/agents/<host>/migrations/<id>/blob`, queueing `importSession`
+  on the target (recording `importCmdId`), which unpacks it under the origin cwd's slug and resumes via
+  `_resume_at_cwd`; the target reporting up (`spawnCmdId` == `importCmdId`) makes `advanceMigrations` KILL
+  the source and finish. The Sessions page follows via `migrations`.
 - `_resume_at_cwd` is shared by `resume_transcript` and `import_session`. Hosts may mount `REPOS_ROOT` at
   DIFFERENT paths, so `import_session` first `_localize_migrated_cwd`s the source's absolute worktree
   path onto THIS host's `REPOS_ROOT` (the `.turma/worktrees/<repo>/<dir>` tail is mount-independent).
@@ -203,15 +203,14 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     compaction** (XERK-47): an auto-compaction (context ~95%) can drop a message queued mid-turn.
     `send_input` records every sent message on the record's `pendingInputs` outbox, and
     `_poll_pending_inputs` (every beat, no-op unless a session has an outbox) makes it at-least-once:
-    - a compaction is detected from the transcript's own `compact_boundary` **system entry**
-      (`compactMetadata.trigger`) counted by `_pending_scan`, not by scraping the pane;
-    - a message is **reaped on delivery** (`_pending_scan`'s `delivered`) or **left in flight** while
-      still in the folded live queue (`queued`);
+    - a compaction is counted by `_pending_scan` from the transcript's own `compact_boundary` **system
+      entry** (`compactMetadata.trigger`), never by scraping the pane; a message is **reaped on delivery**
+      (`delivered`) or **left in flight** while still in the folded live queue (`queued`);
     - it is **re-sent** only when a NEW compaction happened since it was sent (`compactBase` rose) AND
       it's neither delivered nor queued AND the pane has settled to idle (`_pane_busy` False, not None)
-      — that gate makes the resend **duplicate-safe**;
-    - bounded: `PENDING_INPUT_MAX_ATTEMPTS` resends, one per beat, aged out at `PENDING_INPUT_TTL_SEC`;
-    - `delivered` matches by text with no timestamp filter, biased AGAINST a resend.
+      — that gate makes the resend **duplicate-safe**. Bounded: `PENDING_INPUT_MAX_ATTEMPTS` resends, one
+      per beat, aged out at `PENDING_INPUT_TTL_SEC`; `delivered` matches by text with no timestamp
+      filter, biased AGAINST a resend.
     - The outbox is internal (not heartbeated), cleared on restart-clear-context. The raw ttyd terminal
       bypasses `send_input`, so a message typed straight into it isn't covered.
     - Tests: `TestPendingScan`, `TestPollPendingInputs`, `TestSendInput`.
@@ -378,18 +377,20 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   `_poll_pr_comments` runs on the PR cadence, for **running sessions only**, over their OWN PRs
   (`session_pr_urls`), through **`send_input`** — inheriting the compaction-survival outbox (XERK-47) and
   the queue if a turn is in flight.
-- `_pr_comment_events(url, self_login)` gathers **three channels** — conversation comments + review
-  bodies (`gh pr view --json comments,reviews`) + inline review-thread comments
-  (`gh api .../pulls/<n>/comments`); an MR's one notes call covers all three (`_mr_comment_events`, system
-  notes dropped). A bare approve is dropped; each event normalizes to `{key, author, body, kind, loc,
-  is_self}`, keyed on a stable id.
+- `_pr_comment_events(url, self_login)` gathers **three channels** — conversation comments, review bodies
+  and inline review-thread comments (an MR's one notes call covers all three, system notes dropped); a
+  bare approve is dropped.
 - **Baseline-on-first-sight, then deliver only new + not-self.** A PR's whole comment set is recorded
   silently the first beat it's seen (`prCommentBase`, capped `PR_COMMENTS_SEEN_MAX`); after that only NEW
-  keys not the agent's own (`viewerDidAuthor`, else a login compare) are typed in.
-- Bounded: `PR_COMMENTS_MAX` PRs per beat, gated per-URL like the status sweep; a fetch failure (→ None)
-  leaves the baseline UNTOUCHED. Disable with `TURMA_PR_COMMENTS=0`. Only the OPENING session receives
-  it, only while running.
-- Tests: `TestPrCommentEvents`, `TestPrCommentMessage`, `TestPollPrComments`.
+  keys not the agent's own (`viewerDidAuthor`, else a login compare) are typed in. Bounded at
+  `PR_COMMENTS_MAX` PRs per beat; a fetch failure (→ None) leaves the baseline UNTOUCHED. Disable with
+  `TURMA_PR_COMMENTS=0`.
+- **A conflicting PR is fixed by the session that opened it, unasked** (XERK-223): `_poll_pr_conflicts`
+  types `_pr_conflict_message` (MERGE `origin/<base>`, never a rebase/force-push) off the `mergeable`
+  `refresh_pr_status` just cached. `prConflicts` = `{url:{at,attempts}}` bounds the nudging per PR;
+  MERGEABLE/closed clears and re-arms it, **UNKNOWN does neither** — that is what a just-pushed fix looks
+  like, so clearing on it would grant unlimited retries. `TURMA_PR_CONFLICTS=0`.
+- Tests: `TestPrComment*`, `TestPollPrComments`, `TestPollPrConflicts`, `TestPrConflictMessage`.
 
 ### Expected-restart "updating" status (XERK-29)
 
@@ -684,7 +685,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     `TURMA_TOKEN`/`JIRA_TOKEN`).
 - The tunnel is **supervised** here, re-exec'd as `turma-agent --tunnel-supervisor` (a respawn loop),
   because a native install is the only place its runtime can be MISSING — node is an apt prereq, not a
-  baked layer. (The container has its own simpler respawn loop in `entrypoint.sh`, XERK-34.)
+  baked layer. (The container has its own simpler respawn loop in `entrypoint.sh`, XERK-34; tests
+  `test_entrypoint.sh`.)
   - The node check lives INSIDE the loop, so installing node heals the terminals (`terminalOnline`)
     within one `TUNNEL_RETRY_SEC`; fire-and-forget makes a missing node silent AND permanent.
   - The supervisor's pkill key is PREFIX-scoped like `tunnel-agent.js`'s; the launcher reaps the
@@ -733,8 +735,6 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     and card Uptime working natively. The log tail stays container-only.
   - **native**: the bundled tmux.conf only takes effect at `/etc/tmux.conf`/`~/.tmux.conf`; a host with
     its own conf loses truecolor and the OSC 52 copy chain (hub-agent launches bare `tmux`).
-  - The tunnel is supervised on BOTH sides (natively by `--tunnel-supervisor`, in the container by the
-    `entrypoint.sh` respawn loop). Tests: `test_entrypoint.sh`.
 - Nothing under `native/` edits the shared runtime files; the one enabling change is `resume_on_boot`'s
   adopt path.
 
@@ -1422,9 +1422,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   channels an over-but-resumable session arrives on: **killed** (`a.closedSessions`), **stopped** (a
   non-running record still in `a.sessions`), and **resumable** (a transcript from each repo's `resumable`
   scan, no registry record behind it).
-- The third channel makes the list **durable**: the first two read out of `~/.turma` and `closed.json` is
-  capped at `CLOSED_PER_REPO`, while `resumable` is re-derived every slow beat from the transcripts under
-  `~/.claude/projects` plus each's recorded cwd.
+- The third channel makes the list **durable**: the first two read the capped `~/.turma` records, while
+  `resumable` is re-derived every slow beat from the transcripts under `~/.claude/projects`.
 - **Deduped on `<host>::<transcriptId>`**, a registry-backed record always winning. A kill that ages out
   of `closed.json` keeps listing, minus its PR chips. Sorted **most recently ended first** (`endedMs`,
   from `closedAt`/`stoppedAt`/`endedTs` — `resumableSession()` must copy `endedTs` onto the record, where
@@ -1540,15 +1539,15 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 ### Notifications
 
-- The hub pushes edge-triggered alerts to the **Android client via FCM**, the sole transport:
-  host offline/recovered, restart loop, per-session turn finished / question
-  waiting / PR created, and Claude login required/expiring/restored.
+- The hub pushes edge-triggered alerts to the **Android client via FCM**, the sole transport: host
+  offline/recovered, restart loop, per-session turn finished / question waiting / PR created, and Claude
+  login required/expiring/restored.
 - **A PR alert waits for that PR's CI to go green** (XERK-153) — never fire on the URL being scraped.
   A new URL enters a per-session wait list (`alerts.sessions[id].prWait`) that `prAlertDecision` re-judges
   each beat against `session.prs`; `prSeen` keeps its old meaning (already alerted), so an older hub's PRs
   don't re-fire on upgrade.
-  - The gate is the **CI rollup alone** (`checks`), not the `ready` verdict — a green PR that conflicts
-    still alerts.
+  - **A CONFLICTING open PR never alerts** (XERK-223): it merges nowhere however green its CI is, so the
+    hold outlasts the age-out (known-bad, not unknown) and lifts when the session resolves the conflict.
   - **`failing` stays quiet, permanently** (sticky `w.red`): the alert is for the PR being ready, not for
     every round trip through red.
   - **Absent `checks` means "not fetched yet", never "no CI"** → hold. A fetched `checks: null` IS a
@@ -1567,32 +1566,31 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   repo or CI-built release APKs ship with Firebase inert and push does nothing. It holds only public
   identifiers (same as the committed release keystore); the gradle apply stays conditional so a fork that
   removes it still builds.
-- Every alert funnels through one `notify()` (`turma/server.js`), fanning out to every registered device
-  via `turma/push.js` (HTTP v1, service-account JWT minted with `node:crypto`, no npm — enabled by
-  `FCM_SERVICE_ACCOUNT_JSON`), carrying `tags`/`priority`/`click`/`route:{host,sessionId}` as message data
-  so the client picks a channel and deep-links a tap. A no-op when no device is registered or FCM is
-  unconfigured. Devices register via `POST /api/devices` (user-authed, persisted to
-  `/data/devices.json`), unregister via `DELETE /api/devices?token=`; dead tokens are pruned on send.
+- Every alert funnels through one `notify()` (`turma/server.js`), fanning out via `turma/push.js` (FCM
+  HTTP v1, service-account JWT minted with `node:crypto`, no npm — enabled by `FCM_SERVICE_ACCOUNT_JSON`)
+  and carrying `tags`/`priority`/`click`/`route:{host,sessionId}` as message data, so the client picks a
+  channel and deep-links a tap. A no-op with no device registered or FCM off. Devices register via
+  `POST /api/devices` (user-authed, `/data/devices.json`), unregister via `DELETE /api/devices?token=`;
+  dead tokens are pruned on send.
 - **An addressed alert is retracted from the phone** (XERK-154): every session alert posts under a stable
   `notifKey` (`question:<host>:<id>`, `pr:<url>`, `turn:<host>:<id>`); `dismiss(notifKey)` sends a
-  title-less `{action:"dismiss", notifKey}` FCM message (no-op with no device / FCM off). `heartbeatAlerts`
-  fires it once per addressed edge: a question cleared, a PR reaching MERGED/CLOSED (over `sa.prSeen` via
-  `prStatus`, deduped by `sa.prDismissed`), a turn the operator replied to (`sa.turnAlerted` + idle→working).
-  App-side `Notifications.idFor` keys the notification off `notifKey`, so alert kinds coexist instead of
-  colliding on one per-session id, and a dismiss cancels the exact one. **Capability-gated**: `dismiss()`
-  reaches only devices that declared `features:["dismiss"]` — an older build has no handler and would show
-  the data-only message as a blank notification (withheld devices keep the stale alert until the app
-  updates). The app sends it via a **required** `DeviceRequest.features` field — `encodeDefaults=false`
-  drops a DEFAULTED value from the body, so the hub would retract nothing. Tests: `XERK-154` in
-  `server.test.js`, `DeviceRequestTest.kt`.
+  title-less `{action:"dismiss", notifKey}` FCM message (no-op with no device / FCM off), fired once per
+  addressed edge: a question cleared, a PR reaching MERGED/CLOSED (over `sa.prSeen` via `prStatus`,
+  deduped by `sa.prDismissed`), a turn the operator replied to (`sa.turnAlerted` + idle→working).
+  App-side `Notifications.idFor` keys off `notifKey`, so alert kinds coexist rather than colliding on one
+  per-session id. **Capability-gated**: `dismiss()` reaches only devices declaring `features:["dismiss"]`
+  — an older build would render the data-only message as a blank notification, so it keeps the stale
+  alert instead. `DeviceRequest.features` is **required**, since `encodeDefaults=false` drops a DEFAULTED
+  value and the hub would then retract nothing. Tests: `XERK-154` in `server.test.js`,
+  `DeviceRequestTest.kt`.
 - The Android client owns the delivery half: `POST_NOTIFICATIONS`, the Android-13+ runtime request in
   `MainActivity`, channels + rendering in `push/Notifications.kt`, `push/PushRegistrar.kt`.
-- **Push health is VISIBLE, not just logged** (XERK-152): a hub without `FCM_SERVICE_ACCOUNT_JSON` delivers
-  ZERO mobile notifications silently. `buildAgentsCache` reports hub-wide **`pushEnabled` =
-  `push.fcmEnabled()`** on `/api/agents`; the dashboard (`index.html` `#pushWarn`) and Android
-  (`FleetScreen` `PushOffBanner`, `FleetState.pushEnabled`) show a "mobile push is off" banner when it's
-  false (strict `=== false`, so an older hub never false-alarms). The key is deployment config, not in
-  this repo. Tests: `push.test.js`, the `pushEnabled` case in `server.test.js`.
+- **Push health is VISIBLE, not just logged** (XERK-152): a hub without `FCM_SERVICE_ACCOUNT_JSON` silently
+  delivers ZERO mobile notifications, so `buildAgentsCache` reports hub-wide **`pushEnabled` =
+  `push.fcmEnabled()`** on `/api/agents` and the dashboard (`index.html` `#pushWarn`) + Android
+  (`FleetScreen` `PushOffBanner`, `FleetState.pushEnabled`) banner "mobile push is off" on it — strict
+  `=== false`, so an older hub never false-alarms. The key is deployment config, not in this repo.
+  Tests: `push.test.js`, the `pushEnabled` case in `server.test.js`.
 
 ### Auth and the glasses surface
 

@@ -1568,6 +1568,18 @@ PR_COMMENTS_MAX = 20               # PRs polled per beat, like PR_STATUS_MAX
 PR_COMMENTS_SEEN_MAX = 500         # per-PR seen-key ceiling (newest kept)
 PR_COMMENTS_BODY_CAP = 1200        # per-comment body chars folded into the message
 
+# Merge-conflict auto-resolution (XERK-223): a PR whose branch conflicts with
+# its base merges nowhere, and the session that opened it is the one thing on
+# this host that can fix it. The conflict is already known — refresh_pr_status
+# fetches `mergeable` every PR beat — so this costs no extra network call, only
+# a message typed into the authoring session. Disable with =0.
+PR_CONFLICT_RESOLVE = os.environ.get("TURMA_PR_CONFLICTS", "1") != "0"
+# Bounded nudging: a session that tried and failed must not be told the same
+# thing every beat forever, and one that ignored the first message deserves more
+# than one chance. Spaced, and capped per conflict episode.
+PR_CONFLICT_MAX_ATTEMPTS = int(os.environ.get("TURMA_PR_CONFLICT_ATTEMPTS", "3"))
+PR_CONFLICT_RETRY_SEC = int(os.environ.get("TURMA_PR_CONFLICT_RETRY_SEC", "1800"))
+
 
 def _check_class(entry):
     """Map one `statusCheckRollup` entry to 'pass' | 'fail' | 'pending' | None.
@@ -1626,7 +1638,11 @@ def _summarize_pr(data):
     """Condense `gh pr view --json …` output to the compact status the hub cards
     render: number, title, state (OPEN/DRAFT/MERGED/CLOSED), a CI-check rollup
     ('passing'/'failing'/'pending'/None) with per-bucket counts, GitHub's raw
-    mergeability, and the merge-readiness verdict the two combine into."""
+    mergeability, and the merge-readiness verdict the two combine into.
+
+    `base` (the PR's target branch) rides along for the conflict nudge
+    (XERK-223), which has to name the branch to merge in; no renderer reads
+    it."""
     state = str(data.get("state") or "").upper()  # OPEN / MERGED / CLOSED
     draft = bool(data.get("isDraft"))
     counts = {"pass": 0, "fail": 0, "pending": 0}
@@ -1654,6 +1670,7 @@ def _summarize_pr(data):
         "checkCounts": counts if total else None,
         "mergeable": mergeable,
         "ready": _merge_ready(state, checks, mergeable),
+        "base": data.get("baseRefName") or None,
     }
 
 
@@ -1667,7 +1684,8 @@ def pr_status(url):
     if MR_URL_RE.match(str(url or "")):
         return mr_status(url)
     raw = run(["gh", "pr", "view", url, "--json",
-               "number,title,state,isDraft,url,statusCheckRollup,mergeable"])
+               "number,title,state,isDraft,url,statusCheckRollup,mergeable,"
+               "baseRefName"])
     if not raw:
         return None
     try:
@@ -1755,6 +1773,7 @@ def _summarize_mr(data):
         "checkCounts": counts if total else None,
         "mergeable": mergeable,
         "ready": _merge_ready(state, checks, mergeable),
+        "base": data.get("target_branch") or None,
     }
 
 
@@ -1946,6 +1965,36 @@ def _pr_comment_message(url, events):
         body = " ".join(str(e.get("body") or "").split())[:PR_COMMENTS_BODY_CAP]
         parts.append(f"[{who} — {tag}] {body}")
     return "  ".join(parts)
+
+
+def _pr_conflict_message(url, base, again=False):
+    """The message typed into the authoring session when its own PR/MR stops
+    being mergeable (XERK-223).
+
+    It asks for a MERGE of the base branch, never a rebase: a merge lands with
+    an ordinary `git push`, while a rebase rewrites the branch and needs a force
+    push — more ways to lose work, for no gain on a branch that is about to be
+    squashed anyway. The base branch is named when we know it (`base`, off the
+    PR status) so the agent doesn't have to guess which branch to merge.
+
+    Deliberately says what to achieve and leaves the how to the session: it is
+    the only thing on this host that knows what the conflicting code MEANS."""
+    m = PR_URL_PARTS_RE.search(url or "")
+    mm = MR_URL_IID_RE.search(url or "") if not m else None
+    num = f"#{m.group(3)}" if m else f"!{mm.group(1)}" if mm else ""
+    what = "MR" if mm else "PR"
+    into = f"origin/{base}" if base else "the base branch (see the PR)"
+    lead = ("still has merge conflicts" if again else "has merge conflicts")
+    return (
+        f"The {what} {num} you opened ({url}) {lead} with its base branch and "
+        f"cannot be merged. Resolve them in this session now, without being "
+        f"asked again: git fetch origin, merge {into} into the {what}'s branch, "
+        f"resolve every conflict on its merits (keep both sides' intent — do "
+        f"not discard someone else's work to make the merge trivial), make sure "
+        f"the build and tests still pass, then commit and push so the {what} "
+        f"goes back to mergeable. Do not rebase or force-push the branch, and "
+        f"do not merge the {what} itself. If a conflict genuinely needs a human "
+        f"decision, say so on the {what} instead of guessing.")
 
 
 LOG_TAIL_LINES = 50
@@ -10135,6 +10184,82 @@ class SessionManager:
                 sess["prCommentBase"] = base
                 self.save()
 
+    def _poll_pr_conflicts(self):
+        """Tell a running session to resolve the merge conflicts on its OWN PR,
+        without an operator relaying it (XERK-223).
+
+        Runs straight off the status the PR sweep just refreshed
+        (`pr_status_cache`), so it costs no network call of its own: the
+        conflict is already known the moment a card can render it. Delivery is
+        send_input, so it inherits the compose path exactly like an operator
+        typing the fix request by hand — the compaction-survival outbox
+        (XERK-47) and the queue when a turn is in flight.
+
+        Per (session, PR) episode bookkeeping lives on the record as
+        `prConflicts` = {url: {at, attempts}}:
+
+          - CONFLICTING on an OPEN/DRAFT PR arms the episode. The first sighting
+            nudges; later beats re-nudge only past PR_CONFLICT_RETRY_SEC and
+            only while attempts remain, so a session that tried and failed isn't
+            told the same thing every beat.
+          - MERGEABLE, or a PR that is no longer open, CLEARS the episode — the
+            conflict is proven gone, and a conflict that comes back later gets a
+            fresh budget.
+          - UNKNOWN clears nothing and nudges nothing. Mergeability is computed
+            lazily server-side, so UNKNOWN is what a just-pushed resolution
+            looks like while GitHub recomputes; treating it as resolved would
+            hand a still-conflicted PR an unbounded supply of retries.
+
+        Only RUNNING sessions: a nudge is a message typed into a live TUI, and
+        there is nobody to receive it otherwise (an ended session's conflicting
+        PR stays for a human, same scope as PR-comment delivery)."""
+        if not PR_CONFLICT_RESOLVE:
+            return
+        now = time.time()
+        for sess in self.registry:
+            if sess.get("status") != "running":
+                continue
+            urls = self.session_pr_urls.get(sess["id"]) or []
+            if not urls:
+                continue
+            eps = sess.get("prConflicts")
+            if not isinstance(eps, dict):
+                eps = {}
+            changed = False
+            for url in urls:
+                st = self.pr_status_cache.get(url) or {}
+                mergeable = st.get("mergeable")
+                open_ = st.get("state") in ("OPEN", "DRAFT")
+                if not open_ or mergeable == "MERGEABLE":
+                    if eps.pop(url, None) is not None:
+                        changed = True          # resolved (or landed): re-arm
+                    continue
+                if mergeable != "CONFLICTING":
+                    continue                    # UNKNOWN / not fetched yet
+                ep = eps.get(url) or {"attempts": 0, "at": 0}
+                attempts = int(ep.get("attempts") or 0)
+                if attempts >= PR_CONFLICT_MAX_ATTEMPTS:
+                    continue
+                if attempts and now - float(ep.get("at") or 0) < PR_CONFLICT_RETRY_SEC:
+                    continue
+                msg = _pr_conflict_message(url, st.get("base"), again=bool(attempts))
+                eps[url] = {"attempts": attempts + 1, "at": now}
+                changed = True
+                log(f"pr conflict: nudging {sess['id']} to resolve {url} "
+                    f"(attempt {attempts + 1})")
+                self.send_input(sess["id"], msg)
+            # Drop episodes for PRs this session no longer owns, so the record
+            # can't accumulate them for the life of a long session.
+            for stale in [u for u in eps if u not in urls]:
+                del eps[stale]
+                changed = True
+            if changed:
+                if eps:
+                    sess["prConflicts"] = eps
+                else:
+                    sess.pop("prConflicts", None)
+                self.save()
+
     def clone(self, repo_spec, source=None):
         """Clone a repo into REPOS_ROOT so it joins the scanned repo list.
 
@@ -11566,6 +11691,14 @@ class SessionManager:
                 self.refresh_pr_status()
             except Exception as e:
                 log(f"pr status refresh failed: {e}")
+            # A PR that just came back CONFLICTING is told to the session that
+            # opened it (XERK-223) — same beat, off the status we just fetched,
+            # so no extra call. Wrapped separately: a nudge failing must not
+            # cost the refresh above, nor take the host's sessions down.
+            try:
+                self._poll_pr_conflicts()
+            except Exception as e:
+                log(f"pr conflict poll failed: {e}")
         # New review activity on a session's PR is typed back into that session
         # so a reply asking for corrections continues the work (XERK-49). Own
         # cadence + per-beat cap; wrapped, because a PR comment is never worth

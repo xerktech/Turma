@@ -682,6 +682,28 @@ test("alerts: a PR with no CI fires on its own, once the empty rollup holds", ()
   assert.match(notifications[0].body, /No CI configured/);
 });
 
+test("alerts: a conflicting PR stays quiet until the conflict is resolved (XERK-223)", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  notifications.length = 0;
+  beat(prBeat([PR_URL]), t0);
+  // Green CI, but the branch conflicts with its base: it merges nowhere, so
+  // "created a PR / all checks passed" would be a lie.
+  const conflicted = { url: PR_URL, state: "OPEN", checks: "passing", mergeable: "CONFLICTING",
+    ready: "blocked" };
+  beat(prBeat([], [conflicted]), t0 + MIN);
+  assert.deepEqual(titles(), []);
+  // Not even past the age-out backstop — this state is known-bad, not unknown.
+  beat(prBeat([], [conflicted]), t0 + 40 * MIN);
+  assert.deepEqual(titles(), []);
+  // The session resolves it (the agent nudges itself to, _poll_pr_conflicts);
+  // GitHub recomputes, and the alert lands.
+  beat(prBeat([], [{ url: PR_URL, state: "OPEN", checks: "passing", mergeable: "MERGEABLE",
+    ready: "ready" }]), t0 + 41 * MIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.match(notifications[0].body, /All checks passed/);
+});
+
 test("alerts: an empty rollup that turns into real checks isn't 'no CI'", () => {
   const beat = makeHost();
   const t0 = Date.now();
@@ -786,6 +808,36 @@ test("prAlertDecision: the verdict table, and its sticky markers", () => {
   assert.equal(prAlertDecision(red, { url: PR_URL, checks: "pending" }, now + 60 * MIN), null);
   // An unresolved wait ages out instead of being lost.
   assert.equal(prAlertDecision({ at: now }, undefined, now + 31 * MIN), "CI state unknown");
+});
+
+test("prAlertDecision: an open PR with merge conflicts never reads as ready (XERK-223)", () => {
+  const now = Date.now();
+  const open = (extra) => ({ url: PR_URL, state: "OPEN", ...extra });
+  const conflict = { mergeable: "CONFLICTING" };
+  // Green CI on a conflicting PR is exactly the alert the ticket forbids.
+  assert.equal(prAlertDecision({ at: now }, open({ checks: "passing", ...conflict }), now), null);
+  assert.equal(prAlertDecision({ at: now }, open({ checks: null, ...conflict }), now), null);
+  assert.equal(prAlertDecision(
+    { at: now }, { url: PR_URL, state: "DRAFT", checks: "passing", ...conflict }, now), null);
+  // And it outranks the age-out backstop: the state is known-bad, not unknown.
+  assert.equal(prAlertDecision({ at: now }, open({ checks: "passing", ...conflict }), now + 60 * MIN),
+    null);
+  // The hold is not sticky — resolving the conflict lets the alert through.
+  const w = { at: now };
+  assert.equal(prAlertDecision(w, open({ checks: "passing", ...conflict }), now), null);
+  assert.equal(prAlertDecision(w, open({ checks: "passing", mergeable: "MERGEABLE" }), now),
+    "All checks passed");
+  // A conflict on a PR that already landed says nothing about mergeability.
+  assert.equal(prAlertDecision(
+    { at: now }, { url: PR_URL, state: "MERGED", checks: "passing", ...conflict }, now),
+    "All checks passed");
+  // A failing PR that also conflicts still records the sticky red marker.
+  const red = { at: now };
+  assert.equal(prAlertDecision(red, open({ checks: "failing", ...conflict }), now), null);
+  assert.equal(red.red, true);
+  // An agent too old to report mergeability is unaffected.
+  assert.equal(prAlertDecision({ at: now }, { url: PR_URL, checks: "passing" }, now),
+    "All checks passed");
 });
 
 test("alerts: turn finished fires on the working->idle edge only", () => {

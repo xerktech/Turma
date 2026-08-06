@@ -4951,6 +4951,156 @@ class TestPollPrComments(ManagerMixin, unittest.TestCase):
         self.assertIn("knew", sess["prCommentBase"][self.URL])
 
 
+class TestPrConflictMessage(unittest.TestCase):
+    """_pr_conflict_message names the PR and the branch to merge, and asks for
+    a merge rather than a rebase (XERK-223)."""
+
+    URL = "https://github.com/o/r/pull/7"
+
+    def test_names_the_pr_and_its_base(self):
+        msg = ha._pr_conflict_message(self.URL, "main")
+        self.assertIn("#7", msg)
+        self.assertIn(self.URL, msg)
+        self.assertIn("origin/main", msg)
+        self.assertIn("merge conflicts", msg)
+
+    def test_asks_for_a_merge_not_a_rebase_or_a_pr_merge(self):
+        msg = ha._pr_conflict_message(self.URL, "main")
+        self.assertIn("Do not rebase or force-push", msg)
+        self.assertIn("do not merge the PR itself", msg)
+
+    def test_unknown_base_still_reads(self):
+        msg = ha._pr_conflict_message(self.URL, None)
+        self.assertNotIn("origin/None", msg)
+        self.assertIn("base branch", msg)
+
+    def test_repeat_says_still(self):
+        self.assertIn("still has merge conflicts",
+                      ha._pr_conflict_message(self.URL, "main", again=True))
+
+    def test_gitlab_mr_speaks_mr(self):
+        msg = ha._pr_conflict_message(
+            "https://gitlab.com/g/p/-/merge_requests/4", "trunk")
+        self.assertIn("!4", msg)
+        self.assertIn("The MR", msg)
+        self.assertNotIn("PR", msg)
+
+
+class TestPollPrConflicts(ManagerMixin, unittest.TestCase):
+    """_poll_pr_conflicts types a resolve-the-conflicts message into the running
+    session that opened a now-unmergeable PR, once per conflict episode
+    (XERK-223)."""
+
+    URL = "https://github.com/o/r/pull/7"
+
+    def make_manager(self):
+        sm = super().make_manager()
+        sm.github = {"available": True, "login": "botlogin", "repos": []}
+        self.run_calls.clear()
+        return sm
+
+    def _session(self, sm, **status):
+        sess = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+                "worktreePath": os.path.join(self.tmp, "wt"), "summary": "work"}
+        sm.registry = [sess]
+        sm.session_pr_urls = {"s1": [self.URL]}
+        sm.pr_status_cache = {self.URL: dict(
+            {"url": self.URL, "state": "OPEN", "mergeable": "CONFLICTING",
+             "checks": "passing", "base": "main"}, **status)}
+        return sess
+
+    def _typed(self):
+        return [c[-1] for c in self.run_calls
+                if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+
+    def test_conflict_is_delivered_once_per_episode(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sm._poll_pr_conflicts()
+        self.assertEqual(len(self._typed()), 1)
+        self.assertIn("origin/main", self._typed()[0])
+        self.assertEqual(sess["prConflicts"][self.URL]["attempts"], 1)
+        sm._poll_pr_conflicts()                    # next beat, still conflicting
+        self.assertEqual(len(self._typed()), 1)    # not re-typed
+
+    def test_mergeable_clears_the_episode_and_rearms(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sm._poll_pr_conflicts()
+        sm.pr_status_cache[self.URL]["mergeable"] = "MERGEABLE"
+        sm._poll_pr_conflicts()
+        self.assertNotIn("prConflicts", sess)
+        sm.pr_status_cache[self.URL]["mergeable"] = "CONFLICTING"
+        sm._poll_pr_conflicts()                    # conflicts again -> nudged again
+        self.assertEqual(len(self._typed()), 2)
+
+    def test_unknown_neither_nudges_nor_clears(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sm._poll_pr_conflicts()
+        sm.pr_status_cache[self.URL]["mergeable"] = "UNKNOWN"
+        sm._poll_pr_conflicts()
+        self.assertEqual(len(self._typed()), 1)
+        # The episode is still armed: a push that didn't resolve it must not get
+        # a fresh retry budget just because GitHub is recomputing.
+        self.assertEqual(sess["prConflicts"][self.URL]["attempts"], 1)
+
+    def test_retries_are_spaced_and_bounded(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        for _ in range(ha.PR_CONFLICT_MAX_ATTEMPTS + 2):
+            sm._poll_pr_conflicts()
+            ep = sess.get("prConflicts", {}).get(self.URL)
+            if ep:
+                ep["at"] = 0                       # age past the backoff
+        self.assertEqual(len(self._typed()), ha.PR_CONFLICT_MAX_ATTEMPTS)
+        self.assertIn("still has merge conflicts", self._typed()[1])
+
+    def test_backoff_holds_a_second_nudge(self):
+        sm = self.make_manager()
+        self._session(sm)
+        sm._poll_pr_conflicts()
+        sm._poll_pr_conflicts()                    # within PR_CONFLICT_RETRY_SEC
+        self.assertEqual(len(self._typed()), 1)
+
+    def test_merged_pr_is_left_alone(self):
+        sm = self.make_manager()
+        sess = self._session(sm, state="MERGED")
+        sm._poll_pr_conflicts()
+        self.assertEqual(self._typed(), [])
+        self.assertNotIn("prConflicts", sess)
+
+    def test_stopped_session_is_skipped(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["status"] = "stopped"
+        sm._poll_pr_conflicts()
+        self.assertEqual(self._typed(), [])
+
+    def test_unfetched_status_does_nothing(self):
+        sm = self.make_manager()
+        self._session(sm)
+        sm.pr_status_cache = {}                    # no status yet this beat
+        sm._poll_pr_conflicts()
+        self.assertEqual(self._typed(), [])
+
+    def test_episode_for_a_dropped_pr_is_forgotten(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sm._poll_pr_conflicts()
+        sm.session_pr_urls["s1"] = ["https://github.com/o/r/pull/9"]
+        sm.pr_status_cache = {}
+        sm._poll_pr_conflicts()
+        self.assertNotIn("prConflicts", sess)
+
+    def test_disabled_by_env_flag(self):
+        sm = self.make_manager()
+        self._session(sm)
+        with mock.patch.object(ha, "PR_CONFLICT_RESOLVE", False):
+            sm._poll_pr_conflicts()
+        self.assertEqual(self._typed(), [])
+
+
 # Verbatim `tmux capture-pane -p` output from a live Claude Code 2.1.220
 # session, trimmed to the dialog region — the two blocking dialogs
 # parse_pane_prompt exists to read. Kept as real captures rather than

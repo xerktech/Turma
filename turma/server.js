@@ -1463,11 +1463,21 @@ function sessionWorking(session, lastSeen, now) {
 //     then fire regardless — the wait is meant to delay the alert, not to lose
 //     it to a host whose `gh` can't answer.
 //
+// One more state outranks all of those: an open PR GitHub says is CONFLICTING
+// merges nowhere however green its CI is, so no alert may claim it is ready
+// (XERK-223). It holds — including past the age-out backstop, which exists for
+// an UNKNOWABLE state, not a known-bad one — and unlike `failing` the hold is
+// NOT sticky: the authoring session is nudged to resolve the conflict
+// (_poll_pr_conflicts), and once it has, this PR alerts like any other.
+//
 // Returns the body prefix to send, or null to keep holding. Mutates `w`.
 function prAlertDecision(w, status, now) {
   const known = !!status && "checks" in status;
   const checks = known ? status.checks : undefined;
+  const open = status?.state === "OPEN" || status?.state === "DRAFT";
+  const conflicted = open && status?.mergeable === "CONFLICTING";
   if (checks === "failing") w.red = true;
+  if (conflicted) return null;
   if (checks === "passing") return "All checks passed";
   if (known && checks == null) {
     w.noCiAt = w.noCiAt || now;
