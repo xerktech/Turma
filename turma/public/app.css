@@ -159,6 +159,9 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 .org-btn.scoped { color: var(--accent); border-color: var(--accent); font-weight: 600; }
 .org-btn .org-dot { display: none; }
 .org-btn.scoped .org-dot { display: block; width: 9px; height: 9px; border-radius: 50%; background: var(--org); flex: none; }
+/* Multi-select (XERK-222): one dot per selected org — pull the dots after the
+   first back so they read as a compact cluster, not a row of gapped beads. */
+.org-btn.scoped .org-dot + .org-dot { margin-left: -4px; }
 .org-btn .org-chev { color: var(--muted); font-size: 10px; }
 /* The menu. Right-aligned under the button (on desktop the button sits at the
    right edge of the header row, so a left-aligned panel would hang off-screen).

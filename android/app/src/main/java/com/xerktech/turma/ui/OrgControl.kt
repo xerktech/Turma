@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -40,7 +41,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.BoardSite
 import com.xerktech.turma.core.ageStr
 import com.xerktech.turma.core.autoStartOn
-import com.xerktech.turma.core.effectiveOrg
+import com.xerktech.turma.core.effectiveOrgs
 import com.xerktech.turma.core.mergeSites
 import com.xerktech.turma.core.orgColorMap
 import com.xerktech.turma.core.orgName
@@ -59,6 +60,12 @@ import com.xerktech.turma.vm.OrgViewModel
  * of divided pills — on a phone a chip strip in the header would crowd out the
  * title, and a menu row has room for the ticket count, the offline note and the
  * per-org auto-start switch the board chips used to carry (XERK-41).
+ *
+ * Multi-select (XERK-222): each org row toggles its org in and out of the
+ * selection and stays checked while it's in — the menu stays open across
+ * toggles so several orgs can be picked in one visit; "All orgs" clears the
+ * selection and closes. The button shows one dot per selected org, and a count
+ * once more than one is selected.
  *
  * Nothing to scope by until some host reports a tracker org, so with no orgs it
  * renders nothing at all (the web's slot collapses the same way) rather than
@@ -80,8 +87,8 @@ fun OrgFilterAction(vm: OrgViewModel = viewModel()) {
     val colorMap = remember(sites, fleet.orgColors) {
         orgColorMap(sites.map { it.siteKey }, fleet.orgColors)
     }
-    val key = effectiveOrg(stored, sites)
-    val scoped = sites.firstOrNull { it.siteKey == key }
+    val keys = effectiveOrgs(stored, sites)
+    val picked = sites.filter { it.siteKey in keys }
     val now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis()
     var open by remember { mutableStateOf(false) }
     // The org whose color-swatch strip is expanded (XERK-145), or null.
@@ -89,36 +96,45 @@ fun OrgFilterAction(vm: OrgViewModel = viewModel()) {
 
     Box {
         TextButton(onClick = { open = true }) {
-            if (scoped != null) {
-                OrgDot(orgColor(colorMap, scoped.siteKey))
+            // One dot per selected org (XERK-222), each in its org's color.
+            Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                for (s in picked) OrgDot(orgColor(colorMap, s.siteKey))
             }
             Text(
-                if (scoped != null) orgName(scoped.siteKey, scoped.orgName) else "All orgs",
+                when {
+                    picked.isEmpty() -> "All orgs"
+                    picked.size == 1 -> orgName(picked[0].siteKey, picked[0].orgName)
+                    else -> "${picked.size} orgs"
+                },
                 style = MaterialTheme.typography.labelLarge,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 // Capped so a long org name can't push the title or the actions
                 // off a phone header — the full key is one tap away in the menu.
                 modifier = Modifier
-                    .padding(start = if (scoped != null) 6.dp else 0.dp)
+                    .padding(start = if (picked.isNotEmpty()) 6.dp else 0.dp)
                     .widthIn(max = 120.dp),
             )
             Icon(Icons.Filled.ArrowDropDown, "Filter by org")
         }
         DropdownMenu(expanded = open, onDismissRequest = { open = false; colorFor = null }) {
             DropdownMenuItem(
-                text = { OrgRowLabel("All orgs", null, sites.sumOf { it.tickets.size }, null, key.isBlank()) },
-                onClick = { open = false; colorFor = null; vm.setOrg("") },
+                text = { OrgRowLabel("All orgs", null, sites.sumOf { it.tickets.size }, null, keys.isEmpty()) },
+                // "All orgs" is a terminal answer: clear the selection and close.
+                onClick = { open = false; colorFor = null; vm.setOrg(emptySet()) },
             )
             for (s in sites) {
                 OrgMenuRow(
                     site = s,
                     color = orgColor(colorMap, s.siteKey),
-                    active = key == s.siteKey,
+                    active = s.siteKey in keys,
                     now = now,
                     autoOn = autoStartOn(fleet.autoStartOrgs, s.siteKey),
                     onToggleAuto = { vm.setAutoStart(s.siteKey, it) },
-                    onPick = { open = false; colorFor = null; vm.setOrg(s.siteKey) },
+                    // A toggle keeps the menu OPEN (XERK-222): multi-select
+                    // means picking several in one visit, and the row shows its
+                    // check flip in place.
+                    onPick = { vm.toggleOrg(s.siteKey) },
                     onToggleColor = { colorFor = if (colorFor == s.siteKey) null else s.siteKey },
                 )
                 // The swatch strip the color dot expands into (XERK-145): one
@@ -198,6 +214,11 @@ private fun OrgMenuRow(
     DropdownMenuItem(
         text = { OrgRowLabel(orgName(site.siteKey, site.orgName), color, site.tickets.size, note, active) },
         onClick = onPick,
+        // A selected org's row carries a check (XERK-222) — the row is a toggle,
+        // and the mark is what flips in place while the menu stays open.
+        leadingIcon = if (active) {
+            { Icon(Icons.Filled.Check, "Selected", tint = MaterialTheme.colorScheme.primary) }
+        } else null,
         trailingIcon = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 // The org's color, tappable to open the swatch strip (XERK-145).

@@ -493,7 +493,7 @@ fun SessionsListPane(
                             // reads very differently from one the org filter
                             // narrowed to nothing, and only one has a way out.
                             fleet.agents.isNotEmpty() && agents.isEmpty() ->
-                                "No hosts report this org. Pick another org (or “All orgs”) in the header."
+                                "No hosts report the selected orgs. Change the org filter (or pick “All orgs”) in the header."
                             fleet.loading -> "Loading…"
                             else -> "No sessions."
                         },

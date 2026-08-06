@@ -142,13 +142,20 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   orgs". A pick for an org nobody reports any more doesn't apply but is KEPT, so it resumes when that
   host comes back, and each screen's empty state distinguishes "nothing reported" from "the filter
   narrowed this to nothing" and points at the header. Ports `turma/public/org.js`: `siteKeyOf` /
-  `filterAgents` / `effectiveOrg` / `scopedAgents` / `storedOrg` / `ageStr` in `core/Board.kt` (tested
+  `filterAgents` / `effectiveOrgs` / `scopedAgents` / `storedOrg` / `ageStr` in `core/Board.kt` (tested
   in `BoardTest`), the pick hoisted to `data/OrgFilter.kt` + `AppContainer` (migrating the old
   board-only preference forward, as the web migrates `turma-board-org` → `turma-org`), the control in
   `ui/OrgControl.kt` + `vm/OrgViewModel.kt`, call sites in `ui/FleetScreen.kt`, `ui/SessionsScreen.kt`,
   `ui/BoardScreen.kt`, `ui/UsageScreen.kt`. Platform form: a Material dropdown of rows (dot, org name,
   ticket count, offline/synced note, `Switch` for auto-start) rather than the web's button + popover of
   divided pills.
+- **Multi-org selection (XERK-222).** The org filter selects a SET of orgs, not one: each menu row is a
+  toggle that stays checked (leading ✓) while selected, the menu stays open across toggles, and "All
+  orgs" clears the selection and closes. The button shows one dot per selected org and a "N orgs"
+  count past one. `data/OrgFilter.kt` persists a string set (`orgFilterSet`, migrating the older
+  single-key prefs to a one-org selection); `core/Board.kt`'s `filterAgents` / `effectiveOrgs` /
+  `scopedAgents` / `filterSites` take the set (each key self-heals independently). Matches the web's
+  checkbox menu rows and JSON-array `turma-org` value.
 - **Ended-session read-only chat review (XERK-70).** Tapping an ended-session card body (not just its
   Resume button) now opens the conversation read-only, the web ended-session stage's counterpart
   (`#transcriptPane` in `sessions.html` → `openEndedSession`). `EndedSessionView` in

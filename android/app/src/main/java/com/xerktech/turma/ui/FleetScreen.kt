@@ -121,7 +121,7 @@ fun FleetScreen(
                             // dashboard reads as "no agents at all".
                             when {
                                 fleet.agents.isNotEmpty() ->
-                                    "No hosts report this org. Pick another org (or “All orgs”) in the header."
+                                    "No hosts report the selected orgs. Change the org filter (or pick “All orgs”) in the header."
                                 fleet.loading -> "Loading fleet…"
                                 else -> fleet.error ?: "No hosts reporting."
                             },

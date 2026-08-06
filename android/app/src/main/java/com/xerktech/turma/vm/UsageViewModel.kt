@@ -18,7 +18,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
     private val container = (app as TurmaApplication).container
     val fleet get() = container.fleet.state
 
-    /** The header's org scope (XERK-62), shared by every screen. */
+    /** The header's org selection (XERK-62, multi per XERK-222), shared by every screen. */
     val orgFilter get() = container.org.stored
 
     fun start() = container.fleet.start()

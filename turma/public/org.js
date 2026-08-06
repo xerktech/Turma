@@ -11,8 +11,13 @@
 // selection is persisted (and shared across open tabs) so it follows the
 // operator from page to page rather than resetting at each nav.
 //
-// The filter value is a full siteKey (what the hub keys and routes on), never
-// the display org name; "" means every org. The per-org auto-start switch
+// The filter value is a SET of full siteKeys (what the hub keys and routes
+// on), never display org names; an empty set means every org. Multi-select
+// (XERK-222): each menu row toggles its org in and out of the set and stays
+// highlighted while selected — the menu stays open across toggles so several
+// orgs can be picked in one visit; "All orgs" clears the set. Persisted as a
+// JSON array; a pre-multi single-siteKey value reads as a one-org selection,
+// so an existing pick survives the upgrade. The per-org auto-start switch
 // (XERK-41) rode the board's chips, so it comes along as a row segment in this
 // menu — it is a per-org setting, and this is now where per-org settings live.
 //
@@ -44,41 +49,59 @@
     return (agent && agent.jira && agent.jira.siteKey) || "";
   }
 
-  // The fleet, scoped to one org. Deliberately NOT board.js's filterSites
-  // fallback ("unknown filter shows everything") — that rule is about a site
-  // list, and here the caller has already resolved the key through
-  // effectiveKey(), which is where a stale pick self-heals.
-  function filterAgents(agents, key) {
+  // Normalize a selection — "", a single siteKey, an array or a Set — to an
+  // array of siteKeys, so every pure function below takes any of the shapes a
+  // caller may still hold.
+  function keysOf(v) {
+    if (!v) return [];
+    if (Array.isArray(v)) return v.filter(Boolean);
+    if (v instanceof Set) return [...v].filter(Boolean);
+    return [v];
+  }
+
+  // The fleet, scoped to the selected orgs (empty selection = every org).
+  // Deliberately NOT board.js's filterSites fallback ("unknown filter shows
+  // everything") — that rule is about a site list, and here the caller has
+  // already resolved the selection through effectiveKeys(), which is where a
+  // stale pick self-heals.
+  function filterAgents(agents, keys) {
     const list = agents || [];
-    if (!key) return list;
-    return list.filter(a => siteKeyOf(a) === key);
+    const sel = keysOf(keys);
+    if (!sel.length) return list;
+    return list.filter(a => sel.includes(siteKeyOf(a)));
   }
 
   // A stored pick only counts while some host still reports that org — an org
   // whose last agent was removed must not leave every page filtered down to
   // nothing with no way back. The stored value is KEPT (a host that comes back
-  // resumes its filter); it just doesn't apply while nothing reports it.
-  function effectiveKey(key, sites) {
-    if (!key) return "";
-    return (sites || []).some(s => s.siteKey === key) ? key : "";
+  // resumes its filter); each key just doesn't apply while nothing reports it.
+  function effectiveKeys(keys, sites) {
+    const list = sites || [];
+    return keysOf(keys).filter(k => list.some(s => s.siteKey === k));
   }
 
   function autoOn(map, siteKey) {
     return !!(map && map[siteKey]);
   }
 
-  // The header button: the current scope, dot-coloured by the org's palette slot
-  // so it matches that org's cards and columns everywhere else.
-  function buttonHtml(sites, key, colorMap, open) {
+  // The header button: the current scope, one dot per selected org, each
+  // coloured by that org's palette slot so it matches its cards and columns
+  // everywhere else. One org shows its name; several show a count.
+  function buttonHtml(sites, keys, colorMap, open) {
     const B = board();
-    const site = (sites || []).find(s => s.siteKey === key);
-    const label = site ? B.orgName(site.siteKey, site.orgName) : "All orgs";
-    const color = site ? (colorMap.get(site.siteKey) || B.orgColor(site.siteKey)) : "";
-    return `<button type="button" class="org-btn${site ? " scoped" : ""}" data-org-toggle
+    const sel = keysOf(keys);
+    const picked = (sites || []).filter(s => sel.includes(s.siteKey));
+    const label = !picked.length ? "All orgs"
+      : picked.length === 1 ? B.orgName(picked[0].siteKey, picked[0].orgName)
+      : `${picked.length} orgs`;
+    const dots = picked.map(s => {
+      const color = colorMap.get(s.siteKey) || B.orgColor(s.siteKey);
+      return `<span class="org-dot" aria-hidden="true"${color ? ` style="--org:${esc(color)}"` : ""}></span>`;
+    }).join("");
+    return `<button type="button" class="org-btn${picked.length ? " scoped" : ""}" data-org-toggle
       aria-haspopup="true" aria-expanded="${open ? "true" : "false"}"
-      title="${site ? "Showing " + esc(label) + " only — click to change" : "Filter every page by org"}"
-      ${color ? `style="--org:${esc(color)}"` : ""}>` +
-      `<span class="org-dot" aria-hidden="true"></span>` +
+      title="${picked.length ? "Showing " + esc(label) + " only — click to change" : "Filter every page by org"}">` +
+      (dots || `<span class="org-dot" aria-hidden="true"></span>`) +
       `<span class="org-btn-label">${esc(label)}</span>` +
       `<span class="org-chev" aria-hidden="true">▾</span></button>`;
   }
@@ -105,16 +128,20 @@
   }
 
   // The menu: "All orgs" plus one row per reporting org. Each named row is three
-  // segments — the scope pick, the org's color chip (XERK-145), and its
+  // segments — the scope toggle, the org's color chip (XERK-145), and its
   // auto-start switch — the divided-pill shape the board chips carried, laid
-  // out as a list. `colorFor` is the org whose swatch strip is expanded.
-  function menuHtml(sites, key, colorMap, autoMap, ageStr, colorPins, colorFor) {
+  // out as a list. Rows are checkboxes, not radios (XERK-222): a click toggles
+  // that org's membership in the selection and the row stays highlighted while
+  // it's in; any number can be on at once. `colorFor` is the org whose swatch
+  // strip is expanded.
+  function menuHtml(sites, keys, colorMap, autoMap, ageStr, colorPins, colorFor) {
     const B = board();
+    const sel = keysOf(keys);
     const total = (sites || []).reduce((n, s) => n + (s.tickets || []).length, 0);
     const rows = [
-      `<div class="org-row${key ? "" : " active"}">` +
-      `<button type="button" class="org-row-main" data-org-key="" role="menuitemradio"` +
-      ` aria-checked="${key ? "false" : "true"}">` +
+      `<div class="org-row${sel.length ? "" : " active"}">` +
+      `<button type="button" class="org-row-main" data-org-key="" role="menuitemcheckbox"` +
+      ` aria-checked="${sel.length ? "false" : "true"}">` +
       `<span class="org-row-name">All orgs</span>` +
       `<span class="chip-n">${total}</span></button></div>`,
     ];
@@ -123,10 +150,11 @@
       const on = autoOn(autoMap, s.siteKey);
       const hosts = (s.hosts || []).length;
       const age = s.online ? "" : (ageStr ? ageStr(s.lastFetched) : "");
+      const picked = sel.includes(s.siteKey);
       rows.push(
-        `<div class="org-row${key === s.siteKey ? " active" : ""}" style="--org:${esc(color)}">` +
+        `<div class="org-row${picked ? " active" : ""}" style="--org:${esc(color)}">` +
         `<button type="button" class="org-row-main has-dot" data-org-key="${esc(s.siteKey)}"` +
-        ` role="menuitemradio" aria-checked="${key === s.siteKey ? "true" : "false"}"` +
+        ` role="menuitemcheckbox" aria-checked="${picked ? "true" : "false"}"` +
         ` title="${esc(s.siteKey)} · ${hosts} host${hosts === 1 ? "" : "s"}">` +
         `<span class="org-dot" aria-hidden="true"></span>` +
         `<span class="org-row-name">${esc(B.orgName(s.siteKey, s.orgName))}</span>` +
@@ -149,10 +177,10 @@
     return `<div class="org-menu" role="menu">${rows.join("")}</div>`;
   }
 
-  function controlHtml(sites, key, colorMap, autoMap, open, ageStr, colorPins, colorFor) {
+  function controlHtml(sites, keys, colorMap, autoMap, open, ageStr, colorPins, colorFor) {
     return `<span class="org-filter${open ? " open" : ""}">` +
-      buttonHtml(sites, key, colorMap, open) +
-      (open ? menuHtml(sites, key, colorMap, autoMap, ageStr, colorPins, colorFor) : "") +
+      buttonHtml(sites, keys, colorMap, open) +
+      (open ? menuHtml(sites, keys, colorMap, autoMap, ageStr, colorPins, colorFor) : "") +
       `</span>`;
   }
 
@@ -166,7 +194,7 @@
   }
 
   const listeners = [];
-  let stored = "";        // what localStorage says, whether or not it applies
+  let stored = [];        // what localStorage says, whether or not it applies
   let sites = [];         // the orgs the fleet currently reports
   let autoMap = {};       // the hub's per-org auto-start opt-in
   let colorPins = {};     // the hub's manual org-color pins (XERK-145)
@@ -175,32 +203,78 @@
   let slot = null;
   let painted = "";       // last markup written, so a beat repaint is a no-op
 
+  // The persisted value is a JSON array of siteKeys ("" for none). A pre-multi
+  // value — this key's own old single-siteKey format, or the board-era legacy
+  // key's — is a bare string, which reads as a one-org selection, so an
+  // operator's existing pick survives the upgrade to multi-select.
+  function parseStored(raw) {
+    if (!raw) return [];
+    if (raw[0] === "[") {
+      try {
+        const a = JSON.parse(raw);
+        if (Array.isArray(a)) return a.filter(k => typeof k === "string" && k);
+      } catch { /* malformed — treat as no selection */ }
+      return [];
+    }
+    return [raw];
+  }
+
+  function encodeStored(keys) {
+    return keys.length ? JSON.stringify(keys) : "";
+  }
+
   function readStored() {
     try {
       const v = localStorage.getItem(KEY);
-      if (v !== null) return v;
+      if (v !== null) return parseStored(v);
       // One-time migration off the board-only key.
       const legacy = localStorage.getItem(LEGACY_KEY);
-      if (legacy) { localStorage.setItem(KEY, legacy); return legacy; }
+      if (legacy) { localStorage.setItem(KEY, legacy); return parseStored(legacy); }
     } catch { /* private mode / no storage — the filter is just not persisted */ }
-    return "";
+    return [];
   }
 
-  // The pick as it APPLIES right now (a pick for an org nobody reports doesn't).
+  // The selection as it APPLIES right now (a pick for an org nobody reports
+  // doesn't) — an array of siteKeys, empty meaning every org.
+  function getKeys() {
+    return effectiveKeys(stored, sites);
+  }
+
+  // Single-key back-compat read: the selected org when exactly one applies,
+  // else "" — what a caller that can only use one org (the new-ticket form's
+  // seed) wants, and what older stubs expect.
   function get() {
-    return effectiveKey(stored, sites);
+    const keys = getKeys();
+    return keys.length === 1 ? keys[0] : "";
   }
 
   function notify() {
-    for (const fn of listeners) { try { fn(get()); } catch { /* a page's own repaint */ } }
+    for (const fn of listeners) { try { fn(getKeys()); } catch { /* a page's own repaint */ } }
   }
 
-  function set(key) {
-    const next = key || "";
-    if (next === stored) { close(); return; }
+  function persist() {
+    try { localStorage.setItem(KEY, encodeStored(stored)); } catch { /* not persisted */ }
+  }
+
+  // Replace the whole selection (the "All orgs" row passes []). Accepts any of
+  // keysOf's shapes, so set("acme") still means "just acme".
+  function set(keys) {
+    const next = keysOf(keys);
+    if (encodeStored(next) === encodeStored(stored)) { close(); paint(); return; }
     stored = next;
-    try { localStorage.setItem(KEY, next); } catch { /* not persisted */ }
+    persist();
     close();
+    paint();
+    notify();
+  }
+
+  // Flip one org in or out of the selection (XERK-222). The menu deliberately
+  // STAYS OPEN — multi-select means picking several in one visit, and closing
+  // on each toggle would make that three open-click round trips.
+  function toggle(key) {
+    if (!key) { set([]); return; }
+    stored = stored.includes(key) ? stored.filter(k => k !== key) : [...stored, key];
+    persist();
     paint();
     notify();
   }
@@ -225,12 +299,12 @@
   function paint() {
     if (!slot) return;
     const B = board();
-    const key = get();
+    const keys = getKeys();
     const colorMap = B.orgColorMap(sites.map(s => s.siteKey), colorPins);
     // Nothing to scope by until at least one host reports a tracker org, so the
     // slot stays empty and collapses (#hdrOrg:empty in app.css) rather than
     // offering a menu whose only entry is "All orgs".
-    const html = sites.length ? controlHtml(sites, key, colorMap, autoMap, open, B.ageStr, colorPins, colorFor) : "";
+    const html = sites.length ? controlHtml(sites, keys, colorMap, autoMap, open, B.ageStr, colorPins, colorFor) : "";
     if (html === painted) return;
     painted = html;
     slot.innerHTML = html;
@@ -345,7 +419,9 @@
         return;
       }
       const pick = e.target.closest("[data-org-key]");
-      if (pick) { set(pick.dataset.orgKey); return; }
+      // An org row toggles and keeps the menu open; the empty key is the
+      // "All orgs" row, which clears the selection and closes.
+      if (pick) { toggle(pick.dataset.orgKey); return; }
       if (e.target.closest("[data-org-toggle]")) { open = !open; paint(); }
     });
     doc.addEventListener("click", (e) => {
@@ -358,7 +434,7 @@
     // with itself across two windows.
     window.addEventListener("storage", (e) => {
       if (e.key !== KEY) return;
-      stored = e.newValue || "";
+      stored = parseStored(e.newValue || "");
       paint();
       notify();
     });
@@ -367,11 +443,11 @@
 
   const api = {
     KEY, LEGACY_KEY, esc,
-    siteKeyOf, filterAgents, effectiveKey, autoOn,
+    siteKeyOf, keysOf, filterAgents, effectiveKeys, autoOn, parseStored, encodeStored,
     buttonHtml, menuHtml, controlHtml, swatchRowHtml,
-    get, set, subscribe, update, sse, setAutoStart, setOrgColor, orgColors, mount,
-    // The common call site: scope the beat's fleet to the current pick.
-    filter(agents) { return filterAgents(agents, get()); },
+    get, getKeys, set, toggle, subscribe, update, sse, setAutoStart, setOrgColor, orgColors, mount,
+    // The common call site: scope the beat's fleet to the current selection.
+    filter(agents) { return filterAgents(agents, getKeys()); },
   };
   if (typeof window !== "undefined") window.TurmaOrg = api;
   // Guarded on `document`, not `window`: the tests put a stand-in TurmaBoard on

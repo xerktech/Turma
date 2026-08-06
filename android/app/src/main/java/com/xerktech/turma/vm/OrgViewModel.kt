@@ -21,10 +21,13 @@ class OrgViewModel(app: Application) : AndroidViewModel(app) {
     private val container = (app as TurmaApplication).container
     val fleet: StateFlow<com.xerktech.turma.net.FleetState> get() = container.fleet.state
 
-    /** The operator's literal pick ("" = all orgs); self-healed at the render. */
-    val org: StateFlow<String> get() = container.org.stored
+    /** The operator's literal selection (empty = all orgs); self-healed at the render. */
+    val org: StateFlow<Set<String>> get() = container.org.stored
 
-    fun setOrg(key: String) = container.org.set(key)
+    fun setOrg(keys: Set<String>) = container.org.set(keys)
+
+    /** Flip one org in or out of the selection (XERK-222). */
+    fun toggleOrg(key: String) = container.org.toggle(key)
 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val messages: SharedFlow<String> = _messages
