@@ -1,4 +1,4 @@
-import type { AgentInfo, SessionInfo, SessionRef } from "./types.ts";
+import type { AgentInfo, PrInfo, SessionInfo, SessionRef } from "./types.ts";
 
 export type LiveState = "working" | "waiting" | "idle" | "stopped" | "error";
 
@@ -23,6 +23,38 @@ export function liveState(s: SessionInfo): LiveState {
     ? live.paneBusy
     : (live?.transcriptAgeSec != null && live.transcriptAgeSec * 1000 < WORKING_WINDOW_MS);
   return working ? "working" : "idle";
+}
+
+// Has this PR left the operator's plate? MERGED/CLOSED are the two end states;
+// everything else — OPEN, DRAFT, and an unfetched/unknown state — counts as
+// still live. An unreadable state must never be what drops work off the list.
+const prLanded = (p: PrInfo): boolean =>
+  ["MERGED", "CLOSED"].includes((p?.state ?? "").toUpperCase());
+
+// "Ready for review" (XERK-224): a running session that has stopped and is now
+// waiting on the OPERATOR rather than on itself — its own section above Active,
+// because a working session is one to leave alone and this is the work to look
+// at. A port of the web's `readyForReview` (turma/public/sessions.html), which
+// the hub's ready-for-review alert (turma/server.js) and the Android client
+// (core/Sessions.kt) mirror too; all four agree on what the group means.
+//
+// Derived from the signals alone — there is no "I've reviewed this" action, so
+// a qualifying session stays listed until it runs again or its PR lands. It
+// qualifies on a pending question (blocked on a human, whatever the busy read
+// says), a PR that hasn't landed (a diff to read), or a finished turn — newest
+// entry is plain assistant output with nothing pending, the only trace a
+// research task that never opened a PR leaves behind. A session that opened a
+// PR is judged on the PR alone: every one merged or closed IS the review, and
+// drops it back to Idle.
+export function readyForReview(s: SessionInfo): boolean {
+  const state = liveState(s);
+  if (state === "waiting") return true;
+  if (state !== "idle") return false;
+  const live = s.session;
+  if (!live) return false;
+  const prs = s.prs ?? [];
+  if (prs.length) return prs.some((p) => !prLanded(p));
+  return live.lastRole === "assistant" && !live.lastHasToolUse;
 }
 
 // Leading status icon on each home-menu session row — chosen to be

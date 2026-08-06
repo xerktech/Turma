@@ -28,7 +28,10 @@ object Notifications {
         val mgr = context.getSystemService(NotificationManager::class.java) ?: return
         val channels = listOf(
             Triple(CH_QUESTION, "Questions", NotificationManager.IMPORTANCE_HIGH),
-            Triple(CH_TURN, "Turn finished", NotificationManager.IMPORTANCE_DEFAULT),
+            // The hub's one per-session work alert (XERK-224). Keeps the channel
+            // ID it had as "Turn finished" so an upgrade renames the operator's
+            // existing channel in place rather than resetting its settings.
+            Triple(CH_TURN, "Ready for review", NotificationManager.IMPORTANCE_DEFAULT),
             Triple(CH_PR, "Pull requests", NotificationManager.IMPORTANCE_DEFAULT),
             Triple(CH_HOST, "Host status", NotificationManager.IMPORTANCE_HIGH),
             Triple(CH_ALERTS, "General alerts", NotificationManager.IMPORTANCE_DEFAULT),
@@ -40,7 +43,10 @@ object Notifications {
 
     private fun channelFor(tags: String): String = when {
         tags.contains("question") -> CH_QUESTION
-        tags.contains("checkered_flag") -> CH_TURN
+        // "mag" is the ready-for-review alert (XERK-224), which replaced the
+        // separate turn-finished ("checkered_flag") and PR ("rocket") ones — both
+        // still routed, since an older hub keeps sending them.
+        tags.contains("mag") || tags.contains("checkered_flag") -> CH_TURN
         tags.contains("rocket") -> CH_PR
         // "key" is the Claude-login alert (XERK-98); "circle" also catches the
         // green_circle "login restored" notification. Both are host-level.

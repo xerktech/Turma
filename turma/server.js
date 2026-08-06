@@ -1498,6 +1498,37 @@ function prAlertDecision(w, status, now) {
   return null;
 }
 
+// Has this PR left the operator's plate? MERGED/CLOSED are the two end states;
+// everything else — OPEN, DRAFT, and an unfetched/unknown state — counts as
+// still live. An unreadable state must never be what drops work off the review
+// list. Mirrors sessions.html.
+function prLanded(p) {
+  const st = String((p && p.state) || "").toUpperCase();
+  return st === "MERGED" || st === "CLOSED";
+}
+
+// "Ready for review" (XERK-224): a running session that has stopped and is now
+// waiting on the OPERATOR rather than on itself. The mirror of the Sessions
+// page's `readyForReview` (public/sessions.html) — the section a session enters
+// is what the alert below announces, so the two rules have to be the same one.
+//
+// Qualifies on a pending question / blocking dialog (blocked on a human, so the
+// busy read doesn't matter), a PR that hasn't landed (a diff to read), or a
+// finished turn — newest entry is plain assistant output with nothing pending,
+// which is the only trace a research task with no PR leaves. A session that
+// opened a PR is judged on the PR alone: it leaves when the session works
+// again, or when every PR it opened has landed (merged or closed IS the
+// review). `working` is the caller's already-computed busy read.
+function readyForReview(session, working) {
+  if (session.status !== "running") return false;
+  const s = session.session || {};
+  if (s.question || (s.panePrompt && s.panePrompt.prompt)) return true;
+  if (working) return false;
+  const prs = session.prs || [];
+  if (prs.length) return prs.some((p) => !prLanded(p));
+  return s.lastRole === "assistant" && !s.lastHasToolUse;
+}
+
 // Alert checks that key off a fresh heartbeat. `next.alerts` is per-agent
 // bookkeeping carried across beats (and persisted, so hub restarts don't
 // re-fire or drop edges).
@@ -1602,6 +1633,8 @@ function heartbeatAlerts(key, prev, next) {
       delete sa.lastQuestion;
     }
 
+    const working = sessionWorking(session, next.lastSeen, now);
+
     // A new PR goes into a per-session wait list rather than alerting straight
     // away, and leaves it when its CI settles (prAlertDecision). `prSeen` keeps
     // its old meaning — URLs already alerted — so PRs an older hub announced
@@ -1615,27 +1648,17 @@ function heartbeatAlerts(key, prev, next) {
     // they're refreshed on the agent's slower PR cadence and persist between.
     const prStatus = new Map();
     for (const p of session.prs || []) if (p && p.url) prStatus.set(p.url, p);
+    // A settled PR no longer alerts on its own (XERK-224). Its verdict is held
+    // here and spent by the one ready-for-review alert below, so a session that
+    // finished a turn AND opened a PR buzzes once instead of twice — which is
+    // the whole point of collapsing these. `prSeen` still records the URL, so a
+    // note is minted once per PR and the hold can never become a loop.
     for (const url of Object.keys(wait)) {
       const note = prAlertDecision(wait[url], prStatus.get(url), now);
       if (!note) continue;
       delete wait[url];
       sa.prSeen = [...(sa.prSeen || []), url].slice(-PR_ALERT_MAX_TRACKED);
-      notify(`${label} created a PR`, `${note} · ${url}`, { tags: "rocket", click: url, route, notifKey: `pr:${url}` });
-    }
-    // Retract a delivered PR alert once the PR has been merged or closed — the
-    // reason to look at it on the phone is gone (XERK-154). `prSeen` holds the
-    // URLs already alerted; `prDismissed` remembers which we've retracted so the
-    // dismiss fires once on the state edge, not every beat, and is bounded like
-    // prSeen. The PR state rides session.prs (prStatus), refreshed on the
-    // agent's PR cadence, so a merge done from the desktop lands within a beat.
-    sa.prDismissed = sa.prDismissed || [];
-    for (const url of sa.prSeen || []) {
-      const st = prStatus.get(url);
-      const done = st && (st.state === "MERGED" || st.state === "CLOSED");
-      if (done && !sa.prDismissed.includes(url)) {
-        sa.prDismissed = [...sa.prDismissed, url].slice(-PR_ALERT_MAX_TRACKED);
-        dismiss(`pr:${url}`);
-      }
+      sa.prNotes = [...(sa.prNotes || []), { url, note }].slice(-PR_ALERT_MAX_TRACKED);
     }
     // Bound the wait list the way prSeen is bounded: a PR whose CI never
     // resolves ages out via the backstop, but a host that somehow outruns that
@@ -1652,19 +1675,82 @@ function heartbeatAlerts(key, prev, next) {
     // is plain assistant output (a pending tool call or question means it's
     // still mid-turn / already alerted above). A beat that just recovered from
     // an offline period skips this — "back online" already covers it and the
-    // working->idle edge across the gap is stale.
-    const turnKey = `turn:${key}:${session.id}`;
-    const working = sessionWorking(session, next.lastSeen, now);
+    // working->idle edge across the gap is stale. It no longer alerts on its
+    // own either; it ARMS the ready-for-review alert below.
     if (sa.wasWorking && !working && !recovered && s.lastRole === "assistant" && !s.lastHasToolUse) {
-      const repo = session.git?.repoName ? ` · ${session.git.repoName}@${session.git.branch}` : "";
-      notify(`${label} finished its turn`, `Waiting for input${repo}`, { tags: "checkered_flag", route, notifKey: turnKey });
-      sa.turnAlerted = true;
+      sa.reviewAt = now;
     }
-    // The "finished its turn — waiting for input" notice is addressed the moment
-    // the session is working again (the operator replied), so retract it
-    // (XERK-154). Fires once on the idle->working edge via the turnAlerted flag.
+
+    // The one per-session alert (XERK-224), replacing the separate "finished
+    // its turn" and "created a PR" notices: the operator wants ONE buzz per
+    // piece of work, not one per signal the work happened to leave behind.
+    //
+    //   - It fires when the session ENTERS the Sessions page's Ready-for-review
+    //     section (readyForReview — the same rule the page renders), and only
+    //     on something new: a turn that just finished, or a PR that just
+    //     settled. A session already sitting there when the hub boots is not
+    //     re-announced.
+    //   - A PR still waiting on its CI HOLDS the alert, so it lands when the
+    //     work is genuinely reviewable and carries the verdict. Nothing is lost
+    //     to a stuck wait — prAlertDecision ages out and answers anyway.
+    //   - A pending question suppresses it: the high-priority question alert
+    //     above is already that session's buzz, and it says more.
+    const reviewKey = `review:${key}:${session.id}`;
+    const ready = readyForReview(session, working);
+    // Only PRs still in play are worth naming — one merged while the alert was
+    // held has answered itself.
+    const notes = (sa.prNotes || []).filter((n) => !prLanded(prStatus.get(n.url)));
+    // What holds the alert is read off the SESSION's PRs, not off the CI wait
+    // list alone: a URL only ever enters that list through the per-beat
+    // `newPrUrls` scrape, so a PR whose scrape landed before this hub booted —
+    // or one already announced once, whose session has since worked and
+    // finished again — leaves the list empty while the PR is still open. Gating
+    // on the list alone therefore fired the alert for work that merges nowhere,
+    // captioned "nothing to merge".
+    const livePrs = (session.prs || []).filter((p) => p && !prLanded(p));
+    const holdingPr = Object.keys(wait).length > 0
+      // A CONFLICTING PR merges nowhere however green its CI is (XERK-223), and
+      // prAlertDecision holds it past the age-out for the same reason. Every
+      // verdict now feeds this one alert, so the hold has to reach it too.
+      || livePrs.some((p) => p.mergeable === "CONFLICTING");
+    if (ready && !sa.reviewAlerted && !s.question && !holdingPr && (sa.reviewAt || notes.length)) {
+      const repo = session.git?.repoName ? ` · ${session.git.repoName}@${session.git.branch}` : "";
+      // "Nothing to merge" is a claim about the session, so it may only be made
+      // when the session really opened nothing. A live PR with no banked verdict
+      // (its alert was spent on an earlier turn) is still named, minus the CI line.
+      const body = notes.length
+        ? notes.map((n) => `${n.note} · ${n.url}`).join("\n")
+        : livePrs.length
+          ? livePrs.map((p) => p.url).join("\n")
+          : `Finished — nothing to merge${repo}`;
+      const click = notes.length ? notes[notes.length - 1].url
+        : livePrs.length ? livePrs[livePrs.length - 1].url : null;
+      notify(`${label} is ready for review`, body, {
+        tags: "mag",
+        route,
+        notifKey: reviewKey,
+        ...(click ? { click } : {}),
+      });
+      sa.reviewAlerted = true;
+      delete sa.reviewAt;
+      delete sa.prNotes;
+    }
+    // Retract it once the reason to look is gone (XERK-154's dismiss contract):
+    // the session left the section, either by working again (the operator
+    // replied, or it picked the work back up) or by its PRs landing — a merge
+    // IS the review. Fires once, on the edge, via the reviewAlerted flag.
+    if (sa.reviewAlerted && !ready) {
+      dismiss(reviewKey);
+      delete sa.reviewAlerted;
+    }
+    // A stale finish edge must not outlive the turn that follows it; a held PR
+    // note must, since its alert is still owed.
+    if (working) delete sa.reviewAt;
+    // An older hub delivered "finished its turn" under its own key. Retract that
+    // one on the same edge it used to, so an upgrade doesn't strand it on the
+    // phone with nothing left to clear it.
     if (working && sa.turnAlerted) {
-      dismiss(turnKey);
+      dismiss(`turn:${key}:${session.id}`);
       delete sa.turnAlerted;
     }
     sa.wasWorking = working;
@@ -4128,6 +4214,7 @@ if (process.env.TURMA_TEST) {
     channelDuplex,
     heartbeatAlerts,
     prAlertDecision,
+    readyForReview,
     sessionWorking,
     userAuthorized,
     agentAuthorized,

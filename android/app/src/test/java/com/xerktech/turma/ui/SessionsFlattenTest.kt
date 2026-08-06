@@ -45,39 +45,62 @@ class SessionsFlattenTest {
         assertEquals(0, flattenSessions(agents, "nomatch").size)
     }
 
-    // ---- rankRunning (the Active / Idle sections, XERK-73) -------------------
+    // ---- rankRunning (Ready for review / Active / Idle, XERK-73 + XERK-224) --
 
     private fun flat(
         id: String, status: String = "running",
         question: String = "", paneBusy: Boolean? = null, ageSec: Double? = null,
+        lastRole: String = "", prs: List<com.xerktech.turma.model.PrInfo> = emptyList(),
     ) = FlatSession(
         host = "h", device = "BOX", online = true, hostLastSeen = 1_000L,
         session = SessionInfo(
-            id = id, status = status,
-            session = LiveSignals(paneBusy = paneBusy, question = question, transcriptAgeSec = ageSec),
+            id = id, status = status, prs = prs,
+            session = LiveSignals(
+                paneBusy = paneBusy, question = question, transcriptAgeSec = ageSec, lastRole = lastRole,
+            ),
         ),
     )
+    private fun pr(state: String) = com.xerktech.turma.model.PrInfo(url = "u$state", state = state)
 
-    @Test fun `rankRunning splits active (waiting+working) from idle, dropping non-running`() {
-        val (active, idle) = rankRunning(
+    @Test fun `rankRunning splits working from quiet, dropping non-running`() {
+        val groups = rankRunning(
             listOf(
                 flat("idleOne", paneBusy = false),
                 flat("workOne", paneBusy = true),
-                flat("waitOne", question = "pick one"),
                 flat("stoppedOne", status = "stopped"),
             ),
             now = 1_000L,
         )
-        // Active is waiting before working (attention-first, web KIND_ORDER).
-        assertEquals(listOf("waitOne", "workOne"), active.map { it.flat.session.id })
-        assertEquals(listOf(LiveState.WAITING, LiveState.WORKING), active.map { it.state })
-        assertEquals(listOf("idleOne"), idle.map { it.flat.session.id })
-        // The stopped session is in neither list.
-        assertTrue(active.none { it.flat.session.id == "stoppedOne" })
+        assertEquals(listOf("workOne"), groups.active.map { it.flat.session.id })
+        assertEquals(listOf(LiveState.WORKING), groups.active.map { it.state })
+        assertEquals(listOf("idleOne"), groups.idle.map { it.flat.session.id })
+        assertTrue(groups.review.isEmpty())
+        // The stopped session is in none of the three.
+        assertTrue(groups.active.none { it.flat.session.id == "stoppedOne" })
+    }
+
+    @Test fun `rankRunning lifts the work waiting on you into Ready for review`() {
+        val groups = rankRunning(
+            listOf(
+                flat("workOne", paneBusy = true),
+                flat("waitOne", question = "pick one"),
+                flat("researchOne", paneBusy = false, lastRole = "assistant"),   // finished, no PR
+                flat("prOne", paneBusy = false, prs = listOf(pr("OPEN"))),
+                flat("mergedOne", paneBusy = false, lastRole = "assistant", prs = listOf(pr("MERGED"))),
+                flat("quietOne", paneBusy = false),                              // nothing written yet
+            ),
+            now = 1_000L,
+        )
+        // A question is the most urgent, so it leads the section — the ranking
+        // happens before the split, exactly as the web's collect() does.
+        assertEquals(listOf("waitOne", "researchOne", "prOne"), groups.review.map { it.flat.session.id })
+        assertEquals(listOf("workOne"), groups.active.map { it.flat.session.id })
+        // Merged IS the review, so it parks in Idle until the build is verified.
+        assertEquals(listOf("mergedOne", "quietOne"), groups.idle.map { it.flat.session.id }.sorted())
     }
 
     @Test fun `rankRunning orders freshest-first within a kind, null age first`() {
-        val (active, _) = rankRunning(
+        val (_, active, _) = rankRunning(
             listOf(
                 flat("stale", paneBusy = true, ageSec = 90.0),
                 flat("fresh", paneBusy = true, ageSec = 3.0),

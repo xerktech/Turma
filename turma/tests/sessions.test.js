@@ -165,12 +165,19 @@ const running = (id, summary, session) => ({ id, status: "running", repo: "repoX
 const working = (id, summary) => running(id, summary, { paneBusy: true, transcriptAgeSec: 3 });
 const waiting = (id, summary) => running(id, summary, { question: "Pick one?", paneBusy: false, transcriptAgeSec: 5 });
 const idle = (id, summary) => running(id, summary, { paneBusy: false, transcriptAgeSec: 800 });
+// A session that finished its turn: quiet, and the newest transcript entry is
+// plain assistant output with no tool call pending — the "research is done"
+// signal a no-PR task leaves behind (XERK-224).
+const finished = (id, summary, extra) => ({
+  ...running(id, summary, { paneBusy: false, transcriptAgeSec: 800, lastRole: "assistant", lastHasToolUse: false }),
+  ...extra,
+});
+const pr = (state, number = 7) => ({ url: `https://github.com/o/r/pull/${number}`, number, state });
 
-test("running sessions split: working/waiting -> Active, idle -> Idle", () => {
+test("running sessions split: working -> Active, quiet-with-nothing-pending -> Idle", () => {
   const { render, els } = loadPage();
   const { now, host: h } = host([
     working("11111", "Working Task"),
-    waiting("22222", "Waiting Task"),
     idle("33333", "Idle Task A"),
     running("44444", "Idle Task B", { paneBusy: null, transcriptAgeSec: 9999 }), // stale transcript, unknown paneBusy -> idle
     { id: "55555", status: "stopped", repo: "repoX", summary: "Dead Task" },
@@ -179,15 +186,105 @@ test("running sessions split: working/waiting -> Active, idle -> Idle", () => {
 
   const a = els.active.innerHTML;
   const i = els.idle.innerHTML;
-  assert.match(a, /Active <span class="count">2<\/span>/);
-  assert.ok(a.includes("Working Task") && a.includes("Waiting Task"));
+  assert.match(a, /Active <span class="count">1<\/span>/);
+  assert.ok(a.includes("Working Task"));
   assert.ok(!a.includes("Idle Task A") && !a.includes("Idle Task B"), "idle sessions must not appear under Active");
 
   assert.match(i, /Idle <span class="count">2<\/span>/);
   assert.ok(i.includes("Idle Task A") && i.includes("Idle Task B"));
   assert.ok(!i.includes("Working Task"), "working sessions must not appear under Idle");
 
+  assert.equal(els.review.innerHTML, "", "Ready for review is hidden when nothing qualifies");
   assert.ok(els.ended.innerHTML.includes("Dead Task"), "ended section still renders");
+});
+
+// --- Ready for review (XERK-224) ---------------------------------------------
+// The section between Active and Idle: work that has stopped and is waiting on
+// the operator. Derived from the signals alone — no acknowledgement — so these
+// pin down exactly which signals qualify, and the one that un-qualifies.
+
+test("ready for review: question, open PR and a finished turn all qualify", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    working("11111", "Working Task"),
+    waiting("22222", "Waiting Task"),
+    finished("33333", "Research Task"),                          // no PR at all
+    finished("44444", "PR Task", { prs: [pr("OPEN")] }),
+    idle("55555", "Never Ran"),                                  // no transcript signal yet
+  ]);
+  render({ now, agents: [h] });
+
+  const r = els.review.innerHTML;
+  assert.match(r, /Ready for review <span class="count">3<\/span>/);
+  assert.ok(r.includes("Waiting Task"), "a pending question is waiting on you");
+  assert.ok(r.includes("Research Task"), "a finished turn with no PR still qualifies");
+  assert.ok(r.includes("PR Task"), "an open PR qualifies");
+  // A question is the most urgent, so it leads the section (collect()'s ranking
+  // survives the filter).
+  assert.ok(r.indexOf("Waiting Task") < r.indexOf("Research Task"), "waiting leads the section");
+
+  assert.match(els.active.innerHTML, /Active <span class="count">1<\/span>/);
+  assert.ok(els.active.innerHTML.includes("Working Task"));
+  assert.ok(!els.active.innerHTML.includes("Waiting Task"), "a question moved out of Active");
+  assert.match(els.idle.innerHTML, /Idle <span class="count">1<\/span>/);
+  assert.ok(els.idle.innerHTML.includes("Never Ran"));
+});
+
+test("ready for review: a session whose every PR has landed drops back to Idle", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    finished("11111", "Merged Task", { prs: [pr("MERGED", 1)] }),
+    finished("22222", "Closed Task", { prs: [pr("CLOSED", 2)] }),
+    finished("33333", "Half Landed", { prs: [pr("MERGED", 3), pr("OPEN", 4)] }),
+    finished("44444", "Unknown State", { prs: [pr("", 5)] }),
+  ]);
+  render({ now, agents: [h] });
+
+  const r = els.review.innerHTML, i = els.idle.innerHTML;
+  assert.ok(i.includes("Merged Task") && i.includes("Closed Task"),
+    "a merged/closed PR IS the review — park it in Idle until the build is verified");
+  assert.ok(r.includes("Half Landed"), "one PR still open keeps it up for review");
+  assert.ok(r.includes("Unknown State"), "an unfetched PR state counts as live, never as landed");
+  assert.ok(!r.includes("Merged Task"), "a landed session must not stay under review");
+});
+
+test("ready for review: a merged PR still comes back once the session runs again", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    // Same session, PR merged, but it has since worked and finished another turn
+    // — the transcript signal is what qualifies it, not the PR.
+    finished("11111", "Follow-up", { prs: [pr("MERGED", 1)] }),
+  ]);
+  render({ now, agents: [h] });
+  assert.ok(els.idle.innerHTML.includes("Follow-up"), "landed and quiet: Idle");
+
+  // Now it has a question pending — blocked on a human whatever its PRs did.
+  const h2 = { ...h, sessions: [{ ...h.sessions[0], session: { ...h.sessions[0].session, question: "Ship it?" } }] };
+  render({ now, agents: [h2] });
+  assert.ok(els.review.innerHTML.includes("Follow-up"), "a question always needs you");
+});
+
+test("ready for review: a card says why it is there instead of a bare 'idle'", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    finished("11111", "Research Task"),
+    finished("22222", "PR Task", { prs: [pr("OPEN")] }),
+  ]);
+  render({ now, agents: [h] });
+
+  const r = els.review.innerHTML;
+  assert.ok(r.includes(`<div class="state review">PR awaiting review</div>`), "an open PR says so");
+  assert.ok(r.includes(`<div class="state review">finished · awaiting review</div>`), "a no-PR task says so");
+  assert.ok(r.includes(`<span class="dot review">`), "and takes the accent dot, not the muted idle one");
+});
+
+test("ready for review: the header count and the Active empty state point at it", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([finished("11111", "Research Task"), waiting("22222", "Waiting Task")]);
+  render({ now, agents: [h] });
+
+  assert.equal(els.hdrMeta.textContent, "2 running · 1 waiting on you · 2 ready for review");
+  assert.match(els.active.innerHTML, /No active sessions\. See Ready for review above\./);
 });
 
 test("session cards carry their host's org tint as --org (XERK-142)", () => {

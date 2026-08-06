@@ -1107,15 +1107,19 @@
       <div class="td-foot"><a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">Open in ${srcName} ↗</a></div>`;
   }
 
-  // The three-column board for the selected sites (filter = a siteKey, or
-  // null/"" for all). Sites are the mergeSites() output; org colors come from
+  // The three-column board for the selected sites (filter = a siteKey, an
+  // array/Set of siteKeys — the header's multi-select (XERK-222) — or null/""
+  // for all). Sites are the mergeSites() output; org colors come from
   // orgColorMap over the FULL org set (opts.allKeys) — computed once here, not
-  // per site — so each org's unique color is the same whether or not it's the
+  // per site — so each org's unique color is the same whether or not it's a
   // filtered-to one.
   function boardHtml(sites, filter, opts) {
     const o = opts || {};
     const colorMap = orgColorMap(o.allKeys || sites.map(s => s.siteKey), o.orgColors);
-    const shown = sites.filter(s => !filter || s.siteKey === filter);
+    const fkeys = filter instanceof Set ? [...filter]
+      : Array.isArray(filter) ? filter
+      : filter ? [filter] : [];
+    const shown = sites.filter(s => !fkeys.length || fkeys.includes(s.siteKey));
     const moves = o.moves || null;
     const cards = { todo: [], inprogress: [], review: [], done: [] };
     for (const site of shown) {

@@ -257,16 +257,26 @@ private val KIND_RANK = mapOf(
     com.xerktech.turma.core.LiveState.IDLE to 2,
 )
 
+/** The three live groups the running sessions split into, in reading order. */
+data class LiveGroups(
+    val review: List<RankedSession>,
+    val active: List<RankedSession>,
+    val idle: List<RankedSession>,
+)
+
 /**
- * The running sessions split into the web sessions sidebar's two live groups —
- * Active (attention-worthy: waiting + working) and Idle — each ranked as the web's
- * `collect()` does: attention-first by [KIND_RANK], then freshest activity first.
- * Freshest-first is ascending transcript age; a session with no transcript yet
- * (null age) sorts first, exactly as the web's `?? -1` fallback. Returns
- * (active, idle). Only status=="running" sessions are ranked here; stopped/queued
- * records are handled separately by the caller.
+ * The running sessions split into the web sessions sidebar's three live groups
+ * (XERK-224) — Ready for review (stopped, and waiting on YOU: see
+ * [com.xerktech.turma.core.readyForReview]), Active (still working, leave it
+ * alone), and Idle (quiet, with nothing asking to be looked at) — each ranked as
+ * the web's `collect()` does: attention-first by [KIND_RANK], then freshest
+ * activity first. Freshest-first is ascending transcript age; a session with no
+ * transcript yet (null age) sorts first, exactly as the web's `?? -1` fallback.
+ * Ranking happens before the split, so the waiting-first order survives into each
+ * group as it does on the web. Only status=="running" sessions are ranked here;
+ * stopped/queued records are handled separately by the caller.
  */
-fun rankRunning(rows: List<FlatSession>, now: Long): Pair<List<RankedSession>, List<RankedSession>> {
+fun rankRunning(rows: List<FlatSession>, now: Long): LiveGroups {
     val running = rows.asSequence()
         .filter { it.session.status == "running" }
         .map { RankedSession(it, liveState(it.session, it.hostLastSeen, now)) }
@@ -275,8 +285,14 @@ fun rankRunning(rows: List<FlatSession>, now: Long): Pair<List<RankedSession>, L
                 .thenBy { it.flat.session.session?.transcriptAgeSec ?: -1.0 },
         )
         .toList()
-    return running.filter { it.state != com.xerktech.turma.core.LiveState.IDLE } to
-        running.filter { it.state == com.xerktech.turma.core.LiveState.IDLE }
+    val (review, rest) = running.partition {
+        com.xerktech.turma.core.readyForReview(it.flat.session, it.state)
+    }
+    return LiveGroups(
+        review = review,
+        active = rest.filter { it.state != com.xerktech.turma.core.LiveState.IDLE },
+        idle = rest.filter { it.state == com.xerktech.turma.core.LiveState.IDLE },
+    )
 }
 
 /** An online host and the repos a new session can be spawned in on it. */
@@ -461,9 +477,10 @@ fun SessionsListPane(
     // non-running registry record lands in Ended with the killed + resumable
     // channels, deduped on <host>::<transcriptId>.
     val lists = remember(agents, query) { collectSessions(agents, query) }
-    // The live sessions split into the web's Active (waiting/working) and Idle
+    // The live sessions split into the web's Ready-for-review / Active / Idle
     // sections, each ranked attention-first / freshest-first (XERK-73).
-    val (active, idle) = remember(lists, now) { rankRunning(lists.running, now) }
+    val groups = remember(lists, now) { rankRunning(lists.running, now) }
+    val (review, active, idle) = groups
     val queued = lists.queued
     val ended = lists.ended
     var endedOpen by remember { mutableStateOf(false) }
@@ -510,15 +527,39 @@ fun SessionsListPane(
                     QueuedSessionCard(r, now, tint = hostTint[r.host], onCancel = { vm.kill(r.host, r.session.id) })
                 }
             }
-            // Active: sessions wanting attention (waiting on you, or working). The
-            // header shows even when empty, so "nothing active right now" reads as
-            // a state rather than a missing section — matching the web sidebar.
+            // Ready for review: the work waiting on you, above Active because a
+            // working session is one to ignore until it's done (XERK-224). Shown
+            // only when non-empty, like Idle — an empty state here would just be
+            // noise above the live list.
+            if (review.isNotEmpty()) {
+                item(key = "review-header") { SectionLabel("Ready for review (${review.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
+                items(review, key = { "r:" + it.flat.host + "/" + it.flat.session.id }) { r ->
+                    SessionListCard(
+                        r.flat, now,
+                        tint = hostTint[r.flat.host],
+                        review = true,
+                        selected = selectedKey == r.flat.host + "/" + r.flat.session.id,
+                        moveTargets = eligibleMoveTargets(fleet.agents, r.flat.host, r.flat.session),
+                        onKill = { vm.kill(r.flat.host, r.flat.session.id) },
+                        onRename = { name -> vm.setSummary(r.flat.host, r.flat.session.id, name) },
+                        onMove = { target -> vm.migrate(r.flat.host, r.flat.session.id, target) },
+                        onClick = { onSelect(r.flat.host, r.flat.session.id) },
+                    )
+                }
+            }
+            // Active: sessions still working. The header shows even when empty, so
+            // "nothing active right now" reads as a state rather than a missing
+            // section — matching the web sidebar.
             if (anyRows || ended.isNotEmpty()) {
                 item(key = "active-header") { SectionLabel("Active (${active.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
                 if (active.isEmpty()) {
                     item(key = "active-empty") {
                         Text(
-                            if (idle.isNotEmpty()) "No active sessions. See Idle below." else "No active sessions.",
+                            when {
+                                review.isNotEmpty() -> "No active sessions. See Ready for review above."
+                                idle.isNotEmpty() -> "No active sessions. See Idle below."
+                                else -> "No active sessions."
+                            },
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.padding(vertical = 4.dp),
@@ -733,6 +774,8 @@ private fun SessionListCard(
     now: Long,
     tint: Color?,
     selected: Boolean,
+    /** Rendered under "Ready for review", which the dot says instead of "idle". */
+    review: Boolean = false,
     moveTargets: List<com.xerktech.turma.model.AgentInfo>,
     onKill: () -> Unit,
     onRename: (String) -> Unit,
@@ -778,7 +821,16 @@ private fun SessionListCard(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            StateDot(liveState(r.session, r.hostLastSeen, now))
+            // A card in the Ready-for-review section is idle by liveState, which
+            // would paint the muted "quiet" dot under a heading that says it is
+            // anything but — so it takes the accent one instead (web
+            // `.dot.review`). A waiting card keeps its own stronger amber.
+            val dotState = liveState(r.session, r.hostLastSeen, now)
+            if (review && dotState == com.xerktech.turma.core.LiveState.IDLE) {
+                StatusLight(com.xerktech.turma.ui.theme.TurmaColors.review)
+            } else {
+                StateDot(dotState)
+            }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
                     optimistic?.ifBlank { null } ?: liveName,

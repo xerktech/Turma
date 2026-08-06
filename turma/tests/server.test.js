@@ -108,7 +108,7 @@ hub.registerDevice("capture-device", "android", ["dismiss"]);
 const {
   server, agents, queueCommand, findSession,
   wsAccept, wsEncode, wsParser, channelDuplex,
-  heartbeatAlerts, prAlertDecision, sessionWorking,
+  heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking,
   userAuthorized, agentAuthorized, agentWsAuthorized, triggerAuthorized, fmtDur,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
@@ -628,23 +628,28 @@ test("alerts: answering a question retracts its notification (XERK-154)", () => 
   assert.deepEqual(dismisses(), []);
 });
 
-// ---- PR alerts held until CI is green (XERK-153) ---------------------------
+// ---- The ready-for-review alert, held until CI is green --------------------
+// XERK-153 (hold a PR alert until its CI settles) collapsed into XERK-224's one
+// per-session alert: a session that finished a turn AND opened a PR is ONE
+// piece of work, so it gets one notification, worded for the PR when there is
+// one. The hold, its verdicts and its backstop are unchanged.
 
 const PR_URL = "https://github.com/xerktech/Turma/pull/34";
 const MIN = 60 * 1000;
+const READY = "nas-repo-s1 is ready for review";
 
 // One beat's worth of a session that has opened `urls` and whose PR statuses
 // currently read `prs`. `newPrUrls` is the per-beat scrape; `prs` is the
 // slower-cadence status the agent attaches to the session record.
 const prBeat = (urls, prs) => ({
   sessions: [{
-    id: "s1", rcName: "nas-repo-s1",
+    id: "s1", rcName: "nas-repo-s1", status: "running",
     prs: prs || null,
     session: { newPrUrls: urls },
   }],
 });
 
-test("alerts: PR alert waits for the CI rollup to come back green", () => {
+test("alerts: the ready-for-review alert waits for the CI rollup to come back green", () => {
   const beat = makeHost();
   const t0 = Date.now();
   notifications.length = 0;
@@ -657,7 +662,7 @@ test("alerts: PR alert waits for the CI rollup to come back green", () => {
   assert.deepEqual(titles(), []);
   // Green.
   beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + 2 * MIN);
-  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.deepEqual(titles(), [READY]);
   assert.equal(notifications[0].data.click, PR_URL);
   assert.match(notifications[0].body, /All checks passed/);
   assert.match(notifications[0].body, new RegExp(PR_URL.replace(/[/.]/g, "\\$&")));
@@ -678,7 +683,7 @@ test("alerts: a PR with no CI fires on its own, once the empty rollup holds", ()
   beat(prBeat([], [{ url: PR_URL, checks: null }]), t0 + MIN);
   assert.deepEqual(titles(), []);
   beat(prBeat([], [{ url: PR_URL, checks: null }]), t0 + 3 * MIN);
-  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.deepEqual(titles(), [READY]);
   assert.match(notifications[0].body, /No CI configured/);
 });
 
@@ -688,7 +693,7 @@ test("alerts: a conflicting PR stays quiet until the conflict is resolved (XERK-
   notifications.length = 0;
   beat(prBeat([PR_URL]), t0);
   // Green CI, but the branch conflicts with its base: it merges nowhere, so
-  // "created a PR / all checks passed" would be a lie.
+  // announcing it as ready with "all checks passed" would be a lie.
   const conflicted = { url: PR_URL, state: "OPEN", checks: "passing", mergeable: "CONFLICTING",
     ready: "blocked" };
   beat(prBeat([], [conflicted]), t0 + MIN);
@@ -700,7 +705,7 @@ test("alerts: a conflicting PR stays quiet until the conflict is resolved (XERK-
   // GitHub recomputes, and the alert lands.
   beat(prBeat([], [{ url: PR_URL, state: "OPEN", checks: "passing", mergeable: "MERGEABLE",
     ready: "ready" }]), t0 + 41 * MIN);
-  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.deepEqual(titles(), [READY]);
   assert.match(notifications[0].body, /All checks passed/);
 });
 
@@ -714,7 +719,7 @@ test("alerts: an empty rollup that turns into real checks isn't 'no CI'", () => 
   beat(prBeat([], [{ url: PR_URL, checks: "pending" }]), t0 + 4 * MIN); // past the no-CI grace
   assert.deepEqual(titles(), []);
   beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + 5 * MIN);
-  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.deepEqual(titles(), [READY]);
   assert.match(notifications[0].body, /All checks passed/);
 });
 
@@ -732,7 +737,7 @@ test("alerts: failing CI stays quiet, then fires when the fix goes green", () =>
   beat(prBeat([], [{ url: PR_URL, checks: "pending" }]), t0 + 61 * MIN); // re-run after a push
   assert.deepEqual(titles(), []);
   beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + 62 * MIN);
-  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.deepEqual(titles(), [READY]);
 });
 
 test("alerts: a PR whose CI verdict never arrives fires on the backstop", () => {
@@ -745,26 +750,34 @@ test("alerts: a PR whose CI verdict never arrives fires on the backstop", () => 
   beat(prBeat([], [{ url: PR_URL }]), t0 + 10 * MIN); // bare link, no `checks` key
   assert.deepEqual(titles(), []);
   beat(prBeat([], [{ url: PR_URL }]), t0 + 31 * MIN);
-  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
+  assert.deepEqual(titles(), [READY]);
   assert.match(notifications[0].body, /CI state unknown/);
 });
 
-test("alerts: PR fires once per URL and tracks several PRs independently", () => {
+test("alerts: a session with two PRs still buzzes once, when the last one settles", () => {
   const beat = makeHost();
   const other = "https://github.com/xerktech/Turma/pull/35";
   const t0 = Date.now();
   notifications.length = 0;
   beat(prBeat([PR_URL]), t0);
+  // One green, one still running: the session isn't settled, so the alert holds
+  // rather than firing now and again later — the whole point of collapsing
+  // these into one per-session notice (XERK-224).
   beat(prBeat([PR_URL, other], [{ url: PR_URL, checks: "passing" },
                                 { url: other, checks: "pending" }]), t0 + MIN);
-  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]); // only the green one
-  assert.equal(notifications[0].data.click, PR_URL);
+  assert.deepEqual(titles(), []);
+  // The second settles: one alert, naming both verdicts.
+  beat(prBeat([], [{ url: PR_URL, checks: "passing" },
+                   { url: other, checks: "passing" }]), t0 + 2 * MIN);
+  assert.deepEqual(titles(), [READY]);
+  assert.match(notifications[0].body, new RegExp(PR_URL.replace(/[/.]/g, "\\$&")));
+  assert.match(notifications[0].body, new RegExp(other.replace(/[/.]/g, "\\$&")));
   notifications.length = 0;
-  // The agent re-delivers an already-alerted URL: still only the once.
-  beat(prBeat([PR_URL], [{ url: PR_URL, checks: "passing" },
-                         { url: other, checks: "passing" }]), t0 + 2 * MIN);
-  assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
-  assert.equal(notifications[0].data.click, other);
+  // The agent re-delivers already-alerted URLs: the session is still ready, but
+  // it has already been announced.
+  beat(prBeat([PR_URL, other], [{ url: PR_URL, checks: "passing" },
+                                { url: other, checks: "passing" }]), t0 + 3 * MIN);
+  assert.deepEqual(titles(), []);
 });
 
 for (const finalState of ["MERGED", "CLOSED"]) {
@@ -774,18 +787,49 @@ for (const finalState of ["MERGED", "CLOSED"]) {
     notifications.length = 0;
     beat(prBeat([PR_URL]), t0);
     beat(prBeat([], [{ url: PR_URL, checks: "passing" }]), t0 + MIN); // the alert fires
-    assert.deepEqual(titles(), ["nas-repo-s1 created a PR"]);
-    assert.equal(notifications.at(-1).data.notifKey, `pr:${PR_URL}`);
+    assert.deepEqual(titles(), [READY]);
+    assert.equal(notifications.at(-1).data.notifKey, "review:host1:s1");
     notifications.length = 0;
     // Operator resolves it on their computer; the agent reports the new state.
+    // The session has left the Ready-for-review section, so the notice goes too.
     beat(prBeat([], [{ url: PR_URL, checks: "passing", state: finalState }]), t0 + 2 * MIN);
     assert.deepEqual(titles(), []); // no new alert
-    assert.deepEqual(dismisses(), [`pr:${PR_URL}`]);
+    assert.deepEqual(dismisses(), ["review:host1:s1"]);
     notifications.length = 0;
     beat(prBeat([], [{ url: PR_URL, checks: "passing", state: finalState }]), t0 + 3 * MIN);
     assert.deepEqual(dismisses(), []); // retracted once, on the edge
   });
 }
+
+test("readyForReview: the qualifiers, and the one thing that un-qualifies", () => {
+  const sess = (session, extra = {}) => ({ id: "s1", status: "running", session, ...extra });
+  const done = { lastRole: "assistant", lastHasToolUse: false };
+  // Blocked on a human — either shape of dialog, and whatever the busy read says.
+  assert.equal(readyForReview(sess({ question: "Ship it?" }), true), true);
+  assert.equal(readyForReview(sess({ panePrompt: { prompt: "Allow?" } }), true), true);
+  // Still its own turn.
+  assert.equal(readyForReview(sess(done), true), false);
+  // Stopped with plain assistant output and nothing pending: the no-PR
+  // research task, which is the case a PR-only rule would miss entirely.
+  assert.equal(readyForReview(sess(done), false), true);
+  // Mid-turn output (a tool call still pending) is not a finished turn.
+  assert.equal(readyForReview(sess({ lastRole: "assistant", lastHasToolUse: true }), false), false);
+  assert.equal(readyForReview(sess({ lastRole: "user" }), false), false);
+  assert.equal(readyForReview(sess({}), false), false); // nothing written yet
+  // A PR is judged on its own state, not on the transcript behind it.
+  const withPr = (...states) => sess({}, { prs: states.map((state) => ({ url: "u" + state, state })) });
+  assert.equal(readyForReview(withPr("OPEN"), false), true);
+  assert.equal(readyForReview(withPr("DRAFT"), false), true);
+  assert.equal(readyForReview(withPr(""), false), true, "an unfetched state never drops the work");
+  assert.equal(readyForReview(withPr("MERGED"), false), false, "merging IS the review");
+  assert.equal(readyForReview(withPr("CLOSED"), false), false);
+  assert.equal(readyForReview(withPr("MERGED", "OPEN"), false), true, "one still open is enough");
+  // A landed PR outranks the finished turn that opened it — otherwise merging
+  // could never move a session out of the section.
+  assert.equal(readyForReview(sess(done, { prs: [{ url: "u", state: "MERGED" }] }), false), false);
+  // Only live sessions; an ended one has its own list.
+  assert.equal(readyForReview({ id: "s1", status: "stopped", session: done }, false), false);
+});
 
 test("prAlertDecision: the verdict table, and its sticky markers", () => {
   const now = Date.now();
@@ -840,11 +884,90 @@ test("prAlertDecision: an open PR with merge conflicts never reads as ready (XER
     "All checks passed");
 });
 
-test("alerts: turn finished fires on the working->idle edge only", () => {
+// A conflicted PR holds prAlertDecision open indefinitely (above), so it holds
+// the one ready-for-review alert too — XERK-223 decided a conflicting PR must
+// not buzz, and XERK-224 routed every PR verdict through that same gate. The
+// session still LISTS under Ready for review; only the notification waits, and
+// XERK-223's own nudge is what gets the session working again to clear it.
+test("alerts: a conflicting PR holds the ready-for-review alert until it is resolved", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  const pr = (extra) => [{ url: PR_URL, state: "OPEN", checks: "passing", ...extra }];
+  const s = (session, prs) => ({
+    sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running", prs: prs || null, session }],
+  });
+  const busy = { paneBusy: true, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: true };
+  const done = { paneBusy: false, transcriptAgeSec: 600, lastRole: "assistant", lastHasToolUse: false };
+
+  notifications.length = 0;
+  beat(s({ ...busy, newPrUrls: [PR_URL] }), t0);
+  // Turn over, CI green — but the branch conflicts, so nothing fires.
+  beat(s(done, pr({ mergeable: "CONFLICTING" })), t0 + MIN);
+  assert.deepEqual(titles(), []);
+  beat(s(done, pr({ mergeable: "CONFLICTING" })), t0 + 60 * MIN); // well past the backstop
+  assert.deepEqual(titles(), []);
+  // The session merges the base and finishes again; now it is genuinely ready.
+  beat(s(busy, pr({ mergeable: "CONFLICTING" })), t0 + 61 * MIN);
+  beat(s(done, pr({ mergeable: "MERGEABLE" })), t0 + 62 * MIN);
+  assert.deepEqual(titles(), [READY]);
+  assert.match(notifications[0].body, /All checks passed/);
+});
+
+// The hold is read off session.prs, not off the CI wait list, because a URL only
+// enters that list through the per-beat `newPrUrls` scrape. These two cases have
+// an EMPTY wait list and a live PR, which is what a hub that booted after the
+// scrape — or a session alerted once and then worked again — actually looks like.
+test("alerts: a conflicting PR that never hit the wait list still holds the alert", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  const s = (session, prs) => ({
+    sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running", prs: prs || null, session }],
+  });
+  const busy = { paneBusy: true, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: true };
+  const done = { paneBusy: false, transcriptAgeSec: 600, lastRole: "assistant", lastHasToolUse: false };
+  const conflicted = [{ url: PR_URL, state: "OPEN", checks: "passing", mergeable: "CONFLICTING" }];
+
+  notifications.length = 0;
+  beat(s(busy), t0);                                   // no newPrUrls this beat
+  beat(s(done, conflicted), t0 + MIN);
+  assert.deepEqual(titles(), [], "a PR that merges nowhere must not be announced");
+  beat(s(done, conflicted), t0 + 60 * MIN);            // past the age-out backstop
+  assert.deepEqual(titles(), []);
+  // The session merges the base (XERK-223 nudged it) and finishes again.
+  beat(s(busy, conflicted), t0 + 61 * MIN);
+  beat(s(done, [{ url: PR_URL, state: "OPEN", checks: "passing", mergeable: "MERGEABLE" }]), t0 + 62 * MIN);
+  assert.deepEqual(titles(), [READY]);
+});
+
+test("alerts: a session with a live PR never claims it has nothing to merge", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  const s = (session, prs) => ({
+    sessions: [{
+      id: "s1", rcName: "nas-repo-s1", status: "running", prs: prs || null,
+      git: { repoName: "turma", branch: "XERK-224" }, session,
+    }],
+  });
+  const busy = { paneBusy: true, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: true };
+  const done = { paneBusy: false, transcriptAgeSec: 600, lastRole: "assistant", lastHasToolUse: false };
+  const open = [{ url: PR_URL, state: "OPEN", checks: "passing", mergeable: "MERGEABLE" }];
+
+  notifications.length = 0;
+  beat(s(busy), t0);
+  beat(s(done, open), t0 + MIN);
+  assert.deepEqual(titles(), [READY]);
+  // No banked CI verdict (nothing was ever queued on the wait list), but the PR
+  // is real — name it rather than reporting the session opened nothing.
+  assert.match(notifications[0].body, new RegExp(PR_URL.replace(/[/.]/g, "\\$&")));
+  assert.doesNotMatch(notifications[0].body, /nothing to merge/);
+  assert.equal(notifications[0].data.click, PR_URL);
+});
+
+test("alerts: a finished turn with no PR fires on the working->idle edge only", () => {
   const beat = makeHost();
   const sess = (ageSec, extra = {}) => ({
     sessions: [{
-      id: "s1", rcName: "nas-repo-s1",
+      id: "s1", rcName: "nas-repo-s1", status: "running",
       session: { transcriptAgeSec: ageSec, lastRole: "assistant", lastHasToolUse: false, ...extra },
     }],
   });
@@ -853,17 +976,45 @@ test("alerts: turn finished fires on the working->idle edge only", () => {
   beat(sess(0), now); // working
   assert.deepEqual(titles(), []);
   beat(sess(600), now + 20000); // went idle, plain assistant output
-  assert.deepEqual(titles(), ["nas-repo-s1 finished its turn"]);
+  assert.deepEqual(titles(), [READY]);
+  // A research task that opened nothing says so, rather than naming a PR.
+  assert.match(notifications[0].body, /Finished — nothing to merge/);
   notifications.length = 0;
   beat(sess(620), now + 40000); // stays idle: edge already fired
   assert.deepEqual(titles(), []);
+});
+
+test("alerts: a pending question suppresses the ready-for-review alert", () => {
+  // The question alert is already that session's one buzz, and it says more —
+  // so the two must not both fire for the same stop (XERK-224).
+  const beat = makeHost();
+  const sess = (ageSec, question) => ({
+    sessions: [{
+      id: "s1", rcName: "nas-repo-s1", status: "running",
+      session: {
+        transcriptAgeSec: ageSec, lastRole: "assistant", lastHasToolUse: false,
+        ...(question ? { question } : {}),
+      },
+    }],
+  });
+  const now = Date.now();
+  notifications.length = 0;
+  beat(sess(0), now);                       // working
+  beat(sess(600, "Ship it?"), now + 20000); // stopped, asking
+  assert.deepEqual(titles(), ["nas-repo-s1 has a question"]);
+  notifications.length = 0;
+  // Answered from the desktop, and the session is still quiet: the ready alert
+  // it was holding fires now that nothing louder covers it.
+  beat(sess(620), now + 40000);
+  assert.deepEqual(titles(), [READY]);
+  assert.deepEqual(dismisses(), ["question:host1:s1"]);
 });
 
 test("alerts: replying to a finished turn retracts its notification (XERK-154)", () => {
   const beat = makeHost();
   const sess = (ageSec, busy) => ({
     sessions: [{
-      id: "s1", rcName: "nas-repo-s1",
+      id: "s1", rcName: "nas-repo-s1", status: "running",
       session: { paneBusy: busy, transcriptAgeSec: ageSec, lastRole: "assistant", lastHasToolUse: false },
     }],
   });
@@ -871,12 +1022,12 @@ test("alerts: replying to a finished turn retracts its notification (XERK-154)",
   notifications.length = 0;
   beat(sess(0, true), now);            // working
   beat(sess(600, false), now + 20000); // went idle: turn finished
-  assert.deepEqual(titles(), ["nas-repo-s1 finished its turn"]);
-  assert.equal(notifications.at(-1).data.notifKey, "turn:host1:s1");
+  assert.deepEqual(titles(), [READY]);
+  assert.equal(notifications.at(-1).data.notifKey, "review:host1:s1");
   notifications.length = 0;
   beat(sess(0, true), now + 40000);    // operator replied: working again
   assert.deepEqual(titles(), []);
-  assert.deepEqual(dismisses(), ["turn:host1:s1"]);
+  assert.deepEqual(dismisses(), ["review:host1:s1"]);
   notifications.length = 0;
   beat(sess(10, true), now + 60000);   // stays working: retracted once, on the edge
   assert.deepEqual(dismisses(), []);

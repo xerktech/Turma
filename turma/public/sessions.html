@@ -91,6 +91,9 @@
   .s-card .state { font-size: 12px; margin-top: 4px; color: var(--ink-2); }
   .s-card .state.working { color: var(--good); }
   .s-card .state.waiting { color: var(--warning); font-weight: 600; }
+  /* A card in the Ready-for-review section says why it is there instead of the
+     bare "idle" it would otherwise read (XERK-224). */
+  .s-card .state.review { color: var(--accent); font-weight: 600; }
   .s-card .question {
     font-size: 12px; color: var(--ink-2); margin-top: 3px;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
@@ -287,8 +290,8 @@
   /* While a query is active, #searchResults overlays the live/ended lists. */
   #searchResults { display: none; }
   body.searching #searchResults { display: block; }
-  body.searching #active, body.searching #idle, body.searching #ended,
-  body.searching #spawn { display: none; }
+  body.searching #review, body.searching #active, body.searching #idle,
+  body.searching #ended, body.searching #spawn { display: none; }
   .sr-hint { color: var(--muted); font-size: 12px; padding: 6px 2px; }
   .sr-group { margin: 10px 0 4px; }
   .sr-group > .grp-h {
@@ -760,6 +763,7 @@
       <div id="searchResults"></div>
       <div id="spawn"></div>
       <div id="queued"></div>
+      <div id="review"></div>
       <div id="active"></div>
       <div id="idle"></div>
       <div id="ended"></div>
@@ -842,6 +846,7 @@
 <script src="/newticket.js"></script>
 
 <script>
+const $review = document.getElementById("review");
 const $active = document.getElementById("active");
 const $idle = document.getElementById("idle");
 const $ended = document.getElementById("ended");
@@ -1315,6 +1320,59 @@ function liveState(sess, host, now) {
   return { kind: "idle", label: "idle", detail: "last write " + ago(age) };
 }
 
+// Has this PR left the operator's plate? MERGED and CLOSED are the two end
+// states; everything else — OPEN, DRAFT, and an empty/unknown state (an older
+// agent, or a PR the status sweep hasn't fetched yet) — counts as still live.
+// The bias is deliberate and one-directional: an unreadable state must never
+// be what drops a piece of work off the review list.
+function prLanded(p) {
+  const st = String(p?.state || "").toUpperCase();
+  return st === "MERGED" || st === "CLOSED";
+}
+
+// "Ready for review" (XERK-224): a live session that has stopped and is now
+// waiting on the OPERATOR rather than on itself. Its own section above Active,
+// because a working session is one to leave alone and this is the work to look
+// at — the split the sidebar was missing.
+//
+// It is DERIVED from the signals alone; there is no "I've reviewed this"
+// action, so nothing here is acknowledged and a session that qualifies stays
+// listed until it runs again or its PR lands. Three qualifiers, deliberately
+// generous — the case a PR-only rule misses is a research task that finished
+// with an answer and no PR, which is the one the operator asked for by name:
+//
+//   - a pending question / blocking TUI dialog. It is BLOCKED on a human, so it
+//     qualifies whatever the busy read says, and it leads the section (collect()
+//     already sorts `waiting` first);
+//   - a PR that hasn't landed — there is a diff to read;
+//   - a finished turn: the newest transcript entry is plain assistant output
+//     with no tool call pending, which is the only trace a no-PR task leaves.
+//     Same read the hub's turn-finished alert takes (server.js heartbeatAlerts).
+//
+// A session that opened a PR is judged on the PR ALONE, not on its transcript:
+// the one way out, short of working again, is that PR LANDING. Every PR merged
+// or closed has been reviewed by definition, so it falls back to Idle — which
+// is where the operator parks work that is merged but not yet verified against
+// a build.
+function readyForReview(s, live) {
+  if (live.kind === "waiting") return true;    // blocked on you either way
+  if (live.kind === "working") return false;   // still its own turn
+  const sig = s.session;
+  if (!sig) return false;
+  const prs = s.prs || [];
+  if (prs.length) return prs.some(p => !prLanded(p));
+  return sig.lastRole === "assistant" && !sig.lastHasToolUse;
+}
+
+// The state line a Ready-for-review card carries. A waiting one keeps its own
+// (stronger) "waiting for your answer"; the rest would otherwise read a bare
+// "idle" under a heading that says they are not, so they say why they qualified.
+function reviewState(s, live) {
+  if (live.kind !== "idle") return live;
+  const label = (s.prs || []).some(p => !prLanded(p)) ? "PR awaiting review" : "finished · awaiting review";
+  return { ...live, kind: "review", label, detail: live.detail };
+}
+
 // Running sessions sorted attention-first: waiting on you, then working, then
 // idle; freshest activity first within each group.
 const KIND_ORDER = { waiting: 0, working: 1, idle: 2 };
@@ -1501,13 +1559,26 @@ function render(data) {
 
   const { running, queued, ended } = collect(agents, now);
   const waiting = running.filter(x => x.live.kind === "waiting").length;
-  $counts.textContent = running.length + " running" + (waiting ? " · " + waiting + " waiting on you" : "");
 
-  // Running sessions split by liveness: attention-worthy (waiting/working) up
-  // top under "Active", quiet ones auto-demoted to "Idle" below. Both are still
-  // live, attachable sessions (same card); collect() already sorted `running`.
-  const active = running.filter(x => x.live.kind !== "idle");
-  const idle = running.filter(x => x.live.kind === "idle");
+  // Running sessions split three ways, in the order the operator reads them:
+  //
+  //   Ready for review — stopped, and waiting on YOU (see readyForReview).
+  //   Active           — still working; leave it alone until it is done.
+  //   Idle             — quiet, and with nothing asking to be looked at:
+  //                      a session whose PR already landed, or one that has
+  //                      not produced anything yet.
+  //
+  // All three are live, attachable sessions rendered with the same card;
+  // collect() already sorted `running`, and filtering preserves that order, so
+  // the waiting-first ranking survives into each section.
+  const review = [], rest = [];
+  for (const x of running) (readyForReview(x.s, x.live) ? review : rest).push(x);
+  const active = rest.filter(x => x.live.kind !== "idle");
+  const idle = rest.filter(x => x.live.kind === "idle");
+
+  $counts.textContent = running.length + " running"
+    + (waiting ? " · " + waiting + " waiting on you" : "")
+    + (review.length ? " · " + review.length + " ready for review" : "");
 
   const hosts = agents.filter(a => a.online && (a.repos || []).length);
   // Preserve focus/caret (in an open composer or a card's rename box), the
@@ -1537,11 +1608,21 @@ function render(data) {
        <div class="s-list">${queued.map(x => queuedCard(x)).join("")}</div>`
     : "";
 
+  // Ready for review: the work waiting on the operator, above Active because a
+  // working session is one to ignore until it's done. Hidden when empty, like
+  // Idle — an empty state here would just be noise above the live list.
+  $review.innerHTML = review.length
+    ? `<h2>Ready for review <span class="count">${review.length}</span></h2>
+       <div class="s-list">${review.map(x => activeCard({ ...x, live: reviewState(x.s, x.live) })).join("")}</div>`
+    : "";
+
   $active.innerHTML = `<h2>Active <span class="count">${active.length}</span></h2>` +
     (active.length
       ? `<div class="s-list">${active.map(x => activeCard(x)).join("")}</div>`
       : `<div class="empty" style="padding:28px 0">No active sessions.${
-          idle.length ? " See Idle below." : hosts.length ? " Start one above." : ""}</div>`);
+          review.length ? " See Ready for review above."
+            : idle.length ? " See Idle below."
+            : hosts.length ? " Start one above." : ""}</div>`);
 
   $idle.innerHTML = idle.length
     ? `<h2>Idle <span class="count">${idle.length}</span></h2>

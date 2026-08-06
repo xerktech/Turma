@@ -313,9 +313,12 @@ those are marked `[MODEL]`.
   (`SessionRenameCard`, painted optimistically until the agent reports the name back or a TTL passes),
   Kill arms "Confirm kill" then confirms. `vm/FleetViewModel.kt` `setSummary`; `net/HubApi.kt`
   `setSummary`/`SummaryRequest`.
-- P1 Sidebar sections: Active / Idle split done (XERK-73, `rankRunning`); the dedicated Queued
-  section done (XERK-78; the old Stopped group folded into Ended). Still open: a state line + question
-  preview on each live card (the dashboard card has both; the sessions-list card shows only the dot).
+- P1 Sidebar sections: Ready for review / Active / Idle split done (XERK-73 + XERK-224,
+  `rankRunning` → `LiveGroups`); the dedicated Queued section done (XERK-78; the old Stopped group
+  folded into Ended). Still open: a state line + question preview on each live card (the dashboard card
+  has both; the sessions-list card shows only the dot). Because there is no state line, a
+  Ready-for-review card carries the accent dot where the web card also spells out *why* it qualified
+  ("PR awaiting review" / "finished · awaiting review").
 - ~~P1 SendUserFile inline previews (XERK-221).~~ **Done**: the app now has an image pipeline (Coil +
   `SvgDecoder`, wired via `TurmaApplication : ImageLoaderFactory`). `SendFile`/`files[]`/`caption` are on
   `ToolUseBlock` (decoded) → `ChatItem.Tool` (`ChatItemsTest`), and `TranscriptView` renders each file:

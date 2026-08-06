@@ -61,7 +61,11 @@ private val DarkScheme = darkColorScheme(
  */
 object TurmaColors {
     val working = Good
-    val idle = AccentDark
+    // Muted, matching the web `.dot.idle` — a quiet session with nothing asking
+    // to be looked at. It used to be the accent, which is now what the
+    // Ready-for-review dot beside it needs (XERK-224).
+    val idle = Muted
+    val review = AccentDark
     val waiting = Warning
     val stopped = Muted
     val good = Good
