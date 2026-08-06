@@ -83,8 +83,7 @@ One agent container per host, multiplexing sessions across every repo it scans.
   `session.queuedReason`/`queuedAt`.
 - **The queue applies to every spawn path; only TICKET spawns split across hosts.** An explicit "+ New
   session" queues on the host whose card was clicked.
-- Tests: `TestSessionLifecycle`, `TestSpawnTicket` in `test_hub_agent.py`;
-  `sessions.test.js`.
+- Tests: `TestSessionLifecycle`, `TestSpawnTicket` in `test_hub_agent.py`; `sessions.test.js`.
 
 ### Repos-root sessions
 
@@ -336,61 +335,61 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 #### PR status
 
 - State (Open/Draft/Merged/Closed), CI rollup (passing/failing/pending) and mergeability
-  (MERGEABLE/CONFLICTING/UNKNOWN) of every PR a session opened. Fetched via `gh pr view`
-  (`pr_status`/`_summarize_pr`/`_check_class`) on the `PR_STATUS_REFRESH_EVERY` cadence.
+  (MERGEABLE/CONFLICTING/UNKNOWN) of every PR a session opened, on the `PR_STATUS_REFRESH_EVERY` cadence.
 - The card's **single ✓/✗/● mark is merge READINESS, not CI** (`ready`, from `_merge_ready`): a conflict
   blocks on its own, and a ✓ requires an affirmative MERGEABLE — a just-opened PR's UNKNOWN is `pending`.
   Conflicts only matter while a PR could still land: MERGED/CLOSED reports CI alone; a PR with **no
-  checks** keeps its no-mark unless it CONFLICTS.
-  - `checks`/`checkCounts` stay pure CI beside it. All four renderers (web ×3, android's `PrBadge`)
-    read `ready`, falling back to the CI half for older agents.
+  checks** keeps its no-mark unless it CONFLICTS. `checks`/`checkCounts` stay pure CI beside it; all
+  four renderers (web ×3, android's `PrBadge`) read `ready`, falling back to the CI half for older agents.
 - Cached by URL in `pr_status_cache`, attached as `session.prs`; kept after the session stops. **Durable
   across an agent restart** (XERK-15): a running session mirrors `session_pr_urls` onto its record
-  (`prUrls`) and rehydrates the map on boot (`test_prs_survive_agent_restart`).
-- **XERK-13 extends that durability to ENDED sessions and to the pill**, keyed by transcript id so it
-  outlives the registry/closed record — two durable ledgers beside the ticket one:
-  - `pr-sessions.json` (`PR_LEDGER_PATH`, `transcriptId -> {urls, at}`): written when the scan finds a
-    URL (`_remember_prs`; on kill via `_remember_closed`), backfilled from closed history. Consumed by
-    the **resumable scan** (the only channel left once a closed record ages out) via `_ledger_prs`;
-    boot backfills `session_pr_urls` for a pre-mirror live record.
+  (`prUrls`) and rehydrates the map on boot — and **for ENDED sessions and the pill too** (XERK-13),
+  keyed by transcript id so it outlives the registry/closed record, via two ledgers beside the ticket one:
+  - `pr-sessions.json` (`PR_LEDGER_PATH`, `transcriptId -> {urls, at}`): written by `_remember_prs` when
+    the scan finds a URL, backfilled from closed history, read by the **resumable scan** (`_ledger_prs`)
+    — the only channel left once a closed record ages out.
   - `pr-status.json` (`PR_STATUS_LEDGER_PATH`, `url -> status`): `refresh_pr_status` persists the cache
     and seeds it back at boot — an ended session is never re-polled, so without this its chip degrades
-    to a bare link. Ledgered URLs count as `referenced`. Tests: `TestPrLedger`, `TestResumableReport`,
-    `sessions.test.js`.
+    to a bare link. Ledgered URLs count as `referenced`.
 - **Which PRs are "a session's"** is decided by `_scan_pr_line`, deliberately narrow: a URL counts only
-  when it comes back in a **creating call's own `tool_result`** — `gh pr create`; for a GitLab MR
-  (XERK-162) `glab mr create` or a `git push -o merge_request.create` (`MR_URL_RE`) — the one event
-  that says this session OPENED it. Call and result are separate entries, often in different beats —
-  pending tool_use ids carry across beats (capped); the scan parses whole JSONL lines.
-  - Cost: a PR opened another way (a subagent's transcript, an MCP tool, the web UI) gets no chip.
-    Widen by teaching `_scan_pr_line` another creation event — never by scanning loose text again.
-- **An MR then answers everywhere a PR does (XERK-162)**: `pr_status`/`_pr_comment_events` dispatch an
-  MR URL to the configured GitLab's API in the same shapes (`mr_status`/`_mr_comment_events`), each URL
-  polled only through the source that can answer it (`_pr_source_ok`; unreachable → bare link chip).
-  The guard denies `glab mr merge`; the image bundles a pinned `glab`. Tests: `TestMrStatus`,
-  `TestMrCommentEvents`.
-- Tests: `TestPrStatus`, `TestRefreshPrStatus`, `TestSessionReport`, `prFooterChip` in `chat.test.js`.
+  when it comes back in a **creating call's own `tool_result`** (`PR_CREATE_RE`) — the one event that
+  says this session OPENED it. `gh pr create`; `glab mr create` / `git push -o merge_request.create`
+  (XERK-162); `az repos pr create` (XERK-226), whose JSON carries no link — `_azdo_created_pr_url` builds
+  one from `repository.webUrl` + `pullRequestId` when the result printed no link itself. Call and result
+  land in different beats, so pending tool_use ids carry across (capped); the scan parses whole lines.
+  - Cost: a PR opened another way (a subagent, an MCP tool, the web UI) gets no chip. Widen by teaching
+    `_scan_pr_line` another creation event — never by scanning loose text again.
+- **A GitLab MR (XERK-162) and an ADO PR (XERK-226) answer everywhere a GitHub PR does**: `pr_status`/
+  `_pr_comment_events` dispatch by URL to `mr_status`/`azdo_pr_status` and their `_*_comment_events`, in
+  identical shapes, each URL polled only through the source that can answer it (`_pr_source_ok`;
+  unreachable → bare link chip). ADO reuses the BOARD's PAT and has no CI rollup, so `checks` is the
+  **CI-bearing branch POLICY evaluations only** (`AZDO_CI_POLICY_IDS`): reviewer/work-item policies would
+  read a PR awaiting a human as "CI pending". `mergeable` is `mergeStatus`, conflicts alone. The image
+  bundles `glab` and az's `azure-devops` extension.
+- Tests: `TestPrStatus`, `TestMr*`, `TestAzdoPr*`, `TestRefreshPrStatus`, `TestPrLedger`; `prFooterChip`
+  in `chat.test.js`, `sessions.test.js`.
 
 #### PR comment delivery (XERK-49)
 
 - **A reply asking for corrections on a session's PR is typed back into the session that opened it.**
   `_poll_pr_comments` runs on the PR cadence, for **running sessions only**, over their OWN PRs
   (`session_pr_urls`), through **`send_input`** — inheriting the compaction-survival outbox (XERK-47) and
-  the queue if a turn is in flight.
+  the queue mid-turn.
 - `_pr_comment_events(url, self_login)` gathers **three channels** — conversation comments, review bodies
-  and inline review-thread comments (an MR's one notes call covers all three, system notes dropped); a
-  bare approve is dropped.
+  and inline review-thread comments; a bare approve is dropped. One call covers all three on GitLab
+  (notes) and ADO (threads), minus that tracker's own system notes. `_pr_ref` numbers it `#12` on
+  GitHub, `!12` on GitLab and ADO (there `#12` is a WORK ITEM).
 - **Baseline-on-first-sight, then deliver only new + not-self.** A PR's whole comment set is recorded
   silently the first beat it's seen (`prCommentBase`, capped `PR_COMMENTS_SEEN_MAX`); after that only NEW
-  keys not the agent's own (`viewerDidAuthor`, else a login compare) are typed in. Bounded at
-  `PR_COMMENTS_MAX` PRs per beat; a fetch failure (→ None) leaves the baseline UNTOUCHED. Disable with
-  `TURMA_PR_COMMENTS=0`.
+  keys not the agent's own (`viewerDidAuthor`, else an identity compare) are typed in. Bounded at
+  `PR_COMMENTS_MAX` PRs per beat; a fetch failure (→ None) leaves the baseline UNTOUCHED.
 - **A conflicting PR is fixed by the session that opened it, unasked** (XERK-223): `_poll_pr_conflicts`
   types `_pr_conflict_message` (MERGE `origin/<base>`, never a rebase/force-push) off the `mergeable`
   `refresh_pr_status` just cached. `prConflicts` = `{url:{at,attempts}}` bounds the nudging per PR;
   MERGEABLE/closed clears and re-arms it, **UNKNOWN does neither** — that is what a just-pushed fix looks
-  like, so clearing on it would grant unlimited retries. `TURMA_PR_CONFLICTS=0`.
-- Tests: `TestPrComment*`, `TestPollPrComments`, `TestPollPrConflicts`, `TestPrConflictMessage`.
+  like, and clearing on it would grant unlimited retries.
+- Disable with `TURMA_PR_COMMENTS=0` / `TURMA_PR_CONFLICTS=0`. Tests: `TestPrComment*`,
+  `TestPollPrComments`, `TestPollPrConflicts`, `TestPrConflictMessage`.
 
 ### Expected-restart "updating" status (XERK-29)
 
@@ -407,8 +406,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   past `until`. The offline sweep suppresses the "host offline" alert while `updating` holds.
 - The dashboard renders it as a distinct amber state (`agentState`/`hostCard`); Android/glasses predate
   the field and keep showing `offline`.
-- Tests: `TestUpdatingAnnounce`, `test_turma_agent_update.sh`,
-  `server.test.js`.
+- Tests: `TestUpdatingAnnounce`, `test_turma_agent_update.sh`, `server.test.js`.
 
 ### Usage aggregates and the attribution ledger
 
@@ -546,7 +544,6 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   - anything **unreadable** — an unparseable shape, or an off-list repo name — is a **failed attempt**
     whose key is omitted, leaving the ticket undecided for retry. Conflating them paints a confident chip
     the model never asserted, left there for good since decisions aren't re-triaged.
-- A ticket not yet triaged carries **no `repoGuess`** (absence ≠ "no repo fits").
 - `_apply_triage()` re-stamps the ledger onto tickets after every poll and merge (`collect_jira` builds
   fresh dicts, else chips blank each slow beat). Tuned by `JIRA_TRIAGE_MODEL` (default `haiku`) /
   `JIRA_TRIAGE_TIMEOUT_SEC`.
@@ -561,7 +558,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Three answers, deliberately distinct — which is why `auto` is a separate field, not an absent `repo`:
   `{repo:"<name>"}` pins that repo; `{repo:null}` is a manual **"no repo fits"**; `{auto:true}`
   **releases** the pin, re-triaging with a **fresh** attempt budget.
-- **Un-cloned repos are offerable** (the board renders them dashed). The name is **allowlist-checked
+- **Un-cloned repos are offerable**. The name is **allowlist-checked
   host-side against that host's own candidates**, and the stored repo/cloned/`nameWithOwner` are read
   off the **candidate**, never the request. The candidate list is heartbeated as **`jira.repoOptions`**
   (`_jira_payload`) via `_refresh_triage_candidates` — one list serving the model's prompt and the
@@ -578,8 +575,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - **Known limits, all multi-host-per-org**: the picker offers the union of the org's hosts' options, so
   it can offer a repo one host rejects (log-only; the panel self-corrects within `REPO_SETTLE_MS`);
   `cloned` is host-relative.
-- Tests: `TestSetJiraRepo`, `repoPickerHtml`/`repoFieldHtml` in
-  `board.test.js`, `server.test.js`.
+- Tests: `TestSetJiraRepo`, `repoPickerHtml`/`repoFieldHtml` in `board.test.js`, `server.test.js`.
 
 ### Jira ticket sessions
 
@@ -646,16 +642,15 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   `store`, reading cached git credentials from an **optional** bind mount. gh is first so github.com
   always gets a fresh token; an unmounted file is a no-op. The guard denies writing
   `~/.git-credentials`. **Native inherits the host's git config untouched.** Tests:
-  `test_entrypoint.sh`, `test_denies_non_github_git_credential_writes` in
-  `test_guard_settings.py`.
-- **Azure DevOps git auth (XERK-54)** — an ADO org already gives the agent a PAT for the board
-  (`AZDO_TOKEN` + `AZDO_URL`), so plain git reuses it: at boot `entrypoint.sh` runs
-  `hub-agent.py --wire-azure-git`, setting a URL-scoped `http.<azure_base>.extraHeader = Authorization:
-  Basic <base64(":<PAT>")>` (`azure_git_auth_config()`). Uses **`extraHeader`, not a credential helper /
+  `test_entrypoint.sh`, `test_denies_non_github_git_credential_writes` in `test_guard_settings.py`.
+- **Azure DevOps auth (XERK-54, XERK-226)** — an ADO org already gives the agent a PAT for the board
+  (`AZDO_TOKEN` + `AZDO_URL`), so everything else reuses it. At boot `entrypoint.sh` runs
+  `hub-agent.py --wire-azure-git`, setting a URL-scoped `http.<azure_base>.extraHeader` (Basic `:<PAT>`,
+  `azure_git_auth_config()`) for plain git — **`extraHeader`, not a credential helper /
   `http.proactiveAuth`**: self-hosted TFS/Server often issues no Basic challenge a helper can act on, and
   the image's git (2.39) predates `proactiveAuth` (2.46). Written `--system` as root before the privilege
-  drop; non-fatal, logs the host never the token. Container-only. Tests: `TestAzureGitAuthConfig`,
-  `test_entrypoint.sh`.
+  drop, and **exports `AZURE_DEVOPS_EXT_PAT`** so `az repos` authenticates too. Non-fatal, logs the host
+  never the token. Container-only. Tests: `TestAzureGitAuthConfig`, `test_entrypoint.sh`.
 
 ### `entrypoint.sh`
 
@@ -764,8 +759,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - `retire()` is idempotent per-socket and **never waits on `ws.close()`**: it schedules the reconnect
   itself. Supervision cannot cover any of this — the native supervisor only respawns on process **exit**,
   and a wedged socket never exits.
-- Tests: `tunnel-agent.test.js` and
-  `server.test.js`.
+- Tests: `tunnel-agent.test.js` and `server.test.js`.
 
 ### Live working footer and agent list
 
@@ -1051,10 +1045,10 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - Each card shows the **repo the agent triaged the ticket to** (`repoChipHtml`, from `repoGuess`), in
   three distinct states: a repo **cloned** on the reporting host is a plain actionable chip; one only in
   the org's `gh` listing is **dashed**; a ticket the model declined shows a muted italic **"no repo"**.
-  A ticket with no `repoGuess` yet gets **no chip** ("not looked at yet" ≠ "no repo fits").
-- The model's rationale rides as the chip's tooltip and the detail panel's Repo row (`repoFieldHtml`,
-  which reads `t.repoGuess` directly — the guess only exists on the heartbeat ticket, not the on-demand
-  Jira fetch). The Repo row is also where the guess is **corrected by hand**.
+  A ticket with no `repoGuess` yet gets **no chip** ("not looked at yet" ≠ "no repo fits"). The model's
+  rationale rides as the chip's tooltip and the detail panel's Repo row (`repoFieldHtml`, which reads
+  `t.repoGuess` directly — the guess only exists on the heartbeat ticket, not the on-demand Jira fetch),
+  which is also where the guess is **corrected by hand**.
 
 #### Starting a session on a ticket
 
@@ -1079,8 +1073,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
     holds, and "command gone" only counts as acked once the command was **seen present** (`sawCmd`) —
     the SSE-fallback poll may not yet have seen a just-queued command.
   - the POST uses **`keepalive: true`** so it outlives the page.
-- Tests: `server.test.js`, `startSweepVerdict` in
-  `board.test.js`.
+- Tests: `server.test.js`, `startSweepVerdict` in `board.test.js`.
 
 ##### Splitting ticket sessions across an org's agents (XERK-14)
 
@@ -1193,11 +1186,13 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `jira.repoOptions` — cloned and un-cloned repos in separate `optgroup`s, plus "No repository fits" and
   "Let the agent decide", `POST`ing to `/api/jira/<siteKey>/<issueKey>/repo`.
 - **Choosing an option IS the save** — every option is a complete answer, so picking one commits it and
-  closes the picker. There is no Save button: with one, closing the panel discarded the choice silently.
-  Re-picking the value already showing saves **nothing** but still closes it; `repoPickerValue` is what
-  the handler compares against and what `repoPickerHtml` preselects from — they must not drift, or a real
-  change reads as a re-pick and gets dropped. **Cancel** is the way out.
-- The row is present even for an **untriaged** ticket, reading "Not triaged yet".
+  closes the picker; **Cancel** is the way out and there is no Save button (with one, closing the panel
+  discards the choice silently). Re-picking the value already showing saves **nothing** but still closes
+  it; `repoPickerValue` is what the handler compares against and what `repoPickerHtml` preselects from —
+  they must not drift, or a real change reads as a re-pick and gets dropped.
+- The row is present even for an **untriaged** ticket ("Not triaged yet"); "Change" only appears when a
+  host of that org is **online**, and the edit state lives in a page variable, not the DOM (as the
+  session card's ⋯ menu does).
 - **Only a manual pin preselects a repo.** An auto guess is the model's answer while the operator's
   setting is "let it decide"; preselecting it would misreport that as a pin.
 - Options are merged **across the org's hosts** (`mergeSites`, cloned winning the dedupe), collected next
@@ -1205,13 +1200,11 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   otherwise offer only whichever host polled Jira last).
 - A pinned repo that has **left** the options is carried back in under "Currently set" so it stays
   selected — else the browser falls back to its first option, turning an untouched panel into a silent
-  release. `_apply_triage` keeps rendering such a repo on purpose. The save is painted
-  **optimistically**; a failed request rolls it back and says so on the row.
+  release (`_apply_triage` keeps rendering it on purpose). The save is painted **optimistically**; a
+  failed request rolls it back and says so on the row.
 - `refreshOpenTicket` re-points the open panel at the rebuilt ticket each beat (`mergeSites` builds fresh
   objects), holds the optimistic paint for `REPO_SETTLE_MS`, repaints only when a rendered field changed,
   and never while the picker is open.
-- "Change" only appears when a host of that org is **online**. The edit state lives in a page variable,
-  not the DOM (the same rule the session card's ⋯ menu follows).
 
 ##### Pinning the agent by hand (XERK-38)
 
@@ -1250,10 +1243,9 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   it host-side (`spawn`'s `resolve_model`); an unpinned ticket omits `model`. The picker offers the
   curated menu (`modelChoices`/`prettyModel`); a pinned alias off the current probe is carried back so it
   stays selected. Un-probed org falls back to the static family aliases, never an empty menu.
-- The pin also feeds the **auto-start sweep**.
-- **Known limit:** as with the repo picker, the union across an org's hosts can offer an alias one lacks.
-- Tests: `server.test.js`, `modelPinOf`/`modelPickerHtml`/`modelChoices` in
-  `board.test.js`, `TestSpawnTicket`, android `BoardTest.kt`.
+- The pin also feeds the **auto-start sweep**, and shares the repo picker's multi-host-per-org limit.
+- Tests: `server.test.js`, `modelPinOf`/`modelPickerHtml`/`modelChoices` in `board.test.js`,
+  `TestSpawnTicket`, android `BoardTest.kt`.
 
 ##### Changing the status by hand (XERK-138)
 
@@ -1394,8 +1386,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   - Tests: `modelOpts`/`prettyModel` in `chat.test.js`, the malformed-model case in
     `server.test.js`.
 - The raw ttyd terminal stays one **"Terminal ▸" toggle** away in the chat header (`#termPane` iframe).
-  `GET /api/ws-token` also authenticates the web chat's `/live` socket. Tests:
-  `chat.test.js`.
+  `GET /api/ws-token` also authenticates the web chat's `/live` socket. Tests: `chat.test.js`.
 
 #### Working-status bar and agent list
 
@@ -1754,16 +1745,16 @@ triage list, each with a reason); anything unlisted still fails.
 
 - The agent image bundles **terraform, `az` and `aws`** (pinned via
   `TERRAFORM_VERSION`/`AZURE_CLI_VERSION`/`AWS_CLI_VERSION` in `agent/Dockerfile`), so a session can manage
-  infrastructure the way it manages GitHub through `gh`.
-- They live in the `tooling` stage, so **every tier carries them and the CI scan covers them** — they are
-  credential-bearing tools talking to cloud control planes. Cost: ~1.0 GB.
+  infrastructure the way it manages GitHub through `gh`. They live in the `tooling` stage, so **every
+  tier carries them and the CI scan covers them** — they are credential-bearing tools talking to cloud
+  control planes. Cost: ~1.0 GB.
 - **Creds are the host's, reused through optional bind mounts** like `~/.claude` and `~/.config/gh`; the
   image bakes no credential: `/root/.aws` (or `AWS_*` env) — `aws`; `/root/.azure` — `az`;
   `/root/.terraform.d` — terraform. **A host that mounts none is supported, not an error**;
-  `entrypoint.sh`'s preflight only LOGS which stores it found.
-- It keys on a **login-marker file** (`~/.aws/credentials`, `~/.azure/msal_token_cache.json`,
-  `~/.terraform.d/credentials.tfrc.json`), never the store directory, because each CLI creates its own
-  store just by RUNNING. The Dockerfile's build-time smoke test drops the stores it creates.
+  `entrypoint.sh`'s preflight only LOGS which stores it found, keying on a **login-marker file**
+  (`~/.aws/credentials`, `~/.azure/msal_token_cache.json`, `~/.terraform.d/credentials.tfrc.json`) never
+  the store dir, because each CLI creates its own store just by RUNNING. The Dockerfile's build-time
+  smoke test drops the stores it creates.
 - The guard's `permissions.deny` protects `~/.azure` and `~/.terraform.d` alongside `~/.aws`/`~/.ssh`
   (shared by every session, so editing one breaks the others). Tests:
   `test_entrypoint.sh` (cloud-creds cases), `test_guard_settings.py`.
@@ -1857,7 +1848,8 @@ Still true: no GitHub Advanced Security, so no code-scanning API — findings li
 - The guard hard-denies only three narrow categories, each with a reason the agent self-corrects from:
   - **destructive** — `rm -rf` of `/`/home/system/`.git`, disk wipes, fork bombs, power changes, recursive
     `chmod`/`chown` of system roots, protected-branch history destruction, `DROP DATABASE|TABLE`;
-  - **policy** — push to / delete `main`/`master`, or `gh pr merge` (work lands via a PR a human merges);
+  - **policy** — push to / delete `main`/`master`, or self-merging a PR/MR (`gh pr merge`,
+    `glab mr merge`, an ADO complete/auto-complete — work lands via a PR a human merges);
   - **attribution** — AI self-attribution trailers in commit/PR messages.
 - Ordinary dev work (edits, builds, tests, git, `rm -rf node_modules`) is untouched. A specific command
   can be allowlisted via `$TURMA_TOOL_GRANTS` (CSV of `Bash(<cmd>)`); attribution toggles via
@@ -1881,8 +1873,7 @@ Still true: no GitHub Advanced Security, so no code-scanning API — findings li
   hook's block timeout (`TURMA_QUESTION_TIMEOUT_SEC`, default 600s) sits under the settings-level
   `timeout`. It passes through silently when its env vars are absent. Kill/delete/restart clear pending
   req/ans files.
-- Tests: `test_ask.py`, plus `TestHookQuestion`/`TestAnswerQuestion` and
-  `test_guard_settings.py`.
+- Tests: `test_ask.py`, plus `TestHookQuestion`/`TestAnswerQuestion` and `test_guard_settings.py`.
 
 ### New-work branching policy
 

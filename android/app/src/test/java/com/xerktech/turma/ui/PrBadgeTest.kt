@@ -22,6 +22,14 @@ class PrBadgeTest {
         )
     }
 
+    // XERK-226: and so does an Azure DevOps pull request.
+    @Test fun `bare azure devops pr url falls back to the pullrequest number`() {
+        assertEquals(
+            "#12",
+            prNumberLabel(PrInfo(url = "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12")),
+        )
+    }
+
     @Test fun `no number anywhere reads PR`() {
         assertEquals("PR", prNumberLabel(PrInfo(url = "https://example.com/somewhere")))
     }

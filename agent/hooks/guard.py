@@ -21,9 +21,9 @@ categories.
 
 2. **policy** — PR-workflow rules, enforced hard (no override): pushing to or
    deleting ``main``/``master`` directly, and merging any pull/merge request
-   (``gh pr merge``, ``glab mr merge``). Work lands via a PR/MR the agent
-   opens but never self-merges. Denied with a reason the agent self-corrects
-   from.
+   (``gh pr merge``, ``glab mr merge``, completing or auto-completing an Azure
+   DevOps PR). Work lands via a PR/MR the agent opens but never self-merges.
+   Denied with a reason the agent self-corrects from.
 
 3. **attribution** — ``git commit`` / PR commands carrying AI self-attribution
    (``Co-Authored-By: ... Claude``/``Anthropic``, ``Generated with Claude``,
@@ -321,9 +321,12 @@ _ATTRIB_PATTERNS = (
     re.compile(r"\U0001f916"),  # 🤖
     re.compile(r"claude-session:", re.IGNORECASE),
 )
-# Only scan commands that author a commit / tag / PR / release message.
+# Only scan commands that author a commit / tag / PR / release message. Every
+# PR CLI belongs here, not just GitHub's — the attribution rule is about the
+# text, and a description written through `glab` or `az` carries it just as far.
 _ATTRIB_CONTEXT = re.compile(
-    r"\bgit\s+(commit|tag|merge|revert)\b|\bgh\s+(pr|release)\b|--message\b|\bcommit\b.*-m\b",
+    r"\bgit\s+(commit|tag|merge|revert)\b|\bgh\s+(pr|release)\b"
+    r"|\bglab\s+mr\b|\baz\s+repos\s+pr\b|--message\b|\bcommit\b.*-m\b",
     re.IGNORECASE,
 )
 
@@ -335,6 +338,30 @@ def _is_protected_ref(tok: str) -> bool:
     """True if a push refspec token targets main/master (`main`, `HEAD:main`,
     `:main` delete, `origin/main`). The remote name (`origin`) is not a ref."""
     return any(part and part.split("/")[-1] in _PROTECTED_BRANCHES for part in tok.split(":"))
+
+
+def _azdo_completes_pr(tokens: list[str]) -> bool:
+    """True if an ``az repos pr`` invocation would MERGE the pull request.
+
+    Azure DevOps has no ``merge`` verb: a PR lands either by being set to the
+    ``completed`` status (``az repos pr update --status completed``) or by
+    arming auto-complete, which merges it the moment its policies pass —
+    including on ``az repos pr create --auto-complete``. Both are the agent
+    merging its own work, so both are the policy's business.
+
+    An explicit ``--auto-complete false`` is the agent DISARMING it, and is
+    allowed."""
+    for i, tok in enumerate(tokens):
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if tok == "--status" and nxt.lower() == "completed":
+            return True
+        if tok.lower() == "--status=completed":
+            return True
+        if tok == "--auto-complete":
+            return nxt.lower() not in ("false", "f", "no", "0")
+        if tok.lower().startswith("--auto-complete="):
+            return tok.split("=", 1)[1].strip().lower() not in ("false", "f", "no", "0")
+    return False
 
 
 def policy_reason(command: str) -> str | None:
@@ -359,6 +386,11 @@ def policy_reason(command: str) -> str | None:
             return (
                 "you must not merge merge requests — open the MR and leave "
                 "merging to a human reviewer"
+            )
+        if prog == "az" and "repos" in rest and "pr" in rest and _azdo_completes_pr(rest):
+            return (
+                "you must not complete pull requests — open the PR and leave "
+                "completing it to a human reviewer"
             )
         if (
             prog == "git"
