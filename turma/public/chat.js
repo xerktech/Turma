@@ -586,8 +586,12 @@
       w += (b.text || "").length + (b.input || "").length + (b.name || "").length +
         (b.args || "").length + (b.summary || "").length + (b.result || "").length +
         (b.desc || "").length + (b.content || "").length + (b.plan || "").length +
-        (b.url || "").length +
-        (b.edit ? (b.edit.old || "").length + (b.edit.new || "").length : 0);
+        (b.url || "").length + (b.caption || "").length +
+        (b.edit ? (b.edit.old || "").length + (b.edit.new || "").length : 0) +
+        // Embedded SendUserFile previews (XERK-221): count them so an image-bearing
+        // copy outweighs a degraded reload (file since deleted → a name-only chip).
+        (Array.isArray(b.files) ? b.files.reduce((s, f) =>
+          s + (f ? (f.src || "").length + (f.html || "").length + (f.name || "").length : 0), 0) : 0);
     }
     return w;
   }
@@ -672,6 +676,10 @@
           if (b.edit) act.edit = { old: b.edit.old || "", new: b.edit.new || "", replaceAll: !!b.edit.replaceAll };
           if (b.content) act.content = b.content;
           if (b.plan) act.plan = b.plan;
+          // SendUserFile inline preview (XERK-221): rendered images/SVG/HTML the
+          // session delivered, embedded on the block by the agent.
+          if (Array.isArray(b.files) && b.files.length) act.files = b.files;
+          if (b.caption) act.caption = b.caption;
           items.push(act);
         } else if (b.t === "tool_result") {
           if (b.forId && toolUseIds.has(b.forId)) continue; // folded into its tool_use card
@@ -793,15 +801,54 @@
   }
   function actionKey(a, gk, idx) { return a.id ? ("act:" + a.id) : ("act:" + gk + ":" + idx); }
 
+  // SendUserFile inline previews (XERK-221): the image/SVG/HTML files a session
+  // delivered, embedded on the block by the agent. An image renders through the
+  // same <img> path as prose images (a data:image/svg+xml SVG in secure static
+  // mode); an HTML page renders in a FULLY sandboxed iframe — `sandbox` with no
+  // tokens forbids scripts, same-origin, forms and navigation, so an agent- or
+  // tool-authored page can't run code or reach the hub, and srcdoc is esc()'d so
+  // it can't break out of the attribute. A non-renderable/oversize file (kind
+  // "file") shows as a name chip. The src scheme is re-checked here (defence in
+  // depth) so only data:image/* and http(s) ever reach an <img>.
+  function renderToolFiles(files, caption) {
+    let out = '<div class="tool-files">';
+    for (const f of files) {
+      if (!f || typeof f !== "object") continue;
+      const name = esc(f.name || "file");
+      if (f.kind === "image" && typeof f.src === "string" && /^(data:image\/|https?:)/i.test(f.src)) {
+        const svg = /^data:image\/svg\+xml/i.test(f.src);
+        out += '<figure class="tool-file"><img class="md-img' + (svg ? " md-svg" : "") +
+          '" src="' + esc(f.src) + '" alt="' + name + '" loading="lazy">' +
+          '<figcaption>' + name + "</figcaption></figure>";
+      } else if (f.kind === "html" && typeof f.html === "string") {
+        out += '<figure class="tool-file"><iframe class="md-embed" sandbox referrerpolicy="no-referrer"' +
+          ' loading="lazy" title="' + name + '" srcdoc="' + esc(f.html) + '"></iframe>' +
+          '<figcaption>' + name + "</figcaption></figure>";
+      } else {
+        out += '<div class="tool-file file"><span class="tool-file-name">📎 ' + name + "</span></div>";
+      }
+    }
+    out += "</div>";
+    if (caption) out += '<div class="tool-caption">' + renderInline(caption) + "</div>";
+    return out;
+  }
+
   function renderActionCard(it, key) {
     const statusCls = it.result ? (it.result.isError ? "err" : "ok") : "";
-    // A plan card's salient line is the plan itself, not the raw input JSON the
-    // summary would otherwise fall back to.
-    const argSrc = it.plan || it.input;
-    const argOne = argSrc ? esc(argSrc.split("\n")[0]) : "";
+    // A plan card's salient line is the plan itself; a SendUserFile card's is its
+    // caption or a file count — not the raw input JSON either would fall back to.
+    const argSrc = it.plan || (it.files ? "" : it.input);
+    let argOne = argSrc ? esc(argSrc.split("\n")[0]) : "";
+    if (it.files && !argOne) {
+      argOne = esc(it.caption ? it.caption.split("\n")[0]
+        : it.files.length + (it.files.length === 1 ? " file" : " files"));
+    }
     const descOne = it.desc ? '<span class="tool-desc">' + esc(it.desc.split("\n")[0]) + "</span>" : "";
     let body = "";
-    if (it.input && !it.plan) {
+    // A SendUserFile delivery renders its files (the point of the card); its raw
+    // input JSON would just be the same paths, so it's suppressed when files show.
+    if (it.files) body += renderToolFiles(it.files, it.caption);
+    if (it.input && !it.plan && !it.files) {
       body += '<div class="tool-block"><div class="tool-label">input</div><pre>' +
         esc(it.input) + "</pre>" + truncBtn(it.entryId, it.inputTrunc) + "</div>";
     }
@@ -832,10 +879,11 @@
     if (!body) body = '<div class="tool-block"><div class="tool-label">running…</div></div>';
     const taskCls = it.task ? " task" : "";
     const icon = it.task ? '<span class="tool-glyph">◆</span>' : '<span class="tool-dot"></span>';
-    // A plan is the thing the operator is asked to approve: open by default.
+    // A plan (approval) and a SendUserFile delivery (its files ARE the point) are
+    // open by default; other tool cards follow the verbosity preset.
     return '<details class="action-card' + (statusCls ? " " + statusCls : "") + taskCls + '" data-dkey="' + esc(key) +
       '" data-uuid="' + esc(it.entryId) + '"' +
-      openAttr(key, it.plan ? true : verbosity.show.outputs) + ">" +
+      openAttr(key, (it.plan || it.files) ? true : verbosity.show.outputs) + ">" +
       "<summary>" + icon + '<span class="tool-name">' + esc(it.name) + "</span>" +
       '<span class="tool-arg">' + argOne + "</span>" + descOne + "</summary>" +
       '<div class="tool-body">' + body + "</div></details>";

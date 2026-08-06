@@ -91,6 +91,33 @@ test("entryBlocks: tool_use with unknown input falls back to compact JSON", () =
   assert.deepEqual(blocks, [{ t: "tool_use", name: "X", input: '{"a":1,"b":"z"}' }]);
 });
 
+test("entryBlocks: SendUserFile embeds image/SVG/HTML files, degrades the rest (XERK-221)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "suf-"));
+  fs.writeFileSync(path.join(dir, "a.svg"), "<svg><rect/></svg>");
+  fs.writeFileSync(path.join(dir, "p.html"), "<h1>Hi</h1>");
+  const inp = {
+    files: [path.join(dir, "a.svg"), path.join(dir, "p.html"),
+            path.join(dir, "gone.png"), path.join(dir, "notes.txt")],
+    display: "render", caption: "the set",
+  };
+  const [b] = entryBlocks(
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "SendUserFile", input: inp }] } },
+    BLOCK_CAPS_LIVE);
+  assert.equal(b.caption, "the set");
+  assert.deepEqual(b.files, [
+    { name: "a.svg", kind: "image", src: "data:image/svg+xml;base64," + Buffer.from("<svg><rect/></svg>").toString("base64") },
+    { name: "p.html", kind: "html", html: "<h1>Hi</h1>" },
+    { name: "gone.png", kind: "file" }, // missing → chip
+    { name: "notes.txt", kind: "file" }, // non-renderable type → chip (never opened)
+  ]);
+  // display:"attach" turns an HTML file into a download chip (not an iframe).
+  const [b2] = entryBlocks(
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "t2", name: "SendUserFile",
+      input: { files: [path.join(dir, "p.html")], display: "attach" } }] } }, BLOCK_CAPS_LIVE);
+  assert.deepEqual(b2.files, [{ name: "p.html", kind: "file" }]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("entryBlocks: over-cap text/result get truncated:true and are clipped", () => {
   const big = "x".repeat(BLOCK_CAPS_LIVE.text + 500);
   const [tb] = entryBlocks({ type: "assistant", message: { content: big } }, BLOCK_CAPS_LIVE);

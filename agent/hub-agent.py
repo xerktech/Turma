@@ -292,6 +292,22 @@ BLOCK_CAPS_FULL = {
     "input": BLOCK_TOOL_INPUT_CHARS_FULL,
     "result": BLOCK_TOOL_RESULT_CHARS_FULL,
 }
+# SendUserFile inline preview (XERK-221): the agent reads the image/SVG/HTML files
+# a session delivers via SendUserFile and embeds them ON the tool_use block (a
+# base64 data: URI for images, the raw markup for HTML) so the chat renders them
+# inline instead of showing a bare "SendUserFile" card. Bounded so a delivery
+# can't bloat a heartbeat/tail frame: at most SEND_FILE_MAX_FILES files, each up
+# to SEND_FILE_MAX_BYTES; a bigger/unreadable/non-renderable file degrades to a
+# name-only chip. Keep the extension→mime map and caps in lockstep with
+# tunnel-agent.js (sendUserFileDetail).
+SEND_FILE_MAX_FILES = int(os.environ.get("SESSION_SEND_FILE_MAX_FILES", "16"))
+SEND_FILE_MAX_BYTES = int(os.environ.get("SESSION_SEND_FILE_MAX_BYTES", str(512 * 1024)))
+SEND_FILE_IMG_MIME = {
+    ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
+    ".avif": "image/avif", ".bmp": "image/bmp", ".ico": "image/x-icon",
+}
+SEND_FILE_HTML_EXT = {".html", ".htm"}
 # Terminal color/cursor codes sometimes make it into pasted transcript text;
 # strip them so the glasses client only ever sees plain text.
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -2348,6 +2364,47 @@ def _tool_input_summary(inp):
     return str(inp)
 
 
+def _send_user_file_detail(inp):
+    """Read the image/SVG/HTML files a SendUserFile call delivered and return a
+    list of preview entries for its tool_use block (XERK-221), or None:
+      image -> {"name", "kind":"image", "src": "data:<mime>;base64,<b64>"}
+      html  -> {"name", "kind":"html",  "html": "<markup>"}   (display:"render" only)
+      else  -> {"name", "kind":"file"}   (attach-mode HTML, oversize, unreadable, or
+                                          a non-renderable type — a bare name chip)
+    Images render regardless of `display` (they ARE the delivery); HTML renders
+    only when the call asked to (`display:"attach"` is a download, not a preview).
+    Only image/html paths are ever opened, and each is read at most
+    SEND_FILE_MAX_BYTES, so a delivery can neither bloat the frame nor leak an
+    arbitrary file's bytes. Mirror of tunnel-agent.js sendUserFileDetail()."""
+    files = inp.get("files")
+    if not isinstance(files, list) or not files:
+        return None
+    display = inp.get("display")
+    out = []
+    for path in files[:SEND_FILE_MAX_FILES]:
+        if not isinstance(path, str) or not path:
+            continue
+        name = os.path.basename(path)
+        ext = os.path.splitext(path)[1].lower()
+        mime = SEND_FILE_IMG_MIME.get(ext)
+        render_html = ext in SEND_FILE_HTML_EXT and display != "attach"
+        entry = {"name": name, "kind": "file"}
+        if mime or render_html:
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read(SEND_FILE_MAX_BYTES + 1)
+                if len(data) <= SEND_FILE_MAX_BYTES:
+                    if mime:
+                        entry = {"name": name, "kind": "image",
+                                 "src": "data:%s;base64,%s" % (mime, base64.b64encode(data).decode("ascii"))}
+                    else:
+                        entry = {"name": name, "kind": "html", "html": data.decode("utf-8", "replace")}
+            except OSError:
+                pass  # unreadable / gone → name chip
+        out.append(entry)
+    return out or None
+
+
 def _tool_use_detail(block, name, inp, caps):
     """Attach the reviewable payload of a known tool call to its tool_use block,
     beyond the one-line `input` summary — the part an operator otherwise opens
@@ -2357,6 +2414,7 @@ def _tool_use_detail(block, name, inp, caps):
       Edit          -> edit: {old, new, replaceAll?}   (the actual change, as a diff)
       Write         -> content: the file body written
       ExitPlanMode  -> plan: the plan markdown the operator was asked to approve
+      SendUserFile  -> files: [{name, kind, src|html}] + caption  (inline preview)
       any tool      -> desc: its human `description` arg (Bash, Agent, Monitor, …)
 
     Mirror of tunnel-agent.js toolUseDetail()."""
@@ -2385,6 +2443,13 @@ def _tool_use_detail(block, name, inp, caps):
             clipped, trunc = _clip(ANSI_RE.sub("", plan).strip(), caps["text"])
             block["plan"] = clipped
             truncated = trunc
+    elif name == "SendUserFile":
+        files = _send_user_file_detail(inp)
+        if files:
+            block["files"] = files
+            cap = inp.get("caption")
+            if isinstance(cap, str) and cap.strip():
+                block["caption"] = _clip(ANSI_RE.sub("", cap).strip(), caps["input"])[0]
     desc = inp.get("description")
     if isinstance(desc, str) and desc.strip():
         block["desc"] = _clip(ANSI_RE.sub("", desc).strip(), caps["input"])[0]
