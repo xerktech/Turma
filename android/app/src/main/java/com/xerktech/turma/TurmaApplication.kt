@@ -1,12 +1,24 @@
 package com.xerktech.turma
 
 import android.app.Application
+import coil.ImageLoader
+import coil.ImageLoaderFactory
+import coil.decode.SvgDecoder
 import com.xerktech.turma.push.Notifications
 import com.xerktech.turma.push.PushRegistrar
 
-class TurmaApplication : Application() {
+class TurmaApplication : Application(), ImageLoaderFactory {
     lateinit var container: AppContainer
         private set
+
+    // Coil's app-wide loader, taught to decode SVG (data:image/svg+xml) so chat
+    // image previews (XERK-221) render inline. AsyncImage picks this up via the
+    // ImageLoaderFactory. SVG is rasterized statically — no script execution.
+    override fun newImageLoader(): ImageLoader =
+        ImageLoader.Builder(this)
+            .components { add(SvgDecoder.Factory()) }
+            .crossfade(true)
+            .build()
 
     override fun onCreate() {
         super.onCreate()

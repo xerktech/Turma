@@ -1,5 +1,6 @@
 package com.xerktech.turma.core
 
+import com.xerktech.turma.model.SendFile
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TextBlock
 import com.xerktech.turma.model.ThinkingBlock
@@ -35,6 +36,31 @@ class ChatItemsTest {
         assertEquals("Bash", tool.name)
         assertTrue(tool.input.contains("command: ls"))
         assertEquals("a\nb\nc", tool.result)
+    }
+
+    @Test fun `SendUserFile files and caption ride onto the tool item (XERK-221)`() {
+        val e = TailEntry(
+            id = "e5", role = "assistant",
+            blocks = listOf(
+                ToolUseBlock(
+                    id = "t9", name = "SendUserFile",
+                    files = listOf(
+                        SendFile(name = "a.svg", kind = "image", src = "data:image/svg+xml;base64,PHN2Zy8+"),
+                        SendFile(name = "p.html", kind = "html", html = "<h1>Hi</h1>"),
+                        SendFile(name = "big.zip", kind = "file"),
+                    ),
+                    caption = "the set",
+                ),
+            ),
+        )
+        val tool = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.NORMAL))
+            .filterIsInstance<ChatItem.Tool>().single()
+        assertEquals("SendUserFile", tool.name)
+        assertEquals("the set", tool.caption)
+        assertEquals(listOf("image", "html", "file"), tool.files.map { it.kind })
+        assertEquals("a.svg", tool.files[0].name)
+        // Concise still hides the whole card (parity with the web's tool gating).
+        assertTrue(buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.CONCISE)).none { it is ChatItem.Tool })
     }
 
     @Test fun `verbose adds thinking traces`() {

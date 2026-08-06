@@ -316,19 +316,20 @@ those are marked `[MODEL]`.
 - P1 Sidebar sections: Active / Idle split done (XERK-73, `rankRunning`); the dedicated Queued
   section done (XERK-78; the old Stopped group folded into Ended). Still open: a state line + question
   preview on each live card (the dashboard card has both; the sessions-list card shows only the dot).
-- P1 Inline images + SVGs in the chat (XERK-221), two web mechanisms:
-  - **Prose**: a markdown `![alt](url)` image (http/https + `data:image/*`) and a raw or fenced
-    `<svg>…</svg>` document render as pictures (`chat.js` `linkify`/`svgToImg`/`renderProse`; SVG via a
-    sandboxed `data:image/svg+xml` `<img>`).
-  - **SendUserFile deliveries**: the agent embeds the image/SVG/HTML files a session sends on the
-    tool_use block (`_tool_use_detail`/`toolUseDetail` → `files[]`, base64 data URIs / raw HTML), and the
-    web card renders images inline and HTML in a fully sandboxed iframe (`renderToolFiles`). The wire
-    fields (`block.files`, `block.caption`) already reach Android's decoder if the model is extended.
-  Android still shows `![alt](url)` as a link (stray `!`), SVG source as text/code, and a SendUserFile
-  call as a plain tool card, because the app has no image-loading pipeline yet — a follow-up needs an
-  image loader (e.g. Coil) + SVG decoder wired into `ProseBlocks`/`TranscriptView`, a
-  `ProseBlock.Image`/`Span.Image` node in `core/Prose.kt`, and a `files[]` field on the tool block model.
-  Deferred so the web change lands verifiable on its own; no silent divergence.
+- ~~P1 SendUserFile inline previews (XERK-221).~~ **Done**: the app now has an image pipeline (Coil +
+  `SvgDecoder`, wired via `TurmaApplication : ImageLoaderFactory`). `SendFile`/`files[]`/`caption` are on
+  `ToolUseBlock` (decoded) → `ChatItem.Tool` (`ChatItemsTest`), and `TranscriptView` renders each file:
+  an image/SVG via Coil `AsyncImage` (data: URIs decoded to a `ByteBuffer` the SVG/bitmap decoders
+  accept; remote URLs pass through), an HTML page in a **JS-disabled, navigation-blocked, null-origin
+  WebView** (the `sandbox` iframe's analogue), else a name chip — open by default, caption below, matching
+  the web's `renderToolFiles`.
+- P1 Inline images in **PROSE** (the OTHER half of XERK-221) — still deferred. A markdown `![alt](url)`
+  and a raw/fenced `<svg>` in an agent's *text* render as pictures on the web (`chat.js`
+  `linkify`/`svgToImg`/`renderSvgAndText`); Android still shows `![alt](url)` as a link (stray `!`) and
+  SVG source as text/code. Needs a `Span.Image`/`ProseBlock.Image` node in `core/Prose.kt` mirroring the
+  web parse, plus splitting a paragraph around an inline image in `ProseBlocks`. The image renderer
+  (Coil `AsyncImage`) is already in place from the SendUserFile work above, so this is parser + layout
+  only.
 - P1 Verbosity NORMAL: tool card collapsed (output on expand) to match web; persist per-card open.
 - ~~P2 Live status bar: token counters + elapsed + spinner + hint lines + subagent list.~~
   Done (XERK-75) — see "Done" below.

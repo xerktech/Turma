@@ -115,6 +115,13 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
+    // Inline image/SVG rendering in chat (XERK-221): Coil for <img>-style loading
+    // of data: URIs + remote URLs, with the SVG decoder for data:image/svg+xml.
+    // Reuses the app's OkHttp for remote fetches; SVG renders in Coil's secure
+    // static mode (no scripts). HTML previews use a JS-disabled WebView instead.
+    implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("io.coil-kt:coil-svg:2.7.0")
+
     // Networking + JSON.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")

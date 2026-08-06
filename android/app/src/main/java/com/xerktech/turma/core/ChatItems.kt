@@ -1,5 +1,6 @@
 package com.xerktech.turma.core
 
+import com.xerktech.turma.model.SendFile
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TaskNotificationBlock
 import com.xerktech.turma.model.TextBlock
@@ -53,6 +54,10 @@ sealed interface ChatItem {
         val input: String,
         val result: String,
         val isError: Boolean,
+        // SendUserFile inline previews + caption (XERK-221). Shown whenever the
+        // card shows (like the web's open-by-default files), not gated on outputs.
+        val files: List<SendFile> = emptyList(),
+        val caption: String = "",
     ) : ChatItem
 
     data class TaskNote(
@@ -117,6 +122,8 @@ fun buildItems(
                             input = renderInput(block.input),
                             result = if (prefs.toolOutputs) (res?.text ?: "") else "",
                             isError = res?.isError ?: false,
+                            files = block.files,
+                            caption = block.caption,
                         )
                     )
                 }
