@@ -314,7 +314,15 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # Glasses-client on-demand commands: how much typed text `input` accepts per
 # call, and how many surviving messages an on-demand `history` request returns
 # (independent of the per-heartbeat TAIL_MSGS above).
-INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "4000"))
+#
+# The cap is a payload backstop, not a product limit (XERK-227): the operator
+# pastes logs and specs into the chat compose box, and the raw terminal takes
+# them at any size, so the chat must too. send_input hands the text to the pane
+# as a tmux PASTE (a keystroke send is capped by tmux's own command length at
+# ~16 KiB), which costs the same handful of milliseconds at 100 KiB as at 100
+# bytes. Keep this at or below the hub's own INPUT_MAX_CHARS, which rejects an
+# over-long message with an error the composer shows rather than truncating it.
+INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "100000"))
 HISTORY_MAX_MSGS = int(os.environ.get("SESSION_HISTORY_MSGS", "200"))
 # Operator messages are EXEMPT from the history window (XERK-186): a
 # tool-heavy session fills HISTORY_MAX_MSGS with tool_use/tool_result turns in
@@ -356,6 +364,21 @@ def run(cmd, cwd=None):
         return out.stdout.strip() if out.returncode == 0 else ""
     except Exception:
         return ""
+
+
+def run_stdin(cmd, data, timeout=15):
+    """Run a command with `data` on its stdin; True on a clean exit, False on
+    any failure. The payload rides stdin rather than an argv element, which is
+    what lets `tmux load-buffer -` carry text of any size (XERK-227) — tmux
+    refuses a command line past ~16 KiB, and the kernel a single argument past
+    128 KiB."""
+    try:
+        out = subprocess.run(
+            cmd, input=data, capture_output=True, text=True, timeout=timeout
+        )
+        return out.returncode == 0
+    except Exception:
+        return False
 
 
 def run_ok(cmd, cwd=None, timeout=30):
@@ -2271,9 +2294,9 @@ def _azdo_pr_comment_events(url):
 
 def _pr_comment_message(url, events):
     """Fold new PR comments into the single free-text message typed into the
-    session (XERK-49). send_input collapses newlines to spaces, so this is built
-    flat: a header naming the PR and telling the agent to act on it in THIS
-    session, then each comment as `@author (kind, loc): body`, bodies capped so
+    session (XERK-49). One flat paragraph — a header naming the PR and telling
+    the agent to act on it in THIS session, then each comment as
+    `@author (kind, loc): body`, each body collapsed to one line and capped so
     one long comment can't crowd out the rest before INPUT_MAX_CHARS truncates."""
     if not events:
         return ""
@@ -4146,6 +4169,69 @@ def _capture_pane(tmux_name):
     if out.returncode != 0:
         return None
     return out.stdout
+
+
+# Control bytes that must never reach a pane. The text is delivered as a
+# bracketed paste, so an ESC — or a literal end-of-paste marker — inside it
+# would close the paste early and have everything after it read as KEYSTROKES;
+# and the text is not always the operator's own (a PR review comment is typed
+# into the session by _poll_pr_comments). Tab and newline are real content and
+# survive; \r is normalized to \n first.
+INPUT_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# The fallback keystroke send carries the text as a tmux COMMAND argument, which
+# tmux refuses past ~16 KiB ("command too long") — clip well under that.
+SENDKEYS_MAX_CHARS = 4000
+
+
+def _clean_input_text(text):
+    """Normalize free text on its way into a pane: CRLF/CR to LF, control bytes
+    (bar tab and newline) dropped. Newlines SURVIVE — see _type_into_pane."""
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return INPUT_CTRL_RE.sub("", text)
+
+
+def _type_into_pane(tmux_name, text):
+    """Put `text` into a session pane's input line and submit it with Enter.
+
+    The text is delivered as a tmux PASTE — `load-buffer` it into a per-session
+    buffer over STDIN, then `paste-buffer -d -p` into the pane — rather than as
+    a `send-keys -l` keystroke send (XERK-227). send-keys carries the text as a
+    tmux command argument, which tmux refuses past ~16 KiB, so a pasted log or
+    spec could never reach the session through the chat composer even though the
+    raw terminal has always accepted one. A paste has no such limit and costs
+    the same few milliseconds at 100 KiB as at 100 bytes.
+
+    The paste is also what keeps NEWLINES: `-p` wraps the text in bracketed-paste
+    markers when the pane's application asked for them (Claude Code does), so a
+    multi-line message lands as ONE message instead of submitting a turn per
+    line. `-p` is conditional, so an application that never requested bracketed
+    paste is sent the bare text and is never shown a stray escape sequence.
+
+    Falls back to the old keystroke send (newlines flattened, clipped to a
+    tmux-safe length) if the paste can't be made — a tmux too old for either
+    subcommand must still be able to deliver a short message. Returns True when
+    the text was pasted."""
+    if not tmux_name:
+        return False
+    buf = f"turma-input-{tmux_name}"      # per-pane, so two sessions can't race
+    pasted = run_stdin(["tmux", "load-buffer", "-b", buf, "-"], text)
+    if pasted:
+        # -d drops the buffer once it has been pasted, so a message never sits
+        # in tmux's paste history waiting to be re-pasted by hand.
+        rc, _err = run_ok(["tmux", "paste-buffer", "-d", "-p", "-b", buf,
+                           "-t", tmux_name], timeout=15)
+        pasted = rc == 0
+        if not pasted:
+            run(["tmux", "delete-buffer", "-b", buf])
+    if not pasted:
+        # `--` ends tmux's own option parsing before the literal text, so a
+        # message starting with '-' isn't misread as more send-keys flags.
+        flat = text.replace("\n", " ")[:SENDKEYS_MAX_CHARS]
+        log(f"paste into {tmux_name} failed; falling back to send-keys "
+            f"({len(flat)} of {len(text)} chars)")
+        run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", flat])
+    run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+    return pasted
 
 
 def session_report(workdir, state, tmux_name=None, session_id=None,
@@ -9092,18 +9178,15 @@ class SessionManager:
     # --- on-demand input/history (glasses client) --------------------------
 
     def send_input(self, sid, text):
-        """Type free-text into a running session's Claude TUI via tmux send-keys:
-        one literal keystroke send (-l — no key-name interpretation, no shell)
-        followed by a separate Enter. This is the plain "type a message into the
-        session" path (the glasses actions-menu Send); AskUserQuestion answers
-        no longer ride it — they go through answer_question below. `--` ends
-        tmux's own option parsing before the literal text so a typed string that
-        happens to start with '-' isn't misread as more send-keys flags; -l
-        still applies to everything after it."""
+        """Type free-text into a running session's Claude TUI and submit it.
+        This is the plain "type a message into the session" path (the chat
+        composer's Send, the glasses actions menu, the PR-comment delivery);
+        AskUserQuestion answers no longer ride it — they go through
+        answer_question below. See _type_into_pane for how the text lands."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
-        text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        text = _clean_input_text(text)
         if not text.strip():
             return
         text = text[:INPUT_MAX_CHARS]
@@ -9117,9 +9200,7 @@ class SessionManager:
         if (not sess.get("summary") and _summary_attempts(sess) == 0
                 and sid not in self.summaries):
             self._start_summary(sess, text)
-        tmux_name = sess["tmuxName"]
-        run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
-        run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+        _type_into_pane(sess["tmuxName"], text)
         # Record it on the session's outbox so _poll_pending_inputs can confirm it
         # landed and re-send it if a compaction drops it (XERK-47). `attempts:1`
         # counts this first type; a resend needs a fresh compaction to fire again.
@@ -9195,8 +9276,7 @@ class SessionManager:
                     if resent:
                         keep.append(item)   # already re-sent one this beat
                         continue
-                    run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", text])
-                    run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
+                    _type_into_pane(tmux_name, text)
                     item["attempts"] = item.get("attempts", 1) + 1
                     item["compactBase"] = compactions  # only a NEWER compaction re-loses it
                     item["at"] = now

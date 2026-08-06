@@ -2433,6 +2433,10 @@ class ManagerMixin:
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.run_calls = []
         self.run_ok_calls = []
+        # (cmd, stdin) per run_stdin call — how the tmux paste path delivers a
+        # message's text to the pane (XERK-227).
+        self.run_stdin_calls = []
+        self.run_stdin_ok = True
 
         def fake_run(cmd, cwd=None):
             self.run_calls.append(cmd)
@@ -2442,9 +2446,14 @@ class ManagerMixin:
             self.run_ok_calls.append(cmd)
             return 0, ""
 
+        def fake_run_stdin(cmd, data, timeout=None):
+            self.run_stdin_calls.append((cmd, data))
+            return self.run_stdin_ok
+
         for name, value in [
             ("run", fake_run),
             ("run_ok", fake_run_ok),
+            ("run_stdin", fake_run_stdin),
             ("REGISTRY_DIR", self.tmp),
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
@@ -4407,6 +4416,8 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         # --version); clear those so run_calls only reflects send_input.
         sm = super().make_manager()
         self.run_calls.clear()
+        self.run_ok_calls.clear()
+        self.run_stdin_calls.clear()
         return sm
 
     def _running_session(self, sm, sid="abcde", status="running"):
@@ -4428,10 +4439,8 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         with mock.patch.object(sm, "_start_summary") as start:
             sm.send_input("abcde", "Add a docker compose flag")
         start.assert_called_once_with(sess, "Add a docker compose flag")
-        # The keystroke still goes through regardless.
-        self.assertIn(
-            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--",
-             "Add a docker compose flag"], self.run_calls)
+        # The message still goes through regardless.
+        self.assertEqual(self.run_stdin_calls[0][1], "Add a docker compose flag")
 
     def test_later_prompts_do_not_resummarize(self):
         sm = self.make_manager()
@@ -4459,72 +4468,104 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
             sm.send_input("abcde", "hello")
         start.assert_not_called()
 
-    def test_exact_argvs_literal_send_then_enter(self):
+    def test_message_is_pasted_then_submitted(self):
+        # The text rides tmux's paste buffer over STDIN — never an argv element,
+        # which tmux refuses past ~16 KiB (XERK-227) — and Enter submits it.
         sm = self.make_manager()
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "hello")
+        self.assertEqual(self.run_stdin_calls, [
+            (["tmux", "load-buffer", "-b", "turma-input-agent-abcde", "-"], "hello"),
+        ])
+        self.assertEqual(self.run_ok_calls, [
+            ["tmux", "paste-buffer", "-d", "-p", "-b", "turma-input-agent-abcde",
+             "-t", "agent-abcde"],
+        ])
         self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--", "hello"],
             ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
         ])
 
-    def test_newlines_flattened_to_spaces(self):
+    def test_a_long_message_is_pasted_whole(self):
+        # The point of the paste path: a message far past what a send-keys
+        # command line could carry reaches the pane intact, in one go.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        text = "x" * 60000
+        sm.send_input(sess["id"], text)
+        self.assertEqual(self.run_stdin_calls[0][1], text)
+        self.assertEqual(sess["pendingInputs"][0]["text"], text)
+
+    def test_newlines_survive_the_paste(self):
+        # A pasted log or spec keeps its line breaks: paste-buffer -p brackets
+        # the text for an application that asked for bracketed paste (Claude Code
+        # does), so the whole thing lands as ONE message rather than submitting a
+        # turn per line. CR and CRLF normalize to LF.
         sm = self.make_manager()
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "line1\r\nline2\rline3\nline4")
-        self.assertEqual(self.run_calls[0], [
-            "tmux", "send-keys", "-t", "agent-abcde", "-l", "--",
-            "line1 line2 line3 line4",
-        ])
+        self.assertEqual(self.run_stdin_calls[0][1], "line1\nline2\nline3\nline4")
 
-    def test_dash_prefixed_text_sent_literally_after_option_terminator(self):
-        # A dictated/typed reply that starts with '-' (or '--') must not be
-        # parsed as a tmux send-keys option — the `--` terminator forces it
-        # through as the literal key-list argument.
+    def test_control_bytes_are_stripped(self):
+        # A control byte inside a bracketed paste would end the paste early and
+        # have what follows read as KEYSTROKES — and the text isn't always the
+        # operator's own (a PR review comment is typed in the same way). Tab and
+        # newline are content and survive.
         sm = self.make_manager()
         sess = self._running_session(sm)
-        sm.send_input(sess["id"], "-1 on that idea")
+        sm.send_input(sess["id"], "safe\x1b[201~rm -rf /\x00\x07 end\tkept\nkept")
+        self.assertEqual(self.run_stdin_calls[0][1],
+                         "safe[201~rm -rf / end\tkept\nkept")
+
+    def test_falls_back_to_send_keys_when_the_paste_fails(self):
+        # A tmux too old for load-buffer/paste-buffer must still deliver a short
+        # message: flattened to one line and clipped to a command-safe length.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        self.run_stdin_ok = False
+        sm.send_input(sess["id"], "line1\nline2")
         self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--", "-1 on that idea"],
+            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--", "line1 line2"],
             ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
         ])
 
-        self.run_calls.clear()
-        sm.send_input(sess["id"], "--force the deploy")
-        self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "agent-abcde", "-l", "--", "--force the deploy"],
-            ["tmux", "send-keys", "-t", "agent-abcde", "Enter"],
-        ])
+    def test_fallback_clips_to_a_tmux_safe_length(self):
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        self.run_stdin_ok = False
+        sm.send_input(sess["id"], "y" * (ha.SENDKEYS_MAX_CHARS + 500))
+        self.assertEqual(len(self.run_calls[0][-1]), ha.SENDKEYS_MAX_CHARS)
 
     def test_text_capped_at_input_max_chars(self):
         sm = self.make_manager()
         sess = self._running_session(sm)
         with mock.patch.object(ha, "INPUT_MAX_CHARS", 5):
             sm.send_input(sess["id"], "abcdefghij")
-        self.assertEqual(self.run_calls[0][-1], "abcde")
+        self.assertEqual(self.run_stdin_calls[0][1], "abcde")
 
     def test_noop_for_unknown_session(self):
         sm = self.make_manager()
         sm.registry = []
         sm.send_input("nope", "hello")
         self.assertEqual(self.run_calls, [])
+        self.assertEqual(self.run_stdin_calls, [])
 
     def test_noop_for_non_running_session(self):
         sm = self.make_manager()
         sess = self._running_session(sm, status="stopped")
         sm.send_input(sess["id"], "hello")
         self.assertEqual(self.run_calls, [])
+        self.assertEqual(self.run_stdin_calls, [])
 
     def test_noop_for_whitespace_only_text(self):
         sm = self.make_manager()
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "   \t\n  ")
         self.assertEqual(self.run_calls, [])
+        self.assertEqual(self.run_stdin_calls, [])
 
     def test_records_the_message_on_the_outbox(self):
         # Every sent message is recorded so _poll_pending_inputs can guarantee it
-        # across a compaction (XERK-47): text as typed (newlines flattened),
-        # attempts=1 (the initial send).
+        # across a compaction (XERK-47): text as sent, attempts=1 (initial send).
         sm = self.make_manager()
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "run the tests")
@@ -4657,8 +4698,11 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
              "compactMetadata": {"trigger": "auto"}}])
         with mock.patch.object(ha, "_pane_busy", return_value=False):
             sm._poll_pending_inputs()
+        # Re-typed the same way a first send goes in: pasted, then Enter.
+        self.assertEqual(self.run_stdin_calls, [
+            (["tmux", "load-buffer", "-b", "turma-input-agent-s1", "-"], "hi there"),
+        ])
         self.assertEqual(self.run_calls, [
-            ["tmux", "send-keys", "-t", "agent-s1", "-l", "--", "hi there"],
             ["tmux", "send-keys", "-t", "agent-s1", "Enter"],
         ])
         it = sess["pendingInputs"][0]
@@ -4715,10 +4759,8 @@ class TestPollPendingInputs(ManagerMixin, unittest.TestCase):
              "compactMetadata": {"trigger": "auto"}}])
         with mock.patch.object(ha, "_pane_busy", return_value=False):
             sm._poll_pending_inputs()
-        # Exactly one message re-typed this beat (type + Enter); the other waits.
-        typed = [c for c in self.run_calls if c[:2] == ["tmux", "send-keys"]
-                 and "-l" in c]
-        self.assertEqual(len(typed), 1)
+        # Exactly one message re-typed this beat (paste + Enter); the other waits.
+        self.assertEqual([data for _cmd, data in self.run_stdin_calls], ["one"])
         self.assertEqual(len(sess["pendingInputs"]), 2)
 
     def test_expired_unconfirmed_message_is_dropped(self):
@@ -5230,8 +5272,8 @@ class TestPollPrComments(ManagerMixin, unittest.TestCase):
         return sess
 
     def _typed(self):
-        return [c for c in self.run_calls
-                if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+        # The texts delivered into the pane — send_input pastes them (XERK-227).
+        return [data for _cmd, data in self.run_stdin_calls]
 
     def _events(self, *events):
         return mock.patch.object(ha, "_pr_comment_events",
@@ -5256,7 +5298,7 @@ class TestPollPrComments(ManagerMixin, unittest.TestCase):
             sm._poll_pr_comments()
         typed = self._typed()
         self.assertEqual(len(typed), 1)
-        self.assertIn("rename it", typed[0][-1])
+        self.assertIn("rename it", typed[0])
         self.assertEqual(set(sess["prCommentBase"][self.URL]), {"c1", "c2"})
 
     def test_self_comment_is_not_delivered_but_is_seen(self):
@@ -5369,8 +5411,8 @@ class TestPollPrConflicts(ManagerMixin, unittest.TestCase):
         return sess
 
     def _typed(self):
-        return [c[-1] for c in self.run_calls
-                if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+        # The texts delivered into the pane — send_input pastes them (XERK-227).
+        return [data for _cmd, data in self.run_stdin_calls]
 
     def test_conflict_is_delivered_once_per_episode(self):
         sm = self.make_manager()

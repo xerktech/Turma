@@ -12,8 +12,10 @@ import com.xerktech.turma.model.JiraIssueEnvelope
 import com.xerktech.turma.model.SearchResponse
 import com.xerktech.turma.model.StatusChangePost
 import com.xerktech.turma.model.StatusChangeResult
+import com.xerktech.turma.model.TurmaJson
 import com.xerktech.turma.model.WsTokenResponse
 import kotlinx.serialization.Serializable
+import retrofit2.HttpException
 import retrofit2.Response
 import retrofit2.http.Body
 import retrofit2.http.DELETE
@@ -270,6 +272,19 @@ interface HubApi {
 
 @Serializable
 data class OkResponse(val ok: Boolean = false, val cmdId: String = "", val error: String = "")
+
+/**
+ * The hub's own `{error}` text from a failed call, or null when it didn't send
+ * one (a transport failure, or a body we can't read). Retrofit throws away a
+ * non-2xx body as an [HttpException], so a refusal the hub explained — "message
+ * too long" (XERK-227), an org/repo mismatch — otherwise reaches the operator as
+ * a generic "hub unreachable".
+ */
+fun hubErrorMessage(e: Throwable): String? {
+    val body = (e as? HttpException)?.response()?.errorBody()?.string() ?: return null
+    val msg = runCatching { TurmaJson.decodeFromString<OkResponse>(body).error }.getOrNull()
+    return msg?.takeIf { it.isNotBlank() }
+}
 
 @Serializable
 data class JiraSessionResponse(

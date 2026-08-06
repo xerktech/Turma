@@ -90,6 +90,15 @@ const PRUNE_AFTER_MS = 7 * 24 * 3600 * 1000; // drop entries gone for a week
 const HISTORY_FRESH_MS = 5 * 60 * 1000; // serve cached session history under this age
 const HISTORY_MAX_AGE_MS = 10 * 60 * 1000; // evict cache entries older than this
 const HISTORY_MAX_SESSIONS = 8; // cap per-host cache; oldest fetchedAt evicted first
+// How long a message typed into a session may be (XERK-227). The operator
+// pastes logs and specs into the chat composer and the raw terminal takes them
+// at any size, so this is a payload backstop — the agent delivers the text to
+// the pane as a tmux paste, which has no length limit of its own — not a
+// product limit. Keep it at or under the agent's own SESSION_INPUT_MAX_CHARS
+// (which truncates) and under readBody's 1 MiB request cap, and keep the
+// rejection explicit so the composer can say "too long" instead of "Send
+// failed".
+const INPUT_MAX_CHARS = Number(process.env.INPUT_MAX_CHARS) || 100000;
 // Board ticket detail (description + comments), fetched on demand from the host
 // that owns the org's Jira creds. Cached briefly so reopening a ticket, or two
 // dashboards viewing one, doesn't re-hit Jira; kept much shorter-lived than a
@@ -3142,7 +3151,11 @@ const server = http.createServer(async (req, res) => {
         const body = JSON.parse((await readBody(req)) || "{}");
         const text = typeof body.text === "string" ? body.text : "";
         if (!text.trim()) return json(res, 400, { error: "text required" });
-        if (text.length > 4000) return json(res, 400, { error: "text too long" });
+        if (text.length > INPUT_MAX_CHARS)
+          return json(res, 413, {
+            error: `message too long — ${text.length.toLocaleString("en-US")} characters, ` +
+              `the limit is ${INPUT_MAX_CHARS.toLocaleString("en-US")}`,
+          });
         const cmdId = queueCommand(key, { type: "input", sessionId, text });
         return json(res, 200, { ok: true, cmdId });
       }
@@ -3200,7 +3213,15 @@ const server = http.createServer(async (req, res) => {
         if (!hasPick && !custom.trim()) {
           return json(res, 400, { error: "optionIndex, optionIndices or custom required" });
         }
-        if (custom.length > 4000) return json(res, 400, { error: "custom too long" });
+        // The chat composer routes to this endpoint whenever a question is
+        // pending, so a pasted answer meets the same cap a typed message does
+        // (XERK-227); the answer rides a file the ask.py bridge reads, so length
+        // costs nothing here.
+        if (custom.length > INPUT_MAX_CHARS)
+          return json(res, 413, {
+            error: `answer too long — ${custom.length.toLocaleString("en-US")} characters, ` +
+              `the limit is ${INPUT_MAX_CHARS.toLocaleString("en-US")}`,
+          });
         const cmd = { type: "answerQuestion", sessionId, optionIndex };
         if (optionIndices && optionIndices.length) cmd.optionIndices = optionIndices;
         if (custom) cmd.custom = custom;

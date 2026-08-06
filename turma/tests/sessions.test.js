@@ -66,11 +66,13 @@ function makeEl(id) {
 // body. Off by default — a POST that never settles is what keeps the boot
 // refresh() inert for every other test, and only the paths that correlate a
 // reply (the cmdId a resumed transcript comes back under) need it.
-function loadPage({ search = "", sidebar = null, textareas = [], postReply = null, narrow = false } = {}) {
+// `postStatus`: the HTTP status those answers carry (200 unless a test wants a
+// refusal, e.g. the hub's 413 for a message past its character cap).
+function loadPage({ search = "", sidebar = null, textareas = [], postReply = null, postStatus = 200, narrow = false } = {}) {
   const els = {};
   const opened = [];
   const posts = [];
-  const chat = { busy: false, stopped: 0 };
+  const chat = { busy: false, stopped: 0, failed: null };
   // Window-level listeners the page registers (e.g. popstate), so a test can
   // drive the mobile back-button flow that `history.back()` triggers.
   const winListeners = {};
@@ -93,7 +95,9 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     fetch: (url, init) => {
       if (init && init.method === "POST") {
         posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
-        if (postReply) return Promise.resolve({ ok: true, status: 200, json: async () => postReply });
+        if (postReply) return Promise.resolve({
+          ok: postStatus < 400, status: postStatus, json: async () => postReply,
+        });
       }
       return new Promise(() => {});
     },
@@ -111,7 +115,8 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       // The chat engine owns the live busy read and the interrupt; the terminal's
       // compose button just defers to it. `busy` is what a test flips to model a
       // turn being in flight, and `stopped` records the delegation.
-      isBusy: () => chat.busy, stop: () => { chat.stopped++; }, actionFailed: noop,
+      isBusy: () => chat.busy, stop: () => { chat.stopped++; },
+      actionFailed: (t) => { chat.failed = t; },
     },
     console, Date, Math, JSON, encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
     addEventListener(type, fn) { (winListeners[type] ||= []).push(fn); }, removeEventListener: noop,
@@ -135,7 +140,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
     script + "\n;return { render, selectSession, followSpawn, toggleComposer,"
       + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
-      + " termComposeAction, termComposeStop, openEndedSession, resumeEnded, openTranscript, backToList,"
+      + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
       + " chatToTerminal, terminalToChat, sessMeta, autoGrowTermInput,"
       + " setCache: (c) => { cache = c; }, setDraft: (t) => { renameDraft = t; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
@@ -595,6 +600,41 @@ test("terminal compose: Send sends the typed message when idle", () => {
   assert.equal(posts.length, 1);
   assert.equal(posts[0].url, "/api/agents/hostA/sessions/11111/input");
   assert.equal(posts[0].body.text, "do the thing");
+});
+
+test("terminal compose: a multi-line paste goes as ONE message, verbatim (XERK-227)", async () => {
+  const { beat, selectSession, sendTermInput, els, posts } = loadPage({ postReply: { ok: true } });
+  const { now, host: h } = host([idle("11111", "Waiting")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+
+  // The pasted log the old 4k cap refused. Nothing here splits or clips it — the
+  // agent pastes it into the pane, which is what the raw terminal always did.
+  const pasted = Array.from({ length: 500 }, (_, i) => `line ${i}: some log output`).join("\n");
+  els.termInput = makeEl("termInput");
+  els.termInput.value = pasted;
+  await sendTermInput();
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].body.text, pasted);
+  assert.equal(els.termInput.value, "", "a sent message clears the box");
+});
+
+test("terminal compose: the hub's 413 says 'too long' and keeps the text (XERK-227)", async () => {
+  const { beat, selectSession, sendTermInput, els, chat } = loadPage({
+    postReply: { error: "message too long" }, postStatus: 413,
+  });
+  const { now, host: h } = host([idle("11111", "Waiting")]);
+  beat({ now, agents: [h] });
+  selectSession("11111");
+
+  els.termInput = makeEl("termInput");
+  els.termInput.value = "x".repeat(20);
+  await sendTermInput();
+  // A refusal the operator can act on: it reads as a length problem, not as the
+  // hub being down, and the message is put back so it can be split rather than
+  // retyped.
+  assert.equal(chat.failed, "Message too long");
+  assert.equal(els.termInput.value, "x".repeat(20));
 });
 
 // --- the draft survives a chat <-> terminal toggle (XERK-122) ----------------
