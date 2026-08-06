@@ -4,6 +4,7 @@ import kotlinx.serialization.decodeFromString
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -210,5 +211,28 @@ class AgentDecodeTest {
         ).agents[0].usage!!
         assertEquals(0, bare.days.size)
         assertEquals("", bare.lastActivity)
+    }
+
+    @Test fun `a tool_use block decodes its SendUserFile files and caption (XERK-221)`() {
+        val json = """
+            {"t":"tool_use","id":"t1","name":"SendUserFile",
+             "files":[{"name":"a.svg","kind":"image","src":"data:image/svg+xml;base64,PHN2Zy8+"},
+                      {"name":"p.html","kind":"html","html":"<h1>Hi</h1>"},
+                      {"name":"x.zip","kind":"file"}],
+             "caption":"three files"}
+        """.trimIndent()
+        val block = TurmaJson.decodeFromString<Block>(json)
+        assertTrue(block is ToolUseBlock)
+        block as ToolUseBlock
+        assertEquals("three files", block.caption)
+        assertEquals(3, block.files.size)
+        assertEquals("image", block.files[0].kind)
+        assertEquals("data:image/svg+xml;base64,PHN2Zy8+", block.files[0].src)
+        assertEquals("<h1>Hi</h1>", block.files[1].html)
+        assertEquals("file", block.files[2].kind)
+        // An older payload with no files/caption still decodes to the defaults.
+        val plain = TurmaJson.decodeFromString<Block>("""{"t":"tool_use","id":"t2","name":"Bash"}""")
+        assertTrue((plain as ToolUseBlock).files.isEmpty())
+        assertEquals("", plain.caption)
     }
 }
