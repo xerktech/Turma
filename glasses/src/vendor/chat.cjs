@@ -108,33 +108,55 @@
   }
   function enc(s) { return encodeURIComponent(s); }
 
-  // Turn plain transcript text into HTML with clickable links. Bare http(s)
-  // URLs and markdown [text](url) links (http/https only) become <a> tags that
-  // open in a new tab; every other run of text is HTML-escaped exactly like
-  // esc(). Only http/https is ever linkified (no javascript:/data: hrefs), and
-  // both the label and the href are escaped, so this is as injection-safe as
-  // esc() — a bare esc() and linkify() produce identical output for link-free
-  // text. Used for prose surfaces (message bubbles, thinking traces); tool
-  // input/output <pre> blocks stay raw esc().
+  // Turn plain transcript text into HTML with clickable links and inline images.
+  // A markdown image ![alt](url) becomes an <img> (XERK-221); bare http(s) URLs
+  // and markdown [text](url) links (http/https only) become <a> tags that open
+  // in a new tab; every other run of text is HTML-escaped exactly like esc().
+  // Only http/https is ever linkified (no javascript:/data: hrefs), and both the
+  // label and the href are escaped, so this is as injection-safe as esc() — a
+  // bare esc() and linkify() produce identical output for link/image-free text.
+  // Used for prose surfaces (message bubbles, thinking traces); tool input/output
+  // <pre> blocks stay raw esc().
   function anchor(url, label) {
     return '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + "</a>";
   }
+  // An inline image (a markdown ![alt](url), or a raw SVG turned into a data URI
+  // by svgToImg). The src is restricted to http(s) and data:image/* at the call
+  // site, so this never emits a script-bearing scheme; a data:image/svg+xml is
+  // safe here because SVG loaded through <img> runs in the browser's secure
+  // static mode (no scripts, no external fetches). Both attrs are esc()'d.
+  function imgTag(url, alt, cls) {
+    return '<img class="md-img' + (cls ? " " + cls : "") + '" src="' + esc(url) +
+      '" alt="' + esc(alt || "") + '" loading="lazy">';
+  }
+  // Render raw SVG source as an image (XERK-221). The markup is URL-encoded into a
+  // data:image/svg+xml URI and shown through <img>, NOT injected into the DOM: an
+  // <img>-embedded SVG runs in secure static mode, so a <script>/onload/foreignObject
+  // in agent- or tool-emitted SVG can never execute or fetch. encodeURIComponent
+  // leaves the result free of <, >, ", & (all percent-encoded), so it's inert in
+  // the attribute; esc() is applied for uniformity with every other src above.
+  function svgToImg(svg) {
+    return imgTag("data:image/svg+xml," + encodeURIComponent(String(svg).trim()), "", "md-svg");
+  }
   function linkify(text) {
     const s = String(text == null ? "" : text);
-    // Markdown link, OR a bare http(s) URL.
-    const re = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<]+)/g;
+    // Markdown image (http(s) or data:image/* src), a markdown link, OR a bare
+    // http(s) URL — image tried first so its leading `!` isn't left as stray text.
+    const re = /!\[([^\]]*)\]\((https?:\/\/[^)\s]+|data:image\/[^)\s]+)\)|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<]+)/g;
     let out = "", last = 0, m;
     while ((m = re.exec(s))) {
       out += esc(s.slice(last, m.index));
-      if (m[2]) {
-        out += anchor(m[2], m[1]);            // [label](url)
+      if (m[2] != null) {
+        out += imgTag(m[2], m[1]);            // ![alt](url)
+      } else if (m[4]) {
+        out += anchor(m[4], m[3]);            // [label](url)
       } else {
         // Bare URL: peel trailing sentence punctuation, markdown emphasis
         // markers (e.g. a URL wrapped in **bold**), and typographic quotes
         // (Claude often emits curly ‘’ “” around URLs) back out of the link,
         // and a trailing ')' only when it isn't part of the URL (e.g. a URL
         // wrapped in parens) — keep it for balanced ones like /wiki/Foo_(bar).
-        let url = m[3], trail = "";
+        let url = m[5], trail = "";
         const tp = /[.,;:!?'"*_‘’“”]+$/.exec(url);
         if (tp) { trail = tp[0]; url = url.slice(0, -tp[0].length); }
         if (url.endsWith(")") && !url.includes("(")) { trail = ")" + trail; url = url.slice(0, -1); }
@@ -261,6 +283,28 @@
     return out;
   }
 
+  // ---- raw (non-fenced) SVG blocks ------------------------------------------
+  // Lift a standalone <svg>…</svg> block out of prose and render it as an image
+  // (XERK-221), passing the surrounding text through renderTables() unchanged. A
+  // block only qualifies when its <svg> opens at the START of a line — so a
+  // `<svg>` mentioned inside an inline `code` span or mid-sentence stays text —
+  // and it must reach a </svg>; an unterminated one (mid-stream reveal) falls
+  // through as escaped text until its closer lands. renderProse() lifts fenced
+  // code out first, so a fenced SVG is handled there, never here.
+  function renderSvgAndText(text) {
+    const s = String(text == null ? "" : text);
+    if (!/<svg[\s>]/i.test(s)) return renderTables(s); // no <svg → nothing to lift out
+    const re = /(^|\n)[ \t]*(<svg[\s>][\s\S]*?<\/svg\s*>)/gi;
+    let out = "", last = 0, m;
+    while ((m = re.exec(s))) {
+      out += renderTables(s.slice(last, m.index) + m[1]); // keep the boundary newline
+      out += svgToImg(m[2]);
+      last = m.index + m[0].length;
+    }
+    out += renderTables(s.slice(last));
+    return out;
+  }
+
   // ---- fenced code blocks ---------------------------------------------------
   // A ``` fence opens a code block that runs to the next fence of at least the
   // same length (or, unterminated, to the end of the text — which is the normal
@@ -339,12 +383,17 @@
     writeClipboard(text).then(function () { flash("copied"); }, function () { flash("failed"); });
     return true;
   }
+  // A fenced block whose entire body is one <svg>…</svg> document renders as an
+  // image, not code (XERK-221) — catches ```svg, ```xml/```html-wrapped SVG, and a
+  // bare ``` fence around SVG alike, without disturbing a fence that merely
+  // contains an <svg> among other content.
+  const SVG_FENCE = /^\s*<svg[\s>][\s\S]*<\/svg\s*>\s*$/i;
   function renderProse(text) {
     const s = String(text == null ? "" : text);
-    if (s.indexOf("```") < 0) return renderTables(s); // no fence → nothing to lift out
+    if (s.indexOf("```") < 0) return renderSvgAndText(s); // no fence → still scan for raw SVG
     const lines = s.split("\n");
     let out = "", i = 0, buf = [];
-    const flush = () => { if (buf.length) { out += renderTables(buf.join("\n")); buf = []; } };
+    const flush = () => { if (buf.length) { out += renderSvgAndText(buf.join("\n")); buf = []; } };
     while (i < lines.length) {
       const open = FENCE_OPEN.exec(lines[i]);
       if (open) {
@@ -353,7 +402,8 @@
         const body = [];
         while (i < lines.length && !fenceCloses(lines[i], open[1])) { body.push(lines[i]); i++; }
         i++; // consume the closer; past the end already for an unterminated block
-        out += renderCode(open[2], body.join("\n"));
+        const bodyStr = body.join("\n");
+        out += SVG_FENCE.test(bodyStr) ? svgToImg(bodyStr) : renderCode(open[2], bodyStr);
         continue;
       }
       buf.push(lines[i]); i++;

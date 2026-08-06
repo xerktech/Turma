@@ -1353,36 +1353,38 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   - Passes nest outward-in — fence, table, inline, link — so a code body is never linkified; the fence
     pass runs above the table pass. An inline span never crosses a line break, and an **unterminated
     fence renders as code**.
-  - A code-carrying bubble is given a **definite** `width: min(760px, 100%)` (scoped by `:has()`), taking
-    it out of shrink-to-fit sizing so overflow lands on the block's own scroller, not a grid track.
-  - Tests: `renderProse` in `turma/tests/chat.test.js`.
+  - A code-carrying bubble gets a **definite** `width: min(760px, 100%)` (`:has()`-scoped), out of
+    shrink-to-fit sizing so overflow lands on the block's own scroller, not a grid track.
+  - **Images/SVGs render inline (XERK-221)**: `![alt](url)` → `<img>` (`linkify`, src `http(s)`+
+    `data:image/*`); a line-start raw `<svg>` (`renderSvgAndText`) or all-SVG fence body → a sandboxed
+    `data:image/svg+xml` `<img>` (`svgToImg`) — **never DOM-injected**, so embedded `<script>`/`onload`
+    can't run. Android deferred (`android/PARITY.md`). Tests: `linkify`/`renderProse` in `chat.test.js`.
 - A per-session **verbosity control** (Concise/Normal/Verbose presets + per-type thinking/tool-calls/
-  tool-outputs toggles, persisted in `localStorage`) filters which `blocks[]` show — a pure client-side
-  filter over the received buffer.
+  tool-outputs toggles, persisted in `localStorage`) filters which `blocks[]` show — client-side, over
+  the received buffer.
 - Typed prompts go to `POST .../input`; pending `AskUserQuestion`s answer via option chips / custom text
   to `POST .../answer`.
-- The pending-question box renders Claude Code's full picker: each option is a card with its
-  `description` and a collapsible **`preview`**, plus a `header` chip and an "n of N" counter. These ride
-  `questionOptionsRich`/`questionHeader`/`questionIndex`/`questionTotal`/`questionMulti` alongside the
-  backward-compat `questionOptions` labels, so glasses/android keep rendering the flat list.
-  - A **`multiSelect`** question renders checkboxes + a Submit that `POST`s `optionIndices` (a list);
-    `answer_question`/`ask.py` accept it. `optionCardHtml` builds each card; the agent side is
+- The pending-question box renders Claude Code's full picker: each option a card with its `description`
+  + collapsible **`preview`**, a `header` chip and an "n of N" counter, riding `questionOptionsRich`/
+  `questionHeader`/`questionIndex`/`questionTotal`/`questionMulti` beside the backward-compat
+  `questionOptions` labels, so glasses/android keep the flat list.
+  - A **`multiSelect`** question renders checkboxes + a Submit that `POST`s `optionIndices`;
+    `answer_question`/`ask.py` accept it. `optionCardHtml` builds each card; agent side
     `_question_options`/`_hook_question` + `TestHookQuestion`/`TestAnswerQuestion`/`test_ask.py`.
-- The compose footer's live agent-mode / model selectors are joined by a compact **PR status chip**
-  (`prFooterChip` in `chat.js`) when it has one.
+- The compose footer's agent-mode / model selectors are joined by a compact **PR status chip**
+  (`prFooterChip`) when it has one.
 - The **model selector is accurate** (XERK-33) — never a hardcoded menu, and never rewriting the shared
   login's default (see `setModel`):
-  - the chip leads with the session's heartbeated `modelActual`, rendered human by `prettyModel`
+  - the chip leads with the session's heartbeated `modelActual`, humanized by `prettyModel`
     ("claude-opus-4-8" → "Opus 4.8"), falling back to the picked alias, raw id in the tooltip;
-  - the menu is built by `modelOpts` from the host's probed `models` block — curated to the aliases the
-    /model picker can reach, "Default (<label>)" saying what it resolves to, the static four when a host
-    hasn't probed;
+  - the menu is `modelOpts` from the host's probed `models` block — curated to the aliases the /model
+    picker can reach, "Default (<label>)" saying what it resolves to, the static four before a probe;
   - a just-picked switch holds its optimistic label until the agent confirms or `MODEL_SWITCH_SETTLE_MS`
-    passes (`modelSwitchPending`). A pick the agent DEFERRED (`session.pendingModel`) outranks the memo
-    and renders with an ellipsis; the mode chip has the same memo
-    (`modeChipValue`/`modeSwitchPending`), retired when the heartbeat's `permissionMode` agrees;
-  - `onPoll` carries the fresh host payload so the menu tracks the probe, and the dashboard composer
-    offers the same probed list (`modelChoices` in `index.html`).
+    passes (`modelSwitchPending`); a DEFERRED pick (`session.pendingModel`) outranks the memo and shows
+    an ellipsis. The mode chip shares the memo (`modeChipValue`/`modeSwitchPending`), retired when the
+    heartbeat's `permissionMode` agrees;
+  - `onPoll` carries the fresh host payload so the menu tracks the probe; the dashboard composer offers
+    the same probed list (`modelChoices` in `index.html`).
   - Tests: `modelOpts`/`prettyModel` in `chat.test.js`, the malformed-model case in
     `server.test.js`.
 - The raw ttyd terminal stays one **"Terminal ▸" toggle** away in the chat header (`#termPane` iframe).
@@ -1393,41 +1395,41 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 - A pinned **working-status bar** below the transcript mirrors the terminal's bottom region from the live
   `status` frame: the spinner verb + ↑/↓ token counters + elapsed, and Claude Code's rotating
-  tip/active-task hint. When background agents run it shows a clickable **agent list** (`agentsHtml` in
-  `chat.js`: `main` as a plain marker, each subagent as a button carrying its type + description).
-- Clicking a subagent opens its transcript read-only in the right stage (`openSubagentView` in
-  `sessions.html` → `GET /api/agents/<host>/sessions/<id>/subagents/history?type=&label=`, reusing the
-  archive viewer + chat engine), with **Back** returning to the live session.
+  tip/active-task hint. When background agents run it shows a clickable **agent list** (`agentsHtml`:
+  `main` a plain marker, each subagent a button carrying its type + description).
+- Clicking a subagent opens its transcript read-only in the right stage (`openSubagentView` →
+  `GET /api/agents/<host>/sessions/<id>/subagents/history?type=&label=`, reusing the archive viewer +
+  chat engine), with **Back** returning to the live session.
 - Tests: `agentsHtml` in `chat.test.js`, the subagent-history cases in `server.test.js`.
 
 #### Queued sessions
 
 - A **"Queued" section** above Active lists sessions the agent hasn't provisioned yet (`status:"queued"`)
   as static cards showing the wait reason (`queuedReasonText`) and a **Cancel** (arm-then-confirm).
-  A followed spawn (`?spawn=<cmdId>`) that lands in the queue words its stage **"Queued — <reason>"** and
-  flips to the live session the moment it provisions; the dashboard's card mirrors this. Tests:
-  `turma/tests/sessions.test.js`.
+  A followed spawn (`?spawn=<cmdId>`) landing in the queue words its stage **"Queued — <reason>"** and
+  flips to the live session once it provisions; the dashboard's card mirrors this. Tests:
+  `sessions.test.js`.
 
 #### Ended sessions
 
 - The sidebar's third section (below Active/Idle/Queued), **collapsed by default**. It merges the three
   channels an over-but-resumable session arrives on: **killed** (`a.closedSessions`), **stopped** (a
-  non-running record still in `a.sessions`), and **resumable** (a transcript from each repo's
-  `resumable` scan, with no registry record behind it).
-- The third channel is what makes the list **durable**: the first two read out of `~/.turma` and
-  `closed.json` is capped at `CLOSED_PER_REPO`, while `resumable` is re-derived every slow beat from the
-  transcripts under `~/.claude/projects` plus each transcript's recorded cwd.
+  non-running record still in `a.sessions`), and **resumable** (a transcript from each repo's `resumable`
+  scan, no registry record behind it).
+- The third channel makes the list **durable**: the first two read out of `~/.turma` and `closed.json` is
+  capped at `CLOSED_PER_REPO`, while `resumable` is re-derived every slow beat from the transcripts under
+  `~/.claude/projects` plus each's recorded cwd.
 - **Deduped on `<host>::<transcriptId>`**, a registry-backed record always winning. A kill that ages out
   of `closed.json` keeps listing, minus its PR chips. Sorted **most recently ended first** (`endedMs`,
-  from `closedAt`/`stoppedAt`/`endedTs` — note `resumableSession()` must copy `endedTs` onto the record,
-  where `endedEntry` reads the key); an undated record sorts oldest.
+  from `closedAt`/`stoppedAt`/`endedTs` — `resumableSession()` must copy `endedTs` onto the record, where
+  `endedEntry` reads the key); an undated record sorts oldest.
 - The resumable channel's **`endedTs` is the last message's own transcript timestamp**
   (`_last_activity_ts`), NOT the file mtime (XERK-73) — mtime is inflated to copy-time by a synced
-  `~/.claude` or a backup restore. `_archive_manifest` dates its rows the same way; both fall back to
-  mtime for a transcript with no timestamped entry. Tests: `TestLastActivityTs`, `TestResumableReport`.
+  `~/.claude` or backup restore. `_archive_manifest` dates rows the same way; both fall back to mtime when
+  no entry is timestamped. Tests: `TestLastActivityTs`, `TestResumableReport`.
 - A **running** session is never also listed as ended: the agent re-cuts the cached scan against its live
   registry every beat (`_sorted_repo_entries`), and the page dedupes resumable rows against every reported
-  session's `transcriptId` (why `_session_payload` reports it for running sessions).
+  session's `transcriptId` (why `_session_payload` reports it while running).
 - **Clicking a row opens that session read-only on the stage** — the same `#transcriptPane` the
   archive/subagent views use: scrollable conversation + a verbosity control, **no terminal toggle and no
   compose box**. `resetEndedBar()` keeps the pane's shared PR/Resume bar from leaking into those views.
@@ -1438,57 +1440,55 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - **Resume** sits on the row and stage bar, dispatching on how the session ended: killed → `.../resume`
   (same id), stopped → `.../start`, resumable → `.../transcripts/<id>/resume` with its origin cwd (the
   agent re-validates the path and re-creates the dir if a prune removed it). The list is DERIVED, so a
-  resumed session drops out on the beat the agent reports it running. The resumable path comes back under
-  a **new id**, so it follows its queued command's `cmdId`. Resume needs the host **online**; reading does
-  not.
-- Tests: `turma/tests/sessions.test.js`, `TestRefreshPrStatus`, `TestSessionLifecycle`,
-  `TestResumableReport`, `TestCardedSlugs`.
+  resumed session drops out the beat the agent reports it running. The resumable path comes back under a
+  **new id**, so it follows its queued command's `cmdId`. Resume needs the host **online**; reading doesn't.
+- Tests: `sessions.test.js`, `TestRefreshPrStatus`, `TestSessionLifecycle`, `TestResumableReport`,
+  `TestCardedSlugs`.
 
 #### Session card ⋯ menu
 
 - Each sidebar session card carries a **⋯ overflow menu** — a sibling of the card `<button>`, absolutely
   positioned over it (a nested button is invalid HTML). **Rename…** swaps the card for an inline field
-  that `POST`s to `.../sessions/<id>/summary`, painted optimistically; **Kill** arms-then-confirms. The
-  menu's open/armed/typing state lives in page variables, not the DOM.
+  `POST`ing to `.../sessions/<id>/summary`, painted optimistically; **Kill** arms-then-confirms. Menu
+  open/armed/typing state lives in page variables, not the DOM.
 
 #### Send and Stop buttons
 
 - **Send always sends, and ◼ Stop is its own button**, in both chat and terminal views. A message sent
   mid-turn QUEUES, so the button that talks must stay available while the agent works. The
   warning-coloured Stop appears beside Send only while a turn runs.
-- Stop interrupts the turn (`chatComposeStop`/`termComposeStop` → `stop()` → `POST
-  /api/agents/<host>/sessions/<id>/interrupt`). Unlike Kill it arms/confirms nothing and leaves the
+- Stop interrupts the turn (`chatComposeStop`/`termComposeStop` → `stop()` →
+  `POST /api/agents/<host>/sessions/<id>/interrupt`). Unlike Kill it arms/confirms nothing and leaves the
   session on the stage. **Enter always sends**, like the button.
-- The busy read driving Stop's visibility is `chat.js`'s `liveStatus` (the ~1s pane scrape), NOT the
-  heartbeat's `paneBusy`. With the live socket down `liveStatus` stays null and Stop stays hidden (a Stop
-  that can't see the turn is worse than no Stop).
+- The busy read driving Stop's visibility is `liveStatus` (the ~1s pane scrape), NOT the heartbeat's
+  `paneBusy`. With the live socket down `liveStatus` stays null and Stop stays hidden (a Stop that can't
+  see the turn is worse than no Stop).
 - A clicked Stop **hides immediately** (`stopPendingAt`, `composeBusy()`); if the turn outlives
-  `STOP_SUPPRESS_MS` the interrupt didn't take and Stop comes back. A failed interrupt POST paints "Stop
-  failed" (`actionFailed`'s selector arg).
+  `STOP_SUPPRESS_MS` the interrupt didn't take and Stop comes back. A failed POST paints "Stop failed"
+  (`actionFailed`'s selector arg).
 - **A pending `AskUserQuestion` hides Stop** (`composeBusy()` returns false while `questionActive`) — the
   answer is typed THROUGH the compose box, routed to `/answer` (`send()`'s `wasAnswer` path), and an
   accidental Stop would destroy the question (XERK-21). `updateQuestion` repaints the bar the instant a
-  question appears or clears.
-- `chat.js` paints every `.compose-action` and `.compose-stop` button from that one read, so the
-  terminal's bar can't disagree with the chat's. Tests: `chat.test.js`,
+  question appears/clears.
+- `chat.js` paints every `.compose-action` + `.compose-stop` button from that one read, so the terminal's
+  bar can't disagree with the chat's. Tests: `chat.test.js`,
   `termComposeAction`/`termComposeStop` in `sessions.test.js`.
 
 #### The compose draft survives the view toggle (XERK-122)
 
 - The chat and terminal panes have a compose box each, but a session has ONE draft: each toggle **moves**
   the text across (`carryDraft`), clearing the source, so the two can never disagree. It is carried
-  **after** the pane swap, not before — `focus()` on a still-`hidden` textarea is a silent no-op. Focus
-  follows only a NON-EMPTY draft, so toggling with an empty box doesn't pop a soft keyboard.
+  **after** the pane swap — `focus()` on a still-`hidden` textarea is a silent no-op. Focus follows only a
+  NON-EMPTY draft, so toggling with an empty box doesn't pop a soft keyboard.
 - Android has no in-place toggle (the terminal is its own screen), so the draft lives outside both screens
-  in the container's `data/DraftStore.kt`, keyed per (host, session); `ChatViewModel` mirrors it into
-  `ChatUiState.draft` and writes every change — incl. dictation and send-clears — back through it.
-- Tests: `turma/tests/sessions.test.js`, `android/.../data/DraftStoreTest.kt`.
+  in `data/DraftStore.kt`, keyed per (host, session); `ChatViewModel` mirrors it into `ChatUiState.draft`
+  and writes every change — incl. dictation and send-clears — back through it.
+- Tests: `sessions.test.js`, `android/.../data/DraftStoreTest.kt`.
 - **A compose box auto-grows to its `scrollHeight`, but only while it is laid out** (XERK-149): a hidden
   textarea (`.chat-pane`/`.term-pane[hidden]`, or a phone's `display:none` `.stage`) reports
   `scrollHeight` 0, and an unguarded `growCompose`→`autoGrow` during the toggle's `carryDraft` pins an
   inline `height:0px`. `autoGrow`/`autoGrowTermInput` bail on `offsetParent === null`, keeping the last
-  laid-out height; `carryDraft` re-grows it when shown. Tests: `autoGrowTermInput` in
-  `turma/tests/sessions.test.js`.
+  laid-out height; `carryDraft` re-grows it when shown. Tests: `autoGrowTermInput` in `sessions.test.js`.
 
 #### Copying out of the terminal
 
@@ -1499,16 +1499,15 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   (defaults off) — `_launch_ttyd` passes it (cost: Mac's Alt+drag column-select). Once a selection EXISTS
   ttyd copies it itself.
 - **Every other copy — the app's own and tmux copy-mode's — travels as OSC 52**, needing all three of:
-  - `agent/tmux.conf` declaring an `Ms` capability (tmux only emits OSC 52 if the OUTER terminfo
+  - `agent/tmux.conf` declaring an `Ms` capability (tmux emits OSC 52 only if the OUTER terminfo
     advertises it, and xterm-256color / tmux-256color lack it);
   - `set-clipboard on` — the default `external` forwards **no** application OSC 52;
   - the hub injecting xterm.js's missing OSC 52 handler (`TERM_OSC52_JS`, in `proxyTerm`, via ttyd's
     `window.term`).
 - The bridge is deliberately **write-only**: an OSC 52 READ request (`?`) is never answered (else any
   program in the pane reads the clipboard). An empty payload is dropped. It splits at the **first `;`**
-  (an app sends `52;c;<b64>`, tmux sends `52;;<b64>`, both must land).
-- Tests: `server.test.js`, `test_launch_ttyd_lets_a_mac_force_a_selection` in
-  `agent/tests/test_hub_agent.py`.
+  (an app sends `52;c;<b64>`, tmux `52;;<b64>`, both must land).
+- Tests: `server.test.js`, `test_launch_ttyd_lets_a_mac_force_a_selection` in `test_hub_agent.py`.
 
 ### Durable archive
 

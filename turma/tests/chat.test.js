@@ -642,6 +642,35 @@ test("linkify: link label and non-link text are still HTML-escaped (no injection
   assert.match(html, /href="https:\/\/example\.com\/\?a=1&amp;b=2"/);
 });
 
+// ---- inline images (XERK-221) --------------------------------------------
+test("linkify: a markdown image ![alt](url) becomes an <img>, not a stray ! + link", () => {
+  const html = linkify("see ![a diagram](https://ex.com/x.png) here");
+  assert.equal(html,
+    'see <img class="md-img" src="https://ex.com/x.png" alt="a diagram" loading="lazy"> here');
+  assert.doesNotMatch(html, /<a /); // an image is not also rendered as a link
+});
+
+test("linkify: an image with an empty alt still renders", () => {
+  assert.match(linkify("![](https://ex.com/x.png)"), /<img class="md-img" src="https:\/\/ex\.com\/x\.png" alt=""/);
+});
+
+test("linkify: a data:image URI is an allowed image src; a non-image data URI is not", () => {
+  const ok = linkify("![i](data:image/png;base64,AAAA)");
+  assert.match(ok, /<img class="md-img" src="data:image\/png;base64,AAAA"/);
+  // data:text/html is not image/*, so it is not turned into an <img> (its label
+  // and the leading ! fall through as escaped text).
+  assert.doesNotMatch(linkify("![x](data:text/html,<script>alert(1)</script>)"), /<img/);
+});
+
+test("linkify: image alt + src are HTML-escaped (no attribute breakout)", () => {
+  const html = linkify('![" onerror=alert(1) x](https://ex.com/a".png)');
+  // The quote that would close the attribute early is escaped in BOTH attrs, so
+  // the onerror text stays inert data inside alt rather than a real attribute.
+  assert.doesNotMatch(html, /"\s+onerror=/); // no raw quote begins a new attribute
+  assert.match(html, /alt="&quot; onerror=alert\(1\) x"/);
+  assert.match(html, /src="https:\/\/ex\.com\/a&quot;\.png"/);
+});
+
 test("linkify: link-free text matches a plain esc()", () => {
   const t = 'plain <text> with "quotes" & ampersand';
   // esc() output for the same string (mirrors chat.js's esc()).
@@ -1055,6 +1084,42 @@ test("renderProse: inline backticks in prose don't open a block", () => {
 test("renderProse: fence-free text is byte-identical to the table renderer", () => {
   const t = "opened [PR #42](https://github.com/o/r/pull/42) — <b>done</b> & dusted";
   assert.equal(renderProse(t), linkify(t));
+});
+
+// ---- raw SVG rendering (XERK-221) ----------------------------------------
+test("renderProse: a standalone <svg> block renders as a data-URI <img>, not text", () => {
+  const html = renderProse("Here it is:\n<svg viewBox=\"0 0 2 2\"><rect width=\"2\" height=\"2\"/></svg>\ndone");
+  assert.match(html, /<img class="md-img md-svg" src="data:image\/svg\+xml,/);
+  assert.match(html, /Here it is:/);
+  assert.match(html, /done/);
+  // The markup is URL-encoded (angle brackets gone), so nothing lands in the DOM.
+  assert.doesNotMatch(html, /<svg/);
+  assert.match(html, /%3Csvg/); // encodeURIComponent turned "<svg" into "%3Csvg"
+});
+
+test("renderProse: a fenced SVG document renders as an image, not a code block", () => {
+  const html = renderProse("```svg\n<svg><circle r=\"1\"/></svg>\n```");
+  assert.match(html, /<img class="md-img md-svg"/);
+  assert.doesNotMatch(html, /md-code/); // not a code block
+});
+
+test("renderProse: a fence that merely mentions <svg> among other content stays code", () => {
+  const html = renderProse("```html\n<div><svg></svg></div>\n<p>hi</p>\n```");
+  assert.match(html, /md-code/);
+  assert.doesNotMatch(html, /md-svg/);
+});
+
+test("renderProse: an <svg> inside an inline code span is NOT rendered as an image", () => {
+  // The <svg> is mid-line (inside backticks), not at a line start, so it stays code.
+  const html = renderProse("the `<svg><rect/></svg>` element");
+  assert.doesNotMatch(html, /md-svg/);
+  assert.match(html, /md-code-inline/);
+});
+
+test("renderProse: an unterminated <svg> (mid-stream) stays escaped text, not an image", () => {
+  const html = renderProse("<svg viewBox=\"0 0 2 2\"><rect");
+  assert.doesNotMatch(html, /md-svg/);
+  assert.match(html, /&lt;svg/); // shown as escaped text until its </svg> lands
 });
 
 // ---- renderInline (inline `code` spans in prose) -------------------------

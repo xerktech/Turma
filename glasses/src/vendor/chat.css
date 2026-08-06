@@ -86,6 +86,14 @@
   font-family: var(--font-mono); font-size: 0.88em; font-style: normal;
   background: var(--page); border: 1px solid var(--border); border-radius: 4px;
   padding: 0.1em 0.35em; overflow-wrap: anywhere; }
+/* Inline images + rendered SVGs (chat.js linkify()/svgToImg(), XERK-221). Block
+   so they sit on their own line; capped so a large asset doesn't blow out the
+   bubble. A light backdrop keeps a transparent/dark-stroked SVG legible. */
+.tr-msg .md-img, .thought-body .md-img, .compact-body .md-img {
+  display: block; max-width: 100%; max-height: 420px; height: auto; margin: 6px 0;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.tr-msg .md-svg, .thought-body .md-svg, .compact-body .md-svg {
+  width: auto; background: #fff; padding: 6px; }
 /* Auto-linkified URLs in chat bubbles + thinking traces (chat.js linkify()). */
 .tr-msg a, .thought-body a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
 .tr-msg a:hover, .thought-body a:hover { text-decoration: none; }
