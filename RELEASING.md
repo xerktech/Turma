@@ -2,7 +2,7 @@
 
 One release publishes **all six components** under a single `v<MAJOR>.<MINOR>.<PATCH>`
 tag: the `turma` image, the `agent` image, the glasses app, the android
-`.apk`, the native-agent tarball, and the foverlay miniapp `.zip`. Driven by
+`.apk`, the native-agent tarball, and the veiller miniapp `.zip`. Driven by
 `.github/workflows/release.yml`;
 the logic lives in `.github/scripts/` (see its README). The glasses build is
 **not a release asset**: its distribution channel is the Even Hub developer
@@ -20,7 +20,7 @@ dev-portal publish").
 ## Patch releases (automatic)
 
 Every merge to `main` that touches a component's source (`turma/`, `agent/`,
-`glasses/`, `android/`, `foverlay/`) cuts a patch release — a merge that touches only docs or
+`glasses/`, `android/`, `veiller/`) cuts a patch release — a merge that touches only docs or
 the release machinery does not, since every component would be carried and the
 release would publish nothing new. `plan` diffs the merge against the previous
 release tag and decides, per component, **build or carry**:
@@ -39,7 +39,7 @@ Carried **images** are referenced in the manifest at their prior `:version` tag
 (we do not retag an unchanged image to the new version — `:0.3.9` pointing at
 `0.3.4` bits would be as misleading as renaming a carried asset). `:latest` is
 already correct on a carried image, so Watchtower needs nothing. Carried
-**assets** (the `.apk`, native tarball, and foverlay `.zip`) are copied forward
+**assets** (the `.apk`, native tarball, and veiller `.zip`) are copied forward
 under their **original filename**, because Android and the native updater version
 an install by the version baked *inside* the file — the name must describe the
 bits. A

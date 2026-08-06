@@ -56,7 +56,7 @@ function main() {
     build_agent_native: changed["agent-native"],
     build_glasses: changed.glasses,
     build_android: changed.android,
-    build_foverlay: changed.foverlay,
+    build_veiller: changed.veiller,
   });
 
   // Human-readable summary for the Actions run log / step summary.
