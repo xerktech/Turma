@@ -34,7 +34,7 @@ and nothing inbound exposed.
 | **`turma/`** | The hub: dashboard, terminal gateway, and durable searchable archive of every ended session. Node **stdlib only** — zero npm dependencies. | Once, anywhere reachable |
 | **`glasses/`** | An [Even Realities G2](https://www.evenrealities.com/) smart-glasses client (Vite + TypeScript). Sessions, transcripts, question answering, and mic dictation. | Even Hub plugin |
 | **`android/`** | Native Android client (Kotlin + Compose). Everything the web dashboard does, plus push notifications and voice. | Phone |
-| **`foverlay/`** | The glasses client as a [Mentra miniapp](foverlay/README.md) for the Foverlay app (Bun + TypeScript). Same G2 experience, bundled into the Foverlay mobile app instead of Even Hub. | Foverlay app |
+| **`veiller/`** | The glasses client as a [Mentra miniapp](veiller/README.md) for the Veiller app (Bun + TypeScript). Same G2 experience, bundled into the Veiller mobile app instead of Even Hub. | Veiller app |
 
 Full architecture, the session model, and the design rationale behind each piece
 live in [`CLAUDE.md`](CLAUDE.md).
@@ -219,7 +219,7 @@ Safety guard section of [`CLAUDE.md`](CLAUDE.md).
 node --test turma/tests/*.test.js agent/tests/*.test.js    # hub + agent (Node 24)
 cd glasses && npm test                                     # glasses (vitest)
 cd android && ./gradlew testDebugUnitTest                   # android (JVM)
-cd foverlay && bun test                                    # foverlay miniapp (bun)
+cd veiller && bun test                                    # veiller miniapp (bun)
 ```
 
 The hub has no build step and no dependencies — `node turma/server.js` runs it,

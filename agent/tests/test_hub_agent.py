@@ -2622,17 +2622,17 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
         # No worktree and no worktrees-shaped slug, but the transcript records
         # its cwd (e.g. an operator's dev-machine session, Windows path) — the
         # repo is read from there when its tail names a repo this host has.
-        self._mk_repo("Foverlay")
-        wt = "/home/me/OneDrive/personal/Foverlay"
+        self._mk_repo("Veiller")
+        wt = "/home/me/OneDrive/personal/Veiller"
         proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(wt))
         os.makedirs(proj, exist_ok=True)
         write_jsonl(os.path.join(proj, "t.jsonl"), [
-            {"type": "user", "cwd": "C:\\Users\\me\\personal\\Foverlay",
+            {"type": "user", "cwd": "C:\\Users\\me\\personal\\Veiller",
              "message": {"role": "user", "content": "hi"}},
         ])
         sm = self.make_manager()
         sm._reconcile_orphan_transcripts()
-        self.assertEqual(sm.usage_ledger[proj]["repo"], "Foverlay")
+        self.assertEqual(sm.usage_ledger[proj]["repo"], "Veiller")
 
     def test_junk_cwd_tail_folds_to_root(self):
         # A cwd whose last segment names no repo this host has ("repo", "tmp",

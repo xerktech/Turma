@@ -1,0 +1,43 @@
+name: veiller-ci
+
+# Typecheck + test + build gate for the Veiller miniapp on PRs to main.
+# Path-filtered to veiller/** so it only runs when that package changes.
+#
+# Bun is this component's toolchain — install, test runner, AND bundler
+# (build.ts calls Bun.build) — the first bun use in the repo, so setup-bun pins
+# the version here rather than reusing the node the other gates install.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "veiller/**"
+      - ".github/workflows/veiller-ci.yml"
+
+concurrency:
+  group: veiller-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: veiller
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.22"
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Test
+        run: bun test
+      - name: Build
+        run: bun run build
