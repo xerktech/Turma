@@ -1739,6 +1739,55 @@ class TestEntryBlocks(unittest.TestCase):
         ]}}, ha.BLOCK_CAPS_LIVE)[0]
         self.assertEqual(block["plan"], "## Plan\n1. do it")
 
+    def test_send_user_file_embeds_images_svg_html_and_degrades_the_rest(self):
+        # XERK-221: SendUserFile reads the delivered files and embeds image/SVG as
+        # data URIs + HTML raw, so the chat renders them; other/missing → a chip.
+        d = tempfile.mkdtemp()
+        try:
+            svg = os.path.join(d, "a.svg")
+            with open(svg, "w") as fh:
+                fh.write("<svg><rect/></svg>")
+            html = os.path.join(d, "p.html")
+            with open(html, "w") as fh:
+                fh.write("<h1>Hi</h1>")
+            inp = {"files": [svg, html, os.path.join(d, "gone.png"),
+                             os.path.join(d, "notes.txt")],
+                   "display": "render", "caption": "the set"}
+            block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "SendUserFile", "input": inp},
+            ]}}, ha.BLOCK_CAPS_LIVE)[0]
+            self.assertEqual(block["caption"], "the set")
+            b64 = base64.b64encode(b"<svg><rect/></svg>").decode()
+            self.assertEqual(block["files"], [
+                {"name": "a.svg", "kind": "image", "src": "data:image/svg+xml;base64," + b64},
+                {"name": "p.html", "kind": "html", "html": "<h1>Hi</h1>"},
+                {"name": "gone.png", "kind": "file"},   # missing → chip
+                {"name": "notes.txt", "kind": "file"},  # non-renderable type → never opened
+            ])
+            # display:"attach" makes an HTML file a download chip, not an iframe.
+            b2 = ha._entry_blocks({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t2", "name": "SendUserFile",
+                 "input": {"files": [html], "display": "attach"}},
+            ]}}, ha.BLOCK_CAPS_LIVE)[0]
+            self.assertEqual(b2["files"], [{"name": "p.html", "kind": "file"}])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_send_user_file_over_cap_degrades_to_a_name_chip(self):
+        # A file past SEND_FILE_MAX_BYTES is not embedded (frame stays bounded).
+        d = tempfile.mkdtemp()
+        try:
+            big = os.path.join(d, "big.png")
+            with open(big, "wb") as fh:
+                fh.write(b"\x00" * (ha.SEND_FILE_MAX_BYTES + 1))
+            block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "SendUserFile",
+                 "input": {"files": [big], "display": "render"}},
+            ]}}, ha.BLOCK_CAPS_LIVE)[0]
+            self.assertEqual(block["files"], [{"name": "big.png", "kind": "file"}])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_description_arg_rides_as_desc(self):
         block = ha._entry_blocks({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Bash", "input": {

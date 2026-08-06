@@ -82,6 +82,16 @@ const BLOCK_CAPS_LIVE = {
   input: BLOCK_TOOL_INPUT_CHARS,
   result: BLOCK_TOOL_RESULT_CHARS,
 };
+// SendUserFile inline-preview embedding (XERK-221) — mirror hub-agent.py's
+// SEND_FILE_* constants exactly (the block shape must match byte-for-byte).
+const SEND_FILE_MAX_FILES = Number(process.env.SESSION_SEND_FILE_MAX_FILES) || 16;
+const SEND_FILE_MAX_BYTES = Number(process.env.SESSION_SEND_FILE_MAX_BYTES) || 512 * 1024;
+const SEND_FILE_IMG_MIME = {
+  ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
+  ".avif": "image/avif", ".bmp": "image/bmp", ".ico": "image/x-icon",
+};
+const SEND_FILE_HTML_EXT = new Set([".html", ".htm"]);
 
 // Claude Code's project-dir slug for a worktree cwd: every non-alphanumeric
 // char -> '-' (mirrors hub-agent.py _project_slug — a plain '/'->'-' map is
@@ -393,11 +403,45 @@ function toolInputSummary(inp) {
   return String(inp);
 }
 
+// Read the image/SVG/HTML files a SendUserFile call delivered and return preview
+// entries for its tool_use block (XERK-221), or null. Mirror of hub-agent.py
+// _send_user_file_detail(): image -> {name, kind:"image", src:data URI};
+// html (render only) -> {name, kind:"html", html}; else -> {name, kind:"file"}.
+function sendUserFileDetail(inp) {
+  const files = inp.files;
+  if (!Array.isArray(files) || !files.length) return null;
+  const display = inp.display;
+  const out = [];
+  for (const p of files.slice(0, SEND_FILE_MAX_FILES)) {
+    if (typeof p !== "string" || !p) continue;
+    const name = path.basename(p);
+    const ext = path.extname(p).toLowerCase();
+    const mime = SEND_FILE_IMG_MIME[ext];
+    const renderHtml = SEND_FILE_HTML_EXT.has(ext) && display !== "attach";
+    let entry = { name, kind: "file" };
+    if (mime || renderHtml) {
+      try {
+        if (fs.statSync(p).size <= SEND_FILE_MAX_BYTES) { // bound the read (mirrors Python's read(cap+1))
+          const data = fs.readFileSync(p);
+          if (data.length <= SEND_FILE_MAX_BYTES) {
+            entry = mime
+              ? { name, kind: "image", src: "data:" + mime + ";base64," + data.toString("base64") }
+              : { name, kind: "html", html: data.toString("utf8") };
+          }
+        }
+      } catch { /* unreadable / gone → name chip */ }
+    }
+    out.push(entry);
+  }
+  return out.length ? out : null;
+}
+
 // Attach the reviewable payload of a known tool call to its tool_use block —
 // the part an operator otherwise opens the raw terminal to see. Returns true
 // when a payload was clipped by its cap. Mirror of hub-agent.py
 // _tool_use_detail(): Edit -> edit {old, new, replaceAll?}; Write -> content;
-// ExitPlanMode -> plan; any tool's human `description` arg -> desc.
+// ExitPlanMode -> plan; SendUserFile -> files + caption (inline preview);
+// any tool's human `description` arg -> desc.
 function toolUseDetail(block, name, inp, caps) {
   if (!inp || typeof inp !== "object" || Array.isArray(inp)) return false;
   let truncated = false;
@@ -422,6 +466,14 @@ function toolUseDetail(block, name, inp, caps) {
       const [clipped, trunc] = clip(inp.plan.replace(ANSI_RE, "").trim(), caps.text);
       block.plan = clipped;
       truncated = trunc;
+    }
+  } else if (name === "SendUserFile") {
+    const files = sendUserFileDetail(inp);
+    if (files) {
+      block.files = files;
+      if (typeof inp.caption === "string" && inp.caption.trim()) {
+        block.caption = clip(inp.caption.replace(ANSI_RE, "").trim(), caps.input)[0];
+      }
     }
   }
   if (typeof inp.description === "string" && inp.description.trim()) {

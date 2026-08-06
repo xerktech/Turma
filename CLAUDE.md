@@ -83,8 +83,8 @@ One agent container per host, not one fixed-repo container per session.
   `session.queuedReason`/`queuedAt`.
 - **The queue applies to every spawn path; only TICKET spawns split across hosts.** An explicit "+ New
   session" queues on the host whose card was clicked.
-- Tests: `TestSessionLifecycle`, `TestSpawnTicket` in `agent/tests/test_hub_agent.py`;
-  `turma/tests/sessions.test.js`.
+- Tests: `TestSessionLifecycle`, `TestSpawnTicket` in `test_hub_agent.py`;
+  `sessions.test.js`.
 
 ### Repos-root sessions
 
@@ -117,8 +117,8 @@ One agent container per host, not one fixed-repo container per session.
 - Two things stay slug-keyed, sharing one identity across a root session's neighbours: archival's
   `_running_slugs` exclusion and the summary/date an archived transcript inherits
   (`_session_meta_by_slug`).
-- Tests: `TestRootSessionIsolation` in `agent/tests/test_hub_agent.py`, `sessionTranscript` in
-  `agent/tests/tunnel-agent.test.js`, `turma/tests/server.test.js`.
+- Tests: `TestRootSessionIsolation` in `test_hub_agent.py`, `sessionTranscript` in
+  `tunnel-agent.test.js`, `server.test.js`.
 
 ### Kill, resume, delete
 
@@ -267,7 +267,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   `coding_agent()` splits `claude --version`'s `"<version> (<product>)"`, preferring the product name
   over the `CODING_AGENT_NAME` default — the NAME is reported because the image is agent-generic. The raw
   string still rides as `claudeVersion` for older hubs (`codingAgent()` in `index.html`). Tests:
-  `TestCodingAgent`, `turma/tests/host-header.test.js`.
+  `TestCodingAgent`, `host-header.test.js`.
 - The **login's real model list** (`models` = `{available, defaultLabel, at}`, XERK-33), probed from the
   CLI: `claude -p "/model"` prints "Current model: <label>" plus the alias list, parsed by
   `parse_model_probe` — so the hub's menus offer what this login can run, with no config to drift.
@@ -305,7 +305,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     hint. `_busy_from_capture` also accepts the mode line's truncated remnant (`PANE_BUSY_TRUNC_RE`,
     glyph-anchored) and the column-0 spinner line (`PANE_SPINNER_RE`, requiring the gerund's ellipsis so
     an idle pane's completed-turn line can't fake busy). Mirrored in `tunnel-agent.js`'s `paneShowsBusy`.
-    Tests: `TestPaneBusy`, `agent/tests/tunnel-agent.test.js`.
+    Tests: `TestPaneBusy`, `tunnel-agent.test.js`.
   - **Busy→idle flicker is suppressed at the source** (`_stable_pane_busy`, XERK-42): the spinner
     repaint's sub-frame gap reads idle mid-turn (20s of false idle + a bogus push). Busy is trusted
     instantly; idle re-confirms once after `TURMA_PANE_IDLE_CONFIRM_SEC` (0.2s, 0 disables), only on
@@ -357,7 +357,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   - `pr-status.json` (`PR_STATUS_LEDGER_PATH`, `url -> status`): `refresh_pr_status` persists the cache
     and seeds it back at boot — an ended session is never re-polled, so without this its chip degrades
     to a bare link. Ledgered URLs count as `referenced`. Tests: `TestPrLedger`, `TestResumableReport`,
-    `turma/tests/sessions.test.js`.
+    `sessions.test.js`.
 - **Which PRs are "a session's"** is decided by `_scan_pr_line`, deliberately narrow: a URL counts only
   when it comes back in a **creating call's own `tool_result`** — `gh pr create`; for a GitLab MR
   (XERK-162) `glab mr create` or a `git push -o merge_request.create` (`MR_URL_RE`) — the one event
@@ -376,19 +376,19 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 
 - **A reply asking for corrections on a session's PR is typed back into the session that opened it.**
   `_poll_pr_comments` runs on the PR cadence, for **running sessions only**, over their OWN PRs
-  (`session_pr_urls`), through **`send_input`**, inheriting the compaction-survival outbox (XERK-47)
-  and the queue if a turn is in flight.
+  (`session_pr_urls`), through **`send_input`** — inheriting the compaction-survival outbox (XERK-47) and
+  the queue if a turn is in flight.
 - `_pr_comment_events(url, self_login)` gathers **three channels** — conversation comments + review
   bodies (`gh pr view --json comments,reviews`) + inline review-thread comments
-  (`gh api .../pulls/<n>/comments`); an MR's one notes call covers all three (`_mr_comment_events`,
-  system notes dropped). A bare approve is dropped; each event normalizes to
-  `{key, author, body, kind, loc, is_self}`, keyed on a stable id.
+  (`gh api .../pulls/<n>/comments`); an MR's one notes call covers all three (`_mr_comment_events`, system
+  notes dropped). A bare approve is dropped; each event normalizes to `{key, author, body, kind, loc,
+  is_self}`, keyed on a stable id.
 - **Baseline-on-first-sight, then deliver only new + not-self.** A PR's whole comment set is recorded
-  silently the first beat it's seen (`prCommentBase`, capped `PR_COMMENTS_SEEN_MAX`); after that only
-  NEW keys not the agent's own (`viewerDidAuthor`, else a login compare) are typed in.
-- Best-effort and bounded: `PR_COMMENTS_MAX` PRs per beat, gated per-URL like the status sweep; a
-  fetch failure (→ None) leaves the baseline UNTOUCHED. Disable with `TURMA_PR_COMMENTS=0`. Only the
-  OPENING session receives it, only while running.
+  silently the first beat it's seen (`prCommentBase`, capped `PR_COMMENTS_SEEN_MAX`); after that only NEW
+  keys not the agent's own (`viewerDidAuthor`, else a login compare) are typed in.
+- Bounded: `PR_COMMENTS_MAX` PRs per beat, gated per-URL like the status sweep; a fetch failure (→ None)
+  leaves the baseline UNTOUCHED. Disable with `TURMA_PR_COMMENTS=0`. Only the OPENING session receives
+  it, only while running.
 - Tests: `TestPrCommentEvents`, `TestPrCommentMessage`, `TestPollPrComments`.
 
 ### Expected-restart "updating" status (XERK-29)
@@ -406,8 +406,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   past `until`. The offline sweep suppresses the "host offline" alert while `updating` holds.
 - The dashboard renders it as a distinct amber state (`agentState`/`hostCard`); Android/glasses predate
   the field and keep showing `offline`.
-- Tests: `TestUpdatingAnnounce`, `agent/tests/test_turma_agent_update.sh`,
-  `turma/tests/server.test.js`.
+- Tests: `TestUpdatingAnnounce`, `test_turma_agent_update.sh`,
+  `server.test.js`.
 
 ### Usage aggregates and the attribution ledger
 
@@ -498,7 +498,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   flattener's counterpart. A comments-endpoint failure degrades to no comments.
 - Tests: `TestNormalizeAzureSite`, `TestAzureBase`, `TestCollectAzure`, `TestShapeAzureItem`,
   `TestAzureCategory`, `TestAzureHtmlToText`, `TestFetchAzureIssue`, `TestBoardSourceDispatch`,
-  `TestSpawnTicket`; `turma/tests/server.test.js`; `turma/tests/board.test.js`,
+  `TestSpawnTicket`; `server.test.js`; `board.test.js`,
   `android/.../BoardTest.kt`.
 
 ### Jira repo triage (`repoGuess`)
@@ -578,7 +578,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   it can offer a repo one host rejects (log-only; the panel self-corrects within `REPO_SETTLE_MS`);
   `cloned` is host-relative.
 - Tests: `TestSetJiraRepo`, `repoPickerHtml`/`repoFieldHtml` in
-  `turma/tests/board.test.js`, `turma/tests/server.test.js`.
+  `board.test.js`, `server.test.js`.
 
 ### Jira ticket sessions
 
@@ -645,7 +645,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   `store`, reading cached git credentials from an **optional** bind mount. gh is first so github.com
   always gets a fresh token; an unmounted file is a no-op. The guard denies writing
   `~/.git-credentials`. **Native inherits the host's git config untouched.** Tests:
-  `agent/tests/test_entrypoint.sh`, `test_denies_non_github_git_credential_writes` in
+  `test_entrypoint.sh`, `test_denies_non_github_git_credential_writes` in
   `test_guard_settings.py`.
 - **Azure DevOps git auth (XERK-54)** — an ADO org already gives the agent a PAT for the board
   (`AZDO_TOKEN` + `AZDO_URL`), so plain git reuses it: at boot `entrypoint.sh` runs
@@ -690,10 +690,10 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   - The supervisor's pkill key is PREFIX-scoped like `tunnel-agent.js`'s; the launcher reaps the
     supervisor BEFORE the tunnel (else the old loop respawns the just-killed tunnel), and
     `turma-agentctl stop` reaps it too. PATH, config and supervisor tests:
-    `agent/tests/test_turma_agent.sh`.
+    `test_turma_agent.sh`.
 - The launcher exports **`TURMA_MANAGER_PID=$$`**, which `exec` makes the manager's own pid, so the
   tunnel's poke (`pokeHeartbeat`) signals the right process. Its PID-1 fallback is right only in the
-  container. Tests: `pokeHeartbeat` in `agent/tests/tunnel-agent.test.js`.
+  container. Tests: `pokeHeartbeat` in `tunnel-agent.test.js`.
 - `install.sh` — idempotent installer (`--verify`/`--uninstall`): auto-installs prereqs (apt + npm +
   pinned static ttyd), lays files into a prefix keeping `hub-agent.py` and `hooks/` siblings, writes a
   `chmod 600` config, wires the service, writes `$PREFIX/VERSION`, then `try-restart`s the service
@@ -701,24 +701,24 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   - **`have_sudo` asks** when it must, rather than probing `sudo -n` only (which makes a password-sudo
     host look sudo-less and skips every apt prereq under `curl … | bash`). Gated on `[ -t 2 ]`; cached.
   - It must never become `curl … | sudo bash`: the install belongs to the invoking user, only prereqs
-    need root. Tests: `agent/tests/test_install_sudo.sh`, wired into `code-scan.yml`.
+    need root. Tests: `test_install_sudo.sh`, wired into `code-scan.yml`.
 - `bootstrap.sh` — the `curl … | bash` front door for a host with no checkout. Resolves the newest native
   tarball, verifies its sha256, unpacks to a temp dir, and `exec`s the `install.sh` inside it (not copied
   into `$PREFIX`, so `--verify`/`--uninstall` re-run through it). Resolves by the version in the
   **asset's filename**, never the release tag (a carried-forward build keeps its older name, so a
   tag-derived name would 404). Anonymous and parser-free (runs BEFORE install.sh apt-installs python3).
-  Tests: `agent/tests/test_bootstrap.sh` (wired into `code-scan.yml`).
+  Tests: `test_bootstrap.sh` (wired into `code-scan.yml`).
 - Service: a systemd **user** unit with `KillMode=process` (a restart signals only the manager, leaving
   tmux/claude/ttyd/tunnel alive), plus a nohup `turma-agentctl` fallback for WSL without systemd. Both
   preserve running sessions via the adopt-on-boot path.
   - `turma-agentctl` keys its pidfiles on `XDG_RUNTIME_DIR` but falls back to `~/.turma` unless that dir
     exists and is **writable** — on a WSL-without-logind host the var points at a `/run/user/<uid>`
     logind never created, so a plain `${XDG_RUNTIME_DIR:-…}` orphans the old manager and spawns a
-    second. Tests: `agent/tests/test_turma_agentctl.sh`.
+    second. Tests: `test_turma_agentctl.sh`.
 - `turma-agent-update` — self-updater: reads the unified release stream, comparing the release
   `manifest.json`'s **agent-native component version** (never the tag), verifies the sha256, swaps files,
   restarts the manager. Falls back to the legacy `agent-native-v*` stream. Driven by a systemd timer or
-  `--loop` poller. Tests: `agent/tests/test_turma_agent_update.sh`.
+  `--loop` poller. Tests: `test_turma_agent_update.sh`.
 - **Auth on that read is an optimisation, never a precondition** (XERK-151): `all_tags`/`download_assets`
   try `gh`, then `$GH_TOKEN`, then **anonymously** — requiring auth pins a host with no GitHub login at
   its installed version forever. The asset endpoint + `Accept: application/octet-stream` serves a public
@@ -734,7 +734,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   - **native**: the bundled tmux.conf only takes effect at `/etc/tmux.conf`/`~/.tmux.conf`; a host with
     its own conf loses truecolor and the OSC 52 copy chain (hub-agent launches bare `tmux`).
   - The tunnel is supervised on BOTH sides (natively by `--tunnel-supervisor`, in the container by the
-    `entrypoint.sh` respawn loop). Tests: `agent/tests/test_entrypoint.sh`.
+    `entrypoint.sh` respawn loop). Tests: `test_entrypoint.sh`.
 - Nothing under `native/` edits the shared runtime files; the one enabling change is `resume_on_boot`'s
   adopt path.
 
@@ -744,7 +744,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   control channel. That channel also carries the **live transcript tail**: on `{watch,worktreePath}` /
   `{unwatch}` it tails that session's newest transcript every ~1s and pushes `{tail,entries}` deltas
   back. It's a JS re-implementation of hub-agent.py's `transcript_tail`/`_entry_text`, parity-tested in
-  `agent/tests/tunnel-agent.test.js`. Tailing runs only while a client watches.
+  `tunnel-agent.test.js`. Tailing runs only while a client watches.
 
 #### Control-channel liveness
 
@@ -764,8 +764,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - `retire()` is idempotent per-socket and **never waits on `ws.close()`**: it schedules the reconnect
   itself. Supervision cannot cover any of this — the native supervisor only respawns on process **exit**,
   and a wedged socket never exits.
-- Tests: `agent/tests/tunnel-agent.test.js` and
-  `turma/tests/server.test.js`.
+- Tests: `tunnel-agent.test.js` and
+  `server.test.js`.
 
 ### Live working footer and agent list
 
@@ -788,7 +788,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   (exact else prefix; trailing pane-ellipsis stripped, XERK-130). Results ride the next beat
   (`subagentHistoryResults`).
 - Tests: `TestResolveSubagent`, `TestStageSubagentHistory`; `parseAgentList`, `liveTurnDecision`,
-  `stripActivityTail` in `agent/tests/tunnel-agent.test.js`.
+  `stripActivityTail` in `tunnel-agent.test.js`.
 
 ### Transcript entry blocks
 
@@ -808,26 +808,31 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   `toolUseDetail`): Edit → `edit {old,new,replaceAll?}` (a −/+ diff), Write → `content`, ExitPlanMode →
   `plan` (markdown, open by default), any tool's `description` → `desc`. An AskUserQuestion card is
   titled with its question text(s), not the input JSON.
+  - **SendUserFile → `files[]`+`caption` (XERK-221)**: the agent embeds each delivered file — image/SVG
+    as a base64 data URI (`kind:"image"`), a `render` HTML page as raw markup (`kind:"html"`), else a name
+    chip (`kind:"file"`: attach/oversize past `SEND_FILE_MAX_BYTES`/missing/other, never opened).
+    `renderToolFiles` shows images inline + HTML in a fully sandboxed iframe (open by default). Only
+    image/html paths are read, bounded, so a delivery can't bloat the frame or leak bytes. py
+    `_send_user_file_detail` ↔ js `sendUserFileDetail`.
 - Two more turns-about-the-session become status markers: a `system`/`compact_boundary` entry →
   `{t:"compact_boundary", trigger, preTokens, postTokens}`, and a `pr-link` entry →
   `{t:"pr_link", url, number, repo}`. pr-link entries carry no uuid, so the feeds synthesize a stable id
   (`_entry_id`/`entryId`) — the client merge drops id-less entries.
-- **A PR marks its FIRST sighting only.** Claude Code re-stamps a session's pr-links in the metadata
-  preamble atop every user turn, so one PR yields ~6 entries differing only in `timestamp`. The
-  synthesized id therefore keys on the **URL alone** and `buildItems` dedups by URL over the whole
-  conversation — `buildItems` is what covers the archive/ended view, which has no merge step. Folding
-  only *consecutive* repeats is not enough.
-- Tests: `TestEntryBlocks` in `agent/tests/test_hub_agent.py`, the tool-detail/marker cases in
-  `agent/tests/tunnel-agent.test.js` and `turma/tests/chat.test.js`.
-- **Still-queued prompts ride beside the entries, not inside them**: a message typed mid-turn only
-  becomes a user entry when dequeued, so the live tail and `/history` fold the transcript's
-  `queue-operation` entries FIFO (`_fold_queue_op` / `foldQueueOp`, enqueue → dequeue → remove-by-content)
-  and ship survivors as `queued[]` beside `entries`. A window opening mid-sequence errs toward hiding;
-  older agents send no `queued`. Tooling payloads ride the same queue, so display filtering happens at
-  REPORT time (`_queued_display` / `queuedDisplay`), never at fold time (which desyncs the dequeues).
+- **A PR marks its FIRST sighting only.** Claude Code re-stamps a session's pr-links atop every user
+  turn, so one PR yields ~6 entries differing only in `timestamp`. The synthesized id keys on the **URL
+  alone** and `buildItems` dedups by URL over the whole conversation — which covers the archive/ended
+  view (no merge step). Folding only *consecutive* repeats is not enough.
+- Tests: `TestEntryBlocks` in `test_hub_agent.py`, the tool-detail/marker cases in
+  `tunnel-agent.test.js` and `chat.test.js`.
+- **Still-queued prompts ride beside the entries, not inside them**: a message typed mid-turn becomes a
+  user entry only when dequeued, so the live tail and `/history` fold the transcript's `queue-operation`
+  entries FIFO (`_fold_queue_op` / `foldQueueOp`, enqueue → dequeue → remove-by-content) and ship
+  survivors as `queued[]` beside `entries`. A window opening mid-sequence errs toward hiding; older
+  agents send no `queued`. Tooling payloads ride the same queue, so display filtering happens at REPORT
+  time (`_queued_display` / `queuedDisplay`), never at fold time (which desyncs the dequeues).
 - Blocks ride the live tail (tight per-block caps), on-demand `history` and the archive push
-  (`_entry_blocks(entry, BLOCK_CAPS_FULL)`, looser caps on the latter two). They are the one place
-  inclusion widens: a tool_result-only turn, dropped by `_entry_text`, is kept when it has blocks. Only
+  (`_entry_blocks(entry, BLOCK_CAPS_FULL)`, looser caps on the latter two) — the one place inclusion
+  widens: a tool_result-only turn, dropped by `_entry_text`, is kept when it has blocks. Only
   `transcript_tail` stays text-only. Archive rows carry `_entry_id` (not the raw uuid), so a uuid-less
   pr-link marker keys identically to the live feeds; already-archived bytes are never re-parsed.
 
@@ -835,7 +840,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 
 - The agent **ships every INACTIVE session's transcript to the hub's durable archive** so history
   survives this host being wiped/offline. On the slow usage cadence `_archive_manifest()` enumerates
-  ended transcripts (every ledger slug's `*.jsonl`, attributed via the usage ledger, excluding any slug
+  ended transcripts (every ledger slug's `*.jsonl`, attributed via the usage ledger, minus any slug
   backing a running session); the hub replies with per-transcript byte cursors (`archiveHave`), and
   `_archive_deltas()` POSTs the missing append-only deltas (pre-parsed through `_entry_text`) to
   `POST /api/agents/<host>/archive/<transcriptId>`, bounded per chunk/beat. Tests: `TestArchiveSync`.
@@ -858,25 +863,25 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   org). Both live in the chrome so they're on every page at once.
 - The header is full-bleed and `.site-header-in` caps its row at `--wrap` and centres it, so every page's
   chrome lands in the same column as a `.wrap` page's content. On `sessions.html` the two-pane
-  `.sess-shell` below is capped at the same `--wrap` and centred too (XERK-28); the cap is inert below
-  `--wrap`, so the phone layout is unchanged.
+  `.sess-shell` below is capped at `--wrap` and centred too (XERK-28); the cap is inert below `--wrap`, so
+  the phone layout is unchanged.
 - Because that row is **centred**, `app.css` reserves the scrollbar gutter globally
   (`html { scrollbar-gutter: stable }`) — else the always-scrolling dashboard centres 15px narrower than
-  the others. Reserved on `sessions.html` too. The gap under the header is a **margin, not padding**, so
-  it collapses with the first content element's margin. Mounted synchronously at the bottom of `<body>`,
-  after both placeholders exist, before the page's script reads the slots.
+  the others (reserved on `sessions.html` too). The gap under the header is a **margin, not padding**, so
+  it collapses with the first content's margin. Mounted synchronously at the bottom of `<body>`, after
+  both placeholders exist, before the page's script reads the slots.
 - **`TurmaNav.preserveScroll(container, paint)` is the one wrapper every recurring innerHTML repaint must
   go through** (XERK-35), else the ~1s beat throws the window scroll and any inner `overflow:auto` region
   back to the start every second. It snapshots the window scroll plus every scrolled descendant of
-  `container`, runs `paint()`, then restores them synchronously. Scrolled nodes are re-matched by a
-  stable `id` anchor if in scope (so a REORDERED list maps its scroll to the right row), else by
-  structural child-index path. Callers: `board.html` (`.kanban-cols`/`.kc-list`), `index.html`
+  `container`, runs `paint()`, then restores them synchronously. Scrolled nodes re-match by a stable `id`
+  anchor if in scope (so a REORDERED list maps its scroll to the right row), else by structural
+  child-index path. Callers: `board.html` (`.kanban-cols`/`.kc-list`), `index.html`
   (`#groups`/`.clone-list`), `usage.html` (`.table-scroll`).
   - Two recurring repaints keep their OWN bespoke logic and must NOT route through it: `chat.js`'s
     transcript `repaint` (stick-to-bottom vs hold-place + selection-guard), and `sessions.html`'s sidebar
     (its `scrollTop` restore is ordered against a focus/caret restore that can itself scroll). New
     recurring repaints without such a special case should use `preserveScroll`.
-- Tests: `turma/tests/nav.test.js`.
+- Tests: `nav.test.js`.
 
 ### The org filter (`turma/public/org.js`, XERK-62)
 
@@ -891,21 +896,20 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   broadcast off the page's existing socket.
 - Scoping is applied to the **agent list**, once, and everything downstream follows. Deliberately NOT
   applied to `findSession`/`sessionHit` (they read `cache` directly) — an open session must not be torn
-  off the stage because its org left the sidebar — nor to pending-command reconciliation, which must run
+  off the stage because its org left the sidebar — nor to pending-command reconciliation, which runs
   against the WHOLE fleet. A host with **no tracker block belongs to no org**: it shows only under
   "All orgs".
-- **A pick for an org nobody reports doesn't apply, but is kept** (`effectiveKey`): otherwise an org
-  whose last host was removed leaves every page filtered to nothing with no chip left to clear it. It
-  resumes when that host returns.
+- **A pick for an org nobody reports doesn't apply, but is kept** (`effectiveKey`): else an org whose
+  last host was removed leaves every page filtered to nothing with no chip to clear it. It resumes when
+  that host returns.
 - The per-org **auto-start switch (XERK-41) rides the menu's org rows** — `org.js` owns its optimistic
   flip, POST and rollback.
 - Repaints are **skipped when the markup is unchanged**, so the beat can't churn the DOM under an open
   menu. Clicks are delegated, and a handled click is flagged **on the event** — the repaint detaches the
-  clicked node, so a `slot.contains(e.target)` click-away test would close the menu on the click that
-  opened it.
+  clicked node, so a `slot.contains(e.target)` click-away test would close the menu on the opening click.
 - It reads board.js's org vocabulary, so **every page loads `board.js`**, ordered board.js → nav.js →
   org.js.
-- Tests: `turma/tests/org.test.js`; Android's port is `data/OrgFilter.kt` + `ui/OrgControl.kt` +
+- Tests: `org.test.js`; Android's port is `data/OrgFilter.kt` + `ui/OrgControl.kt` +
   `core/Board.kt`'s `siteKeyOf`/`filterAgents`/`effectiveOrg`/`scopedAgents`, tested in `BoardTest.kt`.
 
 ### Fleet tree (host → repo → session)
@@ -951,7 +955,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   the board's ticket chips use for anything not running), keyed on the transcript id and resolved through
   `findEndedByTranscript` → `openEndedSession`. It is **bounded** (`ENDED_FOLLOW_MS`) and cannot be folded
   into `?session=`, whose wait only resolves a **running** session.
-- Tests: `turma/tests/sessions.test.js`, plus
+- Tests: `sessions.test.js`, plus
   `TestSessionLifecycle`/`TestResumeTranscript`/`TestHandleCommands`.
 
 ### History page (`/history`)
@@ -979,7 +983,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   derives to its COLLECTION. Deliberately **not** part of the `siteKey`, which the hub
   keys/merges/routes on and which `/api/jira/<siteKey>/…` and the ticket-agent/auto-start ledgers are
   stored under — renaming it would orphan all of those. Also read by the dashboard's host rows. Tests:
-  `TestBoardOrgName`, `turma/tests/board.test.js`, `android/.../BoardTest.kt`.
+  `TestBoardOrgName`, `board.test.js`, `android/.../BoardTest.kt`.
 - Each org gets a **UNIQUE color** — no two share a `--s1..--s8` palette slot (`orgColorMap`, XERK-48),
   computed over the whole org set: each takes its djb2-preferred slot if free, else linear-probes to the
   next free one, keys processed in sorted order. It is **persistent where it can be** — an org keeps its
@@ -1002,7 +1006,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   (`lerp(surface, tint, 0.12)`). Tests: `board.test.js`/`sessions.test.js`.
 - The board READS the tracker; it makes exactly **two** writes back to it — **creating a ticket**
   (XERK-137) and **changing a ticket's status** (XERK-138). Every other control writes a hub/agent
-  ledger, never the board. Tests: `turma/tests/board.test.js`, the ticket-detail and jira-refresh
+  ledger, never the board. Tests: `board.test.js`, the ticket-detail and jira-refresh
   endpoint cases in `server.test.js`.
 
 #### Creating a ticket (XERK-137)
@@ -1073,7 +1077,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
     holds, and "command gone" only counts as acked once the command was **seen present** (`sawCmd`) —
     the SSE-fallback poll may not yet have seen a just-queued command.
   - the POST uses **`keepalive: true`** so it outlives the page.
-- Tests: `turma/tests/server.test.js`, `startSweepVerdict` in
+- Tests: `server.test.js`, `startSweepVerdict` in
   `board.test.js`.
 
 ##### Splitting ticket sessions across an org's agents (XERK-14)
@@ -1092,7 +1096,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `nameWithOwner`) and queues behind the clone — never a refusal.
 - The **multi-host-per-org limits still apply**: the triage/branch state is per-host, so a clone-on-demand
   routed to a host that didn't triage the ticket has no ledger entry to clone from.
-- Tests: `turma/tests/server.test.js`.
+- Tests: `server.test.js`.
 
 ##### Auto-starting To Do tickets (XERK-32)
 
@@ -1125,8 +1129,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
     from the first beat, so a slow spawn is never mistaken for a failed one.
   - A **no-online-host** result spends NO attempt, so it retries once a host returns.
 - Nothing is written to Jira.
-- Tests: `turma/tests/server.test.js`, `autoStartOn` in
-  `turma/tests/board.test.js` and android `BoardTest.kt`, `test_no_agent_side_auto_start_flag` in
+- Tests: `server.test.js`, `autoStartOn` in
+  `board.test.js` and android `BoardTest.kt`, `test_no_agent_side_auto_start_flag` in
   `TestSetJiraRepo`.
 
 ##### Auto-stopping Done tickets (XERK-45, XERK-161)
@@ -1143,7 +1147,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - Only **live** sessions (`running`/`queued`) are stopped; every one on the ticket is killed (a
   two-branch or restart-clear-context ticket has more than one).
 - Guard: `autoStopped`, a `<host>\x00<sessionId>` once-per-hub-lifetime set (a re-issued kill of a dead
-  session is a no-op). Tests: the `auto-stop:` cases in `turma/tests/server.test.js`.
+  session is a no-op). Tests: the `auto-stop:` cases in `server.test.js`.
 
 #### Ticket ↔ session chips
 
@@ -1225,7 +1229,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - The map rides `/api/agents` as top-level `ticketAgents` (plus a `ticketAgents` SSE event); the picker's
   options are `mergeSites`' per-site `hostOptions` (every host reporting the org, online first, offline
   marked). A pinned host that left the fleet is carried back into "Currently set".
-- Tests: `turma/tests/server.test.js`, `board.test.js`,
+- Tests: `server.test.js`, `board.test.js`,
   `hostOptions`/`agentPinOf` in android `BoardTest.kt`.
 
 ##### Pinning the model by hand (XERK-123)
@@ -1247,7 +1251,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - The pin also feeds the **auto-start sweep**.
 - **Known limit (multi-host-per-org only):** the picker offers the union of the org's hosts' probed
   models, so it can offer an alias one host lacks.
-- Tests: `turma/tests/server.test.js`, `modelPinOf`/`modelPickerHtml`/`modelChoices` in
+- Tests: `server.test.js`, `modelPinOf`/`modelPickerHtml`/`modelChoices` in
   `board.test.js`, `TestSpawnTicket`, `android/.../BoardTest.kt`.
 
 ##### Changing the status by hand (XERK-138)
@@ -1271,7 +1275,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   target optimistically, polls `GET .../status?cmdId` until `{ok}`/`{error}`, then re-fetches the detail;
   on failure it reverts the pill. The card's COLUMN catches up on the next poll.
 - Tests: `TestSetBoardStatus`, `TestAzureStatusOptions`, `TestShapeIssueDetail`/`TestFetchJiraIssue`
-  (`agent/tests/test_hub_agent.py`); `turma/tests/server.test.js`;
+  (`test_hub_agent.py`); `server.test.js`;
   `statusFieldHtml`/`statusPickerHtml` in `board.test.js`; `statusChangeable` in android `BoardTest.kt`.
 
 ##### Drag-and-drop status change (XERK-141)
@@ -1295,8 +1299,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   drag suppresses the click it would synthesize so a drop doesn't also open the panel. Android:
   `detectDragGesturesAfterLongPress` + a ghost card in `BoardScreen.kt`, same `moves` override in
   `BoardViewModel`.
-- Tests: `TestSetBoardStatus` + `TestBoardColumn` (`agent/tests/test_hub_agent.py`);
-  `turma/tests/server.test.js`; `boardColumnOf`/`moveSweepVerdict`/`boardHtml` in `board.test.js` and in
+- Tests: `TestSetBoardStatus` + `TestBoardColumn` (`test_hub_agent.py`);
+  `server.test.js`; `boardColumnOf`/`moveSweepVerdict`/`boardHtml` in `board.test.js` and in
   android `BoardTest.kt`.
 
 #### When a host's agent is too old for a write (XERK-151)
@@ -1313,7 +1317,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - A gap **clears** on a result landing, `agentVersion` CHANGING, or `UNSUPPORTED_TTL_MS` (the backstop for
   an update that doesn't move the version). Never conclude anything from a command still in the
   queue: it hasn't been taken yet. `resultWaits` is stripped from the fleet payload; `unsupported` rides
-  it. Tests: `turma/tests/server.test.js`.
+  it. Tests: `server.test.js`.
 
 #### Refresh button
 
@@ -1358,7 +1362,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   - **Images/SVGs render inline (XERK-221)**: `![alt](url)` → `<img>` (`linkify`, src `http(s)`+
     `data:image/*`); a line-start raw `<svg>` (`renderSvgAndText`) or all-SVG fence body → a sandboxed
     `data:image/svg+xml` `<img>` (`svgToImg`) — **never DOM-injected**, so embedded `<script>`/`onload`
-    can't run. Android deferred (`android/PARITY.md`). Tests: `linkify`/`renderProse` in `chat.test.js`.
+    can't run (SendUserFile deliveries render the same way — the tool_use `files[]` above). Android
+    deferred (`android/PARITY.md`). Tests: `linkify`/`renderProse` in `chat.test.js`.
 - A per-session **verbosity control** (Concise/Normal/Verbose presets + per-type thinking/tool-calls/
   tool-outputs toggles, persisted in `localStorage`) filters which `blocks[]` show — client-side, over
   the received buffer.
@@ -1389,7 +1394,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
     `server.test.js`.
 - The raw ttyd terminal stays one **"Terminal ▸" toggle** away in the chat header (`#termPane` iframe).
   `GET /api/ws-token` also authenticates the web chat's `/live` socket. Tests:
-  `turma/tests/chat.test.js`.
+  `chat.test.js`.
 
 #### Working-status bar and agent list
 
@@ -1520,7 +1525,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `<mark>`-highlighted, grouped by `remoteKey`, working for offline hosts) and an "Ended sessions" browser
   (`GET /api/archive`); clicking a result opens the transcript read-only
   (`GET /api/archive/<transcriptId>`). The ingest endpoint is agent-token-authed; the manifest cursors
-  ride the heartbeat reply. Tests: `turma/tests/archive.test.js`, `server.test.js`.
+  ride the heartbeat reply. Tests: `archive.test.js`, `server.test.js`.
 
 ### `POST /api/trigger` — external automation
 
@@ -1551,7 +1556,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   - **An inconclusive wait ages out at `PR_ALERT_MAX_WAIT_MS`** (30 min) and fires anyway — a host with no
     `gh` login never fills the status in. The wait delays the alert; it must not lose it. Red is exempt.
     Body carries the verdict ("All checks passed"/"No CI configured"/"CI state unknown" · url).
-  - Tests: `prAlertDecision` in `turma/tests/server.test.js`.
+  - Tests: `prAlertDecision` in `server.test.js`.
 - **Claude login alerts** (XERK-98) fire in `heartbeatAlerts` off the agent's `claudeAuth` block: two
   edge-triggered states, deduped under `next.alerts` and cleared on recovery — `needsLogin` → urgent
   `key`-tagged "Claude login required", `expiringSoon` → default-priority "Claude login expiring". The
@@ -1587,7 +1592,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   (`FleetScreen` `PushOffBanner`, `FleetState.pushEnabled`) show a "mobile push is off" banner when it's
   false (strict `=== false`, so an older hub never false-alarms). The key is deployment config, not in
   this repo. Tests: the `pushEnabled` case in `server.test.js`.
-- Tests: `turma/tests/push.test.js`, `server.test.js`.
+- Tests: `push.test.js`, `server.test.js`.
 
 ### Auth and the glasses surface
 
@@ -1736,7 +1741,7 @@ The build workflows run only post-merge; these run on `pull_request` → `main` 
 
 - `code-scan.yml` — Semgrep SAST over the JS/Python + Dockerfiles + secret patterns, hadolint on both
   Dockerfiles, ShellCheck on `entrypoint.sh`. Also unit-tests the release logic
-  (`.github/scripts/tests`) and the native updater (`agent/tests/test_turma_agent_update.sh`).
+  (`.github/scripts/tests`) and the native updater (`test_turma_agent_update.sh`).
 - `turma-agent-image-scan.yml` / `turma-image-scan.yml` — build each image locally (no push) and
   Trivy-scan for CVEs + secrets (`ignore-unfixed`, HIGH/CRITICAL gate), path-filtered to their folder.
 - `glasses-ci.yml` — path-filtered to `glasses/**`, runs typecheck + Vitest + production build in a
@@ -1763,7 +1768,7 @@ triage list, each with a reason); anything unlisted still fails.
   store just by RUNNING. The Dockerfile's build-time smoke test drops the stores it creates.
 - The guard's `permissions.deny` protects `~/.azure` and `~/.terraform.d` alongside `~/.aws`/`~/.ssh`
   (shared by every session, so editing one breaks the others). Tests:
-  `agent/tests/test_entrypoint.sh` (cloud-creds cases), `test_guard_settings.py`.
+  `test_entrypoint.sh` (cloud-creds cases), `test_guard_settings.py`.
 
 ### The agent image's Android toolchain
 
@@ -1863,7 +1868,7 @@ Still true: no GitHub Advanced Security, so no code-scanning API — findings li
   `$TURMA_NO_ATTRIBUTION=0`.
 - The guard fails open on malformed input, and if the settings file can't be written the session still
   launches (without it). Adapted from an equivalent hook maintained outside this repo; keep the two in
-  rough sync. Tests: `agent/tests/test_guard.py`, `test_guard_settings.py`.
+  rough sync. Tests: `test_guard.py`, `test_guard_settings.py`.
 
 ### AskUserQuestion answer bridge
 
@@ -1880,7 +1885,7 @@ Still true: no GitHub Advanced Security, so no code-scanning API — findings li
   hook's block timeout (`TURMA_QUESTION_TIMEOUT_SEC`, default 600s) sits under the settings-level
   `timeout`. It passes through silently when its env vars are absent. Kill/delete/restart clear pending
   req/ans files.
-- Tests: `agent/tests/test_ask.py`, plus `TestHookQuestion`/`TestAnswerQuestion` and
+- Tests: `test_ask.py`, plus `TestHookQuestion`/`TestAnswerQuestion` and
   `test_guard_settings.py`.
 
 ### New-work branching policy
