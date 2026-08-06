@@ -30,12 +30,12 @@ Turma is the source and CI for the Claude Code agent fleet used with the TrueNAS
 Code Remote Control sessions, plus a central dashboard ("turma") that lists each host's repos,
 spawns/kills those sessions, and monitors them.
 
-It builds two images and pushes them to GHCR; the running stack is deployed from the sibling
-**DockerOps** repo (`compose/turma-truenas.yaml`, deployed via Portainer GitOps).
+It builds two images and pushes them to GHCR; the running stack comes from the sibling
+**DockerOps** repo (`compose/turma-truenas.yaml`, via Portainer GitOps).
 
-## Session Model (post-redesign)
+## Session Model
 
-One agent container per host, not one fixed-repo container per session.
+One agent container per host, multiplexing sessions across every repo it scans.
 
 ### Hosts and repos
 
@@ -243,7 +243,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     `_set_mode_blind`, the fallback for a marker the parser can't read.
   - **What is stored is always what was read**, so the record can't lie about the mode. No busy gate:
     BTab types nothing into the input line and the TUI cycles modes mid-generation.
-  - Tests: `TestSetModelMode`, `TestParsePaneMode`.
+  - Tests: `TestParsePaneMode`.
 - `clone` — see "GitHub block and cloning".
 - `refreshJira` — the /board manual refresh: re-poll Jira now instead of waiting out
   `JIRA_REFRESH_EVERY`. Re-checks `jira_configured()`, so an unconfigured host stays at zero Jira calls.
@@ -499,7 +499,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Tests: `TestNormalizeAzureSite`, `TestAzureBase`, `TestCollectAzure`, `TestShapeAzureItem`,
   `TestAzureCategory`, `TestAzureHtmlToText`, `TestFetchAzureIssue`, `TestBoardSourceDispatch`,
   `TestSpawnTicket`; `server.test.js`; `board.test.js`,
-  `android/.../BoardTest.kt`.
+  android `BoardTest.kt`.
 
 ### Jira repo triage (`repoGuess`)
 
@@ -601,7 +601,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     pre-pin closed record on its resolved `transcriptId`. Bounded by `TICKET_LEDGER_MAX` oldest-first on
     a first-seen `at`. Deliberately **not** pruned against on-disk transcripts (a transcript archived off
     this host is still the answer).
-  - Tests: `TestTicketLedger`, `TestSpawnTicket`.
+  - Tests: `TestTicketLedger`.
 - A ticket-backed session is **named from its ticket** (`"PROJ-123 <summary>"`, via
   `clean_manual_summary`) instead of paying a `claude -p`. Refusals log and return like spawn's own; a
   failed fetch raises to `handle_commands`, which logs and acks. Nothing is ever written to Jira.
@@ -628,7 +628,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   clonable repos (refreshed slow; the user's own repos, their orgs, and any extra `GH_CLONE_OWNERS`),
   plus any in-flight/recent `clones`. The availability flag is **`available`** and the hub passes the
   block through untouched, so every client must gate its clone UI on that exact key (XERK-126). Tests:
-  `android/.../core/CloneTest.kt`.
+  android `CloneTest.kt`.
 - A `clone` command `git clone`s a validated `owner/repo` (allowlist-checked before it reaches git) into
   `REPOS_ROOT` as a **detached subprocess** (reaped across later beats), after which the new repo joins
   the scan. Private-repo auth rides the system git credential helper (`gh auth git-credential`).
@@ -982,7 +982,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   derives to its COLLECTION. Deliberately **not** part of the `siteKey`, which the hub
   keys/merges/routes on and which `/api/jira/<siteKey>/…` and the ticket-agent/auto-start ledgers are
   stored under — renaming it would orphan all of those. Also read by the dashboard's host rows. Tests:
-  `TestBoardOrgName`, `board.test.js`, `android/.../BoardTest.kt`.
+  `TestBoardOrgName`, `board.test.js`, android `BoardTest.kt`.
 - Each org gets a **UNIQUE color** — no two share a `--s1..--s8` palette slot (`orgColorMap`, XERK-48),
   computed over the whole org set: each takes its djb2-preferred slot if free, else linear-probes to the
   next free one, keys processed in sorted order. It is **persistent where it can be** — an org keeps its
@@ -1021,26 +1021,29 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   - `POST /api/jira/<siteKey>/tickets` (`createTicket`) → the agent creates and stages
     `{cmdId, key, url, error, warning}`; polled at `GET .../tickets/<cmdId>` (`createResults`). All three
     caches are stripped from the fleet payload.
-- The new ticket **self-assigns to the tracker user** (Jira `accountId` via `/myself`; Azure a LADDER
-  of candidates, below) so it lands on the board — best-effort, and reported. Agent
-  dispatch: `create_board_issue`/`board_create_meta`/`board_issue_types` (`create_jira_issue` POSTs
+- The new ticket **self-assigns to the tracker user** (Jira `accountId` via `/myself`; Azure an identity
+  ladder, below) so it lands on the board — best-effort, and reported. Agent dispatch: `create_board_issue`/`board_create_meta`/`board_issue_types` (`create_jira_issue` POSTs
   `/rest/api/3/issue`, plain-text→ADF via `_text_to_adf`; `create_azure_issue` POSTs a JSON-Patch work
   item, `;`-joined `System.Tags`). Jira labels split on whitespace+commas (spaces forbidden), Azure tags
   on commas.
 - Android has the same feature (＋ in the shared `ScreenHeader` → `CreateTicketSheet`): `source` on
   `JiraBlock`/`BoardSite`, the endpoints in `net/HubApi.kt`, the
   `createLabelWord`/`splitLabels`/`classifyCreateMeta`/`classifyCreateResult` ports in `core/Board.kt`.
-- **A refusal carries the tracker's own words; a create bends to the TYPE and IDENTITY** (XERK-151): `_board_urlopen`/`_http_error_detail` keep the body urllib's `HTTPError` drops (else every
-  refusal reads "HTTP Error 400: Bad Request"); the description goes in the field the type HAS
-  (`_azure_description_field`: the Agile/Scrum **Bug** has ReproSteps, not Description); and assignment
-  walks a **ladder**, no one spelling working everywhere — `_azure_identities` (`AZDO_USER`, as often a
-  display LABEL as an identity, then connection-data's account/uniqueName/name), then unassigned,
-  keeping the FIRST error. Re-sent only after a 4xx (proof nothing was created); an unassigned success
-  stages a `warning` both clients render, since the board's `@Me` filter hides it.
+- **A refusal carries the tracker's own words; a create bends to the TYPE and IDENTITY** (XERK-151):
+  `_http_error_detail` keeps the body urllib's `HTTPError` drops (else every refusal reads "HTTP Error
+  400: Bad Request"); the description goes in the field the type HAS (`_azure_description_field`: the
+  Agile/Scrum **Bug** has ReproSteps, not Description); and assignment walks a **ladder** of spellings,
+  then unassigned, keeping the FIRST error and re-sending only after a 4xx (proof nothing was created).
+- **The ladder's best candidate is HARVESTED, not guessed**: `_azure_mine_identities` reads
+  `System.AssignedTo` off an item the board's `@Me` WIQL returns — a value this server has already
+  resolved — ahead of the `AZDO_USER`/connection-data guesses; `_azure_identity_strings` then spells
+  each four ways, an on-prem collection routinely taking only one. Cached, empty included, so nothing
+  assigned yet falls through until one lands. An unassigned success `warning`s with the tracker's own
+  refusal, never "set `AZDO_USER`" — already a candidate.
 - **Any new shared `/*.js` must be registered in `server.js`'s `STATIC_ASSETS`** (it's an allowlist, not
   a directory serve) AND loaded by each page after `org.js` — a missing entry 404s and takes the
   module, and every page's render, down. `newticket.test.js` guards both.
-- Tests: `TestCreateAzureIssue`/`TestAzureIdentities`/`TestHttpErrorDetail` in `test_hub_agent.py`;
+- Tests: `TestCreateAzureIssue`/`TestAzure*Identit*`/`TestHttpErrorDetail` in `test_hub_agent.py`;
   `server.test.js`; `createFormHtml` in `board.test.js`; `newticket.test.js`; android `BoardTest.kt`.
 
 #### Repo chips
@@ -1248,10 +1251,9 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   curated menu (`modelChoices`/`prettyModel`); a pinned alias off the current probe is carried back so it
   stays selected. Un-probed org falls back to the static family aliases, never an empty menu.
 - The pin also feeds the **auto-start sweep**.
-- **Known limit (multi-host-per-org only):** the picker offers the union of the org's hosts' probed
-  models, so it can offer an alias one host lacks.
+- **Known limit:** as with the repo picker, the union across an org's hosts can offer an alias one lacks.
 - Tests: `server.test.js`, `modelPinOf`/`modelPickerHtml`/`modelChoices` in
-  `board.test.js`, `TestSpawnTicket`, `android/.../BoardTest.kt`.
+  `board.test.js`, `TestSpawnTicket`, android `BoardTest.kt`.
 
 ##### Changing the status by hand (XERK-138)
 
@@ -1308,15 +1310,15 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   predating a board write feature reads as a slow one and the routes waiting on a staged result 202
   forever. **The ack IS the evidence**: these commands stage their result inside the same
   `handle_commands` call, so it rides the SAME beat as the ack — an ack with no result means the agent
-  didn't handle it. Version-free by design; no version table to drift.
+  didn't handle it — no version table to drift.
 - `awaitResult`/`resolveResultWaits` record and settle each queued command, writing
   `agent.unsupported[kind]`; the three waiting routes then refuse with `agentGapError` rather than queue
   — create-meta `200 {error}` (the shape both clients read a message from), create/status `409` (which
   Android reads via `hubError()`).
 - A gap **clears** on a result landing, `agentVersion` CHANGING, or `UNSUPPORTED_TTL_MS` (the backstop for
   an update that doesn't move the version). Never conclude anything from a command still in the
-  queue: it hasn't been taken yet. `resultWaits` is stripped from the fleet payload; `unsupported` rides
-  it. Tests: `server.test.js`.
+  queue: it hasn't been taken yet. `resultWaits` is stripped from the fleet payload, `unsupported`
+  rides it. Tests: `server.test.js`.
 
 #### Refresh button
 
@@ -1487,7 +1489,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - Android has no in-place toggle (the terminal is its own screen), so the draft lives outside both screens
   in `data/DraftStore.kt`, keyed per (host, session); `ChatViewModel` mirrors it into `ChatUiState.draft`
   and writes every change — incl. dictation and send-clears — back through it.
-- Tests: `sessions.test.js`, `android/.../data/DraftStoreTest.kt`.
+- Tests: `sessions.test.js`, android `DraftStoreTest.kt`.
 - **A compose box auto-grows to its `scrollHeight`, but only while it is laid out** (XERK-149): a hidden
   textarea (`.chat-pane`/`.term-pane[hidden]`, or a phone's `display:none` `.stage`) reports
   `scrollHeight` 0, and an unguarded `growCompose`→`autoGrow` during the toggle's `carryDraft` pins an
@@ -1590,8 +1592,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `push.fcmEnabled()`** on `/api/agents`; the dashboard (`index.html` `#pushWarn`) and Android
   (`FleetScreen` `PushOffBanner`, `FleetState.pushEnabled`) show a "mobile push is off" banner when it's
   false (strict `=== false`, so an older hub never false-alarms). The key is deployment config, not in
-  this repo. Tests: the `pushEnabled` case in `server.test.js`.
-- Tests: `push.test.js`, `server.test.js`.
+  this repo. Tests: `push.test.js`, the `pushEnabled` case in `server.test.js`.
 
 ### Auth and the glasses surface
 
@@ -1794,13 +1795,11 @@ triage list, each with a reason); anything unlisted still fails.
   is only safe because those builds are hermetic — **don't copy it into `android-ci.yml`, which builds
   against the runner's own Android SDK.**
 - Hosted bills **rounded UP per job**, so prefer fewer batched jobs.
-- If a job genuinely needs self-hosted again, say which in a comment on its `runs-on` and bring back only
-  the workarounds that job needs.
-
-The self-hosted-box workarounds are **deleted, not disabled** — reintroducing any is a regression:
-"Reset workspace ownership" steps; per-job `DOCKER_CONFIG` scoping; `docker image prune` /
-`docker builder prune` cleanup; throwaway `node:24-alpine` containers for `npm view`; the
-`mingc/android-build-box` container.
+- The self-hosted-box workarounds are **deleted, not disabled** — reintroducing any is a regression:
+  "Reset workspace ownership" steps; per-job `DOCKER_CONFIG` scoping; `docker image prune` /
+  `docker builder prune` cleanup; throwaway `node:24-alpine` containers for `npm view`; the
+  `mingc/android-build-box` container. If a job genuinely needs self-hosted again, say which in a
+  comment on its `runs-on` and bring back only the ones it needs.
 
 Still true: no GitHub Advanced Security, so no code-scanning API — findings live in the job log and
 `--exit-code` is the gate (no SARIF upload). Trivy is installed from its release tarball to
