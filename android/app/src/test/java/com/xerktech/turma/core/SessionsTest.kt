@@ -20,6 +20,39 @@ class SessionsTest {
         assertEquals(LiveState.IDLE, liveState(s, now, now))
     }
 
+    // ---- readyForReview (XERK-224) ------------------------------------------
+    // The port of the web's rule (turma/public/sessions.html), which the hub's
+    // ready-for-review alert mirrors again — all three decide the same group.
+
+    private fun quiet(lastRole: String = "", prs: List<com.xerktech.turma.model.PrInfo> = emptyList()) =
+        SessionInfo(status = "running", prs = prs, session = LiveSignals(paneBusy = false, lastRole = lastRole))
+    private fun pr(state: String) = com.xerktech.turma.model.PrInfo(url = "u$state", state = state)
+
+    @Test fun `readyForReview takes a question, an unlanded PR, or a finished turn`() {
+        assertEquals(true, readyForReview(quiet(), LiveState.WAITING))
+        assertEquals(false, readyForReview(quiet(), LiveState.WORKING))
+        assertEquals(false, readyForReview(quiet(), LiveState.STOPPED))
+        // The no-PR research task — the case a PR-only rule would miss.
+        assertEquals(true, readyForReview(quiet(lastRole = "assistant"), LiveState.IDLE))
+        // Nothing written yet, or the last word was the operator's: not review-ready.
+        assertEquals(false, readyForReview(quiet(), LiveState.IDLE))
+        assertEquals(false, readyForReview(quiet(lastRole = "user"), LiveState.IDLE))
+    }
+
+    @Test fun `readyForReview judges a PR-bearing session on the PR alone`() {
+        assertEquals(true, readyForReview(quiet(prs = listOf(pr("OPEN"))), LiveState.IDLE))
+        assertEquals(true, readyForReview(quiet(prs = listOf(pr("DRAFT"))), LiveState.IDLE))
+        // An unfetched state must never be what drops work off the list.
+        assertEquals(true, readyForReview(quiet(prs = listOf(pr(""))), LiveState.IDLE))
+        // Merging (or closing) IS the review — park it in Idle until verified.
+        assertEquals(false, readyForReview(quiet(prs = listOf(pr("MERGED"))), LiveState.IDLE))
+        assertEquals(false, readyForReview(quiet(prs = listOf(pr("CLOSED"))), LiveState.IDLE))
+        assertEquals(true, readyForReview(quiet(prs = listOf(pr("MERGED"), pr("OPEN"))), LiveState.IDLE))
+        // A landed PR outranks the finished turn that opened it, else merging
+        // could never move a session out of the section.
+        assertEquals(false, readyForReview(quiet("assistant", listOf(pr("MERGED"))), LiveState.IDLE))
+    }
+
     @Test fun `falls back to transcript freshness when paneBusy unknown`() {
         val fresh = SessionInfo(status = "running", session = LiveSignals(paneBusy = null, transcriptAgeSec = 5.0))
         assertEquals(LiveState.WORKING, liveState(fresh, now, now))

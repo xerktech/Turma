@@ -337,6 +337,10 @@ input:focus, textarea:focus, select:focus {
 .dot.updating              { background: var(--warning);  box-shadow: 0 0 8px color-mix(in srgb, var(--warning) 75%, transparent); }
 .dot.offline               { background: var(--critical);  box-shadow: 0 0 7px color-mix(in srgb, var(--critical) 55%, transparent); }
 .dot.idle                  { background: var(--muted); }
+/* Ready for review (XERK-224): work that has stopped and is waiting on YOU.
+   Accent rather than the muted idle it is lifted out of — the section is a
+   call to action, and the dot has to read that way beside a quiet card. */
+.dot.review                { background: var(--accent);   box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 65%, transparent); }
 
 /* ---- Spinner ------------------------------------------------------------- */
 .spin {

@@ -288,12 +288,11 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   `~/.claude/.credentials.json` (`CLAUDE_CREDS_PATH`) every beat:
   `{present, needsLogin, expiringSoon, expiresAt, refreshExpiresAt, subscriptionType, at}` (epoch ms).
   The **REFRESH token** (`refreshTokenExpiresAt`) is the signal, NOT the access token: it lapses only
-  when claude hasn't refreshed inside its ~30-day window, when a human must `claude /login`.
+  when claude hasn't refreshed inside its ~30-day window, i.e. when a human must `claude /login`.
   `needsLogin` = missing/unreadable file, no `claudeAiOauth`/access token, or a past refresh expiry;
-  `expiringSoon` = refresh token within `CLAUDE_AUTH_WARN_MS` (3d; `TURMA_CLAUDE_AUTH_WARN_SEC`). A
-  present login with unknown refresh expiry reads healthy; a MISSING login can't heartbeat, so it
-  surfaces as the offline alert. Chip via `claudeAuthBadge` (`index.html`) / `🔑` pill
-  (`FleetScreen.kt`). Tests: `TestClaudeAuthStatus`.
+  `expiringSoon` = within `CLAUDE_AUTH_WARN_MS` (3d; `TURMA_CLAUDE_AUTH_WARN_SEC`). Unknown refresh
+  expiry reads healthy; a MISSING login can't heartbeat, so it surfaces as the offline alert. Chip via
+  `claudeAuthBadge` (`index.html`) / `🔑` pill (`FleetScreen.kt`). Tests: `TestClaudeAuthStatus`.
 
 #### Live-session signals
 
@@ -331,8 +330,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   - Answered by `answerPanePrompt` → `answer_pane_prompt`, typing the option digit — but it **re-reads the
     pane first** and drops the answer unless that number is on screen NOW (a stray digit prepends itself
     to the next message). Both `liveState`s check it ahead of the busy read. Tests:
-    `TestParsePanePrompt`/`TestAnswerPanePrompt`, `pane-prompt` in `server.test.js`, `panePromptHtml`
-    in `chat.test.js`.
+    `TestParsePanePrompt`/`TestAnswerPanePrompt`, `pane-prompt` in `server.test.js`, `panePromptHtml` in
+    `chat.test.js`.
 
 #### PR status
 
@@ -377,7 +376,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - **A reply asking for corrections on a session's PR is typed back into the session that opened it.**
   `_poll_pr_comments` runs on the PR cadence, for **running sessions only**, over their OWN PRs
   (`session_pr_urls`), through **`send_input`** — inheriting the compaction-survival outbox (XERK-47) and
-  the queue if a turn is in flight.
+  the queue if a turn is in flight. Only the OPENING session receives it, only while running.
 - `_pr_comment_events(url, self_login)` gathers **three channels** — conversation comments + review
   bodies (`gh pr view --json comments,reviews`) + inline review-thread comments
   (`gh api .../pulls/<n>/comments`); an MR's one notes call covers all three (`_mr_comment_events`, system
@@ -387,8 +386,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   silently the first beat it's seen (`prCommentBase`, capped `PR_COMMENTS_SEEN_MAX`); after that only NEW
   keys not the agent's own (`viewerDidAuthor`, else a login compare) are typed in.
 - Bounded: `PR_COMMENTS_MAX` PRs per beat, gated per-URL like the status sweep; a fetch failure (→ None)
-  leaves the baseline UNTOUCHED. Disable with `TURMA_PR_COMMENTS=0`. Only the OPENING session receives
-  it, only while running.
+  leaves the baseline UNTOUCHED. Disable with `TURMA_PR_COMMENTS=0`.
 - Tests: `TestPrCommentEvents`, `TestPrCommentMessage`, `TestPollPrComments`.
 
 ### Expected-restart "updating" status (XERK-29)
@@ -443,9 +441,9 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - **No real session is excluded.** The one carve-out is the manager's OWN internal `claude -p` helpers
   (session naming, Jira triage, models probe), which run with `cwd=REGISTRY_DIR` yet write a transcript
   into the shared `~/.claude/projects` — else the reconciler adopts the agent's overhead as a phantom
-  repo (XERK-27). `_is_internal_tool_slug` recognizes them by the registry dir's own slug, or for a
+  repo (XERK-27). `_is_internal_tool_slug` recognizes them by the registry dir's own slug, or a
   harness's temp slug by `INTERNAL_TOOL_PROMPT_SIGS`; the models probe's prompt is a slash command (which
-  `_first_user_text` skips), so it's recognized by `_first_command_name` = `/model`. Such a slug is
+  `_first_user_text` skips), so it goes by `_first_command_name` = `/model`. Such a slug is
   **tombstoned** (`{internal:true}`), which `repo_usage_report`/`_archive_manifest` skip.
   `_sanitize_internal_tool_entries` retires entries earlier builds adopted.
 - **This ledger is also the archive's input** (`_archive_manifest` enumerates ledger slugs), so
@@ -540,12 +538,12 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   attempts are **bounded-retry with backoff**
   (`JIRA_TRIAGE_MAX_ATTEMPTS`/`JIRA_TRIAGE_BACKOFF_SEC`, armed up-front so a restart mid-batch neither
   loops nor loses the retries owed).
-- `_parse_triage` draws a sharp line between the model's two non-answers:
-  - an **explicit `null`** is a verdict → `repoGuess.repo = null` ("no repo fits");
-  - anything **unreadable** — an unparseable shape, or an off-list repo name — is a **failed attempt**
-    whose key is omitted, leaving the ticket undecided for retry. Conflating them paints a confident chip
-    the model never asserted, left there for good since decisions aren't re-triaged.
-- A ticket not yet triaged carries **no `repoGuess`** (absence ≠ "no repo fits").
+- `_parse_triage` draws a sharp line between the model's two non-answers: an **explicit `null`** is a
+  verdict → `repoGuess.repo = null` ("no repo fits"), while anything **unreadable** (an unparseable
+  shape, an off-list repo name) is a **failed attempt** whose key is omitted, leaving the ticket
+  undecided for retry. Conflating them paints a confident chip the model never asserted, left there for
+  good since decisions aren't re-triaged. A ticket not yet triaged carries **no `repoGuess`** at all
+  (absence ≠ "no repo fits").
 - `_apply_triage()` re-stamps the ledger onto tickets after every poll and merge (`collect_jira` builds
   fresh dicts, else chips blank each slow beat). Tuned by `JIRA_TRIAGE_MODEL` (default `haiku`) /
   `JIRA_TRIAGE_TIMEOUT_SEC`.
@@ -562,7 +560,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   **releases** the pin, re-triaging with a **fresh** attempt budget.
 - **Un-cloned repos are offerable** (the board renders them dashed). The name is **allowlist-checked
   host-side against that host's own candidates**, and the stored repo/cloned/`nameWithOwner` are read
-  off the **candidate**, never the request. The candidate list is heartbeated as **`jira.repoOptions`**
+  off the **candidate**, never the request. That list is heartbeated as **`jira.repoOptions`**
   (`_jira_payload`) via `_refresh_triage_candidates` — one list serving the model's prompt and the
   board's picker, so the picker offers exactly what `set_jira_repo` accepts.
 - `_apply_triage` re-reads clone state from the **current** candidates rather than trusting the decision:
@@ -570,13 +568,11 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   the list keeps its stored state (the list blanks on a failed gh sweep).
 - `POST /api/jira/<siteKey>/<issueKey>/repo` **fans out to every host reporting that org** — including
   OFFLINE ones — because the ledger is per-host while the board merges by `siteKey`, so a host that
-  misses the pin can silently revert it. `set_jira_repo` is idempotent; the board gates its **Change**
-  control on an ONLINE host. This writes to the **agent's ledger, not Jira**.
+  misses the pin can silently revert it. `set_jira_repo` is idempotent. This writes to the **agent's
+  ledger, not Jira**. A repo the union offers but this host rejects is log-only (the panel self-corrects
+  within `REPO_SETTLE_MS`); `cloned` is host-relative.
 - A pin also decides **where a ticket session spawns** (`spawn_ticket` re-derives the repo from this
   host's ledger, where a pin outranks the model; still re-checks `scan_repos()`).
-- **Known limits, all multi-host-per-org**: the picker offers the union of the org's hosts' options, so
-  it can offer a repo one host rejects (log-only; the panel self-corrects within `REPO_SETTLE_MS`);
-  `cloned` is host-relative.
 - Tests: `TestSetJiraRepo`, `repoPickerHtml`/`repoFieldHtml` in
   `board.test.js`, `server.test.js`.
 
@@ -840,8 +836,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 
 - The agent **ships every INACTIVE session's transcript to the hub's durable archive** so history
   survives this host being wiped/offline. On the slow usage cadence `_archive_manifest()` enumerates
-  ended transcripts (every ledger slug's `*.jsonl`, attributed via the usage ledger, minus any slug
-  backing a running session); the hub replies with per-transcript byte cursors (`archiveHave`), and
+  ended transcripts (every ledger slug's `*.jsonl`, attributed via the usage ledger, minus any backing a
+  running session); the hub replies with per-transcript byte cursors (`archiveHave`), and
   `_archive_deltas()` POSTs the missing append-only deltas (pre-parsed through `_entry_text`) to
   `POST /api/agents/<host>/archive/<transcriptId>`, bounded per chunk/beat. Tests: `TestArchiveSync`.
 
@@ -969,40 +965,37 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   for tests). `mergeSites` collapses hosts sharing an org into one board keyed by `siteKey` (freshest
   block wins per site+user; different users on one site union, deduped by issue key). Columns are Jira's
   three status categories, each card's pill showing the org's own status name.
-- A fourth **In Review** column (XERK-23) sits between In Progress and Done. Jira has no cross-org category
-  for review/testing (both `indeterminate` → `inprogress`), so `categoryOf` carves it out by matching the
-  org-specific status NAME (`isReviewStatus`, word-boundary: review/testing/QA) and only ever pulls FROM
-  `inprogress`. Purely a board.js/CSS change.
-- The board is scoped by the **header's org filter**, not a strip of its own: it reads
-  `TurmaOrg.getKeys()` each render and passes it to `boardHtml`.
+- A fourth **In Review** column (XERK-23) sits between In Progress and Done. Jira has no cross-org
+  category for review/testing (both `indeterminate` → `inprogress`), so `categoryOf` carves it out by
+  matching the org-specific status NAME (`isReviewStatus`, word-boundary: review/testing/QA), only ever
+  pulling FROM `inprogress`.
+- Scoped by the **header's org filter**, not a strip of its own: `TurmaOrg.getKeys()` each render, passed
+  to `boardHtml`.
 - An org is **labelled by `orgName(siteKey)`** — the site host minus `.atlassian.net` (full host as
-  tooltip). Presentational only; everything stays keyed on the whole `siteKey`.
-- The agent's **`BOARD_ORG_NAME`** overrides that label outright (`orgName(siteKey, override)`, stamped
-  onto the block by `collect_board`, carried by `mergeSites`) — a self-hosted Azure collection otherwise
-  derives to its COLLECTION. Deliberately **not** part of the `siteKey`, which the hub
-  keys/merges/routes on and which `/api/jira/<siteKey>/…` and the ticket-agent/auto-start ledgers are
-  stored under — renaming it would orphan all of those. Also read by the dashboard's host rows. Tests:
-  `TestBoardOrgName`, `board.test.js`, android `BoardTest.kt`.
-- Each org gets a **UNIQUE color** — no two share a `--s1..--s8` palette slot (`orgColorMap`, XERK-48),
-  computed over the whole org set: each takes its djb2-preferred slot if free, else linear-probes to the
-  next free one, keys processed in sorted order. It is **persistent where it can be** — an org keeps its
-  color unless its preferred slot actually collides, and then only the *colliding* orgs move. Unique up
-  to 8 orgs; overflow falls back to its preferred slot. The Android port (`core/Board.kt` `orgColorMap`
-  → `ChartSeries`) uses the identical assignment, pinned by locked test vectors.
-- **An org's color can be pinned by hand** (XERK-145): the header org menu's color dot expands a
-  swatch strip (8 palette slots + "auto" release). Hub-owned durable state like the auto-start opt-in —
-  `POST /api/jira/<siteKey>/color` `{slot:1..8}` / `{auto:true}`, persisted in `/data/org-colors.json`,
-  riding the fleet payload + an `orgColors` SSE event. `orgColorMap(allKeys, pins)` gives a pinned org
-  EXACTLY its slot (two orgs pinned to one slot share it — the operator's choice beats uniqueness) and
-  auto orgs probe around the pinned slots; a malformed pin is ignored. Web reads the pins through
-  `TurmaOrg.orgColors()`; Android via `FleetState.orgColors` + `core/Board.kt`'s pins param. Tests:
-  `board.test.js`/`org.test.js`/`server.test.js`, android `BoardTest.kt`.
-- That org color also **tints the CARD BACKGROUND on every surface** (XERK-142): board ticket cards,
-  Sessions session cards, Dashboard host cards. Web sets `--org` (a `var(--sN)`) inline per card and
-  `color-mix`es it **12% into `--surface`**; a card with no org falls back to plain surface. The tint is
-  computed over the WHOLE fleet's org set (via `orgColorMap`), not the header-filtered view, so a card's
-  colour is stable regardless of the filter. Android mirrors it through `TurmaCard(tint=)`
-  (`lerp(surface, tint, 0.12)`). Tests: `board.test.js`/`sessions.test.js`.
+  tooltip), which the agent's **`BOARD_ORG_NAME`** overrides outright (`orgName(siteKey, override)`,
+  stamped on the block by `collect_board`, carried by `mergeSites`) since a self-hosted Azure collection
+  otherwise derives to its COLLECTION. Labels are presentational and deliberately **not** part of the
+  `siteKey`, which the hub keys/merges/routes on and which `/api/jira/<siteKey>/…` and the
+  ticket-agent/auto-start ledgers are stored under — renaming it would orphan all of those. Also read by
+  the dashboard's host rows. Tests: `TestBoardOrgName`, `board.test.js`, android `BoardTest.kt`.
+- Each org gets a **UNIQUE color** — no two share a `--s1..--s8` palette slot (`orgColorMap(allKeys,
+  pins)`, XERK-48), computed over the whole org set: each takes its djb2-preferred slot if free, else
+  linear-probes to the next free one, keys processed in sorted order. It is **persistent where it can
+  be** — an org keeps its color unless its preferred slot actually collides, and then only the
+  *colliding* orgs move. Unique up to 8 orgs; overflow falls back to its preferred slot.
+  - **Pinnable by hand** (XERK-145): the header org menu's color dot expands a swatch strip (8 slots +
+    "auto" release). Hub-owned durable state like the auto-start opt-in — `POST /api/jira/<siteKey>/color`
+    `{slot:1..8}`/`{auto:true}`, persisted in `/data/org-colors.json`, riding the fleet payload + an
+    `orgColors` SSE event (web reads them via `TurmaOrg.orgColors()`). A pinned org gets EXACTLY its slot
+    (two pinned to one slot share it — the operator's choice beats uniqueness) and auto orgs probe around
+    the pins; a malformed pin is ignored.
+  - It also **tints the CARD BACKGROUND on every surface** (XERK-142): board ticket, Sessions session
+    and Dashboard host cards. Web sets `--org` (a `var(--sN)`) inline per card and `color-mix`es it
+    **12% into `--surface`**; no org falls back to plain surface. Computed over the WHOLE fleet's org
+    set, not the header-filtered view, so a card's colour is stable regardless of the filter.
+  - Android ports all three identically — `core/Board.kt` `orgColorMap` (pins param, `ChartSeries`,
+    locked test vectors), `FleetState.orgColors`, `TurmaCard(tint=)` (`lerp(surface, tint, 0.12)`).
+    Tests: `board.test.js`/`org.test.js`/`sessions.test.js`/`server.test.js`, android `BoardTest.kt`.
 - The board READS the tracker; it makes exactly **two** writes back to it — **creating a ticket**
   (XERK-137) and **changing a ticket's status** (XERK-138). Every other control writes a hub/agent
   ledger, never the board. Tests: `board.test.js`, the ticket-detail and jira-refresh
@@ -1053,8 +1046,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   the org's `gh` listing is **dashed**; a ticket the model declined shows a muted italic **"no repo"**.
   A ticket with no `repoGuess` yet gets **no chip** ("not looked at yet" ≠ "no repo fits").
 - The model's rationale rides as the chip's tooltip and the detail panel's Repo row (`repoFieldHtml`,
-  which reads `t.repoGuess` directly — the guess only exists on the heartbeat ticket, not the on-demand
-  Jira fetch). The Repo row is also where the guess is **corrected by hand**.
+  reading `t.repoGuess` directly — the guess exists only on the heartbeat ticket, not the on-demand Jira
+  fetch). That row is also where the guess is **corrected by hand**.
 
 #### Starting a session on a ticket
 
@@ -1069,16 +1062,14 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   repo" verdict and an untriaged ticket get none. A failed start renders its reason beside a LIVE button.
 - In-flight state clears on **evidence**, not a timer: a session reporting the spawn's `cmdId`, or the
   command clearing from the host's queue (which covers a spawn the agent REFUSED).
-- The press is acknowledged **instantly and survives leaving the board** (XERK-18):
-  - the button acts on **`pointerdown`** (fired before any re-render — the board `innerHTML`-replaces
-    every beat), with `click` kept as the keyboard path; `startFrom` is the one entry both go through,
-    and the pending guard makes a double-fire a no-op.
-  - `startSession` sets the pending state and repaints **synchronously, before the fetch**; `cmdId`/`host`
-    fill in on reply.
-  - `sweepStarts`' verdict is `B.startSweepVerdict` (pure, unit-tested): a cmdId-less pending always
-    holds, and "command gone" only counts as acked once the command was **seen present** (`sawCmd`) —
-    the SSE-fallback poll may not yet have seen a just-queued command.
-  - the POST uses **`keepalive: true`** so it outlives the page.
+- The press is acknowledged **instantly and survives leaving the board** (XERK-18): the button acts on
+  **`pointerdown`** (fired before any re-render — the board `innerHTML`-replaces every beat) with `click`
+  as the keyboard path, both entering through `startFrom` where the pending guard makes a double-fire a
+  no-op; `startSession` sets pending and repaints **synchronously, before the fetch** (`cmdId`/`host` fill
+  in on reply); the POST uses **`keepalive: true`** so it outlives the page. `sweepStarts`' verdict is
+  `B.startSweepVerdict` (pure, unit-tested): a cmdId-less pending always holds, and "command gone" counts
+  as acked only once the command was **seen present** (`sawCmd`) — the SSE-fallback poll may not yet have
+  seen a just-queued one.
 - Tests: `server.test.js`, `startSweepVerdict` in
   `board.test.js`.
 
@@ -1089,13 +1080,12 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - `findTicketHost` chooses among the org's **ONLINE** hosts: **prefers one with the repo cloned**, and —
   within that group, or across all when none has it — picks the **most available**
   (`hostAvailability`). A momentarily-full host is still valid: the session **queues** there.
-- `hostAvailability(a)` = the host's `capacity.free` **minus its `capacity.queued` and the
-  spawn/spawnTicket commands still in its queue** since its last heartbeat — subtracting in-flight
-  commands is what makes rapid clicks split. An agent predating `capacity` scores below one that
-  reports it.
+- `hostAvailability(a)` = `capacity.free` **minus `capacity.queued` and the spawn/spawnTicket commands
+  still in its queue** since its last heartbeat — subtracting in-flight commands is what makes rapid
+  clicks split. An agent predating `capacity` scores below one that reports it.
 - **No host has the repo → clone on demand.** `findTicketHost` returns `{host, needsClone:true}` for the
-  most-available host; `spawn_ticket` then clones the repo (owner from its triage ledger's
-  `nameWithOwner`) and queues behind the clone — never a refusal.
+  most-available host; `spawn_ticket` clones it (owner from its triage ledger's `nameWithOwner`) and
+  queues behind the clone — never a refusal.
 - The **multi-host-per-org limits still apply**: the triage/branch state is per-host, so a clone-on-demand
   routed to a host that didn't triage the ticket has no ledger entry to clone from.
 - Tests: `server.test.js`.
@@ -1107,16 +1097,16 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - **The opt-in is HUB-ONLY (XERK-41)** — the "auto" switch on each org row of the header's org menu is
   the whole control. `POST /api/jira/<siteKey>/autostart` `{enabled}` → `setAutoStartOrg`, stored in
   `autostart-orgs.json` (`AUTOSTART_ORGS_FILE` on `/data`, keyed by siteKey, presence = enabled), riding
-  the fleet payload as top-level `autoStartOrgs` plus an SSE event. **There is no agent-side flag**, so
-  toggling never needs an agent redeploy. `orgsWithAutoStart` is the set of enabled siteKeys.
+  the fleet payload as top-level `autoStartOrgs` plus an SSE event; `orgsWithAutoStart` is the enabled
+  set. **There is no agent-side flag**, so toggling never needs an agent redeploy.
 - **The decision and routing live on the HUB** (only it sees the whole fleet). `autoStartSweep()` (a 15s
   `setInterval`, boot-grace-gated) walks each org in `orgsWithAutoStart` and routes a `spawnTicket`
   through the **same `findTicketHost`** the button uses, for each To Do ticket with a `repoGuess.repo`.
 - Never opens a **second** session for work already started. Three guards, increasing in strength:
-  `startedTicketKeys()` — durable: a ticket carrying a session on ANY channel (`a.sessions`,
-  `a.closedSessions`, or a repo's `resumable` scan) is already handled, and a **killed** session counts;
-  an in-flight `spawnTicket` on some org host, for the window before that session first heartbeats; and
-  `autoStarted`, an in-memory per-ticket ATTEMPT record, the only thing that stops a spawn the agent
+  `startedTicketKeys()` — durable, a ticket carrying a session on ANY channel (`a.sessions`,
+  `a.closedSessions`, a repo's `resumable` scan) is handled, a **killed** session counting; an in-flight
+  `spawnTicket` on some org host, covering the window before that session first heartbeats; and
+  `autoStarted`, an in-memory per-ticket ATTEMPT record, the only thing stopping a spawn the agent
   **refuses** from being re-queued every sweep.
 - **A queued `spawnTicket` is an ATTEMPT, not a start** (XERK-61), so auto-start **retries on a growing
   backoff and never gives up** (XERK-109): a doubling `AUTO_START_RETRY_MS` (1/2/4/8 min) HOLDING at
@@ -1124,12 +1114,12 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `autoStarted` as `{attempts, nextAt}`.
   - The agent **acks a refusal and a mid-spawn exception exactly like a success**, so a TRANSIENT failure
     leaves no session. **Never re-introduce an attempt CAP**: any hard give-up blacklists such a ticket
-    for the hub's lifetime even after its condition clears.
+    for the hub's lifetime even after its condition clears. A **no-online-host** result likewise spends
+    NO attempt, so it retries once a host returns.
   - The retry gate is **evidence, in the sweep's existing order**: a session on any channel ends the
     attempts and drops the record; an in-flight command concludes nothing; only a still-session-less
     ticket with nothing in flight, past its backoff, is retried. A queued session reports its `ticket`
     from the first beat, so a slow spawn is never mistaken for a failed one.
-  - A **no-online-host** result spends NO attempt, so it retries once a host returns.
 - Nothing is written to Jira.
 - Tests: `server.test.js`, `autoStartOn` in
   `board.test.js` and android `BoardTest.kt`, `test_no_agent_side_auto_start_flag` in
@@ -1139,17 +1129,16 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 - The lifecycle **counterpart** to auto-start: moving a ticket to **Done** **kills** its session(s) — only
   a **human** moves it there, a deliberate "finished" signal. **Regardless of the per-org "auto" opt-in**
-  (XERK-161) — that toggle governs ONLY auto-STARTING work. Only a ticket-backed session (`s.ticket`) is
-  touched.
+  (XERK-161) — that toggle governs ONLY auto-STARTING work.
 - The hub **KILLS**, not interrupts: a kill ends it cleanly (Ended, resumable, worktree/conversation/PR
-  chips intact) and frees the `MAX_SESSIONS` slot; an interrupt would leave it idle holding the slot.
+  chips intact) and frees the `MAX_SESSIONS` slot an interrupt would leave it holding.
 - Decision and routing on the HUB. `autoStopSweep()` (15s `setInterval`, beside `autoStartSweep`) reads
   **every** reporting org's **Done** tickets from its freshest block, then scans the WHOLE fleet for
-  sessions whose `ticket` names one, routing each `{type:"kill", sessionId}` to the owning host.
-- Only **live** sessions (`running`/`queued`) are stopped; every one on the ticket is killed (a
-  two-branch or restart-clear-context ticket has more than one).
-- Guard: `autoStopped`, a `<host>\x00<sessionId>` once-per-hub-lifetime set (a re-issued kill of a dead
-  session is a no-op). Tests: the `auto-stop:` cases in `server.test.js`.
+  sessions whose `ticket` names one, routing each `{type:"kill", sessionId}` to the owning host. Only
+  **live** ones (`running`/`queued`) are stopped, and every session on the ticket is (a two-branch or
+  restart-clear-context ticket has more than one). Guard: `autoStopped`, a `<host>\x00<sessionId>`
+  once-per-hub-lifetime set (a re-issued kill of a dead session is a no-op). Tests: the `auto-stop:`
+  cases in `server.test.js`.
 
 #### Ticket ↔ session chips
 
@@ -1172,9 +1161,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - The reverse link rides the session: the Sessions card meta shows the ticket key (a plain span — the
   card is a `<button>`), and the chat footer carries a linked `jira-chip` beside the PR chip
   (`ticketFooterChip`) pointing at Turma's OWN board — `/board?ticket=<key>&site=<siteKey>`, not out to
-  Jira (XERK-16). The board's `consumeDeepLink` (in `board.html`) is one-shot: waits for the ticket's org
-  to report, opens the panel on the first render that resolves the key, and strips the query params;
-  `site` is optional.
+  Jira (XERK-16). `consumeDeepLink` (`board.html`) is one-shot: waits for the ticket's org to report,
+  opens the panel on the first render that resolves the key, strips the params; `site` is optional.
 
 #### Ticket detail panel
 
@@ -1184,82 +1172,73 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   serves a fresh cached copy, or queues a `jiraIssue` command and 202s so the client polls
   (`ingestJiraIssues`, cached by `JIRA_ISSUE_FRESH_MS`/`_MAX_AGE_MS`/`_MAX`, stripped from `/api/agents`).
   An offline-only org serves its last copy flagged `stale`; a cached `error` is kept so a doomed fetch
-  isn't re-queued. The fetched copy wins field-by-field; agent-side text is already plain, so the panel
-  escapes first and linkifies after.
+  isn't re-queued. The fetched copy wins field-by-field; its text is already plain, so the panel escapes
+  first and linkifies after.
 
-##### Changing the repo by hand
+##### The row pickers — one pattern, four rows
 
-- The Repo row's **"Change"** control swaps the row in place for a picker of the org's
-  `jira.repoOptions` — cloned and un-cloned repos in separate `optgroup`s, plus "No repository fits" and
-  "Let the agent decide", `POST`ing to `/api/jira/<siteKey>/<issueKey>/repo`.
-- **Choosing an option IS the save** — every option is a complete answer, so picking one commits it and
-  closes the picker. There is no Save button: with one, closing the panel discarded the choice silently.
-  Re-picking the value already showing saves **nothing** but still closes it; `repoPickerValue` is what
-  the handler compares against and what `repoPickerHtml` preselects from — they must not drift, or a real
-  change reads as a re-pick and gets dropped. **Cancel** is the way out.
-- The row is present even for an **untriaged** ticket, reading "Not triaged yet".
-- **Only a manual pin preselects a repo.** An auto guess is the model's answer while the operator's
-  setting is "let it decide"; preselecting it would misreport that as a pin.
-- Options are merged **across the org's hosts** (`mergeSites`, cloned winning the dedupe), collected next
-  to `hosts` over EVERY agent, not in the winners loop (one block per (site, user), so the picker would
-  otherwise offer only whichever host polled Jira last).
-- A pinned repo that has **left** the options is carried back in under "Currently set" so it stays
-  selected — else the browser falls back to its first option, turning an untouched panel into a silent
-  release. `_apply_triage` keeps rendering such a repo on purpose. The save is painted
-  **optimistically**; a failed request rolls it back and says so on the row.
+The Repo / Agent / Model / Status rows each swap in place for a `<select>` on **"Change"**. All four
+share the rules below; each row's subsection carries only its deltas.
+
+- **Choosing an option IS the save** — every option is a complete answer, so picking one commits and
+  closes. There is no Save button: with one, closing the panel discarded the choice silently. **Cancel**
+  is the way out. Re-picking the showing value saves **nothing**; the value the handler compares against
+  and the one the picker preselects from must not drift, or a real change reads as a re-pick and is
+  dropped.
+- A set value that has **left** the options is carried back under "Currently set" so it stays selected —
+  else the browser falls back to its first option, turning an untouched panel into a silent release. The
+  save paints **optimistically**; a failure rolls it back and says so on the row.
+- Options merge **across the org's hosts** (`mergeSites`); the known limit is that the union can offer
+  what one host lacks. "Change" needs a host of that org **online**, and the edit state lives in a page
+  variable, not the DOM (the session card's ⋯ menu rule).
 - `refreshOpenTicket` re-points the open panel at the rebuilt ticket each beat (`mergeSites` builds fresh
   objects), holds the optimistic paint for `REPO_SETTLE_MS`, repaints only when a rendered field changed,
   and never while the picker is open.
-- "Change" only appears when a host of that org is **online**. The edit state lives in a page variable,
-  not the DOM (the same rule the session card's ⋯ menu follows).
 
-##### Pinning the agent by hand (XERK-38)
+##### Changing the repo by hand
 
-- Below the Repo row sits an **Agent row**: which HOST this ticket's sessions spawn on, defaulting to
-  "Auto — most available agent". Its "Change" swaps in a picker of the org's reporting hosts; **a pick IS
-  the save**. Deliberately **panel-only** — the card gets no chip.
-- **The pin is hub-owned, not an agent-ledger fan-out** like the repo override: routing happens on the
-  hub, so it persists in `/data/ticket-agents.json` (`TICKET_AGENTS_FILE`, keyed `<siteKey>/<issueKey>`,
-  bounded by `TICKET_AGENTS_MAX` oldest-first) — NOT in the best-effort `state.json`.
-- So `POST /api/jira/<siteKey>/<issueKey>/agent` (`{host}` to pin, `{auto:true}` to release) answers an
-  authoritative **200, not the /repo route's 202-on-queue**. The host is allowlist-checked against the
-  fleet's hosts reporting that org; an OFFLINE host is pinnable, a host of another org is not.
-- `findTicketHost` honors a pin over the availability ranking for **both** the Start button and the
-  auto-start sweep. A pinned host that's offline (or gone) **refuses with the pin in the error, never
-  silently reroutes**; the sweep treats that like any no-host result. A pinned host without the repo
-  still works: clones on demand and queues behind the clone.
-- The map rides `/api/agents` as top-level `ticketAgents` (plus a `ticketAgents` SSE event); the picker's
-  options are `mergeSites`' per-site `hostOptions` (every host reporting the org, online first, offline
-  marked). A pinned host that left the fleet is carried back into "Currently set".
-- Tests: `server.test.js`, `board.test.js`,
-  `hostOptions`/`agentPinOf` in android `BoardTest.kt`.
+- A picker of the org's `jira.repoOptions` — cloned and un-cloned repos in separate `optgroup`s, plus
+  "No repository fits" and "Let the agent decide", `POST`ing to `/api/jira/<siteKey>/<issueKey>/repo`.
+  `repoPickerValue`/`repoPickerHtml` are the compare/preselect pair.
+- The row is present even for an **untriaged** ticket, reading "Not triaged yet".
+- **Only a manual pin preselects a repo.** An auto guess is the model's answer while the operator's
+  setting is "let it decide"; preselecting it would misreport that as a pin.
+- Options are collected next to `hosts` over EVERY agent, not in the winners loop (one block per
+  (site, user), so the picker would otherwise offer only whichever host polled Jira last); cloned wins
+  the dedupe. `_apply_triage` keeps rendering a carried-back pinned repo on purpose.
 
-##### Pinning the model by hand (XERK-123)
+##### Pinning the agent (XERK-38) and model (XERK-123) by hand
 
-- A **Model row** sits below the Agent row: which MODEL this ticket's session runs, defaulting to
-  "Default — the agent's default model". Its "Change" swaps in a picker of "Default" + the org's offered
-  aliases; **a pick IS the save**. Panel-only, no card chip.
-- **Hub-owned durable state like the agent pin**, NOT an agent-ledger fan-out: the model is delivered on
-  the `spawnTicket` command the hub already routes (`ticketModelPin` → the command's `model`). Stored in
-  `/data/ticket-models.json` (`TICKET_MODELS_FILE`, keyed `<siteKey>/<issueKey>`, `{model, at}`, bounded
-  `TICKET_MODELS_MAX` oldest-first). `POST /api/jira/<siteKey>/<issueKey>/model` answers an authoritative
-  **200** (`{model}` to pin, `{auto:true}` or `{model:"default"}` to release), rides `/api/agents` as
-  top-level `ticketModels` (+ a `ticketModels` SSE event).
-- The alias must be one the org **actually offers** (`orgModelAliases`: the union of the org's hosts'
-  probed `models.available`, non-bracketed, + the static family aliases). The **agent still re-validates**
-  it host-side (`spawn`'s `resolve_model`); an unpinned ticket omits `model`. The picker offers the
-  curated menu (`modelChoices`/`prettyModel`); a pinned alias off the current probe is carried back so it
-  stays selected. Un-probed org falls back to the static family aliases, never an empty menu.
-- The pin also feeds the **auto-start sweep**.
-- **Known limit:** as with the repo picker, the union across an org's hosts can offer an alias one lacks.
-- Tests: `server.test.js`, `modelPinOf`/`modelPickerHtml`/`modelChoices` in
-  `board.test.js`, `TestSpawnTicket`, android `BoardTest.kt`.
+Two more rows below Repo, both **panel-only** (no card chip) and both **hub-owned durable state, NOT an
+agent-ledger fan-out** like the repo override — the hub is what routes a spawn, so each persists under
+`/data` (`ticket-agents.json`/`TICKET_AGENTS_FILE`, `ticket-models.json`/`TICKET_MODELS_FILE`; keyed
+`<siteKey>/<issueKey>`, bounded `*_MAX` oldest-first), NOT in the best-effort `state.json`. So
+`POST /api/jira/<siteKey>/<issueKey>/agent`|`/model` answers an authoritative **200, not the /repo
+route's 202-on-queue**, and each rides `/api/agents` as top-level `ticketAgents`/`ticketModels` plus an
+SSE event of that name. Both feed the Start button AND the auto-start sweep.
+
+- **Agent row** — which HOST this ticket's sessions spawn on, defaulting to "Auto — most available
+  agent"; a picker of `mergeSites`' per-site `hostOptions` (every host reporting the org, online first,
+  offline marked). `{host}` pins, `{auto:true}` releases; allowlist-checked against the fleet's hosts
+  reporting that org, so an OFFLINE host is pinnable but a host of another org is not.
+  `findTicketHost` honors it over the availability ranking; a pinned host that's offline (or gone)
+  **refuses with the pin in the error, never silently reroutes** (the sweep treats that like any no-host
+  result). A pinned host without the repo still works: clones on demand and queues behind the clone.
+- **Model row** — which MODEL the session runs, defaulting to "Default — the agent's default model";
+  delivered on the `spawnTicket` command the hub already routes (`ticketModelPin` → the command's
+  `model`). `{model}` pins, `{auto:true}` or `{model:"default"}` releases. The alias must be one the org
+  **actually offers** (`orgModelAliases`: the union of its hosts' probed `models.available`,
+  non-bracketed, + the static family aliases), and the **agent still re-validates** it host-side
+  (`spawn`'s `resolve_model`); an unpinned ticket omits `model`. The picker offers the curated menu
+  (`modelChoices`/`prettyModel`); an un-probed org falls back to the static aliases, never an empty menu.
+- Tests: `server.test.js`, `board.test.js` (`modelPinOf`/`modelPickerHtml`/`modelChoices`),
+  `TestSpawnTicket`, `hostOptions`/`agentPinOf`/`modelPinOf` in android `BoardTest.kt`.
 
 ##### Changing the status by hand (XERK-138)
 
 - The Status row is the **one board field that writes BACK to Jira/Azure** — every other detail control
-  writes a hub/agent ledger. Its "Change" swaps in a picker of the statuses the ticket can move to; **a
-  pick IS the save**, its "keep current" first option the no-op.
+  writes a hub/agent ledger. A picker of the statuses the ticket can move to, "keep current" first as the
+  no-op.
 - **The options are the board's own, fetched with the issue, not a fixed list.** The detail carries
   `statusOptions` (`[{id, name, category}]`): Jira's available **transitions** (labelled by the resulting
   status, valued by transition id — from `expand=transitions`), or Azure's **states** for the work-item
@@ -1281,28 +1260,26 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 ##### Drag-and-drop status change (XERK-141)
 
-- **Drag a card into another column to change its status** — the same write path as the panel picker,
+- **Drag a card into another column to change its status** — the XERK-138 write path above, unchanged,
   reached by a gesture.
-- **The drop POSTs the target COLUMN, not a transition** (`{category}` on the SAME
-  `POST .../status`/`setTicketStatus` command the picker's `{value}` uses): a board card never loaded the
-  ticket's transitions, so the client can't name one. `set_board_status` resolves the column to a real
-  status against a FRESH options read — `_status_option_for_column` picks the first option whose
-  `_board_column(name, category)` matches (the Python mirror of `board.js` `categoryOf`, review carve-out
-  included); no match refuses. Everything else is XERK-138 unchanged.
+- **The drop POSTs the target COLUMN, not a transition** (`{category}` on the SAME `setTicketStatus`
+  command the picker's `{value}` uses): a board card never loaded the ticket's transitions, so the client
+  can't name one. `set_board_status` resolves the column against its FRESH options read —
+  `_status_option_for_column` picks the first option whose `_board_column(name, category)` matches (the
+  Python mirror of `board.js` `categoryOf`, review carve-out included); no match refuses.
 - **An optimistic `moves` override holds the card in its dropped column across repaints** until the
   board's own (slow) poll reports it there, else it snaps back each ~1s beat. `boardColumnOf` renders the
   override through BOTH the in-flight `pending` state AND the `settled` state after it — honouring
   `pending` alone lets the card snap back until the next poll, then jump forward again. The sweep
-  (`moveSweepVerdict`) clears the override only once the poll has caught up (`categoryOf` == the dropped
-  column) or a backstop; a failure reverts after a short TTL. On settle the client nudges a re-poll
-  (`POST /api/jira/refresh`). Mirrored in `core/Board.kt`.
-- Web: a pointer long-press drag with a floating ghost + column highlight in `board.html`; a real
-  drag suppresses the click it would synthesize so a drop doesn't also open the panel. Android:
-  `detectDragGesturesAfterLongPress` + a ghost card in `BoardScreen.kt`, same `moves` override in
-  `BoardViewModel`.
-- Tests: `TestSetBoardStatus` + `TestBoardColumn` (`test_hub_agent.py`);
-  `server.test.js`; `boardColumnOf`/`moveSweepVerdict`/`boardHtml` in `board.test.js` and in
-  android `BoardTest.kt`.
+  (`moveSweepVerdict`) clears it only once the poll has caught up (`categoryOf` == the dropped column) or
+  a backstop; a failure reverts after a short TTL. On settle the client nudges a re-poll
+  (`POST /api/jira/refresh`).
+- Web: a pointer long-press drag with a floating ghost + column highlight in `board.html`; a real drag
+  suppresses the click it would synthesize so a drop doesn't also open the panel. Android:
+  `detectDragGesturesAfterLongPress` + a ghost card in `BoardScreen.kt`, same override in
+  `BoardViewModel`/`core/Board.kt`.
+- Tests: `TestBoardColumn` (`test_hub_agent.py`); `server.test.js`;
+  `boardColumnOf`/`moveSweepVerdict`/`boardHtml` in `board.test.js` and android `BoardTest.kt`.
 
 #### When a host's agent is too old for a write (XERK-151)
 
@@ -1342,24 +1319,21 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   its paired tool_result, error-styled) and collapsed thinking traces, the in-progress turn typing in via
   a typewriter reveal (ported from glasses `live.ts`/`transcript.ts`/`reveal.ts`).
   - The live turn is the tmux **pane scrape's "last ● bullet"**, NOT monotonic (XERK-19): it SWAPS
-    blocks mid-turn. Every `turn` frame is CLASSIFIED by `applyTurn` before the reveal — the
-    streaming bubble is only for in-progress **prose**:
-    - an empty frame or a **tool-use bullet** (`isToolBullet`: identifier + `(`) clears the bubble
-      (the tool renders as a committed card); a missed bullet brings the flicker back, so it leans
-      toward matching.
-    - the **same prose block** keeps the LONGER text and never shrinks (`reveal.shown` holds); a
-      **genuinely different prose block** retypes from 0.
-  - Stands in for glasses `advanceReveal`'s entryId snap (the scrape has no id); `repaint`'s prefix
-    check is a defensive clamp. Tests: `chat-selection.test.js`.
+    blocks mid-turn, so every `turn` frame is CLASSIFIED by `applyTurn` before the reveal and the
+    streaming bubble is only for in-progress **prose** — an empty frame or a tool-use bullet
+    (`isToolBullet`, biased toward matching since a miss brings the flicker back) CLEARS it, the same
+    prose block keeps the LONGER text and never shrinks (`reveal.shown`), a different one retypes from 0.
+    Stands in for glasses `advanceReveal`'s entryId snap (the scrape has no id); `repaint`'s prefix check
+    is a defensive clamp. Tests: `chat-selection.test.js`.
 - Bubble prose is rendered by `renderProse` (`chat.js`): **fenced ` ``` ` blocks** become
   `<pre class="md-code">` (language chip from the info string), inline **` `code` ` spans** become
   `<code class="md-code-inline">` chips (`renderInline`), GFM **tables** become real `<table>`s, else
   linkified.
   - Passes nest outward-in — fence, table, inline, link — so a code body is never linkified; the fence
     pass runs above the table pass. An inline span never crosses a line break, and an **unterminated
-    fence renders as code**.
-  - A code-carrying bubble gets a **definite** `width: min(760px, 100%)` (`:has()`-scoped), out of
-    shrink-to-fit sizing so overflow lands on the block's own scroller, not a grid track.
+    fence renders as code**. A code-carrying bubble gets a **definite** `width: min(760px, 100%)`
+    (`:has()`-scoped), out of shrink-to-fit sizing so overflow lands on the block's own scroller, not a
+    grid track.
   - **Images/SVGs render inline (XERK-221)**: `![alt](url)` → `<img>` (`linkify`, src `http(s)`+
     `data:image/*`); a line-start raw `<svg>` (`renderSvgAndText`) or all-SVG fence body → a sandboxed
     `data:image/svg+xml` `<img>` (`svgToImg`) — **never DOM-injected**, so embedded `<script>`/`onload`
@@ -1410,15 +1384,33 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 #### Queued sessions
 
-- A **"Queued" section** above Active lists sessions the agent hasn't provisioned yet (`status:"queued"`)
-  as static cards showing the wait reason (`queuedReasonText`) and a **Cancel** (arm-then-confirm).
-  A followed spawn (`?spawn=<cmdId>`) landing in the queue words its stage **"Queued — <reason>"** and
-  flips to the live session once it provisions; the dashboard's card mirrors this. Tests:
-  `sessions.test.js`.
+- A **"Queued" section** above the live lists shows sessions the agent hasn't provisioned yet
+  (`status:"queued"`) as static cards with the wait reason (`queuedReasonText`) and a **Cancel**
+  (arm-then-confirm). A followed spawn (`?spawn=<cmdId>`) landing in the queue words its stage
+  **"Queued — <reason>"** and flips to the live session once it provisions; the dashboard's card mirrors
+  this. Tests: `sessions.test.js`.
+
+#### Ready for review (XERK-224)
+
+- The live sessions split three ways, in reading order: **Ready for review** (stopped, waiting on YOU),
+  **Active** (working — leave it alone), **Idle** (quiet, asking for nothing).
+- `readyForReview(s, live)` is **derived from the signals alone** — there is no "I've reviewed this"
+  action. It qualifies on a pending question/pane prompt (blocked on a human, so the busy read doesn't
+  matter; it leads the section), a PR that hasn't landed, or a **finished turn** (`lastRole=="assistant"`,
+  no `lastHasToolUse`) — the last being the only trace a research task that opened no PR leaves, and the
+  case a PR-only rule was asked to stop missing.
+- **A PR-bearing session is judged on the PR alone**, not its transcript: the one way out, short of
+  working again, is every PR reaching MERGED/CLOSED — merging IS the review, dropping it to Idle, where
+  work merged but not yet verified against a build is parked. `prLanded` counts an unknown or unfetched
+  state as still live; an unreadable state must never drop work off the list.
+- Four mirrors must agree: `sessions.html`, `server.js` (the alert for entering it), `core/Sessions.kt`
+  (`rankRunning` → `LiveGroups`), `glasses/src/sessions.ts`. The card says WHY it qualified ("PR awaiting
+  review" / "finished · awaiting review") on the accent `.dot.review`. Tests: `sessions.test.js`,
+  `readyForReview` in `server.test.js`, android `SessionsTest`/`SessionsFlattenTest`.
 
 #### Ended sessions
 
-- The sidebar's third section (below Active/Idle/Queued), **collapsed by default**. It merges the three
+- The sidebar's last section, below every live list, **collapsed by default**. It merges the three
   channels an over-but-resumable session arrives on: **killed** (`a.closedSessions`), **stopped** (a
   non-running record still in `a.sessions`), and **resumable** (a transcript from each repo's `resumable`
   scan, no registry record behind it).
@@ -1455,7 +1447,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 - Each sidebar session card carries a **⋯ overflow menu** — a sibling of the card `<button>`, absolutely
   positioned over it (a nested button is invalid HTML). **Rename…** swaps the card for an inline field
-  `POST`ing to `.../sessions/<id>/summary`, painted optimistically; **Kill** arms-then-confirms. Menu
+  `POST`ing to `.../sessions/<id>/summary`, painted optimistically; **Kill** arms-then-confirms. Its
   open/armed/typing state lives in page variables, not the DOM.
 
 #### Send and Stop buttons
@@ -1502,14 +1494,13 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   links, since the text has to survive the app, tmux AND xterm.js (XERK-7).
 - Selecting at all needs a **modifier**, because the Claude TUI holds mouse tracking: **Shift**
   everywhere except macOS, where xterm.js honours **Alt** only when `macOptionClickForcesSelection` is on
-  (defaults off) — `_launch_ttyd` passes it (cost: Mac's Alt+drag column-select). Once a selection EXISTS
+  (defaults off) — `_launch_ttyd` passes it (cost: Mac's Alt+drag column-select). Once a selection exists
   ttyd copies it itself.
 - **Every other copy — the app's own and tmux copy-mode's — travels as OSC 52**, needing all three of:
-  - `agent/tmux.conf` declaring an `Ms` capability (tmux emits OSC 52 only if the OUTER terminfo
-    advertises it, and xterm-256color / tmux-256color lack it);
-  - `set-clipboard on` — the default `external` forwards **no** application OSC 52;
-  - the hub injecting xterm.js's missing OSC 52 handler (`TERM_OSC52_JS`, in `proxyTerm`, via ttyd's
-    `window.term`).
+  `agent/tmux.conf` declaring an `Ms` capability (tmux emits OSC 52 only if the OUTER terminfo advertises
+  it, and xterm-256color / tmux-256color lack it); `set-clipboard on` (the default `external` forwards
+  **no** application OSC 52); and the hub injecting xterm.js's missing OSC 52 handler (`TERM_OSC52_JS`,
+  in `proxyTerm`, via ttyd's `window.term`).
 - The bridge is deliberately **write-only**: an OSC 52 READ request (`?`) is never answered (else any
   program in the pane reads the clipboard). An empty payload is dropped. It splits at the **first `;`**
   (an app sends `52;c;<b64>`, tmux `52;;<b64>`, both must land).
@@ -1541,28 +1532,35 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 ### Notifications
 
 - The hub pushes edge-triggered alerts to the **Android client via FCM**, the sole transport:
-  host offline/recovered, restart loop, per-session turn finished / question
-  waiting / PR created, and Claude login required/expiring/restored.
-- **A PR alert waits for that PR's CI to go green** (XERK-153) — never fire on the URL being scraped.
-  A new URL enters a per-session wait list (`alerts.sessions[id].prWait`) that `prAlertDecision` re-judges
-  each beat against `session.prs`; `prSeen` keeps its old meaning (already alerted), so an older hub's PRs
-  don't re-fire on upgrade.
-  - The gate is the **CI rollup alone** (`checks`), not the `ready` verdict — a green PR that conflicts
-    still alerts.
-  - **`failing` stays quiet, permanently** (sticky `w.red`): the alert is for the PR being ready, not for
-    every round trip through red.
-  - **Absent `checks` means "not fetched yet", never "no CI"** → hold. A fetched `checks: null` IS a
-    CI-less PR, but a just-opened one reads identically while GitHub registers its workflows, so it must
-    hold `PR_NO_CI_GRACE_MS` (2 min) first.
-  - **An inconclusive wait ages out at `PR_ALERT_MAX_WAIT_MS`** (30 min) and fires anyway — a host with no
-    `gh` login never fills the status in. The wait delays the alert; it must not lose it. Red is exempt.
-    Body carries the verdict ("All checks passed"/"No CI configured"/"CI state unknown" · url).
-  - Tests: `prAlertDecision` in `server.test.js`.
+  host offline/recovered, restart loop, per-session ready-for-review / question
+  waiting, and Claude login required/expiring/restored.
+- **A session gets ONE alert per piece of work** (XERK-224): "is ready for review", fired when it enters
+  the Sessions page's Ready-for-review group (`readyForReview`, the hub's mirror of the page's rule),
+  replacing the separate "finished its turn" and "created a PR" notices — two buzzes for one stop.
+  Retracted (`review:<host>:<id>`) when the session leaves the group. Tags `mag` → Android's `CH_TURN`
+  (renamed "Ready for review", id kept so the operator's channel settings survive).
+  - Fires only on something NEW — a turn that just finished (`sa.reviewAt`) or a PR that just settled
+    (`sa.prNotes`) — so a session already sitting there at boot is not re-announced. A pending question
+    **suppresses** it: the question alert is already that session's buzz, and says more.
+  - **A PR still waiting on CI HOLDS it** (XERK-153) — never fire on the URL being scraped. A new URL
+    enters a per-session wait list (`alerts.sessions[id].prWait`) that `prAlertDecision` re-judges each
+    beat against `session.prs`; a settled verdict banks on `prNotes` and is spent by the one alert, whose
+    body names each PR. All must settle first. `prSeen` keeps its old meaning (already alerted), so an
+    older hub's PRs don't re-fire on upgrade.
+  - `prAlertDecision`'s own doc comment is the verdict table; four rules there must not be undone: the
+    gate is the **CI rollup alone**, not `ready` (a green PR that conflicts still alerts); **`failing`
+    stays quiet permanently** (the alert is for the work being ready, not every trip through red);
+    **absent `checks` is "not fetched yet", never "no CI"**; and an inconclusive wait **ages out and
+    fires anyway** — the wait may delay an alert, never lose it. Body carries the verdict, or
+    "Finished — nothing to merge" when the session opened no PR. Tests:
+    `prAlertDecision`/`readyForReview` in `server.test.js`.
 - **Claude login alerts** (XERK-98) fire in `heartbeatAlerts` off the agent's `claudeAuth` block: two
   edge-triggered states, deduped under `next.alerts` and cleared on recovery — `needsLogin` → urgent
   `key`-tagged "Claude login required", `expiringSoon` → default-priority "Claude login expiring". The
   hard state supersedes the soft (`claudeExpiringAt` dropped when `needsLogin`), so a lapse-then-recover
   fires only "restored". `key` routes to Android `CH_HOST`. Tests: `server.test.js`.
+- The Android client owns the delivery half: `POST_NOTIFICATIONS`, the Android-13+ runtime request in
+  `MainActivity`, channels + rendering in `push/Notifications.kt`, `push/PushRegistrar.kt`.
 - **`android/app/google-services.json` is committed** (XERK-37): the Firebase client config must be IN the
   repo or CI-built release APKs ship with Firebase inert and push does nothing. It holds only public
   identifiers (same as the committed release keystore); the gradle apply stays conditional so a fork that
@@ -1574,25 +1572,21 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   unconfigured. Devices register via `POST /api/devices` (user-authed, persisted to
   `/data/devices.json`), unregister via `DELETE /api/devices?token=`; dead tokens are pruned on send.
 - **An addressed alert is retracted from the phone** (XERK-154): every session alert posts under a stable
-  `notifKey` (`question:<host>:<id>`, `pr:<url>`, `turn:<host>:<id>`); `dismiss(notifKey)` sends a
-  title-less `{action:"dismiss", notifKey}` FCM message (no-op with no device / FCM off). `heartbeatAlerts`
-  fires it once per addressed edge: a question cleared, a PR reaching MERGED/CLOSED (over `sa.prSeen` via
-  `prStatus`, deduped by `sa.prDismissed`), a turn the operator replied to (`sa.turnAlerted` + idle→working).
-  App-side `Notifications.idFor` keys the notification off `notifKey`, so alert kinds coexist instead of
-  colliding on one per-session id, and a dismiss cancels the exact one. **Capability-gated**: `dismiss()`
-  reaches only devices that declared `features:["dismiss"]` — an older build has no handler and would show
-  the data-only message as a blank notification (withheld devices keep the stale alert until the app
-  updates). The app sends it via a **required** `DeviceRequest.features` field — `encodeDefaults=false`
-  drops a DEFAULTED value from the body, so the hub would retract nothing. Tests: `XERK-154` in
+  `notifKey` (`question:<host>:<id>`, `review:<host>:<id>`); `dismiss(notifKey)` sends a title-less
+  `{action:"dismiss", notifKey}` FCM message (no-op with no device / FCM off), fired once per addressed
+  edge — a question cleared, a session leaving Ready-for-review. App-side `Notifications.idFor` keys off
+  `notifKey`, so alert kinds coexist instead of colliding on one per-session id. **Capability-gated**:
+  it reaches only devices declaring `features:["dismiss"]` — an older build has no handler and would show
+  the data-only message as a blank notification (those devices keep the stale alert until the app
+  updates). The app sends a **required** `DeviceRequest.features` field: `encodeDefaults=false` drops a
+  DEFAULTED value from the body, so the hub would retract nothing. Tests: `XERK-154` in
   `server.test.js`, `DeviceRequestTest.kt`.
-- The Android client owns the delivery half: `POST_NOTIFICATIONS`, the Android-13+ runtime request in
-  `MainActivity`, channels + rendering in `push/Notifications.kt`, `push/PushRegistrar.kt`.
 - **Push health is VISIBLE, not just logged** (XERK-152): a hub without `FCM_SERVICE_ACCOUNT_JSON` delivers
   ZERO mobile notifications silently. `buildAgentsCache` reports hub-wide **`pushEnabled` =
   `push.fcmEnabled()`** on `/api/agents`; the dashboard (`index.html` `#pushWarn`) and Android
-  (`FleetScreen` `PushOffBanner`, `FleetState.pushEnabled`) show a "mobile push is off" banner when it's
-  false (strict `=== false`, so an older hub never false-alarms). The key is deployment config, not in
-  this repo. Tests: `push.test.js`, the `pushEnabled` case in `server.test.js`.
+  (`FleetScreen` `PushOffBanner`, `FleetState.pushEnabled`) banner "mobile push is off" when it's false
+  (strict `=== false`, so an older hub never false-alarms). The key is deployment config, not in this
+  repo. Tests: `push.test.js`, the `pushEnabled` case in `server.test.js`.
 
 ### Auth and the glasses surface
 

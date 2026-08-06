@@ -106,11 +106,40 @@ describe("phone render", () => {
     expect(html).toContain("ACME-9");
     // Sections.
     expect(html).toContain("Active");
+    expect(html).not.toContain("Ready for review"); // nothing qualifies here
     expect(html).toContain("Queued");
     expect(html).toContain("Ended");
     expect(html).toContain("waiting for a free session slot"); // queued reason
     expect(html).toMatch(/data-cancel="sq"/);
     expect(html).toContain("killed one");
+  });
+
+  it("Ready for review takes the work waiting on you, above Active (XERK-224)", () => {
+    const quiet = { paneBusy: false, transcriptAgeSec: 900 };
+    const st = state({
+      agents: [agent({ sessions: [
+        session({ id: "sw", summary: "working one", session: signals({ paneBusy: true }) }),
+        // Finished its turn with plain output and no PR — the research task.
+        session({ id: "sr", summary: "research one", session: signals({ ...quiet, lastRole: "assistant" }) }),
+        // A PR still up for review, whatever its transcript last said.
+        session({ id: "sp", summary: "pr one", session: signals(quiet),
+          prs: [{ url: "https://github.com/o/r/pull/1", number: 1, state: "Open" }] }),
+        // Merged: reviewed by definition, so it parks in Idle.
+        session({ id: "sm", summary: "merged one", session: signals({ ...quiet, lastRole: "assistant" }),
+          prs: [{ url: "https://github.com/o/r/pull/2", number: 2, state: "Merged" }] }),
+        // Never wrote anything: quiet, and asking for nothing.
+        session({ id: "sq2", summary: "quiet one", session: signals(quiet) }),
+      ] })],
+    });
+    const html = sessionsBodyHtml(st);
+    expect(html.indexOf("Ready for review")).toBeLessThan(html.indexOf("Active"));
+    const review = html.slice(html.indexOf("Ready for review"), html.indexOf("Active"));
+    expect(review).toContain("research one");
+    expect(review).toContain("pr one");
+    expect(review).not.toContain("merged one");
+    const idle = html.slice(html.indexOf("Idle"));
+    expect(idle).toContain("merged one");
+    expect(idle).toContain("quiet one");
   });
 
   it("a session card carries its enter hooks and status", () => {

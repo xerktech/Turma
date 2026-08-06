@@ -10,7 +10,7 @@
 // view; Board is a placeholder tab (Phase 2).
 import type { AppState } from "../app.ts";
 import type { AgentInfo, PrInfo, SessionInfo } from "../types.ts";
-import { filterAgents, liveState, sessionName, siteKeyOf, type LiveState } from "../sessions.ts";
+import { filterAgents, liveState, readyForReview, sessionName, siteKeyOf, type LiveState } from "../sessions.ts";
 import { LIVE_TURN_ID } from "../render.ts";
 import { Board } from "../vendor/engines.ts";
 
@@ -198,10 +198,15 @@ export function sessionsBodyHtml(state: AppState): string {
     }
     for (const s of a.closedSessions ?? []) ended.push({ hostKey: a.key, hostLabel, s: s as unknown as SessionInfo, siteKey });
   }
-  const active = running.filter((r) => ["working", "waiting"].includes(liveState(r.s)));
-  const idle = running.filter((r) => !["working", "waiting"].includes(liveState(r.s)));
+  // Three live groups in reading order (XERK-224): Ready for review (stopped,
+  // and waiting on YOU), Active (still working — leave it alone), Idle (quiet,
+  // with nothing asking to be looked at). Mirrors the web sidebar's split.
+  const review = running.filter((r) => readyForReview(r.s));
+  const rest = running.filter((r) => !readyForReview(r.s));
+  const active = rest.filter((r) => ["working", "waiting"].includes(liveState(r.s)));
+  const idle = rest.filter((r) => !["working", "waiting"].includes(liveState(r.s)));
   const byCreated = (a: Row, b: Row) => (b.s.createdAt ?? "").localeCompare(a.s.createdAt ?? "");
-  [active, idle, queued, ended].forEach((l) => l.sort(byCreated));
+  [review, active, idle, queued, ended].forEach((l) => l.sort(byCreated));
 
   const tintOf = (r: Row): string => orgTintStyle(colorMap, r.siteKey);
   const section = (label: string, list: Row[], render: (r: Row) => string, cls = ""): string =>
@@ -212,6 +217,7 @@ export function sessionsBodyHtml(state: AppState): string {
       : "";
 
   const body =
+    section("Ready for review", review, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r))) +
     section("Active", active, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r))) +
     section("Idle", idle, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r))) +
     section("Queued", queued, (r) => queuedCardHtml(r.hostKey, r.hostLabel, r.s, tintOf(r))) +

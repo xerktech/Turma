@@ -1,6 +1,7 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.PrInfo
 import com.xerktech.turma.model.SessionInfo
 import kotlin.math.max
 
@@ -27,6 +28,47 @@ fun liveState(session: SessionInfo, agentLastSeen: Long, now: Long): LiveState =
     (session.session?.question ?: "").isNotBlank() -> LiveState.WAITING
     sessionWorking(session, agentLastSeen, now) -> LiveState.WORKING
     else -> LiveState.IDLE
+}
+
+/**
+ * Has this PR left the operator's plate? MERGED/CLOSED are the two end states;
+ * everything else — OPEN, DRAFT, and an unfetched/unknown state — counts as
+ * still live. An unreadable state must never be what drops work off the review
+ * list. Mirrors the web (sessions.html / server.js `prLanded`).
+ */
+fun prLanded(p: PrInfo): Boolean = p.state.uppercase().let { it == "MERGED" || it == "CLOSED" }
+
+/**
+ * "Ready for review" (XERK-224): a running session that has stopped and is now
+ * waiting on the OPERATOR rather than on itself — the Sessions list's own
+ * section, above Active, because a working session is one to leave alone and
+ * this is the work to look at. A pure port of the web's `readyForReview`
+ * (turma/public/sessions.html), which the hub's ready-for-review alert mirrors
+ * again (turma/server.js) — all three have to agree on what the group means.
+ *
+ * Derived from the signals alone; there is no "I've reviewed this" action, so a
+ * qualifying session stays listed until it runs again or its PR lands. Three
+ * qualifiers, deliberately generous — the case a PR-only rule misses is a
+ * research task that finished with an answer and never opened one:
+ *
+ *  - waiting on a human (a pending question), which qualifies whatever the busy
+ *    read says, and leads the section;
+ *  - a PR that hasn't landed — there is a diff to read;
+ *  - a finished turn: the newest transcript entry is plain assistant output with
+ *    no tool call pending, the only trace a no-PR task leaves behind.
+ *
+ * A session that opened a PR is judged on the PR ALONE, not on its transcript:
+ * the one way out, short of working again, is that PR LANDING. Every PR merged
+ * or closed IS the review, and the session falls back to Idle — where work that
+ * is merged but not yet verified against a build is parked.
+ */
+fun readyForReview(session: SessionInfo, state: LiveState): Boolean {
+    if (state == LiveState.WAITING) return true      // blocked on you either way
+    if (state != LiveState.IDLE) return false        // working, or not live at all
+    val sig = session.session ?: return false
+    val prs = session.prs
+    if (prs.isNotEmpty()) return prs.any { !prLanded(it) }
+    return sig.lastRole == "assistant" && !sig.lastHasToolUse
 }
 
 /** The few-word display title for a session card (summary → label → worktree). */
