@@ -1463,11 +1463,21 @@ function sessionWorking(session, lastSeen, now) {
 //     then fire regardless — the wait is meant to delay the alert, not to lose
 //     it to a host whose `gh` can't answer.
 //
+// One more state outranks all of those: an open PR GitHub says is CONFLICTING
+// merges nowhere however green its CI is, so no alert may claim it is ready
+// (XERK-223). It holds — including past the age-out backstop, which exists for
+// an UNKNOWABLE state, not a known-bad one — and unlike `failing` the hold is
+// NOT sticky: the authoring session is nudged to resolve the conflict
+// (_poll_pr_conflicts), and once it has, this PR alerts like any other.
+//
 // Returns the body prefix to send, or null to keep holding. Mutates `w`.
 function prAlertDecision(w, status, now) {
   const known = !!status && "checks" in status;
   const checks = known ? status.checks : undefined;
+  const open = status?.state === "OPEN" || status?.state === "DRAFT";
+  const conflicted = open && status?.mergeable === "CONFLICTING";
   if (checks === "failing") w.red = true;
+  if (conflicted) return null;
   if (checks === "passing") return "All checks passed";
   if (known && checks == null) {
     w.noCiAt = w.noCiAt || now;
@@ -1681,17 +1691,36 @@ function heartbeatAlerts(key, prev, next) {
     // Only PRs still in play are worth naming — one merged while the alert was
     // held has answered itself.
     const notes = (sa.prNotes || []).filter((n) => !prLanded(prStatus.get(n.url)));
-    const holdingCi = Object.keys(wait).length > 0;
-    if (ready && !sa.reviewAlerted && !s.question && !holdingCi && (sa.reviewAt || notes.length)) {
+    // What holds the alert is read off the SESSION's PRs, not off the CI wait
+    // list alone: a URL only ever enters that list through the per-beat
+    // `newPrUrls` scrape, so a PR whose scrape landed before this hub booted —
+    // or one already announced once, whose session has since worked and
+    // finished again — leaves the list empty while the PR is still open. Gating
+    // on the list alone therefore fired the alert for work that merges nowhere,
+    // captioned "nothing to merge".
+    const livePrs = (session.prs || []).filter((p) => p && !prLanded(p));
+    const holdingPr = Object.keys(wait).length > 0
+      // A CONFLICTING PR merges nowhere however green its CI is (XERK-223), and
+      // prAlertDecision holds it past the age-out for the same reason. Every
+      // verdict now feeds this one alert, so the hold has to reach it too.
+      || livePrs.some((p) => p.mergeable === "CONFLICTING");
+    if (ready && !sa.reviewAlerted && !s.question && !holdingPr && (sa.reviewAt || notes.length)) {
       const repo = session.git?.repoName ? ` · ${session.git.repoName}@${session.git.branch}` : "";
+      // "Nothing to merge" is a claim about the session, so it may only be made
+      // when the session really opened nothing. A live PR with no banked verdict
+      // (its alert was spent on an earlier turn) is still named, minus the CI line.
       const body = notes.length
         ? notes.map((n) => `${n.note} · ${n.url}`).join("\n")
-        : `Finished — nothing to merge${repo}`;
+        : livePrs.length
+          ? livePrs.map((p) => p.url).join("\n")
+          : `Finished — nothing to merge${repo}`;
+      const click = notes.length ? notes[notes.length - 1].url
+        : livePrs.length ? livePrs[livePrs.length - 1].url : null;
       notify(`${label} is ready for review`, body, {
         tags: "mag",
         route,
         notifKey: reviewKey,
-        ...(notes.length ? { click: notes[notes.length - 1].url } : {}),
+        ...(click ? { click } : {}),
       });
       sa.reviewAlerted = true;
       delete sa.reviewAt;

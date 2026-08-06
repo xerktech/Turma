@@ -65,8 +65,7 @@ One agent container per host, multiplexing sessions across every repo it scans.
 
 - A spawn that can't run RIGHT NOW is **queued, not refused** — an ordinary registry record with
   `status:"queued"` and no worktree/tmux/ttyd yet. `spawn()` splits into the record-build and
-  `_provision_session()` (worktree + tmux + ttyd + naming), which a queued session runs through
-  unchanged when allowed.
+  `_provision_session()` (worktree + tmux + ttyd + naming), which a queued session later runs unchanged.
 - Three orthogonal `queuedReason`s, each re-checked by the drainer: **capacity** (host at
   `MAX_SESSIONS`), **awaiting-clone** (its repo is being cloned on demand), **root-busy** (another root
   session holds the one root slot).
@@ -153,11 +152,11 @@ One agent container per host, multiplexing sessions across every repo it scans.
   rides git; uncommitted work stays on the source (KILLED, so resumable).
 - The hub can't touch a worktree and agents are outbound-only, so a migration is composed hub-side from
   agent commands + a hub-brokered relay of the **RAW transcript bytes** (what `claude --resume` needs and
-  the archive lacks): `exportSession` packs the transcript (`+ subagents/`, truncated to its last
-  complete line) and POSTs the gzip-tar to `POST /api/agents/<host>/migrations/<id>/blob`; that queues
-  `importSession` on the target (recording `importCmdId`), which unpacks it under the origin cwd's slug
-  and resumes via `_resume_at_cwd`; the target reporting up (its `spawnCmdId` == `importCmdId`) makes
-  `advanceMigrations` KILL the source and finish. The Sessions page follows via `migrations`.
+  the archive lacks): `exportSession` packs the transcript (`+ subagents/`, truncated to its last complete
+  line) and POSTs the gzip-tar to `POST /api/agents/<host>/migrations/<id>/blob`, queueing `importSession`
+  on the target (recording `importCmdId`), which unpacks it under the origin cwd's slug and resumes via
+  `_resume_at_cwd`; the target reporting up (`spawnCmdId` == `importCmdId`) makes `advanceMigrations` KILL
+  the source and finish. The Sessions page follows via `migrations`.
 - `_resume_at_cwd` is shared by `resume_transcript` and `import_session`. Hosts may mount `REPOS_ROOT` at
   DIFFERENT paths, so `import_session` first `_localize_migrated_cwd`s the source's absolute worktree
   path onto THIS host's `REPOS_ROOT` (the `.turma/worktrees/<repo>/<dir>` tail is mount-independent).
@@ -203,15 +202,14 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     compaction** (XERK-47): an auto-compaction (context ~95%) can drop a message queued mid-turn.
     `send_input` records every sent message on the record's `pendingInputs` outbox, and
     `_poll_pending_inputs` (every beat, no-op unless a session has an outbox) makes it at-least-once:
-    - a compaction is detected from the transcript's own `compact_boundary` **system entry**
-      (`compactMetadata.trigger`) counted by `_pending_scan`, not by scraping the pane;
-    - a message is **reaped on delivery** (`_pending_scan`'s `delivered`) or **left in flight** while
-      still in the folded live queue (`queued`);
+    - a compaction is counted by `_pending_scan` from the transcript's own `compact_boundary` **system
+      entry** (`compactMetadata.trigger`), never by scraping the pane; a message is **reaped on delivery**
+      (`delivered`) or **left in flight** while still in the folded live queue (`queued`);
     - it is **re-sent** only when a NEW compaction happened since it was sent (`compactBase` rose) AND
       it's neither delivered nor queued AND the pane has settled to idle (`_pane_busy` False, not None)
-      — that gate makes the resend **duplicate-safe**;
-    - bounded: `PENDING_INPUT_MAX_ATTEMPTS` resends, one per beat, aged out at `PENDING_INPUT_TTL_SEC`;
-    - `delivered` matches by text with no timestamp filter, biased AGAINST a resend.
+      — that gate makes the resend **duplicate-safe**. Bounded: `PENDING_INPUT_MAX_ATTEMPTS` resends, one
+      per beat, aged out at `PENDING_INPUT_TTL_SEC`; `delivered` matches by text with no timestamp
+      filter, biased AGAINST a resend.
     - The outbox is internal (not heartbeated), cleared on restart-clear-context. The raw ttyd terminal
       bypasses `send_input`, so a message typed straight into it isn't covered.
     - Tests: `TestPendingScan`, `TestPollPendingInputs`, `TestSendInput`.
@@ -300,25 +298,22 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   `null` fallback). `_pane_busy` captures the tmux pane and looks for Claude Code's "esc to
   interrupt" hint, accurate through a long silent tool call unlike transcript-mtime.
   `true`/`false`/`null`; markers overridable via `TURMA_PANE_BUSY_MARKERS`.
-  - **Busy is read from three shapes, not the full hint alone** (XERK-130): a narrow pane ellipsizes the
-    hint. `_busy_from_capture` also accepts the mode line's truncated remnant (`PANE_BUSY_TRUNC_RE`,
-    glyph-anchored) and the column-0 spinner line (`PANE_SPINNER_RE`, requiring the gerund's ellipsis so
-    an idle pane's completed-turn line can't fake busy). Mirrored in `tunnel-agent.js`'s `paneShowsBusy`.
-    Tests: `TestPaneBusy`, `tunnel-agent.test.js`.
+  - **Busy is read from three shapes, not the full hint alone** (XERK-130): a narrow pane ellipsizes it,
+    so `_busy_from_capture` also accepts the mode line's truncated remnant (`PANE_BUSY_TRUNC_RE`) and the
+    column-0 spinner line (`PANE_SPINNER_RE`, requiring the gerund's ellipsis so an idle pane's
+    completed-turn line can't fake busy). Both glyph-anchored; mirrored in `tunnel-agent.js`'s
+    `paneShowsBusy`. Tests: `TestPaneBusy`, `tunnel-agent.test.js`.
   - **Busy→idle flicker is suppressed at the source** (`_stable_pane_busy`, XERK-42): the spinner
     repaint's sub-frame gap reads idle mid-turn (20s of false idle + a bogus push). Busy is trusted
-    instantly; idle re-confirms once after `TURMA_PANE_IDLE_CONFIRM_SEC` (0.2s, 0 disables), only on
-    the busy→idle EDGE; the stable read rides `sess_state`. Tests: `TestStablePaneBusy`.
-- `modeActual` — the permission mode the TUI is REALLY in, off the footer's mode marker ("⏸ manual mode
-  on" / "⏵⏵ accept edits on" / "⏸ plan mode on" / "⏵⏵ auto mode on" / "⏵⏵ bypass permissions on";
-  glyph-anchored so quoted text can't match — `parse_pane_mode`, read beside the stable busy in
+    instantly; idle re-confirms once after `TURMA_PANE_IDLE_CONFIRM_SEC` (0.2s, 0 disables), only on the
+    busy→idle EDGE. Tests: `TestStablePaneBusy`.
+- `modeActual` — the permission mode the TUI is REALLY in, off the footer's mode marker
+  (glyph-anchored so quoted text can't match — `parse_pane_mode`, read beside the stable busy in
   `_pane_status`). `_session_payload` **reconciles the stored `permissionMode` to it** each beat (the
   operator can cycle modes by hand), and it feeds `setMode`'s closed loop. Tests: `TestParsePaneMode`,
   `TestSessionReportPaneBusy`, `TestModelActualPayload`.
-- **Pending questions** — a pending `AskUserQuestion` is surfaced by the `agent/hooks/ask.py` PreToolUse
-  bridge, which drops a `<sessionId>.req.json` under `~/.turma/questions/` while the call blocks;
-  `session_report` reads it and the answer rides back as `<sessionId>.ans.json` — no pane scraping. A
-  transcript scan is the already-answered fallback.
+- **Pending questions** — surfaced by the `agent/hooks/ask.py` PreToolUse bridge's req/ans files, read
+  by `session_report`, never by pane scraping. A transcript scan is the already-answered fallback.
 - **`panePrompt`** — the TUI's OTHER blocking dialog (tool-permission request / plan approval): no hook
   intercepts it, it writes nothing to the transcript, and while it is up the pane shows neither the
   interrupt hint nor the mode footer, so `paneBusy` alone reads it as idle. `parse_pane_prompt` reads it
@@ -363,7 +358,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   that says this session OPENED it. Call and result are separate entries, often in different beats —
   pending tool_use ids carry across beats (capped); the scan parses whole JSONL lines.
   - Cost: a PR opened another way (a subagent's transcript, an MCP tool, the web UI) gets no chip.
-    Widen by teaching `_scan_pr_line` another creation event — never by scanning loose text again.
+    Widen only by teaching `_scan_pr_line` another creation event, never by scanning loose text.
 - **An MR then answers everywhere a PR does (XERK-162)**: `pr_status`/`_pr_comment_events` dispatch an
   MR URL to the configured GitLab's API in the same shapes (`mr_status`/`_mr_comment_events`), each URL
   polled only through the source that can answer it (`_pr_source_ok`; unreachable → bare link chip).
@@ -376,18 +371,21 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - **A reply asking for corrections on a session's PR is typed back into the session that opened it.**
   `_poll_pr_comments` runs on the PR cadence, for **running sessions only**, over their OWN PRs
   (`session_pr_urls`), through **`send_input`** — inheriting the compaction-survival outbox (XERK-47) and
-  the queue if a turn is in flight. Only the OPENING session receives it, only while running.
-- `_pr_comment_events(url, self_login)` gathers **three channels** — conversation comments + review
-  bodies (`gh pr view --json comments,reviews`) + inline review-thread comments
-  (`gh api .../pulls/<n>/comments`); an MR's one notes call covers all three (`_mr_comment_events`, system
-  notes dropped). A bare approve is dropped; each event normalizes to `{key, author, body, kind, loc,
-  is_self}`, keyed on a stable id.
+  the queue if a turn is in flight.
+- `_pr_comment_events(url, self_login)` gathers **three channels** — conversation comments, review bodies
+  and inline review-thread comments (an MR's one notes call covers all three, system notes dropped); a
+  bare approve is dropped.
 - **Baseline-on-first-sight, then deliver only new + not-self.** A PR's whole comment set is recorded
   silently the first beat it's seen (`prCommentBase`, capped `PR_COMMENTS_SEEN_MAX`); after that only NEW
-  keys not the agent's own (`viewerDidAuthor`, else a login compare) are typed in.
-- Bounded: `PR_COMMENTS_MAX` PRs per beat, gated per-URL like the status sweep; a fetch failure (→ None)
-  leaves the baseline UNTOUCHED. Disable with `TURMA_PR_COMMENTS=0`.
-- Tests: `TestPrCommentEvents`, `TestPrCommentMessage`, `TestPollPrComments`.
+  keys not the agent's own (`viewerDidAuthor`, else a login compare) are typed in. Bounded at
+  `PR_COMMENTS_MAX` PRs per beat; a fetch failure (→ None) leaves the baseline UNTOUCHED. Disable with
+  `TURMA_PR_COMMENTS=0`.
+- **A conflicting PR is fixed by the session that opened it, unasked** (XERK-223): `_poll_pr_conflicts`
+  types `_pr_conflict_message` (MERGE `origin/<base>`, never a rebase/force-push) off the `mergeable`
+  `refresh_pr_status` just cached. `prConflicts` = `{url:{at,attempts}}` bounds the nudging per PR;
+  MERGEABLE/closed clears and re-arms it, **UNKNOWN does neither** — that is what a just-pushed fix looks
+  like, so clearing on it would grant unlimited retries. `TURMA_PR_CONFLICTS=0`.
+- Tests: `TestPrComment*`, `TestPollPrComments`, `TestPollPrConflicts`, `TestPrConflictMessage`.
 
 ### Expected-restart "updating" status (XERK-29)
 
@@ -680,7 +678,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     `TURMA_TOKEN`/`JIRA_TOKEN`).
 - The tunnel is **supervised** here, re-exec'd as `turma-agent --tunnel-supervisor` (a respawn loop),
   because a native install is the only place its runtime can be MISSING — node is an apt prereq, not a
-  baked layer. (The container has its own simpler respawn loop in `entrypoint.sh`, XERK-34.)
+  baked layer. (The container has its own simpler respawn loop in `entrypoint.sh`, XERK-34; tests
+  `test_entrypoint.sh`.)
   - The node check lives INSIDE the loop, so installing node heals the terminals (`terminalOnline`)
     within one `TUNNEL_RETRY_SEC`; fire-and-forget makes a missing node silent AND permanent.
   - The supervisor's pkill key is PREFIX-scoped like `tunnel-agent.js`'s; the launcher reaps the
@@ -729,8 +728,6 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     and card Uptime working natively. The log tail stays container-only.
   - **native**: the bundled tmux.conf only takes effect at `/etc/tmux.conf`/`~/.tmux.conf`; a host with
     its own conf loses truecolor and the OSC 52 copy chain (hub-agent launches bare `tmux`).
-  - The tunnel is supervised on BOTH sides (natively by `--tunnel-supervisor`, in the container by the
-    `entrypoint.sh` respawn loop). Tests: `test_entrypoint.sh`.
 - Nothing under `native/` edits the shared runtime files; the one enabling change is `resume_on_boot`'s
   adopt path.
 
@@ -813,11 +810,11 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Two more turns-about-the-session become status markers: a `system`/`compact_boundary` entry →
   `{t:"compact_boundary", trigger, preTokens, postTokens}`, and a `pr-link` entry →
   `{t:"pr_link", url, number, repo}`. pr-link entries carry no uuid, so the feeds synthesize a stable id
-  (`_entry_id`/`entryId`) — the client merge drops id-less entries.
-- **A PR marks its FIRST sighting only.** Claude Code re-stamps a session's pr-links atop every user
-  turn, so one PR yields ~6 entries differing only in `timestamp`. The synthesized id keys on the **URL
-  alone** and `buildItems` dedups by URL over the whole conversation — which covers the archive/ended
-  view (no merge step). Folding only *consecutive* repeats is not enough.
+  (`_entry_id`/`entryId`) — the client merge drops id-less entries. **A PR marks its FIRST sighting
+  only**: Claude Code re-stamps a session's pr-links atop every user turn, so one PR yields ~6 entries
+  differing only in `timestamp`. That id keys on the **URL alone** and `buildItems` dedups by URL over
+  the whole conversation, which covers the archive/ended view too (no merge step); folding only
+  *consecutive* repeats is not enough.
 - Tests: `TestEntryBlocks` in `test_hub_agent.py`, the tool-detail/marker cases in
   `tunnel-agent.test.js` and `chat.test.js`.
 - **Still-queued prompts ride beside the entries, not inside them**: a message typed mid-turn becomes a
@@ -829,8 +826,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - Blocks ride the live tail (tight per-block caps), on-demand `history` and the archive push
   (`_entry_blocks(entry, BLOCK_CAPS_FULL)`, looser caps on the latter two) — the one place inclusion
   widens: a tool_result-only turn, dropped by `_entry_text`, is kept when it has blocks. Only
-  `transcript_tail` stays text-only. Archive rows carry `_entry_id` (not the raw uuid), so a uuid-less
-  pr-link marker keys identically to the live feeds; already-archived bytes are never re-parsed.
+  `transcript_tail` stays text-only. Already-archived bytes are never re-parsed.
 
 ### Archive sync
 
@@ -1043,8 +1039,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 - Each card shows the **repo the agent triaged the ticket to** (`repoChipHtml`, from `repoGuess`), in
   three distinct states: a repo **cloned** on the reporting host is a plain actionable chip; one only in
-  the org's `gh` listing is **dashed**; a ticket the model declined shows a muted italic **"no repo"**.
-  A ticket with no `repoGuess` yet gets **no chip** ("not looked at yet" ≠ "no repo fits").
+  the org's `gh` listing is **dashed**; a ticket the model declined shows a muted italic **"no repo"**;
+  one not yet triaged (no `repoGuess`) gets **no chip**.
 - The model's rationale rides as the chip's tooltip and the detail panel's Repo row (`repoFieldHtml`,
   reading `t.repoGuess` directly — the guess exists only on the heartbeat ticket, not the on-demand Jira
   fetch). That row is also where the guess is **corrected by hand**.
@@ -1144,8 +1140,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 - A ticket's sessions show as chips on its card, from `ticketSessionIndex` — a reverse index of the fleet
   payload's `session.ticket`, so **no hub-side ticket store exists to keep in sync**.
-- It reads the **same three channels the Ended list merges** (`a.sessions`, `a.closedSessions`, each
-  repo's `resumable`); the resumable channel gets its ticket from the agent's ledger.
+- It reads the **same three channels the Ended list merges**; the resumable one gets its ticket from
+  the agent's ledger.
   - Deduped on `<host>::<transcriptId>` with the **registry-backed record winning** (only it knows the
     session's id, `createdAt`, and that it was renamed); resumable is swept in its own pass after every
     record is seen. Not deduped across hosts (the shared `~/.claude` syncs transcripts, so an id alone
@@ -1173,7 +1169,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   (`ingestJiraIssues`, cached by `JIRA_ISSUE_FRESH_MS`/`_MAX_AGE_MS`/`_MAX`, stripped from `/api/agents`).
   An offline-only org serves its last copy flagged `stale`; a cached `error` is kept so a doomed fetch
   isn't re-queued. The fetched copy wins field-by-field; its text is already plain, so the panel escapes
-  first and linkifies after.
+  before linkifying.
 
 ##### The row pickers — one pattern, four rows
 
@@ -1244,16 +1240,16 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
   status, valued by transition id — from `expand=transitions`), or Azure's **states** for the work-item
   type (id == the state name, minus the current one). Empty → the row stays read-only.
 - **The write is re-validated against a FRESH read.** `POST /api/jira/<siteKey>/<issueKey>/status
-  {value}` routes to an **online** host, single-flight per ticket. The agent (`set_board_status`)
-  re-reads the available options and applies only a `value` still on offer — the board's workflow, not
+  {value}` is single-flight per ticket; the agent (`set_board_status`) re-reads the available options
+  and applies only a `value` still on offer — the board's workflow, not
   the browser, decides what a ticket can move to — then Jira `POST .../transitions` or Azure
   `PATCH .../workitems/<id>` [System.State]. `value` is passed through the hub (checked non-empty), not
   allowlisted there, since only the agent can see the live option set.
 - **The outcome rides back keyed by the queued cmdId.** The agent stages `ticketStatusResults`
   (`{cmdId, ok, error, status, statusCategory}`) plus the re-fetched issue into `jiraIssueResults`; the
-  hub caches it per cmdId (`statusResults`, stripped from `/api/agents`). The panel POSTs, paints the
-  target optimistically, polls `GET .../status?cmdId` until `{ok}`/`{error}`, then re-fetches the detail;
-  on failure it reverts the pill. The card's COLUMN catches up on the next poll.
+  hub caches it per cmdId (`statusResults`, stripped from `/api/agents`). The panel polls
+  `GET .../status?cmdId` until `{ok}`/`{error}`, then re-fetches the detail; the card's COLUMN catches
+  up on the next poll.
 - Tests: `TestSetBoardStatus`, `TestAzureStatusOptions`, `TestShapeIssueDetail`/`TestFetchJiraIssue`
   (`test_hub_agent.py`); `server.test.js`;
   `statusFieldHtml`/`statusPickerHtml` in `board.test.js`; `statusChangeable` in android `BoardTest.kt`.
@@ -1394,19 +1390,19 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
 
 - The live sessions split three ways, in reading order: **Ready for review** (stopped, waiting on YOU),
   **Active** (working — leave it alone), **Idle** (quiet, asking for nothing).
-- `readyForReview(s, live)` is **derived from the signals alone** — there is no "I've reviewed this"
-  action. It qualifies on a pending question/pane prompt (blocked on a human, so the busy read doesn't
-  matter; it leads the section), a PR that hasn't landed, or a **finished turn** (`lastRole=="assistant"`,
-  no `lastHasToolUse`) — the last being the only trace a research task that opened no PR leaves, and the
-  case a PR-only rule was asked to stop missing.
+- `readyForReview(s, live)` is **derived from the signals alone** — no "I've reviewed this" action, so
+  nothing is acknowledged. It qualifies on a pending question/pane prompt (blocked on a human, so the
+  busy read doesn't matter; it leads the section), a PR that hasn't landed, or a **finished turn**
+  (`lastRole=="assistant"`, no `lastHasToolUse`) — the last being the only trace a research task that
+  opened no PR leaves, the case a PR-only rule was asked to stop missing.
 - **A PR-bearing session is judged on the PR alone**, not its transcript: the one way out, short of
   working again, is every PR reaching MERGED/CLOSED — merging IS the review, dropping it to Idle, where
   work merged but not yet verified against a build is parked. `prLanded` counts an unknown or unfetched
   state as still live; an unreadable state must never drop work off the list.
 - Four mirrors must agree: `sessions.html`, `server.js` (the alert for entering it), `core/Sessions.kt`
   (`rankRunning` → `LiveGroups`), `glasses/src/sessions.ts`. The card says WHY it qualified ("PR awaiting
-  review" / "finished · awaiting review") on the accent `.dot.review`. Tests: `sessions.test.js`,
-  `readyForReview` in `server.test.js`, android `SessionsTest`/`SessionsFlattenTest`.
+  review" / "finished · awaiting review") on the accent `.dot.review`. Tests: `sessions.test.js`, `readyForReview` in
+  `server.test.js`, android `SessionsTest`.
 
 #### Ended sessions
 
@@ -1414,9 +1410,8 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
   channels an over-but-resumable session arrives on: **killed** (`a.closedSessions`), **stopped** (a
   non-running record still in `a.sessions`), and **resumable** (a transcript from each repo's `resumable`
   scan, no registry record behind it).
-- The third channel makes the list **durable**: the first two read out of `~/.turma` and `closed.json` is
-  capped at `CLOSED_PER_REPO`, while `resumable` is re-derived every slow beat from the transcripts under
-  `~/.claude/projects` plus each's recorded cwd.
+- The third channel makes the list **durable**: the first two read the capped `~/.turma` records, while
+  `resumable` is re-derived every slow beat from the transcripts under `~/.claude/projects`.
 - **Deduped on `<host>::<transcriptId>`**, a registry-backed record always winning. A kill that ages out
   of `closed.json` keeps listing, minus its PR chips. Sorted **most recently ended first** (`endedMs`,
   from `closedAt`/`stoppedAt`/`endedTs` — `resumableSession()` must copy `endedTs` onto the record, where
@@ -1536,24 +1531,31 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
   waiting, and Claude login required/expiring/restored.
 - **A session gets ONE alert per piece of work** (XERK-224): "is ready for review", fired when it enters
   the Sessions page's Ready-for-review group (`readyForReview`, the hub's mirror of the page's rule),
-  replacing the separate "finished its turn" and "created a PR" notices — two buzzes for one stop.
-  Retracted (`review:<host>:<id>`) when the session leaves the group. Tags `mag` → Android's `CH_TURN`
+  replacing the separate "finished its turn" and "created a PR" notices. Retracted
+  (`review:<host>:<id>`) when the session leaves the group. Tags `mag` → Android's `CH_TURN`
   (renamed "Ready for review", id kept so the operator's channel settings survive).
   - Fires only on something NEW — a turn that just finished (`sa.reviewAt`) or a PR that just settled
     (`sa.prNotes`) — so a session already sitting there at boot is not re-announced. A pending question
     **suppresses** it: the question alert is already that session's buzz, and says more.
   - **A PR still waiting on CI HOLDS it** (XERK-153) — never fire on the URL being scraped. A new URL
     enters a per-session wait list (`alerts.sessions[id].prWait`) that `prAlertDecision` re-judges each
-    beat against `session.prs`; a settled verdict banks on `prNotes` and is spent by the one alert, whose
-    body names each PR. All must settle first. `prSeen` keeps its old meaning (already alerted), so an
-    older hub's PRs don't re-fire on upgrade.
-  - `prAlertDecision`'s own doc comment is the verdict table; four rules there must not be undone: the
-    gate is the **CI rollup alone**, not `ready` (a green PR that conflicts still alerts); **`failing`
-    stays quiet permanently** (the alert is for the work being ready, not every trip through red);
-    **absent `checks` is "not fetched yet", never "no CI"**; and an inconclusive wait **ages out and
-    fires anyway** — the wait may delay an alert, never lose it. Body carries the verdict, or
-    "Finished — nothing to merge" when the session opened no PR. Tests:
-    `prAlertDecision`/`readyForReview` in `server.test.js`.
+    beat; a settled verdict banks on `prNotes` and is spent by the one alert, whose body names each PR.
+    `prSeen` keeps its old meaning (already alerted), so an older hub's PRs don't re-fire on upgrade.
+  - **What holds it is read off `session.prs`, never the wait list alone.** A URL reaches that list only
+    through the per-beat `newPrUrls` scrape, so a PR scraped before this hub booted — or one announced
+    once whose session has since worked and finished again — leaves the list empty while still open.
+    Gating on the list alone fired the alert for work that merges nowhere, captioned "nothing to merge";
+    that caption is a claim about the SESSION and may only be made when it opened nothing at all.
+  - `prAlertDecision`'s doc comment is the verdict table; four rules there must not be undone. **A
+    CONFLICTING open PR never alerts** (XERK-223) — it merges nowhere however green its CI is, so the hold
+    outlasts the age-out (known-bad, not unknown) and reaches this alert too; the session still LISTS
+    under Ready for review, and XERK-223's own nudge is what clears it. **`failing` stays quiet
+    permanently** (the alert is for the work being ready, not every trip through red). **Absent `checks`
+    is "not fetched yet", never "no CI"** — a just-opened PR reads like a CI-less one while GitHub
+    registers its workflows, so `checks: null` holds `PR_NO_CI_GRACE_MS` first. An inconclusive wait
+    **ages out at `PR_ALERT_MAX_WAIT_MS` and fires anyway**: the wait may delay an alert, never lose it.
+  - Body carries each PR's verdict ("All checks passed"/"No CI configured"/"CI state unknown" · url).
+    Tests: `prAlertDecision`/`readyForReview` in `server.test.js`.
 - **Claude login alerts** (XERK-98) fire in `heartbeatAlerts` off the agent's `claudeAuth` block: two
   edge-triggered states, deduped under `next.alerts` and cleared on recovery — `needsLogin` → urgent
   `key`-tagged "Claude login required", `expiringSoon` → default-priority "Claude login expiring". The
@@ -1565,28 +1567,27 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
   repo or CI-built release APKs ship with Firebase inert and push does nothing. It holds only public
   identifiers (same as the committed release keystore); the gradle apply stays conditional so a fork that
   removes it still builds.
-- Every alert funnels through one `notify()` (`turma/server.js`), fanning out to every registered device
-  via `turma/push.js` (HTTP v1, service-account JWT minted with `node:crypto`, no npm — enabled by
-  `FCM_SERVICE_ACCOUNT_JSON`), carrying `tags`/`priority`/`click`/`route:{host,sessionId}` as message data
-  so the client picks a channel and deep-links a tap. A no-op when no device is registered or FCM is
-  unconfigured. Devices register via `POST /api/devices` (user-authed, persisted to
-  `/data/devices.json`), unregister via `DELETE /api/devices?token=`; dead tokens are pruned on send.
+- Every alert funnels through one `notify()` (`turma/server.js`), fanning out via `turma/push.js` (FCM
+  HTTP v1, service-account JWT minted with `node:crypto`, no npm — enabled by `FCM_SERVICE_ACCOUNT_JSON`)
+  and carrying `tags`/`priority`/`click`/`route:{host,sessionId}` as message data, so the client picks a
+  channel and deep-links a tap. A no-op with no device registered or FCM off. Devices register via
+  `POST /api/devices` (user-authed, `/data/devices.json`), unregister via `DELETE /api/devices?token=`;
+  dead tokens are pruned on send.
 - **An addressed alert is retracted from the phone** (XERK-154): every session alert posts under a stable
   `notifKey` (`question:<host>:<id>`, `review:<host>:<id>`); `dismiss(notifKey)` sends a title-less
   `{action:"dismiss", notifKey}` FCM message (no-op with no device / FCM off), fired once per addressed
-  edge — a question cleared, a session leaving Ready-for-review. App-side `Notifications.idFor` keys off
-  `notifKey`, so alert kinds coexist instead of colliding on one per-session id. **Capability-gated**:
-  it reaches only devices declaring `features:["dismiss"]` — an older build has no handler and would show
-  the data-only message as a blank notification (those devices keep the stale alert until the app
-  updates). The app sends a **required** `DeviceRequest.features` field: `encodeDefaults=false` drops a
-  DEFAULTED value from the body, so the hub would retract nothing. Tests: `XERK-154` in
-  `server.test.js`, `DeviceRequestTest.kt`.
-- **Push health is VISIBLE, not just logged** (XERK-152): a hub without `FCM_SERVICE_ACCOUNT_JSON` delivers
-  ZERO mobile notifications silently. `buildAgentsCache` reports hub-wide **`pushEnabled` =
-  `push.fcmEnabled()`** on `/api/agents`; the dashboard (`index.html` `#pushWarn`) and Android
-  (`FleetScreen` `PushOffBanner`, `FleetState.pushEnabled`) banner "mobile push is off" when it's false
-  (strict `=== false`, so an older hub never false-alarms). The key is deployment config, not in this
-  repo. Tests: `push.test.js`, the `pushEnabled` case in `server.test.js`.
+  edge: a question cleared, a session leaving Ready-for-review. App-side `Notifications.idFor` keys off
+  `notifKey`, so alert kinds coexist rather than colliding on one per-session id. **Capability-gated**:
+  `dismiss()` reaches only devices declaring `features:["dismiss"]` — an older build would render the
+  data-only message as a blank notification, so it keeps the stale alert instead. `DeviceRequest.features`
+  is **required**, since `encodeDefaults=false` drops a DEFAULTED value and the hub would then retract
+  nothing. Tests: `XERK-154` in `server.test.js`, `DeviceRequestTest.kt`.
+- **Push health is VISIBLE, not just logged** (XERK-152): a hub without `FCM_SERVICE_ACCOUNT_JSON` silently
+  delivers ZERO mobile notifications, so `buildAgentsCache` reports hub-wide **`pushEnabled` =
+  `push.fcmEnabled()`** on `/api/agents` and the dashboard (`index.html` `#pushWarn`) + Android
+  (`FleetScreen` `PushOffBanner`, `FleetState.pushEnabled`) banner "mobile push is off" on it — strict
+  `=== false`, so an older hub never false-alarms. The key is deployment config, not in this repo.
+  Tests: `push.test.js`, the `pushEnabled` case in `server.test.js`.
 
 ### Auth and the glasses surface
 

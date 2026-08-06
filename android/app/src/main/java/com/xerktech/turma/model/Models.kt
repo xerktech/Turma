@@ -657,6 +657,20 @@ data class TextBlock(val text: String = "", val truncated: Boolean = false) : Bl
 @SerialName("thinking")
 data class ThinkingBlock(val text: String = "", val truncated: Boolean = false) : Block()
 
+/**
+ * One file a SendUserFile call delivered, embedded on its tool_use block by the
+ * agent for inline preview (XERK-221). [kind] is "image" (render [src] — a
+ * data:/http(s) URI — as an <img>), "html" (render [html] in a sandboxed
+ * WebView), or "file" (a name-only chip: oversize/missing/non-renderable).
+ */
+@Serializable
+data class SendFile(
+    val name: String = "",
+    val kind: String = "",
+    val src: String = "",
+    val html: String = "",
+)
+
 @Serializable
 @SerialName("tool_use")
 data class ToolUseBlock(
@@ -664,6 +678,9 @@ data class ToolUseBlock(
     val name: String = "",
     val input: JsonElement? = null,
     val truncated: Boolean = false,
+    // SendUserFile inline previews + its caption (XERK-221).
+    val files: List<SendFile> = emptyList(),
+    val caption: String = "",
 ) : Block()
 
 @Serializable

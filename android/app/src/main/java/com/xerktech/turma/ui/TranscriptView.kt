@@ -58,6 +58,16 @@ import com.xerktech.turma.core.ChatItem
 import com.xerktech.turma.core.ProseBlock
 import com.xerktech.turma.core.Span
 import com.xerktech.turma.core.parseProse
+import com.xerktech.turma.model.SendFile
+import android.graphics.Color as AndroidColor
+import android.util.Base64
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.viewinterop.AndroidView
+import coil.compose.AsyncImage
+import java.nio.ByteBuffer
 import kotlinx.coroutines.delay
 
 /** Shared renderers for one transcript item — used by live chat + the archive. */
@@ -321,7 +331,21 @@ private fun TranscriptTool(t: ChatItem.Tool) {
         Column(Modifier.padding(horizontal = 10.dp, vertical = 7.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("🔧 ${t.name}", fontWeight = FontWeight.SemiBold, fontSize = scaledSp(12f), modifier = Modifier.weight(1f))
-                if (t.input.isNotBlank()) Text(t.input.take(48), fontSize = scaledSp(11f), fontFamily = FontFamily.Monospace, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                // A SendUserFile card leads with its caption/file count, not the raw
+                // path JSON (web parity: renderActionCard's argOne).
+                val summary = if (t.files.isNotEmpty())
+                    (t.caption.substringBefore('\n').ifBlank { "${t.files.size} file" + if (t.files.size == 1) "" else "s" })
+                else t.input
+                if (summary.isNotBlank()) Text(summary.take(48), fontSize = scaledSp(11f), fontFamily = FontFamily.Monospace, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            // SendUserFile inline previews (XERK-221) — shown open, like the web card.
+            if (t.files.isNotEmpty()) {
+                Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for (f in t.files) SendFileView(f)
+                }
+                if (t.caption.isNotBlank()) {
+                    Text(t.caption, Modifier.padding(top = 4.dp), fontSize = scaledSp(12f), lineHeight = scaledSp(16f), color = MaterialTheme.colorScheme.onSurface)
+                }
             }
             if (open && t.result.isNotBlank()) {
                 Text(t.result, Modifier.padding(top = 5.dp), fontSize = scaledSp(11f), lineHeight = scaledSp(15f), fontFamily = FontFamily.Monospace)
@@ -329,3 +353,94 @@ private fun TranscriptTool(t: ChatItem.Tool) {
         }
     }
 }
+
+// One SendUserFile preview (XERK-221): an image/SVG via Coil, an HTML page in a
+// JS-disabled (sandboxed) WebView, else a name chip. Web parity: renderToolFiles.
+@Composable
+private fun SendFileView(f: SendFile) {
+    when (f.kind) {
+        "image" -> {
+            // Coil 2.x doesn't load data: URIs itself, so decode them to bytes (a
+            // ByteBuffer the SVG/bitmap decoders both accept); pass remote URLs
+            // straight through. A bad/empty src degrades to a chip.
+            val model = remember(f.src) {
+                when {
+                    f.src.startsWith("data:", ignoreCase = true) -> dataUriToBytes(f.src)?.let { ByteBuffer.wrap(it) }
+                    f.src.startsWith("http", ignoreCase = true) -> f.src
+                    else -> null
+                }
+            }
+            if (model == null) { FileChip(f.name); return }
+            Column {
+                Box(
+                    Modifier.fillMaxWidth().heightIn(max = 320.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(Color.White)
+                        .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f), RoundedCornerShape(6.dp)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    AsyncImage(
+                        model = model,
+                        contentDescription = f.name,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp).padding(4.dp),
+                    )
+                }
+                Text(f.name, fontSize = scaledSp(10f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
+            }
+        }
+        "html" -> Column {
+            HtmlPreview(f.html, Modifier.fillMaxWidth().height(360.dp)
+                .clip(RoundedCornerShape(6.dp))
+                .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f), RoundedCornerShape(6.dp)))
+            Text(f.name, fontSize = scaledSp(10f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
+        }
+        else -> FileChip(f.name)
+    }
+}
+
+@Composable
+private fun FileChip(name: String) {
+    Text("📎 $name", fontSize = scaledSp(12f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+// A SendUserFile HTML page in a FULLY sandboxed WebView (web parity: the
+// `sandbox` iframe): JavaScript OFF, no file/DOM storage, navigation blocked, a
+// null base URL so it has no origin. Renders static HTML/CSS/inline-SVG only.
+@Composable
+private fun HtmlPreview(html: String, modifier: Modifier) {
+    AndroidView(
+        factory = { ctx ->
+            WebView(ctx).apply {
+                setBackgroundColor(AndroidColor.WHITE)
+                with(settings) {
+                    javaScriptEnabled = false
+                    domStorageEnabled = false
+                    allowFileAccess = false
+                    allowContentAccess = false
+                    loadWithOverviewMode = true
+                    useWideViewPort = true
+                }
+                webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(
+                        view: WebView?, request: android.webkit.WebResourceRequest?,
+                    ): Boolean = true // block all navigation out of the preview
+                }
+            }
+        },
+        update = { it.loadDataWithBaseURL(null, html, "text/html", "utf-8", null) },
+        modifier = modifier,
+    )
+}
+
+// Decode a data: URI to raw bytes. Handles ;base64 payloads and percent-encoded
+// ones (the `+` guard keeps a literal plus in an SVG from decoding to a space).
+private fun dataUriToBytes(src: String): ByteArray? = try {
+    val comma = src.indexOf(',')
+    if (comma < 0) null else {
+        val meta = src.substring(0, comma)
+        val payload = src.substring(comma + 1)
+        if (meta.contains(";base64", ignoreCase = true)) Base64.decode(payload, Base64.DEFAULT)
+        else java.net.URLDecoder.decode(payload.replace("+", "%2B"), "UTF-8").toByteArray(Charsets.UTF_8)
+    }
+} catch (e: Exception) { null }
