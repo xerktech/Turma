@@ -812,8 +812,16 @@ function cleanHint(l) {
 // can't hide one. Biased toward matching like chat.js's isToolBullet: a false
 // strip only trims the live preview's tail (the committed transcript still
 // renders the prose in full), while a missed clause brings the flicker back.
-const PANE_ACTIVITY_TAIL_RE =
-  /(?:^|\s)[A-Z][a-z]+ \d+ [a-z]+(?: [a-z]+){0,2}(?:, [a-z]+ \d+ [a-z]+(?: [a-z]+){0,2})*(?:…|\.\.\.)?$/;
+// A clause is "<Verb> <count> <words>", where the words may include diff-stat
+// tokens ("Making 1 scratchpad edit +3 -2"); clauses comma-join, and the line
+// may close with the TUI's own "· 26s" / "· 1m 3s" elapsed and an ellipsis.
+// The vocabulary EVOLVES across Claude Code releases — committedDupe's
+// prefix-plus-garnish rule below is the phrasing-independent net behind this.
+const ACTIVITY_WORD = "(?:[a-z]+|[+-]\\d+)";
+const ACTIVITY_CLAUSE = `\\d+ ${ACTIVITY_WORD}(?: ${ACTIVITY_WORD}){0,4}`;
+const PANE_ACTIVITY_TAIL_RE = new RegExp(
+  `(?:^|\\s)[A-Z][a-z]+ ${ACTIVITY_CLAUSE}(?:, [a-z]+ ${ACTIVITY_CLAUSE})*` +
+  `(?: · \\d+[smh](?: \\d+[smh])*)?(?:…|\\.\\.\\.)?$`);
 function stripActivityTail(text) {
   let t = text;
   for (;;) {
@@ -1046,6 +1054,7 @@ function captureLiveTurn(sessionId, cb) {
 // committed tail is already rendering.
 const COMMITTED_SCAN = 8;
 const COMMITTED_MIN_SKEL = 24;
+const COMMITTED_GARNISH_MAX = 120; // max skeleton excess for prefix-plus-garnish
 function textSkeleton(s) {
   return String(s == null ? "" : s).toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
@@ -1061,6 +1070,16 @@ function committedDupe(liveText, entries) {
     const committed = textSkeleton(e.text);
     if (!committed) continue;
     if (live.length >= COMMITTED_MIN_SKEL ? committed.endsWith(live) : committed === live) return true;
+    // Prefix-plus-garnish: the TUI appends short activity/elapsed garnish when
+    // it re-paints a finished block ("<the whole prose>: Making 1 scratchpad
+    // edit +3 -2, running 1 shell command · 26s…"), and that vocabulary evolves
+    // faster than PANE_ACTIVITY_TAIL_RE can chase it. A live text that STARTS
+    // with a substantial committed entry and adds only a short excess is that
+    // entry re-painted, whatever the garnish says. The excess cap is what keeps
+    // a genuinely new block that happens to open with the old text streaming:
+    // once it outgrows the cap it renders normally.
+    if (committed.length >= COMMITTED_MIN_SKEL && live.startsWith(committed) &&
+        live.length - committed.length <= COMMITTED_GARNISH_MAX) return true;
   }
   return false;
 }

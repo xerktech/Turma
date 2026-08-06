@@ -852,6 +852,33 @@ test("parsePaneLiveTurn: a narrow pane wrapping an activity clause mid-word stil
   assert.equal(r.text, "Kicking off the release check now.");
 });
 
+test("stripActivityTail: diff-stat and elapsed garnish (shapes from a live session)", () => {
+  const { stripActivityTail } = require("../tunnel-agent.js");
+  // Claude Code also phrases activity with diff stats and appends its own
+  // elapsed: "Making 1 scratchpad edit +3 -2, running 1 shell command · 26s…".
+  assert.equal(stripActivityTail(
+    "Let me fix the payload and assertions and re-run: Making 1 scratchpad edit +3 -2, running 1 shell command · 26s…"),
+    "Let me fix the payload and assertions and re-run:");
+  assert.equal(stripActivityTail("Making 1 scratchpad edit +3 -2, running 1 shell command..."), "");
+  assert.equal(stripActivityTail("Running 1 shell command · 12m 19s…"), "");
+});
+
+test("committedDupe: prefix-plus-garnish suppresses phrasings the clause grammar misses", () => {
+  const { committedDupe } = require("../tunnel-agent.js");
+  const prose = "All five failures are my assertion strings, not the behavior — the heading is " +
+    "uppercased by CSS text-transform. Let me fix the payload and assertions and re-run:";
+  const entries = [{ id: "1", role: "assistant", text: prose }];
+  // A re-paint of the committed prose plus a NOVEL activity phrasing (nothing
+  // the clause grammar knows) is still that entry plus short garnish.
+  assert.equal(committedDupe(prose + " Reticulating 1 spline backwards · 3s…", entries), true);
+  // But a genuinely new block that opens with the old text and has outgrown
+  // the garnish cap streams normally.
+  const excess = " Now, on to something genuinely new: " +
+    "the next phase needs a full rewrite of the assertions, the payload builder, " +
+    "and the fabricated host record, which I will do in three separate steps.";
+  assert.equal(committedDupe(prose + excess, entries), false);
+});
+
 test("stripActivityTail: clause vocabulary and ordinary prose", () => {
   const { stripActivityTail } = require("../tunnel-agent.js");
   // Stacked clauses strip iteratively; pluralized counts match.
