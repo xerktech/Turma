@@ -2326,14 +2326,17 @@ async function sendTermInput() {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ text }),
     });
-    // 413 is the hub's "past the character cap" (XERK-227) — an actionable
-    // failure, unlike the generic one, so it says so. Same wording as the chat
-    // composer's, which shares this session's draft.
-    if (!r.ok) throw new Error(r.status === 413 ? "Message too long" : String(r.status));
+    // 413 is the hub's "past this host's character cap" (XERK-227) — an
+    // actionable failure, unlike the generic one, so it says so and carries the
+    // cap. Worded by the chat engine, which shares this session's draft.
+    if (!r.ok) {
+      const err = await r.json().catch(() => null);
+      throw new Error(TurmaChat.sendFailure(r.status, err && err.limit));
+    }
     fastPoll();
   } catch (e) {
     if (!inp.value.trim()) { inp.value = text; autoGrowTermInput(); }
-    composeFailed(e && e.message === "Message too long" ? e.message : "Send failed");
+    composeFailed(TurmaChat.isTooLong(e && e.message) ? e.message : "Send failed");
   }
 }
 // Transient failure text on the compose button. Routed through the chat engine

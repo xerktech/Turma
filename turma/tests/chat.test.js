@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, sendFailure, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -1429,11 +1429,21 @@ test("compose bar: a pending question hides Stop (XERK-21)", () => {
   clearDom();
 });
 
-test("compose bar: a message past the hub's cap says so, not 'Send failed' (XERK-227)", () => {
-  // The hub answers 413 for a message past INPUT_MAX_CHARS. That is the one send
-  // failure the operator can fix — the text is still in the box, it just has to
-  // be split — so it must not read like the hub is down.
-  assert.equal(sendFailure(413), TOO_LONG);
+test("compose bar: a message past the host's cap says so, with the number (XERK-227)", () => {
+  // The hub answers 413 for a message past the RECEIVING HOST's cap, which is
+  // 4k on an agent too old to paste and 100k on a current one — so the label
+  // carries the limit the hub sent rather than leaving the operator to guess
+  // how much to cut. It must never read like the hub is down.
+  assert.equal(sendFailure(413, 4000), "Too long — max 4,000");
+  assert.equal(sendFailure(413, 100000), "Too long — max 100,000");
+  assert.equal(sendFailure(413), TOO_LONG, "an older hub sends no limit");
+  assert.equal(sendFailure(413, 0), TOO_LONG);
   assert.equal(sendFailure(500), "500");
   assert.equal(sendFailure(404), "404");
+  // isTooLong is what both compose bars test the thrown message against, so a
+  // numbered label must still be recognised as the actionable failure.
+  assert.ok(isTooLong("Too long — max 4,000"));
+  assert.ok(isTooLong(TOO_LONG));
+  assert.ok(!isTooLong("500"));
+  assert.ok(!isTooLong(undefined));
 });

@@ -1942,17 +1942,66 @@ test("http: input endpoint rejects missing/empty/whitespace-only and over-long t
   assert.equal(whitespace.status, 400);
   assert.deepEqual(whitespace.body, { error: "text required" });
 
-  // Past the cap the refusal is a 413 carrying both numbers, so the composer can
-  // say "too long" instead of the generic "Send failed" (XERK-227).
+  // An agent that doesn't report `inputMaxChars` predates the paste delivery and
+  // would CLIP the message to 4k without telling anyone, so the hub refuses past
+  // that with a 413 carrying the limit (XERK-227). hi2's heartbeat has no
+  // inputMaxChars, so this is the legacy cap.
   const long = await request("POST", "/api/agents/hi2/sessions/sess1/input", {
-    body: { text: "a".repeat(100001) }, headers: userHeaders,
+    body: { text: "a".repeat(4001) }, headers: userHeaders,
   });
   assert.equal(long.status, 413);
-  assert.match(long.body.error, /message too long — 100,001 characters, the limit is 100,000/);
+  assert.equal(long.body.limit, 4000);
+  assert.match(long.body.error, /message too long — 4,001 characters, the limit is 4,000/);
+});
+
+test("http: the input cap follows the receiving agent's own limit (XERK-227)", async () => {
+  // The hub is the only side that can see a hub/agent version mismatch. An agent
+  // that says what it can deliver whole gets that cap; one that says nothing gets
+  // the legacy 4k; a wild claim is still clamped to the hub's own ceiling — the
+  // operator must never believe a message went whole when its end was cut.
+  await request("POST", "/api/heartbeat", {
+    body: { device: "new-agent", inputMaxChars: 100000 }, headers: agentHeaders,
+  });
+  await request("POST", "/api/heartbeat", { body: { device: "old-agent" }, headers: agentHeaders });
+  await request("POST", "/api/heartbeat", {
+    body: { device: "greedy-agent", inputMaxChars: 5000000 }, headers: agentHeaders,
+  });
+
+  const big = "b".repeat(50000);
+  const onNew = await request("POST", "/api/agents/new-agent/sessions/s1/input", {
+    body: { text: big }, headers: userHeaders,
+  });
+  assert.equal(onNew.status, 200, "a paste-capable agent takes the whole message");
+
+  const onOld = await request("POST", "/api/agents/old-agent/sessions/s1/input", {
+    body: { text: big }, headers: userHeaders,
+  });
+  assert.equal(onOld.status, 413, "an agent that would clip it is refused instead");
+  assert.equal(onOld.body.limit, 4000);
+
+  const onGreedy = await request("POST", "/api/agents/greedy-agent/sessions/s1/input", {
+    body: { text: "c".repeat(100001) }, headers: userHeaders,
+  });
+  assert.equal(onGreedy.status, 413, "the hub's own ceiling still applies");
+  assert.equal(onGreedy.body.limit, 100000);
+
+  // The same cap governs a pasted ANSWER, which the composer routes to whenever
+  // a question is pending.
+  const answerOnOld = await request("POST", "/api/agents/old-agent/sessions/s1/answer", {
+    body: { custom: big }, headers: userHeaders,
+  });
+  assert.equal(answerOnOld.status, 413);
+  assert.equal(answerOnOld.body.limit, 4000);
+  const answerOnNew = await request("POST", "/api/agents/new-agent/sessions/s1/answer", {
+    body: { custom: big }, headers: userHeaders,
+  });
+  assert.equal(answerOnNew.status, 200);
 });
 
 test("http: input endpoint carries a pasted message far past the old 4k cap (XERK-227)", async () => {
-  await request("POST", "/api/heartbeat", { body: { device: "hi-paste" }, headers: agentHeaders });
+  await request("POST", "/api/heartbeat", {
+    body: { device: "hi-paste", inputMaxChars: 100000 }, headers: agentHeaders,
+  });
   // A pasted log is the case the old cap broke: the raw terminal always took
   // one, so the chat composer must too. Newlines ride through untouched — the
   // agent pastes the text into the pane rather than typing it key by key.
@@ -2203,18 +2252,15 @@ test("http: answer endpoint rejects an empty answer and over-long custom", async
   assert.equal(empty.status, 400);
   assert.deepEqual(empty.body, { error: "optionIndex, optionIndices or custom required" });
 
-  // A pasted answer meets the same cap a typed message does — the composer routes
-  // here whenever a question is pending (XERK-227).
-  const ok = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
-    body: { custom: "a".repeat(50000) }, headers: userHeaders,
-  });
-  assert.equal(ok.status, 200);
-
+  // A pasted answer meets the same per-host cap a typed message does — the
+  // composer routes here whenever a question is pending (XERK-227). ha3 reports
+  // no inputMaxChars, so the legacy 4k applies.
   const long = await request("POST", "/api/agents/ha3/sessions/sess1/answer", {
-    body: { custom: "a".repeat(100001) }, headers: userHeaders,
+    body: { custom: "a".repeat(4001) }, headers: userHeaders,
   });
   assert.equal(long.status, 413);
-  assert.match(long.body.error, /answer too long — 100,001 characters, the limit is 100,000/);
+  assert.equal(long.body.limit, 4000);
+  assert.match(long.body.error, /answer too long — 4,001 characters, the limit is 4,000/);
 });
 
 test("http: answer endpoint 404s unknown host and requires user auth", async () => {

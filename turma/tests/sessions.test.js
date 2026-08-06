@@ -20,6 +20,9 @@ const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
 // loaded by board.html alongside sessions.html; require the real module so the
 // tint the cards carry is the same one the board paints.
 const TurmaBoard = require("../public/board.js");
+// The terminal compose bar words a failed send through the chat engine, so the
+// two bars can't disagree (XERK-227) — use the real functions, not a stub.
+const TurmaChatCore = require("../public/chat.js");
 
 // --- minimal DOM shim --------------------------------------------------------
 function makeEl(id) {
@@ -117,6 +120,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       // turn being in flight, and `stopped` records the delegation.
       isBusy: () => chat.busy, stop: () => { chat.stopped++; },
       actionFailed: (t) => { chat.failed = t; },
+      sendFailure: TurmaChatCore.sendFailure, isTooLong: TurmaChatCore.isTooLong,
     },
     console, Date, Math, JSON, encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
     addEventListener(type, fn) { (winListeners[type] ||= []).push(fn); }, removeEventListener: noop,
@@ -718,7 +722,7 @@ test("terminal compose: a multi-line paste goes as ONE message, verbatim (XERK-2
 
 test("terminal compose: the hub's 413 says 'too long' and keeps the text (XERK-227)", async () => {
   const { beat, selectSession, sendTermInput, els, chat } = loadPage({
-    postReply: { error: "message too long" }, postStatus: 413,
+    postReply: { error: "message too long", limit: 4000 }, postStatus: 413,
   });
   const { now, host: h } = host([idle("11111", "Waiting")]);
   beat({ now, agents: [h] });
@@ -730,7 +734,9 @@ test("terminal compose: the hub's 413 says 'too long' and keeps the text (XERK-2
   // A refusal the operator can act on: it reads as a length problem, not as the
   // hub being down, and the message is put back so it can be split rather than
   // retyped.
-  assert.equal(chat.failed, "Message too long");
+  // The cap is per host — 4k on an agent too old to paste — so the bar names it
+  // rather than leaving the operator to guess how much to cut.
+  assert.equal(chat.failed, "Too long — max 4,000");
   assert.equal(els.termInput.value, "x".repeat(20));
 });
 

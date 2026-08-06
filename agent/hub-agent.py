@@ -4179,7 +4179,9 @@ def _capture_pane(tmux_name):
 # survive; \r is normalized to \n first.
 INPUT_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # The fallback keystroke send carries the text as a tmux COMMAND argument, which
-# tmux refuses past ~16 KiB ("command too long") — clip well under that.
+# tmux refuses past ~16 KiB ("command too long"), so a long message goes in
+# CHUNKS of this size rather than being clipped to it: a message the operator
+# believes they sent whole must never arrive with its end missing (XERK-227).
 SENDKEYS_MAX_CHARS = 4000
 
 
@@ -4207,10 +4209,12 @@ def _type_into_pane(tmux_name, text):
     line. `-p` is conditional, so an application that never requested bracketed
     paste is sent the bare text and is never shown a stray escape sequence.
 
-    Falls back to the old keystroke send (newlines flattened, clipped to a
-    tmux-safe length) if the paste can't be made — a tmux too old for either
-    subcommand must still be able to deliver a short message. Returns True when
-    the text was pasted."""
+    Falls back to a keystroke send when the paste can't be made — a tmux too old
+    for either subcommand must still deliver the message. That path types the
+    text in SENDKEYS_MAX_CHARS **chunks** (newlines flattened, since nothing
+    brackets them there) rather than clipping it: a message the operator believes
+    they sent whole must never arrive with its end quietly missing. Returns True
+    when the text was pasted."""
     if not tmux_name:
         return False
     buf = f"turma-input-{tmux_name}"      # per-pane, so two sessions can't race
@@ -4224,12 +4228,16 @@ def _type_into_pane(tmux_name, text):
         if not pasted:
             run(["tmux", "delete-buffer", "-b", buf])
     if not pasted:
-        # `--` ends tmux's own option parsing before the literal text, so a
-        # message starting with '-' isn't misread as more send-keys flags.
-        flat = text.replace("\n", " ")[:SENDKEYS_MAX_CHARS]
+        flat = text.replace("\n", " ")
+        chunks = [flat[i:i + SENDKEYS_MAX_CHARS]
+                  for i in range(0, len(flat), SENDKEYS_MAX_CHARS)] or [""]
         log(f"paste into {tmux_name} failed; falling back to send-keys "
-            f"({len(flat)} of {len(text)} chars)")
-        run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", flat])
+            f"({len(flat)} chars in {len(chunks)} chunk(s))")
+        for chunk in chunks:
+            # `--` ends tmux's own option parsing before the literal text, so a
+            # message starting with '-' isn't misread as more send-keys flags.
+            # Each chunk appends to the input line; only the Enter below submits.
+            run(["tmux", "send-keys", "-t", tmux_name, "-l", "--", chunk])
     run(["tmux", "send-keys", "-t", tmux_name, "Enter"])
     return pasted
 
@@ -9182,14 +9190,25 @@ class SessionManager:
         This is the plain "type a message into the session" path (the chat
         composer's Send, the glasses actions menu, the PR-comment delivery);
         AskUserQuestion answers no longer ride it — they go through
-        answer_question below. See _type_into_pane for how the text lands."""
+        answer_question below. See _type_into_pane for how the text lands.
+
+        A message past INPUT_MAX_CHARS is REFUSED, never clipped to it
+        (XERK-227): the operator has no way to tell a delivered stub from the
+        whole message, so half a message is worse than none — and the hub, which
+        caps at the `inputMaxChars` this agent heartbeats, has already refused it
+        with an error the composer shows. This is the backstop for a caller that
+        didn't."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
         text = _clean_input_text(text)
         if not text.strip():
             return
-        text = text[:INPUT_MAX_CHARS]
+        if len(text) > INPUT_MAX_CHARS:
+            log(f"refused a {len(text)}-char message for session {sid}: past "
+                f"INPUT_MAX_CHARS ({INPUT_MAX_CHARS}); sending nothing rather "
+                f"than a truncated message")
+            return
         # Name a still-unnamed session (bare/quick spawn or repos-root, where the
         # spawn-time summary was a no-op for lack of an initial prompt) from its
         # first typed prompt — this message is our next chance. Deliberately the
@@ -12238,6 +12257,14 @@ class SessionManager:
             "memory": memory_usage(),
             "logTail": self._log_tail(beat, light),
             "reposRoot": REPOS_ROOT,
+            # The longest message THIS agent can put into a session (XERK-227).
+            # The hub caps a typed message at what the receiving agent will
+            # actually deliver: an agent too old to report this can only take
+            # 4k and would SILENTLY TRUNCATE the rest, so the hub refuses past
+            # its cap instead — a visible "too long" beats a message the
+            # operator believes they sent whole. Rises on its own as hosts
+            # update, with no hub-side version table to keep in step.
+            "inputMaxChars": INPUT_MAX_CHARS,
             # Session ceiling + what's against it, so the hub can rank hosts by
             # free slots (ticket routing) and show a queued session's wait. Cheap
             # enough to send every beat, and it has to be: capacity is the fact
