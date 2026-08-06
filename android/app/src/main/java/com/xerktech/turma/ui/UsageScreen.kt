@@ -156,8 +156,8 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
                     // only the first has a way out, and it's the header control.
                     when {
                         ordered.isNotEmpty() -> "All series are toggled off — tap the legend to bring one back."
-                        fleet.agents.isNotEmpty() && org.isNotBlank() ->
-                            "No usage reported for this org. Pick another org (or “All orgs”) in the header."
+                        fleet.agents.isNotEmpty() && org.isNotEmpty() ->
+                            "No usage reported for the selected orgs. Change the org filter (or pick “All orgs”) in the header."
                         else -> "No usage recorded yet."
                     },
                     color = MaterialTheme.colorScheme.onSurfaceVariant,

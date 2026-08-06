@@ -10371,6 +10371,20 @@ class TestCreateAzureIssue(unittest.TestCase):
         self.assertFalse(out["assigned"])          # drives the client's warning
         self.assertEqual(len(tries), 3)
         self.assertFalse(any(o["path"].endswith("AssignedTo") for o in tries[2]))
+        # An unassigned item is invisible on the board, so the tracker's own
+        # words are the operator's only lead on which spelling it wants.
+        self.assertIn("TF401320", out["assignError"])
+
+    def test_no_candidate_at_all_says_so_rather_than_blaming_the_server(self):
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER=""), \
+             self._has_description(), \
+             mock.patch.object(ha, "_azure_identities", lambda: []), \
+             mock.patch.object(ha, "azure_create_workitem",
+                               lambda p, w, o: {"id": 4}):
+            out = ha.create_azure_issue("P", "Task", "T", "d", [])
+        self.assertFalse(out["assigned"])
+        self.assertIn("could not work out your identity", out["assignError"])
 
     def test_keeps_the_first_error_when_every_attempt_fails(self):
         """A later attempt only proves that identity didn't work either; the
@@ -10434,8 +10448,12 @@ class TestAzureIdentities(unittest.TestCase):
             "uniqueName": "me@corp.com", "providerDisplayName": "Me Myself",
             "id": "guid-1"}}
 
-    def _fresh(self):
-        return mock.patch.object(ha, "_AZDO_ME", {"names": [], "tried": False})
+    def _fresh(self, mine=None):
+        """A clean connection-data probe. The harvest is pinned as already-run
+        (with `mine`, if any) so these cases stay about the probe alone."""
+        return mock.patch.multiple(
+            ha, _AZDO_ME={"names": [], "tried": False},
+            _AZDO_MINE={"names": list(mine or []), "tried": True})
 
     def test_operator_setting_leads_then_connection_data(self):
         with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
@@ -10444,7 +10462,19 @@ class TestAzureIdentities(unittest.TestCase):
              mock.patch.object(ha, "azure_req", return_value=self._conn()):
             self.assertEqual(ha._azure_identities(),
                              ["Board Label", "DOMAIN\\me", "me@corp.com",
-                              "Me Myself", "guid-1"])
+                              "Me Myself", "guid-1",
+                              "Me Myself <DOMAIN\\me>", "Me Myself <me@corp.com>"])
+
+    def test_harvested_spellings_outrank_the_connection_data_guesses(self):
+        """What the server itself calls this user beats anything derived from
+        the PAT's connection data, which is only a guess at what it accepts."""
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
+                                 AZDO_TOKEN="p", AZDO_USER="Board Label"), \
+             self._fresh(mine=["Me Myself <DOMAIN\\me>"]), \
+             mock.patch.object(ha, "azure_req", return_value=self._conn()):
+            got = ha._azure_identities()
+        self.assertEqual(got[:2], ["Board Label", "Me Myself <DOMAIN\\me>"])
+        self.assertEqual(len(got), len(set(got)))
 
     def test_deduped_when_the_setting_is_already_a_candidate(self):
         with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o",
@@ -10473,6 +10503,104 @@ class TestAzureIdentities(unittest.TestCase):
             self.assertIn("DOMAIN\\me", ha._azure_identities())
             ha._azure_identities()
         self.assertEqual(len(calls), 2)            # cached after the success
+
+
+class TestAzureIdentityStrings(unittest.TestCase):
+    """One identity value -> every spelling worth sending back as AssignedTo."""
+
+    def test_an_identity_object_offers_unique_then_the_classic_pairing(self):
+        self.assertEqual(
+            ha._azure_identity_strings({"displayName": "Me Myself",
+                                        "uniqueName": "DOMAIN\\me",
+                                        "id": "guid-1"}),
+            ["DOMAIN\\me", "Me Myself <DOMAIN\\me>", "guid-1", "Me Myself"])
+
+    def test_a_bare_string_is_already_the_servers_own_text(self):
+        self.assertEqual(ha._azure_identity_strings("NCHFA\\mx"), ["NCHFA\\mx"])
+
+    def test_nothing_usable(self):
+        for v in (None, "", "   ", 7, {}, {"displayName": ""}):
+            self.assertEqual(ha._azure_identity_strings(v), [], repr(v))
+
+
+class TestAzureMineIdentities(unittest.TestCase):
+    """Harvesting the assignee spelling off work items already assigned to @Me —
+    the one candidate the server has demonstrably resolved before."""
+
+    def _fresh(self):
+        return mock.patch.object(ha, "_AZDO_MINE", {"names": [], "tried": False})
+
+    def _reqs(self, item, calls=None):
+        def req(path, params, body=None):
+            (calls if calls is not None else []).append((path, params, body))
+            if path == "/_apis/wit/wiql":
+                return {"workItems": [{"id": 51125}, {"id": 9}]}
+            if path == "/_apis/wit/workitems":
+                return {"value": [item]}
+            raise AssertionError(path)
+        return req
+
+    def test_reads_the_assignee_off_the_operators_newest_item(self):
+        calls = []
+        item = {"id": 51125, "fields": {"System.AssignedTo": {
+            "displayName": "Habeeb, Max", "uniqueName": "NCHFA\\mxhabeeb"}}}
+        with mock.patch.multiple(ha, AZDO_URL="https://tfs/x", AZDO_TOKEN="p",
+                                 AZDO_PROJECT=""), \
+             self._fresh(), \
+             mock.patch.object(ha, "azure_req", self._reqs(item, calls)):
+            self.assertEqual(ha._azure_mine_identities(),
+                             ["NCHFA\\mxhabeeb", "Habeeb, Max <NCHFA\\mxhabeeb>",
+                              "Habeeb, Max"])
+        wiql = [c for c in calls if c[0] == "/_apis/wit/wiql"][0]
+        self.assertIn("[System.AssignedTo] = @Me", wiql[2]["query"])
+        # Only the newest item is fetched — this is a spelling probe, not a poll.
+        self.assertEqual([c for c in calls if c[0] == "/_apis/wit/workitems"][0][1]
+                         ["ids"], "51125")
+
+    def test_the_project_scope_is_carried_and_quoted(self):
+        """Same WIQL the poll builds, so the probe sees the same items — and an
+        apostrophe in a project name must not break out of the literal."""
+        calls = []
+        with mock.patch.multiple(ha, AZDO_URL="https://tfs/x", AZDO_TOKEN="p",
+                                 AZDO_PROJECT="O'Brien"), \
+             self._fresh(), \
+             mock.patch.object(ha, "azure_req", self._reqs(
+                 {"id": 1, "fields": {"System.AssignedTo": "x"}}, calls)):
+            self.assertEqual(ha._azure_mine_identities(), ["x"])
+        query = [c for c in calls if c[0] == "/_apis/wit/wiql"][0][2]["query"]
+        self.assertIn("[System.TeamProject] = 'O''Brien'", query)
+
+    def test_no_assigned_items_caches_an_empty_answer(self):
+        calls = []
+
+        def req(path, params, body=None):
+            calls.append(path)
+            return {"workItems": []}
+
+        with mock.patch.multiple(ha, AZDO_URL="https://tfs/x", AZDO_TOKEN="p",
+                                 AZDO_PROJECT=""), \
+             self._fresh(), mock.patch.object(ha, "azure_req", req):
+            self.assertEqual(ha._azure_mine_identities(), [])
+            self.assertEqual(ha._azure_mine_identities(), [])
+        self.assertEqual(len(calls), 1)          # "none" is an answer, cached
+
+    def test_a_failed_probe_is_retried_not_cached(self):
+        calls = []
+        item = {"id": 3, "fields": {"System.AssignedTo": {
+            "displayName": "Me", "uniqueName": "d\\me"}}}
+        ok = self._reqs(item)
+
+        def flaky(path, params, body=None):
+            calls.append(path)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            return ok(path, params, body)
+
+        with mock.patch.multiple(ha, AZDO_URL="https://tfs/x", AZDO_TOKEN="p",
+                                 AZDO_PROJECT=""), \
+             self._fresh(), mock.patch.object(ha, "azure_req", flaky):
+            self.assertEqual(ha._azure_mine_identities(), [])
+            self.assertIn("d\\me", ha._azure_mine_identities())
 
 
 class TestAzureCreateMeta(unittest.TestCase):
@@ -10601,6 +10729,20 @@ class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
         self.assertEqual(out["key"], "ENG-6")
         self.assertIsNone(out["error"])
         self.assertIn("couldn't be assigned", out["warning"])
+
+    def test_the_warning_carries_the_trackers_own_reason(self):
+        """"Set AZDO_USER" was worse than useless as advice — it is already a
+        candidate, and being refused is how a create reaches this path."""
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(
+                ha, "create_board_issue",
+                return_value={"key": "42", "url": "u", "assigned": False,
+                              "assignError": "the server refused every identity "
+                                             "this host could find (TF401320)"}):
+            sm._stage_create_ticket(self._cmd())
+        warning = sm.create_ticket_results[0]["warning"]
+        self.assertIn("TF401320", warning)
+        self.assertNotIn("AZDO_USER", warning)
 
     def test_missing_title_fails_without_creating(self):
         sm = self.make_manager()

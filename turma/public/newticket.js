@@ -102,9 +102,11 @@
   function openCreate() {
     const list = orgSites();
     if (!list.length) return;
+    // Seed the form's org to the first selected one in the header's (multi)
+    // org filter, else the first reporting org.
     const cur = (typeof window !== "undefined" && window.TurmaOrg &&
-      window.TurmaOrg.get && window.TurmaOrg.get()) || "";
-    const pick = list.find((s) => s.siteKey === cur) || list[0];
+      window.TurmaOrg.getKeys && window.TurmaOrg.getKeys()) || [];
+    const pick = list.find((s) => cur.includes(s.siteKey)) || list[0];
     createState = {
       sites: list, siteKey: pick.siteKey, source: pick.source || "jira",
       meta: {}, types: {},

@@ -99,9 +99,9 @@ function render(data) {
     return;
   }
   const allKeys = lastAllKeys;
-  // The scope the header control is on. It's a siteKey (or "" for every org),
-  // already self-healed against orgs nobody reports.
-  const orgFilter = TurmaOrg.get();
+  // The scope the header control is on. An array of siteKeys (empty for every
+  // org), already self-healed against orgs nobody reports.
+  const orgFilter = TurmaOrg.getKeys();
 
   const sessionIndex = B.ticketSessionIndex(data.agents || []);
   const activeMoves = sweepMoves(sites);

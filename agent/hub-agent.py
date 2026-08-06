@@ -5410,9 +5410,10 @@ def fetch_azure_issue(key):
 # POST (application/json-patch+json) — a different content type than azure_req's
 # plain-JSON search/GET — with the work-item TYPE in the URL (`.../workitems/$Bug`).
 # "Labels" map to System.Tags (a `;`-joined string, not an array), and self-assign
-# uses the PAT owner's identity from the connection-data endpoint so the new item
-# lands on the board (which filters by @Me).
+# walks an identity ladder (_azure_identities) so the new item lands on the board
+# (which filters by @Me).
 _AZDO_ME = {"names": [], "tried": False}
+_AZDO_MINE = {"names": [], "tried": False}
 _AZDO_FIELD_CACHE = {}
 
 # Where a work-item type keeps its long description. Most types use
@@ -5463,32 +5464,108 @@ def _azure_description_field(site_key, project, wtype):
     return None
 
 
+def _azure_identity_strings(value):
+    """Every way to spell ONE identity value, best first.
+
+    A modern api-version returns an identity as an object; an older one returns
+    a bare string, which is then already the exact text that server stores."""
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, dict):
+        return []
+    disp = str(value.get("displayName") or "").strip()
+    uniq = str(value.get("uniqueName") or "").strip()
+    out = []
+    if uniq:
+        out.append(uniq)
+    if disp and uniq:
+        # The classic TFS identity-field spelling, and the one an on-prem
+        # collection often insists on where a bare email won't resolve.
+        out.append(f"{disp} <{uniq}>")
+    for extra in (value.get("id"), disp):
+        if str(extra or "").strip():
+            out.append(str(extra).strip())
+    return out
+
+
+def _azure_mine_identities():
+    """Identity spellings harvested from work items ALREADY assigned to the PAT
+    owner, cached. [] when there are none or the lookup fails.
+
+    This is the only source that cannot be wrong about spelling: the same WIQL
+    `@Me` the board polls with names items this server itself decided belong to
+    this user, so their `System.AssignedTo` is a value it has already resolved.
+    Every other candidate is a guess at what it will accept.
+
+    An operator with no assigned work item yet gets nothing here and falls
+    through to the guesses — and the first item that lands on their board (by
+    any route) teaches this host the spelling for every create after it."""
+    if _AZDO_MINE["tried"]:
+        return list(_AZDO_MINE["names"])
+    out = []
+    try:
+        where = ["[System.AssignedTo] = @Me"]
+        if AZDO_PROJECT:
+            where.append("[System.TeamProject] = '"
+                         f"{AZDO_PROJECT.replace(chr(39), chr(39) * 2)}'")
+        res = azure_req("/_apis/wit/wiql", {"$top": 1}, body={
+            "query": "SELECT [System.Id] FROM WorkItems WHERE "
+                     + " AND ".join(where)
+                     + " ORDER BY [System.ChangedDate] DESC"})
+        ids = [w.get("id") for w in (res.get("workItems") or [])
+               if w.get("id") is not None][:1]
+        if ids:
+            data = azure_req("/_apis/wit/workitems", {
+                "ids": ",".join(str(i) for i in ids),
+                "fields": "System.AssignedTo", "errorPolicy": "omit"})
+            for wi in data.get("value") or []:
+                if isinstance(wi, dict):
+                    out.extend(_azure_identity_strings(
+                        (wi.get("fields") or {}).get("System.AssignedTo")))
+        # Cache only a SUCCESSFUL probe (as _AZDO_ME does), but cache an empty
+        # result too: "this user has no assigned items" is an answer.
+        _AZDO_MINE["names"] = out
+        _AZDO_MINE["tried"] = True
+    except Exception as e:
+        log(f"azure assigned-item identity lookup failed: {e}")
+    return out
+
+
 def _azure_identities():
     """Every identity string worth trying as `System.AssignedTo`, best first.
 
     There is no single spelling that works everywhere: Services wants an email,
-    a self-hosted collection usually wants `DOMAIN\\user`, and some accept only
-    the display name or the guid. Rather than guess one and lose the assignment
-    when it's the wrong one, offer them in order and let the create fall through
-    (`create_azure_issue`).
+    a self-hosted collection usually wants `DOMAIN\\user` or the classic
+    `Display Name <unique>`, and some accept only the display name or the guid.
+    Rather than guess one and lose the assignment when it's the wrong one, offer
+    them in order and let the create fall through (`create_azure_issue`).
 
     `AZDO_USER` leads because it is the operator saying so explicitly — but it
     is documented as (and `_azure_org_user` uses it as) the board's display
-    LABEL, so it is frequently NOT an assignable identity, and the connection
-    data behind it is what `@Me` resolves to in the board's own WIQL. That is
-    why it is a candidate rather than the answer."""
+    LABEL, so it is frequently NOT an assignable identity. The harvested
+    spellings come next because they are the server's OWN, and only then the
+    connection-data guesses."""
     out = []
     if AZDO_USER:
         out.append(AZDO_USER)
+    out.extend(_azure_mine_identities())
     if not _AZDO_ME["tried"]:
         try:
             data = azure_req("/_apis/connectionData", {})
             au = data.get("authenticatedUser") or {}
             props = (au.get("properties") or {}).get("Account") or {}
-            _AZDO_ME["names"] = [str(v).strip() for v in (
+            disp = au.get("providerDisplayName") or au.get("customDisplayName")
+            names = [str(v).strip() for v in (
                 props.get("$value"), au.get("uniqueName"), au.get("mailAddress"),
-                au.get("providerDisplayName"), au.get("id"),
+                disp, au.get("id"),
             ) if str(v or "").strip()]
+            # …plus the same `Display Name <unique>` pairing the harvest offers,
+            # which is the spelling a classic on-prem collection resolves.
+            for uniq in (props.get("$value"), au.get("uniqueName"),
+                         au.get("mailAddress")):
+                if str(disp or "").strip() and str(uniq or "").strip():
+                    names.append(f"{str(disp).strip()} <{str(uniq).strip()}>")
+            _AZDO_ME["names"] = names
             # Cache only a SUCCESSFUL probe: marking it tried up-front turns one
             # transient failure into a process that never self-assigns again.
             _AZDO_ME["tried"] = True
@@ -5580,8 +5657,9 @@ def create_azure_issue(project, wtype, title, description, tags):
     # so silently giving up on the first rejection is nearly as bad. Only a
     # REFUSED write (4xx) is retried: after a timeout the create may have
     # landed, and re-sending would duplicate it.
-    data, assigned, first = None, None, None
-    for me in _azure_identities() + [None]:
+    data, assigned, first, refused = None, None, None, None
+    candidates = _azure_identities()
+    for me in candidates + [None]:
         attempt = list(ops)
         if me:
             attempt.append({"op": "add", "path": "/fields/System.AssignedTo",
@@ -5597,17 +5675,27 @@ def create_azure_issue(project, wtype, title, description, tags):
             if not _write_was_refused(e):
                 raise first from None
             if me is not None:
+                refused = refused if refused is not None else e
                 log(f"azure create rejected assignee {me!r} ({e})")
     if data is None:
         raise first
+    assign_error = None
     if assigned is None:
-        log(f"azure work item in {project} created UNASSIGNED "
-            "(no identity this collection accepts)")
+        # Say what was tried and what the server said. An unassigned item is
+        # invisible on the board, so this line (and the warning built from it)
+        # is the operator's only lead on which spelling their server wants.
+        tried = ", ".join(repr(c) for c in candidates) or "no candidate identity"
+        reason = str(refused or "").strip().splitlines()
+        assign_error = (
+            f"the server refused every identity this host could find "
+            f"({reason[0][:BOARD_ERROR_MAX_CHARS]})" if reason else
+            "this host could not work out your identity")
+        log(f"azure work item in {project} created UNASSIGNED — tried {tried}")
     wid = data.get("id")
     if wid is None:
         raise RuntimeError("Azure returned no work-item id")
     return {"key": str(wid), "url": _azure_item_url(base, project, wid),
-            "assigned": bool(assigned)}
+            "assigned": bool(assigned), "assignError": assign_error}
 
 
 # --- Board source dispatch -----------------------------------------------------
@@ -9441,12 +9529,14 @@ class SessionManager:
         # told about: the board filters on the tracker user, so it is created
         # and then invisible there, which reads exactly like a create that
         # didn't happen.
-        unassigned_warning = (
-            "created, but it couldn't be assigned to you, so it won't show on "
-            "your board — set AZDO_USER to your Azure identity"
-            if board_source() == "azure" else
-            "created, but it couldn't be assigned to you, so it won't show on "
-            "your board")
+        def unassigned_warning(created):
+            # The reason comes from the creator, which is the only layer that
+            # knows what it tried and what the tracker said back. Telling the
+            # operator to "set AZDO_USER" is worse than useless here — it is
+            # already a candidate, and being refused is how we got here.
+            why = str(created.get("assignError") or "").strip()
+            return ("created, but it couldn't be assigned to you, so it won't "
+                    "show on your board" + (f" — {why}" if why else ""))
 
         if not board_configured():
             return fail("no board credentials on this host")
@@ -9463,7 +9553,7 @@ class SessionManager:
                 {"cmdId": cid, "key": created.get("key"),
                  "url": created.get("url"), "error": None,
                  "warning": None if created.get("assigned")
-                            else unassigned_warning})
+                            else unassigned_warning(created)})
             log(f"created ticket {created.get('key')} in {project}")
         except Exception as e:
             log(f"ticket creation failed in {project}: {e}")
