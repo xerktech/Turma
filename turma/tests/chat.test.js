@@ -791,6 +791,21 @@ test("prFooterChip: a GitLab MR chips like a PR", () => {
   assert.match(html, /href="https:\/\/gitlab\.example\.com\/grp\/app\/-\/merge_requests\/12"/);
 });
 
+// XERK-226: and so is an Azure DevOps pull request — the third source, chipped
+// identically, its number derived from the ADO URL before any status lands.
+test("prFooterChip: an Azure DevOps PR chips like a GitHub PR", () => {
+  const url = "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12";
+  const html = prFooterChip({ prs: [
+    { url },
+    { url: url.replace("/12", "/13"), number: 13, state: "OPEN",
+      checks: "passing", mergeable: "MERGEABLE", ready: "ready" },
+  ] });
+  assert.match(html, /#12/);                        // number from the ADO URL
+  assert.match(html, /#13 Open/);
+  assert.match(html, /pr-ready ready/);
+  assert.match(html, new RegExp('href="' + url.replace(/[/.]/g, "\\$&") + '"'));
+});
+
 // The mark answers "can this land", not "is CI green": a conflicting branch
 // merges nowhere however clean its checks are, so it reads ✗ and says why.
 test("prFooterChip: a merge conflict blocks the mark despite green CI", () => {
