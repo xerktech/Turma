@@ -15,6 +15,7 @@ import com.xerktech.turma.model.StatusChangeResult
 import com.xerktech.turma.model.TurmaJson
 import com.xerktech.turma.model.WsTokenResponse
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
 import retrofit2.HttpException
 import retrofit2.Response
 import retrofit2.http.Body
