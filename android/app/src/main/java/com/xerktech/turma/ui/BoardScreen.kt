@@ -152,8 +152,8 @@ fun BoardScreen(
     val colorMap = remember(sites, fleet.orgColors) {
         orgColorMap(sites.map { it.siteKey }, fleet.orgColors)
     }
-    // The scope is the header control's (XERK-62); filterSites self-heals a pick
-    // no org still reports, exactly as `effectiveOrg` does for the other screens.
+    // The scope is the header control's (XERK-62); filterSites self-heals picks
+    // no org still reports, exactly as `effectiveOrgs` does for the other screens.
     val shown = remember(sites, orgFilter) { filterSites(sites, orgFilter) }
     var detail by remember { mutableStateOf<Pair<BoardSite, JiraTicket>?>(null) }
 
@@ -176,7 +176,7 @@ fun BoardScreen(
                     // The scoped org reporting nothing is a different story from a
                     // fleet with no tickets at all, and the way out is the header.
                     sites.isNotEmpty() && shown.size < sites.size ->
-                        "No tickets for this org. Pick another org (or “All orgs”) in the header."
+                        "No tickets for the selected orgs. Change the org filter (or pick “All orgs”) in the header."
                     fleet.agents.any { it.jira?.configured == true } -> "No tickets."
                     else -> "No ticket-board-configured hosts."
                 },
@@ -340,7 +340,7 @@ fun NewTicketAction(vm: BoardViewModel = viewModel()) {
     if (creating) {
         // Default the form's org to the header scope when it names a real one,
         // else the first org — the web openCreate's pick.
-        val initial = sites.firstOrNull { it.siteKey == orgFilter }?.siteKey ?: sites.first().siteKey
+        val initial = sites.firstOrNull { it.siteKey in orgFilter }?.siteKey ?: sites.first().siteKey
         CreateTicketSheet(sites, initial, vm, onDismiss = { creating = false })
     }
 }

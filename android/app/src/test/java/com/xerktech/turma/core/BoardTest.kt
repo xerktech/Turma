@@ -221,19 +221,23 @@ class BoardTest {
         siteKey = key, site = key, online = true, error = null, fetchedAt = "", tickets = emptyList(),
     )
 
-    @Test fun `blank filter keeps every site`() {
+    @Test fun `empty filter keeps every site`() {
         val sites = listOf(site("a"), site("b"))
-        assertEquals(sites, filterSites(sites, ""))
+        assertEquals(sites, filterSites(sites, emptySet()))
     }
 
-    @Test fun `a matching filter keeps only that org`() {
-        val sites = listOf(site("a"), site("b"))
-        assertEquals(listOf("b"), filterSites(sites, "b").map { it.siteKey })
+    @Test fun `a matching filter keeps only the selected orgs`() {
+        val sites = listOf(site("a"), site("b"), site("c"))
+        assertEquals(listOf("b"), filterSites(sites, setOf("b")).map { it.siteKey })
+        // Multi-select (XERK-222): every selected org's site shows.
+        assertEquals(listOf("a", "c"), filterSites(sites, setOf("a", "c")).map { it.siteKey })
     }
 
-    @Test fun `a filter naming an org that stopped reporting falls back to all`() {
+    @Test fun `a filter naming only orgs that stopped reporting falls back to all`() {
         val sites = listOf(site("a"), site("b"))
-        assertEquals(sites, filterSites(sites, "gone"))
+        assertEquals(sites, filterSites(sites, setOf("gone")))
+        // A gone key beside a live one is simply ignored.
+        assertEquals(listOf("a"), filterSites(sites, setOf("gone", "a")).map { it.siteKey })
     }
 
     // ---- ticket -> agent pin (XERK-38): parity with board.js hostOptions/agentPinOf
@@ -309,37 +313,44 @@ class BoardTest {
         assertEquals("", siteKeyOf(agent("h2", true, null)))
     }
 
-    @Test fun `filterAgents scopes the fleet to one org`() {
+    @Test fun `filterAgents scopes the fleet to the selected orgs`() {
         val a = agent("h1", true, JiraBlock(siteKey = "acme"))
         val b = agent("h2", true, JiraBlock(siteKey = "beta"))
         // A host with no tracker belongs to no org: under "All orgs" and under
         // none of the named ones.
         val c = agent("h3", true, null)
         val all = listOf(a, b, c)
-        assertEquals(all, filterAgents(all, ""))
-        assertEquals(listOf("h1"), filterAgents(all, "acme").map { it.key })
-        assertEquals(listOf("h3"), filterAgents(all, "").filter { siteKeyOf(it).isEmpty() }.map { it.key })
-        // Unlike filterSites, an unknown key here filters to nothing — the caller
-        // resolves it through effectiveOrg first.
-        assertTrue(filterAgents(all, "gone").isEmpty())
+        assertEquals(all, filterAgents(all, emptySet()))
+        assertEquals(listOf("h1"), filterAgents(all, setOf("acme")).map { it.key })
+        // Multi-select (XERK-222): every selected org's hosts stay.
+        assertEquals(listOf("h1", "h2"), filterAgents(all, setOf("acme", "beta")).map { it.key })
+        assertEquals(listOf("h3"), filterAgents(all, emptySet()).filter { siteKeyOf(it).isEmpty() }.map { it.key })
+        // Unlike filterSites, unknown keys here filter to nothing — the caller
+        // resolves the selection through effectiveOrgs first.
+        assertTrue(filterAgents(all, setOf("gone")).isEmpty())
     }
 
-    @Test fun `effectiveOrg self-heals a pick no host reports any more`() {
+    @Test fun `effectiveOrgs self-heals picks no host reports any more`() {
         val sites = listOf(site("acme"), site("beta"))
-        assertEquals("acme", effectiveOrg("acme", sites))
-        assertEquals("", effectiveOrg("gone", sites))
-        assertEquals("", effectiveOrg("", sites))
+        assertEquals(setOf("acme"), effectiveOrgs(setOf("acme"), sites))
+        assertEquals(emptySet<String>(), effectiveOrgs(setOf("gone"), sites))
+        assertEquals(emptySet<String>(), effectiveOrgs(emptySet(), sites))
+        // Each key self-heals independently (XERK-222): the reported one keeps
+        // applying while the gone one drops out of the effective set.
+        assertEquals(setOf("acme"), effectiveOrgs(setOf("acme", "gone"), sites))
         // Nothing reporting at all can't strand every screen on an empty fleet.
-        assertEquals("", effectiveOrg("acme", emptyList()))
+        assertEquals(emptySet<String>(), effectiveOrgs(setOf("acme"), emptyList()))
     }
 
-    @Test fun `scopedAgents applies the pick only while its org reports`() {
+    @Test fun `scopedAgents applies the selection only while its orgs report`() {
         val a = agent("h1", true, JiraBlock(siteKey = "acme", user = "u", fetchedAt = "2026-07-16T01:00:00Z"))
         val b = agent("h2", true, JiraBlock(siteKey = "beta", user = "u", fetchedAt = "2026-07-16T01:00:00Z"))
-        assertEquals(listOf("h1"), scopedAgents(listOf(a, b), "acme").map { it.key })
-        // The stored pick is kept by the caller; it just doesn't scope anything
-        // while nothing reports that org — the whole fleet shows instead.
-        assertEquals(listOf("h1", "h2"), scopedAgents(listOf(a, b), "gone").map { it.key })
+        assertEquals(listOf("h1"), scopedAgents(listOf(a, b), setOf("acme")).map { it.key })
+        // Multi-select (XERK-222): both orgs selected keeps both hosts.
+        assertEquals(listOf("h1", "h2"), scopedAgents(listOf(a, b), setOf("acme", "beta")).map { it.key })
+        // The stored selection is kept by the caller; it just doesn't scope
+        // anything while nothing reports those orgs — the whole fleet shows.
+        assertEquals(listOf("h1", "h2"), scopedAgents(listOf(a, b), setOf("gone")).map { it.key })
     }
 
     @Test fun `storedOrg migrates the board-only pick forward exactly once`() {

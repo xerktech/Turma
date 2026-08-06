@@ -429,7 +429,7 @@ function renderInner(data) {
   const series = toSeries(agents);
   if (!series.length) {
     $chart.innerHTML = (data.agents || []).length
-      ? `<div class="empty">No usage reported for this org. Pick another org (or “All orgs”) in the header.</div>`
+      ? `<div class="empty">No usage reported for the selected orgs. Change the org filter (or pick “All orgs”) in the header.</div>`
       : `<div class="empty">No usage reported yet (agents aggregate it within ~5 minutes of starting).</div>`;
     return;
   }

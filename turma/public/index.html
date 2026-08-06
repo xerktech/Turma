@@ -882,8 +882,8 @@ function render(data) {
     // Distinguish an empty fleet from one the org filter has narrowed to
     // nothing — otherwise a scoped-out dashboard reads as "no agents at all".
     $groups.innerHTML = (data.agents || []).length
-      ? `<div class="empty">No hosts report this org.<br>
-         Pick another org (or “All orgs”) in the header to see the rest of the fleet.</div>`
+      ? `<div class="empty">No hosts report the selected orgs.<br>
+         Change the org filter (or pick “All orgs”) in the header to see the rest of the fleet.</div>`
       : `<div class="empty">No hosts have reported yet.<br>
          Containers running the agent image heartbeat here automatically.</div>`;
     return;

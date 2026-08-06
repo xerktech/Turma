@@ -880,33 +880,31 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 ### The org filter (`turma/public/org.js`, XERK-62)
 
-- **One org-scoping control, in the header, obeyed by all four pages.** A host polls exactly ONE org
-  (agent-side rule), so an org **partitions the fleet** — the same pick that filters tickets filters
-  hosts, sessions and usage.
-- The value is a **full `siteKey`** (what the hub keys and routes on), never the display org name;
-  `""` is every org. Persisted as `turma-org` (migrated once from the board's `turma-board-org`) and
-  re-read on the `storage` event, so two open tabs agree.
+- **One org-scoping control, in the header, obeyed by all four pages.** A host polls exactly ONE org,
+  so an org **partitions the fleet** — one selection filters tickets, hosts, sessions, usage.
+- **Multi-select (XERK-222): the value is a SET of full `siteKey`s**, never display org names; empty =
+  every org. Menu rows are checkbox toggles that stay highlighted while selected and keep the menu
+  open; "All orgs" clears and closes. Persisted in `turma-org` as JSON (a pre-multi bare
+  siteKey or the legacy `turma-board-org` reads as a one-org selection), re-read on `storage` so two
+  tabs agree. `getKeys()` is the effective selection, `get()` only when exactly one applies.
 - Each page: `TurmaOrg.update(data)` each beat, `TurmaOrg.filter(data.agents)` to scope what it builds,
-  `TurmaOrg.subscribe(...)` to repaint on a change, `TurmaOrg.sse(es)` to take the hub's `autoStartOrgs`
-  broadcast off the page's existing socket.
-- Scoping is applied to the **agent list**, once, and everything downstream follows. Deliberately NOT
-  applied to `findSession`/`sessionHit` (they read `cache` directly) — an open session must not be torn
-  off the stage because its org left the sidebar — nor to pending-command reconciliation, which must run
-  against the WHOLE fleet. A host with **no tracker block belongs to no org**: it shows only under
-  "All orgs".
-- **A pick for an org nobody reports doesn't apply, but is kept** (`effectiveKey`): otherwise an org
-  whose last host was removed leaves every page filtered to nothing with no chip left to clear it. It
-  resumes when that host returns.
+  `TurmaOrg.subscribe(...)` to repaint on a change, `TurmaOrg.sse(es)` to take the hub broadcasts off
+  the page's existing socket.
+- Scoping applies to the **agent list**, once; everything downstream follows. Deliberately NOT applied
+  to `findSession`/`sessionHit` (an open session must not be torn off the stage when its org leaves
+  the sidebar) nor to pending-command reconciliation, which runs against the WHOLE fleet. A host with
+  **no tracker block belongs to no org**: it shows only under "All orgs".
+- **A pick for an org nobody reports doesn't apply, but is kept** (`effectiveKeys`, per key): else an
+  org whose last host was removed leaves every page filtered to nothing with no chip to clear it; it
+  resumes when the host returns.
 - The per-org **auto-start switch (XERK-41) rides the menu's org rows** — `org.js` owns its optimistic
   flip, POST and rollback.
 - Repaints are **skipped when the markup is unchanged**, so the beat can't churn the DOM under an open
-  menu. Clicks are delegated, and a handled click is flagged **on the event** — the repaint detaches the
-  clicked node, so a `slot.contains(e.target)` click-away test would close the menu on the click that
-  opened it.
-- It reads board.js's org vocabulary, so **every page loads `board.js`**, ordered board.js → nav.js →
-  org.js.
-- Tests: `turma/tests/org.test.js`; Android's port is `data/OrgFilter.kt` + `ui/OrgControl.kt` +
-  `core/Board.kt`'s `siteKeyOf`/`filterAgents`/`effectiveOrg`/`scopedAgents`, tested in `BoardTest.kt`.
+  menu. Clicks are delegated; a handled click is flagged **on the event** — the repaint detaches the
+  clicked node, so a `contains()` click-away test would close the menu on the click that opened it.
+- It reads board.js's org vocabulary, so **every page loads `board.js`** (order: board → nav → org).
+- Tests: `turma/tests/org.test.js`; Android port: `data/OrgFilter.kt` + `ui/OrgControl.kt` +
+  `core/Board.kt` (tested in `BoardTest.kt`).
 
 ### Fleet tree (host → repo → session)
 
@@ -970,8 +968,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   for review/testing (both `indeterminate` → `inprogress`), so `categoryOf` carves it out by matching the
   org-specific status NAME (`isReviewStatus`, word-boundary: review/testing/QA) and only ever pulls FROM
   `inprogress`. Purely a board.js/CSS change.
-- The board is scoped by the **header's org filter**, not a strip of its own: it reads `TurmaOrg.get()`
-  each render and passes it to `boardHtml`.
+- The board is scoped by the **header's org filter**, not a strip of its own: it reads
+  `TurmaOrg.getKeys()` each render and passes it to `boardHtml`.
 - An org is **labelled by `orgName(siteKey)`** — the site host minus `.atlassian.net` (full host as
   tooltip). Presentational only; everything stays keyed on the whole `siteKey`.
 - The agent's **`BOARD_ORG_NAME`** overrides that label outright (`orgName(siteKey, override)`, stamped

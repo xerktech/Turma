@@ -392,6 +392,14 @@ test("boardHtml: four columns with counts, org filter scopes tickets", () => {
   assert.ok(all.includes("In Review"), "the In Review column heading renders");
   const one = boardHtml(sites, "other.atlassian.net", {});
   assert.ok(one.includes("O-1") && !one.includes("T-1"));
+  // The header's multi-select (XERK-222) passes an array of siteKeys — every
+  // selected org's tickets show; an empty array is every org.
+  const both = boardHtml(sites, ["myorg.atlassian.net", "other.atlassian.net"], {});
+  assert.ok(both.includes("T-1") && both.includes("O-1"));
+  const arrOne = boardHtml(sites, ["other.atlassian.net"], {});
+  assert.ok(arrOne.includes("O-1") && !arrOne.includes("T-1"));
+  const none = boardHtml(sites, [], {});
+  assert.ok(none.includes("T-1") && none.includes("O-1"));
 });
 
 test("boardHtml: surfaces per-site poll errors and truncation notes", () => {

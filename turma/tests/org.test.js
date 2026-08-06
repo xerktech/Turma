@@ -1,6 +1,6 @@
 // Unit tests for the shared org filter (public/org.js) — the header control
-// that scopes EVERY page to one tracker org (XERK-62), replacing the board's
-// own chip strip.
+// that scopes EVERY page to a selected set of tracker orgs (XERK-62, multi-
+// select per XERK-222), replacing the board's own chip strip.
 //
 // The module is dual-exported like nav.js/board.js, so the pure half (which org
 // a host belongs to, how a stale pick self-heals, the control's markup) is
@@ -61,16 +61,33 @@ test("org: a named filter keeps that org's hosts and drops the rest", () => {
   assert.deepEqual(Org.filterAgents([a, b, c], "nobody.atlassian.net"), []);
 });
 
+test("org: a multi-org filter keeps every selected org's hosts (XERK-222)", () => {
+  const a = agent("a", "acme.atlassian.net");
+  const b = agent("b", "dev.azure.com/other");
+  const c = agent("c", null);
+  assert.deepEqual(Org.filterAgents([a, b, c], ["acme.atlassian.net", "dev.azure.com/other"]), [a, b]);
+  assert.deepEqual(Org.filterAgents([a, b, c], ["dev.azure.com/other"]), [b]);
+  // A Set works too, and an empty selection is every host.
+  assert.deepEqual(Org.filterAgents([a, b, c], new Set(["acme.atlassian.net"])), [a]);
+  assert.deepEqual(Org.filterAgents([a, b, c], []), [a, b, c]);
+});
+
 // ---- a stale pick self-heals ------------------------------------------------
 
 test("org: a pick for an org nobody reports doesn't apply", () => {
   const sites = [site("acme.atlassian.net")];
-  assert.equal(Org.effectiveKey("acme.atlassian.net", sites), "acme.atlassian.net");
+  assert.deepEqual(Org.effectiveKeys(["acme.atlassian.net"], sites), ["acme.atlassian.net"]);
   // The whole fleet would otherwise vanish behind a filter with no chip left to
   // clear it — the one way an operator could lock themselves out of every page.
-  assert.equal(Org.effectiveKey("gone.atlassian.net", sites), "");
-  assert.equal(Org.effectiveKey("acme.atlassian.net", []), "");
-  assert.equal(Org.effectiveKey("", sites), "");
+  assert.deepEqual(Org.effectiveKeys(["gone.atlassian.net"], sites), []);
+  assert.deepEqual(Org.effectiveKeys(["acme.atlassian.net"], []), []);
+  assert.deepEqual(Org.effectiveKeys([], sites), []);
+  // Each key self-heals independently: the reported one keeps applying while
+  // the gone one is dropped from the effective set.
+  assert.deepEqual(Org.effectiveKeys(["gone.atlassian.net", "acme.atlassian.net"], sites),
+    ["acme.atlassian.net"]);
+  // A bare-string selection (the pre-multi shape) still resolves.
+  assert.deepEqual(Org.effectiveKeys("acme.atlassian.net", sites), ["acme.atlassian.net"]);
 });
 
 // ---- the control's markup ---------------------------------------------------
@@ -90,6 +107,19 @@ test("org: the button reads 'All orgs' unscoped and the org's name when scoped",
   assert.match(Org.buttonHtml(sites, "", colors, true), /aria-expanded="true"/);
 });
 
+test("org: several selected orgs read as a count, with one dot per org (XERK-222)", () => {
+  const sites = [site("acme.atlassian.net", 3), site("dev.azure.com/xerk", 4)];
+  const colors = window.TurmaBoard.orgColorMap(sites.map(s => s.siteKey));
+  const multi = Org.buttonHtml(sites, ["acme.atlassian.net", "dev.azure.com/xerk"], colors, false);
+  assert.match(multi, />2 orgs</);
+  assert.match(multi, /class="org-btn scoped"/);
+  assert.equal((multi.match(/class="org-dot"/g) || []).length, 2);
+  // A selected org nobody reports contributes neither a dot nor the count.
+  const one = Org.buttonHtml(sites, ["acme.atlassian.net"], colors, false);
+  assert.match(one, />acme</);
+  assert.equal((one.match(/class="org-dot"/g) || []).length, 1);
+});
+
 test("org: the menu lists All orgs plus every reporting org, with ticket counts", () => {
   const sites = [site("acme.atlassian.net", 3), site("dev.azure.com/xerk", 4)];
   const colors = window.TurmaBoard.orgColorMap(sites.map(s => s.siteKey));
@@ -100,14 +130,26 @@ test("org: the menu lists All orgs plus every reporting org, with ticket counts"
   assert.match(html, /data-org-key="dev\.azure\.com\/xerk"/);
 });
 
-test("org: exactly one menu row is checked, and only the picked one", () => {
+test("org: every selected org's row is checked and highlighted, none else (XERK-222)", () => {
   const sites = [site("acme.atlassian.net"), site("dev.azure.com/xerk")];
   const colors = window.TurmaBoard.orgColorMap(sites.map(s => s.siteKey));
-  for (const key of ["", "acme.atlassian.net", "dev.azure.com/xerk"]) {
-    const html = Org.menuHtml(sites, key, colors, {}, () => "");
-    assert.equal((html.match(/aria-checked="true"/g) || []).length, 1);
-    assert.equal((html.match(/class="org-row active"/g) || []).length, 1);
-  }
+  // Rows are checkboxes, not radios: any subset can be on at once.
+  assert.doesNotMatch(Org.menuHtml(sites, [], colors, {}, () => ""), /menuitemradio/);
+  // Nothing selected: only the "All orgs" row is checked.
+  const none = Org.menuHtml(sites, [], colors, {}, () => "");
+  assert.equal((none.match(/aria-checked="true"/g) || []).length, 1);
+  assert.equal((none.match(/class="org-row active"/g) || []).length, 1);
+  assert.match(none, /data-org-key="" role="menuitemcheckbox" aria-checked="true"/);
+  // One selected: that row alone.
+  const one = Org.menuHtml(sites, ["acme.atlassian.net"], colors, {}, () => "");
+  assert.equal((one.match(/aria-checked="true"/g) || []).length, 1);
+  assert.match(one, /data-org-key="acme\.atlassian\.net"[^>]*aria-checked="true"/);
+  assert.match(one, /data-org-key="" role="menuitemcheckbox" aria-checked="false"/);
+  // Both selected: both rows checked and highlighted, All orgs not.
+  const both = Org.menuHtml(sites, ["acme.atlassian.net", "dev.azure.com/xerk"], colors, {}, () => "");
+  assert.equal((both.match(/aria-checked="true"/g) || []).length, 2);
+  assert.equal((both.match(/class="org-row active"/g) || []).length, 2);
+  assert.match(both, /data-org-key="" role="menuitemcheckbox" aria-checked="false"/);
 });
 
 test("org: each org row carries its auto-start switch, reflecting the hub map", () => {
@@ -203,18 +245,49 @@ test("org: an existing board-only pick is migrated to the shared key", () => {
   assert.equal(store[Org.KEY], "acme.atlassian.net");
 });
 
-test("org: picking an org persists it and notifies every page that asked", () => {
+test("org: picking orgs toggles them into the selection and notifies every page", () => {
   const { store, click } = mountOrg();
   const seen = [];
   Org.subscribe((k) => seen.push(k));
   Org.update({ agents: [agent("a", "acme.atlassian.net"), agent("b", "dev.azure.com/xerk")] });
   click("data-org-key", "acme.atlassian.net");
+  assert.deepEqual(Org.getKeys(), ["acme.atlassian.net"]);
   assert.equal(Org.get(), "acme.atlassian.net");
-  assert.equal(store[Org.KEY], "acme.atlassian.net");
-  assert.deepEqual(seen, ["acme.atlassian.net"]);
-  // Re-picking the scope already showing is a no-op, not a second repaint.
+  assert.equal(store[Org.KEY], JSON.stringify(["acme.atlassian.net"]));
+  assert.deepEqual(seen, [["acme.atlassian.net"]]);
+  // A second org joins the selection instead of replacing it (XERK-222)…
+  click("data-org-key", "dev.azure.com/xerk");
+  assert.deepEqual(Org.getKeys(), ["acme.atlassian.net", "dev.azure.com/xerk"]);
+  assert.equal(Org.get(), "");           // the single-key read only answers for one
+  assert.equal(store[Org.KEY], JSON.stringify(["acme.atlassian.net", "dev.azure.com/xerk"]));
+  // …and re-picking a selected org toggles it back OUT (un-highlights).
   click("data-org-key", "acme.atlassian.net");
-  assert.deepEqual(seen, ["acme.atlassian.net"]);
+  assert.deepEqual(Org.getKeys(), ["dev.azure.com/xerk"]);
+  assert.equal(store[Org.KEY], JSON.stringify(["dev.azure.com/xerk"]));
+  assert.equal(seen.length, 3);
+});
+
+test("org: the All-orgs row clears the whole selection", () => {
+  const { store, click } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net"), agent("b", "dev.azure.com/xerk")] });
+  click("data-org-key", "acme.atlassian.net");
+  click("data-org-key", "dev.azure.com/xerk");
+  click("data-org-key", "");
+  assert.deepEqual(Org.getKeys(), []);
+  assert.equal(store[Org.KEY], "");
+});
+
+test("org: the stored selection round-trips as JSON; pre-multi and junk degrade sanely", () => {
+  assert.deepEqual(Org.parseStored(""), []);
+  // The pre-multi format was the bare siteKey — it reads as a one-org selection.
+  assert.deepEqual(Org.parseStored("acme.atlassian.net"), ["acme.atlassian.net"]);
+  assert.deepEqual(Org.parseStored('["a","b"]'), ["a", "b"]);
+  // Malformed JSON and non-string members degrade to "no selection"/dropped,
+  // never a throw — this runs at mount on whatever localStorage holds.
+  assert.deepEqual(Org.parseStored("["), []);
+  assert.deepEqual(Org.parseStored('[1,"a",null,""]'), ["a"]);
+  assert.equal(Org.encodeStored([]), "");
+  assert.deepEqual(Org.parseStored(Org.encodeStored(["a", "b"])), ["a", "b"]);
 });
 
 test("org: a pick whose org stops reporting stops applying, keeping the stored value", () => {
@@ -223,19 +296,28 @@ test("org: a pick whose org stops reporting stops applying, keeping the stored v
   click("data-org-key", "acme.atlassian.net");
   // That host goes away entirely (removed, not merely offline).
   Org.update({ agents: [agent("b", "dev.azure.com/xerk")] });
-  assert.equal(Org.get(), "");
-  assert.equal(store[Org.KEY], "acme.atlassian.net");  // it comes back when the host does
+  assert.deepEqual(Org.getKeys(), []);
+  // It comes back when the host does.
+  assert.equal(store[Org.KEY], JSON.stringify(["acme.atlassian.net"]));
   Org.update({ agents: [agent("a", "acme.atlassian.net"), agent("b", "dev.azure.com/xerk")] });
-  assert.equal(Org.get(), "acme.atlassian.net");
+  assert.deepEqual(Org.getKeys(), ["acme.atlassian.net"]);
 });
 
-test("org: the menu opens on the button and closes on a pick", () => {
+test("org: the menu stays open across org toggles; All orgs closes it", () => {
   const { slot, click } = mountOrg();
-  Org.update({ agents: [agent("a", "acme.atlassian.net")] });
+  Org.update({ agents: [agent("a", "acme.atlassian.net"), agent("b", "dev.azure.com/xerk")] });
   assert.doesNotMatch(slot.innerHTML, /org-menu/);
   click("data-org-toggle", "");
   assert.match(slot.innerHTML, /org-menu/);
+  // Multi-select means picking several in one visit, so a toggle must not
+  // close the menu — the just-picked row shows highlighted in place.
   click("data-org-key", "acme.atlassian.net");
+  assert.match(slot.innerHTML, /org-menu/);
+  assert.match(slot.innerHTML, /data-org-key="acme\.atlassian\.net"[^>]*aria-checked="true"/);
+  click("data-org-key", "dev.azure.com/xerk");
+  assert.match(slot.innerHTML, /org-menu/);
+  // "All orgs" is a terminal answer: clear and close.
+  click("data-org-key", "");
   assert.doesNotMatch(slot.innerHTML, /org-menu/);
 });
 
