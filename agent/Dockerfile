@@ -148,9 +148,18 @@ RUN apt-get update \
 # a login-marker file rather than the directory for the same reason; keep both,
 # they cover different halves of it (a store the BUILD baked vs one a session
 # creates by running `az` at all).
+#
+# The azure-devops extension is what gives `az` the `repos`/`pipelines`/`boards`
+# verbs — in particular `az repos pr create`, the Azure DevOps counterpart of
+# `gh pr create` and `glab mr create`, and the one command that makes an ADO PR
+# chip possible (XERK-226). It is installed into a SYSTEM dir rather than the
+# default `~/.azure/cliextensions`, which the trailing `rm -rf /root/.azure`
+# would take with it — and which is a host bind mount at runtime anyway.
 ARG TERRAFORM_VERSION=1.15.8
 ARG AWS_CLI_VERSION=2.35.23
 ARG AZURE_CLI_VERSION=2.88.0-1~bookworm
+ARG AZURE_DEVOPS_EXT_VERSION=1.0.6
+ENV AZURE_EXTENSION_DIR=/opt/az-cli-extensions
 RUN set -eux; \
     curl -fsSL "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
       -o /tmp/terraform.zip; \
@@ -168,7 +177,9 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends "azure-cli=${AZURE_CLI_VERSION}"; \
     rm -rf /var/lib/apt/lists/*; \
-    terraform version; aws --version; az version; \
+    mkdir -p "${AZURE_EXTENSION_DIR}"; \
+    az extension add --name azure-devops --version "${AZURE_DEVOPS_EXT_VERSION}" --yes; \
+    terraform version; aws --version; az version; az repos -h >/dev/null; \
     rm -rf /root/.azure /root/.terraform.d
 
 # --- Android BUILD tooling layer (stable, ~0.5 GB) --------------------------

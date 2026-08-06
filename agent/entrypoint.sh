@@ -207,6 +207,16 @@ fi
 # secret-safe: it logs the host, never the token.
 if [ -n "${AZDO_URL:-}" ] && [ -n "${AZDO_TOKEN:-}" ]; then
   python3 /usr/local/bin/hub-agent.py --wire-azure-git || true
+  # The same PAT is what `az repos pr create` authenticates with (XERK-226) —
+  # the azure-devops CLI extension reads it from AZURE_DEVOPS_EXT_PAT, which is
+  # what lets a session OPEN the pull request its chip then tracks. Exported
+  # (not passed on a command line) so it never shows up in `ps`; the extension
+  # resolves the org/project from the clone's own git remote, so nothing else
+  # needs configuring. An operator-set value wins.
+  if [ -z "${AZURE_DEVOPS_EXT_PAT:-}" ]; then
+    AZURE_DEVOPS_EXT_PAT="$AZDO_TOKEN"
+    export AZURE_DEVOPS_EXT_PAT
+  fi
 fi
 
 # --- Cloud CLI creds preflight (agent-agnostic) ----------------------------

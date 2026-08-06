@@ -230,14 +230,15 @@ fun prReady(pr: PrInfo): String = pr.ready.ifEmpty {
 
 /**
  * The pill's "#<number>" label. A bare `{url}` chip (no status fetched yet)
- * falls back to the number in the URL — GitHub `/pull/<n>` or GitLab
- * `/-/merge_requests/<n>` (XERK-162) — else a plain "PR", mirroring the web
- * renderers' fallback.
+ * falls back to the number in the URL — GitHub `/pull/<n>`, GitLab
+ * `/-/merge_requests/<n>` (XERK-162) or Azure DevOps `/pullrequest/<n>`
+ * (XERK-226) — else a plain "PR", mirroring the web renderers' fallback.
  */
 fun prNumberLabel(pr: PrInfo): String {
     if (pr.number != 0) return "#${pr.number}"
-    val m = Regex("""/pull/(\d+)|/-/merge_requests/(\d+)""").find(pr.url) ?: return "PR"
-    return "#" + m.groupValues[1].ifEmpty { m.groupValues[2] }
+    val m = Regex("""/pull/(\d+)|/-/merge_requests/(\d+)|/pullrequest/(\d+)""",
+        RegexOption.IGNORE_CASE).find(pr.url) ?: return "PR"
+    return "#" + m.groupValues.drop(1).first { it.isNotEmpty() }
 }
 
 /**

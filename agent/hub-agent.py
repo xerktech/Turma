@@ -1536,15 +1536,29 @@ PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 # plain `git push`'s "to create a merge request … visit" hint ends in
 # /merge_requests/new, which the \d+ deliberately doesn't match.
 MR_URL_RE = re.compile(r"https://[\w.-]+(?::\d+)?(?:/[\w.-]+)+/-/merge_requests/\d+")
+# An Azure DevOps pull request's URL, on Services or a self-hosted collection
+# (XERK-226): the `/_git/<repo>/` repository namespace plus `pullrequest/<n>`.
+# The leading segments cover the org/collection, a subpath install, and the
+# optional project segment (ADO serves the PR with or without it). ADO's own
+# `git push` hint ends in `/pullrequestcreate?sourceRef=…` — a link to the
+# CREATE form, which the `/<digits>` deliberately doesn't match, exactly as
+# GitLab's `/merge_requests/new` doesn't.
+AZDO_PR_URL_RE = re.compile(
+    r"https://[\w.-]+(?::\d+)?(?:/[^\s/?#\"']+)*/_git/[^\s/?#\"']+/pullrequest/\d+",
+    re.IGNORECASE)
+# The pull-request id inside such a URL, for the places that need the number
+# without re-deciding whether the URL is ours.
+AZDO_PR_URL_ID_RE = re.compile(r"/pullrequest/(\d+)", re.IGNORECASE)
 
 # The Bash commands that OPEN a pull/merge request. `gh pr create` (and its
-# GitLab counterparts — `glab mr create`, or a `git push` carrying the
-# `merge_request.create` push option) prints the new PR/MR's URL as its own
-# output, and that pairing — this command, this output — is the only thing in
-# a transcript that says the session opened the PR rather than merely looked
-# at one. See _scan_pr_line.
+# counterparts — `glab mr create`, a `git push` carrying the
+# `merge_request.create` push option, or `az repos pr create`) reports the new
+# PR/MR as its own output, and that pairing — this command, this output — is
+# the only thing in a transcript that says the session opened the PR rather
+# than merely looked at one. See _scan_pr_line.
 PR_CREATE_RE = re.compile(
-    r"\bgh\s+pr\s+create\b|\bglab\s+mr\s+create\b|\bmerge_request\.create\b")
+    r"\bgh\s+pr\s+create\b|\bglab\s+mr\s+create\b|\bmerge_request\.create\b"
+    r"|\baz\s+repos\s+pr\s+create\b")
 # Unresolved `gh pr create` tool_use ids remembered per session between beats.
 # Capped: a call whose result never lands (the turn was interrupted, the pane
 # died) must not grow the set for the life of the session.
@@ -1679,10 +1693,13 @@ def pr_status(url):
     <url>`. Returns the compact status dict, or None on any failure (gh accepts
     the full URL, so this works from any cwd as long as the login can see the
     repo). Best-effort and network-cheap — one gh call, capped by run()'s
-    timeout. A GitLab merge-request URL dispatches to mr_status, which answers
-    in the same shape (XERK-162)."""
+    timeout. A GitLab merge-request URL dispatches to mr_status (XERK-162) and
+    an Azure DevOps one to azdo_pr_status (XERK-226); both answer in the same
+    shape, so every renderer treats the three alike."""
     if MR_URL_RE.match(str(url or "")):
         return mr_status(url)
+    if AZDO_PR_URL_RE.match(str(url or "")):
+        return azdo_pr_status(url)
     raw = run(["gh", "pr", "view", url, "--json",
                "number,title,state,isDraft,url,statusCheckRollup,mergeable,"
                "baseRefName"])
@@ -1796,8 +1813,248 @@ def mr_status(url):
     return out
 
 
+# --- Azure DevOps pull requests (XERK-226) ---------------------------------
+# The third PR source, answering everywhere GitHub and GitLab do. It reuses the
+# board's PAT (AZDO_URL + AZDO_TOKEN) exactly as the MR half reuses GITLAB_URL:
+# an ADO org already hands this host a credential, so a PR chip on an ADO repo
+# costs no new config.
+
+# url -> (projectId, repositoryId) for a PR this host has already resolved. The
+# comment poller needs the project + repo to reach the threads API, and neither
+# is in the PR's URL (which may omit the project entirely); caching the answer
+# keeps a settled PR at ONE call per beat instead of two.
+_AZDO_PR_REF = {}
+_AZDO_PR_REF_MAX = 200
+
+# Lowercased identity spellings of the PAT's own user, for is_self on comments —
+# the ADO counterpart of GitHub's `viewerDidAuthor` and _gitlab_self_username.
+# None until a successful probe, so a transient failure retries on a later beat.
+_AZDO_SELF = {"ids": None}
+
+# The policy types that ARE a pull request's CI. Azure DevOps has no "checks"
+# concept: build validation and external status posts arrive as branch POLICY
+# evaluations, alongside policies that are governance rather than CI (minimum
+# reviewers, linked work items, comment resolution). Folding those in would make
+# a PR merely waiting on a human reviewer report "CI pending", so `checks` is
+# narrowed to the two CI-bearing types. Keyed on the policy type GUID, which is
+# stable across locales and server versions; the English display names are the
+# fallback for a payload that omits the id.
+AZDO_CI_POLICY_IDS = {
+    "0609b952-1397-4640-95ec-e00a01b2c241",  # Build (build validation)
+    "cbdc66da-9728-4af8-aada-9a5a32e4a226",  # Status (an external CI's post)
+}
+AZDO_CI_POLICY_NAMES = {"build", "status"}
+
+
+def _azure_get(path, params=None):
+    """GET one Azure DevOps REST path with the configured PAT; parsed JSON, or
+    None on any failure. The quiet best-effort shape the PR status/comment
+    pollers need — unlike azure_req, whose raise carries the error into the
+    board block."""
+    try:
+        return azure_req(path, params or {})
+    except Exception:
+        return None
+
+
+def _azdo_pr_id(url):
+    """The pull-request id when `url` is an Azure DevOps PR under the configured
+    AZDO_URL, else None. Prefix-matched against azure_base() so a self-hosted
+    collection (and a subpath install) resolves, while a PR on any OTHER ADO
+    org stays None — this host holds no credential for it, so its chip renders
+    as a bare link, like a PR gh can't see.
+
+    Known limit, shared with the GitLab half: an org reached through its legacy
+    `<org>.visualstudio.com` alias while AZDO_URL names `dev.azure.com/<org>`
+    (or vice versa) doesn't prefix-match, and degrades to a bare link."""
+    base = azure_base()
+    if not base or not azure_configured():
+        return None
+    u = str(url or "")
+    if not AZDO_PR_URL_RE.match(u):
+        return None
+    if not u.lower().startswith(base.lower() + "/"):
+        return None
+    m = AZDO_PR_URL_ID_RE.search(u)
+    return m.group(1) if m else None
+
+
+def _azdo_self_ids():
+    """Every spelling of the PAT owner's own identity, lowercased, for marking a
+    comment as the agent's own. ADO returns a comment's author as an IdentityRef
+    (id + uniqueName + displayName) and which of those is populated varies by
+    server, so all of them are compared. An empty set means "unknown" — the
+    poller then treats every comment as someone else's, which is the safe way
+    round (it delivers, it never silently swallows)."""
+    if _AZDO_SELF["ids"] is None:
+        data = _azure_get("/_apis/connectionData")
+        au = (data or {}).get("authenticatedUser") or {}
+        if au:
+            props = (au.get("properties") or {}).get("Account") or {}
+            vals = (au.get("id"), au.get("uniqueName"), au.get("mailAddress"),
+                    au.get("providerDisplayName"), au.get("customDisplayName"),
+                    props.get("$value"))
+            _AZDO_SELF["ids"] = {str(v).strip().lower()
+                                 for v in vals if str(v or "").strip()}
+    return _AZDO_SELF["ids"] or set()
+
+
+def _azdo_check_class(status):
+    """Map one Azure DevOps policy-evaluation status to _check_class's buckets:
+    approved passes, rejected/broken block, queued/running are pending, and
+    notApplicable (or an enum this build doesn't know) counts for nothing."""
+    s = str(status or "").lower()
+    if s == "approved":
+        return "pass"
+    if s in ("rejected", "broken"):
+        return "fail"
+    if s in ("queued", "running"):
+        return "pending"
+    return None
+
+
+def _azdo_is_ci_policy(ev):
+    """Whether one policy-evaluation record is CI rather than governance —
+    see AZDO_CI_POLICY_IDS."""
+    ptype = ((ev.get("configuration") or {}).get("type") or {})
+    if str(ptype.get("id") or "").lower() in AZDO_CI_POLICY_IDS:
+        return True
+    return str(ptype.get("displayName") or "").strip().lower() in AZDO_CI_POLICY_NAMES
+
+
+def _azdo_policy_evals(pr):
+    """The branch-policy evaluations for a fetched PR — the ADO stand-in for a
+    CI rollup — or None when they can't be read.
+
+    The evaluations API is keyed on a CodeReview artifact id, which is composed
+    (not returned): `vstfs:///CodeReview/CodeReviewId/<projectId>/<prId>`. Note
+    this is NOT the PR's own `artifactId` field, which is the /Git/PullRequestId
+    form and addresses a different artifact."""
+    repo = pr.get("repository") or {}
+    project = repo.get("project") or {}
+    proj = project.get("id") or project.get("name")
+    pr_id = pr.get("pullRequestId")
+    if not proj or pr_id is None:
+        return None
+    data = _azure_get(
+        f"/{urllib.parse.quote(str(proj), safe='')}/_apis/policy/evaluations",
+        {"artifactId": f"vstfs:///CodeReview/CodeReviewId/{proj}/{pr_id}",
+         "api-version": f"{AZDO_API_VERSION}-preview.1"})
+    value = (data or {}).get("value") if isinstance(data, dict) else None
+    return value if isinstance(value, list) else None
+
+
+def _summarize_azdo_pr(data, evals=None):
+    """Condense an Azure DevOps pull-request payload into the SAME compact
+    status dict _summarize_pr builds, so every renderer treats an ADO chip
+    exactly like a GitHub one (XERK-226).
+
+    ADO's vocabulary maps as: status active→OPEN (isDraft→DRAFT),
+    completed→MERGED, abandoned→CLOSED. `checks` is the CI-bearing branch
+    policies (see _azdo_policy_evals); `mergeable` comes from `mergeStatus`
+    (succeeded→MERGEABLE, conflicts→CONFLICTING, anything else UNKNOWN —
+    unproven is not proven, the discipline _merge_ready applies to GitHub's own
+    UNKNOWN), which like GitHub's `mergeable` reports CONFLICTS ALONE, not
+    whether every policy is satisfied.
+
+    `evals` None means the policies weren't readable (no permission, an older
+    server, a failed call), which reports as no CI rather than costing the whole
+    chip — the same place a GitHub PR with no workflows lands."""
+    raw = str(data.get("status") or "").lower()
+    state = {"active": "OPEN", "completed": "MERGED",
+             "abandoned": "CLOSED"}.get(raw, raw.upper())
+    if data.get("isDraft") and state == "OPEN":
+        state = "DRAFT"
+    counts = {"pass": 0, "fail": 0, "pending": 0}
+    for ev in evals or []:
+        if not isinstance(ev, dict) or not _azdo_is_ci_policy(ev):
+            continue
+        cls = _azdo_check_class(ev.get("status"))
+        if cls:
+            counts[cls] += 1
+    total = counts["pass"] + counts["fail"] + counts["pending"]
+    checks = None
+    if total:
+        checks = ("failing" if counts["fail"]
+                  else "pending" if counts["pending"] else "passing")
+    merge = str(data.get("mergeStatus") or "").lower()
+    mergeable = ("MERGEABLE" if merge == "succeeded"
+                 else "CONFLICTING" if merge == "conflicts" else "UNKNOWN")
+    base = str(data.get("targetRefName") or "")
+    if base.startswith("refs/heads/"):
+        base = base[len("refs/heads/"):]
+    return {
+        "url": None,
+        "number": data.get("pullRequestId"),
+        "title": (data.get("title") or "")[:120],
+        "state": state,
+        "checks": checks,
+        "checkCounts": counts if total else None,
+        "mergeable": mergeable,
+        "ready": _merge_ready(state, checks, mergeable),
+        "base": base or None,
+    }
+
+
+def _azdo_fetch_pr(url):
+    """The raw pull-request payload for an ADO PR url, or None.
+
+    Fetched org-scoped by id (`/_apis/git/pullrequests/<id>`) rather than
+    through the repository route, because the URL need not carry the project or
+    repo — the response is what names them, and the (project, repo) pair it
+    yields is cached for the comment poller."""
+    pr_id = _azdo_pr_id(url)
+    if not pr_id:
+        return None
+    data = _azure_get(f"/_apis/git/pullrequests/{pr_id}")
+    if not isinstance(data, dict) or data.get("pullRequestId") is None:
+        return None
+    repo = data.get("repository") or {}
+    proj = (repo.get("project") or {}).get("id") or (repo.get("project") or {}).get("name")
+    rid = repo.get("id") or repo.get("name")
+    if proj and rid:
+        if len(_AZDO_PR_REF) >= _AZDO_PR_REF_MAX:
+            _AZDO_PR_REF.clear()
+        _AZDO_PR_REF[url] = (str(proj), str(rid))
+    return data
+
+
+def azdo_pr_status(url):
+    """pr_status for an Azure DevOps pull request: state, CI-policy rollup and
+    mergeability from the configured org's REST API, in the identical compact
+    shape. None when the PR isn't under AZDO_URL (no credential for a foreign
+    org) or on any fetch failure.
+
+    Two calls, not one: the policy evaluations are keyed on an artifact id that
+    only the fetched PR can supply."""
+    data = _azdo_fetch_pr(url)
+    if data is None:
+        return None
+    out = _summarize_azdo_pr(data, _azdo_policy_evals(data))
+    out["url"] = url
+    return out
+
+
 PR_URL_PARTS_RE = re.compile(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)")
 MR_URL_IID_RE = re.compile(r"/-/merge_requests/(\d+)")
+
+
+def _pr_ref(url):
+    """How to NAME a pull/merge request in a message typed into the session:
+    ("PR"|"MR", "#12"|"!12"), or ("PR", "") for a url that carries no number.
+
+    GitHub writes `#12`; GitLab and Azure DevOps both write `!12` (in ADO `#12`
+    addresses a WORK ITEM, so the sigil is not interchangeable)."""
+    m = PR_URL_PARTS_RE.search(url or "")
+    if m:
+        return "PR", f"#{m.group(3)}"
+    m = MR_URL_IID_RE.search(url or "")
+    if m:
+        return "MR", f"!{m.group(1)}"
+    m = AZDO_PR_URL_ID_RE.search(url or "")
+    if m:
+        return "PR", f"!{m.group(1)}"
+    return "PR", ""
 
 
 def _pr_comment_events(url, self_login):
@@ -1822,10 +2079,13 @@ def _pr_comment_events(url, self_login):
     None on a hard fetch failure so the caller leaves the baseline untouched
     rather than treating "gh errored" as "every prior comment vanished".
 
-    A GitLab merge-request URL dispatches to _mr_comment_events, which answers
-    in the same event shape (XERK-162)."""
+    A GitLab merge-request URL dispatches to _mr_comment_events (XERK-162) and
+    an Azure DevOps one to _azdo_pr_comment_events (XERK-226); both answer in
+    the same event shape."""
     if MR_URL_RE.match(str(url or "")):
         return _mr_comment_events(url)
+    if AZDO_PR_URL_RE.match(str(url or "")):
+        return _azdo_pr_comment_events(url)
     raw = run(["gh", "pr", "view", url, "--json", "comments,reviews"])
     if not raw:
         return None
@@ -1943,6 +2203,72 @@ def _mr_comment_events(url):
     return [e for e in events if e["key"]]
 
 
+def _azdo_pr_comment_events(url):
+    """_pr_comment_events for an Azure DevOps pull request: every human comment
+    on the PR from one threads call — ADO keeps the conversation and the inline
+    diff notes in the same thread list, a `threadContext` marking the latter
+    (mapped to the same 'inline' kind + file:line loc the GitHub channel emits).
+
+    ADO's own bookkeeping ("X voted", "updated the source branch") arrives as
+    comments of type `system`, and is dropped like GitLab's `system: true`
+    notes. A comment id is only unique WITHIN its thread, so the seen-key is the
+    pair.
+
+    Same contract: the event list, or None on a hard fetch failure so the caller
+    keeps its baseline."""
+    pr_id = _azdo_pr_id(url)
+    if not pr_id:
+        return None
+    ref = _AZDO_PR_REF.get(url)
+    if not ref:
+        pr = _azdo_fetch_pr(url)
+        ref = _AZDO_PR_REF.get(url) if pr is not None else None
+    if not ref:
+        return None
+    proj, repo = ref
+    data = _azure_get(
+        f"/{urllib.parse.quote(proj, safe='')}/_apis/git/repositories/"
+        f"{urllib.parse.quote(repo, safe='')}/pullRequests/{pr_id}/threads")
+    threads = (data or {}).get("value") if isinstance(data, dict) else None
+    if not isinstance(threads, list):
+        return None
+    mine = _azdo_self_ids()
+    events = []
+    for th in threads:
+        if not isinstance(th, dict) or th.get("id") is None:
+            continue
+        ctx = th.get("threadContext")
+        ctx = ctx if isinstance(ctx, dict) else None
+        loc = None
+        if ctx:
+            loc = ctx.get("filePath") or None
+            pos = ctx.get("rightFileStart") or ctx.get("leftFileStart") or {}
+            line = pos.get("line") if isinstance(pos, dict) else None
+            if loc and line:
+                loc = f"{loc}:{line}"
+        for c in th.get("comments") or []:
+            if not isinstance(c, dict) or c.get("id") is None:
+                continue
+            if str(c.get("commentType") or "").lower() == "system":
+                continue
+            body = str(c.get("content") or "").strip()
+            if not body:
+                continue
+            author = c.get("author") if isinstance(c.get("author"), dict) else {}
+            spellings = {str(v).strip().lower() for v in (
+                author.get("id"), author.get("uniqueName"),
+                author.get("displayName")) if str(v or "").strip()}
+            events.append({
+                "key": f"{th['id']}:{c['id']}",
+                "author": str(author.get("displayName")
+                              or author.get("uniqueName") or ""),
+                "body": body,
+                "kind": "inline" if ctx else "comment", "loc": loc,
+                "is_self": bool(mine & spellings),
+            })
+    return events
+
+
 def _pr_comment_message(url, events):
     """Fold new PR comments into the single free-text message typed into the
     session (XERK-49). send_input collapses newlines to spaces, so this is built
@@ -1951,10 +2277,7 @@ def _pr_comment_message(url, events):
     one long comment can't crowd out the rest before INPUT_MAX_CHARS truncates."""
     if not events:
         return ""
-    m = PR_URL_PARTS_RE.search(url or "")
-    mm = MR_URL_IID_RE.search(url or "") if not m else None
-    num = f"#{m.group(3)}" if m else f"!{mm.group(1)}" if mm else ""
-    what = "MR" if mm else "PR"
+    what, num = _pr_ref(url)
     parts = [f"New review activity on the {what} {num} you opened ({url}). "
              f"Address it and update the {what} — continue in this session:"]
     for e in events:
@@ -1979,10 +2302,7 @@ def _pr_conflict_message(url, base, again=False):
 
     Deliberately says what to achieve and leaves the how to the session: it is
     the only thing on this host that knows what the conflicting code MEANS."""
-    m = PR_URL_PARTS_RE.search(url or "")
-    mm = MR_URL_IID_RE.search(url or "") if not m else None
-    num = f"#{m.group(3)}" if m else f"!{mm.group(1)}" if mm else ""
-    what = "MR" if mm else "PR"
+    what, num = _pr_ref(url)
     into = f"origin/{base}" if base else "the base branch (see the PR)"
     lead = ("still has merge conflicts" if again else "has merge conflicts")
     return (
@@ -2536,8 +2856,8 @@ def _scan_pr_line(raw, state, report):
 
     Attribution is deliberately narrow: a URL counts only when it comes back in
     a PR/MR-creating call's OWN tool_result (`gh pr create`, `glab mr create`,
-    or a `git push` carrying the `merge_request.create` push option — see
-    PR_CREATE_RE) — i.e. the session literally opened that PR. A PR link reaches a transcript a dozen other ways (`gh pr
+    `az repos pr create`, or a `git push` carrying the `merge_request.create`
+    push option — see PR_CREATE_RE) — i.e. the session literally opened that PR. A PR link reaches a transcript a dozen other ways (`gh pr
     list`/`view`/`checks` output, a link the operator pasted, the model quoting
     a PR another session opened), and taking any of those as "this session's
     PR" is what used to hang a chip — and fire a "created a PR" alert — on the
@@ -2552,6 +2872,65 @@ def _scan_pr_line(raw, state, report):
         return  # partial write, or the backlog cap's leading fragment
     if isinstance(entry, dict):
         _scan_pr_entry(entry, state, report)
+
+
+# A repository's own web URL, as the Azure DevOps API reports it — the base the
+# PR's browser link is built on. Anchored whole so nothing but a repo root is
+# ever extended into a PR link.
+AZDO_REPO_WEB_RE = re.compile(
+    r"^https://[\w.-]+(?::\d+)?(?:/[^\s/?#]+)*/_git/[^\s/?#]+$", re.IGNORECASE)
+# `{` probes tried when looking for a JSON object in a tool result. The az
+# output starts with one, so a real create hits on the first; the cap keeps a
+# result that is merely full of braces from costing a re-parse per brace.
+JSON_OBJECT_PROBES = 5
+
+
+def _first_json_object(text):
+    """The first complete JSON object in `text`, or None. A CLI prints its JSON
+    with whatever banner/warning lines it feels like, so the object is located
+    rather than assumed to be the whole output."""
+    s = str(text or "")
+    dec = json.JSONDecoder()
+    idx = s.find("{")
+    for _ in range(JSON_OBJECT_PROBES):
+        if idx < 0:
+            break
+        try:
+            obj, _end = dec.raw_decode(s, idx)
+        except ValueError:
+            idx = s.find("{", idx + 1)
+            continue
+        if isinstance(obj, dict):
+            return obj
+        idx = s.find("{", idx + 1)
+    return None
+
+
+def _azdo_created_pr_url(text):
+    """The browser URL of the pull request an `az repos pr create` just opened,
+    composed from that command's OWN output, or None (XERK-226).
+
+    Unlike `gh pr create` / `glab mr create`, the Azure DevOps CLI prints the
+    created pull-request OBJECT and no link — the browser URL exists nowhere in
+    the output. It is composed here the way the ADO web UI composes it,
+    `<repository web url>/pullrequest/<id>`, and only when BOTH halves are
+    present and the repository url is really a repository root, so nothing is
+    invented. This is not a widening of attribution: it runs only inside a
+    tool_result already tied to a PR-creating call."""
+    data = _first_json_object(text)
+    if not isinstance(data, dict):
+        return None
+    repo = data.get("repository")
+    pr_id = data.get("pullRequestId")
+    if not isinstance(repo, dict) or not isinstance(pr_id, int):
+        return None
+    web = str(repo.get("webUrl") or repo.get("remoteUrl") or "").strip()
+    # `remoteUrl` can carry a `user@` prefix on some collections; the link the
+    # chip points at must not.
+    web = re.sub(r"^(https://)[^/@]+@", r"\1", web).rstrip("/")
+    if not AZDO_REPO_WEB_RE.match(web):
+        return None
+    return f"{web}/pullrequest/{pr_id}"
 
 
 def _scan_pr_entry(entry, state, report):
@@ -2574,12 +2953,21 @@ def _scan_pr_entry(entry, state, report):
                 del calls[:-PR_CALLS_MAX]
         elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
             text = _tool_result_text(block.get("content"))
-            for rx in (PR_URL_RE, MR_URL_RE):
-                for m in rx.finditer(text):
-                    url = m.group(0)
-                    if url not in seen:
-                        seen.add(url)
-                        report["prUrls"].append(url)
+            found = []
+            for rx in (PR_URL_RE, MR_URL_RE, AZDO_PR_URL_RE):
+                found.extend(m.group(0) for m in rx.finditer(text))
+            if not any(AZDO_PR_URL_RE.match(u) for u in found):
+                # `az repos pr create` reports the PR it opened as a JSON object
+                # carrying no browser link at all, so the URL is composed from
+                # that object (XERK-226). Only consulted when the output printed
+                # no ADO PR link of its own, so one create can't chip twice.
+                composed = _azdo_created_pr_url(text)
+                if composed:
+                    found.append(composed)
+            for url in found:
+                if url not in seen:
+                    seen.add(url)
+                    report["prUrls"].append(url)
 
 
 # The confirmation line Claude Code prints (and transcribes as local-command
@@ -10054,11 +10442,13 @@ class SessionManager:
         them as referenced, the very act of killing a session would evict the PR
         status its ended card is about to show.
 
-        GitLab merge requests refresh through the same sweep (XERK-162): each
-        URL is polled only through the source that can answer for it
-        (_pr_source_ok), so a gh-less GitLab host still refreshes its MRs and
-        a GitLab-less host doesn't burn beats on MRs it can't see."""
-        if not self.github.get("available") and not gitlab_configured():
+        GitLab merge requests (XERK-162) and Azure DevOps pull requests
+        (XERK-226) refresh through the same sweep: each URL is polled only
+        through the source that can answer for it (_pr_source_ok), so a gh-less
+        GitLab or ADO host still refreshes its own, and a host without that
+        source doesn't burn beats on PRs it can't see."""
+        if not (self.github.get("available") or gitlab_configured()
+                or azure_configured()):
             return
         referenced, wanted, seen = set(), [], set()
         for sess in self.registry:
@@ -10098,11 +10488,14 @@ class SessionManager:
 
     def _pr_source_ok(self, url):
         """Whether THIS host can fetch status/comments for a PR/MR url: a
-        GitLab merge request needs the configured GITLAB_URL to cover it,
-        anything else needs the gh login. What can't be fetched keeps its
-        last-known status (or a bare link chip) rather than costing calls."""
+        GitLab merge request needs the configured GITLAB_URL to cover it, an
+        Azure DevOps pull request the configured AZDO_URL, anything else the gh
+        login. What can't be fetched keeps its last-known status (or a bare link
+        chip) rather than costing calls."""
         if MR_URL_RE.match(str(url or "")):
             return _mr_url_parts(url) is not None
+        if AZDO_PR_URL_RE.match(str(url or "")):
+            return _azdo_pr_id(url) is not None
         return bool(self.github.get("available"))
 
     def _session_prs(self, sid):
@@ -10135,12 +10528,14 @@ class SessionManager:
         never mistaken for someone else's on a later beat.
 
         Best-effort and bounded: each URL polls only through the source that
-        can answer for it (_pr_source_ok — gh for PRs, the configured GitLab
-        for MRs, XERK-162), capped at PR_COMMENTS_MAX PRs per beat, and a fetch
+        can answer for it (_pr_source_ok — gh for GitHub PRs, the configured
+        GitLab for MRs (XERK-162), the configured Azure DevOps org for its own
+        PRs (XERK-226)), capped at PR_COMMENTS_MAX PRs per beat, and a fetch
         failure leaves that PR's baseline untouched (a fetch error is not
         evidence the comments vanished)."""
-        if not PR_COMMENTS_DELIVER or (
-                not self.github.get("available") and not gitlab_configured()):
+        if not PR_COMMENTS_DELIVER or not (
+                self.github.get("available") or gitlab_configured()
+                or azure_configured()):
             return
         self_login = self.github.get("login") or ""
         polled = 0

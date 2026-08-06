@@ -1028,6 +1028,64 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         rep = ha.session_report(self.WORKDIR, state)
         self.assertEqual(rep["prUrls"], [self.MR1])
 
+    AZDO1 = "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12"
+
+    def test_az_repos_pr_create_result_is_this_sessions_pr(self):
+        """XERK-226: `az repos pr create` prints the created PR as JSON with no
+        link in it, so the URL is composed from the create call's OWN result."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        out = json.dumps({
+            "pullRequestId": 12, "status": "active",
+            "repository": {"name": "app",
+                           "webUrl": "https://dev.azure.com/myorg/Proj/_git/app"}})
+        write_jsonl(path, [
+            self.pr_create_call(
+                "a1", cmd="az repos pr create --title x --output json"),
+            self.tool_result("a1", out),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [self.AZDO1])
+
+    def test_az_pr_link_in_the_result_counts_once(self):
+        """A result carrying the PR link outright is taken as-is — never also
+        composed, which would chip one PR twice."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        out = (f"Created pull request: {self.AZDO1}\n" + json.dumps({
+            "pullRequestId": 12,
+            "repository": {"webUrl": "https://dev.azure.com/myorg/_git/app"}}))
+        write_jsonl(path, [
+            self.pr_create_call("a2", cmd="az repos pr create --open"),
+            self.tool_result("a2", out),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [self.AZDO1])
+
+    def test_plain_push_azdo_pr_hint_is_not_a_created_pr(self):
+        """ADO's `git push` prints a "create a pull request by visiting …"
+        hint pointing at the CREATE FORM — no PR exists yet."""
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+
+        out = ("remote: Create a pull request for 'xerk-1' on Azure DevOps by visiting:\n"
+               "remote:   https://dev.azure.com/myorg/Proj/_git/app/pullrequestcreate"
+               "?sourceRef=xerk-1&targetRef=main\n")
+        write_jsonl(path, [
+            self.pr_create_call("a3", cmd="git push origin HEAD"),
+            self.tool_result("a3", out),
+        ])
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["prUrls"], [])
+
     def test_plain_push_mr_hint_is_not_a_created_mr(self):
         """A plain `git push` prints GitLab's "to create a merge request …
         visit …/merge_requests/new" hint (and, on later pushes, the existing
@@ -4801,6 +4859,17 @@ class TestPrCommentMessage(unittest.TestCase):
         self.assertIn("MR", msg)
         self.assertIn("@alice", msg)
 
+    def test_names_an_azdo_pr_the_azdo_way(self):
+        """XERK-226: Azure DevOps spells a pull-request reference `!12` — `#12`
+        addresses a WORK ITEM there — but it is still a PR, not an MR."""
+        msg = ha._pr_comment_message(
+            "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12",
+            [{"author": "Alice", "body": "rename it", "kind": "comment",
+              "loc": None}])
+        self.assertIn("!12", msg)
+        self.assertIn("the PR", msg)
+        self.assertNotIn("MR", msg)
+
 
 class TestMrCommentEvents(unittest.TestCase):
     """XERK-162: _mr_comment_events answers _pr_comment_events' exact contract
@@ -4854,6 +4923,289 @@ class TestMrCommentEvents(unittest.TestCase):
         with self._configured():
             self.assertIsNone(ha._pr_comment_events(
                 "https://other.tld/g/a/-/merge_requests/9", ""))
+
+
+class AzdoPrMixin:
+    """The configured-ADO-org fixture the pull-request cases share."""
+
+    ORG = "https://dev.azure.com/myorg"
+    PR = "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12"
+
+    def _configured(self):
+        ha._AZDO_PR_REF.clear()
+        ha._AZDO_SELF["ids"] = None
+        return mock.patch.multiple(ha, AZDO_URL=self.ORG, AZDO_TOKEN="pat")
+
+    def pr_payload(self, **over):
+        data = {
+            "pullRequestId": 12, "title": "Add flag", "status": "active",
+            "isDraft": False, "mergeStatus": "succeeded",
+            "targetRefName": "refs/heads/main",
+            "repository": {"id": "repo-guid", "name": "app",
+                           "project": {"id": "proj-guid", "name": "Proj"}},
+        }
+        data.update(over)
+        return data
+
+    @staticmethod
+    def build_eval(status):
+        return {"status": status, "configuration": {"type": {
+            "id": "0609b952-1397-4640-95ec-e00a01b2c241",
+            "displayName": "Build"}}}
+
+
+class TestAzdoPrStatus(AzdoPrMixin, unittest.TestCase):
+    """XERK-226: an Azure DevOps pull request answers in _summarize_pr's exact
+    shape, so every chip renderer treats it like a GitHub PR."""
+
+    def test_pr_id_under_configured_org(self):
+        with self._configured():
+            self.assertEqual(ha._azdo_pr_id(self.PR), "12")
+            # ADO serves the PR with or without the project segment.
+            self.assertEqual(ha._azdo_pr_id(
+                "https://dev.azure.com/myorg/_git/app/pullrequest/12"), "12")
+            # …and with the web UI's own tab query string.
+            self.assertEqual(ha._azdo_pr_id(self.PR + "?_a=files"), "12")
+
+    def test_pr_id_self_hosted_collection(self):
+        with mock.patch.multiple(ha, AZDO_URL="https://tfs.co:8080/tfs/DefaultCollection",
+                                 AZDO_TOKEN="pat"):
+            self.assertEqual(ha._azdo_pr_id(
+                "https://tfs.co:8080/tfs/DefaultCollection/P/_git/r/pullrequest/9"),
+                "9")
+
+    def test_pr_id_foreign_org_or_unconfigured(self):
+        # Another org (no credential) and an unconfigured host both resolve to
+        # None — the chip stays a bare link.
+        with self._configured():
+            self.assertIsNone(ha._azdo_pr_id(
+                "https://dev.azure.com/other/P/_git/r/pullrequest/1"))
+        with mock.patch.multiple(ha, AZDO_URL="", AZDO_TOKEN=""):
+            self.assertIsNone(ha._azdo_pr_id(self.PR))
+
+    def test_create_form_link_is_not_a_pull_request(self):
+        # ADO's `git push` hint points at the CREATE form, like GitLab's
+        # /merge_requests/new — no PR exists yet.
+        with self._configured():
+            self.assertIsNone(ha._azdo_pr_id(
+                "https://dev.azure.com/myorg/Proj/_git/app/pullrequestcreate"
+                "?sourceRef=xerk-1&targetRef=main"))
+
+    def test_check_class(self):
+        self.assertEqual(ha._azdo_check_class("approved"), "pass")
+        self.assertEqual(ha._azdo_check_class("rejected"), "fail")
+        self.assertEqual(ha._azdo_check_class("broken"), "fail")
+        for s in ("queued", "running"):
+            self.assertEqual(ha._azdo_check_class(s), "pending")
+        self.assertIsNone(ha._azdo_check_class("notApplicable"))
+        self.assertIsNone(ha._azdo_check_class(None))
+
+    def test_only_ci_policies_are_checks(self):
+        """A PR waiting on a human reviewer must not read as "CI pending":
+        governance policies are not this PR's CI."""
+        reviewers = {"status": "queued", "configuration": {"type": {
+            "id": "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd",
+            "displayName": "Minimum number of reviewers"}}}
+        out = ha._summarize_azdo_pr(
+            self.pr_payload(), [reviewers, self.build_eval("approved")])
+        self.assertEqual(out["checks"], "passing")
+        self.assertEqual(out["checkCounts"], {"pass": 1, "fail": 0, "pending": 0})
+
+    def test_ci_policy_recognized_by_display_name_without_an_id(self):
+        ev = {"status": "approved",
+              "configuration": {"type": {"displayName": "Status"}}}
+        self.assertEqual(ha._summarize_azdo_pr(self.pr_payload(), [ev])["checks"],
+                         "passing")
+
+    def test_summarize_open_passing_mergeable(self):
+        out = ha._summarize_azdo_pr(self.pr_payload(),
+                                    [self.build_eval("approved")])
+        self.assertEqual(out["state"], "OPEN")
+        self.assertEqual(out["number"], 12)
+        self.assertEqual(out["title"], "Add flag")
+        self.assertEqual(out["checks"], "passing")
+        self.assertEqual(out["mergeable"], "MERGEABLE")
+        self.assertEqual(out["ready"], "ready")
+        self.assertEqual(out["base"], "main")
+
+    def test_draft_and_terminal_states(self):
+        self.assertEqual(
+            ha._summarize_azdo_pr(self.pr_payload(isDraft=True))["state"], "DRAFT")
+        self.assertEqual(
+            ha._summarize_azdo_pr(self.pr_payload(status="completed"))["state"],
+            "MERGED")
+        self.assertEqual(
+            ha._summarize_azdo_pr(self.pr_payload(status="abandoned"))["state"],
+            "CLOSED")
+
+    def test_conflict_blocks_even_with_green_ci(self):
+        out = ha._summarize_azdo_pr(self.pr_payload(mergeStatus="conflicts"),
+                                    [self.build_eval("approved")])
+        self.assertEqual(out["mergeable"], "CONFLICTING")
+        self.assertEqual(out["ready"], "blocked")
+
+    def test_unproven_mergeability_is_pending(self):
+        for raw in ("queued", "notSet", ""):
+            out = ha._summarize_azdo_pr(self.pr_payload(mergeStatus=raw),
+                                        [self.build_eval("approved")])
+            self.assertEqual(out["mergeable"], "UNKNOWN")
+            self.assertEqual(out["ready"], "pending")
+
+    def test_unreadable_policies_report_no_ci_not_no_chip(self):
+        out = ha._summarize_azdo_pr(self.pr_payload(), None)
+        self.assertIsNone(out["checks"])
+        self.assertIsNone(out["checkCounts"])
+        self.assertEqual(out["state"], "OPEN")
+
+    def test_pr_status_dispatches_and_keeps_the_scraped_url(self):
+        calls = []
+
+        def fake_get(path, params=None):
+            calls.append((path, params or {}))
+            if path.endswith("/_apis/git/pullrequests/12"):
+                return self.pr_payload()
+            return {"value": [self.build_eval("approved")]}
+
+        with self._configured(), \
+                mock.patch.object(ha, "_azure_get", side_effect=fake_get):
+            out = ha.pr_status(self.PR)
+        self.assertEqual(out["url"], self.PR)      # the link the chip opens
+        self.assertEqual(out["ready"], "ready")
+        # The evaluations call is keyed on the CodeReview artifact id, which is
+        # NOT the PR's own /Git/PullRequestId artifactId.
+        self.assertEqual(calls[1][1]["artifactId"],
+                         "vstfs:///CodeReview/CodeReviewId/proj-guid/12")
+
+    def test_pr_status_none_on_fetch_failure(self):
+        with self._configured(), \
+                mock.patch.object(ha, "_azure_get", return_value=None):
+            self.assertIsNone(ha.pr_status(self.PR))
+
+    def test_pr_status_leaves_github_alone(self):
+        with self._configured(), \
+                mock.patch.object(ha, "run", return_value=None):
+            self.assertIsNone(ha.pr_status("https://github.com/o/r/pull/7"))
+
+
+class TestAzdoPrCommentEvents(AzdoPrMixin, unittest.TestCase):
+    """XERK-226: _azdo_pr_comment_events answers _pr_comment_events' exact
+    contract from Azure DevOps' PR threads API."""
+
+    ME = {"authenticatedUser": {"id": "me-guid", "uniqueName": "bot@x.io",
+                                "providerDisplayName": "Turma Bot"}}
+
+    def _events(self, threads, me=None):
+        def fake_get(path, params=None):
+            if path.endswith("/_apis/connectionData"):
+                return self.ME if me is None else me
+            if path.endswith("/_apis/git/pullrequests/12"):
+                return self.pr_payload()
+            return {"value": threads}
+
+        with self._configured(), \
+                mock.patch.object(ha, "_azure_get", side_effect=fake_get):
+            return ha._pr_comment_events(self.PR, "")
+
+    @staticmethod
+    def thread(tid, comments, ctx=None):
+        return {"id": tid, "comments": comments, "threadContext": ctx}
+
+    @staticmethod
+    def comment(cid, body, author=None, ctype="text"):
+        return {"id": cid, "content": body, "commentType": ctype,
+                "author": author or {"id": "alice-guid",
+                                     "displayName": "Alice"}}
+
+    def test_conversation_comment(self):
+        evs = self._events([self.thread(3, [self.comment(1, "rename it")])])
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["author"], "Alice")
+        self.assertEqual(evs[0]["body"], "rename it")
+        self.assertEqual(evs[0]["kind"], "comment")
+        self.assertFalse(evs[0]["is_self"])
+
+    def test_key_pairs_thread_and_comment(self):
+        """A comment id is unique only WITHIN its thread, so the seen-key must
+        carry both — else thread 4's comment 1 dedupes away thread 3's."""
+        evs = self._events([self.thread(3, [self.comment(1, "a")]),
+                            self.thread(4, [self.comment(1, "b")])])
+        self.assertEqual([e["key"] for e in evs], ["3:1", "4:1"])
+
+    def test_inline_comment_carries_file_and_line(self):
+        ctx = {"filePath": "/src/app.py", "rightFileStart": {"line": 42}}
+        evs = self._events([self.thread(5, [self.comment(1, "typo")], ctx)])
+        self.assertEqual(evs[0]["kind"], "inline")
+        self.assertEqual(evs[0]["loc"], "/src/app.py:42")
+
+    def test_system_and_empty_comments_are_dropped(self):
+        evs = self._events([self.thread(6, [
+            self.comment(1, "Alice voted 10", ctype="system"),
+            self.comment(2, "   "),
+            self.comment(3, "real note"),
+        ])])
+        self.assertEqual([e["body"] for e in evs], ["real note"])
+
+    def test_own_comment_is_marked_self(self):
+        mine = {"id": "me-guid", "displayName": "Turma Bot"}
+        evs = self._events([self.thread(7, [
+            self.comment(1, "pushed a fix", author=mine)])])
+        self.assertTrue(evs[0]["is_self"])
+
+    def test_unknown_self_never_swallows_a_comment(self):
+        evs = self._events([self.thread(8, [self.comment(1, "hi")])],
+                           me={})
+        self.assertFalse(evs[0]["is_self"])
+
+    def test_empty_pr_returns_empty_not_none(self):
+        self.assertEqual(self._events([]), [])
+
+    def test_fetch_failure_is_none_so_the_baseline_holds(self):
+        with self._configured(), \
+                mock.patch.object(ha, "_azure_get", return_value=None):
+            self.assertIsNone(ha._pr_comment_events(self.PR, ""))
+
+    def test_foreign_org_is_none(self):
+        with self._configured():
+            self.assertIsNone(ha._pr_comment_events(
+                "https://dev.azure.com/other/P/_git/r/pullrequest/1", ""))
+
+
+class TestAzdoCreatedPrUrl(unittest.TestCase):
+    """XERK-226: `az repos pr create` prints the created PR as JSON and no link
+    at all, so the chip's URL is composed from that object."""
+
+    def _out(self, **over):
+        data = {"pullRequestId": 12, "status": "active",
+                "repository": {"name": "app",
+                               "webUrl": "https://dev.azure.com/myorg/Proj/_git/app"}}
+        data.update(over)
+        return json.dumps(data)
+
+    def test_composes_the_web_url(self):
+        self.assertEqual(
+            ha._azdo_created_pr_url(self._out()),
+            "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12")
+
+    def test_falls_back_to_remote_url_and_strips_userinfo(self):
+        out = self._out(repository={
+            "name": "app",
+            "remoteUrl": "https://myorg@dev.azure.com/myorg/Proj/_git/app"})
+        self.assertEqual(
+            ha._azdo_created_pr_url(out),
+            "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/12")
+
+    def test_finds_the_object_past_a_cli_banner(self):
+        noisy = "WARNING: extension is in preview\n" + self._out()
+        self.assertTrue(ha._azdo_created_pr_url(noisy))
+
+    def test_invents_nothing_when_a_half_is_missing(self):
+        self.assertIsNone(ha._azdo_created_pr_url(self._out(pullRequestId=None)))
+        self.assertIsNone(ha._azdo_created_pr_url(
+            self._out(repository={"name": "app"})))
+        # Not a repository root — never extended into a PR link.
+        self.assertIsNone(ha._azdo_created_pr_url(self._out(
+            repository={"webUrl": "https://dev.azure.com/myorg/Proj"})))
+        self.assertIsNone(ha._azdo_created_pr_url("gh: not json at all"))
 
 
 class TestPollPrComments(ManagerMixin, unittest.TestCase):
@@ -4984,6 +5336,13 @@ class TestPrConflictMessage(unittest.TestCase):
         self.assertIn("!4", msg)
         self.assertIn("The MR", msg)
         self.assertNotIn("PR", msg)
+
+    def test_azdo_pr_is_a_pr_numbered_the_azdo_way(self):
+        msg = ha._pr_conflict_message(
+            "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/4", "main")
+        self.assertIn("!4", msg)
+        self.assertIn("The PR", msg)
+        self.assertNotIn("MR", msg)
 
 
 class TestPollPrConflicts(ManagerMixin, unittest.TestCase):
@@ -8466,6 +8825,21 @@ class TestRefreshPrStatus(ManagerMixin, unittest.TestCase):
                 mock.patch.object(ha, "pr_status") as pr:
             sm.refresh_pr_status()
         pr.assert_not_called()
+
+    def test_gh_less_azdo_host_still_refreshes_its_prs(self):
+        """XERK-226: the same for an Azure DevOps org — its PAT answers for its
+        own PRs, and a foreign org's PR is skipped rather than asked about."""
+        ours = "https://dev.azure.com/myorg/Proj/_git/app/pullrequest/5"
+        theirs = "https://dev.azure.com/other/P/_git/r/pullrequest/9"
+        sm = self._running_session("s1", [ours, theirs,
+                                          "https://github.com/o/r/pull/1"])
+        sm.github = {"available": False}
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/myorg",
+                                 AZDO_TOKEN="pat"), \
+                mock.patch.object(ha, "pr_status",
+                                  return_value={"url": ours, "state": "OPEN"}) as pr:
+            sm.refresh_pr_status()
+        pr.assert_called_once_with(ours)
 
     def test_fetches_and_caches(self):
         url = "https://github.com/o/r/pull/1"

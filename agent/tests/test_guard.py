@@ -103,6 +103,14 @@ POLICY_BLOCKED = [
     "gh pr merge 7 --admin",
     "glab mr merge 123",
     "glab mr merge --squash --yes",
+    # Azure DevOps has no `merge` verb (XERK-226): a PR lands by being set to
+    # `completed`, or by arming auto-complete — which merges it the moment its
+    # policies pass, including straight off the create.
+    "az repos pr update --id 12 --status completed",
+    "az repos pr update --id 12 --status=completed",
+    "az repos pr update --id 12 --auto-complete true",
+    "az repos pr create --title t --auto-complete",
+    "az repos pr create --title t --auto-complete=true",
 ]
 
 POLICY_OK = [
@@ -114,6 +122,10 @@ POLICY_OK = [
     "gh pr view 12",
     "glab mr create --fill",
     "glab mr view 12",
+    "az repos pr create --title t --description b",
+    "az repos pr show --id 12",
+    "az repos pr update --id 12 --status abandoned",
+    "az repos pr update --id 12 --auto-complete false",  # DISARMING it is fine
     "git merge feature/x",  # local branch merge is fine
 ]
 
@@ -122,6 +134,8 @@ ATTRIB_BLOCKED = [
     'git commit -m "feature\n\n🤖 Generated with Claude Code"',
     "git commit -m 'x' --trailer 'Co-authored-by: Anthropic'",
     "gh pr create --title t --body 'Generated with Claude'",
+    "glab mr create --title t --description 'Generated with Claude'",
+    "az repos pr create --title t --description 'Generated with Claude'",
 ]
 
 ATTRIB_OK = [

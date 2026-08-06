@@ -47,6 +47,9 @@ if [ "$2" = "--print-device" ]; then echo "DEVICE_NAME=testbox"; exit 0; fi
 # AZDO_URL+AZDO_TOKEN are set, so echoing a marker proves the plumbing fired.
 if [ "$2" = "--wire-azure-git" ]; then echo "WIRE_AZURE_GIT called"; exit 0; fi
 echo "MANAGER uid=$(id -u) gid=$(id -g) home=$HOME"
+# Whether the ADO PAT reached the manager's env (and so every session's `az`) —
+# reported as set/unset, never the value.
+echo "AZDOEXTPAT=${AZURE_DEVOPS_EXT_PAT:+set}"
 echo "ROOTDIR_OWNER=$(stat -c '%u:%g' /root)"
 touch "$REPOS_ROOT/.probe" 2>/dev/null || true
 echo "NEWFILE_OWNER=$(stat -c '%u:%g' "$REPOS_ROOT/.probe" 2>/dev/null || echo none)"
@@ -277,6 +280,10 @@ if echo "$out" | grep -q "WIRE_AZURE_GIT called"; then
 else
   echo "  FAIL: AZDO configured but git-auth wiring not invoked"; FAILED=1
 fi
+# XERK-226: the same PAT is exported as AZURE_DEVOPS_EXT_PAT so a session's
+# `az repos pr create` authenticates — that command is what opens the PR an ADO
+# chip then tracks. Exported (never a command-line arg), so `ps` can't leak it.
+expect "az repos PAT exported" "set" "$(field "$out" AZDOEXTPAT)"
 expect "manager still starts" "0" "$(field "$out" uid)"
 
 echo "== case: no AZDO creds means no git-auth wiring"
@@ -287,6 +294,15 @@ if echo "$out" | grep -q "WIRE_AZURE_GIT called"; then
 else
   echo "  ok: git-auth wiring skipped without AZDO creds"
 fi
+expect "no az repos PAT without AZDO creds" "" "$(field "$out" AZDOEXTPAT)"
+
+# An operator-set AZURE_DEVOPS_EXT_PAT is a deliberate override and wins over
+# the board's PAT.
+echo "== case: an operator-set az repos PAT is not overwritten"
+make_fixture "$WORK/fx9f" 0 0
+out="$(run_case "$WORK/fx9f" -e AZDO_URL=https://tfs.example.com/Col \
+  -e AZDO_TOKEN=pat -e AZURE_DEVOPS_EXT_PAT=mine)"
+expect "operator PAT kept" "set" "$(field "$out" AZDOEXTPAT)"
 
 # --- Case 10: the tunnel is supervised (XERK-34) -----------------------------
 # A tunnel PROCESS death must not outlive one retry interval. Fire-and-forget
