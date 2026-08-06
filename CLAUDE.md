@@ -198,21 +198,27 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - `resumeTranscript` — resume ANY prior transcript by id. `_resumable_report()` heartbeats each repo's
   resumable list. Tests: `TestResumableReport`, `TestResumeTranscript`, `TestTranscriptCwd`.
 - `input` / `history` / `answerQuestion` — for the glasses client.
-  - `input`/`send_input` types the message into the session's tmux pane and **guarantees it survives a
-    compaction** (XERK-47): an auto-compaction (context ~95%) can drop a message queued mid-turn.
-    `send_input` records every sent message on the record's `pendingInputs` outbox, and
-    `_poll_pending_inputs` (every beat, no-op unless a session has an outbox) makes it at-least-once:
-    - a compaction is counted by `_pending_scan` from the transcript's own `compact_boundary` **system
-      entry** (`compactMetadata.trigger`), never by scraping the pane; a message is **reaped on delivery**
-      (`delivered`) or **left in flight** while still in the folded live queue (`queued`);
+  - `input`/`send_input` puts the message into the session's pane and **guarantees it survives a
+    compaction** (XERK-47), which can drop one queued mid-turn: every sent message goes on the record's
+    `pendingInputs` outbox, and `_poll_pending_inputs` (every beat, no-op without an outbox) makes it
+    at-least-once:
+    - compactions are counted by `_pending_scan` from the transcript's own `compact_boundary` **system
+      entry**, never by scraping the pane; a message is **reaped on delivery** (`delivered`) or **left in
+      flight** while still in the folded live queue (`queued`);
     - it is **re-sent** only when a NEW compaction happened since it was sent (`compactBase` rose) AND
-      it's neither delivered nor queued AND the pane has settled to idle (`_pane_busy` False, not None)
-      — that gate makes the resend **duplicate-safe**. Bounded: `PENDING_INPUT_MAX_ATTEMPTS` resends, one
-      per beat, aged out at `PENDING_INPUT_TTL_SEC`; `delivered` matches by text with no timestamp
-      filter, biased AGAINST a resend.
-    - The outbox is internal (not heartbeated), cleared on restart-clear-context. The raw ttyd terminal
-      bypasses `send_input`, so a message typed straight into it isn't covered.
-    - Tests: `TestPendingScan`, `TestPollPendingInputs`, `TestSendInput`.
+      it's neither, AND the pane has settled to idle (`_pane_busy` False, not None) — that gate makes the
+      resend **duplicate-safe**. Bounded: `PENDING_INPUT_MAX_ATTEMPTS` resends, one per beat, aged out at
+      `PENDING_INPUT_TTL_SEC`; `delivered` matches by text with no timestamp filter, biased AGAINST a
+      resend;
+    - the outbox is internal (not heartbeated), cleared on restart-clear-context; a message typed
+      straight into the raw ttyd terminal bypasses `send_input` and isn't covered. Tests:
+      `TestPendingScan`, `TestPollPendingInputs`, `TestSendInput`.
+  - **The message is PASTED, not typed** (`_type_into_pane`, XERK-227): `load-buffer -` +
+    `paste-buffer -d -p` + Enter — `send-keys` carries the text as a tmux command argument, refused past
+    ~16 KiB, so a pasted log never reached the composer though the raw terminal took one. `-p` brackets
+    only for an app that asked (Claude Code does), so **newlines survive as ONE message**; control bytes
+    are stripped (`_clean_input_text`), else one ends the paste early and the rest reads as KEYSTROKES.
+    The 100k `INPUT_MAX_CHARS` caps (agent truncates, hub **413s**) are payload backstops.
 - `interrupt` — sends a single Escape to the tmux pane, cancelling the in-flight generation/tool call
   with session and conversation intact. Deliberately NOT gated on `paneBusy`. Tests: `TestInterrupt`.
 - **Operator messages are exempt from the `history` window** (XERK-186): the read stays bounded
@@ -283,15 +289,14 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     `TestSessionReportModelActual`, `TestSeedModelActual`, `TestModelActualPayload`,
     `TestInternalToolSlugModelProbe`.
 - The **shared Claude login's health** (`claudeAuth`, XERK-98) — `claude_auth_status()` reads
-  `~/.claude/.credentials.json` (`CLAUDE_CREDS_PATH`) every beat:
-  `{present, needsLogin, expiringSoon, expiresAt, refreshExpiresAt, subscriptionType, at}` (epoch ms).
-  The **REFRESH token** (`refreshTokenExpiresAt`) is the signal, NOT the access token: it lapses only
-  when claude hasn't refreshed inside its ~30-day window, when a human must `claude /login`.
-  `needsLogin` = missing/unreadable file, no `claudeAiOauth`/access token, or a past refresh expiry;
-  `expiringSoon` = refresh token within `CLAUDE_AUTH_WARN_MS` (3d; `TURMA_CLAUDE_AUTH_WARN_SEC`). A
-  present login with unknown refresh expiry reads healthy; a MISSING login can't heartbeat, so it
-  surfaces as the offline alert. Chip via `claudeAuthBadge` (`index.html`) / `🔑` pill
-  (`FleetScreen.kt`). Tests: `TestClaudeAuthStatus`.
+  `~/.claude/.credentials.json` (`CLAUDE_CREDS_PATH`) every beat into `{present, needsLogin,
+  expiringSoon, expiresAt, refreshExpiresAt, subscriptionType, at}` (epoch ms). The **REFRESH token**
+  (`refreshTokenExpiresAt`) is the signal, NOT the access token: it lapses only when claude hasn't
+  refreshed inside its ~30-day window, when a human must `claude /login`. `needsLogin` =
+  missing/unreadable file, no `claudeAiOauth`/access token, or a past refresh expiry; `expiringSoon` =
+  refresh token within `CLAUDE_AUTH_WARN_MS` (3d; `TURMA_CLAUDE_AUTH_WARN_SEC`). A present login with
+  unknown refresh expiry reads healthy; a MISSING login can't heartbeat, so it surfaces as the offline
+  alert. Chip via `claudeAuthBadge` / `🔑` pill (`FleetScreen.kt`). Tests: `TestClaudeAuthStatus`.
 
 #### Live-session signals
 
@@ -1042,13 +1047,12 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 #### Repo chips
 
-- Each card shows the **repo the agent triaged the ticket to** (`repoChipHtml`, from `repoGuess`), in
-  three distinct states: a repo **cloned** on the reporting host is a plain actionable chip; one only in
-  the org's `gh` listing is **dashed**; a ticket the model declined shows a muted italic **"no repo"**.
-  A ticket with no `repoGuess` yet gets **no chip** ("not looked at yet" ≠ "no repo fits"). The model's
-  rationale rides as the chip's tooltip and the detail panel's Repo row (`repoFieldHtml`, which reads
-  `t.repoGuess` directly — the guess only exists on the heartbeat ticket, not the on-demand Jira fetch),
-  which is also where the guess is **corrected by hand**.
+- Each card shows the **repo the agent triaged the ticket to** (`repoChipHtml`, from `repoGuess`) in
+  three states: **cloned** on the reporting host is a plain actionable chip; one only in the org's `gh`
+  listing is **dashed**; a ticket the model declined is a muted italic **"no repo"**; no `repoGuess` yet
+  gets **no chip** ("not looked at yet" ≠ "no repo fits"). The rationale rides as the chip's tooltip and
+  the detail panel's Repo row (`repoFieldHtml`, reading `t.repoGuess` directly — the guess exists only on
+  the heartbeat ticket, not the on-demand Jira fetch), which is where it is **corrected by hand**.
 
 #### Starting a session on a ticket
 
@@ -1565,16 +1569,16 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   dead tokens are pruned on send.
 - **An addressed alert is retracted from the phone** (XERK-154): every session alert posts under a stable
   `notifKey` (`question:<host>:<id>`, `pr:<url>`, `turn:<host>:<id>`); `dismiss(notifKey)` sends a
-  title-less `{action:"dismiss", notifKey}` FCM message (no-op with no device / FCM off), fired once per
-  addressed edge: a question cleared, a PR reaching MERGED/CLOSED (over `sa.prSeen` via `prStatus`,
-  deduped by `sa.prDismissed`), a turn the operator replied to (`sa.turnAlerted` + idle→working).
+  title-less `{action:"dismiss", notifKey}` FCM message once per addressed edge: a question cleared, a PR
+  reaching MERGED/CLOSED (over `sa.prSeen` via `prStatus`, deduped by `sa.prDismissed`), a turn the
+  operator replied to (`sa.turnAlerted` + idle→working).
   App-side `Notifications.idFor` keys off `notifKey`, so alert kinds coexist rather than colliding on one
   per-session id. **Capability-gated**: `dismiss()` reaches only devices declaring `features:["dismiss"]`
   — an older build would render the data-only message as a blank notification, so it keeps the stale
   alert instead. `DeviceRequest.features` is **required**, since `encodeDefaults=false` drops a DEFAULTED
   value and the hub would then retract nothing. Tests: `XERK-154` in `server.test.js`,
   `DeviceRequestTest.kt`.
-- The Android client owns the delivery half: `POST_NOTIFICATIONS`, the Android-13+ runtime request in
+- The Android client owns the delivery half: the Android-13+ `POST_NOTIFICATIONS` request in
   `MainActivity`, channels + rendering in `push/Notifications.kt`, `push/PushRegistrar.kt`.
 - **Push health is VISIBLE, not just logged** (XERK-152): a hub without `FCM_SERVICE_ACCOUNT_JSON` silently
   delivers ZERO mobile notifications, so `buildAgentsCache` reports hub-wide **`pushEnabled` =
@@ -1715,13 +1719,13 @@ GHCR image builds and PR gates — see Build & Deploy.
   mounted at `REPOS_ROOT`, `MAX_SESSIONS`/`TTYD_PORT_BASE`, host mounts, the shared
   `TURMA_TOKEN`/`TURMA_AGENT_TOKEN`, the FCM push service-account (`FCM_SERVICE_ACCOUNT_JSON`), basic-auth.
   Its `mem_limit`/`cpus`/`pids_limit` are sized against `MAX_SESSIONS`. No pricing/cost env — usage is
-  counted in tokens per model name, so there is no rate table.
+  counted in tokens per model, so there is no rate table.
 - Changing how it's RUN (or adding a host) is a DockerOps compose edit; image content edits land here.
 - The hub's `/data` volume (home to `state.json`) also holds the **durable session archive**
   (`/data/archive/` — files + a `node:sqlite` FTS index), which must be a persisted volume. Overridable
   via `ARCHIVE_DIR`/`ARCHIVE_DB`.
 - The `turma` service also takes the LiteLLM env for **Whisper STT** (`LITELLM_URL` = that instance's
-  `/v1` base, optional `LITELLM_API_KEY`; legacy `WHISPER_URL`/`WHISPER_API_KEY` override). Optionally set
+  `/v1` base, optional `LITELLM_API_KEY`; legacy `WHISPER_URL`/`WHISPER_API_KEY` override), and
   `NODE_NO_WARNINGS=1` to silence `node:sqlite`'s experimental warning.
 
 ### PR gates (pre-merge to main)
@@ -1767,7 +1771,7 @@ triage list, each with a reason); anything unlisted still fails.
   `agent/Dockerfile`.
 - **The image is tiered** (`AGENT_BASE`):
   - `:latest` is the `android-build` tier (2.0 GB), no emulator or system image (those cost 4.4 GB and
-    nothing in CI or `android/` needs them; `android-ci.yml` runs `assembleDebug` + `testDebugUnitTest`).
+    nothing in CI or `android/` needs them).
   - To RUN an app, `adb connect` to a device or an emulator on a KVM-capable host (`platform-tools` is in
     the tier); that path is hardware-accelerated, unlike the bundled AVD (needs `/dev/kvm` passed).
   - If you need an in-container AVD, `:emulator` (the `android` tier, 6.4 GB,
@@ -1891,53 +1895,44 @@ Still true: no GitHub Advanced Security, so no code-scanning API — findings li
 
 ### Session activity summaries
 
-- Each session gets a few-word "name" describing its task, shown on the card. Generated **agent-side**,
-  once at spawn, from the initial task prompt by the host's authenticated `claude` in headless print mode
-  (`claude -p`, Haiku default) — reusing the mounted login, so **no external API, key, or endpoint**.
-- `_start_summary()` launches it as a detached subprocess (cwd = `~/.turma`, no `--settings`, so it never
-  loads the guard or explores the repo). `_poll_summaries()` reaps it on later beats, cleans the output
-  (`clean_summary()`: first line, strip quotes/punctuation, cap to ~6 words), and stores it as `summary`
-  (persisted).
-- Always on; tuned only by `SESSION_SUMMARY_MODEL` (default `haiku`) and `SESSION_SUMMARY_TIMEOUT_SEC`
-  (45). The claude.ai/code registered name (`rcName`) is still fixed at spawn.
+- Each session gets a few-word "name" for its task, shown on the card: generated **agent-side** from the
+  initial task prompt by the host's authenticated `claude -p` (Haiku default) — reusing the mounted
+  login, so **no external API, key, or endpoint**. `_start_summary()` runs it detached (cwd `~/.turma`,
+  no `--settings`, so it never loads the guard or explores the repo) and `_poll_summaries()` reaps it on
+  later beats, cleaning the output (`clean_summary()`: first line, quotes/punctuation stripped, ~6 words)
+  into a persisted `summary`. Always on; tuned only by
+  `SESSION_SUMMARY_MODEL`/`SESSION_SUMMARY_TIMEOUT_SEC` (45). The claude.ai/code registered name
+  (`rcName`) is still fixed at spawn.
 - Tests: `TestCleanSummary`, `TestCleanManualSummary`, `TestSetSummary`, `TestSessionSummaries`,
   `TestSummaryDue`, `TestFirstUserText`, `TestSeedSummaries`, `server.test.js`, `sessions.test.js`.
 
-#### Seeding from the transcript
+#### Naming attempts
 
-- The naming attempt fires at spawn from the initial prompt, or — for a bare/quick-spawned session — from
-  its **first user prompt read straight out of the transcript**.
-- `_seed_summaries()` runs each beat: for every running, still-unnamed session it pulls the first genuine
-  human prompt via `_first_user_text()` (skipping the header, `isMeta` caveat entries, and `<command-…>`
-  slash-command wrappers) and triggers `_start_summary`.
-- The transcript read is the **channel-agnostic** naming path, and the only one that names a bare session:
-  its first prompt is typed into the live ttyd terminal, which **never reaches `send_input`**.
-- `send_input` still fires `_start_summary` immediately when a prompt arrives that way — a fast path for
-  the FIRST attempt. Retries belong to `_seed_summaries`.
-
-#### Bounded-retry naming
-
+- The attempt fires at spawn from the initial task prompt, or — for a bare/quick-spawned session — from
+  its **first user prompt read straight out of the transcript**: `_seed_summaries()` runs each beat and,
+  for every running, still-unnamed session, pulls that prompt via `_first_user_text()` (skipping the
+  header, `isMeta` caveat entries and `<command-…>` slash-command wrappers) and calls `_start_summary`.
+  That read is **channel-agnostic** and the only path that names a bare session, whose first prompt is
+  typed into the ttyd terminal and **never reaches `send_input`**; `send_input` still starts one
+  immediately as a fast path for the FIRST attempt — retries belong here.
 - Naming is **bounded-retry, not one-shot**: an attempt can come back with no name for reasons unrelated
-  to the session (a nonzero `claude -p` exit, an empty reply, the timeout, a rate limit from the shared
-  login), which a single attempt would make permanent.
-- `_summary_attempts`/`_summary_due` gate every path on *unnamed + attempts left + past the backoff*: up
-  to `SUMMARY_MAX_ATTEMPTS` (3) tries spaced by a growing `SUMMARY_RETRY_BACKOFF_SEC` (90s × attempt),
-  counted in a persisted `summaryAttempts`/`summaryRetryAt` (armed at launch, so a restart mid-attempt
-  neither loops nor loses the retries owed). Backed off rather than per-beat because of the shared login.
-- The legacy one-shot `summaryStarted` boolean is still written and read as "one attempt spent", so
-  sessions an older agent failed to name pick up their remaining retries.
+  to the session (a nonzero exit, an empty reply, the timeout, a rate limit on the shared login), which a
+  single attempt would make permanent. `_summary_attempts`/`_summary_due` gate every path
+  on *unnamed + attempts left + past the backoff*: `SUMMARY_MAX_ATTEMPTS` (3) tries spaced by a growing
+  `SUMMARY_RETRY_BACKOFF_SEC` (90s × attempt), in a persisted `summaryAttempts`/`summaryRetryAt` armed at
+  launch, so a restart mid-attempt neither loops nor loses the retries owed. Backed off rather than
+  per-beat because of the shared login; the legacy one-shot `summaryStarted` still reads as "one attempt
+  spent", so a session an older agent failed to name picks up its remaining retries.
 - A session with no prompt yet (`_first_user_text` finds nothing) stays unnamed, spends **no** attempt,
   and looks again next beat. Once exhausted it degrades to "no summary" (label/worktree fallback).
 
 #### Manual rename
 
 - **The operator can rename a session by hand**: the Sessions page's ⋯ menu →
-  `POST /api/agents/<host>/sessions/<id>/summary` → a `setSummary` command → `set_summary()`.
-- The typed name goes through `clean_manual_summary()` (first line, whitespace collapsed, capped to
-  `SUMMARY_MAX_CHARS` — but NOT word-capped or stripped of quotes/punctuation) and is persisted like the
-  auto one.
+  `POST /api/agents/<host>/sessions/<id>/summary` → a `setSummary` command → `set_summary()`, the typed
+  name through `clean_manual_summary()` (first line, whitespace collapsed, capped to `SUMMARY_MAX_CHARS`
+  — but NOT word-capped or stripped of quotes/punctuation) and persisted like the auto one.
 - It sets `summaryManual`, which pins the card: `_summary_due` already declines to name a session that has
   any name, and the flag additionally stops a still-in-flight `claude -p` job from clobbering it in
-  `_finish_summary`.
-- A blank rename clears the name (back to the label/worktree fallback) and unpins — the only way back to
-  auto-naming. Renaming works on a stopped session too.
+  `_finish_summary`. A blank rename clears the name (back to the label/worktree fallback) and unpins —
+  the only way back to auto-naming. Renaming works on a stopped session too.

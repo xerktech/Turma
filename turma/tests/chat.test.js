@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, sendFailure, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -1427,4 +1427,13 @@ test("compose bar: a pending question hides Stop (XERK-21)", () => {
   assert.equal(stop[0].hidden, false);
   __setQuestionActive(false);
   clearDom();
+});
+
+test("compose bar: a message past the hub's cap says so, not 'Send failed' (XERK-227)", () => {
+  // The hub answers 413 for a message past INPUT_MAX_CHARS. That is the one send
+  // failure the operator can fix — the text is still in the box, it just has to
+  // be split — so it must not read like the hub is down.
+  assert.equal(sendFailure(413), TOO_LONG);
+  assert.equal(sendFailure(500), "500");
+  assert.equal(sendFailure(404), "404");
 });
