@@ -408,5 +408,4 @@ those are marked `[MODEL]`.
 - P2 Per-day tooltip; the web's texture channel for series 9+ (Android reuses hues past 8).
 
 ### Nav / Login
-- P1 Login: distinguish 401 (bad credentials) from unreachable-host, matching the web's messages.
 - P3 Optional header descriptor/meta slot (e.g. Sessions running/waiting counts).
