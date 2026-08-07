@@ -1541,7 +1541,12 @@ function readyForReview(session, working) {
   if (s.question || (s.panePrompt && s.panePrompt.prompt)) return true;
   if (working) return false;
   const prs = session.prs || [];
-  if (prs.length) return prs.some((p) => !prLanded(p));
+  if (prs.some((p) => !prLanded(p))) return true;
+  // Landed PRs stop being a reason to look, but must not become a reason NOT
+  // to: the same session can be given a new task after the merge, and would
+  // otherwise be hidden for good. `newWorkSincePrs` (XERK-224) expires the
+  // demotion once the conversation moves past the landing.
+  if (prs.length && !session.newWorkSincePrs) return false;
   return s.lastRole === "assistant" && !s.lastHasToolUse;
 }
 

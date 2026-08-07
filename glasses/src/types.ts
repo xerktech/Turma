@@ -83,6 +83,9 @@ export interface SessionInfo {
   // Card chips (XERK-171 full parity): the PR status pills a session opened, the
   // Jira/Azure ticket it works, and — for a queued session — why it's waiting.
   prs?: PrInfo[] | null;
+  // Has the conversation moved on since every PR this session opened landed
+  // (XERK-224)? Expires the "merging IS the review" demotion in readyForReview.
+  newWorkSincePrs?: boolean | null;
   ticket?: { key?: string; siteKey?: string; url?: string; [key: string]: unknown } | null;
   queuedReason?: string | null;
   [key: string]: unknown;

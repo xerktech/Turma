@@ -119,10 +119,9 @@ One agent container per host, multiplexing sessions across every repo it scans.
 
 ### Kill, resume, delete
 
-- **Killing** drops the registry
-  record but KEEPS its worktree (uncommitted work survives), conversation, and token-usage history
-  (transcripts live under `~/.claude/projects`, keyed by worktree path), moving it to the Sessions page's
-  **Ended sessions** list.
+- **Killing** drops the registry record but KEEPS its worktree (uncommitted work survives),
+  conversation and token-usage history (transcripts live under `~/.claude/projects`, keyed by worktree
+  path), moving it to the Sessions page's **Ended sessions** list.
 - On the way out, `_remember_closed` **snapshots onto the closed record** the `prUrls` this session
   opened and its `transcriptId` — `_forget_session_caches` drops both moments later, so the snapshot is
   the only thing keeping an ended session's PR chips reachable. The PR *status* stays in
@@ -191,24 +190,24 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 
 ### Commands
 
-- `spawn` / `kill` / `start` / `restart` / `delete` — session lifecycle. `resume` — resume a killed
-  session (keeps its id).
-- `resumeTranscript` — resume ANY prior transcript by id. `_resumable_report()` heartbeats each repo's
-  resumable list. Tests: `TestResumableReport`, `TestResumeTranscript`, `TestTranscriptCwd`.
+- `spawn` / `kill` / `start` / `restart` / `delete` — session lifecycle. `resume` — a killed session
+  back under its own id.
+- `resumeTranscript` — resume ANY prior transcript by id; `_resumable_report()` heartbeats each repo's
+  list. Tests: `TestResumableReport`, `TestResumeTranscript`, `TestTranscriptCwd`.
 - `input` / `history` / `answerQuestion` — the chat composer + glasses client.
-  - `input`/`send_input` puts the message into the session's pane and **guarantees it survives a
-    compaction** (XERK-47), which can drop one queued mid-turn: every sent message goes on the record's
-    `pendingInputs` outbox, and `_poll_pending_inputs` (every beat, no-op without an outbox) makes it
+  - `input`/`send_input` puts the message into the pane and **guarantees it survives a compaction**
+    (XERK-47), which can drop one queued mid-turn: every sent message goes on the record's
+    `pendingInputs` outbox, and `_poll_pending_inputs` (every beat, no-op without one) makes it
     at-least-once:
     - compactions are counted by `_pending_scan` from the transcript's own `compact_boundary` **system
-      entry**, never by scraping the pane; a message is **reaped on delivery** (`delivered`) or **left in
-      flight** while still in the folded live queue (`queued`);
+      entry**, never by scraping the pane; a message is **reaped on delivery** or **left in flight**
+      while still in the folded live queue;
     - it is **re-sent** only when a NEW compaction happened since it was sent (`compactBase` rose) AND
       it's neither, AND the pane has settled to idle (`_pane_busy` False, not None) — that gate makes the
-      resend **duplicate-safe**. Bounded: `PENDING_INPUT_MAX_ATTEMPTS` resends, one per beat, aged out at
-      `PENDING_INPUT_TTL_SEC`; `delivered` matches by text alone, biased AGAINST a resend;
-    - the outbox is internal (not heartbeated), cleared on restart-clear-context; text typed straight
-      into the raw ttyd terminal bypasses `send_input` and isn't covered. Tests: `TestPendingScan`,
+      resend **duplicate-safe**. Bounded by `PENDING_INPUT_MAX_ATTEMPTS`/`PENDING_INPUT_TTL_SEC`, one per
+      beat; `delivered` matches by text alone, biased AGAINST a resend;
+    - the outbox is internal (not heartbeated), cleared on restart-clear-context; text typed into the
+      raw ttyd terminal bypasses `send_input` and isn't covered. Tests: `TestPendingScan`,
       `TestPollPendingInputs`, `TestSendInput`.
   - **PASTED, not typed** (`_type_into_pane`, XERK-227): `load-buffer -` + `paste-buffer -d -p` + Enter
     — `send-keys` is a tmux command argument, refused past ~16 KiB, which a pasted log exceeds (the raw
@@ -225,7 +224,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   cut every user-authored text turn in the whole transcript folds back in ahead of the window
   (id-deduped, `HISTORY_USER_MSGS` backstop) — tool traffic otherwise evicts them. Tests:
   `TestHistoryCommand`.
-- `setSummary` — rename a session; see "Session activity summaries".
+- `setSummary` — rename a session (see "Session activity summaries").
 - `setModel` — switch a running session's model live, **for that session only** (XERK-33).
   - `set_model` drives Claude Code's /model picker — clear the input line (C-u), open it, parse rows +
     ❯ cursor (`parse_model_picker`), arrow to the target, press `s` ("use this session only"). Never
@@ -248,21 +247,21 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     BTab types nothing into the input line and the TUI cycles modes mid-generation.
   - Tests: `TestParsePaneMode`.
 - `clone` — see "GitHub block and cloning".
-- `refreshJira` — the /board manual refresh: re-poll Jira now instead of waiting out
-  `JIRA_REFRESH_EVERY`. Re-checks `jira_configured()`, so an unconfigured host stays at zero Jira calls.
+- `refreshJira` — the /board manual refresh: re-poll now instead of waiting out `JIRA_REFRESH_EVERY`.
+  Re-checks `jira_configured()`, so an unconfigured host stays at zero Jira calls.
 - `prune` — per-repo cleanup: removes worktrees merged into the latest default branch (skipping any
-  backing a session or holding uncommitted changes), deletes local branches merged into it, reporting a
-  summary on the heartbeat.
-- `jiraIssue` — fetch one issue on demand. `spawnTicket` — start a session to WORK a Jira ticket.
-  `setJiraRepo` — the operator's own repo for a ticket, overriding the guess. `subagentHistory` — open a
-  background subagent's own transcript.
+  backing a session or holding uncommitted changes) and local branches merged into it, summarised on
+  the heartbeat.
+- `jiraIssue` — fetch one issue on demand. `spawnTicket` — start a session to WORK a ticket.
+  `setJiraRepo` — the operator's repo for a ticket, overriding the guess. `subagentHistory` — open a
+  background subagent's transcript.
 
 ### Heartbeat
 
-- **Repo list**, most-recently-active first: `lastActivity` is the later of the repo's newest commit and
-  newest session activity. The repos-root pseudo-repo is pinned first, never ranked.
-- **One record per session**: git state, per-session token usage, live-session signals, new PR links,
-  and PR status. Plus a **container-log tail**.
+- **Repo list**, most-recently-active first (`lastActivity` = the later of the repo's newest commit and
+  newest session activity); the repos-root pseudo-repo is pinned first, never ranked.
+- **One record per session**: git state, per-session token usage, live signals, new PR links and PR
+  status, plus a **container-log tail**.
 - The build's **own version** (`agentVersion`, shown in the host header): `agent_version()` reads
   `TURMA_AGENT_VERSION` (baked at build time), else the `VERSION` file `native/install.sh` stamps beside
   `hub-agent.py`, else the repo-root `VERSION`, else `null`. Tests: `TestAgentVersion`.
@@ -317,8 +316,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   `_pane_status`). `_session_payload` **reconciles the stored `permissionMode` to it** each beat (the
   operator can cycle modes by hand), and it feeds `setMode`'s closed loop. Tests: `TestParsePaneMode`,
   `TestSessionReportPaneBusy`, `TestModelActualPayload`.
-- **Pending questions** — surfaced by the `agent/hooks/ask.py` PreToolUse bridge's req/ans files, read
-  by `session_report`, never by pane scraping. A transcript scan is the already-answered fallback.
+- **Pending questions** — surfaced by `agent/hooks/ask.py`'s req/ans files, read by `session_report`,
+  never by pane scraping. A transcript scan is the already-answered fallback.
 - **`panePrompt`** — the TUI's OTHER blocking dialog (tool-permission request / plan approval): no hook
   intercepts it, it writes nothing to the transcript, and while it is up the pane shows neither the
   interrupt hint nor the mode footer, so `paneBusy` alone reads it as idle. `parse_pane_prompt` reads it
@@ -358,8 +357,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   (XERK-162); `az repos pr create` (XERK-226), whose JSON carries no link — `_azdo_created_pr_url` builds
   one from `repository.webUrl` + `pullRequestId` when the result printed no link itself. Call and result
   land in different beats, so pending tool_use ids carry across (capped); the scan parses whole lines.
-  - Cost: a PR opened another way (a subagent, an MCP tool, the web UI) gets no chip. Widen by teaching
-    `_scan_pr_line` another creation event — never by scanning loose text again.
+  - Cost: a PR opened another way (a subagent, an MCP tool, the web UI) gets no chip. Widen only by
+    teaching `_scan_pr_line` another creation event, never by scanning loose text.
 - **A GitLab MR (XERK-162) and an ADO PR (XERK-226) answer everywhere a GitHub PR does**: `pr_status`/
   `_pr_comment_events` dispatch by URL to `mr_status`/`azdo_pr_status` and their `_*_comment_events`, in
   identical shapes, each URL polled only through the source that can answer it (`_pr_source_ok`;
@@ -449,8 +448,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   **tombstoned** (`{internal:true}`), which `repo_usage_report`/`_archive_manifest` skip.
   `_sanitize_internal_tool_entries` retires entries earlier builds adopted.
 - **This ledger is also the archive's input** (`_archive_manifest` enumerates ledger slugs), so
-  reconciliation *intentionally* widens archival too. Decouple the two only if archival scope should
-  diverge from usage scope.
+  reconciliation *intentionally* widens archival too — decouple them only if the two scopes should
+  diverge.
 - Tests: `TestReconcileOrphanTranscripts`, `TestSanitizeJunkRepoEntries`, android `UsageViewModelTest`.
 
 ### Jira block
@@ -626,8 +625,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   plus any in-flight/recent `clones`. The availability flag is **`available`** and the hub passes the
   block through untouched, so every client must gate its clone UI on that exact key (XERK-126). Tests:
   android `CloneTest.kt`.
-- A `clone` command `git clone`s a validated `owner/repo` (allowlist-checked before it reaches git) into
-  `REPOS_ROOT` as a **detached subprocess** (reaped across later beats), after which the new repo joins
+- A `clone` command `git clone`s a validated `owner/repo` (allowlist-checked before it reaches git)
+  into `REPOS_ROOT` as a **detached subprocess** (reaped across later beats); the new repo then joins
   the scan. Private-repo auth rides the system git credential helper (`gh auth git-credential`).
 - **Multiple git sources (XERK-155)** — `gitSources` heartbeats the EXTRA clone sources beside `github`
   (contract unchanged — gh-gated features read it): the board's ADO org (`AZDO_URL`/`AZDO_TOKEN`,
@@ -668,8 +667,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - The launcher puts **`$HOME/.local/bin` on PATH itself** (XERK-94): a systemd --user unit doesn't
   inherit the login shell's PATH, so claude at the prefix install.sh blesses (`npm config set prefix
   ~/.local`) is otherwise unreachable and every session dies on exec. A missing claude is a **loud,
-  log-only** warning at start; install-time `have claude` checks pass in the login shell and cannot catch
-  this.
+  log-only** warning at start — install-time `have claude` checks run in the login shell and can't catch
+  it.
 - The config is **validated before it is sourced**, and a bad one **idles** rather than exiting:
   - The launcher `.`-sources the env file, so a non-assignment line RUNS (a YAML-style `JIRA_SITE: "x"`
     exits 127 and under `set -e` takes the launcher down). The check is anchored on the `=` directly
@@ -683,7 +682,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   baked layer. (The container has its own simpler respawn loop in `entrypoint.sh`, XERK-34; tests
   `test_entrypoint.sh`.)
   - The node check lives INSIDE the loop, so installing node heals the terminals (`terminalOnline`)
-    within one `TUNNEL_RETRY_SEC`; fire-and-forget makes a missing node silent AND permanent.
+    within one `TUNNEL_RETRY_SEC`; fire-and-forget would make a missing node silent AND permanent.
   - The supervisor's pkill key is PREFIX-scoped like `tunnel-agent.js`'s; the launcher reaps the
     supervisor BEFORE the tunnel (else the old loop respawns the just-killed tunnel), and
     `turma-agentctl stop` reaps it too. PATH, config and supervisor tests:
@@ -693,8 +692,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   container. Tests: `pokeHeartbeat` in `tunnel-agent.test.js`.
 - `install.sh` — idempotent installer (`--verify`/`--uninstall`): auto-installs prereqs (apt + npm +
   pinned static ttyd), lays files into a prefix keeping `hub-agent.py` and `hooks/` siblings, writes a
-  `chmod 600` config, wires the service, writes `$PREFIX/VERSION`, then `try-restart`s the service
-  (`enable --now` does nothing to a running one).
+  `chmod 600` config, wires the service, writes `$PREFIX/VERSION`, then `try-restart`s it (`enable
+  --now` does nothing to a running service).
   - **`have_sudo` asks** when it must, rather than probing `sudo -n` only (which makes a password-sudo
     host look sudo-less and skips every apt prereq under `curl … | bash`). Gated on `[ -t 2 ]`; cached.
   - It must never become `curl … | sudo bash`: the install belongs to the invoking user, only prereqs
@@ -826,7 +825,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   time (`_queued_display` / `queuedDisplay`), never at fold time (which desyncs the dequeues).
 - Blocks ride the live tail (tight per-block caps), on-demand `history` and the archive push
   (`_entry_blocks(entry, BLOCK_CAPS_FULL)`, looser caps on the latter two) — the one place inclusion
-  widens: a tool_result-only turn, dropped by `_entry_text`, is kept when it has blocks. Only
+  widens: a tool_result-only turn, dropped by `_entry_text`, is kept when it has blocks; only
   `transcript_tail` stays text-only. Already-archived bytes are never re-parsed.
 
 ### Archive sync
@@ -911,19 +910,19 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - Each host has a **"Clone from GitHub" bar**: a dropdown of its `gh` login's repos (present ones
   disabled) plus a free-text `owner/repo` box, greyed out on hosts reporting no GitHub creds.
 - Each host expands into a top **⌂ Repos root** entry (no worktree/branch, so its composer hides the
-  base-branch field, and "+ New session" disappears once one root session runs), then its scanned repos
-  by `lastActivity`.
+  base-branch field, and "+ New session" goes once a root session runs), then its repos by
+  `lastActivity`.
 
 ### Per-repo controls
 
-- **"+ New session"** — one click, instant bare spawn with today's defaults.
-- A **▾ caret** opens a "New session" composer: optional task prompt, label, and spawn options (base
-  branch, model, permission mode), last-used options remembered per repo in `localStorage`.
+- **"+ New session"** — one click, an instant bare spawn on today's defaults.
+- A **▾ caret** opens a "New session" composer: task prompt, label and spawn options (base branch,
+  model, permission mode), last-used remembered per repo in `localStorage`.
 - A **"Resume" picker** when the repo has resumable history (`repo.resumable`): any prior Claude session
   for the repo, resumed by transcript id via `POST /api/agents/<host>/transcripts/<transcriptId>/resume`,
   falling back to the last-5 killed `closedSessions` for older agents.
-- An arm/confirm **"Prune"** button that sweeps that repo's worktrees + local branches merged into the
-  latest default, leaving anything unmerged or dirty.
+- An arm/confirm **"Prune"** sweeping that repo's worktrees + local branches merged into the latest
+  default, leaving anything unmerged or dirty.
 
 ### Session cards
 
@@ -1196,12 +1195,12 @@ share the rules below; each row's subsection carries only its deltas.
 - A picker of the org's `jira.repoOptions` — cloned and un-cloned repos in separate `optgroup`s, plus
   "No repository fits" and "Let the agent decide", `POST`ing to `/api/jira/<siteKey>/<issueKey>/repo`.
   `repoPickerValue`/`repoPickerHtml` are the compare/preselect pair.
-- The row is present even for an **untriaged** ticket, reading "Not triaged yet".
-- **Only a manual pin preselects a repo.** An auto guess is the model's answer while the operator's
-  setting is "let it decide"; preselecting it would misreport that as a pin.
+- Present even for an **untriaged** ticket, reading "Not triaged yet". **Only a manual pin preselects
+  a repo**: an auto guess is the model's answer while the operator's setting is "let it decide", and
+  preselecting it would misreport that as a pin.
 - Options are collected next to `hosts` over EVERY agent, not in the winners loop (one block per
-  (site, user), so the picker would otherwise offer only whichever host polled Jira last); cloned wins
-  the dedupe. `_apply_triage` keeps rendering a carried-back pinned repo on purpose.
+  (site, user), else the picker offers only whichever host polled Jira last); cloned wins the dedupe.
+  `_apply_triage` keeps rendering a carried-back pinned repo on purpose.
 
 ##### Pinning the agent (XERK-38) and model (XERK-123) by hand
 
@@ -1325,11 +1324,11 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
   `<pre class="md-code">` (language chip from the info string), inline **` `code` ` spans** become
   `<code class="md-code-inline">` chips (`renderInline`), GFM **tables** become real `<table>`s, else
   linkified.
-  - Passes nest outward-in — fence, table, inline, link — so a code body is never linkified; the fence
-    pass runs above the table pass. An inline span never crosses a line break, and an **unterminated
-    fence renders as code**. A code-carrying bubble gets a **definite** `width: min(760px, 100%)`
-    (`:has()`-scoped), out of shrink-to-fit sizing so overflow lands on the block's own scroller, not a
-    grid track.
+  - Passes nest outward-in — fence, table, inline, link — so a code body is never linkified, and the
+    fence pass runs above the table pass. An inline span never crosses a line break; an **unterminated
+    fence renders as code**. A code-carrying bubble takes a **definite** `width: min(760px, 100%)`
+    (`:has()`-scoped), out of shrink-to-fit sizing so overflow lands on its own scroller, not a grid
+    track.
   - **Images/SVGs render inline (XERK-221)**: `![alt](url)` → `<img>` (`linkify`, src `http(s)`+
     `data:image/*`); a line-start raw `<svg>` (`renderSvgAndText`) or all-SVG fence body → a sandboxed
     `data:image/svg+xml` `<img>` (`svgToImg`) — **never DOM-injected**, so embedded `<script>`/`onload`
@@ -1379,29 +1378,35 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
 
 #### Queued sessions
 
-- A **"Queued" section** above the live lists shows sessions the agent hasn't provisioned yet
-  (`status:"queued"`) as static cards with the wait reason (`queuedReasonText`) and a **Cancel**
-  (arm-then-confirm). A followed spawn (`?spawn=<cmdId>`) landing in the queue words its stage
-  **"Queued — <reason>"** and flips to the live session once it provisions; the dashboard's card mirrors
+- A **"Queued" section** above the live lists: static cards with the wait reason (`queuedReasonText`)
+  and an arm-then-confirm **Cancel**. A followed spawn (`?spawn=<cmdId>`) landing there words its stage
+  **"Queued — <reason>"**, flipping to the live session once provisioned; the dashboard's card mirrors
   this. Tests: `sessions.test.js`.
 
 #### Ready for review (XERK-224)
 
-- The live sessions split three ways, in reading order: **Ready for review** (stopped, waiting on YOU),
-  **Active** (working — leave it alone), **Idle** (quiet, wanting nothing).
+- The live sessions split three ways in reading order — **Ready for review** (stopped, waiting on YOU),
+  **Active** (working), **Idle** (quiet).
 - `readyForReview(s, live)` is **derived from the signals alone** — there is no "I've reviewed this"
-  action. It qualifies on a pending question/pane prompt (blocked on a human, so the
-  busy read doesn't matter; it leads the section), a PR that hasn't landed, or a **finished turn**
-  (`lastRole=="assistant"`, no `lastHasToolUse`) — the last being the only trace a research task that
-  opened no PR leaves, the case a PR-only rule was asked to stop missing.
-- **A PR-bearing session is judged on the PR alone**, not its transcript: the one way out, short of
-  working again, is every PR reaching MERGED/CLOSED — merging IS the review, dropping it to Idle, where
-  work merged but not yet verified is parked. `prLanded` counts an unknown state as still live; an
-  unreadable one must never drop work off the list.
+  action. It qualifies on a pending question/pane prompt (blocked on a human, so the busy read doesn't
+  matter; it leads the section), a PR that hasn't landed, or a **finished turn** (`lastRole=="assistant"`,
+  no `lastHasToolUse`) — the only trace a research task that opened no PR leaves, and the case a PR-only
+  rule was asked to stop missing.
+- Every PR reaching MERGED/CLOSED demotes it: merging IS the review, so it drops to Idle, where work
+  merged but not yet verified is parked. `prLanded` counts an unknown state as still live; an unreadable
+  one must never drop work off the list.
+- **That demotion is scoped in TIME, never absolute**: a landed PR stops being a reason to look but must
+  not become a reason NOT to. A session is a CONVERSATION, not a pull request — hand the same one a new
+  task and it finishes with no new PR to show, which an absolute demotion hid for good.
+  `_poll_prs_landed` stamps `prsLandedTs` (last-activity when the sweep first sees every PR landed; a
+  new PR clears it); `newWorkSincePrs` says the conversation moved past it, and the rule then falls
+  through to the finished-turn signal. Both are **transcript timestamps** — the conversation's clock,
+  not the mtime a synced `~/.claude` inflates. False when unanswerable (older agent included), erring
+  toward parking over a wrong claim.
 - Four mirrors must agree: `sessions.html`, `server.js`, `core/Sessions.kt` (`rankRunning` →
-  `LiveGroups`), `glasses/src/sessions.ts`. The card says WHY it qualified ("PR awaiting review" /
-  "finished · awaiting review") on the accent `.dot.review`. Tests: `sessions.test.js`, `readyForReview`
-  in `server.test.js`, android `SessionsTest`.
+  `LiveGroups`), `glasses/src/sessions.ts`. The card says WHY it qualified, on the accent `.dot.review`.
+  Tests: `sessions.test.js`, `readyForReview` in `server.test.js`, `TestPrsLanded`, android
+  `SessionsTest`.
 
 #### Ended sessions
 
@@ -1411,8 +1416,8 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
   scan, no registry record behind it).
 - The third channel makes the list **durable**: the first two read the capped `~/.turma` records, while
   `resumable` is re-derived every slow beat from the transcripts under `~/.claude/projects`.
-- **Deduped on `<host>::<transcriptId>`**, a registry-backed record always winning. A kill that ages out
-  of `closed.json` keeps listing, minus its PR chips. Sorted **most recently ended first** (`endedMs`,
+- **Deduped on `<host>::<transcriptId>`**, a registry-backed record always winning; a kill that ages
+  out of `closed.json` keeps listing, minus its PR chips. Sorted **most recently ended first** (`endedMs`,
   from `closedAt`/`stoppedAt`/`endedTs` — `resumableSession()` must copy `endedTs` onto the record, where
   `endedEntry` reads the key); an undated record sorts oldest.
 - The resumable channel's **`endedTs` is the last message's own transcript timestamp**
@@ -1442,7 +1447,7 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
 - Each sidebar session card carries a **⋯ overflow menu** — a sibling of the card `<button>`, absolutely
   positioned over it (a nested button is invalid HTML). **Rename…** swaps the card for an inline field
   `POST`ing to `.../sessions/<id>/summary`, painted optimistically; **Kill** arms-then-confirms. Its
-  open/armed/typing state lives in page variables, not the DOM.
+  state lives in page variables, not the DOM.
 
 #### Send and Stop buttons
 
@@ -1508,10 +1513,9 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
   indexed in a **`node:sqlite` FTS5** DB (`/data/archive/index.db`, Node-core, no npm), rebuildable from
   the files.
 - The Sessions page gains a search box (`GET /api/search?q=` — hub-local full-text search, ranked,
-  `<mark>`-highlighted, grouped by `remoteKey`, working for offline hosts) and an "Ended sessions" browser
-  (`GET /api/archive`); clicking a result opens the transcript read-only
-  (`GET /api/archive/<transcriptId>`). The ingest endpoint is agent-token-authed; the manifest cursors
-  ride the heartbeat reply. Tests: `archive.test.js`, `server.test.js`.
+  `<mark>`-highlighted, grouped by `remoteKey`, working for offline hosts) and an "Ended sessions"
+  browser (`GET /api/archive`); a result opens read-only (`GET /api/archive/<transcriptId>`). Ingest is
+  agent-token-authed; the manifest cursors ride the heartbeat reply. Tests: `archive.test.js`, `server.test.js`.
 
 ### `POST /api/trigger` — external automation
 
@@ -1538,22 +1542,21 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
     **suppresses** it: the question alert is already that session's buzz, and says more.
   - **A PR still waiting on CI HOLDS it** (XERK-153) — never fire on the URL being scraped. A new URL
     enters a per-session wait list (`alerts.sessions[id].prWait`) that `prAlertDecision` re-judges each
-    beat; a settled verdict banks on `prNotes` and is spent by the one alert, whose body names each PR.
-    `prSeen` keeps its old meaning (already alerted), so an older hub's PRs don't re-fire on upgrade.
+    beat; a settled verdict banks on `prNotes` and is spent by the one alert, whose body names each PR
+    and its verdict. `prSeen` keeps its old meaning (already alerted), so an older hub's PRs don't
+    re-fire on upgrade.
   - **But the hold is read off `session.prs`, never that list alone**, which only the per-beat
     `newPrUrls` scrape fills: a PR scraped before this hub booted, or announced once and then worked on
     again, leaves it empty while still open. Gating on the list alone announced work that merges nowhere,
     captioned "nothing to merge" — a claim about the SESSION, made only when it opened nothing at all.
   - `prAlertDecision`'s doc comment is the verdict table; four rules there must not be undone. **A
     CONFLICTING open PR never alerts** (XERK-223) — it merges nowhere however green its CI is, so the hold
-    outlasts the age-out (known-bad, not unknown) and reaches this alert too; the session still LISTS
-    under Ready for review, and XERK-223's own nudge is what clears it. **`failing` stays quiet
-    permanently** (the alert is for the work being ready, not every trip through red). **Absent `checks`
-    is "not fetched yet", never "no CI"** — a just-opened PR reads like a CI-less one while GitHub
-    registers its workflows, so `checks: null` holds `PR_NO_CI_GRACE_MS` first. An inconclusive wait
-    **ages out at `PR_ALERT_MAX_WAIT_MS` and fires anyway**: the wait may delay an alert, never lose it.
-  - Body carries each PR's verdict ("All checks passed"/"No CI configured"/"CI state unknown" · url).
-    Tests: `prAlertDecision`/`readyForReview` in `server.test.js`.
+    outlasts the age-out and reaches this alert too; the session still LISTS under Ready for review, and
+    XERK-223's nudge is what clears it. **`failing` stays quiet permanently** (the alert is for the work
+    being ready, not every trip through red). **Absent `checks` is "not fetched yet", never "no CI"** — a
+    just-opened PR reads like a CI-less one while GitHub registers its workflows, so `checks: null` holds
+    `PR_NO_CI_GRACE_MS` first. An inconclusive wait **ages out and fires anyway**: it may delay an alert,
+    never lose it. Tests: `prAlertDecision`/`readyForReview` in `server.test.js`.
 - **Claude login alerts** (XERK-98) fire in `heartbeatAlerts` off the agent's `claudeAuth` block: two
   edge-triggered states, deduped under `next.alerts` and cleared on recovery — `needsLogin` → urgent
   `key`-tagged "Claude login required", `expiringSoon` → default-priority "Claude login expiring". The

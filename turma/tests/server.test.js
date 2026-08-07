@@ -827,6 +827,15 @@ test("readyForReview: the qualifiers, and the one thing that un-qualifies", () =
   // A landed PR outranks the finished turn that opened it — otherwise merging
   // could never move a session out of the section.
   assert.equal(readyForReview(sess(done, { prs: [{ url: "u", state: "MERGED" }] }), false), false);
+  // But only until the conversation moves past the landing: the same session
+  // can be given a new task, and the PR it already shipped must not bury it.
+  assert.equal(
+    readyForReview(sess(done, { prs: [{ url: "u", state: "MERGED" }], newWorkSincePrs: true }), false),
+    true, "new work after the merge is still work awaiting review");
+  // The expiry only lifts the demotion; it is not itself a qualifier.
+  assert.equal(
+    readyForReview(sess({ lastRole: "user" }, { prs: [{ url: "u", state: "MERGED" }], newWorkSincePrs: true }), false),
+    false, "the turn signal still has to hold");
   // Only live sessions; an ended one has its own list.
   assert.equal(readyForReview({ id: "s1", status: "stopped", session: done }, false), false);
 });
@@ -961,6 +970,40 @@ test("alerts: a session with a live PR never claims it has nothing to merge", ()
   assert.match(notifications[0].body, new RegExp(PR_URL.replace(/[/.]/g, "\\$&")));
   assert.doesNotMatch(notifications[0].body, /nothing to merge/);
   assert.equal(notifications[0].data.click, PR_URL);
+});
+
+test("alerts: a new task on a merged-PR session alerts again, without naming that PR", () => {
+  // The lifecycle the Sessions page's expiry exists for, end to end: PR merged
+  // and announced, alert retracted, then the SAME session is given new work.
+  const beat = makeHost();
+  const t0 = Date.now();
+  const s = (session, prs, extra = {}) => ({
+    sessions: [{
+      id: "s1", rcName: "nas-repo-s1", status: "running", prs: prs || null,
+      git: { repoName: "turma", branch: "XERK-224" }, session, ...extra,
+    }],
+  });
+  const busy = { paneBusy: true, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: true };
+  const done = { paneBusy: false, transcriptAgeSec: 600, lastRole: "assistant", lastHasToolUse: false };
+  const open = [{ url: PR_URL, state: "OPEN", checks: "passing", mergeable: "MERGEABLE" }];
+  const merged = [{ url: PR_URL, state: "MERGED", checks: "passing" }];
+
+  notifications.length = 0;
+  beat(s(busy), t0);
+  beat(s(done, open), t0 + MIN);                       // ready: the PR
+  assert.deepEqual(titles(), [READY]);
+  notifications.length = 0;
+  beat(s(done, merged), t0 + 2 * MIN);                 // operator merges it
+  assert.deepEqual(titles(), []);
+  assert.deepEqual(dismisses(), ["review:host1:s1"], "the PR is no longer a reason to look");
+
+  notifications.length = 0;
+  beat(s(busy, merged), t0 + 3 * MIN);                 // a NEW task on the same session
+  beat(s(done, merged, { newWorkSincePrs: true }), t0 + 4 * MIN);
+  assert.deepEqual(titles(), [READY], "the finished follow-up is announced");
+  // It opened nothing new, and the old merged PR is not what awaits review.
+  assert.match(notifications[0].body, /nothing to merge/);
+  assert.doesNotMatch(notifications[0].body, new RegExp(PR_URL.replace(/[/.]/g, "\\$&")));
 });
 
 test("alerts: a finished turn with no PR fires on the working->idle edge only", () => {

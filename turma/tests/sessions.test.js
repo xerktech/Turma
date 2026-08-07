@@ -252,20 +252,56 @@ test("ready for review: a session whose every PR has landed drops back to Idle",
   assert.ok(!r.includes("Merged Task"), "a landed session must not stay under review");
 });
 
-test("ready for review: a merged PR still comes back once the session runs again", () => {
+// A session is a CONVERSATION, not a pull request: the same one can be handed a
+// new task after its PR merged. The demotion is therefore scoped in time — it
+// holds only until the conversation moves past the landing (`newWorkSincePrs`).
+test("ready for review: a new task on a merged-PR session is not hidden by that PR", () => {
   const { render, els } = loadPage();
   const { now, host: h } = host([
-    // Same session, PR merged, but it has since worked and finished another turn
-    // — the transcript signal is what qualifies it, not the PR.
     finished("11111", "Follow-up", { prs: [pr("MERGED", 1)] }),
   ]);
   render({ now, agents: [h] });
-  assert.ok(els.idle.innerHTML.includes("Follow-up"), "landed and quiet: Idle");
+  assert.ok(els.idle.innerHTML.includes("Follow-up"),
+    "merged and nothing said since: parked in Idle until the build is verified");
 
-  // Now it has a question pending — blocked on a human whatever its PRs did.
-  const h2 = { ...h, sessions: [{ ...h.sessions[0], session: { ...h.sessions[0].session, question: "Ship it?" } }] };
-  render({ now, agents: [h2] });
+  // The operator gives it a new task; it works, finishes, and opens no new PR.
+  // Only the old merged one is on the record — which must not bury the result.
+  const worked = { ...h, sessions: [{ ...h.sessions[0], newWorkSincePrs: true }] };
+  render({ now, agents: [worked] });
+  assert.ok(els.review.innerHTML.includes("Follow-up"),
+    "new work after the merge belongs under Ready for review");
+  assert.ok(!els.idle.innerHTML.includes("Follow-up"));
+  // ...and it says so as a finished turn, since the landed PR is not the thing
+  // awaiting review.
+  assert.ok(els.review.innerHTML.includes("finished · awaiting review"));
+
+  // A pending question always qualifies, whatever the PRs did.
+  const asking = { ...h, sessions: [{ ...h.sessions[0], session: { ...h.sessions[0].session, question: "Ship it?" } }] };
+  render({ now, agents: [asking] });
   assert.ok(els.review.innerHTML.includes("Follow-up"), "a question always needs you");
+});
+
+test("ready for review: an agent too old to report newWorkSincePrs keeps the old behaviour", () => {
+  const { render, els } = loadPage();
+  // No `newWorkSincePrs` key at all — the field is what expires the demotion,
+  // so without it a landed PR still parks the session, as it did before.
+  const { now, host: h } = host([finished("11111", "Legacy", { prs: [pr("MERGED", 1)] })]);
+  render({ now, agents: [h] });
+  assert.ok(els.idle.innerHTML.includes("Legacy"));
+  assert.equal(els.review.innerHTML, "");
+});
+
+test("ready for review: an unlanded PR wins before the new-work question is asked", () => {
+  const { render, els } = loadPage();
+  const { now, host: h } = host([
+    // Still open: a diff to read, regardless of what the transcript did since.
+    running("11111", "Open PR", { paneBusy: false, transcriptAgeSec: 900, lastRole: "user" },
+      ),
+  ]);
+  h.sessions[0].prs = [pr("MERGED", 1), pr("OPEN", 2)];
+  render({ now, agents: [h] });
+  assert.ok(els.review.innerHTML.includes("Open PR"));
+  assert.ok(els.review.innerHTML.includes("PR awaiting review"));
 });
 
 test("ready for review: a card says why it is there instead of a bare 'idle'", () => {

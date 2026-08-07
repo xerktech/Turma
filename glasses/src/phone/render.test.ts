@@ -142,6 +142,25 @@ describe("phone render", () => {
     expect(idle).toContain("quiet one");
   });
 
+  it("a new task on a merged-PR session is not hidden by that PR (XERK-224)", () => {
+    const quiet = { paneBusy: false, transcriptAgeSec: 900, lastRole: "assistant" };
+    const merged = [{ url: "https://github.com/o/r/pull/2", number: 2, state: "Merged" }];
+    const build = (newWorkSincePrs: boolean) =>
+      state({
+        agents: [agent({ sessions: [
+          session({ id: "sm", summary: "follow up", session: signals(quiet), prs: merged, newWorkSincePrs }),
+        ] })],
+      });
+    // Merged and nothing said since: parked in Idle.
+    const parked = sessionsBodyHtml(build(false));
+    expect(parked).not.toContain("Ready for review");
+    // Handed a new task, which it finished with no new PR — that must surface.
+    const worked = sessionsBodyHtml(build(true));
+    expect(worked).toContain("Ready for review");
+    expect(worked).not.toContain("Idle");        // it left that section entirely
+    expect(worked).toContain("follow up");
+  });
+
   it("a session card carries its enter hooks and status", () => {
     const st = state({ agents: [agent({ sessions: [session({ id: "sX", summary: "do a thing", session: signals({ paneBusy: true }) })] })] });
     const html = sessionsBodyHtml(st);

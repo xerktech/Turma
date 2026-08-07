@@ -1360,7 +1360,14 @@ function readyForReview(s, live) {
   const sig = s.session;
   if (!sig) return false;
   const prs = s.prs || [];
-  if (prs.length) return prs.some(p => !prLanded(p));
+  if (prs.some(p => !prLanded(p))) return true;   // an unlanded PR is a diff to read
+  // Every PR landed: merging IS the review, so the PR stops being a reason to
+  // look — but it must not become a reason NOT to. A session is a conversation,
+  // not a pull request, and the same one can be handed a new task afterwards;
+  // the landed PR would otherwise hide that work for good. So the demotion is
+  // scoped in time: it holds only until the conversation moves past the point
+  // where the agent saw those PRs land (`newWorkSincePrs`, XERK-224).
+  if (prs.length && !s.newWorkSincePrs) return false;
   return sig.lastRole === "assistant" && !sig.lastHasToolUse;
 }
 

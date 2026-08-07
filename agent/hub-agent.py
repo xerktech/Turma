@@ -4282,6 +4282,7 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         "transcriptAgeSec": None,  # seconds since the newest transcript write
         "lastRole": None,          # "assistant"/"user"/... of the newest entry
         "lastHasToolUse": False,
+        "lastActivityTs": None,    # that entry's own ISO timestamp (XERK-224)
         "question": None,          # pending AskUserQuestion text, if any
         "questionOptions": [],     # pending AskUserQuestion option labels, if any
         # Rich pending-question fields for the native chat picker (backward-compat
@@ -4355,6 +4356,11 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
     entry = _last_entry(newest)
     if entry:
         report["lastRole"] = entry.get("type")
+        # The newest entry's OWN timestamp — the conversation's clock, not the
+        # file's. `_session_payload` compares it against `prsLandedTs` to answer
+        # "has this session said anything since its PRs landed?" (XERK-224);
+        # both sides come from transcript entries, so no wall-clock skew enters.
+        report["lastActivityTs"] = entry.get("timestamp")
         msg = entry.get("message") or {}
         content = msg.get("content")
         if isinstance(content, list):
@@ -10678,6 +10684,53 @@ class SessionManager:
                 sess["prCommentBase"] = base
                 self.save()
 
+    def _poll_prs_landed(self):
+        """Stamp WHEN a session's PRs all landed, so "merging IS the review" can
+        expire (XERK-224).
+
+        The Ready-for-review rule demotes a session whose every PR reached
+        MERGED/CLOSED — the operator merged it, so it goes back to Idle to be
+        parked until the build is verified. But a session is a conversation, not
+        a pull request: give the same session a NEW task after that merge and it
+        will finish new work with no new PR to show for it, and the landed one
+        would hide it forever.
+
+        So the demotion is scoped in TIME rather than being absolute. This
+        records the session's own last-activity timestamp at the moment the
+        sweep first sees every PR landed; `_session_payload` then reports
+        `newWorkSincePrs` = "the conversation has moved past that point", and the
+        clients fall through to the finished-turn signal when it has.
+
+        Both sides of that comparison are transcript timestamps (the
+        conversation's clock), never wall time or file mtime, so a synced
+        ~/.claude or a clock skew can't fake progress. Runs straight off the
+        status the PR sweep just refreshed, like `_poll_pr_conflicts` — no
+        network call of its own.
+
+        A newly opened PR clears the stamp: the session is back to having
+        something unlanded, and whenever THAT lands it gets a fresh mark rather
+        than being measured against the previous round."""
+        for sess in self.registry:
+            urls = self.session_pr_urls.get(sess["id"]) or []
+            if not urls:
+                continue
+            states = [(self.pr_status_cache.get(u) or {}).get("state") for u in urls]
+            # Only decide once every PR has a fetched state: an unfetched one is
+            # "not looked at", and treating it as landed would stamp too early.
+            landed = all(s in ("MERGED", "CLOSED") for s in states) if all(states) else False
+            if not landed:
+                if sess.pop("prsLandedTs", None) is not None:
+                    self.save()
+                continue
+            if sess.get("prsLandedTs"):
+                continue                        # already marked; don't move it
+            path = _session_transcript_path(sess)
+            ts = _last_activity_ts(path) if path else None
+            if not ts:
+                continue                        # no dated entry to measure from
+            sess["prsLandedTs"] = ts
+            self.save()
+
     def _poll_pr_conflicts(self):
         """Tell a running session to resolve the merge conflicts on its OWN PR,
         without an operator relaying it (XERK-223).
@@ -11859,6 +11912,24 @@ class SessionManager:
             gi.update(cached["slow"])  # fold cached repoName/remote/lastCommit in
         return gi, cached["work"]
 
+    def _new_work_since_prs(self, sess, signals):
+        """Has this session said anything since every PR it opened landed?
+
+        The comparison `_poll_prs_landed` exists for: its stamp is the session's
+        last-activity timestamp at the moment the sweep saw the PRs land, and
+        this is the same reading now. Both are transcript entry timestamps, so
+        they share the conversation's clock and sort as ISO-8601 strings.
+
+        False whenever the question can't be answered — no stamp yet, no dated
+        entry, a stopped session with no live signals. The Ready-for-review rule
+        reads it as "the merge still counts as the review", which is the
+        behaviour that shipped before this expiry existed."""
+        landed = sess.get("prsLandedTs")
+        if not landed:
+            return False
+        now_ts = (signals or {}).get("lastActivityTs")
+        return bool(now_ts and str(now_ts) > str(landed))
+
     def _session_payload(self, sess, refresh=True):
         sid = sess["id"]
         running = sess.get("status") == "running"
@@ -11977,6 +12048,15 @@ class SessionManager:
             # pr_status_cache). Kept even after the session stops, as long as the
             # session record survives. None until it opens a PR.
             "prs": self._session_prs(sid),
+            # Has the conversation moved on since every PR it opened landed?
+            # (XERK-224 — see _poll_prs_landed.) "Merging IS the review" demotes
+            # a session out of Ready-for-review, and this is what lets that
+            # expire when the SAME session is handed a new task and finishes it
+            # with no new PR to show. Both timestamps are transcript entries, so
+            # the comparison is on the conversation's own clock. False (never
+            # None) so an older hub reading it gets the pre-XERK-224 behaviour
+            # rather than a truthy surprise.
+            "newWorkSincePrs": self._new_work_since_prs(sess, signals),
             # Which conversation this session is having: the hub opens it
             # read-only from the archive once the session has ENDED, and points
             # the live tail at it (rather than at whatever shares its project
@@ -12193,6 +12273,14 @@ class SessionManager:
                 self._poll_pr_conflicts()
             except Exception as e:
                 log(f"pr conflict poll failed: {e}")
+            # And a PR that just LANDED marks where the conversation stood, so
+            # the Ready-for-review demotion it triggers expires the moment the
+            # session is given new work (XERK-224). Same beat, same cached
+            # status; wrapped for the same reason.
+            try:
+                self._poll_prs_landed()
+            except Exception as e:
+                log(f"pr landed poll failed: {e}")
         # New review activity on a session's PR is typed back into that session
         # so a reply asking for corrections continues the work (XERK-49). Own
         # cadence + per-beat cap; wrapped, because a PR comment is never worth
