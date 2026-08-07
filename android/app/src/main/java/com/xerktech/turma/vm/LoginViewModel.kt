@@ -4,6 +4,8 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.SignInResult
+import com.xerktech.turma.core.signInError
 import com.xerktech.turma.data.Config
 import com.xerktech.turma.push.PushRegistrar
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -22,17 +24,27 @@ class LoginViewModel(private val app: Application) : AndroidViewModel(app) {
 
     val current: Config.Settings get() = container.config.current
 
-    /** Save creds, verify by hitting /api/agents, and register for push on success. */
+    /**
+     * Verify the typed creds against the hub, and only then save them and
+     * register for push.
+     *
+     * The order matters (XERK-228): saving is what flips `Settings.configured`,
+     * which is TurmaApp's NavHost start destination — so saving first signed a
+     * wrong password straight into the dashboard, where every call 401'd, and
+     * left those creds stored for the next launch to walk into again. A
+     * refusal now says so, in the web login's own words.
+     */
     fun signIn(hubUrl: String, user: String, password: String) {
         _state.update { it.copy(busy = true, error = null) }
-        container.config.save(hubUrl, user, password)
+        val candidate = Config.Settings(hubUrl = hubUrl.trim(), user = user.trim(), password = password)
         viewModelScope.launch {
-            val ok = runCatching { container.client.api.listAgents() }.isSuccess
-            if (ok) {
+            val result = container.client.probeCredentials(candidate)
+            if (result == SignInResult.Ok) {
+                container.config.save(hubUrl, user, password)
                 PushRegistrar.register(app, container)
                 _state.update { it.copy(busy = false, done = true) }
             } else {
-                _state.update { it.copy(busy = false, error = "Could not reach the hub — check URL and credentials.") }
+                _state.update { it.copy(busy = false, error = signInError(result)) }
             }
         }
     }

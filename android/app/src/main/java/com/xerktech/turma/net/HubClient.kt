@@ -1,13 +1,21 @@
 package com.xerktech.turma.net
 
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
+import com.xerktech.turma.core.SignInResult
+import com.xerktech.turma.core.signInResultFor
 import com.xerktech.turma.data.Config
+import com.xerktech.turma.model.AgentsResponse
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TurmaJson
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.decodeFromString
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import retrofit2.Retrofit
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
@@ -18,11 +26,13 @@ import java.util.concurrent.TimeUnit
  */
 class HubClient(private val config: Config) {
 
+    // Stamps the STORED credentials on every call — but leaves a request that
+    // already carries its own Authorization alone, so probeCredentials() can
+    // test creds that aren't stored yet (XERK-228) over this same client.
     private val authInterceptor = Interceptor { chain ->
-        val req = chain.request().newBuilder()
-            .header("Authorization", config.current.authHeader)
-            .build()
-        chain.proceed(req)
+        val req = chain.request()
+        if (req.header("Authorization") != null) return@Interceptor chain.proceed(req)
+        chain.proceed(req.newBuilder().header("Authorization", config.current.authHeader).build())
     }
 
     val http: OkHttpClient = OkHttpClient.Builder()
@@ -63,6 +73,40 @@ class HubClient(private val config: Config) {
             }
             return apiRef
         }
+
+    /**
+     * Ask the hub whether it accepts [settings]' credentials, WITHOUT storing
+     * them (XERK-228). The login screen has to know the answer before
+     * [Config.save] runs: saving is what makes the app "configured", and that
+     * alone lands the operator on the dashboard — so persisting first meant a
+     * wrong password signed you in and then 401'd on every call.
+     *
+     * The request carries its own Authorization header (the interceptor above
+     * defers to it) and hits /api/agents, the same read the app opens with. A
+     * 2xx must also DECODE as that payload: a URL pointing at some other server
+     * answers 200 to anything, and accepting it would sign the operator into a
+     * hub that isn't there — the body parse is what the old listAgents() call
+     * gave us for free.
+     */
+    suspend fun probeCredentials(settings: Config.Settings): SignInResult = withContext(Dispatchers.IO) {
+        val req = runCatching {
+            Request.Builder()
+                .url(settings.baseUrl + "api/agents")
+                .header("Authorization", settings.authHeader)
+                .build()
+        }.getOrNull() ?: return@withContext SignInResult.Unreachable // a URL OkHttp can't parse
+        try {
+            http.newCall(req).execute().use { resp ->
+                val result = signInResultFor(resp.code)
+                if (result != SignInResult.Ok) return@use result
+                val body = resp.body?.string().orEmpty()
+                val isHub = runCatching { TurmaJson.decodeFromString<AgentsResponse>(body) }.isSuccess
+                if (isHub) SignInResult.Ok else SignInResult.Unreachable
+            }
+        } catch (_: IOException) {
+            SignInResult.Unreachable
+        }
+    }
 
     sealed interface HistoryResult {
         data class Ready(val entries: List<TailEntry>, val truncated: Boolean) : HistoryResult
