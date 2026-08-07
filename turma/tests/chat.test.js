@@ -692,6 +692,20 @@ function suItems(files, caption) {
   return buildItems([{ id: "a1", role: "assistant", blocks: [block] }]);
 }
 
+test("render: a SendUserFile delivery shows in Concise; a plain tool card doesn't (XERK-221)", () => {
+  const fileItems = suItems([{ name: "a.svg", kind: "image", src: "data:image/svg+xml,x" }]);
+  // Concise hides tool mechanics, but the file-carrying card still renders.
+  const conciseHtml = withVerbosity("concise", () => itemsToHtml(fileItems));
+  assert.match(conciseHtml, /<img class="md-img/);
+  assert.match(conciseHtml, /action-card/);
+  // A file-less tool call is still omitted entirely by Concise.
+  const plain = buildItems([{ id: "a2", role: "assistant",
+    blocks: [{ t: "tool_use", id: "t2", name: "Bash", input: "ls" }] }]);
+  assert.equal(withVerbosity("concise", () => itemsToHtml(plain)), "");
+  // Normal still renders both.
+  assert.match(withVerbosity("normal", () => itemsToHtml(plain)), /action-card/);
+});
+
 test("render: a SendUserFile image renders as an <img>, an SVG gets md-svg", () => {
   const html = withVerbosity("normal", () => itemsToHtml(suItems([
     { name: "logo.svg", kind: "image", src: "data:image/svg+xml,%3Csvg%3E%3C/svg%3E" },
