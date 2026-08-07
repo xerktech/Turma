@@ -974,9 +974,13 @@
       while (j < items.length && items[j].kind === "action") j++;
       const run = items.slice(i, j);
       const gk = "grp:" + (run[0].id || g++);
-      // Concise mode (tools hidden) omits tool actions entirely — no card, no
-      // collapsed box. Otherwise render each action as its own card.
-      if (verbosity.show.tools) out.push(run.map((a, idx) => renderActionCard(a, actionKey(a, gk, idx))).join(""));
+      // Concise mode (tools hidden) omits tool mechanics — but a SendUserFile
+      // DELIVERY (a card carrying rendered files) is user-facing content, not a
+      // tool detail, so it renders in every verbosity (XERK-221). Otherwise show
+      // each action as its own card.
+      out.push(run.map((a, idx) =>
+        (verbosity.show.tools || (a.files && a.files.length))
+          ? renderActionCard(a, actionKey(a, gk, idx)) : "").join(""));
       i = j;
     }
     return out.join("");

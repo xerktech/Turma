@@ -112,7 +112,10 @@ fun buildItems(
                 is ThinkingBlock -> if (prefs.thinking && block.text.isNotBlank()) {
                     out.add(ChatItem.Thinking(entry.key, block.text))
                 }
-                is ToolUseBlock -> if (prefs.toolCalls) {
+                // A SendUserFile delivery (a block carrying rendered files) is
+                // user-facing content, not a tool mechanic, so it shows in EVERY
+                // verbosity — even Concise, which hides ordinary tool cards (XERK-221).
+                is ToolUseBlock -> if (prefs.toolCalls || block.files.isNotEmpty()) {
                     val res = resultsByForId[block.id]
                     if (res != null) consumed.add(block.id)
                     out.add(

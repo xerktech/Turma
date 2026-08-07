@@ -59,8 +59,14 @@ class ChatItemsTest {
         assertEquals("the set", tool.caption)
         assertEquals(listOf("image", "html", "file"), tool.files.map { it.kind })
         assertEquals("a.svg", tool.files[0].name)
-        // Concise still hides the whole card (parity with the web's tool gating).
-        assertTrue(buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.CONCISE)).none { it is ChatItem.Tool })
+        // A file DELIVERY shows even in Concise (which hides ordinary tool cards),
+        // since it's user-facing content, not a tool mechanic.
+        val concise = buildItems(listOf(e), VerbosityPrefs.forPreset(Verbosity.CONCISE))
+            .filterIsInstance<ChatItem.Tool>().single()
+        assertEquals(3, concise.files.size)
+        // A file-less tool call is still hidden by Concise.
+        val bash = TailEntry(id = "e6", role = "assistant", blocks = listOf(ToolUseBlock(id = "b1", name = "Bash")))
+        assertTrue(buildItems(listOf(bash), VerbosityPrefs.forPreset(Verbosity.CONCISE)).none { it is ChatItem.Tool })
     }
 
     @Test fun `verbose adds thinking traces`() {
