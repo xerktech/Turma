@@ -24,8 +24,14 @@ class SessionsTest {
     // The port of the web's rule (turma/public/sessions.html), which the hub's
     // ready-for-review alert mirrors again — all three decide the same group.
 
-    private fun quiet(lastRole: String = "", prs: List<com.xerktech.turma.model.PrInfo> = emptyList()) =
-        SessionInfo(status = "running", prs = prs, session = LiveSignals(paneBusy = false, lastRole = lastRole))
+    private fun quiet(
+        lastRole: String = "",
+        prs: List<com.xerktech.turma.model.PrInfo> = emptyList(),
+        newWork: Boolean = false,
+    ) = SessionInfo(
+        status = "running", prs = prs, newWorkSincePrs = newWork,
+        session = LiveSignals(paneBusy = false, lastRole = lastRole),
+    )
     private fun pr(state: String) = com.xerktech.turma.model.PrInfo(url = "u$state", state = state)
 
     @Test fun `readyForReview takes a question, an unlanded PR, or a finished turn`() {
@@ -51,6 +57,23 @@ class SessionsTest {
         // A landed PR outranks the finished turn that opened it, else merging
         // could never move a session out of the section.
         assertEquals(false, readyForReview(quiet("assistant", listOf(pr("MERGED"))), LiveState.IDLE))
+    }
+
+    @Test fun `readyForReview lets a merged PR stop hiding the session's next task`() {
+        // A session is a conversation, not a pull request: hand the same one a
+        // new task after the merge and the PR it already shipped must not bury
+        // the result (XERK-224).
+        val merged = listOf(pr("MERGED"))
+        assertEquals(false, readyForReview(quiet("assistant", merged), LiveState.IDLE))
+        assertEquals(
+            "new work after the merge is still work awaiting review",
+            true,
+            readyForReview(quiet("assistant", merged, newWork = true), LiveState.IDLE),
+        )
+        // The expiry only lifts the demotion — it is not itself a qualifier.
+        assertEquals(false, readyForReview(quiet("user", merged, newWork = true), LiveState.IDLE))
+        // And an unlanded PR is decided before the question is even asked.
+        assertEquals(true, readyForReview(quiet("user", listOf(pr("MERGED"), pr("OPEN"))), LiveState.IDLE))
     }
 
     @Test fun `falls back to transcript freshness when paneBusy unknown`() {

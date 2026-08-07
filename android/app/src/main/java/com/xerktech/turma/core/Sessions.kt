@@ -57,17 +57,24 @@ fun prLanded(p: PrInfo): Boolean = p.state.uppercase().let { it == "MERGED" || i
  *  - a finished turn: the newest transcript entry is plain assistant output with
  *    no tool call pending, the only trace a no-PR task leaves behind.
  *
- * A session that opened a PR is judged on the PR ALONE, not on its transcript:
- * the one way out, short of working again, is that PR LANDING. Every PR merged
- * or closed IS the review, and the session falls back to Idle — where work that
- * is merged but not yet verified against a build is parked.
+ * Every PR merged or closed IS the review, so it stops being a reason to look
+ * and the session falls back to Idle — where work that is merged but not yet
+ * verified against a build is parked. That demotion is scoped in TIME, never
+ * absolute: a session is a conversation, not a pull request, and handing the
+ * same one a new task after the merge must not be hidden by the PR it already
+ * shipped. See [SessionInfo.newWorkSincePrs].
  */
 fun readyForReview(session: SessionInfo, state: LiveState): Boolean {
     if (state == LiveState.WAITING) return true      // blocked on you either way
     if (state != LiveState.IDLE) return false        // working, or not live at all
     val sig = session.session ?: return false
     val prs = session.prs
-    if (prs.isNotEmpty()) return prs.any { !prLanded(it) }
+    if (prs.any { !prLanded(it) }) return true      // an unlanded PR is a diff to read
+    // Landed PRs stop being a reason to look, but must not become a reason NOT
+    // to: the same session can be given a new task after the merge and would
+    // otherwise be hidden for good. The demotion expires once the conversation
+    // moves past the landing ([SessionInfo.newWorkSincePrs], XERK-224).
+    if (prs.isNotEmpty() && !session.newWorkSincePrs) return false
     return sig.lastRole == "assistant" && !sig.lastHasToolUse
 }
 

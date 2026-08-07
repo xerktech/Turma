@@ -484,6 +484,14 @@ data class SessionInfo(
     val permissionMode: String = "",
     val usage: UsageInfo? = null,
     val prs: List<PrInfo> = emptyList(),
+    /**
+     * Has the conversation moved on since every PR this session opened landed
+     * (hub-agent `_new_work_since_prs`, XERK-224)? Read by [readyForReview] to
+     * expire the "merging IS the review" demotion once the SAME session is
+     * handed a new task. Defaults false, which is the pre-XERK-224 behaviour an
+     * agent too old to report it should get.
+     */
+    val newWorkSincePrs: Boolean = false,
     val session: LiveSignals? = null,
     // The Jira ticket this session was spawned to work (hub-agent
     // _session_payload `ticket`); the board reverse-indexes it into per-ticket

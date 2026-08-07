@@ -53,7 +53,12 @@ export function readyForReview(s: SessionInfo): boolean {
   const live = s.session;
   if (!live) return false;
   const prs = s.prs ?? [];
-  if (prs.length) return prs.some((p) => !prLanded(p));
+  if (prs.some((p) => !prLanded(p))) return true;   // an unlanded PR is a diff to read
+  // Landed PRs stop being a reason to look, but must not become a reason NOT
+  // to: the same session can be given a new task after the merge and would
+  // otherwise be hidden for good. The demotion expires once the conversation
+  // moves past the landing (`newWorkSincePrs`, XERK-224).
+  if (prs.length && !s.newWorkSincePrs) return false;
   return live.lastRole === "assistant" && !live.lastHasToolUse;
 }
 

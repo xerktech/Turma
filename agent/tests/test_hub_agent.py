@@ -5582,6 +5582,95 @@ PANE_IDLE_COMPOSER = """\
 """
 
 
+class TestPrsLanded(ManagerMixin, unittest.TestCase):
+    """`_poll_prs_landed` + `_new_work_since_prs`: the clock that lets the
+    Ready-for-review "merging IS the review" demotion EXPIRE (XERK-224).
+
+    Without it a session whose PR merged is pinned to Idle for good, so giving
+    that same session a new task produced work nobody could see."""
+
+    URL = "https://github.com/o/r/pull/7"
+
+    def _sess(self, sm, state="OPEN"):
+        wt = os.path.join(self.tmp, "wt")
+        sess = {"id": "s1", "status": "running", "worktreePath": wt,
+                "claudeSessionId": "tid-1"}
+        sm.registry = [sess]
+        sm.session_pr_urls = {"s1": [self.URL]}
+        sm.pr_status_cache = {self.URL: {"url": self.URL, "state": state}}
+        return sess
+
+    def _transcript(self, sess, *timestamps):
+        """Write the session's transcript with one dated entry per timestamp."""
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, sess["claudeSessionId"] + ".jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            for ts in timestamps:
+                fh.write(json.dumps({"type": "assistant", "timestamp": ts}) + "\n")
+        return path
+
+    def test_stamps_the_conversation_clock_when_every_pr_lands(self):
+        sm = self.make_manager()
+        sess = self._sess(sm, state="OPEN")
+        self._transcript(sess, "2026-08-06T10:00:00.000Z")
+        sm._poll_prs_landed()
+        self.assertIsNone(sess.get("prsLandedTs"), "an OPEN PR marks nothing")
+
+        sm.pr_status_cache[self.URL]["state"] = "MERGED"
+        sm._poll_prs_landed()
+        # The stamp is the transcript's own timestamp, NOT wall time — both
+        # sides of the later comparison have to share one clock.
+        self.assertEqual(sess["prsLandedTs"], "2026-08-06T10:00:00.000Z")
+
+    def test_the_stamp_does_not_drift_once_set(self):
+        sm = self.make_manager()
+        sess = self._sess(sm, state="MERGED")
+        self._transcript(sess, "2026-08-06T10:00:00.000Z")
+        sm._poll_prs_landed()
+        self._transcript(sess, "2026-08-06T10:00:00.000Z", "2026-08-06T11:00:00.000Z")
+        sm._poll_prs_landed()
+        self.assertEqual(sess["prsLandedTs"], "2026-08-06T10:00:00.000Z",
+                         "later activity must move the COMPARISON, not the mark")
+
+    def test_an_unfetched_pr_state_stamps_nothing(self):
+        sm = self.make_manager()
+        sess = self._sess(sm, state="MERGED")
+        sm.pr_status_cache["https://github.com/o/r/pull/8"] = {}   # never fetched
+        sm.session_pr_urls["s1"].append("https://github.com/o/r/pull/8")
+        self._transcript(sess, "2026-08-06T10:00:00.000Z")
+        sm._poll_prs_landed()
+        self.assertIsNone(sess.get("prsLandedTs"),
+                          "'not looked at' is not 'landed' — stamping early would "
+                          "measure new work against the wrong moment")
+
+    def test_a_new_pr_clears_the_stamp_for_a_fresh_round(self):
+        sm = self.make_manager()
+        sess = self._sess(sm, state="MERGED")
+        self._transcript(sess, "2026-08-06T10:00:00.000Z")
+        sm._poll_prs_landed()
+        self.assertTrue(sess.get("prsLandedTs"))
+        sm.pr_status_cache[self.URL]["state"] = "OPEN"    # session opened another
+        sm._poll_prs_landed()
+        self.assertIsNone(sess.get("prsLandedTs"))
+
+    def test_new_work_since_prs_reads_the_two_stamps(self):
+        sm = self.make_manager()
+        sess = {"id": "s1"}
+        sig = {"lastActivityTs": "2026-08-06T10:00:00.000Z"}
+        # No landing recorded: the question doesn't apply, and False keeps the
+        # behaviour that shipped before this expiry existed.
+        self.assertFalse(sm._new_work_since_prs(sess, sig))
+        sess["prsLandedTs"] = "2026-08-06T10:00:00.000Z"
+        self.assertFalse(sm._new_work_since_prs(sess, sig), "same moment: nothing new")
+        sig["lastActivityTs"] = "2026-08-06T11:00:00.000Z"
+        self.assertTrue(sm._new_work_since_prs(sess, sig), "the session spoke again")
+        # A stopped session reports no live signals, and an undated transcript
+        # answers nothing — neither may read as progress.
+        self.assertFalse(sm._new_work_since_prs(sess, None))
+        self.assertFalse(sm._new_work_since_prs(sess, {"lastActivityTs": None}))
+
+
 class TestAnswerPanePrompt(ManagerMixin, unittest.TestCase):
     """Answering the TUI's blocking dialog from the chat page: type the option
     digit, but only after re-reading the pane — the click was made against a
