@@ -167,6 +167,14 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries) 
   const row = db.prepare("SELECT bytesStored, filePath FROM sessions WHERE transcriptId=?").get(transcriptId);
   const have = row ? row.bytesStored : 0;
   if (Number(startOffset) !== have) return { bytesStored: have };
+  // The cursor only ever moves forward. Without this an endOffset BELOW
+  // startOffset rewound bytesStored, and the next chunk re-ingested a range
+  // already stored — duplicating it in the canonical .jsonl, the msgCount and
+  // the FTS index at once. This store is the durable record that outlives the
+  // host, so a corruption here is not recoverable from the agent (XERK-235).
+  if (!Number.isFinite(Number(endOffset)) || Number(endOffset) < have) {
+    return { bytesStored: have };
+  }
 
   const full = { ...meta, host, transcriptId };
   let relPath = row && row.filePath ? row.filePath : archiveRelPath(transcriptId, full);

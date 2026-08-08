@@ -75,6 +75,34 @@ test("ingestChunk is append-only: mismatched offset returns the real cursor, no 
   assert.equal(lines2.length, 3);
 });
 
+test("ingestChunk: the cursor never rewinds, so a range can't be ingested twice (XERK-235)", () => {
+  // Only startOffset === bytesStored was checked; endOffset was written back
+  // unvalidated. An endOffset BELOW startOffset rewound the cursor, and the
+  // next (now "valid") chunk replayed a range already stored — duplicating it
+  // in the canonical .jsonl, the msgCount AND the FTS index at once.
+  const rel = archive.archiveRelPath("t1", { ...META, host: "nas" });
+  const file = path.join(process.env.ARCHIVE_DIR, rel);
+  const before = fs.readFileSync(file, "utf8").trim().split("\n").length;
+
+  const rewind = archive.ingestChunk("nas", "t1", { ...META }, 160, 5,
+    [ent("bad", "user", "rewinding")]);
+  assert.equal(rewind.bytesStored, 160, "the cursor must hold, not move backwards");
+
+  // The replay the rewind used to enable is now simply an offset mismatch.
+  const replay = archive.ingestChunk("nas", "t1", { ...META }, 5, 160,
+    [ent("u3", "user", "and search it later")]);
+  assert.equal(replay.bytesStored, 160);
+
+  const after = fs.readFileSync(file, "utf8").trim().split("\n").length;
+  assert.equal(after, before, "no line was duplicated into the durable record");
+
+  // A non-numeric endOffset must not poison the cursor either.
+  const junk = archive.ingestChunk("nas", "t1", { ...META }, 160, "abc",
+    [ent("junk", "user", "nope")]);
+  assert.equal(junk.bytesStored, 160);
+  assert.equal(fs.readFileSync(file, "utf8").trim().split("\n").length, before);
+});
+
 test("searchArchive: ranked, <mark>-highlighted snippets, repo/host filters", () => {
   archive.ingestChunk("nas2", "t2", {
     remoteKey: "github.com/xerk/other", repo: "other", worktree: "/w2",

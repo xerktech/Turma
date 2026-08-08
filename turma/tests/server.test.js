@@ -1170,6 +1170,75 @@ test("http: heartbeat auth (bearer or user basic, nothing else)", async () => {
   );
 });
 
+// ---- XERK-235: defects a full QA pass found ---------------------------------
+
+test("http: a fat heartbeat gets a 413 it can act on, not a dropped socket", async () => {
+  // A /history result at the documented FULL block caps reaches ~5 MiB, and the
+  // hub used to req.destroy() past 1 MiB — so the agent saw ECONNRESET with no
+  // status to branch on, kept the staged results, and re-sent the same body
+  // every beat. The host stayed offline forever with nothing logged.
+  const fat = {
+    device: "fat-host",
+    historyResults: [{ sessionId: "s1", entries: [{ text: "x".repeat(3 << 20) }] }],
+  };
+  const res = await request("POST", "/api/heartbeat", { body: fat, headers: agentHeaders });
+  assert.equal(res.status, 200, "a multi-MiB heartbeat is legitimate and must be accepted");
+
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.ok(
+    list.body.agents.some((a) => a.key === "fat-host"),
+    "the host must actually register, not silently vanish"
+  );
+});
+
+test("http: past the heartbeat cap the hub still ANSWERS (413), never a bare reset", async () => {
+  const huge = { device: "huge-host", pad: "y".repeat(33 << 20) };
+  // `connection: close`: past cap + drain slack the hub destroys the socket, and
+  // node's default agent keep-alives, so a pooled-and-doomed socket would fail
+  // the NEXT test with a bogus "socket hang up".
+  const res = await request("POST", "/api/heartbeat", {
+    body: huge, headers: { ...agentHeaders, connection: "close" },
+  });
+  assert.equal(res.status, 413);
+  assert.equal(res.body.error, "body too large");
+  assert.ok(res.body.limit > 0, "the agent needs the limit to resize against");
+});
+
+test("http: a heartbeat whose device is not a plain host name is refused, not silently dropped", async () => {
+  // `__proto__` 200'd while the beat was discarded AND the registry's prototype
+  // was replaced; an object key landed as "[object Object]".
+  for (const device of ["__proto__", "constructor", "prototype"]) {
+    const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
+    assert.equal(res.status, 400, `${device} must be refused`);
+  }
+  for (const device of [{ a: 1 }, ["x"], 12]) {
+    const res = await request("POST", "/api/heartbeat", { body: { device }, headers: agentHeaders });
+    assert.equal(res.status, 400, `${JSON.stringify(device)} must be refused`);
+  }
+  // The prototype must be intact: a route reading agents[x].commands would
+  // otherwise find one on every unknown host.
+  const probe = await request("POST", "/api/agents/never-seen/sessions/x/kill", { headers: userHeaders });
+  assert.equal(probe.status, 404);
+});
+
+test("http: spawn validates repo and bounds its queued fields", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "spawn-val", repos: [{ name: "r1" }] }, headers: agentHeaders });
+  for (const repo of [{ a: 1 }, ["x"], 12]) {
+    const res = await request("POST", "/api/agents/spawn-val/sessions", {
+      body: { repo }, headers: userHeaders,
+    });
+    assert.equal(res.status, 400, `repo ${JSON.stringify(repo)} must be refused`);
+  }
+  const big = await request("POST", "/api/agents/spawn-val/sessions", {
+    body: { repo: "r1", prompt: "P".repeat(100001) }, headers: userHeaders,
+  });
+  assert.equal(big.status, 413, "an unbounded prompt rides every /api/agents response and SSE frame");
+  const ok = await request("POST", "/api/agents/spawn-val/sessions", {
+    body: { repo: "r1", prompt: "do the thing" }, headers: userHeaders,
+  });
+  assert.equal(ok.status, 200);
+});
+
 // ---- Jira board page + heartbeat block ----------------------------------------
 
 test("http: /board page and /board.js are user-gated like the rest of the UI", async () => {

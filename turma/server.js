@@ -1276,17 +1276,61 @@ function findSession(sessionId) {
   return null;
 }
 
-function readBody(req) {
+// Default cap for a JSON body. Generous, because the expensive one is the
+// heartbeat (below) and everything else is small.
+const BODY_MAX = 1 << 20; // 1 MiB
+
+// A heartbeat is not a user request: it carries the agent's on-demand
+// `historyResults`, which at the documented FULL block caps (HISTORY_MAX_MSGS
+// entries × BLOCK_TEXT_CHARS_FULL, plus base64 SendUserFile images) reaches
+// ~5 MiB on an ordinary "open the chat history" click. At 1 MiB the hub
+// destroyed the socket, the agent saw ECONNRESET rather than a status code,
+// and — because it holds staged results until a POST succeeds — re-sent the
+// same oversized body every beat, so the host stayed offline forever with
+// nothing logged (XERK-235).
+const HEARTBEAT_MAX = 32 << 20; // 32 MiB
+
+// Longest prompt/label/baseRef a queued spawn may carry. A queued command is
+// re-serialized into every /api/agents response, every SSE broadcast and
+// state.json, and an offline host never acks — so an unbounded field is a
+// fleet-wide cost that grows without limit (XERK-235). Comfortably above any
+// real task prompt; /api/trigger applies its own 10k cap on prompt alone.
+const SPAWN_FIELD_MAX = 100000;
+
+// Thrown past the cap so a route can answer 413 instead of leaking a generic
+// 400 (or, worse, nothing at all).
+class BodyTooLarge extends Error {
+  constructor(cap) {
+    super("body too large");
+    this.tooLarge = true;
+    this.cap = cap;
+  }
+}
+
+// Collect a request body as a string. Past `cap` it keeps DRAINING for a while
+// rather than destroying the socket: draining is what lets the route write a
+// 413 on the same connection, where a mid-body destroy reaches the client as a
+// socket hang-up with no status to branch on. Same rule readRawBody follows.
+function readBody(req, cap = BODY_MAX) {
   return new Promise((resolve, reject) => {
     let data = "";
+    let len = 0;
+    let over = false;
     req.on("data", (c) => {
-      data += c;
-      if (data.length > 1 << 20) {
-        reject(new Error("body too large"));
-        req.destroy();
+      len += c.length;
+      if (over) {
+        if (len > cap + RAW_BODY_DRAIN_SLACK) req.destroy();
+        return;
       }
+      if (len > cap) {
+        over = true;
+        data = ""; // release it — it is not going to be used
+        reject(new BodyTooLarge(cap));
+        return;
+      }
+      data += c;
     });
-    req.on("end", () => resolve(data));
+    req.on("end", () => { if (!over) resolve(data); });
     req.on("error", reject);
   });
 }
@@ -2867,7 +2911,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/heartbeat") {
-      const payload = JSON.parse((await readBody(req)) || "{}");
+      const payload = JSON.parse((await readBody(req, HEARTBEAT_MAX)) || "{}");
       // Coerce an old agent's per-model usage lists to the current shape before
       // anything (the record, the cache, every client) sees them.
       normalizeUsage(payload);
@@ -2876,6 +2920,15 @@ const server = http.createServer(async (req, res) => {
       // fallback if the host name couldn't be read.
       const key = payload.device || payload.agentId;
       if (!key) return json(res, 400, { error: "device/agentId required" });
+      // `agents` is a plain object keyed by host name, so a non-string or a
+      // prototype key is not a host: `__proto__` 200'd while the beat was
+      // silently discarded (and replaced the registry's prototype), and an
+      // object key landed as "[object Object]" (XERK-235). Refuse it loudly —
+      // a beat the hub throws away must never report success.
+      if (typeof key !== "string" || key.length > 200 ||
+          key === "__proto__" || key === "constructor" || key === "prototype") {
+        return json(res, 400, { error: "device must be a plain host name" });
+      }
       const prev = agents[key] || {};
       // At-least-once command delivery: drop any queued command the agent
       // reports as executed; keep re-sending the rest until acked.
@@ -3300,10 +3353,25 @@ const server = http.createServer(async (req, res) => {
       // queues exactly {type:"spawn", repo} as before.
       if (req.method === "POST" && parts.length === 4) {
         const body = JSON.parse((await readBody(req)) || "{}");
-        if (!body.repo) return json(res, 400, { error: "repo required" });
+        // Only `!body.repo` was checked, so an object/array/number went to the
+        // agent verbatim (XERK-235). /api/trigger already gets this right.
+        if (!body.repo || typeof body.repo !== "string") {
+          return json(res, 400, { error: "repo required" });
+        }
         const cmd = { type: "spawn", repo: body.repo };
         for (const f of ["prompt", "label", "baseRef", "model", "permissionMode"]) {
-          if (body[f] != null && body[f] !== "") cmd[f] = body[f];
+          if (body[f] != null && body[f] !== "") {
+            if (typeof body[f] !== "string") {
+              return json(res, 400, { error: `${f} must be a string` });
+            }
+            // The queue is re-serialized into every /api/agents response, every
+            // SSE frame and state.json, so an unbounded prompt/label is a
+            // fleet-wide cost, not just this command's.
+            if (body[f].length > SPAWN_FIELD_MAX) {
+              return json(res, 413, { error: `${f} too long`, limit: SPAWN_FIELD_MAX });
+            }
+            cmd[f] = body[f];
+          }
         }
         const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });
@@ -3680,20 +3748,33 @@ const server = http.createServer(async (req, res) => {
         parts.length === 5 && parts[3] === "tickets") {
       const siteKey = decodeURIComponent(parts[2]);
       const cmdId = decodeURIComponent(parts[4]);
-      let found = null, host = null;
+      // The create was routed to an ONLINE host, but this loop used to take the
+      // FIRST host reporting the org and judge onlineness by that one — so with
+      // a stale host listed first, a create sitting happily in an online host's
+      // queue was reported as failed, and the operator's retry made a duplicate
+      // ticket on the tracker (XERK-235). Track the host actually holding the
+      // command, and only give up when nothing of this org can still run it.
+      let found = null, seen = false, owner = null, anyLive = false;
       for (const [k, a] of Object.entries(agents)) {
         if (!a.jira || a.jira.siteKey !== siteKey) continue;
-        host = host || k;
+        seen = true;
+        const live = Date.now() - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
+        if (live) anyLive = true;
+        if ((a.commands || []).some((c) => c.cmdId === cmdId)) owner = k;
         const r = (a.createResults || {})[cmdId];
         if (r) { found = r; break; }
       }
-      if (!host) return json(res, 404, { error: "no host reports that org" });
+      if (!seen) return json(res, 404, { error: "no host reports that org" });
       if (found) {
         return json(res, 200, found.error
           ? { error: found.error }
           : { key: found.key, url: found.url, warning: found.warning || null });
       }
-      if (Date.now() - (agents[host].lastSeen || 0) >= OFFLINE_AFTER_MS) {
+      const holder = owner ? agents[owner] : null;
+      const stalled = holder
+        ? Date.now() - (holder.lastSeen || 0) >= OFFLINE_AFTER_MS
+        : !anyLive;
+      if (stalled) {
         return json(res, 503, { error: "the host went offline before the ticket was created" });
       }
       return json(res, 202, { pending: true });
@@ -3988,14 +4069,17 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "not a valid issue key" });
       }
       const body = JSON.parse((await readBody(req)) || "{}");
+      // Reject a non-string `model` FIRST. Coercing it to "" made `auto` true,
+      // so {model:12345} silently RELEASED an existing pin and answered 200 —
+      // the opposite of what the caller asked for (XERK-235).
+      if (body.model != null && typeof body.model !== "string") {
+        return json(res, 400, { error: "body needs {model} or {auto:true}" });
+      }
       const raw = typeof body.model === "string" ? body.model.trim().toLowerCase() : "";
       // "default" is the release value in model's clothing — treat it as {auto},
       // so the picker's "Default" option and an explicit {auto:true} land the same
       // "drop the pin" outcome rather than storing a "default" alias to resolve.
       const auto = body.auto === true || raw === "default" || raw === "";
-      if (!auto && typeof body.model !== "string") {
-        return json(res, 400, { error: "body needs {model} or {auto:true}" });
-      }
       if (!Object.values(agents).some(
         (a) => a && a.jira && a.jira.siteKey === siteKey)) {
         return json(res, 404, { error: "no host reports that Jira org" });
@@ -4063,6 +4147,13 @@ const server = http.createServer(async (req, res) => {
 
     json(res, 404, { error: "not found" });
   } catch (err) {
+    // An oversized body must come back as a status the caller can branch on.
+    // The socket is still open here precisely because readBody drained instead
+    // of destroying it (XERK-235).
+    if (err && err.tooLarge) {
+      if (!res.writableEnded) json(res, 413, { error: "body too large", limit: err.cap });
+      return;
+    }
     json(res, 400, { error: err.message });
   }
 });
