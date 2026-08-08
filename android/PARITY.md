@@ -288,6 +288,23 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   Android uses equal-weight columns that fill the bubble width and wrap long cells, which reads better
   on a phone than a sideways-scrolling grid.
 
+## Done (XERK-234 — file attachments in the composer)
+
+- **Attach images and documents to a message.** Both sides stage each picked file to the hub
+  immediately (`POST .../sessions/<id>/uploads`, raw bytes) and send the ids with the message, so Send
+  is instant and an over-cap file is refused while there is still a chip to remove. The chips (name +
+  size / "uploading…" / the failure) sit above the input box, each with a ✕; Send lights up for
+  attachments alone; a file still uploading holds the message rather than sending it with the file
+  missing. The control is hidden entirely on a host whose agent doesn't report `uploadMaxBytes`, and
+  disabled while an AskUserQuestion is pending (the draft then answers it, and an answer carries no
+  files). Pure half ported to `core/Uploads.kt`, locked to the hub/agent sanitiser in
+  `core/UploadsTest.kt`.
+- **Web-only entry points:** drag-and-drop onto the transcript and paste-a-screenshot. Both are
+  desktop pointer/clipboard gestures with no phone equivalent — Android's picker
+  (`OpenMultipleDocuments`) covers the same ground, and the system share sheet is the phone's idiom for
+  the drop case. Sharing INTO the app is not wired up (no `ACTION_SEND` intent filter yet) — a
+  reasonable follow-up, tracked below.
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
@@ -333,6 +350,10 @@ those are marked `[MODEL]`.
   web parse, plus splitting a paragraph around an inline image in `ProseBlocks`. The image renderer
   (Coil `AsyncImage`) is already in place from the SendUserFile work above, so this is parser + layout
   only.
+- P2 **Share INTO the app as an attachment (XERK-234 follow-up).** Attaching from the picker is done
+  (see "Done" above); the phone-idiomatic counterpart of the web's drag-and-drop is the system share
+  sheet, which needs an `ACTION_SEND`/`ACTION_SEND_MULTIPLE` intent filter routing the Uri(s) into the
+  open session's `ChatViewModel.attach`. No new wire work — the upload path is already there.
 - P1 Verbosity NORMAL: tool card collapsed (output on expand) to match web; persist per-card open.
 - ~~P2 Live status bar: token counters + elapsed + spinner + hint lines + subagent list.~~
   Done (XERK-75) — see "Done" below.

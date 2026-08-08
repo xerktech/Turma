@@ -51,8 +51,8 @@ One agent container per host, multiplexing sessions across every repo it scans.
   base.
 - **The app creates no branch of its own.** The running agent creates and names its own branch when
   ready; that live branch (read from the worktree's git HEAD) shows on the session card, "detached"
-  until then. A ticket session is told the exact branch NAME (`PROJ-123`, `-1`, `-2`) but still cuts it
-  itself, so the worktree stays detached.
+  until then. A ticket session is told its branch NAME but still cuts it itself, so the worktree stays
+  detached.
 - The session runs its own `claude --remote-control` in its own tmux (`agent-<id>`) + loopback ttyd,
   with an optional initial task prompt and optional `--model`/`--permission-mode`.
 - Many sessions run concurrently (up to `MAX_SESSIONS`), including several on one repo via separate
@@ -66,9 +66,8 @@ One agent container per host, multiplexing sessions across every repo it scans.
 - A spawn that can't run RIGHT NOW is **queued, not refused** — an ordinary registry record with
   `status:"queued"` and no worktree/tmux/ttyd yet. `spawn()` splits into the record-build and
   `_provision_session()` (worktree + tmux + ttyd + naming), which a queued session later runs unchanged.
-- Three orthogonal `queuedReason`s, each re-checked by the drainer: **capacity** (host at
-  `MAX_SESSIONS`), **awaiting-clone** (its repo is being cloned on demand), **root-busy** (another root
-  session holds the one root slot).
+- Three orthogonal `queuedReason`s, each re-checked by the drainer: **capacity**, **awaiting-clone**
+  (its repo is being cloned on demand), **root-busy** (another root session holds the one root slot).
 - The queue/run decision is made BEFORE the record is appended, so counts exclude the session being
   added (else a root sees itself as root-busy and capacity is off by one). Prompt/base-ref stash as
   `_pendingPrompt`/`_pendingBaseRef` for `_provision_session` to consume.
@@ -149,11 +148,11 @@ One agent container per host, multiplexing sessions across every repo it scans.
   rides git; uncommitted work stays on the source (KILLED, so resumable).
 - The hub can't touch a worktree and agents are outbound-only, so a migration is composed hub-side from
   agent commands + a hub-brokered relay of the **RAW transcript bytes** (what `claude --resume` needs and
-  the archive lacks): `exportSession` packs the transcript (`+ subagents/`, truncated to its last complete
-  line) and POSTs the gzip-tar to `POST /api/agents/<host>/migrations/<id>/blob`, queueing `importSession`
-  on the target (recording `importCmdId`), which unpacks it under the origin cwd's slug and resumes via
-  `_resume_at_cwd`; the target reporting up (`spawnCmdId` == `importCmdId`) makes `advanceMigrations` KILL
-  the source and finish. The Sessions page follows via `migrations`.
+  the archive lacks): `exportSession` packs the transcript (`+ subagents/`, truncated to its last
+  complete line) and POSTs the gzip-tar to `POST /api/agents/<host>/migrations/<id>/blob`, queueing
+  `importSession` on the target (recording `importCmdId`), which unpacks it under the origin cwd's slug
+  and resumes via `_resume_at_cwd`; the target reporting up (`spawnCmdId` == `importCmdId`) makes
+  `advanceMigrations` KILL the source and finish. Followed on the Sessions page via `migrations`.
 - `_resume_at_cwd` is shared by `resume_transcript` and `import_session`. Hosts may mount `REPOS_ROOT` at
   DIFFERENT paths, so `import_session` first `_localize_migrated_cwd`s the source's worktree path onto
   THIS host's `REPOS_ROOT` (the `.turma/worktrees/<repo>/<dir>` tail is mount-independent) — both the
@@ -217,13 +216,22 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     the agent REFUSES past `INPUT_MAX_CHARS` (100k) and heartbeats it as **`inputMaxChars`**, and the hub
     caps a message at the receiving host's figure (`inputCapFor`; **4k when unreported** — that agent
     predates the paste and clips the tail untold), 413ing with `limit` → "Too long — max N".
+  - **File attachments ride this command** (XERK-234): the 📎 stages a file on the HUB (memory-only,
+    TTL'd) and `input` carries the ids; `send_input` fetches each into `~/.turma/uploads/<sessionId>/`
+    — never a worktree, where it would read as the uncommitted work `prune`/`delete` key on
+    (`build_guard_settings` pre-approves `Read` there) — then prefixes the message with their PATHS,
+    so the COMPOSED text is what lands on the outbox above. The name is sanitized on BOTH sides (it is
+    joined onto a path); one that fails to transfer is NAMED, never dropped. **`uploadMaxBytes` is the
+    cap AND the capability flag** (like `inputMaxChars`): an agent reporting none drops the uploads
+    untold, so the hub refuses and the composers hide the 📎. Tests: `TestStoreUploads`/
+    `TestSendInputUploads`, `uploads:`/`attachments:` in `server.test.js`/`chat.test.js`, `UploadsTest`.
 - `interrupt` — a single Escape to the pane: cancels the in-flight generation/tool call, session and
   conversation intact. Deliberately NOT gated on `paneBusy`. Tests: `TestInterrupt`.
 - **Operator messages are exempt from the `history` window** (XERK-186): the read stays bounded (last
   4 MiB + `HISTORY_MAX_MSGS`, capped inside `_history_entries`; callers must not re-slice), but on any
   cut every user-authored text turn in the whole transcript folds back in ahead of the window
-  (id-deduped, `HISTORY_USER_MSGS` backstop) — tool traffic otherwise evicts them. Tests:
-  `TestHistoryCommand`.
+  (id-deduped, `HISTORY_USER_MSGS` backstop) — tool traffic otherwise evicts them.
+  Tests: `TestHistoryCommand`.
 - `setSummary` — rename a session (see "Session activity summaries").
 - `setModel` — switch a running session's model live, **for that session only** (XERK-33).
   - `set_model` drives Claude Code's /model picker — clear the input line (C-u), open it, parse rows +
@@ -289,12 +297,12 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - The **shared Claude login's health** (`claudeAuth`, XERK-98) — `claude_auth_status()` reads
   `~/.claude/.credentials.json` (`CLAUDE_CREDS_PATH`) every beat:
   `{present, needsLogin, expiringSoon, expiresAt, refreshExpiresAt, subscriptionType, at}` (epoch ms).
-  The **REFRESH token** is the signal, NOT the access token: it lapses only
-  when claude hasn't refreshed inside its ~30-day window, i.e. when a human must `claude /login`.
-  `needsLogin` = missing/unreadable file, no `claudeAiOauth`/access token, or a past refresh expiry;
-  `expiringSoon` = within `CLAUDE_AUTH_WARN_MS` (3d). Unknown refresh
-  expiry reads healthy; a MISSING login can't heartbeat, so it surfaces as the offline alert. Chip via
-  `claudeAuthBadge` / `🔑` pill (`FleetScreen.kt`). Tests: `TestClaudeAuthStatus`.
+  The **REFRESH token** is the signal, NOT the access token: it lapses only when claude hasn't
+  refreshed inside its ~30-day window, i.e. when a human must `claude /login`. `needsLogin` =
+  missing/unreadable file, no `claudeAiOauth`/access token, or a past refresh expiry; `expiringSoon` =
+  within `CLAUDE_AUTH_WARN_MS` (3d). Unknown refresh expiry reads healthy; a MISSING login can't
+  heartbeat, so it surfaces as the offline alert. Chip via `claudeAuthBadge` / `🔑` pill
+  (`FleetScreen.kt`). Tests: `TestClaudeAuthStatus`.
 
 #### Live-session signals
 
@@ -443,9 +451,9 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   (naming, triage, models probe), which run with `cwd=REGISTRY_DIR` yet write a transcript
   into the shared `~/.claude/projects` — else the reconciler adopts the agent's overhead as a phantom
   repo (XERK-27). `_is_internal_tool_slug` knows them by the registry dir's own slug, or a
-  harness's temp slug by `INTERNAL_TOOL_PROMPT_SIGS`; the models probe's prompt is a slash command (which
-  `_first_user_text` skips), so it goes by `_first_command_name` = `/model`. Such a slug is
-  **tombstoned** (`{internal:true}`), which `repo_usage_report`/`_archive_manifest` skip.
+  harness's temp slug by `INTERNAL_TOOL_PROMPT_SIGS`; the models probe's prompt is a slash command
+  (which `_first_user_text` skips), so it goes by `_first_command_name` = `/model`. Such a slug is
+  **tombstoned** (`{internal:true}`), skipped by `repo_usage_report`/`_archive_manifest`;
   `_sanitize_internal_tool_entries` retires entries earlier builds adopted.
 - **This ledger is also the archive's input** (`_archive_manifest` enumerates ledger slugs), so
   reconciliation *intentionally* widens archival too — decouple them only if the two scopes should
@@ -623,8 +631,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
 - The agent heartbeats a `github` block: whether it has a usable `gh` login and, if so, that login's
   clonable repos (refreshed slow; the user's own repos, their orgs, and any extra `GH_CLONE_OWNERS`),
   plus any in-flight/recent `clones`. The availability flag is **`available`** and the hub passes the
-  block through untouched, so every client must gate its clone UI on that exact key (XERK-126). Tests:
-  android `CloneTest.kt`.
+  block through untouched, so every client must gate its clone UI on that exact key (XERK-126).
 - A `clone` command `git clone`s a validated `owner/repo` (allowlist-checked before it reaches git)
   into `REPOS_ROOT` as a **detached subprocess** (reaped across later beats); the new repo then joins
   the scan. Private-repo auth rides the system git credential helper (`gh auth git-credential`).
@@ -635,7 +642,7 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   Listings are per-source keep-last-good; a clone command carries `{repo, source?}` and the agent
   resolves the URL from its OWN cached listing (free text stays the GitHub fallback). Triage candidates /
   `repoOptions` / ticket clone-on-demand consume the union, entries tagged `source`; the clone bar groups
-  per source ("Clone a repo" when >1). Tests: `TestGitSources`, `clone.test.js`, android `CloneTest.kt`.
+  per source ("Clone a repo" when >1). Tests: `TestGitSources`, `clone.test.js`, `CloneTest.kt`.
 - **Non-GitHub git creds (XERK-54)** — the image wires a SECOND system credential helper after gh:
   `store --file=/root/.git-credentials`. gh serves github.com; every other host falls through to
   `store`, reading cached git credentials from an **optional** bind mount. gh is first so github.com
@@ -646,10 +653,10 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   (`AZDO_TOKEN` + `AZDO_URL`), so everything else reuses it. At boot `entrypoint.sh` runs
   `hub-agent.py --wire-azure-git`, setting a URL-scoped `http.<azure_base>.extraHeader` (Basic `:<PAT>`,
   `azure_git_auth_config()`) for plain git — **`extraHeader`, not a credential helper /
-  `http.proactiveAuth`**: self-hosted TFS/Server often issues no Basic challenge a helper can act on, and
-  the image's git (2.39) predates `proactiveAuth` (2.46). Written `--system` as root before the privilege
-  drop, and **exports `AZURE_DEVOPS_EXT_PAT`** so `az repos` authenticates too. Non-fatal, logs the host
-  never the token. Container-only. Tests: `TestAzureGitAuthConfig`, `test_entrypoint.sh`.
+  `http.proactiveAuth`**: self-hosted TFS/Server often issues no Basic challenge a helper can act on,
+  and the image's git (2.39) predates `proactiveAuth` (2.46). Written `--system` as root before the
+  privilege drop; **exports `AZURE_DEVOPS_EXT_PAT`** so `az repos` authenticates too. Non-fatal, logs
+  the host never the token. Container-only. Tests: `TestAzureGitAuthConfig`, `test_entrypoint.sh`.
 
 ### `entrypoint.sh`
 
@@ -671,22 +678,20 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   it.
 - The config is **validated before it is sourced**, and a bad one **idles** rather than exiting:
   - The launcher `.`-sources the env file, so a non-assignment line RUNS (a YAML-style `JIRA_SITE: "x"`
-    exits 127 and under `set -e` takes the launcher down). The check is anchored on the `=` directly
+    exits 127 and takes the launcher down under `set -e`). The check is anchored on the `=` directly
     after the name (`JIRA_TOKEN: "a=b"` carries an `=` in its VALUE); `export` stays legal.
   - **Idling, never `exit 1`.** To systemd an exit is indistinguishable from one worth restarting in 5s
     — the exit IS the loop. `--preflight` is the one exception (exits 1). Nothing is sourced then.
   - The report carries **line numbers and key names, never values** (`chmod 600`, holds
     `TURMA_TOKEN`/`JIRA_TOKEN`).
-- The tunnel is **supervised** here, re-exec'd as `turma-agent --tunnel-supervisor` (a respawn loop),
-  because a native install is the only place its runtime can be MISSING — node is an apt prereq, not a
-  baked layer. (The container has its own simpler respawn loop in `entrypoint.sh`, XERK-34; tests
-  `test_entrypoint.sh`.)
+- The tunnel is **supervised** here, re-exec'd as `turma-agent --tunnel-supervisor` (a respawn loop):
+  a native install is the only place its runtime can be MISSING — node is an apt prereq, not a baked
+  layer. (The container's simpler loop is in `entrypoint.sh`, XERK-34; tests `test_entrypoint.sh`.)
   - The node check lives INSIDE the loop, so installing node heals the terminals (`terminalOnline`)
     within one `TUNNEL_RETRY_SEC`; fire-and-forget would make a missing node silent AND permanent.
   - The supervisor's pkill key is PREFIX-scoped like `tunnel-agent.js`'s; the launcher reaps the
     supervisor BEFORE the tunnel (else the old loop respawns the just-killed tunnel), and
-    `turma-agentctl stop` reaps it too. PATH, config and supervisor tests:
-    `test_turma_agent.sh`.
+    `turma-agentctl stop` reaps it too. PATH/config/supervisor tests: `test_turma_agent.sh`.
 - The launcher exports **`TURMA_MANAGER_PID=$$`**, which `exec` makes the manager's own pid, so the
   tunnel's poke (`pokeHeartbeat`) signals the right process. Its PID-1 fallback is right only in the
   container. Tests: `pokeHeartbeat` in `tunnel-agent.test.js`.
@@ -698,12 +703,12 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     host look sudo-less and skips every apt prereq under `curl … | bash`). Gated on `[ -t 2 ]`; cached.
   - It must never become `curl … | sudo bash`: the install belongs to the invoking user, only prereqs
     need root. Tests: `test_install_sudo.sh`, wired into `code-scan.yml`.
-- `bootstrap.sh` — the `curl … | bash` front door for a host with no checkout. Resolves the newest native
-  tarball, verifies its sha256, unpacks to a temp dir, and `exec`s the `install.sh` inside it (not copied
-  into `$PREFIX`, so `--verify`/`--uninstall` re-run through it). Resolves by the version in the
-  **asset's filename**, never the release tag (a carried-forward build keeps its older name, so a
-  tag-derived name would 404). Anonymous and parser-free (runs BEFORE install.sh apt-installs python3).
-  Tests: `test_bootstrap.sh` (wired into `code-scan.yml`).
+- `bootstrap.sh` — the `curl … | bash` front door for a host with no checkout: resolve the newest native
+  tarball, verify its sha256, unpack to a temp dir, `exec` the `install.sh` inside it (not copied into
+  `$PREFIX`, so `--verify`/`--uninstall` re-run through it). Resolves by the version in the **asset's
+  filename**, never the release tag (a carried-forward build keeps its older name, so a tag-derived name
+  would 404). Anonymous and parser-free (runs BEFORE install.sh apt-installs python3). Tests:
+  `test_bootstrap.sh` (wired into `code-scan.yml`).
 - Service: a systemd **user** unit with `KillMode=process` (a restart signals only the manager, leaving
   tmux/claude/ttyd/tunnel alive), plus a nohup `turma-agentctl` fallback for WSL without systemd. Both
   preserve running sessions via the adopt-on-boot path.
@@ -805,8 +810,8 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
     as a base64 data URI (`kind:"image"`), a `render` HTML page as raw markup (`kind:"html"`), else a name
     chip (`kind:"file"`: attach/oversize past `SEND_FILE_MAX_BYTES`/missing/other, never opened).
     `renderToolFiles` shows images inline + HTML in a fully sandboxed iframe (open by default). Only
-    image/html paths are read, bounded, so a delivery can't bloat the frame or leak bytes. py
-    `_send_user_file_detail` ↔ js `sendUserFileDetail`.
+    image/html paths are read, bounded, so a delivery can't bloat the frame or leak bytes.
+    py `_send_user_file_detail` ↔ js `sendUserFileDetail`.
 - Two more turns-about-the-session become status markers: a `system`/`compact_boundary` entry →
   `{t:"compact_boundary", trigger, preTokens, postTokens}`, and a `pr-link` entry →
   `{t:"pr_link", url, number, repo}`. pr-link entries carry no uuid, so the feeds synthesize a stable id
@@ -823,10 +828,10 @@ Currently Claude Code; the name is agent-generic so it can host other agents lat
   survivors as `queued[]` beside `entries`. A window opening mid-sequence errs toward hiding; older
   agents send no `queued`. Tooling payloads ride the same queue, so display filtering happens at REPORT
   time (`_queued_display` / `queuedDisplay`), never at fold time (which desyncs the dequeues).
-- Blocks ride the live tail (tight per-block caps), on-demand `history` and the archive push
-  (`_entry_blocks(entry, BLOCK_CAPS_FULL)`, looser caps on the latter two) — the one place inclusion
-  widens: a tool_result-only turn, dropped by `_entry_text`, is kept when it has blocks; only
-  `transcript_tail` stays text-only. Already-archived bytes are never re-parsed.
+- Blocks ride the live tail (tight caps), on-demand `history` and the archive push (both
+  `BLOCK_CAPS_FULL`) — the one place inclusion widens: a tool_result-only turn, dropped by
+  `_entry_text`, is kept when it has blocks; only `transcript_tail` stays text-only. Already-archived
+  bytes are never re-parsed.
 
 ### Archive sync
 
@@ -928,8 +933,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 
 - Working/idle/waiting-on-question state, the worktree name, the agent's live branch (or "detached"),
   and per-session token usage parsed from that worktree's `~/.claude/projects` transcripts.
-- Any **PR status** the session opened — a GitHub-style pill (state colour + `#number` + ✓/✗/●
-  merge-readiness mark) from `session.prs`; `prBadgeHtml` builds it, `.pr-badge` CSS in `app.css`.
+- Any **PR status** the session opened, as the merge-readiness pill from `session.prs`
+  (`prBadgeHtml`, `.pr-badge` in `app.css`).
 - Per-session **Attach / Restart (clear context) / Kill / Start / Delete**.
 
 ### Spawn/resume handoff
@@ -1003,7 +1008,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   tracker — source-agnostic across Jira and Azure DevOps, hidden until an org reports. It lives in the
   **shared site header** (`newticket.js` → nav.js's `#hdrNewTicket` slot, XERK-150), not the board
   toolbar; it is fed the beat by `TurmaNewTicket.update(data)`, with the form HTML in `board.js`. It
-  routes to an **ONLINE** host of the org, reusing the `{command → staged result → poll}` pattern:
+  routes to an **ONLINE** host of the org, on the usual command → staged result → poll pattern:
   - `GET /api/jira/<siteKey>/create-meta` (`boardCreateMeta`) → the org's projects + existing labels/tags;
     `?project=<p>` → that project's creatable types. Cascade (project then types) so no meta call fans
     across every project. Cached per host, 202-polled.
@@ -1038,9 +1043,9 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 #### Repo chips
 
 - Each card shows the **repo the agent triaged the ticket to** (`repoChipHtml`, from `repoGuess`) in
-  three states: **cloned** on the reporting host is a plain actionable chip; one only in the org's `gh`
-  listing is **dashed**; a ticket the model declined is a muted italic **"no repo"**; no `repoGuess` yet
-  gets **no chip** ("not looked at yet" ≠ "no repo fits"). The rationale rides as the chip's tooltip and
+  three states: **cloned** on the reporting host is a plain actionable chip, one only in the org's `gh`
+  listing is **dashed**, a ticket the model declined is a muted italic **"no repo"** — and no
+  `repoGuess` yet gets **no chip** ("not looked at yet" ≠ "no repo fits"). The rationale is the tooltip and
   the detail panel's Repo row (`repoFieldHtml`, reading `t.repoGuess` directly — the guess exists only on
   the heartbeat ticket, not the on-demand Jira fetch), which is where it is **corrected by hand**.
 
@@ -1065,8 +1070,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `B.startSweepVerdict` (pure, unit-tested): a cmdId-less pending always holds, and "command gone" counts
   as acked only once the command was **seen present** (`sawCmd`) — the SSE-fallback poll may not yet have
   seen a just-queued one.
-- Tests: `server.test.js`, `startSweepVerdict` in
-  `board.test.js`.
+- Tests: `server.test.js`, `startSweepVerdict` in `board.test.js`.
 
 ##### Splitting ticket sessions across an org's agents (XERK-14)
 
@@ -1547,8 +1551,7 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
     re-fire on upgrade.
   - **But the hold is read off `session.prs`, never that list alone**, which only the per-beat
     `newPrUrls` scrape fills: a PR scraped before this hub booted, or announced once and then worked on
-    again, leaves it empty while still open. Gating on the list alone announced work that merges nowhere,
-    captioned "nothing to merge" — a claim about the SESSION, made only when it opened nothing at all.
+    again, leaves it empty while still open.
   - `prAlertDecision`'s doc comment is the verdict table; four rules there must not be undone. **A
     CONFLICTING open PR never alerts** (XERK-223) — it merges nowhere however green its CI is, so the hold
     outlasts the age-out and reaches this alert too; the session still LISTS under Ready for review, and
@@ -1594,11 +1597,10 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
 - UI, API, and the click-to-attach live terminal (`/term/<sessionId>/`, reverse-tunneled to that session's
   ttyd by port) sit behind single-user HTTP Basic auth (`TURMA_USER`/`TURMA_PASSWORD`). Agents
   authenticate heartbeats, tunnel WebSockets, and ttyd with one shared token (`TURMA_TOKEN` in the
-  agent's env = `TURMA_AGENT_TOKEN` on the hub), set inline in DockerOps' `compose/turma-truenas.yaml`.
+  agent's env = `TURMA_AGENT_TOKEN` on the hub).
 - The hub also serves the `glasses/` client: a CORS'd `/api/*` surface for that cross-origin WebView;
   per-session `input`/`history` endpoints; `GET /api/ws-token` for short-lived WebSocket auth; an
-  `/audio` STT WebSocket (G2-mic PCM via the LiteLLM instance's OpenAI-compatible transcription
-  endpoint — `LITELLM_URL`; `WHISPER_*` override only if the STT server lives elsewhere); and a
+  `/audio` STT WebSocket (G2-mic PCM to the LiteLLM instance's transcription endpoint); and a
   `/live/<host>/<sessionId>` **live-transcript WebSocket** (ws-token auth) — the hub asks the host's
   tunnel-agent to `watch` the session, seeds it with the cached tail, fans the `{tail,entries}` deltas
   out, and `unwatch`es when the last viewer disconnects (re-arming on control reconnect).
@@ -1623,8 +1625,7 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
   - `net/` — the `HubClient` (Retrofit/OkHttp/kotlinx.serialization), `LiveTail`+`FleetRepository`
     (WebSocket `/live` + SSE `/api/events` with a 6s `/api/agents` poll floor), and `Dictation` (16kHz
     PCM → the hub's `/audio` Whisper socket).
-  - `ui/` — the Compose screens (fleet tree, native chat, spawn composer, actions, clone, prune, resume,
-    question sheet, history/usage charts, archive search).
+  - `ui/` — the Compose screens; see `android/PARITY.md` for the web page → screen map.
   - `push/` — the FCM service + `PushRegistrar` (registers via `POST /api/devices`; guarded so a build
     with no `google-services.json` still runs). Driven hub-side by `turma/push.js`.
 
@@ -1723,9 +1724,8 @@ GHCR image builds and PR gates — see Build & Deploy.
   Its `mem_limit`/`cpus`/`pids_limit` are sized against `MAX_SESSIONS`. No pricing/cost env — usage is
   counted in tokens per model, so there is no rate table.
 - Changing how it's RUN (or adding a host) is a DockerOps compose edit; image content edits land here.
-- The hub's `/data` volume (home to `state.json`) also holds the **durable session archive**
-  (`/data/archive/` — files + a `node:sqlite` FTS index), which must be a persisted volume. Overridable
-  via `ARCHIVE_DIR`/`ARCHIVE_DB`.
+- The hub's `/data` volume holds `state.json` AND the durable session archive, so it must be a
+  persisted volume. Overridable via `ARCHIVE_DIR`/`ARCHIVE_DB`.
 - The `turma` service also takes the LiteLLM env for **Whisper STT** (`LITELLM_URL` = that instance's
   `/v1` base, optional `LITELLM_API_KEY`; legacy `WHISPER_URL`/`WHISPER_API_KEY` override), and
   `NODE_NO_WARNINGS=1` to silence `node:sqlite`'s experimental warning.
@@ -1757,8 +1757,7 @@ triage list, each with a reason); anything unlisted still fails.
 - **Creds are the host's, reused through optional bind mounts** like `~/.claude` and `~/.config/gh`; the
   image bakes no credential: `/root/.aws` (or `AWS_*` env) — `aws`; `/root/.azure` — `az`;
   `/root/.terraform.d` — terraform. **A host that mounts none is supported, not an error**;
-  `entrypoint.sh`'s preflight only LOGS which stores it found, keying on a **login-marker file**
-  (`~/.aws/credentials`, `~/.azure/msal_token_cache.json`, `~/.terraform.d/credentials.tfrc.json`) never
+  `entrypoint.sh`'s preflight only LOGS which stores it found, keying on a **login-marker file** never
   the store dir, because each CLI creates its own store just by RUNNING. The Dockerfile's build-time
   smoke test drops the stores it creates.
 - The guard's `permissions.deny` protects `~/.azure` and `~/.terraform.d` alongside `~/.aws`/`~/.ssh`
@@ -1804,9 +1803,8 @@ Still true: no GitHub Advanced Security, so no code-scanning API — findings li
 
 ### Credentials
 
-- All credentials are inline in environment variables (no Docker secrets mechanism). The live secrets
-  (`TURMA_TOKEN`, `TURMA_AGENT_TOKEN`, basic-auth, `FCM_SERVICE_ACCOUNT_JSON`) are set in DockerOps'
-  `compose/turma-truenas.yaml`, not here.
+- All credentials are inline in environment variables (no Docker secrets mechanism), set in
+  DockerOps' `compose/turma-truenas.yaml`, never here.
 
 ### Run-as identity (host permission parity)
 

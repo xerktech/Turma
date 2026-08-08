@@ -2465,6 +2465,9 @@ class ManagerMixin:
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
             ("PROJECTS_ROOT", os.path.join(self.tmp, "projects")),
             ("WORKTREES_ROOT", os.path.join(self.tmp, "worktrees")),
+            # Derived from REGISTRY_DIR at import, so it needs redirecting too —
+            # delete() rmtree's a session's attachment dir (XERK-234).
+            ("UPLOADS_DIR", os.path.join(self.tmp, "uploads")),
         ]:
             p = mock.patch.object(ha, name, value)
             p.start()
@@ -4605,6 +4608,257 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         # The OLDEST are dropped, newest kept.
         self.assertEqual(sess["pendingInputs"][-1]["text"],
                          f"msg {ha.PENDING_INPUT_MAX + 4}")
+
+
+class TestSafeUploadName(unittest.TestCase):
+    """A filename off the wire is joined onto a path, so it must never be able to
+    escape the uploads directory (XERK-234). Mirrors the hub's safeUploadName and
+    android's Uploads.sanitizeUploadName — the three must agree."""
+
+    def test_a_traversal_is_reduced_to_its_basename(self):
+        self.assertEqual(ha.safe_upload_name("../../etc/passwd"), "passwd")
+        self.assertEqual(ha.safe_upload_name("/abs/x.tar.gz"), "x.tar.gz")
+        self.assertEqual(ha.safe_upload_name(r"C:\win\a.png"), "a.png")
+
+    def test_an_upload_is_never_a_dotfile_and_never_nameless(self):
+        # A leading dot would hide the file the operator just attached.
+        self.assertEqual(ha.safe_upload_name("  ..hidden.png"), "hidden.png")
+        for empty in ("", ".", "...", None, "///"):
+            self.assertEqual(ha.safe_upload_name(empty), "upload")
+
+    def test_an_over_long_name_keeps_its_extension(self):
+        # The extension is what tells Claude Code's Read what kind of file it is.
+        out = ha.safe_upload_name("a" * 130 + ".png")
+        self.assertEqual(len(out), ha.UPLOAD_NAME_MAX)
+        self.assertTrue(out.endswith(".png"))
+
+    def test_characters_outside_the_safe_set_become_underscores(self):
+        self.assertEqual(ha.safe_upload_name("déjà vu (1).PNG"), "d_j_ vu (1).PNG")
+        self.assertEqual(ha.safe_upload_name("a\nb;rm -rf.txt"), "a_b_rm -rf.txt")
+
+    def test_the_directory_is_under_uploads_whatever_the_id(self):
+        d = ha.upload_dir_for("../../root")
+        self.assertEqual(os.path.dirname(d), ha.UPLOADS_DIR)
+
+
+class TestAttachmentMessage(unittest.TestCase):
+    """What actually gets typed into the pane for a message with attachments.
+    The files are on disk by then, so the session is told WHERE they are and
+    left to read them with its ordinary tools (XERK-234)."""
+
+    def test_one_file_with_text(self):
+        out = ha.attachment_message(["/u/a.png"], [], "what is this?")
+        self.assertIn("/u/a.png", out)
+        self.assertTrue(out.startswith("[The operator attached a file"))
+        # The operator's own words come last, so the message reads normally.
+        self.assertTrue(out.endswith("what is this?"))
+
+    def test_several_files_are_counted_and_pluralized(self):
+        out = ha.attachment_message(["/u/a.png", "/u/b.pdf"], [], "")
+        self.assertIn("attached 2 files", out)
+        self.assertIn("Read them from disk", out)
+        self.assertEqual(out.splitlines()[1:], ["/u/a.png", "/u/b.pdf"])
+
+    def test_attachments_alone_need_no_text(self):
+        out = ha.attachment_message(["/u/a.png"], [], "")
+        self.assertEqual(out.splitlines(), [
+            "[The operator attached a file to this message. Read it from disk:]",
+            "/u/a.png",
+        ])
+
+    def test_a_file_that_failed_to_transfer_is_named_not_dropped(self):
+        # The operator SAW it attached; a session quietly never receiving it
+        # would be asked about a file it has no way to know existed.
+        out = ha.attachment_message([], ["spec.pdf"], "have a look")
+        self.assertIn("spec.pdf", out)
+        self.assertIn("failed to transfer", out)
+        self.assertTrue(out.endswith("have a look"))
+
+
+class TestStoreUploads(ManagerMixin, unittest.TestCase):
+    """_store_uploads: fetch each staged blob and write it under this session's
+    uploads directory, out of every repo (XERK-234)."""
+
+    def _sess(self, sm, sid="abcde"):
+        sess = {"id": sid, "status": "running", "tmuxName": f"agent-{sid}",
+                "summary": "named", "summaryStarted": True}
+        sm.registry = [sess]
+        return sess
+
+    def test_files_land_under_the_session_and_are_not_in_the_worktree(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(sm, "_download_upload", return_value=b"PNGDATA"):
+            paths, failed = sm._store_uploads(
+                sess, [{"id": "u1", "name": "shot.png"}])
+        self.assertEqual(failed, [])
+        self.assertEqual(paths, [os.path.join(ha.UPLOADS_DIR, "abcde", "shot.png")])
+        with open(paths[0], "rb") as fh:
+            self.assertEqual(fh.read(), b"PNGDATA")
+
+    def test_the_same_name_twice_does_not_overwrite(self):
+        # An earlier message's path still points at the first one.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(sm, "_download_upload", side_effect=[b"one", b"two"]):
+            paths, _ = sm._store_uploads(
+                sess, [{"id": "u1", "name": "a.png"}, {"id": "u2", "name": "a.png"}])
+        self.assertEqual([os.path.basename(p) for p in paths], ["a.png", "a-2.png"])
+        with open(paths[0], "rb") as fh:
+            self.assertEqual(fh.read(), b"one")
+
+    def test_a_download_failure_is_reported_not_swallowed(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(sm, "_download_upload", side_effect=[b"ok", None]):
+            paths, failed = sm._store_uploads(
+                sess, [{"id": "u1", "name": "a.png"}, {"id": "u2", "name": "b.pdf"}])
+        self.assertEqual([os.path.basename(p) for p in paths], ["a.png"])
+        self.assertEqual(failed, ["b.pdf"])
+
+    def test_a_blob_past_the_cap_is_not_written(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        big = b"x" * (ha.UPLOAD_MAX_BYTES + 1)
+        with mock.patch.object(sm, "_download_upload", return_value=big):
+            paths, failed = sm._store_uploads(sess, [{"id": "u1", "name": "a.bin"}])
+        self.assertEqual(paths, [])
+        self.assertEqual(failed, ["a.bin"])
+
+    def test_a_traversing_name_still_lands_inside_the_uploads_dir(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(sm, "_download_upload", return_value=b"x"):
+            paths, _ = sm._store_uploads(
+                sess, [{"id": "u1", "name": "../../../../etc/cron.d/evil"}])
+        self.assertEqual(paths, [os.path.join(ha.UPLOADS_DIR, "abcde", "evil")])
+
+    def test_no_more_than_the_per_message_cap_is_written(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        items = [{"id": f"u{i}", "name": f"f{i}.png"}
+                 for i in range(ha.UPLOAD_MAX_PER_MESSAGE + 5)]
+        with mock.patch.object(sm, "_download_upload", return_value=b"x"):
+            paths, failed = sm._store_uploads(sess, items)
+        self.assertEqual(len(paths), ha.UPLOAD_MAX_PER_MESSAGE)
+        self.assertEqual(failed, [])
+
+
+class TestSendInputUploads(ManagerMixin, unittest.TestCase):
+    """send_input with attachments (XERK-234): the files are written first, and
+    the message that reaches the pane carries their paths."""
+
+    def _sess(self, sm, sid="abcde"):
+        sess = {"id": sid, "status": "running", "tmuxName": f"agent-{sid}",
+                "summary": "named", "summaryStarted": True}
+        sm.registry = [sess]
+        return sess
+
+    def test_the_pasted_message_carries_the_paths_and_then_the_text(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(sm, "_download_upload", return_value=b"x"):
+            sm.send_input("abcde", "what is this?",
+                          uploads=[{"id": "u1", "name": "shot.png"}])
+        typed = self.run_stdin_calls[0][1]
+        self.assertIn(os.path.join(ha.UPLOADS_DIR, "abcde", "shot.png"), typed)
+        self.assertTrue(typed.endswith("what is this?"))
+
+    def test_a_message_can_be_attachments_alone(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(sm, "_download_upload", return_value=b"x"):
+            sm.send_input("abcde", "", uploads=[{"id": "u1", "name": "shot.png"}])
+        self.assertTrue(self.run_stdin_calls)
+        self.assertIn("shot.png", self.run_stdin_calls[0][1])
+
+    def test_the_outbox_holds_the_COMPOSED_text(self):
+        # A compaction resend re-types this verbatim (XERK-47), and the files are
+        # already on disk — so the paths must be what was recorded.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(sm, "_download_upload", return_value=b"x"):
+            sm.send_input("abcde", "hi", uploads=[{"id": "u1", "name": "a.png"}])
+        self.assertIn("a.png", sess["pendingInputs"][0]["text"])
+
+    def test_nothing_is_typed_when_every_attachment_vanished(self):
+        # No text of its own and nothing to say about: there is no message.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        with mock.patch.object(sm, "_store_uploads", return_value=([], [])):
+            sm.send_input("abcde", "", uploads=[{"id": "u1", "name": "a.png"}])
+        self.assertEqual(self.run_stdin_calls, [])
+
+    def test_an_unnamed_session_is_named_from_the_TYPED_text(self):
+        # Not from the attachment header, which says nothing about the task.
+        sm = self.make_manager()
+        sess = {"id": "abcde", "status": "running", "tmuxName": "agent-abcde",
+                "summary": None}
+        sm.registry = [sess]
+        with mock.patch.object(sm, "_download_upload", return_value=b"x"), \
+                mock.patch.object(sm, "_start_summary") as start:
+            sm.send_input("abcde", "review this mock",
+                          uploads=[{"id": "u1", "name": "a.png"}])
+        start.assert_called_once_with(sess, "review this mock")
+
+    def test_an_attachment_only_message_spends_no_naming_attempt(self):
+        sm = self.make_manager()
+        sess = {"id": "abcde", "status": "running", "tmuxName": "agent-abcde",
+                "summary": None}
+        sm.registry = [sess]
+        with mock.patch.object(sm, "_download_upload", return_value=b"x"), \
+                mock.patch.object(sm, "_start_summary") as start:
+            sm.send_input("abcde", "", uploads=[{"id": "u1", "name": "a.png"}])
+        start.assert_not_called()
+
+    def test_an_ordinary_message_never_touches_the_uploads_dir(self):
+        sm = self.make_manager()
+        self._sess(sm)
+        sm.send_input("abcde", "just talking")
+        self.assertFalse(os.path.exists(ha.UPLOADS_DIR))
+
+
+class TestSweepUploads(ManagerMixin, unittest.TestCase):
+    """Attachment dirs of long-gone sessions are swept; a live or resumable
+    session's files stay, because its conversation still names their paths."""
+
+    def _dir(self, sid, age_sec=0):
+        path = os.path.join(ha.UPLOADS_DIR, sid)
+        os.makedirs(path, exist_ok=True)
+        if age_sec:
+            old = time.time() - age_sec
+            os.utime(path, (old, old))
+        return path
+
+    def test_an_unknown_and_aged_dir_goes(self):
+        sm = self.make_manager()
+        sm.registry, sm.closed = [], []
+        gone = self._dir("old", ha.UPLOAD_RETENTION_SEC + 60)
+        sm._sweep_uploads()
+        self.assertFalse(os.path.exists(gone))
+
+    def test_a_running_session_keeps_its_files_however_old(self):
+        sm = self.make_manager()
+        sm.registry = [{"id": "live"}]
+        sm.closed = []
+        keep = self._dir("live", ha.UPLOAD_RETENTION_SEC + 60)
+        sm._sweep_uploads()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_a_killed_but_resumable_session_keeps_its_files(self):
+        sm = self.make_manager()
+        sm.registry = []
+        sm.closed = [{"id": "killed"}]
+        keep = self._dir("killed", ha.UPLOAD_RETENTION_SEC + 60)
+        sm._sweep_uploads()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_a_recent_unknown_dir_is_left_alone(self):
+        sm = self.make_manager()
+        sm.registry, sm.closed = [], []
+        keep = self._dir("recent")
+        sm._sweep_uploads()
+        self.assertTrue(os.path.exists(keep))
 
 
 class TestPendingScan(ProjectDirMixin, unittest.TestCase):
@@ -6815,9 +7069,22 @@ class TestHandleCommandsInputHistory(ManagerMixin, unittest.TestCase):
             {"cmdId": "h1", "type": "history", "sessionId": "s1"},
         ]
         self.assertTrue(sm.handle_commands(cmds))
-        sm.send_input.assert_called_once_with("s1", "hi")
+        sm.send_input.assert_called_once_with("s1", "hi", uploads=None)
         sm._stage_history.assert_called_once_with("s1")
         self.assertEqual(sm.acked, {"i1", "h1"})
+
+    def test_an_input_command_carries_its_attachments_through(self):
+        # The hub names the staged files on the command (XERK-234); the agent is
+        # what fetches and writes them.
+        sm = self.make_manager()
+        sm.save = mock.Mock()
+        sm.send_input = mock.Mock()
+        ups = [{"id": "u1", "name": "shot.png", "size": 12}]
+        self.assertTrue(sm.handle_commands([
+            {"cmdId": "i2", "type": "input", "sessionId": "s1", "text": "look",
+             "uploads": ups},
+        ]))
+        sm.send_input.assert_called_once_with("s1", "look", uploads=ups)
 
     def test_dispatches_interrupt(self):
         sm = self.make_manager()

@@ -117,6 +117,7 @@ const {
   autoStopped, autoStartOrgs, setAutoStartOrg,
   orgColors, setOrgColor,
   migrations, advanceMigrations,
+  safeUploadName, uploadCapFor, uploads, UPLOAD_MAX_PER_MESSAGE,
 } = hub;
 
 // Requires a fresh instance of server.js with mutated env vars (e.g. to test
@@ -5078,4 +5079,195 @@ test("migrate: the blob relay rejects an unauthenticated caller", async () => {
   const badTok = await requestRaw("POST", `/api/agents/auA/migrations/${mid}/blob`,
     { body: Buffer.from("x"), headers: { authorization: "Bearer nope" } });
   assert.equal(badTok.status, 401);
+});
+
+// ---- file attachments (XERK-234) -------------------------------------------
+// The hub is the RELAY, not the store: a client POSTs the bytes, they sit in
+// memory under an id, and the agent GETs them when it picks up the input command
+// naming that id.
+
+const upHost = (device, extra = {}) =>
+  request("POST", "/api/heartbeat", {
+    body: { device, uploadMaxBytes: 1 << 25, ...extra }, headers: agentHeaders,
+  });
+
+const stage = (host, session, name, body, headers = userHeaders) =>
+  requestRaw("POST",
+    `/api/agents/${host}/sessions/${session}/uploads?name=${encodeURIComponent(name)}`,
+    { body, headers });
+
+test("uploads: safeUploadName can never escape the uploads directory", () => {
+  // Mirrored by the agent's safe_upload_name and android's sanitizeUploadName.
+  assert.equal(safeUploadName("../../etc/passwd"), "passwd");
+  assert.equal(safeUploadName("/abs/x.tar.gz"), "x.tar.gz");
+  assert.equal(safeUploadName("C:\\win\\a.png"), "a.png");
+  // Never a dotfile (it would hide the file just attached), never nameless.
+  assert.equal(safeUploadName("  ..hidden.png"), "hidden.png");
+  assert.equal(safeUploadName(""), "upload");
+  assert.equal(safeUploadName("."), "upload");
+  // Anything outside the safe set becomes an underscore, and an over-long name
+  // keeps its extension — that is what says what kind of file it is.
+  assert.equal(safeUploadName("déjà vu (1).PNG"), "d_j_ vu (1).PNG");
+  const long = safeUploadName("a".repeat(130) + ".png");
+  assert.equal(long.length, 100);
+  assert.ok(long.endsWith(".png"));
+});
+
+test("uploads: uploadCapFor is the capability flag as well as the cap", () => {
+  // An agent predating attachments reports nothing and would DROP the uploads on
+  // an input command without a word — 0 is what hides the composer's clip.
+  assert.equal(uploadCapFor({}), 0);
+  assert.equal(uploadCapFor({ uploadMaxBytes: 0 }), 0);
+  assert.equal(uploadCapFor({ uploadMaxBytes: "nonsense" }), 0);
+  assert.equal(uploadCapFor({ uploadMaxBytes: 1 << 20 }), 1 << 20);
+  // A wild claim is still clamped to the hub's own ceiling.
+  assert.equal(uploadCapFor({ uploadMaxBytes: 1e12 }), 1 << 25);
+});
+
+test("uploads: a staged file comes back with a sanitized name and an id", async () => {
+  await upHost("upA");
+  const res = await stage("upA", "s1", "../shot.png", Buffer.from("PNGDATA"));
+  assert.equal(res.status, 200);
+  assert.equal(res.body.name, "shot.png");
+  assert.equal(res.body.size, 7);
+  assert.ok(res.body.uploadId);
+  // Nothing is queued yet — the file reaches the session only when a message is.
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "upA" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, []);
+});
+
+test("uploads: a host whose agent predates attachments refuses the upload", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "upOld" }, headers: agentHeaders });
+  const res = await stage("upOld", "s1", "a.png", Buffer.from("x"));
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /too old/);
+});
+
+test("uploads: an empty file and one past the cap are refused", async () => {
+  await upHost("upCap", { uploadMaxBytes: 16 });
+  const empty = await stage("upCap", "s1", "a.png", null);
+  assert.equal(empty.status, 400);
+  const big = await stage("upCap", "s1", "a.png", Buffer.alloc(17, 1));
+  assert.equal(big.status, 413);
+  assert.equal(big.body.limit, 16);
+});
+
+test("uploads: staging needs the user login, collecting needs the agent token", async () => {
+  await upHost("upAuth");
+  const anon = await stage("upAuth", "s1", "a.png", Buffer.from("x"), {});
+  assert.equal(anon.status, 401);
+  // The agent token is NOT a way in on the operator's side of the relay.
+  const asAgent = await stage("upAuth", "s1", "a.png", Buffer.from("x"), agentHeaders);
+  assert.equal(asAgent.status, 401);
+
+  const ok = await stage("upAuth", "s1", "a.png", Buffer.from("bytes"));
+  const id = ok.body.uploadId;
+  const blobAnon = await requestRaw("GET", `/api/agents/upAuth/uploads/${id}/blob`);
+  assert.equal(blobAnon.status, 401);
+  const blob = await requestRaw("GET", `/api/agents/upAuth/uploads/${id}/blob`,
+    { headers: agentHeaders });
+  assert.equal(blob.status, 200);
+  assert.equal(blob.buf.toString(), "bytes");
+});
+
+test("uploads: one host's agent can't collect another host's staged file", async () => {
+  await upHost("upMine");
+  await upHost("upTheirs");
+  const ok = await stage("upMine", "s1", "a.png", Buffer.from("secret"));
+  const res = await requestRaw("GET", `/api/agents/upTheirs/uploads/${ok.body.uploadId}/blob`,
+    { headers: agentHeaders });
+  assert.equal(res.status, 404);
+});
+
+test("uploads: collecting does NOT drop the blob (commands are at-least-once)", async () => {
+  await upHost("upTwice");
+  const ok = await stage("upTwice", "s1", "a.png", Buffer.from("keepme"));
+  const url = `/api/agents/upTwice/uploads/${ok.body.uploadId}/blob`;
+  assert.equal((await requestRaw("GET", url, { headers: agentHeaders })).status, 200);
+  const again = await requestRaw("GET", url, { headers: agentHeaders });
+  assert.equal(again.status, 200);
+  assert.equal(again.buf.toString(), "keepme");
+});
+
+test("uploads: the input command carries the staged files' ids, names and sizes", async () => {
+  await upHost("upSend");
+  const a = await stage("upSend", "s1", "shot.png", Buffer.from("one"));
+  const b = await stage("upSend", "s1", "spec.pdf", Buffer.from("twotwo"));
+  const res = await request("POST", "/api/agents/upSend/sessions/s1/input", {
+    body: { text: "what is this?", uploadIds: [a.body.uploadId, b.body.uploadId] },
+    headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "upSend" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [{
+    type: "input", sessionId: "s1", text: "what is this?", cmdId: res.body.cmdId,
+    uploads: [
+      { id: a.body.uploadId, name: "shot.png", size: 3 },
+      { id: b.body.uploadId, name: "spec.pdf", size: 6 },
+    ],
+  }]);
+});
+
+test("uploads: a message may be attachments alone, but not empty of both", async () => {
+  await upHost("upBare");
+  const a = await stage("upBare", "s1", "a.png", Buffer.from("x"));
+  const withFile = await request("POST", "/api/agents/upBare/sessions/s1/input", {
+    body: { text: "", uploadIds: [a.body.uploadId] }, headers: userHeaders,
+  });
+  assert.equal(withFile.status, 200);
+  const neither = await request("POST", "/api/agents/upBare/sessions/s1/input", {
+    body: { text: "  ", uploadIds: [] }, headers: userHeaders,
+  });
+  assert.equal(neither.status, 400);
+  assert.deepEqual(neither.body, { error: "text required" });
+});
+
+test("uploads: an ordinary message still queues exactly what it always did", async () => {
+  await upHost("upPlain");
+  const res = await request("POST", "/api/agents/upPlain/sessions/s1/input", {
+    body: { text: "just talking" }, headers: userHeaders,
+  });
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "upPlain" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "input", sessionId: "s1", text: "just talking", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("uploads: a stale, foreign or over-many id refuses the send outright", async () => {
+  await upHost("upStale");
+  await upHost("upElse");
+  // Refusing beats sending the text with the file silently missing.
+  const gone = await request("POST", "/api/agents/upStale/sessions/s1/input", {
+    body: { text: "hi", uploadIds: ["deadbeef"] }, headers: userHeaders,
+  });
+  assert.equal(gone.status, 404);
+  assert.match(gone.body.error, /expired/);
+
+  // Staged for THIS host but a different session, and for another host.
+  const other = await stage("upStale", "s2", "a.png", Buffer.from("x"));
+  const wrongSession = await request("POST", "/api/agents/upStale/sessions/s1/input", {
+    body: { text: "hi", uploadIds: [other.body.uploadId] }, headers: userHeaders,
+  });
+  assert.equal(wrongSession.status, 404);
+  const elsewhere = await stage("upElse", "s1", "a.png", Buffer.from("x"));
+  const wrongHost = await request("POST", "/api/agents/upStale/sessions/s1/input", {
+    body: { text: "hi", uploadIds: [elsewhere.body.uploadId] }, headers: userHeaders,
+  });
+  assert.equal(wrongHost.status, 404);
+
+  const many = await request("POST", "/api/agents/upStale/sessions/s1/input", {
+    body: { text: "hi", uploadIds: Array.from({ length: UPLOAD_MAX_PER_MESSAGE + 1 }, (_, i) => "x" + i) },
+    headers: userHeaders,
+  });
+  assert.equal(many.status, 400);
+  assert.match(many.body.error, /at most/);
+});
+
+test("uploads: the relay is memory-only — nothing rides the fleet payload", async () => {
+  await upHost("upLeak");
+  await stage("upLeak", "s1", "secret.png", Buffer.from("SECRETBYTES"));
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.ok(!JSON.stringify(res.body).includes("SECRETBYTES"));
+  // It IS held, though — the agent has to be able to come and get it.
+  assert.ok([...uploads.values()].some((u) => u.host === "upLeak"));
 });

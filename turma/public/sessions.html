@@ -681,6 +681,34 @@
     color: #1a1200; min-width: 84px; }
   button.compose-stop[hidden] { display: none; }
 
+  /* File attachments (XERK-234). The 📎 sits inside the compose row beside Send;
+     the chips ride ABOVE the row (a strip that grows downward would push the
+     text box around as files are added). Painted by chat.js into every
+     .compose-attach on the page, so the terminal bar can't disagree with the
+     chat's — same rule as the Send/Stop buttons. */
+  button.compose-clip { min-width: 0; padding: 8px 10px; font-size: 15px; line-height: 1;
+    background: var(--page); color: var(--ink); border: 1px solid var(--border); }
+  button.compose-clip[hidden] { display: none; }
+  button.compose-clip:disabled { opacity: .45; cursor: default; }
+  .compose-attach { display: flex; flex-wrap: wrap; gap: 6px; }
+  .compose-attach:empty { display: none; }
+  .att-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 260px;
+    padding: 3px 4px 3px 9px; border: 1px solid var(--border); border-radius: 999px;
+    background: var(--page); font-size: 11.5px; color: var(--ink); }
+  .att-chip .att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .att-chip .att-size { color: var(--muted); flex: none; }
+  .att-chip.att-uploading { opacity: .65; }
+  .att-chip.att-error { border-color: var(--critical); color: var(--critical); }
+  .att-chip .att-x { flex: none; border: 0; background: none; cursor: pointer; padding: 0 5px;
+    color: var(--muted); font: inherit; font-size: 13px; line-height: 1; }
+  .att-chip .att-x:hover { color: var(--ink); }
+  /* Dropping a file anywhere over the transcript attaches it. */
+  .chat-scroll-wrap.att-drop { outline: 2px dashed var(--accent); outline-offset: -6px; }
+  /* app.css lays the terminal's bar out as one row; the chips take a line of
+     their own above it rather than squeezing in beside the text box. */
+  .term-compose { flex-wrap: wrap; }
+  .term-compose .compose-attach { flex-basis: 100%; order: -1; }
+
   /* Live agent-mode (left) / model (right) selectors under the text box; the
      ticket chip and PR status chip (when present) ride just left of the model on
      the right — the ticket the work came from, then the PR it went to. */
@@ -801,9 +829,15 @@
         <div class="chat-status" id="chatStatus" hidden></div>
         <div class="chat-question" id="chatQuestion" hidden></div>
         <div class="chat-compose">
+          <!-- Files staged for the next message (XERK-234). Painted by chat.js;
+               empty means no chips and no strip at all. -->
+          <div class="compose-attach" id="chatAttach"></div>
           <div class="chat-compose-row">
             <textarea id="chatInput" rows="1" placeholder="Message the agent"
-              oninput="autoGrowChatInput()" onkeydown="chatInputKey(event)"></textarea>
+              oninput="autoGrowChatInput()" onkeydown="chatInputKey(event)"
+              onpaste="chatComposePaste(event)"></textarea>
+            <button class="compose-clip" id="chatClip" title="Attach images or documents"
+              onclick="chatComposeAttach()" hidden>📎</button>
             <button class="primary compose-stop" id="chatStop" onclick="chatComposeStop()" hidden>◼ Stop</button>
             <button class="primary compose-action" id="chatSend" onclick="chatComposeAction()">Send</button>
           </div>
@@ -827,6 +861,10 @@
              round trip through the tunnels), and Enter sends the whole line via
              the session's /input endpoint, same as the dashboard's terminal. -->
         <div class="term-compose">
+          <!-- The attach control lives in the chat composer only, but the chips
+               show here too: this bar sends through the same /input, so files
+               staged before the operator toggled over must not go invisible. -->
+          <div class="compose-attach" id="termAttach"></div>
           <textarea id="termInput" rows="1" placeholder="Message the agent"
             oninput="autoGrowTermInput()" onkeydown="termInputKey(event)"></textarea>
           <button class="primary compose-stop" id="termStop" onclick="termComposeStop()" hidden>◼ Stop</button>
@@ -836,6 +874,8 @@
     </main>
   </div>
 
+<!-- One file picker for the page; chat.js opens it from the composer's 📎. -->
+<input type="file" id="chatFilePicker" multiple hidden onchange="chatFilesPicked(event)">
 <nav class="bottom-nav" id="bottomNav"></nav>
 <!-- board.js owns the org vocabulary (mergeSites/orgName/orgColorMap) the
      header's org filter reads; nav.js must build the #hdrOrg slot before
@@ -2320,7 +2360,12 @@ async function sendTermInput() {
   const inp = document.getElementById("termInput");
   if (!id || !inp) return;
   const text = inp.value;
-  if (!text.trim()) return;
+  // Files staged in the chat composer belong to the SESSION, not to one of its
+  // two boxes (XERK-234) — the operator may have attached them, toggled over
+  // here and pressed Send. Same rule as the shared draft.
+  const uploadIds = TurmaChat.readyUploadIds ? TurmaChat.readyUploadIds() : [];
+  if (uploadIds === null) { composeFailed(TurmaChat.attachError()); return; }
+  if (!text.trim() && !uploadIds.length) return;
   const key = hostKeyForSession(id);
   if (!key) { composeFailed("host offline"); return; }
   // Clear + refocus immediately so typing the next message never waits on the
@@ -2329,17 +2374,22 @@ async function sendTermInput() {
   autoGrowTermInput();
   inp.focus();
   try {
+    const body = { text };
+    if (uploadIds.length) body.uploadIds = uploadIds;
     const r = await fetch(`/api/agents/${enc(key)}/sessions/${enc(id)}/input`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify(body),
     });
     // 413 is the hub's "past this host's character cap" (XERK-227) — an
     // actionable failure, unlike the generic one, so it says so and carries the
     // cap. Worded by the chat engine, which shares this session's draft.
     if (!r.ok) {
       const err = await r.json().catch(() => null);
-      throw new Error(TurmaChat.sendFailure(r.status, err && err.limit));
+      throw new Error(TurmaChat.sendFailure(r.status, err && err.limit, err && err.error));
     }
+    // Only once it landed — a failed send leaves the chips where they were so
+    // pressing Send again is all it takes.
+    if (uploadIds.length) TurmaChat.clearAttachments();
     fastPoll();
   } catch (e) {
     if (!inp.value.trim()) { inp.value = text; autoGrowTermInput(); }
