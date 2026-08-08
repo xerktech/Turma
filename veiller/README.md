@@ -26,6 +26,9 @@ this repo's `glasses/`.
   `glasses/app.json`.
 - `vendor/` — the two Mentra SDK tarballs the build depends on (see below).
 - `scripts/pack.mjs` — packs `dist/` into the flat distribution zip.
+- `sim/` — simulator harnesses: a scripted walkthrough of the glasses and a
+  tour of the phone companion, run against the built bundle on the Veiller
+  miniapp simulator. See `sim/README.md`.
 
 ## Vendored SDK tarballs
 
@@ -57,6 +60,14 @@ bun run typecheck   # tsc --noEmit
 bun test            # the ported core + backend suites
 bun run build       # -> dist/background/index.js + dist/ui/
 bun run pack        # -> build/<packageName>-<version>.zip
+```
+
+To exercise a change rather than typecheck it, walk the built bundle on
+simulated glasses (needs a Veiller checkout for the simulator — see
+`sim/README.md`):
+
+```sh
+bun run build && bun run sim/walkthrough.ts && bun run sim/phone-tour.ts
 ```
 
 The zip is FLAT: `miniapp.json` and `icon.png` sit at the archive root next to

@@ -294,7 +294,7 @@ describe("render: session", () => {
     expect(model.transcriptLines).toEqual(["» go", "· done"]);
   });
 
-  it("hang-indents a wrapped turn so continuation lines align under the marker's text column", () => {
+  it("marks a wrapped turn's first line only, leaving continuations flush", () => {
     const s = session({ id: "s1" });
     const agents = [agent({ sessions: [s] })];
     // Long enough to wrap across more than one line at the ~560px width.
@@ -308,11 +308,13 @@ describe("render: session", () => {
 
     const lines = asSession(render(state)).transcriptLines;
     expect(lines.length).toBeGreaterThan(1); // it wrapped
-    // First line opens with the role marker; every continuation line opens with
-    // the matching 2-space indent (not the marker, and not flush-left).
+    // The role marker opens the turn; continuation lines carry no marker and no
+    // indent. A leading indent is not available on this display path — the
+    // phone re-wraps every text element with `trimLines` on, stripping leading
+    // whitespace before the frame reaches the glass (see MARKER_GUTTER).
     expect(lines[0]!.startsWith("· ")).toBe(true);
     for (const cont of lines.slice(1)) {
-      expect(cont.startsWith("  ")).toBe(true);
+      expect(cont.startsWith(" ")).toBe(false);
       expect(cont.startsWith("· ")).toBe(false);
     }
   });

@@ -60,6 +60,13 @@ export const POLL_GRACE_MS = 60 * 1000;
 export const FLASH_DURATION_MS = 4000;
 export const FLASH_QUEUED = "✓ queued — agent picks up in ~20s";
 export const FLASH_HUB_UNREACHABLE = "hub unreachable";
+export const FLASH_SESSION_GONE = "session ended";
+// How many consecutive polls may report the focused session's host WITHOUT
+// that session before the session screen gives up on it. One beat is not
+// evidence — the pending reconciler already treats a session missing from a
+// single beat as a blip (see reconcilePending) — but a host that keeps
+// reporting its other sessions and never this one has genuinely dropped it.
+export const SESSION_GONE_BEATS = 2;
 export const HISTORY_RETRY_MS = 3000;
 export const WORKING_WINDOW_SEC = 90;
 // How often the typewriter reveal advances while a session's newest entry is
@@ -274,6 +281,9 @@ export class App {
   private revealTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRevealAt = 0;
   private paused = false;
+  // Consecutive polls whose payload carried the focused session's host but not
+  // the session itself. See SESSION_GONE_BEATS / dropVanishedSession.
+  private sessionGoneBeats = 0;
   // While `now() < graceUntil`, the poll loop is allowed to keep running even
   // when paused (backgrounded). Set by nudgePoll() after a list mutation; the
   // loop self-terminates once it elapses. See pause()/schedulePoll().
@@ -731,6 +741,11 @@ export class App {
       // in range and off non-selectable rows rather than leaving it stranded
       // on a row that no longer exists or never was tappable.
       this.state = { ...this.state, home: { cursor: clampHomeCursor(this.homeRows(), this.state.home.cursor) } };
+      // A session killed from the phone/web (or auto-stopped when its ticket
+      // moved to Done) simply stops being reported. Without this the glasses
+      // sit on its frozen transcript for good, offering a box that would post
+      // to a session the hub no longer has.
+      if (this.dropVanishedSession()) return;
       // A poll can grow the focused session's transcript too (the 20s
       // heartbeat, or a beat the live stream missed) — re-anchor the reveal so
       // that growth snaps (block) or types (small delta) exactly as a live
@@ -780,6 +795,35 @@ export class App {
     } finally {
       this.schedulePoll(this.pollMs);
     }
+  }
+
+  // Leaves the session screen when the session it shows has gone from the
+  // fleet, and reports it. Returns true when it did (the caller's poll is done:
+  // the state has been repainted on the way home).
+  //
+  // The evidence has to be positive, not merely absent: the host must still be
+  // reporting — it's the thing that would list the session — and it must have
+  // omitted it for SESSION_GONE_BEATS consecutive polls, since one beat can
+  // drop a session that is only being re-registered. A host that has itself
+  // dropped out of the payload says nothing about its sessions, so that case
+  // deliberately leaves the screen alone.
+  private dropVanishedSession(): boolean {
+    const sess = this.state.screen === "session" ? this.state.session : null;
+    if (!sess) {
+      this.sessionGoneBeats = 0;
+      return false;
+    }
+    const agent = findAgent(this.state, sess.hostKey);
+    if (!agent || findSession(this.state, sess.hostKey, sess.sessionId)) {
+      this.sessionGoneBeats = 0;
+      return false;
+    }
+    this.sessionGoneBeats += 1;
+    if (this.sessionGoneBeats < SESSION_GONE_BEATS) return false;
+    this.sessionGoneBeats = 0;
+    this.flash(FLASH_SESSION_GONE);
+    this.goHome();
+    return true;
   }
 
   // Clears a pending entry once its session shows a change from its
@@ -1050,6 +1094,21 @@ export class App {
     const options = live?.session?.questionOptions ?? [];
     if (e.type === "doubleTap") {
       this.cancelBoxDictation(s);
+      // doubleTap keeps meaning what it means for the focus underneath the
+      // sheet: leave the session from transcript focus (the app's universal
+      // "back" gesture), open the actions menu from the bottom box.
+      //
+      // The sheet takes the whole screen regardless of focus, so before this it
+      // swallowed the transcript's doubleTap and there was NO way back to the
+      // session list while a question was pending — with two sessions asking at
+      // once you could only ever answer the one you were already in. The
+      // actions menu (End this session) stays reachable through the sheet's own
+      // "Dictate answer…" row, which hands the box to input mode where a
+      // doubleTap opens it.
+      if (s.focus !== "bottom") {
+        this.setState({ session: { ...s, mic: "idle" } });
+        return this.goHome();
+      }
       this.setState({
         screen: "actions",
         session: { ...s, mic: "idle" },
