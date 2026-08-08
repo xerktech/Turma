@@ -1,5 +1,14 @@
 import { describe, expect, it } from "bun:test";
-import { BOTTOM_MAX_LINES, bottomBoxLines, inputBoxBody, MENU_MAX_LINES, menuBox, sheetBody, statusLabel } from "./input-box.ts";
+import {
+  BOTTOM_MAX_LINES,
+  bottomBoxLines,
+  inputBoxBody,
+  MENU_MAX_LINES,
+  menuBox,
+  sheetBody,
+  SHEET_MAX_LINES,
+  statusLabel,
+} from "./input-box.ts";
 
 describe("bottomBoxLines", () => {
   it("clamps to a minimum of 1 line when content is empty", () => {
@@ -13,6 +22,12 @@ describe("bottomBoxLines", () => {
 
   it("clamps to BOTTOM_MAX_LINES when content overflows", () => {
     expect(bottomBoxLines(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"])).toBe(BOTTOM_MAX_LINES);
+  });
+
+  it("takes a taller budget for the boxes that get one (the sheet)", () => {
+    const many = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    expect(bottomBoxLines(many, SHEET_MAX_LINES)).toBe(SHEET_MAX_LINES);
+    expect(SHEET_MAX_LINES).toBeGreaterThan(BOTTOM_MAX_LINES);
   });
 });
 
@@ -85,33 +100,43 @@ describe("inputBoxBody", () => {
 describe("sheetBody", () => {
   it("wraps the question, numbers options, and appends a Dictate answer row", () => {
     const lines = sheetBody({ question: "Pick one?", options: ["Red", "Green"], selected: 0 });
-    // Veiller port: the 3-line box windows the option list (2 rows fit under
-    // a 1-line question) — the Dictate answer row scrolls into view when
-    // selection moves down (see the tests below).
-    expect(lines).toEqual(["Pick one?", "> 1. Red", "  2. Green"]);
+    expect(lines).toEqual(["Pick one?", "> 1. Red", "  2. Green", "  3. Dictate answer…"]);
   });
 
   it("marks the selected option row", () => {
     const lines = sheetBody({ question: "Pick one?", options: ["Red", "Green"], selected: 1 });
-    expect(lines).toEqual(["Pick one?", "  1. Red", "> 2. Green"]);
+    expect(lines).toEqual(["Pick one?", "  1. Red", "> 2. Green", "  3. Dictate answer…"]);
   });
 
   it("marks the Dictate answer row as selected when it's the chosen index", () => {
     const lines = sheetBody({ question: "Pick one?", options: ["Red", "Green"], selected: 2 });
-    expect(lines).toEqual(["Pick one?", "  2. Green", "> 3. Dictate answer…"]);
+    expect(lines).toEqual(["Pick one?", "  1. Red", "  2. Green", "> 3. Dictate answer…"]);
   });
 
-  it("stays within BOTTOM_MAX_LINES for a long multi-line question and keeps the selected row visible", () => {
+  it("stays within SHEET_MAX_LINES for a long multi-line question and keeps the selected row visible", () => {
     const question = "word ".repeat(60).trim(); // ~300 chars -> wraps to several lines
     const options = ["Red", "Green", "Blue"];
     const lines = sheetBody({ question, options, selected: 1 });
-    expect(lines.length).toBeLessThanOrEqual(BOTTOM_MAX_LINES);
+    expect(lines.length).toBeLessThanOrEqual(SHEET_MAX_LINES);
     expect(lines).toContain("> 2. Green");
+  });
+
+  it("ellipsises a question too long for the box rather than cutting it silently", () => {
+    const question = "word ".repeat(60).trim();
+    const lines = sheetBody({ question, options: ["Red"], selected: 0 });
+    const questionPart = lines.filter((l) => !/^[>\s] /.test(l));
+    expect(questionPart.length).toBe(SHEET_MAX_LINES - 1);
+    expect(questionPart[questionPart.length - 1]!.endsWith("…")).toBe(true);
+  });
+
+  it("leaves a question that fits alone — no ellipsis on unclipped text", () => {
+    const lines = sheetBody({ question: "Pick one?", options: ["Red"], selected: 0 });
+    expect(lines[0]).toBe("Pick one?");
   });
 
   it("clamps an out-of-range selected so a row is still marked", () => {
     const lines = sheetBody({ question: "Pick one?", options: ["Red", "Green"], selected: 99 });
-    expect(lines).toEqual(["Pick one?", "  2. Green", "> 3. Dictate answer…"]);
+    expect(lines).toEqual(["Pick one?", "  1. Red", "  2. Green", "> 3. Dictate answer…"]);
   });
 
   it("windows a long option list so the selected row stays visible", () => {
@@ -119,10 +144,12 @@ describe("sheetBody", () => {
     const lines = sheetBody({ question: "Pick a color?", options, selected: 5 });
     expect(lines).toEqual([
       "Pick a color?",
+      "  4. Yellow",
       "  5. Purple",
       "> 6. Orange",
+      "  7. Pink",
     ]);
-    expect(lines.length).toBeLessThanOrEqual(BOTTOM_MAX_LINES);
+    expect(lines.length).toBeLessThanOrEqual(SHEET_MAX_LINES);
   });
 });
 

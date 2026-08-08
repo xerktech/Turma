@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { fakeTimers } from "../test-utils/fake-timers.ts";
-import { App, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, newSessionState } from "./app.ts";
+import { App, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, FLASH_SESSION_GONE, newSessionState } from "./app.ts";
 import type { HubClient } from "./hub-client.ts";
 import type { GlassesDisplay } from "../display/index.ts";
 import type { Dictation, DictationResult } from "../audio/dictation.ts";
@@ -457,13 +457,34 @@ describe("App", () => {
     expect(app.getState().session?.offset).toBe(0);
   });
 
-  it("sheet mode: doubleTap opens the actions menu (session actions stay reachable while a question is pending)", async () => {
+  it("sheet mode: doubleTap leaves the session, so a pending question can't trap you in it", async () => {
     const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
     const app = makeApp(client);
     await toSheet(app);
 
+    // The sheet covers the whole screen whatever the focus, so it used to
+    // swallow the transcript's "back" gesture — with a question pending there
+    // was no way back to the session list at all.
+    display.emit({ type: "doubleTap" });
+    expect(app.getState().screen).toBe("home");
+  });
+
+  it("sheet mode: the actions menu stays reachable, via the box the Dictate-answer row hands you", async () => {
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents: [questionAgent()] })) });
+    const app = makeApp(client);
+    await toSheet(app);
+
+    // Scroll to the trailing "Dictate answer…" row and take it: the mic goes
+    // hot and the box becomes an ordinary input box (focus "bottom"), where a
+    // doubleTap cancels the dictation and opens the actions menu.
+    display.emit({ type: "scrollDown" });
+    display.emit({ type: "scrollDown" });
+    display.emit({ type: "tap" });
+    expect(app.getState().session?.focus).toBe("bottom");
+
     display.emit({ type: "doubleTap" });
     expect(app.getState().screen).toBe("actions");
+    expect(app.getState().session?.mic).toBe("idle");
   });
 
   it("sheet mode: tap on the trailing 'Dictate answer…' row starts box dictation and hands the box to input mode; the dictated draft then sends as a free-text answer while the question is pending", async () => {
@@ -567,6 +588,66 @@ describe("App", () => {
   });
 
   // ---- bottom-box input mode: dictate / send / clear (Task 5) -----------
+
+  // ---- a session that leaves the fleet ------------------------------------
+
+  it("leaves the session screen once its host stops reporting the session", async () => {
+    let sessions = [session()];
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions })] })),
+    });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await fakeTimers.advanceTimersByTimeAsync(0);
+    display.emit({ type: "tap" }); // home -> session
+    expect(app.getState().screen).toBe("session");
+
+    // Killed from the phone/web: the host keeps heartbeating, without it.
+    sessions = [];
+    await fakeTimers.advanceTimersByTimeAsync(1000);
+    // One beat is not evidence — a session missing from a single beat is a
+    // blip the pending reconciler already tolerates.
+    expect(app.getState().screen).toBe("session");
+
+    await fakeTimers.advanceTimersByTimeAsync(1000);
+    expect(app.getState().screen).toBe("home");
+    expect(app.getState().flash).toBe(FLASH_SESSION_GONE);
+  });
+
+  it("stays put when the session is missing for a single beat", async () => {
+    let sessions: SessionInfo[] = [session()];
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions })] })),
+    });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await fakeTimers.advanceTimersByTimeAsync(0);
+    display.emit({ type: "tap" });
+
+    sessions = [];
+    await fakeTimers.advanceTimersByTimeAsync(1000);
+    sessions = [session()]; // re-registered
+    await fakeTimers.advanceTimersByTimeAsync(1000);
+    await fakeTimers.advanceTimersByTimeAsync(1000);
+    expect(app.getState().screen).toBe("session");
+  });
+
+  it("says nothing about a session whose host has itself dropped out of the payload", async () => {
+    let agents = [agent({ sessions: [session()] })];
+    const client = fakeClient({ listAgents: vi.fn(async () => ({ now: Date.now(), agents })) });
+    const app = makeApp(client, 1000);
+    await app.start();
+    await fakeTimers.advanceTimersByTimeAsync(0);
+    display.emit({ type: "tap" });
+
+    // A host absent from the payload is not evidence about its sessions — only
+    // a host that IS reporting and omits the session counts.
+    agents = [];
+    await fakeTimers.advanceTimersByTimeAsync(1000);
+    await fakeTimers.advanceTimersByTimeAsync(1000);
+    await fakeTimers.advanceTimersByTimeAsync(1000);
+    expect(app.getState().screen).toBe("session");
+  });
 
   async function toSessionBottom(app: App): Promise<void> {
     await app.start();

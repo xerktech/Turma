@@ -56,7 +56,7 @@ function stripMarkdown(text: string): string {
 
 // Drops blank / whitespace-only lines entirely so a message reads as one
 // compact block instead of a wall punctuated by markdown's paragraph gaps —
-// vertical space is scarce on the 10-line canvas. Line breaks BETWEEN non-empty
+// vertical space is scarce on the 7-line canvas. Line breaks BETWEEN non-empty
 // lines (paragraph boundaries, hard-wrapped list items) are preserved; only the
 // empty rows go.
 function collapseBlankLines(text: string): string {

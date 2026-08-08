@@ -1,8 +1,17 @@
 // PURE rendering: (state) -> a ScreenModel. No I/O, no Date.now — every
-// timestamp render needs travels in AppState.now. Target: 10 lines x ~560px
-// usable width (the G2's 576x288 canvas, ~10 text lines).
+// timestamp render needs travels in AppState.now. Target: DISPLAY_LINES lines
+// x LINE_WIDTH_PX usable width — 7 x 560px on the G2's 576x288 canvas at the
+// calibrated 40px line height (see core/layout.ts).
 import type { AppState, ReplyScreenState, SessionScreenState } from "./app.ts";
-import { bottomBoxLines, inputBoxBody, menuBox, sheetBody, statusLabel, type MicState } from "./input-box.ts";
+import {
+  bottomBoxLines,
+  inputBoxBody,
+  menuBox,
+  sheetBody,
+  SHEET_MAX_LINES,
+  statusLabel,
+  type MicState,
+} from "./input-box.ts";
 import { DISPLAY_LINES, LINE_WIDTH_PX } from "./layout.ts";
 import { filterAgents, glyph, liveState, sessionName } from "./sessions.ts";
 import { measureDefault, measureGeneration, wrapText } from "./text-wrap.ts";
@@ -43,10 +52,17 @@ function wrap(text: string): string[] {
   return wrapText(text, LINE_WIDTH_PX);
 }
 
-// The 2-space hang indent under every transcript turn's marker (see roleBlock).
-// Transcript content wraps to a slightly narrower width so the marker + indent
-// never push a line past the display edge.
-const CONTINUATION_INDENT = "  ";
+// The width reserved for a turn's role marker (see roleBlock): transcript
+// content wraps a little narrower than the display so "» "/"· " can never push
+// the first line past the edge.
+//
+// This used to double as a 2-space hang indent on every continuation line. On
+// the Mentra scene path that indent is unreachable: the phone re-wraps every
+// text element through its own TextWrapper, whose `trimLines` is on and not
+// exposed to a miniapp, so leading whitespace is stripped before the frame ever
+// reaches the glass. The role markers alone separate turns; don't re-add an
+// indent here expecting to see it.
+const MARKER_GUTTER = "  ";
 
 // The gutter's pixel width only changes when the default measure is re-pointed
 // (main.ts's pretext upgrade), so memoize it per measure generation — otherwise
@@ -57,7 +73,7 @@ let contentWidthCache: { gen: number; width: number } | null = null;
 function contentWidth(): number {
   const gen = measureGeneration();
   if (!contentWidthCache || contentWidthCache.gen !== gen) {
-    contentWidthCache = { gen, width: LINE_WIDTH_PX - measureDefault(CONTINUATION_INDENT) };
+    contentWidthCache = { gen, width: LINE_WIDTH_PX - measureDefault(MARKER_GUTTER) };
   }
   return contentWidthCache.width;
 }
@@ -237,16 +253,13 @@ function roleMarker(role: string): string {
   return `[${role}] `;
 }
 
-// Wraps one turn's text into hang-indented lines: the role marker on the first
-// line, a matching indent (CONTINUATION_INDENT) on every wrapped continuation
-// line, so each turn reads as one clean left-aligned block and the marker
-// column stays visually distinct. Content is wrapped to `contentWidth()` (a hair
-// narrower than the display) so the prefix never pushes a line past the edge.
+// Wraps one turn's text into lines: the role marker opens the first one, the
+// rest run flush. Content is wrapped to `contentWidth()` (a hair narrower than
+// the display) so the marker never pushes the first line past the edge. See
+// MARKER_GUTTER for why continuation lines carry no indent.
 function roleBlock(role: string, text: string): string[] {
   const marker = roleMarker(role);
-  return wrapCached(text, contentWidth()).map((line, i) =>
-    i === 0 ? marker + line : CONTINUATION_INDENT + line
-  );
+  return wrapCached(text, contentWidth()).map((line, i) => (i === 0 ? marker + line : line));
 }
 
 // Every line the session screen could show, oldest first, bottom-anchored —
@@ -354,13 +367,16 @@ function renderSessionBottom(state: AppState, sess: SessionScreenState): BottomM
   return { mode: "input", lines: inputBoxBody({ text: draft, focused, mic, viewOffset }), status: boxStatus, focused };
 }
 
-// The bottom box's on-screen height in text lines. Input/sheet boxes cap at
-// BOTTOM_MAX_LINES via bottomBoxLines; the menu box is already capped at
-// MENU_MAX_LINES by menuBox, so it sizes to its own content (up to 8 lines).
-// Shared by the evenhub backend (which sizes the box container) and
-// sessionOverlay (which sizes the transcript above it) so the two never drift.
+// The bottom box's on-screen height in text lines. The input box caps at
+// BOTTOM_MAX_LINES; the sheet gets the taller SHEET_MAX_LINES budget it is
+// built against; the menu box is already capped at MENU_MAX_LINES by menuBox,
+// so it sizes to its own content. Shared by the display backend (which sizes
+// the box container) and sessionOverlay/renderSession (which size the
+// transcript above it) so the three never drift.
 export function boxLineCount(bottom: BottomModel): number {
-  return bottom.mode === "menu" ? Math.max(1, bottom.lines.length) : bottomBoxLines(bottom.lines);
+  if (bottom.mode === "menu") return Math.max(1, bottom.lines.length);
+  if (bottom.mode === "sheet") return bottomBoxLines(bottom.lines, SHEET_MAX_LINES);
+  return bottomBoxLines(bottom.lines);
 }
 
 // The transcript's visible line-count for a given session — the bottom box
@@ -368,7 +384,7 @@ export function boxLineCount(bottom: BottomModel): number {
 // math needs this exact figure to stay in sync with what renderSession
 // actually windows. Shared rather than duplicated so the two never drift.
 export function sessionTranscriptArea(state: AppState, sess: SessionScreenState): number {
-  return DISPLAY_LINES - bottomBoxLines(renderSessionBottom(state, sess).lines);
+  return DISPLAY_LINES - boxLineCount(renderSessionBottom(state, sess));
 }
 
 function renderSession(state: AppState): ScreenModel {
@@ -398,7 +414,7 @@ function renderSession(state: AppState): ScreenModel {
   // borrowing from the content window the same way a header line would.
   const flash = activeFlash(state);
   const flashLines = flash ? wrap(flash) : [];
-  const area = Math.max(1, DISPLAY_LINES - bottomBoxLines(bottom.lines) - flashLines.length);
+  const area = Math.max(1, DISPLAY_LINES - boxLineCount(bottom) - flashLines.length);
   const maxOffset = Math.max(0, content.length - area);
   const offset = Math.min(sess.offset, maxOffset);
   const end = content.length - offset;

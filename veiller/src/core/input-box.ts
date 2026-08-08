@@ -14,14 +14,23 @@ export type MicState = "idle" | "recording" | "finalising" | "error";
 export const BOTTOM_MAX_LINES = Math.floor(DISPLAY_LINES / 2);
 
 // The menu-overlay box (actions menu / confirm dialog) is taller than the
-// input/sheet box: it may show a title plus several option rows. Cap it so at
+// input box: it may show a title plus several option rows. Cap it so at
 // least two transcript lines stay visible behind it.
 export const MENU_MAX_LINES = DISPLAY_LINES - 2;
 
+// The AskUserQuestion sheet gets the menu's allowance, not the input box's.
+// It is the same thing the actions menu is — a modal list you must read and
+// choose from — and it is the one moment the agent is blocked on you, so the
+// question deserves the screen more than the transcript behind it does. At
+// BOTTOM_MAX_LINES (3) a two-line question left exactly ONE option row
+// visible, which made every real question a blind scroll.
+export const SHEET_MAX_LINES = MENU_MAX_LINES;
+
 // How many text lines the bottom box should occupy for the given wrapped
-// content — at least 1 (never fully collapse), capped at BOTTOM_MAX_LINES.
-export function bottomBoxLines(contentLines: string[]): number {
-  return Math.max(1, Math.min(BOTTOM_MAX_LINES, contentLines.length));
+// content — at least 1 (never fully collapse), capped at `max` (the input
+// box's half-screen budget by default; the sheet passes its own).
+export function bottomBoxLines(contentLines: string[], max: number = BOTTOM_MAX_LINES): number {
+  return Math.max(1, Math.min(max, contentLines.length));
 }
 
 // Windows `lines` down to at most BOTTOM_MAX_LINES, keeping the tail
@@ -70,7 +79,7 @@ export function inputBoxBody(opts: {
 
 // Sheet-mode body: wrapped question title lines + numbered option rows +
 // a trailing "Dictate answer…" row, windowed around `selected` so it stays
-// visible even when the option list overflows BOTTOM_MAX_LINES.
+// visible even when the option list overflows SHEET_MAX_LINES.
 export function sheetBody(opts: { question: string; options: string[]; selected: number }): string[] {
   const { question, options } = opts;
   const rows = [...options.map((opt, i) => `${i + 1}. ${opt}`), `${options.length + 1}. Dictate answer…`];
@@ -81,10 +90,10 @@ export function sheetBody(opts: { question: string; options: string[]; selected:
 
   // Reserve at least one option row: cap the question portion so it never
   // eats the whole box, then the option area is whatever's left. This keeps
-  // the combined output within BOTTOM_MAX_LINES even for a question that
+  // the combined output within SHEET_MAX_LINES even for a question that
   // wraps to many lines.
-  const questionLines = wrapText(question, LINE_WIDTH_PX).slice(0, BOTTOM_MAX_LINES - 1);
-  const area = BOTTOM_MAX_LINES - questionLines.length;
+  const questionLines = clipQuestion(wrapText(question, LINE_WIDTH_PX), SHEET_MAX_LINES - 1);
+  const area = SHEET_MAX_LINES - questionLines.length;
 
   let start = 0;
   if (total > area) {
@@ -96,6 +105,18 @@ export function sheetBody(opts: { question: string; options: string[]; selected:
     .map((row, i) => (start + i === selected ? `> ${row}` : `  ${row}`));
 
   return [...questionLines, ...visibleRows];
+}
+
+// A question too long for the sheet is cut — but never silently: the last
+// visible line ends in an ellipsis, so the operator can tell they are choosing
+// against a question they have only partly read (the alternative is answering
+// a sentence that stopped mid-clause, which is what this used to do).
+function clipQuestion(lines: string[], max: number): string[] {
+  if (lines.length <= max) return lines;
+  const kept = lines.slice(0, max);
+  const last = kept[kept.length - 1] ?? "";
+  kept[kept.length - 1] = last.endsWith("…") ? last : `${last.replace(/[\s.,;:]+$/, "")}…`;
+  return kept;
 }
 
 // Short right-corner status label from live state + mic. Mic state wins
