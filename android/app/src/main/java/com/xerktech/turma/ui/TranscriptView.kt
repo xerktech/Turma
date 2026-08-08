@@ -63,7 +63,7 @@ import android.graphics.Color as AndroidColor
 import android.util.Base64
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.viewinterop.AndroidView
 import coil.compose.AsyncImage
@@ -372,8 +372,13 @@ private fun SendFileView(f: SendFile) {
             }
             if (model == null) { FileChip(f.name); return }
             Column {
+                // A DEFINITE height, not heightIn(max): AsyncImage's painter starts
+                // with an unknown intrinsic size, so a max-only height constraint
+                // measures the box at 0 (invisible) — the image never appears. A
+                // fixed-height box (like the HTML preview below) always has room; the
+                // SVG/PNG is Fit-scaled into it, centred on the white backdrop.
                 Box(
-                    Modifier.fillMaxWidth().heightIn(max = 320.dp)
+                    Modifier.fillMaxWidth().height(260.dp)
                         .clip(RoundedCornerShape(6.dp))
                         .background(Color.White)
                         .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f), RoundedCornerShape(6.dp)),
@@ -383,7 +388,7 @@ private fun SendFileView(f: SendFile) {
                         model = model,
                         contentDescription = f.name,
                         contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp).padding(4.dp),
+                        modifier = Modifier.fillMaxSize().padding(6.dp),
                     )
                 }
                 Text(f.name, fontSize = scaledSp(10f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
