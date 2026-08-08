@@ -1107,15 +1107,19 @@
       <div class="td-foot"><a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">Open in ${srcName} ↗</a></div>`;
   }
 
-  // The three-column board for the selected sites (filter = a siteKey, or
-  // null/"" for all). Sites are the mergeSites() output; org colors come from
+  // The three-column board for the selected sites (filter = a siteKey, an
+  // array/Set of siteKeys — the header's multi-select (XERK-222) — or null/""
+  // for all). Sites are the mergeSites() output; org colors come from
   // orgColorMap over the FULL org set (opts.allKeys) — computed once here, not
-  // per site — so each org's unique color is the same whether or not it's the
+  // per site — so each org's unique color is the same whether or not it's a
   // filtered-to one.
   function boardHtml(sites, filter, opts) {
     const o = opts || {};
     const colorMap = orgColorMap(o.allKeys || sites.map(s => s.siteKey), o.orgColors);
-    const shown = sites.filter(s => !filter || s.siteKey === filter);
+    const fkeys = filter instanceof Set ? [...filter]
+      : Array.isArray(filter) ? filter
+      : filter ? [filter] : [];
+    const shown = sites.filter(s => !fkeys.length || fkeys.includes(s.siteKey));
     const moves = o.moves || null;
     const cards = { todo: [], inprogress: [], review: [], done: [] };
     for (const site of shown) {
@@ -1262,7 +1266,8 @@
   }
 
   // The whole New-ticket modal body. `st` is the page's create state:
-  //   { sites, siteKey, source, meta, types, values, busy, error, created }
+  //   { sites, siteKey, source, meta, types, values, busy, error, created,
+  //     confirmDiscard }
   // where meta = {loading|error|projects,labels}, types = {loading|error|types}.
   function createFormHtml(st) {
     const s = st || {};
@@ -1343,11 +1348,20 @@
           <datalist id="cf-label-suggestions">${suggestions}</datalist></label>
       </div>
       ${s.error ? `<div class="cf-note cf-err">Couldn't create — ${esc(s.error)}</div>` : ""}
-      <div class="cf-actions">
+      ${s.confirmDiscard
+        // A dirty close was requested (XERK-218): the actions row becomes the
+        // confirmation, so the typed form can't be thrown away by one stray
+        // click — Discard is the only button that closes it.
+        ? `<div class="cf-actions">
+        <span class="cf-note cf-discard-q">Discard this ticket? It hasn't been created yet.</span>
+        <button type="button" class="cf-btn" data-cf-keep="1">Keep editing</button>
+        <button type="button" class="cf-btn cf-danger" data-cf-discard="1">Discard</button>
+      </div>`
+        : `<div class="cf-actions">
         <button type="button" class="cf-btn" data-cf-cancel="1">Cancel</button>
         <button type="button" class="cf-btn cf-primary" data-cf-submit="1"${canSubmit ? "" : " disabled"}>${
           s.busy ? "Creating…" : "Create ticket"}</button>
-      </div>`;
+      </div>`}`;
   }
 
   const api = {

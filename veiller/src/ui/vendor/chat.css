@@ -86,6 +86,24 @@
   font-family: var(--font-mono); font-size: 0.88em; font-style: normal;
   background: var(--page); border: 1px solid var(--border); border-radius: 4px;
   padding: 0.1em 0.35em; overflow-wrap: anywhere; }
+/* Inline images + rendered SVGs (chat.js linkify()/svgToImg(), XERK-221). Block
+   so they sit on their own line; capped so a large asset doesn't blow out the
+   bubble. A light backdrop keeps a transparent/dark-stroked SVG legible. */
+.tr-msg .md-img, .thought-body .md-img, .compact-body .md-img, .tool-file .md-img {
+  display: block; max-width: 100%; max-height: 420px; height: auto; margin: 6px 0;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.tr-msg .md-svg, .thought-body .md-svg, .compact-body .md-svg, .tool-file .md-svg {
+  width: auto; background: #fff; padding: 6px; }
+/* SendUserFile inline previews inside a tool card (chat.js renderToolFiles,
+   XERK-221): a stacked list of image/SVG/HTML previews + name chips. */
+.tool-files { display: flex; flex-direction: column; gap: 8px; margin: 2px 0; }
+.tool-file { margin: 0; min-width: 0; }
+.tool-file figcaption, .tool-file .tool-file-name { font-size: 10.5px; color: var(--muted);
+  margin-top: 2px; overflow-wrap: anywhere; }
+.tool-file.file { font-size: 12px; color: var(--muted); }
+.tool-file .md-embed { width: 100%; height: 440px; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); background: #fff; }
+.tool-caption { font-size: 12px; color: var(--ink); margin-top: 4px; }
 /* Auto-linkified URLs in chat bubbles + thinking traces (chat.js linkify()). */
 .tr-msg a, .thought-body a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
 .tr-msg a:hover, .thought-body a:hover { text-decoration: none; }
