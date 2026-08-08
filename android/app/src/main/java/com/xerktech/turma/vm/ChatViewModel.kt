@@ -6,7 +6,12 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
+import android.net.Uri
+import android.provider.OpenableColumns
+import com.xerktech.turma.core.AttachStatus
+import com.xerktech.turma.core.Attachment
 import com.xerktech.turma.core.RevealState
+import com.xerktech.turma.core.Uploads
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.VerbosityPrefs
 import com.xerktech.turma.core.advanceReveal
@@ -24,6 +29,10 @@ import com.xerktech.turma.net.InputRequest
 import com.xerktech.turma.net.LiveEvent
 import com.xerktech.turma.net.ModeRequest
 import com.xerktech.turma.net.ModelRequest
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import com.xerktech.turma.net.hubErrorMessage
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -48,6 +57,11 @@ data class ChatUiState(
     val loadingHistory: Boolean = false,
     val mic: MicState = MicState.IDLE,
     val draft: String = "",
+    // Files staged for the next message (XERK-234) and this host's per-file cap
+    // (0 = its agent predates attachments, which is what hides the composer's
+    // clip button rather than letting the operator attach into a void).
+    val attachments: List<Attachment> = emptyList(),
+    val uploadMaxBytes: Long = 0,
     val session: SessionInfo? = null,
     // The host this session's agent runs on, shown in the header (XERK-121):
     // the agent's device name, falling back to its registration key.
@@ -61,6 +75,9 @@ data class ChatUiState(
     val questionMulti: Boolean get() = session?.session?.questionMulti ?: false
     val questionTotal: Int? get() = session?.session?.questionTotal
     val questionIndex: Int? get() = session?.session?.questionIndex
+    // Attaching is off while a question is pending: the draft then routes to
+    // POST .../answer, which carries no files (web chat.js renderAttachments).
+    val canAttach: Boolean get() = Uploads.canAttach(uploadMaxBytes) && question.isBlank()
 }
 
 class ChatViewModel(
@@ -111,6 +128,9 @@ class ChatViewModel(
     // at the FULL caps can't refetch forever.
     private val upgradedKeys = HashSet<String>()
     private var dictation: Dictation? = null
+    // Chip ids for staged attachments — a counter, not the Uri, so the same file
+    // picked twice is two removable chips.
+    private var attachSeq = 0
 
     fun onEnter() {
         seedFromFleet()
@@ -138,7 +158,10 @@ class ChatViewModel(
                 val agent = fleet.agents.firstOrNull { it.key == host }
                 val session = agent?.sessions?.firstOrNull { it.id == sessionId }
                 val label = agent?.device?.ifBlank { host } ?: host
-                _state.update { it.copy(session = session, hostLabel = label) }
+                _state.update {
+                    it.copy(session = session, hostLabel = label,
+                        uploadMaxBytes = agent?.uploadMaxBytes ?: 0)
+                }
                 session?.session?.tail?.takeIf { it.isNotEmpty() }?.let { seed ->
                     _state.update { it.copy(entries = mergeTail(it.entries, seed)) }
                 }
@@ -151,7 +174,11 @@ class ChatViewModel(
         val session = agent?.sessions?.firstOrNull { it.id == sessionId }
         val label = agent?.device?.ifBlank { host } ?: host
         val seed = session?.session?.tail ?: emptyList()
-        _state.update { it.copy(session = session, hostLabel = label, entries = mergeTail(it.entries, seed)) }
+        _state.update {
+            it.copy(session = session, hostLabel = label,
+                uploadMaxBytes = agent?.uploadMaxBytes ?: 0,
+                entries = mergeTail(it.entries, seed))
+        }
     }
 
     private fun startLive() {
@@ -291,17 +318,110 @@ class ChatViewModel(
         _state.update { it.copy(verbosity = v) }
     }
 
+    // ---- file attachments (XERK-234) -----------------------------------------
+
+    /**
+     * Stage picked files and start their uploads. Each goes up the moment it is
+     * picked, so Send is instant and a file too big is refused while there is
+     * still a chip on screen to remove — the web composer's attachFiles.
+     */
+    fun attach(uris: List<Uri>) {
+        val cap = _state.value.uploadMaxBytes
+        if (!Uploads.canAttach(cap) || uris.isEmpty()) return
+        val resolver = getApplication<Application>().contentResolver
+        for (uri in uris) {
+            if (_state.value.attachments.size >= Uploads.MAX_PER_MESSAGE) {
+                _messages.tryEmit("✗ at most ${Uploads.MAX_PER_MESSAGE} files per message")
+                break
+            }
+            val (name, size) = runCatching {
+                resolver.query(uri, null, null, null, null)?.use { c ->
+                    val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val si = c.getColumnIndex(OpenableColumns.SIZE)
+                    if (c.moveToFirst()) {
+                        (if (ni >= 0) c.getString(ni) else null) to (if (si >= 0 && !c.isNull(si)) c.getLong(si) else 0L)
+                    } else null
+                }
+            }.getOrNull() ?: (null to 0L)
+            val rec = Attachment(
+                key = "a" + (++attachSeq),
+                name = Uploads.sanitizeUploadName(name ?: uri.lastPathSegment),
+                size = size,
+                status = if (size > cap) AttachStatus.ERROR else AttachStatus.UPLOADING,
+                error = if (size > cap) "too big — max ${Uploads.formatBytes(cap)}" else "",
+            )
+            _state.update { it.copy(attachments = it.attachments + rec) }
+            if (rec.status != AttachStatus.ERROR) uploadOne(rec, uri)
+        }
+    }
+
+    fun removeAttachment(key: String) {
+        _state.update { it.copy(attachments = it.attachments.filterNot { a -> a.key == key }) }
+    }
+
+    private fun updateAttachment(key: String, f: (Attachment) -> Attachment) {
+        _state.update { st ->
+            st.copy(attachments = st.attachments.map { if (it.key == key) f(it) else it })
+        }
+    }
+
+    private fun uploadOne(rec: Attachment, uri: Uri) {
+        viewModelScope.launch {
+            val result = runCatching {
+                // Read on IO: a document provider's stream can be a network
+                // fetch (Drive), and the whole file has to be in hand before the
+                // POST — the hub takes raw bytes with a Content-Length.
+                val bytes = withContext(Dispatchers.IO) {
+                    getApplication<Application>().contentResolver.openInputStream(uri)
+                        ?.use { it.readBytes() } ?: error("can't read the file")
+                }
+                client.api.uploadAttachment(
+                    host, sessionId, rec.name,
+                    bytes.toRequestBody("application/octet-stream".toMediaType()),
+                )
+            }
+            val reply = result.getOrNull()
+            if (reply != null && reply.uploadId.isNotBlank()) {
+                updateAttachment(rec.key) {
+                    it.copy(
+                        status = AttachStatus.READY,
+                        uploadId = reply.uploadId,
+                        name = reply.name.ifBlank { it.name },
+                        size = if (reply.size > 0) reply.size else it.size,
+                    )
+                }
+            } else {
+                val why = result.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "upload failed"
+                updateAttachment(rec.key) { it.copy(status = AttachStatus.ERROR, error = why) }
+            }
+        }
+    }
+
     /** Send the draft: routes to answer(custom) when a question is pending. */
     fun submitDraft() {
         val text = draft.value.trim()
-        if (text.isEmpty()) return
+        val answering = _state.value.question.isNotBlank()
+        // Attachments ride a plain message only, and a message can be
+        // attachments alone — but never one still on its way up, which would
+        // arrive with the file missing and nothing said (web chat.js send()).
+        val staged = if (answering) emptyList() else _state.value.attachments
+        val uploadIds = Uploads.readyUploadIds(staged)
+        if (uploadIds == null) {
+            _messages.tryEmit("✗ " + Uploads.holdReason(staged))
+            return
+        }
+        if (text.isEmpty() && uploadIds.isEmpty()) return
         draft.value = ""
+        if (staged.isNotEmpty()) _state.update { it.copy(attachments = emptyList()) }
         viewModelScope.launch {
             val sent = runCatching {
-                if (_state.value.question.isNotBlank()) {
+                if (answering) {
                     client.api.answerQuestion(host, sessionId, AnswerRequest(optionIndex = -1, custom = text))
                 } else {
-                    client.api.sendInput(host, sessionId, InputRequest(text))
+                    client.api.sendInput(
+                        host, sessionId,
+                        InputRequest(text, uploadIds.ifEmpty { null }),
+                    )
                 }
             }
             if (sent.isSuccess) {
@@ -313,6 +433,13 @@ class ChatViewModel(
                 // fixable; "hub unreachable" would send the operator hunting for
                 // a network fault). Only if nothing has been typed since.
                 if (draft.value.isBlank()) setDraft(text)
+                // Same for the chips: the operator is going to press Send again,
+                // and re-picking the files by hand is not something a failed
+                // POST should cost them (the staged uploads live on the hub for
+                // 20 minutes). Only if nothing has been attached since.
+                if (staged.isNotEmpty() && _state.value.attachments.isEmpty()) {
+                    _state.update { it.copy(attachments = staged) }
+                }
                 val why = sent.exceptionOrNull()?.let { hubErrorMessage(it) }
                 _messages.tryEmit("✗ " + (why ?: "hub unreachable"))
             }

@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive } = require("../public/chat.js");
+const { mergeTail, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setNoExpand, __setLiveStatus, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS } = require("../public/chat.js");
 
 const PRESETS = {
   concise: { thinking: false, tools: false, outputs: false },
@@ -1460,4 +1460,119 @@ test("compose bar: a message past the host's cap says so, with the number (XERK-
   assert.ok(isTooLong(TOO_LONG));
   assert.ok(!isTooLong("500"));
   assert.ok(!isTooLong(undefined));
+});
+
+// ---- file attachments (XERK-234) -------------------------------------------
+
+test("attachments: a chip shows the name, and what the file is doing", () => {
+  const html = attachmentsHtml([
+    { key: "a1", name: "shot.png", size: 2048, status: "ready", uploadId: "u1" },
+    { key: "a2", name: "spec.pdf", size: 0, status: "uploading" },
+    { key: "a3", name: "huge.bin", size: 0, status: "error", error: "too big — max 32 MB" },
+  ]);
+  assert.ok(html.includes("shot.png"));
+  assert.ok(html.includes("2 KB"), "a ready file shows its size");
+  assert.ok(html.includes("uploading…"), "one still on its way says so");
+  assert.ok(html.includes("too big — max 32 MB"), "a failure shows the reason");
+  assert.ok(html.includes("att-error"), "and is styled as one");
+  // The ✕ carries the chip key the delegated remove handler reads.
+  assert.ok(html.includes('data-att="a1"'));
+  assert.equal(attachmentsHtml([]), "");
+});
+
+test("attachments: a chip's name and error are escaped, never injected", () => {
+  const html = attachmentsHtml([
+    { key: "a1", name: '<img src=x onerror=alert(1)>.png', size: 1, status: "ready" },
+  ]);
+  assert.ok(!html.includes("<img"));
+  assert.ok(html.includes("&lt;img"));
+});
+
+test("attachments: sizes read the way the android chip reads them", () => {
+  assert.equal(fmtBytes(812), "812 B");
+  assert.equal(fmtBytes(44 * 1024), "44 KB");
+  assert.equal(fmtBytes(3 * 1024 * 1024), "3.0 MB");
+  assert.equal(fmtBytes(32 * 1024 * 1024), "32 MB");
+});
+
+test("attachments: nothing staged sends an empty list, not a hold", () => {
+  __setAttachments([]);
+  assert.deepEqual(readyUploadIds(), []);
+});
+
+test("attachments: every file ready sends their ids in order", () => {
+  __setAttachments([
+    { key: "a1", name: "a.png", size: 1, status: "ready", uploadId: "u1" },
+    { key: "a2", name: "b.png", size: 1, status: "ready", uploadId: "u2" },
+  ]);
+  assert.deepEqual(readyUploadIds(), ["u1", "u2"]);
+  __setAttachments([]);
+});
+
+test("attachments: a file still uploading or failed HOLDS the message", () => {
+  // Sending anyway would land a message whose file is silently missing.
+  __setAttachments([
+    { key: "a1", name: "a.png", size: 1, status: "ready", uploadId: "u1" },
+    { key: "a2", name: "b.png", size: 1, status: "uploading" },
+  ]);
+  assert.equal(readyUploadIds(), null);
+  __setAttachments([{ key: "a1", name: "a.png", size: 1, status: "error", error: "nope" }]);
+  assert.equal(readyUploadIds(), null);
+  __setAttachments([]);
+});
+
+test("attachments: the clip button follows the HOST's capability, not the hub's", () => {
+  // An agent that reports no uploadMaxBytes would DROP the uploads on an input
+  // command without a word, so the composer must not offer the control at all.
+  const clip = { hidden: false, disabled: false, title: "" };
+  const strips = [{ innerHTML: "" }, { innerHTML: "" }];
+  global.document = {
+    querySelectorAll: (sel) => (sel === ".compose-attach" ? strips : []),
+    getElementById: (id) => (id === "chatClip" ? clip : null),
+  };
+  __setAttachments([]);
+
+  __setAgent({});                       // an agent predating attachments
+  renderAttachments();
+  assert.equal(clip.hidden, true);
+
+  __setAgent({ uploadMaxBytes: 1 << 25 });
+  renderAttachments();
+  assert.equal(clip.hidden, false);
+
+  // A pending question is answered THROUGH the compose box (POST .../answer,
+  // which carries no files), so attaching is off while one is up — and says why.
+  __setQuestionActive(true);
+  renderAttachments();
+  assert.equal(clip.disabled, true);
+  assert.match(clip.title, /Answer the question first/);
+  __setQuestionActive(false);
+  renderAttachments();
+  assert.equal(clip.disabled, false);
+
+  // Both strips are painted from one read, so the chat's and the terminal's can
+  // never disagree about what is attached.
+  __setAttachments([{ key: "a1", name: "a.png", size: 1, status: "ready", uploadId: "u1" }]);
+  renderAttachments();
+  assert.ok(strips[0].innerHTML.includes("a.png"));
+  assert.equal(strips[0].innerHTML, strips[1].innerHTML);
+
+  __setAttachments([]);
+  __setAgent(null);
+  clearDom();
+});
+
+test("attachments: an expired staged file is an actionable refusal, not 'Send failed'", () => {
+  // The hub 404s when a staged upload aged out of its relay; the operator can
+  // fix that by re-attaching, so it gets its own wording like "too long" does.
+  const msg = sendFailure(404, undefined, "an attachment expired before it was sent — re-attach it");
+  assert.equal(msg, "Attachment expired — re-attach");
+  assert.ok(isTooLong(msg), "both compose bars show it verbatim");
+  // A plain 404 with no attachment in it is still just a status.
+  assert.equal(sendFailure(404, undefined, "unknown agent"), "404");
+  assert.equal(sendFailure(404), "404");
+});
+
+test("attachments: the per-message cap matches the hub's", () => {
+  assert.equal(MAX_ATTACHMENTS, 10);
 });

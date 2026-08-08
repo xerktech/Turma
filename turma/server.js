@@ -115,6 +115,77 @@ function inputCapFor(agent) {
   if (!Number.isFinite(reported) || reported <= 0) return LEGACY_INPUT_MAX_CHARS;
   return Math.min(reported, INPUT_MAX_CHARS);
 }
+
+// ---- file attachments (XERK-234) --------------------------------------------
+// The composer's 📎 uploads a file, which lands on the agent's host as a real
+// file the session can Read; the message typed into the pane carries its path.
+// The hub is the RELAY, not the store: agents are outbound-only, so a client
+// POSTs the bytes here, they sit in memory under an id, and the agent GETs them
+// when it picks up the `input` command carrying that id. Nothing touches /data —
+// an upload that is never collected simply expires.
+const UPLOAD_MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES) || (1 << 25); // 32 MiB per file
+// The whole relay's memory ceiling. Held blobs are RAM, so this is the number
+// that keeps a hub with a fat pipe and a slow agent from being OOM'd; a POST
+// arriving over it is refused rather than evicting someone else's pending file.
+const UPLOAD_TOTAL_MAX_BYTES = Number(process.env.UPLOAD_TOTAL_MAX_BYTES) || (1 << 27); // 128 MiB
+// How long a staged blob waits to be collected. Generous, because the operator
+// attaches files and then keeps typing before pressing Send — the clock starts
+// at the upload, not at the message.
+const UPLOAD_TTL_MS = 20 * 60 * 1000;
+const UPLOAD_MAX_PER_MESSAGE = 10;
+
+// uploadId -> {id, host, sessionId, name, size, bytes, at}
+const uploads = new Map();
+
+/**
+ * A filename safe to hand an agent that will join it onto a directory path.
+ * Both sides sanitize (the agent must never trust a name off the wire), but the
+ * hub does it FIRST so the name the operator sees on the chip is the name the
+ * file lands under. Keeps a readable ASCII skeleton: basename only, no
+ * separators, no control bytes, no leading dot (a dotfile hides the upload).
+ */
+function safeUploadName(name) {
+  let s = String(name == null ? "" : name);
+  s = s.split(/[\\/]/).pop() || "";               // basename, both separators
+  s = s.replace(/[\u0000-\u001f\u007f]/g, "");     // control bytes
+  s = s.replace(/[^A-Za-z0-9._ ()+-]/g, "_");     // conservative charset
+  s = s.replace(/\s+/g, " ").trim().replace(/^\.+/, "").trim();
+  if (s.length > 100) {
+    // Keep the extension — it is what tells the agent (and Claude Code's Read)
+    // what kind of file this is; truncating it away would make a .png unreadable.
+    const dot = s.lastIndexOf(".");
+    const ext = dot > 0 && s.length - dot <= 12 ? s.slice(dot) : "";
+    s = s.slice(0, 100 - ext.length) + ext;
+  }
+  return s || "upload";
+}
+
+/** Total bytes the relay is currently holding. */
+function uploadsHeldBytes() {
+  let n = 0;
+  for (const u of uploads.values()) n += u.size;
+  return n;
+}
+
+/** Drop staged blobs nobody collected. Called before every accept and read. */
+function sweepUploads(now = Date.now()) {
+  for (const [id, u] of uploads) {
+    if (now - u.at > UPLOAD_TTL_MS) uploads.delete(id);
+  }
+}
+
+/**
+ * The largest file this host can take, or 0 when it can't take one at all.
+ * `uploadMaxBytes` is the agent's capability flag as well as its cap (like
+ * `inputMaxChars`): an agent predating attachments reports nothing and would
+ * silently drop the `uploads` on an input command, so the clients hide the 📎
+ * rather than let the operator attach into a void.
+ */
+function uploadCapFor(agent) {
+  const reported = Number(agent && agent.uploadMaxBytes);
+  if (!Number.isFinite(reported) || reported <= 0) return 0;
+  return Math.min(reported, UPLOAD_MAX_BYTES);
+}
 // Board ticket detail (description + comments), fetched on demand from the host
 // that owns the org's Jira creds. Cached briefly so reopening a ticket, or two
 // dashboards viewing one, doesn't re-hit Jira; kept much shorter-lived than a
@@ -1220,23 +1291,40 @@ function readBody(req) {
   });
 }
 
-// Collect a request body as raw bytes (for the binary migration relay, which
-// readBody's 1 MiB string cap would truncate). Rejects past `cap` so a huge or
-// runaway upload can't exhaust the hub's memory.
+// How much past `cap` readRawBody keeps draining before it gives up on saying
+// anything and cuts the socket. Draining is what lets the route answer 413 on
+// the same connection — destroying it mid-body reaches the client as a socket
+// hang up, and "the network broke" is the wrong thing to tell someone whose
+// file was simply too big (XERK-234).
+const RAW_BODY_DRAIN_SLACK = 1 << 20; // 1 MiB
+
+// Collect a request body as raw bytes (for the binary migration relay and the
+// attachment uploads, which readBody's 1 MiB string cap would truncate). Rejects
+// past `cap` so a huge or runaway upload can't exhaust the hub's memory: the
+// bytes already held are dropped on the spot, and what follows is discarded
+// rather than buffered.
 function readRawBody(req, cap) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
+    let chunks = [];
     let len = 0;
+    let over = false;
     req.on("data", (c) => {
       len += c.length;
+      if (over) {
+        // Still coming after we've said no: read and throw it away up to a
+        // point, then stop paying for a client that won't.
+        if (len > cap + RAW_BODY_DRAIN_SLACK) req.destroy();
+        return;
+      }
       if (len > cap) {
+        over = true;
+        chunks = []; // release what we'd buffered — it is not going to be used
         reject(new Error("body too large"));
-        req.destroy();
         return;
       }
       chunks.push(c);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("end", () => { if (!over) resolve(Buffer.concat(chunks)); });
     req.on("error", reject);
   });
 }
@@ -2597,8 +2685,15 @@ const server = http.createServer(async (req, res) => {
       parts[0] === "api" && parts[1] === "agents" &&
       parts[3] === "migrations" && parts[5] === "blob" && parts.length === 6;
 
+    // The attachment relay's READ side is the agent collecting a staged file
+    // (XERK-234), so it rides the agent token like the migration bundle above.
+    // The upload itself is the OPERATOR's, and stays on the normal user login.
+    const isUploadBlob =
+      req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
+      parts[3] === "uploads" && parts[5] === "blob" && parts.length === 6;
+
     if (url.pathname === "/api/heartbeat" || isArchiveIngest || isUpdatingSignal ||
-        isMigrationBlob) {
+        isMigrationBlob || isUploadBlob) {
       if (!agentAuthorized(req)) return json(res, 401, { error: "unauthorized" });
     } else if (isTrigger) {
       if (!triggerAuthorized(req)) return json(res, 401, { error: "unauthorized" });
@@ -2996,6 +3091,26 @@ const server = http.createServer(async (req, res) => {
       return res.end(m.blob);
     }
 
+    // GET /api/agents/<host>/uploads/<id>/blob — the agent collecting a file the
+    // operator attached to a message (XERK-234). Agent-authed above. Scoped to
+    // the host the upload was staged for, so one host's agent token can't pull
+    // another host's pending attachment. The blob is NOT dropped on read: the
+    // agent may be re-issued the command (at-least-once delivery), and letting it
+    // expire on the TTL costs nothing a re-download doesn't.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
+        parts[3] === "uploads" && parts[5] === "blob" && parts.length === 6) {
+      sweepUploads();
+      const host = decodeURIComponent(parts[2]);
+      const u = uploads.get(decodeURIComponent(parts[4]));
+      if (!u || u.host !== host) return json(res, 404, { error: "no such upload" });
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": u.bytes.length,
+        "Cache-Control": "no-store",
+      });
+      return res.end(u.bytes);
+    }
+
     // GET /api/search?q=&repo=&host=&limit= — instant hub-local full-text search
     // over every archived session (works even for offline hosts).
     if (req.method === "GET" && url.pathname === "/api/search") {
@@ -3252,12 +3367,66 @@ const server = http.createServer(async (req, res) => {
         const m = startMigration(key, s, target);
         return json(res, 200, { ok: true, migrationId: m.id });
       }
+      // POST /api/agents/<host>/sessions/<id>/uploads?name=<filename> -> stage a
+      // file the operator attached in the composer (XERK-234). Body is the raw
+      // bytes (no multipart: every client already has the file as a blob, and a
+      // parser here would be one more thing to get wrong). The reply's uploadId
+      // is what the following /input carries; nothing reaches the session until
+      // that message is sent, so an attachment the operator removes just expires.
+      if (req.method === "POST" && parts.length === 6 && parts[5] === "uploads") {
+        const cap = uploadCapFor(agents[key]);
+        if (!cap)
+          return json(res, 409, {
+            error: "this host's agent is too old to take file attachments — update it",
+          });
+        sweepUploads();
+        let bytes;
+        try {
+          bytes = await readRawBody(req, cap);
+        } catch {
+          return json(res, 413, {
+            error: `file too large — the limit is ${cap.toLocaleString("en-US")} bytes`,
+            limit: cap,
+          });
+        }
+        if (!bytes.length) return json(res, 400, { error: "empty file" });
+        // Refuse rather than evict: the blobs already held belong to messages
+        // someone is still composing, and dropping one of those would fail a
+        // send that looked ready.
+        if (uploadsHeldBytes() + bytes.length > UPLOAD_TOTAL_MAX_BYTES)
+          return json(res, 503, { error: "the hub is holding too many pending uploads — try again shortly" });
+        const id = crypto.randomBytes(12).toString("hex");
+        const name = safeUploadName(url.searchParams.get("name") || "");
+        uploads.set(id, {
+          id, host: key, sessionId, name, size: bytes.length, bytes, at: Date.now(),
+        });
+        return json(res, 200, { ok: true, uploadId: id, name, size: bytes.length });
+      }
       // POST /api/agents/<host>/sessions/<id>/input -> forward free-text input
-      // to a running session (typing a message into the session). Body: {text}.
+      // to a running session (typing a message into the session). Body: {text},
+      // plus optional {uploadIds} naming files staged above — the agent writes
+      // each to disk on its host and prefixes their paths onto the message, so a
+      // message can be attachments alone with no text of its own.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "input") {
         const body = JSON.parse((await readBody(req)) || "{}");
         const text = typeof body.text === "string" ? body.text : "";
-        if (!text.trim()) return json(res, 400, { error: "text required" });
+        sweepUploads();
+        const wanted = Array.isArray(body.uploadIds)
+          ? body.uploadIds.filter((s) => typeof s === "string" && s)
+          : [];
+        if (wanted.length > UPLOAD_MAX_PER_MESSAGE)
+          return json(res, 400, { error: `at most ${UPLOAD_MAX_PER_MESSAGE} attachments per message` });
+        const attached = [];
+        for (const id of wanted) {
+          const u = uploads.get(id);
+          // A stale id is the TTL having passed (or another hub having served
+          // the upload). Refusing beats sending the text with the files silently
+          // missing — the operator re-attaches and sends again.
+          if (!u || u.host !== key || u.sessionId !== sessionId)
+            return json(res, 404, { error: "an attachment expired before it was sent — re-attach it" });
+          attached.push({ id: u.id, name: u.name, size: u.size });
+        }
+        if (!text.trim() && !attached.length) return json(res, 400, { error: "text required" });
         // Capped at what THIS host will deliver whole (see inputCapFor): an
         // agent that would clip the message instead gets refused here, so the
         // operator sees "too long" rather than a session that received a stub.
@@ -3268,7 +3437,9 @@ const server = http.createServer(async (req, res) => {
               `the limit is ${cap.toLocaleString("en-US")}`,
             limit: cap,
           });
-        const cmdId = queueCommand(key, { type: "input", sessionId, text });
+        const cmd = { type: "input", sessionId, text };
+        if (attached.length) cmd.uploads = attached;
+        const cmdId = queueCommand(key, cmd);
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/model -> switch a running
@@ -4243,6 +4414,10 @@ if (process.env.TURMA_TEST) {
     prAlertDecision,
     readyForReview,
     sessionWorking,
+    safeUploadName,
+    uploadCapFor,
+    uploads,
+    UPLOAD_MAX_PER_MESSAGE,
     userAuthorized,
     agentAuthorized,
     agentWsAuthorized,

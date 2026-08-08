@@ -324,6 +324,31 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # over-long message with an error the composer shows rather than truncating it.
 INPUT_MAX_CHARS = int(os.environ.get("SESSION_INPUT_MAX_CHARS", "100000"))
 HISTORY_MAX_MSGS = int(os.environ.get("SESSION_HISTORY_MSGS", "200"))
+
+# File attachments (XERK-234). The operator attaches an image or a document in
+# the chat composer; the hub stages the bytes and names them on the `input`
+# command, and this agent writes each one to disk HERE, then prefixes the message
+# with their paths so the session reads them with its ordinary Read tool.
+#
+# They land under ~/.turma, deliberately NOT in the session's worktree: a file
+# dropped into the repo shows up as an uncommitted change, which is the signal
+# `prune` and `delete` use to decide a worktree is holding work. build_guard
+# _settings pre-approves Read on this tree so an attachment never costs a
+# permission prompt.
+UPLOADS_DIR = os.path.join(REGISTRY_DIR, "uploads")
+UPLOAD_MAX_BYTES = int(os.environ.get("TURMA_UPLOAD_MAX_BYTES", str(1 << 25)))  # 32 MiB
+UPLOAD_MAX_PER_MESSAGE = int(os.environ.get("TURMA_UPLOAD_MAX_PER_MESSAGE", "10"))
+UPLOAD_DOWNLOAD_TIMEOUT_SEC = int(os.environ.get("TURMA_UPLOAD_TIMEOUT_SEC", "60"))
+# How long an ended session's attachments stay on disk. They are part of a
+# conversation that is still resumable (and still references their paths), so
+# they outlive the session by a good margin; only a session DELETE drops them at
+# once. Swept on the slow usage cadence.
+UPLOAD_RETENTION_SEC = int(os.environ.get("TURMA_UPLOAD_RETENTION_SEC", str(30 * 86400)))
+# Filename charset, mirrored from the hub's safeUploadName. The hub sanitizes
+# first so the operator's chip shows the landing name; this repeats it because a
+# name arriving over the wire must never be able to escape UPLOADS_DIR.
+UPLOAD_NAME_BAD_RE = re.compile(r"[^A-Za-z0-9._ ()+-]")
+UPLOAD_NAME_MAX = 100
 # Operator messages are EXEMPT from the history window (XERK-186): a
 # tool-heavy session fills HISTORY_MAX_MSGS with tool_use/tool_result turns in
 # minutes, evicting the few messages the operator actually typed — measured
@@ -659,6 +684,14 @@ branch, not from this checkout.
 # Host credential / agent-config stores the agent must never write or delete.
 # Path rules use Claude Code's gitignore-style matching and win even under
 # `--permission-mode bypassPermissions`, unlike fragile Bash arg patterns.
+# Read rules the app grants every session outright. The uploads tree is written
+# BY this agent, on the operator's instruction, and lives outside every repo
+# (XERK-234) — so reading it is outside the session's working directory and
+# would otherwise cost a permission prompt on a file the operator just attached.
+_GUARD_ALLOW_PATH_RULES = [
+    "Read(~/.turma/uploads/**)",
+]
+
 _GUARD_DENY_PATH_RULES = [
     "Edit(~/.ssh/**)",
     "Write(~/.ssh/**)",
@@ -763,8 +796,10 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     for rule in deny:  # operator deny unions on top of the guard's own rules
         if rule not in perms["deny"]:
             perms["deny"].append(rule)
-    if allow:
-        perms["allow"] = allow
+    perms["allow"] = list(_GUARD_ALLOW_PATH_RULES)
+    for rule in allow:  # operator allow unions on top of the app's own rules
+        if rule not in perms["allow"]:
+            perms["allow"].append(rule)
     return {
         "permissions": perms,
         "hooks": {
@@ -4190,6 +4225,83 @@ def _clean_input_text(text):
     (bar tab and newline) dropped. Newlines SURVIVE — see _type_into_pane."""
     text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     return INPUT_CTRL_RE.sub("", text)
+
+
+# ---- file attachments (XERK-234) --------------------------------------------
+
+def safe_upload_name(name):
+    """A filename that can only ever land INSIDE the uploads directory.
+
+    Mirrors the hub's safeUploadName. The hub sanitizes first (so the chip the
+    operator sees names the file that lands), but this is not a formality: the
+    name arrives over the wire, and a `../` or an absolute path reaching
+    os.path.join would write anywhere the agent can. Everything outside a
+    conservative ASCII set becomes `_`; the extension survives a length cut,
+    because it is what tells Claude Code's Read what kind of file this is."""
+    s = str(name or "")
+    s = re.split(r"[\\/]", s)[-1]           # basename, both separators
+    s = UPLOAD_NAME_BAD_RE.sub("_", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.lstrip(".")                        # never a dotfile — a hidden upload
+    s = s.strip()
+    if len(s) > UPLOAD_NAME_MAX:
+        stem, dot, ext = s.rpartition(".")
+        ext = f".{ext}" if dot and stem and len(ext) <= 11 else ""
+        s = s[:UPLOAD_NAME_MAX - len(ext)] + ext
+    return s or "upload"
+
+
+def upload_dir_for(session_id):
+    """Where one session's attachments live: ~/.turma/uploads/<sessionId>. The
+    id is app-minted (uuid4/registry key), but it is joined onto a path, so it
+    gets the same treatment as the filename."""
+    return os.path.join(UPLOADS_DIR, safe_upload_name(session_id))
+
+
+def _unique_upload_path(dirpath, name):
+    """`dirpath/name`, suffixed `-2`, `-3`, … if that name is already taken.
+    Attaching screenshot.png twice must not have the second silently replace the
+    first — an earlier message's path still points at it."""
+    path = os.path.join(dirpath, name)
+    if not os.path.exists(path):
+        return path
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    else:
+        ext = f".{ext}"
+    for n in range(2, 1000):
+        cand = os.path.join(dirpath, f"{stem}-{n}{ext}")
+        if not os.path.exists(cand):
+            return cand
+    return os.path.join(dirpath, f"{stem}-{uuid.uuid4().hex[:8]}{ext}")
+
+
+def attachment_message(paths, failed, text):
+    """The message actually typed into the pane for a message with attachments.
+
+    The files are already on disk by the time this runs, so the session is told
+    where they are and left to read them with its ordinary tools — nothing is
+    inlined into the prompt. The operator's own text follows, so a message that
+    had one reads normally underneath the header.
+
+    A file that failed to transfer is NAMED rather than dropped: the operator
+    saw it attached, and a session that quietly never received it would be asked
+    about a file it has no way to know existed."""
+    lines = []
+    if paths:
+        lines.append("[The operator attached %s to this message. Read %s from disk:]"
+                     % ("a file" if len(paths) == 1 else f"{len(paths)} files",
+                        "it" if len(paths) == 1 else "them"))
+        lines.extend(paths)
+    for name in failed or []:
+        lines.append(f"[The operator attached {name}, but it failed to transfer "
+                     f"— ask them to send it again.]")
+    body = str(text or "").strip()
+    if body:
+        lines.append("")
+        lines.append(body)
+    return "\n".join(lines)
 
 
 def _type_into_pane(tmux_name, text):
@@ -9186,12 +9298,104 @@ class SessionManager:
         self.registry = [s for s in self.registry if s.get("id") != sid]
         # The worktree is gone, so any stale closed record must not offer resume.
         self.closed = [c for c in self.closed if c.get("id") != sid]
+        # The files the operator attached to this conversation go with it — the
+        # conversation that named their paths is no longer resumable (XERK-234).
+        shutil.rmtree(upload_dir_for(sid), ignore_errors=True)
         self._forget_session_caches(sid)
         log(f"deleted session {sid}")
 
     # --- on-demand input/history (glasses client) --------------------------
 
-    def send_input(self, sid, text):
+    def _download_upload(self, upload_id):
+        """GET one staged attachment's bytes from the hub's upload relay
+        (agent-authed, like the migration bundle). Returns the bytes, or None on
+        any failure — the caller names the file in the message rather than
+        pretending it arrived."""
+        try:
+            headers = {"User-Agent": "hub-agent/1.0"}
+            if TURMA_TOKEN:
+                headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+            url = (f"{TURMA_URL}/api/agents/"
+                   f"{urllib.parse.quote(self.device, safe='')}"
+                   f"/uploads/{urllib.parse.quote(str(upload_id), safe='')}/blob")
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(
+                    req, timeout=UPLOAD_DOWNLOAD_TIMEOUT_SEC) as resp:
+                return resp.read(UPLOAD_MAX_BYTES + 1)
+        except Exception as e:
+            log(f"upload {upload_id}: download failed: {e}")
+            return None
+
+    def _store_uploads(self, sess, uploads):
+        """Write a message's attachments into this session's uploads directory.
+
+        Returns (paths, failed_names): the absolute paths that landed, and the
+        names of any that didn't. Bounded by UPLOAD_MAX_PER_MESSAGE and
+        UPLOAD_MAX_BYTES — the hub caps both too, but this is the side that
+        writes to the disk."""
+        paths, failed = [], []
+        try:
+            os.makedirs(upload_dir_for(sess["id"]), mode=0o700, exist_ok=True)
+        except Exception as e:
+            log(f"uploads: cannot create the directory for session "
+                f"{sess.get('id')}: {e}")
+            return [], [safe_upload_name((u or {}).get("name"))
+                        for u in (uploads or [])[:UPLOAD_MAX_PER_MESSAGE]]
+        dirpath = upload_dir_for(sess["id"])
+        for item in (uploads or [])[:UPLOAD_MAX_PER_MESSAGE]:
+            if not isinstance(item, dict):
+                continue
+            name = safe_upload_name(item.get("name"))
+            blob = self._download_upload(item.get("id"))
+            if blob is None:
+                failed.append(name)
+                continue
+            if len(blob) > UPLOAD_MAX_BYTES:
+                log(f"upload {item.get('id')}: {len(blob)} bytes is past "
+                    f"UPLOAD_MAX_BYTES ({UPLOAD_MAX_BYTES}); not writing it")
+                failed.append(name)
+                continue
+            path = _unique_upload_path(dirpath, name)
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(blob)
+                os.chmod(path, 0o600)
+                paths.append(path)
+                log(f"session {sess['id']}: attached {len(blob)} bytes as {path}")
+            except Exception as e:
+                log(f"upload {item.get('id')}: write to {path} failed: {e}")
+                failed.append(name)
+        return paths, failed
+
+    def _sweep_uploads(self):
+        """Drop attachment directories for sessions this agent no longer knows
+        about, once they are past UPLOAD_RETENTION_SEC. A live or resumable
+        session's files stay: its conversation still names their paths, and a
+        resumed session re-reading one must find it there.
+
+        Deliberately mtime-based and bounded to the unknown ids — the ledger of
+        what is resumable lives elsewhere, and deleting a file a transcript
+        points at is the one mistake here that can't be undone."""
+        if not os.path.isdir(UPLOADS_DIR):
+            return
+        live = {s.get("id") for s in self.registry}
+        live |= {c.get("id") for c in self.closed}
+        now = time.time()
+        for entry in os.listdir(UPLOADS_DIR):
+            if entry in live:
+                continue
+            path = os.path.join(UPLOADS_DIR, entry)
+            try:
+                if not os.path.isdir(path):
+                    continue
+                if now - os.path.getmtime(path) < UPLOAD_RETENTION_SEC:
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+                log(f"uploads: swept {path} (no such session, past retention)")
+            except Exception as e:
+                log(f"uploads: sweep of {path} failed: {e}")
+
+    def send_input(self, sid, text, uploads=None):
         """Type free-text into a running session's Claude TUI and submit it.
         This is the plain "type a message into the session" path (the chat
         composer's Send, the glasses actions menu, the PR-comment delivery);
@@ -9203,11 +9407,29 @@ class SessionManager:
         whole message, so half a message is worse than none — and the hub, which
         caps at the `inputMaxChars` this agent heartbeats, has already refused it
         with an error the composer shows. This is the backstop for a caller that
-        didn't."""
+        didn't.
+
+        `uploads` are the files the operator attached to this message (XERK-234):
+        they are written to disk HERE, before anything is typed, and the message
+        that goes into the pane carries their paths (see attachment_message). The
+        composed text is what lands on the outbox, so a compaction resend re-types
+        the same paths at files that are already there."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
         text = _clean_input_text(text)
+        # What the operator actually typed, kept aside before the attachment
+        # header is folded in: it is what names an unnamed session below, and a
+        # name built out of upload paths would say nothing about the task.
+        typed = text
+        if uploads:
+            paths, failed = self._store_uploads(sess, uploads)
+            # Nothing landed and nothing was typed: there is no message to send,
+            # and a bare "an attachment failed" turn would just confuse the
+            # session. The failure is in the log where the operator can see it.
+            if not paths and not failed and not text.strip():
+                return
+            text = _clean_input_text(attachment_message(paths, failed, text))
         if not text.strip():
             return
         if len(text) > INPUT_MAX_CHARS:
@@ -9222,9 +9444,9 @@ class SessionManager:
         # _seed_summaries, and later attempts belong there, where the transcript
         # still names the session from its first prompt rather than from whatever
         # turn happens to be typed when a retry comes due.
-        if (not sess.get("summary") and _summary_attempts(sess) == 0
-                and sid not in self.summaries):
-            self._start_summary(sess, text)
+        if (typed.strip() and not sess.get("summary")
+                and _summary_attempts(sess) == 0 and sid not in self.summaries):
+            self._start_summary(sess, typed)
         _type_into_pane(sess["tmuxName"], text)
         # Record it on the session's outbox so _poll_pending_inputs can confirm it
         # landed and re-send it if a compaction drops it (XERK-47). `attempts:1`
@@ -11455,7 +11677,8 @@ class SessionManager:
                 elif ctype == "delete":
                     self.delete(cmd.get("sessionId"))
                 elif ctype == "input":
-                    self.send_input(cmd.get("sessionId"), cmd.get("text") or "")
+                    self.send_input(cmd.get("sessionId"), cmd.get("text") or "",
+                                    uploads=cmd.get("uploads"))
                 elif ctype == "interrupt":
                     self.interrupt(cmd.get("sessionId"))
                 elif ctype == "setSummary":
@@ -11878,6 +12101,11 @@ class SessionManager:
             self.resumable = self._resumable_report()
         except Exception as e:
             log(f"resumable scan failed: {e}")
+        # Attachments of long-gone sessions, on the same slow cadence (XERK-234).
+        try:
+            self._sweep_uploads()
+        except Exception as e:
+            log(f"uploads sweep failed: {e}")
 
     def _session_git(self, sess, refresh):
         """(git-info dict | None, branch-sync work dict) for a session's payload.
@@ -12353,6 +12581,13 @@ class SessionManager:
             # operator believes they sent whole. Rises on its own as hosts
             # update, with no hub-side version table to keep in step.
             "inputMaxChars": INPUT_MAX_CHARS,
+            # The largest file this agent will take as a message attachment
+            # (XERK-234). Doubles as the capability flag, exactly like
+            # inputMaxChars above: an agent predating attachments reports nothing
+            # and would drop the `uploads` on an input command without a word, so
+            # the hub refuses the upload and the composers hide their 📎 rather
+            # than let the operator attach into a void.
+            "uploadMaxBytes": UPLOAD_MAX_BYTES,
             # Session ceiling + what's against it, so the hub can rank hosts by
             # free slots (ticket routing) and show a queued session's wait. Cheap
             # enough to send every beat, and it has to be: capacity is the fact

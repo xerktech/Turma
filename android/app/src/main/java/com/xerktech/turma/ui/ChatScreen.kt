@@ -30,6 +30,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.CheckBox
 import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Terminal
@@ -74,7 +76,10 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.AttachStatus
+import com.xerktech.turma.core.Attachment
 import com.xerktech.turma.core.ChatItem
+import com.xerktech.turma.core.Uploads
 import com.xerktech.turma.core.TextSize
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.buildItems
@@ -217,6 +222,8 @@ fun ChatScreen(
                     session = state.session,
                     draft = state.draft,
                     mic = state.mic,
+                    attachments = state.attachments,
+                    canAttach = state.canAttach,
                     // Working right now: prefer the live turn frames (fast), fall back
                     // to the heartbeat's paneBusy. Drives the separate ◼ Stop button —
                     // suppressed while a question is pending (the draft answers it).
@@ -229,6 +236,8 @@ fun ChatScreen(
                     onMicStop = vm::stopDictation,
                     onModel = vm::setModel,
                     onMode = vm::setMode,
+                    onAttach = vm::attach,
+                    onRemoveAttachment = vm::removeAttachment,
                 )
             }
         },
@@ -500,6 +509,8 @@ private fun ChatFooter(
     draft: String,
     mic: MicState,
     busy: Boolean,
+    attachments: List<Attachment>,
+    canAttach: Boolean,
     onDraft: (String) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
@@ -507,11 +518,18 @@ private fun ChatFooter(
     onMicStop: () -> Unit,
     onModel: (String) -> Unit,
     onMode: (String) -> Unit,
+    onAttach: (List<android.net.Uri>) -> Unit,
+    onRemoveAttachment: (String) -> Unit,
 ) {
     val context = LocalContext.current
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) onMicStart()
     }
+    // Any type: the ticket asks for images AND documents, and the agent writes
+    // whatever arrives to disk for the session to read (XERK-234).
+    val filePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> onAttach(uris) }
     Column(Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         // Model / mode / PR sit ABOVE the input box. Every PR the session opened
         // shows (newest first — the freshest link leads), matching the web footer
@@ -521,6 +539,13 @@ private fun ChatFooter(
             MenuChip("mode: ${session?.permissionMode?.ifBlank { "auto" } ?: "auto"}", listOf("auto", "acceptEdits", "plan", "bypassPermissions", "default"), onMode)
             session?.prs?.asReversed()?.forEach { PrBadge(it) }
         }
+        // Files staged for the next message, above the box so adding one doesn't
+        // shove the text field around (web: the .compose-attach strip).
+        if (attachments.isNotEmpty()) {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                attachments.forEach { a -> AttachmentChip(a, onRemoveAttachment) }
+            }
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = draft, onValueChange = onDraft,
@@ -529,6 +554,13 @@ private fun ChatFooter(
                 modifier = Modifier.weight(1f),
                 maxLines = 4,
             )
+            // Hidden entirely on a host whose agent can't take files, rather
+            // than shown-and-failing (see ChatUiState.canAttach).
+            if (canAttach) {
+                IconButton(onClick = { filePicker.launch(arrayOf("*/*")) }) {
+                    Icon(Icons.Filled.AttachFile, "Attach a file")
+                }
+            }
             IconButton(onClick = {
                 when (mic) {
                     MicState.IDLE -> {
@@ -556,9 +588,51 @@ private fun ChatFooter(
                     Icon(Icons.Filled.Stop, "Stop turn", tint = com.xerktech.turma.ui.theme.TurmaColors.waiting)
                 }
             }
-            IconButton(onClick = onSend, enabled = draft.isNotBlank()) {
+            // A message can be attachments alone, so Send lights up for either.
+            IconButton(onClick = onSend, enabled = draft.isNotBlank() || attachments.isNotEmpty()) {
                 Icon(Icons.AutoMirrored.Filled.Send, if (busy) "Send (queues mid-turn)" else "Send")
             }
+        }
+    }
+}
+
+/**
+ * One staged file: name, then its size — or "uploading…" while it is on its way
+ * up, or why it failed. ✕ removes it. Port of the web chip (`attachmentsHtml`).
+ */
+@Composable
+private fun AttachmentChip(a: Attachment, onRemove: (String) -> Unit) {
+    val failed = a.status == AttachStatus.ERROR
+    val border = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outlineVariant
+    Row(
+        Modifier.clip(RoundedCornerShape(999.dp))
+            .border(1.dp, border, RoundedCornerShape(999.dp))
+            .padding(start = 10.dp, end = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            a.name,
+            Modifier.widthIn(max = 160.dp),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+        )
+        Text(
+            when (a.status) {
+                AttachStatus.UPLOADING -> "uploading…"
+                AttachStatus.ERROR -> a.error.ifBlank { "failed" }
+                AttachStatus.READY -> Uploads.formatBytes(a.size)
+            },
+            Modifier.widthIn(max = 140.dp),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        IconButton(onClick = { onRemove(a.key) }, modifier = Modifier.size(28.dp)) {
+            Icon(Icons.Filled.Close, "Remove ${a.name}", Modifier.size(16.dp))
         }
     }
 }

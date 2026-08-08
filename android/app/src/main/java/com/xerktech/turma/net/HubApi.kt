@@ -70,6 +70,21 @@ interface HubApi {
         @Body body: InputRequest,
     ): OkResponse
 
+    /**
+     * Stage a file the operator attached in the composer (XERK-234). The body is
+     * the raw bytes — no multipart, matching the web composer, which posts the
+     * File object straight through. The reply's uploadId is what the following
+     * [sendInput] carries; nothing reaches the session until that message is
+     * sent, so an attachment the operator removes simply expires hub-side.
+     */
+    @POST("api/agents/{host}/sessions/{id}/uploads")
+    suspend fun uploadAttachment(
+        @Path("host") host: String,
+        @Path("id") id: String,
+        @Query("name") name: String,
+        @Body body: okhttp3.RequestBody,
+    ): UploadResponse
+
     @POST("api/agents/{host}/sessions/{id}/model")
     suspend fun setModel(
         @Path("host") host: String,
@@ -310,7 +325,21 @@ data class SpawnRequest(
 )
 
 @Serializable
-data class InputRequest(val text: String)
+data class InputRequest(
+    val text: String,
+    // Ids of files staged by [HubApi.uploadAttachment] (XERK-234). Omitted when
+    // empty so an ordinary message is the exact body it always was.
+    val uploadIds: List<String>? = null,
+)
+
+/** Reply to [HubApi.uploadAttachment]: the staged id plus the sanitized name. */
+@Serializable
+data class UploadResponse(
+    val ok: Boolean = false,
+    val uploadId: String = "",
+    val name: String = "",
+    val size: Long = 0,
+)
 
 @Serializable
 data class ModelRequest(val model: String)

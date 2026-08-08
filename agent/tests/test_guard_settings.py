@@ -118,14 +118,31 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         self.assertEqual(deny[:n], list(ha._GUARD_DENY_PATH_RULES))
         self.assertIn("Bash(foo)", deny)
 
+    def test_guard_allow_precedes_and_survives(self):
+        # Same shape as the deny rules: an operator can ADD allow rules, but the
+        # app's own uploads Read is always there and always first (XERK-234).
+        path = self._write({"permissions": {"allow": ["Bash(ping *)"]}})
+        allow = ha.build_guard_settings(local_settings_path=path)["permissions"]["allow"]
+        n = len(ha._GUARD_ALLOW_PATH_RULES)
+        self.assertEqual(allow[:n], list(ha._GUARD_ALLOW_PATH_RULES))
+        self.assertIn("Bash(ping *)", allow)
+
+    def test_operator_allow_duplicate_is_not_repeated(self):
+        path = self._write({"permissions": {"allow": ["Read(~/.turma/uploads/**)"]}})
+        allow = ha.build_guard_settings(local_settings_path=path)["permissions"]["allow"]
+        self.assertEqual(allow.count("Read(~/.turma/uploads/**)"), 1)
+
     def test_operator_deny_duplicate_is_not_repeated(self):
         path = self._write({"permissions": {"deny": ["Edit(~/.claude/**)"]}})
         deny = ha.build_guard_settings(local_settings_path=path)["permissions"]["deny"]
         self.assertEqual(deny.count("Edit(~/.claude/**)"), 1)
 
     def test_missing_file_is_noop(self):
+        # No operator file: the settings carry exactly the app's own rules —
+        # every guard deny, plus the uploads Read the app grants itself so an
+        # attached file never costs a permission prompt (XERK-234).
         s = ha.build_guard_settings(local_settings_path="/no/such/file.json")
-        self.assertNotIn("allow", s["permissions"])
+        self.assertEqual(s["permissions"]["allow"], list(ha._GUARD_ALLOW_PATH_RULES))
         self.assertEqual(s["permissions"]["deny"], list(ha._GUARD_DENY_PATH_RULES))
 
     def test_malformed_file_fails_open(self):

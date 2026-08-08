@@ -118,6 +118,11 @@ data class AgentInfo(
     // hosts for the dashboard's session-count tile (XERK-72). Null on a
     // pre-capacity agent.
     val capacity: Capacity? = null,
+    // Largest file this host will take as a message attachment, and the
+    // capability flag for the feature (XERK-234): 0 on an agent predating it,
+    // which is what hides the composer's 📎 rather than letting the operator
+    // attach into a void. See the hub's uploadCapFor.
+    val uploadMaxBytes: Long = 0,
 )
 
 /** A host's session ceiling and live counts (hub-agent `_capacity_payload`). */
