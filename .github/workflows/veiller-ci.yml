@@ -1,7 +1,11 @@
 name: veiller-ci
 
 # Typecheck + test + build gate for the Veiller miniapp on PRs to main.
-# Path-filtered to veiller/** so it only runs when that package changes.
+# Path-filtered to veiller/** — PLUS the two turma/public engines it vendors
+# verbatim. vendor.test asserts those copies stay byte-identical to their source
+# of truth, so a filter that omitted the source meant the one test guarding them
+# could never run on the PR that broke it. That is exactly how three vendored
+# copies drifted unnoticed (XERK-235); keep both sides of the pair in the filter.
 #
 # Bun is this component's toolchain — install, test runner, AND bundler
 # (build.ts calls Bun.build) — the first bun use in the repo, so setup-bun pins
@@ -11,6 +15,8 @@ on:
     branches: [main]
     paths:
       - "veiller/**"
+      - "turma/public/chat.js"
+      - "turma/public/board.js"
       - ".github/workflows/veiller-ci.yml"
 
 concurrency:

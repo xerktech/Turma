@@ -1,7 +1,11 @@
 name: glasses-ci
 
 # Typecheck + test + build gate for the glasses client on PRs to main.
-# Path-filtered to glasses/** so it only runs when that package changes.
+# Path-filtered to glasses/** — PLUS the two turma/public engines it vendors
+# verbatim. vendor.test asserts those copies stay byte-identical to their source
+# of truth, so a filter that omitted the source meant the one test guarding them
+# could never run on the PR that broke it. That is exactly how chat.cjs drifted
+# and landed on main red (XERK-235); keep both sides of the pair in the filter.
 #
 # Runs on GitHub-hosted `ubuntu-latest`: this is a plain npm install/typecheck/
 # test/build with no docker cache to keep warm and nothing big on disk, so
@@ -17,6 +21,8 @@ on:
     branches: [main]
     paths:
       - "glasses/**"
+      - "turma/public/chat.js"
+      - "turma/public/board.js"
       - ".github/workflows/glasses-ci.yml"
 
 concurrency:
