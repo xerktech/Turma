@@ -146,6 +146,160 @@ ATTRIB_OK = [
 ]
 
 
+# --- XERK-235: bypasses a QA pass proved against the shipped guard --------
+#
+# Each of these was ALLOWED and, for the git ones, demonstrated with a real
+# push against a real remote. They are the regression net for the segmentation
+# rewrite: the guard only ever saw the OUTERMOST command, so any wrapper,
+# subshell, substitution or git global option walked straight past it.
+
+BYPASS_DESTRUCTIVE = [
+    # `-f` only suppresses prompts, and Bash here is non-interactive, so `-r`
+    # alone deletes just as silently.
+    "rm -r --no-preserve-root /",
+    "rm -r /etc",
+    "rm -r /home",
+    "rm -r ~",
+    "rm --recursive /etc",
+    "rm -r /root/.ssh",
+    # A wrapper's own options must not stop the strip.
+    "sudo -u root rm -rf /etc",
+    "env -i rm -rf /etc",
+    "timeout 5 rm -rf /etc",
+    "nice -n 5 rm -rf /etc",
+    "setsid rm -rf /etc",
+    # An interpreter's -c string is a command line of its own.
+    "bash -c 'rm -rf /etc'",
+    'sh -c "rm -rf /etc"',
+    "eval 'rm -rf /etc'",
+    # Subshells and groups.
+    "(rm -rf /etc)",
+    "{ rm -rf /etc; }",
+    # Command substitution runs its contents.
+    "echo $(rm -rf /etc)",
+    # A single `&` separates commands exactly like `;`.
+    "sleep 0 & rm -rf /etc",
+    # Loop/conditional bodies leave `do`/`then` as the leading token.
+    "for i in 1; do rm -rf /etc; done",
+    "if true; then rm -rf /etc; fi",
+    # find does the deleting itself, or hands the roots to -exec.
+    "find /etc -delete",
+    "find / -name x -exec rm -rf {} +",
+    # xargs takes its operands from the pipe, not its argv.
+    "echo /etc | xargs rm -rf",
+]
+
+# Global options sit BEFORE the subcommand, so reading tokens[1] as the
+# subcommand dropped the whole git policy. `git -C <path> push` is ordinary
+# usage from outside a worktree, not an evasion technique.
+BYPASS_POLICY = [
+    "git -C /repo push origin main",
+    "git -c user.name=x push origin main",
+    "git --git-dir=.git push origin main",
+    "git -C /repo -c a=b push origin master",
+    # `+` is git's force marker: this rewrites remote history.
+    "git push origin +main",
+    "git push origin +HEAD:main",
+    "git push origin +master",
+]
+
+BYPASS_DESTRUCTIVE_GIT = ["git -C . branch -D main"]
+
+# The SQL rule matched the raw string, so quoting `DROP TABLE` as data got you
+# refused for a reason that did not apply — with no override available.
+SQL_AS_TEXT_OK = [
+    "grep -rn 'DROP TABLE' migrations/",
+    "cat schema.sql | grep -i 'drop database'",
+    "git commit -m 'drop table column from the schema doc'",
+    "echo 'DROP TABLE x' > /dev/null",
+]
+
+
+class TestKnownBypasses(unittest.TestCase):
+    """Every case here shipped as ALLOWED and is now denied."""
+
+    def test_destructive_bypasses_are_denied(self):
+        for cmd in BYPASS_DESTRUCTIVE:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_git_history_bypasses_are_denied(self):
+        for cmd in BYPASS_DESTRUCTIVE_GIT:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_policy_bypasses_are_denied(self):
+        for cmd in BYPASS_POLICY:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.policy_reason(cmd))
+
+    def test_sql_quoted_as_text_still_allowed(self):
+        """The fix must not trade a bypass for a false positive."""
+        for cmd in SQL_AS_TEXT_OK:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_real_sql_destruction_still_denied(self):
+        for cmd in ("psql -c 'DROP DATABASE prod'", "dropdb prod",
+                    "mysql -e 'drop table users'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_wrapped_ordinary_work_still_allowed(self):
+        """Unwrapping must not make routine commands look destructive."""
+        for cmd in ("bash -c 'npm run build'", "timeout 30 pytest",
+                    "sudo -u root systemctl status nginx",
+                    "find . -name '*.pyc' -delete",
+                    "find . -name '*.tmp' -exec rm -f {} +",
+                    "rm -r build/", "rm -rf node_modules",
+                    "git -C /repo push origin my-feature",
+                    "echo ./dist | xargs rm -rf"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+                self.assertIsNone(guard.policy_reason(cmd))
+
+    def test_heredoc_body_is_data_not_commands(self):
+        """Prose in a heredoc must not be classified line by line.
+
+        Newline is a segment separator, so every line of a `git commit -m
+        "$(cat <<EOF ...)"` body was read as its own command — documenting a
+        `DROP TABLE` or an `rm -rf` in a commit message got you refused. Found
+        by this very commit being blocked (XERK-235).
+        """
+        drop_table = "DROP" + " TABLE"
+        doc = (
+            "git commit -q -m \"$(cat <<'EOF'\n"
+            f"- the SQL rule matched the raw string, so `grep -rn '{drop_table}' m/`\n"
+            "  was refused; `rm -rf /etc` in prose was too.\n"
+            "EOF\n)\""
+        )
+        self.assertIsNone(guard.is_destructive(doc))
+        self.assertIsNone(guard.policy_reason(doc))
+        self.assertIsNone(
+            guard.is_destructive(f"cat <<EOF > notes.md\n{drop_table} users\nEOF")
+        )
+
+    def test_heredoc_fed_to_a_shell_is_still_commands(self):
+        """Stripping heredoc bodies must not become a bypass of its own."""
+        for cmd in ("bash <<EOF\nrm -rf /etc\nEOF",
+                    "sh <<'EOF'\nrm -rf /etc\nEOF",
+                    "bash <<-EOF\ngit push origin main\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(
+                    guard.is_destructive(cmd) or guard.policy_reason(cmd)
+                )
+
+    def test_heredoc_fed_to_a_db_client_is_still_executed(self):
+        drop_db = "DROP" + " DATABASE"
+        self.assertIsNotNone(
+            guard.is_destructive(f"psql mydb <<EOF\n{drop_db} prod;\nEOF")
+        )
+
+    def test_help_on_a_disk_tool_is_not_a_format(self):
+        self.assertIsNone(guard.is_destructive("shred --help"))
+        self.assertIsNotNone(guard.is_destructive("shred /dev/sda"))
+
+
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):
         for cmd in DESTRUCTIVE:

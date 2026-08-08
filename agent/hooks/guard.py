@@ -57,19 +57,98 @@ import sys
 # --- command segmentation ------------------------------------------------
 
 # Shell operators that chain separate commands. We inspect each segment so a
-# destructive command hidden after `&&`/`;`/`|`/newline is still caught.
-_SEGMENT_SPLIT = re.compile(r"&&|\|\||[;\n|]")
+# destructive command hidden after `&&`/`;`/`|`/`&`/newline is still caught.
+# A single `&` backgrounds the command before it — it separates two commands
+# exactly like `;` does, so leaving it out let `sleep 0 & rm -rf /etc` past.
+_SEGMENT_SPLIT = re.compile(r"&&|\|\||[;\n|&]")
 
 # A leading `FOO=bar` environment assignment on a command.
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*$")
 
 # Privilege-escalation prefixes we strip before classifying the real command
 # (a destructive command is destructive with or without `sudo`).
-_PREFIX_WORDS = {"sudo", "doas", "runas", "command", "nohup", "time", "exec", "env"}
+_PREFIX_WORDS = {
+    "sudo", "doas", "runas", "command", "nohup", "time", "exec", "env",
+    "timeout", "nice", "ionice", "setsid", "stdbuf", "chrt", "unbuffer",
+}
+
+# Options of those wrappers that consume the NEXT token as their value, so
+# `sudo -u root rm -rf /` strips down to `rm -rf /` rather than stopping at
+# `-u` and classifying nothing. Scoped per wrapper: `env -i` takes no value,
+# and treating it as if it did swallowed the `rm` that followed.
+_PREFIX_OPTS_WITH_VALUE = {
+    "sudo": {"-u", "-g", "-p", "-C", "-h", "-R", "-U", "-r", "-t"},
+    "doas": {"-u", "-C"},
+    "env": {"-u", "--unset", "-C", "--chdir"},
+    "timeout": {"-s", "--signal", "-k", "--kill-after"},
+    "nice": {"-n", "--adjustment"},
+    "ionice": {"-c", "-n", "-p"},
+    "chrt": {"-p"},
+    "stdbuf": {"-i", "-o", "-e"},
+    "setsid": set(),
+}
+
+# Shell keywords that can lead a segment once `for`/`if`/`while` bodies are
+# split on `;` — without these, `do`/`then` becomes the classified program.
+_SHELL_KEYWORDS = {
+    "do", "done", "then", "else", "elif", "fi", "in", "esac", "!",
+    "{", "}", "(", ")",
+}
+
+# Interpreters whose `-c <string>` argument is a whole command line of its own.
+_SHELL_PROGS = {"bash", "sh", "zsh", "ksh", "dash", "ash", "busybox"}
+
+# Command substitutions and backticks run their contents as a command.
+_SUBST_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+
+# How deep the expansion recurses before giving up (a guard against a
+# pathological nest, not a security boundary).
+_MAX_EXPAND_DEPTH = 6
+
+
+# `cmd <<EOF` / `<<-'EOF'` — everything up to the delimiter line is DATA fed to
+# `cmd`, not commands. Newline is a segment separator, so without this every
+# line of a heredoc body gets classified as a command of its own: a commit
+# message documenting `DROP TABLE`, or any prose containing `rm -rf`, was
+# refused. The body is still checked, but attributed to the command it feeds.
+_HEREDOC_START = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
+    """Split `command` into (commands-only text, [(owner line, body), ...])."""
+    kept: list[str] = []
+    bodies: list[tuple[str, str]] = []
+    lines = command.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        kept.append(line)
+        m = _HEREDOC_START.search(line)
+        i += 1
+        if not m:
+            continue
+        delim = m.group(2)
+        body: list[str] = []
+        while i < len(lines) and lines[i].strip() != delim:
+            body.append(lines[i])
+            i += 1
+        i += 1  # the delimiter line itself
+        bodies.append((line, "\n".join(body)))
+    return "\n".join(kept), bodies
 
 
 def _split_segments(command: str) -> list[str]:
     return [seg.strip() for seg in _SEGMENT_SPLIT.split(command) if seg.strip()]
+
+
+def _unwrap_group(segment: str) -> str:
+    """Strip subshell/group wrappers so `(rm -rf /)` classifies as `rm -rf /`."""
+    seg = segment.strip()
+    while len(seg) >= 2 and (
+        (seg[0] == "(" and seg[-1] == ")") or (seg[0] == "{" and seg[-1] == "}")
+    ):
+        seg = seg[1:-1].strip().rstrip(";").strip()
+    return seg
 
 
 def _tokenize(segment: str) -> list[str]:
@@ -81,12 +160,30 @@ def _tokenize(segment: str) -> list[str]:
 
 
 def _strip_prefixes(tokens: list[str]) -> list[str]:
-    """Drop leading env-assignments and wrapper words (sudo/env/...)."""
+    """Drop leading env-assignments, shell keywords and wrapper words.
+
+    A wrapper's own options are dropped too: stopping at the first `-` token
+    meant `sudo -u root rm -rf /` and `env -i rm -rf /` classified as nothing
+    at all, which is the opposite of failing safe.
+    """
     out = list(tokens)
     while out:
         head = out[0]
-        if _ENV_ASSIGN.match(head) or head in _PREFIX_WORDS:
+        if _ENV_ASSIGN.match(head) or head in _SHELL_KEYWORDS:
             out.pop(0)
+            continue
+        if _basename(head) in _PREFIX_WORDS:
+            wrapper = _basename(head)
+            out.pop(0)
+            # The wrapper's own flags, plus any value they consume.
+            takes_value = _PREFIX_OPTS_WITH_VALUE.get(wrapper, set())
+            while out and out[0].startswith("-") and len(out[0]) > 1:
+                opt = out.pop(0)
+                if "=" not in opt and opt in takes_value and out:
+                    out.pop(0)
+            # `timeout 5s cmd` / `nice 10 cmd`: a bare duration/priority operand.
+            if wrapper in ("timeout", "nice") and out and re.match(r"^[0-9]", out[0]):
+                out.pop(0)
             continue
         break
     return out
@@ -94,6 +191,98 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
 
 def _basename(prog: str) -> str:
     return re.split(r"[\\/]", prog)[-1].lower()
+
+
+def _find_roots(tokens: list[str]) -> list[str]:
+    """The paths a `find` invocation walks (its operands before any predicate)."""
+    roots = []
+    for tok in tokens[1:]:
+        if tok.startswith("-") or tok in ("(", ")", "!"):
+            break
+        roots.append(tok)
+    return roots
+
+
+def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]]:
+    """Every command ``command`` would actually run, as (tokens, segment) pairs.
+
+    Splitting on shell operators alone only ever saw the OUTERMOST command, so
+    `bash -c 'rm -rf /etc'`, `(rm -rf /etc)`, `$(rm -rf /etc)`, `eval '...'`,
+    `xargs rm -rf` and `find / -exec rm -rf {} +` each classified as something
+    harmless and sailed past every destructive check. Each of those forms is
+    unwrapped here and its inner command classified on its own terms.
+    """
+    out: list[tuple[list[str], str]] = []
+    if depth > _MAX_EXPAND_DEPTH:
+        return out
+    command, heredocs = _split_heredocs(command)
+    # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF` runs
+    # every line of it. Expand those bodies as commands; bodies fed to anything
+    # else stay data (see _destructive_database for the psql case).
+    for owner, body in heredocs:
+        owner_tokens = _strip_prefixes(_tokenize(_SUBST_RE.sub(" ", owner)))
+        if owner_tokens and _basename(owner_tokens[0]) in (_SHELL_PROGS | {"eval", "source", "."}):
+            out.extend(_expand_segments(body, depth + 1))
+    segments = _split_segments(command)
+    # `xargs` takes its operands from the PIPE, not its own argv, so
+    # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
+    # Collect every path-shaped operand in the command so an xargs segment can
+    # be judged against what is actually going to be fed to it.
+    piped_operands: list[str] = []
+    for raw in segments:
+        for tok in _tokenize(raw):
+            if not tok.startswith("-") and ("/" in tok or tok in ("~", ".", "..")):
+                piped_operands.append(tok)
+    for raw in segments:
+        # Anything a substitution would run, wherever it sits in the segment.
+        for m in _SUBST_RE.finditer(raw):
+            inner = m.group(1) or m.group(2) or ""
+            if inner.strip():
+                out.extend(_expand_segments(inner, depth + 1))
+        seg = _unwrap_group(_SUBST_RE.sub(" ", raw))
+        if seg != raw.strip() and seg:
+            # A group/substitution-stripped body can itself hold operators.
+            if _SEGMENT_SPLIT.search(seg):
+                out.extend(_expand_segments(seg, depth + 1))
+                continue
+        tokens = _strip_prefixes(_tokenize(seg))
+        if not tokens:
+            continue
+        out.append((tokens, seg))
+        prog = _basename(tokens[0])
+        rest = tokens[1:]
+        if prog in _SHELL_PROGS and "-c" in rest:
+            i = rest.index("-c")
+            if i + 1 < len(rest):
+                out.extend(_expand_segments(rest[i + 1], depth + 1))
+        elif prog == "eval" and rest:
+            out.extend(_expand_segments(" ".join(rest), depth + 1))
+        elif prog == "xargs" and rest:
+            # Drop xargs' own leading options, keep the command and ITS flags,
+            # then append what the pipeline will feed it as operands.
+            inner = list(rest)
+            while inner and inner[0].startswith("-"):
+                inner.pop(0)
+            if inner:
+                out.append((_strip_prefixes(inner + piped_operands), seg))
+        elif prog == "find":
+            roots = _find_roots(tokens) or ["."]
+            if "-delete" in rest:
+                # Equivalent to a recursive delete of everything it walks.
+                out.append((["rm", "-r", *roots], seg))
+            for flag in ("-exec", "-execdir", "-ok"):
+                while flag in rest:
+                    i = rest.index(flag)
+                    run = []
+                    for tok in rest[i + 1:]:
+                        if tok in (";", "+", "\\;"):
+                            break
+                        # `{}` stands for each path found — i.e. the roots.
+                        run.extend(roots if tok == "{}" else [tok])
+                    if run:
+                        out.append((_strip_prefixes(run), seg))
+                    rest = rest[i + 1:]
+    return out
 
 
 # --- dangerous-path detection (for rm / chmod / chown) -------------------
@@ -160,10 +349,14 @@ def _is_dangerous_path(tok: str) -> bool:
     return False
 
 
-def _rm_is_recursive_force(flags: str) -> bool:
-    has_r = "r" in flags
-    has_f = "f" in flags
-    return has_r and has_f
+def _rm_is_recursive(flags: str) -> bool:
+    """`-r` alone already deletes a tree.
+
+    This used to require `-f` as well. `-f` only suppresses prompts, and Claude
+    Code runs Bash non-interactively where there is no prompt to answer, so
+    `rm -r /etc` deleted just as silently as `rm -rf /etc` while being allowed.
+    """
+    return "r" in flags
 
 
 def _destructive_rm(tokens: list[str]) -> str | None:
@@ -182,7 +375,7 @@ def _destructive_rm(tokens: list[str]) -> str | None:
             flags += tok[1:].lower()
             continue
         targets.append(tok)
-    if prog == "rm" and not _rm_is_recursive_force(flags):
+    if prog == "rm" and not _rm_is_recursive(flags):
         return None
     for tgt in targets:
         if _is_dangerous_path(tgt):
@@ -229,6 +422,10 @@ _PS_POWER = {"stop-computer", "restart-computer", "clear-disk", "format-volume"}
 def _destructive_disk_power(tokens: list[str], segment: str) -> str | None:
     prog = _basename(tokens[0])
     if prog in _DISK_PROGS:
+        # A pure help/version query destroys nothing, and refusing `shred --help`
+        # blocks the agent from reading a man page it may have been sent to.
+        if all(t in ("--help", "-h", "--version", "-V") for t in tokens[1:]) and len(tokens) > 1:
+            return None
         # `format` is also a benign git/printf word in some contexts, but as
         # argv[0] it is the Windows disk formatter / mkfs family.
         return f"refusing disk-format/partition command ({prog})"
@@ -261,11 +458,44 @@ def _destructive_forkbomb(segment: str) -> str | None:
 
 _PROTECTED_BRANCHES = ("main", "master")
 
+# git's own options, which sit BEFORE the subcommand. `-C`, `-c`, `--git-dir`
+# and friends each take a value; the rest are bare flags.
+_GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                          "--exec-path", "--super-prefix", "--config-env"}
+_GIT_GLOBAL_FLAGS = {"-p", "--paginate", "-P", "--no-pager", "--bare", "--no-replace-objects",
+                     "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs",
+                     "--icase-pathspecs", "--no-optional-locks", "--html-path",
+                     "--man-path", "--info-path"}
+
+
+def _git_args(tokens: list[str]) -> list[str]:
+    """`tokens` after `git` and its GLOBAL options, so args[0] is the subcommand.
+
+    Both the destructive check and the push policy used to read `tokens[1]`
+    directly, so any global option shifted the subcommand out of view and the
+    whole git policy fell away — `git -C /repo push origin main` was allowed,
+    and that is the ordinary way to push from outside a worktree, not an
+    evasion technique.
+    """
+    args = list(tokens[1:])
+    while args:
+        head = args[0]
+        if head in _GIT_GLOBAL_WITH_VALUE:
+            args = args[2:] if len(args) > 1 else []
+            continue
+        if head in _GIT_GLOBAL_FLAGS or any(
+            head.startswith(o + "=") for o in _GIT_GLOBAL_WITH_VALUE
+        ):
+            args.pop(0)
+            continue
+        break
+    return args
+
 
 def _destructive_git(tokens: list[str], segment: str) -> str | None:
     if _basename(tokens[0]) != "git":
         return None
-    args = list(tokens[1:])
+    args = _git_args(tokens)
     if not args:
         return None
     sub = args[0]
@@ -336,8 +566,17 @@ _ATTRIB_CONTEXT = re.compile(
 
 def _is_protected_ref(tok: str) -> bool:
     """True if a push refspec token targets main/master (`main`, `HEAD:main`,
-    `:main` delete, `origin/main`). The remote name (`origin`) is not a ref."""
-    return any(part and part.split("/")[-1] in _PROTECTED_BRANCHES for part in tok.split(":"))
+    `:main` delete, `origin/main`, `+main`). The remote name (`origin`) is not
+    a ref.
+
+    The leading `+` is git's force marker, so `git push origin +main` rewrites
+    remote history — strictly worse than the plain spelling this already
+    caught, and it slipped through while `+main != main`.
+    """
+    return any(
+        part and part.lstrip("+").split("/")[-1] in _PROTECTED_BRANCHES
+        for part in tok.split(":")
+    )
 
 
 def _azdo_completes_pr(tokens: list[str]) -> bool:
@@ -371,12 +610,11 @@ def policy_reason(command: str) -> str | None:
     not push to / delete `main`/`master` directly, and it may not merge any
     pull request — that is a human reviewer's call.
     """
-    for segment in _split_segments(command):
-        tokens = _strip_prefixes(_tokenize(segment))
-        if not tokens:
-            continue
+    for tokens, _segment in _expand_segments(command):
         prog = _basename(tokens[0])
         rest = tokens[1:]
+        if prog == "git":
+            rest = _git_args(tokens)
         if prog in ("gh", "hub") and "pr" in rest and "merge" in rest:
             return (
                 "you must not merge pull requests — open the PR and leave "
@@ -429,9 +667,33 @@ _DB_DESTRUCTION = re.compile(
 )
 
 
+# Programs that only ever READ or QUOTE text. `DROP TABLE` inside their
+# arguments is a search string or a commit message, not a statement anything
+# will execute — matching the raw command string meant `grep -rn 'DROP TABLE'
+# migrations/` and `git commit -m 'drop table x from the doc'` were refused,
+# with a reason that did not apply and no way to override.
+_TEXT_PROGS = {
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "cat", "bat", "echo", "printf",
+    "less", "more", "head", "tail", "awk", "sed", "tee", "git", "diff", "comm",
+    "sort", "uniq", "wc", "strings", "jq", "yq", "find", "ls", "man",
+}
+
+
 def _destructive_database(command: str) -> str | None:
-    if _DB_DESTRUCTION.search(command):
+    for tokens, segment in _expand_segments(command):
+        if not _DB_DESTRUCTION.search(segment):
+            continue
+        if _basename(tokens[0]) in _TEXT_PROGS:
+            continue
         return "refusing database/schema destruction (DROP DATABASE/TABLE)"
+    # A heredoc body is data, but `psql <<EOF ... DROP DATABASE x; ... EOF` is
+    # still the statement being executed — judge it by the command it feeds.
+    for owner, body in _split_heredocs(command)[1]:
+        if not _DB_DESTRUCTION.search(body):
+            continue
+        for tokens, _seg in _expand_segments(owner):
+            if _basename(tokens[0]) not in _TEXT_PROGS:
+                return "refusing database/schema destruction (DROP DATABASE/TABLE)"
     return None
 
 
@@ -444,10 +706,7 @@ def is_destructive(command: str) -> str | None:
     reason = _destructive_database(command)
     if reason:
         return reason
-    for segment in _split_segments(command):
-        tokens = _strip_prefixes(_tokenize(segment))
-        if not tokens:
-            continue
+    for tokens, segment in _expand_segments(command):
         for reason in (
             _destructive_rm(tokens),
             _destructive_chmod_chown(tokens),
