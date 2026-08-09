@@ -745,6 +745,7 @@ function buildAgentsCache() {
   });
   const etag = '"' + crypto.createHash("sha1").update(body).digest("base64") + '"';
   agentsCache = { body, etag };
+  lastGoodAgentsCache = agentsCache;
   return agentsCache;
 }
 
@@ -754,13 +755,17 @@ function buildAgentsCache() {
 // glasses client, and permanently, because the records that caused it live for
 // PRUNE_AFTER_MS. Serving the last good payload (or an empty fleet) keeps the
 // UI alive and puts the reason in the log (XERK-235).
+let lastGoodAgentsCache = null;
 function safeAgentsCache() {
-  const last = agentsCache;
   try {
     return buildAgentsCache();
   } catch (e) {
     console.error(`agents payload could not be serialized: ${e.message}`);
-    if (last) return last;
+    // The route calls this as `agentsCache || safeAgentsCache()`, so the live
+    // cache is null by the time we get here — the last good payload has to be
+    // remembered separately or this branch is dead and every host vanishes from
+    // the dashboard, which is a more alarming failure than the one it replaces.
+    if (lastGoodAgentsCache) return lastGoodAgentsCache;
     const body = JSON.stringify({ now: Date.now(), agents: [], error: "payload too large" });
     return { body, etag: '"' + crypto.createHash("sha1").update(body).digest("base64") + '"' };
   }
@@ -1329,20 +1334,9 @@ const HEARTBEAT_MAX = 32 << 20; // 32 MiB
 // real task prompt; /api/trigger applies its own 10k cap on prompt alone.
 const SPAWN_FIELD_MAX = 100000;
 
-// On-demand deliveries the heartbeat carries. Each is ingested into its own
-// bounded cache on the record; the raw key must then be dropped, or the
-// `...payload` spread keeps an unbounded duplicate of it alive forever.
-const HEARTBEAT_TRANSIENT_KEYS = [
-  "historyResults",
-  "subagentHistoryResults",
-  "jiraIssueResults",
-  "ticketStatusResults",
-  "createMetaResults",
-  "createTicketResults",
-];
-
 // Top-level keys a heartbeat is known to carry — the agent's own payload plus
-// the on-demand deliveries above. Anything else is bounded by
+// the on-demand `*Results` deliveries, which the handler extracts and deletes
+// from the payload itself before the spread. Anything else is bounded by
 // HEARTBEAT_UNKNOWN_MAX (see sanitizeHeartbeat).
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
@@ -1350,7 +1344,8 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "gitSources", "github", "inputMaxChars", "jira", "logTail", "memory",
   "models", "prunes", "repoUsage", "repos", "reposRoot", "sessions",
   "startedAt", "uploadMaxBytes", "usage",
-  ...HEARTBEAT_TRANSIENT_KEYS,
+  "historyResults", "subagentHistoryResults", "jiraIssueResults",
+  "ticketStatusResults", "createMetaResults", "createTicketResults",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -3141,24 +3136,11 @@ const server = http.createServer(async (req, res) => {
         resultWaits: prev.resultWaits || {},
         unsupported: prev.unsupported || {},
       });
-      ingestHistory(next, historyResults);
-      ingestSubagentHistory(next, subagentHistoryResults);
-      ingestJiraIssues(next, jiraIssueResults);
-      ingestStatusResults(next, ticketStatusResults);
-      ingestCreateMeta(next, createMetaResults);
-      ingestCreateResults(next, createTicketResults);
-      // Every `*Results` key above has now been folded into its own BOUNDED
-      // cache, and those caches are what the routes serve. The raw copies came
-      // in through the `...payload` spread, so leaving them on the record keeps
-      // a second, UNBOUNDED copy of the largest thing a heartbeat carries — one
-      // that is re-serialized into state.json, every /api/agents response and
-      // every SSE frame, forever. A single ~5 MiB history delivery therefore
-      // became a permanent per-host tax (XERK-235).
-      for (const k of HEARTBEAT_TRANSIENT_KEYS) delete next[k];
-      // The whole-record ceiling. Refuse the beat rather than persist it: the
-      // previous record stays, so the host degrades to "stale" instead of
-      // poisoning the fleet payload for a week, and the 413 tells the agent
-      // exactly what happened.
+      // The whole-record ceiling, checked BEFORE the ingests run. The caches are
+      // aliased from `prev` (`history: prev.history || {}`), so ingesting first
+      // and then restoring `prev` restored an object the ingests had already
+      // mutated — a refused beat still poisoned the caches and its content came
+      // back out of /history with a 413 on the wire.
       const recordSize = agentRecordSize(next);
       if (recordSize > AGENT_RECORD_MAX) {
         if (prev && Object.keys(prev).length) agents[key] = prev;
@@ -3169,6 +3151,12 @@ const server = http.createServer(async (req, res) => {
         );
         return json(res, 413, { error: "agent record too large", limit: AGENT_RECORD_MAX });
       }
+      ingestHistory(next, historyResults);
+      ingestSubagentHistory(next, subagentHistoryResults);
+      ingestJiraIssues(next, jiraIssueResults);
+      ingestStatusResults(next, ticketStatusResults);
+      ingestCreateMeta(next, createMetaResults);
+      ingestCreateResults(next, createTicketResults);
       // Ordered after every ingest above: an ack settles against what this same
       // beat delivered, which is the whole basis of the gap detection.
       resolveResultWaits(prev, next, commands);
@@ -4656,7 +4644,7 @@ if (process.env.TURMA_TEST) {
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
-    HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, HEARTBEAT_TRANSIENT_KEYS,
+    HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
 
     queueCommand,
     findSession,

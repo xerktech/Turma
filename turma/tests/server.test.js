@@ -109,8 +109,8 @@ const {
   server, agents, queueCommand, findSession,
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking,
-  sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
-  HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX, HEARTBEAT_TRANSIENT_KEYS,
+  invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
+  HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
   userAuthorized, agentAuthorized, agentWsAuthorized, triggerAuthorized, fmtDur,
   credentialsMatch, issueSessionToken, sessionTokenValid,
   pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
@@ -835,21 +835,31 @@ test("agentRecordSize bounds known keys too, and ignores the stripped caches", (
   assert.ok(agentRecordSize(many) > AGENT_RECORD_MAX);
 });
 
-test("HEARTBEAT_TRANSIENT_KEYS names every on-demand delivery", () => {
-  // Each is folded into its own BOUNDED cache and must not also survive on the
-  // record, where it would be an unbounded duplicate re-serialized forever.
-  for (const k of ["historyResults", "subagentHistoryResults", "jiraIssueResults",
-                   "ticketStatusResults", "createMetaResults", "createTicketResults"]) {
-    assert.ok(HEARTBEAT_TRANSIENT_KEYS.includes(k), `${k} must be dropped after ingest`);
-  }
-});
-
 test("safeAgentsCache serves something rather than failing the fleet payload", () => {
-  // Unguarded, a RangeError here reached the route's generic catch as a 400 —
-  // to every dashboard, Android and glasses client, and permanently.
-  const cached = safeAgentsCache();
-  assert.ok(cached && typeof cached.body === "string" && cached.etag);
-  assert.doesNotThrow(() => JSON.parse(cached.body));
+  // Unguarded, a serialization failure here reached the route's generic catch
+  // as a 400 — to every dashboard, Android and glasses client, and permanently,
+  // because the records causing it live for PRUNE_AFTER_MS.
+  const good = safeAgentsCache();
+  assert.ok(good && typeof good.body === "string" && good.etag);
+  assert.doesNotThrow(() => JSON.parse(good.body));
+
+  // Now make it actually throw. A circular record is the cheap stand-in for the
+  // RangeError a >512 MiB fleet produces — same catch, same degraded path.
+  const boom = { key: "boom-host", device: "boom-host", lastSeen: Date.now() };
+  boom.self = boom;
+  agents["boom-host"] = boom;
+  try {
+    assert.throws(() => JSON.stringify(agents), "the fixture must really be unserializable");
+    const degraded = safeAgentsCache();
+    assert.ok(degraded && typeof degraded.body === "string" && degraded.etag,
+      "a serialization failure must still produce a payload");
+    assert.doesNotThrow(() => JSON.parse(degraded.body),
+      "the degraded payload must be valid JSON, not a 400");
+  } finally {
+    delete agents["boom-host"];
+  }
+  // ...and it recovers once the offending record is gone.
+  assert.doesNotThrow(() => JSON.parse(safeAgentsCache().body));
 });
 
 test("sessionWorking: a dead host's session is not still working (XERK-235)", () => {
@@ -875,6 +885,109 @@ test("sessionWorking: a dead host's session is not still working (XERK-235)", ()
     readyForReview(stranded, sessionWorking(stranded, now - 600_000, now)),
     true,
   );
+});
+
+// The bounds above are asserted through the ROUTE, not just their helpers.
+// A QA pass deleted each guard at its point of use and the suite stayed green
+// for three of five — including the whole-record bound, whose removal
+// reinstated the original 30 MiB amplification with 830/0 reported (XERK-235).
+
+test("http: /api/agents degrades instead of 400ing when the fleet cannot serialize", async () => {
+  // The failure this replaces was permanent: buildAgentsCache threw past V8's
+  // string ceiling, the route's generic catch answered 400 to every dashboard,
+  // Android and glasses client, and the records causing it live for a week.
+  const boom = { key: "boom-route", device: "boom-route", lastSeen: Date.now() };
+  boom.self = boom; // circular: the cheap stand-in for the RangeError
+  agents["boom-route"] = boom;
+  invalidateAgentsCache();
+  try {
+    const res = await request("GET", "/api/agents", { headers: userHeaders });
+    assert.equal(res.status, 200, "a serialization failure must not 400 the whole fleet");
+    assert.doesNotThrow(() => JSON.parse(res.raw));
+  } finally {
+    delete agents["boom-route"];
+    invalidateAgentsCache();
+  }
+  // ...and it recovers once the offending record is gone.
+  const after = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(after.status, 200);
+});
+
+test("http: an oversized record is refused and leaves the prior beat intact", async () => {
+  const host = "bound-host";
+  const good = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, repos: [{ name: "r1" }], sessions: [{ id: "s1", status: "running" }] },
+  });
+  assert.equal(good.status, 200);
+
+  // A KNOWN key is just as good an amplifier as an unknown one.
+  const fat = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: "A".repeat(AGENT_RECORD_MAX + 1024) },
+  });
+  assert.equal(fat.status, 413);
+  assert.equal(fat.body.limit, AGENT_RECORD_MAX);
+
+  // ...and the good record is still the one being served.
+  const a = agents[host];
+  assert.deepEqual(a.repos, [{ name: "r1" }]);
+  assert.equal(typeof a.sessions === "string", false, "the refused beat must not have landed");
+
+  // Many small unknown keys must not sum past the ceiling either: the per-key
+  // bound had no aggregate, and 400 of them added 25 MiB.
+  const many = { device: host };
+  for (let i = 0; i < 400; i++) many[`k${i}`] = "B".repeat(HEARTBEAT_UNKNOWN_MAX - 100);
+  assert.equal((await request("POST", "/api/heartbeat", { headers: agentHeaders, body: many })).status, 413);
+  assert.deepEqual(agents[host].repos, [{ name: "r1" }]);
+});
+
+test("http: a refused beat does not leak into the on-demand caches", async () => {
+  // The caches are aliased from the previous record, and the ingests used to
+  // run BEFORE the size check — so a 413 on the wire still served the refused
+  // beat's content back out of /history.
+  const host = "leak-host";
+  assert.equal((await request("POST", "/api/heartbeat", {
+    headers: agentHeaders, body: { device: host, sessions: [{ id: "leaked", status: "running" }] },
+  })).status, 200);
+
+  const refused = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device: host,
+      sessions: "A".repeat(AGENT_RECORD_MAX + 1024),
+      historyResults: [{ sessionId: "leaked", cmdId: "c1",
+                         entries: [{ uuid: "u", role: "user", text: "LEAKED-THROUGH-A-413" }] }],
+    },
+  });
+  assert.equal(refused.status, 413);
+  const hist = await request("GET", `/api/agents/${host}/sessions/leaked/history`, { headers: userHeaders });
+  assert.equal(hist.raw.includes("LEAKED-THROUGH-A-413"), false,
+    "a refused beat's history must not be served");
+});
+
+test("http: the on-demand deliveries are ingested but never persisted", async () => {
+  const host = "transient-host";
+  assert.equal((await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: {
+      device: host, sessions: [{ id: "s9", status: "running" }],
+      historyResults: [{ sessionId: "s9", cmdId: "c9",
+                         entries: [{ uuid: "u9", role: "user", text: "HISTORY-BODY" }] }],
+    },
+  })).status, 200);
+
+  // Served by its own route...
+  const hist = await request("GET", `/api/agents/${host}/sessions/s9/history`, { headers: userHeaders });
+  assert.equal(hist.raw.includes("HISTORY-BODY"), true);
+  // ...but not a second, unbounded copy on the record or in the fleet payload.
+  for (const k of ["historyResults", "subagentHistoryResults", "jiraIssueResults",
+                   "ticketStatusResults", "createMetaResults", "createTicketResults"]) {
+    assert.equal(agents[host][k], undefined, `${k} must not persist on the record`);
+  }
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(fleet.raw.includes("HISTORY-BODY"), false,
+    "the fleet payload must not carry a history delivery");
 });
 
 test("readyForReview: the qualifiers, and the one thing that un-qualifies", () => {

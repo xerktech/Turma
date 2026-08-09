@@ -76,8 +76,15 @@ function inlineHandlers(src) {
 // initializer taints it, whatever else sits beside it.
 function escDerived(src) {
   const BARE_ESC = /(?<![A-Za-z0-9_])esc\(/;
-  const assigns = [...src.matchAll(/(?:^|[\s(,;{])([A-Za-z_$][\w$]*)\s*=\s*([^\n]*)/g)]
-    .map((m) => [m[1], m[2]]);
+  // The initializer must stop at the NEXT declarator, not run to end of line.
+  // A greedy `[^\n]*` swallowed the rest of the line and `matchAll` resumed
+  // past it, so only the FIRST `name =` on any line was ever recorded — and
+  // `const id = esc(s.id), idJs = escJs(s.id), key = escJs(a.key);` ships
+  // today, so changing its THIRD declarator reintroduced the host-key XSS with
+  // this guard green. `=(?![=>])` keeps arrow params and comparisons out.
+  const assigns = [...src.matchAll(
+    /(?:^|[\s(,;{])([A-Za-z_$][\w$]*)\s*=(?![=>])\s*((?:(?!,\s*[A-Za-z_$][\w$]*\s*=(?![=>]))[^\n])*)/g,
+  )].map((m) => [m[1], m[2]]);
   const tainted = new Set(assigns.filter(([, init]) => BARE_ESC.test(init)).map(([n]) => n));
   for (let grew = true; grew; ) {
     grew = false;
