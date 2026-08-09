@@ -112,7 +112,7 @@ _FUNC_DEF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
 _CASE_PATTERN_RE = re.compile(r"^[^()\s]+\)$")
 
 # Interpreters whose `-c <string>` argument is a whole command line of its own.
-_SHELL_PROGS = {"bash", "sh", "zsh", "ksh", "dash", "ash", "busybox"}
+_SHELL_PROGS = {"bash", "sh", "zsh", "ksh", "dash", "ash", "busybox", "su"}
 
 # Programs that merely PRINT their arguments. `eval "$(echo rm -rf /etc)"` runs
 # what the substitution printed, so the echo has to be peeled off to see it.

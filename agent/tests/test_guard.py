@@ -933,6 +933,94 @@ class TestClassification(unittest.TestCase):
                 self.assertIsNone(guard.attribution_reason(cmd))
 
 
+class TestWrapperUnwrapping(unittest.TestCase):
+    """A wrapper must not launder a command past the rules.
+
+    A QA session destroyed a host's /etc with `bash -lc 'rm -rf /etc'`: the
+    outer tokens are just `bash`, so every rule saw nothing. The login shell
+    also re-sourced /etc/profile and reset PATH, defeating the PATH-based `rm`
+    shim the session was relying on as its safety net.
+    """
+
+    SHELL_WRAPPED = [
+        "bash -c 'rm -rf /etc'",
+        "bash -lc 'rm -rf /etc'",
+        "bash -ec 'rm -rf /etc'",
+        "sh -xc 'rm -rf /etc'",
+        "bash -o pipefail -c 'rm -rf /etc'",
+        "/bin/bash -lc 'rm -rf /etc'",
+        "zsh -c 'rm -rf /etc'",
+        "su -c 'rm -rf /etc'",
+        "env FOO=1 bash -lc 'rm -rf /etc'",
+        "bash -c \"bash -c 'rm -rf /etc'\"",
+    ]
+
+    PREFIX_WRAPPED = [
+        "timeout 5 rm -rf /etc",
+        "nice -n 5 rm -rf /etc",
+        "setsid rm -rf /etc",
+        "stdbuf -o0 rm -rf /etc",
+        "eval rm -rf /etc",
+        "xargs rm -rf /etc",
+        "sudo -u root rm -rf /etc",
+    ]
+
+    # Same wrappers, harmless payloads: the unwrapping must not over-block.
+    WRAPPED_SAFE = [
+        "bash -lc 'npm test'",
+        "bash -c 'make build'",
+        "sh -c 'echo hi'",
+        "timeout 30 pytest",
+        "nice -n 10 make",
+        "stdbuf -o0 python3 app.py",
+        "env FOO=bar npm run dev",
+        "bash -lc 'rm -rf node_modules'",
+        "xargs -I {} echo {}",
+    ]
+
+    def test_shell_wrapped_destructive_blocked(self):
+        for cmd in self.SHELL_WRAPPED:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_prefix_wrapped_destructive_blocked(self):
+        for cmd in self.PREFIX_WRAPPED:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_wrapped_safe_still_allowed(self):
+        for cmd in self.WRAPPED_SAFE:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+                self.assertIsNone(guard.policy_reason(cmd))
+
+    def test_policy_rules_also_unwrap(self):
+        for cmd in (
+            "bash -lc 'git push origin main'",
+            "bash -c 'gh pr merge 5'",
+            "sh -c 'glab mr merge 5'",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.policy_reason(cmd))
+
+    def test_wrapped_feature_branch_push_allowed(self):
+        self.assertIsNone(guard.policy_reason("bash -lc 'git push origin feature/x'"))
+
+    def test_decide_denies_wrapped_destructive(self):
+        decision, reason, category = guard.decide(
+            "Bash", {"command": "bash -lc 'rm -rf /etc'"}
+        )
+        self.assertEqual((decision, category), ("deny", "destructive"))
+        self.assertIsNotNone(reason)
+
+    def test_recursion_is_depth_bounded(self):
+        # Deeply nested wrappers must terminate rather than recurse forever.
+        cmd = "echo hi"
+        for _ in range(12):
+            cmd = "bash -c " + repr(cmd)
+        self.assertIsNone(guard.is_destructive(cmd))
+
+
 class TestDecide(unittest.TestCase):
     def test_allows_non_bash(self):
         self.assertEqual(
