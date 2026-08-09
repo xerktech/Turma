@@ -3248,6 +3248,96 @@ test("XERK-241: a create abandoned on a dead host is withdrawn even once deliver
     "a written-off create must not be re-delivered when the host comes back");
 });
 
+test("XERK-241: a create poll can't adopt — or delete — someone else's command", async () => {
+  // The poll is a GET handed a bare cmdId, and it withdraws what it gives up
+  // on. Both halves must be scoped to createTicket, or polling a repo pin's id
+  // deletes the operator's pin and reports a create verdict about it.
+  const site = "mxl.atlassian.net";
+  await jiraBeat("mxl", site);
+  const pin = await request("POST", `/api/jira/${site}/ENG-9/repo`, {
+    body: { repo: "myrepo" }, headers: userHeaders,
+  });
+  const pinCmd = (agents.mxl.commands || []).find((c) => c.type === "setJiraRepo");
+  assert.ok(pinCmd, "the pin should be queued");
+  assert.equal(pin.status < 400, true);
+  agents.mxl.lastSeen = Date.now() - 90 * 1000;
+
+  const out = await request("GET", `/api/jira/${site}/tickets/${pinCmd.cmdId}`, { headers: userHeaders });
+  assert.equal(out.status, 202, "a foreign cmdId is not this route's to answer for");
+  assert.equal((agents.mxl.commands || []).some((c) => c.cmdId === pinCmd.cmdId), true,
+    "the repo pin must survive a create poll that named its id");
+});
+
+test("XERK-241: withdrawal refuses a cmdId that names a different command", () => {
+  // The routes are type-scoped before they reach this, so nothing on the HTTP
+  // surface can drive it — but it deletes state on a bare id, so the guard is
+  // held here rather than left to the callers staying careful forever.
+  agents.mxdrop = { jira: { siteKey: "mxdrop.atlassian.net" }, lastSeen: Date.now(),
+    commands: [{ type: "setJiraRepo", issueKey: "ENG-1", cmdId: "shared-id" }] };
+  assert.equal(hub.dropQueuedCommand("mxdrop", "shared-id", "createTicket"), false);
+  assert.equal(agents.mxdrop.commands.length, 1, "a foreign command must survive");
+  assert.equal(hub.dropQueuedCommand("mxdrop", "shared-id", "setJiraRepo"), true);
+  assert.equal(agents.mxdrop.commands.length, 0);
+  delete agents.mxdrop;
+});
+
+test("XERK-241: an awaited command of another kind isn't adopted by the create poll", () => {
+  // `resultWaits` is keyed by cmdId across every awaited command kind, so the
+  // claim has to check what kind it was waiting for.
+  const site = "mxo.atlassian.net";
+  return (async () => {
+    await jiraBeat("mxo", site);
+    const meta = await request("GET", `/api/jira/${site}/create-meta`, { headers: userHeaders });
+    assert.equal(meta.status, 202);
+    assert.equal(((agents.mxo.resultWaits || {})[meta.body.cmdId] || {}).kind, "boardCreateMeta");
+    agents.mxo.lastSeen = Date.now() - 90 * 1000;
+    const out = await request("GET", `/api/jira/${site}/tickets/${meta.body.cmdId}`, { headers: userHeaders });
+    assert.equal(out.status, 202, "a create-meta fetch is not a create");
+  })();
+});
+
+test("XERK-241: a recorded owner that has left the org no longer answers for it", async () => {
+  const site = "mxm.atlassian.net", other = "mxm-other.atlassian.net";
+  await jiraBeat("mxm-mover", site);
+  const res = await request("POST", `/api/jira/${site}/tickets`, {
+    body: { project: "ENG", issueType: "1", summary: "Moved" }, headers: userHeaders,
+  });
+  assert.equal(res.body.host, "mxm-mover");
+  await jiraBeat("mxm-mover", other);          // re-homed to a different org
+  agents["mxm-mover"].lastSeen = Date.now() - 90 * 1000;
+  await jiraBeat("mxm-stay", site);            // the org still has a host
+
+  const out = await request("GET", `/api/jira/${site}/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(out.status, 202, "a host of another org must not decide this org's create");
+});
+
+test("XERK-241: an offline-only org still serves the host that HAS the copy", async () => {
+  // Health ranks hosts that can still be asked; it says nothing about which
+  // dead host kept the answer. Ranking alone would drop a cached ticket.
+  const site = "mxn.atlassian.net";
+  await request("POST", "/api/heartbeat", {   // holds the cache, but poll failing
+    body: { device: "mxn-sick", jira: { available: false, configured: true, siteKey: site, user: "u", tickets: [] } },
+    headers: agentHeaders,
+  });
+  await request("GET", `/api/jira/${site}/ENG-5`, { headers: userHeaders });  // queue it
+  const issue = { key: "ENG-5", summary: "Cached", description: "d", comments: [] };
+  await request("POST", "/api/heartbeat", {
+    body: {
+      device: "mxn-sick",
+      jira: { available: false, configured: true, siteKey: site, user: "u", tickets: [] },
+      jiraIssueResults: [{ key: "ENG-5", issue, error: null }],
+    },
+    headers: agentHeaders,
+  });
+  await jiraBeat("mxn-well", site);           // healthier, but has no copy
+  agents["mxn-sick"].lastSeen = Date.now() - 90 * 1000;
+  agents["mxn-well"].lastSeen = Date.now() - 90 * 1000;
+
+  const out = await request("GET", `/api/jira/${site}/ENG-5`, { headers: userHeaders });
+  assert.equal(out.status, 200, "an offline-only org serves its last copy");
+  assert.equal(out.body.issue.summary, "Cached");
+});
+
 test("XERK-241: consecutive creates spread across an org's healthy hosts", async () => {
   const site = "mx5.atlassian.net";
   await jiraBeat("mx5-a", site);

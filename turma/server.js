@@ -802,9 +802,10 @@ function queueCommand(key, cmd) {
 // command, ran it and died before acking leaves it sitting there too. Only the
 // `deliveredAt` stamp separates "provably did nothing" from "unknowable", and
 // the two must be reported differently (XERK-241).
-function commandDelivered(key, cmdId) {
+function commandDelivered(key, cmdId, kind) {
   const a = agents[key];
-  return !!((a && a.commands) || []).find((c) => c && c.cmdId === cmdId && c.deliveredAt);
+  return !!((a && a.commands) || []).find(
+    (c) => c && c.cmdId === cmdId && c.type === kind && c.deliveredAt);
 }
 
 // Withdraw a queued command the hub has given up on. This is unconditional, and
@@ -819,11 +820,14 @@ function commandDelivered(key, cmdId) {
 // operator is being told to retry anyway. Making this safe to skip needs a
 // DURABLE acked-set on the agent side; until then the hub must not re-arm work
 // it has just written off.
-function dropQueuedCommand(key, cmdId) {
+function dropQueuedCommand(key, cmdId, kind) {
   const a = agents[key];
   if (!a || !a.commands) return false;
   const before = a.commands.length;
-  a.commands = a.commands.filter((c) => !c || c.cmdId !== cmdId);
+  // `kind` is not belt-and-braces: this runs from a GET that is handed a bare
+  // cmdId, so without it a create poll would delete whatever command that id
+  // happened to name — a repo pin queued for an offline host, say.
+  a.commands = a.commands.filter((c) => !c || c.cmdId !== cmdId || c.type !== kind);
   if (a.commands.length === before) return false;
   delete (a.resultWaits || {})[cmdId];
   scheduleSave();
@@ -1284,23 +1288,31 @@ function pickBoardWriteHost(siteKey, kind) {
 const cmdHosts = new Map(); // cmdId -> {host, at}
 const CMD_HOST_TTL_MS = 30 * 60 * 1000;
 const CMD_HOST_MAX = 200;
-function rememberCmdHost(cmdId, host) {
+function rememberCmdHost(cmdId, host, kind) {
   const now = Date.now();
   for (const [id, e] of cmdHosts) {
     if (now - e.at > CMD_HOST_TTL_MS) cmdHosts.delete(id);
   }
-  cmdHosts.set(cmdId, { host, at: now });
+  cmdHosts.set(cmdId, { host, kind, at: now });
   while (cmdHosts.size > CMD_HOST_MAX) cmdHosts.delete(cmdHosts.keys().next().value);
 }
 // The recorded owner if it still reports the org, else any host of the org that
 // already holds the command or its outcome — an equivalent answer that also
 // covers a hub restart. null when nothing claims it.
-function commandHost(siteKey, cmdId, resultKey) {
-  const owner = (cmdHosts.get(cmdId) || {}).host;
-  const claims = (a) => (a.commands || []).some((c) => c && c.cmdId === cmdId) ||
-    !!(a.resultWaits || {})[cmdId] || !!(a[resultKey] || {})[cmdId];
-  if (owner && agents[owner] && agents[owner].jira &&
-      agents[owner].jira.siteKey === siteKey) return owner;
+//
+// Matched on cmdId AND `kind`, because a cmdId names a command of a PARTICULAR
+// type and these routes act on what they find: a create poll handed a repo-pin
+// or create-meta id must not adopt it, report a create verdict about it, or
+// withdraw it. The org check is the same rule one level up — an owner that has
+// since moved to another org no longer answers for this one.
+function commandHost(siteKey, cmdId, kind, resultKey) {
+  const owner = cmdHosts.get(cmdId);
+  const claims = (a) =>
+    (a.commands || []).some((c) => c && c.cmdId === cmdId && c.type === kind) ||
+    ((a.resultWaits || {})[cmdId] || {}).kind === kind ||
+    !!(a[resultKey] || {})[cmdId];
+  if (owner && owner.kind === kind && agents[owner.host] && agents[owner.host].jira &&
+      agents[owner.host].jira.siteKey === siteKey) return owner.host;
   for (const [key, a] of Object.entries(agents)) {
     if (!a.jira || a.jira.siteKey !== siteKey) continue;
     if (claims(a)) return key;
@@ -3906,7 +3918,7 @@ const server = http.createServer(async (req, res) => {
         type: "createTicket", project, issueType, summary, description, labels,
       });
       awaitResult(agents[key], cmdId, "createTicket");
-      rememberCmdHost(cmdId, key);
+      rememberCmdHost(cmdId, key, "createTicket");
       rememberCreateInFlight(fields, cmdId, key);
       return json(res, 200, { ok: true, cmdId, host: key });
     }
@@ -3942,7 +3954,7 @@ const server = http.createServer(async (req, res) => {
       // Unowned (a hub restart lost the mapping, or a cmdId that was never ours)
       // stays pending: an unanswerable poll times out client-side, which is far
       // cheaper than a wrong failure the operator answers by retrying.
-      const owner = commandHost(siteKey, cmdId, "createResults");
+      const owner = commandHost(siteKey, cmdId, "createTicket", "createResults");
       if (owner && Date.now() - (agents[owner].lastSeen || 0) >= OFFLINE_AFTER_MS) {
         // Telling the operator a create failed invites them to make the ticket
         // again, so the wording has to match what the hub can actually prove.
@@ -3951,8 +3963,8 @@ const server = http.createServer(async (req, res) => {
         // and died before acking. Claiming otherwise is what turns one intent
         // into two tickets, so say which of the two this is and, when it is the
         // unknowable one, send them to look before remaking it.
-        const nothingRan = !commandDelivered(owner, cmdId);
-        dropQueuedCommand(owner, cmdId);
+        const nothingRan = !commandDelivered(owner, cmdId, "createTicket");
+        dropQueuedCommand(owner, cmdId, "createTicket");
         forgetCreateInFlight(cmdId);
         return json(res, 503, { error: nothingRan
           ? "the host went offline before the ticket was created"
@@ -3978,8 +3990,18 @@ const server = http.createServer(async (req, res) => {
       // Fall back to an offline host's cache: its last fetch of this ticket is
       // still worth showing (the board already shows its stale tickets), even
       // though we can't queue a refresh for it.
-      const key = findJiraHost(siteKey, false);
+      //
+      // Which offline host, though, is decided by WHO HOLDS A COPY, not by the
+      // ranking — health says something about a host that can still be asked
+      // and nothing about one that can't, so ranking alone would hand back a
+      // healthier-looking host with no cache and lose an answer we have.
+      let key = findJiraHost(siteKey, false);
       if (!key) return json(res, 404, { error: "no host reports that Jira org" });
+      if (Date.now() - (agents[key].lastSeen || 0) >= OFFLINE_AFTER_MS &&
+          !(agents[key].jiraIssues || {})[issueKey]) {
+        key = jiraHostPool(siteKey, false)
+          .find((k) => (agents[k].jiraIssues || {})[issueKey]) || key;
+      }
       const cached = (agents[key].jiraIssues || {})[issueKey];
       if (cached && Date.now() - cached.fetchedAt < JIRA_ISSUE_FRESH_MS) {
         return json(res, 200, cached.error
@@ -4061,7 +4083,7 @@ const server = http.createServer(async (req, res) => {
       if (gap) return json(res, 409, { error: gap });
       const cmdId = queueCommand(key, { type: "setTicketStatus", issueKey, value, category });
       awaitResult(agents[key], cmdId, "setTicketStatus");
-      rememberCmdHost(cmdId, key);
+      rememberCmdHost(cmdId, key, "setTicketStatus");
       return json(res, 202, { ok: true, cmdId, host: key });
     }
 
@@ -4084,7 +4106,7 @@ const server = http.createServer(async (req, res) => {
       // e.g. the host that took it went offline, or its tracker poll started
       // failing, and the ranking has since moved on to a sibling that never saw
       // the command and would report pending forever.
-      const key = commandHost(siteKey, cmdId, "statusResults")
+      const key = commandHost(siteKey, cmdId, "setTicketStatus", "statusResults")
         || findJiraHost(siteKey, false);
       if (!key) return json(res, 404, { error: "no host reports that org" });
       const r = (agents[key].statusResults || {})[cmdId];
@@ -4690,6 +4712,11 @@ if (process.env.TURMA_TEST) {
     // PRODUCTION default rather than the wound-down one the suite runs with —
     // its value relative to the client's give-up is the whole point (XERK-241).
     CREATE_INFLIGHT_TTL_DEFAULT_MS,
+    // Exported so its type guard can be held directly: the routes above are
+    // type-scoped before they ever call it, which leaves this last check —
+    // the one standing between a stray cmdId and a deleted command — with no
+    // reachable path through the HTTP surface (XERK-241).
+    dropQueuedCommand,
     invalidateAgentsCache,
     queueCommand,
     findSession,
