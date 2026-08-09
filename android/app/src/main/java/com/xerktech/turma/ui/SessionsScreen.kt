@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
@@ -25,7 +26,6 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -49,17 +49,23 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xerktech.turma.core.HISTORY_MIN_QUERY
+import com.xerktech.turma.core.HistorySection
 import com.xerktech.turma.core.Verbosity
 import com.xerktech.turma.core.VerbosityPrefs
 import com.xerktech.turma.core.buildItems
 import com.xerktech.turma.core.eligibleMoveTargets
+import com.xerktech.turma.core.historySection
 import com.xerktech.turma.core.liveState
 import com.xerktech.turma.core.orgColorMap
 import com.xerktech.turma.core.scopedAgents
@@ -67,8 +73,10 @@ import com.xerktech.turma.core.siteKeyOf
 import com.xerktech.turma.core.sessionBranch
 import com.xerktech.turma.core.sessionName
 import com.xerktech.turma.core.sessionRepoLabel
+import com.xerktech.turma.core.snippetSpans
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.ClosedSessionInfo
+import com.xerktech.turma.model.SearchMatch
 import com.xerktech.turma.model.SessionInfo
 import com.xerktech.turma.vm.ArchiveViewModel
 import com.xerktech.turma.vm.FleetViewModel
@@ -332,7 +340,6 @@ fun SessionsRoute(
     wide: Boolean,
     onNavigate: (TopDest) -> Unit,
     onTerminal: (String, String) -> Unit,
-    onOpenArchive: () -> Unit = {},
 ) {
     var selHost by rememberSaveable { mutableStateOf<String?>(null) }
     var selId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -348,6 +355,12 @@ fun SessionsRoute(
     // that session's chat. Cleared whenever a different session/ended row is picked.
     var subType by rememberSaveable { mutableStateOf<String?>(null) }
     var subLabel by rememberSaveable { mutableStateOf<String?>(null) }
+    // The search box's query, held HERE rather than in the list pane (XERK-243):
+    // narrow mode swaps the list out for the open session entirely, so a query
+    // remembered inside it dies on the way in and the operator is back to an
+    // empty box after reading the first result. Searching means trying results
+    // in turn, so it has to survive the round trip.
+    var query by rememberSaveable { mutableStateOf("") }
     val select: (String, String) -> Unit = { h, s ->
         endHost = null; endTid = null; subType = null; subLabel = null; selHost = h; selId = s
     }
@@ -410,7 +423,7 @@ fun SessionsRoute(
                     selectedKey = selKey(selHost, selId) ?: selKey(endHost, endTid),
                     onSelect = select,
                     onSelectEnded = selectEnded,
-                    onOpenArchive = onOpenArchive,
+                    query = query, onQuery = { query = it },
                     modifier = Modifier.width(360.dp).fillMaxHeight(),
                 )
                 VerticalDivider()
@@ -424,7 +437,7 @@ fun SessionsRoute(
         else -> MainScaffold(TopDest.SESSIONS, onNavigate) { m ->
             SessionsListPane(
                 selectedKey = null, onSelect = select, onSelectEnded = selectEnded,
-                onOpenArchive = onOpenArchive, modifier = m,
+                query = query, onQuery = { query = it }, modifier = m,
             )
         }
     }
@@ -448,14 +461,20 @@ fun SessionsListPane(
     selectedKey: String?,
     onSelect: (String, String) -> Unit,
     onSelectEnded: (String, String) -> Unit = { _, _ -> },
-    onOpenArchive: () -> Unit = {},
+    query: String = "",
+    onQuery: (String) -> Unit = {},
     modifier: Modifier = Modifier,
     vm: FleetViewModel = viewModel(),
+    archiveVm: ArchiveViewModel = viewModel(),
 ) {
     LaunchedEffect(Unit) { vm.start() }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val org by vm.orgFilter.collectAsStateWithLifecycle()
-    var query by remember { mutableStateOf("") }
+    // The archive half of the box. The VM debounces and drops anything under
+    // HISTORY_MIN_QUERY, so this can fire on every keystroke.
+    val arch by archiveVm.state.collectAsStateWithLifecycle()
+    LaunchedEffect(query) { archiveVm.onQuery(query) }
+    val history = historySection(query, arch.searchedQuery, arch.searching, arch.groups.isNotEmpty())
     val now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis()
     // Scoped by the header's org control (XERK-62) before anything is built from
     // it, so the lists AND the new-session host picker narrow together — a host
@@ -483,7 +502,11 @@ fun SessionsListPane(
     val (review, active, idle) = groups
     val queued = lists.queued
     val ended = lists.ended
-    var endedOpen by remember { mutableStateOf(false) }
+    var endedOpen by rememberSaveable { mutableStateOf(false) }
+    // A filtered Ended list is a search RESULT, so searching opens the section —
+    // a match hiding behind a collapsed header reads as "nothing matched". Only
+    // on the edge into searching, so it stays collapsible while a query is up.
+    LaunchedEffect(query.isNotBlank()) { if (query.isNotBlank()) endedOpen = true }
     // New-session picker: pick an online host + repo, then the spawn composer.
     var pickerOpen by remember { mutableStateOf(false) }
     var spawnFor by remember { mutableStateOf<Triple<String, String, Boolean>?>(null) }
@@ -491,11 +514,17 @@ fun SessionsListPane(
     Column(modifier.fillMaxSize()) {
         ScreenHeader("Sessions") {
             IconButton(onClick = { pickerOpen = true }) { Icon(Icons.Filled.Add, "New session") }
-            // Full-history archive + FTS search (offline hosts included) — the
-            // live box below only filters the sessions currently in the fleet.
-            IconButton(onClick = onOpenArchive) { Icon(Icons.Filled.Search, "Search all history") }
         }
-        TurmaField(query, { query = it }, "Filter these sessions", Modifier.fillMaxWidth().padding(10.dp, 2.dp))
+        // ONE search affordance (XERK-243): the header carried a Search action
+        // onto a separate archive screen while this box only filtered the live
+        // lists, which crowded the header and split "find that session" in two.
+        // The action is gone and this box does both — it filters the fleet's
+        // sessions as you type, and past HISTORY_MIN_QUERY characters it also
+        // searches the hub's durable archive below them (offline hosts included).
+        TurmaSearchField(
+            query, onQuery, "Search sessions & history",
+            Modifier.fillMaxWidth().padding(10.dp, 2.dp),
+        )
         LazyColumn(
             Modifier.fillMaxSize(),
             contentPadding = PaddingValues(10.dp, 4.dp, 10.dp, 12.dp),
@@ -506,12 +535,14 @@ fun SessionsListPane(
                 item {
                     Text(
                         when {
-                            // Say which of the two it is: a fleet with no sessions
-                            // reads very differently from one the org filter
-                            // narrowed to nothing, and only one has a way out.
+                            // Say which of the three it is: a fleet with no
+                            // sessions, one the org filter narrowed to nothing,
+                            // and one this query didn't match all read
+                            // differently, and each has its own way out.
                             fleet.agents.isNotEmpty() && agents.isEmpty() ->
                                 "No hosts report the selected orgs. Change the org filter (or pick “All orgs”) in the header."
                             fleet.loading -> "Loading…"
+                            query.isNotBlank() -> "No current sessions match “${query.trim()}”."
                             else -> "No sessions."
                         },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -623,6 +654,48 @@ fun SessionsListPane(
                             onOpen = { onSelectEnded(e.host, e.transcriptId) },
                             onResume = { resumeEnded(vm, e); if (e.kind != EndedKind.RESUMABLE) onSelect(e.host, e.id) },
                         )
+                    }
+                }
+            }
+            // In history: full-text matches from the hub's durable archive
+            // (XERK-243) — the sections above are only what the fleet reports
+            // right now, so this is where a session that ended long ago, or whose
+            // host is offline or gone, is found. Last, because a live session is
+            // the likelier answer; a match opens its transcript read-only.
+            if (history != HistorySection.HIDDEN) {
+                item(key = "history-header") {
+                    SectionLabel("In history", Modifier.padding(top = 10.dp, bottom = 2.dp))
+                }
+                when (history) {
+                    HistorySection.HINT -> item(key = "history-hint") {
+                        HistoryNote("Type at least $HISTORY_MIN_QUERY characters to search past sessions.")
+                    }
+                    HistorySection.SEARCHING -> item(key = "history-searching") {
+                        HistoryNote("Searching…")
+                    }
+                    HistorySection.EMPTY -> item(key = "history-empty") {
+                        HistoryNote("No past sessions mention “${query.trim()}”.")
+                    }
+                    else -> arch.groups.forEach { group ->
+                        val repo = group.repo.ifBlank { group.remoteKey.ifBlank { "unknown" } }
+                        item(key = "history-grp:${group.remoteKey}:$repo") {
+                            Text(
+                                repo,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
+                            )
+                        }
+                        itemsIndexed(
+                            group.matches,
+                            key = { i, m -> "history:${group.remoteKey}:${m.transcriptId}:${m.uuid.ifBlank { i.toString() }}" },
+                        ) { _, m ->
+                            HistoryMatchRow(
+                                m,
+                                selected = selectedKey == m.host + "/" + m.transcriptId,
+                                onClick = { onSelectEnded(m.host, m.transcriptId) },
+                            )
+                        }
                     }
                 }
             }
@@ -763,6 +836,72 @@ private fun EndedSessionRow(e: EndedSession, now: Long, tint: Color?, selected: 
             // Resume needs the host online (it rides the heartbeat as a command);
             // reading the conversation does not, so the card stays clickable.
             GhostButton("Resume", onResume, enabled = e.online)
+        }
+    }
+}
+
+/** A one-line note under the "In history" header (hint / searching / no matches). */
+@Composable
+private fun HistoryNote(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(vertical = 4.dp),
+    )
+}
+
+/**
+ * One archive full-text match (web `sr-row`): the session it was found in, the
+ * matched line with its hits highlighted, and where/when it came from.
+ *
+ * Tapping it opens that transcript read-only, the same destination an Ended row
+ * goes to — the archive answers for hosts that are offline, so this works for a
+ * session whose host the fleet no longer reports at all.
+ */
+@Composable
+private fun HistoryMatchRow(m: SearchMatch, selected: Boolean, onClick: () -> Unit) {
+    val hitStyle = SpanStyle(
+        color = MaterialTheme.colorScheme.primary,
+        fontWeight = FontWeight.SemiBold,
+    )
+    val snippet = remember(m.snippet, hitStyle) {
+        buildAnnotatedString {
+            snippetSpans(m.snippet).forEach { span ->
+                if (span.hit) withStyle(hitStyle) { append(span.text) } else append(span.text)
+            }
+        }
+    }
+    val cardMod = Modifier.fillMaxWidth().then(
+        if (selected)
+            Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
+        else Modifier,
+    )
+    TurmaCard(cardMod) {
+        Column(
+            Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Text(
+                m.summary.ifBlank { m.transcriptId.take(8) },
+                fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
+            if (snippet.isNotEmpty()) {
+                Text(
+                    snippet,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 3, overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Text(
+                // The archive stores ISO-8601 text, so the date is its first 10
+                // chars — no parse, and a malformed one just renders short.
+                listOf(m.role, m.host, m.ts.take(10)).filter { it.isNotBlank() }.joinToString(" · "),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
         }
     }
 }
@@ -948,9 +1087,20 @@ internal fun EndedSessionView(
             TopAppBar(
                 title = {
                     Column {
-                        Text(entry?.name ?: "Ended session", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        // The fleet entry names it when there is one; a transcript
+                        // reached from an archive search hit often has none left
+                        // (its host may not even report it any more), so fall back
+                        // to what the archive itself recorded before the generic
+                        // label — a search result must not open untitled.
+                        val name = entry?.name
+                            ?: arch.open?.summary?.takeIf { it.isNotBlank() }
+                            ?: "Ended session"
+                        val repo = entry?.repo?.takeIf { it.isNotBlank() }
+                            ?: arch.open?.repo?.takeIf { it.isNotBlank() }
+                            ?: "—"
+                        Text(name, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
-                            "${agent?.device?.ifBlank { host } ?: host} · ${entry?.repo?.ifBlank { "—" } ?: "—"}",
+                            "${agent?.device?.ifBlank { host } ?: host} · $repo",
                             style = MaterialTheme.typography.bodySmall,
                             fontFamily = FontFamily.Monospace,
                             maxLines = 1,
