@@ -3011,8 +3011,6 @@ test("XERK-241: a create the agent may already have run is not called dead", asy
   assert.equal(out.status, 503);
   assert.match(out.body.error, /may have been created/);
   assert.doesNotMatch(out.body.error, /before the ticket was created/);
-  // Delivered, so it is NOT withdrawn — the agent's own cmdId de-dup owns it now.
-  assert.equal((agents.mx9.commands || []).some((c) => c.cmdId === res.body.cmdId), true);
 });
 
 test("XERK-241: an agent that reports no `available` ranks with the healthy", async () => {
@@ -3125,6 +3123,129 @@ test("XERK-241: the status single-flight spans the org, not one host", async () 
   const queued = ["mxe-a", "mxe-b"].flatMap(
     (h) => (agents[h].commands || []).filter((c) => c.type === "setTicketStatus"));
   assert.equal(queued.length, 1, `two transitions queued across the org: ${queued.length}`);
+});
+
+test("XERK-241: the create single-flight outlives the client's own give-up", async () => {
+  // The suite runs with the TTL wound down, so assert the PRODUCTION default.
+  // newticket.js polls for 60s; the hub's timer starts a round trip EARLIER, so
+  // matching that number would expire the entry moments before the operator is
+  // told it timed out — handing their retry a fresh write every time.
+  const clientDeadlineMs = 60000; // newticket.js pollCreate
+  assert.ok(hub.CREATE_INFLIGHT_TTL_DEFAULT_MS > clientDeadlineMs * 2,
+    `single-flight backstop ${hub.CREATE_INFLIGHT_TTL_DEFAULT_MS}ms must comfortably `
+    + `outlast the client's ${clientDeadlineMs}ms give-up`);
+});
+
+test("XERK-241: a change stranded on a dead host never answers a later one", async () => {
+  // The org-wide search must look only at hosts that can still RUN the command:
+  // a record keeps its queue for days, so reusing a dead host's cmdId would
+  // answer every later change for this ticket with one nothing will ever run.
+  const site = "mxf.atlassian.net";
+  await jiraBeat("mxf-dead", site);
+  const first = await request("POST", `/api/jira/${site}/ENG-7/status`, {
+    body: { value: "31" }, headers: userHeaders,
+  });
+  assert.equal(first.body.host, "mxf-dead");
+  agents["mxf-dead"].lastSeen = Date.now() - 90 * 1000;   // dies holding it
+  await jiraBeat("mxf-live", site);
+
+  const second = await request("POST", `/api/jira/${site}/ENG-7/status`, {
+    body: { value: "31" }, headers: userHeaders,
+  });
+  assert.equal(second.status, 202);
+  assert.equal(second.body.host, "mxf-live");
+  assert.notEqual(second.body.cmdId, first.body.cmdId,
+    "the dead host's stranded change must not answer this one");
+});
+
+test("XERK-241: a status change skips a host that has proven it can't run one", async () => {
+  const site = "mxg.atlassian.net";
+  await jiraBeat("mxg-old", site, { agentVersion: "0.5.38" });
+  const first = await request("POST", `/api/jira/${site}/ENG-3/status`, {
+    body: { value: "31" }, headers: userHeaders,
+  });
+  await ackBeat("mxg-old", site, [first.body.cmdId], { agentVersion: "0.5.38" });
+  await jiraBeat("mxg-new", site);
+  const second = await request("POST", `/api/jira/${site}/ENG-4/status`, {
+    body: { value: "31" }, headers: userHeaders,
+  });
+  assert.equal(second.status, 202);
+  assert.equal(second.body.host, "mxg-new");
+});
+
+test("XERK-241: reads go to an ONLINE host even when an offline one is listed first", async () => {
+  // Online-first is the ranking's primary term; without it a board read serves
+  // (and queues against) a dead host's stale cache.
+  const site = "mxh.atlassian.net";
+  await jiraBeat("mxh-down", site);
+  agents["mxh-down"].lastSeen = Date.now() - 90 * 1000;
+  await jiraBeat("mxh-up", site);
+  const res = await request("GET", `/api/jira/${site}/ENG-2`, { headers: userHeaders });
+  assert.equal(res.status, 202);
+  assert.equal((agents["mxh-up"].commands || []).some((c) => c.type === "jiraIssue"), true);
+  assert.equal((agents["mxh-down"].commands || []).some((c) => c.type === "jiraIssue"), false);
+
+  // …and with every host offline it still answers from the best cache rather
+  // than refusing — the fallback the single ranked lookup has to keep.
+  agents["mxh-up"].lastSeen = Date.now() - 90 * 1000;
+  const off = await request("GET", `/api/jira/${site}/ENG-5`, { headers: userHeaders });
+  assert.notEqual(off.status, 404);
+});
+
+test("XERK-241: a create stranded by a host going quiet stops holding its title", async () => {
+  // Nothing polled this one — the operator closed the modal — so the 503 path
+  // never ran. The in-flight guard is what stops the next attempt rejoining a
+  // cmdId whose host is gone, well inside the backstop window.
+  const site = "mxk.atlassian.net";
+  await jiraBeat("mxk", site);
+  const body = { project: "ENG", issueType: "1", summary: "Orphaned" };
+  const first = await request("POST", `/api/jira/${site}/tickets`, { body, headers: userHeaders });
+  agents.mxk.lastSeen = Date.now() - 90 * 1000;
+  await jiraBeat("mxk-2", site);            // a live sibling keeps the org up
+
+  const again = await request("POST", `/api/jira/${site}/tickets`, { body, headers: userHeaders });
+  assert.equal(again.status, 200);
+  assert.notEqual(again.body.cmdId, first.body.cmdId);
+  assert.equal(again.body.host, "mxk-2");
+});
+
+test("XERK-241: the delivery stamp is hub-internal — it rides no payload", async () => {
+  const site = "mxi.atlassian.net";
+  await jiraBeat("mxi", site);
+  await request("POST", `/api/jira/${site}/tickets`, {
+    body: { project: "ENG", issueType: "1", summary: "Internal" }, headers: userHeaders,
+  });
+  const beat = await jiraBeat("mxi", site);          // the beat that delivers
+  assert.ok(beat.body.commands.length);
+  for (const c of beat.body.commands) {
+    assert.equal("deliveredAt" in c, false, "the agent must not see the delivery stamp");
+  }
+  assert.ok((agents.mxi.commands || []).every((c) => c.deliveredAt), "but the hub records it");
+
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  const rec = fleet.body.agents.find((a) => a.key === "mxi");
+  for (const c of rec.commands || []) {
+    assert.equal("deliveredAt" in c, false, "the fleet payload must not carry it either");
+  }
+});
+
+test("XERK-241: a create abandoned on a dead host is withdrawn even once delivered", async () => {
+  // Delivery is at-least-once and the agent's de-dup of an executed cmdId does
+  // not survive its restart, so a create left in a dead host's queue would run
+  // a SECOND time on its return — landing after the operator remade the ticket.
+  const site = "mxj.atlassian.net";
+  await jiraBeat("mxj", site);
+  const res = await request("POST", `/api/jira/${site}/tickets`, {
+    body: { project: "ENG", issueType: "1", summary: "Handed over" }, headers: userHeaders,
+  });
+  await jiraBeat("mxj", site);                       // hands it to the agent
+  agents.mxj.lastSeen = Date.now() - 90 * 1000;
+
+  const out = await request("GET", `/api/jira/${site}/tickets/${res.body.cmdId}`, { headers: userHeaders });
+  assert.equal(out.status, 503);
+  assert.match(out.body.error, /may have been created/);
+  assert.equal((agents.mxj.commands || []).some((c) => c.cmdId === res.body.cmdId), false,
+    "a written-off create must not be re-delivered when the host comes back");
 });
 
 test("XERK-241: consecutive creates spread across an org's healthy hosts", async () => {

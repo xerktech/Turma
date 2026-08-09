@@ -1009,25 +1009,27 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   **shared site header** (`newticket.js` → nav.js's `#hdrNewTicket` slot, XERK-150), not the board
   toolbar; fed the beat by `TurmaNewTicket.update(data)`, form HTML in `board.js`. It rides the
   command → staged result → poll pattern, against a ranked ONLINE host of the org (below):
-  - `GET /api/jira/<siteKey>/create-meta` (`boardCreateMeta`) → the org's projects + existing labels/tags;
-    `?project=<p>` → that project's creatable types. Cascade (project then types) so no meta call fans
-    across every project. Cached per host, 202-polled.
+  - `GET /api/jira/<siteKey>/create-meta` (`boardCreateMeta`) → the org's projects + existing
+    labels/tags; `?project=<p>` → that project's creatable types, a cascade so no meta call fans across
+    every project. Cached per host, 202-polled.
   - `POST /api/jira/<siteKey>/tickets` (`createTicket`) → the agent creates and stages
-    `{cmdId, key, url, error, warning}`; polled at `GET .../tickets/<cmdId>` (`createResults`). All three
-    caches are stripped from the fleet payload.
-- The new ticket **self-assigns to the tracker user** (Jira `accountId` via `/myself`; Azure an identity
-  ladder, below) so it lands on the board — best-effort, and reported. Agent dispatch:
+    `{cmdId, key, url, error, warning}`; polled at `GET .../tickets/<cmdId>` (`createResults`). All
+    three caches are stripped from the fleet payload.
+- The new ticket **self-assigns to the tracker user** (Jira `accountId` via `/myself`; Azure an
+  identity ladder, below) so it lands on the board — best-effort, and reported. Agent dispatch:
   `create_board_issue`/`board_create_meta`/`board_issue_types` (`create_jira_issue` POSTs
   `/rest/api/3/issue`, plain-text→ADF via `_text_to_adf`; `create_azure_issue` POSTs a JSON-Patch work
-  item, `;`-joined `System.Tags`). Jira labels split on whitespace+commas (spaces forbidden), Azure tags
-  on commas. Android matches it (＋ in `ScreenHeader` → `CreateTicketSheet`): `source` on
-  `JiraBlock`/`BoardSite`, endpoints in `net/HubApi.kt`, the label/meta/result ports in `core/Board.kt`.
+  item, `;`-joined `System.Tags`). Jira labels split on whitespace+commas, Azure tags on commas.
+- Android matches it (＋ in `ScreenHeader` → `CreateTicketSheet`): `source` on `JiraBlock`/`BoardSite`,
+  endpoints in `net/HubApi.kt`, the label/meta/result ports in `core/Board.kt`.
 - **An org's hosts are health-ranked (`jiraHostHealthy`: online, then `jira.available`) and a board
-  write is OWNED by the host that took it** (XERK-241): the poll reads only that owner (`commandHost`),
-  and may say nothing was created ONLY when it withdrew an UNDELIVERED command — the queue drains on
-  ACK, so otherwise the honest answer is "it may exist". Judging a create by a SIBLING's liveness is
-  what made four tickets. A retry rejoins an unresolved identical create (`createInFlight`, hashed
-  over the WHOLE body); creates round-robin past a gapped host, status single-flights across the ORG.
+  write is OWNED by the host that took it** (XERK-241): the poll reads only that owner (`commandHost`)
+  — judging a create by a SIBLING's liveness is what made four tickets. Giving up **withdraws** the
+  command, always — delivery is at-least-once and the agent's acked-set is in-memory, so one left
+  queued re-RUNS on that host's return; `deliveredAt` decides only the WORDING (undelivered provably
+  did nothing, delivered "may have been created"). A retry rejoins an unresolved identical create
+  (`createInFlight`, over the WHOLE body); creates round-robin past gapped hosts, and the status
+  single-flight spans the org's ONLINE hosts.
 - **A refusal carries the tracker's own words; a create bends to the TYPE and IDENTITY** (XERK-151):
   `_http_error_detail` keeps the body urllib's `HTTPError` drops (else every refusal reads "HTTP Error
   400: Bad Request"); the description goes in the field the type HAS (`_azure_description_field`: the
@@ -1040,7 +1042,7 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   the tracker's own refusal, never "set `AZDO_USER`" — already a candidate.
 - **Any new shared `/*.js` must be in `server.js`'s `STATIC_ASSETS`** (an allowlist, not a directory
   serve) AND loaded by each page after `org.js` — a missing entry 404s and takes the module, and every
-  page's render, down. `newticket.test.js` guards both.
+  page's render, down. Guarded by `newticket.test.js`.
 - Tests: `TestCreateAzureIssue`/`TestAzure*Identit*`/`TestHttpErrorDetail` in `test_hub_agent.py`;
   `server.test.js`; `createFormHtml` in `board.test.js`; android `BoardTest.kt`.
 
@@ -1285,17 +1287,16 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
 
 - An agent **acks** a command it doesn't implement (a poison command must not retry forever), so a host
   predating a board write feature reads as a slow one and the routes waiting on a staged result 202
-  forever. **The ack IS the evidence**: these commands stage their result inside the same
-  `handle_commands` call, so it rides the SAME beat as the ack — an ack with no result means the agent
-  didn't handle it — no version table to drift.
+  forever. **The ack IS the evidence**: these commands stage their result in the same `handle_commands`
+  call, so it rides the SAME beat as the ack — an ack with no result means the agent didn't handle it.
 - `awaitResult`/`resolveResultWaits` record and settle each queued command, writing
   `agent.unsupported[kind]`; the waiting routes refuse with `agentGapError` rather than queue —
-  create-meta `200 {error}` (the shape both clients read a message from), create/status `409` (Android
-  reads it via `hubError()`).
+  create-meta `200 {error}` (the shape both clients read), create/status `409` (Android reads it via
+  `hubError()`).
 - A gap **clears** on a result landing, `agentVersion` CHANGING, or `UNSUPPORTED_TTL_MS` (the backstop
-  for an update that doesn't move the version). Conclude nothing from a command still in the queue: it
-  is unACKED, which is not the same as untaken. `resultWaits` is stripped from the fleet payload,
-  `unsupported` rides it. Tests: `server.test.js`.
+  for an update that doesn't move the version). Conclude nothing from a queued command: unACKED is not
+  untaken. `resultWaits` is stripped from the fleet payload, `unsupported` rides it.
+  Tests: `server.test.js`.
 
 #### Refresh button
 

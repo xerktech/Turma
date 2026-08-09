@@ -797,22 +797,34 @@ function queueCommand(key, cmd) {
   return cmdId;
 }
 
-// Withdraw a queued command the hub has given up on, ONLY if the agent has
-// never been handed it (XERK-241). The queue drains on ACK, not on delivery, so
-// "still queued" alone does NOT mean "never ran" — an agent that took the
+// Has this command been handed to the agent? The queue drains on ACK, not on
+// delivery, so being queued does NOT mean it never ran — an agent that took a
 // command, ran it and died before acking leaves it sitting there too. Only the
-// `deliveredAt` stamp separates the two, and only the undelivered case is safe
-// to cancel: it provably did nothing, so dropping it just stops it running late
-// and duplicating whatever the operator remade after being told it failed.
+// `deliveredAt` stamp separates "provably did nothing" from "unknowable", and
+// the two must be reported differently (XERK-241).
+function commandDelivered(key, cmdId) {
+  const a = agents[key];
+  return !!((a && a.commands) || []).find((c) => c && c.cmdId === cmdId && c.deliveredAt);
+}
+
+// Withdraw a queued command the hub has given up on. This is unconditional, and
+// deliberately so: delivery is at-least-once, and the agent's de-dup of an
+// already-executed cmdId is IN-MEMORY (hub-agent.py's `self.acked`, rebuilt
+// empty at boot), so a command left in a dead host's queue is re-delivered and
+// re-RUN when that host returns. Leaving a delivered create there to "maybe
+// finish" is therefore not the cautious choice — it is a second ticket, landing
+// after the operator has already remade the one they were told had failed.
 //
-// Returns true only when a command was actually withdrawn — i.e. only when the
-// caller may state that nothing happened.
+// Withdrawing costs at most a create that was genuinely lost, which the
+// operator is being told to retry anyway. Making this safe to skip needs a
+// DURABLE acked-set on the agent side; until then the hub must not re-arm work
+// it has just written off.
 function dropQueuedCommand(key, cmdId) {
   const a = agents[key];
   if (!a || !a.commands) return false;
-  const cmd = a.commands.find((c) => c && c.cmdId === cmdId);
-  if (!cmd || cmd.deliveredAt) return false;
+  const before = a.commands.length;
   a.commands = a.commands.filter((c) => !c || c.cmdId !== cmdId);
+  if (a.commands.length === before) return false;
   delete (a.resultWaits || {})[cmdId];
   scheduleSave();
   publishAgent(key);
@@ -1219,7 +1231,10 @@ function jiraHostPool(siteKey, requireOnline) {
 
 // Which single HOST should answer for a Jira org — the head of that pool.
 // null when no host covers the org (or the only ones that do are offline, and
-// `requireOnline`). Deliberately STICKY rather than rotating: the read paths
+// `requireOnline`). A read that can fall back to an offline host's cache passes
+// requireOnline=false and gets the online one anyway, because the pool already
+// ranks them first — no need to ask twice. Deliberately STICKY rather than
+// rotating: the read paths
 // cache per host (createMeta, createTypes, jiraIssues), so spreading reads would
 // just multiply cache misses. Writes use pickBoardWriteHost below.
 function findJiraHost(siteKey, requireOnline) {
@@ -1301,16 +1316,23 @@ function commandHost(siteKey, cmdId, resultKey) {
 //
 // Held hub-side rather than read off the agent's queue, because the queue entry
 // disappears the moment the agent ACKS — precisely the window a retry lands in.
-// The entry is dropped as soon as an outcome exists, and otherwise expires with
-// the CLIENT's own poll deadline (newticket.js gives up at 60s): once the
-// operator has been told the create didn't complete, their next click is a fresh
-// intent and must open a fresh write rather than rejoin a cmdId nobody is
-// waiting on any more.
+// What actually releases an entry is EVIDENCE, checked below: an outcome
+// landed, the host went quiet, or it proved it can't run the command. The TTL
+// is only the backstop for a create that vanished leaving none of those, so it
+// is deliberately set WELL PAST the client's own 60s give-up (newticket.js).
+//
+// Matching the client's deadline instead would be the worst of both: the TTL
+// starts when the create is queued and the client's when the response lands, so
+// the entry would expire microseconds BEFORE the operator is told it timed out
+// — guaranteeing their next click opens a second write. That is the duplicate
+// this whole mechanism exists to prevent, so the backstop is the same 5 minutes
+// after which the hub stops expecting an answer at all (RESULT_WAIT_MAX_MS).
 const createInFlight = new Map(); // fingerprint -> {cmdId, host, at}
-// Env-tunable for the same reason CONTROL_PING_EVERY_MS is: a one-minute
+// Env-tunable for the same reason CONTROL_PING_EVERY_MS is: a multi-minute
 // expiry can only be tested by winding it down to milliseconds.
+const CREATE_INFLIGHT_TTL_DEFAULT_MS = RESULT_WAIT_MAX_MS;
 const CREATE_INFLIGHT_TTL_MS =
-  Number(process.env.CREATE_INFLIGHT_TTL_MS) || 60 * 1000;
+  Number(process.env.CREATE_INFLIGHT_TTL_MS) || CREATE_INFLIGHT_TTL_DEFAULT_MS;
 // Hashed, and over the WHOLE body rather than the title alone: two tickets that
 // share a title but differ in description or labels are DIFFERENT tickets, and
 // folding them would not just suppress a retry — it would discard the second
@@ -1337,11 +1359,9 @@ function findCreateInFlight(siteKey, project, issueType, summary, description, l
   // its own merits (XERK-151).
   if (agentGapError(a, "createTicket", "create tickets")) return null;
   // Nor is a create still in flight once its host has gone quiet holding it:
-  // rejoining would hand the retry a cmdId nothing can answer. Note this is
-  // reached only inside the TTL, which is far shorter than the 75s of silence
-  // it takes to call a host offline — so in practice such an entry has already
-  // expired, and this is the guard for the case where the host was ALREADY down
-  // when the create was queued.
+  // rejoining would hand the retry a cmdId nothing can answer, and the poll has
+  // by now withdrawn the command anyway. (Reachable because a host picked while
+  // it was merely stale can cross the offline line inside the backstop window.)
   if (Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) return null;
   return e;
 }
@@ -3926,12 +3946,13 @@ const server = http.createServer(async (req, res) => {
       if (owner && Date.now() - (agents[owner].lastSeen || 0) >= OFFLINE_AFTER_MS) {
         // Telling the operator a create failed invites them to make the ticket
         // again, so the wording has to match what the hub can actually prove.
-        // Withdrawing the command succeeds only when the agent was never handed
-        // it — that, and only that, proves no ticket exists. Once it has been
-        // delivered the hub cannot know: the agent may have created the ticket
-        // and died before acking, and claiming otherwise is what turns one
-        // intent into two tickets. Say so, and send them to look first.
-        const nothingRan = dropQueuedCommand(owner, cmdId);
+        // Never having handed the command over proves no ticket exists; once
+        // delivered the hub cannot know, because the agent may have created it
+        // and died before acking. Claiming otherwise is what turns one intent
+        // into two tickets, so say which of the two this is and, when it is the
+        // unknowable one, send them to look before remaking it.
+        const nothingRan = !commandDelivered(owner, cmdId);
+        dropQueuedCommand(owner, cmdId);
         forgetCreateInFlight(cmdId);
         return json(res, 503, { error: nothingRan
           ? "the host went offline before the ticket was created"
@@ -3957,7 +3978,7 @@ const server = http.createServer(async (req, res) => {
       // Fall back to an offline host's cache: its last fetch of this ticket is
       // still worth showing (the board already shows its stale tickets), even
       // though we can't queue a refresh for it.
-      const key = findJiraHost(siteKey, true) || findJiraHost(siteKey, false);
+      const key = findJiraHost(siteKey, false);
       if (!key) return json(res, 404, { error: "no host reports that Jira org" });
       const cached = (agents[key].jiraIssues || {})[issueKey];
       if (cached && Date.now() - cached.fetchedAt < JIRA_ISSUE_FRESH_MS) {
@@ -4016,12 +4037,18 @@ const server = http.createServer(async (req, res) => {
       if (!findJiraHost(siteKey, false)) {
         return json(res, 404, { error: "no host reports that org" });
       }
-      // The single-flight spans the ORG, not one host (XERK-241). Which host
-      // answers for an org can move between two clicks — a health flip is enough
-      // — so looking for the pending change in only the CURRENT host's queue
-      // would miss the one already queued on a sibling and fire a second
-      // transition on the same ticket, which is exactly what it exists to stop.
-      for (const k of jiraHostPool(siteKey, false)) {
+      // The single-flight spans the org's ONLINE hosts, not just the one this
+      // click would pick (XERK-241). Which host answers can move between two
+      // clicks — a health flip is enough — so searching only the current host's
+      // queue would miss the change already queued on a sibling and fire a
+      // second transition on the same ticket.
+      //
+      // Online, though: a command queued on a host that then died sits in its
+      // queue for as long as the record lives (days), and reusing THAT cmdId
+      // would answer every later change for this ticket with a command nothing
+      // will ever run. A pending change is only "pending" on a host that can
+      // still run it.
+      for (const k of jiraHostPool(siteKey, true)) {
         const p = (agents[k].commands || [])
           .find((c) => c.type === "setTicketStatus" && c.issueKey === issueKey);
         if (p) return json(res, 202, { ok: true, cmdId: p.cmdId, host: k });
@@ -4058,7 +4085,7 @@ const server = http.createServer(async (req, res) => {
       // failing, and the ranking has since moved on to a sibling that never saw
       // the command and would report pending forever.
       const key = commandHost(siteKey, cmdId, "statusResults")
-        || findJiraHost(siteKey, true) || findJiraHost(siteKey, false);
+        || findJiraHost(siteKey, false);
       if (!key) return json(res, 404, { error: "no host reports that org" });
       const r = (agents[key].statusResults || {})[cmdId];
       if (!r) return json(res, 200, { pending: true });
@@ -4659,6 +4686,10 @@ if (process.env.TURMA_TEST) {
   module.exports = {
     server,
     agents,
+    // The create single-flight's backstop, exported so a test can hold the
+    // PRODUCTION default rather than the wound-down one the suite runs with —
+    // its value relative to the client's give-up is the whole point (XERK-241).
+    CREATE_INFLIGHT_TTL_DEFAULT_MS,
     invalidateAgentsCache,
     queueCommand,
     findSession,
