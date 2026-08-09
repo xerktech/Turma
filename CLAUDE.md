@@ -1844,11 +1844,11 @@ Still true: no GitHub Advanced Security, so no code-scanning API — findings li
 
 ### Safety guard
 
-- Because sessions run hands-off, every launch passes `--settings` a generated file
-  (`build_guard_settings()`, written once to `~/.turma/guard-settings.json`) wiring a `PreToolUse` hook —
-  `agent/hooks/guard.py`, stdlib-only, at `/usr/local/bin/hooks/guard.py` — over Bash, plus
-  `permissions.deny` rules protecting the host credential stores (`~/.ssh`, `~/.aws`, `~/.claude`,
-  `~/.config/gcloud`; deny wins even under bypass).
+- Sessions run hands-off, so every launch passes `--settings` a generated file
+  (`build_guard_settings()` → `~/.turma/guard-settings.json`) wiring a `PreToolUse` hook over Bash —
+  `agent/hooks/guard.py`, stdlib-only, at `/usr/local/bin/hooks/guard.py` — plus `permissions.deny`
+  rules protecting host credential stores (`~/.ssh`, `~/.aws`, `~/.claude`, `~/.config/gcloud`; deny
+  wins even under bypass).
 - The guard hard-denies only three narrow categories, each with a reason the agent self-corrects from:
   - **destructive** — `rm -rf` of `/`/home/system/`.git`, disk wipes, fork bombs, power changes, recursive
     `chmod`/`chown` of system roots, protected-branch history destruction, `DROP DATABASE|TABLE`;
@@ -1858,9 +1858,9 @@ Still true: no GitHub Advanced Security, so no code-scanning API — findings li
 - Ordinary dev work (edits, builds, tests, git, `rm -rf node_modules`) is untouched. A specific command
   can be allowlisted via `$TURMA_TOOL_GRANTS` (CSV of `Bash(<cmd>)`); attribution toggles via
   `$TURMA_NO_ATTRIBUTION=0`.
-- The guard fails open on malformed input, and if the settings file can't be written the session still
-  launches (without it). Adapted from an equivalent hook maintained outside this repo; keep the two in
-  rough sync. Tests: `test_guard.py`, `test_guard_settings.py`.
+- Fails open on malformed input; an unwritable settings file still launches the session (without it).
+  Adapted from an equivalent hook outside this repo; keep the two in rough sync. Tests:
+  `test_guard.py`, `test_guard_settings.py`.
 
 ### AskUserQuestion answer bridge
 
