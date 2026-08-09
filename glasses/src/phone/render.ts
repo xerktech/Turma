@@ -295,6 +295,10 @@ export function sessionViewHtml(state: AppState, verbosity: VerbosityPreset, sho
     `<div class="ph-verbbar">${verbBtns}</div>` +
     `<div class="chat-scroll" id="ph-transcript"></div>` +
     questionBox +
+    // Why a send can fail, said out loud. The box used to be cleared before
+    // the POST and every rejection swallowed, so a message the hub REFUSED
+    // (413 "too long", 401, host offline) vanished with no trace (XERK-235).
+    `<div class="ph-senderr" id="ph-senderr" hidden></div>` +
     `<div class="ph-compose">` +
     `<textarea class="ph-input" id="ph-input" rows="1" placeholder="Message…"></textarea>` +
     `<button class="ph-stop" data-stop="1" hidden>◼ Stop</button>` +

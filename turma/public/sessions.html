@@ -1209,32 +1209,32 @@ function composer(a, repo, rk, spawning) {
       <textarea id="${cid(rk, "task")}" data-rk="${esc(rk)}"
         ${composerHeight.has(rk) ? `style="height:${esc(composerHeight.get(rk))}"` : ""}
         placeholder="Describe the task, or leave blank to start an empty session."
-        oninput="draftSet('${esc(rk)}','task',this.value)"
+        oninput="draftSet('${escJs(rk)}','task',this.value)"
         onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();${submit};}">${esc(d.task || "")}</textarea>
     </div>
     <div>
       <label>Label <span class="hint">(optional)</span></label>
       <input id="${cid(rk, "label")}" type="text" placeholder="e.g. fix login bug" value="${esc(d.label || "")}"
-        oninput="draftSet('${esc(rk)}','label',this.value)">
+        oninput="draftSet('${escJs(rk)}','label',this.value)">
     </div>
-    <details class="opts" ${optsExpanded ? "open" : ""} ontoggle="onOptionsToggle('${esc(rk)}','${rn}',this.open)">
+    <details class="opts" ${optsExpanded ? "open" : ""} ontoggle="onOptionsToggle('${escJs(rk)}','${rn}',this.open)">
       <summary>${optsExpanded ? "▾" : "▸"} Options</summary>
       <div class="opts-grid">
         ${repo.isRoot ? "" : `<div class="full">
           <label>Base branch <span class="hint">(fork point; latest is fetched)</span></label>
-          <select id="${cid(rk, "base")}" onchange="onOptChange('${esc(rk)}','${rn}')">
+          <select id="${cid(rk, "base")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
             ${bases.map(b => opt(b, b, selBase)).join("")}
           </select>
         </div>`}
         <div>
           <label>Model</label>
-          <select id="${cid(rk, "model")}" onchange="onOptChange('${esc(rk)}','${rn}')">
+          <select id="${cid(rk, "model")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
             ${opt("default", "Default", selModel)}${opt("opus", "Opus", selModel)}${opt("sonnet", "Sonnet", selModel)}${opt("haiku", "Haiku", selModel)}
           </select>
         </div>
         <div>
           <label>Permission mode</label>
-          <select id="${cid(rk, "perm")}" onchange="onOptChange('${esc(rk)}','${rn}')">
+          <select id="${cid(rk, "perm")}" onchange="onOptChange('${escJs(rk)}','${rn}')">
             ${opt("auto", "auto", selPerm)}${opt("bypassPermissions", "bypassPermissions", selPerm)}${opt("acceptEdits", "acceptEdits", selPerm)}${opt("plan", "plan", selPerm)}${opt("default", "default", selPerm)}
           </select>
         </div>
@@ -1294,6 +1294,43 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   })[c]);
+}
+// A URL for an `href`, or "#" if it is not one we will navigate to.
+//
+// esc() escapes the TEXT but says nothing about the SCHEME, so an agent- or
+// tracker-supplied `javascript:` URL was rendered into a real anchor. Chrome
+// happens to block javascript: into a new browsing context, so `target="_blank"`
+// was the only thing standing between this and a second XSS — which is not a
+// defence, it is a coincidence (XERK-235). http(s) and mailto only.
+function safeUrl(u) {
+  const s = String(u ?? "").trim();
+  return /^(https?:|mailto:)/i.test(s) ? esc(s) : "#";
+}
+// Escape a value for a JS STRING LITERAL that sits inside an HTML attribute —
+// i.e. every `onclick="f('${...}')"` handler below.
+//
+// esc() is the wrong tool there and gives no protection at all: it turns `'`
+// into `&#39;`, but the HTML parser decodes entities in an attribute value
+// BEFORE the handler source is compiled, so the quote comes back and the
+// string closes. A repo directory name (raw os.listdir output, no validation)
+// or a transcript id containing `');...//` therefore executed attacker JS in
+// the operator's authenticated browser with no interaction at all (XERK-235).
+//
+// Everything dangerous becomes a backslash escape built from safe characters,
+// so the result is inert in a JS string AND in an HTML attribute, single- or
+// double-quoted. Use escJs inside handler attributes; esc everywhere else.
+function escJs(s) {
+  return String(s ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\x27")
+    .replace(/"/g, "\\x22")
+    .replace(/&/g, "\\x26")
+    .replace(/</g, "\\x3C")
+    .replace(/>/g, "\\x3E")
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 }
 
 // The PR's merge-readiness verdict ('ready'/'blocked'/'pending'/""), derived
@@ -1746,7 +1783,7 @@ function queuedCard({ a, s }) {
       </span>
     </div>
     <button class="s-dots" title="Cancel queued session" aria-label="Cancel queued session"
-        onclick="cardKill(event,'${esc(a.key)}','${esc(s.id)}')">${armed ? "Confirm" : "Cancel"}</button>
+        onclick="cardKill(event,'${escJs(a.key)}','${escJs(s.id)}')">${armed ? "Confirm" : "Cancel"}</button>
   </div>`;
 }
 
@@ -1765,7 +1802,7 @@ function activeCard({ a, s, live }) {
     ? `<div class="s-moving"><span class="spin"></span> Moving to ${esc(mig.targetHost)}…</div>` : "";
   return `<div class="s-card-wrap"${orgTintStyle(a)}>
     <button class="s-card ${cur ? "cur" : ""}" ${attachable ? "" : "disabled"}
-        onclick="selectSession('${esc(s.id)}')"
+        onclick="selectSession('${escJs(s.id)}')"
         ${attachable ? "" : 'title="Terminal tunnel offline"'}>
       <span class="dot ${live.kind}"></span>
       <span class="body">
@@ -1780,7 +1817,7 @@ function activeCard({ a, s, live }) {
       </span>
     </button>
     <button class="s-dots ${menuOpenId === s.id ? "open" : ""}" title="Session actions"
-        aria-label="Session actions" onclick="toggleCardMenu(event,'${esc(s.id)}')">⋯</button>
+        aria-label="Session actions" onclick="toggleCardMenu(event,'${escJs(s.id)}')">⋯</button>
     ${menuOpenId === s.id ? cardMenu(a, s) : ""}
   </div>`;
 }
@@ -1795,10 +1832,10 @@ function cardMenu(a, s) {
   const armed = killArmedId === s.id;
   const targets = eligibleMoveTargets(a, s);
   return `<div class="s-menu" onclick="event.stopPropagation()">
-    <button onclick="startRename(event,'${esc(s.id)}')">Rename…</button>
-    ${targets.length ? `<button onclick="openMove(event,'${esc(s.id)}')">Move to another agent…</button>` : ""}
+    <button onclick="startRename(event,'${escJs(s.id)}')">Rename…</button>
+    ${targets.length ? `<button onclick="openMove(event,'${escJs(s.id)}')">Move to another agent…</button>` : ""}
     <button class="danger ${armed ? "armed" : ""}"
-        onclick="cardKill(event,'${esc(a.key)}','${esc(s.id)}')">
+        onclick="cardKill(event,'${escJs(a.key)}','${escJs(s.id)}')">
       ${armed ? "Confirm kill" : "Kill session"}
     </button>
   </div>`;
@@ -1810,7 +1847,7 @@ function moveMenu(a, s) {
   return `<div class="s-menu" onclick="event.stopPropagation()">
     <div class="s-menu-head">Move to…</div>
     ${targets.length
-      ? targets.map(t => `<button onclick="moveTo(event,'${esc(a.key)}','${esc(s.id)}','${esc(t.key)}')">${esc(t.device || t.key)}</button>`).join("")
+      ? targets.map(t => `<button onclick="moveTo(event,'${escJs(a.key)}','${escJs(s.id)}','${escJs(t.key)}')">${esc(t.device || t.key)}</button>`).join("")
       : `<div class="s-menu-empty">No eligible agent.</div>`}
     <button onclick="closeMove(event)">Cancel</button>
   </div>`;
@@ -1857,7 +1894,7 @@ function endedRow(e) {
     : (s.status === "error" ? "failed" : "stopped"))
     + (when ? " " + when : "");
   return `<div class="s-card-wrap ended-wrap"${orgTintStyle(a)}>
-    <button class="s-card ended ${cur ? "cur" : ""}" onclick="openEndedSession('${esc(e.id)}')">
+    <button class="s-card ended ${cur ? "cur" : ""}" onclick="openEndedSession('${escJs(e.id)}')">
       <span class="dot"></span>
       <span class="body">
         <div class="title">${esc(sessTitle(s))}</div>
@@ -1871,7 +1908,7 @@ function endedRow(e) {
     </button>
     <button class="s-resume" ${a.online && !resuming ? "" : "disabled"}
         ${a.online ? "" : 'title="Host offline"'}
-        onclick="resumeEnded(event,'${esc(e.id)}')">
+        onclick="resumeEnded(event,'${escJs(e.id)}')">
       ${resuming ? '<span class="spin"></span>' : "Resume"}
     </button>
   </div>`;
@@ -1885,7 +1922,7 @@ function hostBlock(a) {
     // Clicking a repo opens its composer (task/label/options). Leaving Task blank
     // and hitting Start spawns instantly with defaults — the old one-click path.
     const btn = `<button class="primary" ${spawning ? "disabled" : ""}
-        onclick="toggleComposer('${esc(rk)}','${esc(r.name)}')">
+        onclick="toggleComposer('${escJs(rk)}','${escJs(r.name)}')">
       ${spawning ? '<span class="spin"></span> Starting…' : (open ? "− " : "+ ") + esc(r.name)}
     </button>`;
     const panel = open ? composer(a, r, rk, spawning) : "";
@@ -2471,7 +2508,7 @@ function prBadgeLinkHtml(pr) {
   if (!span) return "";
   const url = pr && pr.url ? pr.url : "";
   return span
-    .replace(/^<span /, `<a href="${esc(url)}" target="_blank" rel="noopener" `)
+    .replace(/^<span /, `<a href="${safeUrl(url)}" target="_blank" rel="noopener" `)
     .replace(/<\/span>$/, "</a>");
 }
 

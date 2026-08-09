@@ -431,8 +431,12 @@ button:disabled .spin { border-top-color: var(--ink-2); }
   color: var(--ink-2); font-family: var(--font-mono); font-size: 10.5px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* Only the card is tight enough to need the cap; the detail panel has room. */
+/* Only the card is tight enough to need a TIGHT cap; the detail panel has more
+   room — but not unlimited. Uncapped, an ordinary long repo directory name
+   overflowed the detail panel's field column and painted on top of the AGENT
+   column beside it (XERK-235). 100% keeps it inside whatever column it is in. */
 .kanban-card .kc-repo { max-width: 15ch; }
+.td-field .kc-repo, .td-fields .kc-repo { max-width: 100%; }
 .kc-repo.kc-repo-uncloned { border-style: dashed; color: var(--muted); }
 .kc-repo.kc-repo-none {
   border: 0; background: none; padding: 0; color: var(--muted);

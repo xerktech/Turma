@@ -582,6 +582,35 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
   root.addEventListener("pointerup", releasePointer);
   root.addEventListener("pointercancel", () => { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } if (drag) endDrag(null); press = null; });
 
+  // Say why a send failed, and give the text back.
+  //
+  // The box was cleared BEFORE the POST and every rejection swallowed by an
+  // empty `.catch(() => {})`, so a message the hub refused — 413 "too long",
+  // 401, an offline host — disappeared with nothing on screen and no way to
+  // recover what was typed (XERK-235). The web restores the text and paints
+  // the reason; so does this now.
+  function showSendError(message: string): void {
+    const box = root.querySelector<HTMLElement>("#ph-senderr");
+    if (!box) return;
+    box.textContent = message;
+    box.hidden = false;
+  }
+  function clearSendError(): void {
+    const box = root.querySelector<HTMLElement>("#ph-senderr");
+    if (box) { box.textContent = ""; box.hidden = true; }
+  }
+  function sendFailed(text: string, err: unknown): void {
+    const status = (err as { status?: number } | null)?.status;
+    showSendError(
+      status === 413 ? "Too long — shorten the message and try again"
+        : status === 401 ? "Not authorised — check the hub login"
+        : status ? `Send failed (${status})`
+        : "Send failed — hub unreachable",
+    );
+    const inp = root.querySelector<HTMLTextAreaElement>("#ph-input");
+    if (inp && !inp.value.trim()) { inp.value = text; autoGrow(inp); }
+  }
+
   function send(): void {
     const inp = root.querySelector<HTMLTextAreaElement>("#ph-input");
     const f = focused();
@@ -590,10 +619,16 @@ export function mountPhone({ root, app, client, onSignOut }: MountPhoneOpts): Ph
     if (!text) return;
     inp.value = "";
     autoGrow(inp);
+    clearSendError();
     // A pending question answers through /answer; otherwise /input.
     const live = last.agents.find((a) => a.key === f.host)?.sessions.find((s) => s.id === f.id);
-    if (live?.session?.question) void client.answerQuestion(f.host, f.id, { optionIndex: -1, custom: text }).catch(() => {});
-    else void client.sendInput(f.host, f.id, text).catch(() => {});
+    if (live?.session?.question) {
+      void client.answerQuestion(f.host, f.id, { optionIndex: -1, custom: text })
+        .catch((err: unknown) => sendFailed(text, err));
+    } else {
+      void client.sendInput(f.host, f.id, text)
+        .catch((err: unknown) => sendFailed(text, err));
+    }
   }
 
   const handle: PhoneHandle = {

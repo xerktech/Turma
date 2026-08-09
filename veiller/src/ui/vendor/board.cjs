@@ -19,6 +19,19 @@
     })[c]);
   }
 
+  // A URL for an `href`, or "#" if it is not one we will navigate to.
+  //
+  // esc() escapes the TEXT but says nothing about the SCHEME, so a ticket URL
+  // of `javascript:...` — which the agent derives from JIRA_SITE/AZDO_URL, so
+  // a compromised tracker supplies it — was rendered into a real anchor.
+  // Chrome happens to block javascript: into a new browsing context, so
+  // `target="_blank"` was the only thing between this and a second XSS. That
+  // is a coincidence, not a defence (XERK-235). http(s) and mailto only.
+  function safeUrl(u) {
+    const s = String(u ?? "").trim();
+    return /^(https?:|mailto:)/i.test(s) ? esc(s) : "#";
+  }
+
   // "In Review"/"Testing" statuses live in Jira's `indeterminate` category
   // (which the agent maps to `inprogress`) — there is no fourth cross-org
   // category for them. So the In Review column is carved out of `inprogress`
@@ -599,7 +612,7 @@
       data-key="${esc(t.key)}" data-site="${esc(site && site.siteKey || "")}"
       aria-label="${esc(t.key + ": " + (t.summary || ""))}">
       <div class="kc-top">
-        <a class="kc-key" href="${esc(t.url || "#")}" target="_blank" rel="noopener">${esc(t.key)}</a>
+        <a class="kc-key" href="${safeUrl(t.url)}" target="_blank" rel="noopener">${esc(t.key)}</a>
         <span class="kc-type">${esc(t.type || "")}</span>
         <span class="kc-age" title="${esc(t.updated || "")}">${esc(ageStr(t.updated, now))}</span>
       </div>
@@ -1065,13 +1078,13 @@
     // section carries the loading or error state rather than an empty void.
     let body;
     if (o.error) {
-      body = `<div class="td-note td-err">Couldn't load the full ticket — ${esc(o.error)}. <a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">Open in ${srcName}</a> instead.</div>`;
+      body = `<div class="td-note td-err">Couldn't load the full ticket — ${esc(o.error)}. <a href="${safeUrl(v("url"))}" target="_blank" rel="noopener">Open in ${srcName}</a> instead.</div>`;
     } else if (!detail) {
       body = `<div class="td-note">Loading description and comments…</div>`;
     } else {
       const desc = d.description
         ? textHtml(d.description) +
-          (d.descriptionTruncated ? `<div class="td-note">Description truncated — <a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">read the rest in ${srcName}</a>.</div>` : "")
+          (d.descriptionTruncated ? `<div class="td-note">Description truncated — <a href="${safeUrl(v("url"))}" target="_blank" rel="noopener">read the rest in ${srcName}</a>.</div>` : "")
         : `<div class="td-none">No description.</div>`;
       const comments = d.comments || [];
       const dropped = Math.max(0, (d.commentTotal || comments.length) - comments.length);
@@ -1087,7 +1100,7 @@
         </section>
         <section class="td-section">
           <h3>Comments <span class="td-dim">${d.commentTotal || comments.length}</span></h3>
-          ${dropped ? `<div class="td-note">Showing the ${comments.length} newest — <a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">${dropped} older in ${srcName}</a>.</div>` : ""}
+          ${dropped ? `<div class="td-note">Showing the ${comments.length} newest — <a href="${safeUrl(v("url"))}" target="_blank" rel="noopener">${dropped} older in ${srcName}</a>.</div>` : ""}
           ${cHtml}
         </section>`;
     }
@@ -1096,7 +1109,7 @@
     return `<div class="td-head">
         <div class="td-crumbs">
           <span class="kc-org" style="--org:${esc(color)}" title="${esc(o.siteKey || "")}">${esc(v("project") || "")}</span>
-          <a class="kc-key" href="${esc(v("url") || "#")}" target="_blank" rel="noopener">${esc(t.key)}</a>
+          <a class="kc-key" href="${safeUrl(v("url"))}" target="_blank" rel="noopener">${esc(t.key)}</a>
           <span class="kc-type">${esc(v("type") || "")}</span>
         </div>
         <button class="td-close" type="button" aria-label="Close">✕</button>
@@ -1104,7 +1117,7 @@
       <h2 class="td-summary">${esc(v("summary") || "")}</h2>
       <dl class="td-fields">${fields}</dl>
       ${body}
-      <div class="td-foot"><a href="${esc(v("url") || "#")}" target="_blank" rel="noopener">Open in ${srcName} ↗</a></div>`;
+      <div class="td-foot"><a href="${safeUrl(v("url"))}" target="_blank" rel="noopener">Open in ${srcName} ↗</a></div>`;
   }
 
   // The three-column board for the selected sites (filter = a siteKey, an
@@ -1278,7 +1291,7 @@
     // operator sees where the ticket landed and can open it or make another.
     if (s.created && s.created.key) {
       const link = s.created.url
-        ? `<a href="${esc(s.created.url)}" target="_blank" rel="noopener">${esc(s.created.key)} ↗</a>`
+        ? `<a href="${safeUrl(s.created.url)}" target="_blank" rel="noopener">${esc(s.created.key)} ↗</a>`
         : esc(s.created.key);
       return `<div class="cf-head">
           <h2>Ticket created</h2>
