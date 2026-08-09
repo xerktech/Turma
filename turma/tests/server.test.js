@@ -110,6 +110,7 @@ const {
   wsAccept, wsEncode, wsParser, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
+  serializeAgentsForSave,
   HEARTBEAT_UNKNOWN_MAX, AGENT_RECORD_MAX,
   userAuthorized, agentAuthorized, agentWsAuthorized, triggerAuthorized, fmtDur,
   credentialsMatch, issueSessionToken, sessionTokenValid,
@@ -839,9 +840,14 @@ test("safeAgentsCache serves something rather than failing the fleet payload", (
   // Unguarded, a serialization failure here reached the route's generic catch
   // as a 400 — to every dashboard, Android and glasses client, and permanently,
   // because the records causing it live for PRUNE_AFTER_MS.
+  // A host must actually be present, or "last good == degraded" is vacuously
+  // true and the assertion below proves nothing.
+  agents["cache-witness"] = { key: "cache-witness", device: "cache-witness", lastSeen: Date.now() };
+  invalidateAgentsCache();
   const good = safeAgentsCache();
   assert.ok(good && typeof good.body === "string" && good.etag);
   assert.doesNotThrow(() => JSON.parse(good.body));
+  assert.ok(JSON.parse(good.body).agents.length > 0, "the fixture must put a host in the payload");
 
   // Now make it actually throw. A circular record is the cheap stand-in for the
   // RangeError a >512 MiB fleet produces — same catch, same degraded path.
@@ -855,11 +861,26 @@ test("safeAgentsCache serves something rather than failing the fleet payload", (
       "a serialization failure must still produce a payload");
     assert.doesNotThrow(() => JSON.parse(degraded.body),
       "the degraded payload must be valid JSON, not a 400");
+    // It must be the LAST GOOD payload, not an empty fleet: deleting the
+    // last-good branch still yields valid JSON, so asserting only that would
+    // let every host silently vanish from the dashboard.
+    assert.deepEqual(
+      JSON.parse(degraded.body).agents, JSON.parse(good.body).agents,
+      "the degraded payload must be the last good fleet, not an empty one",
+    );
+
+    // The SAVE path has the same failure and a worse consequence: this runs
+    // inside a timer, so an unguarded throw exits the whole hub.
+    assert.equal(serializeAgentsForSave(), null,
+      "an unserializable fleet must skip the save, not throw out of the timer");
   } finally {
     delete agents["boom-host"];
+    delete agents["cache-witness"];
+    invalidateAgentsCache();
   }
   // ...and it recovers once the offending record is gone.
   assert.doesNotThrow(() => JSON.parse(safeAgentsCache().body));
+  assert.equal(typeof serializeAgentsForSave(), "string", "a healthy fleet still saves");
 });
 
 test("sessionWorking: a dead host's session is not still working (XERK-235)", () => {

@@ -74,6 +74,18 @@ function inlineHandlers(src) {
 // Names whose value derives from esc() — directly, or through any chain of
 // assignments that interpolates such a name. A bare `esc(` anywhere in an
 // initializer taints it, whatever else sits beside it.
+//
+// This is a HEURISTIC, deliberately over-approximate: it reads HTML attribute
+// text as JavaScript, so harmless names (`class`, `href`, `value`) land in the
+// set too. That error direction is the safe one — noise can only ever produce a
+// FALSE POSITIVE someone investigates, never a missed injection. **If a
+// legitimate handler ever trips this, fix it by renaming the variable or by
+// using escJs — never by loosening the scanner.**
+//
+// It cannot follow a value into a function PARAMETER, so the convention that
+// keeps it sufficient is: **escape at the interpolation site; never pass an
+// already-escaped value into a markup helper.** Hold that and the direct-`esc(`
+// check covers the helper's own body.
 function escDerived(src) {
   const BARE_ESC = /(?<![A-Za-z0-9_])esc\(/;
   // The initializer must stop at the NEXT declarator, not run to end of line.

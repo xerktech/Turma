@@ -341,6 +341,22 @@ try {
 } catch {
   /* first boot or no volume mounted */
 }
+// The state blob, or null when it cannot be produced. JSON.stringify throws
+// RangeError once the aggregate passes V8's ~512 MiB string ceiling, and it runs
+// inside the save TIMER — an unguarded throw is an uncaught exception on the
+// main loop, so the whole hub exits, taking every host's control plane with it
+// and losing the very file the save exists to protect. Failing to save is
+// survivable; dying is not (XERK-235). Lifted out of scheduleSave so the
+// failure path is reachable from a test.
+function serializeAgentsForSave() {
+  try {
+    return JSON.stringify(agents);
+  } catch (e) {
+    console.error(`state save skipped — could not serialize agent state: ${e.message}`);
+    return null;
+  }
+}
+
 let saveTimer = null;
 function scheduleSave() {
   if (saveTimer) return;
@@ -352,13 +368,8 @@ function scheduleSave() {
     // every host's control plane with it, and state.json is the one thing the
     // crash was supposed to protect. Failing to save is survivable; dying is
     // not (XERK-235).
-    let blob;
-    try {
-      blob = JSON.stringify(agents);
-    } catch (e) {
-      console.error(`state save skipped — could not serialize agent state: ${e.message}`);
-      return;
-    }
+    const blob = serializeAgentsForSave();
+    if (blob === null) return;
     fs.mkdir(path.dirname(STATE_FILE), { recursive: true }, () => {
       fs.writeFile(STATE_FILE, blob, (err) => {
         if (err) console.error(`state save failed: ${err.message}`);
@@ -3142,6 +3153,15 @@ const server = http.createServer(async (req, res) => {
       // mutated — a refused beat still poisoned the caches and its content came
       // back out of /history with a 413 on the wire.
       const recordSize = agentRecordSize(next);
+      if (recordSize > AGENT_RECORD_MAX / 2 && recordSize <= AGENT_RECORD_MAX) {
+        // Visible BEFORE it 413s. Measured against the operator's real fleet the
+        // largest record is 0.30 MiB, so half the ceiling means something has
+        // changed shape (~316 repos or ~165 sessions on one host).
+        console.warn(
+          `heartbeat from ${key}: record is ${recordSize} bytes, over half the ` +
+            `${AGENT_RECORD_MAX} limit`
+        );
+      }
       if (recordSize > AGENT_RECORD_MAX) {
         if (prev && Object.keys(prev).length) agents[key] = prev;
         else delete agents[key];
@@ -4641,6 +4661,7 @@ if (process.env.TURMA_TEST) {
     server,
     agents,
     invalidateAgentsCache,
+    serializeAgentsForSave,
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
