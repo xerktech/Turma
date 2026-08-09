@@ -404,6 +404,23 @@ exercised code in the tree.
   **Always diff the new behaviour against `origin/main` over a corpus**, in one
   process, and treat "main denied this and we now allow it" as a finding unless
   it is deliberate and written down.
+- **A bound that is per-item with no aggregate.** Capping each unknown heartbeat
+  key at 64 KiB was defeated by sending 400 of them in one beat — 25 MiB through
+  the very path written to stop it — and left every KNOWN key unbounded besides.
+  When you see a per-item limit, always ask what N of them costs.
+- **A fix nothing can reach.** The glasses online gate was added as
+  `if (hostLastSeen != null)` with two optional parameters, and every production
+  caller omitted them; only the new unit test exercised it. **Check the call
+  sites, not just the function** — a fix behind an optional argument is a fix
+  only for whoever passes it.
+- **A doc that undercounts.** CLAUDE.md said "four mirrors must agree" for
+  `readyForReview`; there are five, and the fifth (`veiller/src/core/sessions.ts`,
+  a fork rather than an import) was missed for exactly that reason. When a rule
+  names its own copies, grep for a sixth before believing the list.
+- **A test that asserts presence rather than meaning.** The Android backup-rules
+  test checked that both prefs filenames appeared in the XML. Flipping `<exclude>`
+  to `<include>` keeps both names present and INVERTS the rule — those two files
+  become the only things backed up — and the suite stayed green through it.
 
 ---
 

@@ -1407,10 +1407,10 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
   through to the finished-turn signal. Both are **transcript timestamps** — the conversation's clock,
   not the mtime a synced `~/.claude` inflates. False when unanswerable (older agent included), erring
   toward parking over a wrong claim.
-- Four mirrors must agree: `sessions.html`, `server.js`, `core/Sessions.kt` (`rankRunning` →
-  `LiveGroups`), `glasses/src/sessions.ts`. The card says WHY it qualified, on the accent `.dot.review`.
-  Tests: `sessions.test.js`, `readyForReview` in `server.test.js`, `TestPrsLanded`, android
-  `SessionsTest`.
+- FIVE mirrors must agree: `sessions.html`, `server.js`, `core/Sessions.kt` (`rankRunning` →
+  `LiveGroups`), `glasses/src/sessions.ts`, and veiller's FORK of the last. The card says WHY it
+  qualified, on `.dot.review`. Tests: `sessions.test.js`, `readyForReview` in `server.test.js`,
+  `TestPrsLanded`, `SessionsTest`.
 
 #### Ended sessions
 
