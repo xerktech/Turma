@@ -718,6 +718,61 @@ class TestKnownBypasses(unittest.TestCase):
         self.assertIsNotNone(guard.is_destructive(f"echo '{drop_db} p' | docker exec -i db psql"))
         self.assertIsNone(guard.is_destructive(f"cat schema.sql | grep '{drop_tb}'"))
 
+    def test_every_wrapper_has_an_entry_in_every_table(self):
+        """`.get(prog, set())` is a silent default on a security-critical lookup.
+
+        Seven of the twelve wrappers had no value-option entry at all, which
+        silently meant "no option takes a value" and made each of them a bypass.
+        This turns "we forgot podman" from a silent hole into a red test.
+        """
+        self.assertEqual(set(guard._EXEC_WRAPPERS), set(guard._EXEC_WRAPPER_OPERANDS))
+        self.assertEqual(set(guard._EXEC_WRAPPERS), set(guard._EXEC_WRAPPER_OPTS_WITH_VALUE))
+
+    def test_an_unknown_wrapper_option_is_not_a_bypass(self):
+        """The option table CANNOT be kept complete — value-taking options are
+        many and grow every release — so a miss must cost sharpness, not safety.
+        Every non-option suffix is classified as an argv, so wherever the command
+        really starts, one of them begins at it.
+        """
+        for cmd in ("ssh --madeup-flag val host rm -rf /etc",
+                    "docker exec --not-a-real-flag x c rm -rf /etc",
+                    "kubectl --invented thing exec pod rm -rf /etc",
+                    # ...and the 27 real options we had both missed.
+                    "ssh -B eth0 host rm -rf /etc", "ssh -O check host rm -rf /etc",
+                    "docker -c foo exec c rm -rf /etc",
+                    "docker --log-level debug exec c rm -rf /etc",
+                    "kubectl --token abc exec pod rm -rf /etc",
+                    "kubectl -v 5 exec pod rm -rf /etc",
+                    "oc --token abc exec pod rm -rf /etc",
+                    "podman --url x exec c rm -rf /etc"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_wrappers_without_a_table_entry_are_covered(self):
+        """These had NO entry, so every option read as taking no value. And
+        `nsenter` expects 0 operands, which made it return its own flags as the
+        command with `-t` as the program."""
+        for cmd in ("chroot --userspec root /mnt rm -rf /etc",
+                    "lxc --project p exec c rm -rf /etc",
+                    "incus --project p exec c rm -rf /etc",
+                    "docker-compose -f c.yml exec db rm -rf /etc",
+                    "nsenter -t 1 -m rm -rf /etc",
+                    "nsenter --target 1 --mount rm -rf /etc"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_ssh_joins_its_operands_but_exec_wrappers_do_not(self):
+        """`ssh host 'rm -rf /etc' 'b'` really runs `rm -rf /etc b` — ssh hands a
+        joined STRING to a remote shell. `docker exec`/`kubectl exec` exec the
+        argv directly, so they must keep argv semantics."""
+        for cmd in ("ssh host 'rm -rf /etc' 'b'",
+                    "ssh host 'cd /tmp' '&&' 'rm -rf /etc'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        # `ssh host 'a' 'rm -rf /etc'` runs `a rm -rf /etc` — rm is an ARGUMENT
+        # to `a`, and denying it was a false positive.
+        self.assertIsNone(guard.is_destructive("ssh host 'a' 'rm -rf /etc'"))
+
     def test_tokenising_is_memoised(self):
         """The hook runs before EVERY Bash call, so its cost is on the critical path.
 

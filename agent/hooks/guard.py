@@ -601,9 +601,25 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             inner_cmd = _wrapper_command(prog, rest)
             if len(inner_cmd) == 1 and re.search(r"\s", inner_cmd[0]):
                 out.extend(_expand_segments(inner_cmd[0], depth + 1))
+            elif inner_cmd and prog in _JOINING_WRAPPERS:
+                # ssh JOINS its operands and hands the string to a remote shell,
+                # so `ssh host 'rm -rf /etc' 'b'` runs `rm -rf /etc b`.
+                out.extend(_expand_segments(" ".join(inner_cmd), depth + 1))
             elif inner_cmd:
                 out.extend(_expand_segments(
                     " ".join(shlex.quote(t) for t in inner_cmd), depth + 1))
+            # ...and, because the option table above CANNOT be kept complete,
+            # classify every non-option suffix as an argv too. Wherever the
+            # command really starts, one of these begins at it, so a missing
+            # option is a lost sharpening rather than a bypass. Safe to
+            # over-approximate: a suffix starting in the wrong place yields a
+            # program like `host` or a quoted message, which matches nothing.
+            for idx in range(len(rest)):
+                if rest[idx].startswith("-"):
+                    continue
+                tail = _strip_prefixes(rest[idx:])
+                if len(tail) > 1:
+                    out.append((tail, seg))
         elif prog == "xargs" and rest:
             # Drop xargs' own leading options, keep the command and ITS flags,
             # then append what the pipeline will feed it as operands. An option
@@ -1121,16 +1137,42 @@ _EXEC_WRAPPER_OPERANDS = {
 # VALUE eats an operand slot and the command is missed entirely: `ssh -i key
 # host rm -rf /etc` counted `key` as the host and returned `['host','rm',…]`.
 # Same shape, and the same reason, as _PREFIX_OPTS_WITH_VALUE.
+# NB: this table is an OPTIMISATION, not a security boundary. It cannot be kept
+# complete — value-taking options are many and grow every release — so a miss
+# must not be a bypass. `_expand_segments` therefore also classifies every
+# non-option suffix of a wrapper's argv (see the wrapper branch), which finds the
+# command wherever it actually starts. The table only sharpens the ONE position
+# that gets the single-token-is-a-command-line reading.
 _EXEC_WRAPPER_OPTS_WITH_VALUE = {
-    "ssh": {"-i", "-p", "-o", "-l", "-F", "-c", "-m", "-b", "-D", "-L", "-R",
-            "-W", "-e", "-E", "-I", "-J", "-Q", "-S", "-w"},
+    "ssh": {"-i", "-p", "-o", "-l", "-F", "-c", "-m", "-b", "-B", "-D", "-e",
+            "-E", "-I", "-J", "-L", "-O", "-Q", "-R", "-S", "-W", "-w"},
     "docker": {"-u", "--user", "-w", "--workdir", "-e", "--env", "--context",
-               "--config", "-H", "--host", "--detach-keys", "--env-file"},
-    "podman": {"-u", "--user", "-w", "--workdir", "-e", "--env"},
+               "-c", "--config", "-H", "--host", "--detach-keys", "--env-file",
+               "-l", "--log-level", "--tlscacert", "--tlscert", "--tlskey"},
+    "podman": {"-u", "--user", "-w", "--workdir", "-e", "--env", "--url",
+               "--connection", "--detach-keys", "--env-file", "--log-level"},
     "kubectl": {"-n", "--namespace", "--context", "--cluster", "--user", "-c",
-                "--container", "--kubeconfig", "--as"},
-    "oc": {"-n", "--namespace", "--context", "-c", "--container"},
+                "--container", "--kubeconfig", "--as", "--as-group", "--token",
+                "-s", "--server", "-v", "--tls-server-name", "--request-timeout",
+                "--certificate-authority", "--client-certificate", "--client-key",
+                "--pod-running-timeout"},
+    "oc": {"-n", "--namespace", "--context", "--cluster", "--user", "-c",
+           "--container", "--kubeconfig", "--as", "--token", "-s", "--server"},
+    "chroot": {"--userspec", "--groups", "--skip-chdir"},
+    "nsenter": {"-t", "--target", "-S", "--setuid", "-G", "--setgid",
+                "-r", "--root", "-w", "--wd"},
+    "lxc": {"--project", "--env", "--user", "--group", "--cwd"},
+    "incus": {"--project", "--env", "--user", "--group", "--cwd"},
+    "docker-compose": {"-f", "--file", "-p", "--project-name", "--project-directory",
+                       "--env-file", "--profile", "-c", "--context"},
+    "flatpak": {"--command", "--branch", "--arch", "--env", "--filesystem"},
+    "distrobox": {"-n", "--name", "-e", "--extra-flags"},
 }
+
+# Wrappers whose remaining operands are JOINED into one command line for a
+# remote shell, rather than exec'd as an argv: `ssh host 'rm -rf /etc' 'b'`
+# really runs `rm -rf /etc b`. `docker exec`/`kubectl exec` do NOT join.
+_JOINING_WRAPPERS = {"ssh", "chroot"}
 
 
 def _wrapper_command(prog: str, rest: list[str]) -> list[str]:
@@ -1140,13 +1182,19 @@ def _wrapper_command(prog: str, rest: list[str]) -> list[str]:
     remaining = _EXEC_WRAPPER_OPERANDS.get(prog, 1)
     takes_value = _EXEC_WRAPPER_OPTS_WITH_VALUE.get(prog, set())
     i = 0
-    while i < len(rest) and remaining > 0:
+    # Leading options are skipped even when no operand is expected — `nsenter`
+    # takes 0 operands, and without this it returned its own flags as the
+    # command, with `-t` as the program.
+    while i < len(rest):
         tok = rest[i]
-        if tok.startswith("-"):
+        if tok.startswith("-") and len(tok) > 1:
             if "=" not in tok and tok in takes_value:
-                i += 1  # its value is not an operand
-        else:
-            remaining -= 1
+                i += 1
+            i += 1
+            continue
+        if remaining == 0:
+            break
+        remaining -= 1
         i += 1
     return rest[i:] if remaining == 0 else []
 
