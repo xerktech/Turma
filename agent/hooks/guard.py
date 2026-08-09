@@ -65,10 +65,6 @@ import sys
 # exactly like `;` does, so leaving it out let `sleep 0 & rm -rf /etc` past.
 _SEGMENT_SPLIT = re.compile(r"&&|\|\||[;\n|&]")
 
-# The same, MINUS the single `|`: a pipeline's stages are one statement, and
-# some checks (see _destructive_database) have to see it whole.
-_PIPELINE_SPLIT = re.compile(r"&&|\|\||[;\n&]")
-
 # A leading `FOO=bar` environment assignment on a command.
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*$")
 
