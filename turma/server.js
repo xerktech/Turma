@@ -4717,6 +4717,9 @@ if (process.env.TURMA_TEST) {
     // the one standing between a stray cmdId and a deleted command — with no
     // reachable path through the HTTP surface (XERK-241).
     dropQueuedCommand,
+    // In-memory by design, so a hub restart drops it and ownership falls back
+    // to the fleet scan. Exported so a test can stage exactly that (XERK-241).
+    cmdHosts,
     invalidateAgentsCache,
     queueCommand,
     findSession,

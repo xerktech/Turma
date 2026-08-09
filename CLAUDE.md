@@ -1024,10 +1024,10 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   endpoints in `net/HubApi.kt`, the label/meta/result ports in `core/Board.kt`.
 - **An org's hosts are health-ranked (`jiraHostHealthy`: online, then `jira.available`) and a board
   write is OWNED by the host that took it** (XERK-241): the poll reads only that owner (`commandHost`)
-  — judging a create by a SIBLING's liveness is what made four tickets. Giving up **withdraws** the
-  command, always — delivery is at-least-once and the agent's acked-set is in-memory, so one left
-  queued re-RUNS on that host's return; `deliveredAt` decides only the WORDING (undelivered provably
-  did nothing, delivered "may have been created"). A retry rejoins an unresolved identical create
+  — judging a create by a SIBLING's liveness is what made four tickets. Giving up on a create
+  **withdraws** it even when delivered: delivery is at-least-once and the agent's acked-set is
+  in-memory, so one left queued re-RUNS on that host's return; `deliveredAt` decides only the WORDING
+  (undelivered provably did nothing, delivered "may have been created"). A retry rejoins an unresolved identical create
   (`createInFlight`, over the WHOLE body); creates round-robin past gapped hosts, and the status
   single-flight spans the org's ONLINE hosts.
 - **A refusal carries the tracker's own words; a create bends to the TYPE and IDENTITY** (XERK-151):

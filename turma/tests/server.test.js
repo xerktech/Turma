@@ -3296,6 +3296,49 @@ test("XERK-241: an awaited command of another kind isn't adopted by the create p
   })();
 });
 
+test("XERK-241: a RECORDED owner of another kind isn't adopted either", async () => {
+  // The other kind-scoped claims run in the fleet scan; this one is the owner
+  // fast-path, and only a cmdId that cmdHosts actually records reaches it —
+  // so it takes a status change's id, polled at the create route.
+  const site = "mxp.atlassian.net";
+  await jiraBeat("mxp", site);
+  const st = await request("POST", `/api/jira/${site}/ENG-8/status`, {
+    body: { value: "31" }, headers: userHeaders,
+  });
+  assert.equal(st.status, 202);
+  agents.mxp.lastSeen = Date.now() - 90 * 1000;
+  const out = await request("GET", `/api/jira/${site}/tickets/${st.body.cmdId}`, { headers: userHeaders });
+  assert.equal(out.status, 202, "a status change's id is not a create's");
+});
+
+test("XERK-241: ownership survives a hub restart via the fleet scan", async () => {
+  // cmdHosts is in-memory, so a restart forgets who ran what and the scan is
+  // the only thing left that can answer. Losing it silently turns a COMPLETED
+  // change into one that polls pending forever.
+  const site = "mxq.atlassian.net";
+  await jiraBeat("mxq-a", site);
+  await jiraBeat("mxq-b", site);
+  const st = await request("POST", `/api/jira/${site}/ENG-6/status`, {
+    body: { value: "31" }, headers: userHeaders,
+  });
+  const owner = st.body.host, other = owner === "mxq-a" ? "mxq-b" : "mxq-a";
+  await jiraBeat(owner, site, {
+    ticketStatusResults: [{ cmdId: st.body.cmdId, ok: true, status: "Done", statusCategory: "done" }],
+  });
+  hub.cmdHosts.clear();                       // the restart
+  // …and the ranking now prefers the sibling, so nothing but the scan can find
+  // the host that actually holds the outcome.
+  await jiraBeat(owner, site, {
+    jira: { available: false, configured: true, siteKey: site, user: "u", tickets: [] },
+  });
+  await jiraBeat(other, site);
+
+  const out = await request("GET", `/api/jira/${site}/ENG-6/status?cmdId=${st.body.cmdId}`, { headers: userHeaders });
+  assert.equal(out.status, 200);
+  assert.equal(out.body.ok, true, "a completed change must not read as pending after a restart");
+  assert.equal(out.body.status, "Done");
+});
+
 test("XERK-241: a recorded owner that has left the org no longer answers for it", async () => {
   const site = "mxm.atlassian.net", other = "mxm-other.atlassian.net";
   await jiraBeat("mxm-mover", site);
