@@ -363,6 +363,48 @@ sees when it trips one, and whether the client can recover.
   `core/*.kt` vs its web original). They drift, and the drift is invisible until
   you diff them side by side with a concrete input.
 
+### 5.7 Shapes the SECOND round found — all of them in the FIRST round's fixes
+
+Every one of these was introduced or left behind by a pass that believed it was
+done. Re-QA a fix as hard as you QA'd the original; the fix is the newest, least
+exercised code in the tree.
+
+- **A sanitiser reached through a variable.** The first XSS pass converted every
+  `esc(` written *inside* an `on*="…"` attribute and missed all 20 sites that
+  did `const key = esc(a.key)` and interpolated `${key}` — same bug, one
+  indirection away. **The regression test had the same blind spot**, greps for a
+  literal `esc(` inside the attribute, and was green with the vulnerability
+  shipped. When you write or judge a taint guard, mutation-test it in the shape
+  the bug *actually shipped in*, not the shape it is easiest to grep for.
+- **A fix placed in the wrong loop.** The Android `repoOptions` union was added
+  over the `byUser` winners instead of over every agent — and `board.js` has a
+  comment naming that exact loop as the wrong one. It did nothing in the common
+  case, and the three tests added with it all used two different tracker users,
+  which is the one arrangement where the wrong loop still works. **Fixture
+  choice hid the bug**, exactly as it had in the commit being fixed.
+- **A cap that bounds the small thing and not the large one.** `SPAWN_FIELD_MAX`
+  bounded queued-command fields while the heartbeat spread an unbounded payload
+  onto a persisted record — and the same commit raised that body cap 32×. One
+  agent could then park 30 MiB per beat and, with enough hosts, kill the hub
+  outright: `JSON.stringify` throws past ~512 MiB and the throw was inside a
+  timer callback, so it was uncaught. Look for the *biggest* unbounded thing,
+  not the one nearest the change.
+- **A guard with a lower bound and no upper one.** The archive cursor refused a
+  rewind but accepted `endOffset` past 2^53, which SQLite stores and then
+  refuses to read back — bricking that transcript forever.
+- **Security fixes with nothing that can fail.** Reverting the Android WebView
+  debug flag left `testDebugUnitTest`, `lintVitalRelease` and semgrep all green,
+  and `android-ci.yml` runs neither of the last two on a PR. Ask of every
+  security fix: *what turns red if someone undoes this?* If the answer is
+  nothing, that is a finding.
+- **Two fixes that were regressions of their own fixes.** Substituting a
+  placeholder for an unknowable `$( )` cured one false positive and made
+  `rm -rf /$(cat x)` look like a deep path; following exec wrappers to a client
+  missed the normal spelling, where the remote command is a single quoted token.
+  **Always diff the new behaviour against `origin/main` over a corpus**, in one
+  process, and treat "main denied this and we now allow it" as a finding unless
+  it is deliberate and written down.
+
 ---
 
 ## 6. Known-unverifiable on this host
@@ -416,7 +458,19 @@ from **SUSPECTED** (you reasoned it). A suite passing is the floor, never the
 verification — if you did not build and drive the thing, say so, and the verdict
 is PARTIAL.
 
-Two habits that paid off in XERK-235 and cost almost nothing:
+**A FAIL verdict is worth more than a PASS.** All four gates in XERK-235 came
+back FAIL on their first run and three on their second; every round found real
+defects, including a stored XSS that was executing in the operator's browser and
+a remote crash of the whole hub. A gate that returns PASS on its first look at a
+substantial change has usually not tried hard enough — say what you could not
+break, and how you tried.
+
+Three habits that paid off in XERK-235 and cost almost nothing:
+
+- **Diff the new behaviour against `origin/main`.** Load both versions in one
+  process and run a corpus through each. "main denied this and HEAD allows it"
+  found three regressions in the guard alone that no test covered — including
+  one the fixing commit introduced.
 
 - **Mutation-test your own verification.** Break three behaviors the suite
   claims to protect and confirm it notices. Every agent that did this found at
