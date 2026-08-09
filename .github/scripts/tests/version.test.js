@@ -8,6 +8,25 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const V = require("../version.js");
 
+// The committed VERSION file itself, not just the parser. Nothing else reads it
+// until release.yml's `plan` job does, on main, AFTER the merge — so a stray
+// edit (a full MAJOR.MINOR.PATCH is the natural mistake, since that is what the
+// tags and the releases are called) takes the release pipeline down and stays
+// down until someone notices. That happened: `0.6.65` landed and four
+// consecutive releases died on it. Same reasoning as the CLAUDE.md size gate —
+// the check has to run on the change it exists to catch, so `VERSION` is in
+// code-scan.yml's path filter too.
+test("the committed VERSION file is a valid MAJOR.MINOR base", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const raw = fs.readFileSync(
+    path.join(__dirname, "..", "..", "..", "VERSION"), "utf8");
+  assert.doesNotThrow(
+    () => V.parseBase(raw),
+    `VERSION must hold MAJOR.MINOR only — the PATCH is derived from the v* tags `
+      + `and is never committed (see RELEASING.md). Got ${JSON.stringify(raw)}.`);
+});
+
 test("parseBase accepts MAJOR.MINOR, rejects everything else", () => {
   assert.deepEqual(V.parseBase("0.3"), { major: 0, minor: 3 });
   assert.deepEqual(V.parseBase(" 12.7\n"), { major: 12, minor: 7 });

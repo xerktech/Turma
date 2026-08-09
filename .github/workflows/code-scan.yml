@@ -41,6 +41,11 @@ on:
       # pushes the file over its limit is usually a docs-only PR — without this
       # path the gate would never run on the change it exists to catch.
       - "CLAUDE.md"
+      # Same reason: version.test.js parses the committed VERSION file, and a
+      # VERSION bump is a one-line PR touching nothing else. Nothing until
+      # release.yml's `plan` job reads that file, so an unparseable one is only
+      # discovered on main, after the merge, by a dead release.
+      - "VERSION"
 
 concurrency:
   group: code-scan-${{ github.ref }}
