@@ -1,0 +1,435 @@
+---
+paths:
+  - "agent/**"
+---
+
+# `agent/` — per-host headless agent image
+
+Currently Claude Code; the name is agent-generic so it can host other agents later. Read `CLAUDE.md`
+first — session model, cross-cutting contracts and safety-guard policy live there.
+
+## `hub-agent.py` — session manager and heartbeat in one process
+
+- Scans `REPOS_ROOT`; owns a persisted registry (`~/.turma/sessions.json`); executes hub commands
+  riding the heartbeat reply (at-least-once, `cmdId` de-dup); drives each session's worktree + tmux
+  + ttyd; heartbeats repos, one record per session, and a container-log tail.
+- `resume_on_boot` **adopts** a session whose claude tmux is still alive (tmux/ttyd outlive a
+  manager restart) — only re-ensures the ttyd, so the native agent updates in place without stopping
+  sessions. `--resume` relaunch is the fallback when the tmux is gone. ttyd is adopted by port when
+  the persisted `ttydPid` is alive; `_kill_ttyd` reaps that pid so an adopted ttyd isn't leaked.
+  Tests: `TestResumeOnBootAdopt`.
+
+## Commands
+
+Lifecycle (`spawn`/`kill`/`start`/`restart`/`delete`/`resume`/`resumeTranscript`) behaves as the
+session model describes. Tests: `TestResumableReport`, `TestResumeTranscript`, `TestTranscriptCwd`.
+
+- `interrupt` — one Escape to the pane. Deliberately **NOT** gated on `paneBusy`. Tests:
+  `TestInterrupt`.
+- `prune` — removes worktrees merged into the latest default branch (**skipping any backing a
+  session or holding uncommitted changes**) and local branches merged into it.
+- `refreshJira` — the /board manual refresh: re-poll now instead of waiting out
+  `JIRA_REFRESH_EVERY`. Re-checks `jira_configured()`, so an unconfigured host stays at zero Jira
+  calls.
+- `input` / `history` / `answerQuestion` — the chat composer + glasses client (below).
+
+### `input` / `send_input`
+
+- **Guarantees the message survives a compaction** (XERK-47), which can drop one queued mid-turn:
+  every sent message goes on the record's `pendingInputs` outbox, made at-least-once by
+  `_poll_pending_inputs`.
+  - Compactions are counted by `_pending_scan` from the transcript's own `compact_boundary` **system
+    entry**, never by scraping the pane.
+  - A message is **re-sent** only when a NEW compaction happened since it was sent (`compactBase`
+    rose) AND it is neither delivered nor still in the folded live queue AND the pane has settled to
+    idle (`_pane_busy` False, not None). That three-way gate is what makes the resend
+    **duplicate-safe**; `delivered` matches by text alone, biased AGAINST a resend. Bounded by
+    `PENDING_INPUT_MAX_ATTEMPTS`/`PENDING_INPUT_TTL_SEC`, one per beat.
+  - The outbox is internal (not heartbeated), cleared on restart-clear-context; text typed into the
+    raw ttyd terminal bypasses `send_input` and isn't covered.
+  - Tests: `TestPendingScan`, `TestPollPendingInputs`, `TestSendInput`.
+- **PASTED, not typed** (`_type_into_pane`, XERK-227): `send-keys` is a tmux command argument,
+  refused past ~16 KiB, which a pasted log exceeds. `-p` brackets only for an app that asked (Claude
+  Code does) so **newlines survive as ONE message**; control bytes are stripped, else one ends the
+  paste and the rest reads as KEYSTROKES.
+- **Nothing truncates silently**: the fallback CHUNKS its send-keys; the agent REFUSES past
+  `INPUT_MAX_CHARS` (100k) and heartbeats it as **`inputMaxChars`**; the hub caps at the receiving
+  host's figure (`inputCapFor`, **4k when unreported** — that agent predates the paste and clips the
+  tail untold), 413ing with `limit`.
+- **File attachments ride this command** (XERK-234): `send_input` fetches each hub-staged upload
+  into `~/.turma/uploads/<sessionId>/` — **never a worktree**, where it would read as the
+  uncommitted work `prune`/`delete` key on (`build_guard_settings` pre-approves `Read` there) — then
+  prefixes the message with their PATHS, so the COMPOSED text is what lands on the outbox. The name
+  is sanitized on BOTH sides (it is joined onto a path); one that fails to transfer is NAMED, never
+  dropped. **`uploadMaxBytes` is the cap AND the capability flag** (like `inputMaxChars`): an agent
+  reporting none drops uploads untold, so the hub refuses and the composers hide the 📎. Tests:
+  `TestStoreUploads`, `TestSendInputUploads`, `UploadsTest`.
+
+### `history`
+
+- **Operator messages are exempt from the window** (XERK-186): the read stays bounded (last 4 MiB +
+  `HISTORY_MAX_MSGS`, capped inside `_history_entries` — **callers must not re-slice**), but on any
+  cut every user-authored text turn in the whole transcript folds back in ahead of the window
+  (id-deduped, `HISTORY_USER_MSGS` backstop); tool traffic otherwise evicts them. Tests:
+  `TestHistoryCommand`.
+
+### `setModel` — live model switch, for that session only (XERK-33)
+
+- `set_model` drives Claude Code's /model picker (`parse_model_picker`). **Never `/model <name>`**,
+  whose argument form ALSO saves the pick as the host's login-wide default.
+- Arrows go **one press at a time, each verified by re-reading the ❯** (`_await_picker_step`), so a
+  dropped/doubled key can't land `s` on the wrong row. The record updates only on the TUI's own "Set
+  model to…" confirmation (`_await_model_confirmation`).
+- A busy pane **defers, never drops**: the pick lands as `pendingModel` (persisted, heartbeated) and
+  `_apply_pending_switches` applies it on the first idle beat. Backs out with Escape when the picker
+  has no row for the target (the bracketed `[1m]` aliases have none). Tests: `TestSetModelMode`,
+  `TestParseModelPicker`.
+
+### `setMode` — live permission-mode switch
+
+- A **closed loop**: Shift+Tab, read the footer marker back (`parse_pane_mode`), repeat until the
+  target reads back or the cycle wraps (a logged no-op). **Never a computed press count** — the real
+  cycle is account- and model-dependent, and the record's "current" goes stale when the operator
+  cycles by hand. Blind math survives only as `_set_mode_blind`, for a marker the parser can't read.
+- **What is stored is always what was read**, so the record can't lie. No busy gate: BTab types
+  nothing into the input line and the TUI cycles mid-generation. Tests: `TestParsePaneMode`.
+
+## Heartbeat
+
+- Repo list is most-recently-active first (`lastActivity`); the repos-root pseudo-repo is **pinned
+  first, never ranked**.
+- `agentVersion` (`agent_version()`) falls back `TURMA_AGENT_VERSION` → the `VERSION` file
+  `native/install.sh` stamps beside `hub-agent.py` → repo-root `VERSION` → `null`. Tests:
+  `TestAgentVersion`.
+- `codingAgent` = `{name, version}` from `claude --version` (`coding_agent()`), **preferring the
+  product name** over the `CODING_AGENT_NAME` default — the NAME is reported because the image is
+  agent-generic. The raw string still rides as `claudeVersion` for older hubs. Tests:
+  `TestCodingAgent`, `host-header.test.js`.
+
+### The login's real model list (XERK-33)
+
+- `models` = `{available, defaultLabel, at}`, probed with `claude -p "/model"` and
+  `parse_model_probe`, so the hub's menus offer what this login can run **with no config to drift**.
+- A detached one-shot on `MODELS_REFRESH_EVERY`/`MODELS_RETRY_EVERY`, same shape as the
+  summary/triage helpers (cwd=`REGISTRY_DIR`, **no `--settings`**, reaped by `_poll_models_probe`).
+  A failed/unparseable probe **keeps the previous list**; `None` until first success (hub falls back
+  to its static menu).
+- `resolve_model(model, extra)` accepts probed aliases beyond the static four, charset-checked
+  (`SPAWN_MODEL_RE`); the bracketed `[1m]` variants never reach a launch command line.
+- `modelActual` is the per-session counterpart, folded by `_scan_entry_line` — **ONE json parse
+  feeding both the PR scan and `_scan_model_entry`** — from each assistant entry's `message.model`
+  plus "Set model to X", newest winning. Seeded once for older records (`_seed_model_actual`).
+- Tests: `TestParseModelProbe`, `TestModelsProbe`, `TestScanModelEntry`,
+  `TestSessionReportModelActual`, `TestSeedModelActual`, `TestModelActualPayload`,
+  `TestInternalToolSlugModelProbe`.
+
+### Claude login health (`claudeAuth`, XERK-98)
+
+- `claude_auth_status()` reads `~/.claude/.credentials.json` (`CLAUDE_CREDS_PATH`) every beat.
+- **The REFRESH token is the signal, NOT the access token**: it lapses only when claude hasn't
+  refreshed inside its ~30-day window, i.e. when a human must `claude /login`. `needsLogin` =
+  missing/unreadable file, no `claudeAiOauth`/access token, or a past refresh expiry; `expiringSoon`
+  = within `CLAUDE_AUTH_WARN_MS` (3d). Unknown refresh expiry reads **healthy**; a MISSING login
+  can't heartbeat, so it surfaces as the offline alert. Tests: `TestClaudeAuthStatus`.
+
+### Live-session signals
+
+- `paneBusy` is the **primary** activity signal (transcript freshness is only the `null` fallback):
+  `_pane_busy` looks for the "esc to interrupt" hint, accurate through a long silent tool call
+  unlike transcript-mtime. Markers overridable via `TURMA_PANE_BUSY_MARKERS`.
+  - **Busy is read from three shapes, not the full hint alone** (XERK-130): a narrow pane ellipsizes
+    it, so `_busy_from_capture` also accepts the mode line's truncated remnant
+    (`PANE_BUSY_TRUNC_RE`) and the column-0 spinner (`PANE_SPINNER_RE`, **requiring the gerund's
+    ellipsis** so an idle pane's completed-turn line can't fake busy). Both glyph-anchored. Tests:
+    `TestPaneBusy`.
+  - **Busy→idle flicker is suppressed at the source** (`_stable_pane_busy`, XERK-42): a spinner
+    repaint's sub-frame gap reads idle mid-turn. Busy is trusted instantly; idle re-confirms once
+    after `TURMA_PANE_IDLE_CONFIRM_SEC` (0.2s, 0 disables), **only on the busy→idle EDGE**. Tests:
+    `TestStablePaneBusy`.
+- `modeActual` — the mode the TUI is REALLY in, off the footer marker (glyph-anchored so quoted text
+  can't match; read beside the stable busy in `_pane_status`). `_session_payload` **reconciles the
+  stored `permissionMode` to it** each beat, since the operator can cycle by hand. Tests:
+  `TestSessionReportPaneBusy`, `TestModelActualPayload`.
+- **Pending questions** come from `agent/hooks/ask.py`'s req/ans files, read by `session_report` and
+  **never by pane scraping**; a transcript scan is the already-answered fallback.
+- **`panePrompt`** — the TUI's OTHER blocking dialog (tool-permission / plan approval). No hook
+  intercepts it and it writes nothing to the transcript, and while it is up the pane shows neither
+  the interrupt hint nor the mode footer, so `paneBusy` alone reads it as **idle**.
+  `parse_pane_prompt` reads it off the mode marker's capture as `{prompt,
+  options:[{number,label,selected}], detail}`.
+  - **Nothing keys on the wording.** A line run is a dialog only with ALL of: options numbered 1..N
+    (N≥2), exactly one carrying `❯`, a `?` line directly above, and **no mode footer below** (the
+    footer rides the composer, which a dialog replaces). `detail` is the block above the question:
+    blanks never close it, a rule does.
+  - Answered by `answerPanePrompt` → `answer_pane_prompt`, which **re-reads the pane first** and
+    drops the answer unless that number is on screen NOW — a stray digit prepends itself to the next
+    message. Both `liveState`s check the prompt ahead of the busy read. Tests:
+    `TestParsePanePrompt`, `TestAnswerPanePrompt`, `pane-prompt` in `server.test.js`,
+    `panePromptHtml` in `chat.test.js`.
+
+## PR status
+
+- State, CI rollup and mergeability of every PR a session opened, on `PR_STATUS_REFRESH_EVERY`.
+- The card's **single ✓/✗/● mark is merge READINESS, not CI** (`ready`, from `_merge_ready`): a
+  conflict blocks on its own, and a ✓ requires an affirmative MERGEABLE — a just-opened PR's UNKNOWN
+  is `pending`. Conflicts only matter while a PR could still land: MERGED/CLOSED reports CI alone; a
+  PR with **no checks** keeps its no-mark unless it CONFLICTS. `checks`/`checkCounts` stay pure CI
+  beside it; all four renderers (web ×3, android's `PrBadge`) read `ready`, falling back to the CI
+  half for older agents.
+- Cached by URL in `pr_status_cache`, attached as `session.prs`, kept after the session stops.
+  **Durable across an agent restart** (XERK-15) via `prUrls` on the record, and **for ENDED sessions
+  and the pill too** (XERK-13) via two transcript-keyed ledgers that outlive the registry record:
+  - `pr-sessions.json` (`PR_LEDGER_PATH`) — written by `_remember_prs`, backfilled from closed
+    history, read by the resumable scan (`_ledger_prs`); the only channel left once a closed record
+    ages out.
+  - `pr-status.json` (`PR_STATUS_LEDGER_PATH`) — persisted by `refresh_pr_status` and seeded back at
+    boot; an ended session is never re-polled, so without this its chip degrades to a bare link.
+    Ledgered URLs count as `referenced`.
+- **Which PRs are "a session's"** is `_scan_pr_line`, deliberately narrow: a URL counts only when it
+  comes back in a **creating call's own `tool_result`** (`PR_CREATE_RE`) — the one event that says
+  this session OPENED it. `gh pr create`; `glab mr create` / `git push -o merge_request.create`
+  (XERK-162); `az repos pr create` (XERK-226), whose JSON carries no link, so `_azdo_created_pr_url`
+  builds one from `repository.webUrl` + `pullRequestId`. Call and result land in different beats, so
+  pending tool_use ids carry across (capped); the scan parses whole lines.
+  - Cost: a PR opened another way (subagent, MCP tool, web UI) gets no chip. **Widen only by
+    teaching `_scan_pr_line` another creation event, never by scanning loose text.**
+- **A GitLab MR and an ADO PR answer everywhere a GitHub PR does**: `pr_status`/`_pr_comment_events`
+  dispatch by URL to `mr_status`/`azdo_pr_status`, identical shapes, each URL polled only through
+  the source that can answer it (`_pr_source_ok`; unreachable → bare link chip). ADO reuses the
+  BOARD's PAT and has no CI rollup, so `checks` is the **CI-bearing branch POLICY evaluations only**
+  (`AZDO_CI_POLICY_IDS`) — reviewer/work-item policies would read a PR awaiting a human as "CI
+  pending". `mergeable` is `mergeStatus`, conflicts alone. The image bundles `glab` and az's
+  `azure-devops` extension.
+- Tests: `TestPrStatus`, `TestMr*`, `TestAzdoPr*`, `TestRefreshPrStatus`, `TestPrLedger`.
+
+### PR comment delivery (XERK-49) and conflict nudges (XERK-223)
+
+- **A reply asking for corrections on a session's PR is typed back into the session that opened
+  it.** `_poll_pr_comments` runs on the PR cadence, **running sessions only**, over their OWN PRs
+  (`session_pr_urls`), through `send_input` — inheriting the compaction-survival outbox and the
+  mid-turn queue.
+- `_pr_comment_events(url, self_login)` gathers **three channels** — conversation comments, review
+  bodies, inline review-thread comments; a bare approve is dropped. One call covers all three on
+  GitLab (notes) and ADO (threads), minus that tracker's own system notes. `_pr_ref` numbers it
+  `#12` on GitHub, `!12` on GitLab and ADO (there `#12` is a WORK ITEM).
+- **Baseline-on-first-sight, then deliver only new + not-self.** The whole comment set is recorded
+  silently the first beat a PR is seen (`prCommentBase`, capped `PR_COMMENTS_SEEN_MAX`); after that
+  only NEW keys not the agent's own (`viewerDidAuthor`, else an identity compare) are typed in.
+  Bounded `PR_COMMENTS_MAX` per beat; **a fetch failure (→ None) leaves the baseline UNTOUCHED.**
+- `_poll_pr_conflicts` types `_pr_conflict_message` (**MERGE `origin/<base>`, never a
+  rebase/force-push**) off the `mergeable` just cached. `prConflicts` bounds the nudging per PR;
+  MERGEABLE/closed clears and re-arms it, **UNKNOWN does neither** — that is what a just-pushed fix
+  looks like, and clearing on it would grant unlimited retries.
+- Disable with `TURMA_PR_COMMENTS=0` / `TURMA_PR_CONFLICTS=0`. Tests: `TestPrComment*`,
+  `TestPollPrComments`, `TestPollPrConflicts`, `TestPrConflictMessage`.
+- `_poll_prs_landed` stamps `prsLandedTs` (last-activity when the sweep first sees every PR landed;
+  a new PR clears it) so the hub can tell "merged and done" from "merged, then handed new work". It
+  and `newWorkSincePrs` are **transcript timestamps** — the conversation's clock, not the mtime a
+  synced `~/.claude` inflates. Tests: `TestPrsLanded`.
+
+## Expected-restart "updating" status (XERK-29)
+
+- An agent update takes the host down like a crash, so `_handle_shutdown` (SIGTERM/SIGINT)
+  **announces an EXPECTED restart before the silence**: `POST /api/agents/<host>/updating`
+  (`_announce_updating`, agent-token authed, best-effort short-timeout). One signal covers both
+  paths. Hub-side it sets `a.updating` with a `UPDATING_GRACE_MS` deadline, which `serializeAgent`
+  surfaces **only while the host is silent**; the dashboard renders it as a distinct amber state
+  (`agentState`/`hostCard`).
+- The native updater leaves `~/.turma/updating.json` (`UPDATING_FLAG_PATH`) which the handler reads
+  to enrich the announcement (`reason:"update"`); a container update leaves no file and announces
+  `reason:"restart"`. Next boot clears a stale flag. Tests: `TestUpdatingAnnounce`.
+
+## Usage aggregates and the attribution ledger
+
+- The heartbeat carries **usage aggregates independent of the live registry** — per-repo
+  `repoUsage[]` and host-level `usage`, from re-parsing *every* known transcript
+  (`repo_usage_report()`). Each entry carries a `remoteKey` (`normalize_remote()`) so the hub can
+  unify a repo across hosts.
+- The per-model breakdown **excludes `<synthetic>`** (and any `<...>` model): Claude Code stamps
+  fabricated entries with that model and an all-zero usage block, so `_accumulate_usage` keeps them
+  out of `acc.models`, else the usage page lists a phantom model that ran nothing. Their tokens
+  still fold into the grand totals. Mirrors `_scan_model_entry`'s guard.
+- A durable worktree→{repo, remote, slug} **attribution ledger** (`~/.turma/repo-usage.json`) keeps
+  a transcript traceable after its session and worktree are gone, so **usage history survives
+  kill/delete/prune**. Written at spawn (`_remember_usage`), backfilled from registry/closed
+  history, reconciled each usage beat by `_reconcile_orphan_transcripts()`, pruned only when a
+  transcript dir disappears. `repo_usage_report()` folds only slugs the ledger names, so
+  **reconciliation is what makes it cover every transcript on disk**.
+- Orphans are adopted best-effort in order: (1) exact repo + git origin when the worktree exists;
+  (2) the repo from the worktree-shaped slug; (3) the repo from the transcript's recorded `cwd`
+  (`_repo_from_transcript_cwd`); (4) the root bucket (`ROOT_REPO_NAME`) — **there is no "(other)"
+  bucket**.
+- **A derived name (case 2/3) only stands when it names a repo this host scans** (XERK-147): both
+  heuristics are lossy and unvalidated they mint phantom repos. `_sanitize_junk_repo_entries`
+  retires persisted junk the same way each beat (a stored name stands only with a recorded git
+  remote or a scanned repo), and is a **no-op when the repo scan is empty** so an unreadable
+  `REPOS_ROOT` can't fold real history into root.
+- **No real session is excluded.** The one carve-out is the manager's OWN internal `claude -p`
+  helpers (naming, triage, models probe), which run with `cwd=REGISTRY_DIR` yet write into the
+  shared projects dir — else the reconciler adopts the agent's overhead as a phantom repo (XERK-27).
+  `_is_internal_tool_slug` knows them by the registry dir's slug, or a harness's temp slug via
+  `INTERNAL_TOOL_PROMPT_SIGS`; the models probe's prompt is a slash command (which
+  `_first_user_text` skips) so it goes by `_first_command_name` = `/model`. Such a slug is
+  **tombstoned** (`{internal:true}`); `_sanitize_internal_tool_entries` retires entries earlier
+  builds adopted.
+  - **But the `REPOS_ROOT` slug is never `internal`**: the check reads only the newest transcript,
+    and a root session where the operator typed only `/model` reads exactly like the models probe.
+    The sanitizer lifts such a tombstone.
+- **This ledger is also the archive's input** (`_archive_manifest` enumerates ledger slugs), so
+  reconciliation *intentionally* widens archival too — decouple them only if the scopes should
+  diverge.
+- Tests: `TestReconcileOrphanTranscripts`, `TestSanitizeJunkRepoEntries`, android
+  `UsageViewModelTest`.
+
+## Board sources, triage and ticket sessions
+
+See `.claude/rules/agent-board.md` — the Jira/Azure DevOps collectors, the two tracker writes, repo
+triage and ticket-backed sessions. All of it lives in `hub-agent.py`.
+
+## Session activity summaries
+
+- Each session gets a few-word "name", generated **agent-side** by the host's authenticated `claude
+  -p` (Haiku default) — reusing the mounted login, so **no external API, key, or endpoint**.
+  `_start_summary()` runs it detached (cwd `~/.turma`, **no `--settings`**, so it never loads the
+  guard or explores the repo); `_poll_summaries()` reaps it through `clean_summary()`. Tuned by
+  `SESSION_SUMMARY_MODEL`/`SESSION_SUMMARY_TIMEOUT_SEC`. `rcName` is still fixed at spawn.
+- The attempt fires at spawn from the initial prompt, or — for a bare/quick-spawned session — from
+  its **first user prompt read straight out of the transcript**: `_seed_summaries()` pulls it via
+  `_first_user_text()` (skipping the header, `isMeta` caveat entries and `<command-…>` wrappers).
+  That read is **channel-agnostic and the only path that names a bare session**, whose first prompt
+  is typed into the ttyd terminal and **never reaches `send_input`**. `send_input` still starts one
+  immediately as a fast path for the FIRST attempt — retries belong in the seeder.
+- Naming is **bounded-retry, not one-shot**: an attempt can come back empty for reasons unrelated to
+  the session (nonzero exit, empty reply, timeout, rate limit on the shared login), which one
+  attempt would make permanent. `_summary_attempts`/`_summary_due` gate every path on *unnamed +
+  attempts left + past the backoff* (`SUMMARY_MAX_ATTEMPTS`, `SUMMARY_RETRY_BACKOFF_SEC`, persisted
+  as `summaryAttempts`/`summaryRetryAt`) and **armed at launch** so a restart mid-attempt neither
+  loops nor loses the retries owed. The legacy one-shot `summaryStarted` still reads as "one attempt
+  spent".
+- A session with no prompt yet stays unnamed, spends **no** attempt, and looks again next beat. Once
+  exhausted it degrades to the label/worktree fallback.
+- **Manual rename**: `setSummary` → `set_summary()` through `clean_manual_summary()` (first line,
+  whitespace collapsed, capped to `SUMMARY_MAX_CHARS` — but **NOT** word-capped or stripped of
+  quotes/punctuation). It sets `summaryManual`, which pins the card and stops a still-in-flight
+  `claude -p` from clobbering it in `_finish_summary`. A blank rename clears the name and unpins —
+  the only way back to auto-naming. Works on a stopped session too.
+- Tests: `TestCleanSummary`, `TestSetSummary`, `TestSessionSummaries`, `TestSummaryDue`,
+  `TestSeedSummaries`.
+
+## GitHub block and cloning
+
+- The `github` block reports whether the host has a usable `gh` login and that login's clonable
+  repos (the user's own, their orgs, any extra `GH_CLONE_OWNERS`), plus in-flight/recent `clones`.
+  The availability flag is **`available`** and the hub passes the block through untouched, so
+  **every client must gate its clone UI on that exact key** (XERK-126).
+- A `clone` command `git clone`s a validated `owner/repo` (**allowlist-checked before it reaches
+  git**) into `REPOS_ROOT` as a detached subprocess, reaped across later beats. Private-repo auth
+  rides the system git credential helper (`gh auth git-credential`).
+- **Multiple git sources (XERK-155)** — `gitSources` heartbeats the EXTRA sources beside `github`
+  (contract unchanged, so gh-gated features keep reading it): the board's ADO org
+  (`_apis/git/repositories`) and a GitLab host (`GITLAB_URL` + `GITLAB_TOKEN`,
+  `/api/v4/projects?membership`; **clones over SSH via the mounted `~/.ssh` — the token only
+  LISTS**). Listings are per-source keep-last-good; a clone command carries `{repo, source?}` and
+  the agent resolves the URL from its OWN cached listing (free text stays the GitHub fallback).
+  Triage candidates / `repoOptions` / clone-on-demand consume the union, tagged `source`. Tests:
+  `TestGitSources`, `clone.test.js`, `CloneTest.kt`.
+- **Non-GitHub git creds (XERK-54)** — the image wires a SECOND system credential helper after gh:
+  `store --file=/root/.git-credentials`. gh serves github.com; every other host falls through to
+  `store`, reading an **optional** bind mount. **gh is first** so github.com always gets a fresh
+  token; an unmounted file is a no-op. The guard denies writing `~/.git-credentials`. **Native
+  inherits the host's git config untouched.** Tests: `test_entrypoint.sh`,
+  `test_denies_non_github_git_credential_writes`.
+- **Azure DevOps git auth (XERK-54, XERK-226)** — reuses the board PAT. At boot `entrypoint.sh` runs
+  `hub-agent.py --wire-azure-git`, setting a URL-scoped `http.<azure_base>.extraHeader`
+  (`azure_git_auth_config()`) — **`extraHeader`, not a credential helper / `http.proactiveAuth`**:
+  self-hosted TFS/Server often issues no Basic challenge a helper can act on, and the image's git
+  (2.39) predates `proactiveAuth` (2.46). Written `--system` as root before the privilege drop;
+  **exports `AZURE_DEVOPS_EXT_PAT`** so `az repos` authenticates too. Non-fatal; logs the host never
+  the token. Container-only. Tests: `TestAzureGitAuthConfig`, `test_entrypoint.sh`.
+
+## `tunnel-agent.js`
+
+See `.claude/rules/agent-tunnel.md` — the reverse tunnel, control-channel liveness and the live
+working footer. It is a JS re-implementation of `hub-agent.py`'s parsers; the parity contract is in
+`CLAUDE.md`.
+
+## Transcript entry blocks
+
+- Each tail entry carries a rich **`blocks[]`** beside the flat `text` (`_entry_blocks` /
+  `entryBlocks`), preserving the thinking text, tool_use inputs and tool_result outputs that
+  `_entry_text` flattens away, so the chat UI can render + verbosity-filter each component.
+- Turns that are ABOUT the session rather than someone talking are classified: `[Request interrupted
+  by user…]` → `{t:"interrupt"}` (`_entry_text` keeps the raw line); the `!` shell passthrough's
+  `<bash-*>` turns → the same command/command_output shapes as slash commands (name `!`, via
+  `_parse_local_command`; **stderr only wins when non-empty**); `system`/ `away_summary` →
+  `{t:"away_summary"}` with the "(disable recaps in /config)" hint stripped (`_away_summary_text`)
+  (**every other system subtype stays dropped**); `tool_reference` inside a tool_result → `[tool:
+  <name>]`.
+- **A known tool call carries its reviewable payload on the tool_use block** (`_tool_use_detail` /
+  `toolUseDetail`): Edit → `edit`, Write → `content`, ExitPlanMode → `plan`, any tool's
+  `description` → `desc`. An AskUserQuestion card is titled with its question text(s), not the input
+  JSON.
+  - **SendUserFile → `files[]`+`caption`** (XERK-221): image/SVG as a base64 data URI
+    (`kind:"image"`), a `render` HTML page as raw markup (`kind:"html"`), else a name chip
+    (`kind:"file"` — attach/oversize past `SEND_FILE_MAX_BYTES`/missing/other, **never opened**).
+    Only image/html paths are read, bounded, so a delivery can't bloat the frame or leak bytes.
+- Two more markers: `system`/`compact_boundary` → `{t:"compact_boundary", trigger, preTokens,
+  postTokens}`, and a `pr-link` entry → `{t:"pr_link", url, number, repo}`. pr-link entries carry no
+  uuid, so the feeds synthesize a stable id (`_entry_id`/`entryId`) — the client merge drops id-less
+  entries. **A PR marks its FIRST sighting only**: Claude Code re-stamps pr-links atop every user
+  turn, so one PR yields ~6 entries differing only in `timestamp`. That id keys on the **URL alone**
+  and the client dedups by URL over the whole conversation; folding only *consecutive* repeats is
+  not enough.
+- **Still-queued prompts ride beside the entries, not inside them**: a message typed mid-turn
+  becomes a user entry only when dequeued, so both feeds fold the transcript's `queue-operation`
+  entries FIFO (`_fold_queue_op` / `foldQueueOp`: enqueue → dequeue → remove-by-content) and ship
+  survivors as `queued[]`. A window opening mid-sequence errs toward hiding; older agents send no
+  `queued`. Tooling payloads ride the same queue, so **display filtering happens at REPORT time**
+  (`_queued_display` / `queuedDisplay`), never at fold time, which desyncs the dequeues.
+- Blocks ride the live tail (tight caps), on-demand `history` and the archive push (both
+  `BLOCK_CAPS_FULL`) — the one place inclusion widens: a tool_result-only turn, dropped by
+  `_entry_text`, is kept when it has blocks. Only `transcript_tail` stays text-only.
+  Already-archived bytes are never re-parsed.
+- Tests: `TestEntryBlocks`, the tool-detail/marker cases in `tunnel-agent.test.js`.
+
+## Archive sync
+
+- The agent **ships every INACTIVE session's transcript to the hub's durable archive** so history
+  survives this host being wiped/offline. `_archive_manifest()` enumerates ended transcripts (every
+  ledger slug's `*.jsonl`, minus any backing a running session); the hub replies with per-transcript
+  byte cursors (`archiveHave`), and `_archive_deltas()` POSTs the missing append-only deltas
+  (pre-parsed through `_entry_text`), bounded per chunk/beat.
+- Rows are dated by `_last_activity_ts` — the last message's own transcript timestamp, **NOT the
+  file mtime** (XERK-73), which a synced `~/.claude` or backup restore inflates to copy-time. Falls
+  back to mtime only when no entry is timestamped. Tests: `TestArchiveSync`, `TestLastActivityTs`,
+  `TestResumableReport`.
+
+## Hooks
+
+See `.claude/rules/agent-hooks.md` (scoped to `agent/hooks/**`). `build_guard_settings()` writes
+`~/.turma/guard-settings.json`, passed to every launch as `--settings`, wiring both hooks plus the
+`permissions.deny` credential-store rules. Policy is in `CLAUDE.md`.
+
+## `entrypoint.sh` and the bundled toolchains
+
+- Creds preflight, then launches the tunnel (a simple respawn loop, XERK-34) and `exec`s the session
+  manager as PID 1 — the container stays up with zero sessions. Uid resolution is in `CLAUDE.md`'s
+  "Run-as identity". Tests: `test_entrypoint.sh`.
+- **Cloud CLIs** (terraform/`az`/`aws`, pinned via
+  `TERRAFORM_VERSION`/`AZURE_CLI_VERSION`/`AWS_CLI_VERSION` in `agent/Dockerfile`) live in the
+  `tooling` stage, so **every tier carries them and the CI scan covers them** — they are
+  credential-bearing tools talking to cloud control planes.
+  - **Creds are the host's, via optional bind mounts** (`/root/.aws` or `AWS_*`, `/root/.azure`,
+    `/root/.terraform.d`); the image bakes none. **A host that mounts none is supported, not an
+    error**: the preflight only LOGS which stores it found, keying on a **login-marker file** never
+    the store dir, because each CLI creates its own store just by RUNNING. The Dockerfile's
+    build-time smoke test drops the stores it creates. `permissions.deny` protects them.
+- **Android toolchain** — JDK 17 + Gradle + Android SDK (`gradle`/`sdkmanager`/`avdmanager`/`adb`/
+  `aapt2` on PATH), pinned via
+  `GRADLE_VERSION`/`ANDROID_CMDLINE_TOOLS`/`ANDROID_PLATFORM`/`ANDROID_BUILD_TOOLS` in
+  `agent/Dockerfile`; tiering in `.claude/rules/release.md`.
+
+## `native/` — non-Docker install
+
+See `.claude/rules/agent-native.md` (scoped to `agent/native/**`). **Nothing under `native/` edits
+the shared runtime files**; the one enabling change is `resume_on_boot`'s adopt path.
