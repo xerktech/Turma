@@ -791,6 +791,14 @@ class TestKnownBypasses(unittest.TestCase):
         # that one is found at the command POSITION, not by the suffix pass.
         self.assertIsNotNone(guard.is_destructive("ssh prod 'shutdown -h now'"))
         self.assertIsNotNone(guard.is_destructive("shutdown -h now"))
+        # A suffix naming a BLOCK DEVICE is judged by the disk rules anyway — no
+        # container is called /dev/sda — which recovers the device-bearing half
+        # of what the narrowing above gives up.
+        for cmd in ("docker --madeup v exec c mkfs.ext4 /dev/sda1",
+                    "docker --madeup v exec c dd if=/dev/zero of=/dev/sda",
+                    "podman --root /x exec c wipefs -a /dev/sda"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
 
     def test_what_follows_a_printer_is_data(self):
         """`ssh host echo rm -rf /etc` prints text; it deletes nothing."""

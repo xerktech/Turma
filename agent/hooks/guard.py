@@ -1151,12 +1151,18 @@ _EXEC_WRAPPER_OPERANDS = {
 # of a wrapper's argv, which finds an UNQUOTED command wherever it starts. For
 # that form a missing option costs sharpness, not safety.
 #
-# For a QUOTED command (`ssh -unlisted v host 'rm -rf /etc'`) the table IS still
-# the boundary: the command is one token, and only the position this table
-# identifies gets the single-token-is-a-command-line reading. A suffix pass
-# cannot help there — the difference between a quoted COMMAND and a quoted
-# MESSAGE (`ssh host git commit -m 'rm -rf /etc is banned'`) is precisely the
-# operand count. So do not delete an entry believing the suffix pass covers it.
+# BEHIND AN UNLISTED OPTION, though, this table is still the boundary — for more
+# than the quoted case, so do not delete an entry believing the suffix pass
+# covers it. What is still missed when an option is absent from here:
+#   * a QUOTED command — the operand count is the only thing distinguishing it
+#     from a quoted MESSAGE (`ssh host git commit -m 'rm -rf /etc is banned'`);
+#   * any DISK/POWER command — suffix candidates skip the argv[0]-only rules, so
+#     that a container named `reboot` is not a power command (the `/dev/` carve-
+#     out in is_destructive recovers the device-bearing half);
+#   * a command after a printer-NAMED operand (`docker exec cat rm -rf /etc`);
+#   * a command needing re-expansion (`find / -delete`, `eval …`, `bash -c '…'`),
+#     because suffix candidates are terminal and are not expanded again.
+# Keep the table complete; the suffix pass does not make it optional.
 _EXEC_WRAPPER_OPTS_WITH_VALUE = {
     "ssh": {"-i", "-p", "-o", "-l", "-F", "-c", "-m", "-b", "-B", "-D", "-e",
             "-E", "-I", "-J", "-L", "-O", "-Q", "-R", "-S", "-W", "-w"},
@@ -1325,6 +1331,12 @@ def is_destructive(command: str) -> str | None:
         if not from_suffix:
             checks.append(_destructive_disk_power(tokens, segment))
             checks.append(_destructive_powershell_remove(segment))
+        elif any(t.lower().startswith(("/dev/", "of=/dev/")) for t in tokens[1:]):
+            # ...unless it names a BLOCK DEVICE. A container is never called
+            # `/dev/sda`, so this recovers `mkfs.ext4 /dev/sda1`, `dd of=/dev/sda`
+            # and `wipefs -a /dev/sda` behind an unlisted option without bringing
+            # back the container-named-`reboot` false positive.
+            checks.append(_destructive_disk_power(tokens, segment))
         for reason in checks:
             if reason:
                 return reason
