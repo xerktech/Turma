@@ -974,11 +974,11 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   to `boardHtml`.
 - An org is **labelled by `orgName(siteKey)`** — the site host minus `.atlassian.net` (full host as
   tooltip), which the agent's **`BOARD_ORG_NAME`** overrides outright (`orgName(siteKey, override)`,
-  stamped on the block by `collect_board`, carried by `mergeSites`) since a self-hosted Azure collection
-  otherwise derives to its COLLECTION. Labels are presentational and deliberately **not** part of the
-  `siteKey`, which the hub keys/merges/routes on and which `/api/jira/<siteKey>/…` and the
-  ticket-agent/auto-start ledgers are stored under — renaming it would orphan all of those. Also read by
-  the dashboard's host rows. Tests: `TestBoardOrgName`, `board.test.js`, android `BoardTest.kt`.
+  stamped by `collect_board`, carried by `mergeSites`) since a self-hosted Azure collection otherwise
+  derives to its COLLECTION. Labels are presentational and deliberately **not** part of the `siteKey`,
+  which the hub keys/merges/routes on and which `/api/jira/<siteKey>/…` and the ticket-agent/auto-start
+  ledgers are stored under — renaming it orphans all of those.
+  Tests: `TestBoardOrgName`, `board.test.js`, android `BoardTest.kt`.
 - Each org gets a **UNIQUE color** — no two share a `--s1..--s8` palette slot (`orgColorMap(allKeys,
   pins)`, XERK-48), computed over the whole org set: each takes its djb2-preferred slot if free, else
   linear-probes to the next free one, keys processed in sorted order. It is **persistent where it can
@@ -1007,8 +1007,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
 - The **"New ticket"** button opens a modal to create a ticket (title, description, labels) on an org's
   tracker — source-agnostic across Jira and Azure DevOps, hidden until an org reports. It lives in the
   **shared site header** (`newticket.js` → nav.js's `#hdrNewTicket` slot, XERK-150), not the board
-  toolbar; fed the beat by `TurmaNewTicket.update(data)`, form HTML in `board.js`. It routes to an
-  ONLINE host of the org (ranked, below) on the command → staged result → poll pattern:
+  toolbar; fed the beat by `TurmaNewTicket.update(data)`, form HTML in `board.js`. It rides the
+  command → staged result → poll pattern, against a ranked ONLINE host of the org (below):
   - `GET /api/jira/<siteKey>/create-meta` (`boardCreateMeta`) → the org's projects + existing labels/tags;
     `?project=<p>` → that project's creatable types. Cascade (project then types) so no meta call fans
     across every project. Cached per host, 202-polled.
@@ -1021,12 +1021,13 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `/rest/api/3/issue`, plain-text→ADF via `_text_to_adf`; `create_azure_issue` POSTs a JSON-Patch work
   item, `;`-joined `System.Tags`). Jira labels split on whitespace+commas (spaces forbidden), Azure tags
   on commas. Android matches it (＋ in `ScreenHeader` → `CreateTicketSheet`): `source` on
-  `JiraBlock`/`BoardSite`, endpoints in `net/HubApi.kt`,
-  `createLabelWord`/`splitLabels`/`classifyCreateMeta`/`classifyCreateResult` in `core/Board.kt`.
-- **An org's hosts are health-ranked (`jiraHostPool`: online, then `jira.available`) and a create is
-  OWNED by the host that took it** (XERK-241): a SIBLING's liveness 503'd healthy creates, and every
-  retry that invited made a real ticket. The poll reads only the owner (`commandHost`) and withdraws an
-  UNDELIVERED create; an identical unresolved one rejoins it; creates round-robin (`pickBoardWriteHost`).
+  `JiraBlock`/`BoardSite`, endpoints in `net/HubApi.kt`, the label/meta/result ports in `core/Board.kt`.
+- **An org's hosts are health-ranked (`jiraHostHealthy`: online, then `jira.available`) and a board
+  write is OWNED by the host that took it** (XERK-241): the poll reads only that owner (`commandHost`),
+  and may say nothing was created ONLY when it withdrew an UNDELIVERED command — the queue drains on
+  ACK, so otherwise the honest answer is "it may exist". Judging a create by a SIBLING's liveness is
+  what made four tickets. A retry rejoins an unresolved identical create (`createInFlight`, hashed
+  over the WHOLE body); creates round-robin past a gapped host, status single-flights across the ORG.
 - **A refusal carries the tracker's own words; a create bends to the TYPE and IDENTITY** (XERK-151):
   `_http_error_detail` keeps the body urllib's `HTTPError` drops (else every refusal reads "HTTP Error
   400: Bad Request"); the description goes in the field the type HAS (`_azure_description_field`: the
@@ -1041,16 +1042,16 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   serve) AND loaded by each page after `org.js` — a missing entry 404s and takes the module, and every
   page's render, down. `newticket.test.js` guards both.
 - Tests: `TestCreateAzureIssue`/`TestAzure*Identit*`/`TestHttpErrorDetail` in `test_hub_agent.py`;
-  `server.test.js`; `createFormHtml` in `board.test.js`; `newticket.test.js`; android `BoardTest.kt`.
+  `server.test.js`; `createFormHtml` in `board.test.js`; android `BoardTest.kt`.
 
 #### Repo chips
 
 - Each card shows the **repo the agent triaged the ticket to** (`repoChipHtml`, from `repoGuess`) in
   three states: **cloned** on the reporting host is a plain actionable chip, one only in the org's `gh`
-  listing is **dashed**, a ticket the model declined is a muted italic **"no repo"** — and no
-  `repoGuess` yet gets **no chip** ("not looked at yet" ≠ "no repo fits"). The rationale is the tooltip
-  and the detail panel's Repo row (`repoFieldHtml`, reading `t.repoGuess` directly — the guess exists
-  only on the heartbeat ticket, not the on-demand fetch), where it is **corrected by hand**.
+  listing is **dashed**, a declined ticket a muted italic **"no repo"** — and no `repoGuess` yet gets
+  **no chip** ("not looked at yet" ≠ "no repo fits"). The rationale is the tooltip and the detail
+  panel's Repo row (`repoFieldHtml`, reading `t.repoGuess` directly — the guess is on the heartbeat
+  ticket, not the on-demand fetch), where it is **corrected by hand**.
 
 #### Starting a session on a ticket
 
@@ -1121,30 +1122,31 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
     attempts and drops the record; an in-flight command concludes nothing; only a still-session-less
     ticket with nothing in flight, past its backoff, is retried. A queued session reports its `ticket`
     from the first beat, so a slow spawn is never mistaken for a failed one.
+- Nothing is written to Jira.
 - Tests: `server.test.js`, `autoStartOn` in `board.test.js` and android `BoardTest.kt`,
   `test_no_agent_side_auto_start_flag` in `TestSetJiraRepo`.
 
 ##### Auto-stopping Done tickets (XERK-45, XERK-161)
 
-- The lifecycle **counterpart** to auto-start: moving a ticket to **Done** **kills** its session(s) — only
-  a **human** moves it there, a deliberate "finished" signal. **Regardless of the per-org "auto" opt-in**
-  (XERK-161) — that toggle governs ONLY auto-STARTING work.
+- The lifecycle **counterpart** to auto-start: moving a ticket to **Done** **kills** its session(s) —
+  only a **human** moves it there, a deliberate "finished" signal. **Regardless of the per-org "auto"
+  opt-in** (XERK-161), which governs ONLY auto-STARTING work.
 - The hub **KILLS**, not interrupts: a kill ends it cleanly (Ended, resumable, worktree/conversation/PR
   chips intact) and frees the `MAX_SESSIONS` slot an interrupt would leave it holding.
-- Decision and routing on the HUB. `autoStopSweep()` (15s `setInterval`, beside `autoStartSweep`) reads
-  **every** reporting org's **Done** tickets from its freshest block, then scans the WHOLE fleet for
-  sessions whose `ticket` names one, routing each `{type:"kill", sessionId}` to the owning host. Only
-  **live** ones (`running`/`queued`) are stopped, and every session on the ticket is (a two-branch or
-  restart-clear-context ticket has more than one). Guard: `autoStopped`, a `<host>\x00<sessionId>`
-  once-per-hub-lifetime set (a re-issued kill of a dead session is a no-op). Tests: the `auto-stop:`
-  cases in `server.test.js`.
+- Decision and routing on the HUB. `autoStopSweep()` (15s `setInterval`, beside `autoStartSweep`)
+  reads **every** reporting org's **Done** tickets from its freshest block, then scans the WHOLE fleet
+  for sessions whose `ticket` names one, routing each `{type:"kill", sessionId}` to the owning host.
+  Only **live** ones (`running`/`queued`) are stopped, and every session on the ticket is (a
+  two-branch or restart-clear-context ticket has more than one). Guard: `autoStopped`, a
+  `<host>\x00<sessionId>` once-per-hub-lifetime set (re-killing a dead session is a no-op). Tests:
+  the `auto-stop:` cases in `server.test.js`.
 
 #### Ticket ↔ session chips
 
-- A ticket's sessions show as chips on its card, from `ticketSessionIndex` — a reverse index of the fleet
-  payload's `session.ticket`, so **no hub-side ticket store exists to keep in sync**.
-- It reads the **same three channels the Ended list merges**; the resumable one gets its ticket from
-  the agent's ledger.
+- A ticket's sessions show as chips on its card, from `ticketSessionIndex` — a reverse index of the
+  fleet payload's `session.ticket`, so **no hub-side ticket store exists to keep in sync**. It reads
+  the **same three channels the Ended list merges**; the resumable one gets its ticket from the
+  agent's ledger.
   - Deduped on `<host>::<transcriptId>`, the **registry-backed record winning** (only it knows the id,
     `createdAt`, and the rename); resumable is swept last. NOT deduped across hosts (the shared
     `~/.claude` syncs transcripts, so an id alone isn't fleet-unique), and a **restart-clear-context
@@ -1159,9 +1161,9 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   `text-overflow` can't clip anonymous flex content — the same trap `.kc-repo` documents).
 - The reverse link rides the session: the Sessions card meta shows the ticket key (a plain span — the
   card is a `<button>`), and the chat footer carries a linked `jira-chip` beside the PR chip
-  (`ticketFooterChip`) pointing at Turma's OWN board — `/board?ticket=<key>&site=<siteKey>`, not out to
-  Jira (XERK-16). `consumeDeepLink` (`board.html`) is one-shot: waits for the ticket's org to report,
-  opens the panel on the first render that resolves the key, strips the params; `site` is optional.
+  (`ticketFooterChip`) pointing at Turma's OWN board — `/board?ticket=<key>&site=<siteKey>`, not out
+  to Jira (XERK-16). `consumeDeepLink` (`board.html`) is one-shot: waits for the org to report, opens
+  the panel on the first render resolving the key, strips the params; `site` is optional.
 
 #### Ticket detail panel
 
@@ -1171,8 +1173,8 @@ Reached over the Cloudflare tunnel (the operator's public hub URL); port 8300 on
   serving a fresh cached copy or queueing a `jiraIssue` command and 202-ing for the client to poll
   (`ingestJiraIssues`, cached by `JIRA_ISSUE_FRESH_MS`/`_MAX_AGE_MS`/`_MAX`, stripped from `/api/agents`).
   An offline-only org serves its last copy flagged `stale`; a cached `error` is kept so a doomed fetch
-  isn't re-queued. The fetched copy wins field-by-field; its text is already plain, so the panel escapes
-  before linkifying.
+  isn't re-queued. The fetched copy wins field-by-field; its text is plain, so the panel escapes before
+  linkifying.
 
 ##### The row pickers — one pattern, four rows
 
@@ -1287,24 +1289,24 @@ SSE event of that name. Both feed the Start button AND the auto-start sweep.
   `handle_commands` call, so it rides the SAME beat as the ack — an ack with no result means the agent
   didn't handle it — no version table to drift.
 - `awaitResult`/`resolveResultWaits` record and settle each queued command, writing
-  `agent.unsupported[kind]`; the three waiting routes then refuse with `agentGapError` rather than queue
-  — create-meta `200 {error}` (the shape both clients read a message from), create/status `409` (which
-  Android reads via `hubError()`).
-- A gap **clears** on a result landing, `agentVersion` CHANGING, or `UNSUPPORTED_TTL_MS` (the backstop for
-  an update that doesn't move the version). Never conclude anything from a command still in the
-  queue: it hasn't been taken yet. `resultWaits` is stripped from the fleet payload, `unsupported`
-  rides it. Tests: `server.test.js`.
+  `agent.unsupported[kind]`; the waiting routes refuse with `agentGapError` rather than queue —
+  create-meta `200 {error}` (the shape both clients read a message from), create/status `409` (Android
+  reads it via `hubError()`).
+- A gap **clears** on a result landing, `agentVersion` CHANGING, or `UNSUPPORTED_TTL_MS` (the backstop
+  for an update that doesn't move the version). Conclude nothing from a command still in the queue: it
+  is unACKED, which is not the same as untaken. `resultWaits` is stripped from the fleet payload,
+  `unsupported` rides it. Tests: `server.test.js`.
 
 #### Refresh button
 
-- `POST /api/jira/refresh` fans a `refreshJira` out to every Jira-**`configured`** host (the board is a
-  *merge* of every host's block), deduped so a mashed button costs one poll per host. `configured`
-  (creds present) not `available` (a poll succeeded), because a failing host reports
+- `POST /api/jira/refresh` fans a `refreshJira` out to every Jira-**`configured`** host, deduped so a
+  mashed button costs one poll per host. `configured` (creds present) not `available` (a poll
+  succeeded), because a failing host reports
   `available=false`/`siteKey=null` — exactly the host a retry is for; `siteKey` is the older-agent
   fallback.
-- It resolves on real fleet state: holds until the queued command clears from the targeted hosts'
-  records (`jiraRefreshPending`, which covers a poll that FAILED and left `fetchedAt` untouched), with
-  `newestFetchedAt` as a second signal and a 45s timeout. "Refresh failed" only when EVERY targeted
+- It resolves on real fleet state: holds until the command clears from the targeted hosts' records
+  (`jiraRefreshPending`, covering a poll that FAILED leaving `fetchedAt` untouched), with
+  `newestFetchedAt` as a second signal and a 45s timeout; "Refresh failed" only when EVERY targeted
   host errored (`jiraRefreshFailed`).
 
 ### Sessions page (`/sessions`)

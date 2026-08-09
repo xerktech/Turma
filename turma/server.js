@@ -687,6 +687,20 @@ function invalidateAgentsCache() { agentsCache = null; }
 // has its own route — plus the two time/tunnel-derived live flags.
 // Shared by the fleet payload and the SSE per-agent push so both stay in
 // lockstep.
+// A queued command as anyone outside the hub may see it. `deliveredAt` is the
+// hub's own record of having handed the command over (XERK-241) — it lives on
+// the command because that is exactly how long it is meaningful, but it is
+// internal bookkeeping, so neither the agent's reply nor the fleet payload
+// carries it. Returns the same array when there is nothing to strip.
+function publicCommands(cmds) {
+  if (!cmds || !cmds.some((c) => c && c.deliveredAt)) return cmds;
+  return cmds.map((c) => {
+    if (!c || !c.deliveredAt) return c;
+    const { deliveredAt, ...rest } = c;
+    return rest;
+  });
+}
+
 function serializeAgent(key, agent, now) {
   // `resultWaits` is per-command bookkeeping with timestamps (XERK-151) — pure
   // internal state, stripped like the caches. `unsupported` is NOT: it's a tiny,
@@ -697,6 +711,7 @@ function serializeAgent(key, agent, now) {
   return {
     key,
     ...a,
+    commands: publicCommands(a.commands),
     online,
     // An expected restart in progress (XERK-29): only meaningful while the host
     // is actually silent — a host that came back is just `online` again, and its
@@ -782,16 +797,22 @@ function queueCommand(key, cmd) {
   return cmdId;
 }
 
-// Withdraw a queued command the hub has given up on, if the agent hasn't taken
-// it yet (XERK-241). Delivery is at-least-once and irreversible, so this is only
-// ever a no-op or a cancellation of something UNDELIVERED — the presence of the
-// cmdId in the queue is what proves it never ran. Returns whether it was there.
+// Withdraw a queued command the hub has given up on, ONLY if the agent has
+// never been handed it (XERK-241). The queue drains on ACK, not on delivery, so
+// "still queued" alone does NOT mean "never ran" — an agent that took the
+// command, ran it and died before acking leaves it sitting there too. Only the
+// `deliveredAt` stamp separates the two, and only the undelivered case is safe
+// to cancel: it provably did nothing, so dropping it just stops it running late
+// and duplicating whatever the operator remade after being told it failed.
+//
+// Returns true only when a command was actually withdrawn — i.e. only when the
+// caller may state that nothing happened.
 function dropQueuedCommand(key, cmdId) {
   const a = agents[key];
   if (!a || !a.commands) return false;
-  const before = a.commands.length;
+  const cmd = a.commands.find((c) => c && c.cmdId === cmdId);
+  if (!cmd || cmd.deliveredAt) return false;
   a.commands = a.commands.filter((c) => !c || c.cmdId !== cmdId);
-  if (a.commands.length === before) return false;
   delete (a.resultWaits || {})[cmdId];
   scheduleSave();
   publishAgent(key);
@@ -1176,6 +1197,11 @@ function isIssueKey(k) {
 //     when the host says so explicitly; an agent that omits it ranks with the
 //     healthy (never assume a gap is a failure).
 // Ties keep insertion order, so the pick is stable and deterministic.
+// The ONE health predicate — both the ranking and the write rotation read it,
+// so the rule can't drift between them. `available` is trusted only when the
+// host says false; an agent that omits it ranks with the healthy, because a
+// missing field means "older agent", never "broken tracker".
+const jiraHostHealthy = (a) => a.jira.available !== false;
 function jiraHostPool(siteKey, requireOnline) {
   const now = Date.now();
   const pool = [];
@@ -1183,7 +1209,7 @@ function jiraHostPool(siteKey, requireOnline) {
     if (!a.jira || a.jira.siteKey !== siteKey) continue;
     const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
     if (requireOnline && !online) continue;
-    pool.push({ key, online, healthy: a.jira.available !== false });
+    pool.push({ key, online, healthy: jiraHostHealthy(a) });
   }
   // Stable sort (Array#sort is stable in Node), so equal-scoring hosts stay in
   // insertion order and the pick doesn't wander between requests.
@@ -1209,13 +1235,22 @@ function findJiraHost(siteKey, requireOnline) {
 // show, hammering the same one repeats the same failure, while rotating gets the
 // operator a working host on the next attempt. Rotation is confined to hosts of
 // the TOP health tier, so a sick host is never re-elected just because its turn
-// came round.
+// came round — and `kind` further excludes any host that has already PROVEN it
+// can't run this command (XERK-151). Without that, an org with one too-old agent
+// refuses every other click, which reads as flakiness rather than as the one bad
+// host it is. When EVERY host is gapped nothing is excluded, so the caller still
+// reaches the honest refusal.
+//
+// The turn counter is keyed by siteKey and only written for an org with a live
+// reporting host, so an unknown key from a URL can never grow it.
 const boardWriteTurn = new Map(); // siteKey -> next index into its healthy leaders
-function pickBoardWriteHost(siteKey) {
+function pickBoardWriteHost(siteKey, kind) {
   const pool = jiraHostPool(siteKey, true);
   if (!pool.length) return null;
-  const top = agents[pool[0]].jira.available !== false;
-  const leaders = pool.filter((k) => (agents[k].jira.available !== false) === top);
+  const top = jiraHostHealthy(agents[pool[0]]);
+  let leaders = pool.filter((k) => jiraHostHealthy(agents[k]) === top);
+  const able = kind ? leaders.filter((k) => !agentGapError(agents[k], kind, "")) : leaders;
+  if (able.length) leaders = able;
   const n = (boardWriteTurn.get(siteKey) || 0) % leaders.length;
   boardWriteTurn.set(siteKey, (n + 1) % leaders.length);
   return leaders[n];
@@ -1266,30 +1301,48 @@ function commandHost(siteKey, cmdId, resultKey) {
 //
 // Held hub-side rather than read off the agent's queue, because the queue entry
 // disappears the moment the agent ACKS — precisely the window a retry lands in.
-// Bounded by a TTL comfortably past the client's own poll deadline, so a create
-// whose outcome never comes back stops blocking repeats rather than wedging the
-// title forever; the entry is dropped as soon as an outcome exists.
+// The entry is dropped as soon as an outcome exists, and otherwise expires with
+// the CLIENT's own poll deadline (newticket.js gives up at 60s): once the
+// operator has been told the create didn't complete, their next click is a fresh
+// intent and must open a fresh write rather than rejoin a cmdId nobody is
+// waiting on any more.
 const createInFlight = new Map(); // fingerprint -> {cmdId, host, at}
-const CREATE_INFLIGHT_TTL_MS = 2 * 60 * 1000;
-const createFp = (siteKey, project, issueType, summary) =>
-  [siteKey, project, issueType, summary].join("\u0000");
-function findCreateInFlight(siteKey, project, issueType, summary) {
+// Env-tunable for the same reason CONTROL_PING_EVERY_MS is: a one-minute
+// expiry can only be tested by winding it down to milliseconds.
+const CREATE_INFLIGHT_TTL_MS =
+  Number(process.env.CREATE_INFLIGHT_TTL_MS) || 60 * 1000;
+// Hashed, and over the WHOLE body rather than the title alone: two tickets that
+// share a title but differ in description or labels are DIFFERENT tickets, and
+// folding them would not just suppress a retry — it would discard the second
+// one's text and report it created under the first one's key. Hashing also keeps
+// an unbounded operator-supplied summary out of the map's keys.
+const createFp = (siteKey, project, issueType, summary, description, labels) =>
+  crypto.createHash("sha256")
+    .update(JSON.stringify([siteKey, project, issueType, summary, description, labels]))
+    .digest("hex");
+function findCreateInFlight(siteKey, project, issueType, summary, description, labels) {
   const now = Date.now();
   for (const [fp, e] of createInFlight) {
     if (now - e.at > CREATE_INFLIGHT_TTL_MS) createInFlight.delete(fp);
   }
-  const e = createInFlight.get(createFp(siteKey, project, issueType, summary));
+  const e = createInFlight.get(
+    createFp(siteKey, project, issueType, summary, description, labels));
   if (!e) return null;
   const a = agents[e.host];
   // Resolved (or its host is gone): it's a finished piece of work, so an
   // identical create from here is a deliberate second ticket.
   if (!a || (a.createResults || {})[e.cmdId]) return null;
-  // Nor is it in flight once it can no longer produce an outcome — the host has
-  // gone quiet holding it, or has proven it doesn't implement createTicket at
-  // all (XERK-151). Rejoining either would hand the retry a cmdId that never
-  // answers; letting it through re-routes or refuses on its own merits.
-  if (Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) return null;
+  // An agent that has proven it can't run createTicket will never answer, so
+  // rejoining it would hand the retry a dead cmdId; let it through to refuse on
+  // its own merits (XERK-151).
   if (agentGapError(a, "createTicket", "create tickets")) return null;
+  // Nor is a create still in flight once its host has gone quiet holding it:
+  // rejoining would hand the retry a cmdId nothing can answer. Note this is
+  // reached only inside the TTL, which is far shorter than the 75s of silence
+  // it takes to call a host offline — so in practice such an entry has already
+  // expired, and this is the guard for the case where the host was ALREADY down
+  // when the create was queued.
+  if (Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) return null;
   return e;
 }
 // Stop treating a create as in flight. Called where the hub REPORTS a create as
@@ -1300,9 +1353,8 @@ function forgetCreateInFlight(cmdId) {
     if (e.cmdId === cmdId) createInFlight.delete(fp);
   }
 }
-function rememberCreateInFlight(siteKey, project, issueType, summary, cmdId, host) {
-  createInFlight.set(createFp(siteKey, project, issueType, summary),
-    { cmdId, host, at: Date.now() });
+function rememberCreateInFlight(fields, cmdId, host) {
+  createInFlight.set(createFp(...fields), { cmdId, host, at: Date.now() });
   while (createInFlight.size > CMD_HOST_MAX) {
     createInFlight.delete(createInFlight.keys().next().value);
   }
@@ -3115,11 +3167,19 @@ const server = http.createServer(async (req, res) => {
       // the handoff (kill source, mark done) now rather than waiting out the
       // sweep interval (XERK-101). Cheap: a no-op unless a migration is live.
       if (migrations.size) advanceMigrations();
-      scheduleSave();
+      // Stamp what this reply hands over. Delivery is the line between "the
+      // agent never saw this" and "the agent may already have run it" — the
+      // hub's only evidence for either, since the queue drains on ACK, not on
+      // delivery. dropQueuedCommand and the create poll both turn on it.
+      for (const c of commands) if (c && !c.deliveredAt) c.deliveredAt = Date.now();
+      const reply = publicCommands(commands);   // strip AFTER stamping, or the
+      scheduleSave();                           // no-op copy hands back the
+                                                // same objects and leaks it
       // A fresh beat landed — refresh the memoized fleet payload and push the
       // updated record to open dashboards so the UI reflects it near-instantly.
       publishAgent(key);
-      return json(res, 200, archiveHave ? { commands, archiveHave } : { commands });
+      return json(res, 200,
+        archiveHave ? { commands: reply, archiveHave } : { commands: reply });
     }
 
     // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart
@@ -3809,9 +3869,10 @@ const server = http.createServer(async (req, res) => {
       // yet is a retry, not a second ticket, so it rejoins the first cmdId. Once
       // that create RESOLVES, an identical one is a new ticket again — deliberate
       // repeats stay possible.
-      const inFlight = findCreateInFlight(siteKey, project, issueType, summary);
+      const fields = [siteKey, project, issueType, summary, description, labels];
+      const inFlight = findCreateInFlight(...fields);
       if (inFlight) return json(res, 200, { ok: true, cmdId: inFlight.cmdId, host: inFlight.host });
-      const key = pickBoardWriteHost(siteKey);
+      const key = pickBoardWriteHost(siteKey, "createTicket");
       if (!key) {
         return findJiraHost(siteKey, false)
           ? json(res, 503, { error: "no online host reports that org" })
@@ -3826,7 +3887,7 @@ const server = http.createServer(async (req, res) => {
       });
       awaitResult(agents[key], cmdId, "createTicket");
       rememberCmdHost(cmdId, key);
-      rememberCreateInFlight(siteKey, project, issueType, summary, cmdId, key);
+      rememberCreateInFlight(fields, cmdId, key);
       return json(res, 200, { ok: true, cmdId, host: key });
     }
 
@@ -3863,14 +3924,19 @@ const server = http.createServer(async (req, res) => {
       // cheaper than a wrong failure the operator answers by retrying.
       const owner = commandHost(siteKey, cmdId, "createResults");
       if (owner && Date.now() - (agents[owner].lastSeen || 0) >= OFFLINE_AFTER_MS) {
-        // Telling the operator this create failed invites them to make the
-        // ticket again — so a create still sitting UNDELIVERED in the dead
-        // host's queue must not fire whenever it wakes up and add a duplicate
-        // to the one they just remade. Only the undelivered case is dropped:
-        // still being in the queue is proof the agent never took it.
-        dropQueuedCommand(owner, cmdId);
+        // Telling the operator a create failed invites them to make the ticket
+        // again, so the wording has to match what the hub can actually prove.
+        // Withdrawing the command succeeds only when the agent was never handed
+        // it — that, and only that, proves no ticket exists. Once it has been
+        // delivered the hub cannot know: the agent may have created the ticket
+        // and died before acking, and claiming otherwise is what turns one
+        // intent into two tickets. Say so, and send them to look first.
+        const nothingRan = dropQueuedCommand(owner, cmdId);
         forgetCreateInFlight(cmdId);
-        return json(res, 503, { error: "the host went offline before the ticket was created" });
+        return json(res, 503, { error: nothingRan
+          ? "the host went offline before the ticket was created"
+          : "the host went silent while creating the ticket — it may have been created, "
+            + "so check the board before making it again" });
       }
       return json(res, 202, { pending: true });
     }
@@ -3950,21 +4016,24 @@ const server = http.createServer(async (req, res) => {
       if (!findJiraHost(siteKey, false)) {
         return json(res, 404, { error: "no host reports that org" });
       }
-      // Health-ranked but deliberately NOT rotated the way a create is
-      // (XERK-241): this route's single-flight looks for the pending change in
-      // ONE host's queue, so spreading consecutive changes across the org's
-      // agents would let a double-click fire two transitions on one ticket.
-      const key = findJiraHost(siteKey, true);
+      // The single-flight spans the ORG, not one host (XERK-241). Which host
+      // answers for an org can move between two clicks — a health flip is enough
+      // — so looking for the pending change in only the CURRENT host's queue
+      // would miss the one already queued on a sibling and fire a second
+      // transition on the same ticket, which is exactly what it exists to stop.
+      for (const k of jiraHostPool(siteKey, false)) {
+        const p = (agents[k].commands || [])
+          .find((c) => c.type === "setTicketStatus" && c.issueKey === issueKey);
+        if (p) return json(res, 202, { ok: true, cmdId: p.cmdId, host: k });
+      }
+      const key = pickBoardWriteHost(siteKey, "setTicketStatus");
       if (!key) return json(res, 503, { error: "no online host reports that org" });
       // Same refusal as the create route: an agent predating XERK-138 acks this
       // and stages nothing, which the panel/drag would poll out to a timeout.
       const gap = agentGapError(agents[key], "setTicketStatus", "change a ticket's status");
       if (gap) return json(res, 409, { error: gap });
-      const pending = (agents[key].commands || [])
-        .find((c) => c.type === "setTicketStatus" && c.issueKey === issueKey);
-      const cmdId = pending ? pending.cmdId
-        : queueCommand(key, { type: "setTicketStatus", issueKey, value, category });
-      if (!pending) awaitResult(agents[key], cmdId, "setTicketStatus");
+      const cmdId = queueCommand(key, { type: "setTicketStatus", issueKey, value, category });
+      awaitResult(agents[key], cmdId, "setTicketStatus");
       rememberCmdHost(cmdId, key);
       return json(res, 202, { ok: true, cmdId, host: key });
     }
