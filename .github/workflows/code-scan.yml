@@ -43,10 +43,11 @@ on:
       # Resolve flags step in release.yml. Workflow edits are rare, so the wider
       # trigger costs little.
       - ".github/workflows/**"
-      # The CLAUDE.md size gate lives in the tests job below, and the PR that
-      # pushes the file over its limit is usually a docs-only PR — without this
-      # path the gate would never run on the change it exists to catch.
+      # The instruction-file size gate lives in the tests job below, and the PR
+      # that pushes a file over its limit is usually a docs-only PR — without
+      # these paths the gate would never run on the change it exists to catch.
       - "CLAUDE.md"
+      - ".claude/rules/**"
 
 concurrency:
   group: code-scan-${{ github.ref }}
@@ -168,22 +169,31 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
-      # CLAUDE.md is loaded into EVERY session's context on every host, so its
-      # size is a token cost the whole fleet pays on every run, and past Claude
-      # Code's 150k-character limit it stops loading in full at all. The file's
-      # own "Editing This File" rule has always said to stay under that; the rule
-      # went unenforced and the file drifted 23% past it, which is why this gate
-      # exists. Characters, not bytes (the file is full of multibyte glyphs) —
-      # locally the same number is `wc -m CLAUDE.md`.
-      - name: CLAUDE.md size limit
+      # CLAUDE.md is loaded into EVERY session's context on every host, and each
+      # .claude/rules/*.md is loaded whenever a session touches the paths its
+      # frontmatter names — so both are a token cost the fleet pays repeatedly.
+      # 40,000 is Claude Code's own threshold: past it the CLI prints "Large
+      # CLAUDE.md will impact performance (Xk chars > 40.0k)" at startup and
+      # adherence to the instructions drops. (There is no truncation cliff —
+      # Claude Code loads a CLAUDE.md in full at any length. An earlier version
+      # of this gate claimed a 150k hard limit; that was wrong.) The remedy when
+      # a file approaches the ceiling is to split it by path into another rules
+      # file, not to raise the number. Characters, not bytes (these files are
+      # full of multibyte glyphs) — locally the same number is `wc -m <file>`.
+      - name: Instruction file size limits
         run: |
-          limit=150000
-          size=$(python3 -c "print(len(open('CLAUDE.md', encoding='utf-8').read()))")
-          echo "CLAUDE.md is ${size} characters (limit ${limit})"
-          if [ "$size" -ge "$limit" ]; then
-            echo "::error file=CLAUDE.md::CLAUDE.md is ${size} characters, at or over the ${limit} limit. Consolidate before adding — see the 'Editing This File' section."
-            exit 1
-          fi
+          limit=40000
+          fail=0
+          for f in CLAUDE.md .claude/rules/*.md; do
+            [ -e "$f" ] || continue
+            size=$(python3 -c "import sys;print(len(open(sys.argv[1], encoding='utf-8').read()))" "$f")
+            echo "${f} is ${size} characters (limit ${limit})"
+            if [ "$size" -ge "$limit" ]; then
+              echo "::error file=${f}::${f} is ${size} characters, at or over the ${limit} limit. Consolidate, or split it by path into another .claude/rules file — see CLAUDE.md's 'Editing these files'."
+              fail=1
+            fi
+          done
+          exit "$fail"
       - name: Python unit tests (agent/hub-agent.py)
         run: python3 -m unittest discover -s agent/tests -p "test_*.py" -v
       - name: Node unit tests (turma/server.js + agent/tunnel-agent.js + release scripts)
