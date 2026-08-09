@@ -48,6 +48,7 @@ as cwd, so it cannot rely on any package being importable.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -61,6 +62,10 @@ import sys
 # A single `&` backgrounds the command before it — it separates two commands
 # exactly like `;` does, so leaving it out let `sleep 0 & rm -rf /etc` past.
 _SEGMENT_SPLIT = re.compile(r"&&|\|\||[;\n|&]")
+
+# The same, MINUS the single `|`: a pipeline's stages are one statement, and
+# some checks (see _destructive_database) have to see it whole.
+_PIPELINE_SPLIT = re.compile(r"&&|\|\||[;\n&]")
 
 # A leading `FOO=bar` environment assignment on a command.
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*$")
@@ -92,18 +97,120 @@ _PREFIX_OPTS_WITH_VALUE = {
 # split on `;` — without these, `do`/`then` becomes the classified program.
 _SHELL_KEYWORDS = {
     "do", "done", "then", "else", "elif", "fi", "in", "esac", "!",
-    "{", "}", "(", ")",
+    "{", "}", "(", ")", ";;", "if", "while", "until",
 }
+
+# Compound-statement heads whose word list runs up to `in` — without skipping
+# it, `case x in x) rm -rf /etc;; esac` classified as the program `x`.
+_WORDLIST_HEADS = {"for", "case", "select"}
+
+# `f()` in `f() { rm -rf /etc; }`, and `x)` in a case arm. Both lead a segment
+# whose real command follows them.
+_FUNC_DEF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
+_CASE_PATTERN_RE = re.compile(r"^[^()\s]+\)$")
 
 # Interpreters whose `-c <string>` argument is a whole command line of its own.
 _SHELL_PROGS = {"bash", "sh", "zsh", "ksh", "dash", "ash", "busybox"}
 
-# Command substitutions and backticks run their contents as a command.
-_SUBST_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+# Programs that merely PRINT their arguments. `eval "$(echo rm -rf /etc)"` runs
+# what the substitution printed, so the echo has to be peeled off to see it.
+_ECHO_PROGS = {"echo", "printf"}
+
+# Command substitutions, backticks and process substitutions all run their
+# contents as a command — `cat <(rm -rf /etc)` runs the `rm` just as surely as
+# `$(...)` does.
+_SUBST_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|<\(([^()]*)\)|>\(([^()]*)\)")
+
+
+def _subst_inner(m: "re.Match[str]") -> str:
+    """The command text inside whichever substitution form matched."""
+    return next((g for g in m.groups() if g), "")
+
 
 # How deep the expansion recurses before giving up (a guard against a
 # pathological nest, not a security boundary).
 _MAX_EXPAND_DEPTH = 6
+
+
+# --- pre-normalisation ---------------------------------------------------
+#
+# The shell rewrites a command line before it runs it, and every one of these
+# rewrites was a way to spell a destructive command that the classifier read as
+# something else. They are undone here, once, so the rest of the file only ever
+# sees the plain form: `rm${IFS}-rf${IFS}/etc`, `rm -rf {/etc,/var}`,
+# `rm -rf $'\x2fetc'` and `for d in /etc; do rm -rf $d; done` all normalise to
+# `rm -rf /etc`.
+
+_IFS_RE = re.compile(r"\$\{IFS\}|\$IFS")
+_ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
+_BRACE_RE = re.compile(r"\{([^{}]+,[^{}]*)\}")
+_VAR_ASSIGN_RE = re.compile(
+    r"(?:^|[;\n&|]|\bexport\s+)\s*([A-Za-z_][A-Za-z0-9_]*)=([^\s;|&\n]+)"
+)
+_FOR_IN_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]+)")
+_VAR_USE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _decode_ansi_c(command: str) -> str:
+    """`$'\\x2fetc'` → `/etc`, re-quoted so it stays one token."""
+
+    def rep(m: "re.Match[str]") -> str:
+        try:
+            return shlex.quote(m.group(1).encode().decode("unicode_escape"))
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return m.group(0)
+
+    return _ANSI_C_RE.sub(rep, command)
+
+
+def _expand_braces(command: str) -> str:
+    """`rm -rf {/etc,/var}` → `rm -rf /etc /var` (prefix/suffix preserved)."""
+    for _ in range(4):  # bounded: an expansion can re-create a brace
+        m = _BRACE_RE.search(command)
+        if not m:
+            break
+        start, end = m.span()
+        word_start = command.rfind(" ", 0, start) + 1
+        word_end = command.find(" ", end)
+        if word_end == -1:
+            word_end = len(command)
+        prefix, suffix = command[word_start:start], command[end:word_end]
+        parts = [prefix + p.strip() + suffix for p in m.group(1).split(",")]
+        command = command[:word_start] + " ".join(parts) + command[word_end:]
+    return command
+
+
+def _var_values(command: str) -> dict[str, list[str]]:
+    """Values this command line itself assigns to a variable."""
+    vals: dict[str, list[str]] = {}
+    for m in _VAR_ASSIGN_RE.finditer(command):
+        vals.setdefault(m.group(1), []).append(m.group(2).strip("'\""))
+    for m in _FOR_IN_RE.finditer(command):
+        words = [w for w in m.group(2).split() if w != "do"]
+        if words:
+            vals.setdefault(m.group(1), []).extend(words)
+    return vals
+
+
+def _substitute_vars(command: str) -> str:
+    """Inline variables the command line sets itself.
+
+    Only names this very command assigns are substituted — an unresolved
+    `$TMPDIR` is left alone rather than guessed at.
+    """
+    vals = _var_values(command)
+    if not vals:
+        return command
+
+    def rep(m: "re.Match[str]") -> str:
+        got = vals.get(m.group(1) or m.group(2) or "")
+        return " ".join(got) if got else m.group(0)
+
+    return _VAR_USE_RE.sub(rep, command)
+
+
+def _prenormalise(command: str) -> str:
+    return _substitute_vars(_expand_braces(_IFS_RE.sub(" ", _decode_ansi_c(command))))
 
 
 # `cmd <<EOF` / `<<-'EOF'` — everything up to the delimiter line is DATA fed to
@@ -172,6 +279,21 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
         if _ENV_ASSIGN.match(head) or head in _SHELL_KEYWORDS:
             out.pop(0)
             continue
+        if _FUNC_DEF_RE.match(head) or _CASE_PATTERN_RE.match(head):
+            out.pop(0)
+            continue
+        if head == "function":
+            out.pop(0)
+            if out:
+                out.pop(0)  # the function's name
+            continue
+        if head in _WORDLIST_HEADS:
+            out.pop(0)
+            while out and out[0] != "in":
+                out.pop(0)
+            if out:
+                out.pop(0)  # the `in` itself
+            continue
         if _basename(head) in _PREFIX_WORDS:
             wrapper = _basename(head)
             out.pop(0)
@@ -191,6 +313,30 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
 
 def _basename(prog: str) -> str:
     return re.split(r"[\\/]", prog)[-1].lower()
+
+
+# xargs options that consume the NEXT token as their value.
+_XARGS_OPTS_WITH_VALUE = {
+    "-I", "-i", "-n", "-L", "-P", "-s", "-d", "-E", "-e", "-a",
+    "--replace", "--max-args", "--max-lines", "--max-procs", "--max-chars",
+    "--delimiter", "--arg-file", "--eof",
+}
+
+
+def _shell_c_index(rest: list[str]) -> int:
+    """Index of a shell's `-c` flag, however it is spelled.
+
+    Short options combine, so `bash -lc '<cmd>'` and `sh -xc '<cmd>'` carry the
+    script in exactly the place `-c` does. Testing for the bare `-c` token alone
+    missed every combined spelling — and `bash -lc` is the form a shell actually
+    gets invoked with.
+    """
+    for i, tok in enumerate(rest):
+        if tok == "-c":
+            return i
+        if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
+            return i
+    return -1
 
 
 def _find_roots(tokens: list[str]) -> list[str]:
@@ -215,7 +361,7 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
     out: list[tuple[list[str], str]] = []
     if depth > _MAX_EXPAND_DEPTH:
         return out
-    command, heredocs = _split_heredocs(command)
+    command, heredocs = _split_heredocs(_prenormalise(command))
     # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF` runs
     # every line of it. Expand those bodies as commands; bodies fed to anything
     # else stay data (see _destructive_database for the psql case).
@@ -236,9 +382,18 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
     for raw in segments:
         # Anything a substitution would run, wherever it sits in the segment.
         for m in _SUBST_RE.finditer(raw):
-            inner = m.group(1) or m.group(2) or ""
+            inner = _subst_inner(m)
             if inner.strip():
                 out.extend(_expand_segments(inner, depth + 1))
+        # `eval "$(echo rm -rf /etc)"` runs what the substitution PRINTED, so the
+        # loop above (which only sees the `echo`) is not enough — peel the echo
+        # off and expand its arguments as the command they become.
+        pre = _strip_prefixes(_tokenize(_SUBST_RE.sub(" ", raw)))
+        if pre and _basename(pre[0]) == "eval":
+            for m in _SUBST_RE.finditer(raw):
+                inner_tokens = _tokenize(_subst_inner(m))
+                if inner_tokens and _basename(inner_tokens[0]) in _ECHO_PROGS:
+                    out.extend(_expand_segments(" ".join(inner_tokens[1:]), depth + 1))
         seg = _unwrap_group(_SUBST_RE.sub(" ", raw))
         if seg != raw.strip() and seg:
             # A group/substitution-stripped body can itself hold operators.
@@ -251,20 +406,31 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
         out.append((tokens, seg))
         prog = _basename(tokens[0])
         rest = tokens[1:]
-        if prog in _SHELL_PROGS and "-c" in rest:
-            i = rest.index("-c")
-            if i + 1 < len(rest):
+        if prog in _SHELL_PROGS:
+            i = _shell_c_index(rest)
+            if i >= 0 and i + 1 < len(rest):
                 out.extend(_expand_segments(rest[i + 1], depth + 1))
         elif prog == "eval" and rest:
             out.extend(_expand_segments(" ".join(rest), depth + 1))
+        elif prog == "trap" and rest:
+            # `trap 'rm -rf /etc' EXIT` runs its handler on the way out.
+            out.extend(_expand_segments(rest[0], depth + 1))
         elif prog == "xargs" and rest:
             # Drop xargs' own leading options, keep the command and ITS flags,
-            # then append what the pipeline will feed it as operands.
+            # then append what the pipeline will feed it as operands. An option
+            # that takes a SEPARATE value must consume it, else `-I {} rm -rf {}`
+            # left `{}` as the command and classified nothing.
             inner = list(rest)
             while inner and inner[0].startswith("-"):
-                inner.pop(0)
+                opt = inner.pop(0)
+                if "=" not in opt and opt in _XARGS_OPTS_WITH_VALUE and inner:
+                    inner.pop(0)
             if inner:
-                out.append((_strip_prefixes(inner + piped_operands), seg))
+                # `{}` stands for whatever the pipeline feeds in.
+                expanded: list[str] = []
+                for tok in inner:
+                    expanded.extend(piped_operands if tok == "{}" else [tok])
+                out.append((_strip_prefixes(expanded + piped_operands), seg))
         elif prog == "find":
             roots = _find_roots(tokens) or ["."]
             if "-delete" in rest:
@@ -313,10 +479,33 @@ _SYSTEM_ROOTS = (
 _HOME_TOKENS = {"~", "~/", "$home", "${home}", "%userprofile%", "%homepath%", "%homedrive%"}
 
 
+_GLOB_CHARS = re.compile(r"[*?\[]")
+
+
 def _norm_path(tok: str) -> str:
     t = tok.strip().strip('"').strip("'")
+    # `//etc` and `/etc//` address exactly what `/etc` does; the shell collapses
+    # repeated separators and so must this, or `rm -rf //etc` reads as unmatched.
+    t = re.sub(r"/{2,}", "/", t)
     # Windows drive root (C:\ , C:/ , c:) and Windows system dirs.
     return t
+
+
+def _glob_hits_system_root(pattern: str) -> bool:
+    """True if an absolute glob could expand onto a system root.
+
+    `rm -rf /et*` deletes `/etc` — the shell expands it before `rm` ever runs,
+    so a literal-only comparison never saw the target. Only ABSOLUTE patterns
+    are judged this way: a bare `*` cannot name `/etc`, and treating it as if it
+    could would refuse an ordinary `rm -rf *` in a build directory.
+    """
+    if not pattern.startswith("/"):
+        return False
+    for root in _SYSTEM_ROOTS:
+        bare = root.rstrip("/") or "/"
+        if fnmatch.fnmatch(bare, pattern) or fnmatch.fnmatch(bare + "/", pattern):
+            return True
+    return False
 
 
 def _is_dangerous_path(tok: str) -> bool:
@@ -330,6 +519,8 @@ def _is_dangerous_path(tok: str) -> bool:
         return True
     # `.git` (with or without trailing slash / leading ./) → repo history.
     if low.endswith("/.git") or low in (".git", "./.git") or low.endswith("\\.git"):
+        return True
+    if _GLOB_CHARS.search(low) and _glob_hits_system_root(low):
         return True
     # Windows drive roots: C:, C:\, C:\windows, C:\users, ...
     if re.match(r"^[a-z]:([\\/].*)?$", low):
@@ -679,6 +870,22 @@ _TEXT_PROGS = {
 }
 
 
+# Programs that EXECUTE SQL they are fed. A heredoc or pipeline carrying
+# `DROP DATABASE` only drops one when it reaches one of these; fed to `python3`
+# or `cat` it is a string in a script, which is why this is a named list rather
+# than "anything that is not a text tool".
+_DB_CLIENTS = {
+    "psql", "mysql", "mariadb", "mysqldump", "sqlite3", "sqlite", "mongo",
+    "mongosh", "cqlsh", "sqlcmd", "clickhouse-client", "cockroach", "usql",
+    "duckdb", "impala-shell", "beeline", "snowsql",
+}
+
+
+def _executes_sql(prog: str) -> bool:
+    """True if text reaching `prog` gets run as SQL (or as shell, which may)."""
+    return prog in _DB_CLIENTS or prog in _SHELL_PROGS
+
+
 def _destructive_database(command: str) -> str | None:
     for tokens, segment in _expand_segments(command):
         if not _DB_DESTRUCTION.search(segment):
@@ -686,13 +893,25 @@ def _destructive_database(command: str) -> str | None:
         if _basename(tokens[0]) in _TEXT_PROGS:
             continue
         return "refusing database/schema destruction (DROP DATABASE/TABLE)"
+    # A pipeline is ONE statement crossing several segments: in
+    # `echo 'DROP DATABASE prod' | mysql` the SQL sits in the exempt `echo`
+    # stage while the stage that executes it carries no SQL of its own, so
+    # judging stages separately cleared both halves. Judge the pipeline whole —
+    # it is destructive if any stage is something other than a text tool.
+    for pipeline in _PIPELINE_SPLIT.split(_split_heredocs(_prenormalise(command))[0]):
+        if not _DB_DESTRUCTION.search(pipeline):
+            continue
+        for stage in pipeline.split("|"):
+            toks = _strip_prefixes(_tokenize(_unwrap_group(_SUBST_RE.sub(" ", stage))))
+            if toks and _executes_sql(_basename(toks[0])):
+                return "refusing database/schema destruction (DROP DATABASE/TABLE)"
     # A heredoc body is data, but `psql <<EOF ... DROP DATABASE x; ... EOF` is
     # still the statement being executed — judge it by the command it feeds.
     for owner, body in _split_heredocs(command)[1]:
         if not _DB_DESTRUCTION.search(body):
             continue
         for tokens, _seg in _expand_segments(owner):
-            if _basename(tokens[0]) not in _TEXT_PROGS:
+            if _executes_sql(_basename(tokens[0])):
                 return "refusing database/schema destruction (DROP DATABASE/TABLE)"
     return None
 

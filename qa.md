@@ -44,6 +44,20 @@ a QA session.
 - **`/tmp` is `noexec`.** Write scratch files there freely, but anything that
   must be *executed* (a downloaded binary, an extracted tool) goes in
   `/root/.local`.
+- **`/etc` is mounted read-only** (`boot-pool/ROOT/<ver>/etc`, `ro`), hardened
+  after the incident in §1.
+- Those two together **fail six of the agent's shell suites for environmental
+  reasons only** — `test_bootstrap`, `test_entrypoint`, `test_install_sudo`,
+  `test_turma_agent`, `test_turma_agent_update`, `test_turma_agentctl`. They
+  install into a temp prefix and `exec` what they installed, so `noexec /tmp`
+  makes them die with `setsid: Permission denied`, and `test_entrypoint` also
+  tries to `cp` a `tmux.conf` into the read-only `/etc`. **Do not file these as
+  regressions.** Point `TMPDIR` at an exec-capable filesystem and all six pass:
+  ```bash
+  mkdir -p /mnt/data/tmp-qa && export TMPDIR=/mnt/data/tmp-qa
+  cd agent && for t in tests/test_*.sh; do bash "$t"; done   # all 6 OK
+  ```
+  CI runs them on `ubuntu-latest`, where neither constraint exists.
 - `docker` works and can pull from ghcr.
 
 ---
@@ -56,6 +70,43 @@ any bug you might find.
 
 Hard rules:
 
+- **NEVER EXECUTE A COMMAND YOU ARE TESTING THE GUARD AGAINST.** This is the
+  first rule because breaking it cost this project its `/etc`. During XERK-235 a
+  QA agent proving a `guard.py` bypass ran the payload for real behind a fake-`rm`
+  PATH shim; the payload was `bash -lc 'rm -rf /etc'`, `bash -l` re-read
+  `/etc/profile`, `/etc/profile` reset `PATH`, the shim went out of scope and the
+  **real `/bin/rm` deleted `/etc` on the live host**. The box had to be rebooted
+  and rolled back from a ZFS snapshot.
+  - **The shim is not a sandbox.** Anything that re-execs, re-reads a profile,
+    resets `PATH`, or uses an absolute path steps straight around it. There is no
+    safe way to "just check whether it would really run".
+  - **You never need to.** `guard.decide()` / `is_destructive()` /
+    `policy_reason()` are **pure functions over a string** — they return a
+    verdict and execute nothing. Testing the guard means calling them and
+    comparing the verdict. Import the module and assert:
+    ```python
+    import sys; sys.path.insert(0, "agent/hooks"); import guard
+    guard.decide("Bash", {"command": "bash -lc 'rm -rf /etc'"})  # -> ('deny', ...)
+    ```
+    `agent/tests/test_guard.py::TestKnownBypasses` is the pattern to copy. The
+    probe used to close this pass's 19 bypasses executed nothing at all.
+  - If you genuinely believe a payload must *run* to prove something, it runs in
+    `docker run --rm` on a throwaway image, never on the host — and say in your
+    report that you did it.
+- **Your own Bash calls are policed by the INSTALLED guard, not the one in your
+  worktree.** The hook path is baked into the session's `--settings` file, so
+  editing `agent/hooks/guard.py` changes what your *tests* see and nothing about
+  what *you* are allowed to run. During XERK-235 this looked exactly like a fresh
+  false positive: a commit message quoting `DROP DATABASE … | mysql` was refused
+  even though the branch's own guard allowed it. It was the installed (older)
+  guard refusing — the very bug the branch was fixing. Before filing a false
+  positive against your branch, check both:
+  ```python
+  # branch copy vs the installed one, same string, in one process
+  import sys; sys.path.insert(0, "agent/hooks"); import guard
+  guard.is_destructive(cmd)
+  ```
+  If they disagree, you are looking at the deployed version, not a regression.
 - **Never write to the real `~/.turma` or `~/.claude`.** Override `HOME` to a
   temp dir for anything that boots `hub-agent.py`; `REGISTRY_DIR` is hardcoded to
   `~/.turma` and is *not* env-overridable, so `HOME` is the only lever.
@@ -332,6 +383,28 @@ Say these are unverified rather than implying otherwise:
 - **Live Jira / Azure DevOps / GitHub / GitLab APIs** unless creds are present.
   Note the trap in §1: the systemd agent's env leaks into shells here, so a
   "hermetic" agent can hit the REAL tracker without being asked to.
+
+### 6.1 Guard limits that are deliberate, not bugs
+
+`guard.py` classifies **the command string it is handed**. Where the target is
+not in that string, it cannot decide, and the two candidate fixes are worse than
+the gap. Do not re-file these:
+
+- **`xargs rm -rf < list.txt`** — operands come from a file the hook cannot
+  read. Denying the shape would also refuse `find . -name '*.o' | xargs rm -rf`,
+  an everyday idiom. Every form where the target IS visible
+  (`echo /etc | xargs -I {} rm -rf {}`) is denied.
+- **`cat drop.sql | psql`** — the SQL is in the file, not the command line.
+- **An unresolved variable** (`rm -rf $TMPDIR`) is left alone. Only names the
+  same command line assigns are inlined, so `D=/etc; rm -rf $D` IS denied, and a
+  variable set by the surrounding environment is not guessed at.
+- **`rm -rf *`** is allowed. A bare `*` cannot expand onto a system root, and
+  refusing it would break ordinary work in a build directory. Absolute globs
+  (`/et*`, `/e??`) are denied.
+
+The guard is a **backstop against catastrophe, not a sandbox**. It is one layer
+under `permissions.deny` and the operator's own host hardening; treat a gap as
+worth closing, not as a breach of a boundary it never claimed to be.
 
 ---
 

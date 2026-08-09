@@ -187,12 +187,48 @@ BYPASS_DESTRUCTIVE = [
     "find / -name x -exec rm -rf {} +",
     # xargs takes its operands from the pipe, not its argv.
     "echo /etc | xargs rm -rf",
+    # --- second QA pass (XERK-235) -------------------------------------
+    # Short options COMBINE, and `bash -lc` is how a shell is really invoked.
+    # Matching the bare `-c` token missed every combined spelling.
+    "bash -lc 'rm -rf /etc'",
+    "bash -ec 'rm -rf /etc'",
+    "sh -xc 'rm -rf /etc'",
+    # `$IFS` is a word separator, so this is `rm -rf /etc` with no spaces in it.
+    "rm${IFS}-rf${IFS}/etc",
+    # The shell expands globs and braces before `rm` ever sees a path.
+    "rm -rf /et*",
+    "rm -rf /e??",
+    "rm -rf /etc*",
+    "rm -rf {/etc,/var}",
+    # Repeated separators address the same directory.
+    "rm -rf //etc",
+    # `$'...'` is ANSI-C quoting: this spells `/etc`.
+    "rm -rf $'\\x2fetc'",
+    # A trap handler runs on the way out.
+    "trap 'rm -rf /etc' EXIT",
+    # Process substitution runs its body like `$(...)` does.
+    "cat <(rm -rf /etc)",
+    # `-I` detached from its value swallowed the command that followed it.
+    "echo /etc | xargs -I '{}' rm -rf '{}'",
+    "ls /etc | xargs -I{} rm -rf {}",
+    # eval runs what the substitution PRINTED, not the echo itself.
+    'eval "$(echo rm -rf /etc)"',
+    # A function body, and a case arm, each lead with a token of their own.
+    "f() { rm -rf /etc; }; f",
+    "case x in x) rm -rf /etc;; esac",
+    # The loop variable is assigned by the very command that uses it.
+    "for d in /etc; do rm -rf $d; done",
+    "D=/etc; rm -rf $D",
 ]
 
 # Global options sit BEFORE the subcommand, so reading tokens[1] as the
 # subcommand dropped the whole git policy. `git -C <path> push` is ordinary
 # usage from outside a worktree, not an evasion technique.
 BYPASS_POLICY = [
+    # `$IFS` hides the word breaks from a whitespace-shaped reading (XERK-235).
+    "git${IFS}push${IFS}origin${IFS}main",
+    "gh${IFS}pr${IFS}merge${IFS}5",
+    "bash -lc 'git push origin main'",
     "git -C /repo push origin main",
     "git -c user.name=x push origin main",
     "git --git-dir=.git push origin main",
@@ -212,6 +248,30 @@ SQL_AS_TEXT_OK = [
     "cat schema.sql | grep -i 'drop database'",
     "git commit -m 'drop table column from the schema doc'",
     "echo 'DROP TABLE x' > /dev/null",
+    # Piped between two TEXT tools, the SQL is still only ever text.
+    "cat schema.sql | grep 'DROP TABLE' | wc -l",
+    "echo 'DROP TABLE x' | tee out.sql",
+]
+
+# Ordinary commands that must stay allowed. The pre-normalisation pass rewrites
+# every command before it is classified, so this is the net that catches it
+# rewriting a harmless one into something that looks catastrophic.
+ORDINARY_OK = [
+    "rm -rf node_modules", "rm -rf build/*", "rm -rf *", "rm -rf ./dist",
+    "rm -rf /tmp/scratch", "rm -rf target/debug",
+    "npm test", "npm run build", "make -j4", "python3 -m pytest -q",
+    "bash -lc 'npm run build'", "bash -lc 'git push origin my-feature'",
+    "for f in *.txt; do wc -l $f; done",
+    "case $x in a) echo hi;; esac",
+    "xargs -I {} echo {} < list.txt",
+    "find . -name '*.pyc' -delete",
+    "find . -name '*.o' | xargs rm -rf",
+    "trap 'echo bye' EXIT",
+    'eval "$(ssh-agent -s)"',
+    "shred --help", "git reset --hard HEAD~1", "git checkout -b feature",
+    "ls -la /etc", "cat /etc/hosts", "chmod +x script.sh",
+    "docker compose up -d", "tar xzf a.tgz",
+    "BUILD=/tmp/out; rm -rf $BUILD",
 ]
 
 
@@ -244,6 +304,53 @@ class TestKnownBypasses(unittest.TestCase):
                     "mysql -e 'drop table users'"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_sql_piped_into_a_client_is_denied(self):
+        """A pipeline is ONE statement, so per-segment judging cleared both halves.
+
+        The SQL sits in the `echo` stage, which is exempt as a text tool, while
+        the stage that EXECUTES it carries no SQL of its own. Judged separately
+        both looked innocent — a regression this pass introduced against
+        origin/main, where the raw string was matched whole (XERK-235).
+        """
+        drop_db = "DROP" + " DATABASE"
+        # NB: `cat drop.sql | mysql` is NOT here — the SQL lives in the file, so
+        # nothing in the command text can be matched. See the xargs limit below.
+        for cmd in (f"echo '{drop_db} prod' | mysql",
+                    f"printf '{drop_db} prod' | psql -h db",
+                    f"echo '{drop_db} prod' | bash",
+                    f"echo '{drop_db} prod' | sudo mysql -u root"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_sql_piped_into_a_non_client_is_allowed(self):
+        """`_DB_CLIENTS` is a named list, not "anything that isn't a text tool".
+
+        A python heredoc that merely MENTIONS `DROP DATABASE` executes no SQL —
+        and the first draft of the pipeline rule above refused exactly that,
+        which is how it was found.
+        """
+        drop_db = "DROP" + " DATABASE"
+        for cmd in (f"echo '{drop_db} prod' | python3 -c 'import sys; print(sys.stdin.read())'",
+                    f"python3 - <<'EOF'\nSQL = '{drop_db} prod'\nprint(SQL)\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_ordinary_commands_survive_prenormalisation(self):
+        for cmd in ORDINARY_OK:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+                self.assertIsNone(guard.policy_reason(cmd))
+
+    def test_xargs_from_a_file_is_a_known_limit(self):
+        """Documented, not silently believed to be covered.
+
+        `xargs rm -rf < list.txt` takes its operands from a file the guard
+        cannot read, so the target is undecidable at check time. Denying it
+        would also refuse `find . | xargs rm -rf`, an everyday idiom, so it is
+        left allowed and written down in qa.md instead.
+        """
+        self.assertIsNone(guard.is_destructive("xargs -I '{}' rm -rf '{}' < list.txt"))
 
     def test_wrapped_ordinary_work_still_allowed(self):
         """Unwrapping must not make routine commands look destructive."""
