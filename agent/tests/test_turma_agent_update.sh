@@ -97,6 +97,30 @@ STUB
 
 # --- Run the updater against a staged prefix ---------------------------------
 # Echoes the resulting installed VERSION.
+# Neutralise every restart path the updater can take. It tries, in order:
+#   systemctl --user restart turma-agent   (a user manager is reachable)
+#   systemctl restart turma-agent          (system scope)
+#   $PREFIX/bin/turma-agentctl restart     (no systemd at all)
+# The inline stub covered only the last of those, which made the comment it
+# carried ("so a successful install doesn't try to touch systemd") untrue: on a
+# systemd host both systemctl branches were live and would have hit the REAL
+# unit. Measured with a PATH sentinel, today's cases never actually reach the
+# restart, so this is latent rather than a bug anyone has hit — but a test that
+# claims to isolate systemd should isolate all three paths, not one.
+install_fake_restart() {  # <bindir>
+  cat > "$1/turma-agentctl" <<'EOF'
+#!/bin/sh
+echo "turma-agentctl $*" >> "${TURMA_TEST_RESTART_LOG:-/dev/null}"
+exit 0
+EOF
+  cat > "$1/systemctl" <<'EOF'
+#!/bin/sh
+echo "systemctl $*" >> "${TURMA_TEST_RESTART_LOG:-/dev/null}"
+exit 0
+EOF
+  chmod +x "$1/turma-agentctl" "$1/systemctl"
+}
+
 run_case() {  # <installed_version> <fake_gh_dir>
   local installed="$1" ghdir="$2" root prefix bin
   root="$(mktemp -d)"
@@ -108,12 +132,7 @@ run_case() {  # <installed_version> <fake_gh_dir>
   echo "// old" >"$prefix/tunnel-agent.js"
   mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
   echo "$installed" >"$prefix/VERSION"
-  # Stub the restart so a successful install doesn't try to touch systemd.
-  cat > "$bin/turma-agentctl" <<'EOF'
-#!/bin/sh
-exit 0
-EOF
-  chmod +x "$bin/turma-agentctl"
+  install_fake_restart "$bin"
   install_fake_gh "$bin"
 
   FAKE_GH_DIR="$ghdir" HOME="$root/home" PATH="$bin:$PATH" \
@@ -213,7 +232,8 @@ cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
 echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
 mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
 echo "0.3.0" >"$prefix/VERSION"
-printf '#!/bin/sh\nexit 0\n' > "$bin/turma-agentctl"; chmod +x "$bin/turma-agentctl"
+install_fake_restart "$bin"
+
 install_fake_gh "$bin"
 FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
   "$bin/turma-agent-update" >/dev/null 2>&1 || true
@@ -301,7 +321,7 @@ run_noauth_case() {  # <installed_version> <fake_gh_dir> [GH_TOKEN]
   echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
   mkdir -p "$prefix/hooks"; echo "# old" >"$prefix/hooks/guard.py"
   echo "$installed" >"$prefix/VERSION"
-  printf '#!/bin/sh\nexit 0\n' > "$bin/turma-agentctl"; chmod +x "$bin/turma-agentctl"
+  install_fake_restart "$bin"
   install_unauthed_gh "$bin"
   install_fake_curl "$bin"
   FAKE_GH_DIR="$ghdir" HOME="$root/home" PATH="$bin:$PATH" \

@@ -19,6 +19,27 @@ set -eu
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"   # $PREFIX/bin
 PREFIX="$(dirname "$SELF_DIR")"             # $PREFIX
 
+# HOME must exist before anything below reads it, because this script runs under
+# `set -u` and nearly every default path hangs off it.
+#
+# systemd does NOT export HOME to a SYSTEM-scope service. install.sh injects an
+# `Environment=HOME=` line when it writes one, but the launcher must not DEPEND
+# on that: any unit produced another way — a hand-written one, or an /etc
+# restored from a snapshot older than that fix — leaves HOME unset, and the
+# first `$HOME` below then aborts the whole launcher with a one-line
+# "HOME: unbound variable". systemd restarts it, it dies again, and five rounds
+# of that trip StartLimitBurst and leave the host's agent stopped with no
+# retry. That is exactly how this host lost its agent for 7.5 hours.
+#
+# Derive it from the passwd entry for whoever we actually are; /root is the
+# last-resort fallback (the native install's own default for a root install).
+if [ -z "${HOME:-}" ]; then
+  HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+  HOME="${HOME:-/root}"
+  export HOME
+  echo "[turma-agent] HOME was unset (system-scope unit?); using $HOME" >&2
+fi
+
 # Load config. Same plain KEY=value format systemd's EnvironmentFile consumes;
 # `set -a` exports every assignment so it reaches hub-agent.py as an env var.
 CFG="${TURMA_AGENT_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/turma-agent/turma-agent.env}"
