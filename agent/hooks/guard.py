@@ -13,9 +13,10 @@ categories.
    (``mkfs``/``dd of=/dev/...``/``format``), fork bombs, host power-state
    changes, recursive ``chmod``/``chown`` of system roots, git history
    destruction (``branch -D main``, ``filter-branch``, reflog-expire,
-   ``reset --hard`` onto a protected branch), and database drops
-   (``DROP DATABASE``/``TABLE``). Denied with a reason the model self-corrects
-   from. A specific destructive command an operator wants to permit can be
+   ``reset --hard`` onto a protected branch), database drops
+   (``DROP DATABASE``/``TABLE``), and stopping the agent's OWN service — which
+   supervises every session on the host, including the one asking. Denied with a
+   reason the model self-corrects from. A specific destructive command an operator wants to permit can be
    allowlisted via ``$TURMA_TOOL_GRANTS`` (a CSV of ``Bash(<command>)``
    patterns) — the exact command only, never a blanket grant.
 
@@ -301,6 +302,55 @@ _DISK_PROGS = {
     "format",
 }
 _POWER_PROGS = {"shutdown", "reboot", "halt", "poweroff"}
+
+# The agent's OWN service units. Stopping or restarting one kills the manager
+# that supervises every session on this host — including the session issuing the
+# command — so it belongs with the power-state rules rather than with ordinary
+# service management. A session has no way to bring it back afterwards, and
+# systemd will not: five rapid restarts trip StartLimitBurst and leave the unit
+# stopped with no retry, which is how the truenas host lost its agent for 7.5
+# hours. Ask the operator instead.
+_AGENT_UNITS = {
+    "turma-agent", "turma-agent.service",
+    "turma-agent-update", "turma-agent-update.service", "turma-agent-update.timer",
+}
+
+# systemctl verbs that take the unit DOWN (or stop it coming back). Read-only
+# verbs — status, show, cat, is-active, list-units — are deliberately absent:
+# a session should be able to look at its own agent.
+_SERVICE_DOWN_VERBS = {
+    "stop", "restart", "try-restart", "reload-or-restart", "try-reload-or-restart",
+    "kill", "disable", "mask",
+}
+
+
+def _destructive_agent_service(tokens: list[str]) -> str | None:
+    prog = _basename(tokens[0])
+    args = [t for t in tokens[1:] if not t.startswith("-")]
+    if prog == "systemctl":
+        if args and args[0] in _SERVICE_DOWN_VERBS and any(
+            a.lower() in _AGENT_UNITS for a in args[1:]
+        ):
+            return (
+                "refusing to stop/restart the Turma agent's own service — it "
+                "supervises every session on this host, including yours, and a "
+                "session cannot start it again. Ask the operator."
+            )
+    # The installed helper wraps the same operations for hosts without systemd.
+    if prog == "turma-agentctl" and args and args[0] in ("stop", "restart"):
+        return (
+            "refusing to stop/restart the Turma agent — it supervises every "
+            "session on this host, including yours. Ask the operator."
+        )
+    # Signalling the manager directly is the same act by another route.
+    if prog in ("pkill", "killall") and any(
+        "hub-agent" in t or "turma-agent" in t for t in tokens[1:]
+    ):
+        return (
+            "refusing to kill the Turma agent manager — it supervises every "
+            "session on this host, including yours. Ask the operator."
+        )
+    return None
 _PS_POWER = {"stop-computer", "restart-computer", "clear-disk", "format-volume"}
 
 
@@ -538,6 +588,7 @@ def is_destructive(command: str, _depth: int = 0) -> str | None:
             _destructive_chmod_chown(tokens),
             _destructive_git(tokens, segment),
             _destructive_disk_power(tokens, segment),
+            _destructive_agent_service(tokens),
             _destructive_powershell_remove(segment),
         ):
             if reason:
