@@ -49,6 +49,7 @@ as cwd, so it cannot rely on any package being importable.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import json
 import os
 import re
@@ -258,12 +259,24 @@ def _unwrap_group(segment: str) -> str:
     return seg
 
 
-def _tokenize(segment: str) -> list[str]:
-    """Best-effort shell tokenisation; falls back to whitespace split."""
+@functools.lru_cache(maxsize=512)
+def _tokenize_cached(segment: str) -> tuple[str, ...]:
     try:
-        return shlex.split(segment, posix=True)
+        return tuple(shlex.split(segment, posix=True))
     except ValueError:
-        return segment.split()
+        return tuple(segment.split())
+
+
+def _tokenize(segment: str) -> list[str]:
+    """Best-effort shell tokenisation; falls back to whitespace split.
+
+    Memoised because the same segment is tokenised several times per command
+    (the `piped_operands` sweep, then the classification pass, then each
+    unwrapped executor), and `shlex` is the most expensive thing this hook does
+    — it runs before EVERY Bash call, so its cost is on the agent's critical
+    path. A fresh list is returned so callers can treat it as their own.
+    """
+    return list(_tokenize_cached(segment))
 
 
 def _strip_prefixes(tokens: list[str]) -> list[str]:

@@ -342,6 +342,27 @@ class TestKnownBypasses(unittest.TestCase):
                 self.assertIsNone(guard.is_destructive(cmd))
                 self.assertIsNone(guard.policy_reason(cmd))
 
+    def test_tokenising_is_memoised(self):
+        """The hook runs before EVERY Bash call, so its cost is on the critical path.
+
+        Each segment is tokenised several times per command (the piped-operand
+        sweep, the classification pass, then each unwrapped executor), and
+        `shlex` is the most expensive thing here. Asserting cache HITS rather
+        than wall-clock keeps this deterministic in CI.
+        """
+        guard._tokenize_cached.cache_clear()
+        guard.is_destructive("echo /etc | xargs rm -rf && git status")
+        self.assertGreater(guard._tokenize_cached.cache_info().hits, 0)
+
+    def test_tokenize_returns_a_private_list(self):
+        """Memoising must not hand two callers the same mutable list."""
+        a = guard._tokenize("rm -rf /tmp/x")
+        b = guard._tokenize("rm -rf /tmp/x")
+        self.assertEqual(a, b)
+        self.assertIsNot(a, b)
+        a.append("mutated")
+        self.assertNotIn("mutated", guard._tokenize("rm -rf /tmp/x"))
+
     def test_xargs_from_a_file_is_a_known_limit(self):
         """Documented, not silently believed to be covered.
 
