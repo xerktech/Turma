@@ -434,6 +434,12 @@ fun orgColorIndex(siteKey: String, allKeys: List<String>, pins: Map<String, Int>
  * — which it rejects. `Date.parse` on the web accepts both, so every Jira
  * ticket's age chip rendered blank on Android while Azure's Zulu timestamps
  * worked, which is why Azure-only testing never saw it (XERK-235).
+ *
+ * Input with NO offset (`2026-08-08T12:34:56`, `2026-08-08`) deliberately
+ * returns null and renders a blank chip, where the web's `Date.parse` would
+ * guess the viewer's local zone. No tracker emits it — Jira Cloud and Azure
+ * always stamp an offset and the agent stamps Zulu — and guessing would make
+ * two phones in different zones disagree about the same ticket's age.
  */
 internal fun parseIsoMs(iso: String): Long? {
     runCatching { return java.time.Instant.parse(iso).toEpochMilli() }

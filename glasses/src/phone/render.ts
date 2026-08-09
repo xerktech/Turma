@@ -121,8 +121,12 @@ function orgTintStyle(colorMap: Map<string, string>, siteKey: string): string {
   return c ? ` style="--org:${c}"` : "";
 }
 
-function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, current: boolean, tint: string): string {
-  const st = liveState(s);
+function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, current: boolean,
+                        tint: string, hostLastSeen?: number, now?: number): string {
+  // The host arguments matter here as much as in the grouping above: without
+  // them a card sitting under "Ready for review" labelled ITSELF "working",
+  // disagreeing with its own heading (XERK-235).
+  const st = liveState(s, hostLastSeen, now);
   const name = sessionName(s);
   const q = s.session?.question;
   const stateRow =
@@ -221,9 +225,9 @@ export function sessionsBodyHtml(state: AppState): string {
       : "";
 
   const body =
-    section("Ready for review", review, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r))) +
-    section("Active", active, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r))) +
-    section("Idle", idle, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r))) +
+    section("Ready for review", review, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r), r.lastSeen, now)) +
+    section("Active", active, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r), r.lastSeen, now)) +
+    section("Idle", idle, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r), r.lastSeen, now)) +
     section("Queued", queued, (r) => queuedCardHtml(r.hostKey, r.hostLabel, r.s, tintOf(r))) +
     section("Ended", ended.slice(0, 20), (r) => endedCardHtml(r.hostLabel, r.s, tintOf(r)), "ph-ended-section");
 
