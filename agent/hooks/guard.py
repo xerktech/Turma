@@ -582,6 +582,25 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             for tok in rest:
                 if not tok.startswith("-"):
                     out.extend(_expand_segments(tok, depth + 1))
+        elif prog in _EXEC_WRAPPERS and rest:
+            # `ssh h 'rm -rf /'`, `docker exec c rm -rf /etc`,
+            # `kubectl exec pod -- rm -rf /etc` were all allowed: a wrapper's
+            # remote command was followed through for SQL (_stage_executes_sql)
+            # but never expanded as a COMMAND, so the destructive and policy
+            # rules never saw it. The remote host is a peer of this one — the
+            # agent image ships ssh/docker/kubectl and mounts ~/.ssh — so this
+            # is the same blast radius one hop away (XERK-235).
+            #
+            # Only two shapes are treated as the command, to keep an ordinary
+            # `--label 'x=y z'` from being read as one: everything after `--`,
+            # and any single argument that is itself a command line.
+            inner_cmd = _wrapper_command(prog, rest)
+            if inner_cmd:
+                out.extend(_expand_segments(
+                    " ".join(shlex.quote(t) for t in inner_cmd), depth + 1))
+            for tok in rest:
+                if tok.strip() and re.search(r"\s", tok):
+                    out.extend(_expand_segments(tok, depth + 1))
         elif prog == "xargs" and rest:
             # Drop xargs' own leading options, keep the command and ITS flags,
             # then append what the pipeline will feed it as operands. An option
@@ -1085,6 +1104,29 @@ _EXEC_WRAPPERS = {
     "docker-compose", "flatpak", "distrobox", "lxc", "incus",
 }
 
+# How many non-option OPERANDS sit between the wrapper and the command it runs:
+# `ssh <host> <cmd>` is one, `docker exec <container> <cmd>` is two (the
+# subcommand and the target). Used to find the command in the UNQUOTED form; the
+# quoted form (`ssh h '<cmd>'`) arrives as one token and is handled separately.
+_EXEC_WRAPPER_OPERANDS = {
+    "ssh": 1, "nsenter": 0, "chroot": 1,
+    "docker": 2, "podman": 2, "kubectl": 2, "oc": 2,
+    "docker-compose": 2, "flatpak": 2, "distrobox": 2, "lxc": 2, "incus": 2,
+}
+
+
+def _wrapper_command(prog: str, rest: list[str]) -> list[str]:
+    """The command a wrapper runs, in its unquoted form, or []."""
+    if "--" in rest:
+        return rest[rest.index("--") + 1:]
+    remaining = _EXEC_WRAPPER_OPERANDS.get(prog, 1)
+    i = 0
+    while i < len(rest) and remaining > 0:
+        if not rest[i].startswith("-"):
+            remaining -= 1
+        i += 1
+    return rest[i:] if remaining == 0 else []
+
 
 def _stage_executes_sql(tokens: list[str], depth: int = 0) -> bool:
     """True if SQL reaching this command would actually be EXECUTED.
@@ -1128,9 +1170,13 @@ def _stage_executes_sql(tokens: list[str], depth: int = 0) -> bool:
             base = _basename(tokens[idx])
             if base in _DB_CLIENTS or base in _SHELL_PROGS:
                 return _stage_executes_sql(tokens[idx:], depth + 1)
-            words = _tokenize(tokens[idx])
-            if len(words) > 1 and _stage_executes_sql(words, depth + 1):
-                return True
+            # The remote command can be COMPOUND — `ssh h 'cd /tmp && psql -c …'`
+            # classified as `cd` when read as one argv. Only the severed-quote
+            # bug was catching those before it was fixed.
+            for part in _split_on_operators(tokens[idx]):
+                words = _tokenize(part)
+                if len(words) > 1 and _stage_executes_sql(words, depth + 1):
+                    return True
     return False
 
 

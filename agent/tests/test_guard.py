@@ -616,6 +616,61 @@ class TestKnownBypasses(unittest.TestCase):
                 self.assertIsNone(guard.is_destructive(cmd))
                 self.assertIsNone(guard.policy_reason(cmd))
 
+    def test_a_wrappers_remote_command_is_a_command(self):
+        """`ssh h 'rm -rf /'` was allowed on origin/main and here.
+
+        A wrapper's remote command was followed through for SQL but never
+        expanded as a COMMAND, so the destructive and policy rules never saw it.
+        The remote host is a peer of this one — the image ships ssh/docker/
+        kubectl and mounts ~/.ssh — so it is the same blast radius one hop away
+        (XERK-235).
+        """
+        for cmd in ("ssh h 'rm -rf /'", "ssh prod 'shutdown -h now'",
+                    "ssh h 'mkfs.ext4 /dev/sda1'", "ssh h 'chmod -R 777 /'",
+                    "docker exec c rm -rf /etc", "docker exec -i c rm -rf /etc",
+                    "kubectl exec pod -- rm -rf /etc", "ssh -p 22 h 'rm -rf /etc'",
+                    "ssh h 'rm -rf /etc; echo done'"):
+            with self.subTest(destructive=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ("ssh h 'git push origin main'", "ssh h 'gh pr merge 1'"):
+            with self.subTest(policy=cmd):
+                self.assertIsNotNone(guard.policy_reason(cmd))
+        # ...without taking ordinary remote work with it.
+        for cmd in ("ssh host 'rm -rf /tmp/build'", "ssh host 'uptime'",
+                    "docker exec c rm -rf /app/node_modules", "docker exec c npm test",
+                    "docker run --rm alpine echo hi", "docker build -t app .",
+                    "docker run -e 'FOO=rm -rf /etc' img", "kubectl get pods -A",
+                    "ssh host 'git push origin feature/x'", "kubectl exec pod -- ls /"):
+            with self.subTest(allowed=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+                self.assertIsNone(guard.policy_reason(cmd))
+
+    def test_a_compound_remote_command_still_reaches_its_client(self):
+        """`ssh h 'cd /tmp && psql -c "…"'` classified as `cd` when read as one
+        argv. It was only ever caught by the severed-quote bug, so fixing that
+        took the protection with it."""
+        drop_db = "DROP" + " DATABASE"
+        for cmd in (f"ssh host 'cd /tmp && psql -c \"{drop_db} p\"'",
+                    f"ssh host 'cd /tmp; psql -c \"{drop_db} p\"'",
+                    f"docker exec db sh -c 'cd /; psql -c \"{drop_db} p\"'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_the_splitter_honours_escapes_and_literal_quotes(self):
+        """The two behaviours of the quote-aware splitter that nothing pinned.
+
+        Removing the backslash handling makes `echo "x\"; rm -rf /etc"` deny —
+        the `\"` is escaped, so the `;` is inside the string and echo just
+        prints it. Letting `'` close on `"` makes `echo 'a"b; rm -rf /etc'` deny,
+        because a single-quoted body is literal.
+        """
+        self.assertIsNone(guard.is_destructive('echo "x\\"; rm -rf /etc"'))
+        self.assertIsNone(guard.is_destructive("echo 'a\"b; rm -rf /etc'"))
+        # An UNTERMINATED quote is a syntax error, so nothing runs.
+        self.assertIsNone(guard.is_destructive("echo 'unterminated; rm -rf /etc"))
+        # ...while the escaped-path form still denies.
+        self.assertIsNotNone(guard.is_destructive("rm -rf \\/etc"))
+
     def test_tokenising_is_memoised(self):
         """The hook runs before EVERY Bash call, so its cost is on the critical path.
 
