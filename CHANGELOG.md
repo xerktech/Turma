@@ -6,6 +6,10 @@ This file rolls up each **minor** release — the changes since the previous min
 
 <!-- releases:newest-first -->
 
+## 1.0.0 — 2026-08-09
+
+_No changes._
+
 ## 0.6.0 — 2026-07-28
 
 _No changes._
